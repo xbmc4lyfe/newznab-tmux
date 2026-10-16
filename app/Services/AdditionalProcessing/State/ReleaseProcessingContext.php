@@ -9,7 +9,6 @@ use App\Services\AdditionalProcessing\DTO\AdditionalWorkPlan;
 use App\Services\AdditionalProcessing\DTO\ArchivedMediaEntry;
 use App\Services\AdditionalProcessing\DTO\DownloadedArchive;
 use App\Services\AdditionalProcessing\DTO\MediaSourcePlan;
-use App\Support\ReleasePackEvidence;
 
 /**
  * Mutable context object that holds the processing state for a single release.
@@ -26,17 +25,12 @@ class ReleaseProcessingContext
 
     private const int MAX_RETAINED_ARCHIVE_BYTES = 16_777_216;
 
-    private const int MAX_ARCHIVE_FILE_NAMES = 500;
+    private const int MAX_ARCHIVE_FILE_NAMES = 256;
+
+    private const int MAX_NAMING_WITNESS_BYTES = 32768;
 
     // The release being processed
     public Release $release;
-
-    /** @var array{present: bool, id: int, guid: string, name: mixed, searchname: mixed, value: mixed} */
-    public array $packEvidenceObservation;
-
-    public ?string $loadedPackState = null;
-
-    public bool $packEvidenceInvalid = false;
 
     // Processing state flags
     public bool $foundVideo = false;
@@ -58,6 +52,9 @@ class ReleaseProcessingContext
 
     public bool $releaseHasPassword = false;
 
+    /** An archive listing was cut off or had unreadable records, so some entries were never checked for a password. */
+    public bool $archiveListingIncomplete = false;
+
     // NFO state
     public bool $releaseHasNoNFO = false;
 
@@ -68,6 +65,35 @@ class ReleaseProcessingContext
 
     // NZB state
     public bool $nzbHasCompressedFile = false;
+
+    /** Full decoded source generation captured before processing. */
+    public ?string $nzbSourceDigest = null;
+
+    /** @var list<array{name: string, firstMessageId: string}>|null Full raw XML inventory, never proof alone. */
+    public ?array $nzbSourceFiles = null;
+
+    /** @var array<string, string> Complete typed archive listings keyed by source first-message digest. */
+    public array $archiveSourceWitnesses = [];
+
+    /** @var list<array{name: string, firstMessageId: string}>|null Full raw XML nominations, never proof alone. */
+    public ?array $directVideoFiles = null;
+
+    /** @var array<string, array{name: string, size: int, digest: string}> Actual typed first-article observations. */
+    public array $directVideoWitnesses = [];
+
+    /** Every archive set in this source was inspected without omissions. */
+    public bool $archiveNamingInspectionComplete = false;
+
+    /** @var array<string, true> Exact filenames observed in this attempt, including duplicate inventory. */
+    public array $archiveNamingWitnesses = [];
+
+    /** @var array<string, bool> Attempted witness filenames; true only for archive-proof deferral. */
+    public array $archiveFilenameNamingAttempts = [];
+
+    /** Actual observed filenames were omitted due to invalid encoding/size or admission caps. */
+    public bool $namingWitnessesOmitted = false;
+
+    private int $namingWitnessBytes = 0;
 
     /**
      * Archive inspection ran for this release (not skipped for a book flood or disabled downloads).
@@ -86,18 +112,16 @@ class ReleaseProcessingContext
      */
     public bool $archiveRetryable = false;
 
-    /** Every known archive set yielded a listing, allowing probable-pack naming to be reconsidered. */
-    public bool $archiveSetWalkComplete = false;
+    /**
+     * Volume sets of compressed candidates whose data turned out to be plain media,
+     * which has no password.
+     *
+     * @var array<string, true>
+     */
+    public array $mediaVolumeSets = [];
 
-    /** Retryable failures left fewer listed sets than the configured bounded sample requires. */
-    public bool $archiveSampleIncomplete = false;
-
-    /** @var array<string, true> Distinct successfully listed sets across forward and reverse walks. */
-    public array $listedArchiveSets = [];
-
-    public int $archiveListingsRead = 0;
-
-    public bool $archiveFileNamesTruncated = false;
+    // Archive data was found outside the planned archive candidates (e.g. by the probe).
+    public bool $unplannedArchiveSeen = false;
 
     /**
      * @var list<array<string, mixed>>
@@ -111,6 +135,9 @@ class ReleaseProcessingContext
 
     /** One episode was listed from a release with several archive sets; the rest of the season may follow. */
     public bool $seasonPackProbable = false;
+
+    /** Archive naming evidence is partial, omitted, or cannot be classified safely. */
+    public bool $archiveNameEvidenceIncomplete = false;
 
     /** @var list<string> names listed from every archive read for this release */
     public array $archiveFileNames = [];
@@ -225,14 +252,6 @@ class ReleaseProcessingContext
     public function __construct(Release $release)
     {
         $this->release = $release;
-        $this->packEvidenceObservation = ReleasePackEvidence::observe($release);
-        if ($this->packEvidenceObservation['present']) {
-            $evidence = ReleasePackEvidence::decode($release);
-            $this->loadedPackState = $evidence['kind'] === 'current' ? $evidence['state'] : null;
-            $this->packEvidenceInvalid = $evidence['kind'] === 'invalid';
-            $this->seasonPack = $this->loadedPackState === 'confirmed';
-            $this->seasonPackProbable = $this->loadedPackState === 'probable';
-        }
         $attributes = $release->getAttributes();
         $this->producerNamingClaim = array_key_exists('additional_pp_claim_token', $attributes)
             && array_key_exists('additional_pp_claimed_at', $attributes)
@@ -278,8 +297,6 @@ class ReleaseProcessingContext
         $this->currentPar2EvidenceSnapshot = [...$proof['after'], 'additional_pp_claim_token' => $this->par2EvidenceSnapshot['additional_pp_claim_token']];
         $this->release->name = $proof['after']['name'];
         $this->release->searchname = $proof['after']['searchname'];
-        $this->packEvidenceObservation['name'] = $proof['after']['name'];
-        $this->packEvidenceObservation['searchname'] = $proof['after']['searchname'];
 
         return true;
     }
@@ -344,20 +361,29 @@ class ReleaseProcessingContext
     {
         $this->passwordStatus = 0;
         $this->releaseHasPassword = false;
+        $this->archiveListingIncomplete = false;
         $this->nzbHasCompressedFile = false;
         $this->archiveInspectionAttempted = false;
         $this->archiveListingUndecodable = false;
         $this->archiveRetryable = false;
-        $this->archiveSetWalkComplete = false;
-        $this->archiveSampleIncomplete = false;
-        $this->listedArchiveSets = [];
-        $this->archiveListingsRead = 0;
-        $this->archiveFileNamesTruncated = false;
+        $this->mediaVolumeSets = [];
+        $this->unplannedArchiveSeen = false;
         $this->groupUnavailable = false;
         $this->workPlan = null;
-        $this->seasonPack = $this->loadedPackState === 'confirmed';
-        $this->seasonPackProbable = $this->loadedPackState === 'probable';
+        $this->seasonPack = false;
+        $this->seasonPackProbable = false;
+        $this->archiveNameEvidenceIncomplete = false;
         $this->archiveFileNames = [];
+        $this->archiveNamingWitnesses = [];
+        $this->archiveFilenameNamingAttempts = [];
+        $this->namingWitnessBytes = 0;
+        $this->namingWitnessesOmitted = false;
+        $this->nzbSourceDigest = null;
+        $this->nzbSourceFiles = null;
+        $this->archiveSourceWitnesses = [];
+        $this->directVideoFiles = null;
+        $this->directVideoWitnesses = [];
+        $this->archiveNamingInspectionComplete = false;
         $this->firstArchiveFiles = null;
         $this->reverseArchiveSummary = null;
         $this->mediaPlan = null;
@@ -397,16 +423,44 @@ class ReleaseProcessingContext
     {
         foreach ($files as $file) {
             $name = (string) ($file['name'] ?? '');
-            if ($name === '' || in_array($name, $this->archiveFileNames, true)) {
-                continue;
+            if (! $this->rememberNamingWitness($name)) {
+                return;
             }
-            if (count($this->archiveFileNames) >= self::MAX_ARCHIVE_FILE_NAMES) {
-                $this->archiveFileNamesTruncated = true;
-
-                continue;
+            if (! in_array($name, $this->archiveFileNames, true)) {
+                $this->archiveFileNames[] = $name;
             }
-            $this->archiveFileNames[] = $name;
         }
+    }
+
+    public function rememberArchiveFilenameNamingAttempt(string $name, bool $proofDeferred): void
+    {
+        // Reuse the witness count/byte bounds; no separate unbounded name set.
+        if (isset($this->archiveNamingWitnesses[$name])) {
+            $this->archiveFilenameNamingAttempts[$name] = $proofDeferred;
+        }
+    }
+
+    /** Admit names once, before callers retain them for naming or inventory. */
+    public function rememberNamingWitness(string $name): bool
+    {
+        if ($this->namingWitnessesOmitted) {
+            return false;
+        }
+        if (isset($this->archiveNamingWitnesses[$name])) {
+            return true;
+        }
+        if ($name === '' || strlen($name) > 4096 || ! mb_check_encoding($name, 'UTF-8')
+            || count($this->archiveNamingWitnesses) >= self::MAX_ARCHIVE_FILE_NAMES
+            || $this->namingWitnessBytes + strlen($name) > self::MAX_NAMING_WITNESS_BYTES) {
+            $this->namingWitnessesOmitted = true;
+            $this->archiveNameEvidenceIncomplete = true;
+
+            return false;
+        }
+        $this->archiveNamingWitnesses[$name] = true;
+        $this->namingWitnessBytes += strlen($name);
+
+        return true;
     }
 
     /**
@@ -415,7 +469,7 @@ class ReleaseProcessingContext
      */
     public function defersArchiveNameChecks(): bool
     {
-        return $this->seasonPack || $this->seasonPackProbable || $this->archiveFileNamesTruncated || $this->packEvidenceInvalid;
+        return $this->seasonPack || $this->seasonPackProbable || $this->archiveNameEvidenceIncomplete;
     }
 
     /**
@@ -477,6 +531,25 @@ class ReleaseProcessingContext
             'par2Info' => $this->foundPAR2Info = true,
             default => null,
         };
+    }
+
+    /**
+     * True when every compressed candidate was proven to be plain media; an unread or
+     * unreadable archive anywhere else in the release keeps its password status unknown.
+     */
+    public function compressedFilesAreMedia(): bool
+    {
+        if ($this->mediaVolumeSets === [] || $this->unplannedArchiveSeen) {
+            return false;
+        }
+
+        foreach ($this->workPlan->archiveCandidates ?? [] as $candidate) {
+            if (! isset($this->mediaVolumeSets[$candidate->volumeSet()])) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**

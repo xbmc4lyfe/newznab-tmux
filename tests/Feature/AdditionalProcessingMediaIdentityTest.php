@@ -16,13 +16,14 @@ use App\Services\NameFixing\NameFixingService;
 use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\NfoService;
 use App\Services\Nzb\NzbService;
+use App\Services\Nzb\NzbSourceGuard;
 use App\Services\ReleaseExtraService;
 use App\Services\ReleaseImageService;
 use App\Support\Par2FileHashEvidence;
-use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
 use Mhor\MediaInfo\Builder\MediaInfoContainerBuilder;
 use Mhor\MediaInfo\MediaInfo;
@@ -41,14 +42,7 @@ final class AdditionalProcessingMediaIdentityTest extends TestCase
 
     private string $audioFile;
 
-    public function createApplication()
-    {
-        $app = require __DIR__.'/../../bootstrap/app.php';
-        $app->useEnvironmentPath(sys_get_temp_dir())->loadEnvironmentFrom('.nntmux-validation-no-env');
-        $app->make(Kernel::class)->bootstrap();
-
-        return $app;
-    }
+    private string $sourceDirectory;
 
     protected function setUp(): void
     {
@@ -59,6 +53,8 @@ final class AdditionalProcessingMediaIdentityTest extends TestCase
             foreach (['haspreview', 'jpgstatus', 'videostatus'] as $column) {
                 $table->integer($column)->default(0);
             }
+            $table->string('additional_pp_claim_token')->nullable();
+            $table->string('additional_pp_claimed_at')->nullable();
         });
         Schema::table('release_files', static function (Blueprint $table): void {
             $table->bigInteger('size')->default(0);
@@ -75,82 +71,16 @@ final class AdditionalProcessingMediaIdentityTest extends TestCase
         });
         $this->audioFile = tempnam(sys_get_temp_dir(), 'media-identity-');
         file_put_contents($this->audioFile, 'external tool is mocked');
-        config(['nntmux.echocli' => false]);
+        $this->sourceDirectory = sys_get_temp_dir().'/media-identity-nzb-'.bin2hex(random_bytes(8));
+        File::ensureDirectoryExists($this->sourceDirectory);
+        config(['nntmux.echocli' => false, 'nntmux_settings.path_to_nzbs' => $this->sourceDirectory.'/']);
     }
 
     protected function tearDown(): void
     {
         @unlink($this->audioFile);
+        File::deleteDirectory($this->sourceDirectory);
         parent::tearDown();
-    }
-
-    #[DataProvider('audioGenerationAdmissionCases')]
-    public function test_real_audio_metadata_bypass_cannot_reinsert_an_obsolete_cohort(string $mode, string $generation): void
-    {
-        $release = $this->pendingPar2Release(['guid' => 'guid-1', 'name' => 'Original.Canonical-GRP', 'searchname' => 'Original.Canonical-GRP',
-            'categories_id' => Category::OTHER_MISC, 'nzbstatus' => 1, 'additional_pack_evidence' => null, 'predb_id' => $mode === 'linked' ? 7 : 0,
-            'additional_pp_claim_token' => null, 'additional_pp_claimed_at' => null]);
-        $context = new ReleaseProcessingContext($release);
-        $service = $this->service(static function () use ($context, $generation): void {
-            $values = match ($generation) {
-                'epoch' => ['additional_pack_evidence' => json_encode(['v' => 1,
-                    'identity_sha256' => hash('sha256', json_encode([(string) $context->release->id, 'guid-1'], JSON_THROW_ON_ERROR)),
-                    'epoch' => str_repeat('b', 64), 'state' => null], JSON_THROW_ON_ERROR)],
-                'unpublished' => ['nzbstatus' => 0],
-                default => [],
-            };
-            if ($values !== []) {
-                DB::table('releases')->where('id', $context->release->id)->update($values);
-            }
-        }, renameMusic: $mode !== 'rename disabled');
-        Search::shouldReceive('updateRelease')->andReturnNull();
-
-        $result = $service->getAudioInfo($this->audioFile, 'mp3', $context, sys_get_temp_dir().'/');
-
-        self::assertSame($generation === 'current', $result['audioInfo']);
-        self::assertSame($generation === 'current' ? 1 : 0, DB::table('audio_data')->count());
-        self::assertSame('Original.Canonical-GRP', DB::table('releases')->value('searchname'));
-        self::assertSame(0, (int) DB::table('releases')->value('proc_pp'));
-    }
-
-    public static function audioGenerationAdmissionCases(): iterable
-    {
-        foreach (['rename disabled', 'linked'] as $mode) {
-            foreach (['epoch', 'unpublished', 'current'] as $generation) {
-                yield $mode.' '.$generation => [$mode, $generation];
-            }
-        }
-    }
-
-    #[DataProvider('liveAudioPackCases')]
-    public function test_real_owning_audio_producer_honors_live_pack_state_before_finalization(string $state, bool $episode): void
-    {
-        $context = $this->context();
-        DB::table('releases')->where('id', $context->release->id)->update(['nzbstatus' => 1]);
-        $context->release->nzbstatus = 1;
-        $context->seasonPack = $state === 'confirmed';
-        $context->seasonPackProbable = $state === 'probable';
-        $context->archiveFileNamesTruncated = $state === 'truncated';
-        self::assertNull(DB::table('releases')->value('additional_pack_evidence'));
-        Search::shouldReceive('updateRelease')->andReturnNull();
-        $service = $this->service(tags: ['Performer' => 'Artist', 'Album' => $episode ? 'Show.S01E01' : 'Safe Album']);
-
-        $result = $service->getAudioInfo($this->audioFile, 'mp3', $context, sys_get_temp_dir().'/');
-
-        $blocked = $episode && $state !== 'single';
-        self::assertTrue($result['audioInfo']);
-        self::assertSame($blocked ? 'Original.Canonical-GRP' : 'Artist - '.($episode ? 'Show.S01E01' : 'Safe Album').' MP3', DB::table('releases')->value('searchname'));
-        self::assertSame($blocked ? Category::OTHER_MISC : Category::MUSIC_MP3, (int) DB::table('releases')->value('categories_id'));
-        self::assertSame($blocked ? 0 : 1, (int) DB::table('releases')->value('proc_pp'));
-        self::assertSame(1, DB::table('audio_data')->count());
-        self::assertNull(DB::table('releases')->value('additional_pack_evidence'));
-    }
-
-    public static function liveAudioPackCases(): array
-    {
-        return ['confirmed live pack' => ['confirmed', true], 'probable live pack' => ['probable', true],
-            'truncated evidence' => ['truncated', true], 'safe album for pack' => ['confirmed', false],
-            'ordinary episode control' => ['single', true]];
     }
 
     public function test_real_scalar_tags_preserve_unicode_quotes_and_attest_same_cycle_evidence(): void
@@ -454,6 +384,7 @@ final class AdditionalProcessingMediaIdentityTest extends TestCase
         /** @var NameFixingService&MockInterface $names */
         $names = Mockery::mock(NameFixingService::class);
         $names->shouldReceive('matchPreDbFileNames')->once()->andReturn(0);
+        $names->shouldReceive('wasEpisodeNamingDeferredByArchiveProof')->andReturnFalse();
         $names->shouldReceive('reset')->andReturnNull();
         $names->shouldReceive('lastCommittedIdentity')->andReturnNull();
         /** @var CategorizationService&MockInterface $category */
@@ -469,15 +400,30 @@ final class AdditionalProcessingMediaIdentityTest extends TestCase
 
     private function context(): ReleaseProcessingContext
     {
-        return new ReleaseProcessingContext($this->pendingPar2Release([
+        $release = $this->pendingPar2Release([
             'guid' => 'guid-1', 'name' => 'Original.Canonical-GRP', 'searchname' => 'Original.Canonical-GRP',
-            'categories_id' => Category::OTHER_MISC, 'nzbstatus' => 1, 'additional_pack_evidence' => null, 'additional_pp_claim_token' => 'claim',
+            'categories_id' => Category::OTHER_MISC, 'additional_pp_claim_token' => 'claim',
             'additional_pp_claimed_at' => now()->format('Y-m-d H:i:s'),
-        ]));
+        ]);
+        $nzb = app(NzbService::class);
+        $path = $nzb->getNzbPath($release->guid, createIfNotExist: true);
+        if (! File::isFile($path)) {
+            $xml = '<nzb><file subject="fixture.mp3 yEnc (1/1)"><groups><group>alt.binaries.test</group></groups>'
+                .'<segments><segment bytes="1" number="1">fixture-source@article</segment></segments></file></nzb>';
+            File::put($path, gzencode($xml));
+        }
+        $sources = new NzbSourceGuard($nzb);
+        $this->app->instance(NzbSourceGuard::class, $sources);
+        $snapshot = $sources->snapshot($release->guid);
+        self::assertNotNull($snapshot);
+        $context = new ReleaseProcessingContext($release);
+        $context->nzbSourceDigest = $snapshot['digest'];
+
+        return $context;
     }
 
     /** @param array<string, mixed>|null $tags */
-    private function service(?callable $duringTool = null, ?array $tags = null, bool $toolExpected = true, ?ReleaseSearchSyncCoordinator $sharedSync = null, bool $renameMusic = true): MediaExtractionService
+    private function service(?callable $duringTool = null, ?array $tags = null, bool $toolExpected = true, ?ReleaseSearchSyncCoordinator $sharedSync = null): MediaExtractionService
     {
         $builder = new MediaInfoContainerBuilder;
         $builder->addTrackType('General', []);
@@ -496,7 +442,7 @@ final class AdditionalProcessingMediaIdentityTest extends TestCase
         $image = Mockery::mock(ReleaseImageService::class);
         $sync = $sharedSync ?? new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector);
         $service = new MediaExtractionService(
-            $this->makeConfig(['processAudioInfo' => true, 'renameMusicMediaInfo' => $renameMusic]),
+            $this->makeConfig(['processAudioInfo' => true, 'renameMusicMediaInfo' => true]),
             $image, new ReleaseExtraService, $category, $sync,
         );
         (new ReflectionProperty(MediaExtractionService::class, 'mediaInfo'))->setValue($service, $media);

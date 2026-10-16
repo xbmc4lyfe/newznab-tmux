@@ -26,6 +26,7 @@ class UpdateNNTmux extends Command
                             {--skip-composer : Skip composer update}
                             {--skip-npm : Skip npm operations}
                             {--skip-db : Skip database migrations}
+                            {--redis-preflight : Check Redis without performing an update}
                             {--git-lock-timeout=10 : Seconds to wait for an existing Git index lock}
                             {--force : Force update even if up-to-date}';
 
@@ -59,6 +60,18 @@ class UpdateNNTmux extends Command
      */
     public function handle(NntmuxUpdateLock $lock): int
     {
+        if ($this->option('redis-preflight')) {
+            try {
+                $this->checkRedisRuntimeIsHealthy();
+
+                return Command::SUCCESS;
+            } catch (\Throwable $e) {
+                $this->error($e->getMessage());
+
+                return Command::FAILURE;
+            }
+        }
+
         try {
             return $lock->run(fn (): int => $this->updateInstallation(), checkGit: ! $this->option('skip-git'), gitLockTimeout: (int) $this->option('git-lock-timeout'));
         } catch (\Exception $e) {
@@ -244,11 +257,11 @@ class UpdateNNTmux extends Command
      *
      * @param  list<string>  $arguments
      */
-    private function runFreshArtisanCommand(array $arguments): int
+    private function runFreshArtisanCommand(array $arguments, int $timeout = 3600): int
     {
         $this->line('  ℹ Restarting Artisan to load updated code...');
 
-        $result = Process::timeout(3600)
+        $result = Process::timeout($timeout)
             ->path(base_path())
             ->run(array_merge([PHP_BINARY, 'artisan'], $arguments), function (string $type, string $output): void {
                 $this->output->write($output);
@@ -314,19 +327,15 @@ class UpdateNNTmux extends Command
      */
     private function performMaintenanceTasks(): void
     {
-        // Merge environment variables
+        // Merge environment variables before caching their configuration values.
         $this->info('⚙️ Merging environment configuration...');
         $this->mergeEnvironmentConfig();
 
         // Refresh config cache so runtime client/host settings cannot drift.
         $this->info('🧹 Clearing config cache...');
-        if ($this->call('config:clear') !== Command::SUCCESS) {
-            throw new \RuntimeException('config:clear failed while refreshing configuration');
-        }
+        $this->call('config:clear');
         $this->info('Caching config...');
-        if ($this->call('config:cache') !== Command::SUCCESS) {
-            throw new \RuntimeException('config:cache failed while refreshing configuration');
-        }
+        $this->call('config:cache');
 
         // Clear view cache
         $this->info('🧹 Clearing view cache...');
@@ -477,6 +486,13 @@ class UpdateNNTmux extends Command
      * Enforce production Redis client expectations and basic connectivity.
      */
     private function ensureRedisRuntimeIsHealthy(): void
+    {
+        if ($this->runFreshArtisanCommand(['nntmux:all', '--redis-preflight'], 30) !== Command::SUCCESS) {
+            throw new \RuntimeException('Redis preflight failed in a fresh Artisan process; workers remain stopped.');
+        }
+    }
+
+    private function checkRedisRuntimeIsHealthy(): void
     {
         $redisClient = strtolower((string) config('database.redis.client', ''));
         if ($redisClient !== 'phpredis') {

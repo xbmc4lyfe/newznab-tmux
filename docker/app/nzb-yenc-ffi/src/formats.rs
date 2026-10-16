@@ -221,6 +221,57 @@ pub struct SevenZipPackedStream {
     pub crc32_valid: Option<bool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Rar4FirstFileHeader {
+    pub offset: usize,
+    pub header_crc: u16,
+    pub header_type: u8,
+    pub flags: u16,
+    pub header_size: u16,
+    pub header_complete: bool,
+    pub checksum_valid: Option<bool>,
+    pub data_offset: usize,
+    pub pack_size_low: u32,
+    pub unp_size_low: u32,
+    pub high_pack_size: Option<u32>,
+    pub high_unp_size: Option<u32>,
+    pub compressed_size: u64,
+    pub uncompressed_size: Option<u64>,
+    pub uncompressed_size_unknown: bool,
+    pub host_os: u8,
+    pub host_os_name: Option<&'static str>,
+    pub file_crc32: u32,
+    pub ftime_dos: u32,
+    pub unpack_version: u8,
+    pub method: u8,
+    pub method_name: Option<&'static str>,
+    pub name_size: u16,
+    pub file_attributes: u32,
+    pub split_before: bool,
+    pub split_after: bool,
+    pub encrypted: bool,
+    pub comment_present: bool,
+    pub solid: bool,
+    pub is_directory: bool,
+    pub dictionary_size_bytes: Option<u32>,
+    pub large_file: bool,
+    pub unicode_filename: bool,
+    pub salt_present: bool,
+    pub version_flag: bool,
+    pub exttime_present: bool,
+    pub salt_hex: Option<String>,
+    pub name_bytes_available: bool,
+    pub name_contains_nul: bool,
+    pub name_nul_offset: Option<u16>,
+    pub name_utf8_valid: bool,
+    pub name_encoding: Option<&'static str>,
+    pub filename: Option<String>,
+    pub ascii_name_prefix: Option<String>,
+    pub name_preview_hex: Option<String>,
+    pub name_preview_hex_truncated: bool,
+    pub name_sha256: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "format", rename_all = "snake_case")]
 pub enum FormatHeader {
@@ -249,6 +300,9 @@ pub enum FormatHeader {
         authenticity_position_present: Option<bool>,
         encrypted_header_salt_hex: Option<String>,
         encrypted_header_salt_available: Option<bool>,
+        first_file_header_status: &'static str,
+        next_block_type: Option<u8>,
+        first_file: Option<Rar4FirstFileHeader>,
     },
     Rar5 {
         offset: usize,
@@ -1110,6 +1164,13 @@ fn parse_rar4(data: &[u8], offset: usize) -> FormatHeader {
     let pos_av = full_header
         .filter(|block| block.len() >= 13 && header_type == Some(0x73))
         .map(|bytes| u32::from_le_bytes(bytes[9..13].try_into().expect("four-byte RAR4 PosAV")));
+    let (first_file_header_status, next_block_type, first_file) = parse_rar4_first_file_header(
+        data,
+        header_end,
+        main_header_available,
+        checksum_valid,
+        flags.map(|value| value & 0x0080 != 0),
+    );
     FormatHeader::Rar4 {
         offset,
         main_header_available,
@@ -1133,6 +1194,240 @@ fn parse_rar4(data: &[u8], offset: usize) -> FormatHeader {
             .map(|(high, low)| high != 0 || low != 0),
         encrypted_header_salt_hex,
         encrypted_header_salt_available,
+        first_file_header_status,
+        next_block_type,
+        first_file,
+    }
+}
+
+fn parse_rar4_first_file_header(
+    data: &[u8],
+    header_end: Option<usize>,
+    main_header_available: bool,
+    main_checksum_valid: Option<bool>,
+    encrypted_headers: Option<bool>,
+) -> (&'static str, Option<u8>, Option<Rar4FirstFileHeader>) {
+    if !main_header_available {
+        return ("main_header_incomplete", None, None);
+    }
+    if main_checksum_valid != Some(true) {
+        return ("main_header_checksum_invalid", None, None);
+    }
+    if encrypted_headers == Some(true) {
+        return ("encrypted_headers", None, None);
+    }
+    let Some(block_start) = header_end else {
+        return ("main_header_incomplete", None, None);
+    };
+    if data.len() <= block_start {
+        return ("truncated_before_next_block", None, None);
+    }
+    let Some(base_end) = block_start.checked_add(7) else {
+        return ("truncated_base_header", None, None);
+    };
+    let Some(base) = data.get(block_start..base_end) else {
+        return ("truncated_base_header", None, None);
+    };
+    let header_crc = u16::from_le_bytes([base[0], base[1]]);
+    let header_type = base[2];
+    let flags = u16::from_le_bytes([base[3], base[4]]);
+    let header_size = u16::from_le_bytes([base[5], base[6]]);
+    if header_type != 0x74 {
+        return ("non_file_block", Some(header_type), None);
+    }
+    let large_file = flags & 0x0100 != 0;
+    let salt_present = flags & 0x0400 != 0;
+    let name_offset = if large_file { 40usize } else { 32usize };
+    if usize::from(header_size) < name_offset {
+        return ("invalid_header_size", Some(header_type), None);
+    }
+    let Some(fixed_end) = block_start.checked_add(name_offset) else {
+        return ("truncated_file_header", Some(header_type), None);
+    };
+    let Some(fixed_block) = data.get(block_start..fixed_end) else {
+        return ("truncated_file_header", Some(header_type), None);
+    };
+    let name_size = u16::from_le_bytes([fixed_block[26], fixed_block[27]]);
+    let Some(name_end) = name_offset.checked_add(usize::from(name_size)) else {
+        return ("invalid_header_size", Some(header_type), None);
+    };
+    let Some(required_min_size) = name_end.checked_add(if salt_present { 8 } else { 0 }) else {
+        return ("invalid_header_size", Some(header_type), None);
+    };
+    if usize::from(header_size) < required_min_size {
+        return ("invalid_header_size", Some(header_type), None);
+    }
+    let Some(block_end) = block_start.checked_add(usize::from(header_size)) else {
+        return ("truncated_file_header", Some(header_type), None);
+    };
+    let Some(block) = data.get(block_start..block_end) else {
+        return ("truncated_file_header", Some(header_type), None);
+    };
+    let calculated_crc = (crc32fast::hash(&block[2..]) & 0xffff) as u16;
+    let checksum_valid = calculated_crc == header_crc;
+
+    let pack_size_low = u32::from_le_bytes([block[7], block[8], block[9], block[10]]);
+    let unp_size_low = u32::from_le_bytes([block[11], block[12], block[13], block[14]]);
+    let host_os = block[15];
+    let file_crc32 = u32::from_le_bytes([block[16], block[17], block[18], block[19]]);
+    let ftime_dos = u32::from_le_bytes([block[20], block[21], block[22], block[23]]);
+    let unpack_version = block[24];
+    let method = block[25];
+    let file_attributes = u32::from_le_bytes([block[28], block[29], block[30], block[31]]);
+
+    let (
+        high_pack_size,
+        high_unp_size,
+        compressed_size,
+        uncompressed_size,
+        uncompressed_size_unknown,
+    ) = if large_file {
+        let high_pack = u32::from_le_bytes([block[32], block[33], block[34], block[35]]);
+        let high_unp = u32::from_le_bytes([block[36], block[37], block[38], block[39]]);
+        let comp = (u64::from(high_pack) << 32) | u64::from(pack_size_low);
+        let raw_unp = (u64::from(high_unp) << 32) | u64::from(unp_size_low);
+        let unknown = raw_unp == u64::MAX;
+        (
+            Some(high_pack),
+            Some(high_unp),
+            comp,
+            (!unknown).then_some(raw_unp),
+            unknown,
+        )
+    } else {
+        (
+            None,
+            None,
+            u64::from(pack_size_low),
+            Some(u64::from(unp_size_low)),
+            false,
+        )
+    };
+
+    let window_bits = (flags >> 5) & 0x07;
+    let is_directory = window_bits == 7;
+    let dictionary_size_bytes = (!is_directory).then_some(65_536u32 << window_bits);
+    let unicode_filename = flags & 0x0200 != 0;
+
+    let name_bytes = &block[name_offset..name_end];
+    let nul_pos = name_bytes.iter().position(|&b| b == 0);
+    let name_contains_nul = nul_pos.is_some();
+    let name_nul_offset = nul_pos.map(|pos| pos as u16);
+    let name_utf8_valid = !name_contains_nul && std::str::from_utf8(name_bytes).is_ok();
+
+    let (name_encoding, filename, ascii_name_prefix) = if name_contains_nul {
+        let prefix = &name_bytes[..nul_pos.unwrap()];
+        let valid_ascii_prefix =
+            !prefix.is_empty() && prefix.is_ascii() && !prefix.iter().any(u8::is_ascii_control);
+        let prefix_str = valid_ascii_prefix.then(|| String::from_utf8_lossy(prefix).into_owned());
+        if unicode_filename {
+            ("rar4_unicode_split", None, prefix_str)
+        } else {
+            ("embedded_nul", None, prefix_str)
+        }
+    } else if unicode_filename {
+        if let Ok(valid) = std::str::from_utf8(name_bytes) {
+            let owned = valid.to_owned();
+            let ascii_prefix = valid
+                .is_ascii()
+                .then(|| (!name_bytes.iter().any(u8::is_ascii_control)).then(|| owned.clone()))
+                .flatten();
+            ("utf8", Some(owned), ascii_prefix)
+        } else {
+            ("invalid_utf8", None, None)
+        }
+    } else if name_bytes.is_ascii() && !name_bytes.iter().any(u8::is_ascii_control) {
+        let owned = String::from_utf8_lossy(name_bytes).into_owned();
+        ("ascii", Some(owned.clone()), Some(owned))
+    } else {
+        ("oem_non_ascii", None, None)
+    };
+
+    let retained_name = &name_bytes[..name_bytes.len().min(MAX_RECORDED_ZIP_FIELD_HEX_BYTES)];
+    let salt_hex = salt_present.then(|| hex(&block[name_end..name_end + 8]));
+
+    let status = if checksum_valid {
+        "parsed"
+    } else {
+        "checksum_invalid"
+    };
+
+    (
+        status,
+        Some(header_type),
+        Some(Rar4FirstFileHeader {
+            offset: block_start,
+            header_crc,
+            header_type,
+            flags,
+            header_size,
+            header_complete: true,
+            checksum_valid: Some(checksum_valid),
+            data_offset: block_end,
+            pack_size_low,
+            unp_size_low,
+            high_pack_size,
+            high_unp_size,
+            compressed_size,
+            uncompressed_size,
+            uncompressed_size_unknown,
+            host_os,
+            host_os_name: rar4_host_os_name(host_os),
+            file_crc32,
+            ftime_dos,
+            unpack_version,
+            method,
+            method_name: rar4_method_name(method),
+            name_size,
+            file_attributes,
+            split_before: flags & 0x0001 != 0,
+            split_after: flags & 0x0002 != 0,
+            encrypted: flags & 0x0004 != 0,
+            comment_present: flags & 0x0008 != 0,
+            solid: flags & 0x0010 != 0,
+            is_directory,
+            dictionary_size_bytes,
+            large_file,
+            unicode_filename,
+            salt_present,
+            version_flag: flags & 0x0800 != 0,
+            exttime_present: flags & 0x1000 != 0,
+            salt_hex,
+            name_bytes_available: true,
+            name_contains_nul,
+            name_nul_offset,
+            name_utf8_valid,
+            name_encoding: Some(name_encoding),
+            filename,
+            ascii_name_prefix,
+            name_preview_hex: Some(hex(retained_name)),
+            name_preview_hex_truncated: name_bytes.len() > MAX_RECORDED_ZIP_FIELD_HEX_BYTES,
+            name_sha256: Some(hex(&Sha256::digest(name_bytes))),
+        }),
+    )
+}
+
+fn rar4_host_os_name(host_os: u8) -> Option<&'static str> {
+    match host_os {
+        0 => Some("ms_dos"),
+        1 => Some("os2"),
+        2 => Some("win32"),
+        3 => Some("unix"),
+        4 => Some("mac_os"),
+        5 => Some("beos"),
+        _ => None,
+    }
+}
+
+fn rar4_method_name(method: u8) -> Option<&'static str> {
+    match method {
+        0x30 => Some("store"),
+        0x31 => Some("fastest"),
+        0x32 => Some("fast"),
+        0x33 => Some("normal"),
+        0x34 => Some("good"),
+        0x35 => Some("best"),
+        _ => None,
     }
 }
 
@@ -11831,5 +12126,143 @@ mod tests {
             "unrecognized_extra_flags"
         );
         assert_eq!(headers[5]["operating_system_name"], "unknown");
+    }
+
+    #[test]
+    fn rar4_exposes_first_file_header_metadata_and_handles_edge_cases() {
+        let build_rar4_block =
+            |head_type: u8, head_flags: u16, body_after_size: &[u8]| -> Vec<u8> {
+                let head_size = (7 + body_after_size.len()) as u16;
+                let mut body = Vec::with_capacity(5 + body_after_size.len());
+                body.push(head_type);
+                body.extend_from_slice(&head_flags.to_le_bytes());
+                body.extend_from_slice(&head_size.to_le_bytes());
+                body.extend_from_slice(body_after_size);
+                let crc16 = (crc32fast::hash(&body) & 0xffff) as u16;
+                let mut block = Vec::with_capacity(2 + body.len());
+                block.extend_from_slice(&crc16.to_le_bytes());
+                block.extend_from_slice(&body);
+                block
+            };
+
+        // 1. Standard 32-bit RAR4 FILE_HEAD (0x74) with Unix OS, Best method (0x35), split flags
+        let mut standard_archive = RAR4.to_vec();
+        standard_archive.extend_from_slice(&build_rar4_block(0x73, 0x0001, &[0u8; 6]));
+        let filename = b"scene-release.mkv";
+        let mut std_file_body = Vec::new();
+        std_file_body.extend_from_slice(&50_000_000u32.to_le_bytes()); // pack_size_low
+        std_file_body.extend_from_slice(&50_000_000u32.to_le_bytes()); // unp_size_low
+        std_file_body.push(3); // host_os = Unix
+        std_file_body.extend_from_slice(&0xdead_beefu32.to_le_bytes()); // file_crc
+        std_file_body.extend_from_slice(&0x5421_1234u32.to_le_bytes()); // ftime
+        std_file_body.push(29); // unp_ver
+        std_file_body.push(0x35); // method = best
+        std_file_body.extend_from_slice(&(filename.len() as u16).to_le_bytes());
+        std_file_body.extend_from_slice(&0x0020u32.to_le_bytes()); // attr
+        std_file_body.extend_from_slice(filename);
+        // flags: LHD_SPLIT_AFTER (0x0002) | LHD_SOLID (0x0010) | dict 4096 KB (0b110 << 5 = 0x00c0)
+        standard_archive.extend_from_slice(&build_rar4_block(0x74, 0x00d2, &std_file_body));
+
+        let std_json = serde_json::to_value(parse(&standard_archive)).unwrap();
+        let std_rar4 = &std_json["headers"][0];
+        assert_eq!(std_rar4["format"], "rar4");
+        assert_eq!(std_rar4["first_file_header_status"], "parsed");
+        assert_eq!(std_rar4["next_block_type"], 0x74);
+        let first_file = &std_rar4["first_file"];
+        assert_eq!(first_file["checksum_valid"], true);
+        assert_eq!(first_file["compressed_size"], 50_000_000);
+        assert_eq!(first_file["uncompressed_size"], 50_000_000);
+        assert_eq!(first_file["uncompressed_size_unknown"], false);
+        assert_eq!(first_file["host_os"], 3);
+        assert_eq!(first_file["host_os_name"], "unix");
+        assert_eq!(first_file["file_crc32"], 0xdead_beefu32);
+        assert_eq!(first_file["unpack_version"], 29);
+        assert_eq!(first_file["method"], 0x35);
+        assert_eq!(first_file["method_name"], "best");
+        assert_eq!(first_file["dictionary_size_bytes"], 4096 * 1024);
+        assert_eq!(first_file["is_directory"], false);
+        assert_eq!(first_file["split_before"], false);
+        assert_eq!(first_file["split_after"], true);
+        assert_eq!(first_file["solid"], true);
+        assert_eq!(first_file["filename"], "scene-release.mkv");
+        assert_eq!(first_file["ascii_name_prefix"], "scene-release.mkv");
+        assert_eq!(first_file["name_encoding"], "ascii");
+        assert_eq!(first_file["name_utf8_valid"], true);
+
+        // 2. 64-bit LHD_LARGE + unknown unpacked size (u64::MAX) + LHD_UNICODE NUL-split + LHD_SALT
+        let mut large_archive = RAR4.to_vec();
+        large_archive.extend_from_slice(&build_rar4_block(0x73, 0x0000, &[0u8; 6]));
+        let raw_unicode_name = b"ascii_fallback.bin\0encoded_tail";
+        let mut large_body = Vec::new();
+        large_body.extend_from_slice(&0x1000_0000u32.to_le_bytes()); // pack_size_low
+        large_body.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // unp_size_low
+        large_body.push(2); // host_os = win32
+        large_body.extend_from_slice(&0x1122_3344u32.to_le_bytes());
+        large_body.extend_from_slice(&0u32.to_le_bytes());
+        large_body.push(29);
+        large_body.push(0x30); // store
+        large_body.extend_from_slice(&(raw_unicode_name.len() as u16).to_le_bytes());
+        large_body.extend_from_slice(&0u32.to_le_bytes());
+        large_body.extend_from_slice(&1u32.to_le_bytes()); // high_pack_size = 1
+        large_body.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // high_unp_size = u32::MAX
+        large_body.extend_from_slice(raw_unicode_name);
+        large_body.extend_from_slice(&[0xaa; 8]); // 8-byte salt
+        // flags: LHD_LARGE (0x0100) | LHD_UNICODE (0x0200) | LHD_SALT (0x0400) | LHD_PASSWORD (0x0004)
+        large_archive.extend_from_slice(&build_rar4_block(0x74, 0x0704, &large_body));
+
+        let large_json = serde_json::to_value(parse(&large_archive)).unwrap();
+        let large_file = &large_json["headers"][0]["first_file"];
+        assert_eq!(
+            large_json["headers"][0]["first_file_header_status"],
+            "parsed"
+        );
+        assert_eq!(large_file["large_file"], true);
+        assert_eq!(large_file["compressed_size"], (1u64 << 32) | 0x1000_0000u64);
+        assert!(large_file["uncompressed_size"].is_null());
+        assert_eq!(large_file["uncompressed_size_unknown"], true);
+        assert_eq!(large_file["host_os_name"], "win32");
+        assert_eq!(large_file["method_name"], "store");
+        assert_eq!(large_file["encrypted"], true);
+        assert_eq!(large_file["salt_present"], true);
+        assert_eq!(large_file["salt_hex"], "aaaaaaaaaaaaaaaa");
+        assert_eq!(large_file["unicode_filename"], true);
+        assert_eq!(large_file["name_encoding"], "rar4_unicode_split");
+        assert!(large_file["filename"].is_null());
+        assert_eq!(large_file["ascii_name_prefix"], "ascii_fallback.bin");
+
+        // 3. Encrypted headers (MHD_PASSWORD = 0x0080)
+        let mut enc_archive = RAR4.to_vec();
+        enc_archive.extend_from_slice(&build_rar4_block(0x73, 0x0080, &[0u8; 6]));
+        let enc_json = serde_json::to_value(parse(&enc_archive)).unwrap();
+        assert_eq!(
+            enc_json["headers"][0]["first_file_header_status"],
+            "encrypted_headers"
+        );
+        assert!(enc_json["headers"][0]["first_file"].is_null());
+
+        // 4. Non-file block following ARCHIVE_HEAD (e.g., CMT_HEAD = 0x75)
+        let mut cmt_archive = RAR4.to_vec();
+        cmt_archive.extend_from_slice(&build_rar4_block(0x73, 0x0000, &[0u8; 6]));
+        cmt_archive.extend_from_slice(&build_rar4_block(0x75, 0x0000, &[0u8; 4]));
+        let cmt_json = serde_json::to_value(parse(&cmt_archive)).unwrap();
+        assert_eq!(
+            cmt_json["headers"][0]["first_file_header_status"],
+            "non_file_block"
+        );
+        assert_eq!(cmt_json["headers"][0]["next_block_type"], 0x75);
+        assert!(cmt_json["headers"][0]["first_file"].is_null());
+
+        // 5. Invalid FILE_HEAD CRC16
+        let mut bad_crc_archive = standard_archive.clone();
+        bad_crc_archive[20] ^= 0xff;
+        let bad_crc_json = serde_json::to_value(parse(&bad_crc_archive)).unwrap();
+        assert_eq!(
+            bad_crc_json["headers"][0]["first_file_header_status"],
+            "checksum_invalid"
+        );
+        assert_eq!(
+            bad_crc_json["headers"][0]["first_file"]["checksum_valid"],
+            false
+        );
     }
 }

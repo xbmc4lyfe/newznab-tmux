@@ -35,18 +35,19 @@ use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\NfoService;
 use App\Services\Nzb\NzbParserService;
 use App\Services\Nzb\NzbService;
+use App\Services\Nzb\NzbSourceGuard;
 use App\Services\Predb\PredbIdentityRebuild;
 use App\Services\ReleaseImageService;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\TempWorkspaceService;
+use App\Services\Yenc\YencPart;
+use App\Support\ReleaseArchiveNamingEvidence;
 use dariusiii\rarinfo\Par2Info;
+use dariusiii\rarinfo\RarInfo;
 use Illuminate\Contracts\Console\Kernel;
-use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
 use Illuminate\Database\Schema\Blueprint;
-use Illuminate\Support\Carbon;
-use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\File;
@@ -72,6 +73,8 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
 
     private string $databasePath;
 
+    private string $sourceDirectory;
+
     private ?\Closure $filenameDiscoveryMutation = null;
 
     /** @var list<string> */
@@ -84,7 +87,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
 
     public function createApplication()
     {
-        $this->databasePath = sys_get_temp_dir().'/nntmux-release-file-manager-test-'.getmypid().'-'.bin2hex(random_bytes(4)).'.sqlite';
+        $this->databasePath = sys_get_temp_dir().'/nntmux-release-file-manager-test-'.bin2hex(random_bytes(8)).'.sqlite';
 
         $this->originalEnvironment = [
             'APP_ENV' => getenv('APP_ENV'),
@@ -103,7 +106,6 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->setEnvironmentValue('DB_DATABASE', $this->databasePath);
 
         $app = require __DIR__.'/../../bootstrap/app.php';
-        $app->useEnvironmentPath(sys_get_temp_dir())->loadEnvironmentFrom('.nntmux-validation-no-env');
         $app->make(Kernel::class)->bootstrap();
 
         return $app;
@@ -122,6 +124,9 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         DB::reconnect();
 
         $this->createSchema();
+        $this->sourceDirectory = sys_get_temp_dir().'/manager-source-'.bin2hex(random_bytes(8));
+        File::ensureDirectoryExists($this->sourceDirectory);
+        config(['nntmux_settings.path_to_nzbs' => $this->sourceDirectory.'/']);
     }
 
     protected function tearDown(): void
@@ -135,6 +140,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             unlink($this->databasePath);
         }
 
+        File::deleteDirectory($this->sourceDirectory);
         parent::tearDown();
 
         foreach ($this->originalEnvironment as $key => $value) {
@@ -147,7 +153,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->prepareFullPar2NamingEvidence('Unrelated.Title-GRP');
         $wrapped = 'WinterOlympics2026__NZBSPLIT__0456f274737cea074abd86a89144cc7b__NZBSPLIT__Winter_Olympic_Games_Milano_Cortina_2026_Closing_Ceremony_1080p25_WEB-DL_(MultiAudio).7z.065';
         DB::table('releases')->where('id', 1)->update(['name' => $wrapped, 'searchname' => $wrapped]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         DB::table('releases')->where('id', 1)->update(['guid' => 'replacement-guid', 'searchname' => 'Replacement.Identity']);
         $published = [];
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id) use (&$published): void {
@@ -175,7 +181,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->prepareFullPar2NamingEvidence('Unrelated.Title-GRP');
         $wrapped = 'TEST__NZBSPLIT__1234567890abcdef__NZBSPLIT__'.$title.'.mkv';
         DB::table('releases')->where('id', 1)->update(['name' => $wrapped, 'searchname' => $wrapped]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         DB::table('releases')->where('id', 1)->update(['additional_pp_claim_token' => 'replacement-owner']);
         $published = [];
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id) use (&$published): void {
@@ -217,7 +223,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->prepareFullPar2NamingEvidence('Unrelated.Title-GRP');
         $wrapped = 'TEST__NZBSPLIT__1234567890abcdef__NZBSPLIT__'.$title.'.mkv';
         DB::table('releases')->where('id', 1)->update(['name' => $wrapped, 'searchname' => $wrapped]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $replacement = $column === 'additional_pp_claim_token' ? 'replacement-owner' : now()->addMinute()->toDateTimeString();
         $fired = false;
         DB::connection()->beforeExecuting(static function (string $query) use (&$fired, $column, $replacement): void {
@@ -254,7 +260,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->prepareFullPar2NamingEvidence('Unrelated.Title-GRP');
         $wrapped = 'TEST__NZBSPLIT__1234567890abcdef__NZBSPLIT__'.$title.'.mkv';
         DB::table('releases')->where('id', 1)->update(['name' => $wrapped, 'searchname' => $wrapped]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $published = [];
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id) use (&$published): void {
             $published[] = $id;
@@ -281,7 +287,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->prepareFullPar2NamingEvidence('Unrelated.Title-GRP');
         $wrapped = 'TEST__NZBSPLIT__1234567890abcdef__NZBSPLIT__'.$title.'.mkv';
         DB::table('releases')->where('id', 1)->update(['name' => $wrapped, 'searchname' => $wrapped]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $published = [];
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id) use (&$published): void {
             $published[] = $id;
@@ -308,7 +314,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->prepareFullPar2NamingEvidence($title);
         $wrapped = 'TEST__NZBSPLIT__1234567890abcdef__NZBSPLIT__'.$title.'.mkv';
         DB::table('releases')->where('id', 1)->update(['name' => $wrapped, 'searchname' => $wrapped]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
         DB::beginTransaction();
         $this->attemptProducerNaming($kind, $this->makeFullPar2NamingManager($sync), $context, $title, $wrapped);
@@ -329,7 +335,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->prepareFullPar2NamingEvidence('Unrelated.Title-GRP');
         $wrapped = 'TEST__NZBSPLIT__1234567890abcdef__NZBSPLIT__'.$title.'.mkv';
         DB::table('releases')->where('id', 1)->update(['name' => $wrapped, 'searchname' => $wrapped]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $published = [];
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id) use (&$published): void {
             $published[] = $id;
@@ -354,7 +360,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->prepareFullPar2NamingEvidence('Unrelated.Title-GRP');
         $wrapped = 'TEST__NZBSPLIT__1234567890abcdef__NZBSPLIT__'.$title.'.mkv';
         DB::table('releases')->where('id', 1)->update(['name' => $wrapped, 'searchname' => $wrapped]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $published = [];
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id) use (&$published): void {
             $published[] = $id;
@@ -380,7 +386,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->prepareFullPar2NamingEvidence('Unrelated.Title-GRP');
         $wrapped = 'TEST__NZBSPLIT__1234567890abcdef__NZBSPLIT__'.$title.'.mkv';
         DB::table('releases')->where('id', 1)->update(['name' => $wrapped, 'searchname' => $wrapped]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $claim = $context->producerNamingClaim;
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
         DB::beginTransaction();
@@ -403,7 +409,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         });
         $wrapped = 'TEST__NZBSPLIT__1234567890abcdef__NZBSPLIT__'.$title.'.mkv';
         DB::table('releases')->where('id', 1)->update(['name' => $wrapped, 'searchname' => $wrapped]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
         self::assertNull($context->producerNamingClaim);
         self::assertTrue($this->makeFullPar2NamingManager($sync)->processReleaseNameFromNzbContents([['title' => $wrapped]], $context));
@@ -417,7 +423,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->prepareFullPar2NamingEvidence('Unrelated.Title-GRP');
         $wrapped = 'TEST__NZBSPLIT__1234567890abcdef__NZBSPLIT__'.$title.'.mkv';
         DB::table('releases')->where('id', 1)->update(['name' => $wrapped, 'searchname' => $title]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $published = [];
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id) use (&$published): void {
             $published[] = $id;
@@ -427,6 +433,69 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         self::assertFalse($context->fullPar2EvidenceDeferred);
         self::assertSame([], $published);
         Event::assertNotDispatched(ReleaseNameFixed::class);
+    }
+
+    public function test_deferred_archive_filename_cannot_rename_after_the_additional_claim_is_replaced(): void
+    {
+        $title = 'Example.Movie.2026.1080p.BluRay.x264-TARGET';
+        $this->prepareFullPar2NamingEvidence($title);
+        $this->installFilenameSqlIdentity();
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
+        DB::table('releases')->where('id', 1)->update(['additional_pp_claim_token' => 'replacement-owner']);
+        $published = [];
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id) use (&$published): void {
+            $published[] = $id;
+        });
+        $sync->beginReleaseScope(1);
+        $manager = $this->makeFullPar2NamingManager($sync);
+
+        $manager->matchFileNamesToPreDb([['name' => $title.'.mkv']], $context);
+        $manager->finalizeRelease($context, false);
+        $sync->finishReleaseScope();
+
+        self::assertSame('Example', DB::table('releases')->where('id', 1)->value('searchname'));
+        self::assertSame(0, (int) DB::table('releases')->where('id', 1)->value('predb_id'));
+        self::assertSame('replacement-owner', DB::table('releases')->where('id', 1)->value('additional_pp_claim_token'));
+        self::assertSame('Example', $context->release->searchname);
+        self::assertSame('Example', $context->fullPar2EvidenceSnapshot()['searchname']);
+        self::assertTrue($context->fullPar2EvidenceDeferred);
+        self::assertArrayNotHasKey('filename', $context->release->getAttributes());
+        self::assertArrayNotHasKey('observed_additional_pp_claim', $context->release->getAttributes());
+        self::assertSame([], $published);
+        Event::assertNotDispatched(ReleaseNameFixed::class);
+    }
+
+    public function test_deferred_archive_filename_advances_committed_identity_before_metadata_finalization(): void
+    {
+        $title = 'Example.Movie.2026.1080p.BluRay.x264-TARGET';
+        $this->prepareFullPar2NamingEvidence($title);
+        $this->installFilenameSqlIdentity();
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
+        $published = [];
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id) use (&$published): void {
+            $published[] = $id;
+        });
+        $sync->beginReleaseScope(1);
+        $manager = $this->makeFullPar2NamingManager($sync);
+
+        $manager->matchFileNamesToPreDb([['name' => $title.'.mkv']], $context);
+
+        self::assertSame($title, DB::table('releases')->where('id', 1)->value('searchname'));
+        self::assertSame($title, $context->release->searchname);
+        self::assertSame($title, $context->fullPar2EvidenceSnapshot()['searchname']);
+        self::assertSame('Example', $context->par2EvidenceSnapshot['searchname']);
+        self::assertArrayNotHasKey('filename', $context->release->getAttributes());
+        self::assertArrayNotHasKey('observed_additional_pp_claim', $context->release->getAttributes());
+        self::assertTrue($manager->addFileInfo(['name' => '.hidden.mkv', 'size' => 123], $context, 'nfo|par2'));
+        $manager->finalizeRelease($context, false);
+        $sync->finishReleaseScope();
+
+        self::assertFalse($context->fullPar2EvidenceDeferred);
+        self::assertSame(1, DB::table('release_files')->count());
+        self::assertSame(1, (int) DB::table('releases')->where('id', 1)->value('rarinnerfilecount'));
+        self::assertNull(DB::table('releases')->where('id', 1)->value('additional_pp_claim_token'));
+        self::assertSame([1], $published);
+        Event::assertDispatchedTimes(ReleaseNameFixed::class, 1);
     }
 
     private function attemptProducerNaming(string $kind, ReleaseFileManager $manager, ReleaseProcessingContext $context, string $title, string $wrapped): void
@@ -444,7 +513,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     {
         $this->prepareFullPar2Evidence();
         $path = $this->fullPar2Fixture(130);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $manager = $this->makeManagerWithImageService(new ReleaseImageService, configOverrides: ['addPAR2Files' => true]);
         Search::shouldReceive('updateRelease')->once()->with(1);
 
@@ -462,7 +531,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     public function test_disabled_par2_file_collection_still_retains_independent_content_evidence(): void
     {
         $this->prepareFullPar2Evidence();
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $manager = $this->makeManagerWithImageService(new ReleaseImageService, configOverrides: ['addPAR2Files' => false]);
         Search::shouldReceive('updateRelease')->once()->with(1);
         $manager->processPar2File($this->fullPar2Fixture(20), $context, new Par2Info);
@@ -476,7 +545,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     public function test_full_par2_donor_sizes_preserve_adjacent_unsigned_values(): void
     {
         $this->prepareFullPar2Evidence();
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $manager = $this->makeManagerWithImageService(new ReleaseImageService, configOverrides: ['addPAR2Files' => false]);
         Search::shouldReceive('updateRelease')->once()->with(1);
         $manager->processPar2File($this->fullPar2Fixture(2, [pack('V2', 0, 2147483648), pack('V2', 1, 2147483648)]), $context, new Par2Info);
@@ -489,7 +558,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     {
         $this->prepareFullPar2Evidence();
         $path = $this->fullPar2Fixture(1, [pack('V2', 1, 2147483648)], [str_repeat('directory/', 2000).'file.mkv']);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $manager = $this->makeManagerWithImageService(new ReleaseImageService, configOverrides: ['addPAR2Files' => false]);
         Search::shouldReceive('updateRelease')->once()->with(1);
 
@@ -510,7 +579,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->assertTrue($info->open($path));
         $bytes = file_get_contents($path);
         file_put_contents($path, substr_replace($bytes, pack('V2', 2, 2147483648), 112, 8));
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $manager = $this->makeManagerWithImageService(new ReleaseImageService, configOverrides: ['addPAR2Files' => false]);
         (new ReflectionMethod($manager, 'queueFullPar2Evidence'))->invoke($manager, $path, $context, $info);
         Search::shouldReceive('updateRelease')->once()->with(1);
@@ -523,7 +592,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     public function test_lost_additional_claim_refuses_queued_hashes_files_and_publication(): void
     {
         $this->prepareFullPar2Evidence();
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $manager = $this->makeManager();
         $manager->processPar2File($this->fullPar2Fixture(2), $context, new Par2Info);
         DB::table('releases')->where('id', 1)->update(['additional_pp_claim_token' => 'new-owner']);
@@ -539,7 +608,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     public function test_same_guid_name_reset_defers_all_queued_par2_metadata(): void
     {
         $this->prepareFullPar2Evidence();
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $manager = $this->makeManagerWithImageService(new ReleaseImageService, configOverrides: ['addPAR2Files' => true]);
         $manager->processPar2File($this->fullPar2Fixture(2), $context, new Par2Info);
         DB::table('releases')->where('id', 1)->update(['searchname' => 'replacement']);
@@ -557,7 +626,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     {
         $this->prepareFullPar2Evidence();
         DB::table('releases')->where('id', 1)->update(['additional_pp_claimed_at' => AdditionalCandidateQuery::claimStaleBefore()->subSecond()]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $manager = $this->makeManager();
         $manager->processPar2File($this->fullPar2Fixture(2), $context, new Par2Info);
         Search::shouldReceive('updateRelease')->never();
@@ -571,7 +640,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     public function test_finalize_rollback_reverts_full_hashes_files_and_status_together(): void
     {
         $this->prepareFullPar2Evidence();
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $manager = $this->makeManagerWithImageService(new ReleaseImageService, configOverrides: ['addPAR2Files' => true]);
         $manager->processPar2File($this->fullPar2Fixture(2), $context, new Par2Info);
         Search::shouldReceive('updateRelease')->never();
@@ -601,7 +670,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     {
         $title = 'ROSALÍA.Album.2026-GRP';
         $this->prepareFullPar2NamingEvidence($title);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         Search::shouldReceive('updateRelease')->once()->with(1);
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector);
         $sync->beginReleaseScope(1);
@@ -627,7 +696,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     public function test_full_par2_write_boundary_ownership_loss_rolls_back_without_publication(string $point): void
     {
         $this->prepareFullPar2Evidence();
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $manager = $this->makeManagerWithImageService(new ReleaseImageService, configOverrides: ['addPAR2Files' => true]);
         $manager->processPar2File($this->fullPar2Fixture(2), $context, new Par2Info);
         Search::shouldReceive('updateRelease')->never();
@@ -686,7 +755,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     {
         $title = 'ROSALÍA.Album.2026-GRP';
         $this->prepareFullPar2NamingEvidence($title);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector);
         $sync->beginReleaseScope(1);
         $manager = $this->makeFullPar2NamingManager($sync);
@@ -762,7 +831,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             $summary = ['file_list' => [['name' => 'opaque']], 'archives' => ['opaque' => $summary]];
         }
         $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $this->makeFullPar2NamingManager($sync)->processReleaseNameFromRar($summary, $context);
 
         $this->assertSame($expectedId, (int) DB::table('releases')->where('id', 1)->value('predb_id'));
@@ -799,30 +868,44 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         Schema::create('predb', function (Blueprint $table): void {
             $table->unsignedInteger('id')->primary();
             $table->string('title');
-            $table->string('filename')->default('');
         });
         (require database_path('migrations/2026_10_11_215821_create_par2_rename_progress_table.php'))->up();
-        (require database_path('migrations/2026_10_15_150000_create_predb_identity_projection.php'))->up();
-        DB::table('predb')->insert(['id' => 7, 'title' => $title, 'filename' => '']);
-        $this->recertifyFilenameSqlIdentity();
+        DB::table('predb')->insert(['id' => 7, 'title' => $title]);
         DB::table('releases')->where('id', 1)->update(['predb_id' => 0, 'isrenamed' => 0, 'proc_pp' => 0, 'categories_id' => Category::OTHER_HASHED]);
         config(['nntmux.echocli' => false]);
         Event::fake([ReleaseNameFixed::class]);
     }
 
-    private function makeFullPar2NamingManager(ReleaseSearchSyncCoordinator $sync): ReleaseFileManager
+    private function makeFullPar2NamingManager(ReleaseSearchSyncCoordinator $sync, ?\Closure $observeFilenameCheck = null): ReleaseFileManager
     {
         $updater = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
+        $cleaner = $this->filenameDiscoveryCleaner();
+        $nameFixing = $observeFilenameCheck === null
+            ? new NameFixingService($updater, fileNameCleaner: $cleaner)
+            : new class($updater, $cleaner, $observeFilenameCheck) extends NameFixingService
+            {
+                public function __construct(ReleaseUpdateService $updates, FileNameCleaner $fileNameCleaner, private readonly \Closure $observe)
+                {
+                    parent::__construct($updates, fileNameCleaner: $fileNameCleaner);
+                }
+
+                public function matchPreDbFileNames(object $release, array $files, bool $echo, bool $nameStatus, bool $show, ?array $persistedNames = null): int
+                {
+                    if (! isset($release->filename) || $release->filename === '') {
+                        $release->filename = $files[0] ?? '';
+                    }
+                    ($this->observe)($release);
+
+                    return parent::matchPreDbFileNames($release, $files, $echo, $nameStatus, $show, $persistedNames);
+                }
+            };
 
         return new ReleaseFileManager(
             $this->makeConfig(['renamePar2' => true, 'echoCLI' => true, 'addPAR2Files' => true]),
             new ReleaseImageService,
             new NfoService,
             new TestNzbService,
-            new NameFixingService(
-                $updater,
-                fileNameCleaner: $this->filenameDiscoveryMutation !== null ? $this->filenameDiscoveryCleaner() : null,
-            ),
+            $nameFixing,
             $updater,
             searchSyncCoordinator: $sync,
         );
@@ -922,7 +1005,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $nameFixing = new CountingNameFixingService;
 
         $manager = $this->makeManager($nameFixing);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
 
         $this->assertTrue($manager->addFileInfo([
             'name' => 'Example.Movie.2026.mkv',
@@ -1043,6 +1126,9 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             .MappingArticleNntpHarness::rawBody(YencArticles::part(substr($archive, 19000), 'opaque', strlen($archive), 3, 19001, 3));
         $nntp = new MappingArticleNntpHarness($wire);
         $download = new UsenetDownloadService($config, $nntp);
+        $sources = new NzbSourceGuard($nzbService);
+        $this->app->instance(NzbSourceGuard::class, $sources);
+        $this->app->instance(ReleaseArchiveNamingEvidence::class, new ReleaseArchiveNamingEvidence($sources));
         $manager = new ReleaseFileManager($config, new ReleaseImageService, new NfoService, $nzbService, $fixer);
         $archiveService = new class($config) extends ArchiveExtractionService
         {
@@ -1140,7 +1226,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         self::assertSame(1, (int) DB::table('releases')->where('id', 1)->value('proc_files'));
         self::assertSame([], $queries->candidateBatch(NameFixingQueryService::SOURCE_FILES, 0, 1));
         $manager = $this->makeManager($fixer);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
 
         self::assertTrue($manager->addFileInfo(['name' => $title.'.mkv', 'size' => 1024], $context, '\\.(?:par2|sfv|nzb)'));
         $manager->finalizeRelease($context, false);
@@ -1160,7 +1246,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->prepareFilenameNaming();
         DB::table('release_files')->insert(['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin']);
         $manager = $this->makeManager();
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $title = 'Example.Movie.2026.1080p.BluRay.x264-TARGET';
         self::assertTrue($manager->addFileInfo(['name' => $title.'.mkv', 'size' => 1024], $context, '\\.(?:par2|sfv|nzb)'));
         $inserted = false;
@@ -1383,7 +1469,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         DB::table('releases')->where('id', 1)->update(['proc_files' => 1, 'isrenamed' => (int) $renamed, 'predb_id' => $linked ? 7 : 0]);
         Search::shouldReceive('updateRelease')->once()->with(1);
         $manager = $this->makeManager();
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $name = 'Example.Movie.2026.1080p.BluRay.x264-TARGET.mkv';
         self::assertTrue($manager->addFileInfo(['name' => $name, 'size' => 1024], $context, '\\.(?:par2|sfv|nzb)'));
         if ($duplicate) {
@@ -1414,7 +1500,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->prepareFilenameNaming();
         DB::table('releases')->where('id', 1)->update(['proc_files' => 1]);
         $manager = $this->makeManager();
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         self::assertTrue($manager->addFileInfo(['name' => 'Example.Movie.2026.1080p.BluRay.x264-TARGET.mkv', 'size' => 1024], $context, '\\.(?:par2|sfv|nzb)'));
         DB::table('releases')->where('id', 1)->update([$column => $value]);
         Search::shouldReceive('updateRelease')->never();
@@ -1448,7 +1534,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             ['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin'],
         ]);
         $manager = $this->makeManager();
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         self::assertTrue($manager->addFileInfo(['name' => 'Example.Movie.2026.1080p.BluRay.x264-TARGET.mkv', 'size' => 1024], $context, '\\.(?:par2|sfv|nzb)'));
         Search::shouldReceive('updateRelease')->times($addLateFile ? 1 : 0)->with(1);
         $inserted = false;
@@ -1493,11 +1579,17 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
 
     private function installFilenameSqlIdentity(): void
     {
+        if (! Schema::hasColumn('predb', 'filename')) {
+            DB::statement("ALTER TABLE predb ADD COLUMN filename varchar NOT NULL DEFAULT ''");
+        }
+        if (! Schema::hasTable('predb_identity_projection_state')) {
+            (require database_path('migrations/2026_10_15_150000_create_predb_identity_projection.php'))->up();
+        }
         Search::shouldReceive('searchPredbFilenameCandidates')->never();
-        $this->recertifyFilenameSqlIdentity();
+        $this->rebuildFilenameSqlIdentity();
     }
 
-    private function recertifyFilenameSqlIdentity(): void
+    private function rebuildFilenameSqlIdentity(): void
     {
         $rebuild = new PredbIdentityRebuild;
         $start = $rebuild->start(DB::connection());
@@ -1537,1197 +1629,13 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->installFilenameSqlIdentity();
     }
 
-    #[DataProvider('deferredClaimReplacements')]
-    public function test_deferred_predb_naming_preserves_a_replaced_claim(string $column): void
-    {
-        $title = 'Example.Movie.2026.1080p.BluRay.x264-TARGET';
-        $this->prepareFullPar2NamingEvidence($title);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
-        $replacement = $column === 'additional_pp_claim_token' ? 'new-owner' : now()->addMinute()->toDateTimeString();
-        DB::table('releases')->where('id', 1)->update([$column => $replacement]);
-        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $title]]);
-        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (): void {});
-        $manager = $this->makeFullPar2NamingManager($sync);
-
-        $manager->matchFileNamesToPreDb([['name' => $title.'.mkv', 'size' => 100]], $context);
-        $manager->finalizeRelease($context, false);
-
-        self::assertSame('Example', DB::table('releases')->where('id', 1)->value('searchname'));
-        self::assertSame($replacement, DB::table('releases')->where('id', 1)->value($column));
-        self::assertTrue($context->fullPar2EvidenceDeferred);
-        Event::assertNotDispatched(ReleaseNameFixed::class);
-    }
-
-    public static function deferredClaimReplacements(): array
-    {
-        return ['new owner' => ['additional_pp_claim_token'], 'renewed owner' => ['additional_pp_claimed_at']];
-    }
-
-    public function test_deferred_predb_rename_advances_identity_and_finalizes_buffered_files(): void
-    {
-        $title = 'Example.Movie.2026.1080p.BluRay.x264-TARGET';
-        $this->prepareFullPar2NamingEvidence($title);
-        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $title]]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
-        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (): void {});
-        $manager = $this->makeFullPar2NamingManager($sync);
-        $file = ['name' => $title.'.mkv', 'size' => 100];
-        $context->seasonPackProbable = true;
-        $manager->addFileInfo($file, $context, '\\.sfv');
-        $context->seasonPackProbable = false;
-
-        $manager->matchFileNamesToPreDb([$file], $context);
-        $manager->finalizeRelease($context, false);
-
-        self::assertSame($title, $context->fullPar2EvidenceSnapshot()['searchname']);
-        self::assertSame($title, DB::table('releases')->where('id', 1)->value('searchname'));
-        self::assertSame(1, DB::table('release_files')->count());
-        self::assertNull(DB::table('releases')->where('id', 1)->value('additional_pp_claim_token'));
-        self::assertFalse($context->fullPar2EvidenceDeferred);
-    }
-
-    #[DataProvider('deferredIneligibleFiles')]
-    public function test_deferred_predb_matching_skips_archive_and_support_entries(string $extension): void
-    {
-        $title = 'Example.Movie.2026.1080p.BluRay.x264-TARGET';
-        $this->prepareFullPar2NamingEvidence($title);
-        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $title]]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
-        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (): void {});
-
-        $this->makeFullPar2NamingManager($sync)->matchFileNamesToPreDb([['name' => $title.$extension, 'size' => 100]], $context);
-
-        self::assertSame('Example', DB::table('releases')->where('id', 1)->value('searchname'));
-    }
-
-    public static function deferredIneligibleFiles(): array
-    {
-        return array_map(static fn (string $extension): array => [$extension], ['.rar', '.r00', '.zip', '.zipx', '.001', '.part01', '.sfv', '.par2']);
-    }
-
-    public function test_deferred_predb_limit_counts_eligible_files_after_skipped_entries(): void
-    {
-        $title = 'Example.Movie.2026.1080p.BluRay.x264-TARGET';
-        $this->prepareFullPar2NamingEvidence($title);
-        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $title]]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
-        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (): void {});
-        $files = array_fill(0, 11, ['name' => 'ignored.sfv', 'size' => 100]);
-        $files[] = ['name' => $title.'.mkv', 'size' => 100];
-
-        $this->makeFullPar2NamingManager($sync)->matchFileNamesToPreDb($files, $context);
-
-        self::assertSame($title, DB::table('releases')->where('id', 1)->value('searchname'));
-        self::assertSame(0, DB::table('release_files')->count());
-    }
-
-    public function test_two_nzbsplit_episodes_cannot_name_an_obfuscated_release_before_pack_detection(): void
-    {
-        $this->prepareFullPar2NamingEvidence('Unrelated.Title-GRP');
-        $wrapped = 'TEST__NZBSPLIT__1234567890abcdef__NZBSPLIT__';
-        DB::table('releases')->where('id', 1)->update(['name' => $wrapped.'opaque', 'searchname' => $wrapped.'opaque', 'nfostatus' => 1]);
-        $context = $this->processReviewArchiveSets([
-            ['title' => '"'.$wrapped.'Show.S01E01.1080p.WEB-DL-GRP.mkv" yEnc', 'segments' => ['<one>']],
-            ['title' => '"'.$wrapped.'Show.S01E02.1080p.WEB-DL-GRP.mkv" yEnc', 'segments' => ['<two>']],
-        ], [], ['processPasswords' => false], realNaming: true);
-
-        self::assertTrue($context->seasonPack);
-        self::assertSame($wrapped.'opaque', DB::table('releases')->where('id', 1)->value('searchname'));
-        Event::assertNotDispatched(ReleaseNameFixed::class);
-    }
-
-    #[DataProvider('incompleteProbableArchiveWalks')]
-    public function test_an_incomplete_probable_pack_walk_keeps_naming_deferred(string $failure, int $limit): void
-    {
-        DB::table('releases')->insert([...$this->releaseRow(), 'nfostatus' => 1]);
-        Search::shouldReceive('updateRelease')->with(1);
-        $responses = ['<one>' => $this->rar('Show.S01E01.1080p.WEB-DL-GRP.mkv', str_repeat('x', 100)), '<two>' => $failure === 'unreadable' ? 'invalid archive' : null];
-        $context = $this->processReviewArchiveSets([
-            ['title' => '"opaque1.rar" yEnc', 'segments' => ['<one>']],
-            ['title' => '"opaque2.rar" yEnc', 'segments' => ['<two>']],
-        ], $responses, ['seasonPackArchiveSets' => $limit, 'maximumRarSegments' => $limit], unavailable: $failure === 'group-unavailable' ? '<two>' : null);
-
-        self::assertTrue($context->seasonPackProbable);
-        self::assertSame('Example', DB::table('releases')->where('id', 1)->value('searchname'));
-        self::assertSame(1, DB::table('release_files')->count());
-    }
-
-    public static function incompleteProbableArchiveWalks(): array
-    {
-        return ['missing second set' => ['missing', 3], 'unavailable group' => ['group-unavailable', 3], 'unreadable second set' => ['unreadable', 3], 'configured one set cap' => ['missing', 1]];
-    }
-
-    #[DataProvider('boundedArchiveSamples')]
-    public function test_archive_sample_retry_depends_on_remaining_intended_sample(int $sets, bool $expectRetry): void
-    {
-        DB::table('releases')->insert([...$this->releaseRow(), 'nfostatus' => 1]);
-        Search::shouldReceive('updateRelease')->with(1);
-        $contents = $responses = [];
-        for ($episode = 1; $episode <= $sets; $episode++) {
-            $name = sprintf('Show.S01E%02d.1080p.WEB-DL-GRP', $episode);
-            $id = '<episode'.$episode.'>';
-            $contents[] = ['title' => '"'.$name.'.rar" yEnc', 'segments' => [$id]];
-            $responses[$id] = $episode === 2 ? null : $this->rar($name.'.mkv', str_repeat('x', 100));
-        }
-        $context = $this->processReviewArchiveSets($contents, $responses);
-        $release = DB::table('releases')->where('id', 1)->first();
-
-        self::assertTrue($context->seasonPack);
-        self::assertSame($sets === 2 ? 1 : 3, DB::table('release_files')->count());
-        self::assertSame($expectRetry, $release->archive_retry_at !== null);
-        self::assertSame($expectRetry ? -1 : 0, (int) $release->haspreview);
-        self::assertSame($expectRetry ? -1 : 0, (int) $release->passwordstatus);
-        self::assertNull($release->additional_pp_claim_token);
-        if ($expectRetry) {
-            DB::table('releases')->where('id', 1)->update(['additional_pp_claim_token' => 'retry-owner', 'additional_pp_claimed_at' => now()]);
-            $this->processReviewArchiveSets($contents, $responses);
-            self::assertSame(0, (int) DB::table('releases')->where('id', 1)->value('haspreview'));
-            self::assertSame($release->archive_retry_at, DB::table('releases')->where('id', 1)->value('archive_retry_at'));
-        }
-    }
-
-    #[DataProvider('reverseArchiveSamples')]
-    public function test_reverse_archive_recovery_counts_distinct_sets_before_finalizing(bool $recoversMissingSet): void
-    {
-        DB::table('releases')->insert([...$this->releaseRow(), 'nfostatus' => 1]);
-        Search::shouldReceive('updateRelease')->with(1);
-        $contents = $responses = [];
-        foreach ($recoversMissingSet ? [1, 2] : [2, 1] as $episode) {
-            $name = sprintf('Show.S01E%02d.1080p.WEB-DL-GRP', $episode);
-            foreach ([1, 2] as $part) {
-                $id = '<episode'.$episode.'-part'.$part.'>';
-                $contents[] = ['title' => sprintf('"%s.part%02d.rar" yEnc', $name, $part), 'segments' => [$id]];
-                $responses[$id] = $episode === 2 && ($part === 1 || ! $recoversMissingSet)
-                    ? null
-                    : $this->rar($name.'.mkv', str_repeat('x', 100));
-            }
-        }
-
-        $context = $this->processReviewArchiveSets($contents, $responses, [
-            'fetchLastFiles' => true, 'maximumRarPasswordChecks' => 1, 'seasonPackArchiveSets' => 2,
-        ]);
-        $release = DB::table('releases')->where('id', 1)->first();
-
-        self::assertTrue($context->seasonPack);
-        self::assertSame($recoversMissingSet ? 2 : 1, DB::table('release_files')->count());
-        self::assertSame(! $recoversMissingSet, $release->archive_retry_at !== null);
-        self::assertSame($recoversMissingSet ? 0 : -1, (int) $release->haspreview);
-        self::assertSame($recoversMissingSet ? 0 : -1, (int) $release->passwordstatus);
-        self::assertSame(! $recoversMissingSet, $context->archiveSampleIncomplete);
-        self::assertCount($recoversMissingSet ? 2 : 1, $context->listedArchiveSets);
-        self::assertSame($recoversMissingSet ? 2 : 1, (int) $release->rarinnerfilecount);
-        self::assertSame('Example', $release->searchname);
-        self::assertNull($release->additional_pp_claim_token);
-    }
-
-    public function test_reverse_recovery_completes_three_of_four_sets_without_releasing_probable_pack_naming(): void
-    {
-        DB::table('releases')->insert([...$this->releaseRow(), 'nfostatus' => 1]);
-        Search::shouldReceive('updateRelease')->with(1);
-        $contents = $responses = [];
-        $names = [
-            'opaque-a' => 'Show.S01E01.1080p.WEB-DL-GRP.mkv',
-            'opaque-b' => 'Show.S01E01.1080p.WEB-DL-GRP.en.srt',
-            'opaque-d' => null,
-            'opaque-c' => 'Show.S01E01.1080p.WEB-DL-GRP.fr.srt',
-        ];
-        foreach ($names as $set => $name) {
-            foreach ([1, 2] as $part) {
-                $id = '<'.$set.'-part'.$part.'>';
-                $contents[] = ['title' => sprintf('"%s.part%02d.rar" yEnc', $set, $part), 'segments' => [$id]];
-                $responses[$id] = $name === null ? 'unreadable archive' : $this->rar($name, str_repeat('x', 100));
-            }
-        }
-
-        $context = $this->processReviewArchiveSets($contents, $responses, [
-            'fetchLastFiles' => true, 'maximumRarSegments' => 3, 'maximumRarPasswordChecks' => 1, 'seasonPackArchiveSets' => 3,
-        ]);
-        $release = DB::table('releases')->where('id', 1)->first();
-
-        self::assertFalse($context->seasonPack);
-        self::assertTrue($context->seasonPackProbable);
-        self::assertSame(3, DB::table('release_files')->count());
-        self::assertNull($release->archive_retry_at);
-        self::assertSame(0, (int) $release->haspreview);
-        self::assertSame(0, (int) $release->passwordstatus);
-        self::assertSame(3, (int) $release->rarinnerfilecount);
-        self::assertSame('Example', $release->searchname);
-        self::assertNull($release->additional_pp_claim_token);
-    }
-
-    #[DataProvider('reverseMissingMiddleSets')]
-    public function test_reverse_recovery_passes_listed_later_sets_until_the_intended_sample_is_complete(int $sets, int $target, bool $lastSetUnavailable): void
-    {
-        DB::table('releases')->insert([...$this->releaseRow(), 'nfostatus' => 1]);
-        Search::shouldReceive('updateRelease')->with(1);
-        $contents = $responses = [];
-        for ($episode = 1; $episode <= $sets; $episode++) {
-            $name = sprintf('Show.S01E%02d.1080p.WEB-DL-GRP', $episode);
-            foreach ([1, 2] as $part) {
-                $id = '<episode'.$episode.'-part'.$part.'>';
-                $contents[] = ['title' => sprintf('"%s.part%02d.rar" yEnc', $name, $part), 'segments' => [$id]];
-                $missingFirst = $part === 1 && $episode > 1 && $episode < $sets;
-                $unavailableLast = $lastSetUnavailable && $episode === $sets - 1;
-                $responses[$id] = $missingFirst || $unavailableLast
-                    ? null
-                    : $this->rar($name.'.mkv', str_repeat('x', 100));
-            }
-        }
-
-        $context = $this->processReviewArchiveSets($contents, $responses, [
-            'fetchLastFiles' => true, 'maximumRarPasswordChecks' => 1, 'seasonPackArchiveSets' => $target,
-        ]);
-        $release = DB::table('releases')->where('id', 1)->first();
-        $expectRetry = $lastSetUnavailable;
-
-        self::assertTrue($context->seasonPack);
-        self::assertSame($expectRetry ? $target - 1 : $target, DB::table('release_files')->count());
-        self::assertSame($expectRetry, $release->archive_retry_at !== null);
-        self::assertSame($expectRetry ? -1 : 0, (int) $release->haspreview);
-        self::assertSame($expectRetry ? -1 : 0, (int) $release->passwordstatus);
-        self::assertSame($expectRetry, $context->archiveSampleIncomplete);
-        self::assertCount($expectRetry ? $target - 1 : $target, $context->listedArchiveSets);
-        self::assertSame($expectRetry ? $target - 1 : $target, (int) $release->rarinnerfilecount);
-        self::assertSame('Example', $release->searchname);
-        self::assertNull($release->additional_pp_claim_token);
-    }
-
-    public static function reverseMissingMiddleSets(): array
-    {
-        return [
-            'skip later C to recover middle B' => [3, 3, false],
-            'recover two missing middle sets' => [4, 4, false],
-            'stop once three of four sets are listed' => [4, 3, false],
-            'one missing set remains retryable after another recovers' => [4, 4, true],
-        ];
-    }
-
-    public function test_complete_archive_sample_keeps_legacy_reverse_tail_password_inspection(): void
-    {
-        DB::table('releases')->insert([...$this->releaseRow(), 'nfostatus' => 1]);
-        Search::shouldReceive('updateRelease')->with(1);
-        $contents = $responses = [];
-        foreach ([1, 2] as $episode) {
-            $name = sprintf('Show.S01E%02d.1080p.WEB-DL-GRP', $episode);
-            foreach ([1, 2] as $part) {
-                $id = '<episode'.$episode.'-part'.$part.'>';
-                $contents[] = ['title' => sprintf('"%s.part%02d.rar" yEnc', $name, $part), 'segments' => [$id]];
-                $responses[$id] = $this->rar($name.'.mkv', str_repeat('x', 100), $episode === 2 && $part === 2);
-            }
-        }
-
-        $context = $this->processReviewArchiveSets($contents, $responses, ['fetchLastFiles' => true, 'seasonPackArchiveSets' => 2]);
-        $release = DB::table('releases')->where('id', 1)->first();
-
-        self::assertTrue($context->releaseHasPassword);
-        self::assertSame(ReleaseBrowseService::PASSWD_RAR, (int) $release->passwordstatus);
-        self::assertNull($release->archive_retry_at);
-        self::assertSame(2, (int) $release->rarinnerfilecount);
-    }
-
-    public static function reverseArchiveSamples(): array
-    {
-        return ['reverse recovers the missing set' => [true], 'reverse repeats an already listed set' => [false]];
-    }
-
-    public static function boundedArchiveSamples(): array
-    {
-        return ['two sets with one missing retries' => [2, true], 'three listed out of four completes' => [4, false]];
-    }
-
-    /** @param list<array<string, mixed>> $contents
-     * @param  array<string, ?string>  $responses
-     * @param  array<string, mixed>  $overrides
-     */
-    private function processReviewArchiveSets(array $contents, array $responses, array $overrides = [], bool $realNaming = false, ?string $unavailable = null, ?ReleaseFileManager $fileManager = null): ReleaseProcessingContext
-    {
-        $config = $this->makeConfig(['processPasswords' => true, 'archiveProbeFiles' => 0, ...$overrides]);
-        $parser = Mockery::mock(NzbContentParser::class);
-        $parser->shouldReceive('parseNzb')->once()->andReturn(['error' => null, 'contents' => $contents]);
-        $download = Mockery::mock(UsenetDownloadService::class);
-        $download->shouldReceive('beginReleaseScope')->once();
-        $download->shouldReceive('finishReleaseScope')->once()->andReturn(new DownloadMetrics);
-        $download->shouldReceive('download')->andReturnUsing(static fn (DownloadKind $kind, array $ids): array => [
-            'success' => isset($responses[$ids[0]]), 'data' => $responses[$ids[0]] ?? null, 'groupUnavailable' => $ids[0] === $unavailable, 'error' => null,
-        ]);
-        $workspace = Mockery::mock(TempWorkspaceService::class);
-        $workspace->shouldReceive('createReleaseTempFolder')->once()->andReturn('/tmp/review-archive/');
-        $workspace->shouldReceive('listFiles')->andReturn([]);
-        $workspace->shouldReceive('clearDirectory')->once();
-        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (): void {});
-        $manager = $fileManager ?? ($realNaming ? $this->makeFullPar2NamingManager($sync) : $this->makeManager());
-        $processor = new ReleaseProcessor($config, $parser, new AdditionalWorkPlanner($config), new ArchiveExtractionService($config),
-            Mockery::mock(MediaExtractionService::class)->shouldIgnoreMissing(false), $download, $manager,
-            Mockery::mock(ReleaseFilesArchiveFallback::class)->shouldIgnoreMissing(), $workspace,
-            Mockery::mock(ConsoleOutputService::class)->shouldIgnoreMissing());
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
-        $processor->process($context, '/tmp/');
-
-        return $context;
-    }
-
-    #[DataProvider('scheduledPackEvidenceCases')]
-    public function test_finalized_pack_evidence_survives_the_scheduled_naming_boundary(string $state, string $producer): void
-    {
-        $this->prepareFilenameNaming();
-        $title = 'Show.S01E01.1080p.WEB-DL-GRP';
-        DB::table('predb')->where('id', 7)->update(['title' => $title]);
-        $this->recertifyFilenameSqlIdentity();
-        DB::table('releases')->where('id', 1)->update(['nfostatus' => 1]);
-        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $title]]);
-        Search::shouldReceive('updateRelease')->with(1);
-        $contents = [['title' => 'opaque-a.rar', 'segments' => ['<a>']]];
-        $archive = $this->zip($title.'.mkv', 'episode');
-        if ($state === 'confirmed') {
-            $archive .= $this->zip('Show.S01E02.1080p.WEB-DL-GRP.mkv', 'episode two');
-        } elseif ($state === 'probable') {
-            $contents[] = ['title' => 'opaque-b.rar', 'segments' => ['<b>']];
-        }
-        $context = $this->processReviewArchiveSets($contents, ['<a>' => $archive], ['fetchLastFiles' => false]);
-        self::assertSame($state === 'confirmed', $context->seasonPack);
-        self::assertSame($state === 'probable', $context->seasonPackProbable);
-        // Scheduled workers receive a fresh model/query result, never this context.
-        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
-        if ($producer === 'nfo') {
-            Schema::create('release_nfos', function (Blueprint $table): void {
-                $table->unsignedInteger('releases_id')->primary();
-                $table->binary('nfo');
-            });
-            DB::connection()->getPdo()->sqliteCreateFunction('UNCOMPRESS', static fn (string $text): string => $text);
-            DB::table('release_nfos')->insert(['releases_id' => 1, 'nfo' => $title]);
-            DB::table('releases')->where('id', 1)->update(['proc_nfo' => 0]);
-            $fixer->fixNamesWithNfo(0, true, 1, true, false);
-        } else {
-            $fixer->fixNamesWithFiles(0, true, 1, true, false);
-        }
-        $release = Release::query()->findOrFail(1);
-        self::assertSame($state === 'single' ? $title : 'Example', $release->searchname);
-        self::assertSame($state === 'single' ? 7 : 0, (int) $release->predb_id);
-        if ($state !== 'single') {
-            Event::assertNotDispatched(ReleaseNameFixed::class);
-        }
-    }
-
-    public static function scheduledPackEvidenceCases(): iterable
-    {
-        foreach (['confirmed', 'probable', 'single'] as $state) {
-            foreach (['files', 'nfo'] as $producer) {
-                yield $state.' '.$producer => [$state, $producer];
-            }
-        }
-    }
-
-    #[DataProvider('directFulltextPackCases')]
-    public function test_real_fulltext_writer_preserves_pack_identity_and_completes_permanent_rejections(string $stored, string $title, bool $accepted): void
-    {
-        $this->prepareFilenameNaming();
-        DB::table('predb')->where('id', 7)->update(['title' => $title]);
-        DB::table('releases')->where('id', 1)->update(['name' => $title, 'searchname' => $stored,
-            'additional_pp_claim_token' => null, 'additional_pp_claimed_at' => null]);
-        Search::shouldReceive('isAvailable')->once()->andReturnTrue();
-        Search::shouldReceive('supportsReleaseCandidatePaging')->once()->andReturnFalse();
-        Search::shouldReceive('searchReleases')->once()->andReturn([1]);
-        Search::shouldReceive('updateRelease')->with(1);
-        // Only discovery SQL is adapted: SQLite rejects the MySQL ESCAPE literal.
-        // The real final query service, canonical admission and transactional writer stay real.
-        $connection = $this->createStub(ConnectionInterface::class);
-        $connection->method('select')->willReturnCallback(static function (string $query, array $bindings = [], bool $useReadPdo = true): array {
-            $query = str_replace("ESCAPE '".str_repeat(chr(92), 2)."'", "ESCAPE '".chr(92)."'", $query);
-
-            return DB::connection()->select($query, $bindings, $useReadPdo);
-        });
-        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)),
-            queries: new NameFixingQueryService($connection));
-
-        $outcome = $fixer->matchPredbFulltextWithCompletion((object) ['predb_id' => 7, 'title' => $title, 'source' => 'test']);
-
-        self::assertSame(['updated' => $accepted ? 1 : 0, 'matched' => $accepted, 'retry' => false], $outcome);
-        self::assertSame($accepted ? $title : $stored, DB::table('releases')->where('id', 1)->value('searchname'));
-        self::assertSame($accepted ? 7 : 0, (int) DB::table('releases')->where('id', 1)->value('predb_id'));
-        if (! $accepted || $stored === $title) {
-            Event::assertNotDispatched(ReleaseNameFixed::class);
-        }
-    }
-
-    public static function directFulltextPackCases(): array
-    {
-        return [
-            'episode rejected for season pack' => ['Show.S01.1080p.WEB-DL-GRP', 'Show.S01E01.1080p.WEB-DL-GRP', false],
-            'exact season attaches' => ['Show.S01.1080p.WEB-DL-GRP', 'Show.S01.1080p.WEB-DL-GRP', true],
-            'ordinary episode' => ['Example', 'Show.S01E01.1080p.WEB-DL-GRP', true],
-        ];
-    }
-
-    #[DataProvider('distinctWrapperCases')]
-    public function test_distinct_accepted_nzbsplit_wrappers_share_only_the_unwrapped_show_identity(array $titles, bool $pack): void
-    {
-        $this->prepareFullPar2NamingEvidence('Unrelated.Title-GRP');
-        $stored = 'Stored__NZBSPLIT__'.str_repeat('c', 32).'__NZBSPLIT__opaque';
-        DB::table('releases')->where('id', 1)->update(['name' => $stored, 'searchname' => $stored, 'nfostatus' => 1]);
-        $contents = [];
-        foreach ($titles as $i => $title) {
-            $contents[] = ['title' => '"Uploader'.$i.'__NZBSPLIT__'.str_repeat($i === 0 ? 'a' : 'b', 32).'__NZBSPLIT__'.$title.'.mkv" yEnc', 'segments' => ['<'.$i.'>']];
-        }
-        $context = $this->processReviewArchiveSets($contents, [], ['processPasswords' => false], realNaming: true);
-
-        self::assertSame($pack, $context->seasonPack);
-        self::assertSame($pack ? $stored : $titles[0], DB::table('releases')->where('id', 1)->value('searchname'));
-        if ($pack) {
-            Event::assertNotDispatched(ReleaseNameFixed::class);
-        }
-    }
-
-    public static function distinctWrapperCases(): array
-    {
-        return [
-            'same show different uploaders and hashes' => [['Show.S01E01.1080p.WEB-DL-GRP', 'Show.S01E02.1080p.WEB-DL-GRP'], true],
-            'one episode' => [['Show.S01E01.1080p.WEB-DL-GRP'], false],
-            'different shows' => [['Show.S01E01.1080p.WEB-DL-GRP', 'Other.S01E02.1080p.WEB-DL-GRP'], false],
-        ];
-    }
-
-    #[DataProvider('numberedSubjectCases')]
-    public function test_numbered_volume_subjects_complete_the_actual_single_set_without_false_pack_deferral(bool $quoted, bool $twoSets): void
-    {
-        $title = 'Show.S01E01.1080p.WEB-DL-GRP';
-        $this->prepareFullPar2NamingEvidence($title);
-        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $title]]);
-        $quote = $quoted ? '"' : '';
-        $contents = [
-            ['title' => $quote.'opaque.001'.$quote.' yEnc (1/50)', 'segments' => ['<first>']],
-            ['title' => $quote.'opaque.010'.$quote.' yEnc (1/50)', 'segments' => ['<last>']],
-        ];
-        $responses = ['<first>' => $this->rar($title.'.mkv', 'episode')];
-        if ($twoSets) {
-            $contents[] = ['title' => $quote.'other.001'.$quote.' yEnc (1/50)', 'segments' => ['<other-first>']];
-            $contents[] = ['title' => $quote.'other.010'.$quote.' yEnc (1/50)', 'segments' => ['<other-last>']];
-            $responses['<other-first>'] = $this->rar($title.'.srt', 'subtitle');
-        }
-        $context = $this->processReviewArchiveSets($contents, $responses, ['fetchLastFiles' => false], realNaming: true);
-
-        self::assertSame($twoSets ? 2 : 1, $context->workPlan?->archiveSetCount());
-        self::assertFalse($context->seasonPackProbable);
-        self::assertFalse($context->archiveSampleIncomplete);
-        self::assertSame($title, DB::table('releases')->where('id', 1)->value('searchname'));
-    }
-
-    public static function numberedSubjectCases(): array
-    {
-        return ['quoted one' => [true, false], 'bare one' => [false, false], 'quoted two' => [true, true], 'bare two' => [false, true]];
-    }
-
-    #[DataProvider('supportOnlyListingCases')]
-    public function test_a_readable_support_only_set_completes_inspection_independently_of_storage(string $name, bool $supportFirst): void
-    {
-        $title = 'Show.S01E01.1080p.WEB-DL-GRP';
-        $this->prepareFullPar2NamingEvidence($title);
-        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $title]]);
-        $context = $this->processReviewArchiveSets([
-            ['title' => 'opaque-a.rar', 'segments' => ['<a>']],
-            ['title' => 'opaque-b.rar', 'segments' => ['<b>']],
-        ], ['<a>' => $this->rar($supportFirst ? $name : $title.'.mkv', 'first'),
-            '<b>' => $this->rar($supportFirst ? $title.'.mkv' : $name, 'second')], ['fetchLastFiles' => false], realNaming: true);
-
-        self::assertTrue($context->archiveSetWalkComplete);
-        self::assertCount(2, $context->listedArchiveSets);
-        self::assertFalse($context->seasonPackProbable);
-        self::assertFalse($context->seasonPack);
-        self::assertFalse($context->archiveSampleIncomplete);
-        self::assertSame(1, DB::table('release_files')->count());
-        self::assertSame($title, DB::table('releases')->where('id', 1)->value('searchname'));
-    }
-
-    public static function supportOnlyListingCases(): array
-    {
-        return ['checksum second' => ['checksums.sfv', false], 'nested archive second' => ['nested.rar', false],
-            'checksum first' => ['checksums.sfv', true], 'nested archive first' => ['nested.rar', true]];
-    }
-
-    #[DataProvider('previewIncompleteSampleCases')]
-    public function test_preview_does_not_suppress_the_one_delayed_incomplete_sample_retry(bool $retried, bool $recover): void
-    {
-        DB::table('releases')->insert([...$this->releaseRow(), 'nfostatus' => 1, 'archive_retry_at' => $retried ? now()->subMinute() : null]);
-        Search::shouldReceive('updateRelease')->with(1);
-        $images = new class extends ReleaseImageService
-        {
-            public function imageExists(string $directory, string $basename): bool
-            {
-                return true;
-            }
-        };
-        $manager = $this->makeManagerWithImageService($images);
-        $contents = [
-            ['title' => 'opaque-a.rar', 'segments' => ['<a>']],
-            ['title' => 'opaque-b.rar', 'segments' => ['<b>']],
-        ];
-        $responses = ['<a>' => $this->rar('Show.S01E01.1080p.WEB-DL-GRP.mkv', 'episode')];
-        if ($recover) {
-            $responses['<b>'] = $this->rar('Show.S01E01.1080p.WEB-DL-GRP.srt', 'subtitle');
-        }
-        $context = $this->processReviewArchiveSets($contents, $responses, ['fetchLastFiles' => false], fileManager: $manager);
-        $release = Release::query()->findOrFail(1);
-
-        self::assertSame(! $recover, $context->archiveSampleIncomplete);
-        self::assertSame(! $recover && ! $retried ? -1 : 1, (int) $release->haspreview);
-        self::assertSame($recover ? 2 : 1, (int) $release->rarinnerfilecount);
-        self::assertNull($release->additional_pp_claim_token);
-        if (! $recover && ! $retried) {
-            self::assertNotNull($release->archive_retry_at);
-            Schema::create('categories', function (Blueprint $table): void {
-                $table->unsignedInteger('id')->primary();
-                $table->integer('disablepreview')->default(0);
-            });
-            DB::table('categories')->insert(['id' => 10]);
-            self::assertFalse(AdditionalCandidateQuery::baseBuilder(minSizeBytes: 0, maxSizeBytes: 0)->exists());
-            $this->travel(AdditionalCandidateQuery::archiveRetryDelaySeconds() + 1)->seconds();
-            self::assertTrue(AdditionalCandidateQuery::baseBuilder(minSizeBytes: 0, maxSizeBytes: 0)->exists());
-        } elseif ($retried) {
-            self::assertTrue(Carbon::parse((string) $release->archive_retry_at)->isPast());
-        }
-    }
-
-    public static function previewIncompleteSampleCases(): array
-    {
-        return ['first partial preview' => [false, false], 'second partial preview' => [true, false], 'retry succeeds with preview' => [true, true]];
-    }
-
-    #[DataProvider('archiveEvidenceBoundaryCases')]
-    public function test_full_archive_listing_never_treats_a_truncated_name_buffer_as_negative_pack_evidence(int $total, bool $reverse): void
-    {
-        $titles = ['Show.S01E01.1080p.WEB-DL-GRP', 'Show.S01E02.1080p.WEB-DL-GRP'];
-        if ($reverse) {
-            $titles = array_reverse($titles);
-        }
-        $this->prepareFullPar2NamingEvidence($titles[0]);
-        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $titles[0]]]);
-        $archive = '';
-        for ($i = 0; $i < $total - 2; $i++) {
-            $archive .= $this->zip('support-'.$i.'.sfv', 'checksum');
-        }
-        foreach ($titles as $title) {
-            $archive .= $this->zip($title.'.mkv', 'episode');
-        }
-        $context = $this->processReviewArchiveSets([
-            ['title' => 'opaque.zip', 'segments' => ['<a>']],
-        ], ['<a>' => $archive], ['fetchLastFiles' => false], realNaming: true);
-
-        self::assertLessThanOrEqual(500, count($context->archiveFileNames));
-        self::assertTrue($context->defersArchiveNameChecks());
-        self::assertSame('Example', DB::table('releases')->where('id', 1)->value('searchname'));
-        self::assertSame(0, (int) DB::table('releases')->where('id', 1)->value('predb_id'));
-        self::assertSame(2, DB::table('release_files')->count());
-        Event::assertNotDispatched(ReleaseNameFixed::class);
-    }
-
-    public static function archiveEvidenceBoundaryCases(): iterable
-    {
-        foreach ([499, 500, 501, 502, 503] as $total) {
-            foreach ([false, true] as $reverse) {
-                yield $total.' '.($reverse ? 'reverse' : 'forward') => [$total, $reverse];
-            }
-        }
-    }
-
-    #[DataProvider('durablePackTransitions')]
-    public function test_pack_finalization_merges_monotonically_and_clears_only_complete_probable_evidence(string $state, string $intent, ?string $expected): void
-    {
-        DB::table('releases')->insert([...$this->releaseRow(), 'additional_pack_evidence' => $this->packEvidenceFixture($state)]);
-        Search::shouldReceive('updateRelease')->with(1);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
-        $context->seasonPack = $intent === 'confirmed';
-        $context->seasonPackProbable = $intent === 'probable';
-        $context->archiveSetWalkComplete = $intent === 'clear';
-        $context->archiveFileNamesTruncated = $intent === 'truncated';
-
-        $this->makeManager()->finalizeRelease($context, false);
-
-        $value = json_decode((string) DB::table('releases')->value('additional_pack_evidence'), true, flags: JSON_THROW_ON_ERROR);
-        self::assertSame($expected, $value['state']);
-        self::assertSame(str_repeat('a', 64), $value['epoch']);
-        self::assertNull(DB::table('releases')->value('additional_pp_claim_token'));
-    }
-
-    public static function durablePackTransitions(): array
-    {
-        return ['confirmed survives negative' => ['confirmed', 'clear', 'confirmed'],
-            'confirmed survives probable' => ['confirmed', 'probable', 'confirmed'],
-            'probable complete clears classification' => ['probable', 'clear', null],
-            'probable incomplete retains' => ['probable', 'retain', 'probable'],
-            'truncation retains probable' => ['probable', 'truncated', 'probable'],
-            'probable upgrades confirmed' => ['probable', 'confirmed', 'confirmed']];
-    }
-
-    #[DataProvider('legacyPackObservations')]
-    public function test_old_context_cannot_publish_after_a_same_identity_content_epoch_change(bool $legacy): void
-    {
-        DB::table('releases')->insert([...$this->releaseRow(), 'additional_pack_evidence' => $legacy ? null : $this->packEvidenceFixture('probable')]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
-        $context->seasonPack = true;
-        $manager = $this->makeManager();
-        $manager->addFileInfo(['name' => 'Show.S01E01.mkv', 'size' => 100], $context, '\.sfv');
-        $replacement = $this->packEvidenceFixture(null, 'b');
-        DB::table('releases')->where('id', 1)->update(['additional_pack_evidence' => $replacement]);
-
-        $manager->finalizeRelease($context, false);
-
-        self::assertTrue($context->fullPar2EvidenceDeferred);
-        self::assertSame($replacement, DB::table('releases')->value('additional_pack_evidence'));
-        self::assertSame('token', DB::table('releases')->value('additional_pp_claim_token'));
-        self::assertSame(0, DB::table('release_files')->count());
-        self::assertSame($legacy ? null : $this->packEvidenceFixture('probable'), $context->packEvidenceObservation['value']);
-    }
-
-    public static function legacyPackObservations(): array
-    {
-        return ['legacy SQL NULL observation' => [true], 'old explicit epoch' => [false]];
-    }
-
-    #[DataProvider('evidenceOnlyPackCases')]
-    public function test_pack_evidence_finalizes_even_when_file_admission_adds_no_rows(string $inventory): void
-    {
-        DB::table('releases')->insert($this->releaseRow());
-        Search::shouldReceive('updateRelease')->with(1);
-        if ($inventory !== 'none') {
-            $this->seedReleaseFileBudget($inventory === 'full' ? 30 : 1);
-        }
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
-        $context->seasonPack = true;
-        $manager = $this->makeManager();
-        if ($inventory !== 'none') {
-            $manager->addFileInfo(['name' => $inventory === 'full' ? 'overflow.mkv' : 'persisted-00.mkv', 'size' => 100], $context, '\.sfv');
-        }
-        $before = DB::table('release_files')->count();
-        $manager->finalizeRelease($context, false);
-
-        self::assertSame($before, DB::table('release_files')->count());
-        self::assertSame('confirmed', json_decode((string) DB::table('releases')->value('additional_pack_evidence'), true, flags: JSON_THROW_ON_ERROR)['state']);
-        self::assertNull(DB::table('releases')->value('additional_pp_claim_token'));
-    }
-
-    public static function evidenceOnlyPackCases(): array
-    {
-        return ['parsed NZB evidence only' => ['none'], 'duplicate-only listing' => ['duplicates'], 'exhausted storage budget' => ['full']];
-    }
-
-    public function test_enclosing_rollback_does_not_publish_pack_state_or_advance_its_observation(): void
-    {
-        DB::table('releases')->insert($this->releaseRow());
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
-        $context->seasonPack = true;
-        $manager = $this->makeManager();
-        $manager->addFileInfo(['name' => 'Show.S01E01.mkv', 'size' => 100], $context, '\.sfv');
-        DB::beginTransaction();
-        try {
-            $manager->finalizeRelease($context, false);
-            self::assertNull($context->packEvidenceObservation['value']);
-            self::assertNotNull(DB::table('releases')->value('additional_pack_evidence'));
-        } finally {
-            DB::rollBack();
-        }
-        self::assertNull(DB::table('releases')->value('additional_pack_evidence'));
-        self::assertNull($context->packEvidenceObservation['value']);
-        self::assertSame(0, DB::table('release_files')->count());
-        self::assertSame('token', DB::table('releases')->value('additional_pp_claim_token'));
-    }
-
-    public function test_safe_title_changes_away_and_back_preserve_the_exact_pack_envelope(): void
-    {
-        $title = 'Show.S01E01.1080p.WEB-DL-GRP';
-        $this->prepareFullPar2NamingEvidence($title);
-        $before = $this->packEvidenceFixture('confirmed');
-        DB::table('releases')->where('id', 1)->update(['additional_pack_evidence' => $before,
-            'additional_pp_claim_token' => null, 'additional_pp_claimed_at' => null]);
-        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (): void {});
-        $writer = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
-        foreach (['Show.S01.1080p.WEB-DL-GRP', 'Example'] as $safe) {
-            $entry = Release::query()->findOrFail(1);
-            $entry->releases_id = 1;
-            self::assertTrue($writer->updateMediaSnapshot($entry, $safe, Category::OTHER_HASHED));
-            self::assertSame($before, DB::table('releases')->value('additional_pack_evidence'));
-        }
-        $entry = Release::query()->findOrFail(1);
-        $entry->releases_id = 1;
-        $writer->updateRelease($entry, $title, 'preDB', true, 'Filenames, ', true, false, 7);
-        self::assertSame('Example', DB::table('releases')->value('searchname'));
-        self::assertSame($before, DB::table('releases')->value('additional_pack_evidence'));
-        self::assertSame(0, (int) DB::table('releases')->value('predb_id'));
-        Event::assertNotDispatched(ReleaseNameFixed::class);
-    }
-
-    #[DataProvider('invalidPackEnvelopeCases')]
-    public function test_episode_admission_distinguishes_current_invalid_and_other_cohort_envelopes(string $kind, bool $accepted): void
-    {
-        $title = 'Show.S01E01.1080p.WEB-DL-GRP';
-        $this->prepareFullPar2NamingEvidence($title);
-        $value = match ($kind) {
-            'absent' => null,
-            'tombstone' => $this->packEvidenceFixture(null),
-            'probable' => $this->packEvidenceFixture('probable'),
-            'confirmed' => $this->packEvidenceFixture('confirmed'),
-            'malformed' => '{not-json',
-            'unknown version' => str_replace('"v":1', '"v":2', $this->packEvidenceFixture('confirmed')),
-            'other GUID case' => $this->packEvidenceFixture('confirmed', guid: 'GUID-1'),
-            'other ID' => $this->packEvidenceFixture('confirmed', id: 2),
-        };
-        DB::table('releases')->where('id', 1)->update(['additional_pack_evidence' => $value,
-            'additional_pp_claim_token' => null, 'additional_pp_claimed_at' => null]);
-        $entry = Release::query()->findOrFail(1);
-        $entry->releases_id = 1;
-        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (): void {});
-        $writer = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
-
-        $writer->updateRelease($entry, $title, 'preDB', true, 'Filenames, ', true, false, 7);
-
-        self::assertSame($accepted ? $title : 'Example', DB::table('releases')->value('searchname'));
-        self::assertSame($accepted ? 7 : 0, (int) DB::table('releases')->value('predb_id'));
-        self::assertSame($value, DB::table('releases')->value('additional_pack_evidence'));
-    }
-
-    public static function invalidPackEnvelopeCases(): array
-    {
-        return ['legacy SQL NULL' => ['absent', true], 'valid tombstone' => ['tombstone', true],
-            'current probable' => ['probable', false], 'current confirmed' => ['confirmed', false],
-            'malformed' => ['malformed', false], 'unknown version' => ['unknown version', false],
-            'exact GUID case binding' => ['other GUID case', true], 'different exact ID' => ['other ID', true]];
-    }
-
-    public function test_a_separate_filename_worker_defers_episode_evidence_while_an_additional_claim_is_active(): void
-    {
-        $this->prepareFilenameNaming();
-        $title = 'Show.S01E01.1080p.WEB-DL-GRP';
-        DB::table('predb')->where('id', 7)->update(['title' => $title]);
-        DB::table('release_files')->insert(['releases_id' => 1, 'name' => $title.'.mkv']);
-        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $title]]);
-        $fixer = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
-
-        $fixer->fixNamesWithFiles(0, true, 1, true, false);
-
-        self::assertSame('Example', DB::table('releases')->value('searchname'));
-        self::assertSame(0, (int) DB::table('releases')->value('predb_id'));
-        self::assertSame(0, (int) DB::table('releases')->value('proc_files'));
-        self::assertSame('token', DB::table('releases')->value('additional_pp_claim_token'));
-        Event::assertNotDispatched(ReleaseNameFixed::class);
-    }
-
-    #[DataProvider('adjacentEpisodePredbCases')]
-    public function test_real_predb_writer_preserves_pack_evidence_for_adjacent_episode_words(?string $state, string $title, bool $expectedAccepted): void
-    {
-        $this->prepareFullPar2NamingEvidence($title);
-        $evidence = $state === null ? null : $this->packEvidenceFixture($state);
-        DB::table('releases')->where('id', 1)->update([
-            'additional_pack_evidence' => $evidence,
-            'additional_pp_claim_token' => null,
-            'additional_pp_claimed_at' => null,
-        ]);
-        $before = DB::table('releases')->where('id', 1)->first();
-        $entry = Release::query()->findOrFail(1);
-        $entry->releases_id = 1;
-        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (): void {});
-        $writer = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
-
-        $accepted = $writer->updatePredbCandidate($entry, $title, 7, 'adjacent episode regression');
-
-        $after = DB::table('releases')->where('id', 1)->first();
-        self::assertNotNull($before);
-        self::assertNotNull($after);
-        self::assertSame($expectedAccepted, $accepted);
-        self::assertSame($expectedAccepted ? $title : 'Example', $after->searchname);
-        self::assertSame($expectedAccepted ? 7 : 0, (int) $after->predb_id);
-        self::assertSame($evidence, $after->additional_pack_evidence);
-        if (! $expectedAccepted) {
-            self::assertSame((array) $before, (array) $after);
-            self::assertNull($writer->lastCommittedIdentity());
-            Event::assertNotDispatched(ReleaseNameFixed::class);
-        }
-    }
-
-    public static function adjacentEpisodePredbCases(): array
-    {
-        return [
-            'confirmed pack rejects adjacent episode' => ['confirmed', 'Show.S01Episode.1.720p.WEB-GRP', false],
-            'probable pack defers adjacent episode' => ['probable', 'Show.S01Episode.1.720p.WEB-GRP', false],
-            'ordinary adjacent episode remains eligible' => [null, 'Show.S01Episode.1.720p.WEB-GRP', true],
-            'confirmed pack accepts season title' => ['confirmed', 'Show.S01.720p.WEB-GRP', true],
-        ];
-    }
-
-    private function packEvidenceFixture(?string $state, string $epoch = 'a', int $id = 1, string $guid = 'guid-1'): string
-    {
-        return json_encode(['v' => 1, 'identity_sha256' => hash('sha256', json_encode([(string) $id, $guid], JSON_THROW_ON_ERROR)),
-            'epoch' => str_repeat($epoch, 64), 'state' => $state], JSON_THROW_ON_ERROR);
-    }
-
-    #[DataProvider('nonEpisodeGenerationCases')]
-    public function test_real_non_episode_writers_admit_generation_before_safe_title_classification(string $writerKind, string $generation): void
-    {
-        $title = 'Example.Movie.2026.1080p.WEB-DL-GRP';
-        $this->prepareFullPar2NamingEvidence($title);
-        $value = in_array($generation, ['explicit changed', 'current'], true) ? $this->packEvidenceFixture(null) : null;
-        DB::table('releases')->where('id', 1)->update(['additional_pack_evidence' => $value,
-            'nzbstatus' => $generation === 'unpublished' ? 0 : 1,
-            'additional_pp_claim_token' => null, 'additional_pp_claimed_at' => null]);
-        $entry = Release::query()->findOrFail(1);
-        $entry->releases_id = 1;
-        if (str_contains($generation, 'changed')) {
-            DB::table('releases')->where('id', 1)->update(['additional_pack_evidence' => $this->packEvidenceFixture(null, 'b')]);
-        }
-        $before = DB::table('releases')->value('additional_pack_evidence');
-        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (): void {});
-        $writer = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
-
-        $accepted = $writerKind === 'predb' ? $writer->updatePredbCandidate($entry, $title, 7, 'fixture')
-            : $writer->updateMediaSnapshot($entry, $title, Category::OTHER_MISC);
-
-        self::assertSame($generation === 'current', $accepted);
-        self::assertSame($generation === 'current' ? $title : 'Example', DB::table('releases')->value('searchname'));
-        self::assertSame($generation === 'current' && $writerKind === 'predb' ? 7 : 0, (int) DB::table('releases')->value('predb_id'));
-        self::assertSame($before, DB::table('releases')->value('additional_pack_evidence'));
-        if ($generation !== 'current') {
-            self::assertNull($writer->lastCommittedIdentity());
-            Event::assertNotDispatched(ReleaseNameFixed::class);
-        }
-    }
-
-    public static function nonEpisodeGenerationCases(): iterable
-    {
-        foreach (['predb', 'media'] as $writer) {
-            foreach (['NULL changed', 'explicit changed', 'unpublished', 'current'] as $generation) {
-                yield $writer.' '.$generation => [$writer, $generation];
-            }
-        }
-    }
-
-    #[DataProvider('fullHashClaimAdmissionCases')]
-    public function test_evidence_only_full_hash_finalization_admits_the_exact_claim_before_any_hash_write(string $claim): void
-    {
-        $this->freezeSecond();
-        $this->prepareFullPar2Evidence();
-        if ($claim === 'expiry boundary') {
-            DB::table('releases')->where('id', 1)->update(['additional_pp_claimed_at' => AdditionalCandidateQuery::claimStaleBefore()->toDateTimeString()]);
-        }
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
-        $context->pendingFullParHashes[] = ['full_md5' => str_repeat('a', 32), 'hash16k' => str_repeat('b', 32), 'size' => '1024'];
-        self::assertFalse($context->producerNamingAttempted);
-        if ($claim === 'renewed timestamp') {
-            DB::table('releases')->where('id', 1)->update(['additional_pp_claimed_at' => now()->addSecond()->toDateTimeString()]);
-        }
-        $tables = ['par_file_hashes', 'par_file_hash_inventories', 'par2_hash_retry', 'release_files', 'releases'];
-        $before = [];
-        foreach ($tables as $table) {
-            $before[$table] = DB::table($table)->get()->toJson();
-        }
-        Search::shouldReceive('updateRelease')->andReturnNull();
-
-        $this->makeManager()->finalizeRelease($context, false);
-
-        self::assertSame($claim !== 'current', $context->fullPar2EvidenceDeferred);
-        if ($claim !== 'current') {
-            foreach ($tables as $table) {
-                self::assertSame($before[$table], DB::table($table)->get()->toJson(), $table);
-            }
-        } else {
-            self::assertSame(1, DB::table('par_file_hashes')->count());
-            self::assertNull(DB::table('releases')->value('additional_pp_claim_token'));
-        }
-    }
-
-    public static function fullHashClaimAdmissionCases(): array
-    {
-        return ['same token renewed timestamp' => ['renewed timestamp'], 'exact expiry boundary' => ['expiry boundary'], 'valid unchanged claim' => ['current']];
-    }
-
-    #[DataProvider('temporarilyDeferredSourceCases')]
-    public function test_actual_naming_sources_keep_temporary_refusals_pending_and_recover_the_same_evidence(string $source, string $mode, string $barrier): void
-    {
-        $title = 'Show.S01E01.1080p.WEB-DL-GRP';
-        $this->prepareFilenameNaming();
-        DB::connection()->getPdo()->sqliteCreateFunction('UNCOMPRESS', static fn (string $text): string => $text);
-        DB::table('predb')->where('id', 7)->update(['title' => $title]);
-        Schema::table('releases', static function (Blueprint $table): void {
-            $table->char('leftguid', 1)->default('a');
-        });
-        Schema::create('release_nfos', static function (Blueprint $table): void {
-            $table->integer('releases_id');
-            $table->binary('nfo')->nullable();
-        });
-        Schema::create('media_infos', static function (Blueprint $table): void {
-            $table->integer('releases_id');
-            foreach (['unique_id', 'movie_name', 'file_name'] as $column) {
-                $table->string($column)->nullable();
-            }
-        });
-        $column = match ($source) {
-            'uid' => 'proc_uid', 'crc' => 'proc_crc32', 'srr' => 'proc_srr', 'hash' => 'proc_hash16k'
-        };
-        $values = ['nfostatus' => 1, 'passwordstatus' => 0, 'proc_nfo' => 1, 'proc_uid' => 1, 'proc_crc32' => 1,
-            'proc_srr' => 1, 'proc_hash16k' => 1, 'proc_files' => 1, 'proc_par2' => 1, $column => 0,
-            'additional_pack_evidence' => $barrier === 'claim' ? null : $this->packEvidenceFixture($barrier),
-            'additional_pp_claim_token' => $barrier === 'claim' ? 'token' : null,
-            'additional_pp_claimed_at' => $barrier === 'claim' ? now()->toDateTimeString() : null];
-        DB::table('releases')->where('id', 1)->update($values);
-        DB::table('releases')->insert([...$this->releaseRow(), 'id' => 2, 'guid' => 'donor-guid', 'name' => $title,
-            'searchname' => $title, 'predb_id' => 7, 'isrenamed' => 1, 'additional_pp_claim_token' => null,
-            'additional_pp_claimed_at' => null]);
-        if ($source === 'uid') {
-            DB::table('media_infos')->insert([['releases_id' => 1, 'unique_id' => 'shared'],
-                ['releases_id' => 1, 'unique_id' => 'later-no-match'], ['releases_id' => 2, 'unique_id' => 'shared']]);
-        } elseif ($source === 'crc') {
-            DB::table('release_files')->insert([['releases_id' => 1, 'name' => 'opaque.mkv', 'crc32' => 'ABC123'],
-                ['releases_id' => 1, 'name' => 'later-no-match.txt', 'crc32' => 'DEF456'], ['releases_id' => 2, 'name' => $title.'.mkv', 'crc32' => 'ABC123']]);
-        } elseif ($source === 'srr') {
-            DB::table('release_files')->insert([['releases_id' => 1, 'name' => $title.'.srr'],
-                ['releases_id' => 1, 'name' => 'readme.srr']]);
-        } else {
-            DB::table('par_hashes')->insert([['releases_id' => 1, 'hash' => md5('shared')],
-                ['releases_id' => 1, 'hash' => md5('later-no-match')], ['releases_id' => 2, 'hash' => md5('shared')]]);
-        }
-        config(['cache.default' => 'array', 'tmux.fix_names.cache_store' => 'array', 'tmux.fix_names.full_backlog' => true]);
-        Cache::store('array')->flush();
-        Search::shouldReceive('updateRelease')->andReturnNull();
-        $run = function () use ($source, $mode): void {
-            $names = new NameFixingService(new ReleaseUpdateService($this->createStub(CategorizationService::class)));
-            if ($mode === 'standard') {
-                $names->processStandardBatch('a', 10, false);
-            } else {
-                $method = match ($source) {
-                    'uid' => 'fixNamesWithMedia', 'crc' => 'fixNamesWithCrc', 'srr' => 'fixNamesWithSrr', 'hash' => 'fixNamesWithParHash'
-                };
-                $names->{$method}(0, true, 1, true, false);
-            }
-        };
-
-        $run();
-
-        self::assertSame('Example', DB::table('releases')->where('id', 1)->value('searchname'));
-        self::assertSame($barrier === 'confirmed' ? 1 : 0, (int) DB::table('releases')->where('id', 1)->value($column));
-        if ($barrier !== 'confirmed') {
-            DB::table('releases')->where('id', 1)->update(['additional_pp_claim_token' => null, 'additional_pp_claimed_at' => null,
-                'additional_pack_evidence' => $barrier === 'probable' ? $this->packEvidenceFixture(null) : null]);
-            Cache::store('array')->flush();
-            $run();
-            self::assertSame($title, DB::table('releases')->where('id', 1)->value('searchname'));
-        }
-    }
-
-    public static function temporarilyDeferredSourceCases(): iterable
-    {
-        foreach (['uid', 'crc', 'srr', 'hash'] as $source) {
-            foreach (['standard', 'standalone'] as $mode) {
-                foreach (['claim', 'probable', 'confirmed'] as $barrier) {
-                    yield $source.' '.$mode.' '.$barrier => [$source, $mode, $barrier];
-                }
-            }
-        }
-    }
-
-    #[DataProvider('par2ContextNamingStates')]
-    public function test_par2_context_pack_state_blocks_episode_naming_without_losing_files_or_evidence(string $state): void
-    {
-        $title = 'Show.S01E01.1080p.WEB-DL-GRP';
-        $this->prepareFullPar2NamingEvidence($title);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
-        $context->seasonPack = $state === 'confirmed';
-        $context->seasonPackProbable = $state === 'probable';
-        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (): void {});
-        $manager = $this->makeFullPar2NamingManager($sync);
-        $expectedName = $state === 'single' ? $title : 'Example';
-
-        self::assertTrue($manager->processPar2File($this->fullPar2Fixture(2, names: [$title, 'second.bin']), $context, new Par2Info));
-        self::assertSame($expectedName, DB::table('releases')->where('id', 1)->value('searchname'));
-        $manager->finalizeRelease($context, false);
-
-        self::assertSame($expectedName, $context->fullPar2EvidenceSnapshot()['searchname']);
-        self::assertSame(2, DB::table('release_files')->count());
-        self::assertSame(2, DB::table('par_file_hashes')->count());
-        self::assertFalse($context->fullPar2EvidenceDeferred);
-        self::assertNull(DB::table('releases')->where('id', 1)->value('additional_pp_claim_token'));
-        if ($state === 'single') {
-            Event::assertDispatchedTimes(ReleaseNameFixed::class, 1);
-        } else {
-            Event::assertNotDispatched(ReleaseNameFixed::class);
-        }
-    }
-
-    public static function par2ContextNamingStates(): array
-    {
-        return ['NZB-confirmed pack with opaque stored name' => ['confirmed'], 'probable pack with opaque stored name' => ['probable'], 'valid single release still names normally' => ['single']];
-    }
-
-    #[DataProvider('releaseFileBudgetSources')]
-    public function test_release_file_budget_includes_persisted_and_all_pending_sources(bool $pack, int $persisted, array $sources, int $limit): void
-    {
-        $this->prepareFullPar2Evidence();
-        $this->seedReleaseFileBudget($persisted);
-        Search::shouldReceive('updateRelease')->with(1);
-        $manager = $this->makeManagerWithImageService(new ReleaseImageService, configOverrides: ['addPAR2Files' => true]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
-        $context->seasonPack = $pack;
-        foreach ($sources as $source) {
-            $names = array_map(static fn (int $i): string => $source.'-'.$i.'.mkv', range(0, 3));
-            if ($source === 'par2') {
-                $manager->processPar2File($this->fullPar2Fixture(4, names: $names), $context, new Par2Info);
-            } else {
-                foreach ($names as $name) {
-                    $manager->addFileInfo(['name' => $name, 'size' => 100], $context, '\\.(?:par2|sfv|nzb)');
-                }
-            }
-        }
-
-        self::assertCount($limit - $persisted, $context->pendingReleaseFiles);
-        $manager->finalizeRelease($context, false);
-
-        self::assertSame($limit, DB::table('release_files')->count());
-        self::assertSame($limit, (int) DB::table('releases')->where('id', 1)->value('rarinnerfilecount'));
-        if (in_array('par2', $sources, true)) {
-            self::assertSame(4, DB::table('par_file_hashes')->count());
-            self::assertSame(4, DB::table('par_hashes')->count());
-        }
-    }
-
-    public static function releaseFileBudgetSources(): array
-    {
-        return [
-            'persisted28 plus archive input' => [true, 28, ['archive'], 30],
-            'persisted30 plus archive input' => [true, 30, ['archive'], 30],
-            'persisted28 plus PAR2 input' => [true, 28, ['par2'], 30],
-            'persisted30 plus PAR2 input' => [true, 30, ['par2'], 30],
-            'archive then PAR2 share two slots' => [true, 28, ['archive', 'par2'], 30],
-            'PAR2 then archive share two slots' => [true, 28, ['par2', 'archive'], 30],
-            'ordinary release retains eleven row cap' => [false, 10, ['archive', 'par2'], 11],
-        ];
-    }
-
-    #[DataProvider('mixedFileBudgetOrders')]
-    public function test_duplicate_files_do_not_consume_the_shared_budget_or_lose_par2_hashes(array $sources): void
-    {
-        $this->prepareFullPar2Evidence();
-        $this->seedReleaseFileBudget(28);
-        Search::shouldReceive('updateRelease')->with(1);
-        $manager = $this->makeManagerWithImageService(new ReleaseImageService, configOverrides: ['addPAR2Files' => true]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
-        $context->seasonPack = true;
-        $names = ['persisted-00.mkv', 'fresh-a.mkv', 'fresh-a.mkv', 'fresh-b.mkv', 'overflow.mkv'];
-        foreach ($sources as $source) {
-            if ($source === 'par2') {
-                $manager->processPar2File($this->fullPar2Fixture(5, names: $names), $context, new Par2Info);
-            } else {
-                foreach ($names as $name) {
-                    $manager->addFileInfo(['name' => $name, 'size' => 100], $context, '\\.(?:par2|sfv|nzb)');
-                }
-            }
-        }
-
-        self::assertSame(['fresh-a.mkv', 'fresh-b.mkv'], array_keys($context->pendingReleaseFiles));
-        $manager->finalizeRelease($context, false);
-
-        self::assertSame(30, DB::table('release_files')->count());
-        self::assertSame(5, DB::table('par_file_hashes')->count());
-        self::assertSame(5, DB::table('par_hashes')->count());
-    }
-
-    public static function mixedFileBudgetOrders(): array
-    {
-        return ['archive before PAR2' => [['archive', 'par2']], 'PAR2 before archive' => [['par2', 'archive']]];
-    }
-
-    public function test_delayed_retry_uses_only_capacity_left_by_the_previous_context(): void
-    {
-        $this->prepareFullPar2Evidence();
-        $this->seedReleaseFileBudget(28);
-        Search::shouldReceive('updateRelease')->with(1);
-        $manager = $this->makeManager();
-        $first = new ReleaseProcessingContext(Release::query()->findOrFail(1));
-        $first->seasonPack = true;
-        $first->nzbHasCompressedFile = $first->archiveInspectionAttempted = $first->archiveRetryable = $first->archiveSampleIncomplete = true;
-        $manager->addFileInfo(['name' => 'first-pass.mkv', 'size' => 100], $first, '\\.(?:par2|sfv|nzb)');
-        $manager->finalizeRelease($first, true);
-        $retryAt = DB::table('releases')->where('id', 1)->value('archive_retry_at');
-        self::assertNotNull($retryAt);
-        self::assertSame(29, DB::table('release_files')->count());
-        DB::table('releases')->where('id', 1)->update(['additional_pp_claim_token' => 'retry-owner', 'additional_pp_claimed_at' => now()]);
-        $retry = new ReleaseProcessingContext(Release::query()->findOrFail(1));
-        $retry->seasonPack = true;
-        $retry->nzbHasCompressedFile = $retry->archiveInspectionAttempted = $retry->archiveRetryable = $retry->archiveSampleIncomplete = true;
-        foreach (range(1, 4) as $i) {
-            $manager->addFileInfo(['name' => 'retry-'.$i.'.mkv', 'size' => 100], $retry, '\\.(?:par2|sfv|nzb)');
-        }
-        $manager->finalizeRelease($retry, true);
-
-        self::assertSame(30, DB::table('release_files')->count());
-        self::assertSame($retryAt, DB::table('releases')->where('id', 1)->value('archive_retry_at'));
-        self::assertSame(0, (int) DB::table('releases')->where('id', 1)->value('haspreview'));
-    }
-
-    public function test_finalization_rechecks_capacity_after_a_late_persisted_file(): void
-    {
-        $this->prepareFullPar2Evidence();
-        $this->seedReleaseFileBudget(28);
-        Search::shouldReceive('updateRelease')->with(1);
-        $manager = $this->makeManager();
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
-        $context->seasonPack = true;
-        self::assertTrue($manager->addFileInfo(['name' => 'queued-first.mkv', 'size' => 100], $context, '\\.(?:par2|sfv|nzb)'));
-        self::assertTrue($manager->addFileInfo(['name' => 'queued-second.mkv', 'size' => 100], $context, '\\.(?:par2|sfv|nzb)'));
-        DB::table('release_files')->insert(['releases_id' => 1, 'name' => 'late-other-writer.mkv', 'size' => 100]);
-
-        $manager->finalizeRelease($context, false);
-
-        self::assertSame(30, DB::table('release_files')->count());
-        self::assertTrue(DB::table('release_files')->where('name', 'late-other-writer.mkv')->exists());
-        self::assertTrue(DB::table('release_files')->where('name', 'queued-first.mkv')->exists());
-        self::assertFalse(DB::table('release_files')->where('name', 'queued-second.mkv')->exists());
-    }
-
-    public function test_a_full_file_budget_does_not_let_stale_finalization_release_another_claim(): void
-    {
-        $this->prepareFullPar2Evidence();
-        $this->seedReleaseFileBudget(30);
-        Search::shouldReceive('updateRelease')->never();
-        $manager = $this->makeManager();
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
-        $context->seasonPack = true;
-        DB::table('releases')->where('id', 1)->update(['additional_pp_claim_token' => 'replacement-owner']);
-        $manager->addFileInfo(['name' => 'over-budget.mkv', 'size' => 100], $context, '\\.(?:par2|sfv|nzb)');
-
-        $manager->finalizeRelease($context, false);
-
-        self::assertSame(30, DB::table('release_files')->count());
-        self::assertSame('replacement-owner', DB::table('releases')->where('id', 1)->value('additional_pp_claim_token'));
-        self::assertSame(-1, (int) DB::table('releases')->where('id', 1)->value('haspreview'));
-        self::assertTrue($context->fullPar2EvidenceDeferred);
-    }
-
-    public function test_a_late_pack_detection_does_not_turn_a_truncated_normal_file_cache_into_free_capacity(): void
-    {
-        DB::table('releases')->insert($this->releaseRow());
-        $this->seedReleaseFileBudget(28);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
-        $manager = $this->makeManager();
-        self::assertFalse($manager->addFileInfo(['name' => 'normal-overflow.mkv', 'size' => 100], $context, '\.sfv'));
-        $context->seasonPack = true;
-        foreach (['new-a.mkv', 'new-b.mkv', 'new-c.mkv'] as $name) {
-            $manager->addFileInfo(['name' => $name, 'size' => 100], $context, '\.sfv');
-        }
-        self::assertSame(['new-a.mkv', 'new-b.mkv'], array_keys($context->pendingReleaseFiles));
-        self::assertSame(30, count($context->existingReleaseFileNames ?? []));
-    }
-
-    private function seedReleaseFileBudget(int $count): void
-    {
-        $rows = [];
-        for ($i = 0; $i < $count; $i++) {
-            $rows[] = ['releases_id' => 1, 'name' => sprintf('persisted-%02d.mkv', $i), 'size' => 100];
-        }
-        DB::table('release_files')->insert($rows);
-    }
-
     public function test_season_pack_files_are_not_matched_to_predb_one_by_one(): void
     {
         DB::table('releases')->insert(['searchname' => 'Show.S01.1080p.WEB-DL-GRP'] + $this->releaseRow());
         Search::shouldReceive('updateRelease')->with(1);
         $nameFixing = new CountingNameFixingService;
         $manager = $this->makeManager($nameFixing);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $context->seasonPack = true;
 
         $manager->addFileInfo(['name' => 'Show.S01E01.1080p.WEB-DL-GRP.mkv', 'size' => 2048], $context, '\\.sfv');
@@ -2745,9 +1653,9 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         Search::shouldReceive('updateRelease')->twice();
         $manager = $this->makeManager();
 
-        $pack = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $pack = $this->sourceContext(Release::query()->findOrFail(1));
         $pack->seasonPack = true;
-        $other = new ReleaseProcessingContext(Release::query()->findOrFail(2));
+        $other = $this->sourceContext(Release::query()->findOrFail(2));
         for ($episode = 1; $episode <= 25; $episode++) {
             $name = sprintf('Show.S01E%02d.1080p.WEB-DL-GRP.mkv', $episode);
             $manager->addFileInfo(['name' => $name, 'size' => 2048], $pack, '\\.sfv');
@@ -2772,54 +1680,6 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->assertSame('Show.S01.1080p.WEB-DL-GRP', DB::table('releases')->where('id', 1)->value('searchname'));
     }
 
-    #[DataProvider('confirmedPredbUpdateModes')]
-    public function test_confirmed_predb_does_not_rename_a_season_pack_to_an_episode(bool $update): void
-    {
-        $title = 'Show.S01E01.1080p.WEB-DL-GRP';
-        $this->prepareFullPar2NamingEvidence($title);
-        DB::table('releases')->where('id', 1)->update(['searchname' => 'Show.S01.1080p.WEB-DL-GRP']);
-        $release = DB::table('releases')->where('id', 1)->first();
-        $published = [];
-        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id) use (&$published): void {
-            $published[] = $id;
-        });
-        $service = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
-
-        $service->updateRelease($release, $title, 'test', $update, 'PreDB FT Exact, ', true, false, 7);
-
-        self::assertFalse($service->matched);
-        self::assertTrue($service->done);
-        self::assertSame(0, $service->fixed);
-        self::assertNull($service->lastCommittedIdentity());
-        self::assertSame((array) $release, (array) DB::table('releases')->where('id', 1)->first());
-        self::assertSame([], $published);
-        Event::assertNotDispatched(ReleaseNameFixed::class);
-    }
-
-    /** @return array<string, array{bool}> */
-    public static function confirmedPredbUpdateModes(): array
-    {
-        return ['write' => [true], 'preview' => [false]];
-    }
-
-    public function test_confirmed_predb_still_attaches_the_same_season_pack_title(): void
-    {
-        $title = 'Show.S01.1080p.WEB-DL-GRP';
-        $this->prepareFullPar2NamingEvidence($title);
-        DB::table('releases')->where('id', 1)->update(['searchname' => $title]);
-        $release = DB::table('releases')->where('id', 1)->first();
-        $service = new ReleaseUpdateService($this->createStub(CategorizationService::class));
-
-        $service->updateRelease($release, $title, 'test', true, 'PreDB FT Exact, ', true, false, 7);
-
-        self::assertTrue($service->matched);
-        self::assertTrue($service->done);
-        self::assertSame(0, $service->fixed);
-        self::assertSame($title, DB::table('releases')->where('id', 1)->value('searchname'));
-        self::assertSame(7, (int) DB::table('releases')->where('id', 1)->value('predb_id'));
-        Event::assertNotDispatched(ReleaseNameFixed::class);
-    }
-
     public function test_finalization_flushes_rows_and_synchronizes_search_immediately(): void
     {
         DB::table('releases')->insert($this->releaseRow());
@@ -2827,7 +1687,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         Search::shouldReceive('updateRelease')->once()->with(1);
 
         $manager = $this->makeManagerWithImageService(new ReleaseImageService);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $this->assertTrue($manager->addFileInfo([
             'name' => 'Example.Movie.2026.mkv',
             'size' => 2048,
@@ -2861,7 +1721,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         Search::shouldReceive('updateRelease')->once()->with(1);
 
         $manager = $this->makeManagerWithImageService(new ReleaseImageService, configOverrides: ['addPAR2Files' => true]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
 
         $queue = new ReflectionMethod(ReleaseFileManager::class, 'queueReleaseFile');
         $queue->invoke(
@@ -2887,7 +1747,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         DB::table('release_files')->insert(['releases_id' => 1, 'name' => 'existing.mkv', 'size' => 1024]);
         $search = Search::spy();
         $manager = $this->makeManagerWithImageService(new ReleaseImageService, configOverrides: ['addPAR2Files' => true]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $queue = new ReflectionMethod(ReleaseFileManager::class, 'queueReleaseFile');
         $hash = '1234567890abcdef1234567890abcdef';
 
@@ -2912,7 +1772,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         DB::table('releases')->insert($this->releaseRow());
         $search = Search::spy();
         $manager = $this->makeManagerWithImageService(new ReleaseImageService, configOverrides: ['addPAR2Files' => true]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $queue = new ReflectionMethod(ReleaseFileManager::class, 'queueReleaseFile');
         $hash = '1234567890abcdef1234567890abcdef';
 
@@ -2937,7 +1797,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         DB::table('releases')->insert($this->releaseRow());
         Search::shouldReceive('updateRelease')->never();
         $manager = $this->makeManagerWithImageService(new ReleaseImageService, configOverrides: ['addPAR2Files' => true]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $queue = new ReflectionMethod(ReleaseFileManager::class, 'queueReleaseFile');
 
         $this->assertFalse($queue->invoke($manager, $context, 2, 'wrong-release.mkv', 1024, 0, 0, md5('valid')));
@@ -2950,7 +1810,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         DB::table('releases')->insert($this->releaseRow());
         Search::shouldReceive('updateRelease')->never();
         $manager = $this->makeManagerWithImageService(new ReleaseImageService, configOverrides: ['addPAR2Files' => true]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $queue = new ReflectionMethod(ReleaseFileManager::class, 'queueReleaseFile');
 
         $this->assertTrue($queue->invoke($manager, $context, 1, 'invalid-hash.mkv', 1024, 0, 0, str_repeat('z', 32)));
@@ -2963,7 +1823,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         DB::table('releases')->insert($this->releaseRow());
         Search::shouldReceive('updateRelease')->never();
         $manager = $this->makeManagerWithImageService(new ReleaseImageService, configOverrides: ['addPAR2Files' => false]);
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $queue = new ReflectionMethod(ReleaseFileManager::class, 'queueReleaseFile');
 
         $this->assertTrue($queue->invoke($manager, $context, 1, 'file.mkv', 1024, 0, 0, md5('valid')));
@@ -3020,12 +1880,12 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         );
         $par2->method('getPackets')->willReturn(false);
 
-        $firstContext = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $firstContext = $this->sourceContext(Release::query()->findOrFail(1));
         $this->assertTrue($manager->processPar2File('first.par2', $firstContext, $par2));
         $this->assertTrue($updates->matched);
         $this->assertSame(7, DB::table('releases')->where('id', 1)->value('predb_id'));
 
-        $secondContext = new ReleaseProcessingContext(Release::query()->findOrFail(2));
+        $secondContext = $this->sourceContext(Release::query()->findOrFail(2));
         $this->assertTrue($manager->processPar2File('second.par2', $secondContext, $par2));
 
         $this->assertSame($secondTitle, $secondContext->release->getAttribute('textstring'));
@@ -3040,7 +1900,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         Search::shouldReceive('updateRelease')->never();
 
         $manager = $this->makeManager();
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $this->assertTrue($manager->addFileInfo([
             'name' => 'Example.Movie.2026.mkv',
             'size' => 1024,
@@ -3070,7 +1930,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         Search::shouldReceive('updateRelease')->once()->with(1);
 
         $manager = $this->makeManager();
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
 
         $this->assertTrue($manager->addFileInfo([
             'name' => 'Example.Movie.2026.mkv',
@@ -3091,7 +1951,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
 
         // RarInfo and ZipInfo report encrypted files as 'pass' => 1, not true.
         foreach ([1, true] as $pass) {
-            $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+            $context = $this->sourceContext(Release::query()->findOrFail(1));
 
             $this->assertFalse($manager->addFileInfo([
                 'name' => 'Example.Show.S01E01.mkv',
@@ -3112,7 +1972,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $archive = $this->sevenZip('Example.Show.S01E01.mkv', str_repeat('x', 100));
         $archiveService = new ArchiveExtractionService($this->makeConfig());
         $manager = $this->makeManager();
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $context->nzbHasCompressedFile = true;
 
         $joined = $archiveService->withSevenZipEndHeader(substr($archive, 0, 40), substr($archive, -80));
@@ -3137,7 +1997,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->freezeSecond();
 
         $manager = $this->makeManager();
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $context->nzbHasCompressedFile = true;
         $context->archiveInspectionAttempted = true;
         $manager->finalizeRelease($context, true);
@@ -3149,7 +2009,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $this->assertNull($release->additional_pp_claimed_at);
 
         $this->travel(2)->hours();
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $context->nzbHasCompressedFile = true;
         $context->archiveInspectionAttempted = true;
         $manager->finalizeRelease($context, true);
@@ -3170,7 +2030,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         DB::table('releases')->insert($this->releaseRow());
         Search::shouldReceive('updateRelease')->once()->with(1);
 
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $context->nzbHasCompressedFile = true;
         $context->archiveInspectionAttempted = $inspectionAttempted;
         $context->archiveListingUndecodable = $listingUndecodable;
@@ -3214,6 +2074,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         $parser = Mockery::mock(NzbContentParser::class);
         $parser->shouldReceive('parseNzb')->once()->with('guid-1')->andReturn([
             'error' => null,
+            'sourceDigest' => $this->fixtureSourceSnapshot(Release::query()->findOrFail(1))['digest'],
             'contents' => [[
                 'title' => '"obfuscated" yEnc',
                 'segments' => ['<probe>', '<second>', '<third>', '<ignored>'],
@@ -3258,7 +2119,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             $workspace,
             $output,
         );
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
 
         $result = $processor->process($context, '/tmp/');
 
@@ -3296,6 +2157,1247 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         ];
     }
 
+    #[DataProvider('compressedCandidatePayloads')]
+    public function test_plain_media_behind_an_archive_name_finalizes_with_no_password(?string $data, string $expected): void
+    {
+        $data ??= $this->rar('Movie.2026.1080p.mkv', str_repeat('B', 100));
+        DB::table('releases')->insert([...$this->releaseRow(), 'nfostatus' => 1]);
+        Search::shouldReceive('updateRelease')->once()->with(1);
+        config(['nntmux.archive_retry_delay' => 86400]);
+        $this->freezeSecond();
+
+        $config = $this->makeConfig(['processPasswords' => true]);
+        $parser = Mockery::mock(NzbContentParser::class);
+        $parser->shouldReceive('parseNzb')->once()->with('guid-1')->andReturn([
+            'error' => null,
+            'sourceDigest' => $this->fixtureSourceSnapshot(Release::query()->findOrFail(1))['digest'],
+            'contents' => [['title' => '"Movie.2026.part01.rar" yEnc (1/50)', 'segments' => ['<v1>']]],
+        ]);
+        $download = Mockery::mock(UsenetDownloadService::class);
+        $download->shouldReceive('beginReleaseScope')->once();
+        $download->shouldReceive('finishReleaseScope')->once()->andReturn(new DownloadMetrics);
+        $download->shouldReceive('download')->once()
+            ->with(DownloadKind::Compressed, ['<v1>'], '', 1, '"Movie.2026.part01.rar" yEnc (1/50)')
+            ->andReturn(['success' => true, 'data' => $data, 'groupUnavailable' => false, 'error' => null]);
+        $tmpPath = sys_get_temp_dir().'/media-payload-'.uniqid().'/';
+        File::ensureDirectoryExists($tmpPath);
+        $workspace = Mockery::mock(TempWorkspaceService::class);
+        $workspace->shouldReceive('createReleaseTempFolder')->once()->andReturn($tmpPath);
+        $workspace->shouldReceive('listFiles')->andReturn([]);
+        $workspace->shouldReceive('clearDirectory')->once()->with($tmpPath, false)
+            ->andReturnUsing(static fn () => File::deleteDirectory($tmpPath));
+        $processor = new ReleaseProcessor(
+            $config,
+            $parser,
+            new AdditionalWorkPlanner($config),
+            new ArchiveExtractionService($config),
+            Mockery::mock(MediaExtractionService::class),
+            $download,
+            $this->makeManager(),
+            Mockery::mock(ReleaseFilesArchiveFallback::class)->shouldIgnoreMissing(),
+            $workspace,
+            Mockery::mock(ConsoleOutputService::class)->shouldIgnoreMissing(),
+        );
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
+
+        $processor->process($context, '/tmp/');
+
+        $release = DB::table('releases')->where('id', 1)->first();
+        $this->assertSame($expected === 'archive' ? 1 : 0, DB::table('release_files')->count());
+        if ($expected === 'unknown') {
+            $this->assertSame(-1, (int) $release->passwordstatus);
+            $this->assertSame(-1, (int) $release->haspreview);
+            $this->assertSame(now()->addDay()->toDateTimeString(), $release->archive_retry_at);
+        } else {
+            $this->assertSame(ReleaseBrowseService::PASSWD_NONE, (int) $release->passwordstatus);
+            $this->assertSame(0, (int) $release->haspreview);
+            $this->assertNull($release->archive_retry_at);
+        }
+    }
+
+    /**
+     * @return array<string, array{string|null, string}>
+     */
+    public static function compressedCandidatePayloads(): array
+    {
+        $pad = static fn (string $head): string => str_pad($head, 512, "\x5A");
+        $ts = str_repeat("\x47".str_repeat("\x10", 187), 3);
+
+        return [
+            'Matroska' => [$pad("\x1A\x45\xDF\xA3\x01\x00\x00\x00"), 'media'],
+            'MP4' => [$pad("\x00\x00\x00\x20ftypmp42"), 'media'],
+            'MOV' => [$pad("\x00\x00\x00\x14ftypqt  "), 'media'],
+            'AVI' => [$pad('RIFF'."\x00\x10\x00\x00".'AVI LIST'), 'media'],
+            'MPEG-TS' => [$ts, 'media'],
+            'MPEG-PS' => [$pad("\x00\x00\x01\xBA\x44"), 'media'],
+            'FLV' => [$pad("FLV\x01\x05\x00\x00\x00\x09"), 'media'],
+            'Ogg' => [$pad("OggS\x00\x02"), 'media'],
+            'RAR' => [null, 'archive'],
+            'unknown data' => [$pad("\x8E\x13\x7F\x02random"), 'unknown'],
+        ];
+    }
+
+    /**
+     * @param  list<array{string, string, string|false|null}>  $files  title, message-id and its data (false: download fails,
+     *                                                                 null: not downloaded, 'encrypted rar'/'encrypted zip'/'encrypted 7z': such an archive)
+     */
+    #[DataProvider('mediaBesideOtherCandidates')]
+    public function test_plain_media_only_finalizes_when_no_other_archive_stayed_unread(array $files, int $status): void
+    {
+        $files = array_map(fn (array $file): array => [$file[0], $file[1], match ($file[2]) {
+            'encrypted rar' => $this->rar('Movie.2026.1080p.mkv', str_repeat('x', 100), encryptedFile: true),
+            'encrypted zip' => $this->zip('Movie.2026.1080p.mkv', str_repeat('x', 100), encryptedFile: true),
+            'encrypted 7z' => $this->sevenZip('Movie.2026.1080p.mkv', str_repeat('x', 100), encryptedHeader: true),
+            default => $file[2],
+        }], $files);
+        DB::table('releases')->insert([...$this->releaseRow(), 'nfostatus' => 1]);
+        Search::shouldReceive('updateRelease')->once()->with(1);
+        config(['nntmux.archive_retry_delay' => 86400]);
+        $this->freezeSecond();
+
+        $config = $this->makeConfig(['processPasswords' => true, 'maximumRarPasswordChecks' => 2]);
+        $parser = Mockery::mock(NzbContentParser::class);
+        $parser->shouldReceive('parseNzb')->once()->with('guid-1')->andReturn([
+            'error' => null,
+            'sourceDigest' => $this->fixtureSourceSnapshot(Release::query()->findOrFail(1))['digest'],
+            'contents' => array_map(static fn (array $file): array => ['title' => $file[0], 'segments' => [$file[1]]], $files),
+        ]);
+        $download = Mockery::mock(UsenetDownloadService::class);
+        $download->shouldReceive('beginReleaseScope')->once();
+        $download->shouldReceive('finishReleaseScope')->once()->andReturn(new DownloadMetrics);
+        foreach ($files as [$title, $messageId, $data]) {
+            if ($data === null) {
+                continue;
+            }
+            $download->shouldReceive('download')->once()
+                ->with(DownloadKind::Compressed, [$messageId], '', 1, $title)
+                ->andReturn(['success' => $data !== false, 'data' => $data === false ? null : $data, 'groupUnavailable' => false, 'error' => null]);
+        }
+        $tmpPath = sys_get_temp_dir().'/media-payload-'.uniqid().'/';
+        File::ensureDirectoryExists($tmpPath);
+        $workspace = Mockery::mock(TempWorkspaceService::class);
+        $workspace->shouldReceive('createReleaseTempFolder')->once()->andReturn($tmpPath);
+        $workspace->shouldReceive('listFiles')->andReturn([]);
+        $workspace->shouldReceive('clearDirectory')->once()->with($tmpPath, false)
+            ->andReturnUsing(static fn () => File::deleteDirectory($tmpPath));
+        $processor = new ReleaseProcessor(
+            $config,
+            $parser,
+            new AdditionalWorkPlanner($config),
+            new ArchiveExtractionService($config),
+            Mockery::mock(MediaExtractionService::class)->shouldIgnoreMissing(false),
+            $download,
+            $this->makeManager(),
+            Mockery::mock(ReleaseFilesArchiveFallback::class)->shouldIgnoreMissing(),
+            $workspace,
+            Mockery::mock(ConsoleOutputService::class)->shouldIgnoreMissing(),
+        );
+
+        $processor->process($this->sourceContext(Release::query()->findOrFail(1)), '/tmp/');
+
+        $release = DB::table('releases')->where('id', 1)->first();
+        $this->assertSame($status, (int) $release->passwordstatus);
+        $this->assertSame($status === -1 ? now()->addDay()->toDateTimeString() : null, $release->archive_retry_at);
+    }
+
+    /**
+     * @return array<string, array{list<array{string, string, string|false|null}>, int}>
+     */
+    public static function mediaBesideOtherCandidates(): array
+    {
+        $mkv = str_pad("\x1A\x45\xDF\xA3\x01\x00\x00\x00", 512, "\x5A");
+        $media = ['"Movie.2026.part01.rar" yEnc (1/50)', '<v1>', $mkv];
+        $spaced = ['First Movie.rar yEnc (1/50)', '<v1>', $mkv];
+
+        $unreadable = str_pad("\x8E\x13\x7F\x02", 512, "\x5A");
+        $none = ReleaseBrowseService::PASSWD_NONE;
+        $passworded = ReleaseBrowseService::PASSWD_RAR;
+
+        return [
+            'an unreadable archive beside it' => [[$media, ['"Extras.2026.rar" yEnc (1/3)', '<x1>', $unreadable]], -1],
+            'a missing archive beside it' => [[$media, ['"Extras.2026.rar" yEnc (1/3)', '<x1>', false]], -1],
+            'later volumes of the same file' => [[$media, ['"Movie.2026.part02.rar" yEnc (1/50)', '<v2>', null]], $none],
+            'unquoted later volumes of the same file' => [[
+                ['Movie.2026.part01.rar yEnc (1/50)', '<v1>', $mkv],
+                ['Movie.2026.part02.rar yEnc (1/50)', '<v2>', null],
+                ['[03/50] - Movie.2026.part03.rar yEnc', '<v3>', null],
+            ], $none],
+            'a split video piece and its later pieces' => [[['"Show.S01E01.mkv.001" yEnc (1/80)', '<s1>', $mkv], ['"Show.S01E01.mkv.002" yEnc (1/80)', '<s2>', null]], $none],
+            'an unquoted split video piece and its later pieces' => [[['Show.S01E01.mkv.001 yEnc (1/80)', '<s1>', $mkv], ['Show.S01E01.mkv.002 yEnc (1/80)', '<s2>', null]], $none],
+            'an encrypted same-stem ZIP beside it' => [[$media, ['"Movie.2026.zip" yEnc (1/3)', '<z1>', 'encrypted zip']], $passworded],
+            'an encrypted same-stem 7z beside it' => [[$media, ['"Movie.2026.7z" yEnc (1/3)', '<z1>', 'encrypted 7z']], $passworded],
+            'an unreadable same-stem ZIP beside it' => [[$media, ['"Movie.2026.zip" yEnc (1/3)', '<z1>', $unreadable]], -1],
+            'an unreadable same-stem 7z beside it' => [[$media, ['"Movie.2026.7z.001" yEnc (1/3)', '<z1>', $unreadable]], -1],
+            'an encrypted same-stem ZIP beside a split video' => [[
+                ['"Movie.2026.mkv.001" yEnc (1/80)', '<s1>', $mkv],
+                ['"Movie.2026.mkv.zip" yEnc (1/3)', '<z1>', 'encrypted zip'],
+            ], $passworded],
+            'an encrypted archive with another spaced name beside it' => [[$spaced, ['Second Movie.rar yEnc (1/50)', '<x1>', 'encrypted rar']], $passworded],
+            'an unreadable archive with another spaced name beside it' => [[$spaced, ['Second Movie.rar yEnc (1/50)', '<x1>', $unreadable]], -1],
+            'a missing archive with another spaced name beside it' => [[$spaced, ['Second Movie.rar yEnc (1/50)', '<x1>', false]], -1],
+            'spaced later volumes of the same file' => [[
+                ['First Movie.part01.rar yEnc (1/50)', '<v1>', $mkv],
+                ['First Movie.part02.rar yEnc (1/50)', '<v2>', null],
+                ['[03/50] - First Movie.part03.rar yEnc', '<v3>', null],
+                ['"First Movie.part04.rar" yEnc (1/50)', '<v4>', null],
+            ], $none],
+        ];
+    }
+
+    #[DataProvider('incompleteArchiveNamingCases')]
+    public function test_partial_archive_evidence_only_defers_episode_naming(string $kind, bool $episode): void
+    {
+        $title = $episode ? 'Show.S01E01.1080p.WEB-DL-GRP' : 'Movie.2026.1080p.WEB-DL-GRP';
+        $this->prepareFullPar2NamingEvidence($title);
+        $this->installFilenameSqlIdentity();
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
+        $manager = $this->makeFullPar2NamingManager($sync);
+        $dir = sys_get_temp_dir().'/'.uniqid('7z-naming-', true);
+        mkdir($dir);
+        try {
+            $script = "#!/bin/sh\nprintf 'Path = ".$title.".mkv\\nSize = 100\\nEncrypted = -\\n\\n'\n"
+                ."printf 'Path = Show.S01E02\\001.mkv\\nSize = 100\\nEncrypted = -\\n\\n'\n";
+            file_put_contents($dir.'/7z', $script);
+            chmod($dir.'/7z', 0755);
+            $config = $this->makeConfig(['processPasswords' => true, 'sevenZipPath' => $dir.'/7z']);
+            $planner = new AdditionalWorkPlanner($config);
+            $context = $this->sourceContext(Release::query()->findOrFail(1));
+            $context->tmpPath = $dir.'/';
+            $context->nzbHasCompressedFile = true;
+            $context->archiveInspectionAttempted = true;
+            $contents = [['title' => '"a1b2c3d4.'.($kind === '7z' ? '7z' : 'rar').'" yEnc (1/1)', 'segments' => ['<archive>']]];
+            if ($kind === 'truncated rar with extras') {
+                $contents[] = ['title' => '"e5f6a7b8.rar" yEnc (1/1)', 'segments' => ['<extras>']];
+            }
+            $context->workPlan = $planner->plan($contents, '');
+            $processor = new ReleaseProcessor(
+                $config, Mockery::mock(NzbContentParser::class), $planner, new ArchiveExtractionService($config),
+                Mockery::mock(MediaExtractionService::class), Mockery::mock(UsenetDownloadService::class), $manager,
+                Mockery::mock(ReleaseFilesArchiveFallback::class), Mockery::mock(TempWorkspaceService::class),
+                Mockery::mock(ConsoleOutputService::class)->shouldIgnoreMissing(),
+            );
+            $archive = $kind === '7z'
+                ? $this->sevenZip('ignored.mkv', str_repeat('x', 100), compressedHeader: true)
+                : $this->rar($title.'.mkv', str_repeat('x', 1000));
+            if ($kind === 'complete rar' || $kind === 'continuing rar') {
+                $end = pack('Cvv', RarInfo::BLOCK_ENDARC, $kind === 'continuing rar' ? 1 : 0, 7);
+                $archive .= pack('v', crc32($end) & 0xFFFF).$end;
+            } elseif ($kind === 'complete rar5') {
+                $name = $title.'.mkv';
+                $main = "\x03\x01\x00\x00";
+                $file = "\x02\x02\x0a\x00\x0a\x00\x00\x00".chr(strlen($name)).$name;
+                $file = chr(strlen($file)).$file;
+                $end = "\x03\x05\x00\x00";
+                $archive = "Rar!\x1a\x07\x01\x00".pack('V', crc32($main)).$main
+                    .pack('V', crc32($file)).$file.str_repeat('x', 10).pack('V', crc32($end)).$end;
+            } elseif ($kind === 'payload boundary' || $kind === 'partial next header') {
+                $prefixLength = strlen($archive);
+                $archive .= substr($this->rar('Show.S01E02.1080p.WEB-DL-GRP.mkv', str_repeat('y', 100)), 20);
+                $archive = substr($archive, 0, $prefixLength + ($kind === 'partial next header' ? 3 : 0));
+            }
+            if (str_starts_with($kind, 'truncated rar')) {
+                // The full archive has a second episode; the downloaded prefix ends in E01's payload.
+                $archive .= substr($this->rar('Show.S01E02.1080p.WEB-DL-GRP.mkv', str_repeat('y', 100)), 20);
+                $archive = substr($archive, 0, strlen($archive) - 1100);
+                $listing = (new ArchiveExtractionService($config))->processCompressedData($archive, $context, $dir.'/');
+                $this->assertSame([$title.'.mkv'], array_column($listing['files'], 'name'));
+                $this->assertGreaterThan(strlen($archive), $listing['files'][0]['next_offset']);
+            }
+            if ($kind === 'payload boundary' || $kind === 'partial next header' || str_starts_with($kind, 'complete rar')) {
+                $reader = new RarInfo;
+                $this->assertTrue($reader->setData($archive, true));
+                $this->assertSame([$title.'.mkv'], array_column($reader->getFileList(), 'name'));
+                $blocks = $reader->getBlocks(false);
+                $last = end($blocks);
+                if (str_starts_with($kind, 'complete rar')) {
+                    $this->assertContains($last['head_type'], [RarInfo::BLOCK_ENDARC, RarInfo::R50_BLOCK_ENDARC]);
+                    $this->assertFalse($last['more_volumes']);
+                    $this->assertSame(strlen($archive), $last['next_offset']);
+                } else {
+                    $this->assertSame(RarInfo::BLOCK_FILE, $last['head_type']);
+                    $this->assertSame(strlen($archive) - ($kind === 'partial next header' ? 3 : 0), $last['next_offset']);
+                }
+            }
+            $readSets = [];
+            $handler = new ReflectionMethod($processor, 'processArchiveData');
+
+            $handler->invokeArgs($processor, [$context, $archive, [], false, 'a1b2c3d4', $context->workPlan->archiveCandidates[0], &$readSets]);
+            if ($kind === 'truncated rar with extras') {
+                $handler->invokeArgs($processor, [$context, $this->rar('extras.txt', 'extra'), [], false, 'e5f6a7b8.rar', $context->workPlan->archiveCandidates[1], &$readSets]);
+            }
+            (new ReflectionMethod($processor, 'runDeferredArchiveNameChecks'))->invoke($processor, $context, $readSets);
+            $manager->finalizeRelease($context, true);
+
+            $deferred = $episode && ! str_starts_with($kind, 'complete rar');
+            $this->assertSame($deferred ? 'Example' : $title, DB::table('releases')->where('id', 1)->value('searchname'));
+            $this->assertSame($deferred ? 0 : 7, (int) DB::table('releases')->where('id', 1)->value('predb_id'));
+            $this->assertSame($deferred ? 'Example' : $title, $context->release->searchname);
+            $this->assertTrue(DB::table('release_files')->where('releases_id', 1)->where('name', $title.'.mkv')->exists());
+            if ($kind === '7z') {
+                $this->assertTrue($context->archiveListingIncomplete);
+                $this->assertSame(-1, (int) DB::table('releases')->where('id', 1)->value('passwordstatus'));
+            }
+            if ($deferred) {
+                Event::assertNotDispatched(ReleaseNameFixed::class);
+            }
+        } finally {
+            File::deleteDirectory($dir);
+        }
+    }
+
+    /** @return array<string, array{string, bool, 2?: string}> */
+    public static function finalizedArchiveFilenameCases(): array
+    {
+        return [
+            'confirmed two-episode compressed 7z' => ['pack 7z', false],
+            'incomplete single-episode compressed 7z' => ['partial 7z', false],
+            'incomplete single-episode rar' => ['partial rar', false],
+            'complete single-episode compressed 7z' => ['complete 7z', true],
+            'complete single-episode rar' => ['complete rar', true],
+            'complete movie rar' => ['movie rar', true],
+            'unattested single-episode zip' => ['partial zip', false],
+            'unattested movie zip' => ['movie zip', true],
+            'complete subset beside unread second archive' => ['subset 7z', false],
+            'same-source partial then complete listing' => ['recovered 7z', true],
+            'merged distinct archive files' => ['merged 7z', false],
+            'known archive beside unknown file' => ['unknown 7z', false],
+            'legacy first scan beside unread opaque archive' => ['first scan partial rar', false],
+            'legacy first scan complete source' => ['first scan complete rar', true],
+            'complete archive containing two different shows' => ['mixed shows 7z', false],
+            'complete archive containing a pack plus another show' => ['mixed show pack 7z', false],
+            'one episode with two encode variants' => ['episode variants 7z', true],
+            'complete movie miss does not repeat a failed filename lookup' => ['movie miss rar', false],
+            'complete episode miss does not repeat a failed filename lookup' => ['episode miss rar', false],
+            'opaque filename mapped to an episode keeps same-cycle naming' => ['opaque episode rar', true],
+            'terminal continuation runs only after outer commit' => ['first scan complete rar', true, 'commit'],
+            'terminal continuation is discarded by outer rollback' => ['first scan complete rar', true, 'rollback'],
+            'terminal continuation rejects successor claim' => ['first scan complete rar', true, 'claim'],
+            'terminal continuation rejects successor source with same filename' => ['first scan complete rar', true, 'source'],
+        ];
+    }
+
+    #[DataProvider('finalizedArchiveFilenameCases')]
+    public function test_finalized_archive_scope_survives_the_real_prefile_consumer(string $kind, bool $accepted, string $terminalAction = 'normal'): void
+    {
+        $title = str_starts_with($kind, 'movie') ? 'Movie.2026.1080p.WEB-DL-GRP' : 'Show.S01E01.1080p.WEB-DL-GRP';
+        $lookupControl = in_array($kind, ['movie miss rar', 'episode miss rar', 'opaque episode rar'], true);
+        $lookupMiss = in_array($kind, ['movie miss rar', 'episode miss rar'], true);
+        $firstScan = str_starts_with($kind, 'first scan') || $lookupControl;
+        $mixedShows = str_starts_with($kind, 'mixed show');
+        if ($mixedShows) {
+            $title = 'ShowA.S01E01.1080p.WEB-DL-GRP';
+        }
+        $opaque = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+        $this->prepareFullPar2NamingEvidence($title);
+        Schema::table('releases', static function (Blueprint $table): void {
+            $table->string('fromname')->default('fixture');
+        });
+        $this->installFilenameSqlIdentity();
+        if ($kind === 'opaque episode rar') {
+            DB::table('predb')->where('id', 7)->update(['filename' => 'abcdef12.mkv']);
+        }
+        if (! $firstScan || $lookupMiss) {
+            DB::table('predb')->where('id', 7)->delete();
+        }
+        $this->rebuildFilenameSqlIdentity();
+        DB::table('releases')->where('id', 1)->update(['name' => $opaque, 'searchname' => $opaque, 'nfostatus' => 1]);
+        $published = [];
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id) use (&$published): void {
+            $published[] = $id;
+        });
+        $filenameChecks = [];
+        $observe = $lookupControl ? static function (object $entry) use (&$filenameChecks): void {
+            $filenameChecks[] = ['name' => $entry->filename, 'terminal' => isset($entry->observed_archive_source_digest)];
+        } : null;
+        $manager = $this->makeFullPar2NamingManager($sync, $observe);
+        $dir = sys_get_temp_dir().'/'.uniqid('finalized-archive-scope-', true);
+        mkdir($dir);
+        try {
+            config(['nntmux_settings.path_to_nzbs' => $dir.'/nzbs/']);
+            $nzb = new TestNzbService;
+            $sources = new NzbSourceGuard($nzb);
+            $this->app->instance(NzbSourceGuard::class, $sources);
+            $this->app->instance(ReleaseArchiveNamingEvidence::class, new ReleaseArchiveNamingEvidence($sources));
+            $script = "#!/bin/sh\nprintf 'Path = ".$title.".mkv\\nSize = 100\\nEncrypted = -\\n\\n'\n";
+            if ($kind === 'pack 7z') {
+                $script .= "printf 'Path = Show.S01E02.1080p.WEB-DL-GRP.mkv\\nSize = 100\\nEncrypted = -\\n\\n'\n";
+            } elseif ($kind === 'episode variants 7z') {
+                $script .= "printf 'Path = Show.S01E01.720p.WEB-DL-GRP.mkv\\nSize = 100\\nEncrypted = -\\n\\n'\n";
+            } elseif ($mixedShows) {
+                if ($kind === 'mixed show pack 7z') {
+                    $script .= "printf 'Path = ShowA.S01E02.1080p.WEB-DL-GRP.mkv\\nSize = 100\\nEncrypted = -\\n\\n'\n";
+                }
+                $script .= "printf 'Path = ShowB.S01E02.1080p.WEB-DL-GRP.mkv\\nSize = 100\\nEncrypted = -\\n\\n'\n";
+            } elseif (in_array($kind, ['partial 7z', 'recovered 7z'], true)) {
+                $script .= "printf 'Path = Show.S01E02\\001.mkv\\nSize = 100\\nEncrypted = -\\n\\n'\n";
+            }
+            file_put_contents($dir.'/7z', $script);
+            chmod($dir.'/7z', 0755);
+            $config = $this->makeConfig(['processPasswords' => true, 'sevenZipPath' => $dir.'/7z', 'maximumRarSegments' => $kind === 'merged 7z' ? 1 : 3, ...($firstScan ? ['archiveProbeFiles' => 0] : [])]);
+            $planner = new AdditionalWorkPlanner($config);
+            $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+            $context->tmpPath = $dir.'/';
+            $context->nzbHasCompressedFile = true;
+            $context->archiveInspectionAttempted = true;
+            $isSevenZip = str_ends_with($kind, '7z');
+            $isZip = str_ends_with($kind, ' zip');
+            $subject = '"'.$opaque.'.'.($isSevenZip ? '7z' : ($isZip ? 'zip' : 'rar')).'" yEnc (1/1)';
+            $source = '<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">'
+                .'<file poster="fixture" date="1" subject="'.htmlspecialchars($subject, ENT_QUOTES | ENT_XML1).'">'
+                .'<groups><group>alt.binaries.fixture</group></groups><segments><segment bytes="100" number="1">archive</segment></segments></file></nzb>';
+            if (in_array($kind, ['subset 7z', 'first scan partial rar'], true)) {
+                $source = str_replace('</nzb>', '<file poster="fixture" date="1" subject="e5f60718'.($kind === 'first scan partial rar' ? '' : '.7z').' yEnc (1/1)"><groups><group>alt.binaries.fixture</group></groups><segments><segment bytes="100" number="1">unread</segment></segments></file></nzb>', $source);
+            }
+            if (in_array($kind, ['merged 7z', 'unknown 7z'], true)) {
+                $otherSubject = $kind === 'merged 7z' ? str_replace('(1/1)', '(2/2)', $subject) : '"deadbeef" yEnc (1/1)';
+                $source = str_replace('</nzb>', '<file poster="fixture" date="1" subject="'.htmlspecialchars($otherSubject, ENT_QUOTES | ENT_XML1).'"><groups><group>alt.binaries.fixture</group></groups><segments><segment bytes="100" number="1">unread</segment></segments></file></nzb>', $source);
+                $rawFiles = (new NzbParserService)->parseNzbFileList($source, ['no-file-key' => false, 'strip-count' => true]);
+                $this->assertSame($kind === 'merged 7z' ? [2] : [1, 1], array_column(array_values($rawFiles), 'filecount'));
+            }
+            file_put_contents($nzb->getNzbPath($context->release->guid, createIfNotExist: true), gzencode($source));
+            $listedName = $kind === 'opaque episode rar' ? 'abcdef12.mkv' : $title.'.mkv';
+            $archive = $isSevenZip
+                ? $this->sevenZip('ignored.mkv', str_repeat('x', 100), compressedHeader: true)
+                : ($isZip ? $this->zip($title.'.mkv', str_repeat('x', 100)) : $this->rar($listedName, str_repeat('x', 100)));
+            if (! $isSevenZip && ! $isZip && ($accepted || $firstScan)) {
+                $end = pack('Cvv', RarInfo::BLOCK_ENDARC, 0, 7);
+                $archive .= pack('v', crc32($end) & 0xFFFF).$end;
+            }
+            $downloads = Mockery::mock(UsenetDownloadService::class);
+            $attempts = $kind === 'recovered 7z' ? 2 : 1;
+            $downloads->shouldReceive('beginReleaseScope')->times($attempts)->andReturnNull();
+            $downloads->shouldReceive('finishReleaseScope')->times($attempts)->andReturn(new DownloadMetrics);
+            $success = ['success' => true, 'data' => $archive, 'groupUnavailable' => false, 'error' => null];
+            if ($kind === 'subset 7z') {
+                $downloads->shouldReceive('download')->twice()->andReturn($success, [
+                    'success' => false, 'data' => null, 'groupUnavailable' => false, 'error' => 'fixture unread second archive',
+                ]);
+            } else {
+                $downloads->shouldReceive('download')->times($attempts)
+                    ->withArgs(static fn (DownloadKind $downloadKind, array $ids): bool => $downloadKind === DownloadKind::Compressed && $ids === ['archive'])
+                    ->andReturn($success);
+            }
+            $workspace = Mockery::mock(TempWorkspaceService::class);
+            $workspace->shouldReceive('createReleaseTempFolder')->times($attempts)->andReturn($dir.'/');
+            $workspace->shouldReceive('listFiles')->andReturn([]);
+            $workspace->shouldReceive('clearDirectory')->times($attempts)->with($dir.'/', false)->andReturnNull();
+            $processor = new ReleaseProcessor(
+                $config, new NzbContentParser($nzb, new NzbParserService), $planner, new ArchiveExtractionService($config),
+                Mockery::mock(MediaExtractionService::class), $downloads, $manager,
+                Mockery::mock(ReleaseFilesArchiveFallback::class)->shouldIgnoreMissing(), $workspace,
+                Mockery::mock(ConsoleOutputService::class)->shouldIgnoreMissing(), $sync,
+            );
+            if ($firstScan) {
+                $this->assertSame(0, DB::table('release_archive_naming_evidence')->count());
+                $this->assertSame(0, DB::table('release_files')->count());
+            }
+            $successorObserved = false;
+            $replacementSource = str_replace('>archive</segment>', '>replacement</segment>', $source);
+            if ($terminalAction !== 'normal') {
+                DB::beginTransaction();
+                DB::afterCommit(function () use ($terminalAction, $sources, $nzb, $replacementSource, $archive, $config, $dir, $title, &$successorObserved): void {
+                    $successorObserved = true;
+                    if ($terminalAction === 'claim') {
+                        DB::table('releases')->where('id', 1)->update(['additional_pp_claim_token' => 'successor-owner']);
+                    } elseif ($terminalAction === 'source') {
+                        DB::transaction(function () use ($sources, $nzb, $replacementSource, $archive, $config, $dir, $title): void {
+                            $current = Release::query()->where('id', 1)->lockForUpdate()->firstOrFail();
+                            $temporary = $dir.'/replacement.nzb.gz';
+                            file_put_contents($temporary, gzencode($replacementSource));
+                            $receipt = $sources->install($current, $temporary, $nzb->getNzbPath($current->guid));
+                            DB::afterRollBack($receipt->rollback(...));
+                            DB::afterCommit($receipt->close(...));
+                            $listed = (new ArchiveExtractionService($config))->processCompressedData($archive, new ReleaseProcessingContext($current), $dir.'/');
+                            $this->assertTrue($listed['success']);
+                            $this->assertSame([$title.'.mkv'], array_column($listed['files'], 'name'));
+                            $this->assertTrue(app(ReleaseArchiveNamingEvidence::class)->recordLocked($current, $receipt->digest, 'complete_single', array_column($listed['files'], 'name'), true));
+                        });
+                    }
+                });
+            }
+            $result = $processor->process($context, $dir.'/');
+            if ($kind === 'recovered 7z') {
+                $this->assertFalse($context->archiveNamingInspectionComplete);
+                $this->assertSame('incomplete', DB::table('release_archive_naming_evidence')->where('releases_id', 1)->value('scope'));
+                file_put_contents($dir.'/7z', "#!/bin/sh\nprintf 'Path = ".$title.".mkv\\nSize = 100\\nEncrypted = -\\n\\n'\n");
+                $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+                $result = $processor->process($context, $dir.'/');
+            }
+            $this->assertSame($kind === 'recovered 7z' ? ProcessingOutcome::NoUsefulArtifacts : ProcessingOutcome::Completed, $result->outcome);
+            $this->assertSame(NzbSourceGuard::digest($source), $context->nzbSourceDigest);
+            if ($lookupControl) {
+                $this->assertSame('complete_single', DB::table('release_archive_naming_evidence')->where('releases_id', 1)->value('scope'));
+                $this->assertTrue(DB::table('release_files')->where('releases_id', 1)->where('name', $listedName)->exists());
+                $this->assertSame($accepted ? $title : $opaque, DB::table('releases')->where('id', 1)->value('searchname'));
+                $this->assertSame($accepted ? 7 : 0, (int) DB::table('releases')->where('id', 1)->value('predb_id'));
+                $this->assertCount($accepted ? 2 : 1, $filenameChecks, 'Only a real archive-proof-deferred canonical episode lookup may be repeated after finalization.');
+                $this->assertSame([['name' => $listedName, 'terminal' => false], ...($accepted ? [['name' => $listedName, 'terminal' => true]] : [])], $filenameChecks);
+                if ($accepted) {
+                    Event::assertDispatched(ReleaseNameFixed::class);
+                } else {
+                    Event::assertNotDispatched(ReleaseNameFixed::class);
+                }
+
+                return;
+            }
+            if ($terminalAction !== 'normal') {
+                $this->assertFalse($successorObserved);
+                $this->assertSame($opaque, DB::table('releases')->where('id', 1)->value('searchname'), 'Producer naming must wait for the outer transaction to commit.');
+                $this->assertTrue(DB::table('release_files')->where('releases_id', 1)->where('name', $title.'.mkv')->exists());
+                Event::assertNotDispatched(ReleaseNameFixed::class);
+                if ($terminalAction === 'rollback') {
+                    DB::rollBack();
+                    $this->assertFalse($successorObserved);
+                    $this->assertSame(0, DB::table('release_files')->count());
+                    $this->assertSame(0, DB::table('release_archive_naming_evidence')->count());
+                } else {
+                    DB::commit();
+                    $this->assertTrue($successorObserved);
+                    $this->assertSame('complete_single', DB::table('release_archive_naming_evidence')->where('releases_id', 1)->value('scope'));
+                }
+                $renamed = $terminalAction === 'commit';
+                $this->assertSame($renamed ? $title : $opaque, DB::table('releases')->where('id', 1)->value('searchname'));
+                $this->assertSame($renamed ? 7 : 0, (int) DB::table('releases')->where('id', 1)->value('predb_id'));
+                if ($terminalAction === 'claim') {
+                    $this->assertSame('successor-owner', DB::table('releases')->where('id', 1)->value('additional_pp_claim_token'));
+                } elseif ($terminalAction === 'source') {
+                    $this->assertSame(NzbSourceGuard::digest($replacementSource), DB::table('release_archive_naming_evidence')->where('releases_id', 1)->value('source_sha256'));
+                    $this->assertNotSame($context->nzbSourceDigest, $sources->snapshot($context->release->guid)['digest']);
+                    $this->assertTrue(DB::table('release_files')->where('releases_id', 1)->where('name', $title.'.mkv')->exists());
+                }
+                if ($renamed) {
+                    Event::assertDispatched(ReleaseNameFixed::class);
+                } else {
+                    Event::assertNotDispatched(ReleaseNameFixed::class);
+                }
+
+                return;
+            }
+            if ($firstScan) {
+                $this->assertCount(1, $context->workPlan?->archiveCandidates ?? []);
+                $this->assertCount($accepted ? 1 : 2, $context->nzbSourceFiles ?? []);
+                $this->assertTrue(DB::table('release_files')->where('releases_id', 1)->where('name', $title.'.mkv')->exists());
+                $this->assertSame($accepted ? 'complete_single' : 'incomplete', DB::table('release_archive_naming_evidence')->where('releases_id', 1)->value('scope'));
+                $this->assertSame($accepted ? $title : $opaque, DB::table('releases')->where('id', 1)->value('searchname'), 'First-scan PreDB must not rename from one complete archive while another source remains unread.');
+                $this->assertSame($accepted ? 7 : 0, (int) DB::table('releases')->where('id', 1)->value('predb_id'));
+                if ($accepted) {
+                    Event::assertDispatched(ReleaseNameFixed::class);
+                } else {
+                    Event::assertNotDispatched(ReleaseNameFixed::class);
+                }
+
+                return;
+            }
+            if (! $mixedShows && ! in_array($kind, ['merged 7z', 'unknown 7z'], true)) {
+                $this->assertSame(in_array($kind, ['pack 7z', 'complete 7z', 'complete rar', 'movie rar', 'recovered 7z', 'episode variants 7z'], true), $context->archiveNamingInspectionComplete);
+                $this->assertSame(! $accepted, $context->defersArchiveNameChecks());
+                $this->assertSame($kind === 'pack 7z' ? 'multi_episode'
+                    : (in_array($kind, ['complete 7z', 'complete rar', 'movie rar', 'recovered 7z', 'episode variants 7z'], true) ? 'complete_single' : 'incomplete'),
+                    DB::table('release_archive_naming_evidence')->where('releases_id', 1)->value('scope'));
+            }
+
+            $before = DB::table('releases')->where('id', 1)->first();
+            $this->assertSame($opaque, $before->searchname, 'The fixture must reach the ordinary consumer without an earlier rename.');
+            $this->assertSame(0, (int) $before->predb_id);
+            $this->assertSame(0, (int) $before->isrenamed);
+            $this->assertSame(NameFixingService::PROC_FILES_NONE, (int) $before->proc_files);
+            $inventory = DB::table('release_files')->where('releases_id', 1)->orderBy('name')->get()->map(static fn (object $file): array => (array) $file)->all();
+            $this->assertContains($title.'.mkv', array_column($inventory, 'name'));
+            $this->assertCount($kind === 'mixed show pack 7z' ? 3 : ((in_array($kind, ['pack 7z', 'episode variants 7z'], true) || $mixedShows) ? 2 : 1), $inventory);
+            Event::assertNotDispatched(ReleaseNameFixed::class);
+            DB::table('predb')->insert(['id' => 7, 'title' => $title]);
+            $this->rebuildFilenameSqlIdentity();
+            $consumerUpdates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
+            // A new service has no processing context: this is the real persisted-file consumer.
+            (new NameFixingService($consumerUpdates))->getPreFileNames(['prefiles', 1]);
+
+            $after = DB::table('releases')->where('id', 1)->first();
+            $this->assertSame($inventory, DB::table('release_files')->where('releases_id', 1)->orderBy('name')->get()->map(static fn (object $file): array => (array) $file)->all(), 'Scope protection must preserve all stored file evidence.');
+            $this->assertSame($accepted ? $title : $opaque, $after->searchname, 'The real second-stage consumer must respect finalized archive scope.');
+            if (in_array($kind, ['merged 7z', 'unknown 7z'], true)) {
+                $this->assertFalse($context->archiveNamingInspectionComplete);
+                $this->assertSame('incomplete', DB::table('release_archive_naming_evidence')->where('releases_id', 1)->value('scope'));
+            }
+            $this->assertSame($accepted ? 7 : 0, (int) $after->predb_id);
+            $this->assertSame($accepted, $consumerUpdates->matched);
+            if ($accepted) {
+                Event::assertDispatched(ReleaseNameFixed::class);
+            } else {
+                Event::assertNotDispatched(ReleaseNameFixed::class);
+            }
+        } finally {
+            if ($terminalAction !== 'normal') {
+                while (DB::transactionLevel() > 0) {
+                    DB::rollBack();
+                }
+            }
+            File::deleteDirectory($dir);
+        }
+    }
+
+    /** @return iterable<string, array{list<string>, array<string, string>, bool, bool}> */
+    public static function unresolvedArchivePayloadCases(): iterable
+    {
+        $e01 = 'Show.S01E01.1080p.WEB-DL-GRP';
+        $e02 = 'Show.S01E02.1080p.WEB-DL-GRP';
+        $opaque = 'abcdef12.mkv';
+        $otherOpaque = 'fedcba34.mkv';
+        foreach (['same-cycle' => true, 'later consumer' => false] as $phase => $firstScan) {
+            yield 'named E01 then opaque E02 '.$phase => [[$e01.'.mkv', $opaque], [$opaque => $e02], false, $firstScan];
+            yield 'opaque E02 then named E01 '.$phase => [[$opaque, $e01.'.mkv'], [$opaque => $e02], false, $firstScan];
+            yield 'two opaque episode siblings '.$phase => [[$opaque, $otherOpaque], [$opaque => $e01, $otherOpaque => $e02], false, $firstScan];
+            yield 'two extensionless opaque siblings '.$phase => [['abcdefgh', 'hgfedcba'], ['abcdefgh' => $e01, 'hgfedcba' => $e02], false, $firstScan];
+            yield 'two unknown-suffix opaque siblings '.$phase => [['abcdef12.blob', 'fedcba34.blob'], ['abcdef12.blob' => $e01, 'fedcba34.blob' => $e02], false, $firstScan];
+            yield 'extensionless opaque singleton '.$phase => [['abcdefgh'], ['abcdefgh' => $e01], true, $firstScan];
+            yield 'unknown-suffix opaque singleton '.$phase => [['abcdef12.blob'], ['abcdef12.blob' => $e01], true, $firstScan];
+            yield 'named E01 and opaque same E01 '.$phase => [[$e01.'.mkv', $opaque], [$opaque => $e01], true, $firstScan];
+            yield 'opaque singleton '.$phase => [[$opaque], [$opaque => $e01], true, $firstScan];
+            yield 'opaque main with ancillary and sample files '.$phase => [
+                [$opaque, 'readme.txt', 'subtitles.srt', 'Sample/Show.S01E02.sample.mkv', 'Show.S01E02.proof.mkv'],
+                [$opaque => $e01], true, $firstScan,
+            ];
+        }
+        foreach (['same-cycle' => true, 'later consumer' => false] as $phase => $firstScan) {
+            foreach (['S01E01E02', 'S01E01.E02', 'S01E01-E03', 'S01E01-03', '1x01-02', '1x01x02', '1x01-1x02', 'S01E01.S02E02'] as $tokens) {
+                $combined = 'Show.'.$tokens.'.1080p.WEB-DL-GRP';
+                yield 'admission token combined witness '.$tokens.' '.$phase => [[$e01.'.mkv', $combined.'.mkv'], [$e01.'.mkv' => $e01], false, $firstScan];
+                yield 'admission token combined canonical '.$tokens.' '.$phase => [[$e01.'.mkv'], [$e01.'.mkv' => $combined], false, $firstScan];
+            }
+            foreach (['S01', 'Season.1', 'Complete.Season', 'Complete.Series'] as $tokens) {
+                $pack = 'Show.'.$tokens.'.1080p.WEB-DL-GRP.mkv';
+                yield 'admission token pack witness '.$tokens.' '.$phase => [[$pack], [$pack => $e01], false, $firstScan];
+            }
+            $pack = 'Show.S01.1080p.WEB-DL-GRP.mkv';
+            yield 'admission token episode beside season pack '.$phase => [[$e01.'.mkv', $pack], [$pack => $e01], false, $firstScan];
+            $coexisting = 'Show.S01E01.Complete.Season.1080p.WEB-DL-GRP.mkv';
+            yield 'admission token episode and pack coexist '.$phase => [[$coexisting], [$coexisting => $e01], false, $firstScan];
+            foreach ([
+                'simple x' => ['Show.1x01.1080p.WEB-DL-GRP.mkv', $e01],
+                'year season' => ['Show.S2024E01.1080p.WEB-DL-GRP.mkv', 'Show.S2024E01.1080p.WEB-DL-GRP'],
+                'dotted year season' => ['Show.S2024.E01.1080p.WEB-DL-GRP.mkv', 'Show.S2024.E01.1080p.WEB-DL-GRP'],
+                'hyphen before resolution' => ['Show.S01E01-1080p.WEB-DL-GRP.mkv', $e01],
+                'numeric episode title' => ['Show.S01E01.24.1080p.WEB-DL-GRP.mkv', $e01],
+            ] as $label => [$filename, $canonical]) {
+                yield 'admission token positive '.$label.' '.$phase => [[$filename], [$filename => $canonical], true, $firstScan];
+            }
+            yield 'admission token sample and proof stay ancillary '.$phase => [
+                [$e01.'.mkv', 'Show.S01E01E02.sample.mkv', 'Show.S01E01.Complete.Season.proof.mkv', 'readme.txt'],
+                [$e01.'.mkv' => $e01], true, $firstScan,
+            ];
+        }
+        foreach (['same-cycle' => true, 'later consumer' => false] as $phase => $firstScan) {
+            foreach (['S01E01', 'S01.E01', 'S2024E01', '1x01'] as $notation) {
+                foreach (['x264', 'x265'] as $codec) {
+                    $title = 'Show.'.$notation.'.1080p.WEB.'.$codec.'-GRP';
+                    yield 'codec regression named '.$notation.' '.$codec.' '.$phase => [[$title.'.mkv'], [$title.'.mkv' => $title], true, $firstScan];
+                    yield 'codec regression opaque '.$notation.' '.$codec.' '.$phase => [[$opaque], [$opaque => $title], true, $firstScan];
+                }
+            }
+            foreach ([
+                'h264 audio and bitdepth' => 'Show.S01E01.1080p.WEB.H264.DDP5.1.8bit-GRP',
+                'h265 audio and bitdepth' => 'Show.S01E01.2160p.WEB.H265.EAC3.10bit-GRP',
+                'hevc quality' => 'Show.S01E01.2160p.UHD.HEVC.HDR10-GRP',
+                'avc quality' => 'Show.S01E01.720p.BluRay.AVC.DTS5.1-GRP',
+                'uppercase dot codec' => 'Show.S01E01.1080p.WEB.X264.DDP5.1-GRP',
+                'hyphen codec boundary' => 'Show.S01E01-1080p-WEB-x265-GRP',
+            ] as $label => $title) {
+                yield 'codec regression release info '.$label.' '.$phase => [[$title.'.mkv'], [$title.'.mkv' => $title], true, $firstScan];
+            }
+            foreach (['x02', 'x264E02', 'x265x02', 'x264.E02', 'x265.E02', 'x264.S02', 'x265.Complete.Season'] as $continuation) {
+                $ambiguous = 'Show.S01E01.1080p.WEB.'.$continuation.'-GRP';
+                yield 'codec regression unsafe witness '.$continuation.' '.$phase => [[$ambiguous.'.mkv'], [$ambiguous.'.mkv' => $e01], false, $firstScan];
+                yield 'codec regression unsafe canonical '.$continuation.' '.$phase => [[$opaque], [$opaque => $ambiguous], false, $firstScan];
+            }
+            yield 'codec regression immediate x continuation '.$phase => [[$opaque], [$opaque => 'Show.1x01x02.1080p.WEB.x264-GRP'], false, $firstScan];
+        }
+        yield 'same episode encode variants' => [[$e01.'.mkv', 'Show.S01E01.720p.WEB-DL-GRP.mkv'], [$e01.'.mkv' => $e01], true, true];
+        yield 'ordinary movie with an unresolved video sibling' => [
+            ['Movie.2026.1080p.WEB-DL-GRP.mkv', $opaque],
+            ['Movie.2026.1080p.WEB-DL-GRP.mkv' => 'Movie.2026.1080p.WEB-DL-GRP'], true, true,
+        ];
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @param  array<string, string>  $mappings
+     */
+    #[DataProvider('unresolvedArchivePayloadCases')]
+    public function test_real_archive_consumer_requires_one_resolved_main_episode_identity(array $names, array $mappings, bool $accepted, bool $firstScan): void
+    {
+        $canonicalTitle = array_values($mappings)[0];
+        $this->prepareFullPar2NamingEvidence($canonicalTitle);
+        Schema::table('releases', static function (Blueprint $table): void {
+            $table->string('fromname')->default('fixture');
+        });
+        $this->installFilenameSqlIdentity();
+        DB::table('predb')->delete();
+        if ($firstScan) {
+            $id = 7;
+            foreach ($mappings as $filename => $title) {
+                DB::table('predb')->insert(['id' => $id++, 'title' => $title, 'filename' => $filename]);
+            }
+        }
+        $this->rebuildFilenameSqlIdentity();
+        $opaqueRelease = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+        DB::table('releases')->where('id', 1)->update(['name' => $opaqueRelease, 'searchname' => $opaqueRelease, 'nfostatus' => 1]);
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
+        $manager = $this->makeFullPar2NamingManager($sync);
+        $directory = sys_get_temp_dir().'/resolved-main-episode-'.bin2hex(random_bytes(8));
+        mkdir($directory);
+        try {
+            config(['nntmux_settings.path_to_nzbs' => $directory.'/nzbs/']);
+            $nzb = new TestNzbService;
+            $sources = new NzbSourceGuard($nzb);
+            $this->app->instance(NzbSourceGuard::class, $sources);
+            $this->app->instance(ReleaseArchiveNamingEvidence::class, new ReleaseArchiveNamingEvidence($sources));
+            $script = "#!/bin/sh\n";
+            foreach ($names as $name) {
+                $record = 'Path = '.$name."\nSize = 100\nEncrypted = -\n\n";
+                $script .= 'printf %s '.escapeshellarg($record)."\n";
+            }
+            file_put_contents($directory.'/7z', $script);
+            chmod($directory.'/7z', 0755);
+            $source = '<nzb><file poster="fixture" date="1" subject="&quot;deadbeef.7z&quot; yEnc (1/1)">'
+                .'<groups><group>alt.binaries.fixture</group></groups><segments><segment bytes="100" number="1">archive</segment></segments></file></nzb>';
+            $release = Release::query()->findOrFail(1);
+            file_put_contents($nzb->getNzbPath($release->guid, createIfNotExist: true), gzencode($source));
+            $context = new ReleaseProcessingContext($release);
+            $context->tmpPath = $directory.'/';
+            $archive = $this->sevenZip('ignored.mkv', str_repeat('x', 100), compressedHeader: true);
+            $config = $this->makeConfig(['processPasswords' => true, 'sevenZipPath' => $directory.'/7z']);
+            $downloads = Mockery::mock(UsenetDownloadService::class);
+            $downloads->shouldReceive('beginReleaseScope')->once()->andReturnNull();
+            $downloads->shouldReceive('finishReleaseScope')->once()->andReturn(new DownloadMetrics);
+            $downloads->shouldReceive('download')->once()->withArgs(static fn (DownloadKind $kind, array $ids): bool => $kind === DownloadKind::Compressed && $ids === ['archive'])
+                ->andReturn(['success' => true, 'data' => $archive, 'groupUnavailable' => false, 'error' => null]);
+            $workspace = Mockery::mock(TempWorkspaceService::class);
+            $workspace->shouldReceive('createReleaseTempFolder')->once()->andReturn($directory.'/');
+            $workspace->shouldReceive('listFiles')->andReturn([]);
+            $workspace->shouldReceive('clearDirectory')->once()->with($directory.'/', false)->andReturnNull();
+            $processor = new ReleaseProcessor(
+                $config, new NzbContentParser($nzb, new NzbParserService), new AdditionalWorkPlanner($config), new ArchiveExtractionService($config),
+                Mockery::mock(MediaExtractionService::class), $downloads, $manager,
+                Mockery::mock(ReleaseFilesArchiveFallback::class)->shouldIgnoreMissing(), $workspace,
+                Mockery::mock(ConsoleOutputService::class)->shouldIgnoreMissing(), $sync,
+            );
+            $this->assertSame(0, DB::table('release_archive_naming_evidence')->count());
+            $result = $processor->process($context, $directory.'/');
+            $this->assertSame(ProcessingOutcome::Completed, $result->outcome);
+            if (in_array('Show.1x01x02.1080p.WEB-DL-GRP.mkv', $names, true)) {
+                $this->assertFalse($context->archiveListingIncomplete, 'The decoded raw listing is complete even though its episode identity is ambiguous.');
+                $this->assertFalse($context->archiveNamingInspectionComplete);
+                $this->assertTrue($context->archiveNameEvidenceIncomplete);
+            } else {
+                $this->assertTrue($context->archiveNamingInspectionComplete, 'All source files and decoded archive entries must actually have been inspected.');
+            }
+            $this->assertSame(NzbSourceGuard::digest($source), $context->nzbSourceDigest);
+            $this->assertSame($context->nzbSourceDigest, DB::table('release_archive_naming_evidence')->where('releases_id', 1)->value('source_sha256'));
+            if ($accepted && $canonicalTitle !== 'Movie.2026.1080p.WEB-DL-GRP') {
+                $this->assertSame('complete_single', DB::table('release_archive_naming_evidence')->where('releases_id', 1)->value('scope'));
+                $this->assertTrue(DB::transaction(fn (): bool => app(ReleaseArchiveNamingEvidence::class)->recordLocked(
+                    Release::query()->findOrFail(1), $context->nzbSourceDigest, 'complete_single', $names, true
+                )));
+                $this->assertSame('complete_single', DB::table('release_archive_naming_evidence')->where('releases_id', 1)->value('scope'), 'Repeated inspection of the same source must preserve complete_single.');
+            }
+            $inventory = DB::table('release_files')->where('releases_id', 1)->orderBy('name')->get()->map(static fn (object $file): array => (array) $file)->all();
+            $expectedNames = $names;
+            sort($expectedNames, SORT_STRING);
+            $this->assertSame($expectedNames, array_column($inventory, 'name'), 'Every payload and ancillary row must remain in inventory.');
+            if (! $firstScan) {
+                $this->assertSame($opaqueRelease, DB::table('releases')->where('id', 1)->value('searchname'));
+                Event::assertNotDispatched(ReleaseNameFixed::class);
+                $id = 7;
+                foreach ($mappings as $filename => $title) {
+                    DB::table('predb')->insert(['id' => $id++, 'title' => $title, 'filename' => $filename]);
+                }
+                $this->rebuildFilenameSqlIdentity();
+                $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
+                (new NameFixingService($updates))->getPreFileNames(['prefiles', 1]);
+                $this->assertSame($accepted, $updates->matched);
+            }
+            $this->assertSame($inventory, DB::table('release_files')->where('releases_id', 1)->orderBy('name')->get()->map(static fn (object $file): array => (array) $file)->all());
+            $this->assertSame($accepted ? $canonicalTitle : $opaqueRelease, DB::table('releases')->where('id', 1)->value('searchname'), 'Episode admission must account for every main video, including the validated candidate identity.');
+            $this->assertSame($accepted ? 7 : 0, (int) DB::table('releases')->where('id', 1)->value('predb_id'));
+            if ($accepted) {
+                Event::assertDispatched(ReleaseNameFixed::class);
+            } else {
+                Event::assertNotDispatched(ReleaseNameFixed::class);
+            }
+        } finally {
+            File::deleteDirectory($directory);
+        }
+    }
+
+    /** @return array<string, array{string, bool}> */
+    public static function legacyEpisodeAdmissionCases(): array
+    {
+        return [
+            'seasonless Episode token is not a complete identity' => ['Show.Episode.5.1080p.WEB-DL-GRP', false],
+            'seasonless EP token is not a complete identity' => ['Show.EP05.1080p.WEB-DL-GRP', false],
+            'historical simple episode keeps legacy compatibility' => ['Show.S01E01.1080p.WEB-DL-GRP', true],
+            'historical x264 episode keeps legacy compatibility' => ['Show.S01E01.1080p.WEB.x264-GRP', true],
+            'historical x265 episode keeps legacy compatibility' => ['Show.S01E01.1080p.WEB.x265-GRP', true],
+            'historical x02 continuation is not a singleton' => ['Show.S01E01.1080p.WEB.x02-GRP', false],
+        ];
+    }
+
+    #[DataProvider('legacyEpisodeAdmissionCases')]
+    public function test_legacy_consumer_requires_a_single_show_and_season_episode_identity(string $title, bool $accepted): void
+    {
+        $this->prepareFullPar2NamingEvidence($title);
+        Schema::table('releases', static function (Blueprint $table): void {
+            $table->string('fromname')->default('fixture');
+        });
+        $this->installFilenameSqlIdentity();
+        $opaque = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+        DB::table('releases')->where('id', 1)->update([
+            'name' => $opaque, 'searchname' => $opaque,
+            'additional_pp_claim_token' => null, 'additional_pp_claimed_at' => null,
+        ]);
+        DB::table('release_files')->insert(['releases_id' => 1, 'name' => $title.'.mkv', 'size' => 100]);
+        $this->assertSame(0, DB::table('release_archive_naming_evidence')->count());
+        $inventory = DB::table('release_files')->get()->map(static fn (object $file): array => (array) $file)->all();
+        $sources = new NzbSourceGuard(new TestNzbService);
+        $this->app->instance(NzbSourceGuard::class, $sources);
+        $this->app->instance(ReleaseArchiveNamingEvidence::class, new ReleaseArchiveNamingEvidence($sources));
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
+        $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
+
+        (new NameFixingService($updates))->getPreFileNames(['prefiles', 1]);
+
+        $this->assertSame($accepted, $updates->matched);
+        $this->assertSame($accepted ? $title : $opaque, DB::table('releases')->where('id', 1)->value('searchname'));
+        $this->assertSame($accepted ? 7 : 0, (int) DB::table('releases')->where('id', 1)->value('predb_id'));
+        $this->assertSame(0, DB::table('release_archive_naming_evidence')->count());
+        $this->assertSame($inventory, DB::table('release_files')->get()->map(static fn (object $file): array => (array) $file)->all());
+        if ($accepted) {
+            Event::assertDispatched(ReleaseNameFixed::class);
+        } else {
+            Event::assertNotDispatched(ReleaseNameFixed::class);
+        }
+    }
+
+    public function test_archive_proof_deferral_is_reset_between_real_filename_attempts(): void
+    {
+        $title = 'Show.S01E01.1080p.WEB-DL-GRP';
+        $this->prepareFullPar2NamingEvidence($title);
+        $this->installFilenameSqlIdentity();
+        DB::table('predb')->where('id', 7)->update(['filename' => 'abcdef12.mkv']);
+        $this->rebuildFilenameSqlIdentity();
+        $release = Release::query()->findOrFail(1);
+        $context = $this->sourceContext($release);
+        $sourceDigest = $context->nzbSourceDigest;
+        $this->assertNotNull($sourceDigest);
+        DB::transaction(static function () use ($sourceDigest): void {
+            $current = DB::table('releases')->where('id', 1)->lockForUpdate()->first();
+            app(ReleaseArchiveNamingEvidence::class)->sourceReplacedLocked($current, $sourceDigest);
+        });
+        $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class));
+        $names = new NameFixingService($updates);
+        $observed = DB::table('releases')->where('id', 1)->first();
+        $entry = clone $release;
+        $entry->setAttribute('observed_additional_pp_claim', ['token' => $observed->additional_pp_claim_token, 'claimed_at' => $observed->additional_pp_claimed_at]);
+        $entry->setAttribute('filename', 'abcdef12.mkv');
+
+        $this->assertSame(0, $names->matchPreDbFiles($entry, true, true, true));
+        $this->assertTrue($names->wasEpisodeNamingDeferredByArchiveProof());
+        $entry->setAttribute('filename', 'Different.Movie.2026.1080p.mkv');
+        $this->assertSame(0, $names->matchPreDbFiles($entry, true, true, true));
+        $this->assertFalse($names->wasEpisodeNamingDeferredByArchiveProof(), 'A later actual miss must not inherit a prior canonical proof rejection.');
+        $entry->setAttribute('filename', 'abcdef12.mkv');
+        $this->assertSame(0, $names->matchPreDbFiles($entry, true, true, true));
+        $this->assertTrue($names->wasEpisodeNamingDeferredByArchiveProof());
+        $names->reset();
+        $this->assertFalse($names->wasEpisodeNamingDeferredByArchiveProof());
+        $this->assertSame(0, $names->matchPreDbFiles($entry, true, true, true));
+        $this->assertTrue($names->wasEpisodeNamingDeferredByArchiveProof());
+        $updates->updateRelease($entry, '', 'fixture invalid candidate', true, '', true, true);
+        $this->assertFalse($names->wasEpisodeNamingDeferredByArchiveProof(), 'A new update attempt clears the per-attempt reason before validation.');
+        DB::table('releases')->where('id', 1)->update(['additional_pp_claim_token' => 'successor-owner']);
+        $this->assertSame(0, $names->matchPreDbFiles($entry, true, true, true));
+        $this->assertFalse($names->wasEpisodeNamingDeferredByArchiveProof(), 'Stale claim rejection is not an archive-proof deferral.');
+        $this->assertSame('Example', DB::table('releases')->where('id', 1)->value('searchname'));
+        $this->assertSame(0, (int) DB::table('releases')->where('id', 1)->value('predb_id'));
+        Event::assertNotDispatched(ReleaseNameFixed::class);
+    }
+
+    /** @return array<string, array{string, int, bool}> */
+    public static function directBodyNamingCases(): array
+    {
+        return [
+            'actual single episode body' => ['episode', 1, true],
+            'actual movie body' => ['movie', 1, true],
+            'actual two episode bodies' => ['episode', 2, false],
+            'cached bytes without yenc header' => ['cached', 1, false],
+            'actual header does not match nzb name' => ['different name', 1, false],
+            'archive bytes disguised as video' => ['archive', 1, false],
+            'third source was not fetched' => ['episode', 3, false],
+        ];
+    }
+
+    #[DataProvider('directBodyNamingCases')]
+    public function test_existing_direct_media_fetches_prove_only_their_actual_current_file_names(string $kind, int $count, bool $accepted): void
+    {
+        $title = $kind === 'movie' ? 'Movie.2026.1080p.WEB-DL-GRP' : 'Show.S01E01.1080p.WEB-DL-GRP';
+        $this->prepareFullPar2NamingEvidence($title);
+        Schema::table('releases', static function (Blueprint $table): void {
+            $table->string('fromname')->default('fixture');
+        });
+        $this->installFilenameSqlIdentity();
+        $opaque = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+        DB::table('releases')->where('id', 1)->update(['name' => $opaque, 'searchname' => $opaque, 'nfostatus' => 1]);
+        DB::table('predb')->delete();
+        $this->rebuildFilenameSqlIdentity();
+        $dir = sys_get_temp_dir().'/'.uniqid('direct-body-scope-', true);
+        mkdir($dir);
+        try {
+            config(['nntmux_settings.path_to_nzbs' => $dir.'/nzbs/']);
+            $nzb = new TestNzbService;
+            $sources = new NzbSourceGuard($nzb);
+            $this->app->instance(NzbSourceGuard::class, $sources);
+            $this->app->instance(ReleaseArchiveNamingEvidence::class, new ReleaseArchiveNamingEvidence($sources));
+            $names = [];
+            $source = '<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">';
+            for ($index = 0; $index < $count; $index++) {
+                $name = $index === 0 ? $title.'.mkv' : 'Show.S01E0'.($index + 1).'.1080p.WEB-DL-GRP.mkv';
+                $names['video-'.$index] = $name;
+                $subject = '"'.$name.'" yEnc (1/1)';
+                $source .= '<file poster="fixture" date="1" subject="'.htmlspecialchars($subject, ENT_QUOTES | ENT_XML1).'">'
+                    .'<groups><group>alt.binaries.fixture</group></groups><segments><segment bytes="128" number="1">video-'.$index.'</segment></segments></file>';
+            }
+            $source .= '</nzb>';
+            $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+            file_put_contents($nzb->getNzbPath($context->release->guid, createIfNotExist: true), gzencode($source));
+            $config = $this->makeConfig(['processThumbnails' => true, 'mediaMainVideoFallback' => true,
+                'mediaMainVideoMinBytes' => 1, 'mediaSampleMaxBytes' => 512]);
+            $downloads = Mockery::mock(UsenetDownloadService::class);
+            $downloads->shouldReceive('beginReleaseScope')->once()->andReturnNull();
+            $downloads->shouldReceive('finishReleaseScope')->once()->andReturn(new DownloadMetrics);
+            $downloads->shouldReceive('download')->never();
+            $fetched = [];
+            $downloads->shouldReceive('downloadArticle')->times(min(2, $count))->andReturnUsing(
+                function (DownloadKind $downloadKind, string $id) use (&$fetched, $names, $kind): array {
+                    $this->assertSame(DownloadKind::MediaSource, $downloadKind);
+                    $fetched[] = $id;
+                    $data = $kind === 'archive' ? $this->rar('Hidden.S01E02.mkv', str_repeat('x', 100)) : "\x1a\x45\xdf\xa3".str_repeat('x', 100);
+
+                    return ['success' => true, 'data' => $data,
+                        'part' => $kind === 'cached' ? null : new YencPart($kind === 'different name' ? 'Other.S01E01.mkv' : $names[$id], max(128, strlen($data)), 1, 1, strlen($data)),
+                        'groupUnavailable' => false, 'error' => null];
+                }
+            );
+            $media = Mockery::mock(MediaExtractionService::class);
+            $media->shouldReceive('getSample')->times(min(2, $count))->andReturnFalse();
+            $workspace = Mockery::mock(TempWorkspaceService::class);
+            $workspace->shouldReceive('createReleaseTempFolder')->once()->andReturn($dir.'/');
+            $workspace->shouldReceive('listFiles')->andReturn([]);
+            $workspace->shouldReceive('clearDirectory')->once()->with($dir.'/', false)->andReturnNull();
+            $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
+            $processor = new ReleaseProcessor($config, new NzbContentParser($nzb, new NzbParserService),
+                new AdditionalWorkPlanner($config), new ArchiveExtractionService($config), $media, $downloads,
+                $this->makeFullPar2NamingManager($sync), Mockery::mock(ReleaseFilesArchiveFallback::class)->shouldIgnoreMissing(),
+                $workspace, Mockery::mock(ConsoleOutputService::class)->shouldIgnoreMissing(), $sync);
+            $processor->process($context, $dir.'/');
+            $this->assertSame(array_slice(array_keys($names), 0, 2), $fetched, 'Admission must use only the already planned media fetches.');
+            $this->assertSame($count <= 2 && in_array($kind, ['episode', 'movie'], true), $context->archiveNamingInspectionComplete);
+            $expectedScope = $count > 1 ? 'multi_episode' : ($accepted ? 'complete_single' : 'incomplete');
+            $this->assertSame($expectedScope, DB::table('release_archive_naming_evidence')->where('releases_id', 1)->value('scope'));
+            $stored = DB::table('release_files')->where('releases_id', 1)->orderBy('name')->pluck('name')->all();
+            $this->assertCount(in_array($kind, ['episode', 'movie'], true) ? min(2, $count) : 0, $stored);
+            DB::table('predb')->insert(['id' => 7, 'title' => $title]);
+            $this->rebuildFilenameSqlIdentity();
+            $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
+            (new NameFixingService($updates))->getPreFileNames(['prefiles', 1]);
+            $this->assertSame($accepted ? $title : $opaque, DB::table('releases')->where('id', 1)->value('searchname'));
+            $this->assertSame($accepted ? 7 : 0, (int) DB::table('releases')->where('id', 1)->value('predb_id'));
+            $this->assertSame($stored, DB::table('release_files')->where('releases_id', 1)->orderBy('name')->pluck('name')->all());
+        } finally {
+            File::deleteDirectory($dir);
+        }
+    }
+
+    /** @return iterable<string, array{string, string, bool}> */
+    public static function sharedArchiveAdmissionCases(): iterable
+    {
+        foreach (['generic', 'generic preview', 'media', 'preview', 'attach', 'same-name candidate', 'same-name preview'] as $path) {
+            yield $path.' incomplete' => [$path, 'incomplete', false];
+            yield $path.' complete' => [$path, 'complete', true];
+        }
+        foreach (['generic', 'media'] as $path) {
+            yield $path.' retained old filename' => [$path, 'replacement old', false];
+            yield $path.' current replacement filename' => [$path, 'replacement current', true];
+            yield $path.' identical decoded recompression' => [$path, 'recompressed', true];
+        }
+    }
+
+    #[DataProvider('sharedArchiveAdmissionCases')]
+    public function test_shared_rename_admission_requires_current_archive_scope_and_filename(string $path, string $proof, bool $accepted): void
+    {
+        $oldTitle = 'Show.S01E01.1080p.WEB.x264-GRP';
+        $currentTitle = 'Show.S01E03.1080p.WEB.x265-GRP';
+        $title = $proof === 'replacement current' ? $currentTitle : $oldTitle;
+        $sameName = in_array($path, ['attach', 'same-name candidate', 'same-name preview'], true);
+        $preview = in_array($path, ['preview', 'generic preview', 'same-name preview'], true);
+        $this->prepareFullPar2NamingEvidence($title);
+        $this->installFilenameSqlIdentity();
+        DB::table('releases')->where('id', 1)->update(['searchname' => $sameName ? $title : 'a1b2c3d4e5f60718293a4b5c6d7e8f90']);
+        $dir = sys_get_temp_dir().'/'.uniqid('shared-archive-admission-', true);
+        mkdir($dir);
+        try {
+            config(['nntmux_settings.path_to_nzbs' => $dir.'/nzbs/']);
+            $nzb = new TestNzbService;
+            $sources = new NzbSourceGuard($nzb);
+            $evidence = new ReleaseArchiveNamingEvidence($sources);
+            $this->app->instance(NzbSourceGuard::class, $sources);
+            $this->app->instance(ReleaseArchiveNamingEvidence::class, $evidence);
+            $release = Release::query()->findOrFail(1);
+            $release->releases_id = $release->id;
+            $release->filename = $title.'.mkv';
+            $source = '<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"><file poster="fixture" date="1" subject="opaque.rar"><groups><group>alt.binaries.fixture</group></groups><segments><segment bytes="100" number="1">old-source</segment></segments></file></nzb>';
+            $sourcePath = $nzb->getNzbPath($release->guid, createIfNotExist: true);
+            $originalCompressed = gzencode($source, 1);
+            file_put_contents($sourcePath, $originalCompressed);
+            $digest = NzbSourceGuard::digest($source);
+            DB::table('release_files')->insert(['releases_id' => 1, 'name' => $oldTitle.'.mkv', 'size' => 100]);
+            $this->assertTrue(DB::transaction(fn (): bool => $evidence->recordLocked($release, $digest,
+                $proof === 'incomplete' ? 'incomplete' : 'complete_single', [$oldTitle.'.mkv'], $proof !== 'incomplete')));
+            if (str_starts_with($proof, 'replacement') || $proof === 'recompressed') {
+                $nextSource = $proof === 'recompressed' ? $source : str_replace('old-source', 'new-source', $source);
+                $temporary = $dir.'/replacement.nzb.gz';
+                $nextCompressed = gzencode($nextSource, 9);
+                file_put_contents($temporary, $nextCompressed);
+                $receipt = DB::transaction(fn () => $sources->install($release, $temporary, $sourcePath, $digest));
+                $receipt->close();
+                if ($proof === 'recompressed') {
+                    $this->assertNotSame($originalCompressed, $nextCompressed);
+                    $this->assertSame($digest, $sources->snapshot($release->guid)['digest']);
+                } else {
+                    DB::table('release_files')->insert(['releases_id' => 1, 'name' => $currentTitle.'.mkv', 'size' => 100]);
+                    $this->assertTrue(DB::transaction(fn (): bool => $evidence->recordLocked($release,
+                        NzbSourceGuard::digest($nextSource), 'complete_single', [$currentTitle.'.mkv'], true)));
+                }
+            }
+            $before = (array) DB::table('releases')->where('id', 1)->first();
+            $files = DB::table('release_files')->where('releases_id', 1)->orderBy('name')->pluck('name')->all();
+            $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
+            $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
+            if ($path === 'generic') {
+                $updates->updateRelease($release, $title, 'Fixture filename', true, 'Filenames, ', true, false);
+                $result = $updates->matched;
+            } elseif ($path === 'generic preview') {
+                $updates->updateRelease($release, $title, 'Fixture filename', false, 'Filenames, ', true, false);
+                $result = $updates->matched;
+            } elseif ($path === 'media') {
+                $result = $updates->updateMediaSnapshot($release, $title, Category::TV_HD);
+            } elseif ($preview) {
+                $result = (new NameFixingService($updates))->matchPreDbFiles($release, false, true, false) === 1;
+            } elseif ($path === 'attach') {
+                $result = $updates->attachPredbSnapshot($release, 7, $title, $title);
+            } else {
+                $result = $updates->updatePredbCandidate($release, $title, 7, 'fixture');
+            }
+            $this->assertSame($accepted, $result);
+            $this->assertSame($accepted, $updates->matched);
+            $after = (array) DB::table('releases')->where('id', 1)->first();
+            $this->assertSame($files, DB::table('release_files')->where('releases_id', 1)->orderBy('name')->pluck('name')->all());
+            if (! $accepted || $preview) {
+                $this->assertSame($before, $after, 'Rejected or preview admission must not mutate release state.');
+                $this->assertNull($updates->lastCommittedIdentity());
+                Event::assertNotDispatched(ReleaseNameFixed::class);
+            } else {
+                $this->assertSame($title, $after['searchname']);
+                $this->assertSame($sameName ? 7 : 0, (int) $after['predb_id']);
+                $this->assertSame($title, $updates->lastCommittedIdentity()['after']['searchname'] ?? null);
+            }
+            if (! $accepted) {
+                $this->assertSame(0, $updates->fixed);
+                $this->assertSame(0, $updates->checked);
+                $this->assertSame(0, (int) $after['predb_id']);
+            }
+        } finally {
+            File::deleteDirectory($dir);
+        }
+    }
+
+    /** @return array<string, array{string, bool}> */
+    public static function incompleteArchiveNamingCases(): array
+    {
+        return [
+            'incomplete 7z episode' => ['7z', true],
+            'incomplete 7z movie' => ['7z', false],
+            'truncated rar episode' => ['truncated rar', true],
+            'truncated rar movie' => ['truncated rar', false],
+            'truncated rar followed by extras' => ['truncated rar with extras', true],
+            'complete rar episode' => ['complete rar', true],
+            'complete rar movie' => ['complete rar', false],
+            'exact payload boundary episode' => ['payload boundary', true],
+            'exact payload boundary movie' => ['payload boundary', false],
+            'partial next header episode' => ['partial next header', true],
+            'partial next header movie' => ['partial next header', false],
+            'complete rar5 episode' => ['complete rar5', true],
+            'complete rar5 movie' => ['complete rar5', false],
+            'rar terminal requests another volume' => ['continuing rar', true],
+        ];
+    }
+
+    #[DataProvider('sevenZipListings')]
+    public function test_a_cut_off_7z_listing_leaves_the_password_status_unknown(string $script, int $passwordStatus, array $names = []): void
+    {
+        DB::table('releases')->insert($this->releaseRow());
+        Search::shouldReceive('updateRelease')->once()->with(1);
+
+        $dir = sys_get_temp_dir().'/'.uniqid('7z-listing-', true);
+        mkdir($dir);
+        try {
+            file_put_contents($dir.'/7z', "#!/bin/sh\n".$script."\n");
+            chmod($dir.'/7z', 0755);
+            $archiveService = new ArchiveExtractionService($this->makeConfig(['sevenZipPath' => $dir.'/7z']));
+            $manager = $this->makeManager();
+            $context = $this->sourceContext(Release::query()->findOrFail(1));
+            $context->nzbHasCompressedFile = true;
+
+            $archive = $this->sevenZip('ignored.mkv', str_repeat('x', 100), compressedHeader: true);
+            $result = $archiveService->listEncodedSevenZip($archive, null, $context, $dir.'/');
+            $this->assertIsArray($result);
+            foreach ($result['files'] as $file) {
+                if ($context->releaseHasPassword) {
+                    break;
+                }
+                $manager->addFileInfo($file, $context, '\\.(?:par2|sfv|nzb)');
+            }
+            $manager->finalizeRelease($context, true);
+        } finally {
+            array_map('unlink', glob($dir.'/*') ?: []);
+            rmdir($dir);
+        }
+
+        $release = DB::table('releases')->where('id', 1)->first();
+        $this->assertSame($passwordStatus, (int) $release->passwordstatus);
+        $this->assertSame(0, (int) $release->haspreview);
+        $this->assertNull($release->archive_retry_at);
+        $this->assertGreaterThan(0, DB::table('release_files')->count());
+        foreach ($names as $name) {
+            $this->assertTrue(DB::table('release_files')->where('name', $name)->exists(), $name);
+        }
+    }
+
+    /**
+     * @return array<string, array{0: string, 1: int, 2?: list<string>}>
+     */
+    public static function sevenZipListings(): array
+    {
+        $plain = static fn (int $count, string $pad = ''): string => 'i=0; while [ $i -lt '.$count.' ]; do '
+            .'printf \'Path = %d'.$pad.'.txt\\nSize = 0\\nEncrypted = -\\n\\n\' $i; i=$((i+1)); done; ';
+        $encrypted = 'printf \'Path = Movie.2026.1080p.mkv\\nSize = 100\\nEncrypted = +\\n\\n\'; ';
+
+        return [
+            'encrypted entry past the entry cap' => [
+                $plain(ArchiveExtractionService::SEVENZIP_LISTING_MAX_ENTRIES).$encrypted,
+                -1,
+            ],
+            'encrypted entry past the output cap' => [
+                $plain(300, str_repeat('a', 20000)).$encrypted,
+                -1,
+            ],
+            'encrypted entry before the cap' => [
+                $plain(5).$encrypted.$plain(2000),
+                ReleaseBrowseService::PASSWD_RAR,
+            ],
+            'complete listing without encryption' => [
+                $plain(5),
+                ReleaseBrowseService::PASSWD_NONE,
+            ],
+            'CRLF listing of names containing byte 0x85' => [
+                'printf \'Path = \303\205land.mkv\r\nSize = 10\r\nEncrypted = -\r\n\r\n\'; '
+                    .'printf \'Path = Movie.\344\271\205.mkv\r\nSize = 13\r\nEncrypted = -\r\n\r\n\'; ',
+                ReleaseBrowseService::PASSWD_NONE,
+                ['Åland.mkv', 'Movie.久.mkv'],
+            ],
+            'encrypted entry behind a control character' => [
+                $plain(5).'printf \'Path = Movie\001.mkv\nSize = 100\nEncrypted = +\n\n\'; ',
+                -1,
+            ],
+            'encrypted entry behind a duplicate property' => [
+                $plain(5).'printf \'Path = a.txt\nPath = Movie.mkv\nSize = 100\nEncrypted = +\n\n\'; ',
+                -1,
+            ],
+        ];
+    }
+
+    /**
+     * @param  list<string>  $listings  7-Zip client output for each 7z archive of the release, listed in order
+     */
+    #[DataProvider('sevenZipListingsWithoutReadableRecords')]
+    public function test_a_7z_listing_without_one_readable_record_still_leaves_the_password_status_unknown(
+        array $listings,
+        bool $hasReleaseFile,
+        int $passwordStatus,
+        bool $retried,
+    ): void {
+        DB::table('releases')->insert($this->releaseRow());
+        if ($hasReleaseFile) {
+            DB::table('release_files')->insert(['releases_id' => 1, 'name' => 'Extras/readme.txt', 'size' => 10]);
+        }
+        Search::shouldReceive('updateRelease')->once()->with(1);
+        config(['nntmux.archive_retry_delay' => 86400]);
+        $this->freezeSecond();
+
+        $dir = sys_get_temp_dir().'/'.uniqid('7z-listing-', true);
+        mkdir($dir);
+        try {
+            $manager = $this->makeManager();
+            $context = $this->sourceContext(Release::query()->findOrFail(1));
+            $context->nzbHasCompressedFile = true;
+            $context->archiveInspectionAttempted = true;
+            $archive = $this->sevenZip('ignored.mkv', str_repeat('x', 100), compressedHeader: true);
+
+            foreach ($listings as $index => $listing) {
+                $client = $dir.'/7z-'.$index;
+                file_put_contents($client, "#!/bin/sh\n".$listing."\n");
+                chmod($client, 0755);
+                $result = (new ArchiveExtractionService($this->makeConfig(['sevenZipPath' => $client])))
+                    ->listEncodedSevenZip($archive, null, $context, $dir.'/');
+                foreach ($result['files'] ?? [] as $file) {
+                    if ($context->releaseHasPassword) {
+                        break;
+                    }
+                    $manager->addFileInfo($file, $context, '\\.(?:par2|sfv|nzb)');
+                }
+            }
+            $manager->finalizeRelease($context, true);
+        } finally {
+            array_map('unlink', glob($dir.'/*') ?: []);
+            rmdir($dir);
+        }
+
+        $release = DB::table('releases')->where('id', 1)->first();
+        $this->assertSame($passwordStatus, (int) $release->passwordstatus);
+        $this->assertSame($retried ? -1 : 0, (int) $release->haspreview);
+        $this->assertSame($retried ? now()->addDay()->toDateTimeString() : null, $release->archive_retry_at);
+    }
+
+    /**
+     * @return array<string, array{list<string>, bool, int, bool}>
+     */
+    public static function sevenZipListingsWithoutReadableRecords(): array
+    {
+        $controlCharacter = 'printf \'Path = Movie\001.mkv\nSize = 100\nEncrypted = +\n\n\'';
+        $duplicateProperty = 'printf \'Path = a.txt\nPath = Movie.mkv\nSize = 100\nEncrypted = +\n\n\'';
+        $plain = 'printf \'Path = Extras/info.txt\nSize = 4\nEncrypted = -\n\n\'';
+        $encrypted = 'printf \'Path = Movie.2026.1080p.mkv\nSize = 100\nEncrypted = +\n\n\'';
+
+        return [
+            'control character beside a stored file' => [[$controlCharacter], true, -1, false],
+            'duplicate property beside a stored file' => [[$duplicateProperty], true, -1, false],
+            'control character, then a complete listing' => [[$controlCharacter, $plain], false, -1, false],
+            'duplicate property, then a complete listing' => [[$duplicateProperty, $plain], false, -1, false],
+            'complete listing, then a control character' => [[$plain, $controlCharacter], false, -1, false],
+            'control character, then an encrypted entry' => [[$controlCharacter, $encrypted], false, ReleaseBrowseService::PASSWD_RAR, false],
+            'control character and no file at all' => [[$controlCharacter], false, -1, true],
+            'empty listing beside a stored file' => [[''], true, ReleaseBrowseService::PASSWD_NONE, false],
+        ];
+    }
+
     public function test_invalid_release_file_sizes_are_rejected(): void
     {
         DB::table('releases')->insert($this->releaseRow());
@@ -3305,7 +3407,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             ->with('Skipping release file with invalid size metadata.', Mockery::type('array'));
 
         $manager = $this->makeManager();
-        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $context = $this->sourceContext(Release::query()->findOrFail(1));
         $invalidSizes = [-1, INF, PHP_INT_MAX + 1.0, 'not-numeric'];
 
         foreach ($invalidSizes as $index => $invalidSize) {
@@ -3334,7 +3436,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
 
         try {
             $manager = $this->makeManagerWithImageService($imageService);
-            $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+            $context = $this->sourceContext(Release::query()->findOrFail(1));
 
             $manager->finalizeRelease($context, false);
 
@@ -3343,6 +3445,50 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
         } finally {
             File::delete([$preview, $sample]);
         }
+    }
+
+    public function test_finalization_without_a_source_snapshot_preserves_inventory_status_and_publication(): void
+    {
+        DB::table('releases')->insert($this->releaseRow());
+        Search::shouldReceive('updateRelease')->never();
+        $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+        $manager = $this->makeManager();
+        $before = (array) DB::table('releases')->where('id', 1)->first();
+        $this->assertTrue($manager->addFileInfo(['name' => 'Movie.2026.mkv', 'size' => 100], $context, '\\.(?:par2|sfv|nzb)'));
+
+        $manager->finalizeRelease($context, false);
+
+        $this->assertTrue($context->fullPar2EvidenceDeferred);
+        $this->assertSame(0, DB::table('release_files')->count());
+        $this->assertSame(0, DB::table('release_archive_naming_evidence')->count());
+        $this->assertSame($before, (array) DB::table('releases')->where('id', 1)->first());
+    }
+
+    private function sourceContext(object $release): ReleaseProcessingContext
+    {
+        $snapshot = $this->fixtureSourceSnapshot($release);
+        $context = new ReleaseProcessingContext($release);
+        $context->nzbSourceDigest = $snapshot['digest'];
+
+        return $context;
+    }
+
+    /** @return array{guid: string, path: string, contents: string, digest: string} */
+    private function fixtureSourceSnapshot(object $release): array
+    {
+        $nzb = new TestNzbService;
+        $path = $nzb->getNzbPath($release->guid, createIfNotExist: true);
+        if (! File::isFile($path)) {
+            $xml = '<nzb><file subject="fixture.bin yEnc (1/1)"><groups><group>alt.fixture</group></groups>'
+                .'<segments><segment bytes="1" number="1">fixture-source@article</segment></segments></file></nzb>';
+            File::put($path, gzencode($xml));
+        }
+        $sources = new NzbSourceGuard($nzb);
+        $this->app->instance(NzbSourceGuard::class, $sources);
+        $snapshot = $sources->snapshot($release->guid);
+        $this->assertNotNull($snapshot);
+
+        return $snapshot;
     }
 
     private function makeManager(?NameFixingService $nameFixing = null): ReleaseFileManager
@@ -3408,6 +3554,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
     private function createSchema(): void
     {
 
+        Schema::dropIfExists('release_archive_naming_evidence');
         Schema::dropIfExists('par_hashes');
         Schema::dropIfExists('release_files');
         Schema::dropIfExists('releases');
@@ -3417,7 +3564,6 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             $table->string('guid');
             $table->string('name')->default('');
             $table->string('searchname')->default('');
-            $table->json('additional_pack_evidence')->nullable();
             $table->unsignedBigInteger('size')->default(0);
             $table->unsignedInteger('groups_id')->default(0);
             $table->integer('nfostatus')->default(0);
@@ -3455,6 +3601,7 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             $table->string('hash', 32);
             $table->primary(['releases_id', 'hash']);
         });
+        (require database_path('migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
     }
 }
 

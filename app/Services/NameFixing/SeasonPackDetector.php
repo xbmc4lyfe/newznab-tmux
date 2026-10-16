@@ -13,7 +13,7 @@ namespace App\Services\NameFixing;
  */
 final class SeasonPackDetector
 {
-    /** S01, S1, S2024, S01-S03, S01-03, S01D1, S01.Disc.2 between separators */
+    /** S01, S1, S01-S03, S01-03, S01D1, S01.Disc.2 between separators */
     private const string SEASON_TOKEN_REGEX = '/(?:^|[._ \-\[(])S\d{1,4}(?:[._ ]?D(?:is[ck])?[._ ]?\d{1,2})?(?=$|[._ \-\])])/i';
 
     /** Season.1, Season 2, Seasons.1-3 */
@@ -22,14 +22,19 @@ final class SeasonPackDetector
     /** Complete.Series, Complete.Season */
     private const string COMPLETE_REGEX = '/(?:^|[._ \-\[(])Complete[._ ](?:Series|Seasons?)(?=$|[._ \-\])])/i';
 
-    /** S01E01, S01.E05, S01Episode.1, S01E01E02, S2024E01, 1x05, Episode.5, EP06, standalone E05 */
-    private const string EPISODE_REGEX = '/(?:^|[^a-z0-9])(?:S\d{1,4}[._ ]?E(?:pisode[._ ]?)?\d{1,4}(?!\d)|\d{1,2}x\d{2,3}(?![0-9a-z])|Episode[._ ]?\d{1,4}(?!\d)|EP?\d{2,3}(?![0-9a-z]))/i';
+    /** Potential episode markers include compound/oversized forms; admission parses strictly below. */
+    private const string EPISODE_REGEX = '/(?:^|[^a-z0-9])(?:S\d+[._ ]?E\d+|\d{1,2}x\d{2,}(?=$|[^a-z0-9]|[exs]\d)|Episode[._ ]?\d{1,4}(?!\d)|EP?\d{2,3}(?![0-9a-z]))/i';
 
-    /** Show prefix, explicit season, first episode (E01 or Episode.1), extra episodes and the rest */
-    private const string EPISODE_SPLIT_REGEX = '/^(?<prefix>.+?)(?<sep>[._ \-]+)S(?<season>\d{1,4})[._ ]?E(?:pisode[._ ]?)?(?<episode>\d{1,4})(?:[._\-]?E\d{1,4}|-\d{1,4}(?=$|[._ ]))*(?!\d)(?<rest>.*)$/i';
+    /** Show prefix, separator, season, first episode, extra episodes (E02, -E03, -03) and the rest */
+    private const string EPISODE_SPLIT_REGEX = '/^(?<prefix>.+?)(?<sep>[._ \-]+)S(?<season>\d{1,4})[._ ]?E(?<episode>\d{1,4})(?!\d)(?:[._\-]?E\d{1,4}|-\d{1,4}(?=$|[._ ]))*(?<rest>.*)$/i';
 
-    /** Explicit season and episode in 1x01 notation, including ranges such as 1x01-03 */
-    private const string X_EPISODE_SPLIT_REGEX = '/^(?<prefix>.+?)(?<sep>[._ \-]+)(?<season>\d{1,2})x(?<episode>\d{2,3})(?:-\d{2,3}(?=$|[._ ]))*(?![a-z0-9])(?<rest>.*)$/i';
+    private const string X_EPISODE_SPLIT_REGEX = '/^(?<prefix>.+?)(?<sep>[._ \-]+)(?<season>\d{1,2})x(?<episode>\d{2,3})(?![0-9a-z])(?<rest>.*)$/i';
+
+    /** Admission must inspect the unconsumed suffix, unlike season-title derivation. */
+    private const string SINGLE_EPISODE_SPLIT_REGEX = '/^(?<prefix>.+?)[._ \-]+(?:S(?<season>\d{1,4})[._ ]?E(?<episode>\d{1,4})|(?<xseason>\d{1,2})x(?<xepisode>\d{2,3}))(?!\d)(?<rest>.*)$/i';
+
+    /** A separate season token; S01.E01 is an episode, not an explicit pack. */
+    private const string ADMISSION_SEASON_TOKEN_REGEX = '/(?:^|[._ \-\[(])S\d{1,4}(?!\d)(?![._ ]?E\d)(?:[._ ]?D(?:is[ck])?[._ ]?\d{1,2})?(?=$|[._ \-\])])/i';
 
     /** A token where the release information starts; an episode title ends before it */
     private const string RELEASE_INFO_TOKEN_REGEX = '/^(?:\d{3,4}[pi]|4k|uhd|hdr(?:10)?(?:plus)?|dv|sdr|web|webrip|webdl|bluray|blu|bd|bdrip|bdremux|brrip|remux|dvd|dvdrip|dvdr|dvd5|dvd9|hdtv|pdtv|sdtv|hdrip|dsr|amzn|nf|dsnp|hmax|atvp|hulu|pcok|pmtp|stan|crav|x26[45]|h26[45]|hevc|avc|xvid|divx|10bit|8bit|aac\d*|e?ac3|ddp?\d*|dts|truehd|atmos|flac|proper|repack\d*|rerip|internal|multi|dual|subbed|dubbed|extended|uncut|german|french|spanish|italian|dutch|nordic|swedish|danish|finnish|norwegian|polish|russian|hindi|japanese|korean)$/i';
@@ -61,6 +66,15 @@ final class SeasonPackDetector
         return preg_match(self::EPISODE_REGEX, $name) === 1;
     }
 
+    /** Recognized episode markers without enough information to infer a season safely. */
+    public static function isUnclassifiedEpisodeName(string $name): bool
+    {
+        $base = self::baseName($name);
+
+        return preg_match(self::SAMPLE_REGEX, $base) !== 1
+            && self::isEpisodeName($base) && self::parseEpisode($name) === null;
+    }
+
     /**
      * Whether the file names are at least two distinct episodes of one show.
      *
@@ -69,6 +83,111 @@ final class SeasonPackDetector
     public static function isMultiEpisodeSet(array $names): bool
     {
         return self::parseEpisodeSet($names) !== null;
+    }
+
+    /**
+     * Naming admission needs one episode identity, even when different shows
+     * cannot supply the common title required by seasonNameFromEpisodes().
+     * Different encodes or ancillary files for the same episode remain one.
+     *
+     * @param  list<string>  $names
+     */
+    public static function hasDistinctEpisodeIdentities(array $names): bool
+    {
+        $first = null;
+        foreach ($names as $name) {
+            $episode = self::parseEpisode($name);
+            if ($episode === null) {
+                continue;
+            }
+            $identity = $episode['key'].':'.$episode['season'].':'.$episode['episode'];
+            if ($first !== null && $first !== $identity) {
+                return true;
+            }
+            $first = $identity;
+        }
+
+        return false;
+    }
+
+    public static function episodeIdentity(string $name): ?string
+    {
+        $base = self::baseName($name);
+        if ($base === '' || preg_match(self::SAMPLE_REGEX, $base) === 1 || self::hasExplicitPackMarker($base)
+            || preg_match(self::SINGLE_EPISODE_SPLIT_REGEX, $base, $match) !== 1) {
+            return null;
+        }
+        $rest = $match['rest'];
+        if (self::isEpisodeName($match['prefix']) || self::isEpisodeName($rest)
+            || preg_match('/^[a-z0-9]/i', $rest) === 1
+            || preg_match('/(?:^|[^a-z0-9])(?:S\d+[._ ]?E\d+|E(?:pisode|P)?[._ ]?\d+)/i', $rest) === 1
+            || self::hasXEpisodeContinuation($rest)
+            || preg_match('/^[._ ]*(?:[-+&,]|–|—|(?:to|through)[._ ]+)[._ ]*\d+(?=$|[^a-z0-9])/i', $rest) === 1) {
+            return null;
+        }
+        $prefix = strtolower(trim((string) preg_replace('/[._ \-]+/', '.', $match['prefix']), '.'));
+        if ($prefix === '') {
+            return null;
+        }
+        $season = $match['season'] !== '' ? $match['season'] : $match['xseason'];
+        $episode = $match['episode'] !== '' ? $match['episode'] : $match['xepisode'];
+
+        return $prefix.':'.(int) $season.':'.(int) $episode;
+    }
+
+    private static function hasXEpisodeContinuation(string $rest): bool
+    {
+        // Keep the whole token: x264/x265 are codecs, but x02 and x264E02
+        // cannot become codecs by accepting only an initial numeric prefix.
+        preg_match_all('/(?:^|[^a-z0-9])(x\d+[^._ \-\[\](){}]*)/i', $rest, $matches);
+        foreach ($matches[1] as $token) {
+            if (preg_match(self::RELEASE_INFO_TOKEN_REGEX, $token) !== 1) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /** Explicit pack/compound evidence cannot become an opaque canonical singleton.
+     *
+     * @param  list<string>  $names
+     */
+    public static function hasNonSingleEpisodeEvidence(array $names): bool
+    {
+        foreach ($names as $name) {
+            $base = self::baseName($name);
+            if (preg_match(self::SAMPLE_REGEX, $base) === 1) {
+                continue;
+            }
+            if (self::hasExplicitPackMarker($base)
+                || (self::isEpisodeName($base) && self::episodeIdentity($name) === null)) {
+                return true;
+            }
+        }
+
+        return self::hasDistinctEpisodeIdentities($names);
+    }
+
+    private static function hasExplicitPackMarker(string $base): bool
+    {
+        return preg_match(self::ADMISSION_SEASON_TOKEN_REGEX, $base) === 1
+            || preg_match(self::SEASON_WORD_REGEX, $base) === 1
+            || preg_match(self::COMPLETE_REGEX, $base) === 1;
+    }
+
+    /** Only explicit metadata/subtitle/artwork and sample conventions are ancillary. */
+    public static function isAncillaryName(string $name): bool
+    {
+        if (preg_match(self::SAMPLE_REGEX, self::baseName($name)) === 1) {
+            return true;
+        }
+        $base = basename(str_replace('\\', '/', trim($name)));
+
+        // A narrow subset of FileNameCleaner's metadata/subtitle suffixes and
+        // ProcessingConfiguration's support files. Unknown suffixes, archives,
+        // documents and extensionless names remain possible episode payloads.
+        return preg_match('/\.(?:nfo|sfv|nzb|srr|srs|par2|jpe?g|png|gif|bmp|tiff?|webp|txt|diz|md5|sha1|cue|log|srt|sub|idx|ass|ssa|vtt|sup)$/i', $base) === 1;
     }
 
     /**
@@ -198,7 +317,8 @@ final class SeasonPackDetector
             return null;
         }
         if (preg_match(self::EPISODE_SPLIT_REGEX, $base, $match) !== 1
-            && preg_match(self::X_EPISODE_SPLIT_REGEX, $base, $match) !== 1) {
+            && preg_match(self::X_EPISODE_SPLIT_REGEX, $base, $match) !== 1
+        ) {
             return null;
         }
 

@@ -858,6 +858,7 @@ class CbpCleanupServiceTest extends TestCase
             title VARCHAR(255),
             filename VARCHAR(255)
         )');
+        (require database_path('migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
         DB::table('usenet_groups')->insert(['id' => 1, 'name' => 'alt.test']);
         DB::table('categories')->insert(['id' => 1, 'title' => 'Misc', 'parent_categories_id' => null]);
     }

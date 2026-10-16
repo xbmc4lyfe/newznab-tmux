@@ -67,7 +67,24 @@ final readonly class AdditionalWorkPlanner
                     $sevenZipTails[$volume[0]] = [$volume[1], (string) $segments[array_key_last($segments)]];
                 }
 
-                if (preg_match(self::ARCHIVE_PATTERN, $title) === 1) {
+                // HJSplit-style pieces of a video (name.mkv.001) are usually plain media, but may
+                // hide an archive: only the first article of the first piece is checked, by its data.
+                $mediaSplit = $this->mediaSplitVolume($title);
+                if ($mediaSplit !== null) {
+                    $messageIds = $mediaSplit <= 1
+                        ? $this->extractSegments($segments, 1, $seenMessageIds, $duplicateMessageIdCount)
+                        : [];
+                    if ($messageIds !== []) {
+                        $archiveCandidates[] = new ArchiveCandidate(
+                            title: $title,
+                            messageIds: $messageIds,
+                            likelyFirstVolume: true,
+                            sourceIndex: $sourceIndex,
+                            hasFirstSegment: ($file['firstsegment'] ?? true) !== false,
+                            setKey: $this->archiveSetKey($title),
+                        );
+                    }
+                } elseif (preg_match(self::ARCHIVE_PATTERN, $title) === 1) {
                     $archiveMessageIds = $this->extractSegments(
                         $segments,
                         $this->config->maximumRarSegments,
@@ -403,30 +420,12 @@ final readonly class AdditionalWorkPlanner
     }
 
     /**
-     * Name shared by every volume of one archive set (Show.S01E01.part01.rar and
+     * Key shared by every volume of one archive set (Show.S01E01.part01.rar and
      * Show.S01E01.part02.rar), so a season pack packed per episode can be read set by set.
      */
     private function archiveSetKey(string $title): string
     {
-        $volume = $this->rarVolume($title) ?? $this->sevenZipVolume($title) ?? $this->numberedVolume($title);
-        if ($volume !== null) {
-            return $volume[0];
-        }
-
-        [$zipName, $zipPrefix] = preg_match('/"([^"\r\n]+)"/', $title, $quotedZip) === 1
-            ? [$quotedZip[1], '^(.+)']
-            : [(string) preg_replace('/^\[[0-9]+\/[0-9]+\][ \t]+-[ \t]+(?=[^ \t])/', '', $title), '^([^"\r\n]+)'];
-        if (preg_match('/'.$zipPrefix.'\.(?:zipx?|zipr\d{2,3}|z\d{2,3})(?:$|[ ")-])/i', $zipName, $zip) === 1) {
-            return strtolower($zip[1]);
-        }
-
-        if (preg_match('/"([a-f0-9]{32})\.[1-9]\d{1,2}"/i', $title, $hashed) === 1) {
-            return strtolower($hashed[1]);
-        }
-
-        $name = preg_match('/"([^"\r\n]+)"/', $title, $quoted) === 1 ? $quoted[1] : $title;
-
-        return strtolower((string) preg_replace('/\.(?:zipx?|zipr\d{2,3}|z\d{2,3}|rar|r\d{2,3}|7z|\d{3})$/i', '', trim($name)));
+        return ArchiveCandidate::volumeSetKey($title);
     }
 
     /**
@@ -449,6 +448,15 @@ final readonly class AdditionalWorkPlanner
         }
 
         return null;
+    }
+
+    private function mediaSplitVolume(string $title): ?int
+    {
+        if (preg_match('/'.$this->config->videoFileRegex.'\.(?<volume>\d{3})$/i', ArchiveCandidate::fileName($title), $match) !== 1) {
+            return null;
+        }
+
+        return (int) $match['volume'];
     }
 
     private function hasFileExtension(string $title): bool

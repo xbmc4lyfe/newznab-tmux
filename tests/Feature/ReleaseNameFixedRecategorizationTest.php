@@ -69,6 +69,7 @@ class ReleaseNameFixedRecategorizationTest extends TestCase
         $this->createSchema();
         $migration = require base_path('database/migrations/2026_10_11_215821_create_par2_rename_progress_table.php');
         $migration->up();
+        (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
     }
 
     protected function tearDown(): void
@@ -394,6 +395,19 @@ class ReleaseNameFixedRecategorizationTest extends TestCase
                 $table->json('additional_pack_evidence')->nullable();
                 $table->string('additional_pp_claim_token')->nullable();
                 $table->timestamp('additional_pp_claimed_at')->nullable();
+            });
+        }
+
+        if (! Schema::hasTable('release_files')) {
+            Schema::create('release_files', function (Blueprint $table): void {
+                $table->unsignedInteger('releases_id');
+                $table->string('name');
+                $table->unsignedBigInteger('size')->default(0);
+                $table->string('crc32')->default('');
+                $table->timestamp('created_at')->nullable();
+                $table->timestamp('updated_at')->nullable();
+                $table->boolean('passworded')->default(false);
+                $table->primary(['releases_id', 'name']);
             });
         }
     }

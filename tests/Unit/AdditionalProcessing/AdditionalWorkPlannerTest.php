@@ -6,155 +6,13 @@ namespace Tests\Unit\AdditionalProcessing;
 
 use App\Services\AdditionalProcessing\AdditionalWorkPlanner;
 use App\Services\AdditionalProcessing\DTO\ArchiveCandidate;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 
 class AdditionalWorkPlannerTest extends TestCase
 {
     use CreatesProcessingConfiguration;
-
-    #[Test]
-    public function it_groups_zip_volumes_after_leading_posting_counters_without_losing_the_filename(): void
-    {
-        $planner = new AdditionalWorkPlanner($this->makeConfig());
-        foreach ([
-            ['Show.S01E01', 'Show.S01E02', 'show.s01e01', 'show.s01e02'],
-            ['Show.One S01E01', 'Show.Two S01E01', 'show.one s01e01', 'show.two s01e01'],
-            ['Show.zip Episode1', 'Show.zip Episode2', 'show.zip episode1', 'show.zip episode2'],
-            ['Show.zip-Episode1', 'Show.zip-Episode2', 'show.zip-episode1', 'show.zip-episode2'],
-        ] as [$one, $two, $oneKey, $twoKey]) {
-            $contents = [
-                ['title' => '[01/04] - '.$one.'.zip yEnc (1/4)', 'segments' => ['<one>']],
-                ['title' => "[02/04]\t-\t".$one.'.z01 yEnc (1/4)', 'segments' => ['<one-next>']],
-                ['title' => '[03/04] - '.$two.'.zip yEnc (1/4)', 'segments' => ['<two>']],
-                ['title' => '[04/04] - '.$two.'.z01 yEnc (1/4)', 'segments' => ['<two-next>']],
-            ];
-            $plan = $planner->plan($contents, 'alt.binaries.test');
-
-            self::assertSame([$oneKey, $oneKey, $twoKey, $twoKey], array_map(
-                static fn (ArchiveCandidate $candidate): string => $candidate->setKey,
-                $plan->archiveCandidates,
-            ));
-            self::assertSame(2, $plan->archiveSetCount());
-            self::assertSame(1, $planner->plan(array_slice($contents, 0, 2), 'alt.binaries.test')->archiveSetCount());
-            self::assertSame(array_column($contents, 'title'), array_map(
-                static fn (ArchiveCandidate $candidate): string => $candidate->title,
-                $plan->archiveCandidates,
-            ));
-        }
-    }
-
-    #[Test]
-    public function it_preserves_posting_counter_text_inside_quoted_zip_filenames(): void
-    {
-        $plan = (new AdditionalWorkPlanner($this->makeConfig()))->plan([
-            ['title' => '[01/04] - "[01/02] - Show.S01E01.zip" yEnc', 'segments' => ['<one>']],
-            ['title' => '[02/04] - "[01/02] - Show.S01E01.z01" yEnc', 'segments' => ['<one-next>']],
-            ['title' => '"[02/02] - Show.S01E01.zip" yEnc', 'segments' => ['<two>']],
-            ['title' => '"[02/02] - Show.S01E01.z01" yEnc', 'segments' => ['<two-next>']],
-        ], 'alt.binaries.test');
-
-        self::assertSame([
-            '[01/02] - show.s01e01', '[01/02] - show.s01e01',
-            '[02/02] - show.s01e01', '[02/02] - show.s01e01',
-        ], array_map(static fn (ArchiveCandidate $candidate): string => $candidate->setKey, $plan->archiveCandidates));
-        self::assertSame(2, $plan->archiveSetCount());
-    }
-
-    #[Test]
-    public function it_preserves_unrecognized_or_nonanchored_zip_posting_prefixes(): void
-    {
-        $planner = new AdditionalWorkPlanner($this->makeConfig());
-        foreach ([
-            ['[part/04] - Show.S01E01.zip', '[part/04] - show.s01e01'],
-            ['[01/total] - Show.S01E01.zip', '[01/total] - show.s01e01'],
-            ['prefix [01/04] - Show.S01E01.zip', 'prefix [01/04] - show.s01e01'],
-            [' [01/04] - Show.S01E01.zip', ' [01/04] - show.s01e01'],
-            ['[01/04]-Show.S01E01.zip', '[01/04]-show.s01e01'],
-            ['[01/04] -Show.S01E01.zip', '[01/04] -show.s01e01'],
-        ] as [$title, $key]) {
-            $plan = $planner->plan([['title' => $title, 'segments' => ['<first>']]], 'alt.binaries.test');
-
-            self::assertCount(1, $plan->archiveCandidates);
-            self::assertSame($key, $plan->archiveCandidates[0]->setKey);
-            self::assertSame($title, $plan->archiveCandidates[0]->title);
-        }
-    }
-
-    #[Test]
-    public function it_keeps_distinct_zip_names_with_spaces_separate(): void
-    {
-        $planner = new AdditionalWorkPlanner($this->makeConfig());
-        foreach ([['Show.One S01E01', 'Show.Two S01E01'], ['Show.zip Episode1', 'Show.zip Episode2']] as [$one, $two]) {
-            foreach ([false, true] as $quoted) {
-                $quote = $quoted ? '"' : '';
-                $plan = $planner->plan([
-                    ['title' => $quote.$one.'.zip'.$quote.' yEnc (1/4)', 'segments' => ['<one>']],
-                    ['title' => $quote.$one.'.z01'.$quote.' yEnc (1/4)', 'segments' => ['<one-next>']],
-                    ['title' => $quote.$two.'.zip'.$quote.' yEnc (1/4)', 'segments' => ['<two>']],
-                    ['title' => $quote.$two.'.z01'.$quote.' yEnc (1/4)', 'segments' => ['<two-next>']],
-                ], 'alt.binaries.test');
-                $keys = [];
-                foreach ($plan->archiveCandidates as $candidate) {
-                    $keys[$candidate->messageIds[0]] = $plan->setKeyOf($candidate);
-                }
-                self::assertSame($keys['<one>'], $keys['<one-next>']);
-                self::assertSame($keys['<two>'], $keys['<two-next>']);
-                self::assertNotSame($keys['<one>'], $keys['<two>']);
-                self::assertSame(2, $plan->archiveSetCount());
-            }
-        }
-    }
-
-    #[Test]
-    public function it_groups_zip_volumes_before_subject_trailers(): void
-    {
-        $planner = new AdditionalWorkPlanner($this->makeConfig());
-        foreach ([false, true] as $quoted) {
-            $quote = $quoted ? '"' : '';
-            $plan = $planner->plan([
-                ['title' => $quote.'Show.S01E01.zip'.$quote.' yEnc (1/4)', 'segments' => ['<first>']],
-                ['title' => $quote.'Show.S01E01.z01'.$quote.' yEnc (1/4)', 'segments' => ['<next>']],
-                ['title' => $quote.'Show.S01E02.zip'.$quote.' yEnc (1/4)', 'segments' => ['<other>']],
-                ['title' => $quote.'Show.S01E02.z01'.$quote.' yEnc (1/4)', 'segments' => ['<other-next>']],
-            ], 'alt.binaries.test');
-            $keys = [];
-            foreach ($plan->archiveCandidates as $candidate) {
-                $keys[$candidate->messageIds[0]] = $plan->setKeyOf($candidate);
-            }
-            self::assertSame($keys['<first>'], $keys['<next>']);
-            self::assertSame($keys['<other>'], $keys['<other-next>']);
-            self::assertNotSame($keys['<first>'], $keys['<other>']);
-            self::assertSame(2, $plan->archiveSetCount());
-        }
-    }
-
-    #[Test]
-    public function it_uses_one_set_identity_for_numbered_subjects_without_merging_distinct_names_or_families(): void
-    {
-        $planner = new AdditionalWorkPlanner($this->makeConfig());
-        foreach ([true, false] as $quoted) {
-            $quote = $quoted ? '"' : '';
-            $plan = $planner->plan([
-                ['title' => $quote.'opaque.001'.$quote.' yEnc (1/50)', 'segments' => ['<a-first>']],
-                ['title' => $quote.'opaque.010'.$quote.' yEnc (1/50)', 'segments' => ['<a-last>']],
-                ['title' => $quote.'other.001'.$quote.' yEnc (1/50)', 'segments' => ['<b-first>']],
-                ['title' => $quote.'other.010'.$quote.' yEnc (1/50)', 'segments' => ['<b-last>']],
-                ['title' => 'opaque.part01.rar yEnc (1/50)', 'segments' => ['<rar>']],
-                ['title' => 'opaque.7z.001 yEnc (1/50)', 'segments' => ['<7z>']],
-            ], 'alt.binaries.test');
-            $keys = [];
-            foreach ($plan->archiveCandidates as $candidate) {
-                $keys[$candidate->messageIds[0]] = $plan->setKeyOf($candidate);
-            }
-            self::assertSame($keys['<a-first>'], $keys['<a-last>']);
-            self::assertSame($keys['<b-first>'], $keys['<b-last>']);
-            self::assertNotSame($keys['<a-first>'], $keys['<b-first>']);
-            self::assertNotSame($keys['<a-first>'], $keys['<rar>']);
-            self::assertNotSame($keys['<a-first>'], $keys['<7z>']);
-            self::assertSame(3, $plan->archiveSetCount());
-        }
-    }
 
     #[Test]
     public function it_builds_one_ordered_plan_for_direct_and_archive_candidates(): void
@@ -572,11 +430,11 @@ class AdditionalWorkPlannerTest extends TestCase
         ], 'alt.binaries.test');
 
         $this->assertSame(
-            ['show.s01e01.1080p-grp', 'show.s01e01.1080p-grp', 'show.s01e02.1080p-grp', 'show.s01e02.1080p-grp', 'show.s01e03.1080p-grp', 'subs'],
+            ['rar:show.s01e01.1080p-grp', 'rar:show.s01e01.1080p-grp', 'rar:show.s01e02.1080p-grp', 'rar:show.s01e02.1080p-grp', '7z:show.s01e03.1080p-grp', 'zip:subs'],
             $keys($episodes->archiveCandidates),
         );
         $this->assertSame(4, $episodes->archiveSetCount());
-        $this->assertSame(['0123456789abcdef0123456789abcdef', '0123456789abcdef0123456789abcdef'], $keys($hashed->archiveCandidates));
+        $this->assertSame(['split:0123456789abcdef0123456789abcdef', 'split:0123456789abcdef0123456789abcdef'], $keys($hashed->archiveCandidates));
         $this->assertSame(1, $hashed->archiveSetCount());
     }
 
@@ -591,7 +449,171 @@ class AdditionalWorkPlannerTest extends TestCase
         ], 'alt.binaries.test');
 
         foreach ($plan->prioritizedArchiveCandidates() as $candidate) {
-            $this->assertSame('show.s01e01', $candidate->setKey);
+            $this->assertSame('rar:show.s01e01', $candidate->setKey);
+        }
+    }
+
+    #[Test]
+    public function it_checks_only_the_first_article_of_a_split_video_and_keeps_numbered_archives(): void
+    {
+        $planner = new AdditionalWorkPlanner($this->makeConfig(['processMediaInfo' => true]));
+
+        $split = $planner->plan([
+            ['title' => '"Movie.2026.mkv.002" yEnc (1/80)', 'segments' => ['<m2-1>']],
+            ['title' => '"Movie.2026.mkv.001" yEnc (1/80)', 'segments' => ['<m1-1>', '<m1-2>']],
+        ], 'alt.binaries.test');
+        $archives = $planner->plan([
+            ['title' => '"Movie.2026.7z.001" yEnc (1/80)', 'segments' => ['<z1>']],
+            ['title' => '"Movie.2026.001" yEnc (1/80)', 'segments' => ['<n1>']],
+        ], 'alt.binaries.test');
+
+        $this->assertCount(1, $split->archiveCandidates);
+        $this->assertSame('"Movie.2026.mkv.001" yEnc (1/80)', $split->archiveCandidates[0]->title);
+        $this->assertSame(['<m1-1>'], $split->archiveCandidates[0]->messageIds);
+        $this->assertSame('split:movie.2026.mkv', $split->archiveCandidates[0]->volumeSet());
+        $this->assertSame('', $split->mediaInfoMessageId);
+        $this->assertSame(
+            ['"Movie.2026.7z.001" yEnc (1/80)', '"Movie.2026.001" yEnc (1/80)'],
+            array_map(static fn (ArchiveCandidate $candidate): string => $candidate->title, $archives->archiveCandidates),
+        );
+        $this->assertSame('', $archives->mediaInfoMessageId);
+    }
+
+    #[Test]
+    public function it_checks_a_split_video_when_a_sample_has_the_mediainfo_or_only_passwords_are_checked(): void
+    {
+        $contents = [
+            ['title' => '"Movie.2026.sample.mkv" yEnc (1/5)', 'segments' => ['<s-1>']],
+            ['title' => '"Movie.2026.mkv.001" yEnc (1/80)', 'segments' => ['<m1-1>', '<m1-2>']],
+        ];
+
+        foreach ([['processMediaInfo' => true], ['processPasswords' => true]] as $settings) {
+            $plan = (new AdditionalWorkPlanner($this->makeConfig($settings)))->plan($contents, 'alt.binaries.test');
+
+            $this->assertTrue($plan->hasCompressedFile());
+            $this->assertSame(['<m1-1>'], $plan->archiveCandidates[0]->messageIds);
+        }
+    }
+
+    /**
+     * @return array<string, array{string, string}>
+     */
+    public static function volumeNames(): array
+    {
+        return [
+            'RAR part' => ['Movie.2026.part01.rar', 'rar:movie.2026'],
+            'RAR old-style' => ['Movie.2026.r00', 'rar:movie.2026'],
+            '7z volume' => ['Movie.2026.7z.002', '7z:movie.2026'],
+            'ZIP' => ['Movie.2026.zip', 'zip:movie.2026'],
+            'ZIP volume' => ['Movie.2026.z01', 'zip:movie.2026'],
+            'split video' => ['Movie.2026.mkv.001', 'split:movie.2026.mkv'],
+            'spaced RAR part' => ['First Movie.part01.rar', 'rar:first movie'],
+            'spaced ZIP volume' => ['First Movie.z01', 'zip:first movie'],
+            'spaced 7z volume' => ['First Movie.7z.001', '7z:first movie'],
+            'spaced split video' => ['First Movie.mkv.001', 'split:first movie.mkv'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('volumeNames')]
+    public function it_keys_quoted_and_unquoted_subjects_alike(string $name, string $key): void
+    {
+        $subjects = [
+            '"'.$name.'" yEnc (1/50)',
+            $name.' yEnc (1/50)',
+            $name.' (1/50)',
+            strtoupper($name).' - yEnc (01/50)',
+            '[01/10] - '.$name.' yEnc',
+            '[01/10] - "'.$name.'" yEnc (1/50)',
+        ];
+
+        foreach ($subjects as $subject) {
+            $this->assertSame(strtolower($name), ArchiveCandidate::fileName($subject), $subject);
+            $this->assertSame($key, ArchiveCandidate::volumeSetKey($subject), $subject);
+        }
+    }
+
+    #[Test]
+    public function it_keeps_unquoted_names_that_differ_before_their_last_space_apart(): void
+    {
+        $this->assertSame('first movie.rar', ArchiveCandidate::fileName('First Movie.rar yEnc (1/50)'));
+        $this->assertSame('rar:first movie', ArchiveCandidate::volumeSetKey('First Movie.rar yEnc (1/50)'));
+        $this->assertSame('rar:second movie', ArchiveCandidate::volumeSetKey('Second Movie.rar yEnc (1/50)'));
+        $this->assertSame('rar:other post - movie.2026', ArchiveCandidate::volumeSetKey('Other Post - Movie.2026.part01.rar - yEnc (01/50)'));
+        $this->assertSame('rar:movie (1 of 2) extras', ArchiveCandidate::volumeSetKey('Movie (1 of 2) Extras.rar yEnc (1/50)'));
+        $this->assertSame('rar:movie (2 of 2) extras', ArchiveCandidate::volumeSetKey('Movie (2 of 2) Extras.rar yEnc (1/50)'));
+    }
+
+    #[Test]
+    public function it_groups_unquoted_volumes_whose_subjects_differ_only_in_post_counters(): void
+    {
+        $subjects = [
+            'Group Post - Movie.2026.part01.rar - yEnc (01/50)',
+            'Group Post - Movie.2026.part02.rar - yEnc (02/50)',
+            'Group Post [01/10] - Movie.2026.part01.rar yEnc (1/50)',
+            'Group Post [02/10] - Movie.2026.part02.rar yEnc (1/50)',
+        ];
+
+        $this->assertSame(
+            ['rar:group post - movie.2026', 'rar:group post - movie.2026', 'rar:group post movie.2026', 'rar:group post movie.2026'],
+            array_map(ArchiveCandidate::volumeSetKey(...), $subjects),
+        );
+    }
+
+    #[Test]
+    public function it_groups_only_genuine_sibling_volumes_of_one_archive_family(): void
+    {
+        $planner = new AdditionalWorkPlanner($this->makeConfig());
+        $titles = [
+            'Movie.2026.part01.rar yEnc (1/50)',
+            '"Movie.2026.part02.rar" yEnc (1/50)',
+            '"Movie.2026.rar" yEnc (1/50)',
+            'Movie.2026.r00 yEnc (1/50)',
+            '"Movie.2026.zip" yEnc (1/50)',
+            'Movie.2026.z01 yEnc (1/50)',
+            '"Movie.2026.7z.001" yEnc (1/50)',
+            'Movie.2026.mkv.001 yEnc (1/80)',
+        ];
+
+        $plan = $planner->plan(array_map(
+            static fn (string $title, int $index): array => ['title' => $title, 'segments' => ['<a'.$index.'>']],
+            $titles,
+            array_keys($titles),
+        ), 'alt.binaries.test');
+        $keys = [];
+        foreach ($plan->archiveCandidates as $candidate) {
+            $keys[$candidate->title] = $candidate->setKey;
+            $this->assertSame($candidate->setKey, $candidate->volumeSet());
+        }
+
+        $this->assertSame([
+            'Movie.2026.part01.rar yEnc (1/50)' => 'rar:movie.2026',
+            '"Movie.2026.part02.rar" yEnc (1/50)' => 'rar:movie.2026',
+            '"Movie.2026.rar" yEnc (1/50)' => 'rar:movie.2026',
+            'Movie.2026.r00 yEnc (1/50)' => 'rar:movie.2026',
+            '"Movie.2026.zip" yEnc (1/50)' => 'zip:movie.2026',
+            'Movie.2026.z01 yEnc (1/50)' => 'zip:movie.2026',
+            '"Movie.2026.7z.001" yEnc (1/50)' => '7z:movie.2026',
+            'Movie.2026.mkv.001 yEnc (1/80)' => 'split:movie.2026.mkv',
+        ], $keys);
+        $this->assertSame(4, $plan->archiveSetCount());
+    }
+
+    #[Test]
+    public function it_plans_an_unquoted_split_video_like_a_quoted_one(): void
+    {
+        $planner = new AdditionalWorkPlanner($this->makeConfig(['processPasswords' => true]));
+
+        foreach (['Movie.2026.mkv.%03d yEnc (1/80)', '[%1$02d/80] - Movie.2026.mkv.%1$03d yEnc', '"Movie.2026.mkv.%03d" yEnc (1/80)'] as $format) {
+            $plan = $planner->plan([
+                ['title' => sprintf($format, 2), 'segments' => ['<m2-1>']],
+                ['title' => sprintf($format, 1), 'segments' => ['<m1-1>', '<m1-2>']],
+            ], 'alt.binaries.test');
+
+            $this->assertCount(1, $plan->archiveCandidates, $format);
+            $this->assertSame(sprintf($format, 1), $plan->archiveCandidates[0]->title);
+            $this->assertSame(['<m1-1>'], $plan->archiveCandidates[0]->messageIds);
+            $this->assertSame('split:movie.2026.mkv', $plan->archiveCandidates[0]->setKey);
         }
     }
 }

@@ -70,13 +70,6 @@ class VerifiedReleasePasswordMetadataTest extends ReleaseVerificationCandidatesT
         app('files')->ensureDirectoryExists(config('nntmux_settings.path_to_nzbs'));
         Schema::create('releases', function (Blueprint $table): void {
             $table->id();
-            $table->json('additional_pack_evidence')->nullable();
-            $table->string('additional_pp_claim_token')->nullable();
-            $table->timestamp('additional_pp_claimed_at')->nullable();
-            $table->timestamp('archive_retry_at')->nullable();
-            foreach (['proc_nfo', 'proc_files', 'proc_srr', 'proc_crc32', 'proc_uid', 'proc_par2', 'proc_hash16k', 'rarinnerfilecount', 'pp_timeout_count'] as $column) {
-                $table->integer($column)->default(0);
-            }
             $table->string('article_fingerprint')->nullable();
             foreach (['name', 'searchname', 'guid', 'leftguid', 'fromname', 'postdate', 'adddate'] as $column) {
                 $table->string($column);
@@ -85,11 +78,7 @@ class VerifiedReleasePasswordMetadataTest extends ReleaseVerificationCandidatesT
                 $table->integer($column);
             }
         });
-        foreach (['release_files', 'release_nfos', 'media_infos', 'par_hashes', 'par_file_hashes', 'par_file_hash_inventories', 'par2_hash_retry', 'par2_rename_progress', 'par2_descriptor_evidence'] as $table) {
-            Schema::create($table, static function (Blueprint $schema): void {
-                $schema->integer('releases_id')->primary();
-            });
-        }
+        (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
         Schema::create('release_regexes', function (Blueprint $table): void {
             $table->integer('releases_id');
             $table->integer('collection_regex_id');
@@ -289,6 +278,7 @@ class VerifiedReleasePasswordMetadataTest extends ReleaseVerificationCandidatesT
             $table->id();
             $table->string('guid');
         });
+        (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
         config(['nntmux_settings.path_to_nzbs' => config('release_verification.storage_path').'/snapshot-nzbs']);
         $guid = (string) Str::uuid();
         DB::table('releases')->insert(['id' => 33, 'guid' => $guid]);

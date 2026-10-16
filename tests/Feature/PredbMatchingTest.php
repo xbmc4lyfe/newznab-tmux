@@ -81,6 +81,7 @@ final class PredbMatchingTest extends TestCase
         DB::statement('CREATE TABLE releases (additional_pack_evidence TEXT DEFAULT NULL, id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, searchname TEXT, totalpart INTEGER, groups_id INTEGER, adddate TEXT, guid TEXT, leftguid TEXT, postdate TEXT, fromname TEXT, size INTEGER, passwordstatus INTEGER, haspreview INTEGER, categories_id INTEGER, nfostatus INTEGER, nzbstatus INTEGER DEFAULT 1, isrenamed INTEGER, iscategorized INTEGER, predb_id INTEGER)');
         DB::statement('PRAGMA foreign_keys = ON');
         (require base_path('database/migrations/2026_10_11_215821_create_par2_rename_progress_table.php'))->up();
+        (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
         DB::statement('CREATE TABLE usenet_groups (id INTEGER PRIMARY KEY, name TEXT)');
         DB::table('usenet_groups')->insert(['id' => 1, 'name' => 'alt.binaries.test']);
     }

@@ -47,7 +47,7 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         $collector = new ReleaseFingerprintCollector($nzb, new NzbFingerprintAnalyzer($yenc), new Par2MetadataParser, $yenc);
         (new CollectReleaseFingerprintMetadata(1))->handle($collector);
         self::assertSame('unavailable', ReleaseFingerprintMetadata::query()->findOrFail(1)->status);
-        foreach ([28, 29, 30, 31, 32, 33, 34, 35] as $schemaVersion) {
+        foreach ([28, 29, 30, 31, 32, 33, 34, 35, 36] as $schemaVersion) {
             ReleaseFingerprintMetadata::query()->findOrFail(1)->update(['status' => 'complete', 'metadata' => ['schema_version' => $schemaVersion]]);
             $nzb->shouldReceive('readNzbContents')->once()->with('qo-schema-fixture')->andReturn(false);
             (new CollectReleaseFingerprintMetadata(1))->handle($collector);
@@ -143,6 +143,58 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         self::assertSame('fast', $headers[3]['deflate_effort_class']);
         self::assertSame('resolved_extra_flags', $headers[3]['deflate_effort_status']);
         self::assertSame('ntfs_filesystem', $headers[3]['operating_system_name']);
+    }
+
+    #[Test]
+    public function it_exposes_rar4_first_file_header_metadata_through_yenc(): void
+    {
+        $rar4Block = static function (int $type, int $flags, string $bodyAfterSize): string {
+            $size = 7 + strlen($bodyAfterSize);
+            $body = chr($type).pack('vv', $flags, $size).$bodyAfterSize;
+            $crc16 = crc32($body) & 0xFFFF;
+
+            return pack('v', $crc16).$body;
+        };
+
+        $filename = 'scene-release.mkv';
+        $fileBody = pack('VV', 50_000_000, 50_000_000)
+            .chr(3)
+            .pack('VV', 0xDEAD_BEEF, 0x5421_1234)
+            .chr(29)
+            .chr(0x35)
+            .pack('vV', strlen($filename), 0x0020)
+            .$filename;
+        $sample = "Rar!\x1a\x07\x00"
+            .$rar4Block(0x73, 0x0001, str_repeat("\0", 6))
+            .$rar4Block(0x74, 0x00D2, $fileBody);
+
+        if ((new NativeMetadataParser)->parseFormats($sample) === null) {
+            self::markTestSkipped('Native Rust format metadata is required for RAR4 first file header integration.');
+        }
+
+        $body = YencArticles::article($sample);
+        $analysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], $body);
+        self::assertSame($sample, $analysis['decoded_bytes']);
+        $rar4 = $analysis['metadata']['decoded_format_metadata']['headers'][0];
+        self::assertSame('rar4', $rar4['format']);
+        self::assertSame('parsed', $rar4['first_file_header_status']);
+        self::assertSame(0x74, $rar4['next_block_type']);
+        $firstFile = $rar4['first_file'];
+        self::assertTrue($firstFile['checksum_valid']);
+        self::assertSame(50_000_000, $firstFile['compressed_size']);
+        self::assertSame(50_000_000, $firstFile['uncompressed_size']);
+        self::assertFalse($firstFile['uncompressed_size_unknown']);
+        self::assertSame('unix', $firstFile['host_os_name']);
+        self::assertSame(0xDEAD_BEEF, $firstFile['file_crc32']);
+        self::assertSame(29, $firstFile['unpack_version']);
+        self::assertSame('best', $firstFile['method_name']);
+        self::assertSame(4096 * 1024, $firstFile['dictionary_size_bytes']);
+        self::assertFalse($firstFile['is_directory']);
+        self::assertFalse($firstFile['split_before']);
+        self::assertTrue($firstFile['split_after']);
+        self::assertTrue($firstFile['solid']);
+        self::assertSame('scene-release.mkv', $firstFile['filename']);
+        self::assertSame('ascii', $firstFile['name_encoding']);
     }
 
     #[Test]

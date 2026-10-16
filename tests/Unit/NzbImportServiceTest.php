@@ -15,6 +15,7 @@ use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
 use PDO;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -23,6 +24,9 @@ use Tests\TestCase;
 final class NzbImportServiceTest extends TestCase
 {
     private string $databasePath;
+
+    /** @var list<string> */
+    private array $privateSourceRoots = [];
 
     /**
      * @var array<string, string|false>
@@ -80,6 +84,9 @@ final class NzbImportServiceTest extends TestCase
 
     protected function tearDown(): void
     {
+        foreach ($this->privateSourceRoots as $root) {
+            File::deleteDirectory($root);
+        }
         if ($this->databasePath !== '' && file_exists($this->databasePath)) {
             unlink($this->databasePath);
         }
@@ -89,6 +96,45 @@ final class NzbImportServiceTest extends TestCase
         foreach ($this->originalEnvironment as $key => $value) {
             $this->setEnvironmentValue($key, $value === false ? null : $value);
         }
+    }
+
+    private function preparePrivateImportSource(string $root, string $guid): string
+    {
+        $this->privateSourceRoots[] = $root;
+        $directory = $root.'/'.$guid[0];
+        mkdir($directory, 0700, true);
+        Schema::create('releases', static function (Blueprint $table): void {
+            $table->unsignedInteger('id')->primary();
+            $table->string('guid', 40);
+        });
+        (require __DIR__.'/../../database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php')->up();
+        DB::table('releases')->insert(['id' => 1, 'guid' => $guid]);
+        $nzb = \Mockery::mock(NzbService::class);
+        $nzb->shouldReceive('buildNzbPath')->andReturn($root.'/');
+        $nzb->shouldReceive('getNzbPath')->andReturn($directory.'/'.$guid.'.nzb.gz');
+        app()->instance(NzbService::class, $nzb);
+
+        return $directory;
+    }
+
+    public function test_compressed_nzb_without_its_release_row_is_not_installed(): void
+    {
+        $directory = $this->preparePrivateImportSource(sys_get_temp_dir().'/nzb-missing-row-'.bin2hex(random_bytes(5)), 'missing');
+        DB::table('releases')->delete();
+        $service = new class(['Browser' => true]) extends NzbImportService
+        {
+            public function writeForTest(string $path): bool
+            {
+                $this->relId = 1;
+                $this->relGuid = 'missing';
+
+                return $this->writeCompressedNzb($path, '<nzb />');
+            }
+        };
+
+        $this->assertFalse($service->writeForTest($directory.'/missing.nzb.gz'));
+        $this->assertSame([], array_values(array_diff(scandir($directory), ['.', '..'])));
+        $this->assertSame(0, DB::table('release_archive_naming_evidence')->count());
     }
 
     public function test_begin_import_uses_specific_messages_and_counts_duplicates_separately(): void
@@ -315,13 +361,16 @@ final class NzbImportServiceTest extends TestCase
     public function test_compressed_nzb_is_written_to_a_temporary_file_and_renamed_into_place(): void
     {
         $directory = sys_get_temp_dir().'/nzb-atomic-'.bin2hex(random_bytes(5));
-        mkdir($directory);
+        $directory = $this->preparePrivateImportSource($directory, 'stored');
         $service = new class(['Browser' => true]) extends NzbImportService
         {
             public bool $failRename = false;
 
             public function writeForTest(string $path, string $contents): bool
             {
+                $this->relId = 1;
+                $this->relGuid = basename($path, '.nzb.gz');
+
                 return $this->writeCompressedNzb($path, $contents);
             }
 
@@ -429,13 +478,16 @@ final class NzbImportServiceTest extends TestCase
     public function test_temporary_nzb_names_are_recognised_by_the_stale_temp_cleanup(): void
     {
         $directory = sys_get_temp_dir().'/nzb-tmpname-'.bin2hex(random_bytes(5));
-        mkdir($directory);
+        $directory = $this->preparePrivateImportSource($directory, 'x');
         $service = new class(['Browser' => true]) extends NzbImportService
         {
             public string $temporaryPath = '';
 
             public function writeForTest(string $path, string $contents): bool
             {
+                $this->relId = 1;
+                $this->relGuid = basename($path, '.nzb.gz');
+
                 return $this->writeCompressedNzb($path, $contents);
             }
 

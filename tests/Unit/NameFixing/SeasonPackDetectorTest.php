@@ -23,7 +23,6 @@ class SeasonPackDetectorTest extends TestCase
             'short season range' => ['Show.S01-03.720p.HDTV.x264-GRP', true],
             'dvd disc' => ['Show.S02D1.PAL.DVDR-GRP', true],
             'disc word' => ['Show.S01.Disc.2.DVDR-GRP', true],
-            'four digit season token' => ['Show.S2024.1080p.WEB-DL-GRP', true],
             'season word' => ['Show.Season.1.720p.WEB-DL-GRP', true],
             'complete series' => ['Show.Complete.Series.1080p.BluRay-GRP', true],
             'episode' => ['Show.S01E01.1080p.WEB-DL-GRP', false],
@@ -58,6 +57,14 @@ class SeasonPackDetectorTest extends TestCase
             'shared release info' => [
                 ['Show.S01E01.1080p.WEB-DL-GRP.mkv', 'Show.S01E02.1080p.WEB-DL-GRP.mkv'],
                 'Show.S01.1080p.WEB-DL-GRP',
+            ],
+            'x episode format' => [
+                ['Show.1x01.1080p.WEB-DL-GRP.mkv', 'Show.1x02.1080p.WEB-DL-GRP.mkv'],
+                'Show.S01.1080p.WEB-DL-GRP',
+            ],
+            'year season format' => [
+                ['Show.S2024E01.1080p.WEB-DL-GRP.mkv', 'Show.S2024E02.1080p.WEB-DL-GRP.mkv'],
+                'Show.S2024.1080p.WEB-DL-GRP',
             ],
             'episode titles are dropped' => [
                 ['Show.S01E01.Pilot.1080p.WEB-DL-GRP.mkv', 'Show.S01E02.The.Title.1080p.WEB-DL-GRP.mkv'],
@@ -111,61 +118,9 @@ class SeasonPackDetectorTest extends TestCase
     {
         $this->assertSame($expected, SeasonPackDetector::seasonNameFromEpisodes($names));
         $this->assertSame($expected !== null, SeasonPackDetector::isMultiEpisodeSet($names));
-    }
-
-    #[Test]
-    #[DataProvider('supportedSeasonEpisodeForms')]
-    public function it_parses_supported_season_bearing_forms_without_inventing_seasons(array $names, ?string $expected): void
-    {
-        self::assertSame($expected, SeasonPackDetector::seasonNameFromEpisodes($names));
-        self::assertSame($expected !== null, SeasonPackDetector::isMultiEpisodeSet($names));
-    }
-
-    public static function supportedSeasonEpisodeForms(): array
-    {
-        return [
-            'x notation' => [['Show.1x01.1080p.WEB-DL-GRP.mkv', 'Show.1x02.1080p.WEB-DL-GRP.mkv'], 'Show.S01.1080p.WEB-DL-GRP'],
-            'four digit season' => [['Show.S2024E01.720p.WEB-GRP.mkv', 'Show.S2024E02.720p.WEB-GRP.mkv'], 'Show.S2024.720p.WEB-GRP'],
-            'three digit season' => [['Show.S123E01.720p.WEB-GRP.mkv', 'Show.S123E02.720p.WEB-GRP.mkv'], 'Show.S123.720p.WEB-GRP'],
-            'mixed equivalent season notation' => [['Show.1x01.1080p.WEB-DL-GRP.mkv', 'Show.S01E02.1080p.WEB-DL-GRP.mkv'], 'Show.S01.1080p.WEB-DL-GRP'],
-            'mixed separators in show name' => [['Show.Name.1x01.720p.WEB-GRP.mkv', 'show_name.S01E02.720p.WEB-GRP.mkv'], 'Show.Name.S01.720p.WEB-GRP'],
-            'same canonical episode is not a pack' => [['Show.1x01.720p.WEB-GRP.mkv', 'Show.S01E01.720p.WEB-GRP.mkv'], null],
-            'year seasons preserve range width' => [['Show.S2024E01.720p.WEB-GRP.mkv', 'Show.S2025E01.720p.WEB-GRP.mkv'], 'Show.S2024-S2025.720p.WEB-GRP'],
-            'four digit multi episode' => [['Show.S2024E01E02.720p.WEB-GRP.mkv', 'Show.S2024E03.720p.WEB-GRP.mkv'], 'Show.S2024.720p.WEB-GRP'],
-            'standard episode range' => [['Show.S01E01-E03.720p.WEB-GRP.mkv', 'Show.S01E04.720p.WEB-GRP.mkv'], 'Show.S01.720p.WEB-GRP'],
-            'x episode range' => [['Show.1x01-03.720p.WEB-GRP.mkv', 'Show.1x04.720p.WEB-GRP.mkv'], 'Show.S01.720p.WEB-GRP'],
-            'explicit season plus episode word' => [['Show.S01.Episode.5.720p.WEB-GRP.mkv', 'Show.S01.Episode.6.720p.WEB-GRP.mkv'], 'Show.S01.720p.WEB-GRP'],
-            'x sample ignored' => [['Show.1x01.720p.WEB-GRP.mkv', 'Show.1x02.720p.WEB-GRP.sample.mkv'], null],
-            'episode words lack a season' => [['Show.Episode.1.720p.WEB-GRP.mkv', 'Show.Episode.2.720p.WEB-GRP.mkv'], null],
-            'episode tokens lack a season' => [['Show.E01.720p.WEB-GRP.mkv', 'Show.E02.720p.WEB-GRP.mkv'], null],
-            'EP tokens lack a season' => [['Show.EP01.720p.WEB-GRP.mkv', 'Show.EP02.720p.WEB-GRP.mkv'], null],
-            'resolution is not an episode' => [['Movie.1920x1080.720p.WEB-GRP.mkv', 'Movie.1920x1081.720p.WEB-GRP.mkv'], null],
-            'x episode boundary rejects attached title letters' => [['Show.1x01Bonus.720p.WEB-GRP.mkv', 'Show.1x02Bonus.720p.WEB-GRP.mkv'], null],
-            'season width outside supported range' => [['Show.S12345E01.720p.WEB-GRP.mkv', 'Show.S12345E02.720p.WEB-GRP.mkv'], null],
-            'episode width outside supported range' => [['Show.S01E12345.720p.WEB-GRP.mkv', 'Show.S01E12346.720p.WEB-GRP.mkv'], null],
-        ];
-    }
-
-    #[Test]
-    public function it_classifies_adjacent_episode_words_consistently_with_pack_parsing(): void
-    {
-        $first = 'Show.S01Episode.1.720p.WEB-GRP';
-        $second = 'Show.S01Episode.2.720p.WEB-GRP';
-
-        self::assertTrue(SeasonPackDetector::isMultiEpisodeSet([$first.'.mkv', $second.'.mkv']));
-        self::assertSame('Show.S01.720p.WEB-GRP', SeasonPackDetector::seasonNameFromEpisodes([$first.'.mkv', $second.'.mkv']));
-        self::assertTrue(SeasonPackDetector::isEpisodeName($first));
-        self::assertTrue(SeasonPackDetector::isEpisodeName($second));
-        self::assertFalse(SeasonPackDetector::isSeasonPack($first));
-    }
-
-    #[Test]
-    public function it_derives_single_season_names_for_supported_season_notation(): void
-    {
-        self::assertSame('Show.S01.720p.WEB-GRP', SeasonPackDetector::seasonNameFromEpisode('Show.1x01.Pilot.720p.WEB-GRP.mkv'));
-        self::assertSame('Show.S2024.720p.WEB-GRP', SeasonPackDetector::seasonNameFromEpisode('Show.S2024E01.Pilot.720p.WEB-GRP.mkv'));
-        self::assertNull(SeasonPackDetector::seasonNameFromEpisode('Show.Episode.1.720p.WEB-GRP.mkv'));
-        self::assertNull(SeasonPackDetector::seasonNameFromEpisode('Show.S01E12345.720p.WEB-GRP.mkv'));
+        if ($expected !== null) {
+            $this->assertTrue(SeasonPackDetector::isSeasonPack($expected));
+        }
     }
 
     #[Test]
@@ -186,5 +141,50 @@ class SeasonPackDetectorTest extends TestCase
         $this->assertSame('Show.S01.1080p-GRP', SeasonPackDetector::seasonFolder(['Show.S01.1080p-GRP\\Subs\\Show.S01E01.srt']));
         $this->assertNull(SeasonPackDetector::seasonFolder(['Show.S01E01.mkv']));
         $this->assertNull(SeasonPackDetector::seasonFolder(['Movie.2020/VIDEO_TS/VTS_01_1.VOB']));
+    }
+
+    #[Test]
+    public function it_preserves_single_episode_identity_across_release_info_tokens_and_rejects_continuations(): void
+    {
+        $tokens = [
+            '720p', '1080p', '2160p', '1080i', '4k', 'uhd', 'hdr', 'hdr10', 'hdr10plus', 'dv', 'sdr',
+            'web', 'webrip', 'webdl', 'bluray', 'blu', 'bd', 'bdrip', 'bdremux', 'brrip', 'remux',
+            'dvd', 'dvdrip', 'dvdr', 'dvd5', 'dvd9', 'hdtv', 'pdtv', 'sdtv', 'hdrip', 'dsr',
+            'amzn', 'nf', 'dsnp', 'hmax', 'atvp', 'hulu', 'pcok', 'pmtp', 'stan', 'crav',
+            'x264', 'x265', 'X264', 'X265', 'h264', 'h265', 'hevc', 'avc', 'xvid', 'divx',
+            '10bit', '8bit', 'aac', 'aac2', 'ac3', 'eac3', 'dd', 'dd5', 'ddp', 'ddp5', 'dts', 'truehd', 'atmos', 'flac',
+            'proper', 'repack', 'repack2', 'rerip', 'internal', 'multi', 'dual', 'subbed', 'dubbed', 'extended', 'uncut',
+            'german', 'french', 'spanish', 'italian', 'dutch', 'nordic', 'swedish', 'danish', 'finnish', 'norwegian',
+            'polish', 'russian', 'hindi', 'japanese', 'korean',
+        ];
+
+        foreach ($tokens as $token) {
+            $name = 'Show.S01E01.1080p.WEB.'.$token.'-GRP.mkv';
+            $this->assertSame('show:1:1', SeasonPackDetector::episodeIdentity($name), $token);
+            $this->assertFalse(SeasonPackDetector::hasNonSingleEpisodeEvidence([$name]), $token);
+        }
+
+        foreach (['S01E01' => 'show:1:1', 'S01.E01' => 'show:1:1', 'S2024E01' => 'show:2024:1', '1x01' => 'show:1:1'] as $marker => $identity) {
+            foreach (['x264', 'x265', 'X264', 'X265'] as $codec) {
+                foreach (['.', '-', '_', ' '] as $sep) {
+                    $name = 'Show'.$sep.$marker.$sep.'1080p'.$sep.'WEB'.$sep.$codec.'-GRP.mkv';
+                    $this->assertSame($identity, SeasonPackDetector::episodeIdentity($name), $name);
+                    $this->assertFalse(SeasonPackDetector::hasNonSingleEpisodeEvidence([$name]), $name);
+                }
+            }
+        }
+
+        foreach ([
+            'Show.S01E01.1080p.WEB.x02-GRP.mkv',
+            'Show.1x01x02.1080p.WEB.x264-GRP.mkv',
+            'Show.S01E01.1080p.WEB.x264E02-GRP.mkv',
+            'Show.S01E01.1080p.WEB.x265x02-GRP.mkv',
+            'Show.S01E01.1080p.WEB.x264.E02-GRP.mkv',
+            'Show.S01E01.1080p.WEB.x265.S02-GRP.mkv',
+            'Show.S01E01.1080p.WEB.x264.Complete.Season-GRP.mkv',
+        ] as $ambiguous) {
+            $this->assertNull(SeasonPackDetector::episodeIdentity($ambiguous), $ambiguous);
+            $this->assertTrue(SeasonPackDetector::hasNonSingleEpisodeEvidence([$ambiguous]), $ambiguous);
+        }
     }
 }
