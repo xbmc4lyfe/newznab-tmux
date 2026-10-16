@@ -11,6 +11,8 @@ final class NativeMetadataParser
 {
     public const NNTP_HEADER_SCHEMA_VERSION = 3;
 
+    public const ARTICLE_DATES_SCHEMA_VERSION = 2;
+
     /** @var array<string, FFI> */
     private static array $libraries = [];
 
@@ -121,6 +123,93 @@ final class NativeMetadataParser
         return ($metadata['parser_engine'] ?? null) === 'nntmux-rust-nntp-headers'
             && ($metadata['schema_version'] ?? null) === self::NNTP_HEADER_SCHEMA_VERSION
             && ($metadata['status'] ?? null) === 'complete';
+    }
+
+    /** @param array<string, mixed>|null $metadata */
+    public static function hasCurrentArticleDatesSchema(?array $metadata): bool
+    {
+        if (($metadata['parser_engine'] ?? null) !== 'nntmux-rust-article-dates'
+            || ($metadata['schema_version'] ?? null) !== self::ARTICLE_DATES_SCHEMA_VERSION
+            || ! is_array($metadata['reported_clock_relations'] ?? null)) {
+            return false;
+        }
+        $sources = ['date', 'injection_date', 'legacy_nntp_posting_date'];
+        foreach ($sources as $source) {
+            $value = $metadata[$source] ?? null;
+            if (! is_array($value) || ! in_array($value['parse_status'] ?? null, [
+                'valid', 'missing', 'duplicate', 'budget_exceeded', 'malformed_or_unsupported_absolute_date',
+                'invalid_octet_or_folding', 'unsupported_absolute_timezone', 'invalid_calendar_or_time',
+                'weekday_calendar_mismatch',
+            ], true)
+                || ! array_key_exists('utc_epoch_seconds', $value)
+                || ($value['parse_status'] === 'valid'
+                    ? ! is_int($value['utc_epoch_seconds']) : $value['utc_epoch_seconds'] !== null)) {
+                return false;
+            }
+        }
+        foreach ($sources as $source) {
+            $value = $metadata[$source];
+            $candidates = $value['candidates'] ?? null;
+            $count = $value['occurrence_count'] ?? null;
+            if (! is_int($count) || $count < 0 || $count > 256
+                || ! is_string($value['occurrence_count_basis'] ?? null)
+                || trim($value['occurrence_count_basis']) === ''
+                || ! is_array($candidates) || ! array_is_list($candidates) || count($candidates) !== $count) {
+                return false;
+            }
+            foreach ($candidates as $candidate) {
+                if (! is_array($candidate) || ! in_array($candidate['parse_status'] ?? null, [
+                    'valid', 'malformed_or_unsupported_absolute_date', 'invalid_octet_or_folding',
+                    'unsupported_absolute_timezone', 'invalid_calendar_or_time', 'weekday_calendar_mismatch',
+                ], true) || ! array_key_exists('utc_epoch_seconds', $candidate)
+                    || ($candidate['parse_status'] === 'valid'
+                        ? ! is_int($candidate['utc_epoch_seconds']) : $candidate['utc_epoch_seconds'] !== null)
+                    || ! is_array($candidate['source_line_indices'] ?? null)
+                    || ! array_is_list($candidate['source_line_indices']) || $candidate['source_line_indices'] === []) {
+                    return false;
+                }
+                $previousLine = 0;
+                foreach ($candidate['source_line_indices'] as $line) {
+                    if (! is_int($line) || $line <= $previousLine || $line > 65_536) {
+                        return false;
+                    }
+                    $previousLine = $line;
+                }
+            }
+            if ($value['parse_status'] === 'budget_exceeded' && ! in_array($count, [0, 256], true)) {
+                return false;
+            }
+            $status = $value['parse_status'];
+            if ($status === 'missing' ? $count !== 0
+                : ($status === 'duplicate' ? ($count < 2 || $count >= 256)
+                    : ($status !== 'budget_exceeded' && ($count !== 1
+                        || $candidates[0]['parse_status'] !== $status
+                        || $candidates[0]['utc_epoch_seconds'] !== $value['utc_epoch_seconds'])))) {
+                return false;
+            }
+        }
+        foreach ([['date', 'injection_date'], ['date', 'legacy_nntp_posting_date'],
+            ['injection_date', 'legacy_nntp_posting_date']] as [$lhs, $rhs]) {
+            $relation = $metadata['reported_clock_relations'][$lhs.'_to_'.$rhs] ?? null;
+            if (! is_array($relation)
+                || ($relation['lhs_parse_status'] ?? null) !== $metadata[$lhs]['parse_status']
+                || ($relation['rhs_parse_status'] ?? null) !== $metadata[$rhs]['parse_status']
+                || ! array_key_exists('rhs_minus_lhs_seconds', $relation)
+                || ! array_key_exists('lhs_order_relative_to_rhs', $relation)) {
+                return false;
+            }
+            $available = $metadata[$lhs]['parse_status'] === 'valid' && $metadata[$rhs]['parse_status'] === 'valid';
+            $delta = $available ? $metadata[$rhs]['utc_epoch_seconds'] - $metadata[$lhs]['utc_epoch_seconds'] : null;
+            $status = ! $available ? 'source_unavailable' : (is_int($delta) ? 'compared' : 'epoch_difference_out_of_range');
+            $order = $status === 'compared' ? ($delta > 0 ? 'before' : ($delta < 0 ? 'after' : 'equal')) : null;
+            if (($relation['comparison_status'] ?? null) !== $status
+                || $relation['rhs_minus_lhs_seconds'] !== ($status === 'compared' ? $delta : null)
+                || $relation['lhs_order_relative_to_rhs'] !== $order) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /** @param list<string> $rawHeaders

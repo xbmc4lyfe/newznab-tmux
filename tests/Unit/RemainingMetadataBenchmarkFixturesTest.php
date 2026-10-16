@@ -19,7 +19,7 @@ final class RemainingMetadataBenchmarkFixturesTest extends TestCase
         foreach (RemainingMetadataBenchmarkFixtures::strata() as $name => $definition) {
             $fixture = RemainingMetadataBenchmarkFixtures::make($name);
             self::assertSame($fixture, RemainingMetadataBenchmarkFixtures::make($name), $name);
-            self::assertSame('bounded-reference-shared-projection-v1', $definition['comparison_scope']);
+            self::assertSame($definition['module'] === 'article_dates' ? 'bounded-reference-date-clock-projection-v2' : 'bounded-reference-shared-projection-v1', $definition['comparison_scope']);
             $projection = RemainingMetadataBenchmarkFixtures::baseline($fixture);
             self::assertSame($fixture['expected'], $projection, $name);
             self::assertTrue(RemainingMetadataBenchmarkFixtures::correct($fixture, $projection), $name);
@@ -32,6 +32,124 @@ final class RemainingMetadataBenchmarkFixturesTest extends TestCase
         foreach ($counts as $count) {
             self::assertSame(['common' => 2, 'uncommon' => 2], $count);
         }
+    }
+
+    public function test_date_reference_preserves_every_reported_clock_relation(): void
+    {
+        $fixture = RemainingMetadataBenchmarkFixtures::make('dates-ordinary');
+        $projection = RemainingMetadataBenchmarkFixtures::baseline($fixture);
+        self::assertArrayHasKey('reported_clock_relations', $projection);
+        $pairs = ['date_to_injection_date' => [3600, 'before'], 'date_to_legacy_nntp_posting_date' => [0, 'equal'],
+            'injection_date_to_legacy_nntp_posting_date' => [-3600, 'after']];
+        foreach ($pairs as $pair => [$delta, $order]) {
+            self::assertSame(['comparison_status' => 'compared', 'lhs_parse_status' => 'valid', 'rhs_parse_status' => 'valid',
+                'rhs_minus_lhs_seconds' => $delta, 'lhs_order_relative_to_rhs' => $order], $projection['reported_clock_relations'][$pair]);
+            foreach (['comparison_status', 'lhs_parse_status', 'rhs_parse_status', 'rhs_minus_lhs_seconds', 'lhs_order_relative_to_rhs'] as $field) {
+                $mutated = $projection;
+                $mutated['reported_clock_relations'][$pair][$field] = 'mutated';
+                self::assertFalse(RemainingMetadataBenchmarkFixtures::correct($fixture, $mutated));
+                unset($mutated['reported_clock_relations'][$pair][$field]);
+                self::assertFalse(RemainingMetadataBenchmarkFixtures::correct($fixture, $mutated));
+            }
+        }
+    }
+
+    public function test_fixed_date_fixtures_have_independent_normalized_complete_output_oracles(): void
+    {
+        foreach (['dates-ordinary', 'dates-folded', 'dates-uncommon-duplicates', 'dates-uncommon-malformed'] as $name) {
+            $fixture = RemainingMetadataBenchmarkFixtures::make($name);
+            $expected = RemainingMetadataBenchmarkFixtures::expectedFullDates($fixture);
+            self::assertSame($expected, RemainingMetadataBenchmarkFixtures::normalizeFullDates($expected), $name);
+            self::assertSame(2, $expected['schema_version'], $name);
+            self::assertSame('Absolute header timestamps describe reported composition or injection clocks; they do not measure uploader bandwidth or establish uploader location. A -0000 zone gives UTC time without information about the originating local timezone.', $expected['interpretation'], $name);
+        }
+
+        $ordinary = RemainingMetadataBenchmarkFixtures::expectedFullDates(RemainingMetadataBenchmarkFixtures::make('dates-ordinary'));
+        self::assertSame(bin2hex("Date: Mon, 01 Jan 2024 00:00:00 +0000\r\n"), $ordinary['date']['candidates'][0]['raw_field_hex']);
+        self::assertSame(bin2hex(' Mon, 01 Jan 2024 00:00:00 +0000'), $ordinary['date']['candidates'][0]['unfolded_value_hex']);
+        self::assertSame('+0000', $ordinary['date']['candidates'][0]['timezone_token']);
+        self::assertSame('valid', $ordinary['date']['candidates'][0]['parse_status']);
+        self::assertSame(1704067200, $ordinary['date']['candidates'][0]['utc_epoch_seconds']);
+        self::assertTrue($ordinary['date']['candidates'][0]['weekday_matches_calendar']);
+
+        $folded = RemainingMetadataBenchmarkFixtures::expectedFullDates(RemainingMetadataBenchmarkFixtures::make('dates-folded'));
+        self::assertSame(bin2hex("dAtE: 01 Jan 2024\r\n\t00:00 -0000\r\n"), $folded['date']['candidates'][0]['raw_field_hex']);
+        self::assertSame(bin2hex(" 01 Jan 2024\t00:00 -0000"), $folded['date']['candidates'][0]['unfolded_value_hex']);
+        self::assertSame([2, 3], $folded['date']['candidates'][0]['source_line_indices']);
+
+        $duplicates = RemainingMetadataBenchmarkFixtures::expectedFullDates(RemainingMetadataBenchmarkFixtures::make('dates-uncommon-duplicates'));
+        self::assertSame('budget_exceeded', $duplicates['date']['parse_status']);
+        self::assertCount(256, $duplicates['date']['candidates']);
+        self::assertSame([1], $duplicates['date']['candidates'][0]['source_line_indices']);
+        self::assertSame([256], $duplicates['date']['candidates'][255]['source_line_indices']);
+    }
+
+    public function test_complete_date_normalizer_ignores_only_top_level_engine_and_syntax(): void
+    {
+        $expected = RemainingMetadataBenchmarkFixtures::expectedFullDates(RemainingMetadataBenchmarkFixtures::make('dates-ordinary'));
+        $identified = $expected + ['parser_engine' => 'different implementation', 'syntax_profile' => 'restricted reference grammar'];
+        self::assertSame($expected, RemainingMetadataBenchmarkFixtures::normalizeFullDates($identified));
+
+        $nestedIdentification = $expected;
+        $nestedIdentification['date']['parser_engine'] = 'nested field must remain';
+        self::assertNotSame($expected, RemainingMetadataBenchmarkFixtures::normalizeFullDates($nestedIdentification));
+
+        $reordered = ['interpretation' => $expected['interpretation'], 'reported_clock_relations' => $expected['reported_clock_relations'],
+            'legacy_nntp_posting_date' => $expected['legacy_nntp_posting_date'], 'injection_date' => $expected['injection_date'],
+            'date' => $expected['date'], 'schema_version' => $expected['schema_version']];
+        self::assertSame($expected, RemainingMetadataBenchmarkFixtures::normalizeFullDates($reordered));
+
+        $reordered['date']['candidates'][0]['source_line_indices'] = [2, 1];
+        self::assertNotSame($expected, RemainingMetadataBenchmarkFixtures::normalizeFullDates($reordered));
+    }
+
+    public function test_every_rich_date_field_and_unknown_key_changes_the_complete_oracle(): void
+    {
+        $expected = RemainingMetadataBenchmarkFixtures::expectedFullDates(RemainingMetadataBenchmarkFixtures::make('dates-ordinary'));
+        $paths = [
+            ['schema_version'],
+            ['interpretation'],
+            ['date', 'occurrence_count_basis'],
+            ['date', 'candidates', 0, 'source_line_indices'],
+            ['date', 'candidates', 0, 'raw_field_hex'],
+            ['date', 'candidates', 0, 'unfolded_value_hex'],
+            ['date', 'candidates', 0, 'parse_status'],
+            ['date', 'candidates', 0, 'utc_epoch_seconds'],
+            ['date', 'candidates', 0, 'timezone_token'],
+            ['date', 'candidates', 0, 'timezone_offset_minutes'],
+            ['date', 'candidates', 0, 'timezone_local_offset_unknown'],
+            ['date', 'candidates', 0, 'seconds_present'],
+            ['date', 'candidates', 0, 'leap_second'],
+            ['date', 'candidates', 0, 'weekday_matches_calendar'],
+            ['date', 'candidates', 0, 'epoch_basis'],
+        ];
+        foreach ($paths as $path) {
+            $changed = $expected;
+            $reference = &$changed;
+            foreach (array_slice($path, 0, -1) as $key) {
+                $reference = &$reference[$key];
+            }
+            $key = $path[array_key_last($path)];
+            $value = $reference[$key];
+            $reference[$key] = is_int($value) ? $value + 1 : (is_bool($value) ? ! $value : (is_string($value) ? $value.'!' : 'changed'));
+            unset($reference);
+            self::assertNotSame($expected, RemainingMetadataBenchmarkFixtures::normalizeFullDates($changed), implode('.', $path));
+        }
+
+        $changed = $expected;
+        $changed['unexpected_top_level'] = 'must be retained';
+        self::assertNotSame($expected, RemainingMetadataBenchmarkFixtures::normalizeFullDates($changed));
+        $changed = $expected;
+        $changed['date']['candidates'][0]['unexpected_candidate_field'] = 'must be retained';
+        self::assertNotSame($expected, RemainingMetadataBenchmarkFixtures::normalizeFullDates($changed));
+    }
+
+    public function test_complete_date_oracle_rejects_mutated_fixture_bytes(): void
+    {
+        $fixture = RemainingMetadataBenchmarkFixtures::make('dates-folded');
+        $fixture['raw_headers'][2] = "\t00:01 -0000\r\n";
+        $this->expectException(\InvalidArgumentException::class);
+        RemainingMetadataBenchmarkFixtures::expectedFullDates($fixture);
     }
 
     public function test_reference_reads_raw_input_and_ignores_oracle_and_fixture_name(): void
@@ -110,6 +228,11 @@ final class RemainingMetadataBenchmarkFixturesTest extends TestCase
                 self::assertTrue(RemainingMetadataBenchmarkFixtures::correct($fixture, $result['projection']), $name);
                 self::assertSame('nntmux-rust-'.str_replace('_', '-', $definition['module']), $result['full']['parser_engine']);
                 self::assertArrayHasKey('interpretation', $result['full']);
+                if ($definition['module'] === 'article_dates') {
+                    self::assertTrue(NativeMetadataParser::hasCurrentArticleDatesSchema($result['full']));
+                    self::assertSame(RemainingMetadataBenchmarkFixtures::expectedFullDates($fixture),
+                        RemainingMetadataBenchmarkFixtures::normalizeFullDates($result['full']), $name);
+                }
                 self::assertNotSame($result['full'], $result['projection']);
             }
         } finally {
