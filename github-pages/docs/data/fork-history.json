@@ -2,8 +2,8 @@
   "snapshot": {
     "repository": "xbmc4lyfe/newznab-tmux",
     "head_ref": "master",
-    "head_sha": "26873006789074c436572e7f93cfbfeb03d10398",
-    "head_url": "https://github.com/xbmc4lyfe/newznab-tmux/commit/26873006789074c436572e7f93cfbfeb03d10398",
+    "head_sha": "7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839",
+    "head_url": "https://github.com/xbmc4lyfe/newznab-tmux/commit/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839",
     "upstream_repository": "NNTmux/newznab-tmux",
     "upstream_ref": "master",
     "upstream_sha": "2fef08b34e4e6cced23333bd186b28a09e94ea2f",
@@ -11,10 +11,10 @@
     "common_ancestor_sha": "ef0e8c363f13cca5fb62506db64ccbbb329fde84",
     "merge_base_url": "https://github.com/xbmc4lyfe/newznab-tmux/commit/ef0e8c363f13cca5fb62506db64ccbbb329fde84",
     "upstream_only_count": 13,
-    "fork_only_count": 210,
+    "fork_only_count": 211,
     "upstream_only_compare_url": "https://github.com/NNTmux/newznab-tmux/compare/ef0e8c363f13cca5fb62506db64ccbbb329fde84...2fef08b34e4e6cced23333bd186b28a09e94ea2f",
-    "fork_only_compare_url": "https://github.com/xbmc4lyfe/newznab-tmux/compare/ef0e8c363f13cca5fb62506db64ccbbb329fde84...26873006789074c436572e7f93cfbfeb03d10398",
-    "fork_vs_upstream_compare_url": "https://github.com/xbmc4lyfe/newznab-tmux/compare/2fef08b34e4e6cced23333bd186b28a09e94ea2f...26873006789074c436572e7f93cfbfeb03d10398",
+    "fork_only_compare_url": "https://github.com/xbmc4lyfe/newznab-tmux/compare/ef0e8c363f13cca5fb62506db64ccbbb329fde84...7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839",
+    "fork_vs_upstream_compare_url": "https://github.com/xbmc4lyfe/newznab-tmux/compare/2fef08b34e4e6cced23333bd186b28a09e94ea2f...7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839",
     "captured_on": "2026-10-16"
   },
   "method": "Refs and PRs queried from GitHub at capture; commit reachability computed with git rev-list. fork-only means reachable from fork/master and not from the captured upstream/master ref. PR category buckets are editorial indexes, not exhaustive explanations of every changed line.",
@@ -22,7 +22,7 @@
     {
       "path": "README.md",
       "lines": "1-20,24-108,114-120",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/26873006789074c436572e7f93cfbfeb03d10398/README.md",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839/README.md",
       "line_ranges": [
         [
           1,
@@ -41,7 +41,7 @@
     {
       "path": "docker/Makefile",
       "lines": "45-107",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/26873006789074c436572e7f93cfbfeb03d10398/docker/Makefile",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839/docker/Makefile",
       "line_ranges": [
         [
           45,
@@ -52,7 +52,7 @@
     {
       "path": "docker/bin/deploy-app",
       "lines": "15-109",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/26873006789074c436572e7f93cfbfeb03d10398/docker/bin/deploy-app",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839/docker/bin/deploy-app",
       "line_ranges": [
         [
           15,
@@ -63,7 +63,7 @@
     {
       "path": "app/Console/Commands/TmuxDrain.php",
       "lines": "20-26,106-145,174-206",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/26873006789074c436572e7f93cfbfeb03d10398/app/Console/Commands/TmuxDrain.php",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839/app/Console/Commands/TmuxDrain.php",
       "line_ranges": [
         [
           20,
@@ -82,7 +82,7 @@
     {
       "path": "app/Services/Releases/Verification/VerifiedReleasePublisher.php",
       "lines": "28-69,100-140",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/26873006789074c436572e7f93cfbfeb03d10398/app/Services/Releases/Verification/VerifiedReleasePublisher.php",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839/app/Services/Releases/Verification/VerifiedReleasePublisher.php",
       "line_ranges": [
         [
           28,
@@ -97,7 +97,7 @@
     {
       "path": "app/Services/Releases/Verification/PayloadVerifier.php",
       "lines": "28-63,67-100",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/26873006789074c436572e7f93cfbfeb03d10398/app/Services/Releases/Verification/PayloadVerifier.php",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839/app/Services/Releases/Verification/PayloadVerifier.php",
       "line_ranges": [
         [
           28,
@@ -112,7 +112,7 @@
     {
       "path": "app/Services/NameFixing/PredbMatchSelector.php",
       "lines": "9-12,67-82,208-230",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/26873006789074c436572e7f93cfbfeb03d10398/app/Services/NameFixing/PredbMatchSelector.php",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839/app/Services/NameFixing/PredbMatchSelector.php",
       "line_ranges": [
         [
           9,
@@ -131,7 +131,7 @@
     {
       "path": "app/Services/NameFixing/NameFixingService.php",
       "lines": "587-656,665-671,753-792",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/26873006789074c436572e7f93cfbfeb03d10398/app/Services/NameFixing/NameFixingService.php",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839/app/Services/NameFixing/NameFixingService.php",
       "line_ranges": [
         [
           587,
@@ -150,7 +150,7 @@
     {
       "path": ".github/workflows/benchmark-pages.yml",
       "lines": "1-103",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/26873006789074c436572e7f93cfbfeb03d10398/.github/workflows/benchmark-pages.yml",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839/.github/workflows/benchmark-pages.yml",
       "line_ranges": [
         [
           1,
@@ -161,7 +161,7 @@
     {
       "path": "scripts/benchmark-pages.py",
       "lines": "90-147,150-180",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/26873006789074c436572e7f93cfbfeb03d10398/scripts/benchmark-pages.py",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839/scripts/benchmark-pages.py",
       "line_ranges": [
         [
           90,
@@ -5577,6 +5577,27 @@
       ],
       "primary_group": "NNTP, IRC, and provider reliability",
       "author_summary": "Scalar NNTP reads now forward ownership callbacks on both providers."
+    },
+    {
+      "number": 220,
+      "title": "test(additional-processing): qualify mapped archive parser-to-consumer flow",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/220",
+      "merged_at": "2026-10-16T08:01:22Z",
+      "merge_sha": "7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence",
+        "release verification, NZB integrity, PAR2, and archive evidence"
+      ],
+      "paths": [
+        ".ai/rules/git-workflow.md",
+        ".ai/rules/index.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+        "TODO.md",
+        "tests/Feature/AdditionalProcessingReleaseFileManagerTest.php"
+      ],
+      "primary_group": "Verification, NZB integrity, PAR2, and archive evidence",
+      "author_summary": "Exercise NzbContentParser, ReleaseProcessor, SQLite release_files persistence, and NameFixingService for mapped archive article reuse."
     }
   ],
   "primary_groups": {

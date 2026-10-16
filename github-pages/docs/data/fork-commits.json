@@ -1,7 +1,7 @@
 {
-  "snapshot_head": "26873006789074c436572e7f93cfbfeb03d10398",
+  "snapshot_head": "7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839",
   "upstream_baseline": "2fef08b34e4e6cced23333bd186b28a09e94ea2f",
-  "fork_only_commit_count": 210,
+  "fork_only_commit_count": 211,
   "association_source": "GitHub associated-PR API and commit subjects; unknown commits explicitly marked unassociated",
   "commits": [
     {
@@ -6280,6 +6280,30 @@
       ],
       "pull_request_urls": [
         "https://github.com/xbmc4lyfe/newznab-tmux/pull/180"
+      ]
+    },
+    {
+      "sha": "7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839",
+      "subject": "test(additional-processing): qualify mapped archive parser-to-consumer flow (#220)",
+      "parents": [
+        "26873006789074c436572e7f93cfbfeb03d10398"
+      ],
+      "authored_at": "2026-10-16T10:01:21+02:00",
+      "committed_at": "2026-10-16T10:01:21+02:00",
+      "pull_requests": [
+        220
+      ],
+      "association": "merged_pull_request",
+      "first_parent_changed_paths": [
+        ".ai/rules/git-workflow.md",
+        ".ai/rules/index.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+        "TODO.md",
+        "tests/Feature/AdditionalProcessingReleaseFileManagerTest.php"
+      ],
+      "pull_request_urls": [
+        "https://github.com/xbmc4lyfe/newznab-tmux/pull/220"
       ]
     }
   ]
