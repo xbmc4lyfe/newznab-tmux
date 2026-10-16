@@ -161,6 +161,49 @@ class TmuxFixNamesScheduleTest extends TestCase
         $this->assertStringNotContainsString('releases:fix-names 4 ', $this->launched[0]);
     }
 
+    #[Test]
+    public function the_pane_omits_par2_passes_when_par2_scheduled_is_enabled(): void
+    {
+        config(['tmux.fix_names.par2_scheduled' => true]);
+
+        $this->assertTrue($this->runTask(alive: false, renames: 5));
+
+        $this->assertCount(1, $this->launched);
+        $command = $this->launched[0];
+        $this->assertStringNotContainsString('releases:fix-names 7 ', $command);
+        $this->assertStringNotContainsString('releases:fix-names 8 ', $command);
+        $this->assertStringContainsString('releases:fix-names 3 ', $command);
+        $this->assertStringContainsString('releases:fix-names 4 ', $command);
+    }
+
+    #[Test]
+    public function full_backlog_passes_run_continuously_when_interval_is_zero(): void
+    {
+        config(['tmux.fix_names.full_backlog_interval_minutes' => 0]);
+
+        $this->assertTrue($this->runTask(alive: false, renames: 5));
+        $this->assertTrue($this->runTask(alive: false, renames: 5));
+
+        $this->assertCount(2, $this->launched);
+        $this->assertStringContainsString('releases:fix-names 4 ', $this->launched[0]);
+        $this->assertStringContainsString('releases:fix-names 4 ', $this->launched[1]);
+    }
+
+    #[Test]
+    public function passes_propagate_configured_category_and_batch_limit(): void
+    {
+        config([
+            'tmux.fix_names.category' => 'all',
+            'tmux.fix_names.batch_limit' => 2500,
+        ]);
+
+        $this->assertTrue($this->runTask(alive: false, renames: 5));
+
+        $this->assertCount(1, $this->launched);
+        $this->assertStringContainsString('--category=\'all\'', $this->launched[0]);
+        $this->assertStringContainsString('--limit=2500', $this->launched[0]);
+    }
+
     private function runTask(bool $alive, int $renames, bool $respawnSucceeds = true): bool
     {
         $runner = new TmuxTaskRunner('fixnames-test');

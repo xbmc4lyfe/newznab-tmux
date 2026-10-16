@@ -136,7 +136,9 @@ class FileNameExtractor
         }
 
         // RAR file contents - look for release name in RAR path
-        if (preg_match('/^([A-Za-z0-9][\w.\-]+(?:[\.\-_ ][\w.\-]+)+)[\\\\\\/](?:CD\d|Disc\d|DVD\d|Subs?)?[\\\\\\/]?.+\.(rar|r\d{2,4}|zip|7z)$/i', $filename, $result)) {
+        if ((strpbrk($filename, '\\/') !== false)
+            && preg_match('/^([A-Za-z0-9][\w.\-]+(?:[\.\-_ ][\w.\-]+)+)[\\\\\\/](?:CD\d|Disc\d|DVD\d|Subs?)?[\\\\\\/]?.+\.(rar|r\d{2,4}|zip|7z)$/i', $filename, $result)
+        ) {
             return NameFixResult::fromMatch($result[1], 'RAR archive path', 'File');
         }
 
