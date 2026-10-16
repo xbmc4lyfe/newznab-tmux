@@ -42,7 +42,7 @@ final class ReleaseFingerprintCollector
         private readonly Par2MetadataParser $par2, private readonly YencService $yenc) {}
 
     /** @return array{status: string, data: array<string, mixed>} */
-    public function collect(Release $release): array
+    public function collect(Release $release, ?NNTPService $nntp = null): array
     {
         $xml = $this->nzb->readNzbContents((string) $release->guid);
         if (! is_string($xml) || $xml === '') {
@@ -53,7 +53,7 @@ final class ReleaseFingerprintCollector
         $omittedSampleCount = 0;
         $samples = $this->analyzer->selectArticleSamples($manifest['files'], NzbFingerprintAnalyzer::MAX_ARTICLE_SAMPLES, $omittedSampleCount);
         $servers = $this->configuredServers();
-        $nntp = new NNTPService;
+        $nntp ??= new NNTPService;
         $observations = [];
         $errors = [];
         $serverProfiles = [];
