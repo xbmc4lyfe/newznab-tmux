@@ -117,3 +117,11 @@ jobs:
           ADDITIONAL_ADMISSION_TEST_USERNAME: root
           ADDITIONAL_ADMISSION_TEST_PASSWORD: donor-fixture-only
         run: php -d memory_limit=2G vendor/bin/phpunit --fail-on-skipped tests/Integration/AdditionalPasswordDisabledMariaDbTest.php
+
+      - name: Qualify reopened filename lifecycle against MariaDB
+        env:
+          FILENAME_LIFECYCLE_TEST_HOST: 127.0.0.1
+          FILENAME_LIFECYCLE_TEST_PORT: 3306
+          FILENAME_LIFECYCLE_TEST_USERNAME: root
+          FILENAME_LIFECYCLE_TEST_PASSWORD: donor-fixture-only
+        run: php -d memory_limit=2G vendor/bin/phpunit --fail-on-skipped tests/Integration/ReopenedFilenameLifecycleMariaDbTest.php
