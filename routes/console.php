@@ -88,6 +88,17 @@ Schedule::command('predb:check 3 --quiet')->everyTenMinutes()->withoutOverlappin
 Schedule::command('multiprocessing:fixrelnames predbft')->everyFiveMinutes()->withoutOverlapping()->runInBackground()
     ->when(static fn (): bool => (bool) config('tmux.fix_names.predbft') && (bool) config('tmux.fix_names.predbft_scheduled'));
 
+// Run slow NNTP PAR2 sweeps (levels 7 & 8) independently from the scheduler when TMUX_FIX_NAMES_PAR2_SCHEDULED
+// is enabled. This decouples slow network downloads from fast database passes in Pane 1.0.
+$par2Category = in_array(config('tmux.fix_names.category'), ['all', 'predb_id'], true) ? (string) config('tmux.fix_names.category') : 'other';
+$par2Limit = max(1, (int) config('tmux.fix_names.batch_limit', 1000));
+Schedule::command("releases:fix-names 7 --update --category={$par2Category} --set-status --limit={$par2Limit}")
+    ->everyFiveMinutes()->withoutOverlapping()->runInBackground()
+    ->when(static fn (): bool => (bool) config('tmux.fix_names.par2_scheduled'));
+Schedule::command("releases:fix-names 8 --update --category={$par2Category} --set-status --limit={$par2Limit}")
+    ->everyMinute()->withoutOverlapping()->runInBackground()
+    ->when(static fn (): bool => (bool) config('tmux.fix_names.par2_scheduled'));
+
 // One metadata preparer parks uploads without consuming a spot-verification slot.
 $preparationCommand = escapeshellarg(PHP_BINARY).' -d memory_limit=256M '
     .escapeshellarg(base_path('artisan')).' releases:prepare-candidates --limit=5000 --max-seconds=30 --diagnostics';

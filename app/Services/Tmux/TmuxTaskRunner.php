@@ -510,15 +510,25 @@ class TmuxTaskRunner
         if ($fullBacklog) {
             array_push($levels, 4, 6, 10, 12, 14, 16, 18, 20);
         }
-        if ($renamePasses) {
-            $levels[] = 7;
-        }
-        if ($fullBacklog || ($renamePasses && (bool) config('tmux.fix_names.full_backlog', true))) {
-            $levels[] = 8;
+
+        $par2Scheduled = (bool) config('tmux.fix_names.par2_scheduled', false);
+        if (! $par2Scheduled) {
+            if ($renamePasses) {
+                $levels[] = 7;
+            }
+            if ($fullBacklog || ($renamePasses && (bool) config('tmux.fix_names.full_backlog', true))) {
+                $levels[] = 8;
+            }
         }
 
+        $category = escapeshellarg((string) config('tmux.fix_names.category', 'other'));
+        $batchLimit = config('tmux.fix_names.batch_limit');
+        $limitOption = $batchLimit !== null && (int) $batchLimit > 0
+            ? ' --limit='.(int) $batchLimit
+            : '';
+
         $commands = array_map(
-            static fn (int $level): string => "{$artisan} releases:fix-names {$level} --update --category=other --set-status --show",
+            static fn (int $level): string => "{$artisan} releases:fix-names {$level} --update --category={$category} --set-status{$limitOption} --show",
             $levels,
         );
 
@@ -538,7 +548,10 @@ class TmuxTaskRunner
             return false;
         }
 
-        $interval = max(1, (int) config('tmux.fix_names.full_backlog_interval_minutes', 60));
+        $interval = (int) config('tmux.fix_names.full_backlog_interval_minutes', 60);
+        if ($interval <= 0) {
+            return true;
+        }
 
         try {
             return $this->fullBacklogClaimStore()->add(self::FULL_BACKLOG_SLOT, true, now()->addMinutes($interval));
