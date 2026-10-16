@@ -680,6 +680,33 @@ SH);
         $this->assertMatchesRegularExpression('/web\s+app\s+skip\s+unchanged/', $output);
     }
 
+    public function test_external_image_replacement_or_tag_change_invalidates_build_stamp(): void
+    {
+        $this->make(['build'], ['NNTMUX_IMAGE_ID' => 'sha256:first-build'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        $this->make(['build'], ['NNTMUX_IMAGE_ID' => 'sha256:replaced-externally'])->mustRun();
+        $this->assertStringContainsString('build --target selfhosted-web', $this->events());
+    }
+
+    public function test_legacy_stamp_diffs_against_stamped_revision_across_multiple_commits(): void
+    {
+        $baseRev = trim((new Process(['git', 'rev-parse', 'HEAD'], $this->directory))->mustRun()->getOutput());
+        mkdir($this->directory.'/docker/config/caddy', 0777, true);
+        file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', ":8080\n");
+        (new Process(['git', 'add', '.'], $this->directory))->mustRun();
+        (new Process(['git', 'commit', '-q', '-m', 'commit 1: caddy change'], $this->directory))->mustRun();
+
+        file_put_contents($this->directory.'/app.txt', "commit 2\n");
+        (new Process(['git', 'add', '.'], $this->directory))->mustRun();
+        (new Process(['git', 'commit', '-q', '-m', 'commit 2: app change'], $this->directory))->mustRun();
+
+        file_put_contents($this->directory.'/docker/.deploy.stamp', $baseRev." oldcfg fixture-config\n");
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+    }
+
     private function events(): string
     {
         return (string) file_get_contents($this->directory.'/events');

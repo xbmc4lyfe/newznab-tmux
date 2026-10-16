@@ -199,6 +199,9 @@ unchanged() {
         for req_img in $REQUIRE_IMAGE; do
             docker image inspect "$req_img" >/dev/null 2>&1 || return 1
         done
+        if [ "${target:-}" = "build" ]; then
+            [ -z "$(DEPLOY_STAMP="$STAMP" "$DIR/bin/deploy-plan" --build-targets)" ] || return 1
+        fi
     fi
     if [ -n "${CHECK_UNCHANGED_COMMAND:-}" ]; then
         "$CHECK_UNCHANGED_COMMAND" || return 1

@@ -66,16 +66,17 @@ build *args:
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
     if [ "${APP_IMAGE:-nntmux/app:local}" != "nntmux/app:local" ]; then
-        export WEB_IMAGE="${WEB_IMAGE:-$APP_IMAGE}"
-        export HORIZON_IMAGE="${HORIZON_IMAGE:-$APP_IMAGE}"
-        export SCHEDULER_IMAGE="${SCHEDULER_IMAGE:-$APP_IMAGE}"
-        export INDEXER_IMAGE="${INDEXER_IMAGE:-$APP_IMAGE}"
+        [ -n "${WEB_IMAGE:-}" ] && [ "$WEB_IMAGE" != "nntmux/web:local" ] || WEB_IMAGE="$APP_IMAGE"
+        [ -n "${HORIZON_IMAGE:-}" ] && [ "$HORIZON_IMAGE" != "nntmux/horizon:local" ] || HORIZON_IMAGE="$APP_IMAGE"
+        [ -n "${SCHEDULER_IMAGE:-}" ] && [ "$SCHEDULER_IMAGE" != "nntmux/scheduler:local" ] || SCHEDULER_IMAGE="$APP_IMAGE"
+        [ -n "${INDEXER_IMAGE:-}" ] && [ "$INDEXER_IMAGE" != "nntmux/indexer:local" ] || INDEXER_IMAGE="$APP_IMAGE"
     else
-        export WEB_IMAGE="${WEB_IMAGE:-nntmux/web:local}"
-        export HORIZON_IMAGE="${HORIZON_IMAGE:-nntmux/horizon:local}"
-        export SCHEDULER_IMAGE="${SCHEDULER_IMAGE:-nntmux/scheduler:local}"
-        export INDEXER_IMAGE="${INDEXER_IMAGE:-nntmux/indexer:local}"
+        WEB_IMAGE="${WEB_IMAGE:-nntmux/web:local}"
+        HORIZON_IMAGE="${HORIZON_IMAGE:-nntmux/horizon:local}"
+        SCHEDULER_IMAGE="${SCHEDULER_IMAGE:-nntmux/scheduler:local}"
+        INDEXER_IMAGE="${INDEXER_IMAGE:-nntmux/indexer:local}"
     fi
+    export WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE
     SKIP_IF_UNCHANGED=1 STAMP_ON_SUCCESS=1 \
         REQUIRE_IMAGE="$WEB_IMAGE $HORIZON_IMAGE $SCHEDULER_IMAGE $INDEXER_IMAGE" \
         DEPLOY_STAMP="{{CURDIR}}/.build.stamp" FORCE="$FORCE" \
@@ -114,16 +115,17 @@ deploy *args:
         exit 0
     fi
     if [ "${APP_IMAGE:-nntmux/app:local}" != "nntmux/app:local" ]; then
-        export WEB_IMAGE="${WEB_IMAGE:-$APP_IMAGE}"
-        export HORIZON_IMAGE="${HORIZON_IMAGE:-$APP_IMAGE}"
-        export SCHEDULER_IMAGE="${SCHEDULER_IMAGE:-$APP_IMAGE}"
-        export INDEXER_IMAGE="${INDEXER_IMAGE:-$APP_IMAGE}"
+        [ -n "${WEB_IMAGE:-}" ] && [ "$WEB_IMAGE" != "nntmux/web:local" ] || WEB_IMAGE="$APP_IMAGE"
+        [ -n "${HORIZON_IMAGE:-}" ] && [ "$HORIZON_IMAGE" != "nntmux/horizon:local" ] || HORIZON_IMAGE="$APP_IMAGE"
+        [ -n "${SCHEDULER_IMAGE:-}" ] && [ "$SCHEDULER_IMAGE" != "nntmux/scheduler:local" ] || SCHEDULER_IMAGE="$APP_IMAGE"
+        [ -n "${INDEXER_IMAGE:-}" ] && [ "$INDEXER_IMAGE" != "nntmux/indexer:local" ] || INDEXER_IMAGE="$APP_IMAGE"
     else
-        export WEB_IMAGE="${WEB_IMAGE:-nntmux/web:local}"
-        export HORIZON_IMAGE="${HORIZON_IMAGE:-nntmux/horizon:local}"
-        export SCHEDULER_IMAGE="${SCHEDULER_IMAGE:-nntmux/scheduler:local}"
-        export INDEXER_IMAGE="${INDEXER_IMAGE:-nntmux/indexer:local}"
+        WEB_IMAGE="${WEB_IMAGE:-nntmux/web:local}"
+        HORIZON_IMAGE="${HORIZON_IMAGE:-nntmux/horizon:local}"
+        SCHEDULER_IMAGE="${SCHEDULER_IMAGE:-nntmux/scheduler:local}"
+        INDEXER_IMAGE="${INDEXER_IMAGE:-nntmux/indexer:local}"
     fi
+    export WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE
     SKIP_IF_UNCHANGED=1 STAMP_ON_SUCCESS=1 RECORD_DEPLOY_TIME=1 \
         REQUIRE_IMAGE="$WEB_IMAGE $HORIZON_IMAGE $SCHEDULER_IMAGE $INDEXER_IMAGE" \
         DEPLOY_CONFIG_COMMAND="{{CURDIR}}/bin/deploy-current" \

@@ -124,7 +124,6 @@ HORIZON_ONLY_PREFIXES: tuple[str, ...] = ()
 SCHEDULER_ONLY_EXACT = {
     "docker/app/bin/scheduler.py",
     "routes/console.php",
-    "config/predb_feeds.php",
     "app/Console/Commands/PredbImportFeed.php",
     "app/Console/Commands/WarmAdminDashboard.php",
     "app/Console/Commands/CollectStats.php",
@@ -144,9 +143,7 @@ SCHEDULER_ONLY_EXACT = {
     "app/Console/Commands/VerifyReleaseCandidates.php",
 }
 
-SCHEDULER_ONLY_PREFIXES = (
-    "app/Services/Predb/Feeds/",
-)
+SCHEDULER_ONLY_PREFIXES: tuple[str, ...] = ()
 
 INDEXER_ONLY_EXACT = {
     "docker/app/bin/indexer.sh",
@@ -175,8 +172,6 @@ INDEXER_ONLY_EXACT = {
 
 INDEXER_ONLY_PREFIXES = (
     "app/Services/Backfill/",
-    "app/Services/Binaries/",
-    "app/Services/Runners/",
     "app/Services/Tmux/",
 )
 
@@ -231,13 +226,31 @@ def classify_path(rel_path: str) -> tuple[str, ...]:
     if rel_path == "routes/web.php":
         return ("web", "horizon")
 
+    # Shared PreDB feed and release-runner/script paths used by both scheduler and indexer
+    if (
+        rel_path == "config/predb_feeds.php"
+        or rel_path.startswith("app/Services/Predb/Feeds/")
+        or rel_path.startswith("app/Services/Runners/")
+        or rel_path.startswith("app/Services/Tmux/Scripts/")
+    ):
+        return ("scheduler", "indexer")
+
+    # Binaries services are used by indexer and by NzbService (resolved in web's GetNzbController)
+    if rel_path.startswith("app/Services/Binaries/"):
+        return ("web", "indexer")
+
     # Web-only paths
     if rel_path in WEB_ONLY_EXACT or any(rel_path.startswith(p) for p in WEB_ONLY_PREFIXES):
         return ("web",)
     if rel_path.startswith("public/") and rel_path != "public/index.php":
         return ("web",)
     if rel_path.startswith("resources/views/"):
-        if rel_path.startswith("resources/views/emails/") or rel_path.startswith("resources/views/mail/"):
+        if (
+            rel_path.startswith("resources/views/emails/")
+            or rel_path.startswith("resources/views/mail/")
+            or rel_path.startswith("resources/views/components/mail/")
+            or rel_path.startswith("resources/views/vendor/mail/")
+        ):
             return ("shared-app",)
         return ("web",)
 
@@ -399,6 +412,18 @@ def get_compose_service_hashes(docker_dir: Path) -> tuple[str, dict[str, str]]:
     return global_hash, per_service
 
 
+def service_image_name(svc: str) -> str:
+    env_key = f"{svc.upper()}_IMAGE"
+    default_role_img = f"nntmux/{svc}:local"
+    role_img = os.environ.get(env_key, "")
+    app_img = os.environ.get("APP_IMAGE", "")
+    if role_img and (role_img != default_role_img or not app_img or app_img == "nntmux/app:local"):
+        return role_img
+    if app_img and app_img != "nntmux/app:local":
+        return app_img
+    return default_role_img
+
+
 def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[str, str]:
     buckets: dict[str, list[str]] = {
         "shared-app": [],
@@ -422,7 +447,9 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
             env_hashes.append(sha256_bytes(env_file.read_bytes()))
         else:
             env_hashes.append("missing")
-    configuration_hash = sha256_text("\n".join(env_hashes))
+    base_img = os.environ.get("BASE_IMAGE", "nntmux/base:local")
+    image_tags = [base_img, *(service_image_name(svc) for svc in APP_SERVICES)]
+    configuration_hash = sha256_text("\n".join([*env_hashes, *image_tags]))
     app_env_hash = env_hashes[1]
 
     effective_hash = "none"
@@ -445,7 +472,7 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
     runtime_tree_hash = sha256_text("\n".join(runtime_records))
     shared_app_hash = sha256_text("\n".join(buckets["shared-app"]))
     migration_hash = sha256_text("\n".join(buckets["migrations"]))
-    base_hash = dockerfile_base_hash(repo)
+    base_hash = sha256_text(f"{dockerfile_base_hash(repo)}\n{base_img}")
 
     state: dict[str, str] = {
         "fingerprint": f"{runtime_tree_hash} {configuration_hash} {effective_hash}",
@@ -457,8 +484,9 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
     }
 
     for svc in APP_SERVICES:
+        img = service_image_name(svc)
         svc_files_hash = sha256_text("\n".join(buckets[svc]))
-        build_hash = sha256_text(f"{base_hash}\n{shared_app_hash}\n{svc_files_hash}")
+        build_hash = sha256_text(f"{base_hash}\n{shared_app_hash}\n{svc_files_hash}\n{img}")
         deploy_hash = sha256_text(f"{build_hash}\n{app_env_hash}\n{per_service_compose[svc]}")
         state[f"build:{svc}"] = build_hash
         state[f"service:{svc}"] = deploy_hash
@@ -493,20 +521,20 @@ def parse_stamp(stamp_path: Path) -> dict[str, str]:
 
 
 def format_stamp(state: dict[str, str]) -> str:
-    lines = [state["fingerprint"]]
-    for key in sorted(k for k in state if k != "fingerprint"):
-        lines.append(f"{key}={state[key]}")
+    stamped = dict(state)
+    base_img = os.environ.get("BASE_IMAGE", "nntmux/base:local")
+    base_id = image_id(base_img)
+    if base_id:
+        stamped["image:base"] = f"{base_img}@{base_id}"
+    for svc in APP_SERVICES:
+        img = service_image_name(svc)
+        svc_id = image_id(img)
+        if svc_id:
+            stamped[f"image:{svc}"] = f"{img}@{svc_id}"
+    lines = [stamped["fingerprint"]]
+    for key in sorted(k for k in stamped if k != "fingerprint"):
+        lines.append(f"{key}={stamped[key]}")
     return "\n".join(lines) + "\n"
-
-
-def service_image_name(svc: str) -> str:
-    env_key = f"{svc.upper()}_IMAGE"
-    if os.environ.get(env_key):
-        return os.environ[env_key]
-    app_img = os.environ.get("APP_IMAGE", "")
-    if app_img and app_img != "nntmux/app:local":
-        return app_img
-    return f"nntmux/{svc}:local"
 
 
 def image_exists(image: str) -> bool:
@@ -568,17 +596,30 @@ def check_app_container(docker_dir: Path, svc: str, verify_image: bool = True) -
     return True, "healthy"
 
 
-def recent_dirty_buckets(repo: Path) -> set[str]:
-    """Return ownership buckets modified in working tree or in HEAD commit (used during legacy stamp upgrades)."""
+def recent_dirty_buckets(repo: Path, stamped_fingerprint: str = "") -> set[str]:
+    """Return ownership buckets modified since the legacy stamped revision (or conservatively all data/infra if unresolvable)."""
+    tokens = stamped_fingerprint.split()
+    base_rev = tokens[0] if tokens else ""
+    if not base_rev:
+        return set(DATA_SERVICES) | set(INFRA_SERVICES)
+    verify = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{base_rev}^{{commit}}"],
+        capture_output=True,
+        check=False,
+    )
+    if verify.returncode != 0:
+        return set(DATA_SERVICES) | set(INFRA_SERVICES)
     buckets: set[str] = set()
     cmds = [
+        ["git", "-C", str(repo), "diff", "--name-only", "-z", base_rev, "HEAD"],
         ["git", "-C", str(repo), "diff", "--name-only", "-z", "HEAD"],
         ["git", "-C", str(repo), "ls-files", "-o", "--exclude-standard", "-z"],
-        ["git", "-C", str(repo), "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "HEAD"],
     ]
     for cmd in cmds:
         proc = subprocess.run(cmd, capture_output=True, check=False)
-        if proc.returncode == 0 and proc.stdout:
+        if proc.returncode != 0:
+            return set(DATA_SERVICES) | set(INFRA_SERVICES)
+        if proc.stdout:
             for raw in proc.stdout.split(b"\x00"):
                 if raw:
                     rel_path = raw.decode("utf-8", errors="surrogateescape")
@@ -593,16 +634,24 @@ def compute_build_targets(repo: Path, docker_dir: Path, stamp_path: Path) -> lis
 
     targets: list[str] = []
     base_img = os.environ.get("BASE_IMAGE", "nntmux/base:local")
-    if force or stamped.get("base") != state["base"] or not image_exists(base_img):
+    base_id = image_id(base_img)
+    if (
+        force
+        or stamped.get("base") != state["base"]
+        or not base_id
+        or stamped.get("image:base") != f"{base_img}@{base_id}"
+    ):
         targets.append("base")
 
     for svc in APP_SERVICES:
         img = service_image_name(svc)
+        svc_id = image_id(img)
         if (
             force
             or f"build:{svc}" not in stamped
             or stamped.get(f"build:{svc}") != state[f"build:{svc}"]
-            or not image_exists(img)
+            or not svc_id
+            or stamped.get(f"image:{svc}") != f"{img}@{svc_id}"
         ):
             targets.append(svc)
 
@@ -615,7 +664,7 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
     force = os.environ.get("FORCE", "0") == "1"
     first_deploy = not bool(stamped)
     legacy_stamp = "__legacy__" in stamped
-    legacy_buckets = recent_dirty_buckets(repo) if legacy_stamp else set()
+    legacy_buckets = recent_dirty_buckets(repo, stamped.get("fingerprint", "")) if legacy_stamp else set()
 
     dirty_app: list[str] = []
     app_reasons: dict[str, str] = {}
