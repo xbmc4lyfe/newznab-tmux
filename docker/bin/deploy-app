@@ -33,7 +33,7 @@ in_list() {
     return 1
 }
 
-if [ "$MIGRATE" = 1 ] || [ -n "$DIRTY_DATA" ]; then
+if [ "$MIGRATE" = 1 ] || [ -n "$DIRTY_DATA" ] || [ -n "$RECONCILE_DATA" ]; then
     need_scheduler_drain=1
     need_indexer_drain=1
     need_horizon_stop=1
@@ -156,6 +156,13 @@ fi
 if [ -n "$DIRTY_DATA" ]; then
     # shellcheck disable=SC2086
     compose up -d --no-deps --force-recreate --wait $DIRTY_DATA
+    verify
+fi
+
+if [ -n "$RECONCILE_DATA" ]; then
+    # Without a stamp, only Compose drift is reconciled; unchanged data services keep running.
+    # shellcheck disable=SC2086
+    compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $RECONCILE_DATA
     verify
 fi
 

@@ -393,7 +393,9 @@ def get_compose_service_hashes(docker_dir: Path) -> tuple[str, dict[str, str]]:
         parsed = json.loads(raw)
         if isinstance(parsed, dict) and isinstance(parsed.get("services"), dict):
             services_map = parsed["services"]
-            for svc in ALL_SERVICES:
+            # Services outside the known roster are stateless infrastructure by default, so an
+            # added Compose service is started rather than silently stamped as deployed.
+            for svc in sorted(set(ALL_SERVICES) | set(services_map)):
                 if svc in services_map:
                     svc_payload = {
                         "service": services_map[svc],
@@ -453,6 +455,7 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
 
     effective_hash = "none"
     per_service_compose: dict[str, str] = {svc: "none" for svc in ALL_SERVICES}
+    compose_rendered = False
     config_cmd = os.environ.get("DEPLOY_CONFIG_COMMAND", "")
     if config_cmd:
         proc = subprocess.run([config_cmd, "--fingerprint"], capture_output=True, text=True, check=False)
@@ -463,10 +466,12 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
         if include_compose:
             if Path(config_cmd).name == "deploy-current":
                 _, per_service_compose = get_compose_service_hashes(docker_dir)
+                compose_rendered = True
             else:
                 per_service_compose = {svc: effective_hash for svc in ALL_SERVICES}
     elif include_compose:
         effective_hash, per_service_compose = get_compose_service_hashes(docker_dir)
+        compose_rendered = True
 
     runtime_tree_hash = sha256_text("\n".join(runtime_records))
     shared_app_hash = sha256_text("\n".join(buckets["shared-app"]))
@@ -490,10 +495,13 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
         state[f"build:{svc}"] = build_hash
         state[f"service:{svc}"] = deploy_hash
 
-    for svc in (*DATA_SERVICES, *INFRA_SERVICES):
-        svc_files_hash = sha256_text("\n".join(buckets[svc]))
+    extra_infra = sorted(set(per_service_compose) - set(ALL_SERVICES)) if compose_rendered else []
+    for svc in (*DATA_SERVICES, *INFRA_SERVICES, *extra_infra):
+        svc_files_hash = sha256_text("\n".join(buckets.get(svc, [])))
         deploy_hash = sha256_text(f"{svc_files_hash}\n{per_service_compose[svc]}")
         state[f"service:{svc}"] = deploy_hash
+        if per_service_compose[svc] == "absent":
+            state[f"compose:{svc}"] = "absent"
 
     return state
 
@@ -657,6 +665,18 @@ def compute_build_targets(repo: Path, docker_dir: Path, stamp_path: Path) -> lis
     return targets
 
 
+def infra_services(state: dict[str, str]) -> list[str]:
+    """Known infrastructure plus any additional service rendered by the effective Compose files."""
+    rendered = {key.split(":", 1)[1] for key in state if key.startswith("service:")}
+    extra = sorted(rendered - set(ALL_SERVICES))
+    return [*INFRA_SERVICES, *extra]
+
+
+def compose_present(state: dict[str, str], svc: str) -> bool:
+    """False when the effective Compose configuration does not render this service."""
+    return state.get(f"compose:{svc}", "none") != "absent"
+
+
 def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[str, object]:
     state = compute_state(repo, docker_dir, include_compose=True)
     stamped = parse_stamp(stamp_path)
@@ -692,10 +712,16 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
             app_reasons[svc] = "unchanged"
 
     dirty_data: list[str] = []
+    reconcile_data: list[str] = []
     data_reasons: dict[str, str] = {}
     for svc in DATA_SERVICES:
-        if first_deploy:
-            data_reasons[svc] = "unchanged"
+        if not compose_present(state, svc):
+            data_reasons[svc] = "not rendered"
+        elif first_deploy:
+            # No record of what is running: let Compose reconcile drift while writers are
+            # stopped, without force-recreating stateful services.
+            reconcile_data.append(svc)
+            data_reasons[svc] = "reconcile (no stamp)"
         elif legacy_stamp:
             if svc in legacy_buckets:
                 dirty_data.append(svc)
@@ -710,15 +736,22 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
 
     dirty_infra: list[str] = []
     infra_reasons: dict[str, str] = {}
-    for svc in INFRA_SERVICES:
-        if first_deploy:
-            infra_reasons[svc] = "unchanged"
+    for svc in infra_services(state):
+        if not compose_present(state, svc):
+            infra_reasons[svc] = "not rendered"
+        elif first_deploy:
+            # Stateless: recreate so bind-mounted configuration matches what gets stamped.
+            dirty_infra.append(svc)
+            infra_reasons[svc] = "recreate (no stamp)"
         elif legacy_stamp:
             if svc in legacy_buckets:
                 dirty_infra.append(svc)
                 infra_reasons[svc] = "config/compose changed"
             else:
                 infra_reasons[svc] = "unchanged"
+        elif f"service:{svc}" not in stamped:
+            dirty_infra.append(svc)
+            infra_reasons[svc] = "added to Compose"
         elif stamped.get(f"service:{svc}") != state[f"service:{svc}"]:
             dirty_infra.append(svc)
             infra_reasons[svc] = "config/compose changed"
@@ -762,6 +795,7 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
         "dirty_app": dirty_app,
         "dirty_data": dirty_data,
         "dirty_infra": dirty_infra,
+        "reconcile_data": reconcile_data,
         "build_targets": build_targets,
         "app_reasons": app_reasons,
         "data_reasons": data_reasons,
@@ -801,6 +835,7 @@ def main() -> None:
         print(f"DIRTY_APP={shlex.quote(' '.join(plan['dirty_app']))}")
         print(f"DIRTY_DATA={shlex.quote(' '.join(plan['dirty_data']))}")
         print(f"DIRTY_INFRA={shlex.quote(' '.join(plan['dirty_infra']))}")
+        print(f"RECONCILE_DATA={shlex.quote(' '.join(plan['reconcile_data']))}")
         print(f"BUILD_TARGETS={shlex.quote(' '.join(plan['build_targets']))}")
         return
 
@@ -822,9 +857,14 @@ def main() -> None:
                 action = "skip"
             print(f"{svc:<18} {'app':<10} {action:<18} {reason}")
         for svc in DATA_SERVICES:
-            action = "drain+recreate" if svc in plan["dirty_data"] else "skip"
+            if svc in plan["dirty_data"]:
+                action = "drain+recreate"
+            elif svc in plan["reconcile_data"]:
+                action = "reconcile"
+            else:
+                action = "skip"
             print(f"{svc:<18} {'data':<10} {action:<18} {plan['data_reasons'][svc]}")
-        for svc in INFRA_SERVICES:
+        for svc in plan["infra_reasons"]:
             action = "recreate" if svc in plan["dirty_infra"] else "skip"
             print(f"{svc:<18} {'infra':<10} {action:<18} {plan['infra_reasons'][svc]}")
         return

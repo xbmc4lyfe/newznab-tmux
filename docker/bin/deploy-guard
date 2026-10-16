@@ -263,10 +263,15 @@ cmd_run() {
     check_recovery_hold
     if "$@"; then rc=0; else rc=$?; fi
     if [ "$rc" -eq 0 ] && [ "${STAMP_ON_SUCCESS:-0}" = 1 ]; then
-        if [ "$(fingerprint)" = "$before" ]; then
-            "$DIR/bin/deploy-plan" --stamp-data "$target" >"$STAMP"
+        # One snapshot supplies both the comparison and the stamp, so a checkout change between
+        # them cannot stamp per-service data that was never built or verified.
+        stamp_tmp="$STAMP.tmp.$$"
+        if "$DIR/bin/deploy-plan" --stamp-data "$target" >"$stamp_tmp" \
+            && [ "$(head -n 1 "$stamp_tmp")" = "$before" ]; then
+            mv -f "$stamp_tmp" "$STAMP"
             if [ "${RECORD_DEPLOY_TIME:-0}" = 1 ]; then date +%s >"$SUCCESS_TIME"; fi
         else
+            rm -f "$stamp_tmp"
             rm -f "$STAMP"
             log "$target" "result=tree-changed-during-run (not stamped; the next build will run)"
             echo "deploy-guard: the checkout changed while $target ran, so what was built is already out of date; not deploying it. Run again." >&2

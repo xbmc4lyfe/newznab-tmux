@@ -16,17 +16,21 @@ if [ "${1:-}" = --fingerprint ]; then
 fi
 
 APP_IMAGE="${APP_IMAGE:-nntmux/app:local}"
+# Same resolution as bin/compose and bin/deploy-plan: a custom APP_IMAGE replaces blank or
+# default role tags, while an explicit custom role tag wins.
 service_image() {
     default_role_img="nntmux/$1:local"
-    if [ "$APP_IMAGE" != "nntmux/app:local" ]; then
-        default_role_img="$APP_IMAGE"
-    fi
     case "$1" in
-        web) printf '%s\n' "${WEB_IMAGE:-$default_role_img}" ;;
-        horizon) printf '%s\n' "${HORIZON_IMAGE:-$default_role_img}" ;;
-        scheduler) printf '%s\n' "${SCHEDULER_IMAGE:-$default_role_img}" ;;
-        indexer) printf '%s\n' "${INDEXER_IMAGE:-$default_role_img}" ;;
+        web) role_img="${WEB_IMAGE:-}" ;;
+        horizon) role_img="${HORIZON_IMAGE:-}" ;;
+        scheduler) role_img="${SCHEDULER_IMAGE:-}" ;;
+        indexer) role_img="${INDEXER_IMAGE:-}" ;;
     esac
+    if [ "$APP_IMAGE" != "nntmux/app:local" ] && { [ -z "$role_img" ] || [ "$role_img" = "$default_role_img" ]; }; then
+        printf '%s\n' "$APP_IMAGE"
+    else
+        printf '%s\n' "${role_img:-$default_role_img}"
+    fi
 }
 
 for service in web horizon scheduler indexer; do

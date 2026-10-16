@@ -61,6 +61,7 @@ case "$*" in
     *'artisan migrate'*) [ "${NNTMUX_MIGRATION_FAIL:-0}" != 1 ] || exit 42 ;;
     *' up -d'*)
         [ "${NNTMUX_HEALTH_FAIL:-0}" != 1 ] || exit 44
+        if [ "${NNTMUX_STALE_UP:-0}" = 1 ]; then echo changed > "$NNTMUX_REPO/app.txt"; fi
         case "$*" in *' --force-recreate '*) : > "$NNTMUX_REPO/recreated" ;; esac ;;
 esac
 exit 0
@@ -223,7 +224,8 @@ SH);
         $process = $this->deploy(['NNTMUX_MIGRATION_FAIL' => '1']);
         $process->run();
         $this->assertFalse($process->isSuccessful());
-        $this->assertStringNotContainsString(' up -d', $this->events());
+        // A first deployment may reconcile data services for the migration, never start new app containers.
+        $this->assertStringNotContainsString(' up -d --no-deps --force-recreate', $this->events());
         $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp');
         $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.time');
     }
@@ -289,7 +291,7 @@ SH);
         $process->run();
         $this->assertFalse($process->isSuccessful());
         $this->assertStringContainsString('artisan migrate', $this->events());
-        $this->assertStringNotContainsString(' up -d', $this->events());
+        $this->assertStringNotContainsString(' up -d --no-deps --force-recreate', $this->events());
     }
 
     public function test_up_preserves_first_bringup_when_no_app_containers_exist(): void
@@ -678,6 +680,43 @@ SH);
         $this->assertStringContainsString('Run Migrations  : no', $output);
         $this->assertMatchesRegularExpression('/scheduler\s+app\s+drain\+recreate\s+code\/config changed/', $output);
         $this->assertMatchesRegularExpression('/web\s+app\s+skip\s+unchanged/', $output);
+    }
+
+    public function test_first_deploy_without_stamp_recreates_infra_and_reconciles_data_without_force(): void
+    {
+        $this->deploy()->mustRun();
+        $events = $this->events();
+        $reconcile = ' up -d --no-deps --wait --wait-timeout 240 mariadb redis manticore';
+        $this->assertStringContainsString($reconcile, $events);
+        $this->assertStringNotContainsString('--force-recreate --wait mariadb', $events);
+        $this->assertLessThan(strpos($events, 'artisan migrate'), strpos($events, $reconcile));
+        $this->assertGreaterThan(strpos($events, ' stop web scheduler indexer'), strpos($events, $reconcile));
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy mailpit', $events);
+    }
+
+    public function test_service_added_to_effective_compose_is_started_and_unrendered_data_is_left_alone(): void
+    {
+        $services = '"web":{},"horizon":{},"scheduler":{},"indexer":{},"redis":{},"manticore":{},"proxy":{}';
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => '{"services":{'.$services.'}}'])->mustRun();
+        $this->assertStringNotContainsString('mariadb', $this->events());
+        file_put_contents($this->directory.'/events', '');
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => '{"services":{'.$services.',"sidecar":{}}}'])->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 sidecar', $events);
+        $this->assertStringNotContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $events);
+        $this->assertStringNotContainsString('artisan migrate', $events);
+        $this->assertFileExists($this->directory.'/docker/.deploy.stamp');
+        $this->assertStringContainsString('service:sidecar=', (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
+    }
+
+    public function test_checkout_change_during_rollout_never_publishes_a_stamp(): void
+    {
+        $process = $this->deploy(['NNTMUX_STALE_UP' => '1']);
+        $process->run();
+        $this->assertSame(76, $process->getExitCode());
+        $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp');
+        $this->assertSame([], glob($this->directory.'/docker/.deploy.stamp.tmp.*') ?: []);
     }
 
     public function test_external_image_replacement_or_tag_change_invalidates_build_stamp(): void
