@@ -4,13 +4,17 @@ declare(strict_types=1);
 
 namespace Tests\Unit\Services\NameFixing;
 
+use App\Facades\Search;
 use App\Models\Release;
 use App\Services\NameFixing\DonorMatchSelector;
 use App\Services\NameFixing\FileNameCleaner;
 use App\Services\NameFixing\FilePrioritizer;
 use App\Services\NameFixing\NameFixingQueryService;
 use App\Services\NameFixing\NameFixingService;
+use App\Services\NameFixing\PredbMatchSelector;
 use App\Services\NameFixing\ReleaseUpdateService;
+use App\Services\Predb\PredbIdentityLookup;
+use App\Services\Predb\PredbIdentityRebuild;
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
 use Illuminate\Database\Capsule\Manager as Capsule;
@@ -43,20 +47,22 @@ final class GenericPredbAttachmentTest extends TestCase
         $this->previousContainer = Container::getInstance();
         $this->previousFacadeApplication = Facade::getFacadeApplication();
         $this->previousResolver = Release::getConnectionResolver();
-        $container = new Application(dirname(__DIR__, 4));
+        $container = new Application(dirname((new ReflectionClass(PredbIdentityLookup::class))->getFileName(), 4));
         $container->instance('config', new Repository);
         Container::setInstance($container);
         $this->database = new Capsule($container);
         $this->database->addConnection(['driver' => 'sqlite', 'database' => ':memory:']);
         $container->instance('db', $this->database->getDatabaseManager());
+        $container->bind('db.schema', fn () => $this->database->getConnection()->getSchemaBuilder());
         $this->database->bootEloquent();
         $this->database->getConnection()->setTransactionManager(new DatabaseTransactionsManager);
         Facade::clearResolvedInstances();
         Facade::setFacadeApplication($container);
         DB::statement('CREATE TABLE par2_rename_progress (releases_id INTEGER PRIMARY KEY)');
-        DB::statement('CREATE TABLE predb (id INTEGER PRIMARY KEY, title TEXT, filename TEXT)');
+        DB::statement("CREATE TABLE predb (id INTEGER PRIMARY KEY NOT NULL, title VARCHAR NOT NULL, filename VARCHAR NOT NULL DEFAULT '')");
         DB::statement('CREATE TABLE releases (additional_pack_evidence TEXT DEFAULT NULL, nzbstatus INTEGER DEFAULT 1, id INTEGER PRIMARY KEY, guid TEXT, name TEXT COLLATE NOCASE, searchname TEXT COLLATE NOCASE, predb_id INTEGER DEFAULT 0, fromname TEXT, groups_id INTEGER DEFAULT 1, categories_id INTEGER DEFAULT 10, size INTEGER DEFAULT 5000, nfostatus INTEGER DEFAULT 1, isrenamed INTEGER DEFAULT 0, proc_nfo INTEGER DEFAULT 0, proc_files INTEGER DEFAULT 0, proc_par2 INTEGER DEFAULT 0, proc_uid INTEGER DEFAULT 0, proc_srr INTEGER DEFAULT 0, proc_hash16k INTEGER DEFAULT 0, proc_crc32 INTEGER DEFAULT 0)');
         DB::statement('CREATE TABLE release_files (releases_id INTEGER, name TEXT, crc32 TEXT)');
+        (require database_path('migrations/2026_10_15_150000_create_predb_identity_projection.php'))->up();
     }
 
     protected function tearDown(): void
@@ -226,6 +232,7 @@ final class GenericPredbAttachmentTest extends TestCase
     {
         $release = $this->seed(0);
         DB::table('predb')->where('id', 7)->update(['filename' => $stem.'.mkv']);
+        $this->certifySqlFixture();
         [, $updater] = $this->services();
         $attached = $updater->attachPredbSnapshot($release, 7, self::TITLE, $stem);
         self::assertSame(0, (int) DB::table('releases')->where('id', 42)->value('predb_id'));
@@ -238,6 +245,7 @@ final class GenericPredbAttachmentTest extends TestCase
     {
         $release = $this->seed(0);
         DB::table('predb')->where('id', 7)->update(['title' => $stem]);
+        $this->certifySqlFixture();
         DB::table('releases')->where('id', 42)->update(['name' => $stem, 'searchname' => $stem]);
         $release->name = $release->searchname = $stem;
         [, $updater] = $this->services();
@@ -250,6 +258,7 @@ final class GenericPredbAttachmentTest extends TestCase
     {
         $release = $this->seed(0);
         DB::table('predb')->where('id', 7)->update(['filename' => '第１２話.mkv']);
+        $this->certifySqlFixture();
         [, $updater] = $this->services();
         self::assertSame(self::TITLE, $updater->currentPredbTitle(7, self::TITLE, '第１２話'));
         self::assertTrue($updater->attachPredbSnapshot($release, 7, self::TITLE, '第１２話'));
@@ -261,6 +270,7 @@ final class GenericPredbAttachmentTest extends TestCase
         DB::table('predb')->insert(['id' => 7, 'title' => self::TITLE]);
         DB::table('releases')->insert(['id' => 42, 'guid' => 'original-guid', 'name' => self::TITLE, 'searchname' => self::TITLE, 'predb_id' => $predbId]);
         DB::table('release_files')->insert(['releases_id' => 42, 'name' => self::TITLE.'.mkv']);
+        $this->certifySqlFixture();
         $release = DB::table('releases')->where('id', 42)->first();
         $release->releases_id = 42;
         $release->textstring = self::TITLE;
@@ -278,8 +288,21 @@ final class GenericPredbAttachmentTest extends TestCase
         (new ReflectionProperty(NameFixingService::class, 'fileNameCleaner'))->setValue($service, new FileNameCleaner);
         (new ReflectionProperty(NameFixingService::class, 'filePrioritizer'))->setValue($service, new FilePrioritizer);
         (new ReflectionProperty(NameFixingService::class, 'donorMatchSelector'))->setValue($service, new DonorMatchSelector);
-        (new ReflectionProperty(NameFixingService::class, 'predbMatchCache'))->setValue($service, [self::TITLE => ['id' => 7, 'title' => self::TITLE]]);
+        (new ReflectionProperty(NameFixingService::class, 'predbMatchSelector'))->setValue($service, new PredbMatchSelector);
+        Search::shouldReceive('searchPredb')->with(self::TITLE)
+            ->andReturn([['id' => 7, 'title' => self::TITLE, 'filename' => '']]);
+        Search::shouldReceive('searchPredbFilenameCandidates')->never();
 
         return [$service, $updater];
+    }
+
+    private function certifySqlFixture(): void
+    {
+        $rebuild = new PredbIdentityRebuild;
+        $start = $rebuild->start(DB::connection());
+        do {
+            $page = $rebuild->chunk(DB::connection(), $start['generation']);
+        } while (! $page['exhausted']);
+        $rebuild->certify(DB::connection(), $start['generation']);
     }
 }

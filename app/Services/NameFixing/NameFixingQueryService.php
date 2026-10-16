@@ -17,6 +17,8 @@ use RuntimeException;
 
 final class NameFixingQueryService
 {
+    public const PREDB_IDENTITY_POLICY = 'a315040d188f2aa4dbbfb0671fb9ab71591059d244b01baa7e2a7a1fa5268e9a';
+
     public const SOURCE_NFO = 'nfo';
 
     public const SOURCE_FILES = 'files';

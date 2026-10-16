@@ -7,11 +7,14 @@ namespace App\Services\NameFixing;
 use App\Enums\Par2RenameOutcome;
 use App\Exceptions\IncompletePredbMatchException;
 use App\Facades\Search;
+use App\Services\NameFixing\Data\FilenamePass;
 use App\Services\NameFixing\Extractors\FileNameExtractor;
 use App\Services\NameFixing\Extractors\NfoNameExtractor;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbContentsService;
 use App\Services\Nzb\NzbService;
+use App\Services\Predb\PredbIdentityLookup;
+use App\Services\Predb\PredbIdentityPolicy;
 use App\Support\Par2FileHashEvidence;
 use App\Support\PredbSearchDocument;
 use App\Support\ReleasePackEvidence;
@@ -32,6 +35,8 @@ use Throwable;
  */
 class NameFixingService
 {
+    public const PREDB_IDENTITY_POLICY = '1f261f87e0e2ffb82c122b0b7148fcb153074aa2c404b2572ede594ea6268040';
+
     private const PREDB_CANDIDATE_PAGE_SIZE = 21;
 
     private const PREDB_CANDIDATE_MAX_PAGES = 10;
@@ -440,48 +445,163 @@ class NameFixingService
     /**
      * Check PreDB for filename matches.
      */
-    protected function preDbFileCheck(object $release, bool $echo, string $type, bool $nameStatus, bool $show, ?bool &$hadEvidence = null): bool
+    protected function preDbFileCheck(object $release, bool $echo, string $type, bool $nameStatus, bool $show, ?bool &$hadEvidence = null, ?bool &$lookupComplete = null, ?FilenamePass $observedPass = null, ?callable $filenameGuard = null): bool
     {
-        $hadEvidence = true;
-        $fileName = $this->fileNameCleaner->cleanForMatching($release->textstring, preserveLeadingNumber: true);
+        $pass = $observedPass ?? $this->collectPredbFilenamePass([(string) $release->textstring]);
+        $filenameGuard ??= $this->filenamePassGuard($release, $pass);
+        $hadEvidence = $pass->lookups[0]['evidence'] ?? true;
+        $lookupComplete = $pass->complete();
+        $selected = $pass->uniqueMatches()[0] ?? null;
 
-        if (empty($fileName)) {
+        if ($selected === null) {
             return false;
         }
+        $matched = $this->applyPredbFilenameMatch($release, $selected['match'], $echo, $type, $nameStatus, $show, $filenameGuard);
+        if ($echo && ! $matched) {
+            $lookupComplete = false;
+        }
 
-        $bestMatch = $this->findBestPredbMatch($fileName);
-        $hadEvidence = $bestMatch !== null || ($this->predbEvidenceCache[$fileName] ?? false);
-        if ($bestMatch !== null) {
-            if ((int) ($bestMatch['id'] ?? 0) <= 0) {
+        return $matched;
+    }
+
+    /** @param list<string> $filenames */
+    private function collectPredbFilenamePass(array $filenames, int $minimumLength = 0): FilenamePass
+    {
+        $lookups = [];
+        $eligible = [];
+        $localRejections = [];
+        $localPolicy = null;
+        foreach ($filenames as $index => $filename) {
+            $evidence = new OriginalFilenameEvidence($filename);
+            $query = $this->fileNameCleaner->cleanForFilenameDiscovery($evidence);
+            $lookups[$index] = ['filename' => $filename, 'match' => null, 'evidence' => true, 'complete' => true];
+            if ($evidence->isLocallyRejectedPipe()) {
+                $localRejections[] = $index;
+                $localPolicy ??= (new PredbIdentityPolicy)->fingerprint();
+
+                continue;
+            }
+            if (empty($query) || strlen($query) < $minimumLength) {
+                continue;
+            }
+            $eligible[] = ['index' => $index, 'evidence' => $evidence, 'query' => $query];
+        }
+        $results = (new PredbIdentityLookup)->lookupMany(DB::connection(), array_column($eligible, 'evidence'));
+        foreach ($eligible as $position => $observation) {
+            $result = $results[$position];
+            $lookup = &$lookups[$observation['index']];
+            $lookup['complete'] = $result['status'] !== 'unknown';
+            $lookup['evidence'] = $result['status'] !== 'absent';
+            if ($result['status'] === 'unique') {
+                $lookup['match'] = $this->findBestPredbFilenameMatch($observation['query'], $observation['evidence'], $result['candidate']);
+            }
+            unset($lookup);
+        }
+
+        if ($localRejections !== [] && ($localPolicy === null || (new PredbIdentityPolicy)->fingerprint() !== $localPolicy)) {
+            foreach ($localRejections as $index) {
+                $lookups[$index]['complete'] = false;
+            }
+        }
+
+        return new FilenamePass($filenames, $lookups, $localPolicy);
+    }
+
+    /** @return list<string> */
+    private function persistedFilenameInventory(object $release): array
+    {
+        return DB::table('release_files')->where('releases_id', (int) ($release->releases_id ?? $release->id ?? 0))
+            ->pluck('name')->map(static fn (mixed $name): string => (string) $name)->all();
+    }
+
+    /** @param list<string>|null $inventory
+     * @return callable(): bool
+     */
+    private function filenamePassGuard(object $release, FilenamePass $pass, int $minimumLength = 0, ?array $inventory = null): callable
+    {
+        $release = clone $release;
+        $inventory ??= $this->persistedFilenameInventory($release);
+        $inventory = array_values(array_unique($inventory, SORT_STRING));
+        sort($inventory, SORT_STRING);
+        $valid = true;
+
+        return function () use ($release, $pass, $minimumLength, $inventory, &$valid): bool {
+            if (! $valid) {
                 return false;
             }
-            if (! $echo && $this->updateService->currentPredbTitle((int) ($bestMatch['id'] ?? 0), (string) $bestMatch['title'], $fileName) === null) {
-                return false;
+            if ($pass->localRejectionPolicy !== null && (new PredbIdentityPolicy)->fingerprint() !== $pass->localRejectionPolicy) {
+                return $valid = false;
             }
-            if (PredbSearchDocument::exactValue((string) ($bestMatch['title'] ?? '')) === PredbSearchDocument::exactValue((string) $release->searchname)) {
-                if ($echo) {
-                    $this->updateService->attachPredbSnapshot($release, (int) ($bestMatch['id'] ?? 0), (string) $bestMatch['title'], $fileName);
-                }
-
-                return $this->updateService->matched;
+            $current = DB::table('release_files')->where('releases_id', (int) ($release->releases_id ?? $release->id ?? 0))
+                ->sharedLock()->pluck('name')->map(static fn (mixed $name): string => (string) $name)->all();
+            $current = array_values(array_unique($current, SORT_STRING));
+            sort($current, SORT_STRING);
+            if ($current !== $inventory || ! $pass->complete()) {
+                return $valid = false;
             }
+            $fresh = $this->collectPredbFilenamePass($pass->filenames, $minimumLength);
 
-            $this->updateService->updateRelease(
-                $release,
-                $bestMatch['title'] ?? '',
-                'PreDb: Filename match',
-                $echo,
-                $type,
-                $nameStatus,
-                $show,
-                $bestMatch['id'] ?? null,
-                $fileName
-            );
+            return $valid = $fresh->complete() && $fresh->lookups === $pass->lookups
+                && $fresh->localRejectionPolicy === $pass->localRejectionPolicy;
+        };
+    }
+
+    /** @param array<string, mixed> $bestMatch */
+    private function applyPredbFilenameMatch(object $release, array $bestMatch, bool $echo, string $type, bool $nameStatus, bool $show, ?callable $filenameGuard = null): bool
+    {
+        $originalFilename = (string) $release->textstring;
+        if ((int) ($bestMatch['id'] ?? 0) <= 0) {
+            return false;
+        }
+        if (! $echo && $this->updateService->currentPredbTitle((int) ($bestMatch['id'] ?? 0), (string) $bestMatch['title'], $originalFilename) === null) {
+            return false;
+        }
+        if (PredbSearchDocument::exactValue((string) ($bestMatch['title'] ?? '')) === PredbSearchDocument::exactValue((string) $release->searchname)) {
+            if ($echo) {
+                $this->updateService->attachPredbSnapshot($release, (int) ($bestMatch['id'] ?? 0), (string) $bestMatch['title'], $originalFilename, $filenameGuard);
+            }
 
             return $this->updateService->matched;
         }
 
-        return false;
+        $this->updateService->updateRelease(
+            $release,
+            $bestMatch['title'] ?? '',
+            'PreDb: Filename match',
+            $echo,
+            $type,
+            $nameStatus,
+            $show,
+            $bestMatch['id'] ?? null,
+            $originalFilename,
+            $filenameGuard
+        );
+
+        return $this->updateService->matched;
+    }
+
+    /**
+     * Apply existing scorer policy only after certified SQL nomination.
+     *
+     * @param  array{id: int, title: string, filename: string}  $candidate
+     * @return array<string, mixed>|null
+     */
+    private function findBestPredbFilenameMatch(string $query, OriginalFilenameEvidence $evidence, array $candidate): ?array
+    {
+        if (! $evidence->accepts((string) $candidate['title'], (string) $candidate['filename'])) {
+            return null;
+        }
+        $eligible = [$candidate];
+        // Certified uniqueness does not bypass generic-name and scoring policy.
+        $match = $this->predbMatchSelector->selectBestMatch($evidence->stem, $eligible, $evidence)
+            ?? $this->predbMatchSelector->selectBestMatch($evidence->basename, $eligible, $evidence)
+            ?? $this->predbMatchSelector->selectBestMatch($query, $eligible, $evidence);
+        if ($match === null || (int) ($match['id'] ?? 0) !== (int) $candidate['id']
+            || PredbSearchDocument::exactValue((string) ($match['title'] ?? '')) !== PredbSearchDocument::exactValue((string) $candidate['title'])) {
+            return null;
+        }
+
+        return $match;
     }
 
     /**
@@ -872,38 +992,52 @@ class NameFixingService
         )));
         $prioritized = $this->filePrioritizer->prioritizeForMatching($filenames);
 
-        foreach ($prioritized as $filename) {
+        // No updater call may occur until every prioritized observation is resolved.
+        $pass = $this->collectPredbFilenamePass($prioritized);
+        $filenameGuard = $this->filenamePassGuard($release, $pass, 0, $filenames);
+        foreach ($pass->uniqueMatches() as $selected) {
             $candidate = clone $release;
-            $candidate->textstring = $filename;
-            $hadEvidence = false;
-            $this->preDbFileCheck($candidate, $echo, 'Filenames, ', $nameStatus, $show, $hadEvidence);
-            if ($this->updateService->matched) {
-                break;
-            }
-            if ($hadEvidence) {
-                continue;
-            }
-            $fileResult = $this->fileExtractor->extractFromFile($filename);
-
-            if ($fileResult !== null) {
-                $this->updateService->updateRelease(
-                    $candidate,
-                    $fileResult->newName,
-                    'fileCheck: '.$fileResult->method,
-                    $echo,
-                    'Filenames, ',
-                    $nameStatus,
-                    $show
-                );
-            }
-
+            $candidate->textstring = $selected['filename'];
+            $this->applyPredbFilenameMatch($candidate, $selected['match'], $echo, 'Filenames, ', $nameStatus, $show, $filenameGuard);
             if ($this->updateService->matched) {
                 break;
             }
         }
+        $allLookupsComplete = $pass->complete() && ! $pass->hasMatches();
+        $fallbacks = [];
+        foreach ($pass->lookups as $lookup) {
+            if (! $lookup['evidence']) {
+                $candidate = clone $release;
+                $candidate->textstring = $lookup['filename'];
+                $fallbacks[] = $candidate;
+            }
+        }
 
-        if (! $this->updateService->matched) {
-            $this->completeFilenamePass($release, $filenames, $echo, $nameStatus);
+        if (! $this->updateService->matched && $allLookupsComplete) {
+            foreach ($fallbacks as $candidate) {
+                $fileResult = $this->fileExtractor->extractFromFile($candidate->textstring);
+                if ($fileResult !== null) {
+                    $this->updateService->updateRelease(
+                        $candidate,
+                        $fileResult->newName,
+                        'fileCheck: '.$fileResult->method,
+                        $echo,
+                        'Filenames, ',
+                        $nameStatus,
+                        $show,
+                        0,
+                        null,
+                        $filenameGuard
+                    );
+                }
+                if ($this->updateService->matched) {
+                    break;
+                }
+            }
+        }
+
+        if (! $this->updateService->matched && $allLookupsComplete) {
+            $this->completeFilenamePass($release, $filenames, $echo, $nameStatus, $filenameGuard, $pass);
         }
 
         if ($showProgress) {
@@ -912,7 +1046,7 @@ class NameFixingService
     }
 
     /** @param list<string> $filenames */
-    private function completeFilenamePass(object $release, array $filenames, bool $echo, bool $nameStatus): void
+    private function completeFilenamePass(object $release, array $filenames, bool $echo, bool $nameStatus, ?callable $filenameGuard = null, ?FilenamePass $observedPass = null): void
     {
         if (! $echo || ! $nameStatus || $this->updateService->namingDeferred()) {
             return;
@@ -920,8 +1054,18 @@ class NameFixingService
         $release = clone $release;
         $release->observed_isrenamed = (int) ($release->isrenamed ?? 0);
         $observedCategory = isset($release->categories_id) ? (int) $release->categories_id : null;
+        $filenames = array_values(array_unique($filenames, SORT_STRING));
         sort($filenames, SORT_STRING);
-        DB::transaction(function () use ($release, $filenames, $observedCategory): void {
+        if ($observedPass === null) {
+            return;
+        }
+        $observedNames = array_values(array_unique($observedPass->filenames, SORT_STRING));
+        sort($observedNames, SORT_STRING);
+        if ($observedNames !== $filenames) {
+            return;
+        }
+        $filenameGuard ??= $this->filenamePassGuard($release, $observedPass, 0, $filenames);
+        $completionGuard = function () use ($release, $filenames, $observedCategory, $filenameGuard): bool {
             $query = DB::table('releases')->where('id', (int) $release->releases_id)
                 ->where('predb_id', $release->predb_id ?? 0)->where('isrenamed', $release->observed_isrenamed);
             if ($observedCategory !== null) {
@@ -929,7 +1073,7 @@ class NameFixingService
             }
             $current = $query->lockForUpdate()->first();
             if ($current === null) {
-                return;
+                return false;
             }
             // A locking read sees newly committed names even under REPEATABLE READ.
             $currentNames = DB::table('release_files')->where('releases_id', (int) $release->releases_id)
@@ -937,10 +1081,12 @@ class NameFixingService
             $currentNames = array_values(array_unique($currentNames));
             sort($currentNames, SORT_STRING);
             if ($currentNames !== $filenames) {
-                return;
+                return false;
             }
-            $this->updateService->completeFilenameSnapshot($release);
-        }, 3);
+
+            return $filenameGuard();
+        };
+        $this->updateService->completeFilenameSnapshot($release, $completionGuard);
     }
 
     protected function markProcessed(bool $echo, bool $nameStatus, string $column, object $release): void
@@ -1597,20 +1743,37 @@ class NameFixingService
                 $this->updateService->reset();
                 $this->updateService->incrementChecked();
 
-                foreach ($files[(int) $release->releases_id] ?? [] as $file) {
+                $filenames = array_values(array_unique(array_map(
+                    static fn (object $file): string => (string) $file->textstring,
+                    $files[(int) $release->releases_id] ?? [],
+                )));
+                $pass = $this->collectPredbFilenamePass($filenames);
+                $filenameGuard = $this->filenamePassGuard($release, $pass, 0, $filenames);
+                foreach ($pass->uniqueMatches() as $selected) {
                     $candidate = clone $release;
-                    $candidate->textstring = (string) $file->textstring;
-                    if ($this->xxxNameCheck($candidate, $echo, $type, $nameStatus, $show)) {
+                    $candidate->textstring = $selected['filename'];
+                    $this->applyPredbFilenameMatch($candidate, $selected['match'], $echo, $type, $nameStatus, $show, $filenameGuard);
+                    if ($this->updateService->matched) {
                         break;
                     }
                 }
 
-                if (! $this->updateService->matched) {
-                    $filenames = array_values(array_unique(array_map(
-                        static fn (object $file): string => (string) $file->textstring,
-                        $files[(int) $release->releases_id] ?? [],
-                    )));
-                    $this->completeFilenamePass($release, $filenames, $echo, $nameStatus);
+                $allLookupsComplete = $pass->complete() && ! $pass->hasMatches();
+                if (! $this->updateService->matched && $allLookupsComplete) {
+                    foreach ($pass->lookups as $lookup) {
+                        if ($lookup['evidence']) {
+                            continue;
+                        }
+                        $candidate = clone $release;
+                        $candidate->textstring = $lookup['filename'];
+                        if ($this->xxxNameCheck($candidate, $echo, $type, $nameStatus, $show, $filenameGuard)) {
+                            break;
+                        }
+                    }
+                }
+
+                if (! $this->updateService->matched && $allLookupsComplete) {
+                    $this->completeFilenamePass($release, $filenames, $echo, $nameStatus, $filenameGuard, $pass);
                 }
 
                 $this->echoRenamed($show);
@@ -1668,10 +1831,10 @@ class NameFixingService
     /**
      * Check for XXX release name.
      */
-    protected function xxxNameCheck(object $release, bool $echo, string $type, bool $nameStatus, bool $show): bool
+    protected function xxxNameCheck(object $release, bool $echo, string $type, bool $nameStatus, bool $show, ?callable $filenameGuard = null): bool
     {
         if (preg_match('/^.+?SDPORN/i', $release->textstring, $hit)) {
-            $this->updateService->updateRelease($release, $hit[0], 'fileCheck: XXX SDPORN', $echo, $type, $nameStatus, $show);
+            $this->updateService->updateRelease($release, $hit[0], 'fileCheck: XXX SDPORN', $echo, $type, $nameStatus, $show, 0, null, $filenameGuard);
 
             return $this->updateService->matched;
         }
@@ -1739,6 +1902,27 @@ class NameFixingService
             return $this->processNfoCandidate(clone $release, $echo, $nameStatus, $show, ! $preId, false, $markProcessed && ! $preId);
         }
 
+        if ($type === 'Filenames, ') {
+            $this->updateService->reset();
+            $hadEvidence = false;
+            $lookupComplete = true;
+            $inventory = $this->persistedFilenameInventory($release);
+            $pass = $this->collectPredbFilenamePass([(string) $release->textstring]);
+            $filenameGuard = $this->filenamePassGuard($release, $pass, 0, $inventory);
+            $this->preDbFileCheck($release, $echo, $type, $nameStatus, $show, $hadEvidence, $lookupComplete, $pass, $filenameGuard);
+            if (! $preId && ! $this->updateService->matched && ! $hadEvidence) {
+                $result = $this->fileExtractor->extractFromFile($release->textstring);
+                if ($result !== null) {
+                    $this->updateService->updateRelease($release, $result->newName, 'fileCheck: '.$result->method, $echo, $type, $nameStatus, $show, 0, null, $filenameGuard);
+                }
+            }
+            if (! $preId && $echo && $nameStatus && $markProcessed && $lookupComplete && ! $this->updateService->matched) {
+                $this->completeFilenamePass($release, $inventory, $echo, $nameStatus, $filenameGuard, $pass);
+            }
+
+            return $this->updateService->matched;
+        }
+
         $identityText = $release->textstring;
 
         // Check PreDB first
@@ -1768,17 +1952,6 @@ class NameFixingService
                 }
                 break;
 
-            case 'Filenames, ':
-                $hadEvidence = false;
-                $this->preDbFileCheck($release, $echo, $type, $nameStatus, $show, $hadEvidence);
-                if (! $this->updateService->matched && ! $hadEvidence) {
-                    $result = $this->fileExtractor->extractFromFile($release->textstring);
-                    if ($result !== null) {
-                        $this->updateService->updateRelease($release, $result->newName, 'fileCheck: '.$result->method, $echo, $type, $nameStatus, $show);
-                    }
-                }
-                break;
-
             default:
                 // Use pattern checker service
                 $result = $this->checkerService->check($release, $release->textstring);
@@ -1789,11 +1962,7 @@ class NameFixingService
 
         // Update processing flags if not matched
         if ($echo && $nameStatus && $markProcessed && ! $this->updateService->matched && ! $this->updateService->namingDeferred()) {
-            if ($type === 'Filenames, ') {
-                $this->completeFilenamePass($release, [(string) $identityText], $echo, $nameStatus);
-            } else {
-                $this->updateProcessingFlags($type, $release);
-            }
+            $this->updateProcessingFlags($type, $release);
         }
 
         return $this->updateService->matched;
@@ -1821,41 +1990,60 @@ class NameFixingService
      */
     public function matchPreDbFiles(object $release, bool $echo, bool $nameStatus, bool $show): int
     {
-        $matching = 0;
+        return $this->matchPreDbFileNames($release, explode('||', $release->filename ?? ''), $echo, $nameStatus, $show);
+    }
 
-        $files = explode('||', $release->filename ?? '');
-        $prioritizedFiles = $this->filePrioritizer->prioritizeForPreDb($files);
-
-        foreach ($prioritizedFiles as $fileName) {
-            $cleanedFileName = $this->fileNameCleaner->cleanForMatching($fileName, preserveLeadingNumber: true);
-
-            if (empty($cleanedFileName) || strlen($cleanedFileName) < 8) {
+    /**
+     * Match independent filename observations without serializing their boundaries.
+     *
+     * @param  list<string>  $files
+     * @param  list<string>|null  $persistedNames
+     *
+     * @throws \Exception
+     */
+    public function matchPreDbFileNames(object $release, array $files, bool $echo, bool $nameStatus, bool $show, ?array $persistedNames = null): int
+    {
+        $inventory = $persistedNames ?? $this->persistedFilenameInventory($release);
+        $pass = $this->collectPredbFilenamePass($this->filePrioritizer->prioritizeForPreDb($files), 8);
+        $filenameGuard = $this->filenamePassGuard($release, $pass, 8, $inventory);
+        foreach ($pass->uniqueMatches() as $selected) {
+            $bestMatch = $selected['match'];
+            $fileName = $selected['filename'];
+            if (! $echo && $this->updateService->currentPredbTitle((int) $bestMatch['id'], (string) $bestMatch['title'], $fileName) === null) {
                 continue;
             }
-
-            $bestMatch = $this->findBestPredbMatch($cleanedFileName);
-
-            if ($bestMatch !== null && (int) ($bestMatch['id'] ?? 0) > 0) {
-                if (! $echo && $this->updateService->currentPredbTitle((int) $bestMatch['id'], (string) $bestMatch['title'], $cleanedFileName) === null) {
+            if (PredbSearchDocument::exactValue((string) $bestMatch['title']) !== PredbSearchDocument::exactValue((string) $release->searchname)) {
+                $this->updateService->updateRelease($release, $bestMatch['title'], 'file matched source: '.$this->predbFilenameSourceDiagnostic((int) $bestMatch['id']), $echo, 'PreDB file match, ', $nameStatus, $show, (int) $bestMatch['id'], $fileName, $filenameGuard);
+                if ($echo && ! $this->updateService->matched) {
                     continue;
                 }
-                if (PredbSearchDocument::exactValue((string) $bestMatch['title']) !== PredbSearchDocument::exactValue((string) $release->searchname)) {
-                    $this->updateService->updateRelease($release, $bestMatch['title'], 'file matched source: '.($bestMatch['source'] ?? ''), $echo, 'PreDB file match, ', $nameStatus, $show, (int) $bestMatch['id'], $cleanedFileName);
-                    if ($echo && ! $this->updateService->matched) {
-                        continue;
-                    }
-                } elseif ($echo) {
-                    $matching = $this->updateService->attachPredbSnapshot($release, (int) $bestMatch['id'], (string) $bestMatch['title'], $cleanedFileName) ? 1 : 0;
 
-                    return $matching;
-                }
-                $matching++;
-
-                return $matching;
+                return 1;
+            }
+            if (! $echo || $this->updateService->attachPredbSnapshot($release, (int) $bestMatch['id'], (string) $bestMatch['title'], $fileName, $filenameGuard)) {
+                return 1;
             }
         }
 
-        return $matching;
+        return 0;
+    }
+
+    /** Optional CLI context; never used to authorize or compare release identity. */
+    private function predbFilenameSourceDiagnostic(int $predbId): string
+    {
+        try {
+            $connection = DB::connection();
+            if ($connection->getDriverName() !== 'sqlite' || ! $connection->getSchemaBuilder()->hasColumn('predb', 'source')) {
+                return '';
+            }
+            $source = $connection->table('predb')->where('id', $predbId)
+                ->selectRaw('substr(CAST(source AS BLOB), 1, 201) AS diagnostic_source')->value('diagnostic_source');
+
+            return is_string($source) && strlen($source) <= 200 && mb_check_encoding($source, 'UTF-8')
+                && mb_strlen($source, 'UTF-8') <= 50 && preg_match('/\p{C}/u', $source) === 0 ? $source : '';
+        } catch (Throwable) {
+            return '';
+        }
     }
 
     /**
@@ -1921,12 +2109,15 @@ class NameFixingService
             foreach ($batch as $row) {
                 $releaseFiles = $files[(int) $row->releases_id] ?? [];
                 usort($releaseFiles, static fn (object $left, object $right): int => strlen((string) $right->textstring) <=> strlen((string) $left->textstring));
-                $row->filename = implode('||', array_map(
+                $fileNames = array_map(
                     static fn (object $file): string => (string) $file->textstring,
                     $releaseFiles
-                ));
+                );
 
-                if ($this->matchPreDbFiles($row, true, true, $show) === 1) {
+                // Preserve the CLI display context; matching uses the original row list.
+                $row->filename = implode('||', $fileNames);
+
+                if ($this->matchPreDbFileNames($row, $fileNames, true, true, $show, $fileNames) === 1) {
                     $counted++;
                 }
                 $counter++;

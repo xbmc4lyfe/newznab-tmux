@@ -50,6 +50,7 @@ use Illuminate\Support\Facades\Facade;
  * @method static array searchSecondary(\App\Enums\SecondarySearchIndex $index, string $query, int $limit = 100)
  * @method static array searchAnimeTitle(string $query, int $limit = 100)
  * @method static array searchMoviesByFields(array $fieldTerms, int $limit = 5000)
+ * @method static list<array{id: int, title: string, filename: string, source: string}>|null searchPredbFilenameCandidates(string $searchTerm)
  *
  * @see SearchService
  */

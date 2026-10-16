@@ -453,7 +453,7 @@ final class AdditionalProcessingMediaIdentityTest extends TestCase
     {
         /** @var NameFixingService&MockInterface $names */
         $names = Mockery::mock(NameFixingService::class);
-        $names->shouldReceive('matchPreDbFiles')->once()->andReturn(0);
+        $names->shouldReceive('matchPreDbFileNames')->once()->andReturn(0);
         $names->shouldReceive('reset')->andReturnNull();
         $names->shouldReceive('lastCommittedIdentity')->andReturnNull();
         /** @var CategorizationService&MockInterface $category */

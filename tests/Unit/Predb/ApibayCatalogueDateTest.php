@@ -13,6 +13,7 @@ use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Contracts\Foundation\Application as ApplicationContract;
 use Illuminate\Database\Capsule\Manager as Capsule;
 use Illuminate\Database\ConnectionResolverInterface;
+use Illuminate\Database\DatabaseTransactionsManager;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\DB;
@@ -58,6 +59,7 @@ final class ApibayCatalogueDateTest extends TestCase
         $this->database = new Capsule($container);
         $this->database->addConnection(['driver' => 'sqlite', 'database' => ':memory:']);
         $this->database->bootEloquent();
+        $this->database->getConnection()->setTransactionManager(new DatabaseTransactionsManager);
         $container->instance('db', $this->database->getDatabaseManager());
         DB::statement('CREATE TABLE predb (id INTEGER PRIMARY KEY AUTOINCREMENT, title VARCHAR(255) NOT NULL UNIQUE, source TEXT NOT NULL DEFAULT "", category TEXT NULL, size TEXT NULL, files TEXT NULL, predate TEXT NULL, nuked INTEGER NOT NULL DEFAULT 0, nukereason TEXT NULL, filename TEXT NOT NULL DEFAULT "", searched INTEGER NOT NULL DEFAULT 0)');
         DB::statement('CREATE TABLE releases (id INTEGER PRIMARY KEY, searchname TEXT, predb_id INTEGER DEFAULT 0, isrenamed INTEGER DEFAULT 1, adddate TEXT)');

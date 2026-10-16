@@ -6,7 +6,9 @@ namespace App\Services\Predb\Feeds;
 
 use App\Facades\Search;
 use App\Models\Predb;
+use App\Services\Predb\PredbIdentityWriter;
 use App\Support\PredbSearchDocument;
+use Illuminate\Database\Connection;
 use Illuminate\Database\QueryException;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Collection;
@@ -44,41 +46,43 @@ class PredbFeedImporter
         $result = ['inserted' => 0, 'updated' => 0, 'skipped' => 0];
 
         foreach ($entries as $entry) {
-            try {
-                $outcome = $this->importEntry($entry, $dryRun);
-            } catch (QueryException $e) {
-                // Skip rows the database rejects as data (SQLSTATE class 22, e.g. a bad value);
-                // connection, schema and other infrastructure failures must fail the run.
-                if (! str_starts_with((string) $e->getCode(), '22')) {
-                    throw $e;
+            $connection = DB::connection();
+            $ambient = $connection->transactionLevel() > 0;
+            $plan = $this->importEntry($entry, $dryRun, $connection);
+            $failure = $plan['source_failure'];
+            if ($failure !== null) {
+                if (! str_starts_with((string) $failure->getCode(), '22')) {
+                    throw $failure;
                 }
-
-                Log::warning('PreDB feed entry import failed', ['title' => $entry->title, 'source' => $entry->source, 'error' => $e->getMessage()]);
-                $outcome = 'skipped';
+                Log::warning('PreDB feed entry import failed', ['title' => $entry->title, 'source' => $entry->source, 'error' => $failure->getMessage()]);
+                $plan = $this->plan('skipped');
+            }
+            if ($plan['publication'] !== null) {
+                $this->publish($connection, $ambient, $plan['publication']);
             }
 
-            $result[$outcome]++;
+            $result[$plan['outcome']]++;
         }
 
         return $result;
     }
 
     /**
-     * @return 'inserted'|'updated'|'skipped'
+     * @return array{outcome: 'inserted'|'updated'|'skipped', publication: null|array{method: 'insert'|'update', document: array<string, mixed>}, source_failure: QueryException|null}
      */
-    private function importEntry(PredbFeedEntry $entry, bool $dryRun): string
+    private function importEntry(PredbFeedEntry $entry, bool $dryRun, Connection $connection): array
     {
         $title = trim($entry->title);
 
         if ($title === '' || mb_strlen($title) > 255) {
-            return 'skipped';
+            return $this->plan('skipped');
         }
 
         $existing = ($dryRun ? $this->findDryRunRow($title) : null) ?? Predb::query()->where('title', $title)->first();
 
         if ($existing === null) {
             if ($entry->enrichOnly) {
-                return 'skipped';
+                return $this->plan('skipped');
             }
 
             if ($dryRun) {
@@ -93,23 +97,22 @@ class PredbFeedImporter
                     'nukereason' => $entry->nukeReason,
                 ]);
 
-                return 'inserted';
+                return $this->plan('inserted');
             }
 
-            try {
-                return $this->insert($title, $entry);
-            } catch (UniqueConstraintViolationException) {
-                // Another ingester (IRC scraper) inserted the title concurrently; fall through to an update.
-                $existing = Predb::query()->where('title', $title)->first();
-
-                if ($existing === null) {
-                    return 'skipped';
-                }
+            $insert = $this->insert($title, $entry, $connection);
+            if (! $insert['source_failure'] instanceof UniqueConstraintViolationException) {
+                return $insert;
+            }
+            // Only a verified source INSERT rejection can enter competing-row recovery.
+            $existing = Predb::query()->where('title', $title)->first();
+            if ($existing === null) {
+                return $this->plan('skipped');
             }
         }
 
         if (PredbSearchDocument::exactValue((string) $existing->title) !== PredbSearchDocument::exactValue($title)) {
-            return 'skipped';
+            return $this->plan('skipped');
         }
 
         $changes = $this->changesFor($existing, $entry);
@@ -118,10 +121,10 @@ class PredbFeedImporter
             if (! $dryRun && $existing->exists) {
                 // Idempotent re-index from the current row (another ingester may have changed the
                 // indexed fields), so a document dropped by an earlier failed index write recovers.
-                $this->reindex((int) $existing->id, Predb::query()->find($existing->id, ['id', 'title', 'filename', 'source']), $title);
+                return $this->plan('skipped', $this->reindexPlan((int) $existing->id, Predb::query()->find($existing->id, ['id', 'title', 'filename', 'source']), $title));
             }
 
-            return 'skipped';
+            return $this->plan('skipped');
         }
 
         if ($dryRun) {
@@ -131,31 +134,53 @@ class PredbFeedImporter
             }
             $this->dryRunRows[$this->shadowKey($title)] = $shadow;
 
-            return 'updated';
+            return $this->plan('updated');
         }
 
         $changes['_observed_title'] = (string) $existing->title;
-        if (! $this->applyChanges((int) $existing->id, $changes)) {
-            return 'skipped';
+        try {
+            $changed = $this->applyChanges((int) $existing->id, $changes);
+        } catch (QueryException $error) {
+            // This existing method contains source metadata DML only, never writer maintenance.
+            if (! str_starts_with((string) $error->getCode(), '22')) {
+                throw $error;
+            }
+
+            return $this->plan('skipped', null, $error);
+        }
+        if (! $changed) {
+            return $this->plan('skipped');
         }
 
         // Re-read the indexed fields: another ingester may have changed them since $existing was read.
-        return $this->reindex((int) $existing->id, Predb::query()->find($existing->id, ['id', 'title', 'filename', 'source']), $title) ? 'updated' : 'skipped';
+        $publication = $this->reindexPlan((int) $existing->id, Predb::query()->find($existing->id, ['id', 'title', 'filename', 'source']), $title);
+
+        return $this->plan($publication !== null ? 'updated' : 'skipped', $publication);
     }
 
-    private function reindex(int $id, ?Predb $row, string $expectedTitle): bool
+    /** @return null|array{method: 'update', document: array<string, mixed>} */
+    private function reindexPlan(int $id, ?Predb $row, string $expectedTitle): ?array
     {
         if ($row === null || PredbSearchDocument::exactValue((string) $row->title) !== PredbSearchDocument::exactValue($expectedTitle)) {
-            return false;
+            return null;
         }
-        Search::updatePreDb([
+
+        return ['method' => 'update', 'document' => [
             'id' => $id,
             'title' => $row->title,
             'filename' => $row->filename,
             'source' => $row->source,
-        ]);
+        ]];
+    }
 
-        return true;
+    /**
+     * @param  'inserted'|'updated'|'skipped'  $outcome
+     * @param  null|array{method: 'insert'|'update', document: array<string, mixed>}  $publication
+     * @return array{outcome: 'inserted'|'updated'|'skipped', publication: null|array{method: 'insert'|'update', document: array<string, mixed>}, source_failure: QueryException|null}
+     */
+    private function plan(string $outcome, ?array $publication = null, ?QueryException $sourceFailure = null): array
+    {
+        return ['outcome' => $outcome, 'publication' => $publication, 'source_failure' => $sourceFailure];
     }
 
     /**
@@ -302,29 +327,44 @@ class PredbFeedImporter
         return $changed;
     }
 
-    private function insert(string $title, PredbFeedEntry $entry): string
+    /** @return array{outcome: 'inserted'|'updated'|'skipped', publication: null|array{method: 'insert'|'update', document: array<string, mixed>}, source_failure: QueryException|null} */
+    private function insert(string $title, PredbFeedEntry $entry, Connection $connection): array
     {
-        $id = DB::table('predb')->insertGetId([
-            'title' => $title,
-            'source' => mb_substr($entry->source, 0, 50),
-            'category' => $entry->category !== null ? mb_substr($entry->category, 0, 255) : null,
-            'size' => $entry->size !== null ? mb_substr($entry->size, 0, 50) : null,
-            'files' => $entry->files !== null ? mb_substr($entry->files, 0, 50) : null,
-            // Unknown stays null so a later source with the real time can fill it.
-            'predate' => $entry->predate?->format('Y-m-d H:i:s'),
-            'nuked' => $entry->nuked,
-            'nukereason' => $entry->nukeReason !== null ? mb_substr($entry->nukeReason, 0, 255) : null,
-            'filename' => '',
-        ]);
+        $written = (new PredbIdentityWriter($connection))->insertFeed($title, $entry);
+        if ($written['status'] === 'source_rejected') {
+            if (! $written['source_failure'] instanceof QueryException) {
+                throw new RuntimeException('PreDB writer source rejection lacks its original failure.');
+            }
 
-        Search::insertPredb([
-            'id' => (int) $id,
+            return $this->plan('skipped', null, $written['source_failure']);
+        }
+        if ($written['status'] !== 'inserted' || $written['id'] === null) {
+            throw new RuntimeException('PreDB writer did not return the inserted feed owner.');
+        }
+
+        return $this->plan('inserted', ['method' => 'insert', 'document' => [
+            'id' => $written['id'],
             'title' => $title,
             'filename' => '',
             'source' => $entry->source,
-        ]);
+        ]]);
+    }
 
-        return 'inserted';
+    /** @param array{method: 'insert'|'update', document: array<string, mixed>} $publication */
+    private function publish(Connection $connection, bool $ambient, array $publication): void
+    {
+        $publish = static function () use ($publication): void {
+            if ($publication['method'] === 'insert') {
+                Search::insertPredb($publication['document']);
+            } else {
+                Search::updatePreDb($publication['document']);
+            }
+        };
+        if ($ambient) {
+            $connection->afterCommit($publish);
+        } else {
+            $publish();
+        }
     }
 
     /**

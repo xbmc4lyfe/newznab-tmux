@@ -12,6 +12,7 @@ use App\Services\Categorization\CategorizationService;
 use App\Services\NameFixing\NameFixingQueryService;
 use App\Services\NameFixing\NameFixingService;
 use App\Services\NameFixing\ReleaseUpdateService;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\SQLiteConnection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
@@ -48,10 +49,14 @@ final class PredbFulltextCompletionPagingBoundaryTest extends TestCase
         $winner = $this->updater($synchronized);
         $snapshot = (object) array_merge((array) $database->table('releases')->find(1), ['releases_id' => 1]);
         $changed = false;
-        $database->beforeExecuting(function (string $query) use ($winner, $snapshot, &$changed): void {
-            if (! $changed && str_starts_with($query, 'update "releases"')) {
+        DB::listen(function (QueryExecuted $event) use ($database, $winner, $snapshot, &$changed): void {
+            if (! $changed && $event->connection === $database && str_starts_with($event->sql, 'SELECT r.id AS releases_id')) {
                 $changed = true;
+                $this->assertSame(0, $database->transactionLevel());
+                $this->assertFalse($database->getPdo()->inTransaction());
                 $this->assertTrue($winner->updatePredbCandidate($snapshot, self::TITLE, 7, 'synthetic'));
+                $this->assertSame(0, $database->transactionLevel());
+                $this->assertFalse($database->getPdo()->inTransaction());
             }
         });
         $this->bindServices($database, $loser, [1]);
@@ -521,7 +526,7 @@ final class PredbFulltextCompletionPagingBoundaryTest extends TestCase
         $pdo->exec('CREATE TABLE cache_locks (key TEXT PRIMARY KEY, owner TEXT, expiration INTEGER)');
         $pdo->sqliteCreateFunction('regexp', static fn (string $pattern, string $subject): int => (int) preg_match('~'.$pattern.'~', $subject), 2);
         $pdo->sqliteCreateFunction('MOD', static fn (int $value, int $divisor): int => $value % $divisor, 2);
-        $database = new class($pdo, ':memory:', '', ['driver' => 'sqlite']) extends SQLiteConnection
+        $database = new class($pdo, ':memory:', '', ['driver' => 'sqlite', 'name' => 'completion']) extends SQLiteConnection
         {
             /**
              * @param  string  $query
