@@ -2,27 +2,27 @@
   "snapshot": {
     "repository": "xbmc4lyfe/newznab-tmux",
     "head_ref": "master",
-    "head_sha": "4cd2b2f3fddff73c3df3b9a508ec3cde46f92ac7",
-    "head_url": "https://github.com/xbmc4lyfe/newznab-tmux/commit/4cd2b2f3fddff73c3df3b9a508ec3cde46f92ac7",
+    "head_sha": "7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839",
+    "head_url": "https://github.com/xbmc4lyfe/newznab-tmux/commit/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839",
     "upstream_repository": "NNTmux/newznab-tmux",
     "upstream_ref": "master",
-    "upstream_sha": "20400fe9822051a3ad60dacb887e0aacac77fae8",
-    "upstream_url": "https://github.com/NNTmux/newznab-tmux/commit/20400fe9822051a3ad60dacb887e0aacac77fae8",
+    "upstream_sha": "2fef08b34e4e6cced23333bd186b28a09e94ea2f",
+    "upstream_url": "https://github.com/NNTmux/newznab-tmux/commit/2fef08b34e4e6cced23333bd186b28a09e94ea2f",
     "common_ancestor_sha": "ef0e8c363f13cca5fb62506db64ccbbb329fde84",
     "merge_base_url": "https://github.com/xbmc4lyfe/newznab-tmux/commit/ef0e8c363f13cca5fb62506db64ccbbb329fde84",
-    "upstream_only_count": 3,
-    "fork_only_count": 165,
-    "upstream_only_compare_url": "https://github.com/NNTmux/newznab-tmux/compare/ef0e8c363f13cca5fb62506db64ccbbb329fde84...20400fe9822051a3ad60dacb887e0aacac77fae8",
-    "fork_only_compare_url": "https://github.com/xbmc4lyfe/newznab-tmux/compare/ef0e8c363f13cca5fb62506db64ccbbb329fde84...4cd2b2f3fddff73c3df3b9a508ec3cde46f92ac7",
-    "fork_vs_upstream_compare_url": "https://github.com/xbmc4lyfe/newznab-tmux/compare/20400fe9822051a3ad60dacb887e0aacac77fae8...4cd2b2f3fddff73c3df3b9a508ec3cde46f92ac7",
-    "captured_on": "2026-10-15"
+    "upstream_only_count": 13,
+    "fork_only_count": 211,
+    "upstream_only_compare_url": "https://github.com/NNTmux/newznab-tmux/compare/ef0e8c363f13cca5fb62506db64ccbbb329fde84...2fef08b34e4e6cced23333bd186b28a09e94ea2f",
+    "fork_only_compare_url": "https://github.com/xbmc4lyfe/newznab-tmux/compare/ef0e8c363f13cca5fb62506db64ccbbb329fde84...7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839",
+    "fork_vs_upstream_compare_url": "https://github.com/xbmc4lyfe/newznab-tmux/compare/2fef08b34e4e6cced23333bd186b28a09e94ea2f...7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839",
+    "captured_on": "2026-10-16"
   },
   "method": "Refs and PRs queried from GitHub at capture; commit reachability computed with git rev-list. fork-only means reachable from fork/master and not from the captured upstream/master ref. PR category buckets are editorial indexes, not exhaustive explanations of every changed line.",
   "source_anchors": [
     {
       "path": "README.md",
       "lines": "1-20,24-108,114-120",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/4cd2b2f3fddff73c3df3b9a508ec3cde46f92ac7/README.md",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839/README.md",
       "line_ranges": [
         [
           1,
@@ -41,7 +41,7 @@
     {
       "path": "docker/Makefile",
       "lines": "45-107",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/4cd2b2f3fddff73c3df3b9a508ec3cde46f92ac7/docker/Makefile",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839/docker/Makefile",
       "line_ranges": [
         [
           45,
@@ -52,7 +52,7 @@
     {
       "path": "docker/bin/deploy-app",
       "lines": "15-109",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/4cd2b2f3fddff73c3df3b9a508ec3cde46f92ac7/docker/bin/deploy-app",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839/docker/bin/deploy-app",
       "line_ranges": [
         [
           15,
@@ -63,7 +63,7 @@
     {
       "path": "app/Console/Commands/TmuxDrain.php",
       "lines": "20-26,106-145,174-206",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/4cd2b2f3fddff73c3df3b9a508ec3cde46f92ac7/app/Console/Commands/TmuxDrain.php",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839/app/Console/Commands/TmuxDrain.php",
       "line_ranges": [
         [
           20,
@@ -82,7 +82,7 @@
     {
       "path": "app/Services/Releases/Verification/VerifiedReleasePublisher.php",
       "lines": "28-69,100-140",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/4cd2b2f3fddff73c3df3b9a508ec3cde46f92ac7/app/Services/Releases/Verification/VerifiedReleasePublisher.php",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839/app/Services/Releases/Verification/VerifiedReleasePublisher.php",
       "line_ranges": [
         [
           28,
@@ -97,7 +97,7 @@
     {
       "path": "app/Services/Releases/Verification/PayloadVerifier.php",
       "lines": "28-63,67-100",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/4cd2b2f3fddff73c3df3b9a508ec3cde46f92ac7/app/Services/Releases/Verification/PayloadVerifier.php",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839/app/Services/Releases/Verification/PayloadVerifier.php",
       "line_ranges": [
         [
           28,
@@ -111,46 +111,46 @@
     },
     {
       "path": "app/Services/NameFixing/PredbMatchSelector.php",
-      "lines": "9-11,65-80,187-220",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/4cd2b2f3fddff73c3df3b9a508ec3cde46f92ac7/app/Services/NameFixing/PredbMatchSelector.php",
+      "lines": "9-12,67-82,208-230",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839/app/Services/NameFixing/PredbMatchSelector.php",
       "line_ranges": [
         [
           9,
-          11
+          12
         ],
         [
-          65,
-          80
+          67,
+          82
         ],
         [
-          187,
-          220
+          208,
+          230
         ]
       ]
     },
     {
       "path": "app/Services/NameFixing/NameFixingService.php",
-      "lines": "502-535,545-550,633-671",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/4cd2b2f3fddff73c3df3b9a508ec3cde46f92ac7/app/Services/NameFixing/NameFixingService.php",
+      "lines": "587-656,665-671,753-792",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839/app/Services/NameFixing/NameFixingService.php",
       "line_ranges": [
         [
-          502,
-          535
+          587,
+          656
         ],
         [
-          545,
-          550
-        ],
-        [
-          633,
+          665,
           671
+        ],
+        [
+          753,
+          792
         ]
       ]
     },
     {
       "path": ".github/workflows/benchmark-pages.yml",
       "lines": "1-103",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/4cd2b2f3fddff73c3df3b9a508ec3cde46f92ac7/.github/workflows/benchmark-pages.yml",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839/.github/workflows/benchmark-pages.yml",
       "line_ranges": [
         [
           1,
@@ -161,7 +161,7 @@
     {
       "path": "scripts/benchmark-pages.py",
       "lines": "90-147,150-180",
-      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/4cd2b2f3fddff73c3df3b9a508ec3cde46f92ac7/scripts/benchmark-pages.py",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/blob/7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839/scripts/benchmark-pages.py",
       "line_ranges": [
         [
           90,
@@ -177,7 +177,7 @@
   "caveats": [
     "This is a historical snapshot. Newer PRs and upstream commits are not included.",
     "PR titles and paths are an inventory aid, not a claim that every described behavior is still active. Representative current behavior is linked to source.",
-    "The upstream side has three newer commits at the snapshot, listed separately; they are not included in fork/master.",
+    "The upstream side has 13 newer commits at the snapshot, listed separately; they are not included in fork/master.",
     "Benchmark presence or dashboard status does not establish Rust adoption qualification or production throughput. See performance.html and the benchmark evidence.",
     "The source compare includes generated reports, fixtures, lockfiles, and historical artifacts; aggregate line counts do not represent authored application code."
   ],
@@ -962,7 +962,7 @@
         "tests/Unit/Services/NNTPServiceConnectFailureTest.php"
       ],
       "primary_group": "NNTP, IRC, and provider reliability",
-      "author_summary": "At 05:20 and 05:25 UTC on 2026-10-11 Newshosting answered a burst of worker logins with Authentication rejected (11 that day; this stack held 58 connections against a cap of 73, so the account was probably at its limit through other…"
+      "author_summary": "At 05:20 and 05:25 UTC on 2026-10-11 Newshosting answered a burst of worker logins with Authentication rejected (11 that day; this stack held 58 connections against a cap of 73, so the account was probably at its limit through other\u2026"
     },
     {
       "number": 31,
@@ -995,7 +995,7 @@
         "tests/Unit/DockerDeployGuardTest.php"
       ],
       "primary_group": "Deployment, setup, and runtime operations",
-      "author_summary": "Follow-up to the deploy guard (27), from Codex's last review: when another session edits the shared checkout between build and up, make deploy still recreated the stack from a stale image. deploy-guard verify now compares the current…"
+      "author_summary": "Follow-up to the deploy guard (27), from Codex's last review: when another session edits the shared checkout between build and up, make deploy still recreated the stack from a stale image. deploy-guard verify now compares the current\u2026"
     },
     {
       "number": 33,
@@ -1032,7 +1032,7 @@
         "tests/Feature/TmuxFixNamesScheduleTest.php"
       ],
       "primary_group": "Release naming, PreDB, and discovery",
-      "author_summary": "PreDB feeds only help name releases once their titles are matched against the releases we already have. multiprocessing:fixrelnames predbft does that: it takes unsearched PreDB titles (oldest first), looks for releases whose name or…"
+      "author_summary": "PreDB feeds only help name releases once their titles are matched against the releases we already have. multiprocessing:fixrelnames predbft does that: it takes unsearched PreDB titles (oldest first), looks for releases whose name or\u2026"
     },
     {
       "number": 35,
@@ -1246,7 +1246,7 @@
         "tests/Feature/Console/TmuxHealthCheckCommandTest.php"
       ],
       "primary_group": "Scheduling, database correctness, and other application work",
-      "author_summary": "Found in the health window after the 43 deploy: with the database saturated, tmux:health-check logged monitorheartbeatstale three times in a row at 08:44–08:46 UTC and twelve times between 10:25 and 10:45, close to the five consecutive…"
+      "author_summary": "Found in the health window after the 43 deploy: with the database saturated, tmux:health-check logged monitorheartbeatstale three times in a row at 08:44\u201308:46 UTC and twelve times between 10:25 and 10:45, close to the five consecutive\u2026"
     },
     {
       "number": 48,
@@ -2538,7 +2538,7 @@
         "tests/Unit/ReleaseSearchFiltersTest.php"
       ],
       "primary_group": "Release naming, PreDB, and discovery",
-      "author_summary": "Follow up on 86: carry the exact poster value in the link so browsing remains stable if the source release disappears, compare it directly in SQL without requiring Manticore or the optional MySQL fallback, and escape poster punctuation…"
+      "author_summary": "Follow up on 86: carry the exact poster value in the link so browsing remains stable if the source release disappears, compare it directly in SQL without requiring Manticore or the optional MySQL fallback, and escape poster punctuation\u2026"
     },
     {
       "number": 89,
@@ -2824,7 +2824,7 @@
         "docs/deployment.md"
       ],
       "primary_group": "Deployment, setup, and runtime operations",
-      "author_summary": "The README inherited a long upstream installation guide and did not explain this fork’s recent work or its local Compose stack."
+      "author_summary": "The README inherited a long upstream installation guide and did not explain this fork\u2019s recent work or its local Compose stack."
     },
     {
       "number": 101,
@@ -3536,7 +3536,7 @@
         "tests/Unit/YencServiceTest.php"
       ],
       "primary_group": "Verification, NZB integrity, PAR2, and archive evidence",
-      "author_summary": "Additional processing can download an ambiguous archive’s first article while mapping PAR2 evidence, then fetch that same article again when reading the archive."
+      "author_summary": "Additional processing can download an ambiguous archive\u2019s first article while mapping PAR2 evidence, then fetch that same article again when reading the archive."
     },
     {
       "number": 136,
@@ -4036,7 +4036,7 @@
         "tests/Integration/VerificationReadyQueueMariaDbTest.php"
       ],
       "primary_group": "Scheduling, database correctness, and other application work",
-      "author_summary": "Candidate preparation spent 6.7–12.9 seconds updating 5,000 metadata classifications while producing few ready candidates."
+      "author_summary": "Candidate preparation spent 6.7\u201312.9 seconds updating 5,000 metadata classifications while producing few ready candidates."
     },
     {
       "number": 155,
@@ -4203,7 +4203,7 @@
         "tests/Unit/test_benchmark_cpu.py"
       ],
       "primary_group": "Rust components, benchmarking, and engineering evidence",
-      "author_summary": "CPU benchmark captures now use the existing Rust crate’s nntmux-cpu-snapshot executable."
+      "author_summary": "CPU benchmark captures now use the existing Rust crate\u2019s nntmux-cpu-snapshot executable."
     },
     {
       "number": 160,
@@ -4357,6 +4357,89 @@
       "author_summary": "The Rust work has comparative yEnc and release-rendering benchmarks, BODY/fingerprint profiles, and several targets without recurring performance comparisons."
     },
     {
+      "number": 169,
+      "title": "Preserve explicit NZB password metadata and input custody",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/169",
+      "merged_at": "2026-10-15T15:09:15Z",
+      "merge_sha": "45afc85fd5713a45fba046db50cd99293d061907",
+      "categories": [
+        "article verification, NZB integrity, PAR2, and archives"
+      ],
+      "paths": [
+        ".gitattributes",
+        ".github/workflows/laravel.yml",
+        "app/Console/Commands/ImportNzbs.php",
+        "app/Console/Commands/NntmuxResetDb.php",
+        "app/Console/Commands/VerifyReleaseCandidates.php",
+        "app/Enums/NzbImportStatus.php",
+        "app/Exceptions/NfoPayloadRejected.php",
+        "app/Exceptions/NzbCustodyCollision.php",
+        "app/Exceptions/NzbPasswordMetadataRejected.php",
+        "app/Services/NfoService.php",
+        "app/Services/Nzb/DirectorySyncBridge.php",
+        "app/Services/Nzb/NfoImportService.php",
+        "app/Services/Nzb/NzbArticleCoverage.php",
+        "app/Services/Nzb/NzbImportService.php",
+        "app/Services/Nzb/NzbUploadManifestService.php",
+        "app/Services/Nzb/NzbUploadStagingService.php",
+        "app/Services/Nzb/NzbXmlElements.php",
+        "app/Services/Releases/Verification/CandidateAdmission.php",
+        "app/Services/Releases/Verification/CandidateAdmissionDeferredException.php",
+        "app/Services/Releases/Verification/CandidateCapacityException.php",
+        "app/Services/Releases/Verification/CandidateRepository.php",
+        "app/Services/Releases/Verification/ManifestStore.php",
+        "app/Services/Releases/Verification/NzbManifestReader.php",
+        "app/Services/Releases/Verification/PreparedManifest.php",
+        "app/Services/Releases/Verification/VerifiedNzbWriter.php",
+        "app/Services/Releases/Verification/VerifiedReleasePublisher.php",
+        "app/Support/NzbPasswordMetadata.php",
+        "benchmarks/nzb-custody/compare.py",
+        "benchmarks/nzb-custody/flow.php",
+        "benchmarks/nzb-custody/recorded/metadata.json",
+        "benchmarks/nzb-custody/recorded/raw.json",
+        "benchmarks/nzb-custody/recorded/summary.json",
+        "benchmarks/nzb-custody/sync.rs",
+        "database/migrations/2026_10_15_034000_create_nfo_cleanup_commits_table.php",
+        "docs/nzb-custody-rust-comparison.md",
+        "docs/nzb-upload-custody.md",
+        "tests/Feature/AdmissionStaleRetryTest.php",
+        "tests/Feature/AmbientImportCustodyTest.php",
+        "tests/Feature/CapturedInputGenerationFinalizationTest.php",
+        "tests/Feature/CleanupIntentResumeTest.php",
+        "tests/Feature/DirectPublicationCompanionTest.php",
+        "tests/Feature/ExistingImportPasswordEnrichmentTest.php",
+        "tests/Feature/ManifestOccupiedCodecTest.php",
+        "tests/Feature/MetadataDeferredProgressTest.php",
+        "tests/Feature/MetadataRepublicationLineageTest.php",
+        "tests/Feature/NzbEarlyPasswordCustodyTest.php",
+        "tests/Feature/NzbHiddenEntityCustodyTest.php",
+        "tests/Feature/NzbPasswordMetadataCustodyTest.php",
+        "tests/Feature/NzbProgrammaticPasswordBoundaryTest.php",
+        "tests/Feature/NzbPublishedPasswordRaceTest.php",
+        "tests/Feature/NzbPublishedPasswordReplayTest.php",
+        "tests/Feature/NzbPublisherPasswordReplayTest.php",
+        "tests/Feature/NzbQueuedUploadLifecycleTest.php",
+        "tests/Feature/OccupiedManifestImportCustodyTest.php",
+        "tests/Feature/PublishedVerificationScratchCleanupTest.php",
+        "tests/Feature/ReleaseVerificationArtifactCleanupTest.php",
+        "tests/Feature/ReleaseVerificationCandidateLifecycleTest.php",
+        "tests/Feature/ReleaseVerificationResetTest.php",
+        "tests/Feature/VerifiedReleasePasswordMetadataTest.php",
+        "tests/Fixtures/NativeManifestIoProbe.php",
+        "tests/Support/CapturedUploadFixture.php",
+        "tests/Unit/DirectorySyncBridgeTest.php",
+        "tests/Unit/NfoImportServiceTest.php",
+        "tests/Unit/Nzb/NzbImportNamespaceContractTest.php",
+        "tests/Unit/NzbHiddenEntityReaderTest.php",
+        "tests/Unit/NzbPasswordEntityReferenceTest.php",
+        "tests/Unit/NzbPasswordLegacyHeadParityTest.php",
+        "tests/Unit/NzbUploadStagingServiceTest.php",
+        "tests/bootstrap.php"
+      ],
+      "primary_group": "Verification, NZB integrity, PAR2, and archive evidence",
+      "author_summary": "NZB imports preserve explicit uploader password metadata through admission, enrichment and verified publication."
+    },
+    {
       "number": 170,
       "title": "Authorize deployment coordination across project sessions",
       "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/170",
@@ -4370,6 +4453,1151 @@
       ],
       "primary_group": "Deployment, setup, and runtime operations",
       "author_summary": "Record the user's explicit standing authorization to send deployment handoffs, status messages, and related coordination to the appropriate project session without asking again."
+    },
+    {
+      "number": 171,
+      "title": "Keep deployment recovery holds effective across owner exit",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/171",
+      "merged_at": "2026-10-15T00:09:51Z",
+      "merge_sha": "4b96286badb8c46f229e0a2c52db3f1b522039ea",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence"
+      ],
+      "paths": [
+        ".dockerignore",
+        "TODO.md",
+        "docker/.gitignore",
+        "docker/bin/deploy-guard",
+        "tests/Unit/DockerDeployGuardTest.php"
+      ],
+      "primary_group": "Deployment, setup, and runtime operations",
+      "author_summary": "A deployment process exiting during recovery could release its lock and let a new deployment start before recovery was settled."
+    },
+    {
+      "number": 172,
+      "title": "Document fork changes and Rust benchmark evidence on GitHub Pages",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/172",
+      "merged_at": "2026-10-15T01:25:40Z",
+      "merge_sha": "e9f4bff3cb04eb252171ff757c14efb034e191f4",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence",
+        "search, administration, and user-visible features"
+      ],
+      "paths": [
+        ".gitattributes",
+        ".github/workflows/benchmark-pages.yml",
+        ".github/workflows/native-utilities-performance.yml",
+        ".github/workflows/yenc-performance.yml",
+        "README.md",
+        "github-pages/docs/.vale.ini",
+        "github-pages/docs/assets/site.css",
+        "github-pages/docs/assets/site.js",
+        "github-pages/docs/content/deployment.html",
+        "github-pages/docs/content/differences.html",
+        "github-pages/docs/content/evidence.html",
+        "github-pages/docs/content/index.html",
+        "github-pages/docs/content/performance.html",
+        "github-pages/docs/content/processing.html",
+        "github-pages/docs/content/pull-requests.html",
+        "github-pages/docs/content/releases.html",
+        "github-pages/docs/content/rust.html",
+        "github-pages/docs/data/fork-commits.json",
+        "github-pages/docs/data/fork-history.json",
+        "github-pages/docs/data/historical-cpp-arm.json",
+        "github-pages/docs/data/historical-cpp-x86.json",
+        "github-pages/docs/data/historical-cpu-snapshot-arm.json",
+        "github-pages/docs/data/historical-cpu-snapshot-x86.json",
+        "github-pages/docs/data/historical-fingerprint-ffi-arm.json",
+        "github-pages/docs/data/historical-fingerprint-ffi-x86.json",
+        "github-pages/docs/data/historical-fingerprint-worker-arm.json",
+        "github-pages/docs/data/historical-fingerprint-worker-x86.json",
+        "github-pages/docs/data/historical-php-arm.json",
+        "github-pages/docs/data/historical-php-x86.json",
+        "github-pages/docs/data/historical-presentation-x86.json",
+        "github-pages/docs/data/historical-profile-arm.json",
+        "github-pages/docs/data/historical-profile-x86.json",
+        "github-pages/docs/data/historical-provenance.json",
+        "github-pages/docs/template.html",
+        "github-pages/docs/vale/styles/Google/AMPM.yml",
+        "github-pages/docs/vale/styles/Google/Acronyms.yml",
+        "github-pages/docs/vale/styles/Google/Anthropomorphism.yml",
+        "github-pages/docs/vale/styles/Google/Colons.yml",
+        "github-pages/docs/vale/styles/Google/Contractions.yml",
+        "github-pages/docs/vale/styles/Google/DateFormat.yml",
+        "github-pages/docs/vale/styles/Google/Ellipses.yml",
+        "github-pages/docs/vale/styles/Google/EmDash.yml",
+        "github-pages/docs/vale/styles/Google/ExcessiveClaims.yml",
+        "github-pages/docs/vale/styles/Google/Exclamation.yml",
+        "github-pages/docs/vale/styles/Google/FirstPerson.yml",
+        "github-pages/docs/vale/styles/Google/Gender.yml",
+        "github-pages/docs/vale/styles/Google/GenderBias.yml",
+        "github-pages/docs/vale/styles/Google/HeadingPunctuation.yml",
+        "github-pages/docs/vale/styles/Google/Headings.yml",
+        "github-pages/docs/vale/styles/Google/Jargon.yml",
+        "github-pages/docs/vale/styles/Google/LICENSE",
+        "github-pages/docs/vale/styles/Google/Latin.yml",
+        "github-pages/docs/vale/styles/Google/LyHyphens.yml",
+        "github-pages/docs/vale/styles/Google/OptionalPlurals.yml",
+        "github-pages/docs/vale/styles/Google/Ordinal.yml",
+        "github-pages/docs/vale/styles/Google/OxfordComma.yml",
+        "github-pages/docs/vale/styles/Google/Parens.yml",
+        "github-pages/docs/vale/styles/Google/Passive.yml",
+        "github-pages/docs/vale/styles/Google/Periods.yml",
+        "github-pages/docs/vale/styles/Google/Quotes.yml",
+        "github-pages/docs/vale/styles/Google/Ranges.yml",
+        "github-pages/docs/vale/styles/Google/Semicolons.yml",
+        "github-pages/docs/vale/styles/Google/Slang.yml",
+        "github-pages/docs/vale/styles/Google/Spacing.yml",
+        "github-pages/docs/vale/styles/Google/Spelling.yml",
+        "github-pages/docs/vale/styles/Google/Timeless.yml",
+        "github-pages/docs/vale/styles/Google/Units.yml",
+        "github-pages/docs/vale/styles/Google/We.yml",
+        "github-pages/docs/vale/styles/Google/Will.yml",
+        "github-pages/docs/vale/styles/Google/WordList.yml",
+        "github-pages/docs/vale/styles/Google/WordListCase.yml",
+        "github-pages/docs/vale/styles/Google/meta.json",
+        "github-pages/docs/vale/styles/Google/vocab.txt",
+        "github-pages/docs/vale/styles/config/vocabularies/NNTmux/accept.txt",
+        "scripts/benchmark-pages.py",
+        "scripts/build-docs.py",
+        "scripts/check-docs.py",
+        "scripts/export-benchmark-summary.py",
+        "tests/Unit/test_benchmark_pages.py",
+        "tests/Unit/test_benchmark_summary_export.py",
+        "tests/Unit/test_docs_links.py",
+        "tests/Unit/test_docs_site.py"
+      ],
+      "primary_group": "Rust components, benchmarking, and engineering evidence",
+      "author_summary": "This fork had separate benchmark reports but no integrated guide to its Rust experiments, processing changes, release identification, and local deployment."
+    },
+    {
+      "number": 173,
+      "title": "Move article summaries to Rust with a measured 3x speedup",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/173",
+      "merged_at": "2026-10-15T00:49:31Z",
+      "merge_sha": "9b56d025d1cddfc72598b9a587cdbfb27c3efb83",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence"
+      ],
+      "paths": [
+        ".github/workflows/yenc-performance.yml",
+        "docker/app/nzb-yenc-ffi/src/bin/nntmux-evidence-utility.rs"
+      ],
+      "primary_group": "Rust components, benchmarking, and engineering evidence",
+      "author_summary": "The article-processing workflow starts Python to read retained observations and append a Markdown summary."
+    },
+    {
+      "number": 175,
+      "title": "Record bounded ISO primary descriptor byte relationships",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/175",
+      "merged_at": "2026-10-15T01:50:55Z",
+      "merge_sha": "6dfaed6e20cce9f48495ef93dd678f4c3feaf0bf",
+      "categories": [
+        "article verification, NZB integrity, PAR2, and archives",
+        "search, administration, and user-visible features"
+      ],
+      "paths": [
+        ".github/workflows/yenc-performance.yml",
+        "app/Services/Releases/Fingerprint/ReleaseFingerprintCollector.php",
+        "docker/app/nzb-yenc-ffi/src/formats.rs",
+        "docker/app/nzb-yenc-ffi/src/iso_primary_copies.rs",
+        "tests/Feature/ReleaseFingerprintMetadataTest.php"
+      ],
+      "primary_group": "Verification, NZB integrity, PAR2, and archive evidence",
+      "author_summary": "Collect raw-byte relationships between repeated ISO primary volume descriptor recordings through the existing bounded Rust format parser and release fingerprint metadata JSON."
+    },
+    {
+      "number": 176,
+      "title": "Ignore OVH nuke events for contradictory PRE identifiers",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/176",
+      "merged_at": "2026-10-15T03:34:14Z",
+      "merge_sha": "451587433561b009e0e5dd7804e4ac12c04fb5c9",
+      "categories": [
+        "release identification, naming, PreDB, and search",
+        "NNTP, IRC, provider reliability, and ingestion"
+      ],
+      "paths": [
+        "app/Services/Predb/Feeds/Sources/PredbOvhSource.php",
+        "tests/Unit/Predb/PredbOvhForeignPreImportTest.php",
+        "tests/Unit/Predb/PredbOvhForeignPreSourceTest.php"
+      ],
+      "primary_group": "Release naming, PreDB, and discovery",
+      "author_summary": "OVH can pair a PRE row with a status/reason for a different valid PRE ID."
+    },
+    {
+      "number": 177,
+      "title": "Remove obsolete issue and Terraform workflows [skip ci]",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/177",
+      "merged_at": "2026-10-15T00:30:41Z",
+      "merge_sha": "309230078af06a710be74631fc8335c10a97c450",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence",
+        "maintenance and smaller reliability fixes"
+      ],
+      "paths": [
+        ".github/workflows/add_label_to_issue.yml",
+        ".github/workflows/add_label_to_reopened_issue.yml",
+        ".github/workflows/close_inactive_issues.yml",
+        ".github/workflows/terraform.yml"
+      ],
+      "primary_group": "Deployment, setup, and runtime operations",
+      "author_summary": "Remove the four workflows requested by the repository owner."
+    },
+    {
+      "number": 178,
+      "title": "Remove unused native deployment tooling for Docker-only support",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/178",
+      "merged_at": "2026-10-15T01:05:05Z",
+      "merge_sha": "deeaf354e3ecc41ede0557ead34a36ba1c1465a4",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence",
+        "maintenance and smaller reliability fixes"
+      ],
+      "paths": [
+        ".gitignore",
+        "README.md",
+        "deploy/baremetal/deploy.py",
+        "deploy/baremetal/health.php",
+        "deploy/baremetal/host.py",
+        "deploy/baremetal/tests/test_lifecycle.py",
+        "deploy/baremetal/tmux.sh",
+        "docs/deployment.md",
+        "infra/ansible/.yamllint.yml",
+        "infra/ansible/ansible.cfg",
+        "infra/ansible/inventory/hosts.yml.example",
+        "infra/ansible/inventory/settings.yml.example",
+        "infra/ansible/inventory/vault.yml.example",
+        "infra/ansible/playbooks/backup.yml",
+        "infra/ansible/playbooks/install.yml",
+        "infra/ansible/playbooks/processing-start.yml",
+        "infra/ansible/playbooks/processing-stop.yml",
+        "infra/ansible/playbooks/restore.yml",
+        "infra/ansible/playbooks/rollback.yml",
+        "infra/ansible/playbooks/update.yml",
+        "infra/ansible/playbooks/verify.yml",
+        "infra/ansible/requirements.txt",
+        "infra/ansible/requirements.yml",
+        "infra/ansible/roles/application/tasks/main.yml",
+        "infra/ansible/roles/base/tasks/lifecycle-helpers.yml",
+        "infra/ansible/roles/base/tasks/main.yml",
+        "infra/ansible/roles/lifecycle/tasks/main.yml",
+        "infra/ansible/roles/nntmux/defaults/main.yml",
+        "infra/ansible/roles/nntmux/tasks/main.yml",
+        "infra/ansible/roles/packages/tasks/main.yml",
+        "infra/ansible/roles/packages/tasks/native.yml",
+        "infra/ansible/roles/services/tasks/main.yml",
+        "infra/ansible/roles/services/templates/elasticsearch.yml.j2",
+        "infra/ansible/roles/services/templates/manticore.conf.j2",
+        "infra/ansible/roles/services/templates/mariadb.cnf.j2",
+        "infra/ansible/roles/services/templates/nntmux-backup.service.j2",
+        "infra/ansible/roles/services/templates/nntmux-backup.timer.j2",
+        "infra/ansible/roles/services/templates/nntmux-horizon.service.j2",
+        "infra/ansible/roles/services/templates/nntmux-scheduler.service.j2",
+        "infra/ansible/roles/services/templates/nntmux-scheduler.timer.j2",
+        "infra/ansible/roles/services/templates/nntmux-tmux.service.j2",
+        "infra/ansible/roles/services/templates/php-fpm.conf.j2",
+        "infra/ansible/roles/services/templates/php.ini.j2",
+        "infra/ansible/roles/services/templates/redis.conf.j2",
+        "infra/ansible/roles/tls/tasks/main.yml",
+        "infra/ansible/roles/tls/templates/acme.conf.j2",
+        "infra/ansible/roles/tls/templates/nginx.conf.j2",
+        "infra/terraform/baremetal/.tflint.hcl",
+        "infra/terraform/baremetal/backend.hcl.example",
+        "infra/terraform/baremetal/outputs.tf",
+        "infra/terraform/baremetal/terraform.tfvars.example",
+        "infra/terraform/baremetal/tests/inventory.tftest.hcl",
+        "infra/terraform/baremetal/variables.tf",
+        "infra/terraform/baremetal/versions.tf"
+      ],
+      "primary_group": "Deployment, setup, and runtime operations",
+      "author_summary": "This fork supports Docker deployments only."
+    },
+    {
+      "number": 179,
+      "title": "Fix and accelerate Python-compatible Rust summary helpers",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/179",
+      "merged_at": "2026-10-15T04:04:38Z",
+      "merge_sha": "c93eb896ab602958ed1784b0ab2477bece3ffe04",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence"
+      ],
+      "paths": [
+        "docker/app/nzb-yenc-ffi/src/bin/nntmux-evidence-utility.rs"
+      ],
+      "primary_group": "Rust components, benchmarking, and engineering evidence",
+      "author_summary": "The existing CPP/PHP Rust summary helpers can print the wrong last digit at a dyadic rounding tie and treat denied input parents as missing."
+    },
+    {
+      "number": 180,
+      "title": "Preserve literal filename evidence and require complete fresh PreDB matches",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/180",
+      "merged_at": "2026-10-16T07:47:25Z",
+      "merge_sha": "26873006789074c436572e7f93cfbfeb03d10398",
+      "categories": [
+        "database, migrations, and storage performance",
+        "release identification, naming, PreDB, and search"
+      ],
+      "paths": [
+        "app/Console/Commands/PredbIdentityRebuildCommand.php",
+        "app/Facades/Search.php",
+        "app/Services/AdditionalProcessing/ReleaseFileManager.php",
+        "app/Services/IRCScraper.php",
+        "app/Services/NameFixing/Data/FilenamePass.php",
+        "app/Services/NameFixing/DonorMatchSelector.php",
+        "app/Services/NameFixing/FileNameCleaner.php",
+        "app/Services/NameFixing/FilePrioritizer.php",
+        "app/Services/NameFixing/NameFixingQueryService.php",
+        "app/Services/NameFixing/NameFixingService.php",
+        "app/Services/NameFixing/NzbSplitUnwrapper.php",
+        "app/Services/NameFixing/OriginalFilenameEvidence.php",
+        "app/Services/NameFixing/PredbMatchSelector.php",
+        "app/Services/NameFixing/ReleaseUpdateService.php",
+        "app/Services/Predb/Feeds/PredbFeedImporter.php",
+        "app/Services/Predb/PredbIdentityKeys.php",
+        "app/Services/Predb/PredbIdentityLookup.php",
+        "app/Services/Predb/PredbIdentityPolicy.php",
+        "app/Services/Predb/PredbIdentityProjector.php",
+        "app/Services/Predb/PredbIdentityRebuild.php",
+        "app/Services/Predb/PredbIdentitySchema.php",
+        "app/Services/Predb/PredbIdentitySchemaAttestation.php",
+        "app/Services/Predb/PredbIdentityWriter.php",
+        "app/Services/Search/Contracts/PredbFilenameCandidateLookup.php",
+        "app/Services/Search/Drivers/ElasticSearchDriver.php",
+        "app/Services/Search/Drivers/ManticoreSearchDriver.php",
+        "app/Services/Search/SearchService.php",
+        "app/Support/PredbSearchDocument.php",
+        "app/Traits/DetectsHashedNames.php",
+        "app/Traits/OwnsPredbIdentityTransactions.php",
+        "database/migrations/2026_10_15_150000_create_predb_identity_projection.php",
+        "tests/Feature/AdditionalProcessingMediaIdentityTest.php",
+        "tests/Feature/AdditionalProcessingReleaseFileManagerTest.php",
+        "tests/Feature/CompleteTitleSuffixTest.php",
+        "tests/Feature/OriginalFilenameAcceptanceTest.php",
+        "tests/Feature/PredbAuthoritativeIdentityTest.php",
+        "tests/Feature/PredbFilenameBackendCompletenessTest.php",
+        "tests/Feature/PredbFilenameCompletionCallbackFailureTest.php",
+        "tests/Feature/PredbFilenameCompletionCommitFailureTest.php",
+        "tests/Feature/PredbFilenameCompletionRetryTest.php",
+        "tests/Feature/PredbFilenameCompletionRollbackNewTransactionTest.php",
+        "tests/Feature/PredbFilenameCompletionRollbackReplayTest.php",
+        "tests/Feature/PredbFilenamePipePolicyDriftTest.php",
+        "tests/Feature/PredbFilenamePipeRejectionRegressionTest.php",
+        "tests/Feature/PredbFilenameRawProjectionTest.php",
+        "tests/Feature/PredbFilenameRetryCompletionTest.php",
+        "tests/Feature/PredbFilenameRowsTest.php",
+        "tests/Feature/PredbFilenameSourceDiagnosticTest.php",
+        "tests/Feature/PredbFilenameSqlAuthorityTest.php",
+        "tests/Feature/PredbFulltextCompletionPagingBoundaryTest.php",
+        "tests/Feature/PredbFulltextCompletionTest.php",
+        "tests/Feature/PredbIdentityLookupBatchTest.php",
+        "tests/Feature/PredbIdentityLookupTest.php",
+        "tests/Feature/PredbIdentityOwnerProjectionTest.php",
+        "tests/Feature/PredbIdentityProjectionSchemaTest.php",
+        "tests/Feature/PredbIdentityRebuildTest.php",
+        "tests/Feature/PredbIdentitySchemaAttestationTest.php",
+        "tests/Feature/PredbMatchingTest.php",
+        "tests/Feature/PredbUnicodeIdentityTest.php",
+        "tests/Feature/ReleaseUpdateCommitFailureTest.php",
+        "tests/Feature/ReleaseUpdateFilenameGuardTest.php",
+        "tests/Feature/ReleaseUpdateFilenameOrderingTest.php",
+        "tests/Feature/ReleaseUpdateParentSnapshotTest.php",
+        "tests/Feature/VerifiedReleasePasswordMetadataTest.php",
+        "tests/Unit/LegacyIrcIdentityTest.php",
+        "tests/Unit/NzbSplitUnwrapperTest.php",
+        "tests/Unit/Predb/ApibayCatalogueDateTest.php",
+        "tests/Unit/Predb/OpentrackersRelayImportTest.php",
+        "tests/Unit/Predb/PredbFeedImporterCollationIdentityTest.php",
+        "tests/Unit/Predb/PredbFeedImporterIdentityTest.php",
+        "tests/Unit/Predb/PredbIdentityEngineGuardTest.php",
+        "tests/Unit/Predb/PredbIdentityKeysTest.php",
+        "tests/Unit/Predb/PredbIdentityProjectorSqlTest.php",
+        "tests/Unit/Predb/PredbIdentityRebuildCommandTest.php",
+        "tests/Unit/Predb/PredbIdentitySqlDefaultTest.php",
+        "tests/Unit/Predb/PredbIdentityTriggerSpecificationTest.php",
+        "tests/Unit/Predb/PredbOvhForeignPreImportTest.php",
+        "tests/Unit/PredbFilenameManticoreWireApiTest.php",
+        "tests/Unit/PredbSearchDriverTest.php",
+        "tests/Unit/Services/NameFixing/CertifiedPredbSqlFixture.php",
+        "tests/Unit/Services/NameFixing/CertifiedPredbSqlFixtureTest.php",
+        "tests/Unit/Services/NameFixing/CompleteTitleSuffixAuthorityTest.php",
+        "tests/Unit/Services/NameFixing/FilenamePassTest.php",
+        "tests/Unit/Services/NameFixing/GenericPredbAttachmentTest.php",
+        "tests/Unit/Services/NameFixing/NameFixingPredbSearchTextTest.php",
+        "tests/Unit/Services/NameFixing/OriginalFilenameNominationTest.php",
+        "tests/Unit/Services/NameFixing/OriginalFilenamePipeClassificationTest.php",
+        "tests/Unit/Services/NameFixing/OriginalFilenameSuffixCompatibilityTest.php",
+        "tests/Unit/Services/NameFixing/PredbFeedPublicationFailureTest.php",
+        "tests/Unit/Services/NameFixing/PredbIdentityMixedCaseShadowTest.php",
+        "tests/Unit/Services/NameFixing/PredbIdentityPolicyTest.php",
+        "tests/Unit/Services/NameFixing/PredbIdentityRebuildCustodyTest.php",
+        "tests/Unit/Services/NameFixing/PredbIdentityWriterIdentifierCaseTest.php",
+        "tests/Unit/Services/NameFixing/PredbIdentityWriterRuntimeControlsTest.php"
+      ],
+      "primary_group": "Release naming, PreDB, and discovery",
+      "author_summary": "Require complete certified SQL identity evidence and whole-pass lookup completion before linking releases to PreDB filenames."
+    },
+    {
+      "number": 181,
+      "title": "Honor article Pulse opt-in and preserve fixture cleanup failures",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/181",
+      "merged_at": "2026-10-15T01:20:24Z",
+      "merge_sha": "efc67e5531460f28e1508e9faf1c5ebe91ba2046",
+      "categories": [
+        "indexing, database correctness, scheduling, and throughput",
+        "maintenance and smaller reliability fixes"
+      ],
+      "paths": [
+        ".env.example",
+        "TODO.md",
+        "app/Providers/AppServiceProvider.php",
+        "docker/.env.example",
+        "docker/docker-compose.yml",
+        "tests/Feature/ProcessingPulseRecordingTest.php",
+        "tests/Integration/ReleaseVerificationArchiveLockMariaDbTest.php"
+      ],
+      "primary_group": "Scheduling, database correctness, and other application work",
+      "author_summary": "Article-range workers now honor the processing Pulse suppression gate, including both Artisan --env forms."
+    },
+    {
+      "number": 182,
+      "title": "Preserve literal submitter filters through SQL and Elasticsearch search",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/182",
+      "merged_at": "2026-10-15T02:14:23Z",
+      "merge_sha": "e4afbfeb67f6c11e1d4ebe880ba8315ed6107b81",
+      "categories": [
+        "release identification, naming, PreDB, and search",
+        "search, administration, and user-visible features"
+      ],
+      "paths": [
+        "app/Services/Releases/ReleaseSearchService.php",
+        "app/Services/Search/Drivers/ElasticSearchDriver.php",
+        "resources/views/details/partials/info-sidebar.blade.php",
+        "resources/views/search/index.blade.php",
+        "tests/Feature/ApiRequestMatrixTest.php",
+        "tests/Feature/SearchResultsControlsViewTest.php",
+        "tests/Unit/ReleaseSearchFiltersTest.php"
+      ],
+      "primary_group": "Release naming, PreDB, and discovery",
+      "author_summary": "Treat percent, underscore, backslash and the explicit SQL escape character literally in advanced Poster filters."
+    },
+    {
+      "number": 183,
+      "title": "Preserve admitted work and retry custody during cooperative drain",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/183",
+      "merged_at": "2026-10-15T02:36:33Z",
+      "merge_sha": "4e1bea933df62ef4faace59ecee6d350110687bb",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence",
+        "NNTP, IRC, provider reliability, and ingestion"
+      ],
+      "paths": [
+        "app/Console/Commands/GetArticleRange.php",
+        "app/Services/Binaries/BinariesService.php",
+        "app/Services/Binaries/MissedPartHandler.php",
+        "app/Services/NNTP/NNTPService.php",
+        "app/Services/Runners/BaseRunner.php",
+        "tests/Feature/BackfillDrainTest.php",
+        "tests/Feature/BinariesServiceDrainTest.php",
+        "tests/Feature/BinariesStorageInternalsTest.php",
+        "tests/Feature/GetArticleRangeContiguousTest.php",
+        "tests/Feature/GetArticleRangeFailureTest.php",
+        "tests/Feature/MissedPartHandlerTest.php",
+        "tests/Feature/ReleasesRunnerCompletionFailureTest.php",
+        "tests/Unit/Services/Runners/BaseRunnerTest.php"
+      ],
+      "primary_group": "Deployment, setup, and runtime operations",
+      "author_summary": "Stop admitting work when cooperative drain is requested or its state cannot be read; let admitted children finish before reporting the error."
+    },
+    {
+      "number": 184,
+      "title": "Exclude deferred hash retries from actionable rename counts",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/184",
+      "merged_at": "2026-10-15T03:01:51Z",
+      "merge_sha": "0c2f2ec64cb60ee5296cf386e4282a6de240a359",
+      "categories": [
+        "release identification, naming, PreDB, and search",
+        "indexing, database correctness, scheduling, and throughput"
+      ],
+      "paths": [
+        "TODO.md",
+        "app/Services/NameFixing/NameFixingQueryService.php",
+        "tests/Feature/TmuxProcessingBacklogTest.php"
+      ],
+      "primary_group": "Release naming, PreDB, and discovery",
+      "author_summary": "A release waiting for a future PAR2 hash retry was still counted as actionable rename work."
+    },
+    {
+      "number": 185,
+      "title": "Preserve literal NIMA names without rejecting inert HTML text",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/185",
+      "merged_at": "2026-10-15T10:52:14Z",
+      "merge_sha": "69b66b3fd36ef7ef279456ef67d8ad0962c6800c",
+      "categories": [
+        "release identification, naming, PreDB, and search"
+      ],
+      "paths": [
+        "TODO.md",
+        "app/Services/Predb/Feeds/Sources/Nima4kSource.php",
+        "tests/Unit/Nima4kSourceTest.php"
+      ],
+      "primary_group": "Release naming, PreDB, and discovery",
+      "author_summary": "NIMA listings could reject valid inert HTML text or accept names after parser recovery."
+    },
+    {
+      "number": 186,
+      "title": "Record bounded conditional ISO path-table copy evidence",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/186",
+      "merged_at": "2026-10-15T20:57:05Z",
+      "merge_sha": "6c423997205aa8d64cedb21dda652275553868e9",
+      "categories": [
+        "article verification, NZB integrity, PAR2, and archives",
+        "search, administration, and user-visible features"
+      ],
+      "paths": [
+        ".github/workflows/yenc-performance.yml",
+        "app/Services/Releases/Fingerprint/ReleaseFingerprintCollector.php",
+        "docker/app/nzb-yenc-ffi/src/formats.rs",
+        "docker/app/nzb-yenc-ffi/src/iso_path_tables.rs",
+        "scripts/export-benchmark-summary.py",
+        "tests/Feature/ReleaseFingerprintMetadataTest.php"
+      ],
+      "primary_group": "Verification, NZB integrity, PAR2, and archive evidence",
+      "author_summary": "Observe all four declared ISO path-table ranges and compare only required/optional copies with the same byte order."
+    },
+    {
+      "number": 187,
+      "title": "Restore native fingerprinting after failed Rust admission",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/187",
+      "merged_at": "2026-10-15T04:14:09Z",
+      "merge_sha": "a56a819652de7b6cbc4808e87ba3a9e781bd92c8",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence",
+        "article verification, NZB integrity, PAR2, and archives"
+      ],
+      "paths": [
+        ".github/workflows/laravel.yml",
+        ".github/workflows/native-utilities-performance.yml",
+        "app/Services/Nzb/NzbArticleFingerprint.php",
+        "docker/app/nzb-yenc-ffi/src/bin/benchmark-article-fingerprint.rs",
+        "github-pages/docs/content/differences.html",
+        "github-pages/docs/content/index.html",
+        "github-pages/docs/content/processing.html",
+        "github-pages/docs/content/rust.html",
+        "scripts/benchmark-pages.py",
+        "scripts/export-benchmark-summary.py",
+        "tests/Feature/NzbCreationReliabilityTest.php",
+        "tests/Fixtures/nzb-article-fingerprint/NzbArticleFingerprint.php",
+        "tests/Unit/Nzb/NzbArticleFingerprintTest.php",
+        "tests/Unit/Nzb/NzbNativeFingerprintTest.php",
+        "tests/Unit/test_benchmark_pages.py",
+        "tests/Unit/test_benchmark_summary_export.py"
+      ],
+      "primary_group": "Rust components, benchmarking, and engineering evidence",
+      "author_summary": "The Rust article-fingerprint adoption lacks the required uncommon-p99 confidence evidence, and its original 15-pair screen contains substantial small-input cold and worker regressions."
+    },
+    {
+      "number": 188,
+      "title": "Avoid per-segment XPath evaluation in NZB article coverage",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/188",
+      "merged_at": "2026-10-15T07:00:17Z",
+      "merge_sha": "099431a611f542d86c22481a7e1da385225d84f8",
+      "categories": [
+        "article verification, NZB integrity, PAR2, and archives",
+        "indexing, database correctness, scheduling, and throughput"
+      ],
+      "paths": [
+        "app/Services/Nzb/NzbArticleCoverage.php",
+        "tests/Feature/NzbArticleCoverageImportTest.php"
+      ],
+      "primary_group": "Verification, NZB integrity, PAR2, and archive evidence",
+      "author_summary": "Avoid per-segment XPath evaluation when rejecting nested NZB segment elements."
+    },
+    {
+      "number": 189,
+      "title": "Repair bounded gzip metadata and advance collection to schema 34",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/189",
+      "merged_at": "2026-10-15T21:47:38Z",
+      "merge_sha": "0e62874c6a1090072de9fac50e50a6ec7f4c5bea",
+      "categories": [
+        "article verification, NZB integrity, PAR2, and archives",
+        "search, administration, and user-visible features"
+      ],
+      "paths": [
+        ".github/workflows/yenc-performance.yml",
+        "app/Services/Releases/Fingerprint/ReleaseFingerprintCollector.php",
+        "docker/app/nzb-yenc-ffi/src/formats.rs",
+        "tests/Feature/ReleaseFingerprintMetadataTest.php"
+      ],
+      "primary_group": "Verification, NZB integrity, PAR2, and archive evidence",
+      "author_summary": "Repair gzip FNAME/FCOMMENT observation through 65,536 content bytes plus one bounded NUL lookahead."
+    },
+    {
+      "number": 190,
+      "title": "Correct CPU benchmark bootstrap and confidence provenance",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/190",
+      "merged_at": "2026-10-15T03:53:05Z",
+      "merge_sha": "41b8e35c9f30bf0f5a24ce6426b774b8b67da75a",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence"
+      ],
+      "paths": [
+        "docker/app/nzb-yenc-ffi/src/bin/benchmark-cpu-snapshot.rs",
+        "github-pages/docs/content/performance.html",
+        "scripts/benchmark-pages.py",
+        "scripts/export-benchmark-summary.py",
+        "tests/Unit/test_benchmark_pages.py",
+        "tests/Unit/test_benchmark_summary_export.py"
+      ],
+      "primary_group": "Rust components, benchmarking, and engineering evidence",
+      "author_summary": "The CPU benchmark\u2019s old LCG sampled indices modulo 1,000 with a forced modulo-eight population in every bootstrap replicate."
+    },
+    {
+      "number": 191,
+      "title": "Collect bounded Zstandard frame and literal size evidence",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/191",
+      "merged_at": "2026-10-15T05:46:51Z",
+      "merge_sha": "3a71ccccd309e3672339043fcbb489cf53f6e5f7",
+      "categories": [
+        "article verification, NZB integrity, PAR2, and archives",
+        "search, administration, and user-visible features"
+      ],
+      "paths": [
+        ".github/workflows/yenc-performance.yml",
+        "app/Services/Releases/Fingerprint/ReleaseFingerprintCollector.php",
+        "docker/app/nzb-yenc-ffi/src/formats.rs",
+        "docker/app/nzb-yenc-ffi/src/zstd_frame.rs",
+        "tests/Feature/ReleaseFingerprintMetadataTest.php"
+      ],
+      "primary_group": "Verification, NZB integrity, PAR2, and archive evidence",
+      "author_summary": "Add bounded Zstandard frame observations to the existing Rust format parser and public release metadata JSON."
+    },
+    {
+      "number": 192,
+      "title": "Preserve unconfirmed legacy scheduler pauses",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/192",
+      "merged_at": "2026-10-15T04:48:14Z",
+      "merge_sha": "d0b11ef4a941f69e97b10089c10e384fb00b6fc6",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence"
+      ],
+      "paths": [
+        "AGENTS.md",
+        "TODO.md",
+        "docker/bin/legacy-scheduler-drain.py",
+        "tests/Integration/LegacySchedulerDrainRuntimeTest.php"
+      ],
+      "primary_group": "Deployment, setup, and runtime operations",
+      "author_summary": "The legacy scheduler could be resumed from a saved STOP intent even when the helper had never confirmed that it stopped the process."
+    },
+    {
+      "number": 193,
+      "title": "Benchmark remaining Rust callers and publish current CI evidence",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/193",
+      "merged_at": "2026-10-15T05:13:50Z",
+      "merge_sha": "bb3aee25ef915d5f3feaec6197eff0631409bcaf",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence"
+      ],
+      "paths": [
+        ".gitattributes",
+        ".github/workflows/archive-sample-performance.yml",
+        ".github/workflows/benchmark-pages.yml",
+        ".github/workflows/native-utilities-performance.yml",
+        "docker/app/nzb-yenc-ffi/src/bin/benchmark-article-fingerprint.rs",
+        "docker/app/nzb-yenc-ffi/src/bin/benchmark-cpu-snapshot.rs",
+        "github-pages/deployment/RUST_BENCHMARK_PAGES_TODO.md",
+        "github-pages/docs/content/performance.html",
+        "github-pages/docs/content/rust.html",
+        "github-pages/docs/data/historical-provenance.json",
+        "github-pages/docs/data/par2-normalization-screen.json",
+        "github-pages/docs/data/study-cpu-protocol3-arm.json",
+        "github-pages/docs/data/study-cpu-protocol3-x86.json",
+        "github-pages/docs/data/study-remaining-archive-parsing-arm.json",
+        "github-pages/docs/data/study-remaining-archive-parsing-x86.json",
+        "github-pages/docs/data/study-remaining-cpu-snapshot-arm.json",
+        "github-pages/docs/data/study-remaining-cpu-snapshot-x86.json",
+        "github-pages/docs/data/study-remaining-fingerprint-ffi-arm.json",
+        "github-pages/docs/data/study-remaining-fingerprint-ffi-x86.json",
+        "github-pages/docs/data/study-remaining-fingerprint-worker-arm.json",
+        "github-pages/docs/data/study-remaining-fingerprint-worker-x86.json",
+        "github-pages/docs/data/study-remaining-sample-planning-arm.json",
+        "github-pages/docs/data/study-remaining-sample-planning-x86.json",
+        "github-pages/docs/data/study-remaining-vendor-archive-arm.json",
+        "github-pages/docs/data/study-remaining-vendor-archive-x86.json",
+        "scripts/benchmark-archive-parsing.php",
+        "scripts/benchmark-pages.py",
+        "scripts/benchmark-resource-limits.py",
+        "scripts/benchmark-sample-planning.php",
+        "scripts/benchmark-vendor-archive.php",
+        "scripts/benchmark_callers_summary.py",
+        "scripts/export-benchmark-summary.py",
+        "tests/Fixtures/ArchiveParsingBenchmarkFixtures.php",
+        "tests/Fixtures/SamplePlanningBenchmarkFixtures.php",
+        "tests/Fixtures/VendorArchiveBenchmarkFixtures.php",
+        "tests/Unit/ArchiveParsingBenchmarkTest.php",
+        "tests/Unit/SamplePlanningBenchmarkTest.php",
+        "tests/Unit/VendorArchiveBenchmarkTest.php",
+        "tests/Unit/test_benchmark_callers_export.py",
+        "tests/Unit/test_benchmark_pages.py",
+        "tests/Unit/test_benchmark_resource_limits.py",
+        "tests/Unit/test_benchmark_summary_export.py",
+        "tests/Unit/test_benchmark_utility_extended.py"
+      ],
+      "primary_group": "Rust components, benchmarking, and engineering evidence",
+      "author_summary": "These Rust targets had correctness coverage or limited median screens, leaving caller costs and uncommon tails unmeasured."
+    },
+    {
+      "number": 195,
+      "title": "Collect bounded XZ first-block metadata and range evidence",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/195",
+      "merged_at": "2026-10-15T10:10:24Z",
+      "merge_sha": "eaf45834ffb8e7a75d30ead1ef1b37de07c4032d",
+      "categories": [
+        "article verification, NZB integrity, PAR2, and archives",
+        "search, administration, and user-visible features"
+      ],
+      "paths": [
+        ".github/workflows/yenc-performance.yml",
+        "app/Services/Releases/Fingerprint/ReleaseFingerprintCollector.php",
+        "docker/app/nzb-yenc-ffi/src/formats.rs",
+        "docker/app/nzb-yenc-ffi/src/xz_first_block.rs",
+        "tests/Feature/ReleaseFingerprintMetadataTest.php"
+      ],
+      "primary_group": "Verification, NZB integrity, PAR2, and archive evidence",
+      "author_summary": "Add bounded Rust XZ first-block metadata: header size/flags/CRC, canonical size VLIs, up to four filter IDs and raw properties, header padding, check type/size, and bounded range coordinates."
+    },
+    {
+      "number": 196,
+      "title": "Benchmark six remaining Rust modules in CI and Pages",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/196",
+      "merged_at": "2026-10-15T11:23:59Z",
+      "merge_sha": "b876d6c50165f6200e958dd9301d956e82e26417",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence"
+      ],
+      "paths": [
+        ".gitattributes",
+        ".github/workflows/archive-sample-performance.yml",
+        ".github/workflows/benchmark-pages.yml",
+        "github-pages/deployment/RUST_BENCHMARK_PAGES_TODO.md",
+        "github-pages/docs/content/rust.html",
+        "github-pages/docs/data/historical-provenance.json",
+        "github-pages/docs/data/study-six-archive-modules-arm.json",
+        "github-pages/docs/data/study-six-archive-modules-x86.json",
+        "github-pages/docs/data/study-six-metadata-modules-arm.json",
+        "github-pages/docs/data/study-six-metadata-modules-x86.json",
+        "scripts/benchmark-pages.py",
+        "scripts/benchmark-remaining-modules.php",
+        "scripts/benchmark_callers_summary.py",
+        "tests/Fixtures/RemainingArchiveBenchmarkFixtures.php",
+        "tests/Fixtures/RemainingMetadataBenchmarkFixtures.php",
+        "tests/Unit/RemainingArchiveBenchmarkFixturesTest.php",
+        "tests/Unit/RemainingMetadataBenchmarkFixturesTest.php",
+        "tests/Unit/RemainingModulesBenchmarkTest.php",
+        "tests/Unit/test_benchmark_pages.py",
+        "tests/Unit/test_benchmark_remaining_modules_export.py"
+      ],
+      "primary_group": "Rust components, benchmarking, and engineering evidence",
+      "author_summary": "Six existing Rust metadata modules lacked independent comparative CI coverage."
+    },
+    {
+      "number": 197,
+      "title": "Document guarded master rollout timing and production evidence",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/197",
+      "merged_at": "2026-10-15T11:57:12Z",
+      "merge_sha": "3ece77d70488a4d97541d4122de339970cb902e4",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence"
+      ],
+      "paths": [
+        "AGENTS.md"
+      ],
+      "primary_group": "Deployment, setup, and runtime operations",
+      "author_summary": "The rollout guide described a 15\u201316 minute cadence that did not account for polling, build or drain latency, and did not define how to substantiate deployment speed."
+    },
+    {
+      "number": 198,
+      "title": "Keep Rust benchmark Pages complete and verify each publication",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/198",
+      "merged_at": "2026-10-15T12:57:43Z",
+      "merge_sha": "46dbe0cc97283d91e7b6a7903c7570ca1c6cfcd5",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence"
+      ],
+      "paths": [
+        ".gitattributes",
+        ".github/workflows/archive-sample-performance.yml",
+        ".github/workflows/benchmark-pages.yml",
+        ".github/workflows/native-utilities-performance.yml",
+        ".github/workflows/release-presentation.yml",
+        ".github/workflows/yenc-performance.yml",
+        "github-pages/docs/content/performance.html",
+        "github-pages/docs/content/rust.html",
+        "scripts/benchmark-pages.py",
+        "scripts/benchmark-rust-toolchain.sh",
+        "scripts/benchmark_rust_inventory.py",
+        "scripts/export-benchmark-summary.py",
+        "scripts/verify-benchmark-pages.py",
+        "tests/Unit/test_benchmark_pages_completeness.py",
+        "tests/Unit/test_benchmark_rust_inventory.py",
+        "tests/Unit/test_benchmark_summary_export.py",
+        "tests/Unit/test_benchmark_toolchain.py",
+        "tests/Unit/test_verify_benchmark_pages.py"
+      ],
+      "primary_group": "Rust components, benchmarking, and engineering evidence",
+      "author_summary": "Rust benchmark Pages could accept a complete native summary without measurement rows, omitted current-master manual qualification runs, and did not verify every deployed public file against the tested source."
+    },
+    {
+      "number": 199,
+      "title": "Require periodic fork-master refreshes in task worktrees",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/199",
+      "merged_at": "2026-10-15T12:29:10Z",
+      "merge_sha": "2f00e161482f79e4450855952c665236505d2dd6",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence"
+      ],
+      "paths": [
+        ".ai/rules/git-workflow.md",
+        "AGENTS.md"
+      ],
+      "primary_group": "Deployment, setup, and runtime operations",
+      "author_summary": "Require each new task to use an isolated worktree and a fresh codex/ branch based on the latest xbmc4lyfe/newznab-tmux:master."
+    },
+    {
+      "number": 200,
+      "title": "Fix Clippy setup on read-only runner toolchain stores",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/200",
+      "merged_at": "2026-10-15T13:17:27Z",
+      "merge_sha": "db8ff642fb975b607984dc12ebba84e6a68baa07",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence"
+      ],
+      "paths": [
+        ".gitattributes",
+        ".github/workflows/rust-clippy.yml",
+        "scripts/clippy-rust-toolchain.sh",
+        "tests/Unit/test_clippy_toolchain.py"
+      ],
+      "primary_group": "Rust components, benchmarking, and engineering evidence",
+      "author_summary": "Clippy setup unconditionally installed Rust into the runner\u2019s shared Rustup store, failing when that store was read-only."
+    },
+    {
+      "number": 201,
+      "title": "Preserve automatic benchmark coverage and verify public Pages files",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/201",
+      "merged_at": "2026-10-15T13:37:51Z",
+      "merge_sha": "798f20f97b2034175d13b1109e3e9f6a9747c0d0",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence"
+      ],
+      "paths": [
+        ".gitattributes",
+        ".github/workflows/archive-sample-performance.yml",
+        ".github/workflows/benchmark-pages.yml",
+        ".github/workflows/native-utilities-performance.yml",
+        ".github/workflows/yenc-performance.yml",
+        "github-pages/docs/content/performance.html",
+        "scripts/verify-benchmark-pages.py",
+        "tests/Unit/test_benchmark_concurrency.py",
+        "tests/Unit/test_verify_benchmark_pages.py"
+      ],
+      "primary_group": "Rust components, benchmarking, and engineering evidence",
+      "author_summary": "Manual benchmark dispatches could cancel a pending automatic master run because both shared a concurrency group."
+    },
+    {
+      "number": 202,
+      "title": "Add default-off experimental XZ Index metadata",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/202",
+      "merged_at": "2026-10-15T14:40:17Z",
+      "merge_sha": "acb01804f47a0ac52faaa866b248a1adf79923fe",
+      "categories": [
+        "article verification, NZB integrity, PAR2, and archives"
+      ],
+      "paths": [
+        ".gitattributes",
+        ".github/workflows/archive-sample-performance.yml",
+        ".github/workflows/rust-clippy.yml",
+        "docker/app/nzb-yenc-ffi/Cargo.toml",
+        "docker/app/nzb-yenc-ffi/src/formats.rs",
+        "docker/app/nzb-yenc-ffi/src/lib.rs",
+        "docker/app/nzb-yenc-ffi/src/xz_first_block.rs",
+        "scripts/composer-install-ci.sh",
+        "tests/Unit/test_composer_install_retry.py"
+      ],
+      "primary_group": "Verification, NZB integrity, PAR2, and archive evidence",
+      "author_summary": "Add bounded XZ following-Index observations: canonical VLIs, record sizes, CRC/padding checks, first-Block declaration relationships, and bounded Index byte ranges."
+    },
+    {
+      "number": 203,
+      "title": "Document guarded remote deployments on m5stephen",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/203",
+      "merged_at": "2026-10-15T17:54:44Z",
+      "merge_sha": "603485f3807cda32273944eca40acae1a215273a",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence"
+      ],
+      "paths": [
+        "AGENTS.md"
+      ],
+      "primary_group": "Deployment, setup, and runtime operations",
+      "author_summary": "Production now runs in OrbStack on m5stephen, while the source clone and persistent Compose runtime use different directories."
+    },
+    {
+      "number": 204,
+      "title": "Reduce allocations in experimental XZ Index evidence",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/204",
+      "merged_at": "2026-10-15T17:49:10Z",
+      "merge_sha": "057f6c7f6b54485df49a46e4f4121062623646a9",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence",
+        "article verification, NZB integrity, PAR2, and archives"
+      ],
+      "paths": [
+        "docker/app/nzb-yenc-ffi/src/lib.rs",
+        "docker/app/nzb-yenc-ffi/src/xz_first_block.rs"
+      ],
+      "primary_group": "Rust components, benchmarking, and engineering evidence",
+      "author_summary": "Reduce allocations in the experimental XZ single-record Index observer."
+    },
+    {
+      "number": 205,
+      "title": "Allow bounded Pages propagation before exact publication verification fails",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/205",
+      "merged_at": "2026-10-15T18:24:39Z",
+      "merge_sha": "27cf958cba57b42c0f5cb13985f9c4c567486f29",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence"
+      ],
+      "paths": [
+        "github-pages/docs/content/performance.html",
+        "scripts/verify-benchmark-pages.py",
+        "tests/Unit/test_verify_benchmark_pages.py"
+      ],
+      "primary_group": "Rust components, benchmarking, and engineering evidence",
+      "author_summary": "Recent Pages refreshes built successfully but failed exact-manifest verification after roughly 50 seconds."
+    },
+    {
+      "number": 206,
+      "title": "Document rejected custody Rust screen and optional XZ coverage",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/206",
+      "merged_at": "2026-10-15T18:28:14Z",
+      "merge_sha": "5834f9c4e8faca1fac2aad4dc57ddbbd1165dff2",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence"
+      ],
+      "paths": [
+        "github-pages/docs/content/differences.html",
+        "github-pages/docs/content/pull-requests.html",
+        "github-pages/docs/content/rust.html"
+      ],
+      "primary_group": "Rust components, benchmarking, and engineering evidence",
+      "author_summary": "The Rust page describes its inventory as covering every Rust source file, but PR #169 added a separate custody experiment outside the scanned crate and PR #202 added a default-off XZ Index feature."
+    },
+    {
+      "number": 207,
+      "title": "Preserve lossless PAR2 descriptor evidence independently of file collection",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/207",
+      "merged_at": "2026-10-15T18:43:36Z",
+      "merge_sha": "44ca3ef2a2ce6df1480481f6e78d35004e70cfe4",
+      "categories": [
+        "article verification, NZB integrity, PAR2, and archives",
+        "release identification, naming, PreDB, and search"
+      ],
+      "paths": [
+        "TODO.md",
+        "app/Console/Commands/NntmuxResetDb.php",
+        "app/Services/Par2PacketAccumulator.php",
+        "app/Services/Par2Processor.php",
+        "app/Support/Par2DescriptorEvidence.php",
+        "database/migrations/2026_10_15_190000_create_par2_descriptor_evidence_table.php",
+        "tests/Feature/Par2HashResetTest.php",
+        "tests/Integration/Par2DonorInventoryMariaDbTest.php",
+        "tests/Support/Par2RenameTestDatabase.php",
+        "tests/Unit/Par2InventoryPersistenceTest.php",
+        "tests/Unit/Par2NameRecoveryIntegrationTest.php",
+        "tests/Unit/Par2PacketAccumulatorTest.php"
+      ],
+      "primary_group": "Verification, NZB integrity, PAR2, and archive evidence",
+      "author_summary": "PAR2 naming currently discards descriptor filenames when optional file collection is disabled."
+    },
+    {
+      "number": 208,
+      "title": "Run full yEnc Rust tests in Docker builds",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/208",
+      "merged_at": "2026-10-15T17:56:50Z",
+      "merge_sha": "fe48cd3edd1a36ea893d267ec6e2413274fba035",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence"
+      ],
+      "paths": [
+        ".dockerignore",
+        "Dockerfile",
+        "docker/app/Dockerfile"
+      ],
+      "primary_group": "Deployment, setup, and runtime operations",
+      "author_summary": "The Docker yEnc build stage runs the complete Rust suite, but it previously lacked PHP/FFI and the repository files required by benchmark contract tests."
+    },
+    {
+      "number": 209,
+      "title": "Align yEnc Docker test with FrankenPHP stage",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/209",
+      "merged_at": "2026-10-15T18:22:37Z",
+      "merge_sha": "d858f473acdfddc4196870958185d741581f57c3",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence"
+      ],
+      "paths": [
+        "tests/Unit/ViteDockerConfigurationTest.php"
+      ],
+      "primary_group": "Deployment, setup, and runtime operations",
+      "author_summary": "The yEnc build stage now runs on FrankenPHP while Rust is provided by a separate toolchain stage."
+    },
+    {
+      "number": 210,
+      "title": "Observe bounded experimental XZ Footer relationships",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/210",
+      "merged_at": "2026-10-15T22:44:57Z",
+      "merge_sha": "7563c60502df227aeb4c2f271a4980ccd4e29dbb",
+      "categories": [
+        "article verification, NZB integrity, PAR2, and archives"
+      ],
+      "paths": [
+        ".github/workflows/yenc-performance.yml",
+        "docker/app/nzb-yenc-ffi/src/formats.rs",
+        "docker/app/nzb-yenc-ffi/src/lib.rs",
+        "docker/app/nzb-yenc-ffi/src/xz_first_block.rs",
+        "tests/Feature/ReleaseFingerprintMetadataTest.php"
+      ],
+      "primary_group": "Verification, NZB integrity, PAR2, and archive evidence",
+      "author_summary": "Add a bounded following_footer record under the existing, default-off experimental-xz-index feature."
+    },
+    {
+      "number": 211,
+      "title": "Document remote guarded deployment and measured rollout times",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/211",
+      "merged_at": "2026-10-15T18:53:24Z",
+      "merge_sha": "cf5deaf8ae876919442d742fd18d0efa3acc50cb",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence"
+      ],
+      "paths": [
+        "github-pages/docs/content/deployment.html"
+      ],
+      "primary_group": "Deployment, setup, and runtime operations",
+      "author_summary": "The deployment guide now documents the existing SSH/OrbStack installation, its split source/runtime layout, shared guard and history, configuration checks, and the guarded deployment command."
+    },
+    {
+      "number": 212,
+      "title": "Record natural verifier admission stop diagnostics",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/212",
+      "merged_at": "2026-10-15T20:38:13Z",
+      "merge_sha": "74788c8fa4d73d71140c1db0bb2b50f73f456efe",
+      "categories": [
+        "article verification, NZB integrity, PAR2, and archives",
+        "indexing, database correctness, scheduling, and throughput"
+      ],
+      "paths": [
+        "TODO.md",
+        "app/Console/Commands/VerifyReleaseCandidates.php",
+        "app/Services/Releases/Verification/VerificationRunDiagnostics.php",
+        "routes/console.php",
+        "tests/Feature/VerificationRunDiagnosticsCommandTest.php",
+        "tests/Fixtures/VerificationFairnessWriteProbe.php",
+        "tests/Unit/VerificationRunDiagnosticsTest.php"
+      ],
+      "primary_group": "Verification, NZB integrity, PAR2, and archive evidence",
+      "author_summary": "Scheduled verifier output currently cannot show whether a run stopped at its candidate limit, soft time budget or inability to obtain a claim."
+    },
+    {
+      "number": 213,
+      "title": "Reuse prepared updates during candidate preparation",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/213",
+      "merged_at": "2026-10-15T21:13:59Z",
+      "merge_sha": "9e4fa50c7922c3f93424608e601c25137ae0e841",
+      "categories": [
+        "indexing, database correctness, scheduling, and throughput"
+      ],
+      "paths": [
+        "TODO.md",
+        "app/Services/Releases/Verification/CandidatePreparationService.php",
+        "app/Services/Releases/Verification/PreparedCandidateUpdate.php",
+        "tests/Feature/VerificationReadyQueueTest.php",
+        "tests/Unit/PreparedCandidateUpdateTest.php"
+      ],
+      "primary_group": "Scheduling, database correctness, and other application work",
+      "author_summary": "Candidate preparation currently creates a new server-side prepared UPDATE for every UNKNOWN retry or READY promotion."
+    },
+    {
+      "number": 214,
+      "title": "Fail paired benchmark checks on inconclusive results",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/214",
+      "merged_at": "2026-10-16T00:56:18Z",
+      "merge_sha": "5191bf56976f1cf1fbaf158b8a2f728b4cec280e",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence"
+      ],
+      "paths": [
+        "scripts/benchmark-yenc.php",
+        "tests/Unit/YencBenchmarkTest.php"
+      ],
+      "primary_group": "Rust components, benchmarking, and engineering evidence",
+      "author_summary": "Return zero only when every measured stratum demonstrates useful improvement; otherwise-valid inconclusive or regressed runs return one, invalid runs return two."
+    },
+    {
+      "number": 216,
+      "title": "Document nonqualifying provider connection reuse diagnostic",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/216",
+      "merged_at": "2026-10-16T00:57:16Z",
+      "merge_sha": "351170ee17ee2975a8667a7b311ca5851af039b8",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence"
+      ],
+      "paths": [
+        "github-pages/docs/content/deployment.html",
+        "github-pages/docs/content/performance.html",
+        "github-pages/docs/data/diagnostic-fingerprint-provider-reuse.json",
+        "github-pages/docs/data/historical-provenance.json"
+      ],
+      "primary_group": "Rust components, benchmarking, and engineering evidence",
+      "author_summary": "The performance guide now retains the reviewed synthetic fingerprint connection-reuse diagnostic, including its caller ratios and the longer authenticated occupancy on the alternate connection."
+    },
+    {
+      "number": 218,
+      "title": "Preserve NNTP ownership callbacks and cancellation",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/218",
+      "merged_at": "2026-10-16T03:02:21Z",
+      "merge_sha": "5efeb826a76129eb8cca2a9fbaf24cb7dfb64b97",
+      "categories": [
+        "NNTP, IRC, provider reliability, and ingestion"
+      ],
+      "paths": [
+        "TODO.md",
+        "app/Services/NNTP/NNTPService.php",
+        "tests/Unit/Services/NNTPServiceReadBodyTest.php"
+      ],
+      "primary_group": "NNTP, IRC, and provider reliability",
+      "author_summary": "Scalar NNTP reads now forward ownership callbacks on both providers."
+    },
+    {
+      "number": 220,
+      "title": "test(additional-processing): qualify mapped archive parser-to-consumer flow",
+      "url": "https://github.com/xbmc4lyfe/newznab-tmux/pull/220",
+      "merged_at": "2026-10-16T08:01:22Z",
+      "merge_sha": "7e7b8b6f4a7302d7aa0bce7f8b1058e6fbcae839",
+      "categories": [
+        "build, deployment, tooling, benchmarks, and evidence",
+        "release verification, NZB integrity, PAR2, and archive evidence"
+      ],
+      "paths": [
+        ".ai/rules/git-workflow.md",
+        ".ai/rules/index.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+        "TODO.md",
+        "tests/Feature/AdditionalProcessingReleaseFileManagerTest.php"
+      ],
+      "primary_group": "Verification, NZB integrity, PAR2, and archive evidence",
+      "author_summary": "Exercise NzbContentParser, ReleaseProcessor, SQLite release_files persistence, and NameFixingService for mapped archive article reuse."
     }
   ],
   "primary_groups": {
@@ -4497,21 +5725,81 @@
   "upstream_only_commits": [
     {
       "sha": "f1839d1d1fb13e09990e2acec51c837e82f51260",
-      "committed_at": "2026-10-14T18:05:32+02:00",
+      "committed_at": "2026-10-14T16:05:32Z",
       "subject": "Update used packages to their latest versions",
       "url": "https://github.com/NNTmux/newznab-tmux/commit/f1839d1d1fb13e09990e2acec51c837e82f51260"
     },
     {
       "sha": "b548e19d6bf4dd666f397c10871e39381a236237",
-      "committed_at": "2026-10-14T18:18:52+02:00",
+      "committed_at": "2026-10-14T16:18:52Z",
       "subject": "Update updater",
       "url": "https://github.com/NNTmux/newznab-tmux/commit/b548e19d6bf4dd666f397c10871e39381a236237"
     },
     {
       "sha": "20400fe9822051a3ad60dacb887e0aacac77fae8",
-      "committed_at": "2026-10-14T20:24:01+02:00",
+      "committed_at": "2026-10-14T18:24:01Z",
       "subject": "Fix season pack check",
       "url": "https://github.com/NNTmux/newznab-tmux/commit/20400fe9822051a3ad60dacb887e0aacac77fae8"
+    },
+    {
+      "sha": "dead25f5a65c6101563eddfd427b9889a086d279",
+      "committed_at": "2026-10-15T17:37:30Z",
+      "subject": "Update the updating command to wait for panes",
+      "url": "https://github.com/NNTmux/newznab-tmux/commit/dead25f5a65c6101563eddfd427b9889a086d279"
+    },
+    {
+      "sha": "419fa11802a26377391aed5da71da5bcbc4c93db",
+      "committed_at": "2026-10-15T19:59:19Z",
+      "subject": "List 7z archives with compressed headers through 7-Zip",
+      "url": "https://github.com/NNTmux/newznab-tmux/commit/419fa11802a26377391aed5da71da5bcbc4c93db"
+    },
+    {
+      "sha": "b24615412d2a6936981a4996d1f0f7d17e729a00",
+      "committed_at": "2026-10-15T19:59:21Z",
+      "subject": "Finalize plain media behind archive names as unpassworded",
+      "url": "https://github.com/NNTmux/newznab-tmux/commit/b24615412d2a6936981a4996d1f0f7d17e729a00"
+    },
+    {
+      "sha": "504f08475af59a80371c0a1d89d43fd137e6bbfc",
+      "committed_at": "2026-10-15T20:34:43Z",
+      "subject": "Merge pull request #1891 from RapidMark/feat/media-signature-no-password",
+      "url": "https://github.com/NNTmux/newznab-tmux/commit/504f08475af59a80371c0a1d89d43fd137e6bbfc"
+    },
+    {
+      "sha": "bfff5cfd289565a16d692e1d25efac437f43fc0f",
+      "committed_at": "2026-10-15T20:52:52Z",
+      "subject": "Merge pull request #1888 from RapidMark/feat/7z-encoded-header",
+      "url": "https://github.com/NNTmux/newznab-tmux/commit/bfff5cfd289565a16d692e1d25efac437f43fc0f"
+    },
+    {
+      "sha": "5e42b2f2a66c94a36cde35aa2584d6d0cb606553",
+      "committed_at": "2026-10-15T21:04:07Z",
+      "subject": "Keep password status unknown for rejected 7z listings and spaced archive names",
+      "url": "https://github.com/NNTmux/newznab-tmux/commit/5e42b2f2a66c94a36cde35aa2584d6d0cb606553"
+    },
+    {
+      "sha": "f20f09cda0d79bb0d7e56472516dd7e6596654f1",
+      "committed_at": "2026-10-15T21:28:45Z",
+      "subject": "Cut a streamed 7z listing exactly at the output cap",
+      "url": "https://github.com/NNTmux/newznab-tmux/commit/f20f09cda0d79bb0d7e56472516dd7e6596654f1"
+    },
+    {
+      "sha": "67ab3be2c15fd531d1796ddd8b59ed13a2f3c277",
+      "committed_at": "2026-10-15T21:36:40Z",
+      "subject": "Merge pull request #1899 from RapidMark/fix/7z-output-cap",
+      "url": "https://github.com/NNTmux/newznab-tmux/commit/67ab3be2c15fd531d1796ddd8b59ed13a2f3c277"
+    },
+    {
+      "sha": "ecea90e3fe35f7d2f4abbc814414e855ade79a37",
+      "committed_at": "2026-10-15T22:38:42Z",
+      "subject": "Reduce waiting time",
+      "url": "https://github.com/NNTmux/newznab-tmux/commit/ecea90e3fe35f7d2f4abbc814414e855ade79a37"
+    },
+    {
+      "sha": "2fef08b34e4e6cced23333bd186b28a09e94ea2f",
+      "committed_at": "2026-10-16T06:43:31Z",
+      "subject": "Update packages and categorization",
+      "url": "https://github.com/NNTmux/newznab-tmux/commit/2fef08b34e4e6cced23333bd186b28a09e94ea2f"
     }
   ],
   "pr_summary_note": "author_summary fields are short excerpts from the opening prose of the merged pull request descriptions; they record author context and are not independent verification."
