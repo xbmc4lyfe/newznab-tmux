@@ -12,7 +12,7 @@ use Throwable;
 
 final class ReleaseFingerprintCollector
 {
-    public const SCHEMA_VERSION = 35;
+    public const SCHEMA_VERSION = 36;
 
     private const MAX_ARTICLE_BODY_BYTES = 2_000_000;
 
@@ -282,7 +282,7 @@ final class ReleaseFingerprintCollector
                     $articleDates = (new NativeMetadataParser)->parseArticleDates($article['headers']);
                     $metadata['article_dates'] = $articleDates ?? [
                         'parser_engine' => null,
-                        'schema_version' => 1,
+                        'schema_version' => NativeMetadataParser::ARTICLE_DATES_SCHEMA_VERSION,
                         'collection_status' => 'unavailable',
                         'reason' => 'native_parser_unavailable_or_input_exceeded_budget',
                     ];
@@ -1165,12 +1165,7 @@ final class ReleaseFingerprintCollector
                 === 'nntmux-rust-article-xref'
                 && ($observation['metadata']['article_xref']['schema_version'] ?? null) === 1,
         )) === count($observations);
-        $dateParserCoverageComplete = $observations !== [] && count(array_filter(
-            $observations,
-            static fn (array $observation): bool => ($observation['metadata']['article_dates']['parser_engine'] ?? null)
-                === 'nntmux-rust-article-dates'
-                && ($observation['metadata']['article_dates']['schema_version'] ?? null) === 1,
-        )) === count($observations);
+        $dateParserCoverageComplete = self::articleDateParserCoverageComplete($observations);
         $yencEscapeStateValid = count(array_filter(
             $observations,
             static fn (array $observation): bool => ($observation['metadata']['yenc']['payload_escape_state_valid'] ?? null) === false,
@@ -1311,6 +1306,27 @@ final class ReleaseFingerprintCollector
                 ],
             ],
         ];
+    }
+
+    /** @param list<array<string, mixed>> $observations */
+    private static function articleDateParserCoverageComplete(array $observations): bool
+    {
+        return $observations !== [] && count(array_filter(
+            $observations,
+            static function (array $observation): bool {
+                $dates = $observation['metadata']['article_dates'] ?? null;
+                if (! NativeMetadataParser::hasCurrentArticleDatesSchema($dates)) {
+                    return false;
+                }
+                foreach (['date', 'injection_date', 'legacy_nntp_posting_date'] as $source) {
+                    if ($dates[$source]['parse_status'] === 'budget_exceeded') {
+                        return false;
+                    }
+                }
+
+                return true;
+            },
+        )) === count($observations);
     }
 
     /**
