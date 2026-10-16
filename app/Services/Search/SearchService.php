@@ -6,6 +6,7 @@ namespace App\Services\Search;
 
 use App\Enums\SecondarySearchIndex;
 use App\Services\Search\Contracts\BulkReleaseIndexUpdater;
+use App\Services\Search\Contracts\PredbFilenameCandidateLookup;
 use App\Services\Search\Contracts\ReleaseCandidatePager;
 use App\Services\Search\Contracts\SearchDriverInterface;
 use App\Services\Search\Contracts\SearchServiceInterface;
@@ -471,6 +472,16 @@ class SearchService extends Manager implements SearchServiceInterface
     public function searchPredb(array|string $searchTerm): array
     {
         return $this->driver()->searchPredb($searchTerm);
+    }
+
+    /** @return list<array{id: int, title: string, filename: string, source: string}>|null */
+    public function searchPredbFilenameCandidates(string $searchTerm): ?array
+    {
+        $driver = $this->driver();
+
+        return $driver instanceof PredbFilenameCandidateLookup
+            ? $driver->searchPredbFilenameCandidates($searchTerm)
+            : null;
     }
 
     /** @return array{id: int, title: string, filename: string, source: string}|null */
