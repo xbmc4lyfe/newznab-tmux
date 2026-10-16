@@ -104,6 +104,27 @@ final class SeasonPackDetector
         return false;
     }
 
+    public static function episodeIdentity(string $name): ?string
+    {
+        $episode = self::parseEpisode($name);
+
+        return $episode === null ? null : $episode['key'].':'.$episode['season'].':'.$episode['episode'];
+    }
+
+    /** Only explicit metadata/subtitle/artwork and sample conventions are ancillary. */
+    public static function isAncillaryName(string $name): bool
+    {
+        if (preg_match(self::SAMPLE_REGEX, self::baseName($name)) === 1) {
+            return true;
+        }
+        $base = basename(str_replace('\\', '/', trim($name)));
+
+        // A narrow subset of FileNameCleaner's metadata/subtitle suffixes and
+        // ProcessingConfiguration's support files. Unknown suffixes, archives,
+        // documents and extensionless names remain possible episode payloads.
+        return preg_match('/\.(?:nfo|sfv|nzb|srr|srs|par2|jpe?g|png|gif|bmp|tiff?|webp|txt|diz|md5|sha1|cue|log|srt|sub|idx|ass|ssa|vtt|sup)$/i', $base) === 1;
+    }
+
     /**
      * Collapse the episode file names of one show into a season-level release name.
      *

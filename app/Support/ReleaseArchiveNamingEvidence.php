@@ -126,19 +126,36 @@ final class ReleaseArchiveNamingEvidence
             // Preserve legacy compatibility, but reject positively known packs.
             return count($names) <= self::MAX_WITNESSES && ! SeasonPackDetector::hasDistinctEpisodeIdentities($names);
         }
-        if ($evidence->scope !== 'complete_single'
-            || SeasonPackDetector::hasDistinctEpisodeIdentities($this->decodeNames($evidence->episode_files))) {
+        $names = $this->decodeNames($evidence->episode_files);
+        $candidateIdentity = SeasonPackDetector::episodeIdentity($candidate);
+        if ($evidence->scope !== 'complete_single' || $candidateIdentity === null
+            || SeasonPackDetector::hasDistinctEpisodeIdentities($names)) {
             return false;
         }
 
-        return $this->sources->withLockedSource($release, function (?array $source) use ($evidence, $candidate, $filenameEvidence): bool {
+        return $this->sources->withLockedSource($release, function (?array $source) use ($evidence, $names, $candidate, $candidateIdentity, $filenameEvidence): bool {
             if ($source === null || ! hash_equals($evidence->source_sha256, $source['digest'])) {
                 return false;
             }
             $cleaner = new FileNameCleaner;
-            foreach ($this->decodeNames($evidence->episode_files) as $name) {
+            $query = $filenameEvidence === null ? false : $cleaner->cleanForMatching($filenameEvidence, preserveLeadingNumber: true);
+            $resolvedOpaquePayload = false;
+            foreach ($names as $name) {
+                $identity = SeasonPackDetector::episodeIdentity($name);
+                if ($identity !== null && $identity !== $candidateIdentity) {
+                    return false;
+                }
+                if ($identity === null && ! SeasonPackDetector::isAncillaryName($name)) {
+                    // A canonical filename mapping resolves one opaque payload,
+                    // regardless of its extension, not an unclassified sibling.
+                    if ($resolvedOpaquePayload || $query === false || ! $cleaner->matchesPredbFilenameEvidence($name, $query)) {
+                        return false;
+                    }
+                    $resolvedOpaquePayload = true;
+                }
+            }
+            foreach ($names as $name) {
                 if ($filenameEvidence !== null) {
-                    $query = $cleaner->cleanForMatching($filenameEvidence, preserveLeadingNumber: true);
                     if ($query !== false && $cleaner->matchesPredbFilenameEvidence($name, $query)) {
                         return true;
                     }
