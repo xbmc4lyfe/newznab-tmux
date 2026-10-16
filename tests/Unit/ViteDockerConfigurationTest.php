@@ -87,8 +87,34 @@ class ViteDockerConfigurationTest extends TestCase
         }
         $this->assertDoesNotMatchRegularExpression(
             '~^COPY[^\n]+yenc-ffi\.ini[^\n]+/conf\.d/~m',
-            $this->projectFile('docker/app/Dockerfile'),
+            $this->projectFile('Dockerfile'),
         );
+        $this->assertFileDoesNotExist(__DIR__.'/../../docker/app/Dockerfile');
+    }
+
+    public function test_dockerfile_separates_cached_base_isolated_builders_and_per_service_targets(): void
+    {
+        $dockerfile = $this->projectFile('Dockerfile');
+        $compose = Yaml::parse($this->projectFile('docker/docker-compose.yml'))['services'];
+
+        $basePos = strpos($dockerfile, 'FROM base-os AS base');
+        $firstCopyPos = strpos($dockerfile, 'COPY docker/app/nzb-yenc-ffi/');
+        $this->assertNotFalse($basePos);
+        $this->assertNotFalse($firstCopyPos);
+        $this->assertLessThan($firstCopyPos, $basePos, 'OS base stage must precede repository COPY layers');
+
+        $this->assertStringContainsString('--mount=type=cache,target=/src/docker/app/nzb-yenc-ffi/target', $dockerfile);
+        $this->assertMatchesRegularExpression('/^FROM base-os AS vendor$/m', $dockerfile);
+        $this->assertMatchesRegularExpression('/^FROM node AS frontend$/m', $dockerfile);
+        $this->assertMatchesRegularExpression('/^FROM selfhost-runtime AS app-core$/m', $dockerfile);
+        foreach (['selfhosted-web', 'selfhosted-horizon', 'selfhosted-scheduler', 'selfhosted-indexer', 'selfhosted', 'production'] as $target) {
+            $this->assertMatchesRegularExpression('/^FROM [^\r\n]+ AS '.preg_quote($target, '/').'$/m', $dockerfile);
+        }
+
+        $this->assertSame('${WEB_IMAGE:-${APP_IMAGE:-nntmux/web:local}}', $compose['web']['image']);
+        $this->assertSame('${HORIZON_IMAGE:-${APP_IMAGE:-nntmux/horizon:local}}', $compose['horizon']['image']);
+        $this->assertSame('${SCHEDULER_IMAGE:-${APP_IMAGE:-nntmux/scheduler:local}}', $compose['scheduler']['image']);
+        $this->assertSame('${INDEXER_IMAGE:-${APP_IMAGE:-nntmux/indexer:local}}', $compose['indexer']['image']);
     }
 
     /**
@@ -113,14 +139,18 @@ class ViteDockerConfigurationTest extends TestCase
 
     public function test_docker_build_targets_always_pull_images_before_building(): void
     {
+        $this->assertFileDoesNotExist(__DIR__.'/../../Makefile');
+        $this->assertFileDoesNotExist(__DIR__.'/../../docker/Makefile');
+        $this->assertFileExists(__DIR__.'/../../Justfile');
+        $this->assertFileExists(__DIR__.'/../../docker/Justfile');
+
         foreach (['build', 'rebuild', 'update', 'fresh'] as $target) {
             $process = new Process([
-                'make', '--dry-run', '--no-print-directory', $target,
-                'SAIL=mock-sail', 'DOCKER_COMPOSE=mock-compose',
+                'just', '--dry-run', 'SAIL=mock-sail', 'DOCKER_COMPOSE=mock-compose', $target,
             ], __DIR__.'/../..');
             $process->mustRun();
 
-            $commands = $process->getOutput();
+            $commands = $process->getOutput().$process->getErrorOutput();
             $pullPosition = strpos($commands, 'mock-compose pull --ignore-buildable --policy always');
             $buildCommand = in_array($target, ['rebuild', 'fresh'], true)
                 ? 'mock-sail build --no-cache --pull'

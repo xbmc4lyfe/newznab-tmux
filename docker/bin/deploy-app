@@ -1,5 +1,5 @@
 #!/bin/sh
-# Run only through deploy-guard. Build first, then quiesce the old singleton indexer.
+# Run only through deploy-guard. Build dirty targets first, then drain/update only affected services.
 set -eu
 DIR=$(cd "$(dirname "$0")/.." && pwd)
 COMPOSE_FILE="${COMPOSE_FILE:-$DIR/docker-compose.yml}"
@@ -9,20 +9,60 @@ verify() {
     DEPLOY_CONFIG_COMMAND= DEPLOY_STAMP="$DIR/.build.stamp" "$DIR/bin/deploy-guard" verify
     "$DIR/bin/deploy-guard" verify-expected
 }
-make --no-print-directory -C "$DIR" build
-verify
 
-# A stopped/missing indexer has no writers to drain. A running one must understand the
-# drain command; do not silently continue if preflight fails (including old images).
-indexer=$(compose ps -q indexer)
-drained=0
-legacy=0
-scheduler_drained=0
-scheduler_legacy=0
 scheduler_timeout="${DEPLOY_SCHEDULER_DRAIN_TIMEOUT:-1800}"
 case "$scheduler_timeout" in
     ''|*[!0-9]*) echo "DEPLOY_SCHEDULER_DRAIN_TIMEOUT must be a nonnegative integer." >&2; exit 1 ;;
 esac
+
+eval "$("$DIR/bin/deploy-plan" --deploy-actions)"
+
+just --justfile "$DIR/Justfile" --working-directory "$DIR" build
+verify
+
+if [ "$MODE" = "noop" ]; then
+    exit 0
+fi
+
+in_list() {
+    needle=$1
+    shift
+    for item in "$@"; do
+        [ "$item" = "$needle" ] && return 0
+    done
+    return 1
+}
+
+if [ "$MIGRATE" = 1 ] || [ -n "$DIRTY_DATA" ]; then
+    need_scheduler_drain=1
+    need_indexer_drain=1
+    need_horizon_stop=1
+    stop_services="web scheduler indexer"
+    up_app_services="web horizon scheduler indexer"
+else
+    need_scheduler_drain=0
+    need_indexer_drain=0
+    need_horizon_stop=0
+    stop_list=""
+    for svc in web horizon scheduler indexer; do
+        # shellcheck disable=SC2086
+        if in_list "$svc" $DIRTY_APP; then
+            case "$svc" in
+                scheduler) need_scheduler_drain=1; stop_list="${stop_list:+$stop_list }scheduler" ;;
+                indexer) need_indexer_drain=1; stop_list="${stop_list:+$stop_list }indexer" ;;
+                horizon) need_horizon_stop=1 ;;
+                web) ;;
+            esac
+        fi
+    done
+    stop_services="$stop_list"
+    up_app_services="$DIRTY_APP"
+fi
+
+drained=0
+legacy=0
+scheduler_drained=0
+scheduler_legacy=0
 operation_token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 legacy_drain() { compose exec -T indexer php -- /app "$1" "${DEPLOY_LEGACY_DRAIN_TIMEOUT:-1800}" "$operation_token" < "$DIR/bin/legacy-drain.php"; }
 legacy_scheduler() { compose exec -T scheduler python3 - "$1" "$scheduler_timeout" "$operation_token" < "$DIR/bin/legacy-scheduler-drain.py"; }
@@ -45,53 +85,58 @@ resume() {
 }
 trap 'resume' EXIT
 trap 'exit 130' INT TERM
-# Pause scheduled admission before waiting for any other service. A failed probe
-# is distinct from an old image; it must never silently select the legacy path.
-scheduler=$(compose ps -q scheduler)
-if [ -n "$scheduler" ]; then
-    capability=$(compose exec -T scheduler python3 -c 'from pathlib import Path; print("native" if Path("/app/docker/app/bin/scheduler.py").is_file() else "legacy")')
-    case "$capability" in
-        native) scheduler_drained=1; scheduler_command drain --timeout="$scheduler_timeout" --token="$operation_token" ;;
-        legacy)
+
+if [ "$need_scheduler_drain" = 1 ]; then
+    scheduler=$(compose ps -q scheduler)
+    if [ -n "$scheduler" ]; then
+        capability=$(compose exec -T scheduler python3 -c 'from pathlib import Path; print("native" if Path("/app/docker/app/bin/scheduler.py").is_file() else "legacy")')
+        case "$capability" in
+            native) scheduler_drained=1; scheduler_command drain --timeout="$scheduler_timeout" --token="$operation_token" ;;
+            legacy)
+                if [ "${DEPLOY_LEGACY_DRAIN:-0}" != 1 ]; then
+                    echo "Old scheduler requires the authorized DEPLOY_LEGACY_DRAIN=1 transition." >&2
+                    exit 1
+                fi
+                scheduler_legacy=1
+                scheduler_drained=1
+                legacy_scheduler drain ;;
+            *) echo "Cannot verify scheduler drain capability." >&2; exit 1 ;;
+        esac
+        scheduler_drained=1
+    fi
+    verify
+fi
+
+if [ "$need_indexer_drain" = 1 ]; then
+    indexer=$(compose ps -q indexer)
+    if [ -n "$indexer" ]; then
+        commands=$(compose exec -T indexer php artisan list --raw --no-interaction)
+        if printf '%s\n' "$commands" | grep -q '^tmux:drain[[:space:]]'; then
+            drained=1
+            compose exec -T indexer php artisan tmux:drain --timeout="${DEPLOY_DRAIN_TIMEOUT:-90}" --session=nntmux --token="$operation_token" --no-interaction
+        else
             if [ "${DEPLOY_LEGACY_DRAIN:-0}" != 1 ]; then
-                echo "Old scheduler requires the authorized DEPLOY_LEGACY_DRAIN=1 transition." >&2
+                echo "Old image lacks tmux:drain. Authorized first upgrades require DEPLOY_LEGACY_DRAIN=1; legacy IRC disconnects at final stop." >&2
                 exit 1
             fi
-            scheduler_legacy=1
-            scheduler_drained=1
-            legacy_scheduler drain ;;
-        *) echo "Cannot verify scheduler drain capability." >&2; exit 1 ;;
-    esac
-    scheduler_drained=1
-fi
-verify
-if [ -n "$indexer" ]; then
-    commands=$(compose exec -T indexer php artisan list --raw --no-interaction)
-    if printf '%s\n' "$commands" | grep -q '^tmux:drain[[:space:]]'; then
-        drained=1
-        compose exec -T indexer php artisan tmux:drain --timeout="${DEPLOY_DRAIN_TIMEOUT:-90}" --session=nntmux --token="$operation_token" --no-interaction
-    else
-        if [ "${DEPLOY_LEGACY_DRAIN:-0}" != 1 ]; then
-            echo "Old image lacks tmux:drain. Authorized first upgrades require DEPLOY_LEGACY_DRAIN=1; legacy IRC disconnects at final stop." >&2
-            exit 1
+            legacy=1
+            drained=1
+            legacy_drain drain
         fi
-        legacy=1
         drained=1
-        legacy_drain drain
     fi
-    drained=1
+    verify
 fi
-verify
-# Let active Horizon jobs finish while the existing web service remains available.
-# Explicit timeout also protects containers created before the longer Compose grace.
-compose stop --timeout 1920 horizon
-verify
+
+if [ "$need_horizon_stop" = 1 ]; then
+    # Let active Horizon jobs finish while the existing web service remains available.
+    compose stop --timeout 1920 horizon
+    verify
+fi
+
 if [ "$scheduler_legacy" = 1 ]; then
     legacy_scheduler check
     verify
-    # Keep the old coordinator frozen: TERM+CONT can reopen its launch race.
-    # Only this verified idle coordinator reaches Docker's short kill deadline;
-    # Docker records manual shutdown first, preventing a restart-policy relaunch.
     compose stop --timeout 1 scheduler
     scheduler_drained=0
     verify
@@ -99,11 +144,32 @@ elif [ "$scheduler_drained" = 1 ]; then
     scheduler_command check
     verify
 fi
-# Stop the remaining database writers before migration; persistent services stay running.
-compose stop web scheduler indexer
-drained=0
-scheduler_drained=0
-verify
-compose run --rm --no-deps web php artisan migrate --force --no-interaction
-verify
-compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" web horizon scheduler indexer
+
+if [ -n "$stop_services" ]; then
+    # shellcheck disable=SC2086
+    compose stop $stop_services
+    drained=0
+    scheduler_drained=0
+    verify
+fi
+
+if [ -n "$DIRTY_DATA" ]; then
+    # shellcheck disable=SC2086
+    compose up -d --no-deps --force-recreate --wait $DIRTY_DATA
+    verify
+fi
+
+if [ "$MIGRATE" = 1 ]; then
+    compose run --rm --no-deps web php artisan migrate --force --no-interaction
+    verify
+fi
+
+if [ -n "$up_app_services" ]; then
+    # shellcheck disable=SC2086
+    compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $up_app_services
+fi
+
+if [ -n "$DIRTY_INFRA" ]; then
+    # shellcheck disable=SC2086
+    compose up -d --no-deps --force-recreate $DIRTY_INFRA
+fi

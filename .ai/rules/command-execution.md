@@ -11,7 +11,7 @@ Run host commands such as `php artisan`, `./vendor/bin/pint`, and `npm run build
 
 - Official Boost override: `.ai/guidelines/sail/core.blade.php` (wins on `boost:install` / `boost:update`).
 - Host binaries for generated guidelines: `config/boost.php` → `executable_paths` defaults (`php`, `composer`, `npm`, `vendor/bin/`).
-- Use Sail / `Makefile` only for Compose lifecycle or when the user asks for containerized runs.
+- Use Sail / `Justfile` only for Compose lifecycle or when the user asks for containerized runs.
 - Check Docker Desktop or the configured Linux VM on macOS. Check the Docker service and socket access on Linux. Host tools can run while Docker is unavailable if their required services are reachable.
 
 ## Validate behavior and label evidence

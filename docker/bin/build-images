@@ -1,0 +1,36 @@
+#!/bin/sh
+# Build only the Docker targets whose inputs changed since the last .build.stamp.
+set -eu
+DIR=$(cd "$(dirname "$0")/.." && pwd)
+REPO="${DEPLOY_REPO:-$(cd "$DIR/.." && pwd)}"
+
+BASE_IMAGE="${BASE_IMAGE:-nntmux/base:local}"
+APP_IMAGE="${APP_IMAGE:-nntmux/app:local}"
+WEB_IMAGE="${WEB_IMAGE:-$APP_IMAGE}"
+HORIZON_IMAGE="${HORIZON_IMAGE:-$APP_IMAGE}"
+SCHEDULER_IMAGE="${SCHEDULER_IMAGE:-$APP_IMAGE}"
+INDEXER_IMAGE="${INDEXER_IMAGE:-$APP_IMAGE}"
+export BASE_IMAGE APP_IMAGE WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE
+
+targets=$(DEPLOY_STAMP="${DEPLOY_STAMP:-$DIR/.build.stamp}" "$DIR/bin/deploy-plan" --build-targets)
+[ -n "$targets" ] || exit 0
+
+for target in $targets; do
+    case "$target" in
+        base)
+            docker build --target base -t "$BASE_IMAGE" -f "$REPO/Dockerfile" "$REPO"
+            ;;
+        web)
+            docker build --target selfhosted-web -t "$WEB_IMAGE" -f "$REPO/Dockerfile" "$REPO"
+            ;;
+        horizon)
+            docker build --target selfhosted-horizon -t "$HORIZON_IMAGE" -f "$REPO/Dockerfile" "$REPO"
+            ;;
+        scheduler)
+            docker build --target selfhosted-scheduler -t "$SCHEDULER_IMAGE" -f "$REPO/Dockerfile" "$REPO"
+            ;;
+        indexer)
+            docker build --target selfhosted-indexer -t "$INDEXER_IMAGE" -f "$REPO/Dockerfile" "$REPO"
+            ;;
+    esac
+done

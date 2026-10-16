@@ -1,5 +1,5 @@
 #!/bin/sh
-# A matching source stamp only skips a deploy while every app service is healthy.
+# A matching source stamp only skips a deploy while every app service is healthy and on its expected image.
 set -eu
 DIR=$(cd "$(dirname "$0")/.." && pwd)
 COMPOSE_FILE="${COMPOSE_FILE:-$DIR/docker-compose.yml}"
@@ -14,13 +14,24 @@ if [ "${1:-}" = --fingerprint ]; then
     fi
     exit 0
 fi
-expected=$(docker image inspect --format '{{.Id}}' "${APP_IMAGE:-nntmux/app:local}") || exit 1
+
+APP_IMAGE="${APP_IMAGE:-nntmux/app:local}"
+service_image() {
+    case "$1" in
+        web) printf '%s\n' "${WEB_IMAGE:-$APP_IMAGE}" ;;
+        horizon) printf '%s\n' "${HORIZON_IMAGE:-$APP_IMAGE}" ;;
+        scheduler) printf '%s\n' "${SCHEDULER_IMAGE:-$APP_IMAGE}" ;;
+        indexer) printf '%s\n' "${INDEXER_IMAGE:-$APP_IMAGE}" ;;
+    esac
+}
+
 for service in web horizon scheduler indexer; do
     container=$(compose ps -q "$service") || exit 1
     [ -n "$container" ] || exit 1
     status=$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container") || exit 1
     [ "$status" = 'running healthy' ] || exit 1
     if [ "${1:-}" != --healthy ]; then
+        expected=$(docker image inspect --format '{{.Id}}' "$(service_image "$service")") || exit 1
         image=$(docker inspect --format '{{.Image}}' "$container") || exit 1
         [ "$image" = "$expected" ] || exit 1
     fi

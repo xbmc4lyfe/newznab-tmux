@@ -675,6 +675,37 @@ PHP);
         $this->assertFileExists($this->dir.'/stamp');
     }
 
+    #[Test]
+    public function documentation_and_test_changes_do_not_invalidate_the_runtime_fingerprint(): void
+    {
+        $build = ['run', 'build', '--', 'sh', '-c', 'echo x >> '.$this->dir.'/builds'];
+        $flags = ['SKIP_IF_UNCHANGED' => '1', 'STAMP_ON_SUCCESS' => '1'];
+        $builds = fn (): int => is_file($this->dir.'/builds') ? count(file($this->dir.'/builds')) : 0;
+
+        $this->guard($build, $flags);
+        $this->assertSame(1, $builds());
+
+        mkdir($this->repo.'/docs', 0777, true);
+        mkdir($this->repo.'/.ai/rules', 0777, true);
+        mkdir($this->repo.'/tests/Feature', 0777, true);
+        file_put_contents($this->repo.'/README.md', "# Updated docs\n");
+        file_put_contents($this->repo.'/AGENTS.md', "# Agent rules\n");
+        file_put_contents($this->repo.'/docs/guide.md', "Guide\n");
+        file_put_contents($this->repo.'/.ai/rules/index.md', "Rule\n");
+        file_put_contents($this->repo.'/tests/Feature/ExampleTest.php', "<?php\n");
+        file_put_contents($this->repo.'/phpstan.neon', "parameters:\n");
+
+        // Uncommitted non-runtime changes must skip
+        $this->guard($build, $flags);
+        $this->assertSame(1, $builds());
+
+        // Committed non-runtime changes (changing git HEAD) must also skip
+        $this->git('add', '.');
+        $this->git('commit', '-q', '-m', 'docs and tests only');
+        $this->guard($build, $flags);
+        $this->assertSame(1, $builds());
+    }
+
     /**
      * @param  list<string>  $arguments
      * @param  array<string, string>  $env

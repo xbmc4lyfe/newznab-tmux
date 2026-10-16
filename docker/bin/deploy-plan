@@ -1,0 +1,726 @@
+#!/usr/bin/env python3
+"""Per-service content fingerprinting and selective deployment planner for the docker/ stack."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+APP_SERVICES = ("web", "horizon", "scheduler", "indexer")
+DATA_SERVICES = ("mariadb", "redis", "manticore")
+INFRA_SERVICES = (
+    "proxy",
+    "mailpit",
+    "prometheus",
+    "pushgateway",
+    "grafana",
+    "node-exporter",
+    "mysqld-exporter",
+    "redis-exporter",
+)
+ALL_SERVICES = (*APP_SERVICES, *DATA_SERVICES, *INFRA_SERVICES)
+
+SERVICE_TARGET = {
+    "web": "selfhosted-web",
+    "horizon": "selfhosted-horizon",
+    "scheduler": "selfhosted-scheduler",
+    "indexer": "selfhosted-indexer",
+}
+
+IGNORED_EXACT = {
+    ".dockerignore",
+    ".editorconfig",
+    ".gitattributes",
+    ".gitignore",
+    ".prettierignore",
+    ".prettierrc",
+    ".vale-plugin.toml",
+    "LICENSE",
+    "Justfile",
+    "Makefile",
+    "boost.json",
+    "captainhook.json",
+    "commit",
+    "debug_scrapers.php",
+    "docker-compose.monitoring.yml",
+    "docker-compose.yml.prod-dist",
+    "docker-entrypoint.sh",
+    "docker/Justfile",
+    "docker/Makefile",
+    "nntmux",
+    "pint.json",
+    "rector.php",
+    "sail",
+    "skills-lock.json",
+}
+
+IGNORED_PREFIXES = (
+    ".agents/",
+    ".ai/",
+    ".claude/",
+    ".codex/",
+    ".cursor/",
+    ".github/",
+    ".idea/",
+    ".junie/",
+    ".phpunit",
+    ".superpowers/",
+    ".vscode/",
+    "benchmarks/",
+    "deploy/aws/",
+    "deploy/cloud/tests/",
+    "docker/.build.stamp",
+    "docker/.deploy",
+    "docker/backups/",
+    "docker/data/",
+    "docker/docs/",
+    "docker/logs/",
+    "docs/",
+    "github-pages/",
+    "infra/",
+    "misc/",
+    "phpstan",
+    "phpunit.xml",
+    "scripts/",
+)
+
+WEB_ONLY_EXACT = {
+    "docker/app/Caddyfile",
+    "package-lock.json",
+    "package.json",
+    "tsconfig.json",
+    "vite.config.js",
+    "routes/api.php",
+    "routes/channels.php",
+    "routes/rss.php",
+    "routes/web.php",
+    "config/captcha.php",
+    "config/cors.php",
+    "config/google2fa.php",
+    "config/passkeys.php",
+    "config/tinymce.php",
+    "config/trustedproxy.php",
+}
+
+WEB_ONLY_PREFIXES = (
+    "app/Http/",
+    "app/View/",
+    "config/forum/",
+    "resources/css/",
+    "resources/forum/",
+    "resources/js/",
+)
+
+HORIZON_ONLY_EXACT = {
+    "config/horizon.php",
+}
+
+HORIZON_ONLY_PREFIXES = (
+    "app/Mail/",
+    "app/Notifications/",
+    "resources/views/emails/",
+    "resources/views/mail/",
+)
+
+SCHEDULER_ONLY_EXACT = {
+    "docker/app/bin/scheduler.py",
+    "routes/console.php",
+    "config/predb_feeds.php",
+    "config/release_verification.php",
+    "app/Console/Commands/PredbImportFeed.php",
+    "app/Console/Commands/WarmAdminDashboard.php",
+    "app/Console/Commands/CollectStats.php",
+    "app/Console/Commands/DeleteUnverifiedUsers.php",
+    "app/Console/Commands/UpdateExpiredRoles.php",
+    "app/Console/Commands/DisableExpiredPromotions.php",
+    "app/Console/Commands/DisableExpiredRegistrationPeriods.php",
+    "app/Console/Commands/CloudflareReload.php",
+    "app/Console/Commands/PurgeExpiredGdprExports.php",
+    "app/Console/Commands/PopulateSteamApps.php",
+    "app/Console/Commands/MetricsCollect.php",
+    "app/Console/Commands/MonitoringExportMetrics.php",
+    "app/Console/Commands/CheckServiceHealth.php",
+    "app/Console/Commands/SearchRepair.php",
+    "app/Console/Commands/IndexLogs.php",
+    "app/Console/Commands/PrepareReleaseCandidates.php",
+    "app/Console/Commands/VerifyReleaseCandidates.php",
+}
+
+SCHEDULER_ONLY_PREFIXES = (
+    "app/Services/Predb/Feeds/",
+)
+
+INDEXER_ONLY_EXACT = {
+    "docker/app/bin/indexer.sh",
+    "docker/app/php/yenc-ffi.ini",
+    "config/irc_settings.php",
+    "config/tmux.conf",
+    "config/tmux.php",
+    "app/Services/IRCClient.php",
+    "app/Services/IRCScraper.php",
+    "app/Console/Commands/NntmuxIrcScraper.php",
+    "app/Console/Commands/ProcessPostProcess.php",
+    "app/Console/Commands/ProcessReleasesCommand.php",
+    "app/Console/Commands/ProcessReleasesMulti.php",
+    "app/Console/Commands/ProcessSafe.php",
+    "app/Console/Commands/ProcessUpdatePerGroup.php",
+    "app/Console/Commands/TmuxAttach.php",
+    "app/Console/Commands/TmuxDrain.php",
+    "app/Console/Commands/TmuxHealthCheck.php",
+    "app/Console/Commands/TmuxMonitor.php",
+    "app/Console/Commands/TmuxStart.php",
+    "app/Console/Commands/TmuxStop.php",
+    "app/Console/Commands/UpdateBackfill.php",
+    "app/Console/Commands/UpdateBinaries.php",
+    "app/Console/Commands/UpdateGroupHeaders.php",
+    "app/Console/Commands/UpdatePerGroup.php",
+    "app/Console/Commands/UpdatePostProcess.php",
+}
+
+INDEXER_ONLY_PREFIXES = (
+    "app/Services/AdditionalProcessing/",
+    "app/Services/Backfill/",
+    "app/Services/Binaries/",
+    "app/Services/Runners/",
+    "app/Services/Tmux/",
+)
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_text(text: str) -> str:
+    return sha256_bytes(text.encode("utf-8", errors="surrogateescape"))
+
+
+def classify_path(rel_path: str) -> tuple[str, ...]:
+    """Return the logical ownership bucket(s) for a repository-relative path."""
+    if rel_path == "tests/Fixtures/nzb-article-fingerprint/NzbArticleFingerprint.php":
+        return ("shared-app",)
+    if rel_path.endswith(".md") or rel_path in IGNORED_EXACT:
+        return ()
+    if rel_path.startswith("install") and rel_path.endswith(".sh"):
+        return ()
+    if any(rel_path.startswith(prefix) for prefix in IGNORED_PREFIXES):
+        return ()
+    if rel_path.startswith("tests/"):
+        return ()
+    if rel_path.startswith("docker/8.5/") and rel_path != "docker/8.5/php.ini":
+        return ()
+    if rel_path.startswith("docker/bin/"):
+        return ()
+    if rel_path == "docker/docker-compose.yml":
+        # Tracked via rendered compose config --format json per service.
+        return ()
+
+    # Infrastructure config files
+    if rel_path.startswith("docker/config/caddy/"):
+        return ("proxy",)
+    if rel_path.startswith("docker/config/prometheus/"):
+        return ("prometheus",)
+    if rel_path.startswith("docker/monitoring/grafana/"):
+        return ("grafana",)
+    if rel_path.startswith("docker/config/mariadb/"):
+        return ("mariadb",)
+    if rel_path.startswith("docker/config/redis/"):
+        return ("redis",)
+    if rel_path.startswith("docker/config/manticore/"):
+        return ("manticore",)
+
+    # Database migrations require writer drain + migrate + app rollout
+    if rel_path.startswith("database/migrations/"):
+        return ("migrations", "shared-app")
+
+    # Web-only paths
+    if rel_path in WEB_ONLY_EXACT or any(rel_path.startswith(p) for p in WEB_ONLY_PREFIXES):
+        return ("web",)
+    if rel_path.startswith("public/") and rel_path != "public/index.php":
+        return ("web",)
+    if rel_path.startswith("resources/views/"):
+        if rel_path.startswith("resources/views/emails/") or rel_path.startswith("resources/views/mail/"):
+            return ("horizon",)
+        return ("web",)
+
+    # Horizon-only paths
+    if rel_path in HORIZON_ONLY_EXACT or any(rel_path.startswith(p) for p in HORIZON_ONLY_PREFIXES):
+        return ("horizon",)
+    if rel_path.startswith("app/Jobs/"):
+        if rel_path in ("app/Jobs/PurgeDeletedAccounts.php", "app/Jobs/RemoveInactiveAccounts.php"):
+            return ("horizon", "scheduler")
+        return ("horizon",)
+
+    # Scheduler-only paths
+    if rel_path in SCHEDULER_ONLY_EXACT or any(rel_path.startswith(p) for p in SCHEDULER_ONLY_PREFIXES):
+        return ("scheduler",)
+
+    # Indexer-only paths
+    if rel_path in INDEXER_ONLY_EXACT or any(rel_path.startswith(p) for p in INDEXER_ONLY_PREFIXES):
+        return ("indexer",)
+
+    # Everything else (shared PHP core, composer, Dockerfile, etc.) affects all 4 app services
+    return ("shared-app",)
+
+
+def file_record(repo: Path, rel_path: str) -> str:
+    """Compute a deterministic content+mode+symlink record for a working-tree file."""
+    full = repo / rel_path
+    try:
+        st = os.lstat(full)
+    except OSError:
+        return f"deleted {rel_path}"
+    mode = oct(st.st_mode & 0o7777)[2:]
+    if os.path.islink(full):
+        target = os.readlink(full)
+        try:
+            target_bytes = full.read_bytes()
+            content_hash = sha256_bytes(target_bytes)
+        except OSError:
+            content_hash = "dangling"
+        return f"link {mode} {content_hash} {rel_path} -> {target}"
+    if os.path.isfile(full):
+        return f"file {mode} {sha256_bytes(full.read_bytes())} {rel_path}"
+    return f"other {mode} {rel_path}"
+
+
+def collect_repo_records(repo: Path) -> list[tuple[str, str]]:
+    """Return sorted (rel_path, record_line) for all tracked and untracked files in repo."""
+    records: dict[str, str] = {}
+
+    ls_files = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "-s", "-z"],
+        capture_output=True,
+        check=False,
+    )
+    dirty_files: set[str] = set()
+    diff_proc = subprocess.run(
+        ["git", "-C", str(repo), "diff", "--name-only", "-z", "HEAD"],
+        capture_output=True,
+        check=False,
+    )
+    if diff_proc.returncode == 0 and diff_proc.stdout:
+        for entry in diff_proc.stdout.split(b"\x00"):
+            if entry:
+                dirty_files.add(entry.decode("utf-8", errors="surrogateescape"))
+
+    if ls_files.returncode == 0 and ls_files.stdout:
+        for raw in ls_files.stdout.split(b"\x00"):
+            if not raw:
+                continue
+            text = raw.decode("utf-8", errors="surrogateescape")
+            meta, _, rel_path = text.partition("\t")
+            parts = meta.split()
+            if len(parts) >= 2 and rel_path not in dirty_files and (repo / rel_path).exists():
+                mode, blob_sha = parts[0], parts[1]
+                records[rel_path] = f"git {mode} {blob_sha} {rel_path}"
+            else:
+                records[rel_path] = file_record(repo, rel_path)
+    else:
+        for path in sorted(repo.rglob("*")):
+            if ".git" in path.parts:
+                continue
+            rel = path.relative_to(repo).as_posix()
+            records[rel] = file_record(repo, rel)
+
+    for rel_path in dirty_files:
+        records[rel_path] = file_record(repo, rel_path)
+
+    untracked = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "-o", "--exclude-standard", "-z"],
+        capture_output=True,
+        check=False,
+    )
+    if untracked.returncode == 0 and untracked.stdout:
+        for raw in untracked.stdout.split(b"\x00"):
+            if not raw:
+                continue
+            rel_path = raw.decode("utf-8", errors="surrogateescape")
+            records[rel_path] = file_record(repo, rel_path)
+
+    return sorted(records.items(), key=lambda item: item[0])
+
+
+def dockerfile_base_hash(repo: Path) -> str:
+    dockerfile = repo / "Dockerfile"
+    if not dockerfile.is_file():
+        return "missing"
+    text = dockerfile.read_text(encoding="utf-8", errors="surrogateescape")
+    # Hash up through the end of the `FROM base-os AS base` stage
+    marker = "FROM dunglas/frankenphp:1-php8.5-bookworm AS yenc"
+    prefix = text.split(marker, 1)[0] if marker in text else text
+    return sha256_text(prefix)
+
+
+def compose_command(docker_dir: Path) -> list[str]:
+    return [str(docker_dir / "bin/compose")]
+
+
+def get_compose_service_hashes(docker_dir: Path) -> tuple[str, dict[str, str]]:
+    """Return (global_config_hash, per_service_config_hashes)."""
+    env = dict(os.environ)
+    env.setdefault("COMPOSE_FILE", str(docker_dir / "docker-compose.yml"))
+    proc = subprocess.run(
+        [*compose_command(docker_dir), "config", "--format", "json"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        sys.exit(proc.returncode or 1)
+    raw = proc.stdout.strip()
+    context_meta = f"{os.environ.get('DC', '')}\n{os.environ.get('DOCKER_CONTEXT', '')}\n{os.environ.get('DOCKER_HOST', '')}"
+    global_hash = sha256_text(f"{raw}\n{context_meta}")
+    per_service: dict[str, str] = {}
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and isinstance(parsed.get("services"), dict):
+            services_map = parsed["services"]
+            for svc in ALL_SERVICES:
+                if svc in services_map:
+                    svc_json = json.dumps(services_map[svc], sort_keys=True)
+                    per_service[svc] = sha256_text(f"{svc_json}\n{context_meta}")
+                else:
+                    per_service[svc] = "absent"
+            return global_hash, per_service
+    except (ValueError, TypeError):
+        pass
+    for svc in ALL_SERVICES:
+        per_service[svc] = global_hash
+    return global_hash, per_service
+
+
+def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[str, str]:
+    buckets: dict[str, list[str]] = {
+        "shared-app": [],
+        "migrations": [],
+        **{svc: [] for svc in ALL_SERVICES},
+    }
+    runtime_records: list[str] = []
+
+    for rel_path, record in collect_repo_records(repo):
+        owners = classify_path(rel_path)
+        if not owners:
+            continue
+        runtime_records.append(record)
+        for owner in owners:
+            if owner in buckets:
+                buckets[owner].append(record)
+
+    env_hashes: list[str] = []
+    for env_file in (docker_dir / ".env", docker_dir / "config/app.env"):
+        if env_file.is_file():
+            env_hashes.append(sha256_bytes(env_file.read_bytes()))
+        else:
+            env_hashes.append("missing")
+    configuration_hash = sha256_text("\n".join(env_hashes))
+    app_env_hash = env_hashes[1]
+
+    effective_hash = "none"
+    per_service_compose: dict[str, str] = {svc: "none" for svc in ALL_SERVICES}
+    config_cmd = os.environ.get("DEPLOY_CONFIG_COMMAND", "")
+    if config_cmd:
+        proc = subprocess.run([config_cmd, "--fingerprint"], capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            sys.stderr.write(proc.stderr)
+            sys.exit(proc.returncode or 1)
+        effective_hash = proc.stdout.strip()
+        if include_compose:
+            if Path(config_cmd).name == "deploy-current":
+                _, per_service_compose = get_compose_service_hashes(docker_dir)
+            else:
+                per_service_compose = {svc: effective_hash for svc in ALL_SERVICES}
+    elif include_compose:
+        effective_hash, per_service_compose = get_compose_service_hashes(docker_dir)
+
+    runtime_tree_hash = sha256_text("\n".join(runtime_records))
+    shared_app_hash = sha256_text("\n".join(buckets["shared-app"]))
+    migration_hash = sha256_text("\n".join(buckets["migrations"]))
+    base_hash = dockerfile_base_hash(repo)
+
+    state: dict[str, str] = {
+        "fingerprint": f"{runtime_tree_hash} {configuration_hash} {effective_hash}",
+        "base": base_hash,
+        "migration": migration_hash,
+        "shared_app": shared_app_hash,
+        "app_env": app_env_hash,
+        "effective": effective_hash,
+    }
+
+    for svc in APP_SERVICES:
+        svc_files_hash = sha256_text("\n".join(buckets[svc]))
+        build_hash = sha256_text(f"{base_hash}\n{shared_app_hash}\n{svc_files_hash}")
+        deploy_hash = sha256_text(f"{build_hash}\n{app_env_hash}\n{per_service_compose[svc]}")
+        state[f"build:{svc}"] = build_hash
+        state[f"service:{svc}"] = deploy_hash
+
+    for svc in (*DATA_SERVICES, *INFRA_SERVICES):
+        svc_files_hash = sha256_text("\n".join(buckets[svc]))
+        deploy_hash = sha256_text(f"{svc_files_hash}\n{per_service_compose[svc]}")
+        state[f"service:{svc}"] = deploy_hash
+
+    return state
+
+
+def parse_stamp(stamp_path: Path) -> dict[str, str]:
+    if not stamp_path.is_file():
+        return {}
+    lines = stamp_path.read_text(encoding="utf-8", errors="surrogateescape").splitlines()
+    if not lines:
+        return {}
+    parsed: dict[str, str] = {"fingerprint": lines[0].strip()}
+    for line in lines[1:]:
+        if "=" in line:
+            k, _, v = line.partition("=")
+            parsed[k.strip()] = v.strip()
+    return parsed
+
+
+def format_stamp(state: dict[str, str]) -> str:
+    lines = [state["fingerprint"]]
+    for key in sorted(k for k in state if k != "fingerprint"):
+        lines.append(f"{key}={state[key]}")
+    return "\n".join(lines) + "\n"
+
+
+def service_image_name(svc: str) -> str:
+    env_key = f"{svc.upper()}_IMAGE"
+    if os.environ.get(env_key):
+        return os.environ[env_key]
+    if os.environ.get("APP_IMAGE"):
+        return os.environ["APP_IMAGE"]
+    return f"nntmux/{svc}:local"
+
+
+def image_exists(image: str) -> bool:
+    proc = subprocess.run(
+        ["docker", "image", "inspect", image],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
+def image_id(image: str) -> str | None:
+    proc = subprocess.run(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", image],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def check_app_container(docker_dir: Path, svc: str, verify_image: bool = True) -> tuple[bool, str]:
+    """Return (is_ok, reason) for a running app service container."""
+    env = dict(os.environ)
+    env.setdefault("COMPOSE_FILE", str(docker_dir / "docker-compose.yml"))
+    ps = subprocess.run(
+        [*compose_command(docker_dir), "ps", "-q", svc],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    if ps.returncode != 0 or not ps.stdout.strip():
+        return False, "missing"
+    container = ps.stdout.strip().splitlines()[0]
+    status_proc = subprocess.run(
+        ["docker", "inspect", "--format", "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}", container],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if status_proc.returncode != 0 or status_proc.stdout.strip() != "running healthy":
+        return False, f"unhealthy ({status_proc.stdout.strip() or 'inspect-failed'})"
+    if verify_image:
+        expected = image_id(service_image_name(svc))
+        if not expected:
+            return False, "missing-image"
+        img_proc = subprocess.run(
+            ["docker", "inspect", "--format", "{{.Image}}", container],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if img_proc.returncode != 0 or img_proc.stdout.strip() != expected:
+            return False, "stale-image"
+    return True, "healthy"
+
+
+def compute_build_targets(repo: Path, docker_dir: Path, stamp_path: Path) -> list[str]:
+    state = compute_state(repo, docker_dir, include_compose=False)
+    stamped = parse_stamp(stamp_path)
+    force = os.environ.get("FORCE", "0") == "1"
+
+    targets: list[str] = []
+    base_img = os.environ.get("BASE_IMAGE", "nntmux/base:local")
+    if force or stamped.get("base") != state["base"] or not image_exists(base_img):
+        targets.append("base")
+
+    for svc in APP_SERVICES:
+        img = service_image_name(svc)
+        if (
+            force
+            or f"build:{svc}" not in stamped
+            or stamped.get(f"build:{svc}") != state[f"build:{svc}"]
+            or not image_exists(img)
+        ):
+            targets.append(svc)
+
+    return targets
+
+
+def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[str, object]:
+    state = compute_state(repo, docker_dir, include_compose=True)
+    stamped = parse_stamp(stamp_path)
+    force = os.environ.get("FORCE", "0") == "1"
+    first_deploy = not bool(stamped) or "migration" not in stamped
+
+    dirty_app: list[str] = []
+    app_reasons: dict[str, str] = {}
+    any_missing_or_unhealthy = False
+
+    for svc in APP_SERVICES:
+        ok, reason = check_app_container(docker_dir, svc, verify_image=True)
+        if not ok and reason in ("missing", "missing-image") or reason.startswith("unhealthy"):
+            any_missing_or_unhealthy = True
+        if force:
+            dirty_app.append(svc)
+            app_reasons[svc] = "forced (FORCE=1)"
+        elif first_deploy:
+            dirty_app.append(svc)
+            app_reasons[svc] = "initial deployment"
+        elif stamped.get(f"service:{svc}") != state[f"service:{svc}"]:
+            dirty_app.append(svc)
+            app_reasons[svc] = "code/config changed"
+        elif not ok:
+            dirty_app.append(svc)
+            app_reasons[svc] = reason
+        else:
+            app_reasons[svc] = "unchanged"
+
+    dirty_data: list[str] = []
+    data_reasons: dict[str, str] = {}
+    for svc in DATA_SERVICES:
+        if not first_deploy and stamped.get(f"service:{svc}") != state[f"service:{svc}"]:
+            dirty_data.append(svc)
+            data_reasons[svc] = "config/compose changed"
+        else:
+            data_reasons[svc] = "unchanged"
+
+    dirty_infra: list[str] = []
+    infra_reasons: dict[str, str] = {}
+    for svc in INFRA_SERVICES:
+        if not first_deploy and stamped.get(f"service:{svc}") != state[f"service:{svc}"]:
+            dirty_infra.append(svc)
+            infra_reasons[svc] = "config/compose changed"
+        else:
+            infra_reasons[svc] = "unchanged"
+
+    compose_global_changed = not first_deploy and stamped.get("effective") != state["effective"]
+    # If all 4 app services changed due to a global compose config change, run migrations too
+    all_app_compose_changed = compose_global_changed and len(dirty_app) == len(APP_SERVICES)
+
+    migrate = (
+        force
+        or first_deploy
+        or any_missing_or_unhealthy
+        or stamped.get("migration") != state["migration"]
+        or all_app_compose_changed
+    )
+
+    if not dirty_app and not dirty_data and not dirty_infra and not migrate:
+        mode = "noop"
+    elif migrate or dirty_data:
+        mode = "full"
+        if not dirty_app:
+            dirty_app = list(APP_SERVICES)
+    else:
+        mode = "selective"
+
+    build_targets = compute_build_targets(repo, docker_dir, Path(os.environ.get("DEPLOY_BUILD_STAMP", docker_dir / ".build.stamp")))
+
+    return {
+        "mode": mode,
+        "migrate": migrate,
+        "dirty_app": dirty_app,
+        "dirty_data": dirty_data,
+        "dirty_infra": dirty_infra,
+        "build_targets": build_targets,
+        "app_reasons": app_reasons,
+        "data_reasons": data_reasons,
+        "infra_reasons": infra_reasons,
+        "state": state,
+    }
+
+
+def main() -> None:
+    docker_dir = Path(__file__).resolve().parent.parent
+    repo = Path(os.environ.get("DEPLOY_REPO", docker_dir.parent)).resolve()
+    stamp_path = Path(os.environ.get("DEPLOY_STAMP", docker_dir / ".deploy.stamp"))
+
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "--explain"
+
+    if cmd == "--fingerprint":
+        state = compute_state(repo, docker_dir, include_compose=False)
+        print(state["fingerprint"])
+        return
+
+    if cmd == "--stamp-data":
+        include_compose = bool(os.environ.get("DEPLOY_CONFIG_COMMAND", "")) or (len(sys.argv) > 2 and sys.argv[2] == "deploy")
+        state = compute_state(repo, docker_dir, include_compose=include_compose)
+        sys.stdout.write(format_stamp(state))
+        return
+
+    if cmd == "--build-targets":
+        build_stamp = Path(os.environ.get("DEPLOY_STAMP", docker_dir / ".build.stamp"))
+        targets = compute_build_targets(repo, docker_dir, build_stamp)
+        print(" ".join(targets))
+        return
+
+    if cmd == "--deploy-actions":
+        plan = compute_deploy_plan(repo, docker_dir, stamp_path)
+        print(f"MODE={shlex.quote(str(plan['mode']))}")
+        print(f"MIGRATE={'1' if plan['migrate'] else '0'}")
+        print(f"DIRTY_APP={shlex.quote(' '.join(plan['dirty_app']))}")
+        print(f"DIRTY_DATA={shlex.quote(' '.join(plan['dirty_data']))}")
+        print(f"DIRTY_INFRA={shlex.quote(' '.join(plan['dirty_infra']))}")
+        print(f"BUILD_TARGETS={shlex.quote(' '.join(plan['build_targets']))}")
+        return
+
+    if cmd == "--explain":
+        plan = compute_deploy_plan(repo, docker_dir, stamp_path)
+        print(f"Deployment Mode : {plan['mode']}")
+        print(f"Build Targets   : {', '.join(plan['build_targets']) if plan['build_targets'] else 'none (all cached)'}")
+        print(f"Run Migrations  : {'yes (full writer quiesce)' if plan['migrate'] else 'no'}")
+        print("")
+        print(f"{'Service':<18} {'Category':<10} {'Action':<18} {'Reason'}")
+        print("-" * 72)
+        for svc in APP_SERVICES:
+            action = "drain+recreate" if svc in plan["dirty_app"] and svc != "web" else ("recreate" if svc in plan["dirty_app"] else "skip")
+            if plan["migrate"] and svc not in plan["dirty_app"]:
+                action = "quiesce+restart"
+            print(f"{svc:<18} {'app':<10} {action:<18} {plan['app_reasons'][svc]}")
+        for svc in DATA_SERVICES:
+            action = "drain+recreate" if svc in plan["dirty_data"] else "skip"
+            print(f"{svc:<18} {'data':<10} {action:<18} {plan['data_reasons'][svc]}")
+        for svc in INFRA_SERVICES:
+            action = "recreate" if svc in plan["dirty_infra"] else "skip"
+            print(f"{svc:<18} {'infra':<10} {action:<18} {plan['infra_reasons'][svc]}")
+        return
+
+    sys.exit(f"Unknown option: {cmd}")
+
+
+if __name__ == "__main__":
+    main()

@@ -117,8 +117,8 @@ class InstallMonitoring extends Command
         ]);
 
         $this->components->info('Next steps:');
-        $this->line('  make build          # picks up the /grafana/ proxy in docker/8.5/nginx.conf');
-        $this->line('  make up             # now also starts Prometheus, Grafana, the Pushgateway and exporters');
+        $this->line('  just build          # picks up the /grafana/ proxy in docker/8.5/nginx.conf');
+        $this->line('  just up             # now also starts Prometheus, Grafana, the Pushgateway and exporters');
         $this->line('  ./sail artisan config:clear');
 
         return self::SUCCESS;

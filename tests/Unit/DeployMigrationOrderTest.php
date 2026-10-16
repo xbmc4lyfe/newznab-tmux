@@ -16,8 +16,8 @@ class DeployMigrationOrderTest extends TestCase
         $this->directory = sys_get_temp_dir().'/deploy-order-'.bin2hex(random_bytes(8));
         mkdir($this->directory.'/docker/bin', 0700, true);
         mkdir($this->directory.'/bin', 0700);
-        copy(__DIR__.'/../../docker/Makefile', $this->directory.'/docker/Makefile');
-        foreach (['deploy-guard', 'deploy-app', 'deploy-current', 'up-app', 'compose', 'legacy-drain.php', 'legacy-scheduler-drain.py'] as $script) {
+        copy(__DIR__.'/../../docker/Justfile', $this->directory.'/docker/Justfile');
+        foreach (['deploy-guard', 'deploy-app', 'deploy-current', 'deploy-plan', 'build-images', 'up-app', 'compose', 'legacy-drain.php', 'legacy-scheduler-drain.py'] as $script) {
             copy(__DIR__.'/../../docker/bin/'.$script, $this->directory.'/docker/bin/'.$script);
             chmod($this->directory.'/docker/bin/'.$script, 0755);
         }
@@ -441,6 +441,188 @@ SH);
         $this->assertStringNotContainsString(' stop ', $this->events());
     }
 
+    public function test_documentation_and_test_changes_skip_all_builds_drains_and_restarts(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        mkdir($this->directory.'/docs', 0777, true);
+        mkdir($this->directory.'/tests/Feature', 0777, true);
+        file_put_contents($this->directory.'/README.md', "# Docs\n");
+        file_put_contents($this->directory.'/docs/architecture.md', "# Arch\n");
+        file_put_contents($this->directory.'/tests/Feature/SampleTest.php', "<?php\n");
+        (new Process(['git', 'add', '.'], $this->directory))->mustRun();
+        (new Process(['git', 'commit', '-q', '-m', 'docs and tests'], $this->directory))->mustRun();
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->assertStringNotContainsString('build --target', $this->events());
+        $this->assertStringNotContainsString('scheduler.py drain', $this->events());
+        $this->assertStringNotContainsString('tmux:drain', $this->events());
+        $this->assertStringNotContainsString(' stop ', $this->events());
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
+        $this->assertStringNotContainsString(' up -d', $this->events());
+    }
+
+    public function test_web_only_changes_rebuild_and_recreate_only_web_without_draining_writers_or_migrating(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        mkdir($this->directory.'/app/Http/Controllers', 0777, true);
+        file_put_contents($this->directory.'/app/Http/Controllers/HomeController.php', "<?php\n");
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('build --target selfhosted-web', $events);
+        $this->assertStringNotContainsString('build --target selfhosted-horizon', $events);
+        $this->assertStringNotContainsString('build --target selfhosted-scheduler', $events);
+        $this->assertStringNotContainsString('build --target selfhosted-indexer', $events);
+        $this->assertStringNotContainsString('scheduler.py drain', $events);
+        $this->assertStringNotContainsString('tmux:drain', $events);
+        $this->assertStringNotContainsString(' stop ', $events);
+        $this->assertStringNotContainsString('artisan migrate', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web', $events);
+        $this->assertStringNotContainsString('horizon scheduler indexer', $events);
+    }
+
+    public function test_scheduler_only_changes_rebuild_drain_and_recreate_only_scheduler(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        mkdir($this->directory.'/routes', 0777, true);
+        file_put_contents($this->directory.'/routes/console.php', "<?php\n");
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('build --target selfhosted-scheduler', $events);
+        $this->assertStringNotContainsString('build --target selfhosted-web', $events);
+        $this->assertStringNotContainsString('build --target selfhosted-horizon', $events);
+        $this->assertStringNotContainsString('build --target selfhosted-indexer', $events);
+        $this->assertStringContainsString('scheduler.py drain --timeout=1800', $events);
+        $this->assertStringContainsString('scheduler.py check', $events);
+        $this->assertStringContainsString(' stop scheduler', $events);
+        $this->assertStringNotContainsString('tmux:drain', $events);
+        $this->assertStringNotContainsString(' stop --timeout 1920 horizon', $events);
+        $this->assertStringNotContainsString('artisan migrate', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 scheduler', $events);
+    }
+
+    public function test_indexer_only_changes_rebuild_drain_and_recreate_only_indexer(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        mkdir($this->directory.'/app/Services/Tmux', 0777, true);
+        file_put_contents($this->directory.'/app/Services/Tmux/TmuxSessionManager.php', "<?php\n");
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('build --target selfhosted-indexer', $events);
+        $this->assertStringNotContainsString('build --target selfhosted-web', $events);
+        $this->assertStringNotContainsString('build --target selfhosted-horizon', $events);
+        $this->assertStringNotContainsString('build --target selfhosted-scheduler', $events);
+        $this->assertStringContainsString('artisan tmux:drain --timeout=90', $events);
+        $this->assertStringContainsString(' stop indexer', $events);
+        $this->assertStringNotContainsString('scheduler.py drain', $events);
+        $this->assertStringNotContainsString(' stop --timeout 1920 horizon', $events);
+        $this->assertStringNotContainsString('artisan migrate', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 indexer', $events);
+    }
+
+    public function test_horizon_only_changes_rebuild_stop_and_recreate_only_horizon(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        mkdir($this->directory.'/app/Jobs', 0777, true);
+        file_put_contents($this->directory.'/app/Jobs/SendWelcomeEmail.php', "<?php\n");
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('build --target selfhosted-horizon', $events);
+        $this->assertStringNotContainsString('build --target selfhosted-web', $events);
+        $this->assertStringNotContainsString('build --target selfhosted-scheduler', $events);
+        $this->assertStringNotContainsString('build --target selfhosted-indexer', $events);
+        $this->assertStringContainsString(' stop --timeout 1920 horizon', $events);
+        $this->assertStringNotContainsString('scheduler.py drain', $events);
+        $this->assertStringNotContainsString('tmux:drain', $events);
+        $this->assertStringNotContainsString('artisan migrate', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 horizon', $events);
+    }
+
+    public function test_migration_changes_trigger_full_writer_quiesce_and_artisan_migrate(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        mkdir($this->directory.'/database/migrations', 0777, true);
+        file_put_contents($this->directory.'/database/migrations/2026_10_16_000000_test.php', "<?php\n");
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('scheduler.py drain --timeout=1800', $events);
+        $this->assertStringContainsString('artisan tmux:drain --timeout=90', $events);
+        $this->assertStringContainsString(' stop --timeout 1920 horizon', $events);
+        $this->assertStringContainsString(' stop web scheduler indexer', $events);
+        $this->assertStringContainsString('artisan migrate --force --no-interaction', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $events);
+    }
+
+    public function test_stateless_infra_config_changes_recreate_only_the_affected_infra_service_without_draining_writers(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        mkdir($this->directory.'/docker/config/caddy', 0777, true);
+        file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', ":8080\n");
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $events = $this->events();
+        $this->assertStringNotContainsString('build --target', $events);
+        $this->assertStringNotContainsString('scheduler.py drain', $events);
+        $this->assertStringNotContainsString('tmux:drain', $events);
+        $this->assertStringNotContainsString(' stop ', $events);
+        $this->assertStringNotContainsString('artisan migrate', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate proxy', $events);
+    }
+
+    public function test_stateful_data_service_config_changes_drain_writers_before_recreating_the_data_service(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        mkdir($this->directory.'/docker/config/redis', 0777, true);
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 1gb\n");
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('scheduler.py drain --timeout=1800', $events);
+        $this->assertStringContainsString('artisan tmux:drain --timeout=90', $events);
+        $this->assertStringContainsString(' stop web scheduler indexer', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait redis', $events);
+        $this->assertLessThan(
+            strpos($events, ' up -d --no-deps --force-recreate --wait redis'),
+            strpos($events, ' stop web scheduler indexer'),
+        );
+    }
+
+    public function test_deploy_plan_outputs_human_readable_per_service_explanation(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        mkdir($this->directory.'/docker/app/bin', 0777, true);
+        file_put_contents($this->directory.'/docker/app/bin/scheduler.py', "# updated\n");
+
+        $process = $this->make(['deploy-plan']);
+        $process->mustRun();
+        $output = $process->getOutput();
+        $this->assertStringContainsString('Deployment Mode : selective', $output);
+        $this->assertStringContainsString('Build Targets   : scheduler', $output);
+        $this->assertStringContainsString('Run Migrations  : no', $output);
+        $this->assertMatchesRegularExpression('/scheduler\s+app\s+drain\+recreate\s+code\/config changed/', $output);
+        $this->assertMatchesRegularExpression('/web\s+app\s+skip\s+unchanged/', $output);
+    }
+
     private function events(): string
     {
         return (string) file_get_contents($this->directory.'/events');
@@ -458,7 +640,11 @@ SH);
      */
     private function make(array $arguments, array $environment = []): Process
     {
-        return new Process(['make', '-s', '-C', $this->directory.'/docker', ...$arguments, 'DEPLOY_BY=fixture'], env: $environment + [
+        return new Process([
+            'just', '--justfile', $this->directory.'/docker/Justfile',
+            '--working-directory', $this->directory.'/docker',
+            ...$arguments, 'DEPLOY_BY=fixture',
+        ], env: $environment + [
             'PATH' => $this->directory.'/bin:'.getenv('PATH'), 'NNTMUX_DEPLOY_EVENTS' => $this->directory.'/events',
             'NNTMUX_REPO' => $this->directory,
         ]);

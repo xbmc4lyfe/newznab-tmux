@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Use the Makefile's Compose argv consistently, without evaluating shell code."""
+"""Use the Justfile's Compose argv consistently, without evaluating shell code."""
 import os
 import shlex
 import sys
