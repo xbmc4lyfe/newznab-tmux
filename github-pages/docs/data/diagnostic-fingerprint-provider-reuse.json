@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "status": "synthetic_diagnostic_not_qualified",
+  "title": "Fingerprint provider connection reuse",
+  "source_head": "badb7683cd0f99bb45df5bbf3be48e77647a8048",
+  "run_url": "https://github.com/xbmc4lyfe/newznab-tmux/actions/runs/38831253316",
+  "artifact_zip_sha256": "66976acded9a3a2c19b11de2311327eb2852254686296b1003a26f0af50f7a83",
+  "driver_started_utc": "2026-10-16T00:45:27Z",
+  "driver_finished_utc": "2026-10-16T00:45:39Z",
+  "runtime": "GitHub-hosted Ubuntu24.04 x86_64 PHP8.5.11",
+  "native_artifact": {
+    "sha256": "02eeb2be7d182cbc046cd5358792795825acf9daac549a020afc0fb2ea847213",
+    "source_head": "0e62874c6a1090072de9fac50e50a6ec7f4c5bea",
+    "historical_isa_abi_provenance_known": false,
+    "new_rust_compilation": false,
+    "input_artifact_id": 12009103317,
+    "input_workflow_run": 38812539972,
+    "input_artifact_zip_sha256": "8011646596debf96645b1d18ede0afb0e66e098471ea3ec34fd77215a7005e8a"
+  },
+  "counts": {
+    "paired_samples_per_stratum": 5,
+    "workers": 20,
+    "collections": 40,
+    "collections_per_arm": 20,
+    "article_observations": 160,
+    "tls_connections": 120,
+    "authenticated_connections": 120,
+    "fingerprint_commands": 640,
+    "process_cleanup_receipts": 27,
+    "invalid_workers": 0
+  },
+  "results": [
+    {
+      "bytes_per_part": 65536,
+      "phase": "first_after_preflight",
+      "baseline_caller_ms": 118.191126,
+      "baseline_alternate_authenticated_slot_ms": 3.204509,
+      "baseline_primary_authenticated_slot_ms": 91.356698,
+      "candidate_caller_ms": 73.017817,
+      "candidate_alternate_authenticated_slot_ms": 23.526304,
+      "candidate_primary_authenticated_slot_ms": 46.697043,
+      "paired_median_baseline_over_candidate_caller_ratio": 1.61887522004294,
+      "paired_median_candidate_over_baseline_alternate_slot_ratio": 7.093016434,
+      "pairs": 5
+    },
+    {
+      "bytes_per_part": 65536,
+      "phase": "repeat",
+      "baseline_caller_ms": 112.565155,
+      "baseline_alternate_authenticated_slot_ms": 3.164876,
+      "baseline_primary_authenticated_slot_ms": 89.933413,
+      "candidate_caller_ms": 67.310924,
+      "candidate_alternate_authenticated_slot_ms": 21.96229,
+      "candidate_primary_authenticated_slot_ms": 44.660487,
+      "paired_median_baseline_over_candidate_caller_ratio": 1.660385259307984,
+      "paired_median_candidate_over_baseline_alternate_slot_ratio": 6.939384039,
+      "pairs": 5
+    },
+    {
+      "bytes_per_part": 786432,
+      "phase": "first_after_preflight",
+      "baseline_caller_ms": 231.489837,
+      "baseline_alternate_authenticated_slot_ms": 16.465866,
+      "baseline_primary_authenticated_slot_ms": 204.364334,
+      "candidate_caller_ms": 185.211366,
+      "candidate_alternate_authenticated_slot_ms": 135.958602,
+      "candidate_primary_authenticated_slot_ms": 158.827231,
+      "paired_median_baseline_over_candidate_caller_ratio": 1.2392933858699375,
+      "paired_median_candidate_over_baseline_alternate_slot_ratio": 8.351355708,
+      "pairs": 5
+    },
+    {
+      "bytes_per_part": 786432,
+      "phase": "repeat",
+      "baseline_caller_ms": 225.846459,
+      "baseline_alternate_authenticated_slot_ms": 16.146516,
+      "baseline_primary_authenticated_slot_ms": 202.137562,
+      "candidate_caller_ms": 180.4406,
+      "candidate_alternate_authenticated_slot_ms": 134.851722,
+      "candidate_primary_authenticated_slot_ms": 157.7955,
+      "paired_median_baseline_over_candidate_caller_ratio": 1.2540674808092738,
+      "paired_median_candidate_over_baseline_alternate_slot_ratio": 8.216246279,
+      "pairs": 5
+    }
+  ],
+  "correctness": {
+    "full_report_parity_excluding_only_checked_retrieval_duration_leaves": true,
+    "payload_size_sha256_and_crc_match": true,
+    "independent_raw_audit": "no_invalid_trials_or_cleanup_faults",
+    "cleanup_complete": true
+  },
+  "decision": "Keep candidate unbound. Larger payload is below the 1.5x gate; no Rust adoption, p99 or production throughput qualification. Investigate early transport release without reordering budget-sensitive collection.",
+  "limitations": [
+    "Two synthetic payload sizes with two parts each; not an observed production distribution",
+    "Ratios are uncorrected observer-instrumented diagnostics; synchronous peer JSON serialization/flush has differing event counts and requires quieter confirmation before speedup interpretation",
+    "Authenticated slot time runs auth-success to close and excludes full TCP/TLS handshake occupancy",
+    "Alternate authenticated occupancy grows approximately7\u20138.4x; fairness and provider capacity not tested",
+    "First_after_preflight is partially warmed; repeat is second same-process collection",
+    "Healthy-only screen; adverse idle-TLS-close parity unproved",
+    "Historical native artifact ISA/ABI provenance unknown; no production ARM qualification",
+    "No p99, fresh publication, deployment, Horizon/SQL or live-provider proof"
+  ],
+  "screen_output_artifact_id": 12016309812,
+  "screen_output_artifact_name": "fingerprint-tls-diagnostic-38831253316-1",
+  "screen_output_artifact_metadata_url": "https://api.github.com/repos/xbmc4lyfe/newznab-tmux/actions/artifacts/12016309812"
+}
