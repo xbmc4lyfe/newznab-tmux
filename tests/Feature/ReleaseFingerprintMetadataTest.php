@@ -17,6 +17,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
+use Tests\Fixtures\RemainingMetadataBenchmarkFixtures;
 use Tests\Fixtures\YencArticles;
 use Tests\TestCase;
 
@@ -45,13 +46,58 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         $collector = new ReleaseFingerprintCollector($nzb, new NzbFingerprintAnalyzer($yenc), new Par2MetadataParser, $yenc);
         (new CollectReleaseFingerprintMetadata(1))->handle($collector);
         self::assertSame('unavailable', ReleaseFingerprintMetadata::query()->findOrFail(1)->status);
-        foreach ([28, 29, 30, 31, 32, 33] as $schemaVersion) {
+        foreach ([28, 29, 30, 31, 32, 33, 34] as $schemaVersion) {
             ReleaseFingerprintMetadata::query()->findOrFail(1)->update(['status' => 'complete', 'metadata' => ['schema_version' => $schemaVersion]]);
             $nzb->shouldReceive('readNzbContents')->once()->with('qo-schema-fixture')->andReturn(false);
             (new CollectReleaseFingerprintMetadata(1))->handle($collector);
             $recollected = ReleaseFingerprintMetadata::query()->where('releases_id', 1)->firstOrFail();
             self::assertSame('unavailable', $recollected->status);
         }
+    }
+
+    #[Test]
+    public function it_preserves_reported_clock_evidence_in_storage_and_public_output(): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:',
+            'database.connections.sqlite.url' => null]);
+        DB::purge();
+        DB::reconnect();
+        Schema::create('releases', static function (Blueprint $table): void {
+            $table->increments('id');
+        });
+        $migration = require database_path('migrations/2026_10_12_120000_create_release_fingerprint_metadata_table.php');
+        $migration->up();
+        DB::table('releases')->insert(['id' => 1]);
+        // Synthetic parser-shaped evidence tests persistence/rendering, not native execution.
+        $dates = RemainingMetadataBenchmarkFixtures::baseline(
+            RemainingMetadataBenchmarkFixtures::make('dates-folded'),
+        ) + ['parser_engine' => 'nntmux-rust-article-dates', 'schema_version' => 2];
+        foreach (['date', 'injection_date', 'legacy_nntp_posting_date'] as $source) {
+            $dates[$source]['occurrence_count_basis'] = 'retained candidates; the total may be larger when budget_exceeded';
+        }
+        $dates['date']['candidates'][0]['raw_field_hex'] = bin2hex("dAtE: 01 Jan 2024\r\n\t00:00 -0000\r\n");
+        $metadata = ['schema_version' => 35, 'article_observations' => [[
+            'server' => 'fixture.example.invalid', 'server_port' => 563, 'server_tls' => true,
+            'provider_label' => 'Fixture provider', 'queried_at_utc' => '2026-10-16T00:00:00Z',
+            'message_id' => '<clock@example.invalid>', 'sample_role' => 'first',
+            'metadata' => ['article_dates' => $dates, 'raw_headers' => ['Subject: <script>bad()</script>']],
+        ]]];
+        ReleaseFingerprintMetadata::query()->create(['releases_id' => 1, 'status' => 'partial', 'metadata' => $metadata]);
+        $persisted = ReleaseFingerprintMetadata::query()->findOrFail(1);
+        self::assertSame($metadata, $persisted->metadata);
+        $storedDates = $persisted->metadata['article_observations'][0]['metadata']['article_dates'];
+        self::assertTrue(NativeMetadataParser::hasCurrentArticleDatesSchema($storedDates));
+        self::assertSame(0, $storedDates['reported_clock_relations']['date_to_injection_date']['rhs_minus_lhs_seconds']);
+        self::assertNull($storedDates['reported_clock_relations']['date_to_legacy_nntp_posting_date']['rhs_minus_lhs_seconds']);
+        self::assertSame([2, 3], $storedDates['date']['candidates'][0]['source_line_indices']);
+        $html = view('details.partials.fingerprint-metadata', ['fingerprintMetadata' => $persisted])->render();
+        foreach (['reported_clock_relations', 'rhs_minus_lhs_seconds', 'lhs_order_relative_to_rhs', 'source_unavailable',
+            'fixture.example.invalid', 'Fixture provider', 'raw_field_hex', 'source_line_indices', 'Partial'] as $value) {
+            self::assertStringContainsString($value, $html);
+        }
+        self::assertStringContainsString('&lt;clock@example.invalid&gt;', $html);
+        self::assertStringContainsString('&lt;script&gt;bad()&lt;/script&gt;', $html);
+        self::assertStringNotContainsString('<script>bad()</script>', $html);
     }
 
     #[Test]

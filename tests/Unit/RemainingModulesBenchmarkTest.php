@@ -19,6 +19,118 @@ final class RemainingModulesBenchmarkTest extends TestCase
         require_once $path;
     }
 
+    public function test_cpp_date_plan_uses_only_date_strata_and_an_honest_native_identity(): void
+    {
+        $this->loadHarness();
+        $this->assertTrue(function_exists('remainingBenchmarkStrata'));
+        $strata = remainingBenchmarkStrata('date-cpp');
+        $this->assertSame(['dates-ordinary', 'dates-folded', 'dates-uncommon-duplicates', 'dates-uncommon-malformed'], array_keys($strata));
+        $this->assertSame(['article_dates'], array_values(array_unique(array_column($strata, 'module'))));
+        $this->assertCount(12, remainingBenchmarkStrata('metadata-modules'));
+        $this->assertSame(['cache' => 'dateLibraries', 'engine' => 'nntmux-cpp-nzbget-date-reference'], remainingBenchmarkNativeIdentity('article_dates', 'cpp'));
+        $summary = remainingBenchmarkAcceptance(true, 0, true, 'date-cpp');
+        $this->assertSame('cpp_nzbget_restricted_date_complete_metadata', $summary['baseline_kind']);
+        $this->assertFalse($summary['adoption_qualified']);
+    }
+
+    public function test_full_date_parity_rejects_metadata_discarded_by_the_projection(): void
+    {
+        $this->loadHarness();
+        self::assertTrue(function_exists('remainingBenchmarkDateFullParity'));
+        $fixture = RemainingMetadataBenchmarkFixtures::make('dates-ordinary');
+        $left = RemainingMetadataBenchmarkFixtures::expectedFullDates($fixture)
+            + ['parser_engine' => 'cpp', 'syntax_profile' => 'restricted'];
+        $right = array_replace($left, ['parser_engine' => 'rust', 'syntax_profile' => 'broader']);
+        self::assertTrue(remainingBenchmarkDateFullParity($fixture, $left, $right));
+        foreach (['raw_field_hex', 'unfolded_value_hex', 'timezone_token', 'timezone_offset_minutes',
+            'timezone_local_offset_unknown', 'seconds_present', 'leap_second', 'weekday_matches_calendar', 'epoch_basis'] as $key) {
+            $changed = $right;
+            $changed['date']['candidates'][0][$key] = 'mutation';
+            self::assertFalse(remainingBenchmarkDateFullParity($fixture, $left, $changed), $key);
+            self::assertFalse(remainingBenchmarkDateFullParity($fixture, $changed, $changed), 'shared wrong '.$key);
+        }
+        $changed = $right;
+        $changed['unrecognized_metadata'] = true;
+        self::assertFalse(remainingBenchmarkDateFullParity($fixture, $left, $changed));
+    }
+
+    public function test_cpp_inputs_are_required_only_for_the_explicit_date_family(): void
+    {
+        $this->loadHarness();
+        $this->assertTrue(function_exists('remainingBenchmarkStrata'));
+        $valid = ['family' => 'date-cpp', 'baseline-native' => '/baseline.so', 'baseline-runtime-manifest' => '/baseline.json'];
+        $this->assertSame('date-cpp', remainingBenchmarkOptions($valid)['family']);
+        foreach ([['family' => 'date-cpp'], ['family' => 'date-cpp', 'baseline-native' => '/baseline.so'],
+            array_replace($valid, ['family' => 'metadata-modules'])] as $invalid) {
+            try {
+                remainingBenchmarkOptions($invalid);
+                $this->fail('Invalid baseline options were accepted.');
+            } catch (\InvalidArgumentException) {
+                $this->addToAssertionCount(1);
+            }
+        }
+    }
+
+    public function test_cpp_worker_cannot_escape_its_family_or_module(): void
+    {
+        $this->loadHarness();
+        $this->assertTrue(function_exists('remainingBenchmarkValidateWorker'));
+        remainingBenchmarkValidateWorker('date-cpp', 'cpp', 'article_dates');
+        foreach ([['metadata-modules', 'cpp', 'article_dates'], ['archive-modules', 'cpp', 'article_dates'],
+            ['date-cpp', 'cpp', 'article_identity'], ['date-cpp', 'php', 'article_dates']] as $arguments) {
+            try {
+                remainingBenchmarkValidateWorker(...$arguments);
+                $this->fail('Invalid worker role was accepted.');
+            } catch (\InvalidArgumentException) {
+                $this->addToAssertionCount(1);
+            }
+        }
+    }
+
+    public function test_cpp_receipt_binds_its_library_sources_and_genuine_parser_separately(): void
+    {
+        $this->loadHarness();
+        $this->assertTrue(function_exists('remainingBenchmarkVerifyCppManifest'));
+        $sources = ['scripts/benchmark-date-cpp.cpp' => str_repeat('a', 64), 'caller.php' => str_repeat('b', 64)];
+        $manifest = ['baseline_library_sha256' => str_repeat('c', 64), 'baseline_source_sha256' => $sources,
+            'baseline_kind' => 'cpp_nzbget_restricted_date_complete_metadata',
+            'compiler' => ['path' => '/usr/bin/clang++', 'sha256' => str_repeat('d', 64), 'version' => 'clang test',
+                'flags' => ['-std=c++20', '-O3', '-DNDEBUG', '-fPIC', '-shared']],
+            'upstream' => ['commit' => '8f2f409d4e263ecac3313404ed4685e7dca3d9ec',
+                'source_sha256' => '14a1c4c82c6c551806b142b3f9ac177a39af48dbaa92bceb763f98a21f0390d8']];
+        remainingBenchmarkVerifyCppManifest($manifest, $sources, str_repeat('c', 64));
+        foreach (['baseline_library_sha256', 'baseline_source_sha256', 'compiler', 'upstream', 'baseline_kind'] as $key) {
+            $invalid = $manifest;
+            unset($invalid[$key]);
+            try {
+                remainingBenchmarkVerifyCppManifest($invalid, $sources, str_repeat('c', 64));
+                $this->fail('An incomplete C++ receipt was accepted.');
+            } catch (\RuntimeException) {
+                $this->addToAssertionCount(1);
+            }
+        }
+        foreach (['-O0', '-DNZBGET_USE_RUST', '-fno-inline'] as $flag) {
+            $invalid = $manifest;
+            $invalid['compiler']['flags'][] = $flag;
+            try {
+                remainingBenchmarkVerifyCppManifest($invalid, $sources, str_repeat('c', 64));
+                $this->fail('An undeclared C++ build flag was accepted.');
+            } catch (\RuntimeException) {
+                $this->addToAssertionCount(1);
+            }
+        }
+        foreach (array_keys($sources) as $path) {
+            $invalid = $manifest;
+            $invalid['baseline_source_sha256'][$path] = str_repeat('e', 64);
+            try {
+                remainingBenchmarkVerifyCppManifest($invalid, $sources, str_repeat('c', 64));
+                $this->fail('Changed baseline source was accepted.');
+            } catch (\RuntimeException) {
+                $this->addToAssertionCount(1);
+            }
+        }
+    }
+
     public function test_tail_screen_cannot_qualify_or_invent_a_finite_upper_bound(): void
     {
         $this->loadHarness();

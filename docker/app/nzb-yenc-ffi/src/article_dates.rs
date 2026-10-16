@@ -11,7 +11,24 @@ pub struct ArticleDates {
     pub date: DateSource,
     pub injection_date: DateSource,
     pub legacy_nntp_posting_date: DateSource,
+    pub reported_clock_relations: ReportedClockRelations,
     pub interpretation: &'static str,
+}
+
+#[derive(Serialize)]
+pub struct ReportedClockRelations {
+    pub date_to_injection_date: ClockRelation,
+    pub date_to_legacy_nntp_posting_date: ClockRelation,
+    pub injection_date_to_legacy_nntp_posting_date: ClockRelation,
+}
+
+#[derive(Serialize)]
+pub struct ClockRelation {
+    pub comparison_status: &'static str,
+    pub lhs_parse_status: &'static str,
+    pub rhs_parse_status: &'static str,
+    pub rhs_minus_lhs_seconds: Option<i64>,
+    pub lhs_order_relative_to_rhs: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -77,6 +94,13 @@ pub fn parse(headers: &[u8]) -> ArticleDates {
             raw.clear();
             lines.clear();
             if let Some(colon) = line.iter().position(|byte| *byte == b':') {
+                let field_name = &line[..colon];
+                if !field_name.eq_ignore_ascii_case(b"Date")
+                    && !field_name.eq_ignore_ascii_case(b"Injection-Date")
+                    && !field_name.eq_ignore_ascii_case(b"NNTP-Posting-Date")
+                {
+                    continue;
+                }
                 name.extend_from_slice(&line[..colon]);
                 value.extend_from_slice(&line[colon + 1..]);
                 raw.extend_from_slice(physical);
@@ -93,14 +117,50 @@ pub fn parse(headers: &[u8]) -> ArticleDates {
             &mut legacy,
         );
     }
+    let date = source(date, exceeded);
+    let injection_date = source(injection, exceeded);
+    let legacy_nntp_posting_date = source(legacy, exceeded);
+    let reported_clock_relations = ReportedClockRelations {
+        date_to_injection_date: clock_relation(&date, &injection_date),
+        date_to_legacy_nntp_posting_date: clock_relation(&date, &legacy_nntp_posting_date),
+        injection_date_to_legacy_nntp_posting_date: clock_relation(
+            &injection_date,
+            &legacy_nntp_posting_date,
+        ),
+    };
     ArticleDates {
         parser_engine: "nntmux-rust-article-dates",
-        schema_version: 1,
+        schema_version: 2,
         syntax_profile: "Absolute RFC-style dates with four-or-more-digit years, numeric zones, GMT or UT, optional seconds, folded whitespace and bounded nested comments; other obsolete forms are retained as malformed or unsupported",
-        date: source(date, exceeded),
-        injection_date: source(injection, exceeded),
-        legacy_nntp_posting_date: source(legacy, exceeded),
+        date,
+        injection_date,
+        legacy_nntp_posting_date,
+        reported_clock_relations,
         interpretation: "Absolute header timestamps describe reported composition or injection clocks; they do not measure uploader bandwidth or establish uploader location. A -0000 zone gives UTC time without information about the originating local timezone.",
+    }
+}
+
+fn clock_relation(lhs: &DateSource, rhs: &DateSource) -> ClockRelation {
+    let delta = match (lhs.utc_epoch_seconds, rhs.utc_epoch_seconds) {
+        (Some(lhs), Some(rhs)) => rhs.checked_sub(lhs),
+        _ => None,
+    };
+    ClockRelation {
+        comparison_status: if delta.is_some() {
+            "compared"
+        } else if lhs.utc_epoch_seconds.is_none() || rhs.utc_epoch_seconds.is_none() {
+            "source_unavailable"
+        } else {
+            "epoch_difference_out_of_range"
+        },
+        lhs_parse_status: lhs.parse_status,
+        rhs_parse_status: rhs.parse_status,
+        rhs_minus_lhs_seconds: delta,
+        lhs_order_relative_to_rhs: delta.map(|delta| match delta.cmp(&0) {
+            std::cmp::Ordering::Greater => "before",
+            std::cmp::Ordering::Equal => "equal",
+            std::cmp::Ordering::Less => "after",
+        }),
     }
 }
 
@@ -406,6 +466,227 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retains_date_provenance_around_ignored_folded_fields() {
+        let parsed = serde_json::to_value(parse(
+            b"Subject: ignored\r\n\tfolded\r\ndAtE: 01 Jan 2024\r\n\t00:00 -0000\r\nX-Trace: ignored\r\n\tfolded too\r\nInjection-Date: 01 Jan 2024 01:00 +0000\r\n\r\nNNTP-Posting-Date: 01 Jan 2024 00:00 +0000\r\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            parsed["date"]["candidates"][0]["source_line_indices"],
+            serde_json::json!([3, 4])
+        );
+        assert_eq!(
+            parsed["date"]["candidates"][0]["raw_field_hex"],
+            hex(b"dAtE: 01 Jan 2024\r\n\t00:00 -0000\r\n")
+        );
+        assert_eq!(
+            parsed["injection_date"]["candidates"][0]["source_line_indices"],
+            serde_json::json!([7])
+        );
+        assert_eq!(parsed["date"]["utc_epoch_seconds"], 1_704_067_200);
+        assert_eq!(
+            parsed["legacy_nntp_posting_date"]["parse_status"],
+            "missing"
+        );
+        assert_eq!(
+            parsed["reported_clock_relations"]["date_to_injection_date"]["rhs_minus_lhs_seconds"],
+            3600
+        );
+    }
+
+    #[test]
+    fn reports_pairwise_reported_clock_relations() {
+        let parsed = serde_json::to_value(parse(
+            b"Date: Thu, 01 Jan 1970 00:00:00 +0000\r\nInjection-Date: Thu, 01 Jan 1970 01:00:00 +0000\r\nNNTP-Posting-Date: Thu, 01 Jan 1970 00:00:00 +0000\r\n",
+        ))
+        .unwrap();
+        for (pair, delta, order) in [
+            ("date_to_injection_date", 3600, "before"),
+            ("date_to_legacy_nntp_posting_date", 0, "equal"),
+            ("injection_date_to_legacy_nntp_posting_date", -3600, "after"),
+        ] {
+            let relation = &parsed["reported_clock_relations"][pair];
+            assert_eq!(relation["comparison_status"], "compared", "{pair}");
+            assert_eq!(relation["rhs_minus_lhs_seconds"], delta, "{pair}");
+            assert_eq!(relation["lhs_order_relative_to_rhs"], order, "{pair}");
+        }
+    }
+
+    #[test]
+    fn compares_absolute_instants_without_inferring_local_timezones() {
+        let parsed = serde_json::to_value(parse(
+            b"Date: Thu, 01 Jan 1970\r\n 00:00:00 -0000\r\nInjection-Date: Thu, 01 Jan 1970 01:00:00 +0100\r\nNNTP-Posting-Date: Thu, 01 Jan 1970 00:00:00 GMT\r\n",
+        ))
+        .unwrap();
+        assert_eq!(parsed["date"]["parse_status"], "valid");
+        for pair in [
+            "date_to_injection_date",
+            "date_to_legacy_nntp_posting_date",
+            "injection_date_to_legacy_nntp_posting_date",
+        ] {
+            let relation = &parsed["reported_clock_relations"][pair];
+            assert_eq!(relation["comparison_status"], "compared", "{pair}");
+            assert_eq!(relation["rhs_minus_lhs_seconds"], 0, "{pair}");
+            assert_eq!(relation["lhs_order_relative_to_rhs"], "equal", "{pair}");
+        }
+        assert_eq!(
+            parsed["date"]["candidates"][0]["timezone_local_offset_unknown"],
+            true
+        );
+    }
+
+    #[test]
+    fn withholds_clock_relations_for_unavailable_operands() {
+        for (date, status) in [
+            ("", "missing"),
+            ("Date: bad\r\n", "malformed_or_unsupported_absolute_date"),
+            (
+                "Date: Thu, 01 Jan 1970 00:00:00 +0000\r\nDate: Thu, 01 Jan 1970 00:00:00 +0000\r\n",
+                "duplicate",
+            ),
+        ] {
+            let headers = format!(
+                "{date}Injection-Date: Thu, 01 Jan 1970 00:00:00 +0000\r\nNNTP-Posting-Date: Thu, 01 Jan 1970 01:00:00 +0000\r\n"
+            );
+            let parsed = serde_json::to_value(parse(headers.as_bytes())).unwrap();
+            assert_eq!(parsed["date"]["parse_status"], status);
+            for pair in ["date_to_injection_date", "date_to_legacy_nntp_posting_date"] {
+                let relation = &parsed["reported_clock_relations"][pair];
+                assert_eq!(
+                    relation["comparison_status"], "source_unavailable",
+                    "{status}: {pair}"
+                );
+                assert!(relation["rhs_minus_lhs_seconds"].is_null());
+                assert!(relation["lhs_order_relative_to_rhs"].is_null());
+            }
+            assert_eq!(
+                parsed["reported_clock_relations"]["injection_date_to_legacy_nntp_posting_date"]["rhs_minus_lhs_seconds"],
+                3600
+            );
+        }
+        let parsed = serde_json::to_value(parse(&vec![b'x'; MAX_HEADER_BYTES + 1])).unwrap();
+        for pair in [
+            "date_to_injection_date",
+            "date_to_legacy_nntp_posting_date",
+            "injection_date_to_legacy_nntp_posting_date",
+        ] {
+            let relation = &parsed["reported_clock_relations"][pair];
+            assert_eq!(relation["comparison_status"], "source_unavailable");
+            assert!(relation["rhs_minus_lhs_seconds"].is_null());
+        }
+    }
+
+    #[test]
+    fn qualifies_each_clock_pair_independently_of_other_unavailable_sources() {
+        let fields = ["Date", "Injection-Date", "NNTP-Posting-Date"];
+        let pairs = [
+            ("date_to_injection_date", 0, 1),
+            ("date_to_legacy_nntp_posting_date", 0, 2),
+            ("injection_date_to_legacy_nntp_posting_date", 1, 2),
+        ];
+        for unavailable in 0..fields.len() {
+            for replacement in ["", "bad", "duplicate"] {
+                let mut headers = String::new();
+                for (index, field) in fields.iter().enumerate() {
+                    if index != unavailable || replacement == "duplicate" {
+                        headers.push_str(&format!("{field}: Thu, 01 Jan 1970 00:00:00 +0000\r\n"));
+                    }
+                    if index == unavailable && !replacement.is_empty() {
+                        headers.push_str(&format!(
+                            "{field}: {}\r\n",
+                            if replacement == "duplicate" {
+                                "Thu, 01 Jan 1970 00:00:00 +0000"
+                            } else {
+                                replacement
+                            }
+                        ));
+                    }
+                }
+                let parsed = serde_json::to_value(parse(headers.as_bytes())).unwrap();
+                for (pair, lhs, rhs) in pairs {
+                    let relation = &parsed["reported_clock_relations"][pair];
+                    let unavailable_pair = lhs == unavailable || rhs == unavailable;
+                    assert_eq!(
+                        relation["comparison_status"],
+                        if unavailable_pair {
+                            "source_unavailable"
+                        } else {
+                            "compared"
+                        },
+                        "{} {replacement}: {pair}",
+                        fields[unavailable]
+                    );
+                    if unavailable_pair {
+                        assert!(relation["rhs_minus_lhs_seconds"].is_null());
+                        assert!(relation["lhs_order_relative_to_rhs"].is_null());
+                    } else {
+                        assert_eq!(relation["rhs_minus_lhs_seconds"], 0);
+                        assert_eq!(relation["lhs_order_relative_to_rhs"], "equal");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keeps_unaffected_clock_pair_when_one_source_exhausts_its_budget() {
+        let fields = ["Date", "Injection-Date", "NNTP-Posting-Date"];
+        let pairs = [
+            ("date_to_injection_date", 0, 1, 3600),
+            ("date_to_legacy_nntp_posting_date", 0, 2, 10800),
+            ("injection_date_to_legacy_nntp_posting_date", 1, 2, 7200),
+        ];
+        for exhausted in 0..fields.len() {
+            let mut headers = String::new();
+            for (index, field) in fields.iter().enumerate() {
+                let hour = [0, 1, 3][index];
+                for _ in 0..if index == exhausted {
+                    MAX_OCCURRENCES
+                } else {
+                    1
+                } {
+                    headers.push_str(&format!(
+                        "{field}: Thu, 01 Jan 1970 {hour:02}:00:00 +0000\r\n"
+                    ));
+                }
+            }
+            let parsed = serde_json::to_value(parse(headers.as_bytes())).unwrap();
+            let source = ["date", "injection_date", "legacy_nntp_posting_date"][exhausted];
+            assert_eq!(parsed[source]["parse_status"], "budget_exceeded");
+            for (pair, lhs, rhs, delta) in pairs {
+                let relation = &parsed["reported_clock_relations"][pair];
+                if lhs == exhausted || rhs == exhausted {
+                    assert_eq!(relation["comparison_status"], "source_unavailable");
+                    assert!(relation["rhs_minus_lhs_seconds"].is_null());
+                    assert!(relation["lhs_order_relative_to_rhs"].is_null());
+                } else {
+                    assert_eq!(relation["comparison_status"], "compared");
+                    assert_eq!(relation["rhs_minus_lhs_seconds"], delta);
+                    assert_eq!(relation["lhs_order_relative_to_rhs"], "before");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compares_distinct_clock_pairs_across_the_epoch() {
+        let parsed = serde_json::to_value(parse(
+            b"Date: Wed, 31 Dec 1969 23:59:00 +0000\r\nInjection-Date: Thu, 01 Jan 1970 00:01:00 +0000\r\nNNTP-Posting-Date: Wed, 31 Dec 1969 23:58:00 +0000\r\n",
+        ))
+        .unwrap();
+        for (pair, delta, order) in [
+            ("date_to_injection_date", 120, "before"),
+            ("date_to_legacy_nntp_posting_date", -60, "after"),
+            ("injection_date_to_legacy_nntp_posting_date", -180, "after"),
+        ] {
+            let relation = &parsed["reported_clock_relations"][pair];
+            assert_eq!(relation["comparison_status"], "compared");
+            assert_eq!(relation["rhs_minus_lhs_seconds"], delta);
+            assert_eq!(relation["lhs_order_relative_to_rhs"], order);
+        }
+    }
 
     #[test]
     fn flushes_the_final_date_once_at_the_header_body_boundary() {

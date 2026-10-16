@@ -17,6 +17,8 @@ on:
       - 'tests/Unit/*BenchmarkTest.php'
       - 'tests/Unit/test_benchmark*'
       - 'tests/Unit/test_composer_install_retry.py'
+      - 'tests/Unit/test_date_cpp_reference.py'
+      - 'tests/Unit/CppDateWorkerTest.php'
       - 'composer.json'
       - 'composer.lock'
   workflow_dispatch:
@@ -95,6 +97,27 @@ jobs:
           source scripts/benchmark-rust-toolchain.sh
           cargo +"$RUST_TOOLCHAIN" test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml 2>&1 | tee utility-evidence/build/test.log
           cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml --lib 2>&1 | tee utility-evidence/build/build.log
+      - name: Verify restricted C++ dates through literal oracles and the actual PHP worker
+        if: matrix.kind == 'metadata-modules'
+        shell: bash
+        run: |
+          umask 077
+          mkdir -p utility-evidence/date-cpp-correctness
+          c++ -std=c++20 -O3 -DNDEBUG -fPIC -shared -Wall -Wextra -Werror \
+            scripts/benchmark-date-cpp.cpp \
+            -o "$GITHUB_WORKSPACE/utility-evidence/date-cpp-correctness/libdate-reference.so" \
+            2>&1 | tee utility-evidence/date-cpp-correctness/build.log
+          NNTMUX_DATE_CPP_LIBRARY="$GITHUB_WORKSPACE/utility-evidence/date-cpp-correctness/libdate-reference.so" \
+            python3 -B tests/Unit/test_date_cpp_reference.py \
+            2>&1 | tee utility-evidence/date-cpp-correctness/python-oracles.log
+          NNTMUX_TEST_DATE_CPP_LIBRARY="$GITHUB_WORKSPACE/utility-evidence/date-cpp-correctness/libdate-reference.so" \
+            php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped tests/Unit/CppDateWorkerTest.php \
+            2>&1 | tee utility-evidence/date-cpp-correctness/php-worker.log
+          NNTMUX_TEST_NATIVE_LIBRARY="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
+            php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped \
+            --filter=test_real_linux_native_wrappers_match_all_projection_oracles_and_retain_full_metadata \
+            tests/Unit/RemainingMetadataBenchmarkFixturesTest.php \
+            2>&1 | tee utility-evidence/date-cpp-correctness/rust-full-oracles.log
       - name: Verify sample planner through the native public caller
         env:
           NNTMUX_TEST_NATIVE_LIBRARY: ${{ github.workspace }}/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so
