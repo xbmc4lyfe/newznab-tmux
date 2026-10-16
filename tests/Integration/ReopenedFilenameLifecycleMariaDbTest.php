@@ -21,7 +21,6 @@ use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\NfoService;
 use App\Services\Nzb\NzbService;
 use App\Services\Nzb\NzbSourceGuard;
-use App\Services\Predb\PredbIdentityRebuild;
 use App\Services\ReleaseImageService;
 use App\Support\ReleaseArchiveNamingEvidence;
 use Illuminate\Database\Events\QueryExecuted;
@@ -93,7 +92,7 @@ final class ReopenedFilenameLifecycleMariaDbTest extends TestCase
             config([
                 'database.default' => 'filename_lifecycle_qualification',
                 'database.connections.filename_lifecycle_qualification' => [
-                    'driver' => 'mysql',
+                    'driver' => 'mariadb',
                     'host' => $host,
                     'port' => $port,
                     'database' => $this->database,
@@ -125,7 +124,6 @@ final class ReopenedFilenameLifecycleMariaDbTest extends TestCase
             ]);
             DB::table('usenet_groups')->insertOrIgnore(['id' => 1, 'name' => 'alt.binaries.filename.test']);
             DB::table('predb')->insertOrIgnore(['id' => 7, 'title' => 'Unrelated.Title-GRP']);
-            $this->rebuildFilenameSqlIdentity();
             Search::shouldReceive('searchPredbFilenameCandidates')->never();
             Event::fake([ReleaseNameFixed::class]);
         } catch (\Throwable $exception) {
@@ -274,7 +272,7 @@ final class ReopenedFilenameLifecycleMariaDbTest extends TestCase
     ): void {
         $this->isolation($isolation);
         $this->insertRelease();
-        DB::table('release_files')->insert(['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin']);
+        DB::table('release_files')->insert(['releases_id' => 1, 'name' => '01.bin']);
         $this->filenameDiscoveryMutation = function () use ($column, $value): array {
             DB::table('releases')->where('id', 1)->update([$column => $value]);
 
@@ -332,7 +330,7 @@ final class ReopenedFilenameLifecycleMariaDbTest extends TestCase
     {
         $this->isolation($isolation);
         $this->insertRelease();
-        $name = str_repeat('a', 32).'.bin';
+        $name = '01.bin';
         DB::table('release_files')->insert(['releases_id' => 1, 'name' => $name]);
         $fixer = $this->makeFixer();
 
@@ -364,8 +362,8 @@ final class ReopenedFilenameLifecycleMariaDbTest extends TestCase
         $this->isolation($isolation);
         $this->insertRelease();
         DB::table('release_files')->insert([
-            ['releases_id' => 1, 'name' => 'SDPORN.bin'],
-            ['releases_id' => 1, 'name' => str_repeat('a', 32).'.bin'],
+            ['releases_id' => 1, 'name' => 'SDPORN|01.bin'],
+            ['releases_id' => 1, 'name' => '01.bin'],
         ]);
         $manager = $this->makeManager();
         $context = $this->sourceContext(Release::query()->findOrFail(1));
@@ -412,7 +410,7 @@ final class ReopenedFilenameLifecycleMariaDbTest extends TestCase
     ): void {
         $this->isolation($isolation);
         $this->insertRelease(['predb_id' => $observedPredb]);
-        $name = str_repeat('a', 32).'.bin';
+        $name = '01.bin';
         DB::table('release_files')->insert(['releases_id' => 1, 'name' => $name]);
         $input = Release::query()->findOrFail(1);
         $input->releases_id = 1;
@@ -451,9 +449,9 @@ final class ReopenedFilenameLifecycleMariaDbTest extends TestCase
     ): void {
         $this->isolation($isolation);
         $this->insertRelease();
-        $name = str_repeat('a', 32).'.bin';
+        $name = '01.bin';
         for ($index = 0; $index < $fileCount; $index++) {
-            DB::table('release_files')->insert(['releases_id' => 1, 'name' => $index === 0 ? $name : str_repeat('b', 32).'.bin']);
+            DB::table('release_files')->insert(['releases_id' => 1, 'name' => $index === 0 ? $name : '02.bin']);
         }
         $fixer = $this->makeFixer();
         $input = Release::query()->findOrFail(1);
@@ -586,15 +584,5 @@ final class ReopenedFilenameLifecycleMariaDbTest extends TestCase
         });
 
         return $cleaner;
-    }
-
-    private function rebuildFilenameSqlIdentity(): void
-    {
-        $rebuild = new PredbIdentityRebuild;
-        $start = $rebuild->start(DB::connection());
-        do {
-            $chunk = $rebuild->chunk(DB::connection(), $start['generation']);
-        } while (! $chunk['exhausted']);
-        $rebuild->certify(DB::connection(), $start['generation']);
     }
 }
