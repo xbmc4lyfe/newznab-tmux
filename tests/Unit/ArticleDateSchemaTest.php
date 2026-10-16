@@ -61,7 +61,7 @@ final class ArticleDateSchemaTest extends TestCase
             self::assertFalse($method->invoke(null, [$observation]));
             self::assertFalse($method->invoke(null, [$valid, $observation]));
         }
-        self::assertSame(38, ReleaseFingerprintCollector::SCHEMA_VERSION);
+        self::assertSame(39, ReleaseFingerprintCollector::SCHEMA_VERSION);
     }
 
     public function test_missing_or_inconsistent_candidate_provenance_is_not_current(): void
@@ -92,7 +92,7 @@ final class ArticleDateSchemaTest extends TestCase
         for ($line = 1; $line <= 256; $line++) {
             $metadata['date']['candidates'][] = ['parse_status' => 'valid', 'utc_epoch_seconds' => 100, 'source_line_indices' => [$line]];
         }
-        foreach (['date_to_injection_date', 'date_to_legacy_nntp_posting_date'] as $pair) {
+        foreach (['date_to_injection_date', 'date_to_legacy_nntp_posting_date', 'date_to_expires'] as $pair) {
             $metadata['reported_clock_relations'][$pair]['comparison_status'] = 'source_unavailable';
             $metadata['reported_clock_relations'][$pair]['lhs_parse_status'] = 'budget_exceeded';
             $metadata['reported_clock_relations'][$pair]['rhs_minus_lhs_seconds'] = null;
@@ -118,18 +118,24 @@ final class ArticleDateSchemaTest extends TestCase
     {
         $unavailable = ['comparison_status' => 'source_unavailable', 'lhs_parse_status' => 'valid',
             'rhs_parse_status' => 'missing', 'rhs_minus_lhs_seconds' => null, 'lhs_order_relative_to_rhs' => null];
+        $bothMissing = ['comparison_status' => 'source_unavailable', 'lhs_parse_status' => 'missing',
+            'rhs_parse_status' => 'missing', 'rhs_minus_lhs_seconds' => null, 'lhs_order_relative_to_rhs' => null];
 
         $metadata = ['parser_engine' => 'nntmux-rust-article-dates', 'schema_version' => 2,
             'date' => ['parse_status' => 'valid', 'utc_epoch_seconds' => 100],
             'injection_date' => ['parse_status' => 'valid', 'utc_epoch_seconds' => 101],
             'legacy_nntp_posting_date' => ['parse_status' => 'missing', 'utc_epoch_seconds' => null],
+            'expires' => ['parse_status' => 'missing', 'utc_epoch_seconds' => null],
             'reported_clock_relations' => [
                 'date_to_injection_date' => ['comparison_status' => 'compared', 'lhs_parse_status' => 'valid',
                     'rhs_parse_status' => 'valid', 'rhs_minus_lhs_seconds' => 1, 'lhs_order_relative_to_rhs' => 'before'],
                 'date_to_legacy_nntp_posting_date' => $unavailable,
                 'injection_date_to_legacy_nntp_posting_date' => $unavailable,
+                'date_to_expires' => $unavailable,
+                'injection_date_to_expires' => $unavailable,
+                'legacy_nntp_posting_date_to_expires' => $bothMissing,
             ]];
-        foreach (['date', 'injection_date', 'legacy_nntp_posting_date'] as $index => $source) {
+        foreach (['date', 'injection_date', 'legacy_nntp_posting_date', 'expires'] as $index => $source) {
             $value = &$metadata[$source];
             $value['occurrence_count_basis'] = 'retained candidates; total may be larger when budget_exceeded';
             $value['candidates'] = $value['parse_status'] === 'missing' ? [] : [[

@@ -75,7 +75,22 @@ class CompletenessTest(unittest.TestCase):
 
     def test_actual_xz_source_gets_an_explicit_comparison_gap(self):
         rows = {Path(r['target']).stem: r for r in pages.coverage(ROOT)}
-        self.assertIn('Explicit coverage gap', rows['xz_first_block']['detail'])
+        for name in ('iso_path_tables', 'zstd_frame', 'xz_first_block'):
+            with self.subTest(name=name):
+                self.assertEqual('No automated benchmark', rows[name]['coverage'])
+                self.assertIn('Explicit coverage gap', rows[name]['detail'])
+        for name in ('abi_crc', 'abi_decoder', 'abi_decoder_arm', 'abi_decoder_x86'):
+            with self.subTest(name=name):
+                self.assertEqual('No automated benchmark', rows[name]['coverage'])
+                self.assertEqual(['experimental'], rows[name]['payload_modes'])
+                self.assertIn('Explicit coverage gap', rows[name]['detail'])
+        for name in ('abi_receipts', 'benchmark', 'evidence', 'installation', 'tooling',
+                     'install-yenc', 'qualify-yenc', 'verify-yenc-evidence'):
+            with self.subTest(name=name):
+                self.assertEqual('Auxiliary correctness only', rows[name]['coverage'])
+                self.assertIn('does not measure its own performance', rows[name]['detail'])
+        for row in rows.values():
+            self.assertNotEqual('Correctness tests or utility execution do not measure speed.', row['detail'])
 
     def test_every_public_export_is_in_the_collected_report(self):
         def unavailable(_):

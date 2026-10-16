@@ -649,8 +649,13 @@ def coverage(root):
             label, detail = 'Comparative public caller benchmark', 'Exact serialized PHP/native output, cold/warm calls, common median and uncommon p99 qualification mode; small/unsupported inputs remain PHP controls.'
         elif name in ('article_identity', 'article_xref', 'article_dates', 'iso_primary_copies', 'rar5_copy_checksums', 'rar5_quick_open'):
             label, detail = 'Shared independent PHP reference comparison', 'New bounded PHP references compare declared shared projections only; actual native wrapper includes FFI, allocation, JSON decoding and the full richer native result before projection. Cold/warm common median and uncommon p99 gates do not qualify adoption or historical PHP speedups.'
-        elif name in ('zstd_frame', 'xz', 'xz_frame', 'xz_first_block'):
+        elif name in ('iso_path_tables', 'zstd_frame', 'xz', 'xz_frame', 'xz_first_block'):
             label, detail = 'No automated benchmark', 'Explicit coverage gap: no independent PHP reference comparison or qualified caller benchmark.'
+        elif name in ('abi_crc', 'abi_decoder', 'abi_decoder_arm', 'abi_decoder_x86'):
+            modes = ['experimental']
+            label, detail = 'No automated benchmark', 'Explicit coverage gap: opt-in experimental RapidYenc ABI implementation with no production PHP caller or live comparative benchmark.'
+        elif name in ('abi_receipts', 'benchmark', 'evidence', 'installation', 'tooling', 'install-yenc', 'qualify-yenc', 'verify-yenc-evidence'):
+            label, detail = 'Auxiliary correctness only', 'Offline yEnc ABI qualification, receipt verification and installation guard tooling; live benchmark execution is disabled and running it does not measure its own performance.'
         elif name == 'nntmux-evidence-utility':
             label, detail = 'Auxiliary correctness only', 'CI evidence and rendering utility; running it does not measure its own performance.'
         elif name == 'lib':

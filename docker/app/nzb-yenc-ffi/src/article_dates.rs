@@ -11,6 +11,7 @@ pub struct ArticleDates {
     pub date: DateSource,
     pub injection_date: DateSource,
     pub legacy_nntp_posting_date: DateSource,
+    pub expires: DateSource,
     pub reported_clock_relations: ReportedClockRelations,
     pub interpretation: &'static str,
 }
@@ -20,6 +21,9 @@ pub struct ReportedClockRelations {
     pub date_to_injection_date: ClockRelation,
     pub date_to_legacy_nntp_posting_date: ClockRelation,
     pub injection_date_to_legacy_nntp_posting_date: ClockRelation,
+    pub date_to_expires: ClockRelation,
+    pub injection_date_to_expires: ClockRelation,
+    pub legacy_nntp_posting_date_to_expires: ClockRelation,
 }
 
 #[derive(Serialize)]
@@ -61,6 +65,7 @@ pub fn parse(headers: &[u8]) -> ArticleDates {
     let mut date = Vec::new();
     let mut injection = Vec::new();
     let mut legacy = Vec::new();
+    let mut expires = Vec::new();
     if !exceeded {
         let mut name = Vec::new();
         let mut value = Vec::new();
@@ -88,6 +93,7 @@ pub fn parse(headers: &[u8]) -> ArticleDates {
                 &mut date,
                 &mut injection,
                 &mut legacy,
+                &mut expires,
             );
             name.clear();
             value.clear();
@@ -98,6 +104,7 @@ pub fn parse(headers: &[u8]) -> ArticleDates {
                 if !field_name.eq_ignore_ascii_case(b"Date")
                     && !field_name.eq_ignore_ascii_case(b"Injection-Date")
                     && !field_name.eq_ignore_ascii_case(b"NNTP-Posting-Date")
+                    && !field_name.eq_ignore_ascii_case(b"Expires")
                 {
                     continue;
                 }
@@ -115,11 +122,13 @@ pub fn parse(headers: &[u8]) -> ArticleDates {
             &mut date,
             &mut injection,
             &mut legacy,
+            &mut expires,
         );
     }
     let date = source(date, exceeded);
     let injection_date = source(injection, exceeded);
     let legacy_nntp_posting_date = source(legacy, exceeded);
+    let expires = source(expires, exceeded);
     let reported_clock_relations = ReportedClockRelations {
         date_to_injection_date: clock_relation(&date, &injection_date),
         date_to_legacy_nntp_posting_date: clock_relation(&date, &legacy_nntp_posting_date),
@@ -127,6 +136,9 @@ pub fn parse(headers: &[u8]) -> ArticleDates {
             &injection_date,
             &legacy_nntp_posting_date,
         ),
+        date_to_expires: clock_relation(&date, &expires),
+        injection_date_to_expires: clock_relation(&injection_date, &expires),
+        legacy_nntp_posting_date_to_expires: clock_relation(&legacy_nntp_posting_date, &expires),
     };
     ArticleDates {
         parser_engine: "nntmux-rust-article-dates",
@@ -135,6 +147,7 @@ pub fn parse(headers: &[u8]) -> ArticleDates {
         date,
         injection_date,
         legacy_nntp_posting_date,
+        expires,
         reported_clock_relations,
         interpretation: "Absolute header timestamps describe reported composition or injection clocks; they do not measure uploader bandwidth or establish uploader location. A -0000 zone gives UTC time without information about the originating local timezone.",
     }
@@ -195,6 +208,7 @@ fn append(
     date: &mut Vec<DateOccurrence>,
     injection: &mut Vec<DateOccurrence>,
     legacy: &mut Vec<DateOccurrence>,
+    expires: &mut Vec<DateOccurrence>,
 ) {
     let output = if name.eq_ignore_ascii_case(b"Date") {
         date
@@ -202,6 +216,8 @@ fn append(
         injection
     } else if name.eq_ignore_ascii_case(b"NNTP-Posting-Date") {
         legacy
+    } else if name.eq_ignore_ascii_case(b"Expires") {
+        expires
     } else {
         return;
     };
@@ -294,6 +310,8 @@ fn parse_value(value: &[u8], result: &mut DateOccurrence) {
                 if digits / 100 > 23 || digits % 100 > 59 {
                     return None;
                 }
+                result.timezone_token =
+                    Some(String::from_utf8_lossy(&value[zone_start..parser.position]).into_owned());
                 let minutes = (digits / 100 * 60 + digits % 100) as i32;
                 (
                     if negative { -minutes } else { minutes },
@@ -310,8 +328,6 @@ fn parse_value(value: &[u8], result: &mut DateOccurrence) {
                 (0, false)
             }
         };
-        result.timezone_token =
-            Some(String::from_utf8_lossy(&value[zone_start..parser.position]).into_owned());
         result.timezone_offset_minutes = Some(offset);
         result.timezone_local_offset_unknown = Some(unknown);
         result.seconds_present = Some(seconds_present);
@@ -470,7 +486,7 @@ mod tests {
     #[test]
     fn retains_date_provenance_around_ignored_folded_fields() {
         let parsed = serde_json::to_value(parse(
-            b"Subject: ignored\r\n\tfolded\r\ndAtE: 01 Jan 2024\r\n\t00:00 -0000\r\nX-Trace: ignored\r\n\tfolded too\r\nInjection-Date: 01 Jan 2024 01:00 +0000\r\n\r\nNNTP-Posting-Date: 01 Jan 2024 00:00 +0000\r\n",
+            b"Subject: ignored\r\n\tfolded\r\ndAtE: 01 Jan 2024\r\n\t00:00 -0000\r\nX-Trace: ignored\r\n\tfolded too\r\nInjection-Date: 01 Jan 2024 01:00 +0000\r\neXpIrEs: 02 Jan 2024 00:00 +0000\r\n\r\nNNTP-Posting-Date: 01 Jan 2024 00:00 +0000\r\n",
         ))
         .unwrap();
         assert_eq!(
@@ -485,7 +501,12 @@ mod tests {
             parsed["injection_date"]["candidates"][0]["source_line_indices"],
             serde_json::json!([7])
         );
+        assert_eq!(
+            parsed["expires"]["candidates"][0]["source_line_indices"],
+            serde_json::json!([8])
+        );
         assert_eq!(parsed["date"]["utc_epoch_seconds"], 1_704_067_200);
+        assert_eq!(parsed["expires"]["utc_epoch_seconds"], 1_704_153_600);
         assert_eq!(
             parsed["legacy_nntp_posting_date"]["parse_status"],
             "missing"
@@ -494,18 +515,29 @@ mod tests {
             parsed["reported_clock_relations"]["date_to_injection_date"]["rhs_minus_lhs_seconds"],
             3600
         );
+        assert_eq!(
+            parsed["reported_clock_relations"]["date_to_expires"]["rhs_minus_lhs_seconds"],
+            86_400
+        );
+        assert_eq!(
+            parsed["reported_clock_relations"]["injection_date_to_expires"]["rhs_minus_lhs_seconds"],
+            82_800
+        );
     }
 
     #[test]
     fn reports_pairwise_reported_clock_relations() {
         let parsed = serde_json::to_value(parse(
-            b"Date: Thu, 01 Jan 1970 00:00:00 +0000\r\nInjection-Date: Thu, 01 Jan 1970 01:00:00 +0000\r\nNNTP-Posting-Date: Thu, 01 Jan 1970 00:00:00 +0000\r\n",
+            b"Date: Thu, 01 Jan 1970 00:00:00 +0000\r\nInjection-Date: Thu, 01 Jan 1970 01:00:00 +0000\r\nNNTP-Posting-Date: Thu, 01 Jan 1970 00:00:00 +0000\r\nExpires: Thu, 01 Jan 1970 02:00:00 +0000\r\n",
         ))
         .unwrap();
         for (pair, delta, order) in [
             ("date_to_injection_date", 3600, "before"),
             ("date_to_legacy_nntp_posting_date", 0, "equal"),
             ("injection_date_to_legacy_nntp_posting_date", -3600, "after"),
+            ("date_to_expires", 7200, "before"),
+            ("injection_date_to_expires", 3600, "before"),
+            ("legacy_nntp_posting_date_to_expires", 7200, "before"),
         ] {
             let relation = &parsed["reported_clock_relations"][pair];
             assert_eq!(relation["comparison_status"], "compared", "{pair}");
@@ -517,7 +549,7 @@ mod tests {
     #[test]
     fn compares_absolute_instants_without_inferring_local_timezones() {
         let parsed = serde_json::to_value(parse(
-            b"Date: Thu, 01 Jan 1970\r\n 00:00:00 -0000\r\nInjection-Date: Thu, 01 Jan 1970 01:00:00 +0100\r\nNNTP-Posting-Date: Thu, 01 Jan 1970 00:00:00 GMT\r\n",
+            b"Date: Thu, 01 Jan 1970\r\n 00:00:00 -0000\r\nInjection-Date: Thu, 01 Jan 1970 01:00:00 +0100\r\nNNTP-Posting-Date: Thu, 01 Jan 1970 00:00:00 GMT\r\nExpires: Thu, 01 Jan 1970 00:00:00 UT\r\n",
         ))
         .unwrap();
         assert_eq!(parsed["date"]["parse_status"], "valid");
@@ -525,6 +557,9 @@ mod tests {
             "date_to_injection_date",
             "date_to_legacy_nntp_posting_date",
             "injection_date_to_legacy_nntp_posting_date",
+            "date_to_expires",
+            "injection_date_to_expires",
+            "legacy_nntp_posting_date_to_expires",
         ] {
             let relation = &parsed["reported_clock_relations"][pair];
             assert_eq!(relation["comparison_status"], "compared", "{pair}");
@@ -548,11 +583,15 @@ mod tests {
             ),
         ] {
             let headers = format!(
-                "{date}Injection-Date: Thu, 01 Jan 1970 00:00:00 +0000\r\nNNTP-Posting-Date: Thu, 01 Jan 1970 01:00:00 +0000\r\n"
+                "{date}Injection-Date: Thu, 01 Jan 1970 00:00:00 +0000\r\nNNTP-Posting-Date: Thu, 01 Jan 1970 01:00:00 +0000\r\nExpires: Thu, 01 Jan 1970 02:00:00 +0000\r\n"
             );
             let parsed = serde_json::to_value(parse(headers.as_bytes())).unwrap();
             assert_eq!(parsed["date"]["parse_status"], status);
-            for pair in ["date_to_injection_date", "date_to_legacy_nntp_posting_date"] {
+            for pair in [
+                "date_to_injection_date",
+                "date_to_legacy_nntp_posting_date",
+                "date_to_expires",
+            ] {
                 let relation = &parsed["reported_clock_relations"][pair];
                 assert_eq!(
                     relation["comparison_status"], "source_unavailable",
@@ -565,12 +604,23 @@ mod tests {
                 parsed["reported_clock_relations"]["injection_date_to_legacy_nntp_posting_date"]["rhs_minus_lhs_seconds"],
                 3600
             );
+            assert_eq!(
+                parsed["reported_clock_relations"]["injection_date_to_expires"]["rhs_minus_lhs_seconds"],
+                7200
+            );
+            assert_eq!(
+                parsed["reported_clock_relations"]["legacy_nntp_posting_date_to_expires"]["rhs_minus_lhs_seconds"],
+                3600
+            );
         }
         let parsed = serde_json::to_value(parse(&vec![b'x'; MAX_HEADER_BYTES + 1])).unwrap();
         for pair in [
             "date_to_injection_date",
             "date_to_legacy_nntp_posting_date",
             "injection_date_to_legacy_nntp_posting_date",
+            "date_to_expires",
+            "injection_date_to_expires",
+            "legacy_nntp_posting_date_to_expires",
         ] {
             let relation = &parsed["reported_clock_relations"][pair];
             assert_eq!(relation["comparison_status"], "source_unavailable");
@@ -580,11 +630,14 @@ mod tests {
 
     #[test]
     fn qualifies_each_clock_pair_independently_of_other_unavailable_sources() {
-        let fields = ["Date", "Injection-Date", "NNTP-Posting-Date"];
+        let fields = ["Date", "Injection-Date", "NNTP-Posting-Date", "Expires"];
         let pairs = [
             ("date_to_injection_date", 0, 1),
             ("date_to_legacy_nntp_posting_date", 0, 2),
             ("injection_date_to_legacy_nntp_posting_date", 1, 2),
+            ("date_to_expires", 0, 3),
+            ("injection_date_to_expires", 1, 3),
+            ("legacy_nntp_posting_date_to_expires", 2, 3),
         ];
         for unavailable in 0..fields.len() {
             for replacement in ["", "bad", "duplicate"] {
@@ -632,16 +685,19 @@ mod tests {
 
     #[test]
     fn keeps_unaffected_clock_pair_when_one_source_exhausts_its_budget() {
-        let fields = ["Date", "Injection-Date", "NNTP-Posting-Date"];
+        let fields = ["Date", "Injection-Date", "NNTP-Posting-Date", "Expires"];
         let pairs = [
             ("date_to_injection_date", 0, 1, 3600),
             ("date_to_legacy_nntp_posting_date", 0, 2, 10800),
             ("injection_date_to_legacy_nntp_posting_date", 1, 2, 7200),
+            ("date_to_expires", 0, 3, 21600),
+            ("injection_date_to_expires", 1, 3, 18000),
+            ("legacy_nntp_posting_date_to_expires", 2, 3, 10800),
         ];
         for exhausted in 0..fields.len() {
             let mut headers = String::new();
             for (index, field) in fields.iter().enumerate() {
-                let hour = [0, 1, 3][index];
+                let hour = [0, 1, 3, 6][index];
                 for _ in 0..if index == exhausted {
                     MAX_OCCURRENCES
                 } else {
@@ -653,7 +709,12 @@ mod tests {
                 }
             }
             let parsed = serde_json::to_value(parse(headers.as_bytes())).unwrap();
-            let source = ["date", "injection_date", "legacy_nntp_posting_date"][exhausted];
+            let source = [
+                "date",
+                "injection_date",
+                "legacy_nntp_posting_date",
+                "expires",
+            ][exhausted];
             assert_eq!(parsed[source]["parse_status"], "budget_exceeded");
             for (pair, lhs, rhs, delta) in pairs {
                 let relation = &parsed["reported_clock_relations"][pair];
@@ -673,13 +734,16 @@ mod tests {
     #[test]
     fn compares_distinct_clock_pairs_across_the_epoch() {
         let parsed = serde_json::to_value(parse(
-            b"Date: Wed, 31 Dec 1969 23:59:00 +0000\r\nInjection-Date: Thu, 01 Jan 1970 00:01:00 +0000\r\nNNTP-Posting-Date: Wed, 31 Dec 1969 23:58:00 +0000\r\n",
+            b"Date: Wed, 31 Dec 1969 23:59:00 +0000\r\nInjection-Date: Thu, 01 Jan 1970 00:01:00 +0000\r\nNNTP-Posting-Date: Wed, 31 Dec 1969 23:58:00 +0000\r\nExpires: Wed, 31 Dec 1969 23:57:00 +0000\r\n",
         ))
         .unwrap();
         for (pair, delta, order) in [
             ("date_to_injection_date", 120, "before"),
             ("date_to_legacy_nntp_posting_date", -60, "after"),
             ("injection_date_to_legacy_nntp_posting_date", -180, "after"),
+            ("date_to_expires", -120, "after"),
+            ("injection_date_to_expires", -240, "after"),
+            ("legacy_nntp_posting_date_to_expires", -60, "after"),
         ] {
             let relation = &parsed["reported_clock_relations"][pair];
             assert_eq!(relation["comparison_status"], "compared");

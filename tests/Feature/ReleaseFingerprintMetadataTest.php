@@ -47,7 +47,7 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         $collector = new ReleaseFingerprintCollector($nzb, new NzbFingerprintAnalyzer($yenc), new Par2MetadataParser, $yenc);
         (new CollectReleaseFingerprintMetadata(1))->handle($collector);
         self::assertSame('unavailable', ReleaseFingerprintMetadata::query()->findOrFail(1)->status);
-        foreach ([28, 29, 30, 31, 32, 33, 34, 35, 36, 37] as $schemaVersion) {
+        foreach ([28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38] as $schemaVersion) {
             ReleaseFingerprintMetadata::query()->findOrFail(1)->update(['status' => 'complete', 'metadata' => ['schema_version' => $schemaVersion]]);
             $nzb->shouldReceive('readNzbContents')->once()->with('qo-schema-fixture')->andReturn(false);
             (new CollectReleaseFingerprintMetadata(1))->handle($collector);
@@ -73,11 +73,11 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         $dates = RemainingMetadataBenchmarkFixtures::baseline(
             RemainingMetadataBenchmarkFixtures::make('dates-folded'),
         ) + ['parser_engine' => 'nntmux-rust-article-dates', 'schema_version' => 2];
-        foreach (['date', 'injection_date', 'legacy_nntp_posting_date'] as $source) {
+        foreach (['date', 'injection_date', 'legacy_nntp_posting_date', 'expires'] as $source) {
             $dates[$source]['occurrence_count_basis'] = 'retained candidates; the total may be larger when budget_exceeded';
         }
         $dates['date']['candidates'][0]['raw_field_hex'] = bin2hex("dAtE: 01 Jan 2024\r\n\t00:00 -0000\r\n");
-        $metadata = ['schema_version' => 36, 'article_observations' => [[
+        $metadata = ['schema_version' => 38, 'article_observations' => [[
             'server' => 'fixture.example.invalid', 'server_port' => 563, 'server_tls' => true,
             'provider_label' => 'Fixture provider', 'queried_at_utc' => '2026-10-16T00:00:00Z',
             'message_id' => '<clock@example.invalid>', 'sample_role' => 'first',
