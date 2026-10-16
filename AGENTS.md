@@ -15,14 +15,14 @@ These model rules apply to Codex subagents only; Claude uses `CLAUDE.md`. Keep t
 - Escalate when evidence shows the task exceeds its route; give a concrete reason. Reserve `xhigh`/`max` for unresolved difficult reasoning. Check advertised model/effort support; report unavailable overrides rather than silently inheriting or bypassing permissions.
 - Parallelize independent reads; give each writer exclusive files or an isolated worktree. Keep the source/experiment/deployment ownership rules below.
 
-# Git workflow and Codex review
+# Git workflow and code review
 
 A human prompt or goal authorizes agents to commit task changes, push a feature branch, open a PR, and squash-merge it into `master` in `xbmc4lyfe/newznab-tmux` after all review gates pass. Follow [.ai/rules/git-workflow.md](.ai/rules/git-workflow.md). This permission doesn't authorize deployment, production changes, or dependency changes.
 
-- Before opening a PR, obtain an independent local Codex review with no findings. Use a Codex subagent when a slot is available, or a separate Codex command-line process when all Codex subagent slots have active tasks or the current harness isn't Codex.
-- After opening the PR, request `@codex review`. Address and reply to every finding, resolve each review thread, and request another review after fixes or an explanation that a finding doesn't apply.
-- Merge only after Codex gives an explicit approval or go-ahead for the current PR head and required checks pass. Every change after a review requires a fresh review with no findings.
-- If the GitHub Codex app reports exhausted review credits, use a fresh independent local review of the current PR head with `gpt-6.1-sol` or a stronger model, `high` effort, and normal speed. Record the review and commit hash in the PR. Use a separate process if a subagent can't select these settings.
+- Before opening a PR, obtain an independent local review with no findings from Antigravity (via an independent Antigravity subagent or session) or Codex (via a Codex subagent when a slot is available, or a separate Codex command-line process).
+- After opening the PR, obtain a PR review from Antigravity or request `@codex review`. Address and reply to every finding, resolve each review thread, and obtain another review after fixes or an explanation that a finding doesn't apply.
+- Merge only after the reviewer (Antigravity or Codex) gives an explicit approval or go-ahead for the current PR head and required checks pass. Every change after a review requires a fresh review with no findings.
+- If the GitHub Codex app reports exhausted review credits (or when using Antigravity as the reviewer), use a fresh independent review of the current PR head from an independent Antigravity reviewer or a local Codex reviewer (`gpt-6.1-sol` or a stronger model, `high` effort, and normal speed). Record the review and commit hash in the PR.
 - Feature pull requests target this fork's `master`. Upstream synchronization with `NNTmux/newznab-tmux` uses a merge commit and requires a separate synchronization request.
 
 ## Code review rules
@@ -40,7 +40,7 @@ Laravel 13 Usenet indexer. Use this file for repo-wide defaults; load a project 
 - Fetch the latest `master` from `xbmc4lyfe/newznab-tmux` before creating that worktree/branch, and base it on the fetched commit. Verify the remote URL: this is the fork's `master`, not `NNTmux/newznab-tmux/master`. Reuse the worktree and branch already created for the current task; continuing an explicitly requested existing PR keeps that PR's branch.
 - While actively working, fetch and integrate newer commits from `xbmc4lyfe/newznab-tmux/master` every 30–60 minutes. Refresh at the beginning of each resumed work session if the last fetch is older than 30 minutes. Preserve unrelated and uncommitted work; never reset or discard it to synchronize.
 - After a PR is merged, fetch the fork's `master` again before creating the next task's worktree and new `codex/` branch. Base that branch on the newly fetched commit rather than the previous task branch or a stale local `master`.
-- Fetch and integrate any newer commits from `xbmc4lyfe/newznab-tmux/master` again immediately before the first local Codex review and again before creating the PR. Resolve conflicts, retain the intended behavior, and rerun affected checks before review/submission; do not review or submit a stale base just because the branch was current when work began. If `master` has not advanced, no additional merge is needed.
+- Fetch and integrate any newer commits from `xbmc4lyfe/newznab-tmux/master` again immediately before the first local review and again before creating the PR. Resolve conflicts, retain the intended behavior, and rerun affected checks before review/submission; do not review or submit a stale base just because the branch was current when work began. If `master` has not advanced, no additional merge is needed.
 - Read [.ai/rules/index.md](.ai/rules/index.md), every rule matching the target paths, and search `.ai/rules` for task keywords.
 - Record durable shared rules with Boost's `record-rule`; don't substitute personal memory.
 - Follow existing sibling conventions and reuse existing components. Keep dependencies and new base directories subject to user approval.

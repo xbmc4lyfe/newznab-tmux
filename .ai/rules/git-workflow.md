@@ -20,12 +20,12 @@ A human prompt or goal authorizes agents to commit task changes, push feature br
 ## Review locally before opening a PR
 
 1. Commit the changes and record the head commit hash and destination base commit hash.
-2. Obtain an independent local Codex review of the complete diff against that base. Use a Codex subagent when a slot is available. Use a separate Codex command-line process when all Codex subagent slots have active tasks or the current harness isn't Codex. The implementation agent can't approve its own work.
+2. Obtain an independent local review of the complete diff against that base using Antigravity (via an independent Antigravity subagent or session) or Codex (via a Codex subagent when a slot is available, or a separate Codex command-line process). The implementation agent can't approve its own work.
 3. Address all findings, repeat relevant checks, and obtain another review. Open the PR only when the final review reports no findings and gives an explicit go-ahead for the committed head.
 
 You may push the feature branch before review. Opening a PR still requires a clean local review.
 
-For a command-line review, use the installed command's supported flags. For example:
+For a Codex command-line review, use the installed command's supported flags. For example:
 
 ```bash
 codex exec --model gpt-6.1-sol \
@@ -33,26 +33,25 @@ codex exec --model gpt-6.1-sol \
   --sandbox read-only --ephemeral review --base origin/master
 ```
 
-Record the reviewer, model, effort, speed, base commit hash, head commit hash, findings, and final verdict. Read the result. A successful process exit doesn't prove a clean review.
+Record the reviewer (Antigravity or Codex), model, effort/settings, base commit hash, head commit hash, findings, and final verdict. Read the result. A successful process exit doesn't prove a clean review.
 
 ## Review the PR before merging
 
-1. Open the PR against `xbmc4lyfe/newznab-tmux:master` and comment `@codex review`.
+1. Open the PR against `xbmc4lyfe/newznab-tmux:master` and obtain an independent Antigravity review of the PR or comment `@codex review`.
 2. Check every finding against the code. Reproduce bugs when practical. Fix valid findings and run relevant checks. Reply in each finding's thread with the fix and evidence, or explain with evidence why the finding doesn't apply. Resolve the thread after replying.
-3. Request `@codex review` again after fixes or replies that explain why a finding doesn't apply. Repeat until Codex gives an explicit approval or go-ahead for the current head. Require no unresolved findings or review threads.
+3. Obtain a fresh Antigravity review or request `@codex review` again after fixes or replies that explain why a finding doesn't apply. Repeat until the reviewer (Antigravity or Codex) gives an explicit approval or go-ahead for the current head. Require no unresolved findings or review threads.
 4. Wait for required checks to pass. Verify that the remote PR head and destination base still match the reviewed revisions, then squash-merge the feature PR. If the destination base has changed, update the branch, rerun relevant checks, and repeat both reviews before merging.
 
 Every content change after a review invalidates that review. Make the needed changes, rerun checks, and obtain a fresh review with no findings before opening or merging the PR. This applies to documentation and review fixes too.
 
-### When GitHub review credits run out
+### Independent Antigravity review or exhausted GitHub review credits
 
-Use this fallback only when the GitHub Codex app reports that review credits have run out. Other review failures don't qualify.
+Use an independent Antigravity review directly, or use this local fallback when the GitHub Codex app reports that review credits have run out.
 
-- After the PR is open, obtain a fresh independent local Codex review of its current head against its current destination base. The earlier review before PR creation isn't a substitute.
-- Use `gpt-6.1-sol` or a stronger model, `high` reasoning effort, and normal speed. For the Codex command-line tool, set `service_tier=default`. Verify the resolved settings. Use a separate process if a subagent can't select normal speed. Don't silently downgrade the model or effort.
+- After the PR is open, obtain a fresh independent review of its current head against its current destination base from an independent Antigravity reviewer or a local Codex reviewer (`gpt-6.1-sol` or a stronger model, `high` reasoning effort, and normal speed with `service_tier=default`). The earlier review before PR creation isn't a substitute.
 - Require no findings and an explicit go-ahead. After any change, repeat the review on the new head.
-- Record the credit-exhaustion notice, reviewed base and head commit hashes, model, effort, speed, and full review result in the PR. Address existing GitHub findings and resolve their threads before merging.
-- Required checks and repository protections still apply. If an approval requirement blocks the fallback, report the blocker. Don't bypass it.
+- Record the reviewer, reviewed base and head commit hashes, model/settings, and full review result in the PR. Address existing GitHub findings and resolve their threads before merging.
+- Required checks and repository protections still apply. If an approval requirement blocks the merge, report the blocker. Don't bypass it.
 
 ## Upstream synchronization
 
