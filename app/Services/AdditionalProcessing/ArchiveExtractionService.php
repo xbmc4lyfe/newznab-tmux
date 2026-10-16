@@ -9,6 +9,7 @@ use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
 use App\Services\Releases\ReleaseBrowseService;
 use dariusiii\rarinfo\ArchiveInfo;
 use dariusiii\rarinfo\Par2Info;
+use dariusiii\rarinfo\RarInfo;
 use dariusiii\rarinfo\SzipInfo;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
@@ -172,7 +173,27 @@ class ArchiveExtractionService
             'archiveMarker' => $archiveMarker,
             'dataSummary' => $dataSummary,
             'listingOnly' => $listingOnly,
+            'rarListingComplete' => $this->archiveInfo->type === ArchiveInfo::TYPE_RAR
+                ? $this->hasTerminalRarBlock($compressedData)
+                : null,
         ];
+    }
+
+    private function hasTerminalRarBlock(string $data): bool
+    {
+        $reader = $this->archiveInfo->getReader();
+        if (! $reader instanceof RarInfo) {
+            return false;
+        }
+        $blocks = $reader->getBlocks(false);
+        if (! is_array($blocks) || $blocks === []) {
+            return false;
+        }
+        $last = end($blocks);
+
+        return in_array($last['head_type'] ?? null, [RarInfo::BLOCK_ENDARC, RarInfo::R50_BLOCK_ENDARC], true)
+            && ($last['more_volumes'] ?? true) === false
+            && ($last['next_offset'] ?? null) === strlen($data);
     }
 
     /**

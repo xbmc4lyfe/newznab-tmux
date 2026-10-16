@@ -38,6 +38,7 @@ use App\Services\ReleaseImageService;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\TempWorkspaceService;
 use dariusiii\rarinfo\Par2Info;
+use dariusiii\rarinfo\RarInfo;
 use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
@@ -2105,6 +2106,128 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
                 ['[03/50] - First Movie.part03.rar yEnc', '<v3>', null],
                 ['"First Movie.part04.rar" yEnc (1/50)', '<v4>', null],
             ], $none],
+        ];
+    }
+
+    #[DataProvider('incompleteArchiveNamingCases')]
+    public function test_partial_archive_evidence_only_defers_episode_naming(string $kind, bool $episode): void
+    {
+        $title = $episode ? 'Show.S01E01.1080p.WEB-DL-GRP' : 'Movie.2026.1080p.WEB-DL-GRP';
+        $this->prepareFullPar2NamingEvidence($title);
+        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $title, 'source' => 'fixture']]);
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
+        $manager = $this->makeFullPar2NamingManager($sync);
+        $dir = sys_get_temp_dir().'/'.uniqid('7z-naming-', true);
+        mkdir($dir);
+        try {
+            $script = "#!/bin/sh\nprintf 'Path = ".$title.".mkv\\nSize = 100\\nEncrypted = -\\n\\n'\n"
+                ."printf 'Path = Show.S01E02\\001.mkv\\nSize = 100\\nEncrypted = -\\n\\n'\n";
+            file_put_contents($dir.'/7z', $script);
+            chmod($dir.'/7z', 0755);
+            $config = $this->makeConfig(['processPasswords' => true, 'sevenZipPath' => $dir.'/7z']);
+            $planner = new AdditionalWorkPlanner($config);
+            $context = new ReleaseProcessingContext(Release::query()->findOrFail(1));
+            $context->tmpPath = $dir.'/';
+            $context->nzbHasCompressedFile = true;
+            $context->archiveInspectionAttempted = true;
+            $contents = [['title' => '"a1b2c3d4.'.($kind === '7z' ? '7z' : 'rar').'" yEnc (1/1)', 'segments' => ['<archive>']]];
+            if ($kind === 'truncated rar with extras') {
+                $contents[] = ['title' => '"e5f6a7b8.rar" yEnc (1/1)', 'segments' => ['<extras>']];
+            }
+            $context->workPlan = $planner->plan($contents, '');
+            $processor = new ReleaseProcessor(
+                $config, Mockery::mock(NzbContentParser::class), $planner, new ArchiveExtractionService($config),
+                Mockery::mock(MediaExtractionService::class), Mockery::mock(UsenetDownloadService::class), $manager,
+                Mockery::mock(ReleaseFilesArchiveFallback::class), Mockery::mock(TempWorkspaceService::class),
+                Mockery::mock(ConsoleOutputService::class)->shouldIgnoreMissing(),
+            );
+            $archive = $kind === '7z'
+                ? $this->sevenZip('ignored.mkv', str_repeat('x', 100), compressedHeader: true)
+                : $this->rar($title.'.mkv', str_repeat('x', 1000));
+            if ($kind === 'complete rar' || $kind === 'continuing rar') {
+                $end = pack('Cvv', RarInfo::BLOCK_ENDARC, $kind === 'continuing rar' ? 1 : 0, 7);
+                $archive .= pack('v', crc32($end) & 0xFFFF).$end;
+            } elseif ($kind === 'complete rar5') {
+                $name = $title.'.mkv';
+                $main = "\x03\x01\x00\x00";
+                $file = "\x02\x02\x0a\x00\x0a\x00\x00\x00".chr(strlen($name)).$name;
+                $file = chr(strlen($file)).$file;
+                $end = "\x03\x05\x00\x00";
+                $archive = "Rar!\x1a\x07\x01\x00".pack('V', crc32($main)).$main
+                    .pack('V', crc32($file)).$file.str_repeat('x', 10).pack('V', crc32($end)).$end;
+            } elseif ($kind === 'payload boundary' || $kind === 'partial next header') {
+                $prefixLength = strlen($archive);
+                $archive .= substr($this->rar('Show.S01E02.1080p.WEB-DL-GRP.mkv', str_repeat('y', 100)), 20);
+                $archive = substr($archive, 0, $prefixLength + ($kind === 'partial next header' ? 3 : 0));
+            }
+            if (str_starts_with($kind, 'truncated rar')) {
+                // The full archive has a second episode; the downloaded prefix ends in E01's payload.
+                $archive .= substr($this->rar('Show.S01E02.1080p.WEB-DL-GRP.mkv', str_repeat('y', 100)), 20);
+                $archive = substr($archive, 0, strlen($archive) - 1100);
+                $listing = (new ArchiveExtractionService($config))->processCompressedData($archive, $context, $dir.'/');
+                $this->assertSame([$title.'.mkv'], array_column($listing['files'], 'name'));
+                $this->assertGreaterThan(strlen($archive), $listing['files'][0]['next_offset']);
+            }
+            if ($kind === 'payload boundary' || $kind === 'partial next header' || str_starts_with($kind, 'complete rar')) {
+                $reader = new RarInfo;
+                $this->assertTrue($reader->setData($archive, true));
+                $this->assertSame([$title.'.mkv'], array_column($reader->getFileList(), 'name'));
+                $blocks = $reader->getBlocks(false);
+                $last = end($blocks);
+                if (str_starts_with($kind, 'complete rar')) {
+                    $this->assertContains($last['head_type'], [RarInfo::BLOCK_ENDARC, RarInfo::R50_BLOCK_ENDARC]);
+                    $this->assertFalse($last['more_volumes']);
+                    $this->assertSame(strlen($archive), $last['next_offset']);
+                } else {
+                    $this->assertSame(RarInfo::BLOCK_FILE, $last['head_type']);
+                    $this->assertSame(strlen($archive) - ($kind === 'partial next header' ? 3 : 0), $last['next_offset']);
+                }
+            }
+            $readSets = [];
+            $handler = new ReflectionMethod($processor, 'processArchiveData');
+
+            $handler->invokeArgs($processor, [$context, $archive, [], false, 'a1b2c3d4', $context->workPlan->archiveCandidates[0], &$readSets]);
+            if ($kind === 'truncated rar with extras') {
+                $handler->invokeArgs($processor, [$context, $this->rar('extras.txt', 'extra'), [], false, 'e5f6a7b8.rar', $context->workPlan->archiveCandidates[1], &$readSets]);
+            }
+            (new ReflectionMethod($processor, 'runDeferredArchiveNameChecks'))->invoke($processor, $context, $readSets);
+            $manager->finalizeRelease($context, true);
+
+            $deferred = $episode && ! str_starts_with($kind, 'complete rar');
+            $this->assertSame($deferred ? 'Example' : $title, DB::table('releases')->where('id', 1)->value('searchname'));
+            $this->assertSame($deferred ? 0 : 7, (int) DB::table('releases')->where('id', 1)->value('predb_id'));
+            $this->assertSame($deferred ? 'Example' : $title, $context->release->searchname);
+            $this->assertTrue(DB::table('release_files')->where('releases_id', 1)->where('name', $title.'.mkv')->exists());
+            if ($kind === '7z') {
+                $this->assertTrue($context->archiveListingIncomplete);
+                $this->assertSame(-1, (int) DB::table('releases')->where('id', 1)->value('passwordstatus'));
+            }
+            if ($deferred) {
+                Event::assertNotDispatched(ReleaseNameFixed::class);
+            }
+        } finally {
+            File::deleteDirectory($dir);
+        }
+    }
+
+    /** @return array<string, array{string, bool}> */
+    public static function incompleteArchiveNamingCases(): array
+    {
+        return [
+            'incomplete 7z episode' => ['7z', true],
+            'incomplete 7z movie' => ['7z', false],
+            'truncated rar episode' => ['truncated rar', true],
+            'truncated rar movie' => ['truncated rar', false],
+            'truncated rar followed by extras' => ['truncated rar with extras', true],
+            'complete rar episode' => ['complete rar', true],
+            'complete rar movie' => ['complete rar', false],
+            'exact payload boundary episode' => ['payload boundary', true],
+            'exact payload boundary movie' => ['payload boundary', false],
+            'partial next header episode' => ['partial next header', true],
+            'partial next header movie' => ['partial next header', false],
+            'complete rar5 episode' => ['complete rar5', true],
+            'complete rar5 movie' => ['complete rar5', false],
+            'rar terminal requests another volume' => ['continuing rar', true],
         ];
     }
 

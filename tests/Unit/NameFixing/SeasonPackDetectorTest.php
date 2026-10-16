@@ -58,6 +58,14 @@ class SeasonPackDetectorTest extends TestCase
                 ['Show.S01E01.1080p.WEB-DL-GRP.mkv', 'Show.S01E02.1080p.WEB-DL-GRP.mkv'],
                 'Show.S01.1080p.WEB-DL-GRP',
             ],
+            'x episode format' => [
+                ['Show.1x01.1080p.WEB-DL-GRP.mkv', 'Show.1x02.1080p.WEB-DL-GRP.mkv'],
+                'Show.S01.1080p.WEB-DL-GRP',
+            ],
+            'year season format' => [
+                ['Show.S2024E01.1080p.WEB-DL-GRP.mkv', 'Show.S2024E02.1080p.WEB-DL-GRP.mkv'],
+                'Show.S2024.1080p.WEB-DL-GRP',
+            ],
             'episode titles are dropped' => [
                 ['Show.S01E01.Pilot.1080p.WEB-DL-GRP.mkv', 'Show.S01E02.The.Title.1080p.WEB-DL-GRP.mkv'],
                 'Show.S01.1080p.WEB-DL-GRP',
@@ -110,6 +118,9 @@ class SeasonPackDetectorTest extends TestCase
     {
         $this->assertSame($expected, SeasonPackDetector::seasonNameFromEpisodes($names));
         $this->assertSame($expected !== null, SeasonPackDetector::isMultiEpisodeSet($names));
+        if ($expected !== null) {
+            $this->assertTrue(SeasonPackDetector::isSeasonPack($expected));
+        }
     }
 
     #[Test]

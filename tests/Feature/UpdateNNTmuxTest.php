@@ -8,6 +8,7 @@ use App\Console\Commands\UpdateNNTmux;
 use App\Services\NntmuxUpdateLock;
 use Illuminate\Console\OutputStyle;
 use Illuminate\Contracts\Foundation\MaintenanceMode;
+use Illuminate\Process\Exceptions\ProcessTimedOutException;
 use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
@@ -16,10 +17,10 @@ use Illuminate\Support\Facades\Redis;
 use Mockery;
 use Mockery\MockInterface;
 use PHPUnit\Framework\Attributes\DataProvider;
-use RuntimeException;
 use Symfony\Component\Console\Helper\ProgressBar;
 use Symfony\Component\Console\Input\ArrayInput;
 use Symfony\Component\Console\Output\BufferedOutput;
+use Symfony\Component\Process\Process as SymfonyProcess;
 use Tests\Support\ConfigurationTestBuilder;
 use Tests\TestCase;
 
@@ -35,6 +36,12 @@ class UpdateNNTmuxTest extends TestCase
 
     private int $tmuxStartExitCode = 0;
 
+    private int $redisPreflightExitCode = 0;
+
+    private string $redisPreflightError = '';
+
+    private bool $expectFreshRedisPreflight = false;
+
     protected function setUp(): void
     {
         parent::setUp();
@@ -48,9 +55,11 @@ class UpdateNNTmuxTest extends TestCase
         File::ensureDirectoryExists($this->directory.'/.git');
         $this->mock(MaintenanceMode::class)->shouldReceive('active')->andReturnUsing(fn (): bool => $this->maintenanceActive);
         Process::preventStrayProcesses();
-        Process::fake(fn (PendingProcess $process) => $this->isFreshTmuxStart($process)
-            ? Process::result(exitCode: $this->tmuxStartExitCode)
-            : Process::result($this->directory.'/.git/index.lock'));
+        Process::fake(fn (PendingProcess $process) => match (true) {
+            $this->isFreshTmuxStart($process) => Process::result(exitCode: $this->tmuxStartExitCode),
+            $this->isFreshRedisPreflight($process) => Process::result(errorOutput: $this->redisPreflightError, exitCode: $this->redisPreflightExitCode),
+            default => Process::result($this->directory.'/.git/index.lock'),
+        });
     }
 
     protected function tearDown(): void
@@ -167,6 +176,205 @@ class UpdateNNTmuxTest extends TestCase
         (new \ReflectionMethod(UpdateNNTmux::class, 'performMaintenanceTasks'))->invoke($command);
     }
 
+    #[DataProvider('updatedRedisEndpoints')]
+    public function test_redis_preflight_uses_worker_configuration_after_real_cache_commands(string $newHost, bool $healthy): void
+    {
+        File::ensureDirectoryExists($this->directory.'/bootstrap/cache');
+        File::ensureDirectoryExists($this->directory.'/config');
+        File::ensureDirectoryExists($this->directory.'/storage/framework/views');
+        File::put($this->directory.'/.env', "REDIS_HOST={$newHost}\n");
+        File::put($this->directory.'/.env.example', "REDIS_HOST={$newHost}\n");
+        File::put($this->directory.'/config/database.php', <<<'PHP'
+<?php
+return ['redis' => ['client' => 'phpredis', 'default' => ['host' => env('REDIS_HOST')]]];
+PHP);
+        // The extension and endpoints are simulated only inside this isolated fixture process.
+        File::put($this->directory.'/redis-fixture.php', <<<'PHP'
+<?php
+namespace App\Console\Commands {
+    function extension_loaded(string $name): bool
+    {
+        return $name === 'redis' || \extension_loaded($name);
+    }
+}
+namespace UpdaterFixture {
+    class RedisProvider extends \Illuminate\Support\ServiceProvider
+    {
+        public function register(): void
+        {
+            $this->app->extend('redis', static fn ($manager, $app) => new class($app) {
+                public function __construct(private $app) {}
+                public function connection(): self { return $this; }
+                public function ping(): string
+                {
+                    $host = $this->app['config']->get('database.redis.default.host');
+                    file_put_contents($this->app->basePath('probes.jsonl'), json_encode(['host' => $host, 'pid' => getmypid()])."\n", FILE_APPEND);
+                    if (! str_starts_with($host, 'healthy-')) {
+                        throw new \RuntimeException('fixture endpoint unreachable');
+                    }
+                    return 'PONG';
+                }
+            });
+        }
+    }
+}
+PHP);
+        $autoload = var_export($this->originalBasePath.'/vendor/autoload.php', true);
+        File::put($this->directory.'/bootstrap/app.php', str_replace('__AUTOLOAD__', $autoload, <<<'PHP'
+<?php
+require_once __AUTOLOAD__;
+require_once dirname(__DIR__).'/redis-fixture.php';
+return \Illuminate\Foundation\Application::configure(basePath: dirname(__DIR__))
+    ->withProviders([\UpdaterFixture\RedisProvider::class], withBootstrapProviders: false)
+    ->withCommands([\App\Console\Commands\UpdateNNTmux::class])
+    ->withExceptions()
+    ->withRouting(using: static function (): void {
+        \Illuminate\Support\Facades\Route::get('/fixture', [\Illuminate\Routing\RedirectController::class, '__invoke']);
+    })->create();
+PHP));
+        File::put($this->directory.'/artisan', <<<'PHP'
+<?php
+$app = require __DIR__.'/bootstrap/app.php';
+exit($app->handleCommand(new \Symfony\Component\Console\Input\ArgvInput));
+PHP);
+        File::put($this->directory.'/scenario.php', <<<'PHP'
+<?php
+try {
+$app = require __DIR__.'/bootstrap/app.php';
+$providers = [...\Illuminate\Support\ServiceProvider::defaultProviders()->toArray(), \UpdaterFixture\RedisProvider::class];
+$old = [
+    'app' => ['name' => 'UpdaterFixture', 'env' => 'testing', 'timezone' => 'UTC', 'providers' => $providers, 'debug' => false, 'locale' => 'en', 'fallback_locale' => 'en'],
+    'database' => ['redis' => ['client' => 'phpredis', 'default' => ['host' => 'healthy-old']]],
+    'cache' => ['default' => 'array', 'stores' => ['array' => ['driver' => 'array']]],
+    'view' => ['compiled' => __DIR__.'/storage/framework/views', 'paths' => []],
+];
+file_put_contents($app->getCachedConfigPath(), '<?php return '.var_export($old, true).';');
+$kernel = $app->make(\Illuminate\Contracts\Console\Kernel::class);
+$kernel->bootstrap();
+$oldPong = \Illuminate\Support\Facades\Redis::connection()->ping();
+$command = \Mockery::mock(\App\Console\Commands\UpdateNNTmux::class)->makePartial();
+$command->__construct();
+$command->setLaravel($app);
+$buffer = new \Symfony\Component\Console\Output\BufferedOutput;
+$output = new \Illuminate\Console\OutputStyle(new \Symfony\Component\Console\Input\ArrayInput([]), $buffer);
+$command->setOutput($output);
+(new \ReflectionProperty(\App\Console\Commands\UpdateNNTmux::class, 'progressBar'))->setValue($command, new \Symfony\Component\Console\Helper\ProgressBar($output, 1));
+$command->shouldReceive('call')->andReturnUsing(static fn (string $name, array $arguments = []): int => $kernel->call($name, $arguments));
+(new \ReflectionMethod(\App\Console\Commands\UpdateNNTmux::class, 'performMaintenanceTasks'))->invoke($command);
+$cached = require $app->getCachedConfigPath();
+$restoredHost = config('database.redis.default.host');
+$accepted = false;
+try {
+    (new \ReflectionMethod(\App\Console\Commands\UpdateNNTmux::class, 'ensureRedisRuntimeIsHealthy'))->invoke($command);
+    $accepted = true;
+} catch (\Throwable $error) {
+    $message = $error->getMessage();
+}
+$probes = array_map(static fn (string $line): array => json_decode($line, true, flags: JSON_THROW_ON_ERROR), file(__DIR__.'/probes.jsonl', FILE_IGNORE_NEW_LINES));
+file_put_contents(__DIR__.'/result.json', json_encode(['old_pong' => $oldPong, 'restored_host' => $restoredHost, 'cached_host' => $cached['database']['redis']['default']['host'], 'accepted' => $accepted, 'probes' => $probes, 'output' => $buffer->fetch(), 'error' => $message ?? null], JSON_THROW_ON_ERROR));
+} catch (\Throwable $error) {
+    fwrite(STDERR, (string) $error);
+    exit(1);
+}
+PHP);
+        $process = new SymfonyProcess([PHP_BINARY, '-n', $this->directory.'/scenario.php'], $this->directory, [
+            'REDIS_HOST' => false,
+            'REDIS_CLIENT' => false,
+            'APP_CONFIG_CACHE' => false,
+            'APP_ROUTES_CACHE' => false,
+        ]);
+        $process->setTimeout(15);
+        $process->run();
+        $this->assertSame(0, $process->getExitCode(), $process->getOutput().$process->getErrorOutput());
+        $resultPath = $this->directory.'/result.json';
+        $this->assertFileExists($resultPath, $process->getOutput().$process->getErrorOutput());
+        $observed = json_decode(File::get($resultPath), true, flags: JSON_THROW_ON_ERROR);
+        $this->assertSame('PONG', $observed['old_pong']);
+        $this->assertSame('healthy-old', $observed['restored_host']);
+        $this->assertSame($newHost, $observed['cached_host']);
+        $this->assertSame($healthy, $observed['accepted'], $observed['output']);
+        $this->assertSame($newHost, $observed['probes'][array_key_last($observed['probes'])]['host']);
+        $this->assertNotSame($observed['probes'][0]['pid'], $observed['probes'][array_key_last($observed['probes'])]['pid']);
+        if (! $healthy) {
+            $this->assertStringContainsString('fixture endpoint unreachable', $observed['output']);
+        }
+    }
+
+    public static function updatedRedisEndpoints(): array
+    {
+        return [
+            'changed endpoint is unreachable' => ['unreachable-new', false],
+            'changed endpoint is healthy' => ['healthy-new', true],
+        ];
+    }
+
+    public function test_internal_redis_preflight_does_not_prepare_or_acquire_the_update_lock(): void
+    {
+        config(['database.redis.client' => 'predis']);
+        $command = $this->command();
+        $command->shouldReceive('call')->never();
+        $status = (new NntmuxUpdateLock)->run(function () use ($command): int {
+            [$status, $output] = $this->runCommand($command, ['--redis-preflight' => true]);
+            $this->assertStringContainsString('Redis client mismatch', $output);
+
+            return $status;
+        }, checkGit: false);
+
+        $this->assertSame(1, $status);
+        $this->assertFalse($this->maintenanceActive);
+        Process::assertNothingRan();
+    }
+
+    #[DataProvider('failedProbeStates')]
+    public function test_fresh_redis_probe_failure_preserves_worker_pause_and_restores_web_access(bool $wasRunning, bool $timeout): void
+    {
+        ConfigurationTestBuilder::updateRuntime(['tmux_running' => $wasRunning]);
+        $command = $this->command();
+        $this->expectPreparation($command);
+        $this->expectMaintenanceTasks($command);
+        $this->expectWebRestore($command);
+        $this->expectFreshRedisPreflight = ! $timeout;
+        $probeAttempted = false;
+        $this->redisPreflightExitCode = 1;
+        $this->redisPreflightError = 'fixture fresh Redis probe failed';
+        if ($timeout) {
+            Process::fake(function (PendingProcess $process) use (&$probeAttempted) {
+                if ($this->isFreshRedisPreflight($process)) {
+                    $probeAttempted = true;
+                    $this->assertSame(30, $process->timeout);
+                    $original = new \Symfony\Component\Process\Exception\ProcessTimedOutException(
+                        (new SymfonyProcess([PHP_BINARY, 'artisan', 'nntmux:all', '--redis-preflight']))->setTimeout(30),
+                        \Symfony\Component\Process\Exception\ProcessTimedOutException::TYPE_GENERAL,
+                    );
+                    throw new ProcessTimedOutException($original, Process::result(exitCode: 1));
+                }
+
+                return Process::result();
+            });
+        }
+
+        [$status, $output] = $this->runCommand($command, ['--skip-git' => true]);
+
+        $this->assertSame(1, $status);
+        $this->assertFalse($this->maintenanceActive);
+        $this->assertStringNotContainsString('update completed successfully', $output);
+        if ($timeout) {
+            $this->assertTrue($probeAttempted);
+        }
+        Process::assertNotRan(fn (PendingProcess $process): bool => $this->isFreshTmuxStart($process));
+        $this->assertSame(0, (new NntmuxUpdateLock)->run(fn (): int => 0, checkGit: false));
+    }
+
+    public static function failedProbeStates(): array
+    {
+        return [
+            'running, nonzero' => [true, false],
+            'paused, nonzero' => [false, false],
+            'running, timeout' => [true, true],
+            'paused, timeout' => [false, true],
+        ];
+    }
+
     public function test_failed_tmux_shutdown_aborts_before_git_and_restores_web_access(): void
     {
         $command = $this->command();
@@ -219,6 +427,9 @@ class UpdateNNTmuxTest extends TestCase
     public function test_redis_preflight_failure_restores_web_access_without_restarting_tmux(): void
     {
         config(['database.redis.client' => 'predis']);
+        $this->redisPreflightExitCode = 1;
+        $this->redisPreflightError = 'Redis client mismatch';
+        $this->expectFreshRedisPreflight = true;
         $command = $this->command();
         $this->expectPreparation($command);
         $this->expectMaintenanceTasks($command);
@@ -267,7 +478,8 @@ class UpdateNNTmuxTest extends TestCase
         [$status] = $this->runCommand($command, ['--skip-git' => true]);
 
         $this->assertSame(0, $status);
-        Process::assertNotRan(fn (PendingProcess $process): bool => ! $this->isFreshTmuxStart($process));
+        Process::assertNotRan(fn (PendingProcess $process): bool => ! $this->isFreshTmuxStart($process)
+            && ! $this->isFreshRedisPreflight($process));
     }
 
     public function test_npm_ci_failure_reports_diagnostics_and_completes_using_install_fallback(): void
@@ -342,7 +554,9 @@ class UpdateNNTmuxTest extends TestCase
         $this->expectPreparation($command);
         $this->expectMaintenanceTasks($command);
         $this->expectWebRestore($command);
-        Redis::shouldReceive('connection->ping')->once()->andThrow(new RuntimeException('connection refused'));
+        $this->redisPreflightExitCode = 1;
+        $this->redisPreflightError = 'Redis preflight failed: connection refused';
+        $this->expectFreshRedisPreflight = true;
 
         [$status, $output] = $this->runCommand($command, ['--skip-git' => true]);
 
@@ -351,6 +565,11 @@ class UpdateNNTmuxTest extends TestCase
         $this->assertStringContainsString('Redis preflight failed: connection refused', $output);
         Process::assertNotRan(fn (PendingProcess $process): bool => $this->isFreshTmuxStart($process));
         $this->assertSame(0, (new NntmuxUpdateLock)->run(fn (): int => 0, checkGit: false));
+    }
+
+    private function isFreshRedisPreflight(PendingProcess $process): bool
+    {
+        return $process->command === [PHP_BINARY, 'artisan', 'nntmux:all', '--redis-preflight'];
     }
 
     private function isFreshTmuxStart(PendingProcess $process): bool
@@ -405,7 +624,9 @@ class UpdateNNTmuxTest extends TestCase
 
     private function expectHealthyRedis(): void
     {
-        Redis::shouldReceive('connection->ping')->once()->andReturn('PONG');
+        $this->redisPreflightExitCode = 0;
+        $this->redisPreflightError = '';
+        $this->expectFreshRedisPreflight = true;
     }
 
     /**
@@ -422,6 +643,9 @@ class UpdateNNTmuxTest extends TestCase
             '--skip-db' => true,
             ...$options,
         ]), $output);
+        if ($this->expectFreshRedisPreflight) {
+            Process::assertRanTimes(fn (PendingProcess $process): bool => $this->isFreshRedisPreflight($process), 1);
+        }
 
         return [$status, $output->fetch()];
     }

@@ -24,6 +24,7 @@ use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
 use App\Services\NameFixing\SeasonPackDetector;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\TempWorkspaceService;
+use dariusiii\rarinfo\ArchiveInfo;
 use dariusiii\rarinfo\SzipInfo;
 use Illuminate\Support\Facades\File;
 
@@ -488,6 +489,11 @@ class ReleaseProcessor
     private function noteArchiveListing(ReleaseProcessingContext $context, array $files): void
     {
         $context->rememberArchiveFileNames($files);
+        foreach ($files as $file) {
+            if (SeasonPackDetector::isUnclassifiedEpisodeName((string) ($file['name'] ?? ''))) {
+                $context->archiveNameEvidenceIncomplete = true;
+            }
+        }
         if ($context->seasonPack) {
             return;
         }
@@ -514,18 +520,18 @@ class ReleaseProcessor
      * Once every archive set was read: a confirmed season pack keeps its name, and when no
      * second episode showed up the per-file renames held back during the walk run as usual.
      *
-     * @param  array<string, true>  $readArchiveSets
+     * @param  array<string, bool>  $readArchiveSets
      */
     private function runDeferredArchiveNameChecks(ReleaseProcessingContext $context, array $readArchiveSets): void
     {
         if ($context->releaseHasPassword || $context->seasonPack || ! $context->seasonPackProbable
-            || $context->archiveListingIncomplete || $context->workPlan === null
+            || $context->archiveListingIncomplete || $context->archiveNameEvidenceIncomplete || $context->workPlan === null
         ) {
             return;
         }
 
         foreach ($context->workPlan->archiveCandidates as $candidate) {
-            if (! isset($readArchiveSets[$context->workPlan->setKeyOf($candidate)])) {
+            if (($readArchiveSets[$context->workPlan->setKeyOf($candidate)] ?? false) !== true) {
                 return;
             }
         }
@@ -797,7 +803,7 @@ class ReleaseProcessor
 
     /**
      * @param  list<string>  $triedCompressedMids
-     * @param  array<string, true>  $readArchiveSets
+     * @param  array<string, bool>  $readArchiveSets
      */
     private function processNzbCompressedFiles(
         ReleaseProcessingContext $context,
@@ -921,7 +927,7 @@ class ReleaseProcessor
 
     /**
      * @param  list<string>  $tailMessageIds
-     * @param  array<string, true>  $readArchiveSets
+     * @param  array<string, bool>  $readArchiveSets
      */
     private function processArchiveData(
         ReleaseProcessingContext $context,
@@ -947,14 +953,51 @@ class ReleaseProcessor
             );
         }
 
-        if ($source !== null && $context->workPlan !== null
-            && ! $context->archiveListingIncomplete
-            && ($listing['success'] || isset($listing['standaloneVideoType']))
-        ) {
-            $readArchiveSets[$context->workPlan->setKeyOf($source)] = true;
+        $partialListing = $context->archiveListingIncomplete || $this->hasPartialArchiveListing($listing, $archiveData);
+        if ($source !== null && $context->workPlan !== null) {
+            $key = $context->workPlan->setKeyOf($source);
+            if ($partialListing) {
+                $readArchiveSets[$key] = false;
+            } elseif (! array_key_exists($key, $readArchiveSets) && ! $context->archiveNameEvidenceIncomplete
+                && ($listing['success'] || isset($listing['standaloneVideoType']))
+            ) {
+                $readArchiveSets[$key] = true;
+            }
+            $partialListing = $partialListing || ($readArchiveSets[$key] ?? true) === false;
         }
 
-        return $this->handleArchiveResult($listing, $archiveData, $context, $reverse, $archiveTitle, $source);
+        return $this->handleArchiveResult($listing, $archiveData, $context, $reverse, $archiveTitle, $source, $partialListing);
+    }
+
+    /** @param array<string, mixed> $listing */
+    private function hasPartialArchiveListing(array $listing, string $data): bool
+    {
+        if (($listing['dataSummary']['main_type'] ?? null) === ArchiveInfo::TYPE_RAR
+            && ($listing['rarListingComplete'] ?? false) !== true
+        ) {
+            return true;
+        }
+        // A successful volume listing need not include the other episodes in its set.
+        if (! empty($listing['dataSummary']['is_volume'])) {
+            return true;
+        }
+        foreach ($listing['files'] ?? [] as $file) {
+            if (! empty($file['split']) || ! empty($file['split_before']) || ! empty($file['split_after'])) {
+                return true;
+            }
+            // Decoded 7z lists have an explicit completeness result instead of byte offsets.
+            if (! empty($listing['listingOnly']) && ($listing['dataSummary']['main_type'] ?? null) === ArchiveInfo::TYPE_SZIP) {
+                continue;
+            }
+            // Nested offsets use another buffer, and missing bounds cannot prove completeness.
+            if (($file['source'] ?? null) !== ArchiveInfo::MAIN_SOURCE || ! is_int($file['next_offset'] ?? null)
+                || $file['next_offset'] < 0 || $file['next_offset'] > strlen($data)
+            ) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -1006,6 +1049,7 @@ class ReleaseProcessor
         bool $reverse,
         string $archiveTitle,
         ?ArchiveCandidate $source,
+        bool $partialListing = false,
     ): bool {
         if ($result['hasPassword']) {
             $context->releaseHasPassword = true;
@@ -1047,6 +1091,15 @@ class ReleaseProcessor
         }
 
         $files = is_array($result['files'] ?? null) ? $result['files'] : [];
+        if ($partialListing || $context->archiveListingIncomplete || $this->hasPartialArchiveListing($result, $compressedData)) {
+            foreach ($files as $file) {
+                if (SeasonPackDetector::isEpisodeName(basename(str_replace('\\', '/', (string) ($file['name'] ?? ''))))) {
+                    $context->archiveNameEvidenceIncomplete = true;
+
+                    break;
+                }
+            }
+        }
         $this->noteArchiveListing($context, $files);
         if (! $reverse && $files !== [] && $context->defersArchiveNameChecks()) {
             $context->firstArchiveFiles ??= $files;

@@ -2,7 +2,7 @@
 
 ## Qualify upstream archive synchronization (2026-10-15)
 
-- [ ] Run the full integrated PHPUnit/native retest on final synchronized master, including real Linux 7-Zip compressed/encrypted-header fixtures, archive naming, claim/provenance and publication guards, and tmux/updater behavior. Bounded private SQLite and fake-client checks do not complete this gate.
+- [ ] Run the full integrated PHPUnit/native retest on final synchronized master, including RAR4/RAR5 terminal and more-volume evidence, exact-boundary and partial-header prefixes, incomplete 7-Zip episode naming, real Linux 7-Zip compressed/encrypted-header fixtures, the native stored-sample preview with FFmpeg/FFprobe, fresh Redis cached-config preflight, archive naming, claim/provenance and publication guards, and tmux/updater behavior. The native `it_lists_real_7z_archives_with_compressed_headers` and `it_takes_a_preview_from_a_sample_stored_in_an_archive_without_extracting_it` checks remain unverified. Bounded private SQLite and fake-client checks do not complete this gate.
 
 ## Qualify preparation statement reuse (2026-10-15)
 

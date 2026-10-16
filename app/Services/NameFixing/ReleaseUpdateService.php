@@ -267,7 +267,7 @@ class ReleaseUpdateService
         }
         if (! $update) {
             $currentTitle = $this->currentPredbTitle($predbId, $title, $filenameEvidence);
-            if ($currentTitle === null) {
+            if ($currentTitle === null || $this->renamesSeasonPackToEpisode((string) $release->searchname, $currentTitle)) {
                 return;
             }
             $title = $currentTitle;
@@ -659,7 +659,8 @@ class ReleaseUpdateService
         $write = function (?string $canonicalTitle = null) use ($release, $releaseId, $newTitle, $type, $nameStatus, $preId, $expectedSnapshot, $attempt, &$completedSnapshot): bool {
             $newTitle = $canonicalTitle ?? $newTitle;
             $actualRelease = DB::table('releases')->where('id', $releaseId)->lockForUpdate()->first();
-            if ($actualRelease === null) {
+            if ($actualRelease === null
+                || ($preId > 0 && $this->renamesSeasonPackToEpisode((string) $actualRelease->searchname, $newTitle))) {
                 return false;
             }
             $completedSnapshot = $this->completedReleaseSnapshot($actualRelease, $newTitle);

@@ -1687,7 +1687,8 @@ class ReleaseProcessorTest extends TestCase
     }
 
     #[Test]
-    public function it_still_stops_at_the_first_listed_archive_set_of_a_movie(): void
+    #[DataProvider('movieArchiveVolumes')]
+    public function it_still_stops_at_the_first_listed_archive_set_of_a_movie(bool $splitVolume): void
     {
         $config = $this->makeConfig(['processPasswords' => true]);
         $nzbParser = Mockery::mock(NzbContentParser::class);
@@ -1697,15 +1698,24 @@ class ReleaseProcessorTest extends TestCase
         ]]);
         $downloadService = Mockery::mock(UsenetDownloadService::class);
         $this->expectDownloadScope($downloadService);
-        $downloadService->shouldReceive('download')->once()
-            ->andReturn(['success' => true, 'data' => $this->rar('Movie.2026.1080p.BluRay-GRP.cd1.mkv', str_repeat('x', 100)), 'groupUnavailable' => false, 'error' => null]);
+        $downloadService->shouldReceive('download')
+            ->andReturn(['success' => true, 'data' => $splitVolume
+                ? $this->rarVolume('Movie.2026.1080p.BluRay-GRP.cd1.mkv', str_repeat('x', 100), 200, false, true)
+                : $this->rar('Movie.2026.1080p.BluRay-GRP.cd1.mkv', str_repeat('x', 100)), 'groupUnavailable' => false, 'error' => null]);
 
         $context = $this->makeContext();
         $context->release->nfostatus = 1;
         $this->seasonPackProcessor($config, $nzbParser, $downloadService, $this->countingReleaseManager())->process($context, '/tmp/main/');
 
         $this->assertFalse($context->seasonPack);
+        $this->assertFalse($context->defersArchiveNameChecks());
         $this->assertSame(1, $context->totalFileInfo);
+    }
+
+    /** @return array<string, array{bool}> */
+    public static function movieArchiveVolumes(): array
+    {
+        return ['complete archive' => [false], 'split volume' => [true]];
     }
 
     #[Test]
@@ -1721,7 +1731,8 @@ class ReleaseProcessorTest extends TestCase
         $this->expectDownloadScope($downloadService);
         $downloadService->shouldReceive('download')->twice()->andReturnUsing(fn (DownloadKind $kind, array $ids): array => [
             'success' => true,
-            'data' => $this->rar($ids === ['<episode>'] ? 'Show.S01E05.1080p.WEB-DL-GRP.mkv' : 'Show.S01E05.1080p.WEB-DL-GRP.en.srt', str_repeat('x', 100)),
+            'data' => $this->rar($ids === ['<episode>'] ? 'Show.S01E05.1080p.WEB-DL-GRP.mkv' : 'Show.S01E05.1080p.WEB-DL-GRP.en.srt', str_repeat('x', 100))
+                .pack('v', crc32("\x7b\x00\x00\x07\x00") & 0xFFFF)."\x7b\x00\x00\x07\x00",
             'groupUnavailable' => false,
             'error' => null,
         ]);
@@ -1811,6 +1822,88 @@ class ReleaseProcessorTest extends TestCase
             'set limit leaves a later archive unread' => ['unreadable', 1, 2, ['<episode>']],
             'download limit leaves a third archive unread' => ['unreadable', 2, 3, ['<episode>', '<later>']],
         ];
+    }
+
+    #[Test]
+    #[DataProvider('unsafeArchiveNamingEvidence')]
+    public function it_preserves_pack_naming_when_archive_evidence_is_partial_or_alternate(string $case): void
+    {
+        $config = $this->makeConfig(['processPasswords' => true, 'archiveProbeFiles' => 0]);
+        $episode = 'Show.S01E01.1080p.WEB-DL-GRP.mkv';
+        $first = $this->rar($episode, 'video');
+        $second = $this->rar('extras.txt', 'extras');
+        if ($case === 'split volume') {
+            $first = $this->rarVolume($episode, 'start', 100, false, true);
+        } elseif ($case === 'name overflow') {
+            for ($index = 1; $index < 500; $index++) {
+                $first .= substr($this->rar('extra-'.$index.'.txt', 'extra'), 20);
+            }
+            $first .= substr($this->rar('Show.S01E02.1080p.WEB-DL-GRP.mkv', 'video'), 20);
+        } else {
+            [$one, $two] = match ($case) {
+                'x episodes' => ['1x01', '1x02'],
+                'year season' => ['S2024E01', 'S2024E02'],
+                'episode word' => ['Episode.1', 'Episode.2'],
+                'short episode' => ['EP01', 'EP02'],
+                default => ['E01', 'E02'],
+            };
+            $first = $this->rar('Show.'.$one.'.1080p.WEB-DL-GRP.mkv', 'video');
+            $second = $this->rar('Show.'.$two.'.1080p.WEB-DL-GRP.mkv', 'video');
+        }
+        $parser = Mockery::mock(NzbContentParser::class);
+        $parser->shouldReceive('parseNzb')->once()->andReturn(['error' => null, 'contents' => [
+            ['title' => '"a1b2c3d4.part01.rar" yEnc (1/2)', 'segments' => ['<first>']],
+            ['title' => '"a1b2c3d4.part02.rar" yEnc (1/2)', 'segments' => ['<continuation>']],
+            ['title' => '"e5f6a7b8.rar" yEnc (1/1)', 'segments' => ['<second>']],
+        ]]);
+        $downloads = Mockery::mock(UsenetDownloadService::class);
+        $this->expectDownloadScope($downloads);
+        $downloads->shouldReceive('download')->twice()->andReturnUsing(static fn (DownloadKind $kind, array $ids): array => [
+            'success' => true, 'data' => $ids === ['<first>'] ? $first : $second,
+            'groupUnavailable' => false, 'error' => null,
+        ]);
+        $manager = $this->countingReleaseManager();
+        $renames = [];
+        $manager->shouldReceive('matchFileNamesToPreDb')->andReturnUsing(static function (array $files) use (&$renames): void {
+            $renames[] = $files[0]['name'];
+        });
+        $context = $this->makeContext();
+        $context->release->nfostatus = 1;
+
+        $this->seasonPackProcessor($config, $parser, $downloads, $manager)->process($context, '/tmp/main/');
+
+        $this->assertSame([], $renames);
+        $this->assertTrue($context->defersArchiveNameChecks());
+        $this->assertLessThanOrEqual(500, count($context->archiveFileNames));
+    }
+
+    /** @return array<string, array{string}> */
+    public static function unsafeArchiveNamingEvidence(): array
+    {
+        return array_combine(
+            $cases = ['split volume', 'name overflow', 'x episodes', 'year season', 'episode word', 'short episode', 'bare episode'],
+            array_map(static fn (string $case): array => [$case], $cases),
+        );
+    }
+
+    #[Test]
+    public function archive_name_evidence_is_complete_at_the_cap_but_not_after_overflow(): void
+    {
+        $context = $this->makeContext();
+        $files = array_map(static fn (int $index): array => ['name' => 'file-'.$index.'.txt'], range(1, 500));
+        $context->rememberArchiveFileNames($files);
+        $this->assertCount(500, $context->archiveFileNames);
+        $this->assertFalse($context->defersArchiveNameChecks());
+        $context->rememberArchiveFileNames([$files[0]]);
+        $this->assertFalse($context->defersArchiveNameChecks());
+
+        $context->rememberArchiveFileNames([['name' => 'Show.S01E02.mkv']]);
+
+        $this->assertCount(500, $context->archiveFileNames);
+        $this->assertTrue($context->defersArchiveNameChecks());
+        $context->reset();
+        $this->assertSame([], $context->archiveFileNames);
+        $this->assertFalse($context->defersArchiveNameChecks());
     }
 
     /**

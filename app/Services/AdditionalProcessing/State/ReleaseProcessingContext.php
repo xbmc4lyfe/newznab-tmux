@@ -105,6 +105,9 @@ class ReleaseProcessingContext
     /** One episode was listed from a release with several archive sets; the rest of the season may follow. */
     public bool $seasonPackProbable = false;
 
+    /** Archive naming evidence is partial, omitted, or cannot be classified safely. */
+    public bool $archiveNameEvidenceIncomplete = false;
+
     /** @var list<string> names listed from every archive read for this release */
     public array $archiveFileNames = [];
 
@@ -338,6 +341,7 @@ class ReleaseProcessingContext
         $this->workPlan = null;
         $this->seasonPack = false;
         $this->seasonPackProbable = false;
+        $this->archiveNameEvidenceIncomplete = false;
         $this->archiveFileNames = [];
         $this->firstArchiveFiles = null;
         $this->reverseArchiveSummary = null;
@@ -378,7 +382,12 @@ class ReleaseProcessingContext
     {
         foreach ($files as $file) {
             $name = (string) ($file['name'] ?? '');
-            if ($name === '' || count($this->archiveFileNames) >= self::MAX_ARCHIVE_FILE_NAMES || in_array($name, $this->archiveFileNames, true)) {
+            if ($name === '' || in_array($name, $this->archiveFileNames, true)) {
+                continue;
+            }
+            if (count($this->archiveFileNames) >= self::MAX_ARCHIVE_FILE_NAMES) {
+                $this->archiveNameEvidenceIncomplete = true;
+
                 continue;
             }
             $this->archiveFileNames[] = $name;
@@ -391,7 +400,7 @@ class ReleaseProcessingContext
      */
     public function defersArchiveNameChecks(): bool
     {
-        return $this->seasonPack || $this->seasonPackProbable;
+        return $this->seasonPack || $this->seasonPackProbable || $this->archiveNameEvidenceIncomplete;
     }
 
     /**
