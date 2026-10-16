@@ -17,7 +17,7 @@ use RuntimeException;
 
 final class NameFixingQueryService
 {
-    public const PREDB_IDENTITY_POLICY = '60352d14a81c11e037605b48cf33bc251b978fd2e1078819f8a4f7f6d1a7b282';
+    public const PREDB_IDENTITY_POLICY = 'dff26e2821d76963df052e8c27f9b5db2fab767de5ee7ee9f75949e961f11a27';
 
     public const SOURCE_NFO = 'nfo';
 
@@ -92,9 +92,14 @@ final class NameFixingQueryService
             $sources[] = '(r.'.$column.' = 0 AND ('.$sourceCondition.'))';
         }
 
+        $categoryScope = (string) config('tmux.fix_names.category', 'other');
+        $categoryFilter = $categoryScope === 'all'
+            ? ''
+            : ' AND r.categories_id IN ('.implode(',', Category::OTHERS_GROUP).')';
+
         $condition = 'r.predb_id = 0 AND (r.isrenamed = 0 OR r.categories_id IN ('
             .Category::OTHER_MISC.', '.Category::OTHER_HASHED.'))'
-            .' AND r.categories_id IN ('.implode(',', Category::OTHERS_GROUP).')'
+            .$categoryFilter
             .' AND (CASE WHEN r.proc_par2 = 0 AND ('.self::SOURCE_EXISTS[self::SOURCE_PAR2].') THEN 1'
             .' WHEN '.implode(' OR ', $sources).' THEN 1 ELSE 0 END = 1)';
 
@@ -126,7 +131,14 @@ final class NameFixingQueryService
             $ceiling = ' AND r.id <= ?';
             $bindings[] = $throughId;
         }
-        $bindings[] = max(1, $limit);
+        $batchLimit = $limit;
+        if ($limit === self::BATCH_SIZE) {
+            $configuredLimit = config('tmux.fix_names.batch_limit');
+            if ($configuredLimit !== null && (int) $configuredLimit > 0) {
+                $batchLimit = (int) $configuredLimit;
+            }
+        }
+        $bindings[] = max(1, $batchLimit);
 
         return $this->database->select(
             "SELECT r.id AS releases_id, r.id, r.name, r.searchname, r.fromname, r.groups_id,
@@ -166,6 +178,10 @@ final class NameFixingQueryService
     public function standardCandidateBatch(string $leftGuid, int $limit, ?int $beforeId = null): array
     {
         $cursor = $beforeId === null ? '' : ' AND r.id < ?';
+        $categoryScope = (string) config('tmux.fix_names.category', 'other');
+        $categoryFilter = $categoryScope === 'all'
+            ? ''
+            : ' AND r.categories_id IN ('.implode(',', Category::OTHERS_GROUP).')';
         $bindings = [$leftGuid, CarbonImmutable::now()->toDateTimeString()];
         if ($beforeId !== null) {
             $bindings[] = $beforeId;
@@ -193,7 +209,7 @@ final class NameFixingQueryService
                     WHERE hr.releases_id = r.id AND HEX(hr.release_guid) = HEX(r.guid) AND hr.retry_at > ?))
                 OR r.proc_crc32 = 0
              )
-             AND r.categories_id IN ('.implode(',', Category::OTHERS_GROUP).')'.$cursor.'
+             '.$categoryFilter.$cursor.'
              ORDER BY r.id DESC
              LIMIT ?',
             $bindings
@@ -223,9 +239,9 @@ final class NameFixingQueryService
     {
         $filter = match ($source) {
             self::SOURCE_FILES => '',
-            self::SOURCE_SRR => " AND (rf.name LIKE '%.srr' OR rf.name LIKE '%.srs')",
+            self::SOURCE_SRR => " AND (rf.name LIKE '%%.srr' OR rf.name LIKE '%%.srs')",
             self::SOURCE_CRC => " AND rf.crc32 IS NOT NULL AND rf.crc32 != ''",
-            self::SOURCE_XXX => " AND rf.name LIKE '%SDPORN%'",
+            self::SOURCE_XXX => " AND rf.name LIKE '%%SDPORN%%'",
             default => throw new InvalidArgumentException("Unsupported release-file source [{$source}]."),
         };
 

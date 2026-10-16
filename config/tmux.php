@@ -36,6 +36,9 @@ return [
     'fix_names' => [
         'full_backlog' => (bool) env('TMUX_FIX_NAMES_FULL_BACKLOG', true),
         'full_backlog_interval_minutes' => (int) env('TMUX_FIX_NAMES_FULL_INTERVAL', 60),
+        'batch_limit' => (int) env('TMUX_FIX_NAMES_BATCH_LIMIT', 1000),
+        'category' => (string) env('TMUX_FIX_NAMES_CATEGORY', 'other'),
+        'par2_scheduled' => (bool) env('TMUX_FIX_NAMES_PAR2_SCHEDULED', false),
         'predbft' => (bool) env('TMUX_FIX_NAMES_PREDBFT', true),
         // Run the PreDB full-text pass from the scheduler every five minutes (routes/console.php) instead of at the
         // end of the tmux cycle, where slow passes starve it. While this is on, the tmux cycle skips the pass, so

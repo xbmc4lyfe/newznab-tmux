@@ -20,6 +20,7 @@ class FixReleaseNames extends Command
                                  {--update : Actually update the names, otherwise just display results}
                                  {--category=other : Category to process: "other", "all", or "predb_id"}
                                  {--set-status : Set releases as checked after processing}
+                                 {--limit=1000 : Candidate batch limit per pass}
                                  {--show : Display detailed release changes rather than just counters}';
 
     /**
@@ -38,6 +39,12 @@ class FixReleaseNames extends Command
         $update = (bool) $this->option('update');
         $setStatus = (bool) $this->option('set-status');
         $show = $this->option('show');
+
+        $limitOption = $this->option('limit');
+        if ($limitOption !== null && $limitOption !== '') {
+            $limit = max(1, (int) $limitOption);
+            config(['tmux.fix_names.batch_limit' => $limit]);
+        }
 
         // Set category option
         $categoryOption = $this->option('category');
@@ -161,6 +168,7 @@ class FixReleaseNames extends Command
         $this->info('  --update           Actually update the names (default: only display potential changes)');
         $this->info('  --category=VALUE   Process "other" categories (default), "all" categories, or "predb_id" for unmatched');
         $this->info('  --set-status       Mark releases as checked so they won\'t be processed again');
+        $this->info('  --limit=VALUE      Candidate batch limit per pass (default from TMUX_FIX_NAMES_BATCH_LIMIT or 1000)');
         $this->info('  --show             Display detailed release changes (default: only show counters)');
         $this->info('');
     }

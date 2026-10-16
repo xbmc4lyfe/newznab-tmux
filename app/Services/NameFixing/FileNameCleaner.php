@@ -15,7 +15,7 @@ use App\Traits\DetectsHashedNames;
  */
 class FileNameCleaner
 {
-    public const PREDB_IDENTITY_POLICY = '3cc5cfe848ed5a685bda1c95998bb113f4e25e6caacfc17c87dd990b6c8286b4';
+    public const PREDB_IDENTITY_POLICY = '65afde111b1c96db73695c3268de2caa001a9a46b6bf0dfb0bc04580b8ea9235';
 
     use DetectsHashedNames;
 
@@ -240,17 +240,19 @@ class FileNameCleaner
         $fileName = preg_replace('/[\.\-_](sample|proof|subs?|thumbs?|cover|screens?)[\.\-_]?$/i', '', $fileName);
 
         // Remove archive extensions
-        foreach (self::ARCHIVE_PATTERNS as $pattern) {
-            $fileName = preg_replace($pattern, '', $fileName);
-        }
+        if (str_contains($fileName, '.')) {
+            foreach (self::ARCHIVE_PATTERNS as $pattern) {
+                $fileName = preg_replace($pattern, '', $fileName);
+            }
 
-        // Remove media extensions
-        $fileName = preg_replace(self::VIDEO_EXTENSIONS, '', $fileName);
-        $fileName = preg_replace(self::AUDIO_EXTENSIONS, '', $fileName);
-        $fileName = preg_replace(self::IMAGE_EXTENSIONS, '', $fileName);
-        $fileName = preg_replace(self::EBOOK_EXTENSIONS, '', $fileName);
-        $fileName = preg_replace(self::GAMEAPP_EXTENSIONS, '', $fileName);
-        $fileName = preg_replace(self::SUBTITLE_EXTENSIONS, '', $fileName);
+            // Remove media extensions
+            $fileName = preg_replace(self::VIDEO_EXTENSIONS, '', $fileName);
+            $fileName = preg_replace(self::AUDIO_EXTENSIONS, '', $fileName);
+            $fileName = preg_replace(self::IMAGE_EXTENSIONS, '', $fileName);
+            $fileName = preg_replace(self::EBOOK_EXTENSIONS, '', $fileName);
+            $fileName = preg_replace(self::GAMEAPP_EXTENSIONS, '', $fileName);
+            $fileName = preg_replace(self::SUBTITLE_EXTENSIONS, '', $fileName);
+        }
 
         // Remove part/volume indicators
         $fileName = preg_replace('/[\.\-_]?(part|vol|cd|dvd|disc|disk)\d*$/i', '', $fileName);
@@ -399,13 +401,23 @@ class FileNameCleaner
         }
 
         // Check for valid release indicators
-        $hasGroupSuffix = (bool) preg_match('/[-.][A-Za-z0-9]{2,}$/', $t);
-        $hasYear = (bool) preg_match('/\b(19|20)\d{2}\b/', $t);
-        $hasQuality = (bool) preg_match('/\b(480p|720p|1080p|2160p|4k|webrip|web[ .-]?dl|bluray|bdrip|dvdrip|hdtv|hdrip|xvid|x264|x265|hevc|h\.?264|ts|cam|r5|proper|repack)\b/i', $t);
+        if (preg_match('/[-.][A-Za-z0-9]{2,}$/', $t)) {
+            return true;
+        }
         $hasTV = (bool) preg_match('/\bS\d{1,2}[Eex]\d{1,3}\b/i', $t) || SeasonPackDetector::isSeasonPack($t);
-        $hasXXX = (bool) preg_match('/\bXXX\b/i', $t);
+        $hasQuality = (bool) preg_match('/\b(480p|720p|1080p|2160p|4k|webrip|web[ .-]?dl|bluray|bdrip|dvdrip|hdtv|hdrip|xvid|x264|x265|hevc|h\.?264|ts|cam|r5|proper|repack)\b/i', $t);
+        if ($hasTV && $hasQuality) {
+            return true;
+        }
+        $hasYear = (bool) preg_match('/\b(19|20)\d{2}\b/', $t);
+        if ($hasYear && ($hasQuality || $hasTV)) {
+            return true;
+        }
+        if (preg_match('/\bXXX\b/i', $t)) {
+            return true;
+        }
 
-        return $hasGroupSuffix || ($hasTV && $hasQuality) || ($hasYear && ($hasQuality || $hasTV)) || $hasXXX || $hasQuality || $hasTV;
+        return $hasQuality || $hasTV;
     }
 
     /**
