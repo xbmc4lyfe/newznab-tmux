@@ -328,7 +328,7 @@ function yencBenchmarkSourceHashes(string $root): array
 
 /**
  * @param  array<string, mixed>  $options
- * @return int 1: demonstrated regression; 2: invalid run; 0: improvement or inconclusive.
+ * @return int 0: every stratum demonstrates useful improvement; 1: regression or inconclusive; 2: invalid run.
  */
 function runPairedYencBenchmark(array $options, int $samples): int
 {
@@ -488,7 +488,7 @@ function runPairedYencBenchmark(array $options, int $samples): int
             'rust_speed_advantage_demonstrated_for_every_stratum' => ! $invalid && $allImproved,
             'strata' => count($summaries), 'claim_limit' => $protocol['claim_limit']]);
 
-        return $invalid ? 2 : ($regressed ? 1 : 0);
+        return $invalid ? 2 : ($allImproved ? 0 : 1);
     } catch (Throwable $exception) {
         $emit(['type' => 'run_failure', 'status' => 'invalid', 'error_class' => $exception::class, 'error' => $exception->getMessage()]);
 
