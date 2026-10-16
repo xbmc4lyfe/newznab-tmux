@@ -36,8 +36,8 @@ jobs:
           extensions: dom, curl, ffi, intl, libxml, mbstring, zip, pcntl, pdo, pdo_mysql, sqlite, pdo_sqlite
           coverage: none
 
-      - name: Install archive and PAR2 verification tools
-        run: sudo apt-get update -qq && sudo apt-get install -y par2 unrar
+      - name: Install archive, PAR2 verification, and task runner tools
+        run: sudo apt-get update -qq && sudo apt-get install -y par2 unrar just
 
       - name: Copy env file
         run:

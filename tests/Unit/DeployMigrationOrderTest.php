@@ -513,8 +513,8 @@ SH);
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         file_put_contents($this->directory.'/events', '');
 
-        mkdir($this->directory.'/app/Services/Tmux', 0777, true);
-        file_put_contents($this->directory.'/app/Services/Tmux/TmuxSessionManager.php', "<?php\n");
+        mkdir($this->directory.'/app/Services/Backfill', 0777, true);
+        file_put_contents($this->directory.'/app/Services/Backfill/BackfillService.php', "<?php\n");
 
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         $events = $this->events();
@@ -530,7 +530,7 @@ SH);
         $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 indexer', $events);
     }
 
-    public function test_horizon_only_changes_rebuild_stop_and_recreate_only_horizon(): void
+    public function test_horizon_config_changes_rebuild_stop_and_recreate_web_and_horizon_without_draining_scheduler_or_indexer(): void
     {
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         file_put_contents($this->directory.'/events', '');
@@ -540,15 +540,15 @@ SH);
 
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         $events = $this->events();
+        $this->assertStringContainsString('build --target selfhosted-web', $events);
         $this->assertStringContainsString('build --target selfhosted-horizon', $events);
-        $this->assertStringNotContainsString('build --target selfhosted-web', $events);
         $this->assertStringNotContainsString('build --target selfhosted-scheduler', $events);
         $this->assertStringNotContainsString('build --target selfhosted-indexer', $events);
         $this->assertStringContainsString(' stop --timeout 1920 horizon', $events);
         $this->assertStringNotContainsString('scheduler.py drain', $events);
         $this->assertStringNotContainsString('tmux:drain', $events);
         $this->assertStringNotContainsString('artisan migrate', $events);
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 horizon', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon', $events);
     }
 
     public function test_migration_changes_trigger_full_writer_quiesce_and_artisan_migrate(): void

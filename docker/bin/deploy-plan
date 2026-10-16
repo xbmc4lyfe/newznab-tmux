@@ -103,7 +103,6 @@ WEB_ONLY_EXACT = {
     "config/google2fa.php",
     "config/passkeys.php",
     "config/tinymce.php",
-    "config/trustedproxy.php",
 }
 
 WEB_ONLY_PREFIXES = (
@@ -115,9 +114,7 @@ WEB_ONLY_PREFIXES = (
     "resources/js/",
 )
 
-HORIZON_ONLY_EXACT = {
-    "config/horizon.php",
-}
+HORIZON_ONLY_EXACT: set[str] = set()
 
 HORIZON_ONLY_PREFIXES: tuple[str, ...] = ()
 
@@ -127,17 +124,17 @@ SCHEDULER_ONLY_EXACT = {
     "app/Console/Commands/PredbImportFeed.php",
     "app/Console/Commands/WarmAdminDashboard.php",
     "app/Console/Commands/CollectStats.php",
-    "app/Console/Commands/DeleteUnverifiedUsers.php",
-    "app/Console/Commands/UpdateExpiredRoles.php",
+    "app/Console/Commands/NntmuxDeleteUnVerifiedUsers.php",
+    "app/Console/Commands/NntmuxUpdateExpiredRoles.php",
     "app/Console/Commands/DisableExpiredPromotions.php",
     "app/Console/Commands/DisableExpiredRegistrationPeriods.php",
     "app/Console/Commands/CloudflareReload.php",
     "app/Console/Commands/PurgeExpiredGdprExports.php",
-    "app/Console/Commands/PopulateSteamApps.php",
-    "app/Console/Commands/MetricsCollect.php",
-    "app/Console/Commands/MonitoringExportMetrics.php",
+    "app/Console/Commands/NntmuxPopulateSteamApps.php",
+    "app/Console/Commands/CollectSystemMetrics.php",
+    "app/Console/Commands/ExportMonitoringMetrics.php",
     "app/Console/Commands/CheckServiceHealth.php",
-    "app/Console/Commands/SearchRepair.php",
+    "app/Console/Commands/NntmuxSearchRepair.php",
     "app/Console/Commands/IndexLogs.php",
     "app/Console/Commands/PrepareReleaseCandidates.php",
     "app/Console/Commands/VerifyReleaseCandidates.php",
@@ -151,7 +148,7 @@ INDEXER_ONLY_EXACT = {
     "config/tmux.conf",
     "app/Services/IRCClient.php",
     "app/Services/IRCScraper.php",
-    "app/Console/Commands/NntmuxIrcScraper.php",
+    "app/Console/Commands/IrcScraperCommand.php",
     "app/Console/Commands/ProcessPostProcess.php",
     "app/Console/Commands/ProcessReleasesCommand.php",
     "app/Console/Commands/ProcessReleasesMulti.php",
@@ -159,7 +156,6 @@ INDEXER_ONLY_EXACT = {
     "app/Console/Commands/ProcessUpdatePerGroup.php",
     "app/Console/Commands/TmuxAttach.php",
     "app/Console/Commands/TmuxDrain.php",
-    "app/Console/Commands/TmuxHealthCheck.php",
     "app/Console/Commands/TmuxMonitor.php",
     "app/Console/Commands/TmuxStart.php",
     "app/Console/Commands/TmuxStop.php",
@@ -172,7 +168,6 @@ INDEXER_ONLY_EXACT = {
 
 INDEXER_ONLY_PREFIXES = (
     "app/Services/Backfill/",
-    "app/Services/Tmux/",
 )
 
 
@@ -222,16 +217,20 @@ def classify_path(rel_path: str) -> tuple[str, ...]:
     if rel_path.startswith("database/migrations/"):
         return ("migrations", "shared-app")
 
-    # Web routes are also used by queued notifications/mailers running in Horizon
-    if rel_path == "routes/web.php":
+    # Web routes and Horizon dashboard config affect both web and Horizon
+    if rel_path in ("routes/web.php", "config/horizon.php"):
         return ("web", "horizon")
 
-    # Shared PreDB feed and release-runner/script paths used by both scheduler and indexer
+    # Trusted proxy config is used by web middleware and by scheduler's cloudflare:reload command
+    if rel_path == "config/trustedproxy.php":
+        return ("web", "scheduler")
+
+    # Shared PreDB feed, tmux health/session services, and release-runner/script paths used by both scheduler and indexer
     if (
-        rel_path == "config/predb_feeds.php"
+        rel_path in ("config/predb_feeds.php", "app/Console/Commands/TmuxHealthCheck.php")
         or rel_path.startswith("app/Services/Predb/Feeds/")
         or rel_path.startswith("app/Services/Runners/")
-        or rel_path.startswith("app/Services/Tmux/Scripts/")
+        or rel_path.startswith("app/Services/Tmux/")
     ):
         return ("scheduler", "indexer")
 
