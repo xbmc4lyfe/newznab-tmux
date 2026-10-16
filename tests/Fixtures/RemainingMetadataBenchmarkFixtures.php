@@ -47,11 +47,12 @@ final class RemainingMetadataBenchmarkFixtures
         if ($definition['module'] === 'article_dates') {
             $missing = self::dateSource('missing', []);
             $valid = self::dateCandidate('valid', 1704067200, [1]);
-            $expected = ['date' => self::dateSource('valid', [$valid]), 'injection_date' => $missing, 'legacy_nntp_posting_date' => $missing];
+            $expected = ['date' => self::dateSource('valid', [$valid]), 'injection_date' => $missing, 'legacy_nntp_posting_date' => $missing, 'expires' => $missing];
             if ($name === 'dates-ordinary') {
-                $fixture['raw_headers'] = ["Date: Mon, 01 Jan 2024 00:00:00 +0000\r\n", "Injection-Date: 01 Jan 2024 01:00:00 +0000\r\n", "NNTP-Posting-Date: 31 Dec 2023 19:00:00 -0500\r\n"];
+                $fixture['raw_headers'] = ["Date: Mon, 01 Jan 2024 00:00:00 +0000\r\n", "Injection-Date: 01 Jan 2024 01:00:00 +0000\r\n", "NNTP-Posting-Date: 31 Dec 2023 19:00:00 -0500\r\n", "Expires: 02 Jan 2024 00:00:00 +0000\r\n"];
                 $expected['injection_date'] = self::dateSource('valid', [self::dateCandidate('valid', 1704070800, [2])]);
                 $expected['legacy_nntp_posting_date'] = self::dateSource('valid', [self::dateCandidate('valid', 1704067200, [3])]);
+                $expected['expires'] = self::dateSource('valid', [self::dateCandidate('valid', 1704153600, [4])]);
             } elseif ($name === 'dates-folded') {
                 $fixture['raw_headers'] = ["Subject: folded offline date\r\n", "dAtE: 01 Jan 2024\r\n", "\t00:00 -0000\r\n", "Injection-Date: 01 Jan 2024 00:00:00 GMT\r\n"];
                 $expected['date'] = self::dateSource('valid', [self::dateCandidate('valid', 1704067200, [2, 3])]);
@@ -67,16 +68,52 @@ final class RemainingMetadataBenchmarkFixtures
                 $fixture['raw_headers'] = ["Date: 31 Feb 2024 00:00:00 +0000\r\n", "Injection-Date: 01 Jan 2024 00:00:00 PST\r\n", "NNTP-Posting-Date: 01 Jan 2024 00:00:00 +0000\0\r\n"];
                 $expected = ['date' => self::dateSource('invalid_calendar_or_time', [self::dateCandidate('invalid_calendar_or_time', null, [1])]),
                     'injection_date' => self::dateSource('unsupported_absolute_timezone', [self::dateCandidate('unsupported_absolute_timezone', null, [2])]),
-                    'legacy_nntp_posting_date' => self::dateSource('invalid_octet_or_folding', [self::dateCandidate('invalid_octet_or_folding', null, [3])])];
+                    'legacy_nntp_posting_date' => self::dateSource('invalid_octet_or_folding', [self::dateCandidate('invalid_octet_or_folding', null, [3])]),
+                    'expires' => $missing];
             }
             $tuples = match ($name) {
-                'dates-ordinary' => [['compared', 'valid', 'valid', 3600, 'before'], ['compared', 'valid', 'valid', 0, 'equal'], ['compared', 'valid', 'valid', -3600, 'after']],
-                'dates-folded' => [['compared', 'valid', 'valid', 0, 'equal'], ['source_unavailable', 'valid', 'missing', null, null], ['source_unavailable', 'valid', 'missing', null, null]],
-                'dates-uncommon-duplicates' => [['source_unavailable', 'budget_exceeded', 'missing', null, null], ['source_unavailable', 'budget_exceeded', 'missing', null, null], ['source_unavailable', 'missing', 'missing', null, null]],
-                default => [['source_unavailable', 'invalid_calendar_or_time', 'unsupported_absolute_timezone', null, null], ['source_unavailable', 'invalid_calendar_or_time', 'invalid_octet_or_folding', null, null], ['source_unavailable', 'unsupported_absolute_timezone', 'invalid_octet_or_folding', null, null]],
+                'dates-ordinary' => [
+                    ['compared', 'valid', 'valid', 3600, 'before'],
+                    ['compared', 'valid', 'valid', 0, 'equal'],
+                    ['compared', 'valid', 'valid', -3600, 'after'],
+                    ['compared', 'valid', 'valid', 86400, 'before'],
+                    ['compared', 'valid', 'valid', 82800, 'before'],
+                    ['compared', 'valid', 'valid', 86400, 'before'],
+                ],
+                'dates-folded' => [
+                    ['compared', 'valid', 'valid', 0, 'equal'],
+                    ['source_unavailable', 'valid', 'missing', null, null],
+                    ['source_unavailable', 'valid', 'missing', null, null],
+                    ['source_unavailable', 'valid', 'missing', null, null],
+                    ['source_unavailable', 'valid', 'missing', null, null],
+                    ['source_unavailable', 'missing', 'missing', null, null],
+                ],
+                'dates-uncommon-duplicates' => [
+                    ['source_unavailable', 'budget_exceeded', 'missing', null, null],
+                    ['source_unavailable', 'budget_exceeded', 'missing', null, null],
+                    ['source_unavailable', 'missing', 'missing', null, null],
+                    ['source_unavailable', 'budget_exceeded', 'missing', null, null],
+                    ['source_unavailable', 'missing', 'missing', null, null],
+                    ['source_unavailable', 'missing', 'missing', null, null],
+                ],
+                default => [
+                    ['source_unavailable', 'invalid_calendar_or_time', 'unsupported_absolute_timezone', null, null],
+                    ['source_unavailable', 'invalid_calendar_or_time', 'invalid_octet_or_folding', null, null],
+                    ['source_unavailable', 'unsupported_absolute_timezone', 'invalid_octet_or_folding', null, null],
+                    ['source_unavailable', 'invalid_calendar_or_time', 'missing', null, null],
+                    ['source_unavailable', 'unsupported_absolute_timezone', 'missing', null, null],
+                    ['source_unavailable', 'invalid_octet_or_folding', 'missing', null, null],
+                ],
             };
             $expected['reported_clock_relations'] = array_combine(
-                ['date_to_injection_date', 'date_to_legacy_nntp_posting_date', 'injection_date_to_legacy_nntp_posting_date'],
+                [
+                    'date_to_injection_date',
+                    'date_to_legacy_nntp_posting_date',
+                    'injection_date_to_legacy_nntp_posting_date',
+                    'date_to_expires',
+                    'injection_date_to_expires',
+                    'legacy_nntp_posting_date_to_expires',
+                ],
                 array_map(static fn (array $tuple): array => array_combine(
                     ['comparison_status', 'lhs_parse_status', 'rhs_parse_status', 'rhs_minus_lhs_seconds', 'lhs_order_relative_to_rhs'], $tuple,
                 ), $tuples),
@@ -203,11 +240,11 @@ final class RemainingMetadataBenchmarkFixtures
             throw new RuntimeException('Native metadata wrapper returned null for '.$fixture['module']);
         }
         $projection = match ($fixture['module']) {
-            'article_dates' => array_combine(['date', 'injection_date', 'legacy_nntp_posting_date'], array_map(static function (string $key) use ($full): array {
+            'article_dates' => array_combine(['date', 'injection_date', 'legacy_nntp_posting_date', 'expires'], array_map(static function (string $key) use ($full): array {
                 return ['parse_status' => $full[$key]['parse_status'], 'occurrence_count' => $full[$key]['occurrence_count'],
                     'utc_epoch_seconds' => $full[$key]['utc_epoch_seconds'], 'candidates' => array_map(static fn (array $row): array => self::dateCandidate(
                         $row['parse_status'], $row['utc_epoch_seconds'], $row['source_line_indices']), $full[$key]['candidates'])];
-            }, ['date', 'injection_date', 'legacy_nntp_posting_date'])) + ['reported_clock_relations' => $full['reported_clock_relations']],
+            }, ['date', 'injection_date', 'legacy_nntp_posting_date', 'expires'])) + ['reported_clock_relations' => $full['reported_clock_relations']],
             'article_identity' => ['request_status' => $full['request']['syntax_status'],
                 'head' => self::identityProjection($full['head_message_id']), 'overview' => self::identityProjection($full['overview_message_id']),
                 'overview_article_number' => $full['overview_article_number'],
@@ -247,7 +284,7 @@ final class RemainingMetadataBenchmarkFixtures
         }
 
         $expectedHeaders = match ($name) {
-            'dates-ordinary' => ["Date: Mon, 01 Jan 2024 00:00:00 +0000\r\n", "Injection-Date: 01 Jan 2024 01:00:00 +0000\r\n", "NNTP-Posting-Date: 31 Dec 2023 19:00:00 -0500\r\n"],
+            'dates-ordinary' => ["Date: Mon, 01 Jan 2024 00:00:00 +0000\r\n", "Injection-Date: 01 Jan 2024 01:00:00 +0000\r\n", "NNTP-Posting-Date: 31 Dec 2023 19:00:00 -0500\r\n", "Expires: 02 Jan 2024 00:00:00 +0000\r\n"],
             'dates-folded' => ["Subject: folded offline date\r\n", "dAtE: 01 Jan 2024\r\n", "\t00:00 -0000\r\n", "Injection-Date: 01 Jan 2024 00:00:00 GMT\r\n"],
             'dates-uncommon-duplicates' => self::padHeaders(array_fill(0, 257, "Date: 01 Jan 2024 00:00:00 +0000\r\n")),
             default => ["Date: 31 Feb 2024 00:00:00 +0000\r\n", "Injection-Date: 01 Jan 2024 00:00:00 PST\r\n", "NNTP-Posting-Date: 01 Jan 2024 00:00:00 +0000\0\r\n"],
@@ -282,16 +319,18 @@ final class RemainingMetadataBenchmarkFixtures
             'rhs_minus_lhs_seconds' => $delta, 'lhs_order_relative_to_rhs' => $delta > 0 ? 'before' : ($delta < 0 ? 'after' : 'equal'),
         ];
 
+        $expires = $missing;
         if ($name === 'dates-ordinary') {
             $date = $source('valid', [$candidate("Date: Mon, 01 Jan 2024 00:00:00 +0000\r\n", ' Mon, 01 Jan 2024 00:00:00 +0000', [1], 'valid', 1704067200, '+0000', 0, false, true, false, true)], 1704067200);
             $injection = $source('valid', [$candidate("Injection-Date: 01 Jan 2024 01:00:00 +0000\r\n", ' 01 Jan 2024 01:00:00 +0000', [2], 'valid', 1704070800, '+0000', 0, false, true, false, null)], 1704070800);
             $legacy = $source('valid', [$candidate("NNTP-Posting-Date: 31 Dec 2023 19:00:00 -0500\r\n", ' 31 Dec 2023 19:00:00 -0500', [3], 'valid', 1704067200, '-0500', -300, false, true, false, null)], 1704067200);
-            $relations = [$compared(3600), $compared(0), $compared(-3600)];
+            $expires = $source('valid', [$candidate("Expires: 02 Jan 2024 00:00:00 +0000\r\n", ' 02 Jan 2024 00:00:00 +0000', [4], 'valid', 1704153600, '+0000', 0, false, true, false, null)], 1704153600);
+            $relations = [$compared(3600), $compared(0), $compared(-3600), $compared(86400), $compared(82800), $compared(86400)];
         } elseif ($name === 'dates-folded') {
             $date = $source('valid', [$candidate("dAtE: 01 Jan 2024\r\n\t00:00 -0000\r\n", " 01 Jan 2024\t00:00 -0000", [2, 3], 'valid', 1704067200, '-0000', 0, true, false, false, null)], 1704067200);
             $injection = $source('valid', [$candidate("Injection-Date: 01 Jan 2024 00:00:00 GMT\r\n", ' 01 Jan 2024 00:00:00 GMT', [4], 'valid', 1704067200, 'GMT', 0, false, true, false, null)], 1704067200);
             $legacy = $missing;
-            $relations = [$compared(0), $unavailable('valid', 'missing'), $unavailable('valid', 'missing')];
+            $relations = [$compared(0), $unavailable('valid', 'missing'), $unavailable('valid', 'missing'), $unavailable('valid', 'missing'), $unavailable('valid', 'missing'), $unavailable('missing', 'missing')];
         } elseif ($name === 'dates-uncommon-duplicates') {
             $raw = "Date: 01 Jan 2024 00:00:00 +0000\r\n";
             $dateCandidate = $candidate($raw, ' 01 Jan 2024 00:00:00 +0000', [], 'valid', 1704067200, '+0000', 0, false, true, false, null);
@@ -301,7 +340,7 @@ final class RemainingMetadataBenchmarkFixtures
             }
             $date = $source('budget_exceeded', $candidates, null);
             $injection = $legacy = $missing;
-            $relations = [$unavailable('budget_exceeded', 'missing'), $unavailable('budget_exceeded', 'missing'), $unavailable('missing', 'missing')];
+            $relations = [$unavailable('budget_exceeded', 'missing'), $unavailable('budget_exceeded', 'missing'), $unavailable('missing', 'missing'), $unavailable('budget_exceeded', 'missing'), $unavailable('missing', 'missing'), $unavailable('missing', 'missing')];
         } else {
             $dateStatus = 'invalid_calendar_or_time';
             $injectionStatus = 'unsupported_absolute_timezone';
@@ -309,7 +348,7 @@ final class RemainingMetadataBenchmarkFixtures
             $date = $source($dateStatus, [$candidate("Date: 31 Feb 2024 00:00:00 +0000\r\n", ' 31 Feb 2024 00:00:00 +0000', [1], $dateStatus, null, '+0000', 0, false, true, false, null)], null);
             $injection = $source($injectionStatus, [$candidate("Injection-Date: 01 Jan 2024 00:00:00 PST\r\n", ' 01 Jan 2024 00:00:00 PST', [2], $injectionStatus, null, 'PST', null, null, null, null, null)], null);
             $legacy = $source($legacyStatus, [$candidate("NNTP-Posting-Date: 01 Jan 2024 00:00:00 +0000\0\r\n", " 01 Jan 2024 00:00:00 +0000\0", [3], $legacyStatus, null, null, null, null, null, null, null)], null);
-            $relations = [$unavailable($dateStatus, $injectionStatus), $unavailable($dateStatus, $legacyStatus), $unavailable($injectionStatus, $legacyStatus)];
+            $relations = [$unavailable($dateStatus, $injectionStatus), $unavailable($dateStatus, $legacyStatus), $unavailable($injectionStatus, $legacyStatus), $unavailable($dateStatus, 'missing'), $unavailable($injectionStatus, 'missing'), $unavailable($legacyStatus, 'missing')];
         }
 
         return self::normalizeFullDates([
@@ -317,8 +356,17 @@ final class RemainingMetadataBenchmarkFixtures
             'date' => $date,
             'injection_date' => $injection,
             'legacy_nntp_posting_date' => $legacy,
+            'expires' => $expires,
             'reported_clock_relations' => array_combine(
-                ['date_to_injection_date', 'date_to_legacy_nntp_posting_date', 'injection_date_to_legacy_nntp_posting_date'], $relations,
+                [
+                    'date_to_injection_date',
+                    'date_to_legacy_nntp_posting_date',
+                    'injection_date_to_legacy_nntp_posting_date',
+                    'date_to_expires',
+                    'injection_date_to_expires',
+                    'legacy_nntp_posting_date_to_expires',
+                ],
+                $relations,
             ),
             'interpretation' => 'Absolute header timestamps describe reported composition or injection clocks; they do not measure uploader bandwidth or establish uploader location. A -0000 zone gives UTC time without information about the originating local timezone.',
         ]);
@@ -415,7 +463,7 @@ final class RemainingMetadataBenchmarkFixtures
     {
         $result = [];
         $fields = strlen($headers) > 65536 ? [] : self::fields($headers);
-        foreach (['date' => 'date', 'injection_date' => 'injection-date', 'legacy_nntp_posting_date' => 'nntp-posting-date'] as $key => $name) {
+        foreach (['date' => 'date', 'injection_date' => 'injection-date', 'legacy_nntp_posting_date' => 'nntp-posting-date', 'expires' => 'expires'] as $key => $name) {
             $candidates = [];
             foreach ($fields as $field) {
                 if ($field['name'] !== $name || count($candidates) >= 256) {
@@ -429,7 +477,14 @@ final class RemainingMetadataBenchmarkFixtures
             $result[$key] = self::dateSource($status, $candidates);
         }
 
-        foreach ([['date', 'injection_date'], ['date', 'legacy_nntp_posting_date'], ['injection_date', 'legacy_nntp_posting_date']] as [$lhs, $rhs]) {
+        foreach ([
+            ['date', 'injection_date'],
+            ['date', 'legacy_nntp_posting_date'],
+            ['injection_date', 'legacy_nntp_posting_date'],
+            ['date', 'expires'],
+            ['injection_date', 'expires'],
+            ['legacy_nntp_posting_date', 'expires'],
+        ] as [$lhs, $rhs]) {
             $available = $result[$lhs]['parse_status'] === 'valid' && $result[$rhs]['parse_status'] === 'valid';
             $delta = $available ? $result[$rhs]['utc_epoch_seconds'] - $result[$lhs]['utc_epoch_seconds'] : null;
             $result['reported_clock_relations'][$lhs.'_to_'.$rhs] = [

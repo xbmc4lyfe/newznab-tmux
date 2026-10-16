@@ -1032,11 +1032,14 @@ mod tests {
     fn article_dates_export_preserves_clock_relations_and_owned_json() {
         for (input, expected) in [
             (
-                b"Date: 01 Jan 2024 00:00:00 +0000\r\nInjection-Date: 01 Jan 2024 01:00:00 +0000\r\nNNTP-Posting-Date: 31 Dec 2023 19:00:00 -0500\r\n".as_slice(),
+                b"Date: 01 Jan 2024 00:00:00 +0000\r\nInjection-Date: 01 Jan 2024 01:00:00 +0000\r\nNNTP-Posting-Date: 31 Dec 2023 19:00:00 -0500\r\nExpires: 02 Jan 2024 00:00:00 +0000\r\n".as_slice(),
                 [
                     ("compared", "valid", "valid", Some(3600), Some("before")),
                     ("compared", "valid", "valid", Some(0), Some("equal")),
                     ("compared", "valid", "valid", Some(-3600), Some("after")),
+                    ("compared", "valid", "valid", Some(86_400), Some("before")),
+                    ("compared", "valid", "valid", Some(82_800), Some("before")),
+                    ("compared", "valid", "valid", Some(86_400), Some("before")),
                 ],
             ),
             (
@@ -1045,6 +1048,9 @@ mod tests {
                     ("source_unavailable", "malformed_or_unsupported_absolute_date", "valid", None, None),
                     ("source_unavailable", "malformed_or_unsupported_absolute_date", "missing", None, None),
                     ("source_unavailable", "valid", "missing", None, None),
+                    ("source_unavailable", "malformed_or_unsupported_absolute_date", "missing", None, None),
+                    ("source_unavailable", "valid", "missing", None, None),
+                    ("source_unavailable", "missing", "missing", None, None),
                 ],
             ),
         ] {
@@ -1056,11 +1062,14 @@ mod tests {
             assert_eq!(metadata["schema_version"], 2);
             assert_eq!(metadata["parser_engine"], "nntmux-rust-article-dates");
             let relations = &metadata["reported_clock_relations"];
-            assert_eq!(relations.as_object().unwrap().len(), 3);
+            assert_eq!(relations.as_object().unwrap().len(), 6);
             for (pair, (status, lhs, rhs, delta, order)) in [
                 "date_to_injection_date",
                 "date_to_legacy_nntp_posting_date",
                 "injection_date_to_legacy_nntp_posting_date",
+                "date_to_expires",
+                "injection_date_to_expires",
+                "legacy_nntp_posting_date_to_expires",
             ].into_iter().zip(expected) {
                 assert_eq!(relations[pair], serde_json::json!({
                     "comparison_status": status,
@@ -1086,6 +1095,7 @@ mod tests {
             let metadata: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(metadata["schema_version"], 2);
             assert_eq!(metadata["date"]["parse_status"], "missing");
+            assert_eq!(metadata["expires"]["parse_status"], "missing");
         }
     }
 
@@ -1193,6 +1203,7 @@ mod tests {
         assert_eq!(metadata.date.parse_status, "missing");
         assert_eq!(metadata.injection_date.parse_status, "missing");
         assert_eq!(metadata.legacy_nntp_posting_date.parse_status, "missing");
+        assert_eq!(metadata.expires.parse_status, "missing");
         assert_eq!(
             allocations, 0,
             "unrelated fields have no retained date evidence"
