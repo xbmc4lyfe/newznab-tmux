@@ -1,5 +1,10 @@
 # To do
 
+## Retest scalar NNTP ownership callbacks (2026-10-16)
+
+- [x] Reproduce missing callbacks through the public handler, then pass focused NNTP validation with literal `codex --yolo`: 86 tests and 381 assertions, no errors or skips. Pint, changed-file syntax and focused NNTP PHPStan passed.
+- [ ] Run the full integrated PHPUnit/native retest on final synchronized master, covering scalar Message-IDs, integer/numeric-string article numbers and arrays on primary/alternate providers, callback cadence, ownership-loss cancellation, body/framing/session reuse and the PAR2 post-download persistence guard. Provider/runtime qualification remains deferred to the deployment owner. Performance remains unqualified.
+
 ## Qualify preparation statement reuse (2026-10-15)
 
 Keep unknown retry updates and ready promotions immediate, with their existing row-local timestamps and complete snapshot predicates. A private local MariaDB mechanism comparison found a 1.88× median paired improvement from retaining a native prepared statement; this is not a Laravel caller or production throughput result. Preserve all eight pairs, the slow retained-execute observation and the cleanup-classifier failure with its independent absence reconciliation in `nntmux-preparation-prepare-cost-20261015-v1`.

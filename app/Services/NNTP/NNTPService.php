@@ -1130,10 +1130,10 @@ class NNTPService extends NntpClient
 
             // If it's a string check if it's a valid message-ID.
         } elseif (\is_string($identifiers) || is_numeric($identifiers)) {
-            $body = $this->_getMessage($groupName, $identifiers);
+            $body = $this->_getMessage($groupName, $identifiers, $onRead);
             if ($alternate && self::isError($body)) {
                 $nntp->doConnect($this->_configCompressedHeaders, true);
-                $body = $nntp->_getMessage($groupName, $identifiers);
+                $body = $nntp->_getMessage($groupName, $identifiers, $onRead);
                 $aConnected = true;
             }
 
