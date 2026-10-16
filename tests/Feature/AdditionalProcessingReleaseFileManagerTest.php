@@ -2554,6 +2554,34 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
                 [$opaque => $e01], true, $firstScan,
             ];
         }
+        foreach (['same-cycle' => true, 'later consumer' => false] as $phase => $firstScan) {
+            foreach (['S01E01E02', 'S01E01.E02', 'S01E01-E03', 'S01E01-03', '1x01-02', '1x01x02', '1x01-1x02', 'S01E01.S02E02'] as $tokens) {
+                $combined = 'Show.'.$tokens.'.1080p.WEB-DL-GRP';
+                yield 'admission token combined witness '.$tokens.' '.$phase => [[$e01.'.mkv', $combined.'.mkv'], [$e01.'.mkv' => $e01], false, $firstScan];
+                yield 'admission token combined canonical '.$tokens.' '.$phase => [[$e01.'.mkv'], [$e01.'.mkv' => $combined], false, $firstScan];
+            }
+            foreach (['S01', 'Season.1', 'Complete.Season', 'Complete.Series'] as $tokens) {
+                $pack = 'Show.'.$tokens.'.1080p.WEB-DL-GRP.mkv';
+                yield 'admission token pack witness '.$tokens.' '.$phase => [[$pack], [$pack => $e01], false, $firstScan];
+            }
+            $pack = 'Show.S01.1080p.WEB-DL-GRP.mkv';
+            yield 'admission token episode beside season pack '.$phase => [[$e01.'.mkv', $pack], [$pack => $e01], false, $firstScan];
+            $coexisting = 'Show.S01E01.Complete.Season.1080p.WEB-DL-GRP.mkv';
+            yield 'admission token episode and pack coexist '.$phase => [[$coexisting], [$coexisting => $e01], false, $firstScan];
+            foreach ([
+                'simple x' => ['Show.1x01.1080p.WEB-DL-GRP.mkv', $e01],
+                'year season' => ['Show.S2024E01.1080p.WEB-DL-GRP.mkv', 'Show.S2024E01.1080p.WEB-DL-GRP'],
+                'dotted year season' => ['Show.S2024.E01.1080p.WEB-DL-GRP.mkv', 'Show.S2024.E01.1080p.WEB-DL-GRP'],
+                'hyphen before resolution' => ['Show.S01E01-1080p.WEB-DL-GRP.mkv', $e01],
+                'numeric episode title' => ['Show.S01E01.24.1080p.WEB-DL-GRP.mkv', $e01],
+            ] as $label => [$filename, $canonical]) {
+                yield 'admission token positive '.$label.' '.$phase => [[$filename], [$filename => $canonical], true, $firstScan];
+            }
+            yield 'admission token sample and proof stay ancillary '.$phase => [
+                [$e01.'.mkv', 'Show.S01E01E02.sample.mkv', 'Show.S01E01.Complete.Season.proof.mkv', 'readme.txt'],
+                [$e01.'.mkv' => $e01], true, $firstScan,
+            ];
+        }
         yield 'same episode encode variants' => [[$e01.'.mkv', 'Show.S01E01.720p.WEB-DL-GRP.mkv'], [$e01.'.mkv' => $e01], true, true];
         yield 'ordinary movie with an unresolved video sibling' => [
             ['Movie.2026.1080p.WEB-DL-GRP.mkv', $opaque],
@@ -2637,7 +2665,13 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             $this->assertSame(0, DB::table('release_archive_naming_evidence')->count());
             $result = $processor->process($context, $directory.'/');
             $this->assertSame(ProcessingOutcome::Completed, $result->outcome);
-            $this->assertTrue($context->archiveNamingInspectionComplete, 'All source files and decoded archive entries must actually have been inspected.');
+            if (in_array('Show.1x01x02.1080p.WEB-DL-GRP.mkv', $names, true)) {
+                $this->assertFalse($context->archiveListingIncomplete, 'The decoded raw listing is complete even though its episode identity is ambiguous.');
+                $this->assertFalse($context->archiveNamingInspectionComplete);
+                $this->assertTrue($context->archiveNameEvidenceIncomplete);
+            } else {
+                $this->assertTrue($context->archiveNamingInspectionComplete, 'All source files and decoded archive entries must actually have been inspected.');
+            }
             $this->assertSame(NzbSourceGuard::digest($source), $context->nzbSourceDigest);
             $this->assertSame($context->nzbSourceDigest, DB::table('release_archive_naming_evidence')->where('releases_id', 1)->value('source_sha256'));
             $inventory = DB::table('release_files')->where('releases_id', 1)->orderBy('name')->get()->map(static fn (object $file): array => (array) $file)->all();
@@ -2662,6 +2696,52 @@ class AdditionalProcessingReleaseFileManagerTest extends TestCase
             }
         } finally {
             File::deleteDirectory($directory);
+        }
+    }
+
+    /** @return array<string, array{string, bool}> */
+    public static function legacyEpisodeAdmissionCases(): array
+    {
+        return [
+            'seasonless Episode token is not a complete identity' => ['Show.Episode.5.1080p.WEB-DL-GRP', false],
+            'seasonless EP token is not a complete identity' => ['Show.EP05.1080p.WEB-DL-GRP', false],
+            'historical simple episode keeps legacy compatibility' => ['Show.S01E01.1080p.WEB-DL-GRP', true],
+        ];
+    }
+
+    #[DataProvider('legacyEpisodeAdmissionCases')]
+    public function test_legacy_consumer_requires_a_single_show_and_season_episode_identity(string $title, bool $accepted): void
+    {
+        $this->prepareFullPar2NamingEvidence($title);
+        Schema::table('releases', static function (Blueprint $table): void {
+            $table->string('fromname')->default('fixture');
+        });
+        $opaque = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+        DB::table('releases')->where('id', 1)->update([
+            'name' => $opaque, 'searchname' => $opaque,
+            'additional_pp_claim_token' => null, 'additional_pp_claimed_at' => null,
+        ]);
+        DB::table('release_files')->insert(['releases_id' => 1, 'name' => $title.'.mkv', 'size' => 100]);
+        $this->assertSame(0, DB::table('release_archive_naming_evidence')->count());
+        $inventory = DB::table('release_files')->get()->map(static fn (object $file): array => (array) $file)->all();
+        $sources = new NzbSourceGuard(new TestNzbService);
+        $this->app->instance(NzbSourceGuard::class, $sources);
+        $this->app->instance(ReleaseArchiveNamingEvidence::class, new ReleaseArchiveNamingEvidence($sources));
+        Search::shouldReceive('searchPredb')->andReturn([['id' => 7, 'title' => $title, 'source' => 'fixture']]);
+        $sync = new ReleaseSearchSyncCoordinator(new PersistenceMetricsCollector, static function (int $id): void {});
+        $updates = new ReleaseUpdateService($this->createStub(CategorizationService::class), searchSyncCoordinator: $sync);
+
+        (new NameFixingService($updates))->getPreFileNames(['prefiles', 1]);
+
+        $this->assertSame($accepted, $updates->matched);
+        $this->assertSame($accepted ? $title : $opaque, DB::table('releases')->where('id', 1)->value('searchname'));
+        $this->assertSame($accepted ? 7 : 0, (int) DB::table('releases')->where('id', 1)->value('predb_id'));
+        $this->assertSame(0, DB::table('release_archive_naming_evidence')->count());
+        $this->assertSame($inventory, DB::table('release_files')->get()->map(static fn (object $file): array => (array) $file)->all());
+        if ($accepted) {
+            Event::assertDispatched(ReleaseNameFixed::class);
+        } else {
+            Event::assertNotDispatched(ReleaseNameFixed::class);
         }
     }
 

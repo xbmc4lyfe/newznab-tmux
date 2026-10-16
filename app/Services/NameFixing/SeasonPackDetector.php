@@ -22,13 +22,19 @@ final class SeasonPackDetector
     /** Complete.Series, Complete.Season */
     private const string COMPLETE_REGEX = '/(?:^|[._ \-\[(])Complete[._ ](?:Series|Seasons?)(?=$|[._ \-\])])/i';
 
-    /** S01E01, S01.E05, S01E01E02, S2024E01, 1x05, Episode.5, EP06, standalone E05 */
-    private const string EPISODE_REGEX = '/(?:^|[^a-z0-9])(?:S\d{1,4}[._ ]?E\d{1,4}(?!\d)|\d{1,2}x\d{2,3}(?![0-9a-z])|Episode[._ ]?\d{1,4}(?!\d)|EP?\d{2,3}(?![0-9a-z]))/i';
+    /** Potential episode markers include compound/oversized forms; admission parses strictly below. */
+    private const string EPISODE_REGEX = '/(?:^|[^a-z0-9])(?:S\d+[._ ]?E\d+|\d{1,2}x\d{2,}(?=$|[^a-z0-9]|[exs]\d)|Episode[._ ]?\d{1,4}(?!\d)|EP?\d{2,3}(?![0-9a-z]))/i';
 
     /** Show prefix, separator, season, first episode, extra episodes (E02, -E03, -03) and the rest */
     private const string EPISODE_SPLIT_REGEX = '/^(?<prefix>.+?)(?<sep>[._ \-]+)S(?<season>\d{1,4})[._ ]?E(?<episode>\d{1,4})(?!\d)(?:[._\-]?E\d{1,4}|-\d{1,4}(?=$|[._ ]))*(?<rest>.*)$/i';
 
     private const string X_EPISODE_SPLIT_REGEX = '/^(?<prefix>.+?)(?<sep>[._ \-]+)(?<season>\d{1,2})x(?<episode>\d{2,3})(?![0-9a-z])(?<rest>.*)$/i';
+
+    /** Admission must inspect the unconsumed suffix, unlike season-title derivation. */
+    private const string SINGLE_EPISODE_SPLIT_REGEX = '/^(?<prefix>.+?)[._ \-]+(?:S(?<season>\d{1,4})[._ ]?E(?<episode>\d{1,4})|(?<xseason>\d{1,2})x(?<xepisode>\d{2,3}))(?!\d)(?<rest>.*)$/i';
+
+    /** A separate season token; S01.E01 is an episode, not an explicit pack. */
+    private const string ADMISSION_SEASON_TOKEN_REGEX = '/(?:^|[._ \-\[(])S\d{1,4}(?!\d)(?![._ ]?E\d)(?:[._ ]?D(?:is[ck])?[._ ]?\d{1,2})?(?=$|[._ \-\])])/i';
 
     /** A token where the release information starts; an episode title ends before it */
     private const string RELEASE_INFO_TOKEN_REGEX = '/^(?:\d{3,4}[pi]|4k|uhd|hdr(?:10)?(?:plus)?|dv|sdr|web|webrip|webdl|bluray|blu|bd|bdrip|bdremux|brrip|remux|dvd|dvdrip|dvdr|dvd5|dvd9|hdtv|pdtv|sdtv|hdrip|dsr|amzn|nf|dsnp|hmax|atvp|hulu|pcok|pmtp|stan|crav|x26[45]|h26[45]|hevc|avc|xvid|divx|10bit|8bit|aac\d*|e?ac3|ddp?\d*|dts|truehd|atmos|flac|proper|repack\d*|rerip|internal|multi|dual|subbed|dubbed|extended|uncut|german|french|spanish|italian|dutch|nordic|swedish|danish|finnish|norwegian|polish|russian|hindi|japanese|korean)$/i';
@@ -106,9 +112,53 @@ final class SeasonPackDetector
 
     public static function episodeIdentity(string $name): ?string
     {
-        $episode = self::parseEpisode($name);
+        $base = self::baseName($name);
+        if ($base === '' || preg_match(self::SAMPLE_REGEX, $base) === 1 || self::hasExplicitPackMarker($base)
+            || preg_match(self::SINGLE_EPISODE_SPLIT_REGEX, $base, $match) !== 1) {
+            return null;
+        }
+        $rest = $match['rest'];
+        if (self::isEpisodeName($match['prefix']) || self::isEpisodeName($rest)
+            || preg_match('/^[a-z0-9]/i', $rest) === 1
+            || preg_match('/(?:^|[^a-z0-9])(?:S\d+[._ ]?E\d+|E(?:pisode|P)?[._ ]?\d+|x\d+)/i', $rest) === 1
+            || preg_match('/^[._ ]*(?:[-+&,]|–|—|(?:to|through)[._ ]+)[._ ]*\d+(?=$|[^a-z0-9])/i', $rest) === 1) {
+            return null;
+        }
+        $prefix = strtolower(trim((string) preg_replace('/[._ \-]+/', '.', $match['prefix']), '.'));
+        if ($prefix === '') {
+            return null;
+        }
+        $season = $match['season'] !== '' ? $match['season'] : $match['xseason'];
+        $episode = $match['episode'] !== '' ? $match['episode'] : $match['xepisode'];
 
-        return $episode === null ? null : $episode['key'].':'.$episode['season'].':'.$episode['episode'];
+        return $prefix.':'.(int) $season.':'.(int) $episode;
+    }
+
+    /** Explicit pack/compound evidence cannot become an opaque canonical singleton.
+     *
+     * @param  list<string>  $names
+     */
+    public static function hasNonSingleEpisodeEvidence(array $names): bool
+    {
+        foreach ($names as $name) {
+            $base = self::baseName($name);
+            if (preg_match(self::SAMPLE_REGEX, $base) === 1) {
+                continue;
+            }
+            if (self::hasExplicitPackMarker($base)
+                || (self::isEpisodeName($base) && self::episodeIdentity($name) === null)) {
+                return true;
+            }
+        }
+
+        return self::hasDistinctEpisodeIdentities($names);
+    }
+
+    private static function hasExplicitPackMarker(string $base): bool
+    {
+        return preg_match(self::ADMISSION_SEASON_TOKEN_REGEX, $base) === 1
+            || preg_match(self::SEASON_WORD_REGEX, $base) === 1
+            || preg_match(self::COMPLETE_REGEX, $base) === 1;
     }
 
     /** Only explicit metadata/subtitle/artwork and sample conventions are ancillary. */

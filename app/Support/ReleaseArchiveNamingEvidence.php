@@ -48,7 +48,7 @@ final class ReleaseArchiveNamingEvidence
             $previous = $this->loadLocked($release);
             [$names, $overflow] = $this->boundedNames($filenames);
             $overflow = $overflow || $evidenceOmitted;
-            if (SeasonPackDetector::hasDistinctEpisodeIdentities($names)) {
+            if (SeasonPackDetector::hasNonSingleEpisodeEvidence($names)) {
                 $scope = 'multi_episode';
             } elseif ($scope !== 'multi_episode' && ($overflow || ($scope === 'complete_single' && (! $authoritativeComplete || $names === [])))) {
                 $scope = 'incomplete';
@@ -63,7 +63,7 @@ final class ReleaseArchiveNamingEvidence
                 }
                 // Evidence from disjoint attempts must not erase a witnessed pack.
                 $observed = array_values(array_unique([...$this->decodeNames($previous->episode_files), ...$names]));
-                if (SeasonPackDetector::hasDistinctEpisodeIdentities($observed)) {
+                if (SeasonPackDetector::hasNonSingleEpisodeEvidence($observed)) {
                     $scope = 'multi_episode';
                 } elseif (! $overflow && $previous->scope === 'complete_single' && in_array($scope, ['unknown', 'incomplete'], true)) {
                     if ($persist !== null) {
@@ -111,6 +111,10 @@ final class ReleaseArchiveNamingEvidence
         if (! SeasonPackDetector::isEpisodeName($candidate)) {
             return true;
         }
+        $candidateIdentity = SeasonPackDetector::episodeIdentity($candidate);
+        if ($candidateIdentity === null) {
+            return false;
+        }
         $this->requireTransaction();
         // The release lock serializes both observations and generation changes.
         $actual = DB::table('releases')->where('id', $release->id)->where('guid', $release->guid)->lockForUpdate()->first(['id']);
@@ -124,12 +128,10 @@ final class ReleaseArchiveNamingEvidence
 
             // Historical singleton listings cannot be certified retroactively.
             // Preserve legacy compatibility, but reject positively known packs.
-            return count($names) <= self::MAX_WITNESSES && ! SeasonPackDetector::hasDistinctEpisodeIdentities($names);
+            return count($names) <= self::MAX_WITNESSES && ! SeasonPackDetector::hasNonSingleEpisodeEvidence($names);
         }
         $names = $this->decodeNames($evidence->episode_files);
-        $candidateIdentity = SeasonPackDetector::episodeIdentity($candidate);
-        if ($evidence->scope !== 'complete_single' || $candidateIdentity === null
-            || SeasonPackDetector::hasDistinctEpisodeIdentities($names)) {
+        if ($evidence->scope !== 'complete_single' || SeasonPackDetector::hasNonSingleEpisodeEvidence($names)) {
             return false;
         }
 
