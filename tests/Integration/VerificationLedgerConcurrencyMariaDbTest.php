@@ -338,6 +338,21 @@ final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
         }
     }
 
+    public function test_entering_publication_leaves_the_read_view_for_the_duplicate_search(): void
+    {
+        $other = $this->connection();
+        DB::beginTransaction();
+        try {
+            app(VerificationLedger::class)->enterPublication(['size:5']);
+            // A release committed after the locks were granted (here, after entering) must be
+            // visible to the duplicate search's plain reads that follow.
+            $other->exec("INSERT INTO usenet_groups (id, name) VALUES (2, 'alt.committed.meanwhile')");
+            $this->assertTrue(DB::table('usenet_groups')->where('id', 2)->exists());
+        } finally {
+            DB::rollBack();
+        }
+    }
+
     /** @param list<string> $keys */
     private function assertPublicationWaits(array $keys): void
     {

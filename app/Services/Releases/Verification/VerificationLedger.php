@@ -73,11 +73,14 @@ final class VerificationLedger
      * Serialize publications (and their duplicate detection) that share a duplicate-search key,
      * not with admission or unrelated releases.
      *
-     * Every publication first locks the shared `publication` row: striped publications in share
-     * mode, which they hold together, and publications without keys (or before the stripe rows
-     * exist) exclusively, so those wait for, and exclude, every other publication. One statement
-     * then locks all of a publication's stripes in primary-key order, so overlapping publications
-     * cannot deadlock.
+     * One statement locks all of a publication's stripes in primary-key order, so overlapping
+     * publications cannot deadlock. It then locks the shared `publication` row: in share mode,
+     * which striped publications hold together, or exclusively when it has no keys (or some
+     * stripes do not exist yet), so such a publication waits for, and excludes, every other.
+     *
+     * Only locking reads run here: the caller's first plain read, its duplicate search, must take
+     * its REPEATABLE READ view after these locks are granted to see the releases committed while
+     * it waited.
      *
      * @param  list<string>  $keys
      */
@@ -90,15 +93,11 @@ final class VerificationLedger
         }
         $stripes = array_values(array_unique(array_map(self::publicationStripe(...), $keys)));
         sort($stripes);
-        // Stripe rows only change with migrations, so a plain read decides the mode up front and
-        // no transaction ever upgrades its shared lock.
-        $striped = $stripes !== [] && DB::table(self::LOCKS_TABLE)->whereIn('name', $stripes)->count() === count($stripes);
+        $striped = $stripes !== []
+            && DB::table(self::LOCKS_TABLE)->whereIn('name', $stripes)->orderBy('name')->lockForUpdate()->count() === count($stripes);
         $shared = DB::table(self::LOCKS_TABLE)->where('name', self::PUBLICATION_LOCK);
         if (($striped ? $shared->sharedLock() : $shared->lockForUpdate())->first() === null) {
             throw new RuntimeException('Verification publication lock has not been initialized.');
-        }
-        if ($striped && DB::table(self::LOCKS_TABLE)->whereIn('name', $stripes)->orderBy('name')->lockForUpdate()->count() !== count($stripes)) {
-            throw new RuntimeException('Verification publication stripes changed during publication.');
         }
     }
 
