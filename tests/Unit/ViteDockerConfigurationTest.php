@@ -174,6 +174,10 @@ class ViteDockerConfigurationTest extends TestCase
             $process->mustRun();
             $this->assertMatchesRegularExpression('/\$SAIL"? /', $process->getOutput().$process->getErrorOutput(), "{$recipe} must run inside the Sail container.");
         }
+
+        $process = new Process(['just', '--dry-run', 'optimize-deploy'], __DIR__.'/../..');
+        $process->mustRun();
+        $this->assertStringContainsString('only run on the deploy host', $process->getOutput().$process->getErrorOutput());
     }
 
     public function test_vite_uses_the_docker_published_port_without_fallback(): void
