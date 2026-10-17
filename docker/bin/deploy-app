@@ -26,22 +26,33 @@ if [ "$MODE" = "noop" ]; then
     exit 0
 fi
 
+# From here on the stack changes. Invalidate the stamp's fingerprint first (keeping per-service
+# records), forget each service's record before it is stopped or recreated, and record it again
+# from the plan snapshot once healthy: a run failing at any point never leaves a stamp claiming
+# something that is not running, and a retry repeats only what did not complete.
+plan() { "$DIR/bin/deploy-plan" "$@"; }
+plan --invalidate
+
 # Stateless infrastructure first, while every writer still runs: a failing infra service aborts
 # here, before any drain, instead of after a full app rollout that would then repeat every poll.
 if [ -n "$DIRTY_INFRA" ]; then
     # shellcheck disable=SC2086
+    plan --forget $DIRTY_INFRA
+    # shellcheck disable=SC2086
     compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $DIRTY_INFRA
     # shellcheck disable=SC2086
-    "$DIR/bin/deploy-plan" --record-service $DIRTY_INFRA
+    plan --record $DIRTY_INFRA
     verify
 fi
 
 if [ -n "$RECONCILE_INFRA" ]; then
     # Compose recreates only services whose rendered configuration drifted.
     # shellcheck disable=SC2086
+    plan --forget $RECONCILE_INFRA
+    # shellcheck disable=SC2086
     compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $RECONCILE_INFRA
     # shellcheck disable=SC2086
-    "$DIR/bin/deploy-plan" --record-service $RECONCILE_INFRA
+    plan --record $RECONCILE_INFRA
     verify
 fi
 
@@ -149,6 +160,11 @@ if [ "$need_indexer_drain" = 1 ]; then
     verify
 fi
 
+# A failed drain resumes the untouched old writers; from the first stop on, the services this run
+# replaces no longer match their records.
+# shellcheck disable=SC2086
+[ -z "$up_app_services" ] || plan --forget $up_app_services
+
 if [ "$need_horizon_stop" = 1 ]; then
     # Let active Horizon jobs finish while the existing web service remains available.
     compose stop --timeout 1920 horizon
@@ -176,27 +192,35 @@ fi
 
 if [ -n "$DIRTY_DATA" ]; then
     # shellcheck disable=SC2086
+    plan --forget $DIRTY_DATA
+    # shellcheck disable=SC2086
     compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $DIRTY_DATA
     # shellcheck disable=SC2086
-    "$DIR/bin/deploy-plan" --record-service $DIRTY_DATA
+    plan --record $DIRTY_DATA
     verify
 fi
 
 if [ -n "$RECONCILE_DATA" ]; then
     # Without a stamp, only Compose drift is reconciled; unchanged data services keep running.
     # shellcheck disable=SC2086
+    plan --forget $RECONCILE_DATA
+    # shellcheck disable=SC2086
     compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $RECONCILE_DATA
     # shellcheck disable=SC2086
-    "$DIR/bin/deploy-plan" --record-service $RECONCILE_DATA
+    plan --record $RECONCILE_DATA
     verify
 fi
 
 if [ "$MIGRATE" = 1 ]; then
+    plan --forget migration
     compose run --rm --no-deps web php artisan migrate --force --no-interaction
+    plan --record migration
     verify
 fi
 
 if [ -n "$up_app_services" ]; then
     # shellcheck disable=SC2086
     compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $up_app_services
+    # shellcheck disable=SC2086
+    plan --record $up_app_services
 fi

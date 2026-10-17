@@ -98,6 +98,8 @@ docker/.deploy.lock.claim
 docker/.deploy.lock.recovery-hold
 docker/.deploy.log
 docker/.deploy.stamp
+docker/.deploy.stamp.*
+docker/.build.stamp.*
 
 # Agent research, live samples and validation artifacts are never runtime assets.
 .superpowers/

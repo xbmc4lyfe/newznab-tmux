@@ -535,6 +535,7 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
     app_env_hash = env_hashes[1]
 
     effective_hash = "none"
+    fingerprint_effective = ""
     per_service_compose: dict[str, str] = {svc: "none" for svc in ALL_SERVICES}
     compose_rendered = False
     config_cmd = os.environ.get("DEPLOY_CONFIG_COMMAND", "")
@@ -550,7 +551,7 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
             _, per_service_compose = get_compose_service_hashes(docker_dir)
             compose_rendered = True
             mounted = json.dumps(per_service_compose, sort_keys=True)
-            effective_hash = sha256_text(f"{effective_hash}\n{mounted}")
+            fingerprint_effective = sha256_text(f"{effective_hash}\n{mounted}")
         elif include_compose:
             per_service_compose = {svc: effective_hash for svc in ALL_SERVICES}
     elif include_compose:
@@ -563,7 +564,9 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
     base_hash = sha256_text(f"{dockerfile_base_hash(repo)}\n{base_img}")
 
     state: dict[str, str] = {
-        "fingerprint": f"{runtime_tree_hash} {configuration_hash} {effective_hash}",
+        # The fingerprint also covers mounted contents; `effective` (the global Compose rule) is the
+        # rendered configuration only, so a recorded mount change never forces an app rollout.
+        "fingerprint": f"{runtime_tree_hash} {configuration_hash} {fingerprint_effective or effective_hash}",
         "base": base_hash,
         "migration": migration_hash,
         "shared_app": shared_app_hash,
@@ -611,7 +614,7 @@ def parse_stamp(stamp_path: Path) -> dict[str, str]:
     return parsed
 
 
-def format_stamp(state: dict[str, str]) -> str:
+def with_image_ids(state: dict[str, str]) -> dict[str, str]:
     stamped = dict(state)
     base_img = os.environ.get("BASE_IMAGE", "nntmux/base:local")
     base_id = image_id(base_img)
@@ -622,6 +625,11 @@ def format_stamp(state: dict[str, str]) -> str:
         svc_id = image_id(img)
         if svc_id:
             stamped[f"image:{svc}"] = f"{img}@{svc_id}"
+    return stamped
+
+
+def format_stamp(state: dict[str, str]) -> str:
+    stamped = with_image_ids(state)
     lines = [stamped["fingerprint"]]
     for key in sorted(k for k in stamped if k != "fingerprint"):
         lines.append(f"{key}={stamped[key]}")
@@ -945,20 +953,29 @@ def main() -> None:
 
     cmd = sys.argv[1] if len(sys.argv) > 1 else "--explain"
 
-    if cmd == "--record-service":
-        # After a data or infra service was successfully (re)created mid-run, record what it now runs
-        # so a later failure cannot leave a stamp that hides it. The fingerprint line stays invalid
-        # until the whole run succeeds and the guard publishes a complete stamp.
-        services = sys.argv[2:]
-        state = compute_state(repo, docker_dir, include_compose=True)
+    if cmd in ("--invalidate", "--forget", "--record"):
+        # Mid-run stamp maintenance under the guard. --invalidate before the first mutation, --forget
+        # before a service is stopped or recreated, --record after it is healthy (from the plan
+        # snapshot, i.e. the state the run deployed, never a later re-read). Until the guard publishes
+        # a complete stamp, the fingerprint line stays "stale" so no poll can report "unchanged".
         stamped = parse_stamp(stamp_path)
-        record = {k: v for k, v in stamped.items() if k not in ("fingerprint", "__legacy__")}
-        if "__legacy__" in stamped:
-            record = {}
-        for svc in services:
-            for key in (f"service:{svc}", f"compose:{svc}"):
-                if key in state:
-                    record[key] = state[key]
+        if not stamped:
+            if cmd != "--record":
+                return
+        record = {} if "__legacy__" in stamped else {k: v for k, v in stamped.items() if k != "fingerprint"}
+        items = sys.argv[2:]
+        keys = [key for item in items for key in (
+            ("migration",) if item == "migration" else (f"service:{item}", f"compose:{item}", f"image:{item}", f"build:{item}"))]
+        if cmd == "--forget":
+            for key in keys:
+                record.pop(key, None)
+        elif cmd == "--record":
+            snapshot = parse_stamp(Path(f"{stamp_path}.plan"))
+            if not snapshot:
+                sys.exit("deploy-plan: no plan snapshot to record from.")
+            for key in keys:
+                if key in snapshot:
+                    record[key] = snapshot[key]
                 else:
                     record.pop(key, None)
         tmp = stamp_path.with_name(f"{stamp_path.name}.tmp.{os.getpid()}")
@@ -991,6 +1008,10 @@ def main() -> None:
 
     if cmd == "--deploy-actions":
         plan = compute_deploy_plan(repo, docker_dir, stamp_path)
+        snapshot = Path(f"{stamp_path}.plan")
+        tmp = snapshot.with_name(f"{snapshot.name}.tmp.{os.getpid()}")
+        tmp.write_text(format_stamp(plan["state"]))  # type: ignore[arg-type]
+        os.replace(tmp, snapshot)
         print(f"MODE={shlex.quote(str(plan['mode']))}")
         print(f"MIGRATE={'1' if plan['migrate'] else '0'}")
         print(f"DIRTY_APP={shlex.quote(' '.join(plan['dirty_app']))}")

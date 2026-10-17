@@ -62,7 +62,10 @@ case "$*" in
     *'artisan migrate'*) [ "${NNTMUX_MIGRATION_FAIL:-0}" != 1 ] || exit 42 ;;
     *' up -d'*)
         [ "${NNTMUX_HEALTH_FAIL:-0}" != 1 ] || exit 44
-        case "$*" in *' proxy'*) [ "${NNTMUX_PROXY_FAIL:-0}" != 1 ] || exit 51 ;; esac
+        case "$*" in *' proxy'*)
+            if [ -n "${NNTMUX_PROXY_EDIT:-}" ]; then echo C > "$NNTMUX_PROXY_EDIT"; fi
+            [ "${NNTMUX_PROXY_FAIL:-0}" != 1 ] || exit 51 ;; esac
+        case "$*" in *'--wait-timeout 240 web'*) [ "${NNTMUX_APP_UP_FAIL:-0}" != 1 ] || exit 52 ;; esac
         if [ "${NNTMUX_STALE_UP:-0}" = 1 ]; then echo changed > "$NNTMUX_REPO/app.txt"; fi
         case "$*" in *' --force-recreate '*) : > "$NNTMUX_REPO/recreated" ;; esac ;;
 esac
@@ -808,6 +811,75 @@ SH);
         $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp');
     }
 
+    public function test_app_rollout_failing_after_recreate_never_lets_a_revert_be_skipped(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/app.txt', "two\n");
+        $failed = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_APP_UP_FAIL' => '1']);
+        $failed->run();
+        $this->assertSame(52, $failed->getExitCode());
+
+        file_put_contents($this->directory.'/app.txt', "one\n");
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
+    }
+
+    public function test_infra_recreate_failing_never_lets_a_revert_be_skipped(): void
+    {
+        mkdir($this->directory.'/docker/config/caddy', 0777, true);
+        file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', "A\n");
+        $config = ['NNTMUX_CONFIG_ID' => $this->composeJson()];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+
+        file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', "B\n");
+        $failed = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_PROXY_FAIL' => '1']);
+        $failed->run();
+        $this->assertSame(51, $failed->getExitCode());
+
+        file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', "A\n");
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_STARTED_AT' => '2000-01-01T00:00:00Z'])->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+    }
+
+    public function test_mounted_file_changed_during_its_recreate_is_redeployed_on_the_next_poll(): void
+    {
+        mkdir($this->directory.'/docker/config/caddy', 0777, true);
+        $caddyfile = $this->directory.'/docker/config/caddy/Caddyfile';
+        file_put_contents($caddyfile, "A\n");
+        $config = ['NNTMUX_CONFIG_ID' => $this->composeJson()];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+
+        file_put_contents($caddyfile, "B\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_PROXY_EDIT' => $caddyfile])->run();
+        $this->assertSame("C\n", file_get_contents($caddyfile));
+
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+    }
+
+    public function test_recorded_mount_change_with_a_reverted_app_change_needs_no_app_rollout(): void
+    {
+        mkdir($this->directory.'/docker/config/caddy', 0777, true);
+        file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', "A\n");
+        $config = ['NNTMUX_CONFIG_ID' => $this->composeJson()];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+
+        file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', "B\n");
+        file_put_contents($this->directory.'/app.txt', "two\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_SCHEDULER_DRAIN_FAIL' => '1'])->run();
+
+        file_put_contents($this->directory.'/app.txt', "one\n");
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $events = $this->events();
+        $this->assertStringNotContainsString('drain', $events);
+        $this->assertStringNotContainsString('artisan migrate', $events);
+        $this->assertStringNotContainsString(' up -d', $events);
+    }
+
     public function test_host_system_paths_match_on_path_boundaries_only(): void
     {
         $script = 'import importlib.machinery, importlib.util, sys; l = importlib.machinery.SourceFileLoader("dp", sys.argv[1]); '
@@ -858,7 +930,7 @@ SH);
         $this->assertStringContainsString('service:sidecar=', (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
     }
 
-    public function test_checkout_change_during_rollout_keeps_the_previous_record_but_never_reports_unchanged(): void
+    public function test_checkout_change_during_rollout_records_what_was_deployed_but_never_reports_unchanged(): void
     {
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         $previous = (string) file_get_contents($this->directory.'/docker/.deploy.stamp');
@@ -869,7 +941,12 @@ SH);
         $this->assertSame(76, $process->getExitCode());
         $stamp = (string) file_get_contents($this->directory.'/docker/.deploy.stamp');
         $this->assertSame("stale\n", strstr($stamp, "\n", true)."\n");
-        $this->assertSame(substr($previous, strpos($previous, "\n") + 1), substr($stamp, strpos($stamp, "\n") + 1));
+        // Services this run rolled out are recorded from the plan it deployed, not the later tree.
+        preg_match('/^service:web=(.*)$/m', $stamp, $recorded);
+        preg_match('/^service:web=(.*)$/m', (string) file_get_contents($this->directory.'/docker/.deploy.stamp.plan'), $planned);
+        preg_match('/^service:web=(.*)$/m', $previous, $before);
+        $this->assertSame($planned[1], $recorded[1]);
+        $this->assertNotSame($before[1], $recorded[1]);
         $this->assertSame([], glob($this->directory.'/docker/.deploy.stamp.tmp.*') ?: []);
 
         // Not a first installation: infra is left alone, and the app is redeployed.
