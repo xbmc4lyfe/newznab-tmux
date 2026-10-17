@@ -40,7 +40,9 @@ final class VerifiedReleasePublisher
         // so there metadata is resolved after the exclusive fallback, as before striping.
         $preResolved = null;
         $keys = [];
-        if (DB::transactionLevel() === 0) {
+        // A plain read is harmless outside a transaction; it skips the work for a stale claim,
+        // which the locked validation below rejects anyway.
+        if (DB::transactionLevel() === 0 && $this->claimIsCurrent($claim)) {
             try {
                 $preResolved = $this->metadata->resolve($result->manifest);
                 $keys = VerificationLedger::publicationKeys($this->publicationSize($result->manifest), $this->incomingFingerprint($result->manifest),
@@ -261,6 +263,13 @@ final class VerifiedReleasePublisher
         } catch (Throwable) {
             return false;
         }
+    }
+
+    private function claimIsCurrent(object $claim): bool
+    {
+        return DB::table('release_verification_candidates')->where('id', $claim->id)->where('version', $claim->version)
+            ->where('manifest_hash', $claim->manifest_hash)->where('lease_token', $claim->lease_token)->whereNull('release_id')
+            ->where('lease_until', '>=', now()->format('Y-m-d H:i:s'))->exists();
     }
 
     /**
