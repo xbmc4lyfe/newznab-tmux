@@ -1994,6 +1994,8 @@ fn parse_zip(data: &[u8], offset: usize) -> FormatHeader {
         filename_length,
         filename_range,
         flags.map(|value| value & 0x0800 != 0),
+        flags.map(|value| value & 0x2000 != 0),
+        extra_field_records_complete,
         local_filename_str.as_ref(),
         local_filename_display_truncated,
         zip_unicode_path_records.as_deref(),
@@ -2116,6 +2118,8 @@ fn resolve_zip_filename_authority(
     filename_length: Option<usize>,
     filename_range: Option<&[u8]>,
     efs_utf8_flag: Option<bool>,
+    local_header_masked: Option<bool>,
+    extra_fields_fully_inspected: Option<bool>,
     local_filename_str: Option<&String>,
     local_filename_display_truncated: Option<bool>,
     unicode_path_records: Option<&[ZipUnicodePathExtra]>,
@@ -2135,6 +2139,17 @@ fn resolve_zip_filename_authority(
     let Some(filename_bytes) = filename_range else {
         return (None, None, None, "fixed_header_incomplete");
     };
+    // General-purpose bit 13 (central directory encryption) replaces local header
+    // fields with masking tokens, so the observed name is not the real filename.
+    // The raw bytes stay available through the existing hash/hex observations.
+    if local_header_masked != Some(false) {
+        return (None, None, None, "local_header_masked");
+    }
+    // An unseen or unframed extra area can still hold a 0x7075 override or a duplicate
+    // of one, so authority needs a complete extra-field inspection.
+    if extra_fields_fully_inspected != Some(true) {
+        return (None, None, None, "extra_fields_incomplete");
+    }
     if filename_bytes.is_empty() {
         return (Some(String::new()), Some(false), None, "empty_filename");
     }
@@ -13236,7 +13251,7 @@ mod tests {
         assert_eq!(h_gzip["comment_display_truncated"], false);
     }
 
-    fn zip_upath_fixture(flags: u16, name: &[u8], extras: &[Vec<u8>]) -> serde_json::Value {
+    fn zip_upath_bytes(flags: u16, name: &[u8], extras: &[Vec<u8>]) -> Vec<u8> {
         let extra: Vec<u8> = extras.concat();
         let mut buf = Vec::new();
         buf.extend_from_slice(ZIP);
@@ -13252,7 +13267,11 @@ mod tests {
         buf.extend_from_slice(&(extra.len() as u16).to_le_bytes());
         buf.extend_from_slice(name);
         buf.extend_from_slice(&extra);
-        serde_json::to_value(parse(&buf)).unwrap()
+        buf
+    }
+
+    fn zip_upath_fixture(flags: u16, name: &[u8], extras: &[Vec<u8>]) -> serde_json::Value {
+        serde_json::to_value(parse(&zip_upath_bytes(flags, name, extras))).unwrap()
     }
 
     fn zip_upath_record(version: u8, crc32: u32, unicode_name: &[u8]) -> Vec<u8> {
@@ -13378,6 +13397,66 @@ mod tests {
         assert_eq!(headers[2]["filename_encoding"], "iso_8859_1");
         assert_eq!(headers[2]["filename_utf8_text"], "Épisode.tar");
         assert_eq!(headers[2]["comment_utf8_text"], "– note");
+    }
+
+    #[test]
+    fn zip_filename_authority_is_withheld_for_masked_names_and_uninspected_extras() {
+        // Bit 13 (central directory encryption) masks local header names: the token
+        // is not the filename, even though it looks like plain ASCII.
+        let masked = zip_upath_fixture(0x2000, b"00000001", &[]);
+        let header = &masked["headers"][0];
+        assert!(header["resolved_filename"].is_null());
+        assert!(header["resolved_filename_source"].is_null());
+        assert_eq!(header["resolved_filename_status"], "local_header_masked");
+        // The raw observation stays available.
+        assert_eq!(header["filename_bytes_length"], 8);
+        assert_eq!(header["filename"], "00000001");
+
+        // A Unicode Path record can also not rescue a masked name.
+        let local = b"00000001";
+        let record = zip_upath_record(1, crc32fast::hash(local), b"real.mkv");
+        let masked_with_extra = zip_upath_fixture(0x2000, local, &[record.clone()]);
+        assert_eq!(
+            masked_with_extra["headers"][0]["resolved_filename_status"],
+            "local_header_masked"
+        );
+
+        // Declared extra area is cut off by the end of the sample: an unseen 0x7075
+        // record could override the visible ASCII name.
+        let full = zip_upath_bytes(0, b"release.mkv", &[record.clone()]);
+        let cut = &full[..full.len() - 3];
+        let truncated = serde_json::to_value(parse(cut)).unwrap();
+        let header = &truncated["headers"][0];
+        assert!(header["resolved_filename"].is_null());
+        assert_eq!(
+            header["resolved_filename_status"],
+            "extra_fields_incomplete"
+        );
+        let no_extra_at_all = zip_upath_bytes(0, b"release.mkv", &[vec![0u8; 8]]);
+        let cut = &no_extra_at_all[..30 + 11];
+        let truncated = serde_json::to_value(parse(cut)).unwrap();
+        assert_eq!(
+            truncated["headers"][0]["resolved_filename_status"],
+            "extra_fields_incomplete"
+        );
+
+        // A malformed suffix after a usable record can hide a duplicate, so the
+        // usable record no longer carries authority.
+        let usable = zip_upath_record(1, crc32fast::hash(b"release.mkv"), b"x.mkv");
+        let clean = zip_upath_fixture(0, b"release.mkv", std::slice::from_ref(&usable));
+        assert_eq!(clean["headers"][0]["resolved_filename"], "x.mkv");
+        let suffixed = zip_upath_fixture(0, b"release.mkv", &[usable, vec![0x75, 0x70, 0x40]]);
+        let header = &suffixed["headers"][0];
+        assert_eq!(header["extra_field_records_complete"], false);
+        assert!(header["resolved_filename"].is_null());
+        assert_eq!(
+            header["resolved_filename_status"],
+            "extra_fields_incomplete"
+        );
+
+        // Without any extra area the declared-empty case is complete and resolves.
+        let plain = zip_upath_fixture(0, b"release.mkv", &[]);
+        assert_eq!(plain["headers"][0]["resolved_filename"], "release.mkv");
     }
 
     fn gzip_text_fixture(fname: &[u8], fcomment: &[u8]) -> serde_json::Value {
