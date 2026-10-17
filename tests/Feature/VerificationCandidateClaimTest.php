@@ -59,6 +59,63 @@ class VerificationCandidateClaimTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(0, DB::table('release_verification_candidates')->whereNotNull('lease_token')->count());
     }
 
+    public function test_a_window_drained_by_concurrent_claimers_is_read_again(): void
+    {
+        $this->freezeTime();
+        $rows = [];
+        for ($number = 1; $number <= 150; $number++) {
+            $rows[] = ['identity' => sha1('drained-'.$number), 'groups_id' => 1, 'manifest_path' => '',
+                'manifest_bytes' => 0, 'manifest_hash' => str_repeat('0', 64), 'status' => 'unknown',
+                'last_unique_at' => now(), 'next_attempt_at' => now()->subHour()->addSeconds($number)];
+        }
+        DB::table('release_verification_candidates')->insert($rows);
+        $windows = 0;
+        DB::listen(static function (QueryExecuted $query) use (&$windows): void {
+            if (str_starts_with($query->sql, 'select') && str_contains($query->sql, 'order by')
+                && in_array('unknown', $query->bindings, true) && ++$windows === 1) {
+                // Other workers lease every row of this worker's first window before it reaches them.
+                DB::table('release_verification_candidates')->where('id', '<=', 100)
+                    ->update(['status' => 'verifying', 'lease_token' => 'other', 'lease_until' => now()->addMinute()]);
+            }
+        });
+        $attempts = [];
+        $claim = app(CandidateRepository::class)->claim(static function (int $id) use (&$attempts): bool {
+            $attempts[] = $id;
+
+            return true;
+        }, false);
+
+        $this->assertNotNull($claim);
+        $this->assertSame(101, (int) $claim->id);
+        $this->assertSame([101], $attempts);
+        $this->assertGreaterThan(1, $windows);
+    }
+
+    public function test_a_window_that_stays_contended_stops_after_bounded_rereads(): void
+    {
+        $this->freezeTime();
+        DB::table('release_verification_candidates')->insert(['identity' => sha1('contended'), 'groups_id' => 1,
+            'manifest_path' => '', 'manifest_bytes' => 0, 'manifest_hash' => str_repeat('0', 64), 'status' => 'pending',
+            'last_unique_at' => now(), 'next_attempt_at' => now()->subHour()]);
+        $windows = 0;
+        $lease = static fn (?string $until) => DB::table('release_verification_candidates')->update(['lease_until' => $until]);
+        DB::listen(static function (QueryExecuted $query) use (&$windows, $lease): void {
+            if (! str_starts_with($query->sql, 'select')) {
+                return;
+            }
+            if (str_contains($query->sql, 'order by') && in_array('pending', $query->bindings, true)) {
+                // Another worker leases the row after every window read and releases it after this attempt.
+                $windows++;
+                $lease(now()->addMinute()->format('Y-m-d H:i:s'));
+            } elseif (str_contains($query->sql, '"id" = ?')) {
+                $lease(null);
+            }
+        });
+
+        $this->assertNull(app(CandidateRepository::class)->claim(static fn (): bool => true, false));
+        $this->assertSame(10, $windows);
+    }
+
     public function test_status_changes_between_queue_reads_do_not_duplicate_claim_attempts(): void
     {
         $this->freezeTime();

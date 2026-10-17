@@ -118,6 +118,14 @@ jobs:
           ADDITIONAL_ADMISSION_TEST_PASSWORD: donor-fixture-only
         run: php -d memory_limit=2G vendor/bin/phpunit --fail-on-skipped tests/Integration/AdditionalPasswordDisabledMariaDbTest.php
 
+      - name: Qualify verification candidates against MariaDB in both manifest storage modes
+        env:
+          VERIFICATION_MARIADB_TEST: 1
+          VERIFICATION_MARIADB_HOST: 127.0.0.1
+          VERIFICATION_MARIADB_USERNAME: root
+          VERIFICATION_MARIADB_PASSWORD: donor-fixture-only
+        run: php -d memory_limit=2G vendor/bin/phpunit --fail-on-skipped tests/Feature/ReleaseVerificationMariaDbTest.php tests/Feature/ReleaseVerificationDatabaseManifestMariaDbTest.php
+
       - name: Qualify reopened filename lifecycle against MariaDB
         env:
           FILENAME_LIFECYCLE_TEST_HOST: 127.0.0.1
