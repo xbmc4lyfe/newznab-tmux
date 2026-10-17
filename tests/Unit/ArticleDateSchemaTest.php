@@ -61,7 +61,7 @@ final class ArticleDateSchemaTest extends TestCase
             self::assertFalse($method->invoke(null, [$observation]));
             self::assertFalse($method->invoke(null, [$valid, $observation]));
         }
-        self::assertSame(39, ReleaseFingerprintCollector::SCHEMA_VERSION);
+        self::assertSame(40, ReleaseFingerprintCollector::SCHEMA_VERSION);
     }
 
     public function test_missing_or_inconsistent_candidate_provenance_is_not_current(): void

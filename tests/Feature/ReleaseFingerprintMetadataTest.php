@@ -47,7 +47,7 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         $collector = new ReleaseFingerprintCollector($nzb, new NzbFingerprintAnalyzer($yenc), new Par2MetadataParser, $yenc);
         (new CollectReleaseFingerprintMetadata(1))->handle($collector);
         self::assertSame('unavailable', ReleaseFingerprintMetadata::query()->findOrFail(1)->status);
-        foreach ([28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38] as $schemaVersion) {
+        foreach ([28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39] as $schemaVersion) {
             ReleaseFingerprintMetadata::query()->findOrFail(1)->update(['status' => 'complete', 'metadata' => ['schema_version' => $schemaVersion]]);
             $nzb->shouldReceive('readNzbContents')->once()->with('qo-schema-fixture')->andReturn(false);
             (new CollectReleaseFingerprintMetadata(1))->handle($collector);
@@ -248,9 +248,61 @@ final class ReleaseFingerprintMetadataTest extends TestCase
                 self::assertSame(512, strlen($gzip['comment_bytes_hex']));
                 self::assertTrue($gzip['filename_bytes_hex_truncated']);
                 self::assertTrue($gzip['comment_bytes_hex_truncated']);
+                self::assertSame('ascii', $gzip['filename_encoding']);
+                self::assertSame(str_repeat('A', 4096), $gzip['filename']);
+                self::assertTrue($gzip['filename_display_truncated']);
+                self::assertSame('ascii', $gzip['comment_encoding']);
+                self::assertSame(str_repeat('B', 4096), $gzip['comment']);
+                self::assertTrue($gzip['comment_display_truncated']);
                 self::assertSame(8208, $gzip['header_bytes']);
             }
         }
+    }
+
+    #[Test]
+    public function it_resolves_zip_and_gzip_filename_authority_through_yenc(): void
+    {
+        $legacyName = "caf\x82.mkv";
+        $legacyCrc = crc32($legacyName);
+        $utf8Override = 'café.mkv';
+        $upathExtra = pack('vvCV', 0x7075, 5 + strlen($utf8Override), 1, $legacyCrc).$utf8Override;
+        $zipOverride = "PK\x03\x04".pack('vvvvvVVVvv', 20, 0x0000, 8, 0, 0, 0x1234_5678, 100, 200, strlen($legacyName), strlen($upathExtra))
+            .$legacyName.$upathExtra;
+        $gzipLatin1 = "\x1f\x8b\x08\x18\x00\x00\x00\x00\x02\x03"."caf\xe9.tar\0"."packed by caf\xc3\xa9\0";
+        $sample = $zipOverride.$gzipLatin1;
+        if ((new NativeMetadataParser)->parseFormats($sample) === null) {
+            self::markTestSkipped('Native Rust format metadata is required for ZIP/Gzip filename authority integration.');
+        }
+
+        $body = YencArticles::article($sample);
+        $analysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], $body);
+        self::assertSame($sample, $analysis['decoded_bytes']);
+        $headers = $analysis['metadata']['decoded_format_metadata']['headers'];
+        self::assertCount(2, $headers);
+
+        $zip = $headers[0];
+        self::assertSame('zip', $zip['format']);
+        self::assertNull($zip['filename']);
+        self::assertFalse($zip['filename_display_truncated']);
+        self::assertSame('café.mkv', $zip['resolved_filename']);
+        self::assertFalse($zip['resolved_filename_display_truncated']);
+        self::assertSame('unicode_path_extra', $zip['resolved_filename_source']);
+        self::assertSame('resolved', $zip['resolved_filename_status']);
+        self::assertSame('café.mkv', $zip['zip_unicode_path_records'][0]['unicode_filename']);
+        self::assertFalse($zip['zip_unicode_path_records'][0]['unicode_filename_display_truncated']);
+
+        $gzip = $headers[1];
+        self::assertSame('gzip', $gzip['format']);
+        self::assertFalse($gzip['filename_utf8_valid']);
+        self::assertTrue($gzip['filename_latin1_printable']);
+        self::assertSame('iso_8859_1', $gzip['filename_encoding']);
+        self::assertSame('café.tar', $gzip['filename']);
+        self::assertFalse($gzip['filename_display_truncated']);
+        self::assertTrue($gzip['comment_utf8_valid']);
+        self::assertTrue($gzip['comment_latin1_printable']);
+        self::assertSame('utf8', $gzip['comment_encoding']);
+        self::assertSame('packed by café', $gzip['comment']);
+        self::assertFalse($gzip['comment_display_truncated']);
     }
 
     #[Test]
