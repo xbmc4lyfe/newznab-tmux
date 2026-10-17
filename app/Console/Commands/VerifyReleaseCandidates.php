@@ -208,8 +208,11 @@ class VerifyReleaseCandidates extends Command
                         $this->line($claim->id.': '.$filtered->verdict.' — '.$filtered->reason);
                     } else {
                         $recovery = $diagnostics === null ? null : hrtime(true);
-                        $repository->finish($claim, new VerificationResult('unknown', $error->getMessage()));
-                        $diagnostics?->phase('finish', $recovery);
+                        try {
+                            $repository->finish($claim, new VerificationResult('unknown', $error->getMessage()));
+                        } finally {
+                            $diagnostics?->phase('finish', $recovery);
+                        }
                         $diagnostics?->finished();
                         $this->warn($claim->id.': retry pending — '.$error->getMessage());
                     }
