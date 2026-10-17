@@ -45,7 +45,9 @@ case "$*" in
         [ "${NNTMUX_NO_EXISTING_APP:-0}" = 1 ] && exit 0
         [ -n "${NNTMUX_NO_CONTAINER:-}" ] && [ "$last" = "$NNTMUX_NO_CONTAINER" ] && exit 0
         echo fixture-container ;;
-    *' ps -q '*) [ "${NNTMUX_SERVICE_MISSING:-0}" = 1 ] || echo "fixture-container-$last" ;;
+    *' ps -q '*)
+        [ "${NNTMUX_PS_FAIL:-0}" != 1 ] || { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
+        [ "${NNTMUX_SERVICE_MISSING:-0}" = 1 ] || echo "fixture-container-$last" ;;
     *'scheduler python3 -c '*) [ "${NNTMUX_SCHEDULER_CAPABILITY_FAIL:-0}" != 1 ] || exit 48; echo "${NNTMUX_SCHEDULER_CAPABILITY:-native}" ;;
     *'scheduler.py drain --timeout='*)
         [ "${NNTMUX_SCHEDULER_DRAIN_FAIL:-0}" != 1 ] || exit 47
@@ -72,6 +74,7 @@ case "$*" in
             if [ -n "${NNTMUX_PROXY_EDIT:-}" ]; then echo C > "$NNTMUX_PROXY_EDIT"; fi
             [ "${NNTMUX_PROXY_FAIL:-0}" != 1 ] || exit 51 ;; esac
         case "$*" in *'--wait-timeout 240 web'*) [ "${NNTMUX_APP_UP_FAIL:-0}" != 1 ] || exit 52 ;; esac
+        case "$*" in *'--force-recreate'*' redis'*) [ "${NNTMUX_REDIS_FAIL:-0}" != 1 ] || exit 53 ;; esac
         if [ "${NNTMUX_STALE_UP:-0}" = 1 ]; then echo changed > "$NNTMUX_REPO/app.txt"; fi
         case "$*" in *' --force-recreate '*) : > "$NNTMUX_REPO/recreated" ;; esac ;;
 esac
@@ -182,7 +185,7 @@ SH);
         mkdir($this->directory.'/database/migrations', 0777, true);
         file_put_contents($this->directory.'/database/migrations/2026_10_17_000001_x.php', "<?php\n");
         file_put_contents($this->directory.'/events', '');
-        $failed = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_APP_UP_FAIL' => '1']);
+        $failed = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_APP_UP_FAIL' => '1', 'NNTMUX_UNHEALTHY' => 'web']);
         $failed->run();
         $this->assertSame(52, $failed->getExitCode());
         $this->assertSame(1, substr_count($this->events(), 'artisan migrate'));
@@ -190,7 +193,9 @@ SH);
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_UNHEALTHY' => 'web'])->run();
         $this->assertStringNotContainsString('artisan migrate', $this->events());
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
+        // Only the service that never came up healthy is redeployed.
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web', $this->events());
+        $this->assertStringNotContainsString('web horizon', $this->events());
     }
 
     public function test_stale_container_image_id_forces_recreation_so_subsequent_unchanged_deploy_skips(): void
@@ -983,7 +988,8 @@ SH);
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $context)->mustRun();
         $this->assertStringNotContainsString('artisan migrate', $this->events());
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
+        // Every service came up healthy despite the failed wait: nothing is repeated.
+        $this->assertStringNotContainsString('--wait-timeout 240 web', $this->events());
     }
 
     public function test_removing_a_service_from_compose_needs_no_app_rollout(): void
@@ -1109,6 +1115,62 @@ SH);
         $this->assertStringContainsString($recreate, $events);
         $this->assertLessThan(strpos($events, $recreate), strpos($events, ' stop web scheduler indexer'));
         $this->assertStringNotContainsString(' up -d --no-deps --wait --wait-timeout 240 redis', $events);
+    }
+
+    public function test_interrupted_recreate_of_a_changed_data_service_is_still_forced_on_retry(): void
+    {
+        mkdir($this->directory.'/docker/config/redis', 0777, true);
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 1gb\n");
+        $config = ['NNTMUX_CONFIG_ID' => $this->composeJson()];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+
+        // An mtime-preserving copy: the file is not newer than the container, only its content changed.
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 2gb\n");
+        touch($this->directory.'/docker/config/redis/redis.conf', 946684800);
+        $failed = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_REDIS_FAIL' => '1']);
+        $failed->run();
+        $this->assertSame(53, $failed->getExitCode());
+        $this->assertStringContainsString('service:redis=pending', (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
+
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 redis', $this->events());
+    }
+
+    public function test_partially_failed_app_start_keeps_the_services_that_came_up(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/app.txt', "two\n");
+        $failed = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_APP_UP_FAIL' => '1', 'NNTMUX_UNHEALTHY' => 'indexer']);
+        $failed->run();
+        $this->assertSame(52, $failed->getExitCode());
+
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 indexer', $events);
+        $this->assertStringNotContainsString('web horizon', $events);
+        $this->assertStringNotContainsString('scheduler.py drain', $events);
+        $this->assertStringNotContainsString(' stop --timeout 1920 horizon', $events);
+    }
+
+    public function test_failed_container_query_during_planning_aborts_without_touching_services(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/app.txt', "two\n");
+        file_put_contents($this->directory.'/events', '');
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_PS_FAIL' => '1']);
+        $process->run();
+        $this->assertNotSame(0, $process->getExitCode());
+        $this->assertStringNotContainsString(' up -d', $this->events());
+        $this->assertStringNotContainsString('drain', $this->events());
+    }
+
+    public function test_dc_from_docker_env_replaces_the_default_compose_command(): void
+    {
+        file_put_contents($this->directory.'/docker/.env', "DC=docker compose --project-directory /persistent/runtime\n");
+        $this->make(['deploy-plan'])->mustRun();
+        $this->assertStringContainsString('compose --project-directory /persistent/runtime config --format json', $this->events());
     }
 
     public function test_host_system_paths_match_on_path_boundaries_only(): void

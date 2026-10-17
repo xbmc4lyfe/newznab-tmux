@@ -46,7 +46,7 @@ plan --invalidate
 # here, before any drain, instead of after a full app rollout that would then repeat every poll.
 if [ -n "$DIRTY_INFRA" ]; then
     # shellcheck disable=SC2086
-    plan --forget $DIRTY_INFRA
+    plan --pending $DIRTY_INFRA
     # shellcheck disable=SC2086
     compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $DIRTY_INFRA
     # shellcheck disable=SC2086
@@ -215,7 +215,7 @@ fi
 
 if [ -n "$DIRTY_DATA" ]; then
     # shellcheck disable=SC2086
-    plan --forget $DIRTY_DATA
+    plan --pending $DIRTY_DATA
     # shellcheck disable=SC2086
     compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $DIRTY_DATA
     # shellcheck disable=SC2086
@@ -243,7 +243,15 @@ fi
 
 if [ -n "$up_app_services" ]; then
     # shellcheck disable=SC2086
-    compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $up_app_services
+    if compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $up_app_services; then
+        :
+    else
+        up_rc=$?
+        # Keep the services that did come up healthy on this run's image; the retry repeats the rest.
+        # shellcheck disable=SC2086
+        plan --record-healthy $up_app_services || true
+        exit "$up_rc"
+    fi
     # shellcheck disable=SC2086
     plan --record $up_app_services
 fi

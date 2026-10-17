@@ -681,7 +681,10 @@ def check_app_container(docker_dir: Path, svc: str, verify_image: bool = True) -
         env=env,
         check=False,
     )
-    if ps.returncode != 0 or not ps.stdout.strip():
+    if ps.returncode != 0:
+        # A failed query is not a missing container (that would recreate every app service).
+        sys.exit(f"deploy-plan: cannot list the {svc} container: {ps.stderr.strip()}")
+    if not ps.stdout.strip():
         return False, "missing"
     container = ps.stdout.strip().splitlines()[0]
     status_proc = subprocess.run(
@@ -690,8 +693,10 @@ def check_app_container(docker_dir: Path, svc: str, verify_image: bool = True) -
         text=True,
         check=False,
     )
-    if status_proc.returncode != 0 or status_proc.stdout.strip() != "running healthy":
-        return False, f"unhealthy ({status_proc.stdout.strip() or 'inspect-failed'})"
+    if status_proc.returncode != 0:
+        sys.exit(f"deploy-plan: cannot inspect the {svc} container: {status_proc.stderr.strip()}")
+    if status_proc.stdout.strip() != "running healthy":
+        return False, f"unhealthy ({status_proc.stdout.strip()})"
     if verify_image:
         expected = image_id(service_image_name(svc))
         if not expected:
@@ -702,7 +707,9 @@ def check_app_container(docker_dir: Path, svc: str, verify_image: bool = True) -
             text=True,
             check=False,
         )
-        if img_proc.returncode != 0 or img_proc.stdout.strip() != expected:
+        if img_proc.returncode != 0:
+            sys.exit(f"deploy-plan: cannot inspect the {svc} container image: {img_proc.stderr.strip()}")
+        if img_proc.stdout.strip() != expected:
             return False, "stale-image"
     return True, "healthy"
 
@@ -711,11 +718,15 @@ def running_image(docker_dir: Path, svc: str) -> str | None:
     env = dict(os.environ)
     env.setdefault("COMPOSE_FILE", str(docker_dir / "docker-compose.yml"))
     ps = subprocess.run([*compose_command(docker_dir), "ps", "-q", svc], capture_output=True, text=True, env=env, check=False)
-    if ps.returncode != 0 or not ps.stdout.strip():
+    if ps.returncode != 0:
+        sys.exit(f"deploy-plan: cannot list the {svc} container: {ps.stderr.strip()}")
+    if not ps.stdout.strip():
         return None
     container = ps.stdout.strip().splitlines()[0]
     proc = subprocess.run(["docker", "inspect", "--format", "{{.Image}}", container], capture_output=True, text=True, check=False)
-    return proc.stdout.strip() if proc.returncode == 0 else None
+    if proc.returncode != 0:
+        sys.exit(f"deploy-plan: cannot inspect the {svc} container image: {proc.stderr.strip()}")
+    return proc.stdout.strip()
 
 
 def container_exists(docker_dir: Path, svc: str) -> bool:
@@ -1000,7 +1011,7 @@ def main() -> None:
 
     cmd = sys.argv[1] if len(sys.argv) > 1 else "--explain"
 
-    if cmd in ("--invalidate", "--forget", "--record"):
+    if cmd in ("--invalidate", "--forget", "--pending", "--record", "--record-healthy"):
         # Mid-run stamp maintenance under the guard. --invalidate before the first mutation, --forget
         # before a service is stopped or recreated, --record after it is healthy (from the plan
         # snapshot, i.e. the state the run deployed, never a later re-read). Until the guard publishes
@@ -1016,6 +1027,25 @@ def main() -> None:
         if cmd == "--forget":
             for key in keys:
                 record.pop(key, None)
+        elif cmd == "--pending":
+            # A service whose recreate is about to start: if the run stops before it is healthy,
+            # the retry must still force-recreate it rather than fall back to the mtime rule.
+            for key in keys:
+                record.pop(key, None)
+            for item in items:
+                if item not in ("migration", "effective"):
+                    record[f"service:{item}"] = "pending"
+        elif cmd == "--record-healthy":
+            # After a partially failed app start: keep the services that are running healthy on the
+            # image this run planned, so the retry repeats only the ones that did not come up.
+            snapshot = parse_stamp(Path(f"{stamp_path}.plan"))
+            for item in items:
+                planned = snapshot.get(f"image:{item}", "").rsplit("@", 1)[-1]
+                ok, _ = check_app_container(docker_dir, item, verify_image=False)
+                if ok and planned and running_image(docker_dir, item) == planned:
+                    for key in (f"service:{item}", f"compose:{item}", f"image:{item}", f"build:{item}"):
+                        if key in snapshot:
+                            record[key] = snapshot[key]
         elif cmd == "--record":
             snapshot = parse_stamp(Path(f"{stamp_path}.plan"))
             if not snapshot:
