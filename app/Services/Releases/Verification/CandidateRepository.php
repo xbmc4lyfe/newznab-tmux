@@ -97,6 +97,7 @@ final class CandidateRepository
                 // A pending generation whose partial was deleted holds no partial any more: retire it (its
                 // retained articles must not publish anew) so it neither absorbs nor diverts later uploads.
                 $retiredBytes = 0;
+                $identityAfter = null;
                 if ($existing !== null && self::tracksUpgrades()) {
                     $orphans = DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)->whereNull('release_id')
                         ->whereNotNull('upgrades_release_id')->where('manifest_path', '<>', '')
@@ -118,13 +119,13 @@ final class CandidateRepository
                         $existing = null;
                     }
                 }
-                if ($holder === null && ($existing !== null || isset($identityAfter))) {
+                if ($holder === null && ($existing !== null || $identityAfter !== null)) {
                     // Not a partial's articles: they join the newest pending candidate that holds no partial's
                     // inventory. Before partials that was always the newest row; posts kept apart from a
                     // partial can leave one behind newer holders or generations, whatever became of them.
                     // Where partials share the hash, headers that would spoil that candidate are kept apart too.
                     $own = $this->lockLatestUnheld($sourceIdentity, array_map(static fn (object $held): int => (int) $held->id, $holders));
-                    $shared = $holders !== [] || isset($identityAfter) || ($own !== null && (int) $own->id !== (int) ($existing->id ?? 0));
+                    $shared = $holders !== [] || $identityAfter !== null || ($own !== null && (int) $own->id !== (int) ($existing->id ?? 0));
                     if ($own !== null && $shared && $snapshotFailure === null) {
                         $manifest ??= $this->snapshotHeaders($collection, $currentReads);
                         if ($this->spoils($this->store->read($own->manifest_path), $this->merge($this->store->read($own->manifest_path), $manifest))) {
@@ -135,7 +136,7 @@ final class CandidateRepository
                     if ($own !== null && (int) $own->id !== (int) ($existing->id ?? 0)) {
                         $existing = $own;
                         $apart = false;
-                        unset($identityAfter);
+                        $identityAfter = null;
                     }
                 }
                 if ($holder !== null && ($holder->release_id === null || (int) $holder->id === (int) ($existing->id ?? 0))) {
