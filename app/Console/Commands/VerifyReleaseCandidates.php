@@ -117,10 +117,14 @@ class VerifyReleaseCandidates extends Command
                     break;
                 }
                 $phase = $diagnostics === null ? null : hrtime(true);
-                $preferReady = $locks->preferReady();
-                $diagnostics?->claimCalled();
-                $claim = $repository->claim(fn (int $id): bool => $locks->tryCandidate($id), $preferReady);
-                $diagnostics?->phase('claim', $phase);
+                try {
+                    $preferReady = $locks->preferReady();
+                    $diagnostics?->claimCalled();
+                    $claim = $repository->claim(fn (int $id): bool => $locks->tryCandidate($id), $preferReady);
+                } finally {
+                    // Also on a throwing claim, which the outer handler reports as fatal.
+                    $diagnostics?->phase('claim', $phase);
+                }
                 if ($claim === null) {
                     $diagnostics?->stop('no_claim', hrtime(true));
                     break;
