@@ -8,13 +8,13 @@ use Illuminate\Support\Facades\DB;
 return new class extends Migration
 {
     /**
-     * One publication lock row per release-size stripe, so publications of different sizes no
-     * longer wait for each other while exact duplicates still serialize on a shared stripe.
+     * Publication lock stripes keyed by duplicate-search keys (fingerprint, predb id, names, size),
+     * so unrelated publications no longer wait for each other while possible duplicates still do.
      */
     public function up(): void
     {
         DB::table('release_verification_locks')->insertOrIgnore(array_map(
-            static fn (int $stripe): array => ['name' => 'publication:'.$stripe], range(0, 63)));
+            static fn (int $stripe): array => ['name' => 'publication:'.$stripe], range(0, 1023)));
     }
 
     public function down(): void

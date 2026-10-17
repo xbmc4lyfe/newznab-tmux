@@ -275,10 +275,10 @@ final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
         $other = $this->connection();
         DB::beginTransaction();
         try {
-            $ledger->enterPublication(5);
-            // Only this size's stripe is held; other stripes and the shared fallback row stay free.
-            $this->assertLocked($other, 'SELECT name FROM release_verification_locks WHERE name = \'publication:5\' FOR UPDATE NOWAIT');
-            $this->assertNotLocked($other, 'SELECT name FROM release_verification_locks WHERE name = \'publication:6\' FOR UPDATE NOWAIT');
+            $ledger->enterPublication(['size:5']);
+            // Only this key's stripe is held; other stripes and the shared fallback row stay free.
+            $this->assertLocked($other, $this->stripeLock('size:5'));
+            $this->assertNotLocked($other, $this->stripeLock($this->keyOnAnotherStripe('size:5')));
             $this->assertNotLocked($other, 'SELECT name FROM release_verification_locks WHERE name = \'publication\' FOR UPDATE NOWAIT');
             $this->assertNotLocked($other, 'SELECT id FROM release_verification_state WHERE id = 1 FOR UPDATE NOWAIT');
             $this->assertFalse($ledger->adjust(61), 'A delta beyond capacity changes nothing.');
@@ -300,11 +300,56 @@ final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
         $other = $this->connection();
         DB::beginTransaction();
         try {
-            app(VerificationLedger::class)->enterPublication(5);
+            app(VerificationLedger::class)->enterPublication(['size:5']);
             $this->assertLocked($other, 'SELECT name FROM release_verification_locks WHERE name = \'publication\' FOR UPDATE NOWAIT');
         } finally {
             DB::rollBack();
         }
+    }
+
+    public function test_identical_articles_with_different_sizes_serialize_on_their_shared_fingerprint(): void
+    {
+        $first = VerificationLedger::publicationKeys(1000, 'ABCDEF', 'Movie.2020', 'Movie 2020', 0);
+        $second = VerificationLedger::publicationKeys(1234, 'abcdef', 'Other.Upload', 'Other Upload', 0);
+        $this->assertNotSame(VerificationLedger::publicationStripe('size:1000'), VerificationLedger::publicationStripe('size:1234'));
+        $other = $this->connection();
+        $other->beginTransaction();
+        try {
+            $stripes = array_map(VerificationLedger::publicationStripe(...), $second);
+            $other->query("SELECT name FROM release_verification_locks WHERE name IN ('".implode("','", $stripes)."') FOR UPDATE")->fetchAll();
+            DB::beginTransaction();
+            try {
+                app(VerificationLedger::class)->enterPublication($first);
+                $this->fail('A publication sharing a duplicate-search key must wait for the other.');
+            } catch (QueryException $error) {
+                $this->assertSame(1205, (int) $error->errorInfo[1]);
+            } finally {
+                DB::rollBack();
+            }
+        } finally {
+            $other->rollBack();
+        }
+    }
+
+    public function test_names_equal_under_the_collation_share_a_publication_key(): void
+    {
+        $this->assertSame(VerificationLedger::publicationKeys(0, null, 'Café.Movie 2020 ', '', 0),
+            VerificationLedger::publicationKeys(0, null, 'CAFE.movie.2020', '', 0));
+        $this->assertSame(['name:moviex264'], VerificationLedger::publicationKeys(0, null, '', 'Movie-x264', 0));
+        $this->assertSame([], VerificationLedger::publicationKeys(0, null, '', '', 0));
+    }
+
+    private function stripeLock(string $key): string
+    {
+        return "SELECT name FROM release_verification_locks WHERE name = '".VerificationLedger::publicationStripe($key)."' FOR UPDATE NOWAIT";
+    }
+
+    private function keyOnAnotherStripe(string $key): string
+    {
+        for ($i = 0; VerificationLedger::publicationStripe('size:'.$i) === VerificationLedger::publicationStripe($key); $i++) {
+        }
+
+        return 'size:'.$i;
     }
 
     private function assertLocked(PDO $other, string $sql): void

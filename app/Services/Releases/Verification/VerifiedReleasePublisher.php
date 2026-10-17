@@ -34,21 +34,26 @@ final class VerifiedReleasePublisher
 
         $timing = PublicationTiming::sample();
         $status = 'threw';
-        // Exact duplicates (crossposts of the same articles) share this size, so they serialize
-        // on one publication stripe while releases of other sizes publish concurrently.
+        // Resolve the duplicate-search keys once, before taking any lock, so the publication locks
+        // exactly the keys its search will use. Without them it falls back to the shared row.
+        $preResolved = null;
+        $keys = [];
         try {
-            $stripe = $this->publicationSize($result->manifest);
+            $preResolved = $this->metadata->resolve($result->manifest);
+            $keys = VerificationLedger::publicationKeys($this->publicationSize($result->manifest), $this->incomingFingerprint($result->manifest),
+                (string) $preResolved['name'], (string) $preResolved['searchname'], (int) $preResolved['predb_id']);
         } catch (Throwable) {
-            $stripe = 0;
+            $preResolved = null;
+            $keys = [];
         }
         try {
-            $id = DB::transaction(function () use ($claim, $result, $timing, $stripe): ?int {
+            $id = DB::transaction(function () use ($claim, $result, $timing, $preResolved, $keys): ?int {
                 $timing?->beginAttempt();
                 $returned = false;
                 try {
-                    // Duplicate detection must see each committed release of the same size;
-                    // admissions, expiry and other sizes no longer wait behind this lock.
-                    app(VerificationLedger::class)->enterPublication($stripe);
+                    // Duplicate detection must see each committed release sharing a search key;
+                    // admissions, expiry and unrelated releases no longer wait behind this lock.
+                    app(VerificationLedger::class)->enterPublication($keys);
                     $timing?->nextPhase('candidate_policy');
                     $candidate = DB::table('release_verification_candidates')->where('id', $claim->id)->lockForUpdate()->first();
                     if ($candidate === null || $candidate->version !== $claim->version
@@ -79,7 +84,7 @@ final class VerifiedReleasePublisher
                         return null;
                     }
                     $timing?->nextPhase('metadata_size');
-                    $metadata = $this->metadata->resolve($manifest);
+                    $metadata = $preResolved ?? $this->metadata->resolve($manifest);
                     $size = $this->publicationSize($manifest);
                     if ($size < 1 && ($manifest['verification_mode'] ?? null) === 'spot_check') {
                         throw new RuntimeException('Spot-checked release has no positive declared size.');
@@ -252,6 +257,18 @@ final class VerifiedReleasePublisher
         } catch (Throwable) {
             return false;
         }
+    }
+
+    /**
+     * The article fingerprint duplicate detection looks up, computed as {@see findCoveredDuplicate()} does.
+     *
+     * @param  array<string, mixed>  $manifest
+     */
+    private function incomingFingerprint(array $manifest): ?string
+    {
+        $xml = (new NzbArticleCoverage(app(NzbService::class), $this->duplicates))->parseXml($this->writer->document($manifest));
+
+        return $xml === null ? null : NzbArticleFingerprint::fromXml($xml);
     }
 
     /**
