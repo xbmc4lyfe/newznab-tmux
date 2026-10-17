@@ -13415,7 +13415,7 @@ mod tests {
         // A Unicode Path record can also not rescue a masked name.
         let local = b"00000001";
         let record = zip_upath_record(1, crc32fast::hash(local), b"real.mkv");
-        let masked_with_extra = zip_upath_fixture(0x2000, local, &[record.clone()]);
+        let masked_with_extra = zip_upath_fixture(0x2000, local, std::slice::from_ref(&record));
         assert_eq!(
             masked_with_extra["headers"][0]["resolved_filename_status"],
             "local_header_masked"
@@ -13423,7 +13423,7 @@ mod tests {
 
         // Declared extra area is cut off by the end of the sample: an unseen 0x7075
         // record could override the visible ASCII name.
-        let full = zip_upath_bytes(0, b"release.mkv", &[record.clone()]);
+        let full = zip_upath_bytes(0, b"release.mkv", std::slice::from_ref(&record));
         let cut = &full[..full.len() - 3];
         let truncated = serde_json::to_value(parse(cut)).unwrap();
         let header = &truncated["headers"][0];
