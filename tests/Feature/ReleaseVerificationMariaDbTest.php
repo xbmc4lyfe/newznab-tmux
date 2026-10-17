@@ -27,6 +27,9 @@ class ReleaseVerificationMariaDbTest extends ReleaseVerificationCandidatesTest
     {
         try {
             parent::setUp();
+            // Production locks archived collections through this unique hash index (see
+            // CandidateRepository::lockArchiveCollection()); the shared fixture's BLOB column needs a prefix.
+            DB::statement('CREATE UNIQUE INDEX ix_collection_collectionhash ON collections (collectionhash(20))');
         } catch (Throwable $error) {
             $this->dropOwnedFixture();
 
@@ -47,6 +50,12 @@ class ReleaseVerificationMariaDbTest extends ReleaseVerificationCandidatesTest
         ];
         config(['database.connections.verification_fixture_admin' => $endpoint]);
         DB::purge('verification_fixture_admin');
+        // Oversized-metadata cases send manifests larger than the server default packet.
+        $admin = DB::connection('verification_fixture_admin');
+        if ((int) $admin->selectOne('SELECT @@GLOBAL.max_allowed_packet AS bytes')->bytes < 268435456) {
+            $admin->statement('SET GLOBAL max_allowed_packet = 268435456');
+            DB::purge('verification_fixture_admin');
+        }
         $this->fixtureDatabase = 'verification_fixture_'.bin2hex(random_bytes(12));
         DB::connection('verification_fixture_admin')->statement(
             'CREATE DATABASE `'.$this->fixtureDatabase.'` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci'
@@ -56,6 +65,9 @@ class ReleaseVerificationMariaDbTest extends ReleaseVerificationCandidatesTest
         config(['database.default' => 'mysql', 'database.connections.mysql' => $endpoint]);
         DB::purge('mysql');
         $this->assertSame($this->fixtureDatabase, DB::selectOne('SELECT DATABASE() AS name')->name);
+        // The shared SQLite fixture creates release_archive_naming_evidence before the releases table some
+        // tests create later, with a different id type; MariaDB would refuse both without this.
+        DB::statement('SET SESSION foreign_key_checks = 0');
     }
 
     protected function tearDown(): void
@@ -100,6 +112,13 @@ class ReleaseVerificationMariaDbTest extends ReleaseVerificationCandidatesTest
         }
     }
 
+    public function test_batched_snapshot_rejects_oversized_metadata_without_removing_headers(): void
+    {
+        // Non-strict MariaDB would silently truncate the parent's oversized message ID to 255 bytes.
+        DB::statement('ALTER TABLE parts MODIFY messageid LONGTEXT NOT NULL');
+        parent::test_batched_snapshot_rejects_oversized_metadata_without_removing_headers();
+    }
+
     public function test_upload_reconciliation_uses_current_admission_reads_inside_an_older_snapshot(): void
     {
         $identity = sha1('import:current-upload');
@@ -119,16 +138,15 @@ class ReleaseVerificationMariaDbTest extends ReleaseVerificationCandidatesTest
                 ]);
             });
             $this->assertNull(DB::table('release_verification_candidates')->where('identity', $identity)->value('id'), 'The consistent read retains its pre-admission snapshot.');
-            $resolved = (new \ReflectionMethod($manifests, 'resolveCandidate'))->invoke($manifests, $manifests->read($manifestPath));
+            // Resolution reads the committed admission despite the caller's older snapshot.
+            $admitted = $other->table('release_verification_candidates')->where('identity', $identity)->first();
+            $resolved = $this->resolveUploadCandidate($manifests, $manifestPath, $identity, ['accepted_admission' => [
+                'identity' => $identity, 'candidate_id' => (int) $admitted->id, 'version' => (int) $admitted->version,
+                'manifest_hash' => (string) $admitted->manifest_hash]]);
             $this->assertSame(NzbUploadManifestService::STATE_NZB_IMPORTED, $resolved['state']);
             $this->assertSame(7, $resolved['release_id']);
-            $this->assertSame(NzbUploadManifestService::STATE_NZB_PENDING, $manifests->read($manifestPath)['state']);
-            $this->assertSame(NzbUploadManifestService::STATE_NZB_PENDING, $manifests->reconcilePending($manifestPath)['state']);
+            $this->assertSame('committed-upload', $resolved['release_guid']);
             DB::commit();
-            $manifest = $manifests->read($manifestPath);
-            $this->assertSame(NzbUploadManifestService::STATE_NZB_IMPORTED, $manifest['state']);
-            $this->assertSame(7, $manifest['release_id']);
-            $this->assertSame('committed-upload', $manifest['release_guid']);
         } finally {
             if (DB::transactionLevel() > 0) {
                 DB::rollBack();
@@ -151,15 +169,16 @@ class ReleaseVerificationMariaDbTest extends ReleaseVerificationCandidatesTest
             $other->table('release_verification_candidates')->insert($this->pendingUploadCandidate($identity) + ['status' => 'pending']);
             $this->assertNull(DB::table('release_verification_candidates')->where('identity', $identity)->value('id'));
             try {
-                $manifests->reconcilePending($manifestPath);
+                DB::transaction(fn (): array => $this->resolveUploadCandidate($manifests, $manifestPath, $identity), 5);
                 $this->fail('An in-progress admission must hold the reconciliation ledger until commit.');
             } catch (QueryException $error) {
                 $this->assertSame(1205, (int) $error->errorInfo[1]);
             }
-            $this->assertSame(NzbUploadManifestService::STATE_NZB_PENDING, $manifests->read($manifestPath)['state']);
             $this->assertNull($manifests->read($manifestPath)['last_error']);
             $other->commit();
-            $this->assertSame(NzbUploadManifestService::STATE_NZB_PENDING, $manifests->reconcilePending($manifestPath)['state']);
+            // Once committed, the pending candidate leaves the upload pending rather than rejecting it as absent.
+            $resolved = DB::transaction(fn (): array => $this->resolveUploadCandidate($manifests, $manifestPath, $identity), 5);
+            $this->assertSame(NzbUploadManifestService::STATE_NZB_PENDING, $resolved['state']);
             $this->assertTrue(DB::table('release_verification_candidates')->where('identity', $identity)->exists());
             $this->assertFileExists(dirname($manifestPath).'/info.nfo');
         } finally {
@@ -168,6 +187,20 @@ class ReleaseVerificationMariaDbTest extends ReleaseVerificationCandidatesTest
             }
             DB::purge('verification_upload_other');
         }
+    }
+
+    /**
+     * Reconciliation's admission lookup, below the accepted-capture provenance gate that
+     * reconcilePending() applies first.
+     *
+     * @param  array<string, mixed>  $admission
+     * @return array<string, mixed>
+     */
+    private function resolveUploadCandidate(NzbUploadManifestService $manifests, string $manifestPath, string $identity, array $admission = []): array
+    {
+        $manifest = $admission + ['state' => NzbUploadManifestService::STATE_NZB_PENDING, 'candidate_identity' => $identity] + $manifests->read($manifestPath);
+
+        return (new \ReflectionMethod($manifests, 'resolveCandidate'))->invoke($manifests, $manifest, $manifestPath);
     }
 
     /** @return array{NzbUploadManifestService, string} */

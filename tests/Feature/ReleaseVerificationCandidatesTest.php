@@ -113,7 +113,7 @@ class ReleaseVerificationCandidatesTest extends TestCase
         ksort($expected);
         $partReads = 0;
         DB::listen(static function (QueryExecuted $query) use (&$partReads): void {
-            if (str_starts_with($query->sql, 'select') && str_contains($query->sql, 'from "parts"')) {
+            if (str_starts_with($query->sql, 'select') && preg_match('/from [`"]parts[`"]/', $query->sql) === 1) {
                 $partReads++;
             }
         });
