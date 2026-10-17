@@ -18,7 +18,7 @@ class CandidateHeaderInventoryTest extends TestCase
         $this->assertSame('waiting_upload', $inventory->assessment($manifest)['status']);
         $manifest['expected_files'] = 2;
         $manifest['files'][0]['segments'][0]['number'] = 3;
-        $this->assertSame('unknown', $inventory->assessment($manifest)['status']);
+        $this->assertSame('header_rejected', $inventory->assessment($manifest)['status']);
     }
 
     public function test_invalid_totals_excess_parts_and_conflicts_are_not_uploads(): void
@@ -37,7 +37,7 @@ class CandidateHeaderInventoryTest extends TestCase
             } else {
                 $manifest['conflict'] = true;
             }
-            $this->assertSame('unknown', $inventory->assessment($manifest)['status'], $case);
+            $this->assertSame('header_rejected', $inventory->assessment($manifest)['status'], $case);
         }
     }
 

@@ -94,7 +94,7 @@ final class VerificationRunDiagnosticsCommandTest extends ReleaseVerificationCan
         $this->assertSame(0, $this->runDiagnostics());
         $this->assertTrue($released);
         $this->assertCount(1, $reports);
-        $this->assertSame('unknown', DB::table('release_verification_candidates')->value('status'));
+        $this->assertSame('header_rejected', DB::table('release_verification_candidates')->value('status'));
         $this->assertNull(DB::table('release_verification_candidates')->value('lease_token'));
     }
 
@@ -326,6 +326,11 @@ final class VerificationRunDiagnosticsCommandTest extends ReleaseVerificationCan
         $this->assertSame(0, array_sum($reports[0]['verifier_verdicts']));
         $this->assertSame('success', $reports[0]['command_result']);
         $this->assertArrayNotHasKey('persisted_outcomes', $reports[0]);
+        // The throwing manifest read is charged to its own phase, and the recovery finish is timed.
+        $this->assertSame(1, $reports[0]['phases']['manifest_read']['count']);
+        $this->assertSame(0, $reports[0]['phases']['verify_other']['count']);
+        $this->assertSame(1, $reports[0]['phases']['finish']['count']);
+        $this->assertSame(1, $reports[0]['phases']['claim']['count']);
     }
 
     public function test_diagnostics_add_no_queries_when_a_claim_attempt_returns_null(): void
@@ -373,7 +378,7 @@ final class VerificationRunDiagnosticsCommandTest extends ReleaseVerificationCan
         $this->assertCount(1, $paths);
         $contents = file_get_contents($paths[0]);
         $this->assertStringContainsString('Candidate verification run summary.', $contents);
-        $this->assertStringContainsString('"schema_version":1', $contents);
+        $this->assertStringContainsString('"schema_version":2', $contents);
         $this->assertStringContainsString('"claims_admitted":0', $contents);
         Log::forgetChannel('daily');
     }

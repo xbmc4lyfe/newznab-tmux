@@ -35,7 +35,8 @@ final class SpotCheckVerifier
         $partial = null;
         if ($assessment['reason'] !== null) {
             if (! $allowPartial || $assessment['status'] !== 'waiting_upload') {
-                return new VerificationResult('unknown', $assessment['reason'], waitingForHeaders: $assessment['status'] === 'waiting_upload');
+                return new VerificationResult('unknown', $assessment['reason'], waitingForHeaders: $assessment['status'] === 'waiting_upload',
+                    headerRejected: $assessment['status'] === CandidateHeaderInventory::REJECTED);
             }
             $partial = $inventory->completeness($manifest);
         }

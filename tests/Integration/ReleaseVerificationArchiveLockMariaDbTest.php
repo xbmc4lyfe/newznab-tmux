@@ -76,6 +76,7 @@ final class ReleaseVerificationArchiveLockMariaDbTest extends TestCase
             DB::purge();
             DB::statement('SET SESSION innodb_lock_wait_timeout = 1');
             (require database_path('migrations/2026_10_11_154028_create_release_verification_candidates_table.php'))->up();
+            (require database_path('migrations/2026_10_17_220000_add_header_check_pending_to_release_verification_candidates.php'))->up();
             DB::statement('CREATE TABLE collections (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                 collectionhash BINARY(20) NOT NULL, subject VARCHAR(255) NOT NULL, fromname VARCHAR(255) NOT NULL,
                 totalfiles INT NOT NULL, groups_id INT NOT NULL, collection_regexes_id INT DEFAULT 0,
