@@ -76,13 +76,14 @@ final class ReleaseFingerprintCollector
         $par2SourceSampleOmittedCount = 0;
         foreach ($servers as $server) {
             $serverKey = ($server['alternate'] ? 'alternate ' : 'primary ').$server['name'];
-            if ($server['alternate'] && $this->alternateRecentlyUnavailable($server)) {
-                // Another job failed to reach this alternate moments ago; skip the probe instead of
-                // waiting out a full connect timeout in every job while the provider stays down.
+            $skipReason = $server['alternate'] ? $this->alternateSkipReason($server) : null;
+            if ($skipReason !== null) {
+                // Another job failed to reach this alternate moments ago, or is re-probing it now; skip
+                // instead of waiting out a full connect timeout in every job while the provider stays down.
                 $unavailable[$serverKey] = class_basename(NntpProviderUnavailableException::class);
                 $serverProfiles[] = $server + [
                     'profile_error_type' => $unavailable[$serverKey],
-                    'profile_skipped_reason' => 'recent_provider_failure',
+                    'profile_skipped_reason' => $skipReason,
                 ];
                 $serverProfileMap[$serverKey] = [];
 
@@ -91,6 +92,9 @@ final class ReleaseFingerprintCollector
             try {
                 $profile = $nntp->getFingerprintServerProfile($server['alternate']);
                 $profileRow = $server + ['profile' => $profile];
+                if ($server['alternate']) {
+                    $this->rememberAlternateReachable($server);
+                }
             } catch (Throwable $exception) {
                 $profile = [];
                 $profileRow = $server + ['profile_error_type' => class_basename($exception)];
@@ -2354,37 +2358,79 @@ final class ReleaseFingerprintCollector
         return $servers;
     }
 
-    /** @param array{name: string, port: string, tls: bool} $server */
-    private function alternateRecentlyUnavailable(array $server): bool
+    /**
+     * Null when this job should probe the alternate. After a failure only one job re-probes once the
+     * breaker window ends; the others skip until it succeeds or the failure reopens the breaker.
+     *
+     * @param  array{name: string, port: string, tls: bool}  $server
+     */
+    private function alternateSkipReason(array $server): ?string
     {
-        if ((int) config('nntmux_nntp.fingerprint_provider_breaker_seconds', 900) <= 0) {
-            return false;
+        if (self::providerBreakerSeconds() <= 0) {
+            return null;
         }
         try {
-            return Cache::has(self::providerBreakerKey($server));
+            if (Cache::has(self::providerBreakerKey($server, 'open'))) {
+                return 'recent_provider_failure';
+            }
+            if (Cache::has(self::providerBreakerKey($server, 'suspect'))
+                && ! Cache::add(self::providerBreakerKey($server, 'probe'), true, self::providerProbeSeconds())) {
+                return 'provider_probe_in_progress';
+            }
         } catch (Throwable) {
-            return false;
+            // Without the cache every job probes the provider itself, as before.
         }
+
+        return null;
     }
 
     /** @param array{name: string, port: string, tls: bool} $server */
     private function rememberAlternateUnavailable(array $server): void
     {
-        $seconds = (int) config('nntmux_nntp.fingerprint_provider_breaker_seconds', 900);
+        $seconds = self::providerBreakerSeconds();
         if ($seconds <= 0) {
             return;
         }
         try {
-            Cache::put(self::providerBreakerKey($server), true, $seconds);
+            Cache::put(self::providerBreakerKey($server, 'open'), true, $seconds);
+            Cache::put(self::providerBreakerKey($server, 'suspect'), true, max(3600, $seconds * 4));
+            Cache::forget(self::providerBreakerKey($server, 'probe'));
         } catch (Throwable) {
             // Without the cache every job probes the provider itself, as before.
         }
     }
 
     /** @param array{name: string, port: string, tls: bool} $server */
-    private static function providerBreakerKey(array $server): string
+    private function rememberAlternateReachable(array $server): void
     {
-        return 'release-fingerprint:provider-unavailable:'.sha1(strtolower($server['name']).'|'.$server['port'].'|'.($server['tls'] ? 'tls' : 'plain'));
+        if (self::providerBreakerSeconds() <= 0) {
+            return;
+        }
+        try {
+            if (Cache::has(self::providerBreakerKey($server, 'suspect'))) {
+                Cache::forget(self::providerBreakerKey($server, 'suspect'));
+                Cache::forget(self::providerBreakerKey($server, 'probe'));
+            }
+        } catch (Throwable) {
+            // A stale suspect key only serialises the next probe.
+        }
+    }
+
+    private static function providerBreakerSeconds(): int
+    {
+        return (int) config('nntmux_nntp.fingerprint_provider_breaker_seconds', 900);
+    }
+
+    /** Long enough to cover one alternate connect attempt, so a crashed prober cannot block it for long. */
+    private static function providerProbeSeconds(): int
+    {
+        return max(60, 2 * (int) config('nntmux_nntp.alternate_server_socket_timeout', 120));
+    }
+
+    /** @param array{name: string, port: string, tls: bool} $server */
+    private static function providerBreakerKey(array $server, string $state): string
+    {
+        return 'release-fingerprint:provider-unavailable:'.$state.':'.sha1(strtolower($server['name']).'|'.$server['port'].'|'.($server['tls'] ? 'tls' : 'plain'));
     }
 
     /** @return array{string, string} */

@@ -12,6 +12,7 @@ use App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer;
 use App\Services\Releases\Fingerprint\Par2MetadataParser;
 use App\Services\Releases\Fingerprint\ReleaseFingerprintCollector;
 use App\Services\YencService;
+use Illuminate\Support\Facades\Cache;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\TestCase;
 
@@ -88,6 +89,62 @@ final class ReleaseFingerprintProviderBreakerTest extends TestCase
     }
 
     #[Test]
+    public function only_one_job_reprobes_an_alternate_after_its_breaker_expires(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->twice()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(true)
+            ->andThrow(new NntpProviderUnavailableException('Unable to connect to the requested NNTP provider.'));
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)
+            ->withArgs(fn (string $id, int $body, int $header, bool $alternate): bool => $alternate === false)
+            ->andThrow(new \RuntimeException('Article unavailable.'));
+
+        $this->collect();
+        $this->travel(901)->seconds();
+        // Another worker has already claimed the re-probe.
+        $this->assertTrue(Cache::add($this->breakerKey('probe'), true, 240));
+
+        $this->assertSame('provider_probe_in_progress', $this->alternateProfile($this->collect()['data'])['profile_skipped_reason']);
+    }
+
+    #[Test]
+    public function a_successful_reprobe_lets_every_job_probe_again(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->times(3)->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(true)
+            ->andThrow(new NntpProviderUnavailableException('Unable to connect to the requested NNTP provider.'));
+        $nntp->shouldReceive('getFingerprintServerProfile')->twice()->with(true)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(15)->andThrow(new \RuntimeException('Article unavailable.'));
+
+        $this->collect();
+        $this->travel(901)->seconds();
+        $this->assertArrayHasKey('profile', $this->alternateProfile($this->collect()['data']));
+        // A leftover probe claim no longer matters once the provider is known to be reachable.
+        Cache::put($this->breakerKey('probe'), true, 240);
+
+        $this->assertArrayHasKey('profile', $this->alternateProfile($this->collect()['data']));
+    }
+
+    #[Test]
+    public function a_failed_reprobe_reopens_the_breaker(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->times(3)->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintServerProfile')->twice()->with(true)
+            ->andThrow(new NntpProviderUnavailableException('Unable to connect to the requested NNTP provider.'));
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(9)
+            ->withArgs(fn (string $id, int $body, int $header, bool $alternate): bool => $alternate === false)
+            ->andThrow(new \RuntimeException('Article unavailable.'));
+
+        $this->collect();
+        $this->travel(901)->seconds();
+        $this->collect();
+
+        $this->assertSame('recent_provider_failure', $this->alternateProfile($this->collect()['data'])['profile_skipped_reason']);
+    }
+
+    #[Test]
     public function a_zero_breaker_window_probes_the_alternate_in_every_job(): void
     {
         config(['nntmux_nntp.fingerprint_provider_breaker_seconds' => 0]);
@@ -130,6 +187,11 @@ final class ReleaseFingerprintProviderBreakerTest extends TestCase
 
         $this->collect();
         $this->collect();
+    }
+
+    private function breakerKey(string $state): string
+    {
+        return 'release-fingerprint:provider-unavailable:'.$state.':'.sha1('news.alternate.invalid||plain');
     }
 
     /**
