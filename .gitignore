@@ -5,6 +5,7 @@ docker/composer-auth.json
 docker/php-overrides.local.ini
 docker-compose.yml
 !docker/docker-compose.yml
+!docker/worker/docker-compose.yml
 docker-compose.override.yml
 .env
 install.lock
@@ -109,6 +110,9 @@ deploy/**/__pycache__/
 /docker/.env
 /docker/config/app.env
 /docker/config/usenet_servers.json
+/docker/worker/config/app.env
+/docker/worker/config/ca.pem
+/docker/worker/config/install.lock
 
 # Local builds of the existing NNTmux Rust runtime.
 /docker/app/nzb-yenc-ffi/target/

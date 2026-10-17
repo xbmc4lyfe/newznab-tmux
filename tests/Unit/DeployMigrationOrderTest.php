@@ -21,13 +21,25 @@ class DeployMigrationOrderTest extends TestCase
             copy(__DIR__.'/../../docker/bin/'.$script, $this->directory.'/docker/bin/'.$script);
             chmod($this->directory.'/docker/bin/'.$script, 0755);
         }
-        file_put_contents($this->directory.'/.gitignore', "/docker/.build.stamp\n/docker/.deploy.stamp\n/docker/.deploy.time\n/docker/.deploy.log\n/docker/.deploy.lock*\n/events\n/recreated\n");
+        file_put_contents($this->directory.'/.gitignore', "/docker/.build.stamp\n/docker/.deploy.stamp\n/docker/.deploy.time\n/docker/.deploy.log\n/docker/.deploy.lock*\n/events\n/recreated\n/barrier.log\n/barrier.running\n");
         file_put_contents($this->directory.'/app.txt', "one\n");
         file_put_contents($this->directory.'/bin/docker', <<<'SH'
 #!/bin/sh
 printf 'COMPOSE_FILE=%s %s\n' "$COMPOSE_FILE" "$*" >> "$NNTMUX_DEPLOY_EVENTS"
 case "$*" in
-    *' config --format json'*) echo "${NNTMUX_CONFIG_ID:-fixture-config}" ;;
+    *'releases:verification-barrier --release'*) echo forced-release >> "$NNTMUX_DEPLOY_EVENTS"; [ "${NNTMUX_FORCED_RELEASE_FAIL:-0}" != 1 ] || exit 52 ;;
+    *'releases:verification-barrier'*)
+        if [ "${NNTMUX_BARRIER_FAIL:-0}" = 1 ]; then echo 'still running' > "$NNTMUX_REPO/barrier.log"; else echo 'barrier held' > "$NNTMUX_REPO/barrier.log"; : > "$NNTMUX_REPO/barrier.running"; fi
+        echo barrier-container ;;
+    'inspect --format {{.State.Running}} '*'-verification-barrier') [ -f "$NNTMUX_REPO/barrier.running" ] && echo 'true nntmux' || echo 'false nntmux' ;;
+    'logs '*'-verification-barrier')
+        cat "$NNTMUX_REPO/barrier.log" 2>/dev/null
+        if [ "${NNTMUX_BARRIER_LOST:-}" != '' ] && grep -q "${NNTMUX_BARRIER_LOST}" "$NNTMUX_DEPLOY_EVENTS"; then echo 'barrier lost'; fi ;;
+    'stop --timeout 30 '*'-verification-barrier')
+        rm -f "$NNTMUX_REPO/barrier.running"; echo released >> "$NNTMUX_DEPLOY_EVENTS"
+        [ "${NNTMUX_BARRIER_UNCLEAN:-0}" = 1 ] || echo 'barrier released' >> "$NNTMUX_REPO/barrier.log" ;;
+    'rm -f '*'-verification-barrier') rm -f "$NNTMUX_REPO/barrier.running" ;;
+    *' config --format json'*) printf '{"name":"nntmux","fixture":"%s"}\n' "${NNTMUX_CONFIG_ID:-fixture-config}" ;;
     *'image inspect --format'*) echo "${NNTMUX_IMAGE_ID:-sha256:fixture}" ;;
     *'image inspect'*) exit 0 ;;
     *'inspect --format {{.Image}}'*)
@@ -85,7 +97,7 @@ SH);
     {
         $this->deploy()->mustRun();
         $events = $this->events();
-        $steps = ['build --target selfhosted', 'artisan list --raw', ' stop --timeout 1920 horizon', 'scheduler.py drain --timeout=1800', 'artisan tmux:drain --timeout=900', ' stop web scheduler indexer', 'artisan migrate --force --no-interaction', ' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer'];
+        $steps = ['build --target selfhosted', 'artisan list --raw', ' stop --timeout 1920 horizon', 'scheduler.py drain --timeout=1800', 'artisan tmux:drain --timeout=900', 'releases:verification-barrier --timeout=900', ' stop web scheduler indexer', 'artisan migrate --force --no-interaction', ' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', 'released'];
         $previous = -1;
         foreach ($steps as $step) {
             $position = strpos($events, $step);
@@ -97,6 +109,92 @@ SH);
         $this->assertFileExists($this->directory.'/docker/.build.stamp');
         $this->assertFileExists($this->directory.'/docker/.deploy.stamp');
         $this->assertFileExists($this->directory.'/docker/.deploy.time');
+    }
+
+    public function test_remote_workers_that_do_not_drain_stop_the_rollout_before_writers_stop(): void
+    {
+        $process = $this->deploy(['NNTMUX_BARRIER_FAIL' => '1']);
+        $process->run();
+
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('Remote verification workers did not drain', $process->getErrorOutput());
+        $events = $this->events();
+        $this->assertStringContainsString('releases:verification-barrier', $events);
+        $this->assertStringNotContainsString(' stop web scheduler indexer', $events);
+        $this->assertStringNotContainsString('artisan migrate', $events);
+        $this->assertStringContainsString(' start horizon', $events);
+        $this->assertStringContainsString('scheduler.py restore --token=', $events);
+        $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp');
+    }
+
+    public function test_a_failed_migration_keeps_remote_workers_held_for_the_repaired_deployment(): void
+    {
+        $process = $this->deploy(['NNTMUX_MIGRATION_FAIL' => '1']);
+        $process->run();
+
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('stay held by container', $process->getErrorOutput());
+        $this->assertStringNotContainsString('released', $this->events());
+        $this->assertFileExists($this->directory.'/barrier.running');
+
+        // The repaired deployment reuses the running barrier and releases it after health.
+        file_put_contents($this->directory.'/events', '');
+        $this->deploy()->mustRun();
+        $events = $this->events();
+        $this->assertSame(0, substr_count($events, 'releases:verification-barrier'));
+        $this->assertGreaterThan(strpos($events, ' up -d --no-deps --force-recreate'), strpos($events, 'released'));
+        $this->assertFileDoesNotExist($this->directory.'/barrier.running');
+    }
+
+    public function test_an_adopted_barrier_stays_held_when_the_repaired_deployment_fails_early(): void
+    {
+        $this->deploy(['NNTMUX_MIGRATION_FAIL' => '1'])->run();
+        $this->assertFileExists($this->directory.'/barrier.running');
+        file_put_contents($this->directory.'/events', '');
+
+        $process = $this->deploy(['NNTMUX_BARRIER_LOST' => ' stop web scheduler indexer']);
+        $process->run();
+
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringNotContainsString('released', $this->events());
+        $this->assertStringContainsString('stay held by container', $process->getErrorOutput());
+    }
+
+    public function test_an_unclean_barrier_stop_clears_the_durable_pause_explicitly(): void
+    {
+        $this->deploy(['NNTMUX_BARRIER_UNCLEAN' => '1'])->mustRun();
+
+        $this->assertGreaterThan(strpos($this->events(), 'released'), strpos($this->events(), 'forced-release'));
+    }
+
+    public function test_a_durable_pause_that_cannot_be_cleared_fails_the_rollout(): void
+    {
+        $process = $this->deploy(['NNTMUX_BARRIER_UNCLEAN' => '1', 'NNTMUX_FORCED_RELEASE_FAIL' => '1']);
+        $process->run();
+
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('deployment pause could not be cleared', $process->getErrorOutput());
+        $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp');
+    }
+
+    public function test_a_barrier_lost_before_migration_aborts_without_migrating(): void
+    {
+        $process = $this->deploy(['NNTMUX_BARRIER_LOST' => ' stop web scheduler indexer']);
+        $process->run();
+
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('The verification barrier was lost', $process->getErrorOutput());
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
+    }
+
+    public function test_a_barrier_lost_during_migration_fails_the_rollout(): void
+    {
+        $process = $this->deploy(['NNTMUX_BARRIER_LOST' => 'artisan migrate']);
+        $process->run();
+
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('The verification barrier was lost', $process->getErrorOutput());
+        $this->assertStringNotContainsString(' up -d --no-deps --force-recreate', $this->events());
     }
 
     public function test_native_indexer_abort_uses_the_same_unique_operation_token_as_its_drain(): void

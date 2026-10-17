@@ -37,6 +37,7 @@ class ReleaseVerificationAuditRetriesTest extends TestCase
         (require database_path('migrations/2026_10_11_175742_create_release_verification_audit_retries_table.php'))->up();
         (require database_path('migrations/2026_10_12_004819_create_release_verification_scratch_table.php'))->up();
         (require database_path('migrations/2026_10_12_053000_add_shared_verification_scratch_budget.php'))->up();
+        (require database_path('migrations/2026_10_17_200000_add_host_to_release_verification_scratch.php'))->up();
         Schema::create('releases', function (Blueprint $table): void {
             $table->id();
             $table->string('guid');
