@@ -109,6 +109,69 @@ final class ReleaseBrowseSearchCacheTest extends TestCase
         $this->assertSame(3150, $page[99]->id);
     }
 
+    #[Test]
+    public function it_counts_browse_rows_through_the_search_index_without_the_pager_cap(): void
+    {
+        config(['nntmux.max_pager_results' => 125000]);
+
+        Search::shouldReceive('isAvailable')->once()->andReturnTrue();
+        Search::shouldReceive('searchReleasesFiltered')
+            ->once()
+            ->withArgs(fn (array $criteria, int $limit): bool => $limit === 1
+                && $criteria['phrases'] === null
+                && $criteria['max_age_days'] === 7
+                && $criteria['excluded_category_ids'] === [2030]
+                && $criteria['groups_id'] === null)
+            ->andReturn(['ids' => [1], 'total' => 2_697_382, 'total_exact' => true, 'fuzzy' => false, 'available' => true]);
+
+        $service = new ReleaseBrowseService;
+
+        $this->assertSame(2_697_382, $service->getBrowseCount([], 7, [2030], -1));
+        // A repeat call is served from the cache without a second index query.
+        $this->assertSame(2_697_382, $service->getBrowseCount([], 7, [2030], -1));
+    }
+
+    #[Test]
+    public function it_falls_back_to_the_database_count_when_the_search_index_is_unavailable(): void
+    {
+        Search::shouldReceive('isAvailable')->once()->andReturnFalse();
+        Search::shouldReceive('searchReleasesFiltered')->never();
+
+        $this->assertSame(0, (new ReleaseBrowseService)->getBrowseCount([], -1, [], -1));
+    }
+
+    #[Test]
+    public function it_falls_back_to_the_database_count_when_the_index_total_is_estimated_or_empty(): void
+    {
+        Search::shouldReceive('isAvailable')->times(3)->andReturnTrue();
+        Search::shouldReceive('searchReleasesFiltered')
+            ->once()
+            ->andReturn(['ids' => [1], 'total' => 5_000, 'fuzzy' => false, 'available' => true]);
+        Search::shouldReceive('searchReleasesFiltered')
+            ->once()
+            ->andReturn(['ids' => [1], 'total' => 5_000, 'total_exact' => false, 'fuzzy' => false, 'available' => true]);
+        Search::shouldReceive('searchReleasesFiltered')
+            ->once()
+            ->andReturn(['ids' => [], 'total' => 0, 'total_exact' => true, 'fuzzy' => false, 'available' => true]);
+
+        $service = new ReleaseBrowseService;
+
+        $this->assertSame(0, $service->getBrowseCount([], -1, [], -1));
+        $this->assertSame(0, $service->getBrowseCount([], 30, [], -1));
+        $this->assertSame(0, $service->getBrowseCount([], 60, [], -1));
+    }
+
+    #[Test]
+    public function it_falls_back_to_the_database_count_when_the_index_query_fails(): void
+    {
+        Search::shouldReceive('isAvailable')->once()->andReturnTrue();
+        Search::shouldReceive('searchReleasesFiltered')
+            ->once()
+            ->andReturn(['ids' => [], 'total' => 0, 'fuzzy' => false, 'available' => false]);
+
+        $this->assertSame(0, (new ReleaseBrowseService)->getBrowseCount([], -1, [], -1));
+    }
+
     /**
      * @return array{ids: list<int>, documents: list<array<string, mixed>>, total: int}
      */

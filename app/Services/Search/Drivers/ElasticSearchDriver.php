@@ -3136,6 +3136,10 @@ class ElasticSearchDriver implements PredbFilenameCandidateLookup, ReleaseCandid
                 return [
                     'ids' => $ids,
                     'total' => $total,
+                    // False when the search timed out, lost shards, or only gave a lower bound.
+                    'total_exact' => ($response['timed_out'] ?? null) === false
+                        && ($response['_shards']['failed'] ?? null) === 0
+                        && ($response['hits']['total']['relation'] ?? null) === 'eq',
                     'fuzzy' => $useFuzzy,
                     'available' => true,
                     'last_sort' => is_array($lastHit) && is_array($lastHit['sort'] ?? null) ? array_values($lastHit['sort']) : [],
