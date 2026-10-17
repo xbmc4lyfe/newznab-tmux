@@ -78,10 +78,26 @@ final class VerificationRunDiagnosticsTest extends TestCase
             'worker_acquired', 'loop_started', 'claim_calls', 'claims_admitted', 'stop_reason',
             'limit_reached', 'deadline_reached_at_stop', 'verifier_verdicts', 'publish_returned',
             'finish_returned', 'filtered_recoveries', 'candidate_errors', 'fatal_error',
-            'command_result', 'exit_code', 'maintenance_state', 'durations_ms'], array_keys($report));
+            'command_result', 'exit_code', 'maintenance_state', 'durations_ms', 'phases'], array_keys($report));
         array_walk_recursive($report, static function (mixed $value): void {
             self::assertTrue($value === null || is_scalar($value));
         });
+    }
+
+    public function test_phase_timings_accumulate_only_known_phases(): void
+    {
+        $diagnostics = new VerificationRunDiagnostics(hrtime(true), '2026-10-17T16:00:00Z', 10, 300, 1);
+        $next = $diagnostics->phase('claim', hrtime(true) - 2_000_000);
+        $diagnostics->phase('claim', $next - 1_000_000);
+        $diagnostics->phase('private-phase', hrtime(true) - 5_000_000);
+        $diagnostics->phase('finish', null);
+
+        $phases = $diagnostics->report(hrtime(true))['phases'];
+
+        self::assertSame(['claim', 'bookkeeping', 'manifest_read', 'verify_passed', 'verify_other', 'publish', 'finish', 'status_write'], array_keys($phases));
+        self::assertSame(2, $phases['claim']['count']);
+        self::assertGreaterThanOrEqual(3.0, $phases['claim']['ms']);
+        self::assertSame(['ms' => 0.0, 'count' => 0], $phases['finish']);
     }
 
     public function test_diagnostics_observer_failure_cannot_hide_an_escaping_error(): void
