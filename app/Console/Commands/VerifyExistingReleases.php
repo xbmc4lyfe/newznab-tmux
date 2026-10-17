@@ -98,6 +98,10 @@ class VerifyExistingReleases extends Command
                 File::ensureDirectoryExists($directory, 0700);
                 $verifier = new SpotCheckVerifier($source, $verificationOptions, $decoder);
                 try {
+                    if (Release::hasLateArticleFlag() && $release->getAttribute('late_article_candidate_id') !== null) {
+                        // Late articles may still replace its NZB; the flag only clears, so a later retry is stable.
+                        throw new \RuntimeException('Partial release is still awaiting late articles.');
+                    }
                     $xml = $nzb->readNzbContents($release->guid);
                     if ($xml === false) {
                         throw new \RuntimeException('Release NZB is unavailable.');

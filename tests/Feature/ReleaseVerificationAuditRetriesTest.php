@@ -126,6 +126,21 @@ class ReleaseVerificationAuditRetriesTest extends TestCase
         $this->assertSame([1 => 'sampled', 2 => 'unknown', 3 => 'unrepairable'], array_column($this->records(), 'verdict', 'id'));
     }
 
+    public function test_a_partial_awaiting_late_articles_is_retried_without_reading_its_nzb(): void
+    {
+        Schema::table('releases', function (Blueprint $table): void {
+            $table->unsignedBigInteger('late_article_candidate_id')->nullable();
+        });
+        $this->release(1);
+        DB::table('releases')->where('id', 1)->update(['late_article_candidate_id' => 9]);
+        $this->mock(NzbService::class)->shouldNotReceive('readNzbContents');
+
+        $this->audit();
+
+        $this->assertSame([['id' => 1, 'verdict' => 'unknown']], array_map(fn (array $record): array => ['id' => $record['id'], 'verdict' => $record['verdict']], $this->records()));
+        $this->assertTrue(DB::table('release_verification_audit_retries')->where('release_id', 1)->exists(), 'It is audited once settled.');
+    }
+
     public function test_sample_budget_exhaustion_can_recover_on_a_later_resume(): void
     {
         $this->release(1);

@@ -131,6 +131,8 @@ final class AdditionalCandidateQuery
         $query
             ->where('r.haspreview', -1)
             ->where('r.nzbstatus', 1);
+        // A partial awaiting late articles may have its NZB replaced; process it once that can't happen.
+        Release::whereNzbSettled($query, 'r');
         if ($joinedCategory) {
             $query->where('c.disablepreview', 0);
         } else {
@@ -388,6 +390,7 @@ final class AdditionalCandidateQuery
                 $lockQuery
                     ->where('r.haspreview', -1)
                     ->where('r.nzbstatus', 1);
+                Release::whereNzbSettled($lockQuery, 'r');
                 self::applyArchiveRetryWindow($lockQuery);
                 self::applyClaimWindow($lockQuery);
 

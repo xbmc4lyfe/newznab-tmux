@@ -325,6 +325,8 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $hash = sha1('late-articles', true);
         $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
         $previous = DB::table('release_verification_candidates')->sole();
+        $holder = fn (): ?int => ($id = DB::table('releases')->where('id', $first)->value('late_article_candidate_id')) === null ? null : (int) $id;
+        $this->assertSame((int) $previous->id, $holder(), 'NZB-reading workers leave the partial alone while it can grow.');
 
         // Backfill finds an earlier-posted article of the same upload.
         app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
@@ -338,6 +340,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame($first, $merged['upgrades_release_id']);
         $this->assertSame((int) $rows[1]->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
         $this->assertNotSame($previous->identity, $rows[1]->identity);
+        $this->assertSame((int) $rows[1]->id, $holder(), 'Only the merging generation may upgrade it.');
 
         $guid = DB::table('releases')->where('id', $first)->value('guid');
         // Post-processing already ran on the smaller NZB.
@@ -345,6 +348,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $upgraded = $this->publishStalledPartial(null);
 
         $this->assertSame($first, $upgraded, 'The partial is upgraded in place, keeping its id and GUID.');
+        $this->assertSame((int) $rows[1]->id, $holder(), 'Still partial: it keeps waiting for late articles.');
         $this->assertSame([$guid, 2, 3], [DB::table('releases')->where('id', $first)->value('guid'),
             (int) DB::table('releases')->where('id', $first)->value('articles_found'), (int) DB::table('releases')->where('id', $first)->value('articles_expected')]);
         $nzb = (string) app(NzbService::class)->readNzbContents($guid);
@@ -428,6 +432,23 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(0, (int) $candidate->manifest_bytes);
         $this->assertSame($releaseId, (int) $candidate->release_id);
         $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        $this->assertNull(DB::table('releases')->where('id', $releaseId)->value('late_article_candidate_id'), 'Workers may now process it.');
+    }
+
+    public function test_a_merging_generation_that_ends_unpublished_releases_the_partial_to_workers(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('filtered-generation', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+        $generation = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        $this->assertSame((int) $generation->id, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
+
+        DB::table('release_verification_candidates')->where('id', $generation->id)->update(['status' => 'filtered', 'manifest_path' => '', 'manifest_bytes' => 0]);
+        $this->limits();
+        app(CandidateRepository::class)->expire();
+
+        $this->assertNull(DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
     }
 
     public function test_oversized_partial_upload_is_filtered_instead_of_deferred(): void
@@ -608,6 +629,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
                 foreach (['articles_found', 'articles_expected', 'files_found', 'files_expected'] as $column) {
                     $table->unsignedInteger($column)->nullable();
                 }
+                $table->unsignedBigInteger('late_article_candidate_id')->nullable();
             }
         });
         (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();

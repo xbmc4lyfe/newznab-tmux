@@ -136,12 +136,13 @@ final class VerifiedReleasePublisher
                         ? max(0, (int) ($manifest['publication_file_count'] ?? $manifest['expected_files'] ?? count($manifest['files'])))
                         : (($manifest['metadata_source'] ?? null) !== 'import'
                             ? count(array_unique($manifest['verified_file_names'])) : max((int) $manifest['expected_files'], count($manifest['files'])));
-                    $upgrade = $legacy === null ? $this->lockUpgradablePartial($manifest, $keys) : null;
+                    $upgrade = $legacy === null ? $this->lockUpgradablePartial($manifest, $keys, (int) $candidate->id) : null;
                     if ($upgrade !== null) {
-                        $id = $this->upgradePartial($upgrade, $manifest, $size, $totalParts, $timing);
+                        $retain = isset($manifest['partial']) && $this->awaitsLateArticles($manifest);
+                        $id = $this->upgradePartial($upgrade, $manifest, $metadata, $size, $totalParts, $retain ? (int) $candidate->id : null, $timing);
                         $this->recordGroups($id, $manifest['groups']);
                         app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
-                        $this->markPublished($candidate->id, $id, $result, retainManifest: isset($manifest['partial']) && $this->awaitsLateArticles($manifest));
+                        $this->markPublished($candidate->id, $id, $result, retainManifest: $retain);
 
                         $returned = true;
 
@@ -196,7 +197,9 @@ final class VerifiedReleasePublisher
                     if (isset($manifest['partial'])) {
                         DB::table('releases')->where('id', $id)->update(['articles_found' => $manifest['partial']['articles_found'],
                             'articles_expected' => $manifest['partial']['articles_expected'],
-                            'files_found' => $manifest['partial']['files_found'], 'files_expected' => $manifest['partial']['files_expected']]);
+                            'files_found' => $manifest['partial']['files_found'], 'files_expected' => $manifest['partial']['files_expected']]
+                            // Until its inventory is released, workers that read NZBs leave it alone.
+                            + (Release::hasLateArticleFlag() && $this->awaitsLateArticles($manifest) ? ['late_article_candidate_id' => (int) $candidate->id] : []));
                     }
                     $timing?->nextPhase('final_xml_gzip');
                     $receipt = $this->writer->writeWithReceipt($manifest, $guid, $release, $timing);
@@ -397,14 +400,16 @@ final class VerifiedReleasePublisher
      * @param  array<string, mixed>  $manifest
      * @param  list<string>  $keys  the publication keys this transaction holds; empty under the keyless lock
      */
-    private function lockUpgradablePartial(array $manifest, array $keys): ?object
+    private function lockUpgradablePartial(array $manifest, array $keys, int $candidateId): ?object
     {
         $releaseId = $manifest['upgrades_release_id'] ?? null;
-        if (! is_int($releaseId) || ! Release::hasPartialArticleCounts()) {
+        if (! is_int($releaseId) || ! Release::hasPartialArticleCounts() || ! Release::hasLateArticleFlag()) {
             return null;
         }
+        // Only while this generation holds the inventory: once the pointer clears, a worker may be reading its NZB.
         $release = DB::table('releases')->where('id', $releaseId)->whereNotNull('articles_expected')
-            ->where('nzbstatus', NzbService::NZB_ADDED)->lockForUpdate()->first(['id', 'guid']);
+            ->where('nzbstatus', NzbService::NZB_ADDED)->where('late_article_candidate_id', $candidateId)
+            ->lockForUpdate()->first(['id', 'guid', 'predb_id']);
         if ($release === null) {
             return null;
         }
@@ -421,16 +426,21 @@ final class VerifiedReleasePublisher
      * (restored if this transaction rolls back), and counts cleared once nothing is missing.
      *
      * @param  array<string, mixed>  $manifest
+     * @param  array<string, mixed>  $metadata
      */
-    private function upgradePartial(object $release, array $manifest, int $size, int $totalParts, ?PublicationTiming $timing): int
+    private function upgradePartial(object $release, array $manifest, array $metadata, int $size, int $totalParts, ?int $holder, ?PublicationTiming $timing): int
     {
         $id = (int) $release->id;
         $timing?->nextPhase('release_identity_sql');
         $partial = $manifest['partial'] ?? null;
+        // No NZB-reading worker has touched a flagged partial, so its name came from publication; take the
+        // fuller inventory's, unless PreDB has since confirmed one.
+        $naming = (int) $release->predb_id > 0 ? [] : array_intersect_key($metadata,
+            array_flip(['name', 'searchname', 'fromname', 'categories_id', 'isrenamed', 'predb_id']));
         DB::table('releases')->where('id', $id)->update(['size' => $size, 'totalpart' => $totalParts,
             'articles_found' => $partial['articles_found'] ?? null, 'articles_expected' => $partial['articles_expected'] ?? null,
-            'files_found' => $partial['files_found'] ?? null, 'files_expected' => $partial['files_expected'] ?? null]
-            + $this->freshPostProcessingState());
+            'files_found' => $partial['files_found'] ?? null, 'files_expected' => $partial['files_expected'] ?? null,
+            'late_article_candidate_id' => $holder] + $naming + $this->freshPostProcessingState());
         // Metadata collected from the smaller NZB is stale; a run in flight sees this and re-queues itself.
         if (Schema::hasTable('release_fingerprint_metadata')) {
             DB::table('release_fingerprint_metadata')->where('releases_id', $id)->update(['status' => 'stale']);

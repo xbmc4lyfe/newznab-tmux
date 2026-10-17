@@ -159,13 +159,19 @@ final class CandidateRepository
                         'manifest_path' => '', 'manifest_bytes' => 0, 'lease_token' => null, 'lease_until' => null]);
                 }
                 if ($existing === null) {
-                    DB::table('release_verification_candidates')->insert($values);
+                    $holderId = (int) DB::table('release_verification_candidates')->insertGetId($values);
                 } else {
+                    $holderId = (int) $existing->id;
                     DB::table('release_verification_candidates')->where('id', $existing->id)->update($values);
                 }
                 if ($previous !== null) {
-                    // The new generation now holds the retained inventory and its capacity.
+                    // The new generation now holds the retained inventory and its capacity, and becomes the
+                    // only candidate that may upgrade the partial; an already expired one settles it.
                     DB::table('release_verification_candidates')->where('id', $previous->id)->update(['manifest_path' => '', 'manifest_bytes' => 0]);
+                    if ($merges && Release::hasLateArticleFlag()) {
+                        DB::table('releases')->where('id', $previous->release_id)->where('late_article_candidate_id', $previous->id)
+                            ->update(['late_article_candidate_id' => $expired ? null : $holderId]);
+                    }
                     if ($previous->manifest_path !== $path) {
                         DB::afterCommit(fn () => $this->store->deleteIfUnreferenced($previous->manifest_path));
                     }
@@ -782,6 +788,29 @@ final class CandidateRepository
             }, 5);
         }
         $this->expireRetainedPartials($mayStart);
+        $this->settleLateArticleHolders();
+    }
+
+    /**
+     * Clear a release's late-article candidate once that candidate can no longer upgrade it: it ended
+     * unpublished (expired, filtered) or published elsewhere. The pointer only ever clears.
+     */
+    private function settleLateArticleHolders(): void
+    {
+        if (! Release::hasLateArticleFlag()) {
+            return;
+        }
+        $held = DB::table('releases')->whereNotNull('late_article_candidate_id')->orderBy('id')->limit(500)
+            ->pluck('late_article_candidate_id', 'id');
+        foreach ($held as $releaseId => $candidateId) {
+            $holder = DB::table('release_verification_candidates')->where('id', $candidateId)->first(['release_id', 'manifest_path', 'status']);
+            $live = $holder !== null && ((int) $holder->release_id === (int) $releaseId
+                ? $holder->manifest_path !== ''
+                : $holder->release_id === null && ! in_array($holder->status, ['expired', 'filtered', 'metadata_expired'], true));
+            if (! $live) {
+                DB::table('releases')->where('id', $releaseId)->where('late_article_candidate_id', $candidateId)->update(['late_article_candidate_id' => null]);
+            }
+        }
     }
 
     /**
@@ -805,6 +834,10 @@ final class CandidateRepository
                     return;
                 }
                 DB::table('release_verification_candidates')->where('id', $id)->update(['manifest_path' => '', 'manifest_bytes' => 0]);
+                if (Release::hasLateArticleFlag()) {
+                    // No late articles can merge any more: workers that read NZBs may now process it.
+                    DB::table('releases')->where('id', $row->release_id)->where('late_article_candidate_id', $id)->update(['late_article_candidate_id' => null]);
+                }
                 $this->ledger->adjust(-(int) $row->manifest_bytes);
                 DB::afterCommit(function () use ($row): void {
                     $this->store->deleteIfUnreferenced($row->manifest_path);
