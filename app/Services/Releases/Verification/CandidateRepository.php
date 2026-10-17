@@ -10,6 +10,7 @@ use App\Services\Nzb\NzbArticleCoverage;
 use App\Services\Nzb\NzbService;
 use App\Support\NzbPasswordMetadata;
 use Illuminate\Database\Query\Builder;
+use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -178,6 +179,26 @@ final class CandidateRepository
         return $row !== null && $row->source_identity === $sourceIdentity ? $row : $latest()->lockForUpdate()->first();
     }
 
+    /**
+     * Lock an import admission's candidate by identity.
+     *
+     * Locking an absent identity gap-locks the unique index, and concurrent first-time imports in one
+     * gap then deadlock on each other's inserts. With database manifests and no outer transaction, a
+     * plain read (this transaction's first, so its view is current) finds a committed candidate to lock
+     * by primary key; an identity committed after that view surfaces as a duplicate key on insert, and
+     * the admission then reruns through this locking read.
+     */
+    private function lockIdentityCandidate(string $identity, bool $lockedLookup): ?object
+    {
+        $query = static fn () => DB::table('release_verification_candidates')->where('identity', $identity);
+        if ($lockedLookup || DB::transactionLevel() > 1 || ! $this->ledger->concurrent()) {
+            return $query()->lockForUpdate()->first();
+        }
+        $id = $query()->value('id');
+
+        return $id === null ? null : DB::table('release_verification_candidates')->where('id', $id)->lockForUpdate()->first();
+    }
+
     /** Lock through ingestion's unique hash index before taking the shared capacity row. */
     private function lockArchiveCollection(int $collectionId, string $hash): ?object
     {
@@ -211,12 +232,12 @@ final class CandidateRepository
                 ? app(VerifiedNzbWriter::class)->document($manifest) : null;
             $headerAssessment = $prepared === null ? null : (new CandidateHeaderInventory)->assessment($manifest);
             $accepted = DB::transaction(function () use ($manifest, $prepared, $headerAssessment, $replayXml, &$capacityDeferred, &$publicationDeferred, $onAdmitted): bool {
-                $admit = function () use ($manifest, $prepared, $headerAssessment, $replayXml, &$capacityDeferred, &$publicationDeferred): bool {
+                $admit = function (bool $lockedLookup = false) use ($manifest, $prepared, $headerAssessment, $replayXml, &$capacityDeferred, &$publicationDeferred, &$admit): bool {
                     $capacityDeferred = false;
                     $publicationDeferred = false;
                     $this->ledger->enter();
                     $identity = (string) $manifest['identity'];
-                    $existing = DB::table('release_verification_candidates')->where('identity', $identity)->lockForUpdate()->first();
+                    $existing = $this->lockIdentityCandidate($identity, $lockedLookup);
                     $release = $existing?->release_id === null ? null
                         : DB::table('releases')->where('id', $existing->release_id)->lockForUpdate()->first(['id', 'guid', 'nzbstatus']);
                     $metadataReadmission = $existing !== null && $existing->status === 'metadata_expired'
@@ -257,7 +278,20 @@ final class CandidateRepository
                         'version' => (int) ($existing->version ?? 0) + 1, 'status' => $assessment['status'], 'reason' => $assessment['reason'],
                         'release_id' => null, 'verified_at' => null, 'lease_token' => null, 'lease_until' => null];
                     if ($existing === null) {
-                        DB::table('release_verification_candidates')->insert($values);
+                        try {
+                            DB::table('release_verification_candidates')->insert($values);
+                        } catch (UniqueConstraintViolationException $race) {
+                            if ($lockedLookup) {
+                                throw $race;
+                            }
+
+                            // A concurrent first admission committed this identity after the plain
+                            // lookup; admit again against its row through the locking lookup, and
+                            // drop this pass's manifest after commit unless the rerun references it.
+                            $this->store->deleteIfUnreferenced($path);
+
+                            return $admit(true);
+                        }
                     } else {
                         DB::table('release_verification_candidates')->where('id', $existing->id)->update($values);
                         if ($existing->manifest_path !== '' && $existing->manifest_path !== $path) {

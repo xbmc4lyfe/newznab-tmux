@@ -157,6 +157,54 @@ final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
         $this->assertSame(1, DB::table('release_verification_candidates')->count());
     }
 
+    public function test_first_time_imports_leave_the_identity_gap_open_for_concurrent_imports(): void
+    {
+        $other = $this->connection();
+        $result = null;
+        DB::listen(function (QueryExecuted $query) use ($other, &$result): void {
+            if ($result !== null || preg_match('/^insert into [`"]?release_verification_manifests[`"]?/i', $query->sql) !== 1) {
+                return;
+            }
+            $other->beginTransaction();
+            try {
+                $this->insertCandidate($other, sha1('import:other'));
+                $result = 'inserted';
+            } catch (\PDOException $error) {
+                $result = (int) $error->errorInfo[1];
+            } finally {
+                $other->rollBack();
+            }
+        });
+
+        $this->assertTrue(app(CandidateRepository::class)->enqueue(['identity' => sha1('import:first'), 'groups_id' => 1, 'files' => []]));
+
+        $this->assertSame('inserted', $result, 'A first-time import must not gap-lock the identity index.');
+        $candidate = DB::table('release_verification_candidates')->sole();
+        $this->assertSame((int) $candidate->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
+    }
+
+    public function test_an_identity_committed_during_import_reruns_admission_against_that_row(): void
+    {
+        $identity = sha1('import:raced');
+        $other = $this->connection();
+        $committed = false;
+        DB::listen(function (QueryExecuted $query) use ($other, $identity, &$committed): void {
+            if ($committed || preg_match('/^insert into [`"]?release_verification_manifests[`"]?/i', $query->sql) !== 1) {
+                return;
+            }
+            $committed = true;
+            $this->insertCandidate($other, $identity);
+        });
+
+        $this->assertTrue(app(CandidateRepository::class)->enqueue(['identity' => $identity, 'groups_id' => 1, 'files' => []]));
+
+        $this->assertTrue($committed);
+        $candidate = DB::table('release_verification_candidates')->sole();
+        $this->assertSame('', $candidate->manifest_path, 'The committed admission is kept.');
+        $this->assertSame(0, DB::table('release_verification_manifests')->count(), 'The rerun leaves no unreferenced manifest.');
+        $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+    }
+
     public function test_capacity_refused_at_commit_rolls_back_the_archive_and_keeps_its_headers(): void
     {
         $id = $this->arrival('late-full');
@@ -265,6 +313,13 @@ final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
         } finally {
             $other->rollBack();
         }
+    }
+
+    private function insertCandidate(PDO $connection, string $identity): void
+    {
+        $connection->prepare("INSERT INTO release_verification_candidates (identity, source_identity, groups_id, manifest_path, manifest_bytes,
+            manifest_hash, status, last_unique_at, next_attempt_at) VALUES (?, ?, 1, '', 0, ?, 'ready', NOW(), NOW())")
+            ->execute([$identity, $identity, str_repeat('0', 64)]);
     }
 
     private function connection(): PDO
