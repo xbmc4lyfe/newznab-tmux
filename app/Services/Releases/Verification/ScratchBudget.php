@@ -70,22 +70,32 @@ final class ScratchBudget
         if ($bytes < 0) {
             throw new RuntimeException('Scratch reservation cannot be negative.');
         }
-        DB::transaction(function () use ($entryId, $bytes): void {
-            $state = DB::table('release_verification_scratch_budget')->where('id', 1)->lockForUpdate()->sole();
-            if (! $state->initialized) {
-                throw new RuntimeException('Shared scratch budget is not initialized.');
-            }
+        // Measured before any lock; counting retained bytes again in the free-space margin is
+        // deliberately conservative after crashes.
+        $free = disk_free_space((string) config('release_verification.storage_path'));
+        if ($free === false) {
+            throw new RuntimeException('Verification is waiting for shared scratch capacity.');
+        }
+        $limit = min((int) config('release_verification.scratch_bytes'), (int) floor($free) - (int) config('release_verification.free_bytes'));
+        DB::transaction(function () use ($entryId, $bytes, $limit): void {
+            // Lock the entry, then change the shared budget with one conditional delta as the last
+            // lock request, so concurrent workers hold the budget row only until commit.
             $entry = DB::table('release_verification_scratch')->where('id', $entryId)->lockForUpdate()->sole();
-            $total = (int) $state->reserved_bytes - (int) $entry->reserved_bytes + $bytes;
-            $root = (string) config('release_verification.storage_path');
-            $free = disk_free_space($root);
-            // Counting retained bytes again in the free-space margin is deliberately conservative after crashes.
-            if ($total > (int) config('release_verification.scratch_bytes') || $free === false
-                || $free < (int) config('release_verification.free_bytes') + $total) {
-                throw new RuntimeException('Verification is waiting for shared scratch capacity.');
+            $delta = $bytes - (int) $entry->reserved_bytes;
+            $changed = DB::table('release_verification_scratch_budget')->where('id', 1)->where('initialized', true)
+                ->whereRaw('reserved_bytes + ? <= ?', [$delta, $limit])
+                ->update(['reserved_bytes' => DB::raw('reserved_bytes + ('.$delta.')')]);
+            if ($changed !== 1) {
+                $state = DB::table('release_verification_scratch_budget')->where('id', 1)->first();
+                if ($state === null || ! $state->initialized) {
+                    throw new RuntimeException('Shared scratch budget is not initialized.');
+                }
+                // An unchanged total within the limit changes no row.
+                if ($delta !== 0 || (int) $state->reserved_bytes > $limit) {
+                    throw new RuntimeException('Verification is waiting for shared scratch capacity.');
+                }
             }
             DB::table('release_verification_scratch')->where('id', $entryId)->update(['reserved_bytes' => $bytes]);
-            DB::table('release_verification_scratch_budget')->where('id', 1)->update(['reserved_bytes' => $total]);
         }, 5);
     }
 
@@ -98,11 +108,8 @@ final class ScratchBudget
         }
         $bytes = $this->directoryBytes((string) config('release_verification.storage_path').'/scratch/'.app(ScratchInventory::class)->directoryName($entry), $heartbeat);
         DB::transaction(function () use ($entryId, $bytes): void {
-            $state = DB::table('release_verification_scratch_budget')->where('id', 1)->lockForUpdate()->sole();
             $entry = DB::table('release_verification_scratch')->where('id', $entryId)->lockForUpdate()->sole();
-            DB::table('release_verification_scratch_budget')->where('id', 1)->update([
-                'reserved_bytes' => (int) $state->reserved_bytes - (int) $entry->reserved_bytes + $bytes,
-            ]);
+            $this->adjust($bytes - (int) $entry->reserved_bytes);
             DB::table('release_verification_scratch')->where('id', $entryId)->update(['reserved_bytes' => $bytes]);
         }, 5);
     }
@@ -111,18 +118,26 @@ final class ScratchBudget
     public function forget(int $entryId): void
     {
         DB::transaction(function () use ($entryId): void {
-            $state = DB::table('release_verification_scratch_budget')->where('id', 1)->lockForUpdate()->first();
             $entry = DB::table('release_verification_scratch')->where('id', $entryId)->lockForUpdate()->first();
             if ($entry === null) {
                 return;
             }
-            if ($state !== null) {
-                DB::table('release_verification_scratch_budget')->where('id', 1)->update([
-                    'reserved_bytes' => max(0, (int) $state->reserved_bytes - (int) $entry->reserved_bytes),
-                ]);
-            }
+            $this->adjust(-(int) $entry->reserved_bytes);
             DB::table('release_verification_scratch')->where('id', $entryId)->delete();
         }, 5);
+    }
+
+    /**
+     * Apply an unconditional delta to the shared total, floored at zero, as the transaction's last
+     * lock request. Runtime paths lock their entry row first, so they cannot deadlock on the pair.
+     */
+    private function adjust(int $delta): void
+    {
+        if ($delta === 0) {
+            return;
+        }
+        DB::table('release_verification_scratch_budget')->where('id', 1)->update(['reserved_bytes' => DB::raw(
+            'CASE WHEN reserved_bytes + ('.$delta.') > 0 THEN reserved_bytes + ('.$delta.') ELSE 0 END')]);
     }
 
     private function directoryBytes(string $directory, ?callable $heartbeat = null): int
