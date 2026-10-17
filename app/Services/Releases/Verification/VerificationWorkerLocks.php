@@ -10,6 +10,9 @@ use RuntimeException;
 /** Stable file locks outlive database leases and manifest generations. */
 final class VerificationWorkerLocks
 {
+    /** Ceiling on scheduled candidate worker slots, whatever the configured count. */
+    public const int MAX_SLOTS = 64;
+
     /** @var resource|null */
     private $global = null;
 
@@ -33,7 +36,7 @@ final class VerificationWorkerLocks
         if ($this->global === null) {
             return false;
         }
-        $maximum = max(1, min(8, (int) config('release_verification.candidate_workers', 2)));
+        $maximum = self::slots();
         foreach ($slot > 0 ? [$slot] : range(1, $maximum) as $number) {
             if ($number > $maximum) {
                 break;
@@ -46,6 +49,12 @@ final class VerificationWorkerLocks
         $this->close();
 
         return false;
+    }
+
+    /** Configured candidate worker slots, from 1 to MAX_SLOTS. */
+    public static function slots(): int
+    {
+        return max(1, min(self::MAX_SLOTS, (int) config('release_verification.candidate_workers', 2)));
     }
 
     public function startPreparation(): bool
