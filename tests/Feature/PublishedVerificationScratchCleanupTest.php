@@ -422,7 +422,7 @@ class PublishedVerificationScratchCleanupTest extends ReleaseVerificationCandida
         });
 
         $this->artisan('releases:verify-candidates')->assertSuccessful();
-        $this->assertSame('unknown', DB::table('release_verification_candidates')->where('id', 2)->value('status'));
+        $this->assertSame('header_rejected', DB::table('release_verification_candidates')->where('id', 2)->value('status'));
         $this->assertFileExists($directory.'/payload');
         $this->artisan('releases:verify-candidates')->assertSuccessful();
         $this->assertSame('expired', DB::table('release_verification_candidates')->where('id', 2)->value('status'));

@@ -159,6 +159,22 @@ class ReleaseVerificationCandidatesTest extends TestCase
         $repository->heartbeat($claim->id, $claim->lease_token);
     }
 
+    public function test_new_headers_bring_a_header_rejected_candidate_back_to_the_queue(): void
+    {
+        $repository = app(CandidateRepository::class);
+        $repository->archive($this->collection('a@b'));
+        DB::table('release_verification_candidates')->update(['status' => 'header_rejected',
+            'reason' => 'Invalid or duplicate article reference in candidate headers.']);
+        $before = DB::table('release_verification_candidates')->sole();
+
+        $repository->archive($this->collection('c@d', 2));
+
+        $after = DB::table('release_verification_candidates')->sole();
+        $this->assertSame((int) $before->version + 1, (int) $after->version);
+        // The merged inventory is reassessed; this one still awaits its second file.
+        $this->assertSame('waiting_upload', $after->status);
+    }
+
     public function test_duplicate_arrivals_do_not_extend_expiry(): void
     {
         $repository = app(CandidateRepository::class);
