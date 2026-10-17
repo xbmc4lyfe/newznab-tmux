@@ -11,11 +11,14 @@ use App\Services\ReleaseCleaningService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\ReleaseMetadataResolver;
+use App\Services\Releases\Verification\ScratchBudget;
 use App\Services\Releases\Verification\ScratchInventory;
+use App\Services\Releases\Verification\VerificationResetService;
 use App\Services\Releases\Verification\VerificationWorkerLocks;
 use App\Services\YencService;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Filesystem\Filesystem;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
@@ -422,7 +425,7 @@ class PublishedVerificationScratchCleanupTest extends ReleaseVerificationCandida
         });
 
         $this->artisan('releases:verify-candidates')->assertSuccessful();
-        $this->assertSame('unknown', DB::table('release_verification_candidates')->where('id', 2)->value('status'));
+        $this->assertSame('header_rejected', DB::table('release_verification_candidates')->where('id', 2)->value('status'));
         $this->assertFileExists($directory.'/payload');
         $this->artisan('releases:verify-candidates')->assertSuccessful();
         $this->assertSame('expired', DB::table('release_verification_candidates')->where('id', 2)->value('status'));
@@ -575,6 +578,172 @@ PHP;
             chmod($root.'/scratch', 0700);
         }
         $this->assertFileExists($directory.'/payload');
+    }
+
+    public function test_a_remote_worker_host_cleans_and_budgets_only_its_own_scratch(): void
+    {
+        $primaryDirectory = $this->candidateScratch(1);
+        DB::table('release_verification_scratch')->update(['reserved_bytes' => 11]);
+        DB::table('release_verification_scratch_budget')->where('host', '')->update(['reserved_bytes' => 11]);
+        $root = (string) config('release_verification.storage_path');
+        $command = app(VerifyReleaseCandidates::class);
+        $method = new \ReflectionMethod($command, 'cleanupTerminalScratch');
+        config(['release_verification.host' => 'm4']);
+        // The remote host has none of the primary's directories; it must not take their absence as proof.
+        File::deleteDirectory($root.'/scratch');
+        $locks = new VerificationWorkerLocks;
+        try {
+            $this->assertTrue(app(ScratchBudget::class)->initialize());
+            $this->assertTrue($locks->start());
+            app(ScratchBudget::class)->join($locks);
+            app(ScratchInventory::class)->register(1, 2);
+            $remoteEntry = app(ScratchInventory::class)->entryId(1, 2);
+            app(ScratchBudget::class)->reserve($remoteEntry, 5);
+            mkdir($root.'/scratch/1-2', 0700, true);
+            file_put_contents($root.'/scratch/1-2/payload', 'remote');
+            $method->invoke($command, $root, $locks);
+            $this->assertSame([], app(ScratchInventory::class)->olderVersions(1, 2)->all());
+        } finally {
+            $locks->close();
+        }
+
+        $this->assertSame(['', 'm4'], DB::table('release_verification_scratch')->orderBy('host')->pluck('host')->all());
+        $this->assertSame(11, (int) DB::table('release_verification_scratch_budget')->where('host', '')->value('reserved_bytes'));
+        $this->assertSame(5, (int) DB::table('release_verification_scratch_budget')->where('host', 'm4')->value('reserved_bytes'));
+        $this->assertTrue((bool) DB::table('release_verification_scratch_budget')->where('host', 'm4')->value('initialized'));
+
+        // The remote host forgets its own terminal entry and releases only its own reservation.
+        $locks = new VerificationWorkerLocks;
+        try {
+            $this->assertTrue($locks->start());
+            DB::table('release_verification_candidates')->where('id', 1)->update(['version' => 2]);
+            File::delete($root.'/indexed-scratch.cursor');
+            $method->invoke($command, $root, $locks);
+        } finally {
+            $locks->close();
+        }
+        $this->assertSame([''], DB::table('release_verification_scratch')->pluck('host')->all());
+        $this->assertSame(0, (int) DB::table('release_verification_scratch_budget')->where('host', 'm4')->value('reserved_bytes'));
+        $this->assertSame(11, (int) DB::table('release_verification_scratch_budget')->where('host', '')->value('reserved_bytes'));
+        $this->assertDirectoryDoesNotExist($root.'/scratch/1-2');
+        $this->assertDirectoryDoesNotExist($primaryDirectory);
+    }
+
+    public function test_a_reset_keeps_remote_scratch_records_until_their_host_removes_the_directories(): void
+    {
+        $root = (string) config('release_verification.storage_path');
+        $this->candidateScratch(1, 'pending');
+        // The remote host's disk does not hold the primary's directory.
+        File::deleteDirectory($root.'/scratch');
+        config(['release_verification.host' => 'm5air']);
+        $this->assertTrue(app(ScratchBudget::class)->initialize());
+        $joining = new VerificationWorkerLocks;
+        try {
+            $this->assertTrue($joining->start());
+            app(ScratchBudget::class)->join($joining);
+            app(ScratchInventory::class)->register(1, 1);
+            app(ScratchBudget::class)->reserve(app(ScratchInventory::class)->entryId(1, 1), 7);
+        } finally {
+            $joining->close();
+        }
+        config(['release_verification.host' => '']);
+
+        app(VerificationResetService::class)->run(static fn () => null);
+
+        $this->assertSame(['m5air'], DB::table('release_verification_scratch')->pluck('host')->all());
+        $this->assertSame(7, (int) DB::table('release_verification_scratch_budget')->where('host', 'm5air')->value('reserved_bytes'));
+        $this->assertSame(0, (int) DB::table('release_verification_scratch_budget')->where('host', '')->value('reserved_bytes'));
+        $this->assertSame(0, DB::table('release_verification_candidates')->count());
+
+        // On the remote host the directory still exists; the reset marked its record terminal.
+        config(['release_verification.host' => 'm5air']);
+        mkdir($root.'/scratch/1-1', 0700, true);
+        file_put_contents($root.'/scratch/1-1/payload', 'remote');
+        $command = app(VerifyReleaseCandidates::class);
+        $locks = new VerificationWorkerLocks;
+        try {
+            $this->assertTrue($locks->start());
+            (new \ReflectionMethod($command, 'cleanupTerminalScratch'))->invoke($command, $root, $locks);
+        } finally {
+            $locks->close();
+        }
+        $this->assertDirectoryDoesNotExist($root.'/scratch/1-1');
+        $this->assertSame(0, DB::table('release_verification_scratch')->count());
+        $this->assertSame(0, (int) DB::table('release_verification_scratch_budget')->where('host', 'm5air')->value('reserved_bytes'));
+    }
+
+    public function test_a_joining_host_creates_its_budget_only_while_holding_a_worker_slot(): void
+    {
+        config(['release_verification.host' => 'm4']);
+        $this->assertTrue(app(ScratchBudget::class)->initialize());
+        $this->assertFalse(DB::table('release_verification_scratch_budget')->where('host', 'm4')->exists());
+        $idle = new VerificationWorkerLocks;
+        try {
+            app(ScratchBudget::class)->join($idle);
+            $this->fail('A host without a held worker slot must not join.');
+        } catch (RuntimeException $error) {
+            $this->assertStringContainsString('only while its worker slot is held', $error->getMessage());
+        }
+        $this->assertSame(0, Artisan::call('releases:verify-candidates', ['--no-summary' => true]));
+        $this->assertTrue((bool) DB::table('release_verification_scratch_budget')->where('host', 'm4')->value('initialized'));
+    }
+
+    public function test_a_durable_pause_refuses_audit_reset_and_worker_admission(): void
+    {
+        (require database_path('migrations/2026_10_17_210000_create_release_verification_pauses_table.php'))->up();
+        VerificationWorkerLocks::pause('deploy-attempt', 'deployment');
+        try {
+            $this->assertFalse((new VerificationWorkerLocks)->tryExclusive());
+            $this->assertFalse((new VerificationWorkerLocks)->start());
+            try {
+                app(VerificationResetService::class)->run(static fn () => null);
+                $this->fail('A reset must wait for the deployment pause.');
+            } catch (RuntimeException $error) {
+                $this->assertStringContainsString('deployment pause', $error->getMessage());
+            }
+        } finally {
+            VerificationWorkerLocks::unpause(null, 'deployment');
+        }
+        $this->assertTrue((new VerificationWorkerLocks)->tryExclusive());
+    }
+
+    public function test_a_reset_removes_its_own_pause_whether_it_finishes_or_throws(): void
+    {
+        (require database_path('migrations/2026_10_17_210000_create_release_verification_pauses_table.php'))->up();
+        $observed = null;
+        app(VerificationResetService::class)->run(static function () use (&$observed): void {
+            $observed = VerificationWorkerLocks::paused();
+        });
+        $this->assertTrue($observed);
+        $this->assertFalse(VerificationWorkerLocks::paused());
+        try {
+            app(VerificationResetService::class)->run(static fn () => throw new RuntimeException('Legacy reset failed.'));
+            $this->fail('The reset failure must escape.');
+        } catch (RuntimeException $error) {
+            $this->assertSame('Legacy reset failed.', $error->getMessage());
+        }
+        $this->assertFalse(VerificationWorkerLocks::paused());
+    }
+
+    public function test_a_durable_reset_pause_refuses_admission(): void
+    {
+        (require database_path('migrations/2026_10_17_210000_create_release_verification_pauses_table.php'))->up();
+        VerificationWorkerLocks::pause('interrupted-reset', 'reset');
+        $admitted = false;
+        try {
+            app(VerificationResetService::class)->withAdmission(static function () use (&$admitted): void {
+                $admitted = true;
+            });
+            $this->fail('Admission must wait for an interrupted reset.');
+        } catch (RuntimeException $error) {
+            $this->assertStringContainsString('retry reset later', $error->getMessage());
+        }
+        $this->assertFalse($admitted);
+        VerificationWorkerLocks::unpause('interrupted-reset');
+        app(VerificationResetService::class)->withAdmission(static function () use (&$admitted): void {
+            $admitted = true;
+        });
+        $this->assertTrue($admitted);
     }
 
     private function candidateScratch(int $id, string $status = 'complete'): string

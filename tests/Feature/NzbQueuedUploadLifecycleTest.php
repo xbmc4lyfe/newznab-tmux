@@ -35,6 +35,7 @@ class NzbQueuedUploadLifecycleTest extends TestCase
         $this->directory = sys_get_temp_dir().'/queued-upload-'.bin2hex(random_bytes(8));
         config(['release_verification.storage_path' => $this->directory.'/verification']);
         (require database_path('migrations/2026_10_11_154028_create_release_verification_candidates_table.php'))->up();
+        (require database_path('migrations/2026_10_17_220000_add_header_check_pending_to_release_verification_candidates.php'))->up();
         (require database_path('migrations/2026_10_15_034000_create_nfo_cleanup_commits_table.php'))->up();
         Schema::create('releases', static function (Blueprint $table): void {
             $table->id();

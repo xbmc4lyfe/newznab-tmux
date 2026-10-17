@@ -80,7 +80,7 @@ class ParallelVerificationWorkersTest extends ReleaseVerificationCandidatesTest
             app(CandidateRepository::class)->enqueue(['identity' => sha1($name), 'groups_id' => 1, 'files' => []]);
         }
         $this->artisan('releases:verify-candidates', ['--limit' => 1000, '--max-seconds' => 300])->assertSuccessful();
-        $this->assertSame(3, DB::table('release_verification_candidates')->where('status', 'unknown')->count());
+        $this->assertSame(3, DB::table('release_verification_candidates')->where('status', 'header_rejected')->count());
         $this->assertSame(0, DB::table('release_verification_candidates')->whereNotNull('release_id')->count());
         $this->assertSame(0, DB::table('release_verification_candidates')->whereNotNull('lease_token')->count());
     }

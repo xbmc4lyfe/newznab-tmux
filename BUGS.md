@@ -377,6 +377,54 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom:** `SQLSTATE[23000] 1062 Duplicate entry 'Less Than Evil-0-2018-12-03 00:00:00-KR' for key 'ix_videos_title'` escaped, killed the worker (exit 1) and failed the whole `postProcess_tv` batch on 2026-10-11 at 13:25 UTC (4 times that day).
 - **Fix (staged):** `add()` catches the unique violation, loads the row the other worker created and takes the normal update path. If the row can't be found the original exception is rethrown. Covered by `TvProviderVideoInsertRaceTest`, which fails without the change.
 
+### 52. Every verification writer waits on one capacity row, which caps ingestion (In progress)
+
+- **Where:** `release_verification_state` row 1. `CandidateRepository::archive()`/`enqueue()`/`expire()`/`rejectByPolicy()`, `VerifiedReleasePublisher::publish()`, `ManifestStore::deleteIfUnreferenced()`/`importLegacyFiles()`, `NzbUploadManifestService::resolveCandidate()` and `verification:audit` each take it `FOR UPDATE` first and hold it until commit, including archived-header deletion and NZB writing.
+- **Symptom (production 2026-10-17 02:20–02:45 UTC):** 16–20 connections were always queued on `select * from release_verification_state where id = 1 for update`. Holders were idle in PHP between statements in 51 of 60 samples, so ingestion, verification and publication ran one transaction at a time, whatever the worker count.
+- **Fix (branch `codex/verification-capacity-ledger`):** with database manifests, the capacity change is one conditional delta and the transaction's last lock request. Publications serialize on their own `release_verification_locks` row, and manifest cleanup locks the manifest row before reading references. File manifests keep the old global lock.
+
+### 53. `ReleaseVerificationMariaDbTest` errors in every test on master (Fixed)
+
+- **Where:** the MariaDB rerun of `ReleaseVerificationCandidatesTest`. The shared SQLite fixture had drifted from MariaDB.
+- **Symptom:** all 15 tests failed. Every one hit `1005 Can't create table ... release_archive_naming_evidence (errno: 150 ...)`: its foreign key references a `releases` table that some tests create later with a different id type. Underneath were:
+  - the missing `ix_collection_collectionhash` index that archive admission forces;
+  - a part-read counter that matched only SQLite quoting;
+  - non-strict `varchar(255)` truncating the oversized-metadata case;
+  - two upload tests written before the `accepted_capture` and `accepted_admission` requirements.
+- **Fix:** the MariaDB fixture now:
+  - disables foreign-key checks for its session;
+  - adds the hash index;
+  - raises the disposable server's `max_allowed_packet`;
+  - widens `parts.messageid` for the oversized case;
+  - tests `resolveCandidate()` directly, with a matching admission receipt.
+
+  The quote-insensitive counter benefits both drivers. `ReleaseVerificationDatabaseManifestMariaDbTest` reruns the suite with database manifests. Both pass all 15 tests.
+
+### 54. `RELEASE_VERIFICATION_CANDIDATE_WORKERS` above 8 is silently ignored (Open)
+
+- **Where:** `routes/console.php` schedules `min(8, candidate_workers)` slots, and `VerificationWorkerLocks` clamps to the same 8.
+- **Symptom:** production sets 48 and runs 8 verification workers.
+- **Suggested fix:** make the ceiling configurable, after BUGS #52, because more workers only add waiters to the capacity row.
+
+### 55. Fingerprint metadata jobs retry a rejected alternate provider for every sample (Fixed)
+
+- **Where:** `ReleaseFingerprintCollector::collect()` queries every configured provider, independent of `NNTP_ALTERNATE_FALLBACK`.
+- **Symptom:** when the alternate rejects its login, each sample repeats the full connect and retry cycle. Horizon logs one "Authentication rejected" about every 2 minutes, and `CollectReleaseFingerprintMetadata` jobs run for minutes or hit their timeout.
+- **Fix:** connection failures raise `NntpProviderUnavailableException`. The collector then records the remaining alternate samples as unavailable without reconnecting. The primary still retries per sample.
+
+### 56. The ARM paired-decoding benchmark fails on most runs (Open)
+
+- **Where:** the `paired-decoding (ubuntu-24.04-arm)` job in the "Paired native yEnc performance" workflow.
+- **Symptom:** the run summary is `inconclusive`, and the job exits 1, whenever any stratum's paired comparison is inconclusive. On #246, 22 of 24 strata showed a useful improvement and 2 were inconclusive. The job failed on the rerun too, and it fails on most master runs since 2026-10-16. The x86 job passes.
+- **Suggested fix:** report inconclusive strata without failing the job, or add pairs on ARM until the bootstrap interval resolves. Until then a red ARM job here says nothing about the change under test.
+
+### 57. Orphaned MariaDB sessions hold row locks for hours after a DB outage (Mitigated)
+
+- **Where:** app connections to MariaDB on the DB host pass through OrbStack's NAT, and the server's `wait_timeout` is 28800 s.
+- **Symptom:** after the 2026-10-17 13:22 UTC outage, about 34 connections stayed half-open on the server: 88 server-side against 54 client-side. Six of them held open transactions with row locks. Binaries and collections inserts waited on them for 74 minutes ("2,923 s to insert binaries/parts", "6000 articles failed to insert"), and a deploy's 900 s indexer drain timed out.
+- **Mitigation:** killed the six sessions at about 14:50 UTC, and binaries recovered at once. Set `idle_transaction_timeout = 600` on the DB host (live, and persisted in `conf.d/98-idle-transactions.cnf`), so an abandoned transaction rolls back after 10 minutes.
+- **Open question:** why the client side's FIN or RST never reached the server. TCP keepalive on the DB host would also reap the idle half-open sessions.
+
 ## Issues in the docker/ stack itself (all fixed)
 
 | Issue | Fix |

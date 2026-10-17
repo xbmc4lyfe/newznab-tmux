@@ -9,6 +9,7 @@ use App\Services\Monitoring\Prometheus\TextFormatter;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
 use App\Services\Releases\ReleaseManagementService;
+use App\Services\Releases\Verification\CandidateHeaderInventory;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\NzbManifestReader;
@@ -71,7 +72,7 @@ class ReleaseVerificationCommandsTest extends ReleaseVerificationCandidatesTest
         $candidates = DB::table('release_verification_candidates')->orderBy('id')->get();
         $this->assertCount(2, $candidates);
         foreach ($candidates as $candidate) {
-            $this->assertSame('unknown', $candidate->status);
+            $this->assertSame('header_rejected', $candidate->status);
             $this->assertNull($candidate->lease_token);
             $this->assertNull($candidate->lease_until);
             $this->assertNull($candidate->release_id);
@@ -195,6 +196,78 @@ class ReleaseVerificationCommandsTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(1, DB::table('release_verification_scratch')->count());
     }
 
+    public function test_a_header_defect_is_claimed_once_and_not_retried(): void
+    {
+        $repository = app(CandidateRepository::class);
+        $repository->enqueue(['identity' => sha1('defective'), 'groups_id' => 1, 'files' => []]);
+        $this->assertSame('unknown', DB::table('release_verification_candidates')->value('status'));
+        $this->artisan('releases:verify-candidates', ['--no-summary' => true])->assertSuccessful();
+        $rejected = DB::table('release_verification_candidates')->sole();
+        $this->assertSame(CandidateHeaderInventory::REJECTED, $rejected->status);
+        $this->assertSame('Candidate has no file inventory to spot check.', $rejected->reason);
+
+        // Long after the retry interval it is still not claimed again.
+        $this->travel(2)->hours();
+        $this->assertNull($repository->claim());
+        $this->artisan('releases:verify-candidates', ['--no-summary' => true])->assertSuccessful();
+        $this->assertSame($rejected->version, DB::table('release_verification_candidates')->value('version'));
+        $this->assertSame(CandidateHeaderInventory::REJECTED, DB::table('release_verification_candidates')->value('status'));
+
+    }
+
+    public function test_an_unrevived_header_defect_still_expires_and_frees_its_manifest(): void
+    {
+        $repository = app(CandidateRepository::class);
+        $repository->enqueue(['identity' => sha1('defective-expiry'), 'groups_id' => 1, 'files' => []]);
+        $this->artisan('releases:verify-candidates', ['--no-summary' => true])->assertSuccessful();
+        $this->assertGreaterThan(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        $this->travel((int) config('release_verification.expiry_hours') + 1)->hours();
+
+        $repository->expire();
+
+        $expired = DB::table('release_verification_candidates')->sole();
+        $this->assertSame('expired', $expired->status);
+        $this->assertSame('', $expired->manifest_path);
+        $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+    }
+
+    public function test_reclassification_moves_only_idle_unknown_header_defects_out_of_the_queue(): void
+    {
+        $rows = [];
+        foreach ([['unknown', 'Invalid or duplicate article reference in candidate headers.', null],
+            ['unknown', 'Conflicting header identities require resolution.', null],
+            ['unknown', 'Invalid or duplicate article reference in candidate headers.', 'held-by-a-worker'],
+            ['unknown', 'Article is unavailable; retry verification later.', null],
+            ['pending', 'Invalid or duplicate article reference in candidate headers.', null]] as $number => [$status, $reason, $lease]) {
+            $rows[] = ['identity' => sha1('reclassify-'.$number), 'groups_id' => 1, 'manifest_path' => '', 'manifest_bytes' => 0,
+                'manifest_hash' => str_repeat('0', 64), 'status' => $status, 'reason' => $reason, 'lease_token' => $lease,
+                'lease_until' => $lease === null ? null : now()->addMinute(), 'last_unique_at' => now(), 'next_attempt_at' => now()];
+        }
+        DB::table('release_verification_candidates')->insert($rows);
+
+        $this->artisan('releases:reclassify-header-rejections', ['--chunk' => 2])->assertSuccessful()
+            ->expectsOutputToContain('Reclassified 2 candidates');
+
+        $this->assertSame([CandidateHeaderInventory::REJECTED, CandidateHeaderInventory::REJECTED, 'unknown', 'unknown', 'pending'],
+            DB::table('release_verification_candidates')->orderBy('id')->pluck('status')->all());
+    }
+
+    public function test_reclassification_resumes_after_a_given_candidate(): void
+    {
+        $rows = [];
+        foreach (range(1, 4) as $number) {
+            $rows[] = ['identity' => sha1('resume-'.$number), 'groups_id' => 1, 'manifest_path' => '', 'manifest_bytes' => 0,
+                'manifest_hash' => str_repeat('0', 64), 'status' => 'unknown', 'reason' => 'Invalid or duplicate article reference in candidate headers.',
+                'last_unique_at' => now(), 'next_attempt_at' => now()];
+        }
+        DB::table('release_verification_candidates')->insert($rows);
+
+        $this->artisan('releases:reclassify-header-rejections', ['--after' => 2, '--chunk' => 1])->assertSuccessful();
+
+        $this->assertSame(['unknown', 'unknown', CandidateHeaderInventory::REJECTED, CandidateHeaderInventory::REJECTED],
+            DB::table('release_verification_candidates')->orderBy('id')->pluck('status')->all());
+    }
+
     public function test_old_version_cleanup_uses_bounded_index_pages_and_keeps_current_version(): void
     {
         app(CandidateRepository::class)->enqueue(['identity' => sha1('many-old-versions'), 'groups_id' => 1, 'files' => []]);
@@ -213,7 +286,8 @@ class ReleaseVerificationCommandsTest extends ReleaseVerificationCandidatesTest
         $this->assertDirectoryExists($root.'/'.$id.'-102');
         $this->assertDirectoryDoesNotExist($root.'/'.$id.'-103');
         $this->assertSame(3, DB::table('release_verification_scratch')->count());
-        DB::table('release_verification_candidates')->where('id', $id)->update(['next_attempt_at' => now()]);
+        // A retryable outcome brings the candidate back for its next claim.
+        DB::table('release_verification_candidates')->where('id', $id)->update(['status' => 'unknown', 'next_attempt_at' => now()]);
         $this->artisan('releases:verify-candidates')->assertSuccessful();
         $this->assertDirectoryDoesNotExist($root.'/'.$id.'-101');
         $this->assertDirectoryDoesNotExist($root.'/'.$id.'-102');
@@ -243,7 +317,7 @@ class ReleaseVerificationCommandsTest extends ReleaseVerificationCandidatesTest
         $now = now();
         $store = app(ManifestStore::class);
         $name = $store->write(['files' => [], 'expected_files' => 0]);
-        $bytes = filesize($store->path($name));
+        $bytes = $store->size($name);
         DB::table('release_verification_state')->update(['pending_bytes' => $bytes]);
         $id = DB::table('release_verification_candidates')->insertGetId(['identity' => sha1('expired'), 'groups_id' => 1,
             'manifest_path' => $name, 'manifest_bytes' => $bytes, 'manifest_hash' => substr($name, 0, 64),

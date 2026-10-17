@@ -13,6 +13,7 @@ use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\PublicationTiming;
 use App\Services\Releases\Verification\ReleaseMetadataResolver;
+use App\Services\Releases\Verification\VerificationLedger;
 use App\Services\Releases\Verification\VerificationResult;
 use App\Services\Releases\Verification\VerifiedNzbWriter;
 use App\Services\Releases\Verification\VerifiedReleasePublisher;
@@ -245,9 +246,9 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         }
         $path = $store->write($manifest);
         DB::table('release_verification_candidates')->insert(['identity' => sha1('publish'), 'groups_id' => 1,
-            'manifest_path' => $path, 'manifest_hash' => substr($path, 0, 64), 'manifest_bytes' => filesize($store->path($path)),
+            'manifest_path' => $path, 'manifest_hash' => substr($path, 0, 64), 'manifest_bytes' => $store->size($path),
             'last_unique_at' => now(), 'next_attempt_at' => now()]);
-        DB::table('release_verification_state')->update(['pending_bytes' => filesize($store->path($path))]);
+        DB::table('release_verification_state')->update(['pending_bytes' => $store->size($path)]);
         $claim = app(CandidateRepository::class)->claim();
         if ($failure === 'legacy_forged') {
             $manifest['legacy_release_id'] = 778;
@@ -281,6 +282,12 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
                 }
             });
         }
+        $stripeLocks = [];
+        DB::listen(function (QueryExecuted $event) use (&$stripeLocks): void {
+            if (str_contains($event->sql, 'from "release_verification_locks"') && str_contains($event->sql, ' in (')) {
+                $stripeLocks[] = $event->bindings;
+            }
+        });
         $pages = 0;
         DB::listen(function (QueryExecuted $event) use (&$pages): void {
             if (str_starts_with($event->sql, 'select "id", "guid"') && str_contains($event->sql, 'limit 128')) {
@@ -417,6 +424,17 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             $this->assertSame(3, DB::table('releases_groups')->where('releases_id', $id)->count());
         }
         $release = DB::table('releases')->where('id', $id)->first();
+        if (config('release_verification.manifest_storage') === 'database' && $timingMode === 'nested') {
+            // Inside an outer transaction, publication takes the exclusive fallback before any read.
+            $this->assertSame([], $stripeLocks);
+        } elseif (config('release_verification.manifest_storage') === 'database') {
+            // The publication locked every stripe its duplicate search could look this release up by.
+            $this->assertNotSame([], $stripeLocks);
+            foreach (VerificationLedger::publicationKeys((int) $release->size, null, (string) $release->name,
+                (string) $release->searchname, (int) $release->predb_id) as $key) {
+                $this->assertContains(VerificationLedger::publicationStripe($key), $stripeLocks[array_key_last($stripeLocks)], $key);
+            }
+        }
         $xml = app(NzbService::class)->readNzbContents($release->guid);
         $this->assertStringContainsString('verified@article', $xml);
         $this->assertSame(1, (int) $release->nzbstatus);

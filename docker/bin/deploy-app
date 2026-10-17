@@ -19,6 +19,7 @@ drained=0
 legacy=0
 scheduler_drained=0
 scheduler_legacy=0
+horizon_stopped=0
 scheduler_timeout="${DEPLOY_SCHEDULER_DRAIN_TIMEOUT:-1800}"
 case "$scheduler_timeout" in
     ''|*[!0-9]*) echo "DEPLOY_SCHEDULER_DRAIN_TIMEOUT must be a nonnegative integer." >&2; exit 1 ;;
@@ -27,7 +28,70 @@ operation_token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 legacy_drain() { compose exec -T indexer php -- /app "$1" "${DEPLOY_LEGACY_DRAIN_TIMEOUT:-1800}" "$operation_token" < "$DIR/bin/legacy-drain.php"; }
 legacy_scheduler() { compose exec -T scheduler python3 - "$1" "$scheduler_timeout" "$operation_token" < "$DIR/bin/legacy-scheduler-drain.py"; }
 scheduler_command() { compose exec -T scheduler python3 /app/docker/app/bin/scheduler.py "$@"; }
+# Remote worker hosts share the database but not this Compose project. The new image's barrier,
+# a one-off container, stops their verification workers, waits for them and keeps them out. It is
+# stopped only after a healthy rollout: a failed migration leaves remote workers held until the
+# repaired deployment (which reuses a running barrier) finishes, or an operator stops it.
+# Named after Compose's effective project, so installations never share or adopt each other's barrier.
+project=$(compose config --format json | python3 -c 'import json, sys; print(json.load(sys.stdin)["name"])')
+case "$project" in
+    ''|*[!a-z0-9_-]*) echo "Cannot resolve the Compose project for the verification barrier." >&2; exit 1 ;;
+esac
+barrier_name="$project-verification-barrier"
+barrier_held=0
+barrier_keep=0
+barrier_running() {
+    [ "$(docker inspect --format '{{.State.Running}} {{index .Config.Labels "com.docker.compose.project"}}' "$barrier_name" 2>/dev/null)" = "true $project" ]
+}
+hold_barrier() {
+    # A barrier still running from a failed attempt is retained until this rollout is healthy.
+    if barrier_running; then
+        barrier_keep=1
+    else
+        docker rm -f "$barrier_name" >/dev/null 2>&1 || true
+        compose run -d --no-deps --name "$barrier_name" web php artisan releases:verification-barrier --timeout="${DEPLOY_REMOTE_DRAIN_TIMEOUT:-900}" --no-interaction >/dev/null
+    fi
+    barrier_held=1
+    until docker logs "$barrier_name" 2>&1 | grep -q '^barrier held'; do
+        if ! barrier_running; then
+            docker logs "$barrier_name" >&2 || true
+            docker rm -f "$barrier_name" >/dev/null 2>&1 || true
+            barrier_held=0
+            echo "Remote verification workers did not drain; not stopping writers or migrating." >&2
+            exit 1
+        fi
+        sleep 1
+    done
+}
+assert_barrier() {
+    if ! barrier_running || docker logs "$barrier_name" 2>&1 | grep -q '^barrier lost'; then
+        echo "The verification barrier was lost; remote verification workers may be writing." >&2
+        exit 1
+    fi
+}
+release_barrier() {
+    if [ "$barrier_held" = 1 ]; then
+        docker stop --timeout 30 "$barrier_name" >/dev/null || true
+        released=0
+        docker logs "$barrier_name" 2>&1 | grep -q '^barrier released' && released=1
+        docker rm -f "$barrier_name" >/dev/null 2>&1 || true
+        barrier_held=0
+        # Its durable pause would otherwise keep every host's workers out after a healthy rollout.
+        if [ "$released" != 1 ] && ! compose run --rm --no-deps -T web php artisan releases:verification-barrier --release --no-interaction; then
+            echo "The verification deployment pause could not be cleared; every host's workers stay paused." >&2
+            return 1
+        fi
+    fi
+}
 resume() {
+    if [ "$barrier_held" = 1 ] && [ "$barrier_keep" = 1 ]; then
+        echo "Remote verification workers stay held by container $barrier_name until a repaired deployment completes or it is stopped." >&2
+    else
+        release_barrier
+    fi
+    if [ "$horizon_stopped" = 1 ]; then
+        compose start horizon || echo "Horizon restart failed; queued jobs wait until it runs." >&2
+    fi
     if [ "$scheduler_drained" = 1 ]; then
         if [ "$scheduler_legacy" = 1 ]; then
             legacy_scheduler resume || echo "Legacy scheduler restoration failed; inspect its admission state before retrying." >&2
@@ -45,46 +109,61 @@ resume() {
 }
 trap 'resume' EXIT
 trap 'exit 130' INT TERM
-# Pause scheduled admission before waiting for any other service. A failed probe
-# is distinct from an old image; it must never silently select the legacy path.
+# Probe both drain capabilities before stopping anything. A failed probe is distinct
+# from an old image; it must never silently select the legacy path.
 scheduler=$(compose ps -q scheduler)
 if [ -n "$scheduler" ]; then
     capability=$(compose exec -T scheduler python3 -c 'from pathlib import Path; print("native" if Path("/app/docker/app/bin/scheduler.py").is_file() else "legacy")')
     case "$capability" in
-        native) scheduler_drained=1; scheduler_command drain --timeout="$scheduler_timeout" --token="$operation_token" ;;
+        native) ;;
         legacy)
             if [ "${DEPLOY_LEGACY_DRAIN:-0}" != 1 ]; then
                 echo "Old scheduler requires the authorized DEPLOY_LEGACY_DRAIN=1 transition." >&2
                 exit 1
             fi
-            scheduler_legacy=1
-            scheduler_drained=1
-            legacy_scheduler drain ;;
+            scheduler_legacy=1 ;;
         *) echo "Cannot verify scheduler drain capability." >&2; exit 1 ;;
     esac
-    scheduler_drained=1
 fi
-verify
 if [ -n "$indexer" ]; then
     commands=$(compose exec -T indexer php artisan list --raw --no-interaction)
-    if printf '%s\n' "$commands" | grep -q '^tmux:drain[[:space:]]'; then
-        drained=1
-        compose exec -T indexer php artisan tmux:drain --timeout="${DEPLOY_DRAIN_TIMEOUT:-90}" --session=nntmux --token="$operation_token" --no-interaction
-    else
+    if ! printf '%s\n' "$commands" | grep -q '^tmux:drain[[:space:]]'; then
         if [ "${DEPLOY_LEGACY_DRAIN:-0}" != 1 ]; then
             echo "Old image lacks tmux:drain. Authorized first upgrades require DEPLOY_LEGACY_DRAIN=1; legacy IRC disconnects at final stop." >&2
             exit 1
         fi
         legacy=1
-        drained=1
-        legacy_drain drain
     fi
-    drained=1
+fi
+# Let active Horizon jobs finish first while the scheduler and indexer keep producing
+# work, which queues in Redis for the new Horizon. Waiting for Horizon after their
+# drains idled every writer for its whole grace. The explicit timeout also protects
+# containers created before the longer Compose grace.
+# A checked assignment: a failed lookup must abort, never read as an absent Horizon.
+horizon=$(compose ps -q horizon)
+if [ -n "$horizon" ]; then
+    horizon_stopped=1
+    compose stop --timeout 1920 horizon
+    verify
+fi
+# Pause scheduled admission before waiting for the indexer.
+if [ -n "$scheduler" ]; then
+    scheduler_drained=1
+    if [ "$scheduler_legacy" = 1 ]; then
+        legacy_scheduler drain
+    else
+        scheduler_command drain --timeout="$scheduler_timeout" --token="$operation_token"
+    fi
 fi
 verify
-# Let active Horizon jobs finish while the existing web service remains available.
-# Explicit timeout also protects containers created before the longer Compose grace.
-compose stop --timeout 1920 horizon
+if [ -n "$indexer" ]; then
+    drained=1
+    if [ "$legacy" = 1 ]; then
+        legacy_drain drain
+    else
+        compose exec -T indexer php artisan tmux:drain --timeout="${DEPLOY_DRAIN_TIMEOUT:-900}" --session=nntmux --token="$operation_token" --no-interaction
+    fi
+fi
 verify
 if [ "$scheduler_legacy" = 1 ]; then
     legacy_scheduler check
@@ -99,11 +178,20 @@ elif [ "$scheduler_drained" = 1 ]; then
     scheduler_command check
     verify
 fi
+hold_barrier
+verify
 # Stop the remaining database writers before migration; persistent services stay running.
 compose stop web scheduler indexer
+horizon_stopped=0
 drained=0
 scheduler_drained=0
 verify
+assert_barrier
+barrier_keep=1
 compose run --rm --no-deps web php artisan migrate --force --no-interaction
+assert_barrier
 verify
 compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" web horizon scheduler indexer
+assert_barrier
+barrier_keep=0
+release_barrier || exit 1

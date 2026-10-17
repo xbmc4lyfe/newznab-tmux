@@ -182,7 +182,7 @@ class VerifiedReleasePasswordMetadataTest extends ReleaseVerificationCandidatesT
         $retainedBytes = is_file($retainedPath) ? file_get_contents($retainedPath) : null;
         $store = app(ManifestStore::class);
         $path = $store->write($manifest);
-        $bytes = filesize($store->path($path));
+        $bytes = $store->size($path);
         DB::table('release_verification_candidates')->insert(['identity' => sha1('fixture'), 'groups_id' => 1,
             'manifest_path' => $path, 'manifest_hash' => substr($path, 0, 64), 'manifest_bytes' => $bytes,
             'last_unique_at' => now(), 'next_attempt_at' => now()]);

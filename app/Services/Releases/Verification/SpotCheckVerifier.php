@@ -29,7 +29,8 @@ final class SpotCheckVerifier
         $inventory = new CandidateHeaderInventory;
         $assessment = $inventory->assessment($manifest);
         if ($assessment['reason'] !== null) {
-            return new VerificationResult('unknown', $assessment['reason'], waitingForHeaders: $assessment['status'] === 'waiting_upload');
+            return new VerificationResult('unknown', $assessment['reason'], waitingForHeaders: $assessment['status'] === 'waiting_upload',
+                headerRejected: $assessment['status'] === CandidateHeaderInventory::REJECTED);
         }
 
         $articleLimit = max(0, min(16, (int) ($this->options['spot_check_articles'] ?? 1)));
@@ -115,24 +116,60 @@ final class SpotCheckVerifier
             }
         }
 
-        $declaredSize = $inventory->bytes($manifest);
-        if ($declaredSize < 1) {
+        if ($inventory->bytes($manifest) < 1) {
             return new VerificationResult('unknown', 'Candidate has no positive declared size.');
         }
+
+        return new VerificationResult('sampled', 'Sampled article checks passed; the full payload was not downloaded.',
+            self::withEvidence($manifest, ['articles' => count($sample), 'bytes' => $bytes,
+                'sampled_files' => count(array_unique(array_column($sample, 'file_key'))),
+                'verified_file_names' => array_keys($names), 'identity_hints' => array_column($identityHints, 'name')]));
+    }
+
+    /**
+     * The sampled article evidence a remote worker sends instead of the whole manifest.
+     *
+     * @param  array<string, mixed>  $manifest  A sampled result manifest.
+     * @return array{articles: int, bytes: int, sampled_files: int, verified_file_names: list<string>, identity_hints: list<string>}
+     */
+    public static function evidence(array $manifest): array
+    {
+        if (($manifest['verification_mode'] ?? null) !== 'spot_check' || ! is_array($manifest['spot_check'] ?? null)) {
+            throw new \RuntimeException('Sampled verdict has no spot-check evidence.');
+        }
+
+        return ['articles' => (int) $manifest['spot_check']['articles'], 'bytes' => (int) $manifest['spot_check']['bytes'],
+            'sampled_files' => (int) $manifest['spot_check']['sampled_files'],
+            'verified_file_names' => array_values(array_map('strval', (array) ($manifest['verified_file_names'] ?? []))),
+            'identity_hints' => array_values(array_map(static fn (mixed $hint): string => (string) ($hint['name'] ?? ''),
+                (array) ($manifest['identity_hints'] ?? [])))];
+    }
+
+    /**
+     * Derive every publication field from the stored manifest and its sampled evidence, so a
+     * remote worker's result is rebuilt exactly as a local one.
+     *
+     * @param  array<string, mixed>  $manifest
+     * @param  array{articles: int, bytes: int, sampled_files: int, verified_file_names: list<string>, identity_hints: list<string>}  $evidence
+     * @return array<string, mixed>
+     */
+    public static function withEvidence(array $manifest, array $evidence): array
+    {
+        $declaredSize = (new CandidateHeaderInventory)->bytes($manifest);
         $manifestFileCount = count(array_filter($manifest['files'], static fn (mixed $file): bool => is_array($file)
             && is_array($file['segments'] ?? null) && $file['segments'] !== []));
         $manifest['verification_mode'] = 'spot_check';
-        $manifest['spot_check'] = ['articles' => count($sample), 'bytes' => $bytes,
-            'sampled_files' => count(array_unique(array_column($sample, 'file_key'))),
-            'method' => 'yenc-crc-and-identity'];
+        $manifest['spot_check'] = ['articles' => $evidence['articles'], 'bytes' => $evidence['bytes'],
+            'sampled_files' => $evidence['sampled_files'], 'method' => 'yenc-crc-and-identity'];
         $manifest['declared_size'] = $declaredSize;
         $manifest['publication_size'] = $declaredSize;
         $manifest['publication_file_count'] = $manifestFileCount;
-        $manifest['verified_file_names'] = array_keys($names);
-        $manifest['verified_file_count'] = count($names);
-        $manifest['identity_hints'] = $identityHints;
+        $manifest['verified_file_names'] = $evidence['verified_file_names'];
+        $manifest['verified_file_count'] = count($evidence['verified_file_names']);
+        $manifest['identity_hints'] = array_map(static fn (string $name): array => ['name' => $name, 'source' => 'yenc-spot-check'],
+            $evidence['identity_hints']);
 
-        return new VerificationResult('sampled', 'Sampled article checks passed; the full payload was not downloaded.', $manifest);
+        return $manifest;
     }
 
     /** @param array<string, mixed> $manifest */

@@ -96,7 +96,7 @@ class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidates
             $stored['conflict'] = true;
         }
         $storedPath = $store->write($stored);
-        $storedBytes = filesize($store->path($storedPath));
+        $storedBytes = $store->size($storedPath);
         DB::table('release_verification_candidates')->where('id', $first->id)->update(['manifest_path' => $storedPath, 'manifest_hash' => substr($storedPath, 0, 64), 'manifest_bytes' => $storedBytes, 'lease_token' => 'fixture-lease', 'lease_until' => now()->addHour()]);
         DB::table('release_verification_state')->update(['pending_bytes' => $storedBytes]);
         if ($mode === 'corrupt') {
@@ -193,7 +193,7 @@ class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidates
             $assessment = (new CandidateHeaderInventory)->assessment($manifest);
             self::assertSame($assessment['status'], $candidate->status);
             self::assertSame($assessment['reason'], $candidate->reason);
-            self::assertSame(filesize($store->path($candidate->manifest_path)), (int) DB::table('release_verification_state')->value('pending_bytes'));
+            self::assertSame($store->size($candidate->manifest_path), (int) DB::table('release_verification_state')->value('pending_bytes'));
         } else {
             self::assertFileExists($path);
             self::assertSame($stored, $manifest);
@@ -322,6 +322,24 @@ class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidates
         self::assertSame($before, (array) DB::table('release_verification_candidates')->first());
         self::assertSame($pendingBytes, DB::table('release_verification_state')->value('pending_bytes'));
         self::assertSame($artifacts, glob(config('release_verification.storage_path').'/manifests/*.json.gz'));
+    }
+
+    public function test_enriching_a_defective_import_before_its_first_check_keeps_it_claimable_once(): void
+    {
+        $repository = app(CandidateRepository::class);
+        $manifest = $this->privateRollbackManifest();
+        $manifest['files'][0]['totalparts'] = 2;
+        $manifest['files'][0]['segments'][] = ['number' => 2] + $manifest['files'][0]['segments'][0];
+        self::assertSame('header_rejected', (new CandidateHeaderInventory)->assessment($manifest)['status']);
+        self::assertTrue($repository->enqueue($manifest));
+        self::assertSame('unknown', DB::table('release_verification_candidates')->value('status'));
+
+        self::assertTrue($repository->enqueue($manifest + ['passwords' => ['secret']]));
+
+        $enriched = DB::table('release_verification_candidates')->sole();
+        self::assertSame(2, (int) $enriched->version);
+        self::assertSame('unknown', $enriched->status);
+        self::assertNotNull($repository->claim());
     }
 
     public function test_accepted_enrichment_preserves_expiry_and_fences_old_claim_before_ordered_reclaim(): void

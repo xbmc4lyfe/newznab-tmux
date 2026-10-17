@@ -17,33 +17,55 @@ final class VerificationResetService
         if (DB::transactionLevel() !== 0) {
             throw new RuntimeException('Database reset cannot run inside an open transaction.');
         }
-        $admissionLock = $this->lock('reset.lock', LOCK_EX);
+        $store = VerificationLockStore::make();
+        $admissionLock = $this->lock($store->exclusiveGroup('reset'));
         try {
-            $workerLock = $this->lock('worker.lock', LOCK_EX);
+            $workerLock = $this->lock($store->exclusiveGroup('worker'));
             try {
-                $this->clearVerification();
-                $reset();
+                // Checked while holding both gates, so a pause cannot appear unseen before the work.
+                if (VerificationWorkerLocks::paused()) {
+                    throw new RuntimeException('A deployment pause holds verification workers; retry reset after it is released.');
+                }
+                // A durable pause fences the whole reset, including filesystem cleanup that a lost
+                // session could not stop. Removing it needs the pinned session, so after a lost
+                // session it stays until an operator runs releases:verification-barrier --release --all.
+                $pause = VerificationWorkerLocks::pauseIfAvailable('reset-'.bin2hex(random_bytes(8)), 'reset');
+                try {
+                    $this->clearVerification();
+                    $reset();
+                } finally {
+                    if ($pause !== null) {
+                        VerificationWorkerLocks::unpause($pause);
+                    }
+                }
             } finally {
-                $this->unlock($workerLock);
+                $store->release($workerLock);
             }
         } finally {
-            $this->unlock($admissionLock);
+            $store->release($admissionLock);
         }
     }
 
     /** Retain admission protection until the caller's outer transaction finishes. */
     public function withAdmission(callable $admit): void
     {
-        $lock = $this->lock('reset.lock', LOCK_SH);
+        $store = VerificationLockStore::make();
+        $lock = $this->lock($store->shared('reset'));
+        // A reset that lost its session keeps its durable pause while its cleanup may still run.
+        if (VerificationWorkerLocks::paused(null, 'reset', current: true)) {
+            $store->release($lock);
+
+            throw new RuntimeException('Verification worker, admission or reset is active; retry reset later.');
+        }
         try {
             $admit();
         } finally {
             if (DB::transactionLevel() > 0) {
-                $release = fn () => $this->unlock($lock);
+                $release = static fn () => $store->release($lock);
                 DB::afterCommit($release);
                 DB::afterRollBack($release);
             } else {
-                $this->unlock($lock);
+                $store->release($lock);
             }
         }
     }
@@ -54,14 +76,31 @@ final class VerificationResetService
             if (Schema::hasTable('release_verification_state')) {
                 DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
             }
-            foreach (['release_verification_scratch', 'release_verification_candidates', 'release_verification_audit_retries'] as $table) {
+            // Other worker hosts keep their scratch records and budgets, marked terminal: only they
+            // can remove their directories.
+            $hosts = Schema::hasTable('release_verification_scratch') && Schema::hasColumn('release_verification_scratch', 'host');
+            if ($hosts) {
+                DB::table('release_verification_scratch')->where('host', '<>', ScratchInventory::host())->update(['terminal' => true]);
+            }
+            foreach (['release_verification_scratch', 'release_verification_candidates', 'release_verification_audit_retries', 'release_verification_manifests'] as $table) {
                 if (Schema::hasTable($table)) {
-                    DB::table($table)->delete();
+                    $query = DB::table($table);
+                    if ($table === 'release_verification_scratch' && $hosts) {
+                        $query->where('host', ScratchInventory::host());
+                    }
+                    $query->delete();
                 }
             }
             if (Schema::hasTable('release_verification_scratch_budget')) {
-                DB::table('release_verification_scratch_budget')->delete();
-                DB::table('release_verification_scratch_budget')->insert(['id' => 1]);
+                if (Schema::hasColumn('release_verification_scratch_budget', 'host')) {
+                    DB::table('release_verification_scratch_budget')->where('host', ScratchInventory::host())->delete();
+                    if (ScratchInventory::host() === '') {
+                        DB::table('release_verification_scratch_budget')->insert(['id' => 1]);
+                    }
+                } else {
+                    DB::table('release_verification_scratch_budget')->delete();
+                    DB::table('release_verification_scratch_budget')->insert(['id' => 1]);
+                }
             }
             if (Schema::hasTable('release_verification_state')) {
                 DB::table('release_verification_state')->delete();
@@ -74,6 +113,7 @@ final class VerificationResetService
         });
 
         $root = (string) config('release_verification.storage_path');
+        File::ensureDirectoryExists($root, 0700);
         foreach (new \FilesystemIterator($root, \FilesystemIterator::SKIP_DOTS) as $entry) {
             if (in_array($entry->getFilename(), ['worker.lock', 'reset.lock', 'locks', '.gitignore'], true)) {
                 continue;
@@ -87,29 +127,8 @@ final class VerificationResetService
         }
     }
 
-    /** @return resource */
-    private function lock(string $name, int $mode)
+    private function lock(?VerificationLock $lock): VerificationLock
     {
-        $root = (string) config('release_verification.storage_path');
-        File::ensureDirectoryExists($root, 0700);
-        $lock = fopen($root.'/'.$name, 'c');
-        if ($lock === false) {
-            throw new RuntimeException('Verification reset lock is unavailable.');
-        }
-        if (! flock($lock, $mode | LOCK_NB)) {
-            fclose($lock);
-            throw new RuntimeException('Verification worker, admission or reset is active; retry reset later.');
-        }
-
-        return $lock;
-    }
-
-    /** @param resource $lock */
-    private function unlock($lock): void
-    {
-        if (is_resource($lock)) {
-            flock($lock, LOCK_UN);
-            fclose($lock);
-        }
+        return $lock ?? throw new RuntimeException('Verification worker, admission or reset is active; retry reset later.');
     }
 }

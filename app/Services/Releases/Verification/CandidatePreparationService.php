@@ -116,7 +116,7 @@ final class CandidatePreparationService
                         $changed += $this->flushWaiting($waiting, $waitingReason, $cutoff, $diagnostics);
                         $updateStarted = $diagnostics?->start();
                         try {
-                            $values = ['status' => $assessment['status']];
+                            $values = ['status' => $assessment['status'], 'header_check_pending' => false];
                             // Preserve a valid candidate's NNTP backoff and diagnostic reason.
                             if ($assessment['status'] !== 'ready') {
                                 $values['reason'] = mb_strcut($assessment['reason'] ?? '', 0, 2000, 'UTF-8');
@@ -204,7 +204,7 @@ final class CandidatePreparationService
                         ->where('status', $row->status)->where('next_attempt_at', $row->next_attempt_at));
                 }
             });
-        $values = ['status' => 'waiting_upload', 'reason' => $reason];
+        $values = ['status' => 'waiting_upload', 'reason' => $reason, 'header_check_pending' => false];
         if (count($rows) === 1 || ! in_array($connection->getDriverName(), ['mysql', 'mariadb'], true)) {
             return $query->update($values);
         }

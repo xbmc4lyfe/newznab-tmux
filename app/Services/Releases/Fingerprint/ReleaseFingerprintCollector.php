@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Releases\Fingerprint;
 
 use App\Models\Release;
+use App\Services\NNTP\NntpProviderUnavailableException;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
 use App\Services\YencService;
@@ -53,7 +54,11 @@ final class ReleaseFingerprintCollector
         $omittedSampleCount = 0;
         $samples = $this->analyzer->selectArticleSamples($manifest['files'], NzbFingerprintAnalyzer::MAX_ARTICLE_SAMPLES, $omittedSampleCount);
         $servers = $this->configuredServers();
-        $nntp = new NNTPService;
+        $nntp = app(NNTPService::class);
+        // Alternate providers whose connection or login failed; their remaining samples are skipped
+        // instead of repeating the full connect-retry cycle for every one. The primary keeps
+        // retrying per sample, so a transient failure cannot blank its observations.
+        $unavailable = [];
         $observations = [];
         $errors = [];
         $serverProfiles = [];
@@ -69,15 +74,18 @@ final class ReleaseFingerprintCollector
         $par2SourceSampleRetainedBytes = 0;
         $par2SourceSampleOmittedCount = 0;
         foreach ($servers as $server) {
+            $serverKey = ($server['alternate'] ? 'alternate ' : 'primary ').$server['name'];
             try {
                 $profile = $nntp->getFingerprintServerProfile($server['alternate']);
                 $profileRow = $server + ['profile' => $profile];
             } catch (Throwable $exception) {
                 $profile = [];
                 $profileRow = $server + ['profile_error_type' => class_basename($exception)];
+                if ($server['alternate'] && $exception instanceof NntpProviderUnavailableException) {
+                    $unavailable[$serverKey] = class_basename($exception);
+                }
             }
             $serverProfiles[] = $profileRow;
-            $serverKey = ($server['alternate'] ? 'alternate ' : 'primary ').$server['name'];
             $serverProfileMap[$serverKey] = $profile;
         }
         foreach ($samples as $sample) {
@@ -87,9 +95,19 @@ final class ReleaseFingerprintCollector
 
                     continue;
                 }
+                $serverKey = ($server['alternate'] ? 'alternate ' : 'primary ').$server['name'];
+                if (isset($unavailable[$serverKey])) {
+                    $errors[] = [
+                        'file_index' => $sample['file_index'],
+                        'message_id' => $sample['messageid'],
+                        'server' => $server['name'],
+                        'error_type' => $unavailable[$serverKey],
+                    ];
+
+                    continue;
+                }
                 try {
                     $queryStart = hrtime(true);
-                    $serverKey = ($server['alternate'] ? 'alternate ' : 'primary ').$server['name'];
                     $capabilities = $serverProfileMap[$serverKey]['capabilities_raw'] ?? [];
                     $supportsMessageIdOverview = count(array_filter(
                         $capabilities,
@@ -377,6 +395,9 @@ final class ReleaseFingerprintCollector
                         'server' => $server['name'],
                         'error_type' => class_basename($exception),
                     ];
+                    if ($server['alternate'] && $exception instanceof NntpProviderUnavailableException) {
+                        $unavailable[$serverKey] = class_basename($exception);
+                    }
                 }
             }
         }
