@@ -901,6 +901,31 @@ SH);
         $this->assertStringNotContainsString(' proxy', $events);
     }
 
+    public function test_compose_change_requiring_migration_still_migrates_when_retried_after_a_failed_drain(): void
+    {
+        $base = json_decode($this->composeJson(), true);
+        $config = function (string $host) use ($base): array {
+            $services = $base;
+            foreach (['web', 'horizon', 'scheduler', 'indexer'] as $role) {
+                $services['services'][$role] = ['environment' => ['DB_HOST' => $host]];
+            }
+
+            return ['NNTMUX_CONFIG_ID' => (string) json_encode($services, JSON_UNESCAPED_SLASHES)];
+        };
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('old'))->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        $failed = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('new') + ['NNTMUX_SCHEDULER_DRAIN_FAIL' => '1']);
+        $failed->run();
+        $this->assertSame(47, $failed->getExitCode());
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
+
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('new'))->mustRun();
+        $this->assertStringContainsString('artisan migrate --force --no-interaction', $this->events());
+        $this->assertStringContainsString(' stop web scheduler indexer', $this->events());
+    }
+
     public function test_host_system_paths_match_on_path_boundaries_only(): void
     {
         $script = 'import importlib.machinery, importlib.util, sys; l = importlib.machinery.SourceFileLoader("dp", sys.argv[1]); '

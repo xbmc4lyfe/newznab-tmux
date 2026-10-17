@@ -32,9 +32,11 @@ fi
 # something that is not running, and a retry repeats only what did not complete.
 plan() { "$DIR/bin/deploy-plan" "$@"; }
 plan --invalidate
-# The rendered-Compose change is explained by the per-service records unless the plan fell back to
-# a full app rollout for it; record it now so an interrupted run's retry is not a full rollout.
-[ "$GLOBAL_FALLBACK" = 1 ] || plan --record effective
+# Record the rendered-Compose hash with whatever it triggers: after the app rollout when the plan
+# fell back to one for it, after the migration when one runs (it may be what requires migrating),
+# otherwise now, since the per-service records explain it and an interrupted run's retry must not
+# turn into a full rollout.
+[ "$GLOBAL_FALLBACK" = 1 ] || [ "$MIGRATE" = 1 ] || plan --record effective
 
 # Stateless infrastructure first, while every writer still runs: a failing infra service aborts
 # here, before any drain, instead of after a full app rollout that would then repeat every poll.
@@ -218,6 +220,7 @@ if [ "$MIGRATE" = 1 ]; then
     plan --forget migration
     compose run --rm --no-deps web php artisan migrate --force --no-interaction
     plan --record migration
+    [ "$GLOBAL_FALLBACK" = 1 ] || plan --record effective
     verify
 fi
 
