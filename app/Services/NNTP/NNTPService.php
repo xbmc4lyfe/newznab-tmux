@@ -64,9 +64,11 @@ class NNTPService extends NntpClient
             }
             if (! str_ends_with($line, "\n")) {
                 $this->doQuit();
-                // A partial line that filled a read capped by the remaining budget means the
-                // article is too large; anything shorter is a truncated response.
-                if (strlen($line) === $limit - 1 && $maximumBytes - strlen($raw) < 65534 && strlen($raw) + strlen($line) >= $maximumBytes) {
+                // A partial line that filled a read capped by the remaining budget proves the article
+                // too large only when its unstuffed bytes already exceed the budget; anything else
+                // (including a dot-stuffed line that exactly fills the cap) is a truncated response.
+                $unstuffed = strlen($line) - (str_starts_with($line, '..') ? 1 : 0);
+                if (strlen($line) === $limit - 1 && $maximumBytes - strlen($raw) < 65534 && strlen($raw) + $unstuffed > $maximumBytes) {
                     throw new ArticleBudgetExceeded('Article exceeds verification memory budget.');
                 }
                 throw new \RuntimeException('Verification article line is truncated or oversized.');
