@@ -326,6 +326,10 @@ final class VerificationRunDiagnosticsCommandTest extends ReleaseVerificationCan
         $this->assertSame(0, array_sum($reports[0]['verifier_verdicts']));
         $this->assertSame('success', $reports[0]['command_result']);
         $this->assertArrayNotHasKey('persisted_outcomes', $reports[0]);
+        // The throwing phase and the recovery finish are both timed.
+        $this->assertSame(1, $reports[0]['phases']['failed']['count']);
+        $this->assertSame(1, $reports[0]['phases']['finish']['count']);
+        $this->assertSame(1, $reports[0]['phases']['claim']['count']);
     }
 
     public function test_diagnostics_add_no_queries_when_a_claim_attempt_returns_null(): void

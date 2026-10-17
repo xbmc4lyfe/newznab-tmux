@@ -161,7 +161,6 @@ class VerifyReleaseCandidates extends Command
                     $diagnostics?->verified($result->verdict);
                     if ($result->passed()) {
                         $published = $publisher->publish($claim, $result);
-                        $phase = $diagnostics?->phase('publish', $phase);
                         if ($published === null) {
                             $result = $this->filteredResult($claim) ?? throw new RuntimeException('Publication did not produce a verified current release.');
                             $diagnostics?->filtered();
@@ -171,11 +170,14 @@ class VerifyReleaseCandidates extends Command
                         if (File::deleteDirectory($directory) || (! file_exists($directory) && ! is_link($directory))) {
                             $scratchInventory->forget($scratchEntryId);
                         }
+                        // Publication includes its filtered-result recovery and scratch removal.
+                        $phase = $diagnostics?->phase('publish', $phase);
                     } else {
                         $repository->finish($claim, $result);
                         $phase = $diagnostics?->phase('finish', $phase);
                         $diagnostics?->finished();
                     }
+                    $phase = hrtime(true);
                     $bytes = $result->passed()
                         ? (int) ($result->manifest['spot_check']['bytes'] ?? $result->manifest['verified_bytes'] ?? 0) : 0;
                     $snapshot = json_encode(['verified_bytes_per_second' => $bytes / max(0.001, microtime(true) - $started),
@@ -193,13 +195,17 @@ class VerifyReleaseCandidates extends Command
                     $diagnostics?->phase('status_write', $phase);
                     $this->line($claim->id.': '.$result->verdict.' — '.$result->reason);
                 } catch (Throwable $error) {
+                    // Time spent in the phase that threw.
+                    $diagnostics?->phase('failed', $phase);
                     $diagnostics?->candidateFailed();
                     $filtered = $this->filteredResult($claim);
                     if ($filtered !== null) {
                         $diagnostics?->filtered();
                         $this->line($claim->id.': '.$filtered->verdict.' — '.$filtered->reason);
                     } else {
+                        $recovery = hrtime(true);
                         $repository->finish($claim, new VerificationResult('unknown', $error->getMessage()));
+                        $diagnostics?->phase('finish', $recovery);
                         $diagnostics?->finished();
                         $this->warn($claim->id.': retry pending — '.$error->getMessage());
                     }
