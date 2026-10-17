@@ -673,7 +673,7 @@ SH);
         $this->assertStringNotContainsString(' stop ', $events);
         $this->assertStringNotContainsString('artisan migrate', $events);
         $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $events);
-        $this->assertStringNotContainsString(' redis', $events);
+        $this->assertDoesNotMatchRegularExpression('/ up -d[^\\n]* redis\\b/', $events);
     }
 
     public function test_compose_command_text_changes_never_recreate_data_services(): void
@@ -742,7 +742,7 @@ SH);
         $this->assertStringContainsString('artisan tmux:drain --timeout=90', $events);
         $this->assertStringContainsString(' stop web scheduler indexer', $events);
         $this->assertStringContainsString($recreate, $events);
-        $this->assertStringNotContainsString('manticore', $events);
+        $this->assertDoesNotMatchRegularExpression('/ up -d[^\\n]* manticore\\b/', $events);
         $this->assertLessThan(strpos($events, $recreate), strpos($events, ' stop web scheduler indexer'));
     }
 
@@ -1058,6 +1058,34 @@ SH);
         $this->assertStringNotContainsString('drain', $this->events());
     }
 
+    public function test_a_stale_mode_in_the_environment_cannot_stand_in_for_a_failed_plan(): void
+    {
+        $head = trim((new Process(['git', 'rev-parse', 'HEAD'], $this->directory))->mustRun()->getOutput());
+        $legacy = $head." e3b0 e3b0 c16c bb93\n";
+        file_put_contents($this->directory.'/docker/.deploy.stamp', $legacy);
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['MODE' => 'noop', 'NNTMUX_CONFIG_ID' => $this->composeJson(), 'NNTMUX_STARTED_AT' => 'not-a-time']);
+        $process->run();
+        $this->assertNotSame(0, $process->getExitCode());
+        $this->assertSame($legacy, file_get_contents($this->directory.'/docker/.deploy.stamp'));
+        $this->assertAttemptsClosed();
+    }
+
+    public function test_newly_rendered_data_service_starts_without_quiescing_writers(): void
+    {
+        $without = '{"services":{"web":{},"horizon":{},"scheduler":{},"indexer":{},"redis":{},"manticore":{},"proxy":{}}}';
+        $with = '{"services":{"web":{},"horizon":{},"scheduler":{},"indexer":{},"mariadb":{},"redis":{},"manticore":{},"proxy":{}}}';
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => $without])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => $with])->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 mariadb', $events);
+        $this->assertStringNotContainsString('drain', $events);
+        $this->assertStringNotContainsString(' stop ', $events);
+        $this->assertStringNotContainsString('--wait-timeout 240 web', $events);
+        $this->assertAttemptsClosed();
+    }
+
     public function test_host_system_paths_match_on_path_boundaries_only(): void
     {
         $script = 'import importlib.machinery, importlib.util, sys; l = importlib.machinery.SourceFileLoader("dp", sys.argv[1]); '
@@ -1219,8 +1247,8 @@ SH);
 
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('true'))->mustRun();
         $events = $this->events();
-        $this->assertStringNotContainsString('redis', $events);
-        $this->assertStringNotContainsString('proxy', $events);
+        $this->assertDoesNotMatchRegularExpression('/ up -d[^\\n]* redis\\b/', $events);
+        $this->assertDoesNotMatchRegularExpression('/ up -d[^\\n]* proxy\\b/', $events);
     }
 
     public function test_fingerprint_change_without_an_affected_service_is_not_logged_as_a_rollout(): void
@@ -1297,7 +1325,7 @@ SH);
         $recreate = ' up -d --no-deps --force-recreate --wait --wait-timeout 240 redis';
         $this->assertStringContainsString($recreate, $events);
         $this->assertLessThan(strpos($events, $recreate), strpos($events, ' stop web scheduler indexer'));
-        $this->assertStringNotContainsString('manticore', $events);
+        $this->assertDoesNotMatchRegularExpression('/ up -d[^\\n]* manticore\\b/', $events);
 
         // A docs-only commit skips.
         file_put_contents($this->directory.'/events', '');
@@ -1328,6 +1356,8 @@ SH);
         $this->assertNotSame(0, $process->getExitCode());
         $this->assertStringContainsString('cannot fingerprint mounted configuration', $process->getErrorOutput());
         $this->assertSame($stamp, (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
+        $this->assertAttemptsClosed();
+        $this->assertStringContainsString('result=failed (cannot fingerprint the checkout', (string) file_get_contents($this->directory.'/docker/.deploy.log'));
     }
 
     public function test_dockerignore_and_copy_rules_match_docker_semantics(): void
@@ -1452,6 +1482,18 @@ SH);
         $services['redis'] = ['volumes' => [$bind('config/redis/redis.conf', '/usr/local/etc/redis/redis.conf')]];
 
         return (string) json_encode(['services' => $services], JSON_UNESCAPED_SLASHES);
+    }
+
+    /** Every `started` line in .deploy.log is closed by a `finished` line for the same target. */
+    private function assertAttemptsClosed(): void
+    {
+        $open = [];
+        foreach (file($this->directory.'/docker/.deploy.log', FILE_IGNORE_NEW_LINES) ?: [] as $line) {
+            if (preg_match('/^\S+ (\S+) by=.* result=(started|finished)/', $line, $match)) {
+                $open[$match[1]] = ($open[$match[1]] ?? 0) + ($match[2] === 'started' ? 1 : -1);
+            }
+        }
+        $this->assertSame([], array_filter($open), 'unmatched started/finished lines in .deploy.log');
     }
 
     /** A failed run may record services it recreated, but never a valid fingerprint. */

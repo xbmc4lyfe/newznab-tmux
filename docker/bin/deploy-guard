@@ -100,6 +100,19 @@ release() {
     rmdir "$CLAIM"
 }
 
+# EXIT trap of a guarded run: close an attempt that ends early (error, signal) with its own
+# `finished` line, then release a lock this process owns.
+guard_exit() {
+    exit_code=$?
+    if [ "${attempt_open:-0}" = 1 ]; then
+        attempt_open=0
+        log "$target" "result=finished rc=$exit_code (interrupted)"
+    fi
+    if [ -n "${owned_info:-}" ]; then
+        release
+    fi
+}
+
 busy() {
     echo "deploy-guard: another deploy is running ($1); leaving the stack alone." >&2
     exit 75
@@ -232,10 +245,12 @@ cmd_run() {
     check_recovery_hold
     if [ -n "${DEPLOY_GUARD_HELD:-}${DEPLOY_GUARD_OWNER_SHA256:-}${DEPLOY_GUARD_LOCK:-}" ]; then
         nested_owner || busy "invalid inherited guard ownership"
+        trap 'guard_exit' EXIT
+        trap 'exit 130' INT TERM
     else
         acquire "$target"
         owned_info=$info
-        trap release EXIT
+        trap 'guard_exit' EXIT
         trap 'exit 130' INT TERM
         DEPLOY_GUARD_HELD=$$
         DEPLOY_GUARD_OWNER_SHA256=$(printf '%s\n' "$owned_info" | hash_stdin)
@@ -254,10 +269,15 @@ cmd_run() {
 
     if cooldown; then exit 0; fi
 
-    log "$target" "result=started"
     # The tree that goes into the build is the one fingerprinted now. Stamp it afterwards only if the
     # shared checkout did not change in the meantime; otherwise the image holds older bytes than the stamp.
-    before=$(fingerprint)
+    # Fingerprint before logging `started` so a fail-closed fingerprint never leaves an open attempt.
+    if ! before=$(fingerprint); then
+        log "$target" "result=failed (cannot fingerprint the checkout; nothing was changed)"
+        exit 1
+    fi
+    log "$target" "result=started"
+    attempt_open=1
     DEPLOY_EXPECTED_FINGERPRINT="$before"
     DEPLOY_NOOP_MARKER="$STAMP.noop.$$"
     [ ! -e "$DEPLOY_NOOP_MARKER" ] || rm -f "$DEPLOY_NOOP_MARKER"
@@ -290,6 +310,7 @@ cmd_run() {
         fi
     fi
     [ ! -e "$DEPLOY_NOOP_MARKER" ] || rm -f "$DEPLOY_NOOP_MARKER"
+    attempt_open=0
     if [ "${noop:-0}" = 1 ]; then
         log "$target" "result=finished rc=$rc (no service affected; stamped without a rollout)"
     else

@@ -718,6 +718,15 @@ def running_image(docker_dir: Path, svc: str) -> str | None:
     return proc.stdout.strip() if proc.returncode == 0 else None
 
 
+def container_exists(docker_dir: Path, svc: str) -> bool:
+    env = dict(os.environ)
+    env.setdefault("COMPOSE_FILE", str(docker_dir / "docker-compose.yml"))
+    ps = subprocess.run([*compose_command(docker_dir), "ps", "-a", "-q", svc], capture_output=True, text=True, env=env, check=False)
+    if ps.returncode != 0:
+        sys.exit(f"deploy-plan: cannot list the {svc} container: {ps.stderr.strip()}")
+    return bool(ps.stdout.strip())
+
+
 def container_started_at(docker_dir: Path, svc: str) -> float | None:
     """Start time of the service's container as a POSIX timestamp, None when it has no container.
     Raises ValueError when an existing container's start time cannot be read."""
@@ -868,10 +877,15 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
 
     dirty_data: list[str] = []
     reconcile_data: list[str] = []
+    start_data: list[str] = []
     data_reasons: dict[str, str] = {}
     for svc in DATA_SERVICES:
         if not compose_present(state, svc):
             data_reasons[svc] = "not rendered"
+        elif not force and (stamped.get(f"compose:{svc}") == "absent" or not container_exists(docker_dir, svc)):
+            # Newly rendered or never created: no writer uses it yet, so it starts without a quiesce.
+            start_data.append(svc)
+            data_reasons[svc] = "start (no container)"
         elif (first_deploy or legacy_stamp or f"service:{svc}" not in stamped) and mounts_changed_since_start(docker_dir, svc):
             # A mounted file changed after the container started: only a recreate loads it.
             dirty_data.append(svc)
@@ -907,7 +921,7 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
             infra_reasons[svc] = "unchanged"
 
     compose_global_changed = not first_deploy and stamped.get("effective") != state["effective"]
-    reconciling = bool(reconcile_data or reconcile_infra)
+    reconciling = bool(reconcile_data or reconcile_infra or start_data)
     # Services the stamp recorded as rendered that the effective Compose no longer renders: their
     # removal explains a rendered-config change by itself (the container is left as an orphan, as
     # Compose would), so it must not fall back to a full app rollout.
@@ -961,6 +975,7 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
         "dirty_data": dirty_data,
         "dirty_infra": dirty_infra,
         "reconcile_data": reconcile_data,
+        "start_data": start_data,
         "global_fallback": global_fallback,
         "reconcile_infra": reconcile_infra,
         "build_targets": build_targets,
@@ -1046,6 +1061,7 @@ def main() -> None:
         print(f"DIRTY_INFRA={shlex.quote(' '.join(plan['dirty_infra']))}")
         print(f"RECONCILE_DATA={shlex.quote(' '.join(plan['reconcile_data']))}")
         print(f"RECONCILE_INFRA={shlex.quote(' '.join(plan['reconcile_infra']))}")
+        print(f"START_DATA={shlex.quote(' '.join(plan['start_data']))}")
         print(f"GLOBAL_FALLBACK={'1' if plan['global_fallback'] else '0'}")
         print(f"BUILD_TARGETS={shlex.quote(' '.join(plan['build_targets']))}")
         return
@@ -1072,6 +1088,8 @@ def main() -> None:
                 action = "drain+recreate"
             elif svc in plan["reconcile_data"]:
                 action = "reconcile"
+            elif svc in plan["start_data"]:
+                action = "start"
             else:
                 action = "skip"
             print(f"{svc:<18} {'data':<10} {action:<18} {plan['data_reasons'][svc]}")
