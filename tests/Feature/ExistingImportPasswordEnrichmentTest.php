@@ -324,6 +324,24 @@ class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidates
         self::assertSame($artifacts, glob(config('release_verification.storage_path').'/manifests/*.json.gz'));
     }
 
+    public function test_enriching_a_defective_import_before_its_first_check_keeps_it_claimable_once(): void
+    {
+        $repository = app(CandidateRepository::class);
+        $manifest = $this->privateRollbackManifest();
+        $manifest['files'][0]['totalparts'] = 2;
+        $manifest['files'][0]['segments'][] = ['number' => 2] + $manifest['files'][0]['segments'][0];
+        self::assertSame('header_rejected', (new CandidateHeaderInventory)->assessment($manifest)['status']);
+        self::assertTrue($repository->enqueue($manifest));
+        self::assertSame('unknown', DB::table('release_verification_candidates')->value('status'));
+
+        self::assertTrue($repository->enqueue($manifest + ['passwords' => ['secret']]));
+
+        $enriched = DB::table('release_verification_candidates')->sole();
+        self::assertSame(2, (int) $enriched->version);
+        self::assertSame('unknown', $enriched->status);
+        self::assertNotNull($repository->claim());
+    }
+
     public function test_accepted_enrichment_preserves_expiry_and_fences_old_claim_before_ordered_reclaim(): void
     {
         $repository = app(CandidateRepository::class);
