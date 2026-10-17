@@ -49,11 +49,22 @@ class ReleaseVerificationBarrier extends Command
             return self::FAILURE;
         }
         try {
+            // Another barrier's release clears every deployment pause; reassert this one's before
+            // reporting readiness and on every check, so it always backs this barrier's gate.
+            VerificationWorkerLocks::pause($token, 'deployment');
             $this->line('barrier held');
             $checked = 0;
             while (! $this->stopping) {
                 if (time() - $checked >= 5) {
-                    if (! $locks->protects(0)) {
+                    try {
+                        $held = $locks->protects(0);
+                        if ($held) {
+                            VerificationWorkerLocks::pause($token, 'deployment');
+                        }
+                    } catch (\Throwable) {
+                        $held = false;
+                    }
+                    if (! $held) {
                         $this->line('barrier lost');
                         $this->error('The verification barrier lost its database session; the durable pause remains until released.');
 
