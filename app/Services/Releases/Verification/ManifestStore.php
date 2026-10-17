@@ -6,6 +6,7 @@ namespace App\Services\Releases\Verification;
 
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use RuntimeException;
 
 /**
@@ -27,6 +28,9 @@ final class ManifestStore
     private const int IMPORT_CHUNK_BYTES = 33554432;
 
     private ?PreparationRunDiagnostics $readDiagnostics = null;
+
+    /** Whether the manifests table exists, checked once per instance in files mode. */
+    private ?bool $tableExists = null;
 
     /** @param array<string, mixed> $manifest */
     public function write(array $manifest): string
@@ -217,6 +221,11 @@ final class ManifestStore
             }
         }
         $size = @filesize($this->path($name));
+        if ($size === false && ! $this->usesDatabase() && $this->tableAvailable()) {
+            // Rolled back to files mode: manifests written in database mode exist only as rows.
+            $bytes = DB::table(self::TABLE)->where('name', $name)->value('bytes');
+            $size = $bytes === null ? false : (int) $bytes;
+        }
         if ($size === false) {
             throw new RuntimeException('Cannot reserve manifest storage.');
         }
@@ -252,7 +261,12 @@ final class ManifestStore
         $chunk = [];
         $chunkBytes = 0;
         foreach (array_values(array_unique($names)) as $name) {
-            $this->assertName($name);
+            if (preg_match('/\A[0-9a-f]{64}\.json\.gz\z/', $name) !== 1) {
+                // A malformed reference cannot name a file or row; count it and keep importing.
+                $counts['invalid']++;
+
+                continue;
+            }
             $path = $this->path($name);
             $body = is_file($path) ? @file_get_contents($path) : false;
             $chunk[$name] = $body === false ? null : ($this->validBody($name, $body) ? $body : false);
@@ -357,7 +371,7 @@ final class ManifestStore
             if ($reference !== null) {
                 return;
             }
-            if ($this->usesDatabase()) {
+            if ($this->tableAvailable()) {
                 DB::table(self::TABLE)->where('name', $name)->delete();
             }
             $path = $this->path($name);
@@ -375,7 +389,10 @@ final class ManifestStore
     private function body(string $name): string|false
     {
         if (! $this->usesDatabase()) {
-            return @file_get_contents($this->path($name));
+            $file = @file_get_contents($this->path($name));
+
+            // Rolled back to files mode: manifests written in database mode exist only as rows.
+            return $file !== false || ! $this->tableAvailable() ? $file : ($this->rowBody($name) ?? false);
         }
         $row = $this->rowBody($name);
         if ($row !== null) {
@@ -386,6 +403,11 @@ final class ManifestStore
         // The importer commits a row before deleting its file, so a file that vanished between the
         // two lookups is now readable from the database.
         return $file !== false ? $file : ($this->rowBody($name) ?? false);
+    }
+
+    private function tableAvailable(): bool
+    {
+        return $this->usesDatabase() || ($this->tableExists ??= Schema::hasTable(self::TABLE));
     }
 
     private function rowBody(string $name): ?string

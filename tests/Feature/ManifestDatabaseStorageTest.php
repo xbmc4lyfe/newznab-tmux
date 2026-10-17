@@ -224,6 +224,37 @@ class ManifestDatabaseStorageTest extends TestCase
         $this->assertSame(0, DB::table('release_verification_candidates')->count());
     }
 
+    public function test_files_mode_still_reads_sizes_and_deletes_database_manifests_after_a_rollback(): void
+    {
+        $manifest = $this->manifest('written before rolling back to files');
+        $name = (new ManifestStore)->write($manifest);
+        config(['release_verification.manifest_storage' => 'files']);
+        $store = new ManifestStore;
+
+        $this->assertFileDoesNotExist($store->path($name));
+        $this->assertSame($manifest, $store->read($name));
+        $this->assertSame(strlen($store->prepare($manifest)->compressed), $store->size($name));
+
+        $store->deleteIfUnreferenced($name);
+
+        $this->assertSame(0, DB::table('release_verification_manifests')->where('name', $name)->count());
+    }
+
+    public function test_import_counts_a_malformed_reference_as_invalid_and_keeps_going(): void
+    {
+        $store = new ManifestStore;
+        $valid = $store->prepare($this->manifest('after a malformed reference'));
+        file_put_contents($store->path($valid->name), $valid->compressed);
+        $this->candidate('../not-a-manifest');
+        $this->candidate($valid->name);
+
+        $this->artisan('verification:import-manifests', ['--delete-files' => true])
+            ->expectsOutputToContain('imported=1 already=0 missing=0 invalid=1 conflict=0 unreferenced=0')
+            ->assertExitCode(0);
+
+        $this->assertSame(1, DB::table('release_verification_manifests')->where('name', $valid->name)->count());
+    }
+
     public function test_files_mode_keeps_writing_manifest_files(): void
     {
         config(['release_verification.manifest_storage' => 'files']);
