@@ -5,6 +5,7 @@ use App\Jobs\RemoveInactiveAccounts;
 use App\Models\UserActivityStat;
 use App\Models\UserDownload;
 use App\Models\UserRequest;
+use App\Services\Releases\Verification\VerificationWorkerLocks;
 use Illuminate\Foundation\Inspiring;
 use Illuminate\Support\Facades\Schedule;
 
@@ -106,7 +107,7 @@ Schedule::exec($preparationCommand)->everyMinute()->runInBackground()
     ->when(static fn (): bool => (bool) config('release_verification.scheduled'));
 
 // Stable worker slots cap concurrency without a stale scheduler overlap mutex.
-for ($slot = 1; $slot <= max(1, min(8, (int) config('release_verification.candidate_workers', 2))); $slot++) {
+for ($slot = 1; $slot <= VerificationWorkerLocks::slots(); $slot++) {
     $verificationCommand = escapeshellarg(PHP_BINARY).' -d ffi.enable=true -d memory_limit=256M '
         .escapeshellarg(base_path('artisan')).' releases:verify-candidates --limit='.max(1, (int) config('release_verification.worker_limit', 1000))
         .' --max-seconds='.max(1, (int) config('release_verification.worker_seconds', 300)).' --slot='.$slot.' --no-summary --diagnostics';
