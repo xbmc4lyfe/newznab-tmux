@@ -827,12 +827,9 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
 
     dirty_app: list[str] = []
     app_reasons: dict[str, str] = {}
-    any_missing_or_unhealthy = False
 
     for svc in APP_SERVICES:
         ok, reason = check_app_container(docker_dir, svc, verify_image=True)
-        if not ok and (reason == "missing" or reason.startswith("unhealthy")):
-            any_missing_or_unhealthy = True
         if force:
             dirty_app.append(svc)
             app_reasons[svc] = "forced (FORCE=1)"
@@ -909,7 +906,6 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
         force
         or first_deploy
         or legacy_stamp
-        or any_missing_or_unhealthy
         or stamped.get("migration") != state["migration"]
         or all_app_compose_changed
     )

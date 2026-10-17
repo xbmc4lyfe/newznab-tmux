@@ -37,9 +37,10 @@ case "$*" in
             echo "${NNTMUX_CONTAINER_IMAGE_ID:-${NNTMUX_IMAGE_ID:-sha256:fixture}}"
         fi ;;
     *'inspect --format {{.State.StartedAt}}'*) echo "${NNTMUX_STARTED_AT:-2999-01-01T00:00:00.123456789Z}" ;;
-    *'inspect --format {{.State.Status}}'*) echo "running ${NNTMUX_HEALTH_STATUS:-healthy}" ;;
+    *'inspect --format {{.State.Status}}'*)
+        case "$*" in *"fixture-container-${NNTMUX_UNHEALTHY:-none}") echo "running unhealthy" ;; *) echo "running ${NNTMUX_HEALTH_STATUS:-healthy}" ;; esac ;;
     *' ps -a -q '*) [ "${NNTMUX_NO_EXISTING_APP:-0}" = 1 ] || echo fixture-container ;;
-    *' ps -q '*) [ "${NNTMUX_SERVICE_MISSING:-0}" = 1 ] || echo fixture-container ;;
+    *' ps -q '*) [ "${NNTMUX_SERVICE_MISSING:-0}" = 1 ] || echo "fixture-container-${*##* }" ;;
     *'scheduler python3 -c '*) [ "${NNTMUX_SCHEDULER_CAPABILITY_FAIL:-0}" != 1 ] || exit 48; echo "${NNTMUX_SCHEDULER_CAPABILITY:-native}" ;;
     *'scheduler.py drain --timeout='*)
         [ "${NNTMUX_SCHEDULER_DRAIN_FAIL:-0}" != 1 ] || exit 47
@@ -145,8 +146,46 @@ SH);
         $this->deploy()->mustRun();
         file_put_contents($this->directory.'/events', '');
         $this->deploy(['NNTMUX_SERVICE_MISSING' => '1'])->mustRun();
-        $this->assertStringContainsString('artisan migrate', $this->events());
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait', $this->events());
+        // Missing services are recreated; the recorded migration state alone decides migrating.
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
+    }
+
+    public function test_retry_after_an_unhealthy_web_only_rollout_recreates_only_web(): void
+    {
+        mkdir($this->directory.'/resources/js', 0777, true);
+        file_put_contents($this->directory.'/resources/js/app.js', "1\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/resources/js/app.js', "2\n");
+        $failed = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_APP_UP_FAIL' => '1']);
+        $failed->run();
+        $this->assertSame(52, $failed->getExitCode());
+
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_UNHEALTHY' => 'web'])->run();
+        $events = $this->events();
+        $this->assertStringNotContainsString('drain', $events);
+        $this->assertStringNotContainsString('artisan migrate', $events);
+        $this->assertStringNotContainsString(' stop ', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web', $events);
+        $this->assertStringNotContainsString('web horizon', $events);
+    }
+
+    public function test_retry_after_a_failed_app_start_does_not_repeat_a_completed_migration(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        mkdir($this->directory.'/database/migrations', 0777, true);
+        file_put_contents($this->directory.'/database/migrations/2026_10_17_000001_x.php', "<?php\n");
+        file_put_contents($this->directory.'/events', '');
+        $failed = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_APP_UP_FAIL' => '1']);
+        $failed->run();
+        $this->assertSame(52, $failed->getExitCode());
+        $this->assertSame(1, substr_count($this->events(), 'artisan migrate'));
+
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_UNHEALTHY' => 'web'])->run();
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
     }
 
     public function test_stale_container_image_id_forces_recreation_so_subsequent_unchanged_deploy_skips(): void
