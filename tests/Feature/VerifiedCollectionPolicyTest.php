@@ -619,6 +619,26 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertTrue(DB::table('collections')->where('id', $late)->exists());
     }
 
+    public function test_a_generation_orphaned_while_pending_is_retired_and_later_uploads_are_admitted(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('orphaned-pending', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+        $orphan = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        $this->assertSame($first, (int) $orphan->upgrades_release_id);
+        DB::table('releases')->where('id', $first)->delete();
+
+        $next = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 3, messageId: 'e@f');
+        app(CandidateRepository::class)->archive($next);
+
+        $row = DB::table('release_verification_candidates')->where('id', $orphan->id)->first();
+        $this->assertNull($row->upgrades_release_id, 'Its deleted partial\'s articles are gone.');
+        $manifest = app(ManifestStore::class)->read((string) $row->manifest_path);
+        $this->assertSame(['e@f'], array_column($manifest['files'][0]['segments'], 'messageid'), 'Only the new upload, not the deleted partial\'s articles.');
+        $this->assertSame((int) $row->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
+    }
+
     public function test_late_articles_never_republish_a_deleted_partial(): void
     {
         $this->publicationSchema(partialColumns: true);

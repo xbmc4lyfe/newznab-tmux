@@ -94,6 +94,25 @@ final class CandidateRepository
                         $apart = $holder === null && in_array((int) $existing->id, array_map(static fn (object $held): int => (int) $held->id, $holders), true);
                     }
                 }
+                // A pending generation whose partial was deleted holds no partial any more: retire it (its
+                // retained articles must not publish anew) so it neither absorbs nor diverts later uploads.
+                $retiredBytes = 0;
+                if ($existing !== null && self::tracksUpgrades()) {
+                    $orphans = DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)->whereNull('release_id')
+                        ->whereNotNull('upgrades_release_id')->where('manifest_path', '<>', '')
+                        ->whereNotIn('id', array_map(static fn (object $held): int => (int) $held->id, $holders) ?: [0])
+                        ->orderByDesc('id')->lockForUpdate()->get();
+                    foreach ($orphans as $orphan) {
+                        DB::table('release_verification_candidates')->where('id', $orphan->id)->update(['status' => 'expired',
+                            'reason' => 'The partial release it would upgrade was deleted.', 'manifest_path' => '', 'manifest_bytes' => 0,
+                            'lease_token' => null, 'lease_until' => null, 'version' => (int) $orphan->version + 1, 'upgrades_release_id' => null]);
+                        $retiredBytes += (int) $orphan->manifest_bytes;
+                        DB::afterCommit(fn () => $this->store->deleteIfUnreferenced($orphan->manifest_path));
+                    }
+                    if ($orphans->contains('id', $existing->id)) {
+                        $existing = DB::table('release_verification_candidates')->where('id', $existing->id)->lockForUpdate()->first();
+                    }
+                }
                 if ($holder === null && $existing !== null) {
                     // Not a partial's articles: they join the newest pending candidate that holds no partial's
                     // inventory. Before partials that was always the newest row; posts kept apart from a
@@ -195,7 +214,7 @@ final class CandidateRepository
                 $lastUniqueAt = $existing === null ? (! $merges ? $arrivalAt : max($arrivalAt, $previous->last_unique_at))
                     : ($newArticles ? max($arrivalAt, $existing->last_unique_at) : $existing->last_unique_at);
                 $expired = $lastUniqueAt < now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
-                $delta = ($expired ? 0 : $size) - (int) ($existing->manifest_bytes ?? 0) - (int) ($previous->manifest_bytes ?? 0);
+                $delta = ($expired ? 0 : $size) - (int) ($existing->manifest_bytes ?? 0) - (int) ($previous->manifest_bytes ?? 0) - $retiredBytes;
                 $full = function () use ($existing, $previous, $path): never {
                     if (($existing === null || $existing->manifest_path !== $path) && $previous?->manifest_path !== $path) {
                         $this->store->deleteIfUnreferenced($path);
@@ -209,6 +228,9 @@ final class CandidateRepository
                 $dirty = $existing !== null && $existing->status === 'dirty';
                 $values = ['identity' => $identity, 'source_identity' => $sourceIdentity, 'groups_id' => (int) $collection->groups_id, 'manifest_path' => $path,
                     'manifest_bytes' => $size, 'manifest_hash' => substr($path, 0, 64)];
+                if ($merges && self::tracksUpgrades()) {
+                    $values['upgrades_release_id'] = (int) $previous->release_id;
+                }
                 if ($changed || $dirty) {
                     $assessment = $headerAssessment ?? (new CandidateHeaderInventory)->assessment($manifest);
                     $values += ['version' => (int) ($existing->version ?? 0) + 1, 'last_unique_at' => $lastUniqueAt,
@@ -582,7 +604,9 @@ final class CandidateRepository
             }
             foreach ($candidates as $candidate) {
                 // A partial's holder these headers don't extend is another post's; archive() keeps that apart.
-                if ($candidate->manifest_path === '' || $candidate->release_id !== null || in_array((int) $candidate->id, $heldIds, true)) {
+                if ($candidate->manifest_path === '' || $candidate->release_id !== null || in_array((int) $candidate->id, $heldIds, true)
+                    || ($candidate->upgrades_release_id ?? null) !== null) {
+                    // An unheld generation is orphaned; archive() retires it.
                     continue;
                 }
                 $old = $this->store->read($candidate->manifest_path);
@@ -622,6 +646,18 @@ final class CandidateRepository
             ->sharedLock()->pluck('late_article_candidate_id')->all()));
 
         return array_values(array_filter($candidates->all(), static fn (object $candidate): bool => isset($held[(int) $candidate->id])));
+    }
+
+    /** @var \WeakMap<\PDO, bool>|null */
+    private static ?\WeakMap $upgradeColumnSupport = null;
+
+    /** Whether candidates record the partial release a pending generation upgrades. */
+    private static function tracksUpgrades(): bool
+    {
+        $pdo = DB::connection()->getPdo();
+        self::$upgradeColumnSupport ??= new \WeakMap;
+
+        return self::$upgradeColumnSupport[$pdo] ??= Schema::hasColumn('release_verification_candidates', 'upgrades_release_id');
     }
 
     /**
@@ -1157,7 +1193,7 @@ final class CandidateRepository
             }
             DB::table('release_verification_candidates')->where('id', $claim->id)->update(['status' => $status,
                 'reason' => mb_strcut($reason, 0, 2000, 'UTF-8'), 'lease_token' => null, 'lease_until' => null,
-                'manifest_path' => '', 'manifest_bytes' => 0]);
+                'manifest_path' => '', 'manifest_bytes' => 0] + (self::tracksUpgrades() ? ['upgrades_release_id' => null] : []));
             $this->ledger->adjust(-(int) $candidate->manifest_bytes);
             DB::afterCommit(function () use ($candidate): void {
                 $this->store->deleteIfUnreferenced($candidate->manifest_path);

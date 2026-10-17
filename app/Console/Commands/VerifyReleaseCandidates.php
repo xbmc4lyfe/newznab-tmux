@@ -383,7 +383,7 @@ class VerifyReleaseCandidates extends Command
     private function filteredResult(object $claim): ?VerificationResult
     {
         $candidate = DB::table('release_verification_candidates')->where('id', $claim->id)->where('version', $claim->version)
-            ->where('manifest_hash', $claim->manifest_hash)->whereIn('status', ['filtered', 'metadata_review'])->whereNull('release_id')->first();
+            ->where('manifest_hash', $claim->manifest_hash)->whereIn('status', ['filtered', 'metadata_review', 'expired'])->whereNull('release_id')->first();
 
         return $candidate === null ? null : new VerificationResult((string) $candidate->status, (string) $candidate->reason);
     }
