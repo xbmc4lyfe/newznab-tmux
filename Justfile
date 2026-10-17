@@ -30,8 +30,9 @@ export cmd := env("cmd", "")
 export FORCE := env("FORCE", "")
 export MAINTENANCE := env("MAINTENANCE", "")
 export filter := env("filter", "")
-HOST_UID := `id -u`
-HOST_GID := `id -g`
+# Overridable like the former `HOST_UID ?= $(shell id -u)`: environment, root .env, or arguments.
+HOST_UID := env("HOST_UID", `scripts/dotenv-get HOST_UID "$(id -u)"`)
+HOST_GID := env("HOST_GID", `scripts/dotenv-get HOST_GID "$(id -g)"`)
 MONITORING_KEY := "storage/app/monitoring/public/grafana-jwt.pub"
 MONITORING_SERVICES := "prometheus pushgateway grafana node-exporter mysqld-exporter redis-exporter"
 # Every Compose call gets the search profile and, once monitoring is installed, its overlay (as the
@@ -399,13 +400,18 @@ redis-cli *args:
 
 # Align UIDs: remap sail to host UID, chown project, register git safe.directory
 fix-permissions *args:
-    @echo "→ Remapping container 'sail' user to UID {{HOST_UID}} and chowning /var/www/html…"
-    @{{COMPOSE_ENV}}; $DOCKER_COMPOSE exec -u root laravel.test usermod -u {{HOST_UID}} -o sail >/dev/null 2>&1 || true
-    @{{COMPOSE_ENV}}; $DOCKER_COMPOSE exec -u root laravel.test groupmod -g {{HOST_GID}} -o sail >/dev/null 2>&1 || true
-    @{{COMPOSE_ENV}}; $DOCKER_COMPOSE exec -u root laravel.test chown -R {{HOST_UID}}:{{HOST_GID}} /var/www/html
-    @{{COMPOSE_ENV}}; $DOCKER_COMPOSE exec -u root laravel.test git config --system --add safe.directory /var/www/html
-    @echo "✔ Permissions fixed."
-    @if [ "{{WWWUSER}}" != "{{HOST_UID}}" ] || [ -z "{{WWWUSER}}" ]; then echo "⚠  WWWUSER ({{WWWUSER}}) ≠ host UID ({{HOST_UID}}). Set WWWUSER={{HOST_UID}} and WWWGROUP={{HOST_GID}} in .env, then run 'just rebuild' to align the container's sail user."; fi
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
+    {{COMPOSE_ENV}}
+    uid="${HOST_UID:-{{HOST_UID}}}" gid="${HOST_GID:-{{HOST_GID}}}"
+    echo "→ Remapping container 'sail' user to UID $uid and chowning /var/www/html…"
+    $DOCKER_COMPOSE exec -u root laravel.test usermod -u "$uid" -o sail >/dev/null 2>&1 || true
+    $DOCKER_COMPOSE exec -u root laravel.test groupmod -g "$gid" -o sail >/dev/null 2>&1 || true
+    $DOCKER_COMPOSE exec -u root laravel.test chown -R "$uid:$gid" /var/www/html
+    $DOCKER_COMPOSE exec -u root laravel.test git config --system --add safe.directory /var/www/html
+    echo "✔ Permissions fixed."
+    if [ "{{WWWUSER}}" != "$uid" ] || [ -z "{{WWWUSER}}" ]; then echo "⚠  WWWUSER ({{WWWUSER}}) ≠ host UID ($uid). Set WWWUSER=$uid and WWWGROUP=$gid in .env, then run 'just rebuild' to align the container's sail user."; fi
 
 # Alias for 'fix-permissions'
 fix-perms *args:

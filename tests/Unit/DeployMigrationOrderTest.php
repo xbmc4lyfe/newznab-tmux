@@ -926,6 +926,22 @@ SH);
         $this->assertStringContainsString(' stop web scheduler indexer', $this->events());
     }
 
+    public function test_retry_after_a_fallback_rollout_failed_past_its_migration_does_not_migrate_again(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $context = ['DOCKER_CONTEXT' => 'other-context'];
+        file_put_contents($this->directory.'/events', '');
+        $failed = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $context + ['NNTMUX_APP_UP_FAIL' => '1']);
+        $failed->run();
+        $this->assertSame(52, $failed->getExitCode());
+        $this->assertStringContainsString('artisan migrate', $this->events());
+
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $context)->mustRun();
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
+    }
+
     public function test_host_system_paths_match_on_path_boundaries_only(): void
     {
         $script = 'import importlib.machinery, importlib.util, sys; l = importlib.machinery.SourceFileLoader("dp", sys.argv[1]); '
