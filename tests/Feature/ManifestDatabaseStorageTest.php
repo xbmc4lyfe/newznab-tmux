@@ -145,6 +145,26 @@ class ManifestDatabaseStorageTest extends TestCase
         $this->assertFileExists($store->path($corrupt->name));
     }
 
+    public function test_import_crosses_chunk_boundaries_and_imports_every_referenced_file(): void
+    {
+        $store = new ManifestStore;
+        $names = [];
+        for ($i = 0; $i < 61; $i++) {
+            $prepared = $store->prepare($this->manifest('chunked '.$i));
+            file_put_contents($store->path($prepared->name), $prepared->compressed);
+            $this->candidate($prepared->name);
+            $names[] = $prepared->name;
+        }
+
+        $counts = $store->importLegacyFiles($names, true);
+
+        $this->assertSame(61, $counts['imported']);
+        $this->assertSame(61, DB::table('release_verification_manifests')->count());
+        foreach ($names as $name) {
+            $this->assertFileDoesNotExist($store->path($name));
+        }
+    }
+
     public function test_import_keeps_the_legacy_file_when_the_stored_row_is_corrupt(): void
     {
         $store = new ManifestStore;

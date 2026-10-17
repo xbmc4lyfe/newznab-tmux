@@ -21,6 +21,11 @@ final class ManifestStore
 {
     private const string TABLE = 'release_verification_manifests';
 
+    /** Import chunk bounds: names per transaction, and file bytes held in memory at once. */
+    private const int IMPORT_CHUNK_NAMES = 50;
+
+    private const int IMPORT_CHUNK_BYTES = 33554432;
+
     private ?PreparationRunDiagnostics $readDiagnostics = null;
 
     /** @param array<string, mixed> $manifest */
@@ -240,54 +245,70 @@ final class ManifestStore
     public function importLegacyFiles(array $names, bool $deleteFiles): array
     {
         $counts = ['imported' => 0, 'already' => 0, 'missing' => 0, 'invalid' => 0, 'conflict' => 0, 'unreferenced' => 0];
-        $names = array_values(array_unique($names));
-        $files = [];
-        foreach ($names as $name) {
+        $chunk = [];
+        $chunkBytes = 0;
+        foreach (array_values(array_unique($names)) as $name) {
             $this->assertName($name);
             $path = $this->path($name);
             $body = is_file($path) ? @file_get_contents($path) : false;
-            if ($body === false) {
-                $files[$name] = null;
-            } elseif ($this->validBody($name, $body)) {
-                $files[$name] = $body;
-            } else {
-                $files[$name] = false;
+            $chunk[$name] = $body === false ? null : ($this->validBody($name, $body) ? $body : false);
+            $chunkBytes += is_string($chunk[$name]) ? strlen($chunk[$name]) : 0;
+            if (count($chunk) >= self::IMPORT_CHUNK_NAMES || $chunkBytes >= self::IMPORT_CHUNK_BYTES) {
+                $this->importChunk($chunk, $deleteFiles, $counts);
+                $chunk = [];
+                $chunkBytes = 0;
             }
         }
+        if ($chunk !== []) {
+            $this->importChunk($chunk, $deleteFiles, $counts);
+        }
+
+        return $counts;
+    }
+
+    /**
+     * Import one bounded chunk (at most IMPORT_CHUNK_NAMES names or about IMPORT_CHUNK_BYTES of
+     * files) in one capacity-locked transaction, one row per statement to stay under the packet limit.
+     *
+     * @param  array<string, string|false|null>  $files  name => verified body, false (invalid) or null (missing)
+     * @param  array{imported: int, already: int, missing: int, invalid: int, conflict: int, unreferenced: int}  $counts
+     */
+    private function importChunk(array $files, bool $deleteFiles, array &$counts): void
+    {
+        $names = array_map('strval', array_keys($files));
         $verified = [];
-        foreach (array_chunk($names, 50) as $chunk) {
-            DB::transaction(function () use ($chunk, $files, &$counts, &$verified): void {
-                if (DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first() === null) {
-                    throw new RuntimeException('Verification capacity state is unavailable; manifests not imported.');
-                }
-                $referenced = array_flip(DB::table('release_verification_candidates')->whereIn('manifest_path', $chunk)
-                    ->lockForUpdate()->pluck('manifest_path')->map(static fn ($name): string => (string) $name)->all());
-                $stored = DB::table(self::TABLE)->whereIn('name', $chunk)->lockForUpdate()->pluck('body', 'name')->all();
-                $insert = [];
-                foreach ($chunk as $name) {
-                    if (array_key_exists($name, $stored)) {
-                        if (is_string($stored[$name]) && $this->validBody($name, $stored[$name])) {
-                            $counts['already']++;
-                            $verified[] = $name;
-                        } else {
-                            $counts['conflict']++;
-                        }
-                    } elseif ($files[$name] === null) {
-                        $counts['missing']++;
-                    } elseif ($files[$name] === false) {
-                        $counts['invalid']++;
-                    } elseif (! isset($referenced[$name])) {
-                        $counts['unreferenced']++;
-                    } else {
-                        $insert[] = ['name' => $name, 'body' => $files[$name], 'bytes' => strlen($files[$name])];
-                        $counts['imported']++;
+        $outcomes = [];
+        DB::transaction(function () use ($files, $names, &$verified, &$outcomes): void {
+            $verified = [];
+            $outcomes = [];
+            if (DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first() === null) {
+                throw new RuntimeException('Verification capacity state is unavailable; manifests not imported.');
+            }
+            $referenced = array_flip(DB::table('release_verification_candidates')->whereIn('manifest_path', $names)
+                ->lockForUpdate()->pluck('manifest_path')->map(static fn ($name): string => (string) $name)->all());
+            foreach ($names as $name) {
+                $stored = DB::table(self::TABLE)->where('name', $name)->lockForUpdate()->value('body');
+                if ($stored !== null) {
+                    $valid = is_string($stored) && $this->validBody($name, $stored);
+                    $outcomes[] = $valid ? 'already' : 'conflict';
+                    if ($valid) {
                         $verified[] = $name;
                     }
+                } elseif ($files[$name] === null) {
+                    $outcomes[] = 'missing';
+                } elseif ($files[$name] === false) {
+                    $outcomes[] = 'invalid';
+                } elseif (! isset($referenced[$name])) {
+                    $outcomes[] = 'unreferenced';
+                } else {
+                    DB::table(self::TABLE)->insert(['name' => $name, 'body' => $files[$name], 'bytes' => strlen($files[$name])]);
+                    $outcomes[] = 'imported';
+                    $verified[] = $name;
                 }
-                if ($insert !== []) {
-                    DB::table(self::TABLE)->insert($insert);
-                }
-            }, 5);
+            }
+        }, 5);
+        foreach ($outcomes as $outcome) {
+            $counts[$outcome]++;
         }
         if ($deleteFiles) {
             foreach ($verified as $name) {
@@ -297,8 +318,6 @@ final class ManifestStore
                 }
             }
         }
-
-        return $counts;
     }
 
     private function validBody(string $name, string $body): bool
@@ -352,7 +371,10 @@ final class ManifestStore
     private function body(string $name): string|false
     {
         if ($this->usesDatabase()) {
-            $body = DB::table(self::TABLE)->where('name', $name)->value('body');
+            // Inside a transaction, read the committed row rather than the snapshot: the importer
+            // may have moved this manifest from its legacy file after the snapshot was taken.
+            $query = DB::table(self::TABLE)->where('name', $name);
+            $body = (DB::transactionLevel() > 0 ? $query->sharedLock() : $query)->value('body');
             if (is_string($body)) {
                 return $body;
             }
