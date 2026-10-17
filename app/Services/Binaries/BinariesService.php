@@ -623,19 +623,18 @@ class BinariesService
      * on the selected provider/group.
      *
      * Usenet article numbers have gaps: expired, cancelled and removed articles, and watermarks that
-     * name none. A missing number is replaced by the nearest existing one found by overview ranges
-     * of growing size, whose number and date are both exact, so the date search never attributes one
-     * article's date to another number. Returns null when no article exists up to $limit; defers
-     * (throws) on any other error or when the bounded windows end before $limit.
+     * name none. Only a number the server confirms missing is replaced, by the nearest existing one
+     * found with overview ranges of growing size; its number and date are both exact, so no number
+     * receives another article's date. Returns null when no article exists up to $limit; defers
+     * (throws) on any other error, an unknown date, or when the bounded windows end before $limit.
      *
      * @return array{int, int}|null
      */
     private function nearestPostdate(int $post, int $limit): ?array
     {
-        try {
-            return [$post, $this->targetPostdate($post)];
-        } catch (\RuntimeException) {
-            // Fall through to the nearest existing article.
+        $exact = $this->targetPostdate($post);
+        if ($exact !== null) {
+            return [$post, $exact];
         }
         $upward = $limit >= $post;
         $from = $post;
@@ -646,32 +645,9 @@ class BinariesService
             $from = $upward ? $from + 1 : $from - 1;
             $to = $upward ? ($limit - $from < $span ? $limit : $from + $span - 1) : ($from - $limit < $span ? $limit : $from - $span + 1);
             [$low, $high] = $upward ? [$from, $to] : [$to, $from];
-            $rows = $this->getNntp()->getXOVER($low.'-'.$high);
-            if (NNTPService::isError($rows)) {
-                // 420/423: no article in that range; anything else leaves the gap unknown.
-                if (! \in_array((int) $rows->getCode(), [420, 423], true)) {
-                    throw new \RuntimeException('NNTP article date is unavailable; defer date-based indexing.');
-                }
-                $rows = [];
-            }
-            if (! \is_array($rows)) {
-                throw new \RuntimeException('NNTP article date is unavailable; defer date-based indexing.');
-            }
-            $found = null;
-            foreach ($rows as $row) {
-                $number = \is_array($row) && isset($row['Number']) && (\is_int($row['Number']) || \is_string($row['Number']))
-                    ? filter_var($row['Number'], FILTER_VALIDATE_INT) : false;
-                $date = \is_array($row) && isset($row['Date']) && \is_string($row['Date']) && trim($row['Date']) !== ''
-                    ? strtotime($row['Date']) : false;
-                if ($number === false || $number < $low || $number > $high || $date === false) {
-                    continue;
-                }
-                if ($found === null || ($upward ? $number < $found[0] : $number > $found[0])) {
-                    $found = [$number, $date];
-                }
-            }
-            if ($found !== null) {
-                return $found;
+            $nearest = $this->nearestOverviewRow($this->getNntp()->getXOVER($low.'-'.$high), $low, $high, $upward);
+            if ($nearest !== null) {
+                return $nearest;
             }
             $from = $to;
         }
@@ -683,12 +659,60 @@ class BinariesService
     }
 
     /**
-     * Admission needs the requested article's date on the selected provider/group.
-     * Stored part numbers and neighboring probes cannot establish that identity.
+     * The exact (number, date) of the lowest (or highest) article in an overview range, null when the
+     * server confirms the range is empty. The nearest article is chosen by number before its date is
+     * read, so an existing article with an unknown date defers instead of being skipped.
+     *
+     * @return array{int, int}|null
      */
-    private function targetPostdate(int|string $post): int
+    private function nearestOverviewRow(mixed $rows, int $low, int $high, bool $upward): ?array
+    {
+        if (NNTPService::isError($rows)) {
+            if (\in_array((int) $rows->getCode(), [420, 423], true)) {
+                return null;
+            }
+            throw new \RuntimeException('NNTP article date is unavailable; defer date-based indexing.');
+        }
+        if (! \is_array($rows)) {
+            throw new \RuntimeException('NNTP article date is unavailable; defer date-based indexing.');
+        }
+        $nearest = null;
+        foreach ($rows as $row) {
+            $number = \is_array($row) && isset($row['Number']) && (\is_int($row['Number']) || \is_string($row['Number']))
+                ? filter_var($row['Number'], FILTER_VALIDATE_INT) : false;
+            if ($number === false || $number < $low || $number > $high) {
+                throw new \RuntimeException('NNTP article date is unavailable; defer date-based indexing.');
+            }
+            if ($nearest === null || ($upward ? $number < $nearest[0] : $number > $nearest[0])) {
+                $nearest = [$number, $row];
+            }
+        }
+        if ($nearest === null) {
+            return null;
+        }
+        $date = isset($nearest[1]['Date']) && \is_string($nearest[1]['Date']) && trim($nearest[1]['Date']) !== ''
+            ? strtotime($nearest[1]['Date']) : false;
+        if ($date === false) {
+            throw new \RuntimeException('NNTP article date is unavailable; defer date-based indexing.');
+        }
+
+        return [$nearest[0], $date];
+    }
+
+    /**
+     * Admission needs the requested article's date on the selected provider/group.
+     * Stored part numbers and neighboring probes cannot establish that identity. Returns null only
+     * when the server confirms there is no such article (420/423 or an empty overview).
+     */
+    private function targetPostdate(int|string $post): ?int
     {
         $header = $this->getNntp()->getXOVER((string) $post);
+        if (NNTPService::isError($header) && \in_array((int) $header->getCode(), [420, 423], true)) {
+            return null;
+        }
+        if ($header === []) {
+            return null;
+        }
         if (\is_array($header)
             && isset($header[0]['Number'], $header[0]['Date'])
             && (\is_int($header[0]['Number']) || \is_string($header[0]['Number']))
@@ -1077,7 +1101,8 @@ class BinariesService
         $remainingProbes = 64;
 
         while (true) {
-            if ($wantedArticle <= $data['first'] || $wantedArticle >= $data['last']) {
+            // Stop once the probe would reach a bound: adjacent bounds are fully resolved.
+            if ($wantedArticle <= $data['first'] || $wantedArticle >= $data['last'] || $wantedArticle <= $aMin || $wantedArticle >= $aMax) {
                 break;
             }
 
@@ -1087,14 +1112,12 @@ class BinariesService
             if ($remainingProbes-- === 0) {
                 throw new \RuntimeException('NNTP date target did not converge; defer date-based indexing.');
             }
+            // $aMin < $wantedArticle < $aMax, so the nearest-article search only moves upward.
             $found = $this->nearestPostdate($wantedArticle, $aMax - 1);
             if ($found === null) {
                 // No article from the probe to the upper bound: the boundary lies below the probe.
                 $aMax = $wantedArticle;
                 $wantedArticle = $this->articleMidpoint($aMin, $wantedArticle);
-                if ($wantedArticle >= $aMax) {
-                    break;
-                }
 
                 continue;
             }

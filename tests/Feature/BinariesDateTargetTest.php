@@ -69,11 +69,41 @@ class BinariesDateTargetTest extends TestCase
         $this->assertSame('950', $service->daytopost(3, $nntp->groupData()));
     }
 
-    public function test_a_gap_up_to_the_upper_bound_narrows_the_search_below_it(): void
+    /** @return array<string, array{int, string}> */
+    public static function gapsBeforeTheUpperBound(): array
     {
-        $nntp = new DateTargetNntpFixture(100, 1100, exists: static fn (int $number): bool => $number <= 610 || $number === 1100);
+        return ['gap after 610' => [610, '611'], 'gap after 609 converges on adjacent bounds' => [609, '610']];
+    }
+
+    #[DataProvider('gapsBeforeTheUpperBound')]
+    public function test_a_gap_up_to_the_upper_bound_narrows_the_search_below_it(int $lastBeforeGap, string $expected): void
+    {
+        $nntp = new DateTargetNntpFixture(100, 1100, exists: static fn (int $number): bool => $number <= $lastBeforeGap || $number === 1100);
         $service = new BinariesService(new BinariesConfig, nntp: $nntp);
-        $this->assertSame('611', $service->daytopost(3, $nntp->groupData()));
+        $this->assertSame($expected, $service->daytopost(3, $nntp->groupData()));
+        $this->assertLessThan(64 * 4, count($nntp->requests));
+    }
+
+    public function test_an_unconfirmed_missing_watermark_defers_instead_of_using_a_neighbor(): void
+    {
+        // A protocol error is not a confirmed absence, even when the following range would succeed.
+        $nntp = new DateTargetNntpFixture(100, 1100, singleError: static fn (int $number): ?int => $number === 100 ? 500 : null);
+        $service = new BinariesService(new BinariesConfig, nntp: $nntp);
+        try {
+            $service->daytopost(3, $nntp->groupData());
+            $this->fail('An unconfirmed missing article must defer.');
+        } catch (\RuntimeException) {
+            $this->assertSame([100], $nntp->requests);
+        }
+    }
+
+    public function test_the_nearest_existing_article_with_an_unknown_date_defers(): void
+    {
+        $nntp = new DateTargetNntpFixture(100, 1100, exists: static fn (int $number): bool => $number !== 100,
+            badDate: static fn (int $number): bool => $number === 101);
+        $service = new BinariesService(new BinariesConfig, nntp: $nntp);
+        $this->expectException(\RuntimeException::class);
+        $service->daytopost(3, $nntp->groupData());
     }
 
     /** @return array<string, array{\Closure(int): bool}> */
@@ -161,7 +191,8 @@ final class DateTargetNntpFixture extends NNTPService
     private bool $selected = false;
 
     public function __construct(private readonly int $first, private readonly int $last, private readonly ?\Closure $response = null,
-        private readonly ?\Closure $exists = null, private readonly ?int $rangeError = null) {}
+        private readonly ?\Closure $exists = null, private readonly ?int $rangeError = null,
+        private readonly ?\Closure $singleError = null, private readonly ?\Closure $badDate = null) {}
 
     public function groupData(): array
     {
@@ -209,6 +240,9 @@ final class DateTargetNntpFixture extends NNTPService
         if ($this->response !== null) {
             return ($this->response)($number, $this->header($number));
         }
+        if ($this->singleError !== null && ($code = ($this->singleError)($number)) !== null) {
+            return $this->error($code);
+        }
         if ($this->exists !== null && ! ($this->exists)($number)) {
             return $this->error(420);
         }
@@ -221,7 +255,7 @@ final class DateTargetNntpFixture extends NNTPService
     private function header(int $number): array
     {
         return ['Number' => (string) $number, 'Subject' => 'date fixture', 'From' => 'fixture@example.invalid',
-            'Date' => gmdate('r', strtotime('2026-10-04 12:00:00 UTC') + ($number - $this->first) * 864),
+            'Date' => $this->badDate !== null && ($this->badDate)($number) ? 'not-a-date' : gmdate('r', strtotime('2026-10-04 12:00:00 UTC') + ($number - $this->first) * 864),
             'Message-ID' => '<'.$number.'@example.invalid>', 'References' => '', 'Bytes' => '1', 'Lines' => '1', 'Xref' => 'fixture alt.fixture:'.$number];
     }
 
