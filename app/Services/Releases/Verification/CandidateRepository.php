@@ -21,6 +21,9 @@ final class CandidateRepository
 {
     private const array CLAIMABLE_STATUSES = ['ready', 'pending', 'unknown', 'verifying'];
 
+    /** Window reads per claim while concurrent claimers keep winning the rows this worker tried. */
+    private const int CLAIM_WINDOW_PASSES = 10;
+
     private int $claimSelections = 0;
 
     public function __construct(private readonly ManifestStore $store, private readonly CollectionCleanupService $cleanup,
@@ -670,40 +673,63 @@ final class CandidateRepository
     {
         $preferReady ??= ++$this->claimSelections % 5 !== 0;
         // Keep legacy/stale leases progressing even while ready candidates are arriving.
-        foreach ($preferReady ? [['ready'], ['pending', 'unknown', 'verifying']] : [['pending', 'unknown', 'verifying'], ['ready']] as $statuses) {
-            $ids = $this->claimQueueIds($statuses);
-            foreach ($ids as $id) {
-                $acquired = false;
-                $claimed = DB::transaction(function () use ($id, $acquireCandidate, &$acquired): ?object {
-                    $query = $this->claimableCandidates()->where('id', $id);
-                    if (in_array(DB::getDriverName(), ['mysql', 'mariadb'], true)) {
-                        $query->forceIndex('PRIMARY')->lock('for update skip locked');
-                    } else {
-                        $query->lockForUpdate();
-                    }
-                    $row = $query->first();
-                    if ($row === null) {
-                        return null;
-                    }
-                    if ($acquireCandidate !== null) {
-                        if (! $acquireCandidate((int) $row->id)) {
+        $queues = $preferReady ? [['ready'], ['pending', 'unknown', 'verifying']] : [['pending', 'unknown', 'verifying'], ['ready']];
+        // Every worker reads the same oldest window. When concurrent claimers drained the rows this
+        // worker tried, read it again rather than stopping while eligible work remains due.
+        for ($pass = 0; $pass < self::CLAIM_WINDOW_PASSES; $pass++) {
+            $contended = false;
+            foreach ($queues as $statuses) {
+                $ids = $this->claimQueueIds($statuses);
+                $spread = false;
+                while ($ids !== []) {
+                    $id = array_shift($ids);
+                    $acquired = false;
+                    $eligible = false;
+                    $claimed = DB::transaction(function () use ($id, $acquireCandidate, &$acquired, &$eligible): ?object {
+                        $eligible = false;
+                        $query = $this->claimableCandidates()->where('id', $id);
+                        if (in_array(DB::getDriverName(), ['mysql', 'mariadb'], true)) {
+                            $query->forceIndex('PRIMARY')->lock('for update skip locked');
+                        } else {
+                            $query->lockForUpdate();
+                        }
+                        $row = $query->first();
+                        if ($row === null) {
                             return null;
                         }
-                        $acquired = true;
-                    }
-                    $token = (string) Str::uuid();
-                    DB::table('release_verification_candidates')->where('id', $row->id)->update([
-                        'status' => 'verifying', 'lease_token' => $token,
-                        'lease_until' => now()->addSeconds((int) config('release_verification.lease_seconds')),
-                    ]);
-                    $row->lease_token = $token;
+                        $eligible = true;
+                        if ($acquireCandidate !== null) {
+                            if (! $acquireCandidate((int) $row->id)) {
+                                return null;
+                            }
+                            $acquired = true;
+                        }
+                        $token = (string) Str::uuid();
+                        DB::table('release_verification_candidates')->where('id', $row->id)->update([
+                            'status' => 'verifying', 'lease_token' => $token,
+                            'lease_until' => now()->addSeconds((int) config('release_verification.lease_seconds')),
+                        ]);
+                        $row->lease_token = $token;
 
-                    return $row;
-                }, 5);
-                // A rolled-back lease may still own its file mutex; let the caller release it.
-                if ($claimed !== null || $acquired) {
-                    return $claimed;
+                        return $row;
+                    }, 5);
+                    // A rolled-back lease may still own its file mutex; let the caller release it.
+                    if ($claimed !== null || $acquired) {
+                        return $claimed;
+                    }
+                    if (! $eligible) {
+                        $contended = true;
+                        // Losers would otherwise advance through the window in lock-step behind
+                        // the winner; spread them over the rest of it once they have lost a row.
+                        if (! $spread) {
+                            shuffle($ids);
+                            $spread = true;
+                        }
+                    }
                 }
+            }
+            if (! $contended) {
+                break;
             }
         }
 
