@@ -9,6 +9,7 @@ use App\Models\Release;
 use App\Services\CollectionCleanupService;
 use App\Services\Nzb\NzbArticleCoverage;
 use App\Services\Nzb\NzbService;
+use App\Services\Releases\ReleaseGroupResolver;
 use App\Support\NzbPasswordMetadata;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\UniqueConstraintViolationException;
@@ -20,6 +21,10 @@ use RuntimeException;
 
 final class CandidateRepository
 {
+    private const string PARTIAL_QUEUED = 'Upload stopped growing before it was complete; queued for partial publication.';
+
+    private const string PARTIAL_DEFERRED = 'Partial publication deferred: ';
+
     private const array CLAIMABLE_STATUSES = ['ready', 'pending', 'unknown', 'verifying'];
 
     /** Window reads per claim while concurrent claimers keep winning the rows this worker tried. */
@@ -137,6 +142,9 @@ final class CandidateRepository
                         $existing = $own;
                         $apart = false;
                         $identityAfter = null;
+                    } elseif ($own === null && $existing !== null && $existing->release_id === null && ($existing->upgrades_release_id ?? null) !== null) {
+                        // The newest row is an orphaned generation still leased to a worker: start a new one.
+                        $apart = true;
                     }
                 }
                 if ($holder !== null && ($holder->release_id === null || (int) $holder->id === (int) ($existing->id ?? 0))) {
@@ -209,7 +217,11 @@ final class CandidateRepository
                 }
                 if ($merges) {
                     if ($this->articleIdentity($retained) === $this->articleIdentity($manifest) && ! ($manifest['conflict'] ?? false)) {
-                        // A replay of headers the partial already holds changes nothing.
+                        // A replay of headers the partial already holds adds no articles, but a crosspost replay
+                        // can add groups: record those on the partial release before discarding the headers.
+                        foreach (array_unique(app(ReleaseGroupResolver::class)->idsByName(array_values(array_diff($manifest['groups'], $retained['groups'])))) as $groupId) {
+                            DB::table('releases_groups')->insertOrIgnore(['releases_id' => (int) $previous->release_id, 'groups_id' => $groupId]);
+                        }
                         $this->cleanup->deleteCollectionsAndDescendants([$collectionId], 'Archived for verification', false, manifestArchived: true);
                         if ($retiredBytes > 0) {
                             $this->ledger->adjust(-$retiredBytes);
@@ -691,6 +703,13 @@ final class CandidateRepository
         return self::$upgradeColumnSupport[$pdo] ??= Schema::hasColumn('release_verification_candidates', 'upgrades_release_id');
     }
 
+    /** A stalled upload not yet tried as a partial, or queued for that try, which expiry must leave. */
+    private static function owedPartialAttempt(object $row): bool
+    {
+        return ($row->status === 'waiting_upload' && ! str_starts_with((string) ($row->reason ?? ''), self::PARTIAL_DEFERRED))
+            || ($row->status === 'ready' && $row->reason === self::PARTIAL_QUEUED);
+    }
+
     /**
      * The newest pending candidate of this upload that holds no partial's inventory, locked.
      *
@@ -698,27 +717,34 @@ final class CandidateRepository
      */
     private function lockLatestUnheld(string $sourceIdentity, array $heldIds): ?object
     {
+        // An unheld upgrade generation is orphaned (its partial was deleted): never admit new uploads into it,
+        // even while a worker's lease keeps it from being retired.
         return DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)->whereNull('release_id')
             ->whereNotIn('status', ['expired', 'filtered', 'metadata_expired'])->whereNotIn('id', $heldIds === [] ? [0] : $heldIds)
+            ->when(self::tracksUpgrades(), fn ($query) => $query->whereNull('upgrades_release_id'))
             ->orderByDesc('id')->lockForUpdate()->first();
     }
 
     /**
-     * The holder whose inventory these headers extend without conflict, if any.
+     * The one holder whose inventory these headers extend without conflict, if exactly one does.
      *
      * @param  list<object>  $partials
      * @param  array<string, mixed>  $manifest
      */
     private function partialOwner(array $partials, array $manifest): ?object
     {
+        // Only an unambiguous owner: a repost by the same poster under the same subject and file count shares
+        // the hash, and a segment at an unseen part number fits either inventory. Mixing them would publish an
+        // unusable NZB, so headers more than one holder could take are kept apart.
+        $owners = [];
         foreach ($partials as $partial) {
             $retained = $this->store->read($partial->manifest_path);
             if (($retained['conflict'] ?? false) || ! $this->spoils($retained, $this->merge($retained, $manifest))) {
-                return $partial;
+                $owners[] = $partial;
             }
         }
 
-        return null;
+        return count($owners) === 1 ? $owners[0] : null;
     }
 
     /**
@@ -815,7 +841,7 @@ final class CandidateRepository
 
             return DB::table('release_verification_candidates')->whereIn('id', $locked)->update(['status' => 'ready',
                 'next_attempt_at' => $now->format('Y-m-d H:i:s'),
-                'reason' => 'Upload stopped growing before it was complete; queued for partial publication.']);
+                'reason' => self::PARTIAL_QUEUED]);
         });
     }
 
@@ -824,7 +850,7 @@ final class CandidateRepository
     {
         DB::table('release_verification_candidates')->where('id', $claim->id)->where('lease_token', $claim->lease_token)
             ->where('version', $claim->version)->whereNull('release_id')->update(['status' => 'waiting_upload',
-                'reason' => mb_strcut('Partial publication deferred: '.$reason, 0, 2000, 'UTF-8'), 'lease_token' => null, 'lease_until' => null,
+                'reason' => mb_strcut(self::PARTIAL_DEFERRED.$reason, 0, 2000, 'UTF-8'), 'lease_token' => null, 'lease_until' => null,
                 'next_attempt_at' => now()->addHours(max(1, (int) config('release_verification.partial_after_hours', 4)))]);
     }
 
@@ -985,22 +1011,29 @@ final class CandidateRepository
         if ($mayStart !== null && ! $mayStart()) {
             return;
         }
+        $partials = (int) config('release_verification.partial_after_hours', 4) > 0;
         $ids = DB::table('release_verification_candidates')->whereNull('release_id')
             ->whereIn('status', ['ready', 'waiting_upload', 'pending', 'unknown', 'header_rejected', 'unrepairable', 'verifying', 'dirty', 'metadata_deferred', 'metadata_review'])
             ->where('last_unique_at', '<', now()->subHours((int) config('release_verification.expiry_hours')))
             ->where(fn ($q) => $q->whereNull('lease_until')->orWhere('lease_until', '<', now()))
+            // A stalled upload still owed its partial attempt is published, not expired (it would otherwise lose
+            // the race with promotion, and always lose it when the hold reaches the expiry window).
+            ->when($partials, fn ($query) => $query->where(fn ($owed) => $owed->whereNotIn('status', ['waiting_upload', 'ready'])
+                ->orWhere(fn ($waiting) => $waiting->where('status', 'waiting_upload')->where('reason', 'like', self::PARTIAL_DEFERRED.'%'))
+                ->orWhere(fn ($ready) => $ready->where('status', 'ready')->where(fn ($r) => $r->whereNull('reason')->orWhere('reason', '!=', self::PARTIAL_QUEUED)))))
             ->orderBy('id')->limit(100)->pluck('id');
         foreach ($ids as $id) {
             if ($mayStart !== null && ! $mayStart()) {
                 break;
             }
-            DB::transaction(function () use ($id): void {
+            DB::transaction(function () use ($id, $partials): void {
                 $this->ledger->enter();
                 $row = DB::table('release_verification_candidates')->where('id', $id)->lockForUpdate()->first();
                 if ($row === null || $row->release_id !== null
                     || ! in_array($row->status, ['ready', 'waiting_upload', 'pending', 'unknown', 'header_rejected', 'unrepairable', 'verifying', 'dirty', 'metadata_deferred', 'metadata_review'], true)
                     || $row->last_unique_at >= now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s')
-                    || ($row->lease_until !== null && $row->lease_until >= now()->format('Y-m-d H:i:s'))) {
+                    || ($row->lease_until !== null && $row->lease_until >= now()->format('Y-m-d H:i:s'))
+                    || ($partials && self::owedPartialAttempt($row))) {
                     return;
                 }
                 DB::table('release_verification_candidates')->where('id', $id)->update(['status' => in_array($row->status, ['metadata_deferred', 'metadata_review'], true) ? 'metadata_expired' : 'expired',
@@ -1055,12 +1088,18 @@ final class CandidateRepository
     {
         $cutoff = now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
         $ids = DB::table('release_verification_candidates')->whereNotNull('release_id')->where('manifest_path', '<>', '')
-            ->where('last_unique_at', '<', $cutoff)->orderBy('id')->limit(100)->pluck('id');
-        foreach ($ids as $id) {
+            ->where('last_unique_at', '<', $cutoff)->orderBy('id')->limit(100)->pluck('source_identity', 'id');
+        foreach ($ids as $id => $sourceIdentity) {
             if ($mayStart !== null && ! $mayStart()) {
                 break;
             }
-            DB::transaction(function () use ($id, $cutoff): void {
+            DB::transaction(function () use ($id, $sourceIdentity, $cutoff): void {
+                // Serialize with header storage and archive(), in their order (the upload's collections, the
+                // ledger, then the candidate): late headers still waiting to be archived keep the inventory.
+                $hash = is_string($sourceIdentity) && ctype_xdigit($sourceIdentity) ? hex2bin($sourceIdentity) : false;
+                if ($hash !== false && DB::table('collections')->where('collectionhash', $hash)->lockForUpdate()->exists()) {
+                    return;
+                }
                 $this->ledger->enter();
                 $row = DB::table('release_verification_candidates')->where('id', $id)->lockForUpdate()->first();
                 if ($row === null || $row->release_id === null || $row->manifest_path === '' || $row->last_unique_at >= $cutoff) {

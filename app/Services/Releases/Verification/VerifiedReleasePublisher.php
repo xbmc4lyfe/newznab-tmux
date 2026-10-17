@@ -149,6 +149,16 @@ final class VerifiedReleasePublisher
 
                         return null;
                     }
+                    $duplicate = null;
+                    if ($upgrade !== null) {
+                        // A complete copy published meanwhile is reused like any covering duplicate; the partial is
+                        // then settled rather than upgraded into a second release of the same articles.
+                        $duplicate = $this->findCoveredDuplicate($claim, $manifest, $metadata, $size, $timing);
+                        if ($duplicate['release_id'] !== null && $duplicate['release_id'] !== (int) $upgrade->id) {
+                            DB::table('releases')->where('id', $upgrade->id)->update(['late_article_candidate_id' => null]);
+                            $upgrade = null;
+                        }
+                    }
                     if ($upgrade !== null) {
                         $retain = isset($manifest['partial']) && $this->awaitsLateArticles($manifest);
                         $id = $this->upgradePartial($upgrade, $manifest, $metadata, $size, $totalParts, $retain ? (int) $candidate->id : null, $timing);
@@ -160,7 +170,7 @@ final class VerifiedReleasePublisher
 
                         return $id;
                     }
-                    $duplicate = $legacy === null ? $this->findCoveredDuplicate($claim, $manifest, $metadata, $size, $timing) : ['release_id' => null, 'metadata_conflict' => false];
+                    $duplicate ??= $legacy === null ? $this->findCoveredDuplicate($claim, $manifest, $metadata, $size, $timing) : ['release_id' => null, 'metadata_conflict' => false];
                     $duplicateId = $duplicate['release_id'];
                     if ($duplicateId !== null || $duplicate['metadata_conflict']) {
                         $timing?->nextPhase('sql_accounting');
@@ -471,10 +481,12 @@ final class VerifiedReleasePublisher
             DB::table('release_fingerprint_metadata')->upsert([['releases_id' => $id, 'status' => 'stale', 'created_at' => now(), 'updated_at' => now()]],
                 ['releases_id'], ['status', 'updated_at']);
         }
-        DB::afterCommit(static function () use ($id): void {
+        $holderLabel = bin2hex(random_bytes(4));
+        DB::afterCommit(static function () use ($id, $holderLabel): void {
             Search::updateRelease($id);
             try {
-                CollectReleaseFingerprintMetadata::dispatch($id);
+                // Its own unique key: a collection still holding the release's lock would drop a plain dispatch.
+                CollectReleaseFingerprintMetadata::dispatch($id, 'upgrade-'.$holderLabel);
             } catch (Throwable $dispatchException) {
                 Log::warning('Could not queue upgraded release fingerprint metadata collection.', [
                     'release_id' => $id,

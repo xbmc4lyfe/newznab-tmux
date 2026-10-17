@@ -14,6 +14,8 @@ final class NzbSourceInstallation
     /** @var resource|null */
     private mixed $handle;
 
+    private bool $keepPrevious = false;
+
     /** @param resource $handle */
     public function __construct(
         private readonly NzbSourceGuard $sources,
@@ -46,12 +48,15 @@ final class NzbSourceInstallation
         try {
             $this->sources->rollbackInstallation($this);
         } catch (Throwable $exception) {
+            // Restoration failed: the displaced source stays beside the installation for manual recovery.
+            $this->keepPrevious = true;
             // Cleanup must not interrupt Laravel's rollback-manager unwind or
             // replace the original publication exception. A retained source is
             // still checked against its actual digest before naming admission.
             try {
                 Log::warning('NZB rollback cleanup retained its source.', [
                     'release_guid' => $this->guid,
+                    'preserved_source' => $this->previous,
                     'exception' => $exception::class,
                 ]);
             } catch (Throwable) {
@@ -68,7 +73,7 @@ final class NzbSourceInstallation
             fclose($this->handle);
         }
         $this->handle = null;
-        if ($this->previous !== null && is_file($this->previous)) {
+        if ($this->previous !== null && ! $this->keepPrevious && is_file($this->previous)) {
             @unlink($this->previous);
         }
     }

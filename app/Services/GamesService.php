@@ -754,6 +754,7 @@ class GamesService
         $query = Release::query()
             ->where('gamesinfo_id', '=', 0)
             ->where('categories_id', '=', Category::PC_GAMES);
+        Release::whereNzbSettled($query);
 
         if ($guidChar !== '') {
             $query->where('leftguid', 'like', $guidChar.'%');

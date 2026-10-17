@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\Category;
+use App\Models\Release;
 
 final class BookProcessingCandidateQuery
 {
@@ -42,8 +43,14 @@ final class BookProcessingCandidateQuery
     /** Shared by dispatch, workers, and the tmux ready-work count. */
     public static function workCondition(int $lookupMode): string
     {
-        return self::categoryCondition().' AND ('.self::metadataCondition($lookupMode)
+        return self::categoryCondition().' AND '.self::settledCondition().' AND ('.self::metadataCondition($lookupMode)
             .' OR '.self::normalizationCondition($lookupMode).')';
+    }
+
+    /** A partial awaiting a late-article upgrade may be renamed and reset, so a lookup on its title would go stale. */
+    public static function settledCondition(): string
+    {
+        return Release::hasLateArticleFlag() ? 'late_article_candidate_id IS NULL' : '1 = 1';
     }
 
     public static function retryDelay(int $failures, int $providerRetryAfter): int

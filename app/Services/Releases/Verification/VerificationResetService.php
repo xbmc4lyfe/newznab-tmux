@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Models\Release;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
@@ -81,6 +82,10 @@ final class VerificationResetService
             $hosts = Schema::hasTable('release_verification_scratch') && Schema::hasColumn('release_verification_scratch', 'host');
             if ($hosts) {
                 DB::table('release_verification_scratch')->where('host', '<>', ScratchInventory::host())->update(['terminal' => true]);
+            }
+            if (Release::hasLateArticleFlag()) {
+                // Partials keep no inventory once candidates are gone; let NZB-reading workers process them.
+                DB::table('releases')->whereNotNull('late_article_candidate_id')->update(['late_article_candidate_id' => null]);
             }
             foreach (['release_verification_scratch', 'release_verification_candidates', 'release_verification_audit_retries', 'release_verification_manifests'] as $table) {
                 if (Schema::hasTable($table)) {

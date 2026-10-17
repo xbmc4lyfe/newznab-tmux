@@ -107,10 +107,13 @@ class ReleaseVerificationAuditRetriesTest extends TestCase
         $this->release(1);
         $this->release(2);
         $this->release(3);
+        $this->release(4);
         $counts = ['articles_expected' => 3, 'files_found' => 1, 'files_expected' => 1];
         DB::table('releases')->where('id', 1)->update($counts + ['articles_found' => 1]);
         // Release 3 was published with two articles; its NZB has since lost one.
         DB::table('releases')->where('id', 3)->update($counts + ['articles_found' => 2]);
+        // Release 4's upgrade installed a fuller NZB but never committed its counts (an interrupted worker).
+        DB::table('releases')->where('id', 4)->update(['articles_found' => 0, 'articles_expected' => 3, 'files_found' => 0, 'files_expected' => 1]);
         // Every NZB declares three articles and contains one; releases 1 and 3 were published as partial.
         $xml = '<nzb><file subject="Release [1/1] &quot;movie.mkv&quot; (1/3)"><groups><group>alt.test</group></groups>'
             .'<segments><segment bytes="5" number="1">a@b</segment></segments></file></nzb>';
@@ -123,9 +126,9 @@ class ReleaseVerificationAuditRetriesTest extends TestCase
             $mock->shouldReceive('doQuit')->andReturn(null);
         });
 
-        $this->audit(3);
+        $this->audit(4);
 
-        $this->assertSame([1 => 'sampled', 2 => 'unknown', 3 => 'unrepairable'], array_column($this->records(), 'verdict', 'id'));
+        $this->assertSame([1 => 'sampled', 2 => 'unknown', 3 => 'unrepairable', 4 => 'sampled'], array_column($this->records(), 'verdict', 'id'));
     }
 
     public function test_a_partial_awaiting_late_articles_is_retried_without_reading_its_nzb(): void
@@ -351,6 +354,19 @@ class ReleaseVerificationAuditRetriesTest extends TestCase
         app(VerificationResetService::class)->run(static function (): void {});
         $this->assertSame(0, DB::table('release_verification_scratch')->count());
         $this->assertDirectoryDoesNotExist($new);
+    }
+
+    public function test_verification_reset_releases_partials_fenced_by_deleted_candidates(): void
+    {
+        Schema::table('releases', function (Blueprint $table): void {
+            $table->unsignedBigInteger('late_article_candidate_id')->nullable();
+        });
+        $this->release(1);
+        DB::table('releases')->where('id', 1)->update(['late_article_candidate_id' => 7]);
+
+        app(VerificationResetService::class)->run(static function (): void {});
+
+        $this->assertNull(DB::table('releases')->where('id', 1)->value('late_article_candidate_id'), 'Its candidate is gone; workers may process it.');
     }
 
     public function test_terminal_audit_symlink_target_and_index_are_preserved(): void

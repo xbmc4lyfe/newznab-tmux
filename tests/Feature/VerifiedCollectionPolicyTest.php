@@ -693,13 +693,80 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
         app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
         $generation = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        $this->travel((int) config('release_verification.expiry_hours') + 1)->hours();
+        $this->limits();
+
+        app(CandidateRepository::class)->expire();
+        $this->assertSame('waiting_upload', DB::table('release_verification_candidates')->where('id', $generation->id)->value('status'),
+            'Still owed its partial attempt: promoted and published, not expired.');
+
+        // Its partial attempt was deferred (it failed policy), so it may now expire.
+        DB::table('release_verification_candidates')->where('id', $generation->id)->update(['reason' => 'Partial publication deferred: below minimum size']);
+        app(CandidateRepository::class)->expire();
+
+        $this->assertSame('expired', DB::table('release_verification_candidates')->where('id', $generation->id)->value('status'));
+        $this->assertNull(DB::table('release_verification_candidates')->where('id', $generation->id)->value('upgrades_release_id'));
+        $this->assertNull(DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
+    }
+
+    public function test_headers_two_reposts_could_take_are_kept_apart(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('two-reposts', true);
+        // The same poster's repost: same subject and file count, so the same hash.
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        // Its part 1 under another message id conflicts with the first post, so it is archived apart.
+        $other = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 1, messageId: 'b1@b');
+        app(CandidateRepository::class)->archive($other);
+        $repost = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        DB::table('releases')->insert(['name' => 'Repost', 'searchname' => 'Repost', 'guid' => 'repost', 'leftguid' => 'r', 'fromname' => 'poster',
+            'postdate' => '2026-10-11 12:00:00', 'adddate' => '2026-10-11 12:00:00', 'totalpart' => 1, 'groups_id' => 1, 'size' => 5,
+            'passwordstatus' => 0, 'haspreview' => -1, 'categories_id' => 2000, 'nfostatus' => -1, 'nzbstatus' => 1, 'isrenamed' => 1,
+            'iscategorized' => 1, 'predb_id' => 0, 'articles_expected' => 3, 'late_article_candidate_id' => $repost->id]);
+        DB::table('release_verification_candidates')->where('id', $repost->id)->update(['release_id' => DB::table('releases')->max('id'), 'status' => 'sampled']);
+        $before = DB::table('release_verification_candidates')->pluck('manifest_path', 'id')->all();
+
+        // Part 3 fits either inventory without conflict.
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 3, messageId: 'e@f'));
+
+        $this->assertSame($before, array_intersect_key(DB::table('release_verification_candidates')->pluck('manifest_path', 'id')->all(), $before),
+            'Neither repost\'s inventory absorbs ambiguous headers.');
+        $this->assertSame(3, DB::table('release_verification_candidates')->count());
+        $this->assertArrayNotHasKey('upgrades_release_id', app(ManifestStore::class)->read((string) DB::table('release_verification_candidates')->orderByDesc('id')->value('manifest_path')));
+        $this->assertNotNull(DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
+    }
+
+    public function test_retained_inventory_is_kept_while_late_headers_await_archiving(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('pending-late-at-expiry', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d');
 
         $this->travel((int) config('release_verification.expiry_hours') + 1)->hours();
         $this->limits();
         app(CandidateRepository::class)->expire();
 
-        $this->assertNull(DB::table('release_verification_candidates')->where('id', $generation->id)->value('upgrades_release_id'));
-        $this->assertNull(DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
+        $this->assertNotSame('', DB::table('release_verification_candidates')->where('release_id', $first)->value('manifest_path'));
+        $this->assertNotNull(DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
+    }
+
+    public function test_a_leased_orphan_never_admits_a_new_upload(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('leased-orphan', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+        $orphan = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        DB::table('release_verification_candidates')->where('id', $orphan->id)->update(['lease_token' => 'worker', 'lease_until' => now()->addMinutes(5)]);
+        DB::table('releases')->where('id', $first)->delete();
+
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 3, messageId: 'e@f'));
+
+        $this->assertSame($orphan->manifest_path, DB::table('release_verification_candidates')->where('id', $orphan->id)->value('manifest_path'),
+            'Left to its worker, and the new upload is not merged into it.');
+        $fresh = app(ManifestStore::class)->read((string) DB::table('release_verification_candidates')->orderByDesc('id')->value('manifest_path'));
+        $this->assertSame(['e@f'], array_column($fresh['files'][0]['segments'], 'messageid'));
     }
 
     public function test_late_articles_never_republish_a_deleted_partial(): void

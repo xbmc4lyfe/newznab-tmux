@@ -416,6 +416,7 @@ class BookService
 
         $query = Release::query()
             ->whereRaw(BookProcessingCandidateQuery::categoryCondition())
+            ->whereRaw(BookProcessingCandidateQuery::settledCondition())
             ->whereRaw(BookProcessingCandidateQuery::metadataCondition($this->lookupMode))
             ->orderByDesc('postdate')
             ->limit($this->bookqty);
@@ -444,6 +445,7 @@ class BookService
         $query = Release::query()
             ->select(['id', 'name', 'searchname', 'categories_id', 'isrenamed'])
             ->whereRaw(BookProcessingCandidateQuery::categoryCondition())
+            ->whereRaw(BookProcessingCandidateQuery::settledCondition())
             ->whereRaw(BookProcessingCandidateQuery::normalizationCondition($this->lookupMode))
             ->orderByDesc('postdate')
             ->limit($this->bookqty);

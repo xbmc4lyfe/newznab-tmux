@@ -219,7 +219,14 @@ class VerifyReleaseCandidates extends Command
                     $active = null;
                     $this->line($claim->id.': '.$result->verdict.' — '.$result->reason);
                 } catch (PartialPublicationDeferredException $deferred) {
-                    $repository->deferPartial($claim, $deferred->getMessage());
+                    // Charged like the generic recovery: the throwing operation, then the deferral update.
+                    $diagnostics?->phase($active, $phase);
+                    $recovery = $diagnostics === null ? null : hrtime(true);
+                    try {
+                        $repository->deferPartial($claim, $deferred->getMessage());
+                    } finally {
+                        $diagnostics?->phase('finish', $recovery);
+                    }
                     $diagnostics?->finished();
                     $this->line($claim->id.': waiting_upload — partial publication deferred: '.$deferred->getMessage());
                 } catch (Throwable $error) {

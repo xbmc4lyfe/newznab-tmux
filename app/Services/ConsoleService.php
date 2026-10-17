@@ -498,6 +498,7 @@ class ConsoleService
             ->select(['searchname', 'id'])
             ->whereBetween('categories_id', [Category::GAME_ROOT, Category::GAME_OTHER])
             ->whereNull('consoleinfo_id');
+        Release::whereNzbSettled($query);
 
         if ($guidChar !== '') {
             $query->where('leftguid', 'like', $guidChar.'%');

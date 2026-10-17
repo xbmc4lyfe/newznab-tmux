@@ -112,8 +112,10 @@ class VerifyExistingReleases extends Command
                     $manifest = $reader->read($xml, $release);
                     $partial = $release->getAttribute('articles_expected') !== null;
                     $found = $partial ? (new CandidateHeaderInventory)->completeness($manifest) : null;
-                    if ($found !== null && ($found['articles_found'] !== (int) $release->getAttribute('articles_found')
-                        || $found['files_found'] !== (int) $release->getAttribute('files_found'))) {
+                    // Fewer than recorded is a truncated NZB. More is an upgrade whose NZB was installed but whose
+                    // transaction never committed (an interrupted worker): a verified, fuller NZB, sampled as usual.
+                    if ($found !== null && ($found['articles_found'] < (int) $release->getAttribute('articles_found')
+                        || $found['files_found'] < (int) $release->getAttribute('files_found'))) {
                         $record = ['id' => $release->id, 'verdict' => 'unrepairable',
                             'reason' => sprintf('Partial release NZB holds %d of %d recorded articles and %d of %d recorded files.',
                                 $found['articles_found'], (int) $release->getAttribute('articles_found'),

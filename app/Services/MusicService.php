@@ -478,12 +478,14 @@ class MusicService
                 SELECT searchname, id
                 FROM releases
                 WHERE musicinfo_id IS NULL
+                AND %s
                 %s
                 %s
                 %s
                 AND categories_id IN (%s, %s, %s)
                 ORDER BY postdate DESC
                 LIMIT %d',
+                Release::nzbSettledSql(),
                 $this->renamed,
                 $guidFilter,
                 $groupFilter,

@@ -1053,6 +1053,7 @@ class MovieService
                 $query->whereNull('imdbid')
                     ->orWhereIn('imdbid', imdb_id_pending_values());
             });
+        Release::whereNzbSettled($query);
 
         if ($groupID !== '') {
             $query->where('groups_id', $groupID);

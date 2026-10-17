@@ -87,6 +87,7 @@ class AnimeProcessor
         $query = Release::query()
             ->whereNull('anidbid')
             ->where('categories_id', Category::TV_ANIME);
+        Release::whereNzbSettled($query);
 
         if ($guidChar !== '') {
             $query->where('leftguid', 'like', $guidChar.'%');
