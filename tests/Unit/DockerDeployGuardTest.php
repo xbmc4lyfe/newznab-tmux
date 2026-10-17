@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Unit;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Process\Process;
@@ -42,6 +43,32 @@ final class DockerDeployGuardTest extends TestCase
         (new Process(['rm', '-rf', $this->dir]))->run();
 
         parent::tearDown();
+    }
+
+    /** @return iterable<string, array{int, int}> */
+    public static function interruptions(): iterable
+    {
+        yield 'SIGTERM' => [15, 130];
+        yield 'SIGHUP (dropped SSH session)' => [1, 129];
+        yield 'SIGINT' => [2, 130];
+    }
+
+    #[Test]
+    #[DataProvider('interruptions')]
+    public function an_interrupted_run_closes_its_attempt_and_releases_the_lock(int $signal, int $code): void
+    {
+        $ready = $this->dir.'/command-started';
+        $process = $this->guardProcess(['run', 'deploy', '--', 'sh', '-c', 'touch '.escapeshellarg($ready).'; sleep 2']);
+        $process->start();
+        $this->waitFor(fn (): bool => file_exists($ready));
+        $process->signal($signal);
+        $this->waitFor(fn (): bool => ! $process->isRunning());
+
+        $log = (string) file_get_contents($this->dir.'/deploy.log');
+        $this->assertStringContainsString('result=started', $log);
+        $this->assertStringContainsString("result=finished rc={$code} (interrupted)", $log);
+        $this->assertSame(substr_count($log, 'result=started'), substr_count($log, 'result=finished'));
+        $this->assertFalse(is_link($this->dir.'/lock'), 'the lock is released after an interruption');
     }
 
     #[Test]
