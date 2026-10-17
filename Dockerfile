@@ -37,8 +37,9 @@ WORKDIR /src/docker/app/nzb-yenc-ffi
 COPY docker/app/nzb-yenc-ffi/ ./
 COPY app/Services/Nzb/RustArticleFingerprintWorker.php /src/app/Services/Nzb/RustArticleFingerprintWorker.php
 COPY tests/Fixtures/nzb-article-fingerprint/NzbArticleFingerprint.php /src/tests/Fixtures/nzb-article-fingerprint/NzbArticleFingerprint.php
+# Only the registry is cached: Cargo trusts mtimes, and COPY preserves them, so a shared target
+# cache could ship another checkout's artifacts.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/docker/app/nzb-yenc-ffi/target \
     cargo test --release --locked \
     && cargo build --release --locked \
     && install -D -m 0644 target/release/libnzbyenc.so /out/libnzbyenc.so \

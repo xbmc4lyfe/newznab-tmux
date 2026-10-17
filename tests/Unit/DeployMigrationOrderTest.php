@@ -465,6 +465,34 @@ SH);
         $this->assertStringNotContainsString(' up -d', $this->events());
     }
 
+    public function test_files_outside_the_image_context_never_trigger_a_rollout(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        mkdir($this->directory.'/storage/app', 0777, true);
+        mkdir($this->directory.'/deploy', 0777, true);
+        file_put_contents($this->directory.'/.env.testing', "APP_ENV=testing\n");
+        file_put_contents($this->directory.'/storage/app/.gitignore', "*\n");
+        file_put_contents($this->directory.'/deploy/select.sh', "#!/bin/sh\n");
+        (new Process(['git', 'add', '.'], $this->directory))->mustRun();
+        (new Process(['git', 'commit', '-q', '-m', 'test env and runtime placeholders'], $this->directory))->mustRun();
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->assertStringNotContainsString('build --target', $this->events());
+        $this->assertStringNotContainsString(' up -d', $this->events());
+    }
+
+    public function test_fingerprinting_fails_closed_outside_a_git_checkout(): void
+    {
+        $outside = $this->directory.'/not-a-checkout';
+        mkdir($outside);
+        $process = new Process([$this->directory.'/docker/bin/deploy-plan', '--fingerprint'], env: ['DEPLOY_REPO' => $outside, 'GIT_CEILING_DIRECTORIES' => $this->directory]);
+        $process->run();
+        $this->assertNotSame(0, $process->getExitCode());
+        $this->assertStringContainsString('cannot fingerprint the checkout', $process->getErrorOutput());
+    }
+
     public function test_web_only_changes_rebuild_and_recreate_only_web_without_draining_writers_or_migrating(): void
     {
         mkdir($this->directory.'/resources/js', 0777, true);

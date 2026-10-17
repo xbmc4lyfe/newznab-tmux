@@ -143,6 +143,10 @@ def classify_path(rel_path: str) -> tuple[str, ...]:
         return ()
     if rel_path.startswith("install") and rel_path.endswith(".sh"):
         return ()
+    # Excluded from the image build context by .dockerignore (root .env.*, runtime state, host-only
+    # deploy selector); they can never change an image.
+    if (rel_path.startswith((".env.", "storage/", "_install/", "bootstrap/cache/")) or rel_path == "deploy/select.sh"):
+        return ()
     if any(rel_path.startswith(prefix) for prefix in IGNORED_PREFIXES):
         return ()
     if rel_path.startswith("tests/"):
@@ -210,24 +214,25 @@ def collect_repo_records(repo: Path) -> list[tuple[str, str]]:
         capture_output=True,
         check=False,
     )
-    if ls_files.returncode == 0:
-        for raw in ls_files.stdout.split(b"\x00"):
-            if raw:
-                candidates.add(raw.decode("utf-8", errors="surrogateescape"))
-        diff_head = subprocess.run(
-            ["git", "-C", str(repo), "diff", "--name-only", "-z", "HEAD"],
-            capture_output=True,
-            check=False,
-        )
-        if diff_head.returncode == 0 and diff_head.stdout:
-            for raw in diff_head.stdout.split(b"\x00"):
-                if raw:
-                    candidates.add(raw.decode("utf-8", errors="surrogateescape"))
-    else:
-        for path in sorted(repo.rglob("*")):
-            if ".git" in path.parts:
-                continue
-            candidates.add(path.relative_to(repo).as_posix())
+    if ls_files.returncode != 0:
+        # Never fall back to walking the tree: unfiltered vendor/storage content makes every
+        # fingerprint slow and unstable.
+        sys.stderr.write(ls_files.stderr.decode("utf-8", errors="replace"))
+        sys.exit("deploy-plan: git ls-files failed; cannot fingerprint the checkout.")
+    for raw in ls_files.stdout.split(b"\x00"):
+        if raw:
+            candidates.add(raw.decode("utf-8", errors="surrogateescape"))
+    diff_head = subprocess.run(
+        ["git", "-C", str(repo), "diff", "--name-only", "-z", "HEAD"],
+        capture_output=True,
+        check=False,
+    )
+    if diff_head.returncode != 0:
+        sys.stderr.write(diff_head.stderr.decode("utf-8", errors="replace"))
+        sys.exit("deploy-plan: git diff failed; cannot fingerprint the checkout.")
+    for raw in diff_head.stdout.split(b"\x00"):
+        if raw:
+            candidates.add(raw.decode("utf-8", errors="surrogateescape"))
 
     records: list[tuple[str, str]] = []
     for rel_path in sorted(candidates):
