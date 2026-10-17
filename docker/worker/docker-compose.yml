@@ -6,7 +6,8 @@
 # Setup on the worker host, from this directory:
 #   1. Copy config/app.env.example to config/app.env and fill in the database login, this host's
 #      NNTP account, RELEASE_VERIFICATION_HOST and a slot range no other host uses.
-#   2. Copy the database CA to config/ca.pem (the primary mounts the same file).
+#   2. Copy the database CA to config/ca.pem (the primary mounts the same file), and
+#      `touch config/install.lock`: the shared database is already initialized by the primary.
 #   3. Load the primary's exact app image, for example
 #        ssh <primary> 'docker save nntmux/app:local' | docker load
 #      Run the image the primary runs; a worker on older code must not run after a migration.
@@ -34,6 +35,7 @@ services:
     volumes:
       - ./config/app.env:/app/.env:ro
       - ./config/ca.pem:/etc/mysql/ssl/ca.pem:ro
+      - ./config/install.lock:/app/_install/install.lock:ro
       - storage:/app/storage
     tmpfs:
       - /var/tmp/nntmux:uid=33,gid=33,mode=0770,size=256m
