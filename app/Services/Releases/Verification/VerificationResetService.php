@@ -51,6 +51,12 @@ final class VerificationResetService
     {
         $store = VerificationLockStore::make();
         $lock = $this->lock($store->shared('reset'));
+        // A reset that lost its session keeps its durable pause while its cleanup may still run.
+        if (VerificationWorkerLocks::paused(null, 'reset')) {
+            $store->release($lock);
+
+            throw new RuntimeException('Verification worker, admission or reset is active; retry reset later.');
+        }
         try {
             $admit();
         } finally {

@@ -725,6 +725,27 @@ PHP;
         $this->assertFalse(VerificationWorkerLocks::paused());
     }
 
+    public function test_a_durable_reset_pause_refuses_admission(): void
+    {
+        (require database_path('migrations/2026_10_17_210000_create_release_verification_pauses_table.php'))->up();
+        VerificationWorkerLocks::pause('interrupted-reset', 'reset');
+        $admitted = false;
+        try {
+            app(VerificationResetService::class)->withAdmission(static function () use (&$admitted): void {
+                $admitted = true;
+            });
+            $this->fail('Admission must wait for an interrupted reset.');
+        } catch (RuntimeException $error) {
+            $this->assertStringContainsString('retry reset later', $error->getMessage());
+        }
+        $this->assertFalse($admitted);
+        VerificationWorkerLocks::unpause('interrupted-reset');
+        app(VerificationResetService::class)->withAdmission(static function () use (&$admitted): void {
+            $admitted = true;
+        });
+        $this->assertTrue($admitted);
+    }
+
     private function candidateScratch(int $id, string $status = 'complete'): string
     {
         DB::table('release_verification_candidates')->insert(['id' => $id, 'identity' => sha1('scratch-'.$id), 'groups_id' => 1,
