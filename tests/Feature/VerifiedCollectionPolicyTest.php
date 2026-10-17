@@ -348,6 +348,10 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertFalse(DB::table('releases')->where('id', $first)->exists(), 'The superseded partial leaves with the same commit.');
         $this->assertFileDoesNotExist((string) app(NzbService::class)->nzbPath($old->guid), 'Its NZB is removed after commit.');
         $this->assertSame(2, (int) DB::table('releases')->where('id', $second)->value('articles_found'));
+        $this->assertSame([$second, $second], DB::table('release_verification_candidates')->orderBy('id')->pluck('release_id')->map(fn ($id): int => (int) $id)->all(),
+            'Candidates of the superseded partial now point at its replacement.');
+        $this->assertSame(0, DB::table('releases_groups')->where('releases_id', $first)->count() - DB::table('releases_groups')->where('releases_id', $first)->whereIn('groups_id',
+            DB::table('releases_groups')->where('releases_id', $second)->pluck('groups_id'))->count(), 'Its groups carry over.');
     }
 
     public function test_a_replay_of_headers_the_partial_holds_changes_nothing(): void

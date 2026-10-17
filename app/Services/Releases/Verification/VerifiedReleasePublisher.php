@@ -54,6 +54,11 @@ final class VerifiedReleasePublisher
                 $keys = [];
             }
         }
+        if ($keys !== []) {
+            // Deleting a superseded partial must serialize with every publication or audit that can
+            // reach it, so hold its keys too; a key that changes before the lock forces a retry.
+            $keys = array_values(array_unique([...$keys, ...$this->supersededPartialKeys($result->manifest)]));
+        }
         try {
             $id = DB::transaction(function () use ($claim, $result, $timing, $preResolved, $keys): ?int {
                 $timing?->beginAttempt();
@@ -143,12 +148,11 @@ final class VerifiedReleasePublisher
                             return null;
                         }
                         $this->recordGroups($duplicateId, $manifest['groups']);
-                        $this->replaceSupersededPartial($manifest, $duplicateId);
+                        $this->replaceSupersededPartial($manifest, $duplicateId, $keys);
                         app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
-                        // Reusing a partial must keep the inventory late articles merge into.
-                        $this->markPublished($candidate->id, $duplicateId, $result, retainManifest: $this->awaitsLateArticles($manifest)
-                            && Release::hasPartialArticleCounts()
-                            && DB::table('releases')->where('id', $duplicateId)->whereNotNull('articles_expected')->exists());
+                        // A covered candidate never keeps inventory: its articles are a subset of the reused release,
+                        // and merging late articles into that subset could replace a more complete partial.
+                        $this->markPublished($candidate->id, $duplicateId, $result);
 
                         $returned = true;
 
@@ -201,7 +205,7 @@ final class VerifiedReleasePublisher
                         }
                     });
                     $this->recordGroups((int) $id, $manifest['groups']);
-                    $this->replaceSupersededPartial($manifest, (int) $id);
+                    $this->replaceSupersededPartial($manifest, (int) $id, $keys);
                     app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
                     // A partial release keeps its inventory so late articles can complete it.
                     $this->markPublished($candidate->id, (int) $id, $result, retainManifest: isset($manifest['partial']) && $this->awaitsLateArticles($manifest));
@@ -339,6 +343,33 @@ final class VerifiedReleasePublisher
     }
 
     /**
+     * Publication keys of the partial release this manifest supersedes; empty when it supersedes none.
+     *
+     * @param  array<string, mixed>  $manifest
+     * @return list<string>
+     */
+    private function supersededPartialKeys(array $manifest): array
+    {
+        $previous = $manifest['replaces_release_id'] ?? null;
+
+        return is_int($previous) ? ($this->releaseKeys($previous) ?? []) : [];
+    }
+
+    /**
+     * A release's publication keys. Inside the publication transaction pass $current: a locking read sees a
+     * rename committed after this transaction's REPEATABLE READ snapshot.
+     *
+     * @return list<string>|null
+     */
+    private function releaseKeys(int $releaseId, bool $current = false): ?array
+    {
+        $release = DB::table('releases')->where('id', $releaseId)->when($current, fn ($query) => $query->lockForUpdate())->first();
+
+        return $release === null ? null : VerificationLedger::publicationKeys((int) $release->size,
+            $release->article_fingerprint ?? null, (string) $release->name, (string) $release->searchname, (int) $release->predb_id);
+    }
+
+    /**
      * Only Usenet-sourced inventories can grow: archive() merges late headers by collection hash, while an
      * imported NZB's candidate is keyed by its full article fingerprint and never receives more articles.
      *
@@ -354,7 +385,7 @@ final class VerifiedReleasePublisher
      *
      * @param  array<string, mixed>  $manifest
      */
-    private function replaceSupersededPartial(array $manifest, int $releaseId): void
+    private function replaceSupersededPartial(array $manifest, int $releaseId, array $keys): void
     {
         $previous = $manifest['replaces_release_id'] ?? null;
         if (! is_int($previous) || $previous === $releaseId) {
@@ -363,6 +394,15 @@ final class VerifiedReleasePublisher
         $release = DB::table('releases')->where('id', $previous)->whereNotNull('articles_expected')->lockForUpdate()->first(['id', 'guid']);
         if ($release === null) {
             return;
+        }
+        $current = $this->releaseKeys($previous, current: true);
+        if ($keys !== [] && ($current === null || array_diff($current, $keys) !== [])) {
+            throw new RuntimeException('Superseded partial release changed before replacement; retry.');
+        }
+        // Everything that pointed at the superseded partial now points at its replacement.
+        DB::table('release_verification_candidates')->where('release_id', $previous)->update(['release_id' => $releaseId]);
+        foreach (DB::table('releases_groups')->where('releases_id', $previous)->pluck('groups_id') as $groupId) {
+            DB::table('releases_groups')->insertOrIgnore(['releases_id' => $releaseId, 'groups_id' => (int) $groupId]);
         }
         // The row goes with this publication's commit, so it can never stay advertised without its NZB.
         // The NZB is anchored first: once the row is gone, a by-GUID delete would find nothing to remove.
