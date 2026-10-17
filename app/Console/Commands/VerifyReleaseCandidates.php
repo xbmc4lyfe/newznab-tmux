@@ -116,7 +116,7 @@ class VerifyReleaseCandidates extends Command
                     $diagnostics?->stop('deadline', hrtime(true));
                     break;
                 }
-                $phase = hrtime(true);
+                $phase = $diagnostics === null ? null : hrtime(true);
                 $preferReady = $locks->preferReady();
                 $diagnostics?->claimCalled();
                 $claim = $repository->claim(fn (int $id): bool => $locks->tryCandidate($id), $preferReady);
@@ -128,7 +128,7 @@ class VerifyReleaseCandidates extends Command
                 $diagnostics?->claimed();
                 $directory = $root.'/scratch/'.$claim->id.'-'.$claim->version;
                 try {
-                    $phase = hrtime(true);
+                    $phase = $diagnostics === null ? null : hrtime(true);
                     $heartbeat = static fn () => $repository->heartbeat((int) $claim->id, $claim->lease_token);
                     $heartbeat();
                     $progressHeartbeat = new LeaseHeartbeat($heartbeat, max(0.1, min(30, (int) config('release_verification.lease_seconds') / 3)));
@@ -177,7 +177,7 @@ class VerifyReleaseCandidates extends Command
                         $phase = $diagnostics?->phase('finish', $phase);
                         $diagnostics?->finished();
                     }
-                    $phase = hrtime(true);
+                    $phase = $diagnostics === null ? null : hrtime(true);
                     $bytes = $result->passed()
                         ? (int) ($result->manifest['spot_check']['bytes'] ?? $result->manifest['verified_bytes'] ?? 0) : 0;
                     $snapshot = json_encode(['verified_bytes_per_second' => $bytes / max(0.001, microtime(true) - $started),
@@ -192,7 +192,7 @@ class VerifyReleaseCandidates extends Command
                             unlink($statusTemporary);
                         }
                     }
-                    $diagnostics?->phase('status_write', $phase);
+                    $phase = $diagnostics?->phase('status_write', $phase);
                     $this->line($claim->id.': '.$result->verdict.' — '.$result->reason);
                 } catch (Throwable $error) {
                     // Time spent in the phase that threw.
@@ -203,7 +203,7 @@ class VerifyReleaseCandidates extends Command
                         $diagnostics?->filtered();
                         $this->line($claim->id.': '.$filtered->verdict.' — '.$filtered->reason);
                     } else {
-                        $recovery = hrtime(true);
+                        $recovery = $diagnostics === null ? null : hrtime(true);
                         $repository->finish($claim, new VerificationResult('unknown', $error->getMessage()));
                         $diagnostics?->phase('finish', $recovery);
                         $diagnostics?->finished();
