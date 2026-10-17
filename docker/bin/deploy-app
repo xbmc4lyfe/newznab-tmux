@@ -36,11 +36,8 @@ fi
 # something that is not running, and a retry repeats only what did not complete.
 plan() { "$DIR/bin/deploy-plan" "$@"; }
 plan --invalidate
-# Record the rendered-Compose hash with what it triggers: after the migration when one runs (it
-# may be what requires migrating; a global fallback always migrates), otherwise now, since the
-# per-service records explain it and an interrupted run's retry must not become a full rollout.
-# The app services' own records were forgotten before they stopped, so a retry still redeploys them.
-[ "$MIGRATE" = 1 ] || plan --record effective
+# The rendered-Compose `effective` record covers only what no service record explains; a change to
+# it always migrates, so it is recorded together with the completed migration.
 
 # Stateless infrastructure first, while every writer still runs: a failing infra service aborts
 # here, before any drain, instead of after a full app rollout that would then repeat every poll.

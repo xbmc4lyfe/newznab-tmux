@@ -1173,6 +1173,34 @@ SH);
         $this->assertStringContainsString('compose --project-directory /persistent/runtime config --format json', $this->events());
     }
 
+    public function test_forced_rollout_starts_a_data_service_whose_container_is_gone(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'FORCE=1'], ['NNTMUX_NO_CONTAINER' => 'redis'])->mustRun();
+        $events = $this->events();
+        $this->assertMatchesRegularExpression('/ up -d --no-deps --wait --wait-timeout 240 [^\n]*redis/', $events);
+        $this->assertLessThan(strpos($events, 'artisan migrate'), strpos($events, ' stop web scheduler indexer'));
+    }
+
+    public function test_reverting_a_data_service_change_after_a_failed_drain_needs_no_rollout(): void
+    {
+        $base = json_decode($this->composeJson(), true);
+        $config = fn (string $image): array => ['NNTMUX_CONFIG_ID' => (string) json_encode(array_replace_recursive($base, ['services' => ['redis' => ['image' => $image]]]), JSON_UNESCAPED_SLASHES)];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('redis:7.4.1'))->mustRun();
+
+        $failed = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('redis:7.4.2') + ['NNTMUX_SCHEDULER_DRAIN_FAIL' => '1']);
+        $failed->run();
+        $this->assertSame(47, $failed->getExitCode());
+
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('redis:7.4.1'))->mustRun();
+        $events = $this->events();
+        $this->assertStringNotContainsString('drain', $events);
+        $this->assertStringNotContainsString('artisan migrate', $events);
+        $this->assertStringNotContainsString(' up -d', $events);
+    }
+
     public function test_host_system_paths_match_on_path_boundaries_only(): void
     {
         $script = 'import importlib.machinery, importlib.util, sys; l = importlib.machinery.SourceFileLoader("dp", sys.argv[1]); '

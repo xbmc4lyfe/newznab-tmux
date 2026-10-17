@@ -463,7 +463,6 @@ def get_compose_service_hashes(docker_dir: Path) -> tuple[str, dict[str, str]]:
         sys.exit(proc.returncode or 1)
     raw = proc.stdout.strip()
     context_meta = f"{os.environ.get('DC', '')}\n{os.environ.get('DOCKER_CONTEXT', '')}\n{os.environ.get('DOCKER_HOST', '')}"
-    global_hash = sha256_text(f"{raw}\n{context_meta}")
     per_service: dict[str, str] = {}
     project_dir = project_directory(docker_dir)
     try:
@@ -486,6 +485,10 @@ def get_compose_service_hashes(docker_dir: Path) -> tuple[str, dict[str, str]]:
                     per_service[svc] = sha256_text(svc_json)
                 else:
                     per_service[svc] = "absent"
+            # The residual: everything no per-service record explains (top-level sections, the
+            # Compose command text and context). Per-service changes are tracked per service.
+            residual = {key: value for key, value in parsed.items() if key != "services"}
+            global_hash = sha256_text(f"{json.dumps(residual, sort_keys=True)}\n{context_meta}")
             return global_hash, per_service
     except (ValueError, TypeError):
         pass
@@ -555,10 +558,11 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
         if Path(config_cmd).name == "deploy-current":
             # Mounted configuration contents are not part of the rendered Compose text; fold them in
             # so a changed bind-mounted file is never skipped as an unchanged deployment.
-            _, per_service_compose = get_compose_service_hashes(docker_dir)
+            residual_hash, per_service_compose = get_compose_service_hashes(docker_dir)
             compose_rendered = True
             mounted = json.dumps(per_service_compose, sort_keys=True)
             fingerprint_effective = sha256_text(f"{effective_hash}\n{mounted}")
+            effective_hash = residual_hash
         elif include_compose:
             per_service_compose = {svc: effective_hash for svc in ALL_SERVICES}
     elif include_compose:
@@ -588,14 +592,14 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
         deploy_hash = sha256_text(f"{build_hash}\n{app_env_hash}\n{per_service_compose[svc]}")
         state[f"build:{svc}"] = build_hash
         state[f"service:{svc}"] = deploy_hash
+        state[f"compose:{svc}"] = per_service_compose[svc]
 
     extra_infra = sorted(set(per_service_compose) - set(ALL_SERVICES)) if compose_rendered else []
     for svc in (*DATA_SERVICES, *INFRA_SERVICES, *extra_infra):
         svc_files_hash = sha256_text("\n".join(buckets.get(svc, [])))
         deploy_hash = sha256_text(f"{svc_files_hash}\n{per_service_compose[svc]}")
         state[f"service:{svc}"] = deploy_hash
-        if per_service_compose[svc] == "absent":
-            state[f"compose:{svc}"] = "absent"
+        state[f"compose:{svc}"] = per_service_compose[svc]
 
     return state
 
@@ -893,9 +897,10 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
     for svc in DATA_SERVICES:
         if not compose_present(state, svc):
             data_reasons[svc] = "not rendered"
-        elif not force and not container_exists(docker_dir, svc):
-            # No container at all: no writer can be using it, so it starts without a quiesce.
-            start_data.append(svc)
+        elif not container_exists(docker_dir, svc):
+            # No container at all: no writer can be using it, so it starts without a quiesce (under
+            # FORCE=1 every writer is stopped anyway, so it is reconciled after they stop).
+            (reconcile_data if force else start_data).append(svc)
             data_reasons[svc] = "start (no container)"
         elif (no_record := (
             first_deploy or legacy_stamp or f"service:{svc}" not in stamped
@@ -950,15 +955,19 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
     )
     for svc in removed:
         (data_reasons if svc in DATA_SERVICES else infra_reasons)[svc] = "removed from Compose"
-    global_fallback = (
-        compose_global_changed and not dirty_app and not dirty_data and not dirty_infra and not reconciling and not removed
-    )
+    # A residual change (top-level Compose sections, the Compose command or context) is explained by
+    # no service record: redeploy every app service and migrate.
+    global_fallback = compose_global_changed
     if global_fallback:
         for svc in APP_SERVICES:
-            dirty_app.append(svc)
-            app_reasons[svc] = "compose config changed"
-    # If all 4 app services changed due to a global compose config change, run migrations too
-    all_app_compose_changed = compose_global_changed and len(dirty_app) == len(APP_SERVICES)
+            if svc not in dirty_app:
+                dirty_app.append(svc)
+                app_reasons[svc] = "compose config changed"
+    # A Compose change to all four app services (e.g. a database cutover) migrates too. Only recorded
+    # app definitions count: a forgotten record means the migration record decides.
+    all_app_compose_changed = global_fallback or all(
+        f"compose:{svc}" in stamped and stamped[f"compose:{svc}"] != state[f"compose:{svc}"] for svc in APP_SERVICES
+    )
 
     migrate = (
         force
