@@ -11,7 +11,7 @@ use Illuminate\Support\Facades\DB;
 /**
  * Candidates recorded before header_rejected existed keep retrying as unknown. Move those whose
  * current reason is a header defect out of the claim queue, in short primary-key ranges, skipping
- * any a worker holds.
+ * any a worker holds and any newly admitted version still awaiting its first check.
  */
 class ReclassifyHeaderRejections extends Command
 {
@@ -42,7 +42,7 @@ class ReclassifyHeaderRejections extends Command
     private function reclassify(int $after, int $through): int
     {
         $query = DB::table('release_verification_candidates')->where('id', '>', $after)->where('id', '<=', $through)
-            ->where('status', 'unknown')->whereNull('release_id')->whereNull('lease_token')
+            ->where('status', 'unknown')->whereNull('release_id')->whereNull('lease_token')->where('header_check_pending', false)
             ->whereIn('reason', CandidateHeaderInventory::REJECTION_REASONS);
         if (! in_array(DB::getDriverName(), ['mysql', 'mariadb'], true)) {
             return $query->update(['status' => CandidateHeaderInventory::REJECTED]);
@@ -59,7 +59,7 @@ class ReclassifyHeaderRejections extends Command
             $table = DB::raw($connection->getQueryGrammar()->wrapTable('release_verification_candidates').' FORCE INDEX (PRIMARY)');
 
             return $connection->table($table)->whereIn('id', $ids)->where('status', 'unknown')->whereNull('release_id')
-                ->whereNull('lease_token')->update(['status' => CandidateHeaderInventory::REJECTED]);
+                ->whereNull('lease_token')->where('header_check_pending', false)->update(['status' => CandidateHeaderInventory::REJECTED]);
         }, 3);
     }
 }

@@ -128,7 +128,7 @@ final class CandidateRepository
                 if ($changed || $dirty) {
                     $assessment = $headerAssessment ?? (new CandidateHeaderInventory)->assessment($manifest);
                     $values += ['version' => (int) ($existing->version ?? 0) + 1, 'last_unique_at' => $lastUniqueAt,
-                        'next_attempt_at' => now(), 'status' => self::admittedStatus($assessment['status']), 'lease_token' => null, 'lease_until' => null, 'reason' => $assessment['reason']];
+                        'next_attempt_at' => now(), 'status' => self::admittedStatus($assessment['status']), 'header_check_pending' => $assessment['status'] === CandidateHeaderInventory::REJECTED, 'lease_token' => null, 'lease_until' => null, 'reason' => $assessment['reason']];
                 }
                 if ($expired) {
                     $values = array_replace($values, ['status' => 'expired', 'last_unique_at' => $lastUniqueAt,
@@ -278,7 +278,7 @@ final class CandidateRepository
                     $values = ['identity' => $identity, 'source_identity' => $identity,
                         'groups_id' => (int) $manifest['groups_id'], 'manifest_path' => $path, 'manifest_bytes' => $bytes,
                         'manifest_hash' => substr($path, 0, 64), 'last_unique_at' => now(), 'next_attempt_at' => now(),
-                        'version' => (int) ($existing->version ?? 0) + 1, 'status' => self::admittedStatus($assessment['status']), 'reason' => $assessment['reason'],
+                        'version' => (int) ($existing->version ?? 0) + 1, 'status' => self::admittedStatus($assessment['status']), 'header_check_pending' => $assessment['status'] === CandidateHeaderInventory::REJECTED, 'reason' => $assessment['reason'],
                         'release_id' => null, 'verified_at' => null, 'lease_token' => null, 'lease_until' => null];
                     if ($existing === null) {
                         try {
@@ -439,7 +439,7 @@ final class CandidateRepository
         }
         DB::table('release_verification_candidates')->where('id', $existing->id)->update([
             'manifest_path' => $path, 'manifest_hash' => substr($path, 0, 64), 'manifest_bytes' => $bytes,
-            'version' => (int) $existing->version + 1, 'status' => self::admittedStatus($assessment['status']), 'reason' => $assessment['reason'],
+            'version' => (int) $existing->version + 1, 'status' => self::admittedStatus($assessment['status']), 'header_check_pending' => $assessment['status'] === CandidateHeaderInventory::REJECTED, 'reason' => $assessment['reason'],
             'next_attempt_at' => now(), 'lease_token' => null, 'lease_until' => null,
         ]);
         DB::afterCommit(function () use ($existing): void {
@@ -794,7 +794,8 @@ final class CandidateRepository
         DB::table('release_verification_candidates')->where('id', $claim->id)->where('lease_token', $claim->lease_token)
             ->where('version', $claim->version)->update(['status' => $result->waitingForHeaders ? 'waiting_upload'
                 : ($result->headerRejected ? CandidateHeaderInventory::REJECTED : ($result->verdict === 'unrepairable' ? 'unrepairable' : 'unknown')), 'reason' => mb_strcut($result->reason, 0, 2000, 'UTF-8'),
-                'lease_token' => null, 'lease_until' => null, 'next_attempt_at' => now()->addSeconds((int) config('release_verification.retry_seconds'))]);
+                'lease_token' => null, 'lease_until' => null, 'header_check_pending' => false,
+                'next_attempt_at' => now()->addSeconds((int) config('release_verification.retry_seconds'))]);
     }
 
     public function rejectByPolicy(object $claim, string $reason): void

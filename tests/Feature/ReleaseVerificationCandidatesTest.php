@@ -8,6 +8,7 @@ use App\Enums\NzbImportStatus;
 use App\Services\Nzb\NzbImportService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
+use App\Services\Releases\Verification\VerificationResult;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
@@ -24,6 +25,7 @@ class ReleaseVerificationCandidatesTest extends TestCase
         $this->configureVerificationDatabase();
         $migration = require database_path('migrations/2026_10_11_154028_create_release_verification_candidates_table.php');
         $migration->up();
+        (require database_path('migrations/2026_10_17_220000_add_header_check_pending_to_release_verification_candidates.php'))->up();
         (require database_path('migrations/2026_10_12_004819_create_release_verification_scratch_table.php'))->up();
         (require database_path('migrations/2026_10_12_053000_add_shared_verification_scratch_budget.php'))->up();
         (require database_path('migrations/2026_10_11_175742_create_release_verification_audit_retries_table.php'))->up();
@@ -173,6 +175,36 @@ class ReleaseVerificationCandidatesTest extends TestCase
         $this->assertSame((int) $before->version + 1, (int) $after->version);
         // The merged inventory is reassessed; this one still awaits its second file.
         $this->assertSame('waiting_upload', $after->status);
+    }
+
+    public function test_the_header_rejection_backfill_leaves_a_fresh_defective_version_to_its_first_check(): void
+    {
+        $repository = app(CandidateRepository::class);
+        $repository->archive($this->collection('a@b'));
+        // A checked legacy row and a freshly admitted defective version share the same reason.
+        $reason = 'Invalid or duplicate article reference in candidate headers.';
+        DB::table('release_verification_candidates')->update(['status' => 'unknown', 'reason' => $reason, 'header_check_pending' => false]);
+        DB::table('release_verification_candidates')->insert(['identity' => sha1('fresh-defect'), 'groups_id' => 1, 'manifest_path' => '',
+            'manifest_bytes' => 0, 'manifest_hash' => str_repeat('0', 64), 'status' => 'unknown', 'reason' => $reason,
+            'header_check_pending' => true, 'last_unique_at' => now(), 'next_attempt_at' => now()]);
+
+        $this->artisan('releases:reclassify-header-rejections')->assertSuccessful();
+
+        $this->assertSame(['header_rejected', 'unknown'], DB::table('release_verification_candidates')->orderBy('id')->pluck('status')->all());
+        $fresh = $repository->claim();
+        $this->assertNotNull($fresh);
+        $repository->finish($fresh, new VerificationResult('unknown', $reason, headerRejected: true));
+        $this->assertFalse((bool) DB::table('release_verification_candidates')->where('id', $fresh->id)->value('header_check_pending'));
+    }
+
+    public function test_admitting_a_defective_version_marks_its_first_check_pending(): void
+    {
+        $repository = app(CandidateRepository::class);
+        $repository->enqueue(['identity' => sha1('defective-admission'), 'groups_id' => 1, 'files' => []]);
+
+        $row = DB::table('release_verification_candidates')->sole();
+        $this->assertSame('unknown', $row->status);
+        $this->assertTrue((bool) $row->header_check_pending);
     }
 
     public function test_duplicate_arrivals_do_not_extend_expiry(): void
