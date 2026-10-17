@@ -57,12 +57,18 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
         $result = $collector->collect($release);
         $encodedMetadata = json_encode($result['data'], JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR);
         $safeMetadata = json_decode($encodedMetadata, true, 512, JSON_THROW_ON_ERROR);
-        $record->update([
+        // Only a run that still owns the record may save: an in-place partial upgrade marks it stale
+        // mid-run, and its own dispatch was dropped by this job's unique lock.
+        $saved = ReleaseFingerprintMetadata::query()->whereKey($record->getKey())->where('status', 'processing')->update([
             'status' => $result['status'],
-            'metadata' => $safeMetadata,
+            // A builder update skips the model's array cast.
+            'metadata' => json_encode($safeMetadata, JSON_THROW_ON_ERROR),
             'last_error' => $result['status'] === 'unavailable' ? ($result['data']['reason'] ?? 'NZB unavailable.') : null,
             'collected_at' => now(),
         ]);
+        if ($saved === 0) {
+            $this->release(30);
+        }
     }
 
     public function failed(?Throwable $exception): void

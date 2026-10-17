@@ -340,6 +340,8 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertNotSame($previous->identity, $rows[1]->identity);
 
         $guid = DB::table('releases')->where('id', $first)->value('guid');
+        // Post-processing already ran on the smaller NZB.
+        DB::table('releases')->where('id', $first)->update(['haspreview' => 0, 'nfostatus' => 0]);
         $upgraded = $this->publishStalledPartial(null);
 
         $this->assertSame($first, $upgraded, 'The partial is upgraded in place, keeping its id and GUID.');
@@ -348,6 +350,8 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $nzb = (string) app(NzbService::class)->readNzbContents($guid);
         $this->assertStringContainsString('a@b', $nzb);
         $this->assertStringContainsString('c@d', $nzb, 'Its NZB now carries the late article.');
+        $this->assertSame([-1, -1], [(int) DB::table('releases')->where('id', $first)->value('haspreview'),
+            (int) DB::table('releases')->where('id', $first)->value('nfostatus')], 'Post-processing reruns on the upgraded NZB.');
         $this->assertSame(1, DB::table('releases')->count());
         $this->assertSame([$first, $first], DB::table('release_verification_candidates')->orderBy('id')->pluck('release_id')->map(fn ($id): int => (int) $id)->all());
     }

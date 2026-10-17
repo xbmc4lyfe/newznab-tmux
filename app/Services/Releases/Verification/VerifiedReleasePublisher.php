@@ -17,6 +17,7 @@ use App\Services\Releases\ReleaseGroupResolver;
 use App\Support\NzbPasswordMetadata;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use RuntimeException;
 use Throwable;
@@ -428,7 +429,12 @@ final class VerifiedReleasePublisher
         $partial = $manifest['partial'] ?? null;
         DB::table('releases')->where('id', $id)->update(['size' => $size, 'totalpart' => $totalParts,
             'articles_found' => $partial['articles_found'] ?? null, 'articles_expected' => $partial['articles_expected'] ?? null,
-            'files_found' => $partial['files_found'] ?? null, 'files_expected' => $partial['files_expected'] ?? null]);
+            'files_found' => $partial['files_found'] ?? null, 'files_expected' => $partial['files_expected'] ?? null]
+            + $this->freshPostProcessingState());
+        // Metadata collected from the smaller NZB is stale; a run in flight sees this and re-queues itself.
+        if (Schema::hasTable('release_fingerprint_metadata')) {
+            DB::table('release_fingerprint_metadata')->where('releases_id', $id)->update(['status' => 'stale']);
+        }
         ReleaseArticleFingerprintStore::store($id, $this->incomingFingerprint($manifest));
         $timing?->nextPhase('final_xml_gzip');
         $receipt = $this->writer->writeWithReceipt($manifest, (string) $release->guid, $release, $timing, replace: true);
@@ -447,6 +453,22 @@ final class VerifiedReleasePublisher
         });
 
         return $id;
+    }
+
+    /**
+     * Post-processing state as a new release starts with: everything derived from the smaller NZB
+     * (completion, NFO, previews, archives, PAR2 renaming) must be redone on the upgraded one.
+     *
+     * @return array<string, int|null>
+     */
+    private function freshPostProcessingState(): array
+    {
+        $state = ['completion' => 0, 'passwordstatus' => config('nntmux_settings.check_passworded_rars') === true ? -1 : 0,
+            'haspreview' => -1, 'nfostatus' => -1, 'jpgstatus' => 0, 'videostatus' => 0, 'proc_pp' => 0, 'proc_par2' => 0,
+            'proc_nfo' => 0, 'proc_files' => 0, 'proc_uid' => 0, 'proc_srr' => 0, 'proc_hash16k' => 0, 'proc_crc32' => 0,
+            'pp_timeout_count' => 0, 'archive_retry_at' => null];
+
+        return array_intersect_key($state, array_flip(Schema::getColumnListing('releases')));
     }
 
     private function markPublished(int $candidateId, int $releaseId, VerificationResult $result, bool $retainManifest = false): void
