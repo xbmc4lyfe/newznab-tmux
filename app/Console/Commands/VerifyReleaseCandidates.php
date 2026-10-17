@@ -10,6 +10,7 @@ use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\LeaseHeartbeat;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\NntpArticleSource;
+use App\Services\Releases\Verification\RemoteReleasePublisher;
 use App\Services\Releases\Verification\ScratchBudget;
 use App\Services\Releases\Verification\ScratchInventory;
 use App\Services\Releases\Verification\SpotCheckVerifier;
@@ -78,6 +79,7 @@ class VerifyReleaseCandidates extends Command
         }
         $diagnostics?->workerAcquired();
         try {
+            $scratchBudget->join($locks);
             if (! $this->scratchRootIsSafe($root.'/scratch')) {
                 $diagnostics?->stop('unsafe_scratch_root', hrtime(true));
                 $this->error('Verification scratch root must be an accessible directory, not a symlink.');
@@ -94,11 +96,13 @@ class VerifyReleaseCandidates extends Command
                     $expiryFirst = $locks->preferExpiry();
                     $maintenanceDeadline = hrtime(true) + 5_000_000_000;
                     $mayMaintain = static fn (): bool => hrtime(true) < $maintenanceDeadline;
-                    if ($expiryFirst) {
+                    // Each host cleans its own scratch; expiry is shared, so another host may hold it.
+                    $expire = $locks->tryExpiry();
+                    if ($expiryFirst && $expire) {
                         $repository->expire($mayMaintain);
-                        $this->cleanupTerminalScratch($root, $locks, $mayMaintain);
-                    } else {
-                        $this->cleanupTerminalScratch($root, $locks, $mayMaintain);
+                    }
+                    $this->cleanupTerminalScratch($root, $locks, $mayMaintain);
+                    if (! $expiryFirst && $expire) {
                         $repository->expire($mayMaintain);
                     }
                     $maintenanceSuccessful = true;
@@ -116,22 +120,38 @@ class VerifyReleaseCandidates extends Command
                     $diagnostics?->stop('deadline', hrtime(true));
                     break;
                 }
-                $preferReady = $locks->preferReady();
-                $diagnostics?->claimCalled();
-                $claim = $repository->claim(fn (int $id): bool => $locks->tryCandidate($id), $preferReady);
+                // Database locks end with their session; stop rather than run unprotected.
+                if (! $locks->held()) {
+                    throw new RuntimeException('Verification worker locks were lost.');
+                }
+                if (! $locks->admitting()) {
+                    $diagnostics?->stop('draining', hrtime(true));
+                    break;
+                }
+                $phase = $diagnostics === null ? null : hrtime(true);
+                try {
+                    $preferReady = $locks->preferReady();
+                    $diagnostics?->claimCalled();
+                    $claim = $repository->claim(fn (int $id): bool => $locks->tryCandidate($id), $preferReady);
+                } finally {
+                    // Also on a throwing claim, which the outer handler reports as fatal.
+                    $diagnostics?->phase('claim', $phase);
+                }
                 if ($claim === null) {
                     $diagnostics?->stop('no_claim', hrtime(true));
                     break;
                 }
                 $diagnostics?->claimed();
                 $directory = $root.'/scratch/'.$claim->id.'-'.$claim->version;
+                // The phase charged if an operation throws.
+                $active = 'bookkeeping';
                 try {
+                    $phase = $diagnostics === null ? null : hrtime(true);
                     $heartbeat = static fn () => $repository->heartbeat((int) $claim->id, $claim->lease_token);
                     $heartbeat();
                     $progressHeartbeat = new LeaseHeartbeat($heartbeat, max(0.1, min(30, (int) config('release_verification.lease_seconds') / 3)));
                     $scratchInventory->register((int) $claim->id, (int) $claim->version);
-                    $scratchEntryId = (int) DB::table('release_verification_scratch')->where('candidate_id', $claim->id)
-                        ->where('version', $claim->version)->value('id');
+                    $scratchEntryId = $scratchInventory->entryId((int) $claim->id, (int) $claim->version);
                     $scratchBudget->reconcile($scratchEntryId, $locks, $progressHeartbeat);
                     $verificationOptions = (array) config('release_verification');
                     $source ??= new NntpArticleSource(app(NNTPService::class), decoder: $decoder,
@@ -149,12 +169,20 @@ class VerifyReleaseCandidates extends Command
                         $scratchInventory->forget((int) $old->id);
                     }
                     $heartbeat();
+                    $phase = $diagnostics?->phase('bookkeeping', $phase);
+                    $active = 'manifest_read';
                     $manifest = $store->read($claim->manifest_path);
+                    $phase = $diagnostics?->phase('manifest_read', $phase);
+                    $active = 'verify_other';
                     $started = microtime(true);
                     $result = $verifier->verify($manifest, $progressHeartbeat);
+                    $phase = $diagnostics?->phase($result->passed() ? 'verify_passed' : 'verify_other', $phase);
+                    $active = $result->passed() ? 'publish' : 'finish';
                     $diagnostics?->verified($result->verdict);
                     if ($result->passed()) {
-                        if ($publisher->publish($claim, $result) === null) {
+                        $published = config('release_verification.publish_url')
+                            ? app(RemoteReleasePublisher::class)->publish($claim, $result) : $publisher->publish($claim, $result);
+                        if ($published === null) {
                             $result = $this->filteredResult($claim) ?? throw new RuntimeException('Publication did not produce a verified current release.');
                             $diagnostics?->filtered();
                         } else {
@@ -163,10 +191,15 @@ class VerifyReleaseCandidates extends Command
                         if (File::deleteDirectory($directory) || (! file_exists($directory) && ! is_link($directory))) {
                             $scratchInventory->forget($scratchEntryId);
                         }
+                        // Publication includes its filtered-result recovery and scratch removal.
+                        $phase = $diagnostics?->phase('publish', $phase);
                     } else {
                         $repository->finish($claim, $result);
+                        $phase = $diagnostics?->phase('finish', $phase);
                         $diagnostics?->finished();
                     }
+                    $phase = $diagnostics === null ? null : hrtime(true);
+                    $active = 'status_write';
                     $bytes = $result->passed()
                         ? (int) ($result->manifest['spot_check']['bytes'] ?? $result->manifest['verified_bytes'] ?? 0) : 0;
                     $snapshot = json_encode(['verified_bytes_per_second' => $bytes / max(0.001, microtime(true) - $started),
@@ -181,15 +214,26 @@ class VerifyReleaseCandidates extends Command
                             unlink($statusTemporary);
                         }
                     }
+                    $phase = $diagnostics?->phase('status_write', $phase);
+                    $active = null;
                     $this->line($claim->id.': '.$result->verdict.' — '.$result->reason);
                 } catch (Throwable $error) {
+                    // Time spent in the operation that threw, under its own phase.
+                    if ($active !== null) {
+                        $diagnostics?->phase($active, $phase);
+                    }
                     $diagnostics?->candidateFailed();
                     $filtered = $this->filteredResult($claim);
                     if ($filtered !== null) {
                         $diagnostics?->filtered();
                         $this->line($claim->id.': '.$filtered->verdict.' — '.$filtered->reason);
                     } else {
-                        $repository->finish($claim, new VerificationResult('unknown', $error->getMessage()));
+                        $recovery = $diagnostics === null ? null : hrtime(true);
+                        try {
+                            $repository->finish($claim, new VerificationResult('unknown', $error->getMessage()));
+                        } finally {
+                            $diagnostics?->phase('finish', $recovery);
+                        }
                         $diagnostics?->finished();
                         $this->warn($claim->id.': retry pending — '.$error->getMessage());
                     }
@@ -236,9 +280,11 @@ class VerifyReleaseCandidates extends Command
         $after = max(0, (int) ($cursor['after'] ?? 0));
         $ceiling = max(0, (int) ($cursor['ceiling'] ?? 0));
         if ($ceiling === 0) {
-            $ceiling = (int) DB::table('release_verification_scratch')->max('id');
+            $ceiling = (int) DB::table('release_verification_scratch')->where('host', ScratchInventory::host())->max('id');
         }
-        $entries = DB::table('release_verification_scratch')->where('id', '>', $after)->where('id', '<=', $ceiling)
+        // Another host's directories are not here; only their owner can prove them absent.
+        $entries = DB::table('release_verification_scratch')->where('host', ScratchInventory::host())
+            ->where('id', '>', $after)->where('id', '<=', $ceiling)
             ->orderBy('id')->limit(100)->get();
         if ($entries->isEmpty() && $ceiling === 0) {
             return;
@@ -270,8 +316,9 @@ class VerifyReleaseCandidates extends Command
                 if (! file_exists($directory) && ! is_link($directory)) {
                     app(ScratchInventory::class)->forget((int) $entry->id);
                 } elseif (is_dir($directory) && ! is_link($directory)) {
+                    // A reset marks the scratch records it keeps for other hosts terminal.
                     $terminal = $entry->audit_release_id !== null ? (bool) $entry->terminal
-                        : DB::table('release_verification_candidates')->where('id', $entry->candidate_id)
+                        : (bool) $entry->terminal || DB::table('release_verification_candidates')->where('id', $entry->candidate_id)
                             ->where('version', '>=', $entry->version)
                             ->where(function ($query): void {
                                 $query->whereIn('status', ['expired', 'filtered', 'metadata_review', 'metadata_deferred', 'metadata_expired'])

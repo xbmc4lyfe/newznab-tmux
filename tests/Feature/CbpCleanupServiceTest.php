@@ -309,6 +309,7 @@ class CbpCleanupServiceTest extends TestCase
         $this->verificationDirectory = sys_get_temp_dir().'/nntmux-cleanup-'.bin2hex(random_bytes(12));
         config(['release_verification.required' => true, 'release_verification.storage_path' => $this->verificationDirectory]);
         (require database_path('migrations/2026_10_11_154028_create_release_verification_candidates_table.php'))->up();
+        (require database_path('migrations/2026_10_17_220000_add_header_check_pending_to_release_verification_candidates.php'))->up();
         DB::statement('ALTER TABLE binaries ADD COLUMN binaryhash VARCHAR(255)');
     }
 

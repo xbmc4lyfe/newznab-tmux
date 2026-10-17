@@ -128,7 +128,7 @@ final class CandidateRepository
                 if ($changed || $dirty) {
                     $assessment = $headerAssessment ?? (new CandidateHeaderInventory)->assessment($manifest);
                     $values += ['version' => (int) ($existing->version ?? 0) + 1, 'last_unique_at' => $lastUniqueAt,
-                        'next_attempt_at' => now(), 'status' => $assessment['status'], 'lease_token' => null, 'lease_until' => null, 'reason' => $assessment['reason']];
+                        'next_attempt_at' => now(), 'status' => self::admittedStatus($assessment['status']), 'header_check_pending' => $assessment['status'] === CandidateHeaderInventory::REJECTED, 'lease_token' => null, 'lease_until' => null, 'reason' => $assessment['reason']];
                 }
                 if ($expired) {
                     $values = array_replace($values, ['status' => 'expired', 'last_unique_at' => $lastUniqueAt,
@@ -278,7 +278,7 @@ final class CandidateRepository
                     $values = ['identity' => $identity, 'source_identity' => $identity,
                         'groups_id' => (int) $manifest['groups_id'], 'manifest_path' => $path, 'manifest_bytes' => $bytes,
                         'manifest_hash' => substr($path, 0, 64), 'last_unique_at' => now(), 'next_attempt_at' => now(),
-                        'version' => (int) ($existing->version ?? 0) + 1, 'status' => $assessment['status'], 'reason' => $assessment['reason'],
+                        'version' => (int) ($existing->version ?? 0) + 1, 'status' => self::admittedStatus($assessment['status']), 'header_check_pending' => $assessment['status'] === CandidateHeaderInventory::REJECTED, 'reason' => $assessment['reason'],
                         'release_id' => null, 'verified_at' => null, 'lease_token' => null, 'lease_until' => null];
                     if ($existing === null) {
                         try {
@@ -392,7 +392,7 @@ final class CandidateRepository
             return ! in_array($existing->status, ['metadata_deferred', 'metadata_review', 'metadata_expired'], true);
         }
         if ($existing->release_id !== null || $existing->manifest_path === ''
-            || ! in_array($existing->status, ['ready', 'waiting_upload', 'pending', 'unknown', 'verifying', 'metadata_deferred'], true)
+            || ! in_array($existing->status, ['ready', 'waiting_upload', 'pending', 'unknown', 'header_rejected', 'verifying', 'metadata_deferred'], true)
             || ($manifest['metadata_source'] ?? null) !== 'import' || ($manifest['conflict'] ?? false)) {
             return false;
         }
@@ -439,7 +439,7 @@ final class CandidateRepository
         }
         DB::table('release_verification_candidates')->where('id', $existing->id)->update([
             'manifest_path' => $path, 'manifest_hash' => substr($path, 0, 64), 'manifest_bytes' => $bytes,
-            'version' => (int) $existing->version + 1, 'status' => $assessment['status'], 'reason' => $assessment['reason'],
+            'version' => (int) $existing->version + 1, 'status' => self::admittedStatus($assessment['status']), 'header_check_pending' => $assessment['status'] === CandidateHeaderInventory::REJECTED, 'reason' => $assessment['reason'],
             'next_attempt_at' => now(), 'lease_token' => null, 'lease_until' => null,
         ]);
         DB::afterCommit(function () use ($existing): void {
@@ -485,6 +485,15 @@ final class CandidateRepository
         sort($ids);
 
         return hash('sha256', implode("\n", $ids));
+    }
+
+    /**
+     * A new version with header defects is claimed once; its verifier or the preparer then moves it
+     * out of the claim queue instead of retrying it every retry interval.
+     */
+    private static function admittedStatus(string $status): string
+    {
+        return $status === CandidateHeaderInventory::REJECTED ? 'unknown' : $status;
     }
 
     public function capacityAvailable(): bool
@@ -636,7 +645,7 @@ final class CandidateRepository
             return;
         }
         $ids = DB::table('release_verification_candidates')->whereNull('release_id')
-            ->whereIn('status', ['ready', 'waiting_upload', 'pending', 'unknown', 'unrepairable', 'verifying', 'dirty', 'metadata_deferred', 'metadata_review'])
+            ->whereIn('status', ['ready', 'waiting_upload', 'pending', 'unknown', 'header_rejected', 'unrepairable', 'verifying', 'dirty', 'metadata_deferred', 'metadata_review'])
             ->where('last_unique_at', '<', now()->subHours((int) config('release_verification.expiry_hours')))
             ->where(fn ($q) => $q->whereNull('lease_until')->orWhere('lease_until', '<', now()))
             ->orderBy('id')->limit(100)->pluck('id');
@@ -648,7 +657,7 @@ final class CandidateRepository
                 $this->ledger->enter();
                 $row = DB::table('release_verification_candidates')->where('id', $id)->lockForUpdate()->first();
                 if ($row === null || $row->release_id !== null
-                    || ! in_array($row->status, ['ready', 'waiting_upload', 'pending', 'unknown', 'unrepairable', 'verifying', 'dirty', 'metadata_deferred', 'metadata_review'], true)
+                    || ! in_array($row->status, ['ready', 'waiting_upload', 'pending', 'unknown', 'header_rejected', 'unrepairable', 'verifying', 'dirty', 'metadata_deferred', 'metadata_review'], true)
                     || $row->last_unique_at >= now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s')
                     || ($row->lease_until !== null && $row->lease_until >= now()->format('Y-m-d H:i:s'))) {
                     return;
@@ -783,8 +792,10 @@ final class CandidateRepository
     public function finish(object $claim, VerificationResult $result): void
     {
         DB::table('release_verification_candidates')->where('id', $claim->id)->where('lease_token', $claim->lease_token)
-            ->where('version', $claim->version)->update(['status' => $result->waitingForHeaders ? 'waiting_upload' : ($result->verdict === 'unrepairable' ? 'unrepairable' : 'unknown'), 'reason' => mb_strcut($result->reason, 0, 2000, 'UTF-8'),
-                'lease_token' => null, 'lease_until' => null, 'next_attempt_at' => now()->addSeconds((int) config('release_verification.retry_seconds'))]);
+            ->where('version', $claim->version)->update(['status' => $result->waitingForHeaders ? 'waiting_upload'
+                : ($result->headerRejected ? CandidateHeaderInventory::REJECTED : ($result->verdict === 'unrepairable' ? 'unrepairable' : 'unknown')), 'reason' => mb_strcut($result->reason, 0, 2000, 'UTF-8'),
+                'lease_token' => null, 'lease_until' => null, 'header_check_pending' => false,
+                'next_attempt_at' => now()->addSeconds((int) config('release_verification.retry_seconds'))]);
     }
 
     public function rejectByPolicy(object $claim, string $reason): void

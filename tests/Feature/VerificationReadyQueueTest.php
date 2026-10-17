@@ -232,14 +232,15 @@ class VerificationReadyQueueTest extends ReleaseVerificationCandidatesTest
             }
         });
         $this->assertSame(7, app(CandidatePreparationService::class)->prepare(7, 30));
-        $this->assertSame(['waiting_upload', 'waiting_upload', 'ready', 'unknown', 'waiting_upload'], $updates);
+        $this->assertSame(['waiting_upload', 'waiting_upload', 'ready', 'header_rejected', 'waiting_upload'], $updates);
         $rows = DB::table('release_verification_candidates')->orderBy('id')->get();
         $this->assertSame($rows[0]->reason, $rows[1]->reason);
         $this->assertSame($rows[2]->reason, $rows[3]->reason);
         $this->assertNotSame($rows[0]->reason, $rows[2]->reason);
         $this->assertSame('old reason', $rows[4]->reason);
         $this->assertSame($originalRetry, $rows[4]->next_attempt_at);
-        $this->assertSame(now()->addSeconds((int) config('release_verification.retry_seconds'))->format('Y-m-d H:i:s'), $rows[5]->next_attempt_at);
+        // A header defect leaves the claim queue rather than being retried after retry_seconds.
+        $this->assertSame('header_rejected', $rows[5]->status);
     }
 
     public function test_late_header_archival_promotes_the_merged_inventory_and_preserves_every_article(): void
@@ -542,8 +543,8 @@ class VerificationReadyQueueTest extends ReleaseVerificationCandidatesTest
         $this->assertCount(1, $reports);
         $report = $reports[0];
         $this->assertSame(4, $report['inspected']);
-        $this->assertSame(['ready' => 1, 'waiting_upload' => 1, 'unknown' => 1], $report['assessments']);
-        $this->assertSame(['ready' => 1, 'waiting_upload' => 1, 'unknown' => 2], $report['updated']);
+        $this->assertSame(['ready' => 1, 'waiting_upload' => 1, 'unknown' => 0, 'header_rejected' => 1], $report['assessments']);
+        $this->assertSame(['ready' => 1, 'waiting_upload' => 1, 'unknown' => 1, 'header_rejected' => 1], $report['updated']);
         $this->assertSame(1, $report['ready_promotions']);
         $this->assertSame(1, $report['read_assessment_failures']);
         $this->assertSame(0, $report['zero_row_updates']);

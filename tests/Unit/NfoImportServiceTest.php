@@ -84,6 +84,7 @@ final class NfoImportServiceTest extends TestCase
         config(['release_verification.required' => true, 'nntmux.release_dedupe_enabled' => true, 'nntmux.echocli' => false,
             'release_verification.storage_path' => $this->uploadFolder.'/verification']);
         (require database_path('migrations/2026_10_11_154028_create_release_verification_candidates_table.php'))->up();
+        (require database_path('migrations/2026_10_17_220000_add_header_check_pending_to_release_verification_candidates.php'))->up();
         (require database_path('migrations/2026_10_15_034000_create_nfo_cleanup_commits_table.php'))->up();
         Schema::create('usenet_groups', static function (Blueprint $table): void {
             $table->id();

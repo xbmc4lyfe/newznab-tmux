@@ -23,6 +23,7 @@ class ManifestDatabaseStorageTest extends TestCase
         mkdir($this->directory.'/manifests', 0700, true);
         config(['release_verification.storage_path' => $this->directory, 'release_verification.manifest_storage' => 'database']);
         (require database_path('migrations/2026_10_11_154028_create_release_verification_candidates_table.php'))->up();
+        (require database_path('migrations/2026_10_17_220000_add_header_check_pending_to_release_verification_candidates.php'))->up();
         (require database_path('migrations/2026_10_17_000000_create_release_verification_manifests_table.php'))->up();
         (require database_path('migrations/2026_10_17_120000_create_release_verification_locks_table.php'))->up();
         (require database_path('migrations/2026_10_17_180000_add_release_verification_publication_stripes.php'))->up();
