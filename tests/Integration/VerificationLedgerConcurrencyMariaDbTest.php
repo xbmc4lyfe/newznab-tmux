@@ -6,6 +6,7 @@ namespace Tests\Integration;
 
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
+use App\Services\Releases\Verification\ScratchBudget;
 use App\Services\Releases\Verification\VerificationLedger;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
@@ -53,7 +54,8 @@ final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
         DB::purge();
         DB::statement('SET SESSION innodb_lock_wait_timeout = 1');
         foreach (['2026_10_11_154028_create_release_verification_candidates_table', '2026_10_17_000000_create_release_verification_manifests_table',
-            '2026_10_17_120000_create_release_verification_locks_table', '2026_10_17_180000_add_release_verification_publication_stripes'] as $migration) {
+            '2026_10_17_120000_create_release_verification_locks_table', '2026_10_17_180000_add_release_verification_publication_stripes',
+            '2026_10_12_004819_create_release_verification_scratch_table', '2026_10_12_053000_add_shared_verification_scratch_budget'] as $migration) {
             (require database_path('migrations/'.$migration.'.php'))->up();
         }
         DB::statement('CREATE TABLE collections (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -203,6 +205,39 @@ final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
         $this->assertSame('', $candidate->manifest_path, 'The committed admission is kept.');
         $this->assertSame(0, DB::table('release_verification_manifests')->count(), 'The rerun leaves no unreferenced manifest.');
         $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+    }
+
+    public function test_scratch_reservations_hold_the_shared_budget_only_for_their_final_delta(): void
+    {
+        config(['release_verification.scratch_bytes' => 1000, 'release_verification.free_bytes' => 0]);
+        app('files')->ensureDirectoryExists($this->storagePath, 0700);
+        DB::table('release_verification_scratch_budget')->where('id', 1)->update(['initialized' => true, 'reserved_bytes' => 0]);
+        $entry = DB::table('release_verification_scratch')->insertGetId(['audit_release_id' => 1, 'reserved_bytes' => 0]);
+        $other = $this->connection();
+        $probed = false;
+        DB::listen(function (QueryExecuted $query) use ($other, &$probed): void {
+            if ($probed || preg_match('/^select \\* from [`"]?release_verification_scratch[`"]? where/i', $query->sql) !== 1) {
+                return;
+            }
+            $probed = true;
+            // Another worker's reservation commits while this one holds only its own entry.
+            $other->exec('UPDATE release_verification_scratch_budget SET reserved_bytes = reserved_bytes + 300 WHERE id = 1');
+        });
+
+        (new ScratchBudget)->reserve($entry, 600);
+
+        $this->assertTrue($probed);
+        $this->assertSame(900, (int) DB::table('release_verification_scratch_budget')->value('reserved_bytes'));
+        try {
+            (new ScratchBudget)->reserve($entry, 701);
+            $this->fail('A reservation beyond the shared limit must be refused.');
+        } catch (RuntimeException $error) {
+            $this->assertSame('Verification is waiting for shared scratch capacity.', $error->getMessage());
+        }
+        $this->assertSame(900, (int) DB::table('release_verification_scratch_budget')->value('reserved_bytes'));
+        $this->assertSame(600, (int) DB::table('release_verification_scratch')->where('id', $entry)->value('reserved_bytes'));
+        (new ScratchBudget)->forget($entry);
+        $this->assertSame(300, (int) DB::table('release_verification_scratch_budget')->value('reserved_bytes'));
     }
 
     public function test_capacity_refused_at_commit_rolls_back_the_archive_and_keeps_its_headers(): void
