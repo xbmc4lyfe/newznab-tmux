@@ -18,7 +18,7 @@ use RuntimeException;
 
 final class NameFixingQueryService
 {
-    public const PREDB_IDENTITY_POLICY = 'f7f4c6ad1d6ecc5c102db0382aefbe973dc942e5d720fdc409d569aabc16248a';
+    public const PREDB_IDENTITY_POLICY = '3981b572b825b8d407229066fb972ae8288e86252c7363e687855f0f622c80bb';
 
     public const SOURCE_NFO = 'nfo';
 
@@ -101,7 +101,7 @@ final class NameFixingQueryService
         $condition = 'r.predb_id = 0 AND (r.isrenamed = 0 OR r.categories_id IN ('
             .Category::OTHER_MISC.', '.Category::OTHER_HASHED.'))'
             .$categoryFilter
-            .' AND (CASE WHEN r.proc_par2 = 0 AND ('.self::SOURCE_EXISTS[self::SOURCE_PAR2].') THEN 1'
+            .' AND (CASE WHEN r.proc_par2 = 0 AND ('.self::SOURCE_EXISTS[self::SOURCE_PAR2].') AND '.Release::nzbSettledSql('r').' THEN 1'
             .' WHEN '.implode(' OR ', $sources).' THEN 1 ELSE 0 END = 1)';
 
         if (! (bool) config('tmux.fix_names.full_backlog', true)) {

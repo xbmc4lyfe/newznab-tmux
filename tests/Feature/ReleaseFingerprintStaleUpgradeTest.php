@@ -19,7 +19,7 @@ use Tests\TestCase;
 final class ReleaseFingerprintStaleUpgradeTest extends TestCase
 {
     #[Test]
-    public function a_run_overtaken_by_an_in_place_upgrade_requeues_instead_of_saving_old_metadata(): void
+    public function a_run_overtaken_by_an_in_place_upgrade_collects_again_instead_of_saving_old_metadata(): void
     {
         config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:',
             'database.connections.sqlite.url' => null]);
@@ -33,8 +33,11 @@ final class ReleaseFingerprintStaleUpgradeTest extends TestCase
         DB::table('releases')->insert(['id' => 1, 'guid' => 'upgraded-partial']);
         $nzb = \Mockery::mock(NzbService::class);
         // The partial is upgraded in place while this run reads the smaller NZB.
-        $nzb->shouldReceive('readNzbContents')->once()->with('upgraded-partial')->andReturnUsing(static function (): bool {
-            DB::table('release_fingerprint_metadata')->where('releases_id', 1)->update(['status' => 'stale']);
+        $reads = 0;
+        $nzb->shouldReceive('readNzbContents')->twice()->with('upgraded-partial')->andReturnUsing(static function () use (&$reads): bool {
+            if (++$reads === 1) {
+                DB::table('release_fingerprint_metadata')->where('releases_id', 1)->update(['status' => 'stale']);
+            }
 
             return false;
         });
@@ -43,7 +46,8 @@ final class ReleaseFingerprintStaleUpgradeTest extends TestCase
 
         $job->handle(new ReleaseFingerprintCollector($nzb, new NzbFingerprintAnalyzer($yenc), new Par2MetadataParser, $yenc));
 
-        $job->assertReleased(30);
-        $this->assertSame('stale', DB::table('release_fingerprint_metadata')->where('releases_id', 1)->value('status'));
+        $job->assertNotReleased();
+        $this->assertSame(2, $reads, 'The overtaken run collected again from the upgraded NZB.');
+        $this->assertSame('unavailable', DB::table('release_fingerprint_metadata')->where('releases_id', 1)->value('status'));
     }
 }

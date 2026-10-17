@@ -343,8 +343,8 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame((int) $rows[1]->id, $holder(), 'Only the merging generation may upgrade it.');
 
         $guid = DB::table('releases')->where('id', $first)->value('guid');
-        // Post-processing already ran on the smaller NZB.
-        DB::table('releases')->where('id', $first)->update(['haspreview' => 0, 'nfostatus' => 0]);
+        // Post-processing already ran on the smaller NZB; a title lookup ran on a later-normalized name.
+        DB::table('releases')->where('id', $first)->update(['haspreview' => 0, 'nfostatus' => 0, 'searchname' => 'Normalized', 'imdbid' => '0000000']);
         $upgraded = $this->publishStalledPartial(null);
 
         $this->assertSame($first, $upgraded, 'The partial is upgraded in place, keeping its id and GUID.');
@@ -354,6 +354,8 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $nzb = (string) app(NzbService::class)->readNzbContents($guid);
         $this->assertStringContainsString('a@b', $nzb);
         $this->assertStringContainsString('c@d', $nzb, 'Its NZB now carries the late article.');
+        $this->assertSame(['Movie', null], [DB::table('releases')->where('id', $first)->value('searchname'),
+            DB::table('releases')->where('id', $first)->value('imdbid')], 'The fuller name is applied and title lookups rerun.');
         $this->assertSame([-1, -1], [(int) DB::table('releases')->where('id', $first)->value('haspreview'),
             (int) DB::table('releases')->where('id', $first)->value('nfostatus')], 'Post-processing reruns on the upgraded NZB.');
         $this->assertSame(1, DB::table('releases')->count());
@@ -630,6 +632,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
                     $table->unsignedInteger($column)->nullable();
                 }
                 $table->unsignedBigInteger('late_article_candidate_id')->nullable();
+                $table->string('imdbid')->nullable();
             }
         });
         (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();

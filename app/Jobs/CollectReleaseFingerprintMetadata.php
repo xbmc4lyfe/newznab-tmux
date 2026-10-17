@@ -52,23 +52,27 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
         if ($record->status === 'complete' && $metadataSchemaVersion >= ReleaseFingerprintCollector::SCHEMA_VERSION) {
             return;
         }
-        $record->update(['status' => 'processing', 'last_error' => null]);
-
-        $result = $collector->collect($release);
-        $encodedMetadata = json_encode($result['data'], JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR);
-        $safeMetadata = json_decode($encodedMetadata, true, 512, JSON_THROW_ON_ERROR);
-        // Only a run that still owns the record may save: an in-place partial upgrade marks it stale
-        // mid-run, and its own dispatch was dropped by this job's unique lock.
-        $saved = ReleaseFingerprintMetadata::query()->whereKey($record->getKey())->where('status', 'processing')->update([
-            'status' => $result['status'],
-            // A builder update skips the model's array cast.
-            'metadata' => json_encode($safeMetadata, JSON_THROW_ON_ERROR),
-            'last_error' => $result['status'] === 'unavailable' ? ($result['data']['reason'] ?? 'NZB unavailable.') : null,
-            'collected_at' => now(),
-        ]);
-        if ($saved === 0) {
-            $this->release(30);
+        // Only a run that still owns the record may save. An in-place partial upgrade marks it stale mid-run,
+        // and its own dispatch was dropped by this job's unique lock, so this run collects again rather than
+        // re-queuing (which would spend a try). Upgrades are rare; a bounded loop always finishes.
+        for ($round = 0; $round < 3; $round++) {
+            // A query update: the model still believes it is processing, so a model update would write nothing.
+            ReleaseFingerprintMetadata::query()->whereKey($record->getKey())->update(['status' => 'processing', 'last_error' => null]);
+            $result = $collector->collect($release->refresh());
+            $encodedMetadata = json_encode($result['data'], JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR);
+            $safeMetadata = json_decode($encodedMetadata, true, 512, JSON_THROW_ON_ERROR);
+            $saved = ReleaseFingerprintMetadata::query()->whereKey($record->getKey())->where('status', 'processing')->update([
+                'status' => $result['status'],
+                // A builder update skips the model's array cast.
+                'metadata' => json_encode($safeMetadata, JSON_THROW_ON_ERROR),
+                'last_error' => $result['status'] === 'unavailable' ? ($result['data']['reason'] ?? 'NZB unavailable.') : null,
+                'collected_at' => now(),
+            ]);
+            if ($saved === 1) {
+                return;
+            }
         }
+        // Still preempted: leave it stale, which the backfill command and the next upgrade's dispatch pick up.
     }
 
     public function failed(?Throwable $exception): void

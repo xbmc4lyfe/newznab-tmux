@@ -14,6 +14,7 @@ use App\Services\Nzb\NzbService;
 use App\Services\Nzb\ReleaseArticleFingerprintStore;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\ReleaseGroupResolver;
+use App\Services\TvProcessing\TvProcessingCandidateQuery;
 use App\Support\NzbPasswordMetadata;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -409,7 +410,7 @@ final class VerifiedReleasePublisher
         // Only while this generation holds the inventory: once the pointer clears, a worker may be reading its NZB.
         $release = DB::table('releases')->where('id', $releaseId)->whereNotNull('articles_expected')
             ->where('nzbstatus', NzbService::NZB_ADDED)->where('late_article_candidate_id', $candidateId)
-            ->lockForUpdate()->first(['id', 'guid', 'predb_id']);
+            ->lockForUpdate()->first(['id', 'guid', 'predb_id', 'searchname']);
         if ($release === null) {
             return null;
         }
@@ -435,8 +436,15 @@ final class VerifiedReleasePublisher
         $partial = $manifest['partial'] ?? null;
         // No NZB-reading worker has touched a flagged partial, so its name came from publication; take the
         // fuller inventory's, unless PreDB has since confirmed one.
-        $naming = (int) $release->predb_id > 0 ? [] : array_intersect_key($metadata,
+        $naming = (int) $release->predb_id > 0 || ($metadata['searchname'] ?? null) === $release->searchname ? [] : array_intersect_key($metadata,
             array_flip(['name', 'searchname', 'fromname', 'categories_id', 'isrenamed', 'predb_id']));
+        if ($naming !== []) {
+            // Title-derived lookups (TV, movie, book, music, console, anime) ran on the old name; redo them,
+            // as any rename does.
+            $naming += array_intersect_key([...TvProcessingCandidateQuery::resetColumns(), 'imdbid' => null, 'musicinfo_id' => null,
+                'consoleinfo_id' => null, 'bookinfo_id' => null, 'book_lookup_attempts' => 0, 'book_lookup_retry_at' => null,
+                'book_name_normalized_at' => null, 'anidbid' => null, 'iscategorized' => 1], array_flip(Schema::getColumnListing('releases')));
+        }
         DB::table('releases')->where('id', $id)->update(['size' => $size, 'totalpart' => $totalParts,
             'articles_found' => $partial['articles_found'] ?? null, 'articles_expected' => $partial['articles_expected'] ?? null,
             'files_found' => $partial['files_found'] ?? null, 'files_expected' => $partial['files_expected'] ?? null,
