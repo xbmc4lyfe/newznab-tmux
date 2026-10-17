@@ -388,8 +388,12 @@ def project_directory(docker_dir: Path) -> Path:
 # Rendered Compose service definitions from the last get_compose_service_hashes() call.
 RENDERED_SERVICES: dict[str, object] = {}
 
-HOST_SYSTEM_DIRS = {"/"}
 HOST_SYSTEM_PREFIXES = ("/proc", "/sys", "/dev", "/run", "/var/run", "/private/var/run")
+
+
+def is_host_system(path: str) -> bool:
+    """`/` and the kernel/runtime trees node-exporter-style services observe (path-boundary exact)."""
+    return path == "/" or any(path == prefix or path.startswith(prefix + "/") for prefix in HOST_SYSTEM_PREFIXES)
 
 
 def bind_source_record(source: str, read_only: bool, project_dir: Path) -> str:
@@ -413,7 +417,7 @@ def bind_source_record(source: str, read_only: bool, project_dir: Path) -> str:
             return f"other {source}"
         resolved = path.resolve()
         # Writable mounts are data or logs; host-system trees are observed, not configuration.
-        if not read_only or str(resolved) in HOST_SYSTEM_DIRS or str(resolved).startswith(HOST_SYSTEM_PREFIXES):
+        if not read_only or is_host_system(str(resolved)):
             return f"dir {source}"
         lines: list[str] = []
         for root, dirs, files in os.walk(resolved, onerror=walk_error):
@@ -730,8 +734,7 @@ def mounts_changed_since_start(docker_dir: Path, svc: str) -> bool:
             if path.is_file():
                 newest = path.stat().st_mtime
             elif path.is_dir() and volume.get("read_only"):
-                resolved = str(path.resolve())
-                if resolved in HOST_SYSTEM_DIRS or resolved.startswith(HOST_SYSTEM_PREFIXES):
+                if is_host_system(str(path.resolve())):
                     continue
                 newest = max([path.stat().st_mtime] + [
                     (Path(root) / name).stat().st_mtime for root, _, files in os.walk(path) for name in files
@@ -856,16 +859,12 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
     for svc in infra_services(state):
         if not compose_present(state, svc):
             infra_reasons[svc] = "not rendered"
-        elif first_deploy:
-            # Stateless: recreate so mounted configuration matches what gets stamped.
-            dirty_infra.append(svc)
-            infra_reasons[svc] = "recreate (no stamp)"
-        elif legacy_stamp and mounts_changed_since_start(docker_dir, svc):
+        elif (first_deploy or legacy_stamp) and mounts_changed_since_start(docker_dir, svc):
             dirty_infra.append(svc)
             infra_reasons[svc] = "mounted config newer than container"
-        elif legacy_stamp:
+        elif first_deploy or legacy_stamp:
             reconcile_infra.append(svc)
-            infra_reasons[svc] = "reconcile (legacy stamp)"
+            infra_reasons[svc] = "reconcile (no stamp)" if first_deploy else "reconcile (legacy stamp)"
         elif f"service:{svc}" not in stamped:
             dirty_infra.append(svc)
             infra_reasons[svc] = "added to Compose"

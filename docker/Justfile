@@ -31,9 +31,13 @@ export cmd := env("cmd", "")
 # the database credentials stay unexported shell variables (Compose parses .env itself).
 ENV_FILE := CURDIR + "/.env"
 LOAD_ENV := '''for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
+    preset=" "
+    for key in COMPOSE_FILE DEPLOY_BY APP_PORT DB_DATABASE DB_ROOTPASSWORD HELPER_IMAGE BASE_IMAGE APP_IMAGE WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE DEPLOY_MIN_INTERVAL DEPLOY_DRAIN_TIMEOUT DEPLOY_SCHEDULER_DRAIN_TIMEOUT DEPLOY_HEALTH_TIMEOUT DEPLOY_LEGACY_DRAIN_TIMEOUT; do
+        [ -z "${!key:-}" ] || preset="$preset$key "
+    done
     if [ -f "''' + ENV_FILE + '''" ]; then
         while IFS= read -r line || [ -n "$line" ]; do
-            [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?(COMPOSE_FILE|DEPLOY_BY|APP_PORT|DB_DATABASE|DB_ROOTPASSWORD|HELPER_IMAGE|BASE_IMAGE|APP_IMAGE|WEB_IMAGE|HORIZON_IMAGE|SCHEDULER_IMAGE|INDEXER_IMAGE|DEPLOY_MIN_INTERVAL|DEPLOY_DRAIN_TIMEOUT|DEPLOY_SCHEDULER_DRAIN_TIMEOUT|DEPLOY_HEALTH_TIMEOUT|DEPLOY_LEGACY_DRAIN_TIMEOUT)=(.*)$ ]] || continue
+            [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?(COMPOSE_FILE|DEPLOY_BY|APP_PORT|DB_DATABASE|DB_ROOTPASSWORD|HELPER_IMAGE|BASE_IMAGE|APP_IMAGE|WEB_IMAGE|HORIZON_IMAGE|SCHEDULER_IMAGE|INDEXER_IMAGE|DEPLOY_MIN_INTERVAL|DEPLOY_DRAIN_TIMEOUT|DEPLOY_SCHEDULER_DRAIN_TIMEOUT|DEPLOY_HEALTH_TIMEOUT|DEPLOY_LEGACY_DRAIN_TIMEOUT)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
             key=${BASH_REMATCH[2]} value=${BASH_REMATCH[3]}
             if [[ "$value" =~ ^\"(.*)\"[[:space:]]*(#.*)?$ || "$value" =~ ^\'(.*)\'[[:space:]]*(#.*)?$ ]]; then
                 value=${BASH_REMATCH[1]}
@@ -41,7 +45,8 @@ LOAD_ENV := '''for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && e
                 value=${value%%[[:space:]]#*}
                 value=${value%"${value##*[![:space:]]}"}
             fi
-            [ -n "${!key:-}" ] || printf -v "$key" '%s' "$value"
+            # Arguments and the environment win; within the file the last assignment wins (as Compose).
+            case "$preset" in *" $key "*) ;; *) printf -v "$key" '%s' "$value" ;; esac
         done < "''' + ENV_FILE + '''"
     fi
     : "${COMPOSE_FILE:=''' + CURDIR + '''/docker-compose.yml}" "${HELPER_IMAGE:=alpine:3.22.2}" "${BASE_IMAGE:=nntmux/base:local}" "${APP_IMAGE:=nntmux/app:local}"

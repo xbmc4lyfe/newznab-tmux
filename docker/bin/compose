@@ -13,8 +13,8 @@ env_file = stack / ".env"
 file_env: dict[str, str] = {}
 if env_file.is_file():
     for raw in env_file.read_text(encoding="utf-8", errors="surrogateescape").splitlines():
-        # Same rules as the Justfile's LOAD_ENV: optional `export`, quoted values with an optional
-        # trailing comment, and unquoted values ending at an inline ` #` comment.
+        # Same rules as the Justfile's LOAD_ENV: optional `export`, spaces around `=`, quoted values with
+        # an optional trailing comment, unquoted values ending at an inline ` #` comment; last one wins.
         m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", raw)
         if m:
             value = m.group(2)

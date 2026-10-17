@@ -167,6 +167,32 @@ class ViteDockerConfigurationTest extends TestCase
         }
     }
 
+    public function test_role_targets_copy_the_files_only_their_role_runs(): void
+    {
+        $dockerfile = $this->projectFile('Dockerfile');
+        $stage = function (string $name) use ($dockerfile): string {
+            $start = strpos($dockerfile, " AS {$name}\n");
+            $this->assertNotFalse($start, $name);
+            $next = strpos($dockerfile, "\nFROM ", $start);
+
+            return substr($dockerfile, $start, $next === false ? null : $next - $start);
+        };
+        $this->assertStringContainsString('COPY docker/app/Caddyfile /etc/frankenphp/nntmux.Caddyfile', $stage('selfhosted-web'));
+        $this->assertStringContainsString('COPY --from=frontend --chown=www-data:www-data /app/public/build /app/public/build', $stage('selfhosted-web'));
+        $this->assertStringContainsString('docker/app/bin/scheduler.py /app/docker/app/bin/scheduler.py', $stage('selfhosted-scheduler'));
+        $this->assertStringContainsString('COPY docker/app/php/yenc-ffi.ini /usr/local/etc/php/indexer-conf.d/99-yenc-ffi.ini', $stage('selfhosted-indexer'));
+        $this->assertStringContainsString('docker/app/bin/indexer.sh /usr/local/bin/nntmux-indexer', $stage('selfhosted-indexer'));
+        foreach (['selfhosted-horizon', 'selfhosted-scheduler', 'selfhosted-indexer'] as $role) {
+            $this->assertStringNotContainsString('public/build', $stage($role), "{$role} must not depend on Vite output");
+        }
+        $allInOne = $stage('selfhosted');
+        foreach (['scheduler.py', 'yenc-ffi.ini', 'indexer.sh'] as $file) {
+            $this->assertStringContainsString($file, $allInOne);
+        }
+        $this->assertStringContainsString('FROM selfhosted-web AS selfhosted', $dockerfile);
+        $this->assertStringContainsString('/app/public/build', $stage('production'));
+    }
+
     public function test_container_quality_and_dependency_recipes_still_run_through_sail(): void
     {
         foreach (['test', 'pint', 'pint-all', 'phpstan', 'rector', 'rector-fix', 'npm-build', 'npm-dev', 'ts-types', 'ts-types-check', 'data-cache', 'composer-install', 'composer-update'] as $recipe) {

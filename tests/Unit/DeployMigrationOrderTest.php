@@ -719,7 +719,7 @@ SH);
         $this->assertMatchesRegularExpression('/web\s+app\s+skip\s+unchanged/', $output);
     }
 
-    public function test_first_deploy_without_stamp_recreates_infra_and_reconciles_data_without_force(): void
+    public function test_first_deploy_without_stamp_reconciles_data_and_infra_without_force(): void
     {
         $this->deploy()->mustRun();
         $events = $this->events();
@@ -728,7 +728,51 @@ SH);
         $this->assertStringNotContainsString('--force-recreate --wait mariadb', $events);
         $this->assertLessThan(strpos($events, 'artisan migrate'), strpos($events, $reconcile));
         $this->assertGreaterThan(strpos($events, ' stop web scheduler indexer'), strpos($events, $reconcile));
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy mailpit', $events);
+        $infra = ' up -d --no-deps --wait --wait-timeout 240 proxy mailpit';
+        $this->assertStringContainsString($infra, $events);
+        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 proxy', $events);
+        $this->assertLessThan(strpos($events, 'scheduler.py drain'), strpos($events, $infra), 'infra is applied before any drain');
+    }
+
+    public function test_first_deploy_recreates_infra_whose_mounted_config_is_newer_than_its_container(): void
+    {
+        mkdir($this->directory.'/docker/config/caddy', 0777, true);
+        file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', ":8080\n");
+        $this->deploy(['NNTMUX_CONFIG_ID' => $this->composeJson(), 'NNTMUX_STARTED_AT' => '2000-01-01T00:00:00Z'])->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+    }
+
+    public function test_host_system_paths_match_on_path_boundaries_only(): void
+    {
+        $script = 'import importlib.machinery, importlib.util, sys; l = importlib.machinery.SourceFileLoader("dp", sys.argv[1]); '
+            .'s = importlib.util.spec_from_loader("dp", l); m = importlib.util.module_from_spec(s); l.exec_module(m); '
+            .'print(" ".join(str(int(m.is_host_system(p))) for p in sys.argv[2:]))';
+        $process = new Process(['python3', '-c', $script, $this->directory.'/docker/bin/deploy-plan',
+            '/', '/proc', '/proc/1', '/sys/fs', '/run', '/var/run/docker.sock', '/development/stack', '/runner/x', '/sysadmin', '/srv/docker',
+        ], env: ['PYTHONDONTWRITEBYTECODE' => '1']);
+        $process->mustRun();
+        $this->assertSame('1 1 1 1 1 1 0 0 0 0', trim($process->getOutput()));
+    }
+
+    public function test_docker_env_last_assignment_wins_and_whitespace_is_trimmed(): void
+    {
+        file_put_contents($this->directory.'/docker/.env', "WEB_IMAGE=first/web:1\nWEB_IMAGE = second/web:2\nDEPLOY_MIN_INTERVAL=  0\nINDEXER_IMAGE=  'idx:3'  # pinned\n");
+        $this->make(['build'])->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('build --target selfhosted-web -t second/web:2', $events);
+        $this->assertStringContainsString('build --target selfhosted-indexer -t idx:3', $events);
+        $this->assertStringNotContainsString('first/web', $events);
+    }
+
+    public function test_nested_recipes_and_helpers_work_without_just_on_path(): void
+    {
+        $just = trim((new Process(['sh', '-c', 'command -v just']))->mustRun()->getOutput());
+        $process = new Process([$just, '--justfile', $this->directory.'/docker/Justfile', '--working-directory', $this->directory.'/docker', 'deploy', 'DEPLOY_BY=fixture'], env: [
+            'PATH' => $this->directory.'/bin:/usr/bin:/bin', 'NNTMUX_DEPLOY_EVENTS' => $this->directory.'/events', 'NNTMUX_REPO' => $this->directory,
+        ]);
+        $process->mustRun();
+        $this->assertStringContainsString('build --target selfhosted-web', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
     }
 
     public function test_service_added_to_effective_compose_is_started_and_unrendered_data_is_left_alone(): void
