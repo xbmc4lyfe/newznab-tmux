@@ -341,14 +341,15 @@ final class VerificationRunDiagnosticsCommandTest extends ReleaseVerificationCan
         $holder = new VerificationWorkerLocks;
         $reports = [];
         $this->captureReports($reports);
+        // The holder's own lock checks are not part of either compared invocation.
+        $this->assertTrue($holder->start(2));
+        $this->assertTrue($holder->tryGc());
         /** @var \ArrayObject<int, array{string, array<mixed>}> $queries */
         $queries = new \ArrayObject;
         DB::listen(static function (QueryExecuted $query) use ($queries): void {
             $queries[] = [$query->sql, $query->connection->prepareBindings($query->bindings)];
         });
         try {
-            $this->assertTrue($holder->start(2));
-            $this->assertTrue($holder->tryGc());
             $this->assertSame(0, Artisan::call('releases:verify-candidates', ['--slot' => 1, '--no-summary' => true]));
             $plain = $queries->getArrayCopy();
             $queries->exchangeArray([]);

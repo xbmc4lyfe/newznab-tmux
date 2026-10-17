@@ -12,6 +12,21 @@ return [
     'worker_limit' => (int) env('RELEASE_VERIFICATION_WORKER_LIMIT', 1000),
     'worker_seconds' => (int) env('RELEASE_VERIFICATION_WORKER_SECONDS', 300),
     'candidate_workers' => (int) env('RELEASE_VERIFICATION_CANDIDATE_WORKERS', 2),
+    // Hosts sharing one database schedule disjoint slots: this host runs slot_offset + 1 through
+    // slot_offset + candidate_workers (at most slot 256).
+    'slot_offset' => (int) env('RELEASE_VERIFICATION_SLOT_OFFSET', 0),
+    // Names this host's scratch inventory and budget. The primary host keeps ''.
+    'host' => (string) env('RELEASE_VERIFICATION_HOST', ''),
+    // A worker-only host schedules nothing but its verification slots.
+    'worker_only' => (bool) env('RELEASE_VERIFICATION_WORKER_ONLY', false),
+    // auto: database locks on MariaDB/MySQL (they cover every worker host), file locks otherwise.
+    'locks' => env('RELEASE_VERIFICATION_LOCKS', 'auto'),
+    // Remote workers publish through the primary host's internal endpoint at this URL.
+    'publish_url' => env('RELEASE_VERIFICATION_PUBLISH_URL'),
+    'publish_timeout' => (int) env('RELEASE_VERIFICATION_PUBLISH_TIMEOUT', 120),
+    // The primary host serves that endpoint, without authentication, to these networks only.
+    'publish_endpoint' => (bool) env('RELEASE_VERIFICATION_PUBLISH_ENDPOINT', false),
+    'publish_allowed_networks' => env('RELEASE_VERIFICATION_PUBLISH_ALLOWED_NETWORKS', '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8'),
     'storage_path' => storage_path('app/release-verification'),
     // database: manifests live in release_verification_manifests (shared by every worker host and
     // written in the candidate's transaction), falling back to legacy files until they are imported.
