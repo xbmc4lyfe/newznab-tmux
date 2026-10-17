@@ -27,6 +27,11 @@ class DeployMigrationOrderTest extends TestCase
 #!/bin/sh
 printf 'COMPOSE_FILE=%s %s\n' "$COMPOSE_FILE" "$*" >> "$NNTMUX_DEPLOY_EVENTS"
 case "$*" in
+    *'releases:verification-barrier'*)
+        [ "${NNTMUX_BARRIER_FAIL:-0}" != 1 ] || { echo 'Verification workers are still running on a host.'; exit 51; }
+        echo 'barrier held'
+        cat > /dev/null
+        echo released >> "$NNTMUX_DEPLOY_EVENTS" ;;
     *' config --format json'*) echo "${NNTMUX_CONFIG_ID:-fixture-config}" ;;
     *'image inspect --format'*) echo "${NNTMUX_IMAGE_ID:-sha256:fixture}" ;;
     *'image inspect'*) exit 0 ;;
@@ -85,7 +90,7 @@ SH);
     {
         $this->deploy()->mustRun();
         $events = $this->events();
-        $steps = ['build --target selfhosted', 'artisan list --raw', ' stop --timeout 1920 horizon', 'scheduler.py drain --timeout=1800', 'artisan tmux:drain --timeout=900', ' stop web scheduler indexer', 'artisan migrate --force --no-interaction', ' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer'];
+        $steps = ['build --target selfhosted', 'artisan list --raw', ' stop --timeout 1920 horizon', 'scheduler.py drain --timeout=1800', 'artisan tmux:drain --timeout=900', 'releases:verification-barrier --timeout=900', ' stop web scheduler indexer', 'artisan migrate --force --no-interaction', ' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', 'released'];
         $previous = -1;
         foreach ($steps as $step) {
             $position = strpos($events, $step);
@@ -97,6 +102,33 @@ SH);
         $this->assertFileExists($this->directory.'/docker/.build.stamp');
         $this->assertFileExists($this->directory.'/docker/.deploy.stamp');
         $this->assertFileExists($this->directory.'/docker/.deploy.time');
+    }
+
+    public function test_remote_workers_that_do_not_drain_stop_the_rollout_before_writers_stop(): void
+    {
+        $process = $this->deploy(['NNTMUX_BARRIER_FAIL' => '1']);
+        $process->run();
+
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('Remote verification workers did not drain', $process->getErrorOutput());
+        $events = $this->events();
+        $this->assertStringContainsString('releases:verification-barrier', $events);
+        $this->assertStringNotContainsString(' stop web scheduler indexer', $events);
+        $this->assertStringNotContainsString('artisan migrate', $events);
+        $this->assertStringContainsString(' start horizon', $events);
+        $this->assertStringContainsString('scheduler.py restore --token=', $events);
+        $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp');
+    }
+
+    public function test_a_failed_migration_releases_the_remote_worker_barrier(): void
+    {
+        $process = $this->deploy(['NNTMUX_MIGRATION_FAIL' => '1']);
+        $process->run();
+
+        $this->assertFalse($process->isSuccessful());
+        $events = $this->events();
+        $this->assertGreaterThan(strpos($events, 'artisan migrate'), strpos($events, "released\n"));
+        $this->assertStringNotContainsString(' up -d', $events);
     }
 
     public function test_native_indexer_abort_uses_the_same_unique_operation_token_as_its_drain(): void

@@ -72,21 +72,60 @@ final class DatabaseVerificationLockStore extends VerificationLockStore
         if (! $this->take($gate)) {
             return null;
         }
-        $members = array_map(fn (int $number): string => $this->key($group.'.'.$number), range(0, $this->members($group) - 1));
         try {
-            $holder = $this->value('SELECT COALESCE('.implode(', ', array_fill(0, count($members), 'IS_USED_LOCK(?)')).') AS v, CONNECTION_ID() AS session', $members);
+            $free = $this->membersFree($group);
         } catch (Throwable $error) {
             $this->drop($gate);
 
             throw $error;
         }
-        if ($holder !== null) {
+        if (! $free) {
             $this->drop($gate);
 
             return null;
         }
 
         return new VerificationLock($group, [$gate]);
+    }
+
+    public function drainGroup(string $group, float $seconds): ?VerificationLock
+    {
+        $deadline = microtime(true) + $seconds;
+        $gate = $this->key($group);
+        while (! $this->take($gate)) {
+            if (microtime(true) >= $deadline) {
+                return null;
+            }
+            usleep(200000);
+        }
+        try {
+            while (! $this->membersFree($group)) {
+                if (microtime(true) >= $deadline) {
+                    $this->drop($gate);
+
+                    return null;
+                }
+                usleep(200000);
+            }
+        } catch (Throwable $error) {
+            $this->drop($gate);
+
+            throw $error;
+        }
+
+        return new VerificationLock($group, [$gate]);
+    }
+
+    public function admitting(string $group): bool
+    {
+        return $this->value('SELECT IS_FREE_LOCK(?) AS v, CONNECTION_ID() AS session', [$this->key($group)]) === 1;
+    }
+
+    private function membersFree(string $group): bool
+    {
+        $members = array_map(fn (int $number): string => $this->key($group.'.'.$number), range(0, $this->members($group) - 1));
+
+        return $this->value('SELECT COALESCE('.implode(', ', array_fill(0, count($members), 'IS_USED_LOCK(?)')).') AS v, CONNECTION_ID() AS session', $members) === null;
     }
 
     public function holds(VerificationLock $lock): bool

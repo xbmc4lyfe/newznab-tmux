@@ -42,6 +42,15 @@ abstract class VerificationLockStore
     /** The sole holder of a group, refused while any shared holder remains. */
     abstract public function exclusiveGroup(string $group): ?VerificationLock;
 
+    /**
+     * Hold the group's gate so no new shared holder joins, then wait for the current ones to leave.
+     * Workers on every host stop claiming once they see the gate held.
+     */
+    abstract public function drainGroup(string $group, float $seconds): ?VerificationLock;
+
+    /** Whether new shared holders may join the group. */
+    abstract public function admitting(string $group): bool;
+
     /** False once the lock is no longer held, such as after its database session ended. */
     abstract public function holds(VerificationLock $lock): bool;
 

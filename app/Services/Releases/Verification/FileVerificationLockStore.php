@@ -24,6 +24,22 @@ final class FileVerificationLockStore extends VerificationLockStore
         return $this->acquire($group, $this->directory(false).'/'.$group.'.lock', LOCK_EX);
     }
 
+    /** One host's flock has no gate; local drains already stopped this host's workers. */
+    public function drainGroup(string $group, float $seconds): ?VerificationLock
+    {
+        $deadline = microtime(true) + $seconds;
+        while (($lock = $this->exclusiveGroup($group)) === null && microtime(true) < $deadline) {
+            usleep(200000);
+        }
+
+        return $lock;
+    }
+
+    public function admitting(string $group): bool
+    {
+        return true;
+    }
+
     public function holds(VerificationLock $lock): bool
     {
         return is_resource($lock->handle());

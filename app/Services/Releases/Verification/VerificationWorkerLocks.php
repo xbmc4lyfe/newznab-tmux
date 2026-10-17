@@ -129,6 +129,22 @@ final class VerificationWorkerLocks
         return $this->exclusive;
     }
 
+    /** Stop every host's workers from claiming and wait up to $seconds for them to finish. */
+    public function drain(float $seconds): bool
+    {
+        $this->close();
+        $this->global = $this->store()->drainGroup('worker', $seconds);
+        $this->exclusive = $this->global !== null;
+
+        return $this->exclusive;
+    }
+
+    /** False while a drain holds the worker gate; a running worker then stops claiming. */
+    public function admitting(): bool
+    {
+        return $this->store()->admitting('worker');
+    }
+
     public function tryCandidate(int $id): bool
     {
         if ($this->candidateId === $id && $this->candidate !== null) {

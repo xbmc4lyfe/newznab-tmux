@@ -125,7 +125,7 @@ final class VerificationRunDiagnostics
         if ($this->stopReason !== null) {
             return;
         }
-        $this->stopReason = in_array($reason, ['limit', 'deadline', 'no_claim', 'worker_unavailable',
+        $this->stopReason = in_array($reason, ['limit', 'deadline', 'no_claim', 'draining', 'worker_unavailable',
             'initialization_unavailable', 'initialization_error', 'unsafe_scratch_root', 'error'], true) ? $reason : 'error';
         $this->stopped = $stopped;
         $this->limitReached = $this->claimsAdmitted >= $this->limit;

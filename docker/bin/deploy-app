@@ -28,7 +28,39 @@ operation_token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 legacy_drain() { compose exec -T indexer php -- /app "$1" "${DEPLOY_LEGACY_DRAIN_TIMEOUT:-1800}" "$operation_token" < "$DIR/bin/legacy-drain.php"; }
 legacy_scheduler() { compose exec -T scheduler python3 - "$1" "$scheduler_timeout" "$operation_token" < "$DIR/bin/legacy-scheduler-drain.py"; }
 scheduler_command() { compose exec -T scheduler python3 /app/docker/app/bin/scheduler.py "$@"; }
+# Remote worker hosts share the database but not this Compose project. The new image's barrier
+# stops their verification workers, waits for them, and keeps them out until its stdin closes.
+barrier_pid=
+barrier_dir=
+hold_barrier() {
+    barrier_dir=$(mktemp -d)
+    mkfifo "$barrier_dir/in"
+    compose run --rm --no-deps -T web php artisan releases:verification-barrier --timeout="${DEPLOY_REMOTE_DRAIN_TIMEOUT:-900}" --no-interaction < "$barrier_dir/in" > "$barrier_dir/out" 2>&1 &
+    barrier_pid=$!
+    exec 9> "$barrier_dir/in"
+    until grep -q '^barrier held' "$barrier_dir/out"; do
+        if ! kill -0 "$barrier_pid" 2>/dev/null; then
+            cat "$barrier_dir/out" >&2
+            barrier_pid=
+            echo "Remote verification workers did not drain; not stopping writers or migrating." >&2
+            exit 1
+        fi
+        sleep 1
+    done
+}
+release_barrier() {
+    if [ -n "$barrier_pid" ]; then
+        exec 9>&-
+        wait "$barrier_pid" || echo "Verification barrier exited abnormally; its session released it." >&2
+        barrier_pid=
+    fi
+    if [ -n "$barrier_dir" ]; then
+        rm -rf "$barrier_dir"
+        barrier_dir=
+    fi
+}
 resume() {
+    release_barrier
     if [ "$horizon_stopped" = 1 ]; then
         compose start horizon || echo "Horizon restart failed; queued jobs wait until it runs." >&2
     fi
@@ -118,6 +150,8 @@ elif [ "$scheduler_drained" = 1 ]; then
     scheduler_command check
     verify
 fi
+hold_barrier
+verify
 # Stop the remaining database writers before migration; persistent services stay running.
 compose stop web scheduler indexer
 horizon_stopped=0
@@ -127,3 +161,4 @@ verify
 compose run --rm --no-deps web php artisan migrate --force --no-interaction
 verify
 compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" web horizon scheduler indexer
+release_barrier

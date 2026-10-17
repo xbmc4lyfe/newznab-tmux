@@ -24,13 +24,16 @@ class VerificationDatabaseLocksMariaDbTest extends TestCase
     /** @var list<string> */
     private array $databases = [];
 
+    private ?string $storage = null;
+
     protected function setUp(): void
     {
         parent::setUp();
         if (getenv('VERIFICATION_MARIADB_TEST') !== '1') {
             $this->markTestSkipped('Requires the isolated verification MariaDB test database.');
         }
-        config(['release_verification.storage_path' => storage_path('framework/testing/db-locks-'.bin2hex(random_bytes(6))),
+        $this->storage = storage_path('framework/testing/db-locks-'.bin2hex(random_bytes(6)));
+        config(['release_verification.storage_path' => $this->storage,
             'release_verification.candidate_workers' => 2, 'release_verification.locks' => 'auto']);
         $this->fixture('mysql');
         foreach (['verification_lock_other', 'verification_lock_third'] as $name) {
@@ -50,7 +53,10 @@ class VerificationDatabaseLocksMariaDbTest extends TestCase
                 DB::connection('verification_lock_admin')->statement('DROP DATABASE IF EXISTS `'.$database.'`');
             }
             DB::purge('verification_lock_admin');
-            File::deleteDirectory((string) config('release_verification.storage_path'));
+            // Only the directory this test allocated; a skipped test allocated none.
+            if ($this->storage !== null) {
+                File::deleteDirectory($this->storage);
+            }
         } finally {
             parent::tearDown();
         }
@@ -268,6 +274,67 @@ class VerificationDatabaseLocksMariaDbTest extends TestCase
             usleep(20000);
         }
         $this->fail('The killed session did not end.');
+    }
+
+    public function test_a_barrier_stops_running_workers_on_other_hosts_and_keeps_new_ones_out(): void
+    {
+        if (! function_exists('pcntl_fork')) {
+            $this->markTestSkipped('Requires pcntl to run a worker in another process.');
+        }
+        config(['database.connections.verification_lock_child' => config('database.connections.mysql')]);
+        [$parentEnd, $childEnd] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        $pid = pcntl_fork();
+        if ($pid === 0) {
+            // A worker on another host: its own session, never the parent's sockets.
+            fclose($parentEnd);
+            $worker = new VerificationWorkerLocks(new DatabaseVerificationLockStore('verification_lock_child'));
+            $report = 'unavailable';
+            if ($worker->start()) {
+                fwrite($childEnd, "started\n");
+                $deadline = microtime(true) + 10;
+                while ($worker->admitting() && microtime(true) < $deadline) {
+                    usleep(50000);
+                }
+                $report = $worker->admitting() ? 'never-saw-drain' : 'saw-drain';
+                $worker->close();
+            }
+            fwrite($childEnd, $report."\n");
+            // Skip every shutdown handler; the killed process ends its own database session.
+            posix_kill(getmypid(), SIGKILL);
+        }
+        fclose($childEnd);
+        $barrier = new VerificationWorkerLocks(new DatabaseVerificationLockStore);
+        $late = new VerificationWorkerLocks(new DatabaseVerificationLockStore('verification_lock_other'));
+        try {
+            $this->assertSame("started\n", fgets($parentEnd));
+            $this->assertTrue($barrier->drain(10));
+            $this->assertSame("saw-drain\n", fgets($parentEnd));
+            $this->assertFalse($late->start());
+            $this->assertFalse($late->admitting());
+            $this->assertTrue($barrier->protects(0));
+        } finally {
+            $barrier->close();
+            pcntl_waitpid($pid, $status);
+            fclose($parentEnd);
+        }
+        $this->assertTrue($late->start());
+        $this->assertTrue($late->admitting());
+        $late->close();
+    }
+
+    public function test_a_barrier_gives_up_and_reopens_admission_while_a_worker_stays_active(): void
+    {
+        $worker = new VerificationWorkerLocks(new DatabaseVerificationLockStore('verification_lock_other'));
+        $barrier = new VerificationWorkerLocks(new DatabaseVerificationLockStore);
+        try {
+            $this->assertTrue($worker->start());
+            $this->assertFalse($barrier->drain(0.5));
+            $this->assertTrue($worker->admitting());
+            $this->assertTrue($worker->held());
+        } finally {
+            $worker->close();
+            $barrier->close();
+        }
     }
 
     public function test_lock_names_are_scoped_to_their_database(): void

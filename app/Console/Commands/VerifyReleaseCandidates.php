@@ -123,6 +123,10 @@ class VerifyReleaseCandidates extends Command
                 if (! $locks->held()) {
                     throw new RuntimeException('Verification worker locks were lost.');
                 }
+                if (! $locks->admitting()) {
+                    $diagnostics?->stop('draining', hrtime(true));
+                    break;
+                }
                 $preferReady = $locks->preferReady();
                 $diagnostics?->claimCalled();
                 $claim = $repository->claim(fn (int $id): bool => $locks->tryCandidate($id), $preferReady);
