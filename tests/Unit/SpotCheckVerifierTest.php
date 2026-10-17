@@ -133,6 +133,44 @@ final class SpotCheckVerifierTest extends TestCase
     }
 
     #[Test]
+    public function article_property_failures_are_deterministic_and_empty_fetches_retry_soon(): void
+    {
+        $manifest = ['identity' => sha1('determinism'), 'expected_files' => 1, 'files' => [
+            ['key' => 'movie', 'subject' => 'movie.mkv', 'totalparts' => 1, 'segments' => [
+                ['number' => 1, 'messageid' => 'only@article', 'bytes' => 5],
+            ]],
+        ]];
+        $cases = [
+            'empty fetch' => ['', ['spot_check_bytes' => 1024, 'spot_check_article_bytes' => 1024], false],
+            'over the article budget' => [YencArticles::part('hello', 'movie.mkv', 5, 1, 1, 1), ['spot_check_bytes' => 1024, 'spot_check_article_bytes' => 10], true],
+            'identity differs' => [YencArticles::part('hello', 'movie.mkv', 10, 1, 1, 2), ['spot_check_bytes' => 1024, 'spot_check_article_bytes' => 1024], true],
+        ];
+        foreach ($cases as $case => [$raw, $options, $deterministic]) {
+            $source = new class($raw) implements ArticleSource
+            {
+                public function __construct(private readonly string $raw) {}
+
+                public function fetch(string $messageId): string
+                {
+                    return $this->raw;
+                }
+            };
+            $result = (new SpotCheckVerifier($source, $options + ['spot_check_articles' => 1], new YencService))->verify($manifest, static function (): void {});
+            self::assertSame('unknown', $result->verdict, $case);
+            self::assertSame($deterministic, $result->deterministic, $case.': '.$result->reason);
+        }
+        $failing = new class implements ArticleSource
+        {
+            public function fetch(string $messageId): string
+            {
+                throw new \RuntimeException('Article is unavailable; retry verification later.');
+            }
+        };
+        $result = (new SpotCheckVerifier($failing, ['spot_check_articles' => 1]))->verify($manifest, static function (): void {});
+        self::assertFalse($result->deterministic, 'Transport errors keep the ordinary retry.');
+    }
+
+    #[Test]
     public function inferred_totals_without_yenc_total_require_a_proved_terminal_endpoint(): void
     {
         foreach ([15 => 'unknown', 10 => 'sampled'] as $fileSize => $verdict) {
