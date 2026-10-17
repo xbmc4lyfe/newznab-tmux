@@ -522,7 +522,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $other = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'x@y');
         DB::table('collections')->where('id', $other)->update(['fromname' => 'someone-else']);
         app(CandidateRepository::class)->archive($other);
-        DB::table('release_verification_candidates')->orderByDesc('id')->limit(1)->update(['status' => 'filtered', 'manifest_path' => '', 'manifest_bytes' => 0]);
+        $this->filterNewestCandidate();
         // Late headers past the 16 MiB metadata budget.
         $late = $this->collectionForPolicy('movie.mkv', 20000, $hash, part: 3, messageId: 'e@f');
         $binary = (int) DB::table('binaries')->where('collections_id', $late)->value('id');
@@ -632,11 +632,69 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $next = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 3, messageId: 'e@f');
         app(CandidateRepository::class)->archive($next);
 
-        $row = DB::table('release_verification_candidates')->where('id', $orphan->id)->first();
-        $this->assertNull($row->upgrades_release_id, 'Its deleted partial\'s articles are gone.');
+        $retired = DB::table('release_verification_candidates')->where('id', $orphan->id)->first();
+        $this->assertSame(['expired', '', null], [$retired->status, $retired->manifest_path, $retired->upgrades_release_id], 'Its deleted partial\'s articles are gone.');
+        $row = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        $this->assertNotSame((int) $orphan->id, (int) $row->id, 'The retired row is never revived.');
         $manifest = app(ManifestStore::class)->read((string) $row->manifest_path);
         $this->assertSame(['e@f'], array_column($manifest['files'][0]['segments'], 'messageid'), 'Only the new upload, not the deleted partial\'s articles.');
         $this->assertSame((int) $row->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
+    }
+
+    public function test_retiring_an_orphan_before_a_filtered_replay_still_releases_its_capacity(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('orphan-then-filtered', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+        $other = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 3, messageId: 'x@y');
+        DB::table('collections')->where('id', $other)->update(['fromname' => 'someone-else']);
+        app(CandidateRepository::class)->archive($other);
+        $this->filterNewestCandidate();
+        DB::table('releases')->where('id', $first)->delete();
+
+        // A replay of the filtered post: the orphan is retired before the replay returns early.
+        $replay = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 3, messageId: 'x@y');
+        DB::table('collections')->where('id', $replay)->update(['fromname' => 'someone-else']);
+        app(CandidateRepository::class)->archive($replay);
+
+        $this->assertSame((int) DB::table('release_verification_candidates')->sum('manifest_bytes'),
+            (int) DB::table('release_verification_state')->value('pending_bytes'), 'No capacity leaks.');
+    }
+
+    public function test_a_defective_late_header_never_poisons_another_posts_pending_candidate(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('defect-past-poster-b', true);
+        $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $b = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 1, messageId: 'b1@b');
+        DB::table('collections')->where('id', $b)->update(['fromname' => 'poster-b']);
+        app(CandidateRepository::class)->archive($b);
+        $own = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        // Poster A's defective late article spoils both A's partial and B's post.
+        $defective = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d');
+        DB::table('parts')->where('messageid', 'c@d')->update(['size' => 0]);
+
+        app(CandidateRepository::class)->archive($defective);
+
+        $after = DB::table('release_verification_candidates')->where('id', $own->id)->first();
+        $this->assertSame([$own->manifest_path, $own->status], [$after->manifest_path, $after->status], 'Poster B\'s post is untouched.');
+    }
+
+    public function test_an_expired_pending_generation_releases_its_partial_to_workers(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('expired-generation', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+        $generation = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+
+        $this->travel((int) config('release_verification.expiry_hours') + 1)->hours();
+        $this->limits();
+        app(CandidateRepository::class)->expire();
+
+        $this->assertNull(DB::table('release_verification_candidates')->where('id', $generation->id)->value('upgrades_release_id'));
+        $this->assertNull(DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
     }
 
     public function test_late_articles_never_republish_a_deleted_partial(): void
@@ -715,6 +773,14 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame($releaseId, (int) $candidate->release_id);
         $this->assertSame(['', 0], [$candidate->manifest_path, (int) $candidate->manifest_bytes]);
         $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+    }
+
+    /** Policy-filter the newest candidate as rejectByPolicy() would, releasing its capacity. */
+    private function filterNewestCandidate(): void
+    {
+        $newest = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        DB::table('release_verification_candidates')->where('id', $newest->id)->update(['status' => 'filtered', 'manifest_path' => '', 'manifest_bytes' => 0]);
+        DB::table('release_verification_state')->decrement('pending_bytes', (int) $newest->manifest_bytes);
     }
 
     /** Archive a collection (unless null), let the upload stall past the hold, and publish it as partial. */

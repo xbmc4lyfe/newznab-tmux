@@ -447,9 +447,9 @@ final class VerifiedReleasePublisher
         $partial = $manifest['partial'] ?? null;
         // No NZB-reading worker has touched a flagged partial, so its name came from publication; take the
         // fuller inventory's, unless PreDB has since confirmed one.
-        $naming = (int) $release->predb_id > 0 || ($metadata['searchname'] ?? null) === $release->searchname ? [] : array_intersect_key($metadata,
+        $naming = (int) $release->predb_id > 0 ? [] : array_intersect_key($metadata,
             array_flip(['name', 'searchname', 'fromname', 'categories_id', 'isrenamed', 'predb_id']));
-        if ($naming !== []) {
+        if ($naming !== [] && ($naming['searchname'] ?? null) !== $release->searchname) {
             // Title-derived lookups (TV, movie, book, music, console, anime) ran on the old name; redo them,
             // as any rename does.
             $naming += array_intersect_key([...TvProcessingCandidateQuery::resetColumns(), 'imdbid' => null, 'movieinfo_id' => null, 'musicinfo_id' => null,

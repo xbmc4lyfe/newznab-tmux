@@ -101,29 +101,44 @@ final class CandidateRepository
                     $orphans = DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)->whereNull('release_id')
                         ->whereNotNull('upgrades_release_id')->where('manifest_path', '<>', '')
                         ->whereNotIn('id', array_map(static fn (object $held): int => (int) $held->id, $holders) ?: [0])
+                        // One a worker is verifying is left to it: the publisher abandons it.
+                        ->where(fn ($query) => $query->whereNull('lease_until')->orWhere('lease_until', '<', now()))
                         ->orderByDesc('id')->lockForUpdate()->get();
                     foreach ($orphans as $orphan) {
+                        // The version stays, as when a worker retires a candidate, so an outcome is still recognized.
                         DB::table('release_verification_candidates')->where('id', $orphan->id)->update(['status' => 'expired',
                             'reason' => 'The partial release it would upgrade was deleted.', 'manifest_path' => '', 'manifest_bytes' => 0,
-                            'lease_token' => null, 'lease_until' => null, 'version' => (int) $orphan->version + 1, 'upgrades_release_id' => null]);
+                            'lease_token' => null, 'lease_until' => null, 'upgrades_release_id' => null]);
                         $retiredBytes += (int) $orphan->manifest_bytes;
                         DB::afterCommit(fn () => $this->store->deleteIfUnreferenced($orphan->manifest_path));
                     }
                     if ($orphans->contains('id', $existing->id)) {
-                        $existing = DB::table('release_verification_candidates')->where('id', $existing->id)->lockForUpdate()->first();
+                        // Never revive the retired row: its identity and timing belonged to the deleted partial.
+                        $identityAfter = sha1($sourceIdentity.':generation:'.$existing->id);
+                        $existing = null;
                     }
                 }
-                if ($holder === null && $existing !== null) {
+                if ($holder === null && ($existing !== null || isset($identityAfter))) {
                     // Not a partial's articles: they join the newest pending candidate that holds no partial's
                     // inventory. Before partials that was always the newest row; posts kept apart from a
                     // partial can leave one behind newer holders or generations, whatever became of them.
+                    // Where partials share the hash, headers that would spoil that candidate are kept apart too.
                     $own = $this->lockLatestUnheld($sourceIdentity, array_map(static fn (object $held): int => (int) $held->id, $holders));
-                    if ($own !== null && (int) $own->id !== (int) $existing->id) {
+                    $shared = $holders !== [] || isset($identityAfter) || ($own !== null && (int) $own->id !== (int) ($existing->id ?? 0));
+                    if ($own !== null && $shared && $snapshotFailure === null) {
+                        $manifest ??= $this->snapshotHeaders($collection, $currentReads);
+                        if ($this->spoils($this->store->read($own->manifest_path), $this->merge($this->store->read($own->manifest_path), $manifest))) {
+                            $own = null;
+                            $apart = $existing !== null;
+                        }
+                    }
+                    if ($own !== null && (int) $own->id !== (int) ($existing->id ?? 0)) {
                         $existing = $own;
                         $apart = false;
+                        unset($identityAfter);
                     }
                 }
-                if ($holder !== null && ($holder->release_id === null || (int) $holder->id === (int) $existing->id)) {
+                if ($holder !== null && ($holder->release_id === null || (int) $holder->id === (int) ($existing->id ?? 0))) {
                     // A pending generation is merged like any candidate; the published partial itself as the
                     // newest candidate takes the usual path below.
                     $existing = $holder;
@@ -145,23 +160,26 @@ final class CandidateRepository
                     if ($usablePart !== null) {
                         $this->cleanup->deleteCollectionsAndDescendants([$collectionId], 'Policy-filtered replay', false, manifestArchived: true);
                     }
+                    if ($retiredBytes > 0) {
+                        $this->ledger->adjust(-$retiredBytes);
+                    }
 
                     return;
                 }
                 if ($snapshotFailure !== null) {
                     throw $snapshotFailure;
                 }
-                $identity = $existing->identity ?? $sourceIdentity;
+                $identity = $existing->identity ?? ($identityAfter ?? $sourceIdentity);
                 // A partial publication retains its inventory: late articles start a generation that
                 // merges it and upgrades that release in place, instead of publishing only the late fragment.
                 $previous = null;
                 $merges = false;
                 if ($holder !== null) {
-                    $identity = sha1($sourceIdentity.':generation:'.$existing->id);
+                    $identity = $existing === null ? $identityAfter : sha1($sourceIdentity.':generation:'.$existing->id);
                     $previous = $holder;
                     $merges = true;
                     $existing = null;
-                } elseif ($apart) {
+                } elseif ($apart && $existing !== null) {
                     // Another post under a holder's hash: its own generation, leaving the holder untouched.
                     $identity = sha1($sourceIdentity.':generation:'.$existing->id);
                     $existing = null;
@@ -192,6 +210,9 @@ final class CandidateRepository
                     if ($this->articleIdentity($retained) === $this->articleIdentity($manifest) && ! ($manifest['conflict'] ?? false)) {
                         // A replay of headers the partial already holds changes nothing.
                         $this->cleanup->deleteCollectionsAndDescendants([$collectionId], 'Archived for verification', false, manifestArchived: true);
+                        if ($retiredBytes > 0) {
+                            $this->ledger->adjust(-$retiredBytes);
+                        }
 
                         return;
                     }
@@ -238,7 +259,12 @@ final class CandidateRepository
                 }
                 if ($expired) {
                     $values = array_replace($values, ['status' => 'expired', 'last_unique_at' => $lastUniqueAt,
-                        'manifest_path' => '', 'manifest_bytes' => 0, 'lease_token' => null, 'lease_until' => null]);
+                        'manifest_path' => '', 'manifest_bytes' => 0, 'lease_token' => null, 'lease_until' => null]
+                        + (self::tracksUpgrades() ? ['upgrades_release_id' => null] : []));
+                    if ($existing !== null && Release::hasLateArticleFlag()) {
+                        // An expired pending generation can no longer upgrade its partial.
+                        DB::table('releases')->where('late_article_candidate_id', $existing->id)->update(['late_article_candidate_id' => null]);
+                    }
                 }
                 if ($existing === null) {
                     $holderId = (int) DB::table('release_verification_candidates')->insertGetId($values);
@@ -611,6 +637,10 @@ final class CandidateRepository
                 }
                 $old = $this->store->read($candidate->manifest_path);
                 $merged = $this->merge($old, $snapshot);
+                if ($heldIds !== [] && $this->spoils($old, $merged)) {
+                    // Where partials share the hash, archive() keeps spoiling headers apart from this post too.
+                    break;
+                }
                 if ($this->articleIdentity($old) !== $this->articleIdentity($merged) || ($merged['conflict'] ?? false)) {
                     DB::table('release_verification_candidates')->where('id', $candidate->id)->update([
                         'status' => 'dirty', 'lease_token' => null, 'lease_until' => null, 'version' => $candidate->version + 1,
@@ -974,7 +1004,12 @@ final class CandidateRepository
                 }
                 DB::table('release_verification_candidates')->where('id', $id)->update(['status' => in_array($row->status, ['metadata_deferred', 'metadata_review'], true) ? 'metadata_expired' : 'expired',
                     'version' => (int) $row->version + 1,
-                    'manifest_path' => '', 'manifest_bytes' => 0, 'lease_token' => null, 'lease_until' => null]);
+                    'manifest_path' => '', 'manifest_bytes' => 0, 'lease_token' => null, 'lease_until' => null]
+                    + (self::tracksUpgrades() ? ['upgrades_release_id' => null] : []));
+                if (($row->upgrades_release_id ?? null) !== null && Release::hasLateArticleFlag()) {
+                    // An expired generation can no longer upgrade its partial; workers may now process it.
+                    DB::table('releases')->where('id', $row->upgrades_release_id)->where('late_article_candidate_id', $id)->update(['late_article_candidate_id' => null]);
+                }
                 $this->ledger->adjust(-(int) $row->manifest_bytes);
                 DB::afterCommit(function () use ($row): void {
                     $this->store->deleteIfUnreferenced($row->manifest_path);
