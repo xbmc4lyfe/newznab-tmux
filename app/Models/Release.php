@@ -205,7 +205,7 @@ class Release extends Model
     /** @var \WeakMap<\PDO, bool>|null */
     private static ?\WeakMap $partialArticleCountSupport = null;
 
-    /** Whether releases record partial publications' found and declared article counts. */
+    /** Whether releases record partial publications' found and declared article and file counts. */
     public static function hasPartialArticleCounts(): bool
     {
         $pdo = DB::connection()->getPdo();
@@ -634,7 +634,7 @@ class Release extends Model
         ];
 
         if (self::hasPartialArticleCounts()) {
-            array_push($columns, 'releases.articles_found', 'releases.articles_expected');
+            array_push($columns, 'releases.articles_found', 'releases.articles_expected', 'releases.files_found', 'releases.files_expected');
         }
 
         if ($includeV1CompatibilityFields) {

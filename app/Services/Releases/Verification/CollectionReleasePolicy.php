@@ -62,7 +62,10 @@ final class CollectionReleasePolicy
             return 'A bounded article spot check did not complete.';
         }
         $bytes = (new CandidateHeaderInventory)->bytes($manifest);
-        $fileCount = count($manifest['files'] ?? []);
+        // Only files with articles are written to the NZB; a partial upload can declare files it never posted.
+        $emitted = array_values(array_filter($manifest['files'] ?? [], static fn (mixed $file): bool => is_array($file)
+            && is_array($file['segments'] ?? null) && $file['segments'] !== []));
+        $fileCount = count($emitted);
         $limits = $this->limits((int) $manifest['groups_id']);
         if ($bytes < $limits['min_size']) {
             return 'Declared collection size is below the configured minimum.';
@@ -74,7 +77,7 @@ final class CollectionReleasePolicy
             return 'Declared file count is below the configured minimum.';
         }
 
-        $subjects = array_map(static fn (array $file): string => (string) ($file['subject'] ?? ''), $manifest['files'] ?? []);
+        $subjects = array_map(static fn (array $file): string => (string) ($file['subject'] ?? ''), $emitted);
         $hasPayload = array_filter($subjects,
             static fn (string $subject): bool => preg_match('/\.par2(?:["\'\s]|$)/i', $subject) !== 1) !== [];
         $sampledNames = array_filter($manifest['verified_file_names'] ?? [],

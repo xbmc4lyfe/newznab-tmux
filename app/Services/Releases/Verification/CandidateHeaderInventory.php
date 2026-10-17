@@ -80,8 +80,8 @@ final class CandidateHeaderInventory
     }
 
     /**
-     * Articles and files found in the headers against those declared. Files never seen declare no
-     * article count, so they count only toward files.
+     * Articles and files found in the headers against those declared. A file is found once it has an
+     * article (only those reach the NZB); files never seen declare no article count.
      *
      * @param  array<string, mixed>  $manifest
      * @return array{articles_found: int, articles_expected: int, files_found: int, files_expected: int}
@@ -90,15 +90,16 @@ final class CandidateHeaderInventory
     {
         $found = 0;
         $expected = 0;
+        $filesFound = 0;
         foreach ($manifest['files'] ?? [] as $file) {
             $segments = is_array($file['segments'] ?? null) ? count($file['segments']) : 0;
             $found += $segments;
             $expected += max($segments, (int) ($file['totalparts'] ?? 0));
+            $filesFound += $segments > 0 ? 1 : 0;
         }
-        $files = count($manifest['files'] ?? []);
 
-        return ['articles_found' => $found, 'articles_expected' => $expected,
-            'files_found' => $files, 'files_expected' => max($files, (int) ($manifest['expected_files'] ?? 0))];
+        return ['articles_found' => $found, 'articles_expected' => $expected, 'files_found' => $filesFound,
+            'files_expected' => max(count($manifest['files'] ?? []), (int) ($manifest['expected_files'] ?? 0))];
     }
 
     /** @param array<string, mixed> $manifest */

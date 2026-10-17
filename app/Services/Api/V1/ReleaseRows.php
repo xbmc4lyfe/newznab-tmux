@@ -4,7 +4,10 @@ declare(strict_types=1);
 
 namespace App\Services\Api\V1;
 
+use App\Models\Release;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
+use Throwable;
 
 final class ReleaseRows
 {
@@ -20,31 +23,74 @@ final class ReleaseRows
      */
     public function rows(): array
     {
-        if ($this->rows !== null) {
-            return $this->rows;
+        return $this->rows ??= $this->withPartialCounts($this->normalizedRows());
+    }
+
+    /**
+     * Search and browse projections, including search-index documents, omit the partial-publication
+     * counts; attach them by GUID with one query so clients see incompleteness before downloading.
+     *
+     * @param  list<mixed>  $rows
+     * @return list<mixed>
+     */
+    private function withPartialCounts(array $rows): array
+    {
+        $guids = array_values(array_filter(array_map(fn (mixed $row): mixed => $this->value($row, 'guid'), $rows), 'is_string'));
+        if ($guids === []) {
+            return $rows;
+        }
+        try {
+            if (! Release::hasPartialArticleCounts()) {
+                return $rows;
+            }
+            $counts = DB::table('releases')->whereIn('guid', $guids)->whereNotNull('articles_expected')
+                ->get(['guid', 'articles_found', 'articles_expected', 'files_found', 'files_expected'])->keyBy('guid');
+        } catch (Throwable) {
+            return $rows;
+        }
+        foreach ($rows as $index => $row) {
+            $count = $counts->get($this->value($row, 'guid'));
+            if ($count === null) {
+                continue;
+            }
+            foreach (['articles_found', 'articles_expected', 'files_found', 'files_expected'] as $key) {
+                if (\is_array($row)) {
+                    $rows[$index][$key] = $count->{$key};
+                } elseif (\is_object($row)) {
+                    $row->{$key} = $count->{$key};
+                }
+            }
         }
 
+        return $rows;
+    }
+
+    /**
+     * @return list<mixed>
+     */
+    private function normalizedRows(): array
+    {
         if ($this->releases === null || $this->releases === false || $this->releases === []) {
-            return $this->rows = [];
+            return [];
         }
 
         if ($this->releases instanceof Collection) {
-            return $this->rows = $this->releases->values()->all();
+            return $this->releases->values()->all();
         }
 
         if (\is_array($this->releases)) {
-            return $this->rows = array_values($this->releases);
+            return array_values($this->releases);
         }
 
         if ($this->releases instanceof \Traversable) {
-            return $this->rows = array_values(iterator_to_array($this->releases));
+            return array_values(iterator_to_array($this->releases));
         }
 
         if (\is_object($this->releases)) {
-            return $this->rows = [$this->releases];
+            return [$this->releases];
         }
 
-        return $this->rows = [];
+        return [];
     }
 
     public function totalRows(): int

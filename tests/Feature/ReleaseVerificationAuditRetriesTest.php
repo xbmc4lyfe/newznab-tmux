@@ -17,6 +17,7 @@ use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
+use Tests\Fixtures\YencArticles;
 use Tests\TestCase;
 
 class ReleaseVerificationAuditRetriesTest extends TestCase
@@ -92,6 +93,31 @@ class ReleaseVerificationAuditRetriesTest extends TestCase
 
         $this->assertSame(['unknown', 'sampled'], array_column($this->records(), 'verdict'));
         $this->assertSame(0, DB::table('release_verification_audit_retries')->count());
+    }
+
+    public function test_audit_samples_a_partial_publication_instead_of_retrying_it_forever(): void
+    {
+        Schema::table('releases', function (Blueprint $table): void {
+            $table->unsignedInteger('articles_expected')->nullable();
+        });
+        $this->release(1);
+        $this->release(2);
+        DB::table('releases')->where('id', 1)->update(['articles_expected' => 3]);
+        // Both NZBs declare three articles and contain one; only release 1 was published as partial.
+        $xml = '<nzb><file subject="Release [1/1] &quot;movie.mkv&quot; (1/3)"><groups><group>alt.test</group></groups>'
+            .'<segments><segment bytes="5" number="1">a@b</segment></segments></file></nzb>';
+        $this->mock(NzbService::class, function ($mock) use ($xml): void {
+            $mock->shouldReceive('readNzbContents')->andReturn($xml);
+        });
+        $this->mock(NNTPService::class, function ($mock): void {
+            $mock->shouldReceive('doConnect')->with(false)->andReturn(true);
+            $mock->shouldReceive('verificationArticle')->with('a@b', 1048576)->andReturn(YencArticles::part('11111', 'movie.mkv', 15, 1, 1, 3));
+            $mock->shouldReceive('doQuit')->andReturn(null);
+        });
+
+        $this->audit(2);
+
+        $this->assertSame([1 => 'sampled', 2 => 'unknown'], array_column($this->records(), 'verdict', 'id'));
     }
 
     public function test_sample_budget_exhaustion_can_recover_on_a_later_resume(): void

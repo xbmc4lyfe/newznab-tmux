@@ -170,7 +170,8 @@ final class VerifiedReleasePublisher
                     }
                     if (isset($manifest['partial'])) {
                         DB::table('releases')->where('id', $id)->update(['articles_found' => $manifest['partial']['articles_found'],
-                            'articles_expected' => $manifest['partial']['articles_expected']]);
+                            'articles_expected' => $manifest['partial']['articles_expected'],
+                            'files_found' => $manifest['partial']['files_found'], 'files_expected' => $manifest['partial']['files_expected']]);
                     }
                     $timing?->nextPhase('final_xml_gzip');
                     $receipt = $this->writer->writeWithReceipt($manifest, $guid, $release, $timing);

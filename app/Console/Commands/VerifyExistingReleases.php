@@ -101,7 +101,9 @@ class VerifyExistingReleases extends Command
                     if ($xml === false) {
                         throw new \RuntimeException('Release NZB is unavailable.');
                     }
-                    $result = $verifier->verify($reader->read($xml, $release), static function (): void {});
+                    // A partial publication's NZB is knowingly incomplete and can never grow; audit what it has.
+                    $result = $verifier->verify($reader->read($xml, $release), static function (): void {},
+                        allowPartial: $release->getAttribute('articles_expected') !== null);
                     $record = ['id' => $release->id, 'verdict' => $result->verdict, 'reason' => $result->reason];
                 } catch (Throwable $error) {
                     $record = ['id' => $release->id, 'verdict' => 'unknown', 'reason' => $error->getMessage()];

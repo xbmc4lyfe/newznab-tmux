@@ -11,6 +11,7 @@ use App\Services\ReleaseCleaningService;
 use App\Services\ReleaseCreationService;
 use App\Services\ReleaseProcessingService;
 use App\Services\Releases\Verification\CandidateRepository;
+use App\Services\Releases\Verification\CollectionReleasePolicy;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\ReleaseMetadataResolver;
 use App\Services\Releases\Verification\ScratchInventory;
@@ -286,8 +287,9 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         }
         $this->publicationSchema();
         Schema::table('releases', function (Blueprint $table): void {
-            $table->unsignedInteger('articles_found')->nullable();
-            $table->unsignedInteger('articles_expected')->nullable();
+            foreach (['articles_found', 'articles_expected', 'files_found', 'files_expected'] as $column) {
+                $table->unsignedInteger($column)->nullable();
+            }
         });
         if ($refusal !== null) {
             try {
@@ -307,7 +309,23 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $release = DB::table('releases')->where('id', $releaseId)->first();
         $this->assertSame(1, (int) $release->articles_found);
         $this->assertSame(3, (int) $release->articles_expected);
+        $this->assertSame(1, (int) $release->files_found);
+        $this->assertSame(1, (int) $release->files_expected);
         $this->assertSame($releaseId, (int) DB::table('release_verification_candidates')->where('id', $claim->id)->value('release_id'));
+    }
+
+    public function test_partial_policy_counts_only_files_written_to_the_nzb(): void
+    {
+        // The payload was declared but none of its articles were seen; only PAR2 would be published.
+        $manifest = ['groups_id' => 1, 'expected_files' => 2, 'verification_mode' => 'spot_check',
+            'spot_check' => ['articles' => 1, 'bytes' => 5, 'sampled_files' => 1, 'method' => 'yenc-crc-and-identity'],
+            'verified_file_names' => ['movie.par2'], 'partial' => ['articles_found' => 1, 'articles_expected' => 4, 'files_found' => 1, 'files_expected' => 2],
+            'files' => [['key' => 'movie', 'subject' => 'Movie "movie.mkv"', 'totalparts' => 3, 'segments' => []],
+                ['key' => 'par2', 'subject' => 'Movie "movie.par2"', 'totalparts' => 1,
+                    'segments' => [['number' => 1, 'messageid' => 'p@article', 'bytes' => 5]]]]];
+
+        $this->assertSame('Header inventory contains only PAR2 files without a declared source payload.',
+            app(CollectionReleasePolicy::class)->verifiedRejection($manifest));
     }
 
     public function test_passed_collection_without_authoritative_inventory_fails_closed(): void
