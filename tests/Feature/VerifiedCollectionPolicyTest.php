@@ -421,14 +421,15 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame((int) $rows[1]->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
     }
 
-    /** @return array<string, array{bool}> */
+    /** @return array<string, array{string}> */
     public static function conflictingPostStates(): array
     {
-        return ['conflicting post still pending' => [false], 'conflicting post filtered' => [true]];
+        return ['conflicting post still pending' => ['pending'], 'conflicting post filtered' => ['filtered'],
+            'conflicting post published as its own partial' => ['published']];
     }
 
     #[DataProvider('conflictingPostStates')]
-    public function test_conflicting_late_headers_are_kept_apart_and_never_shadow_the_partial(bool $filtered): void
+    public function test_conflicting_late_headers_are_kept_apart_and_never_shadow_the_partial(string $state): void
     {
         $this->publicationSchema(partialColumns: true);
         $hash = sha1('conflicting-post', true);
@@ -446,12 +447,24 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame($retained->manifest_path, $rows[0]->manifest_path, 'The clean inventory is kept.');
         $this->assertSame((int) $retained->id, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
         $this->assertArrayNotHasKey('upgrades_release_id', app(ManifestStore::class)->read($rows[1]->manifest_path));
-        if ($filtered) {
+        if ($state === 'filtered') {
             DB::table('release_verification_candidates')->where('id', $rows[1]->id)->update(['status' => 'filtered', 'manifest_path' => '', 'manifest_bytes' => 0]);
+        } elseif ($state === 'published') {
+            $own = DB::table('releases')->insertGetId(['name' => 'Other', 'searchname' => 'Other', 'guid' => 'other-partial', 'leftguid' => 'o',
+                'fromname' => 'someone-else', 'postdate' => '2026-10-11 12:00:00', 'adddate' => '2026-10-11 12:00:00', 'totalpart' => 1, 'groups_id' => 1,
+                'size' => 5, 'passwordstatus' => 0, 'haspreview' => -1, 'categories_id' => 2000, 'nfostatus' => -1, 'nzbstatus' => 1, 'isrenamed' => 1,
+                'iscategorized' => 1, 'predb_id' => 0, 'articles_expected' => 3, 'late_article_candidate_id' => $rows[1]->id]);
+            DB::table('release_verification_candidates')->where('id', $rows[1]->id)->update(['release_id' => $own, 'status' => 'sampled']);
         }
+        $late = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 3, messageId: 'e@f');
+        DB::table('collections')->where('id', $late)->update(['filecheck' => 0]);
+        $statusBefore = DB::table('release_verification_candidates')->where('id', $rows[1]->id)->value('status');
+        app(CandidateRepository::class)->invalidateHotCollections([$late]);
+        $this->assertSame(3, (int) DB::table('collections')->where('id', $late)->value('filecheck'), 'The partial\'s late article is fast-tracked.');
+        $this->assertSame($statusBefore, DB::table('release_verification_candidates')->where('id', $rows[1]->id)->value('status'), 'The other post is left alone.');
 
         // The original poster's next article still reaches the partial's inventory, past the newer post.
-        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 3, messageId: 'e@f'));
+        app(CandidateRepository::class)->archive($late);
 
         $generation = DB::table('release_verification_candidates')->orderByDesc('id')->first();
         $merged = app(ManifestStore::class)->read($generation->manifest_path);
@@ -459,6 +472,21 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame($first, $merged['upgrades_release_id']);
         $this->assertSame((int) $generation->id, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
         $this->assertSame('', DB::table('release_verification_candidates')->where('id', $retained->id)->value('manifest_path'));
+    }
+
+    public function test_late_articles_never_republish_a_deleted_partial(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('deleted-before-upgrade', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+        // Deleted (admin, cleanup) while the merging generation is pending.
+        DB::table('releases')->where('id', $first)->delete();
+
+        $this->assertNull($this->publishStalledPartial(null));
+
+        $this->assertSame('filtered', DB::table('release_verification_candidates')->orderByDesc('id')->value('status'));
+        $this->assertSame(0, DB::table('releases')->count());
     }
 
     public function test_retained_partial_inventory_is_released_at_expiry(): void

@@ -74,18 +74,23 @@ final class CandidateRepository
                 }
                 $this->ledger->enter();
                 $existing = $this->lockLatestCandidate($sourceIdentity, $currentReads);
-                // A conflicting post archived apart is newer than the partial it left alone; the partial's own
-                // late articles still belong with its retained inventory, whatever became of that newer post.
+                // Late articles belong with the live partial whose inventory they extend without conflict,
+                // newest first, even past newer posts under the same hash (conflicting ones archived apart).
                 $holder = null;
-                if ($existing !== null && $snapshotFailure === null && ($existing->release_id === null || $existing->manifest_path === '')) {
-                    $holder = $this->lockRetainedPartial($sourceIdentity, (int) $existing->id);
-                    if ($holder !== null) {
-                        // A filtered newer post skipped the snapshot; these headers may still be the partial's.
-                        $manifest ??= $this->snapshotHeaders($collection, $currentReads);
-                        if ($this->merge($this->store->read($holder->manifest_path), $manifest)['conflict'] ?? false) {
-                            $holder = null;
+                if ($existing !== null && $snapshotFailure === null) {
+                    $partials = $this->lockRetainedPartials($sourceIdentity);
+                    if ($partials !== []) {
+                        try {
+                            // A filtered newer post skipped the snapshot; these headers may still be a partial's.
+                            $manifest ??= $this->snapshotHeaders($collection, $currentReads);
+                            $holder = $this->partialOwner($partials, $manifest);
+                        } catch (CandidateMetadataBudgetExceeded $error) {
+                            $snapshotFailure = $error;
                         }
                     }
+                }
+                if ($holder !== null && (int) $holder->id === (int) $existing->id) {
+                    $holder = null; // The newest candidate is the partial itself: the usual path below merges it.
                 }
                 if ($existing !== null && $existing->status === 'filtered' && $holder === null) {
                     if ($existing->release_id !== null || (int) $existing->groups_id !== (int) $collection->groups_id
@@ -521,27 +526,30 @@ final class CandidateRepository
             $identity = bin2hex($collection->collectionhash);
             $candidates = DB::table('release_verification_candidates')->where('source_identity', $identity)
                 ->where(fn ($query) => $query->whereNull('release_id')->orWhere('manifest_path', '<>', ''))
-                ->whereNotIn('status', ['expired'])->lockForUpdate()->get();
+                ->whereNotIn('status', ['expired'])->orderByDesc('id')->lockForUpdate()->get();
+            $snapshot = $this->snapshot($collection);
+            $partials = array_values(array_filter($candidates->all(), fn (object $candidate): bool => $candidate->release_id !== null
+                && $this->retainsLivePartial($candidate)));
+            $owner = $partials === [] ? null : $this->partialOwner($partials, $snapshot);
+            if ($owner !== null) {
+                // These are a published partial's late articles: keep its inventory from expiring and archive
+                // them now, which starts the generation that upgrades it. Other posts are left alone.
+                $old = $this->store->read($owner->manifest_path);
+                if ($this->articleIdentity($old) !== $this->articleIdentity($this->merge($old, $snapshot))) {
+                    DB::table('release_verification_candidates')->where('id', $owner->id)->update(['last_unique_at' => now()]);
+                    DB::table('collections')->where('id', $collection->id)->where('filecheck', '!=', 4)->update(['filecheck' => 3]);
+                }
+
+                continue;
+            }
             foreach ($candidates as $candidate) {
-                if ($candidate->manifest_path === '') {
+                // Published partials these headers don't extend are another post's; archive() keeps those apart.
+                if ($candidate->manifest_path === '' || $candidate->release_id !== null) {
                     continue;
                 }
                 $old = $this->store->read($candidate->manifest_path);
-                $merged = $this->merge($old, $this->snapshot($collection));
+                $merged = $this->merge($old, $snapshot);
                 if ($this->articleIdentity($old) === $this->articleIdentity($merged) && ! ($merged['conflict'] ?? false)) {
-                    continue;
-                }
-                if ($candidate->release_id !== null && (! $this->retainsLivePartial($candidate) || ($merged['conflict'] ?? false))) {
-                    // Its partial is gone (the next archive() releases this inventory), or these headers are another
-                    // post under the same hash, which archive() keeps apart: nothing to fast-track.
-                    continue;
-                }
-                if ($candidate->release_id !== null) {
-                    // A published partial stays published: keep its inventory from expiring and archive
-                    // the late articles now, which starts the generation that merges and upgrades it.
-                    DB::table('release_verification_candidates')->where('id', $candidate->id)->update(['last_unique_at' => now()]);
-                    DB::table('collections')->where('id', $collection->id)->where('filecheck', '!=', 4)->update(['filecheck' => 3]);
-
                     continue;
                 }
                 DB::table('release_verification_candidates')->where('id', $candidate->id)->update([
@@ -552,13 +560,34 @@ final class CandidateRepository
         }
     }
 
-    /** The newest older candidate of this upload still holding a live partial's retained inventory, locked. */
-    private function lockRetainedPartial(string $sourceIdentity, int $newerThan): ?object
+    /**
+     * Candidates of this upload holding a live partial's retained inventory, newest first, locked.
+     *
+     * @return list<object>
+     */
+    private function lockRetainedPartials(string $sourceIdentity): array
     {
-        $holder = DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)->where('id', '<', $newerThan)
-            ->whereNotNull('release_id')->where('manifest_path', '<>', '')->orderByDesc('id')->lockForUpdate()->first();
+        return array_values(array_filter(DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)
+            ->whereNotNull('release_id')->where('manifest_path', '<>', '')->orderByDesc('id')->lockForUpdate()->get()->all(),
+            fn (object $candidate): bool => $this->retainsLivePartial($candidate)));
+    }
 
-        return $holder !== null && $this->retainsLivePartial($holder) ? $holder : null;
+    /**
+     * The partial whose retained inventory these headers extend without conflict, if any.
+     *
+     * @param  list<object>  $partials
+     * @param  array<string, mixed>  $manifest
+     */
+    private function partialOwner(array $partials, array $manifest): ?object
+    {
+        foreach ($partials as $partial) {
+            $retained = $this->store->read($partial->manifest_path);
+            if (($retained['conflict'] ?? false) || ! ($this->merge($retained, $manifest)['conflict'] ?? false)) {
+                return $partial;
+            }
+        }
+
+        return null;
     }
 
     /** A published candidate's retained inventory still belongs to a live partial release. */
