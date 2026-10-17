@@ -31,6 +31,7 @@ default_config='{"services":{"web":{},"horizon":{},"scheduler":{},"indexer":{},"
 case "$*" in
     *' config --format json'*) if [ -n "${NNTMUX_CONFIG_ID:-}" ]; then echo "$NNTMUX_CONFIG_ID"; else echo "$default_config"; fi ;;
     *'image inspect --format'*)
+        if [ "${NNTMUX_INSPECT_FAIL_AFTER_UP:-0}" = 1 ] && [ -f "$NNTMUX_REPO/recreated" ]; then echo "Error response from daemon: timeout" >&2; exit 1; fi
         [ "${NNTMUX_IMAGE_INSPECT_FAIL:-0}" != 1 ] || { echo "Error response from daemon: request timed out" >&2; exit 1; }
         echo "${NNTMUX_IMAGE_ID:-sha256:fixture}" ;;
     *'image inspect'*) exit 0 ;;
@@ -80,6 +81,7 @@ case "$*" in
             [ "${NNTMUX_PROXY_FAIL:-0}" != 1 ] || exit 51 ;; esac
         case "$*" in *'--wait-timeout 240 web'*) [ "${NNTMUX_APP_UP_FAIL:-0}" != 1 ] || exit 52 ;; esac
         case "$*" in *'--force-recreate'*' redis'*) [ "${NNTMUX_REDIS_FAIL:-0}" != 1 ] || exit 53 ;; esac
+        [ -z "${NNTMUX_UP_FAIL_SERVICE:-}" ] || [ "$last" != "$NNTMUX_UP_FAIL_SERVICE" ] || exit 54
         if [ "${NNTMUX_STALE_UP:-0}" = 1 ]; then echo changed > "$NNTMUX_REPO/app.txt"; fi
         case "$*" in *' --force-recreate '*) : > "$NNTMUX_REPO/recreated" ;; esac ;;
 esac
@@ -817,12 +819,15 @@ SH);
     {
         $this->deploy()->mustRun();
         $events = $this->events();
-        $reconcile = ' up -d --no-deps --wait --wait-timeout 240 mariadb redis manticore';
+        $reconcile = ' up -d --no-deps --wait --wait-timeout 240 mariadb';
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 redis', $events);
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 manticore', $events);
         $this->assertStringContainsString($reconcile, $events);
         $this->assertStringNotContainsString('--force-recreate --wait mariadb', $events);
         $this->assertLessThan(strpos($events, 'artisan migrate'), strpos($events, $reconcile));
         $this->assertGreaterThan(strpos($events, ' stop web scheduler indexer'), strpos($events, $reconcile));
-        $infra = ' up -d --no-deps --wait --wait-timeout 240 proxy mailpit';
+        $infra = ' up -d --no-deps --wait --wait-timeout 240 proxy';
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 mailpit', $events);
         $this->assertStringContainsString($infra, $events);
         $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 proxy', $events);
         $this->assertLessThan(strpos($events, 'scheduler.py drain'), strpos($events, $infra), 'infra is applied before any drain');
@@ -1337,6 +1342,48 @@ SH);
         $this->assertStringContainsString('artisan migrate --force --no-interaction', $this->events());
     }
 
+    public function test_one_failing_infra_service_never_makes_the_retry_repeat_the_others(): void
+    {
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['prometheus'] = ['volumes' => [['type' => 'bind', 'source' => $this->directory.'/docker/config/prometheus.yml', 'target' => '/etc/prometheus/prometheus.yml', 'read_only' => true]]];
+        mkdir($this->directory.'/docker/config/caddy', 0777, true);
+        file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', "A\n");
+        file_put_contents($this->directory.'/docker/config/prometheus.yml', "a\n");
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+
+        file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', "B\n");
+        file_put_contents($this->directory.'/docker/config/prometheus.yml', "b\n");
+        $failed = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_UP_FAIL_SERVICE' => 'prometheus']);
+        $failed->run();
+        $this->assertSame(54, $failed->getExitCode());
+
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 prometheus', $events);
+        $this->assertDoesNotMatchRegularExpression('/ up -d[^\n]* proxy\b/', $events);
+    }
+
+    public function test_stamping_failure_after_a_successful_rollout_is_not_reported_as_a_checkout_change(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/app.txt', "two\n");
+        file_put_contents($this->directory.'/docker/.deploy.time', '1000');
+        // The image inspection fails only after the rollout recreates the app, while the guard
+        // writes the stamp.
+        unlink($this->directory.'/recreated');
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_INSPECT_FAIL_AFTER_UP' => '1']);
+        $process->run();
+        $this->assertSame(1, $process->getExitCode());
+        $log = (string) file_get_contents($this->directory.'/docker/.deploy.log');
+        $this->assertStringContainsString('result=stamp-failed', $log);
+        $this->assertStringNotContainsString('tree-changed-during-run', $log);
+        $this->assertNotSame('1000', trim((string) file_get_contents($this->directory.'/docker/.deploy.time')));
+        $this->assertSame('stale', strtok((string) file_get_contents($this->directory.'/docker/.deploy.stamp'), "\n"));
+        $this->assertAttemptsClosed();
+    }
+
     public function test_host_system_paths_match_on_path_boundaries_only(): void
     {
         $script = 'import importlib.machinery, importlib.util, sys; l = importlib.machinery.SourceFileLoader("dp", sys.argv[1]); '
@@ -1453,7 +1500,8 @@ SH);
 
             $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => $this->composeJson()])->mustRun();
             $events = $this->events();
-            $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 redis manticore', $events, $revision);
+            $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 redis', $events, $revision);
+            $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 manticore', $events, $revision);
             $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 proxy', $events, $revision);
             $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 redis', $events, $revision);
             $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 proxy', $events, $revision);
@@ -1547,7 +1595,8 @@ SH);
         $deploy();
         $events = $this->events();
         $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $events);
-        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 redis manticore', $events);
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 redis', $events);
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 manticore', $events);
         $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 redis', $events);
         $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 proxy', $events);
         $this->assertStringContainsString('compose --project-directory '.$runtime, $events);

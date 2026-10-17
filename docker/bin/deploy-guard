@@ -292,8 +292,18 @@ cmd_run() {
         # One snapshot supplies both the comparison and the stamp, so a checkout change between
         # them cannot stamp per-service data that was never built or verified.
         stamp_tmp="$STAMP.tmp.$$"
-        if "$DIR/bin/deploy-plan" --stamp-data "$target" >"$stamp_tmp" \
-            && [ "$(head -n 1 "$stamp_tmp")" = "$before" ]; then
+        if ! "$DIR/bin/deploy-plan" --stamp-data "$target" >"$stamp_tmp"; then
+            # The rollout succeeded; only recording it failed (e.g. a transient Docker query). Keep
+            # the records but invalidate the fingerprint so the next run re-plans and stamps.
+            if [ -f "$STAMP" ]; then
+                { echo stale; tail -n +2 "$STAMP"; } >"$stamp_tmp" && mv -f "$stamp_tmp" "$STAMP"
+            fi
+            rm -f "$stamp_tmp"
+            if [ ! -f "$DEPLOY_NOOP_MARKER" ] && [ "${RECORD_DEPLOY_TIME:-0}" = 1 ]; then date +%s >"$SUCCESS_TIME"; fi
+            log "$target" "result=stamp-failed (the $target completed; its stamp could not be written)"
+            echo "deploy-guard: $target completed but its stamp could not be written; the next run re-plans." >&2
+            rc=1
+        elif [ "$(head -n 1 "$stamp_tmp")" = "$before" ]; then
             mv -f "$stamp_tmp" "$STAMP"
             if [ -f "$DEPLOY_NOOP_MARKER" ]; then
                 noop=1

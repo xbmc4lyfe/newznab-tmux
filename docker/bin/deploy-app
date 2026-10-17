@@ -36,6 +36,22 @@ fi
 # something that is not running, and a retry repeats only what did not complete.
 plan() { "$DIR/bin/deploy-plan" "$@"; }
 plan --invalidate
+# Data and infra services are applied one at a time (mark, up, record): a failing service never
+# makes the next run repeat the ones that already came up. $1 is --pending (forced recreate) or
+# --forget (non-forced up).
+apply_each() {
+    mark=$1
+    shift
+    for svc in "$@"; do
+        plan "$mark" "$svc"
+        if [ "$mark" = --pending ]; then
+            compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" "$svc"
+        else
+            compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" "$svc"
+        fi
+        plan --record "$svc"
+    done
+}
 # The rendered-Compose `effective` record covers only what no service record explains; a change to
 # it always migrates, so it is recorded together with the completed migration.
 
@@ -43,11 +59,7 @@ plan --invalidate
 # here, before any drain, instead of after a full app rollout that would then repeat every poll.
 if [ -n "$DIRTY_INFRA" ]; then
     # shellcheck disable=SC2086
-    plan --pending $DIRTY_INFRA
-    # shellcheck disable=SC2086
-    compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $DIRTY_INFRA
-    # shellcheck disable=SC2086
-    plan --record $DIRTY_INFRA
+    apply_each --pending $DIRTY_INFRA
     verify
 fi
 
@@ -55,22 +67,14 @@ if [ -n "$START_DATA" ]; then
     # Data services that have no container yet (e.g. newly rendered) are started without
     # quiescing writers: nothing uses them before this run.
     # shellcheck disable=SC2086
-    plan --forget $START_DATA
-    # shellcheck disable=SC2086
-    compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $START_DATA
-    # shellcheck disable=SC2086
-    plan --record $START_DATA
+    apply_each --forget $START_DATA
     verify
 fi
 
 if [ -n "$RECONCILE_INFRA" ]; then
     # Compose recreates only services whose rendered configuration drifted.
     # shellcheck disable=SC2086
-    plan --forget $RECONCILE_INFRA
-    # shellcheck disable=SC2086
-    compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $RECONCILE_INFRA
-    # shellcheck disable=SC2086
-    plan --record $RECONCILE_INFRA
+    apply_each --forget $RECONCILE_INFRA
     verify
 fi
 
@@ -240,22 +244,14 @@ horizon_stopped=0
 
 if [ -n "$DIRTY_DATA" ]; then
     # shellcheck disable=SC2086
-    plan --pending $DIRTY_DATA
-    # shellcheck disable=SC2086
-    compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $DIRTY_DATA
-    # shellcheck disable=SC2086
-    plan --record $DIRTY_DATA
+    apply_each --pending $DIRTY_DATA
     verify
 fi
 
 if [ -n "$RECONCILE_DATA" ]; then
     # Without a stamp, only Compose drift is reconciled; unchanged data services keep running.
     # shellcheck disable=SC2086
-    plan --forget $RECONCILE_DATA
-    # shellcheck disable=SC2086
-    compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $RECONCILE_DATA
-    # shellcheck disable=SC2086
-    plan --record $RECONCILE_DATA
+    apply_each --forget $RECONCILE_DATA
     verify
 fi
 
