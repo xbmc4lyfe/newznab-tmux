@@ -1,0 +1,240 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Tests\Feature;
+
+use App\Services\Releases\Verification\DatabaseVerificationLockStore;
+use App\Services\Releases\Verification\VerificationLockStore;
+use App\Services\Releases\Verification\VerificationResetService;
+use App\Services\Releases\Verification\VerificationWorkerLocks;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\File;
+use RuntimeException;
+use Tests\TestCase;
+use Throwable;
+
+/**
+ * Each extra connection stands for a worker process on another host: MariaDB user-level locks
+ * belong to the session, exactly as they do across hosts sharing the database.
+ */
+class VerificationDatabaseLocksMariaDbTest extends TestCase
+{
+    /** @var list<string> */
+    private array $databases = [];
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        if (getenv('VERIFICATION_MARIADB_TEST') !== '1') {
+            $this->markTestSkipped('Requires the isolated verification MariaDB test database.');
+        }
+        config(['release_verification.storage_path' => storage_path('framework/testing/db-locks-'.bin2hex(random_bytes(6))),
+            'release_verification.candidate_workers' => 2, 'release_verification.locks' => 'auto']);
+        $this->fixture('mysql');
+        foreach (['verification_lock_other', 'verification_lock_third'] as $name) {
+            config(['database.connections.'.$name => config('database.connections.mysql')]);
+            DB::purge($name);
+        }
+        $this->assertInstanceOf(DatabaseVerificationLockStore::class, VerificationLockStore::make());
+    }
+
+    protected function tearDown(): void
+    {
+        try {
+            foreach (array_keys(DB::getConnections()) as $name) {
+                DB::purge($name);
+            }
+            foreach ($this->databases as $database) {
+                DB::connection('verification_lock_admin')->statement('DROP DATABASE IF EXISTS `'.$database.'`');
+            }
+            DB::purge('verification_lock_admin');
+            File::deleteDirectory((string) config('release_verification.storage_path'));
+        } finally {
+            parent::tearDown();
+        }
+    }
+
+    public function test_exclusive_names_exclude_other_sessions_and_a_second_holder_in_this_process(): void
+    {
+        $here = new DatabaseVerificationLockStore;
+        $there = new DatabaseVerificationLockStore('verification_lock_other');
+
+        $held = $here->exclusive('candidate-7');
+        $this->assertNotNull($held);
+        $this->assertNull($there->exclusive('candidate-7'));
+        $this->assertNull($here->exclusive('candidate-7'));
+        $this->assertNotNull($elsewhere = $there->exclusive('candidate-8'));
+        $this->assertTrue($here->holds($held));
+
+        $here->release($held);
+        $this->assertFalse($here->holds($held));
+        $this->assertNotNull($taken = $there->exclusive('candidate-7'));
+        $there->release($taken);
+        $there->release($elsewhere);
+    }
+
+    public function test_shared_holders_coexist_and_exclude_an_exclusive_holder_until_all_leave(): void
+    {
+        $first = new DatabaseVerificationLockStore;
+        $second = new DatabaseVerificationLockStore('verification_lock_other');
+        $exclusive = new DatabaseVerificationLockStore('verification_lock_third');
+
+        $a = $first->shared('worker');
+        $b = $second->shared('worker');
+        $c = $first->shared('worker');
+        $this->assertNotNull($a);
+        $this->assertNotNull($b);
+        $this->assertNotNull($c);
+        $this->assertNull($exclusive->exclusiveGroup('worker'));
+        $first->release($a);
+        $first->release($c);
+        $this->assertNull($exclusive->exclusiveGroup('worker'));
+        $second->release($b);
+
+        $sole = $exclusive->exclusiveGroup('worker');
+        $this->assertNotNull($sole);
+        $this->assertNull($first->shared('worker'));
+        $this->assertNull($second->exclusiveGroup('worker'));
+        $this->assertNotNull($reset = $second->exclusiveGroup('reset'));
+        $exclusive->release($sole);
+        $second->release($reset);
+        $this->assertNotNull($again = $first->shared('worker'));
+        $first->release($again);
+    }
+
+    public function test_an_ended_session_releases_its_locks_and_its_holder_learns_it_lost_them(): void
+    {
+        $here = new DatabaseVerificationLockStore;
+        $there = new DatabaseVerificationLockStore('verification_lock_other');
+        $slot = $there->exclusive('worker-3');
+        $member = $there->shared('worker');
+        $this->assertNotNull($slot);
+        $this->assertNotNull($member);
+        $this->assertNull($here->exclusive('worker-3'));
+
+        DB::connection('verification_lock_other')->disconnect();
+
+        $this->assertNotNull($taken = $here->exclusive('worker-3'));
+        $this->assertNotNull($sole = $here->exclusiveGroup('worker'));
+        $this->assertFalse($there->holds($slot));
+        $this->assertFalse($there->holds($member));
+        $there->release($slot);
+        $there->release($member);
+        $here->release($taken);
+        $here->release($sole);
+    }
+
+    public function test_worker_slots_candidates_and_maintenance_are_fenced_across_hosts(): void
+    {
+        $here = new VerificationWorkerLocks(new DatabaseVerificationLockStore);
+        $there = new VerificationWorkerLocks(new DatabaseVerificationLockStore('verification_lock_other'));
+        $audit = new VerificationWorkerLocks(new DatabaseVerificationLockStore('verification_lock_third'));
+        try {
+            $this->assertTrue($here->start(1));
+            $this->assertFalse($there->start(1));
+            $this->assertTrue($there->start());
+            $this->assertTrue($here->held());
+            $this->assertTrue($here->tryCandidate(5));
+            $this->assertFalse($there->tryCandidate(5));
+            $this->assertTrue($here->protects(5));
+            $this->assertFalse($there->protects(5));
+            $this->assertTrue($here->tryGc());
+            $this->assertFalse($there->tryGc());
+            $this->assertFalse($here->preferExpiry());
+            $this->assertTrue($here->preferExpiry());
+            $this->assertFalse($audit->tryExclusive());
+
+            $here->close();
+            $there->close();
+            $this->assertTrue($audit->tryExclusive());
+            $this->assertTrue($audit->protects(5));
+            $this->assertFalse($here->start(1));
+        } finally {
+            $here->close();
+            $there->close();
+            $audit->close();
+        }
+    }
+
+    public function test_reset_and_admission_exclude_each_other_across_hosts(): void
+    {
+        $reset = app(VerificationResetService::class);
+        $remoteWorker = new VerificationWorkerLocks(new DatabaseVerificationLockStore('verification_lock_other'));
+        $called = false;
+        try {
+            $this->assertTrue($remoteWorker->start());
+            try {
+                $reset->run(function () use (&$called): void {
+                    $called = true;
+                });
+                $this->fail('A worker on another host must exclude reset.');
+            } catch (RuntimeException) {
+                $this->assertFalse($called);
+            }
+        } finally {
+            $remoteWorker->close();
+        }
+
+        $remote = new DatabaseVerificationLockStore('verification_lock_other');
+        $remoteReset = $remote->exclusiveGroup('reset');
+        $this->assertNotNull($remoteReset);
+        try {
+            $reset->withAdmission(static fn () => null);
+            $this->fail('A reset on another host must refuse admission.');
+        } catch (RuntimeException $error) {
+            $this->assertStringContainsString('retry reset later', $error->getMessage());
+        } finally {
+            $remote->release($remoteReset);
+        }
+
+        DB::beginTransaction();
+        try {
+            $reset->withAdmission(static fn () => null);
+            $this->assertNull($remote->exclusiveGroup('reset'));
+        } finally {
+            DB::commit();
+        }
+        $this->assertNotNull($afterCommit = $remote->exclusiveGroup('reset'));
+        $remote->release($afterCommit);
+    }
+
+    public function test_lock_names_are_scoped_to_their_database(): void
+    {
+        $this->fixture('verification_lock_elsewhere');
+        $here = new DatabaseVerificationLockStore('mysql');
+        $elsewhere = new DatabaseVerificationLockStore('verification_lock_elsewhere');
+
+        $this->assertNotNull($a = $here->exclusive('gc'));
+        $this->assertNotNull($b = $elsewhere->exclusive('gc'));
+        $here->release($a);
+        $elsewhere->release($b);
+    }
+
+    private function fixture(string $connection): void
+    {
+        $endpoint = [
+            'driver' => 'mysql', 'url' => null, 'host' => getenv('VERIFICATION_MARIADB_HOST') ?: 'nntmux-verify-db',
+            'port' => (int) (getenv('VERIFICATION_MARIADB_PORT') ?: 3306), 'database' => 'mysql',
+            'username' => getenv('VERIFICATION_MARIADB_USERNAME') ?: 'root', 'password' => (string) getenv('VERIFICATION_MARIADB_PASSWORD'),
+            'unix_socket' => '', 'charset' => 'utf8mb4', 'collation' => 'utf8mb4_unicode_ci', 'prefix' => '',
+            'strict' => false, 'engine' => 'InnoDB', 'options' => [],
+        ];
+        config(['database.connections.verification_lock_admin' => $endpoint]);
+        $database = 'verification_locks_'.bin2hex(random_bytes(10));
+        try {
+            DB::connection('verification_lock_admin')->statement('CREATE DATABASE `'.$database.'`');
+        } catch (Throwable $error) {
+            DB::purge('verification_lock_admin');
+
+            throw $error;
+        }
+        $this->databases[] = $database;
+        config(['database.connections.'.$connection => ['database' => $database] + $endpoint]);
+        if ($connection === 'mysql') {
+            config(['database.default' => 'mysql']);
+        }
+        DB::purge($connection);
+        $this->assertSame($database, DB::connection($connection)->selectOne('SELECT DATABASE() AS name')->name);
+    }
+}

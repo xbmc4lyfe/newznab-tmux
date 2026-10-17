@@ -13,15 +13,19 @@ use App\Services\ReleaseProcessingService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\ReleaseMetadataResolver;
+use App\Services\Releases\Verification\RemoteReleasePublisher;
 use App\Services\Releases\Verification\ScratchInventory;
+use App\Services\Releases\Verification\SpotCheckVerifier;
 use App\Services\Releases\Verification\VerificationResult;
 use App\Services\Releases\Verification\VerifiedReleasePublisher;
 use App\Services\YencService;
 use App\Support\Configuration\IngestionConfigurationData;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Http\Client\Request as HttpRequest;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\DataProvider;
 
@@ -248,6 +252,84 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertIsString($contents);
         $this->assertStringContainsString('nntmux:verification-mode', $contents);
         $this->assertStringContainsString('spot-check', $contents);
+    }
+
+    public function test_remote_worker_publishes_through_the_primary_endpoint_idempotently(): void
+    {
+        config(['release_verification.publish_endpoint' => true, 'release_verification.publish_url' => 'http://primary.test/internal/release-verification/publish']);
+        $id = $this->collectionForPolicy();
+        DB::table('collections')->where('id', $id)->update(['filesize' => 100000]);
+        DB::table('parts')->update(['size' => 100000]);
+        $repository = app(CandidateRepository::class);
+        $repository->archive($id);
+        $claim = $repository->claim();
+        $stored = app(ManifestStore::class)->read($claim->manifest_path);
+        $local = SpotCheckVerifier::withEvidence($stored, ['articles' => 1, 'bytes' => 256, 'sampled_files' => 1,
+            'verified_file_names' => ['movie.mkv'], 'identity_hints' => ['movie.mkv']]);
+        $this->publicationSchema();
+        Search::shouldReceive('updateRelease')->once();
+        $requests = [];
+        // Route the worker's HTTP request into this application, as the primary host would serve it.
+        Http::fake(function (HttpRequest $request) use (&$requests) {
+            $requests[] = $request->data();
+            $response = $this->postJson('/internal/release-verification/publish', $request->data());
+
+            return Http::response($response->json(), $response->status());
+        });
+        $result = new VerificationResult('sampled', 'Sampled article checks passed; the full payload was not downloaded.', $local);
+
+        $releaseId = app(RemoteReleasePublisher::class)->publish($claim, $result);
+        $again = app(RemoteReleasePublisher::class)->publish($claim, $result);
+
+        $this->assertIsInt($releaseId);
+        $this->assertSame($releaseId, $again);
+        $this->assertArrayNotHasKey('files', $requests[0]['evidence']);
+        $this->assertSame(SpotCheckVerifier::evidence($local), $requests[0]['evidence']);
+        $this->assertSame(100000, (int) DB::table('releases')->where('id', $releaseId)->value('size'));
+        $this->assertSame(1, DB::table('releases')->count());
+        $this->assertSame('sampled', DB::table('release_verification_candidates')->where('id', $claim->id)->value('status'));
+        $contents = app(NzbService::class)->readNzbContents((string) DB::table('releases')->where('id', $releaseId)->value('guid'));
+        $this->assertIsString($contents);
+        $this->assertStringContainsString('spot-check', $contents);
+    }
+
+    public function test_remote_publication_endpoint_refuses_disabled_public_and_stale_requests(): void
+    {
+        $id = $this->collectionForPolicy();
+        $repository = app(CandidateRepository::class);
+        $repository->archive($id);
+        $claim = $repository->claim();
+        $this->publicationSchema();
+        $payload = ['claim' => ['id' => $claim->id, 'version' => $claim->version, 'manifest_hash' => $claim->manifest_hash,
+            'lease_token' => 'not-the-lease'], 'reason' => 'Sampled.', 'evidence' => ['articles' => 1, 'bytes' => 256,
+                'sampled_files' => 1, 'verified_file_names' => ['movie.mkv'], 'identity_hints' => ['movie.mkv']]];
+
+        $this->postJson('/internal/release-verification/publish', $payload)->assertNotFound();
+        config(['release_verification.publish_endpoint' => true]);
+        $this->withServerVariables(['REMOTE_ADDR' => '203.0.113.9'])->postJson('/internal/release-verification/publish', $payload)->assertForbidden();
+        $this->withServerVariables(['REMOTE_ADDR' => '192.168.1.113'])->postJson('/internal/release-verification/publish', $payload)
+            ->assertStatus(409)->assertJson(['error' => 'Stale verification result cannot publish.']);
+        $this->withServerVariables(['REMOTE_ADDR' => '192.168.1.113'])->postJson('/internal/release-verification/publish',
+            array_replace_recursive($payload, ['evidence' => ['articles' => 0]]))->assertUnprocessable();
+        $this->assertSame(0, DB::table('releases')->count());
+        $this->assertSame('verifying', DB::table('release_verification_candidates')->where('id', $claim->id)->value('status'));
+    }
+
+    public function test_remote_publisher_reports_the_primary_refusal(): void
+    {
+        config(['release_verification.publish_url' => 'http://primary.test/internal/release-verification/publish']);
+        Http::fake(['primary.test/*' => Http::response(['error' => 'Stale verification result cannot publish.'], 409)]);
+        $claim = (object) ['id' => 1, 'version' => 1, 'manifest_hash' => str_repeat('a', 64), 'lease_token' => 'lease'];
+        $manifest = SpotCheckVerifier::withEvidence(['files' => [], 'groups_id' => 1], ['articles' => 1, 'bytes' => 1,
+            'sampled_files' => 1, 'verified_file_names' => [], 'identity_hints' => []]);
+
+        try {
+            app(RemoteReleasePublisher::class)->publish($claim, new VerificationResult('sampled', 'Sampled.', $manifest));
+            $this->fail('A refused remote publication must fail.');
+        } catch (\RuntimeException $error) {
+            $this->assertSame('Remote publication failed: Stale verification result cannot publish.', $error->getMessage());
+        }
+        $this->assertNull(app(RemoteReleasePublisher::class)->publish($claim, new VerificationResult('unknown', 'Not verified.')));
     }
 
     public function test_passed_collection_without_authoritative_inventory_fails_closed(): void

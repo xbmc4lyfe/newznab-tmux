@@ -4,44 +4,48 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
-use Illuminate\Support\Facades\File;
 use RuntimeException;
 
-/** Stable file locks outlive database leases and manifest generations. */
+/** Stable locks outlive database leases and manifest generations. */
 final class VerificationWorkerLocks
 {
-    /** Ceiling on scheduled candidate worker slots, whatever the configured count. */
+    /** Ceiling on scheduled candidate worker slots per host, whatever the configured count. */
     public const int MAX_SLOTS = 64;
 
-    /** @var resource|null */
-    private $global = null;
+    /** Highest slot number across every worker host; each host schedules its own range. */
+    public const int MAX_SLOT_NUMBER = 256;
 
-    /** @var resource|null */
-    private $slot = null;
+    private ?VerificationLockStore $store;
 
-    /** @var resource|null */
-    private $candidate = null;
+    private ?VerificationLock $global = null;
 
-    /** @var resource|null */
-    private $gc = null;
+    private ?VerificationLock $slot = null;
+
+    private ?VerificationLock $candidate = null;
+
+    private ?VerificationLock $gc = null;
 
     private ?int $candidateId = null;
 
     private bool $exclusive = false;
 
+    public function __construct(?VerificationLockStore $store = null)
+    {
+        $this->store = $store;
+    }
+
     public function start(int $slot = 0): bool
     {
         $this->close();
-        $this->global = $this->acquire('worker.lock', LOCK_SH);
+        $this->global = $this->store()->shared('worker');
         if ($this->global === null) {
             return false;
         }
-        $maximum = self::slots();
-        foreach ($slot > 0 ? [$slot] : range(1, $maximum) as $number) {
-            if ($number > $maximum) {
+        foreach ($slot > 0 ? [$slot] : range(self::firstSlot(), self::lastSlot()) as $number) {
+            if ($number < self::firstSlot() || $number > self::lastSlot()) {
                 break;
             }
-            $this->slot = $this->acquire('locks/worker-'.$number.'.lock', LOCK_EX);
+            $this->slot = $this->store()->exclusive('worker-'.$number);
             if ($this->slot !== null) {
                 return true;
             }
@@ -51,18 +55,29 @@ final class VerificationWorkerLocks
         return false;
     }
 
-    /** Configured candidate worker slots, from 1 to MAX_SLOTS. */
+    /** Configured candidate worker slots on this host, from 1 to MAX_SLOTS. */
     public static function slots(): int
     {
         return max(1, min(self::MAX_SLOTS, (int) config('release_verification.candidate_workers', 2)));
     }
 
+    /** This host's first slot number; hosts sharing a database configure disjoint ranges. */
+    public static function firstSlot(): int
+    {
+        return max(0, min(self::MAX_SLOT_NUMBER - self::MAX_SLOTS, (int) config('release_verification.slot_offset', 0))) + 1;
+    }
+
+    public static function lastSlot(): int
+    {
+        return self::firstSlot() + self::slots() - 1;
+    }
+
     public function startPreparation(): bool
     {
         $this->close();
-        $this->global = $this->acquire('worker.lock', LOCK_SH);
+        $this->global = $this->store()->shared('worker');
         if ($this->global !== null) {
-            $this->slot = $this->acquire('locks/preparation.lock', LOCK_EX);
+            $this->slot = $this->store()->exclusive('preparation');
             if ($this->slot !== null) {
                 return true;
             }
@@ -88,13 +103,14 @@ final class VerificationWorkerLocks
         if ($this->slot === null || $this->global === null) {
             throw new RuntimeException('Queue selection requires an active slot.');
         }
-        rewind($this->slot);
-        $stored = stream_get_contents($this->slot, 16);
+        $state = $this->slot->state();
+        rewind($state);
+        $stored = stream_get_contents($state, 16);
         $phase = is_string($stored) && preg_match('/\A[0-4]\z/D', $stored) === 1 ? (int) $stored : 0;
         $next = ($phase + 1) % 5;
         if ($advance) {
-            rewind($this->slot);
-            if (fwrite($this->slot, (string) $next) !== 1 || ! ftruncate($this->slot, 1) || ! fflush($this->slot)) {
+            rewind($state);
+            if (fwrite($state, (string) $next) !== 1 || ! ftruncate($state, 1) || ! fflush($state)) {
                 throw new RuntimeException('Cannot persist verification queue selection.');
             }
         }
@@ -105,7 +121,7 @@ final class VerificationWorkerLocks
     public function tryExclusive(): bool
     {
         $this->close();
-        $this->global = $this->acquire('worker.lock', LOCK_EX);
+        $this->global = $this->store()->exclusiveGroup('worker');
         $this->exclusive = $this->global !== null;
 
         return $this->exclusive;
@@ -119,7 +135,7 @@ final class VerificationWorkerLocks
         if ($this->candidate !== null || $this->global === null) {
             throw new RuntimeException('Candidate lock requires an active worker and no other candidate lock.');
         }
-        $this->candidate = $this->acquire('locks/candidate-'.$id.'.lock', LOCK_EX);
+        $this->candidate = $this->store()->exclusive('candidate-'.$id);
         if ($this->candidate === null) {
             return false;
         }
@@ -128,14 +144,26 @@ final class VerificationWorkerLocks
         return true;
     }
 
+    /** A database lock is lost with its session, so protection is proved at each use. */
     public function protects(int $id): bool
     {
-        return $this->exclusive || ($this->candidate !== null && $this->candidateId === $id);
+        if ($this->exclusive) {
+            return $this->global !== null && $this->store()->holds($this->global);
+        }
+
+        return $this->candidate !== null && $this->candidateId === $id && $this->store()->holds($this->candidate);
+    }
+
+    /** Whether this worker still holds its group and slot locks. */
+    public function held(): bool
+    {
+        return $this->global !== null && $this->slot !== null
+            && $this->store()->holds($this->global) && $this->store()->holds($this->slot);
     }
 
     public function tryGc(): bool
     {
-        $this->gc = $this->acquire('locks/gc.lock', LOCK_EX);
+        $this->gc = $this->store()->exclusive('gc');
 
         return $this->gc !== null;
     }
@@ -146,10 +174,11 @@ final class VerificationWorkerLocks
         if ($this->gc === null || $this->slot === null || $this->global === null) {
             throw new RuntimeException('Maintenance selection requires an active worker and GC lock.');
         }
-        rewind($this->gc);
-        $expiryFirst = stream_get_contents($this->gc, 16) === '1';
-        rewind($this->gc);
-        if (fwrite($this->gc, $expiryFirst ? '0' : '1') !== 1 || ! ftruncate($this->gc, 1) || ! fflush($this->gc)) {
+        $state = $this->gc->state();
+        rewind($state);
+        $expiryFirst = stream_get_contents($state, 16) === '1';
+        rewind($state);
+        if (fwrite($state, $expiryFirst ? '0' : '1') !== 1 || ! ftruncate($state, 1) || ! fflush($state)) {
             throw new RuntimeException('Cannot persist verification maintenance selection.');
         }
 
@@ -181,44 +210,18 @@ final class VerificationWorkerLocks
         $this->close();
     }
 
-    /** @return resource|null */
-    private function acquire(string $name, int $mode)
+    /** Chosen at first use, so constructing the locks needs no application configuration. */
+    private function store(): VerificationLockStore
     {
-        $root = (string) config('release_verification.storage_path');
-        foreach ([$root, $root.'/locks'] as $directory) {
-            if (is_link($directory)) {
-                throw new RuntimeException('Verification lock directory cannot be a symlink.');
-            }
-            File::ensureDirectoryExists($directory, 0700);
-        }
-        $path = $root.'/'.$name;
-        if (is_link($path)) {
-            throw new RuntimeException('Verification lock cannot be a symlink.');
-        }
-        $handle = fopen($path, 'c+');
-        if ($handle === false) {
-            throw new RuntimeException('Verification lock is unavailable.');
-        }
-        if (! flock($handle, $mode | LOCK_NB)) {
-            fclose($handle);
-
-            return null;
-        }
-
-        return $handle;
+        return $this->store ??= VerificationLockStore::make();
     }
 
-    /**
-     * @param  resource|null  $handle
-     *
-     * @param-out null $handle
-     */
-    private function release(&$handle): void
+    /** @param-out null $lock */
+    private function release(?VerificationLock &$lock): void
     {
-        if (is_resource($handle)) {
-            flock($handle, LOCK_UN);
-            fclose($handle);
+        if ($lock !== null) {
+            $this->store()->release($lock);
         }
-        $handle = null;
+        $lock = null;
     }
 }

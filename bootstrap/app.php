@@ -44,6 +44,8 @@ return Application::configure(basePath: dirname(__DIR__))
             Route::middleware('api')
                 ->prefix('rss')
                 ->group(base_path('routes/rss.php'));
+            Route::prefix('internal')
+                ->group(base_path('routes/internal.php'));
         },
     )
     ->withMiddleware(function (Middleware $middleware) {

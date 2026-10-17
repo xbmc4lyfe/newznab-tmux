@@ -11,6 +11,7 @@ use App\Services\ReleaseCleaningService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\ReleaseMetadataResolver;
+use App\Services\Releases\Verification\ScratchBudget;
 use App\Services\Releases\Verification\ScratchInventory;
 use App\Services\Releases\Verification\VerificationWorkerLocks;
 use App\Services\YencService;
@@ -575,6 +576,54 @@ PHP;
             chmod($root.'/scratch', 0700);
         }
         $this->assertFileExists($directory.'/payload');
+    }
+
+    public function test_a_remote_worker_host_cleans_and_budgets_only_its_own_scratch(): void
+    {
+        $primaryDirectory = $this->candidateScratch(1);
+        DB::table('release_verification_scratch')->update(['reserved_bytes' => 11]);
+        DB::table('release_verification_scratch_budget')->where('host', '')->update(['reserved_bytes' => 11]);
+        $root = (string) config('release_verification.storage_path');
+        $command = app(VerifyReleaseCandidates::class);
+        $method = new \ReflectionMethod($command, 'cleanupTerminalScratch');
+        config(['release_verification.host' => 'm4']);
+        // The remote host has none of the primary's directories; it must not take their absence as proof.
+        File::deleteDirectory($root.'/scratch');
+        $locks = new VerificationWorkerLocks;
+        try {
+            $this->assertTrue(app(ScratchBudget::class)->initialize());
+            $this->assertTrue($locks->start());
+            app(ScratchInventory::class)->register(1, 2);
+            $remoteEntry = app(ScratchInventory::class)->entryId(1, 2);
+            app(ScratchBudget::class)->reserve($remoteEntry, 5);
+            mkdir($root.'/scratch/1-2', 0700, true);
+            file_put_contents($root.'/scratch/1-2/payload', 'remote');
+            $method->invoke($command, $root, $locks);
+            $this->assertSame([], app(ScratchInventory::class)->olderVersions(1, 2)->all());
+        } finally {
+            $locks->close();
+        }
+
+        $this->assertSame(['', 'm4'], DB::table('release_verification_scratch')->orderBy('host')->pluck('host')->all());
+        $this->assertSame(11, (int) DB::table('release_verification_scratch_budget')->where('host', '')->value('reserved_bytes'));
+        $this->assertSame(5, (int) DB::table('release_verification_scratch_budget')->where('host', 'm4')->value('reserved_bytes'));
+        $this->assertTrue((bool) DB::table('release_verification_scratch_budget')->where('host', 'm4')->value('initialized'));
+
+        // The remote host forgets its own terminal entry and releases only its own reservation.
+        $locks = new VerificationWorkerLocks;
+        try {
+            $this->assertTrue($locks->start());
+            DB::table('release_verification_candidates')->where('id', 1)->update(['version' => 2]);
+            File::delete($root.'/indexed-scratch.cursor');
+            $method->invoke($command, $root, $locks);
+        } finally {
+            $locks->close();
+        }
+        $this->assertSame([''], DB::table('release_verification_scratch')->pluck('host')->all());
+        $this->assertSame(0, (int) DB::table('release_verification_scratch_budget')->where('host', 'm4')->value('reserved_bytes'));
+        $this->assertSame(11, (int) DB::table('release_verification_scratch_budget')->where('host', '')->value('reserved_bytes'));
+        $this->assertDirectoryDoesNotExist($root.'/scratch/1-2');
+        $this->assertDirectoryDoesNotExist($primaryDirectory);
     }
 
     private function candidateScratch(int $id, string $status = 'complete'): string

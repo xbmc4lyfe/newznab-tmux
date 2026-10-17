@@ -27,7 +27,24 @@
 		}
 	}
 
+	# Remote-worker endpoints are served only on the internal listener below.
+	handle /internal/* {
+		respond 404
+	}
+
 	handle {
 		reverse_proxy web:80
+	}
+}
+
+# Internal listener for remote verification workers. Its port is published separately
+# (INTERNAL_BIND), so the public site can stay reachable while this one stays on the LAN.
+:8090 {
+	handle /internal/* {
+		reverse_proxy web:80
+	}
+
+	handle {
+		respond 404
 	}
 }

@@ -17,33 +17,35 @@ final class VerificationResetService
         if (DB::transactionLevel() !== 0) {
             throw new RuntimeException('Database reset cannot run inside an open transaction.');
         }
-        $admissionLock = $this->lock('reset.lock', LOCK_EX);
+        $store = VerificationLockStore::make();
+        $admissionLock = $this->lock($store->exclusiveGroup('reset'));
         try {
-            $workerLock = $this->lock('worker.lock', LOCK_EX);
+            $workerLock = $this->lock($store->exclusiveGroup('worker'));
             try {
                 $this->clearVerification();
                 $reset();
             } finally {
-                $this->unlock($workerLock);
+                $store->release($workerLock);
             }
         } finally {
-            $this->unlock($admissionLock);
+            $store->release($admissionLock);
         }
     }
 
     /** Retain admission protection until the caller's outer transaction finishes. */
     public function withAdmission(callable $admit): void
     {
-        $lock = $this->lock('reset.lock', LOCK_SH);
+        $store = VerificationLockStore::make();
+        $lock = $this->lock($store->shared('reset'));
         try {
             $admit();
         } finally {
             if (DB::transactionLevel() > 0) {
-                $release = fn () => $this->unlock($lock);
+                $release = static fn () => $store->release($lock);
                 DB::afterCommit($release);
                 DB::afterRollBack($release);
             } else {
-                $this->unlock($lock);
+                $store->release($lock);
             }
         }
     }
@@ -74,6 +76,7 @@ final class VerificationResetService
         });
 
         $root = (string) config('release_verification.storage_path');
+        File::ensureDirectoryExists($root, 0700);
         foreach (new \FilesystemIterator($root, \FilesystemIterator::SKIP_DOTS) as $entry) {
             if (in_array($entry->getFilename(), ['worker.lock', 'reset.lock', 'locks', '.gitignore'], true)) {
                 continue;
@@ -87,29 +90,8 @@ final class VerificationResetService
         }
     }
 
-    /** @return resource */
-    private function lock(string $name, int $mode)
+    private function lock(?VerificationLock $lock): VerificationLock
     {
-        $root = (string) config('release_verification.storage_path');
-        File::ensureDirectoryExists($root, 0700);
-        $lock = fopen($root.'/'.$name, 'c');
-        if ($lock === false) {
-            throw new RuntimeException('Verification reset lock is unavailable.');
-        }
-        if (! flock($lock, $mode | LOCK_NB)) {
-            fclose($lock);
-            throw new RuntimeException('Verification worker, admission or reset is active; retry reset later.');
-        }
-
-        return $lock;
-    }
-
-    /** @param resource $lock */
-    private function unlock($lock): void
-    {
-        if (is_resource($lock)) {
-            flock($lock, LOCK_UN);
-            fclose($lock);
-        }
+        return $lock ?? throw new RuntimeException('Verification worker, admission or reset is active; retry reset later.');
     }
 }

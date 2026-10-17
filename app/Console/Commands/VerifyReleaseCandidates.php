@@ -10,6 +10,7 @@ use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\LeaseHeartbeat;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\NntpArticleSource;
+use App\Services\Releases\Verification\RemoteReleasePublisher;
 use App\Services\Releases\Verification\ScratchBudget;
 use App\Services\Releases\Verification\ScratchInventory;
 use App\Services\Releases\Verification\SpotCheckVerifier;
@@ -116,6 +117,10 @@ class VerifyReleaseCandidates extends Command
                     $diagnostics?->stop('deadline', hrtime(true));
                     break;
                 }
+                // Database locks end with their session; stop rather than run unprotected.
+                if (! $locks->held()) {
+                    throw new RuntimeException('Verification worker locks were lost.');
+                }
                 $preferReady = $locks->preferReady();
                 $diagnostics?->claimCalled();
                 $claim = $repository->claim(fn (int $id): bool => $locks->tryCandidate($id), $preferReady);
@@ -130,8 +135,7 @@ class VerifyReleaseCandidates extends Command
                     $heartbeat();
                     $progressHeartbeat = new LeaseHeartbeat($heartbeat, max(0.1, min(30, (int) config('release_verification.lease_seconds') / 3)));
                     $scratchInventory->register((int) $claim->id, (int) $claim->version);
-                    $scratchEntryId = (int) DB::table('release_verification_scratch')->where('candidate_id', $claim->id)
-                        ->where('version', $claim->version)->value('id');
+                    $scratchEntryId = $scratchInventory->entryId((int) $claim->id, (int) $claim->version);
                     $scratchBudget->reconcile($scratchEntryId, $locks, $progressHeartbeat);
                     $verificationOptions = (array) config('release_verification');
                     $source ??= new NntpArticleSource(app(NNTPService::class), decoder: $decoder,
@@ -154,7 +158,9 @@ class VerifyReleaseCandidates extends Command
                     $result = $verifier->verify($manifest, $progressHeartbeat);
                     $diagnostics?->verified($result->verdict);
                     if ($result->passed()) {
-                        if ($publisher->publish($claim, $result) === null) {
+                        $released = config('release_verification.publish_url')
+                            ? app(RemoteReleasePublisher::class)->publish($claim, $result) : $publisher->publish($claim, $result);
+                        if ($released === null) {
                             $result = $this->filteredResult($claim) ?? throw new RuntimeException('Publication did not produce a verified current release.');
                             $diagnostics?->filtered();
                         } else {
@@ -236,9 +242,11 @@ class VerifyReleaseCandidates extends Command
         $after = max(0, (int) ($cursor['after'] ?? 0));
         $ceiling = max(0, (int) ($cursor['ceiling'] ?? 0));
         if ($ceiling === 0) {
-            $ceiling = (int) DB::table('release_verification_scratch')->max('id');
+            $ceiling = (int) DB::table('release_verification_scratch')->where('host', ScratchInventory::host())->max('id');
         }
-        $entries = DB::table('release_verification_scratch')->where('id', '>', $after)->where('id', '<=', $ceiling)
+        // Another host's directories are not here; only their owner can prove them absent.
+        $entries = DB::table('release_verification_scratch')->where('host', ScratchInventory::host())
+            ->where('id', '>', $after)->where('id', '<=', $ceiling)
             ->orderBy('id')->limit(100)->get();
         if ($entries->isEmpty() && $ceiling === 0) {
             return;
