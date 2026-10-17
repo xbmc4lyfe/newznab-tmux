@@ -155,7 +155,7 @@ fi
 
 if [ -n "$DIRTY_DATA" ]; then
     # shellcheck disable=SC2086
-    compose up -d --no-deps --force-recreate --wait $DIRTY_DATA
+    compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $DIRTY_DATA
     verify
 fi
 
@@ -179,4 +179,10 @@ fi
 if [ -n "$DIRTY_INFRA" ]; then
     # shellcheck disable=SC2086
     compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $DIRTY_INFRA
+fi
+
+if [ -n "$RECONCILE_INFRA" ]; then
+    # Compose recreates only services whose rendered configuration drifted.
+    # shellcheck disable=SC2086
+    compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $RECONCILE_INFRA
 fi

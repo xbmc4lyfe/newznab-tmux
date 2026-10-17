@@ -89,85 +89,41 @@ IGNORED_PREFIXES = (
     "scripts/",
 )
 
+# Role-specific ownership is limited to inputs no other role can execute: static/Vite assets that
+# only the web image serves, and files copied only into one role's image. Any PHP, config, route or
+# view file can be reached from another role (queued jobs, scheduled commands, tmux scripts, service
+# providers), so it stays shared-app and rebuilds all four app services.
 WEB_ONLY_EXACT = {
     "docker/app/Caddyfile",
     "package-lock.json",
     "package.json",
     "tsconfig.json",
     "vite.config.js",
-    "routes/api.php",
-    "routes/channels.php",
-    "routes/rss.php",
-    "config/captcha.php",
-    "config/cors.php",
-    "config/google2fa.php",
-    "config/passkeys.php",
-    "config/tinymce.php",
 }
 
 WEB_ONLY_PREFIXES = (
-    "app/Http/",
-    "app/View/",
-    "config/forum/",
     "resources/css/",
-    "resources/forum/",
     "resources/js/",
 )
 
-HORIZON_ONLY_EXACT: set[str] = set()
-
-HORIZON_ONLY_PREFIXES: tuple[str, ...] = ()
-
 SCHEDULER_ONLY_EXACT = {
     "docker/app/bin/scheduler.py",
-    "routes/console.php",
-    "app/Console/Commands/PredbImportFeed.php",
-    "app/Console/Commands/WarmAdminDashboard.php",
-    "app/Console/Commands/CollectStats.php",
-    "app/Console/Commands/NntmuxDeleteUnVerifiedUsers.php",
-    "app/Console/Commands/NntmuxUpdateExpiredRoles.php",
-    "app/Console/Commands/DisableExpiredPromotions.php",
-    "app/Console/Commands/DisableExpiredRegistrationPeriods.php",
-    "app/Console/Commands/CloudflareReload.php",
-    "app/Console/Commands/PurgeExpiredGdprExports.php",
-    "app/Console/Commands/NntmuxPopulateSteamApps.php",
-    "app/Console/Commands/CollectSystemMetrics.php",
-    "app/Console/Commands/ExportMonitoringMetrics.php",
-    "app/Console/Commands/CheckServiceHealth.php",
-    "app/Console/Commands/NntmuxSearchRepair.php",
-    "app/Console/Commands/IndexLogs.php",
-    "app/Console/Commands/PrepareReleaseCandidates.php",
-    "app/Console/Commands/VerifyReleaseCandidates.php",
 }
-
-SCHEDULER_ONLY_PREFIXES: tuple[str, ...] = ()
 
 INDEXER_ONLY_EXACT = {
     "docker/app/bin/indexer.sh",
     "docker/app/php/yenc-ffi.ini",
-    "config/tmux.conf",
-    "app/Services/IRCClient.php",
-    "app/Services/IRCScraper.php",
-    "app/Console/Commands/IrcScraperCommand.php",
-    "app/Console/Commands/ProcessPostProcess.php",
-    "app/Console/Commands/ProcessReleasesCommand.php",
-    "app/Console/Commands/ProcessReleasesMulti.php",
-    "app/Console/Commands/ProcessSafe.php",
-    "app/Console/Commands/ProcessUpdatePerGroup.php",
-    "app/Console/Commands/TmuxAttach.php",
-    "app/Console/Commands/TmuxDrain.php",
-    "app/Console/Commands/TmuxMonitor.php",
-    "app/Console/Commands/TmuxStart.php",
-    "app/Console/Commands/TmuxStop.php",
-    "app/Console/Commands/UpdateBackfill.php",
-    "app/Console/Commands/UpdateBinaries.php",
-    "app/Console/Commands/UpdateGroupHeaders.php",
-    "app/Console/Commands/UpdatePerGroup.php",
-    "app/Console/Commands/UpdatePostProcess.php",
 }
 
-INDEXER_ONLY_PREFIXES = (
-    "app/Services/Backfill/",
+# Bind-mounted service configuration. Deploy plans hash the files Compose actually mounts; these
+# repository paths are only used to interpret a legacy one-line stamp.
+LEGACY_CONFIG_OWNERS = (
+    ("docker/config/caddy/", "proxy"),
+    ("docker/config/prometheus/", "prometheus"),
+    ("docker/monitoring/grafana/", "grafana"),
+    ("docker/config/mariadb/", "mariadb"),
+    ("docker/config/redis/", "redis"),
+    ("docker/config/manticore/", "manticore"),
 )
 
 
@@ -199,74 +155,29 @@ def classify_path(rel_path: str) -> tuple[str, ...]:
         # Tracked via rendered compose config --format json per service.
         return ()
 
-    # Infrastructure config files
-    if rel_path.startswith("docker/config/caddy/"):
-        return ("proxy",)
-    if rel_path.startswith("docker/config/prometheus/"):
-        return ("prometheus",)
-    if rel_path.startswith("docker/monitoring/grafana/"):
-        return ("grafana",)
-    if rel_path.startswith("docker/config/mariadb/"):
-        return ("mariadb",)
-    if rel_path.startswith("docker/config/redis/"):
-        return ("redis",)
-    if rel_path.startswith("docker/config/manticore/"):
-        return ("manticore",)
+    # Mounted service configuration is fingerprinted through the rendered Compose bind sources.
+    if any(rel_path.startswith(prefix) for prefix, _ in LEGACY_CONFIG_OWNERS):
+        return ()
 
-    # Database migrations require writer drain + migrate + app rollout
     if rel_path.startswith("database/migrations/"):
         return ("migrations", "shared-app")
-
-    # Web routes and Horizon dashboard config affect both web and Horizon
-    if rel_path in ("routes/web.php", "config/horizon.php"):
-        return ("web", "horizon")
-
-    # Trusted proxy config is used by web middleware and by scheduler's cloudflare:reload command
-    if rel_path == "config/trustedproxy.php":
-        return ("web", "scheduler")
-
-    # Shared PreDB feed, tmux health/session services, and release-runner/script paths used by both scheduler and indexer
-    if (
-        rel_path in ("config/predb_feeds.php", "app/Console/Commands/TmuxHealthCheck.php")
-        or rel_path.startswith("app/Services/Predb/Feeds/")
-        or rel_path.startswith("app/Services/Runners/")
-        or rel_path.startswith("app/Services/Tmux/")
-    ):
-        return ("scheduler", "indexer")
-
-    # Binaries services are used by indexer and by NzbService (resolved in web's GetNzbController)
-    if rel_path.startswith("app/Services/Binaries/"):
-        return ("web", "indexer")
-
-    # Web-only paths
     if rel_path in WEB_ONLY_EXACT or any(rel_path.startswith(p) for p in WEB_ONLY_PREFIXES):
         return ("web",)
-    if rel_path.startswith("public/") and rel_path != "public/index.php":
-        return ("web",)
-    if rel_path.startswith("resources/views/"):
-        if (
-            rel_path.startswith("resources/views/emails/")
-            or rel_path.startswith("resources/views/mail/")
-            or rel_path.startswith("resources/views/components/mail/")
-            or rel_path.startswith("resources/views/vendor/mail/")
-        ):
-            return ("shared-app",)
-        return ("web",)
-
-    # Horizon-only paths
-    if rel_path in HORIZON_ONLY_EXACT or any(rel_path.startswith(p) for p in HORIZON_ONLY_PREFIXES):
-        return ("horizon",)
-
-    # Scheduler-only paths
-    if rel_path in SCHEDULER_ONLY_EXACT or any(rel_path.startswith(p) for p in SCHEDULER_ONLY_PREFIXES):
+    if rel_path in SCHEDULER_ONLY_EXACT:
         return ("scheduler",)
-
-    # Indexer-only paths
-    if rel_path in INDEXER_ONLY_EXACT or any(rel_path.startswith(p) for p in INDEXER_ONLY_PREFIXES):
+    if rel_path in INDEXER_ONLY_EXACT:
         return ("indexer",)
 
-    # Everything else (shared PHP core, Jobs/Mail/Notifications, composer, Dockerfile, etc.) affects all 4 app services
+    # Everything else (PHP, config, routes, views, composer, Dockerfile, ...) affects all 4 app services.
     return ("shared-app",)
+
+
+def legacy_owners(rel_path: str) -> tuple[str, ...]:
+    """Ownership for diffs against a legacy stamp, including mounted service configuration."""
+    for prefix, owner in LEGACY_CONFIG_OWNERS:
+        if rel_path.startswith(prefix):
+            return (owner,)
+    return classify_path(rel_path)
 
 
 def file_record(repo: Path, rel_path: str) -> str:
@@ -371,6 +282,54 @@ def service_top_level_compose_deps(parsed: dict[str, object], svc_cfg: object) -
     return deps
 
 
+def project_directory(docker_dir: Path) -> Path:
+    try:
+        argv = shlex.split(os.environ.get("DC", ""))
+    except ValueError:
+        argv = []
+    for index, arg in enumerate(argv):
+        if arg == "--project-directory" and index + 1 < len(argv):
+            return Path(argv[index + 1]).resolve()
+        if arg.startswith("--project-directory="):
+            return Path(arg.split("=", 1)[1]).resolve()
+    return docker_dir.resolve()
+
+
+def bind_source_record(source: str, read_only: bool, project_dir: Path) -> str:
+    """Content of a bind-mounted configuration source: any file, or a read-only directory inside the
+    Compose project (data, log and host-system directories are not configuration)."""
+    path = Path(source)
+    try:
+        if path.is_file():
+            return f"file {sha256_bytes(path.read_bytes())} {source}"
+        if not path.is_dir():
+            return f"missing {source}"
+        resolved = path.resolve()
+        if not read_only or not resolved.is_relative_to(project_dir):
+            return f"dir {source}"
+        lines: list[str] = []
+        for root, dirs, files in os.walk(resolved):
+            dirs.sort()
+            for name in sorted(files):
+                full = Path(root) / name
+                if len(lines) >= 2000:
+                    return f"dir-too-large {source}"
+                lines.append(f"{full.relative_to(resolved).as_posix()} {sha256_bytes(full.read_bytes())}")
+        return f"tree {sha256_text(chr(10).join(lines))} {source}"
+    except OSError as error:
+        return f"unreadable {source} {error.errno}"
+
+
+def service_bind_records(svc_cfg: object, project_dir: Path) -> list[str]:
+    if not isinstance(svc_cfg, dict) or not isinstance(svc_cfg.get("volumes"), list):
+        return []
+    records: list[str] = []
+    for volume in svc_cfg["volumes"]:
+        if isinstance(volume, dict) and volume.get("type") == "bind" and isinstance(volume.get("source"), str):
+            records.append(bind_source_record(volume["source"], bool(volume.get("read_only")), project_dir))
+    return records
+
+
 def get_compose_service_hashes(docker_dir: Path) -> tuple[str, dict[str, str]]:
     """Return (global_config_hash, per_service_config_hashes)."""
     env = dict(os.environ)
@@ -389,6 +348,7 @@ def get_compose_service_hashes(docker_dir: Path) -> tuple[str, dict[str, str]]:
     context_meta = f"{os.environ.get('DC', '')}\n{os.environ.get('DOCKER_CONTEXT', '')}\n{os.environ.get('DOCKER_HOST', '')}"
     global_hash = sha256_text(f"{raw}\n{context_meta}")
     per_service: dict[str, str] = {}
+    project_dir = project_directory(docker_dir)
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, dict) and isinstance(parsed.get("services"), dict):
@@ -397,12 +357,15 @@ def get_compose_service_hashes(docker_dir: Path) -> tuple[str, dict[str, str]]:
             # added Compose service is started rather than silently stamped as deployed.
             for svc in sorted(set(ALL_SERVICES) | set(services_map)):
                 if svc in services_map:
+                    # The Compose command text and context only feed the global hash: an equivalent
+                    # rendering must not drain writers or recreate stateful services.
                     svc_payload = {
                         "service": services_map[svc],
                         "top_level": service_top_level_compose_deps(parsed, services_map[svc]),
+                        "mounted": service_bind_records(services_map[svc], project_dir),
                     }
                     svc_json = json.dumps(svc_payload, sort_keys=True)
-                    per_service[svc] = sha256_text(f"{svc_json}\n{context_meta}")
+                    per_service[svc] = sha256_text(svc_json)
                 else:
                     per_service[svc] = "absent"
             return global_hash, per_service
@@ -463,12 +426,15 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
             sys.stderr.write(proc.stderr)
             sys.exit(proc.returncode or 1)
         effective_hash = proc.stdout.strip()
-        if include_compose:
-            if Path(config_cmd).name == "deploy-current":
-                _, per_service_compose = get_compose_service_hashes(docker_dir)
-                compose_rendered = True
-            else:
-                per_service_compose = {svc: effective_hash for svc in ALL_SERVICES}
+        if Path(config_cmd).name == "deploy-current":
+            # Mounted configuration contents are not part of the rendered Compose text; fold them in
+            # so a changed bind-mounted file is never skipped as an unchanged deployment.
+            _, per_service_compose = get_compose_service_hashes(docker_dir)
+            compose_rendered = True
+            mounted = json.dumps(per_service_compose, sort_keys=True)
+            effective_hash = sha256_text(f"{effective_hash}\n{mounted}")
+        elif include_compose:
+            per_service_compose = {svc: effective_hash for svc in ALL_SERVICES}
     elif include_compose:
         effective_hash, per_service_compose = get_compose_service_hashes(docker_dir)
         compose_rendered = True
@@ -603,19 +569,30 @@ def check_app_container(docker_dir: Path, svc: str, verify_image: bool = True) -
     return True, "healthy"
 
 
-def recent_dirty_buckets(repo: Path, stamped_fingerprint: str = "") -> set[str]:
-    """Return ownership buckets modified since the legacy stamped revision (or conservatively all data/infra if unresolvable)."""
+def running_image(docker_dir: Path, svc: str) -> str | None:
+    env = dict(os.environ)
+    env.setdefault("COMPOSE_FILE", str(docker_dir / "docker-compose.yml"))
+    ps = subprocess.run([*compose_command(docker_dir), "ps", "-q", svc], capture_output=True, text=True, env=env, check=False)
+    if ps.returncode != 0 or not ps.stdout.strip():
+        return None
+    container = ps.stdout.strip().splitlines()[0]
+    proc = subprocess.run(["docker", "inspect", "--format", "{{.Image}}", container], capture_output=True, text=True, check=False)
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def recent_dirty_buckets(repo: Path, stamped_fingerprint: str = "") -> set[str] | None:
+    """Ownership buckets modified since a legacy stamp's revision, or None when it cannot be diffed."""
     tokens = stamped_fingerprint.split()
     base_rev = tokens[0] if tokens else ""
     if not base_rev:
-        return set(DATA_SERVICES) | set(INFRA_SERVICES)
+        return None
     verify = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{base_rev}^{{commit}}"],
         capture_output=True,
         check=False,
     )
     if verify.returncode != 0:
-        return set(DATA_SERVICES) | set(INFRA_SERVICES)
+        return None
     buckets: set[str] = set()
     cmds = [
         ["git", "-C", str(repo), "diff", "--name-only", "-z", base_rev, "HEAD"],
@@ -625,12 +602,12 @@ def recent_dirty_buckets(repo: Path, stamped_fingerprint: str = "") -> set[str]:
     for cmd in cmds:
         proc = subprocess.run(cmd, capture_output=True, check=False)
         if proc.returncode != 0:
-            return set(DATA_SERVICES) | set(INFRA_SERVICES)
+            return None
         if proc.stdout:
             for raw in proc.stdout.split(b"\x00"):
                 if raw:
                     rel_path = raw.decode("utf-8", errors="surrogateescape")
-                    buckets.update(classify_path(rel_path))
+                    buckets.update(legacy_owners(rel_path))
     return buckets
 
 
@@ -684,6 +661,9 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
     first_deploy = not bool(stamped)
     legacy_stamp = "__legacy__" in stamped
     legacy_buckets = recent_dirty_buckets(repo, stamped.get("fingerprint", "")) if legacy_stamp else set()
+    # A legacy stamp records neither per-service Compose state nor mounted file contents, so Compose
+    # reconciles every rendered data and infra service (recreating only real drift, never forcing).
+    # Repository edits to mounted configuration since a diffable stamped revision still force a recreate.
 
     dirty_app: list[str] = []
     app_reasons: dict[str, str] = {}
@@ -705,6 +685,10 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
         elif stamped.get(f"service:{svc}") != state[f"service:{svc}"]:
             dirty_app.append(svc)
             app_reasons[svc] = "code/config changed"
+        elif f"image:{svc}" not in stamped or running_image(docker_dir, svc) != stamped[f"image:{svc}"].rsplit("@", 1)[-1]:
+            # The running container must be the exact image recorded by the last verified rollout.
+            dirty_app.append(svc)
+            app_reasons[svc] = "running image differs from stamp"
         elif not ok:
             dirty_app.append(svc)
             app_reasons[svc] = reason
@@ -717,17 +701,14 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
     for svc in DATA_SERVICES:
         if not compose_present(state, svc):
             data_reasons[svc] = "not rendered"
-        elif first_deploy:
-            # No record of what is running: let Compose reconcile drift while writers are
-            # stopped, without force-recreating stateful services.
+        elif legacy_stamp and legacy_buckets is not None and svc in legacy_buckets:
+            dirty_data.append(svc)
+            data_reasons[svc] = "config changed since legacy stamp"
+        elif first_deploy or legacy_stamp:
+            # No per-service record: Compose reconciles drift while writers are stopped, without
+            # force-recreating stateful services.
             reconcile_data.append(svc)
-            data_reasons[svc] = "reconcile (no stamp)"
-        elif legacy_stamp:
-            if svc in legacy_buckets:
-                dirty_data.append(svc)
-                data_reasons[svc] = "config/compose changed"
-            else:
-                data_reasons[svc] = "unchanged"
+            data_reasons[svc] = "reconcile (no stamp)" if first_deploy else "reconcile (legacy stamp)"
         elif stamped.get(f"service:{svc}") != state[f"service:{svc}"]:
             dirty_data.append(svc)
             data_reasons[svc] = "config/compose changed"
@@ -735,20 +716,21 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
             data_reasons[svc] = "unchanged"
 
     dirty_infra: list[str] = []
+    reconcile_infra: list[str] = []
     infra_reasons: dict[str, str] = {}
     for svc in infra_services(state):
         if not compose_present(state, svc):
             infra_reasons[svc] = "not rendered"
         elif first_deploy:
-            # Stateless: recreate so bind-mounted configuration matches what gets stamped.
+            # Stateless: recreate so mounted configuration matches what gets stamped.
             dirty_infra.append(svc)
             infra_reasons[svc] = "recreate (no stamp)"
+        elif legacy_stamp and legacy_buckets is not None and svc in legacy_buckets:
+            dirty_infra.append(svc)
+            infra_reasons[svc] = "config changed since legacy stamp"
         elif legacy_stamp:
-            if svc in legacy_buckets:
-                dirty_infra.append(svc)
-                infra_reasons[svc] = "config/compose changed"
-            else:
-                infra_reasons[svc] = "unchanged"
+            reconcile_infra.append(svc)
+            infra_reasons[svc] = "reconcile (legacy stamp)"
         elif f"service:{svc}" not in stamped:
             dirty_infra.append(svc)
             infra_reasons[svc] = "added to Compose"
@@ -796,6 +778,7 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
         "dirty_data": dirty_data,
         "dirty_infra": dirty_infra,
         "reconcile_data": reconcile_data,
+        "reconcile_infra": reconcile_infra,
         "build_targets": build_targets,
         "app_reasons": app_reasons,
         "data_reasons": data_reasons,
@@ -836,6 +819,7 @@ def main() -> None:
         print(f"DIRTY_DATA={shlex.quote(' '.join(plan['dirty_data']))}")
         print(f"DIRTY_INFRA={shlex.quote(' '.join(plan['dirty_infra']))}")
         print(f"RECONCILE_DATA={shlex.quote(' '.join(plan['reconcile_data']))}")
+        print(f"RECONCILE_INFRA={shlex.quote(' '.join(plan['reconcile_infra']))}")
         print(f"BUILD_TARGETS={shlex.quote(' '.join(plan['build_targets']))}")
         return
 
@@ -865,7 +849,12 @@ def main() -> None:
                 action = "skip"
             print(f"{svc:<18} {'data':<10} {action:<18} {plan['data_reasons'][svc]}")
         for svc in plan["infra_reasons"]:
-            action = "recreate" if svc in plan["dirty_infra"] else "skip"
+            if svc in plan["dirty_infra"]:
+                action = "recreate"
+            elif svc in plan["reconcile_infra"]:
+                action = "reconcile"
+            else:
+                action = "skip"
             print(f"{svc:<18} {'infra':<10} {action:<18} {plan['infra_reasons'][svc]}")
         return
 

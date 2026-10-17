@@ -467,11 +467,12 @@ SH);
 
     public function test_web_only_changes_rebuild_and_recreate_only_web_without_draining_writers_or_migrating(): void
     {
+        mkdir($this->directory.'/resources/js', 0777, true);
+        file_put_contents($this->directory.'/resources/js/app.js', "console.log(1);\n");
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         file_put_contents($this->directory.'/events', '');
 
-        mkdir($this->directory.'/app/Http/Controllers', 0777, true);
-        file_put_contents($this->directory.'/app/Http/Controllers/HomeController.php', "<?php\n");
+        file_put_contents($this->directory.'/resources/js/app.js', "console.log(2);\n");
 
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         $events = $this->events();
@@ -489,11 +490,12 @@ SH);
 
     public function test_scheduler_only_changes_rebuild_drain_and_recreate_only_scheduler(): void
     {
+        mkdir($this->directory.'/docker/app/bin', 0777, true);
+        file_put_contents($this->directory.'/docker/app/bin/scheduler.py', "# one\n");
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         file_put_contents($this->directory.'/events', '');
 
-        mkdir($this->directory.'/routes', 0777, true);
-        file_put_contents($this->directory.'/routes/console.php', "<?php\n");
+        file_put_contents($this->directory.'/docker/app/bin/scheduler.py', "# two\n");
 
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         $events = $this->events();
@@ -512,11 +514,12 @@ SH);
 
     public function test_indexer_only_changes_rebuild_drain_and_recreate_only_indexer(): void
     {
+        mkdir($this->directory.'/docker/app/bin', 0777, true);
+        file_put_contents($this->directory.'/docker/app/bin/indexer.sh', "#!/bin/sh\n");
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         file_put_contents($this->directory.'/events', '');
 
-        mkdir($this->directory.'/app/Services/Backfill', 0777, true);
-        file_put_contents($this->directory.'/app/Services/Backfill/BackfillService.php', "<?php\n");
+        file_put_contents($this->directory.'/docker/app/bin/indexer.sh', "#!/bin/sh\nexit 0\n");
 
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         $events = $this->events();
@@ -532,25 +535,31 @@ SH);
         $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 indexer', $events);
     }
 
-    public function test_horizon_config_changes_rebuild_stop_and_recreate_web_and_horizon_without_draining_scheduler_or_indexer(): void
+    public function test_application_code_reachable_from_several_roles_rebuilds_and_drains_every_app_service(): void
     {
+        // Each of these is executed by more than one role (queued jobs, scheduled commands, web
+        // controllers, service providers), so none may be treated as single-role.
+        $paths = [
+            'config/horizon.php', 'routes/web.php', 'routes/console.php', 'app/Services/Tmux/Tmux.php',
+            'app/Services/Binaries/BinariesConfig.php', 'app/Http/Controllers/HomeController.php',
+            'resources/views/home.blade.php', 'resources/forum/views/index.blade.php', 'public/robots.txt',
+        ];
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
-        file_put_contents($this->directory.'/events', '');
+        foreach ($paths as $path) {
+            file_put_contents($this->directory.'/events', '');
+            @mkdir(dirname($this->directory.'/'.$path), 0777, true);
+            file_put_contents($this->directory.'/'.$path, $path."\n");
 
-        mkdir($this->directory.'/config', 0777, true);
-        file_put_contents($this->directory.'/config/horizon.php', "<?php return [];\n");
-
-        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
-        $events = $this->events();
-        $this->assertStringContainsString('build --target selfhosted-web', $events);
-        $this->assertStringContainsString('build --target selfhosted-horizon', $events);
-        $this->assertStringNotContainsString('build --target selfhosted-scheduler', $events);
-        $this->assertStringNotContainsString('build --target selfhosted-indexer', $events);
-        $this->assertStringContainsString(' stop --timeout 1920 horizon', $events);
-        $this->assertStringNotContainsString('scheduler.py drain', $events);
-        $this->assertStringNotContainsString('tmux:drain', $events);
-        $this->assertStringNotContainsString('artisan migrate', $events);
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon', $events);
+            $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+            $events = $this->events();
+            foreach (['web', 'horizon', 'scheduler', 'indexer'] as $role) {
+                $this->assertStringContainsString('build --target selfhosted-'.$role, $events, $path);
+            }
+            $this->assertStringContainsString('scheduler.py drain --timeout=1800', $events, $path);
+            $this->assertStringContainsString('artisan tmux:drain --timeout=90', $events, $path);
+            $this->assertStringContainsString(' stop --timeout 1920 horizon', $events, $path);
+            $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $events, $path);
+        }
     }
 
     public function test_migration_changes_trigger_full_writer_quiesce_and_artisan_migrate(): void
@@ -573,13 +582,16 @@ SH);
 
     public function test_stateless_infra_config_changes_recreate_only_the_affected_infra_service_without_draining_writers(): void
     {
-        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        mkdir($this->directory.'/docker/config/caddy', 0777, true);
+        file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', ":80\n");
+        $config = ['NNTMUX_CONFIG_ID' => $this->composeJson()];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
         file_put_contents($this->directory.'/events', '');
 
-        mkdir($this->directory.'/docker/config/caddy', 0777, true);
+        // The mounted file's content changes; the rendered Compose text does not.
         file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', ":8080\n");
 
-        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
         $events = $this->events();
         $this->assertStringNotContainsString('build --target', $events);
         $this->assertStringNotContainsString('scheduler.py drain', $events);
@@ -587,26 +599,19 @@ SH);
         $this->assertStringNotContainsString(' stop ', $events);
         $this->assertStringNotContainsString('artisan migrate', $events);
         $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $events);
+        $this->assertStringNotContainsString(' redis', $events);
     }
 
-    public function test_web_routes_changes_rebuild_and_recreate_both_web_and_horizon(): void
+    public function test_compose_command_text_changes_never_recreate_data_services(): void
     {
-        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $config = ['NNTMUX_CONFIG_ID' => $this->composeJson()];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
         file_put_contents($this->directory.'/events', '');
 
-        mkdir($this->directory.'/routes', 0777, true);
-        file_put_contents($this->directory.'/routes/web.php', "<?php\n");
-
-        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['DOCKER_CONTEXT' => 'other-spelling'])->mustRun();
         $events = $this->events();
-        $this->assertStringContainsString('build --target selfhosted-web', $events);
-        $this->assertStringContainsString('build --target selfhosted-horizon', $events);
-        $this->assertStringNotContainsString('build --target selfhosted-scheduler', $events);
-        $this->assertStringNotContainsString('build --target selfhosted-indexer', $events);
-        $this->assertStringContainsString(' stop --timeout 1920 horizon', $events);
-        $this->assertStringNotContainsString('scheduler.py drain', $events);
-        $this->assertStringNotContainsString('tmux:drain', $events);
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon', $events);
+        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 redis', $events);
+        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 proxy', $events);
     }
 
     public function test_dockerignore_and_file_permission_changes_invalidate_build_fingerprints(): void
@@ -648,22 +653,23 @@ SH);
 
     public function test_stateful_data_service_config_changes_drain_writers_before_recreating_the_data_service(): void
     {
-        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        mkdir($this->directory.'/docker/config/redis', 0777, true);
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 512mb\n");
+        $config = ['NNTMUX_CONFIG_ID' => $this->composeJson()];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
         file_put_contents($this->directory.'/events', '');
 
-        mkdir($this->directory.'/docker/config/redis', 0777, true);
         file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 1gb\n");
 
-        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
         $events = $this->events();
+        $recreate = ' up -d --no-deps --force-recreate --wait --wait-timeout 240 redis';
         $this->assertStringContainsString('scheduler.py drain --timeout=1800', $events);
         $this->assertStringContainsString('artisan tmux:drain --timeout=90', $events);
         $this->assertStringContainsString(' stop web scheduler indexer', $events);
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait redis', $events);
-        $this->assertLessThan(
-            strpos($events, ' up -d --no-deps --force-recreate --wait redis'),
-            strpos($events, ' stop web scheduler indexer'),
-        );
+        $this->assertStringContainsString($recreate, $events);
+        $this->assertStringNotContainsString('manticore', $events);
+        $this->assertLessThan(strpos($events, $recreate), strpos($events, ' stop web scheduler indexer'));
     }
 
     public function test_deploy_plan_outputs_human_readable_per_service_explanation(): void
@@ -710,13 +716,74 @@ SH);
         $this->assertStringContainsString('service:sidecar=', (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
     }
 
-    public function test_checkout_change_during_rollout_never_publishes_a_stamp(): void
+    public function test_checkout_change_during_rollout_keeps_the_previous_record_but_never_reports_unchanged(): void
     {
-        $process = $this->deploy(['NNTMUX_STALE_UP' => '1']);
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $previous = (string) file_get_contents($this->directory.'/docker/.deploy.stamp');
+        file_put_contents($this->directory.'/app.txt', "two\n");
+
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_STALE_UP' => '1']);
         $process->run();
         $this->assertSame(76, $process->getExitCode());
-        $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp');
+        $stamp = (string) file_get_contents($this->directory.'/docker/.deploy.stamp');
+        $this->assertSame("stale\n", strstr($stamp, "\n", true)."\n");
+        $this->assertSame(substr($previous, strpos($previous, "\n") + 1), substr($stamp, strpos($stamp, "\n") + 1));
         $this->assertSame([], glob($this->directory.'/docker/.deploy.stamp.tmp.*') ?: []);
+
+        // Not a first installation: infra is left alone, and the app is redeployed.
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->assertStringNotContainsString('proxy', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
+    }
+
+    public function test_running_image_that_differs_from_the_stamp_is_redeployed(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+        unlink($this->directory.'/recreated');
+
+        $process = $this->make(['deploy-plan'], ['NNTMUX_CONTAINER_IMAGE_ID' => 'sha256:rolled-out-earlier']);
+        $process->mustRun();
+        $this->assertMatchesRegularExpression('/web\s+app\s+recreate\s+running image differs from stamp/', $process->getOutput());
+    }
+
+    public function test_root_laravel_env_never_reaches_docker_recipes_when_docker_env_is_missing(): void
+    {
+        file_put_contents($this->directory.'/.env', "WEB_IMAGE=leaked/web:1\nAPP_IMAGE=leaked/app:1\nDEPLOY_MIN_INTERVAL=5\n");
+        $this->make(['build'])->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('build --target selfhosted-web -t nntmux/web:local', $events);
+        $this->assertStringNotContainsString('leaked', $events);
+    }
+
+    public function test_docker_env_supplies_settings_below_arguments_and_environment(): void
+    {
+        file_put_contents($this->directory.'/docker/.env', "WEB_IMAGE=\"env/web:1\"\nHORIZON_IMAGE=env/horizon:1 # comment\nDC=docker compose ignored\n");
+        $this->make(['build'], ['HORIZON_IMAGE' => 'caller/horizon:1'])->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('build --target selfhosted-web -t env/web:1', $events);
+        $this->assertStringContainsString('build --target selfhosted-horizon -t caller/horizon:1', $events);
+        $this->assertStringNotContainsString('ignored', $events);
+    }
+
+    public function test_production_legacy_stamp_reconciles_data_and_infra_without_forcing(): void
+    {
+        $head = trim((new Process(['git', 'rev-parse', 'HEAD'], $this->directory))->mustRun()->getOutput());
+        foreach ([$head, str_repeat('0', 40)] as $revision) {
+            file_put_contents($this->directory.'/events', '');
+            @unlink($this->directory.'/docker/.deploy.time');
+            file_put_contents($this->directory.'/docker/.deploy.stamp', $revision.' e3b0 e3b0 c16c bb93'."\n");
+
+            $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => $this->composeJson()])->mustRun();
+            $events = $this->events();
+            $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 redis manticore', $events, $revision);
+            $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 proxy', $events, $revision);
+            $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 redis', $events, $revision);
+            $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 proxy', $events, $revision);
+            $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $events, $revision);
+            $this->assertStringContainsString('service:web=', (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
+        }
     }
 
     public function test_external_image_replacement_or_tag_change_invalidates_build_stamp(): void
@@ -744,6 +811,17 @@ SH);
 
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+    }
+
+    /** Rendered Compose JSON whose proxy and redis bind-mount repository configuration files. */
+    private function composeJson(): string
+    {
+        $bind = fn (string $source, string $target): array => ['type' => 'bind', 'source' => $this->directory.'/docker/'.$source, 'target' => $target, 'read_only' => true];
+        $services = ['web' => [], 'horizon' => [], 'scheduler' => [], 'indexer' => [], 'manticore' => []];
+        $services['proxy'] = ['volumes' => [$bind('config/caddy/Caddyfile', '/etc/caddy/Caddyfile')]];
+        $services['redis'] = ['volumes' => [$bind('config/redis/redis.conf', '/usr/local/etc/redis/redis.conf')]];
+
+        return (string) json_encode(['services' => $services], JSON_UNESCAPED_SLASHES);
     }
 
     private function events(): string

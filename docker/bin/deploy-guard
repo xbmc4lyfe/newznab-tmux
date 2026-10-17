@@ -271,8 +271,13 @@ cmd_run() {
             mv -f "$stamp_tmp" "$STAMP"
             if [ "${RECORD_DEPLOY_TIME:-0}" = 1 ]; then date +%s >"$SUCCESS_TIME"; fi
         else
+            # Keep the previous per-service record so the next run redeploys only what changed instead
+            # of treating the stack as a first installation, but invalidate its fingerprint so it can
+            # never satisfy an unchanged check for images this run may already have rolled out.
+            if [ -f "$STAMP" ]; then
+                { echo stale; tail -n +2 "$STAMP"; } >"$stamp_tmp" && mv -f "$stamp_tmp" "$STAMP"
+            fi
             rm -f "$stamp_tmp"
-            rm -f "$STAMP"
             log "$target" "result=tree-changed-during-run (not stamped; the next build will run)"
             echo "deploy-guard: the checkout changed while $target ran, so what was built is already out of date; not deploying it. Run again." >&2
             rc=76
