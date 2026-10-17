@@ -525,11 +525,30 @@ final class CandidateRepository
             return 0;
         }
 
-        // Rechecked in the update itself: a new article since the read keeps the upload waiting.
-        return DB::table('release_verification_candidates')->whereIn('id', $eligible)->where('status', 'waiting_upload')
-            ->whereNull('release_id')->whereNull('lease_token')->where('last_unique_at', '<', $cutoff)
-            ->update(['status' => 'ready', 'next_attempt_at' => $now->format('Y-m-d H:i:s'),
+        return DB::transaction(function () use ($eligible, $cutoff, $now): int {
+            // Skip rows ingestion holds rather than wait on them in an order it does not share. The
+            // predicates are rechecked under the lock: a new article since the read keeps it waiting.
+            $query = DB::table('release_verification_candidates')->whereIn('id', $eligible)->where('status', 'waiting_upload')
+                ->whereNull('release_id')->whereNull('lease_token')->where('last_unique_at', '<', $cutoff)->orderBy('id');
+            $locked = (in_array(DB::getDriverName(), ['mysql', 'mariadb'], true) ? $query->lock('for update skip locked') : $query->lockForUpdate())
+                ->pluck('id')->all();
+            if ($locked === []) {
+                return 0;
+            }
+
+            return DB::table('release_verification_candidates')->whereIn('id', $locked)->update(['status' => 'ready',
+                'next_attempt_at' => $now->format('Y-m-d H:i:s'),
                 'reason' => 'Upload stopped growing before it was complete; queued for partial publication.']);
+        });
+    }
+
+    /** Return a claimed partial upload that fails publication policy to waiting, for one more hold window. */
+    public function deferPartial(object $claim, string $reason): void
+    {
+        DB::table('release_verification_candidates')->where('id', $claim->id)->where('lease_token', $claim->lease_token)
+            ->where('version', $claim->version)->whereNull('release_id')->update(['status' => 'waiting_upload',
+                'reason' => mb_strcut('Partial publication deferred: '.$reason, 0, 2000, 'UTF-8'), 'lease_token' => null, 'lease_until' => null,
+                'next_attempt_at' => now()->addHours(max(1, (int) config('release_verification.partial_after_hours', 4)))]);
     }
 
     public function capacityAvailable(): bool

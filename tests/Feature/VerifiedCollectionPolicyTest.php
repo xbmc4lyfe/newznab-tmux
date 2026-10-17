@@ -13,6 +13,7 @@ use App\Services\ReleaseProcessingService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\CollectionReleasePolicy;
 use App\Services\Releases\Verification\ManifestStore;
+use App\Services\Releases\Verification\PartialPublicationDeferredException;
 use App\Services\Releases\Verification\ReleaseMetadataResolver;
 use App\Services\Releases\Verification\ScratchInventory;
 use App\Services\Releases\Verification\VerificationResult;
@@ -312,6 +313,36 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(1, (int) $release->files_found);
         $this->assertSame(1, (int) $release->files_expected);
         $this->assertSame($releaseId, (int) DB::table('release_verification_candidates')->where('id', $claim->id)->value('release_id'));
+    }
+
+    public function test_partial_upload_below_policy_keeps_waiting_instead_of_being_filtered(): void
+    {
+        config(['release_verification.partial_after_hours' => 4]);
+        $repository = app(CandidateRepository::class);
+        $repository->archive($this->collectionForPolicy('movie.mkv', 3));
+        $this->travel(5)->hours();
+        $this->limits(files: 2);
+        $repository->promotePartial(10);
+        $claim = $repository->claim();
+        $manifest = app(ManifestStore::class)->read($claim->manifest_path);
+        $manifest += ['verification_mode' => 'spot_check', 'verified_file_names' => ['movie.mkv'],
+            'spot_check' => ['articles' => 1, 'bytes' => 5, 'sampled_files' => 1, 'method' => 'yenc-crc-and-identity'],
+            'partial' => ['articles_found' => 1, 'articles_expected' => 3, 'files_found' => 1, 'files_expected' => 1]];
+        $this->publicationSchema();
+
+        try {
+            app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('sampled', 'Partial sample.', $manifest));
+            $this->fail('A partial upload below policy must be deferred.');
+        } catch (PartialPublicationDeferredException $deferred) {
+            $repository->deferPartial($claim, $deferred->getMessage());
+        }
+
+        $candidate = DB::table('release_verification_candidates')->sole();
+        $this->assertSame('waiting_upload', $candidate->status, 'Later articles may still satisfy the policy.');
+        $this->assertNotSame('', $candidate->manifest_path);
+        $this->assertNull($candidate->lease_token);
+        $this->assertSame(0, $repository->promotePartial(10), 'It waits one more hold window.');
+        $this->assertSame(0, DB::table('releases')->count());
     }
 
     public function test_partial_policy_counts_only_files_written_to_the_nzb(): void

@@ -10,6 +10,7 @@ use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\LeaseHeartbeat;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\NntpArticleSource;
+use App\Services\Releases\Verification\PartialPublicationDeferredException;
 use App\Services\Releases\Verification\ScratchBudget;
 use App\Services\Releases\Verification\ScratchInventory;
 use App\Services\Releases\Verification\SpotCheckVerifier;
@@ -182,6 +183,10 @@ class VerifyReleaseCandidates extends Command
                         }
                     }
                     $this->line($claim->id.': '.$result->verdict.' — '.$result->reason);
+                } catch (PartialPublicationDeferredException $deferred) {
+                    $repository->deferPartial($claim, $deferred->getMessage());
+                    $diagnostics?->finished();
+                    $this->line($claim->id.': waiting_upload — partial publication deferred: '.$deferred->getMessage());
                 } catch (Throwable $error) {
                     $diagnostics?->candidateFailed();
                     $filtered = $this->filteredResult($claim);

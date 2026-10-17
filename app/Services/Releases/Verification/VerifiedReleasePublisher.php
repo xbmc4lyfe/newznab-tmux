@@ -93,6 +93,10 @@ final class VerifiedReleasePublisher
                         }
                     }
                     $filteredReason = app(CollectionReleasePolicy::class)->verifiedRejection($manifest);
+                    if ($filteredReason !== null && isset($manifest['partial'])) {
+                        // Missing files or articles may still satisfy the policy; never filter terminally.
+                        throw new PartialPublicationDeferredException($filteredReason);
+                    }
                     if ($filteredReason !== null) {
                         app(CandidateRepository::class)->rejectByPolicy($claim, $filteredReason);
 
