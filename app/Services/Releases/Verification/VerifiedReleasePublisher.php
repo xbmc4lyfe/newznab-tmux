@@ -384,6 +384,7 @@ final class VerifiedReleasePublisher
      * Remove the partial release a merged later generation supersedes, after this publication commits.
      *
      * @param  array<string, mixed>  $manifest
+     * @param  list<string>  $keys  the publication keys this transaction holds; empty under the keyless lock
      */
     private function replaceSupersededPartial(array $manifest, int $releaseId, array $keys): void
     {
