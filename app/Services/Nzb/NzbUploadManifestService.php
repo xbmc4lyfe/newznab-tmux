@@ -10,6 +10,7 @@ use App\Exceptions\NzbCustodyCollision;
 use App\Models\Release;
 use App\Models\ReleaseNfo;
 use App\Services\NfoService;
+use App\Services\Releases\Verification\VerificationLedger;
 use App\Services\Releases\Verification\VerificationResetService;
 use Illuminate\Contracts\Filesystem\FileNotFoundException;
 use Illuminate\Filesystem\Filesystem;
@@ -631,7 +632,8 @@ final class NzbUploadManifestService
     }
 
     /**
-     * Resolve current admission state while holding the capacity ledger lock.
+     * Resolve current admission state while holding the admission locks (the candidate row, or
+     * the legacy capacity ledger when manifests are files).
      *
      * @param  array<string, mixed>  $manifest
      * @return array<string, mixed>
@@ -642,10 +644,7 @@ final class NzbUploadManifestService
         if (! is_string($identity) || preg_match('/\A[0-9a-f]{40}\z/', $identity) !== 1) {
             throw new RuntimeException('Pending upload has no valid verification candidate identity.');
         }
-        $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
-        if ($state === null) {
-            throw new RuntimeException('Verification capacity state is unavailable; upload reconciliation deferred.');
-        }
+        app(VerificationLedger::class)->enter('Verification capacity state is unavailable; upload reconciliation deferred.');
         $candidate = DB::table('release_verification_candidates as candidates')
             ->leftJoin('releases as published', 'published.id', '=', 'candidates.release_id')
             ->where('candidates.identity', $identity)->lockForUpdate()
