@@ -406,6 +406,25 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom:** production sets 48 and runs 8 verification workers.
 - **Suggested fix:** make the ceiling configurable, after BUGS #52, because more workers only add waiters to the capacity row.
 
+### 55. Fingerprint metadata jobs retry a rejected alternate provider for every sample (Fixed)
+
+- **Where:** `ReleaseFingerprintCollector::collect()` queries every configured provider, independent of `NNTP_ALTERNATE_FALLBACK`.
+- **Symptom:** when the alternate rejects its login, each sample repeats the full connect and retry cycle. Horizon logs one "Authentication rejected" about every 2 minutes, and `CollectReleaseFingerprintMetadata` jobs run for minutes or hit their timeout.
+- **Fix:** connection failures raise `NntpProviderUnavailableException`. The collector then records the remaining alternate samples as unavailable without reconnecting. The primary still retries per sample.
+
+### 56. The ARM paired-decoding benchmark fails on most runs (Open)
+
+- **Where:** the `paired-decoding (ubuntu-24.04-arm)` job in the "Paired native yEnc performance" workflow.
+- **Symptom:** the run summary is `inconclusive`, and the job exits 1, whenever any stratum's paired comparison is inconclusive. On #246, 22 of 24 strata showed a useful improvement and 2 were inconclusive. The job failed on the rerun too, and it fails on most master runs since 2026-10-16. The x86 job passes.
+- **Suggested fix:** report inconclusive strata without failing the job, or add pairs on ARM until the bootstrap interval resolves. Until then a red ARM job here says nothing about the change under test.
+
+### 57. Orphaned MariaDB sessions hold row locks for hours after a DB outage (Mitigated)
+
+- **Where:** app connections to MariaDB on the DB host pass through OrbStack's NAT, and the server's `wait_timeout` is 28800 s.
+- **Symptom:** after the 2026-10-17 13:22 UTC outage, about 34 connections stayed half-open on the server: 88 server-side against 54 client-side. Six of them held open transactions with row locks. Binaries and collections inserts waited on them for 74 minutes ("2,923 s to insert binaries/parts", "6000 articles failed to insert"), and a deploy's 900 s indexer drain timed out.
+- **Mitigation:** killed the six sessions at about 14:50 UTC, and binaries recovered at once. Set `idle_transaction_timeout = 600` on the DB host (live, and persisted in `conf.d/98-idle-transactions.cnf`), so an abandoned transaction rolls back after 10 minutes.
+- **Open question:** why the client side's FIN or RST never reached the server. TCP keepalive on the DB host would also reap the idle half-open sessions.
+
 ## Issues in the docker/ stack itself (all fixed)
 
 | Issue | Fix |

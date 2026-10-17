@@ -1390,7 +1390,7 @@ class NNTPService extends NntpClient
             $connected = $connection->_checkConnection(false);
         }
         if ($connected !== true) {
-            throw new \RuntimeException('Unable to connect to the requested NNTP provider.');
+            throw new NntpProviderUnavailableException('Unable to connect to the requested NNTP provider.');
         }
 
         try {
@@ -1455,7 +1455,7 @@ class NNTPService extends NntpClient
             ? $connection->doConnect($this->_configCompressedHeaders, true)
             : $connection->_checkConnection(false);
         if ($connected !== true) {
-            throw new \RuntimeException('Unable to connect to the requested NNTP provider.');
+            throw new NntpProviderUnavailableException('Unable to connect to the requested NNTP provider.');
         }
 
         try {
