@@ -586,6 +586,39 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertNotSame('dirty', DB::table('release_verification_candidates')->where('id', $own->id)->value('status'));
     }
 
+    public function test_defective_late_headers_never_spoil_the_partials_inventory(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('defective-late', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $retained = DB::table('release_verification_candidates')->sole();
+        // Same poster, but a zero-byte segment: merging only adds, so it could never be repaired.
+        $defective = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d');
+        DB::table('parts')->where('messageid', 'c@d')->update(['size' => 0]);
+
+        app(CandidateRepository::class)->archive($defective);
+
+        $this->assertSame($retained->manifest_path, DB::table('release_verification_candidates')->where('id', $retained->id)->value('manifest_path'));
+        $this->assertSame((int) $retained->id, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
+    }
+
+    public function test_an_over_budget_hot_collection_never_aborts_header_storage(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('over-budget-hot', true);
+        $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $late = $this->collectionForPolicy('movie.mkv', 20000, $hash, part: 3, messageId: 'e@f');
+        $binary = (int) DB::table('binaries')->where('collections_id', $late)->value('id');
+        foreach (array_chunk(range(4, 15003), 500) as $numbers) {
+            DB::table('parts')->insert(array_map(static fn (int $number): array => ['binaries_id' => $binary, 'partnumber' => $number,
+                'messageid' => str_pad((string) $number, 1000, 'm').'@late', 'size' => 5], $numbers));
+        }
+
+        app(CandidateRepository::class)->invalidateHotCollections([$late]);
+
+        $this->assertTrue(DB::table('collections')->where('id', $late)->exists());
+    }
+
     public function test_late_articles_never_republish_a_deleted_partial(): void
     {
         $this->publicationSchema(partialColumns: true);
@@ -597,8 +630,14 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
 
         $this->assertNull($this->publishStalledPartial(null));
 
-        $this->assertSame('filtered', DB::table('release_verification_candidates')->orderByDesc('id')->value('status'));
+        $this->assertSame('expired', DB::table('release_verification_candidates')->orderByDesc('id')->value('status'));
         $this->assertSame(0, DB::table('releases')->count());
+
+        // A later upload under the same hash is admitted, not discarded as a filtered replay.
+        $next = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 3, messageId: 'e@f');
+        app(CandidateRepository::class)->archive($next);
+        $this->assertFalse(DB::table('collections')->where('id', $next)->exists());
+        $this->assertNotSame('', DB::table('release_verification_candidates')->orderByDesc('id')->value('manifest_path'));
     }
 
     public function test_retained_partial_inventory_is_released_at_expiry(): void

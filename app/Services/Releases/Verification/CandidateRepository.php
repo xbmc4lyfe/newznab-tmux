@@ -160,7 +160,7 @@ final class CandidateRepository
                     // The publication consumed any legacy release; the next generation publishes anew.
                     $retained['legacy_release_id'] = null;
                     $merged = $this->merge($retained, $manifest);
-                    if (($merged['conflict'] ?? false) && ! ($retained['conflict'] ?? false)) {
+                    if ($this->spoils($retained, $merged)) {
                         // Conflicting headers (another post under the same hash) would poison the retained
                         // inventory; leave the partial and its inventory as they are and archive these apart.
                         $previous = null;
@@ -554,7 +554,15 @@ final class CandidateRepository
             $candidates = DB::table('release_verification_candidates')->where('source_identity', $identity)
                 ->where(fn ($query) => $query->whereNull('release_id')->orWhere('manifest_path', '<>', ''))
                 ->whereNotIn('status', ['expired'])->orderByDesc('id')->lockForUpdate()->get();
-            $snapshot = $this->snapshot($collection);
+            if ($candidates->every(static fn (object $candidate): bool => $candidate->manifest_path === '')) {
+                continue;
+            }
+            try {
+                $snapshot = $this->snapshot($collection);
+            } catch (CandidateMetadataBudgetExceeded) {
+                // Too large to compare here; archive() handles it on its own pass, without aborting this chunk.
+                continue;
+            }
             $heldIds = array_map(static fn (object $held): int => (int) $held->id, $this->lockPartialHolders($identity));
             $holders = array_values(array_filter($candidates->all(), static fn (object $candidate): bool => in_array((int) $candidate->id, $heldIds, true)));
             $owner = $holders === [] ? null : $this->partialOwner($holders, $snapshot);
@@ -594,8 +602,7 @@ final class CandidateRepository
 
     /**
      * Candidates of this upload holding a partial's inventory (those a release's late_article_candidate_id
-     * names), newest first, locked. Pointers move only under these candidates' locks, or clear once their
-     * holder has ended, so the unlocked read of them is safe.
+     * names), newest first, locked.
      *
      * @return list<object>
      */
@@ -604,14 +611,17 @@ final class CandidateRepository
         if (! Release::hasLateArticleFlag()) {
             return [];
         }
-        $ids = DB::table('release_verification_candidates as c')->join('releases as r', 'r.late_article_candidate_id', '=', 'c.id')
-            ->where('c.source_identity', $sourceIdentity)->where('c.manifest_path', '<>', '')->pluck('c.id')->all();
-        if ($ids === []) {
+        // Lock the upload's candidates, then read the pointers with a current (locking) read: a plain read
+        // would use this transaction's older REPEATABLE READ snapshot and miss a just-published partial.
+        $candidates = DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)->where('manifest_path', '<>', '')
+            ->orderByDesc('id')->lockForUpdate()->get();
+        if ($candidates->isEmpty()) {
             return [];
         }
+        $held = array_flip(array_map('intval', DB::table('releases')->whereIn('late_article_candidate_id', $candidates->pluck('id')->all())
+            ->sharedLock()->pluck('late_article_candidate_id')->all()));
 
-        return DB::table('release_verification_candidates')->whereIn('id', $ids)->where('manifest_path', '<>', '')
-            ->orderByDesc('id')->lockForUpdate()->get()->all();
+        return array_values(array_filter($candidates->all(), static fn (object $candidate): bool => isset($held[(int) $candidate->id])));
     }
 
     /**
@@ -636,7 +646,7 @@ final class CandidateRepository
     {
         foreach ($partials as $partial) {
             $retained = $this->store->read($partial->manifest_path);
-            if (($retained['conflict'] ?? false) || ! ($this->merge($retained, $manifest)['conflict'] ?? false)) {
+            if (($retained['conflict'] ?? false) || ! $this->spoils($retained, $this->merge($retained, $manifest))) {
                 return $partial;
             }
         }
@@ -644,12 +654,30 @@ final class CandidateRepository
         return null;
     }
 
+    /**
+     * Whether merging made a clean retained inventory unusable: conflicting identities, or header defects that
+     * later articles can never repair because merging only adds.
+     *
+     * @param  array<string, mixed>  $retained
+     * @param  array<string, mixed>  $merged
+     */
+    private function spoils(array $retained, array $merged): bool
+    {
+        if ($retained['conflict'] ?? false) {
+            return false;
+        }
+        $inventory = new CandidateHeaderInventory;
+
+        return ($merged['conflict'] ?? false) || ($inventory->assessment($merged)['status'] === CandidateHeaderInventory::REJECTED
+            && $inventory->assessment($retained)['status'] !== CandidateHeaderInventory::REJECTED);
+    }
+
     /** A published candidate's retained inventory still belongs to a live partial release. */
     private function retainsLivePartial(object $candidate): bool
     {
         return $candidate->release_id !== null && $candidate->manifest_path !== '' && $candidate->status === 'sampled'
             && Release::hasPartialArticleCounts()
-            && DB::table('releases')->where('id', $candidate->release_id)->whereNotNull('articles_expected')->exists();
+            && DB::table('releases')->where('id', $candidate->release_id)->whereNotNull('articles_expected')->sharedLock()->exists();
     }
 
     /** @param array<string, mixed> $manifest */
@@ -1106,14 +1134,28 @@ final class CandidateRepository
 
     public function rejectByPolicy(object $claim, string $reason): void
     {
-        DB::transaction(function () use ($claim, $reason): void {
+        $this->retire($claim, $reason, 'filtered');
+    }
+
+    /**
+     * End an upgrade generation whose partial was deleted or no longer awaits it. It is not filtered: a filtered
+     * newest candidate would make archive() discard later uploads under the same hash as replays.
+     */
+    public function abandonUpgrade(object $claim, string $reason): void
+    {
+        $this->retire($claim, $reason, 'expired');
+    }
+
+    private function retire(object $claim, string $reason, string $status): void
+    {
+        DB::transaction(function () use ($claim, $reason, $status): void {
             $this->ledger->enter();
             $candidate = DB::table('release_verification_candidates')->where('id', $claim->id)
                 ->where('lease_token', $claim->lease_token)->where('version', $claim->version)->whereNull('release_id')->lockForUpdate()->first();
             if ($candidate === null) {
                 throw new RuntimeException('Stale verification result cannot filter a candidate.');
             }
-            DB::table('release_verification_candidates')->where('id', $claim->id)->update(['status' => 'filtered',
+            DB::table('release_verification_candidates')->where('id', $claim->id)->update(['status' => $status,
                 'reason' => mb_strcut($reason, 0, 2000, 'UTF-8'), 'lease_token' => null, 'lease_until' => null,
                 'manifest_path' => '', 'manifest_bytes' => 0]);
             $this->ledger->adjust(-(int) $candidate->manifest_bytes);

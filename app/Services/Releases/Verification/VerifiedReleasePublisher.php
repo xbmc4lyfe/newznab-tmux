@@ -141,7 +141,7 @@ final class VerifiedReleasePublisher
                     if ($upgrade === null && is_int($manifest['upgrades_release_id'] ?? null)) {
                         // The partial these late articles would complete was deleted, or no longer awaits this
                         // generation: publishing its retained articles anew would undo the deletion or duplicate it.
-                        app(CandidateRepository::class)->rejectByPolicy($claim, DB::table('releases')->where('id', $manifest['upgrades_release_id'])->exists()
+                        app(CandidateRepository::class)->abandonUpgrade($claim, DB::table('releases')->where('id', $manifest['upgrades_release_id'])->exists()
                             ? 'The partial release these articles would upgrade no longer awaits them.'
                             : 'The partial release these articles would upgrade was deleted.');
 
