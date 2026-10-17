@@ -252,6 +252,22 @@ class ReleaseVerificationCommandsTest extends ReleaseVerificationCandidatesTest
             DB::table('release_verification_candidates')->orderBy('id')->pluck('status')->all());
     }
 
+    public function test_reclassification_resumes_after_a_given_candidate(): void
+    {
+        $rows = [];
+        foreach (range(1, 4) as $number) {
+            $rows[] = ['identity' => sha1('resume-'.$number), 'groups_id' => 1, 'manifest_path' => '', 'manifest_bytes' => 0,
+                'manifest_hash' => str_repeat('0', 64), 'status' => 'unknown', 'reason' => 'Invalid or duplicate article reference in candidate headers.',
+                'last_unique_at' => now(), 'next_attempt_at' => now()];
+        }
+        DB::table('release_verification_candidates')->insert($rows);
+
+        $this->artisan('releases:reclassify-header-rejections', ['--after' => 2, '--chunk' => 1])->assertSuccessful();
+
+        $this->assertSame(['unknown', 'unknown', CandidateHeaderInventory::REJECTED, CandidateHeaderInventory::REJECTED],
+            DB::table('release_verification_candidates')->orderBy('id')->pluck('status')->all());
+    }
+
     public function test_old_version_cleanup_uses_bounded_index_pages_and_keeps_current_version(): void
     {
         app(CandidateRepository::class)->enqueue(['identity' => sha1('many-old-versions'), 'groups_id' => 1, 'files' => []]);

@@ -116,6 +116,31 @@ class ReleaseVerificationMariaDbTest extends ReleaseVerificationCandidatesTest
         }
     }
 
+    public function test_header_rejection_backfill_skips_rows_locked_by_another_session(): void
+    {
+        foreach ([1, 2] as $number) {
+            DB::table('release_verification_candidates')->insert(['identity' => sha1('locked-backfill-'.$number), 'groups_id' => 1,
+                'manifest_path' => '', 'manifest_bytes' => 0, 'manifest_hash' => str_repeat('0', 64), 'status' => 'unknown',
+                'reason' => 'Invalid or duplicate article reference in candidate headers.', 'last_unique_at' => now(), 'next_attempt_at' => now()]);
+        }
+        $ids = DB::table('release_verification_candidates')->orderBy('id')->pluck('id')->all();
+        config(['database.connections.verification_backfill_other' => config('database.connections.mysql')]);
+        DB::purge('verification_backfill_other');
+        $other = DB::connection('verification_backfill_other');
+        $other->statement('SET SESSION innodb_lock_wait_timeout = 1');
+        $other->beginTransaction();
+        try {
+            $other->table('release_verification_candidates')->where('id', $ids[0])->lockForUpdate()->first();
+            DB::statement('SET SESSION innodb_lock_wait_timeout = 2');
+            $started = microtime(true);
+            $this->artisan('releases:reclassify-header-rejections')->assertSuccessful()->expectsOutputToContain('Reclassified 1 candidates');
+            $this->assertLessThan(2, microtime(true) - $started);
+        } finally {
+            $other->rollBack();
+        }
+        $this->assertSame(['unknown', 'header_rejected'], DB::table('release_verification_candidates')->orderBy('id')->pluck('status')->all());
+    }
+
     public function test_batched_snapshot_rejects_oversized_metadata_without_removing_headers(): void
     {
         // Non-strict MariaDB would silently truncate the parent's oversized message ID to 255 bytes.
