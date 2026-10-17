@@ -384,6 +384,29 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame('sampled', $candidate->status);
     }
 
+    public function test_inventory_of_a_deleted_partial_release_is_released_not_merged(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('deleted-partial', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        // Deleted elsewhere (admin, cleanup or audit) while its inventory is still retained.
+        DB::table('releases')->where('id', $first)->delete();
+        $late = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d');
+        DB::table('collections')->where('id', $late)->update(['filecheck' => 0]);
+
+        app(CandidateRepository::class)->invalidateHotCollections([$late]);
+        $this->assertSame(0, (int) DB::table('collections')->where('id', $late)->value('filecheck'), 'No live partial to complete.');
+
+        app(CandidateRepository::class)->archive($late);
+
+        $rows = DB::table('release_verification_candidates')->orderBy('id')->get();
+        $this->assertSame(['', 0], [$rows[0]->manifest_path, (int) $rows[0]->manifest_bytes]);
+        $fresh = app(ManifestStore::class)->read($rows[1]->manifest_path);
+        $this->assertSame(['c@d'], array_column($fresh['files'][0]['segments'], 'messageid'));
+        $this->assertArrayNotHasKey('replaces_release_id', $fresh);
+        $this->assertSame((int) $rows[1]->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
+    }
+
     public function test_retained_partial_inventory_is_released_at_expiry(): void
     {
         $this->publicationSchema(partialColumns: true);

@@ -95,16 +95,17 @@ final class CandidateRepository
                 // A partial publication retains its inventory: late articles start a generation that
                 // merges it and replaces that release, instead of publishing only the late fragment.
                 $previous = null;
+                $merges = false;
                 if ($existing !== null && $existing->release_id !== null) {
                     $identity = sha1($sourceIdentity.':generation:'.$existing->id);
-                    $previous = $existing->manifest_path !== '' && $existing->status === 'sampled'
-                        && Release::hasPartialArticleCounts()
-                        && DB::table('releases')->where('id', $existing->release_id)->whereNotNull('articles_expected')->exists() ? $existing : null;
+                    // A retained inventory whose partial release is gone (deleted elsewhere) is released, not merged.
+                    $previous = $existing->manifest_path !== '' ? $existing : null;
+                    $merges = $previous !== null && $this->retainsLivePartial($previous);
                     $existing = null;
                 }
                 $manifest ??= $this->snapshotHeaders($collection, $currentReads);
                 $manifest['legacy_release_id'] = $this->legacyReleaseId($collection);
-                if ($previous !== null) {
+                if ($merges) {
                     $retained = $this->store->read($previous->manifest_path);
                     // The publication consumed any legacy release; the next generation publishes anew.
                     $retained['legacy_release_id'] = null;
@@ -131,7 +132,7 @@ final class CandidateRepository
                 $path = $prepared === null ? $this->store->write($manifest) : $this->store->writePrepared($prepared);
                 $size = $this->store->size($path);
                 $arrivalAt = Carbon::parse($collection->last_seen_at ?? $collection->dateadded ?? $collection->added ?? now())->format('Y-m-d H:i:s');
-                $lastUniqueAt = $existing === null ? ($previous === null ? $arrivalAt : max($arrivalAt, $previous->last_unique_at))
+                $lastUniqueAt = $existing === null ? (! $merges ? $arrivalAt : max($arrivalAt, $previous->last_unique_at))
                     : ($newArticles ? max($arrivalAt, $existing->last_unique_at) : $existing->last_unique_at);
                 $expired = $lastUniqueAt < now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
                 $delta = ($expired ? 0 : $size) - (int) ($existing->manifest_bytes ?? 0) - (int) ($previous->manifest_bytes ?? 0);
@@ -496,6 +497,10 @@ final class CandidateRepository
                 if ($this->articleIdentity($old) === $this->articleIdentity($merged) && ! ($merged['conflict'] ?? false)) {
                     continue;
                 }
+                if ($candidate->release_id !== null && ! $this->retainsLivePartial($candidate)) {
+                    // Its partial release is gone; the next archive() releases this inventory.
+                    continue;
+                }
                 if ($candidate->release_id !== null) {
                     // A published partial stays published: keep its inventory from expiring and archive
                     // the late articles now, which starts the generation that merges and replaces it.
@@ -510,6 +515,14 @@ final class CandidateRepository
                 DB::table('collections')->where('id', $collection->id)->where('filecheck', '!=', 4)->update(['filecheck' => 3]);
             }
         }
+    }
+
+    /** A published candidate's retained inventory still belongs to a live partial release. */
+    private function retainsLivePartial(object $candidate): bool
+    {
+        return $candidate->release_id !== null && $candidate->manifest_path !== '' && $candidate->status === 'sampled'
+            && Release::hasPartialArticleCounts()
+            && DB::table('releases')->where('id', $candidate->release_id)->whereNotNull('articles_expected')->exists();
     }
 
     /** @param array<string, mixed> $manifest */
