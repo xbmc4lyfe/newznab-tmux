@@ -46,7 +46,7 @@ perms: dirs ## Linux hosts: let the app containers' user (33:33) use their bind 
 # .deploy.log with DEPLOY_BY, and a rebuild is skipped while nothing changed (FORCE=1 overrides).
 APP_IMAGE ?= nntmux/app:local
 DEPLOY_MIN_INTERVAL ?= 900
-DEPLOY_DRAIN_TIMEOUT ?= 90
+DEPLOY_DRAIN_TIMEOUT ?= 900
 DEPLOY_SCHEDULER_DRAIN_TIMEOUT ?= 1800
 DEPLOY_HEALTH_TIMEOUT ?= 240
 DEPLOY_BY ?=
