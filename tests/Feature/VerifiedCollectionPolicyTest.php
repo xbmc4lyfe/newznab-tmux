@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Feature;
 
+use App\Exceptions\CandidateMetadataBudgetExceeded;
 use App\Facades\Search;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
@@ -511,6 +512,32 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         app(CandidateRepository::class)->expire();
 
         $this->assertSame((int) $holder->id, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
+    }
+
+    public function test_unreadable_late_headers_are_kept_not_deleted_as_a_filtered_replay(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('over-budget-late', true);
+        $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $other = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'x@y');
+        DB::table('collections')->where('id', $other)->update(['fromname' => 'someone-else']);
+        app(CandidateRepository::class)->archive($other);
+        DB::table('release_verification_candidates')->orderByDesc('id')->limit(1)->update(['status' => 'filtered', 'manifest_path' => '', 'manifest_bytes' => 0]);
+        // Late headers past the 16 MiB metadata budget.
+        $late = $this->collectionForPolicy('movie.mkv', 20000, $hash, part: 3, messageId: 'e@f');
+        $binary = (int) DB::table('binaries')->where('collections_id', $late)->value('id');
+        foreach (array_chunk(range(4, 15003), 500) as $numbers) {
+            DB::table('parts')->insert(array_map(static fn (int $number): array => ['binaries_id' => $binary, 'partnumber' => $number,
+                'messageid' => str_pad((string) $number, 1000, 'm').'@late', 'size' => 5], $numbers));
+        }
+
+        try {
+            app(CandidateRepository::class)->archive($late);
+        } catch (CandidateMetadataBudgetExceeded) {
+            // Retained for a later pass, as for any over-budget collection.
+        }
+
+        $this->assertTrue(DB::table('collections')->where('id', $late)->exists(), 'They may be the partial\'s late articles.');
     }
 
     public function test_late_articles_never_republish_a_deleted_partial(): void

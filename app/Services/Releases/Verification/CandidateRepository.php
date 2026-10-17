@@ -80,9 +80,10 @@ final class CandidateRepository
                 // conflict with a holder never merge into it.
                 $holder = null;
                 $apart = false;
-                if ($existing !== null && $snapshotFailure === null) {
+                $holders = [];
+                if ($existing !== null) {
                     $holders = $this->lockPartialHolders($sourceIdentity);
-                    if ($holders !== []) {
+                    if ($holders !== [] && $snapshotFailure === null) {
                         try {
                             // A filtered newer post skipped the snapshot; these headers may still be a partial's.
                             $manifest ??= $this->snapshotHeaders($collection, $currentReads);
@@ -98,6 +99,11 @@ final class CandidateRepository
                     // newest candidate takes the usual path below.
                     $existing = $holder;
                     $holder = null;
+                }
+                if ($existing !== null && $existing->status === 'filtered' && $holder === null && $holders !== [] && $snapshotFailure !== null) {
+                    // Unreadable headers might be a live partial's late articles, not the filtered post's replay;
+                    // keep them rather than delete them as one.
+                    throw $snapshotFailure;
                 }
                 if ($existing !== null && $existing->status === 'filtered' && $holder === null) {
                     if ($existing->release_id !== null || (int) $existing->groups_id !== (int) $collection->groups_id
