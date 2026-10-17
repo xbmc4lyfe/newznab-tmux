@@ -27,10 +27,10 @@ final class PreparationRunDiagnostics
     ];
 
     /** @var array{ready: int, waiting_upload: int, unknown: int} */
-    private array $assessments = ['ready' => 0, 'waiting_upload' => 0, 'unknown' => 0];
+    private array $assessments = ['ready' => 0, 'waiting_upload' => 0, 'unknown' => 0, 'header_rejected' => 0];
 
     /** @var array{ready: int, waiting_upload: int, unknown: int} */
-    private array $updated = ['ready' => 0, 'waiting_upload' => 0, 'unknown' => 0];
+    private array $updated = ['ready' => 0, 'waiting_upload' => 0, 'unknown' => 0, 'header_rejected' => 0];
 
     /** @var array{selection: float, read_assessment: float, update: float} */
     private array $durations = ['selection' => 0.0, 'read_assessment' => 0.0, 'update' => 0.0];
@@ -140,7 +140,7 @@ final class PreparationRunDiagnostics
         $this->uninspectedSelected--;
     }
 
-    /** @param 'ready'|'waiting_upload'|'unknown' $status */
+    /** @param 'ready'|'waiting_upload'|'unknown'|'header_rejected' $status */
     public function assessed(string $status): void
     {
         $this->assessments[$status]++;
@@ -154,7 +154,7 @@ final class PreparationRunDiagnostics
     /**
      * Affected rows describe the update result, not an outer transaction's commit.
      *
-     * @param  'ready'|'waiting_upload'|'unknown'  $status
+     * @param  'ready'|'waiting_upload'|'unknown'|'header_rejected'  $status
      */
     public function updated(string $status, int $affected, int $attempted = 1): void
     {

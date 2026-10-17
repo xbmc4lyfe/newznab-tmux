@@ -24,7 +24,70 @@ unset MODE MIGRATE DIRTY_APP DIRTY_DATA DIRTY_INFRA RECONCILE_DATA RECONCILE_INF
 actions=$("$DIR/bin/deploy-plan" --deploy-actions)
 eval "$actions"
 
+# Remote worker hosts share the database but not this Compose project. The new image's barrier,
+# a one-off container, stops their verification workers, waits for them and keeps them out while
+# writers are stopped, data services change or migrations run. It is stopped only after a healthy
+# rollout: a failed migration leaves remote workers held until the repaired deployment (which
+# reuses a running barrier, whatever it then has to do) finishes, or an operator stops it.
+# Named after Compose's effective project, so installations never share or adopt each other's barrier.
+project=$(compose config --format json | python3 -c 'import json, sys; print(json.load(sys.stdin)["name"])')
+case "$project" in
+    ''|*[!a-z0-9_-]*) echo "Cannot resolve the Compose project for the verification barrier." >&2; exit 1 ;;
+esac
+barrier_name="$project-verification-barrier"
+barrier_held=0
+barrier_keep=0
+barrier_running() {
+    [ "$(docker inspect --format '{{.State.Running}} {{index .Config.Labels "com.docker.compose.project"}}' "$barrier_name" 2>/dev/null)" = "true $project" ]
+}
+hold_barrier() {
+    # A barrier still running from a failed attempt is retained until this rollout is healthy.
+    if barrier_running; then
+        barrier_keep=1
+    else
+        docker rm -f "$barrier_name" >/dev/null 2>&1 || true
+        compose run -d --no-deps --name "$barrier_name" web php artisan releases:verification-barrier --timeout="${DEPLOY_REMOTE_DRAIN_TIMEOUT:-900}" --no-interaction >/dev/null
+    fi
+    barrier_held=1
+    until docker logs "$barrier_name" 2>&1 | grep -q '^barrier held'; do
+        if ! barrier_running; then
+            docker logs "$barrier_name" >&2 || true
+            docker rm -f "$barrier_name" >/dev/null 2>&1 || true
+            barrier_held=0
+            echo "Remote verification workers did not drain; not stopping writers or migrating." >&2
+            exit 1
+        fi
+        sleep 1
+    done
+}
+assert_barrier() {
+    [ "$barrier_held" = 1 ] || return 0
+    if ! barrier_running || docker logs "$barrier_name" 2>&1 | grep -q '^barrier lost'; then
+        echo "The verification barrier was lost; remote verification workers may be writing." >&2
+        exit 1
+    fi
+}
+release_barrier() {
+    if [ "$barrier_held" = 1 ]; then
+        docker stop --timeout 30 "$barrier_name" >/dev/null || true
+        released=0
+        docker logs "$barrier_name" 2>&1 | grep -q '^barrier released' && released=1
+        docker rm -f "$barrier_name" >/dev/null 2>&1 || true
+        barrier_held=0
+        # Its durable pause would otherwise keep every host's workers out after a healthy rollout.
+        if [ "$released" != 1 ] && ! compose run --rm --no-deps -T web php artisan releases:verification-barrier --release --no-interaction; then
+            echo "The verification deployment pause could not be cleared; every host's workers stay paused." >&2
+            return 1
+        fi
+    fi
+}
+
 if [ "$MODE" = "noop" ]; then
+    if barrier_running; then
+        # A barrier left by an earlier failed attempt must not hold remote workers out forever.
+        barrier_held=1
+        release_barrier
+    fi
     # Nothing rolled out: let the guard stamp the new fingerprint without recording a deployment.
     if [ -n "${DEPLOY_NOOP_MARKER:-}" ]; then : >"$DEPLOY_NOOP_MARKER"; fi
     exit 0
@@ -93,7 +156,9 @@ if [ "$MIGRATE" = 1 ] || [ -n "$DIRTY_DATA" ] || [ -n "$RECONCILE_DATA" ]; then
     need_horizon_stop=1
     stop_services="web scheduler indexer"
     up_app_services="web horizon scheduler indexer"
+    need_barrier=1
 else
+    need_barrier=0
     need_scheduler_drain=0
     need_indexer_drain=0
     need_horizon_stop=0
@@ -123,6 +188,11 @@ legacy_drain() { compose exec -T indexer php -- /app "$1" "${DEPLOY_LEGACY_DRAIN
 legacy_scheduler() { compose exec -T scheduler python3 - "$1" "$scheduler_timeout" "$operation_token" < "$DIR/bin/legacy-scheduler-drain.py"; }
 scheduler_command() { compose exec -T scheduler python3 /app/docker/app/bin/scheduler.py "$@"; }
 resume() {
+    if [ "$barrier_held" = 1 ] && [ "$barrier_keep" = 1 ]; then
+        echo "Remote verification workers stay held by container $barrier_name until a repaired deployment completes or it is stopped." >&2
+    else
+        release_barrier
+    fi
     if [ "$horizon_stopped" = 1 ]; then
         compose start horizon || echo "Horizon restart failed; queued jobs wait until it runs." >&2
     fi
@@ -232,6 +302,13 @@ elif [ "$scheduler_drained" = 1 ]; then
     verify
 fi
 
+# Remote workers are held out whenever the database's writers stop for a schema or data-service
+# change; a barrier left running by an earlier failed attempt is adopted and released on success.
+if [ "$need_barrier" = 1 ] || barrier_running; then
+    hold_barrier
+    verify
+fi
+
 if [ -n "$stop_services" ]; then
     # shellcheck disable=SC2086
     compose stop $stop_services
@@ -239,6 +316,7 @@ if [ -n "$stop_services" ]; then
     scheduler_drained=0
     verify
 fi
+assert_barrier
 # Past this point Horizon is replaced, never restarted on its old container.
 horizon_stopped=0
 
@@ -256,7 +334,10 @@ if [ -n "$RECONCILE_DATA" ]; then
 fi
 
 if [ "$MIGRATE" = 1 ]; then
+    assert_barrier
+    [ "$barrier_held" != 1 ] || barrier_keep=1
     compose run --rm --no-deps web php artisan migrate --force --no-interaction
+    assert_barrier
     plan --record migration effective
     verify
 fi
@@ -274,4 +355,12 @@ if [ -n "$up_app_services" ]; then
     fi
     # shellcheck disable=SC2086
     plan --record $up_app_services
+fi
+assert_barrier
+barrier_keep=0
+if ! release_barrier; then
+    # Every service is healthy, so the next poll would otherwise skip and leave the pause in
+    # place: owe the (idempotent) migration again, whose run takes and clears the barrier.
+    plan --forget migration || true
+    exit 1
 fi

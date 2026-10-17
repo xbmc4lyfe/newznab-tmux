@@ -30,10 +30,10 @@ class ReleaseVerificationSchedulerRecoveryTest extends TestCase
             'release_verification.candidate_workers' => 1, 'release_verification.free_bytes' => 0, 'release_verification.bytes_per_second' => 0,
             'cache.default' => 'array']);
         DB::purge();
-        foreach (['2026_10_11_154028_create_release_verification_candidates_table.php',
+        foreach (['2026_10_11_154028_create_release_verification_candidates_table.php', '2026_10_17_220000_add_header_check_pending_to_release_verification_candidates.php',
             '2026_10_11_175742_create_release_verification_audit_retries_table.php',
             '2026_10_12_004819_create_release_verification_scratch_table.php',
-            '2026_10_12_053000_add_shared_verification_scratch_budget.php'] as $migration) {
+            '2026_10_12_053000_add_shared_verification_scratch_budget.php', '2026_10_17_200000_add_host_to_release_verification_scratch.php'] as $migration) {
             (require database_path('migrations/'.$migration))->up();
         }
         Schema::create('usenet_groups', static function (Blueprint $table): void {

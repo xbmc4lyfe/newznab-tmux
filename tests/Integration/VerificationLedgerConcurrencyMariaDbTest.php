@@ -53,9 +53,9 @@ final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
             'release_verification.pending_bytes' => 1048576]);
         DB::purge();
         DB::statement('SET SESSION innodb_lock_wait_timeout = 1');
-        foreach (['2026_10_11_154028_create_release_verification_candidates_table', '2026_10_17_000000_create_release_verification_manifests_table',
+        foreach (['2026_10_11_154028_create_release_verification_candidates_table', '2026_10_17_220000_add_header_check_pending_to_release_verification_candidates', '2026_10_17_000000_create_release_verification_manifests_table',
             '2026_10_17_120000_create_release_verification_locks_table', '2026_10_17_180000_add_release_verification_publication_stripes',
-            '2026_10_12_004819_create_release_verification_scratch_table', '2026_10_12_053000_add_shared_verification_scratch_budget'] as $migration) {
+            '2026_10_12_004819_create_release_verification_scratch_table', '2026_10_12_053000_add_shared_verification_scratch_budget', '2026_10_17_200000_add_host_to_release_verification_scratch'] as $migration) {
             (require database_path('migrations/'.$migration.'.php'))->up();
         }
         DB::statement('CREATE TABLE collections (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,

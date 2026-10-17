@@ -91,6 +91,9 @@ docker/backups/
 docker/.env
 docker/config/app.env
 docker/config/usenet_servers.json
+docker/worker/config/app.env
+docker/worker/config/ca.pem
+docker/worker/config/install.lock
 docker/docs/
 docker/app/nzb-yenc-ffi/target/
 docker/.deploy.lock
