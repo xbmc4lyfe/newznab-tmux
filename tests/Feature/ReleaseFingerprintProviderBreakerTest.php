@@ -30,6 +30,8 @@ final class ReleaseFingerprintProviderBreakerTest extends TestCase
             'cache.default' => 'array',
             'nntmux_nntp.server' => 'news.primary.invalid',
             'nntmux_nntp.alternate_server' => 'news.alternate.invalid',
+            'nntmux_nntp.alternate_server_port' => '',
+            'nntmux_nntp.alternate_server_ssl' => false,
             'nntmux_nntp.fingerprint_provider_breaker_seconds' => 900,
         ]);
     }
@@ -181,6 +183,32 @@ final class ReleaseFingerprintProviderBreakerTest extends TestCase
         $this->assertSame('RuntimeException', $this->alternateProfile($this->collect()['data'])['profile_error_type']);
 
         $this->assertArrayHasKey('profile', $this->alternateProfile($this->collect()['data']));
+    }
+
+    #[Test]
+    public function a_success_racing_a_newer_failure_keeps_the_reprobe_serialised(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->twice()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(true)
+            ->andThrow(new NntpProviderUnavailableException('Unable to connect to the requested NNTP provider.'));
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(true)
+            ->andReturnUsing(function (): array {
+                // Another worker records a new failure while this re-probe is still finishing.
+                Cache::put($this->breakerKey('open'), true, 900);
+                Cache::put($this->breakerKey('suspect'), true, 3600);
+                Cache::forget($this->breakerKey('probe'));
+
+                return ['capabilities_raw' => []];
+            });
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(9)->andThrow(new \RuntimeException('Article unavailable.'));
+
+        $this->collect();
+        $this->travel(901)->seconds();
+        $this->collect();
+
+        $this->assertTrue(Cache::has($this->breakerKey('suspect')));
+        $this->assertTrue(Cache::has($this->breakerKey('open')));
     }
 
     #[Test]

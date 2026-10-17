@@ -41,6 +41,9 @@ final class ReleaseFingerprintCollector
 
     private const MAX_RELEASE_IFSC_PREVIEW_RECORDS = 4096;
 
+    /** @var array<string, string> Re-probe claim tokens held by this job, keyed by claim cache key. */
+    private array $providerProbeTokens = [];
+
     public function __construct(private readonly NzbService $nzb, private readonly NzbFingerprintAnalyzer $analyzer,
         private readonly Par2MetadataParser $par2, private readonly YencService $yenc) {}
 
@@ -2370,6 +2373,7 @@ final class ReleaseFingerprintCollector
      */
     private function alternateSkipReason(array $server): ?string
     {
+        unset($this->providerProbeTokens[self::providerBreakerKey($server, 'probe')]);
         if (self::providerBreakerSeconds() <= 0) {
             return null;
         }
@@ -2377,9 +2381,12 @@ final class ReleaseFingerprintCollector
             if (Cache::has(self::providerBreakerKey($server, 'open'))) {
                 return 'recent_provider_failure';
             }
-            if (Cache::has(self::providerBreakerKey($server, 'suspect'))
-                && ! Cache::add(self::providerBreakerKey($server, 'probe'), true, self::providerProbeSeconds())) {
-                return 'provider_probe_in_progress';
+            if (Cache::has(self::providerBreakerKey($server, 'suspect'))) {
+                $token = bin2hex(random_bytes(16));
+                if (! Cache::add(self::providerBreakerKey($server, 'probe'), $token, self::providerProbeSeconds())) {
+                    return 'provider_probe_in_progress';
+                }
+                $this->providerProbeTokens[self::providerBreakerKey($server, 'probe')] = $token;
             }
         } catch (Throwable) {
             // Without the cache every job probes the provider itself, as before.
@@ -2395,26 +2402,39 @@ final class ReleaseFingerprintCollector
         if ($seconds <= 0) {
             return;
         }
+        unset($this->providerProbeTokens[self::providerBreakerKey($server, 'probe')]);
         try {
-            Cache::put(self::providerBreakerKey($server, 'open'), true, $seconds);
-            Cache::put(self::providerBreakerKey($server, 'suspect'), true, max(3600, $seconds * 4));
-            Cache::forget(self::providerBreakerKey($server, 'probe'));
+            // A failure is recorded even when the state lock is unavailable; it only delays probes.
+            $this->withProviderStateLock($server, static function () use ($server, $seconds): void {
+                Cache::put(self::providerBreakerKey($server, 'open'), true, $seconds);
+                Cache::put(self::providerBreakerKey($server, 'suspect'), true, max(3600, $seconds * 4));
+                Cache::forget(self::providerBreakerKey($server, 'probe'));
+            }, true);
         } catch (Throwable) {
             // Without the cache every job probes the provider itself, as before.
         }
     }
 
-    /** @param array{name: string, port: string, tls: bool} $server */
+    /**
+     * Only the job holding the current re-probe claim may clear the suspect state, so a success that
+     * races a newer failure (which drops the claim) cannot reopen probing to every worker.
+     *
+     * @param  array{name: string, port: string, tls: bool}  $server
+     */
     private function rememberAlternateReachable(array $server): void
     {
-        if (self::providerBreakerSeconds() <= 0) {
+        $token = $this->providerProbeTokens[self::providerBreakerKey($server, 'probe')] ?? null;
+        unset($this->providerProbeTokens[self::providerBreakerKey($server, 'probe')]);
+        if ($token === null || self::providerBreakerSeconds() <= 0) {
             return;
         }
         try {
-            if (Cache::has(self::providerBreakerKey($server, 'suspect'))) {
-                Cache::forget(self::providerBreakerKey($server, 'suspect'));
-                Cache::forget(self::providerBreakerKey($server, 'probe'));
-            }
+            $this->withProviderStateLock($server, static function () use ($server, $token): void {
+                if (Cache::get(self::providerBreakerKey($server, 'probe')) === $token) {
+                    Cache::forget(self::providerBreakerKey($server, 'suspect'));
+                    Cache::forget(self::providerBreakerKey($server, 'probe'));
+                }
+            }, false);
         } catch (Throwable) {
             // A stale suspect key only serialises the next probe.
         }
@@ -2423,10 +2443,37 @@ final class ReleaseFingerprintCollector
     /** @param array{name: string, port: string, tls: bool} $server */
     private function releaseAlternateProbe(array $server): void
     {
+        $token = $this->providerProbeTokens[self::providerBreakerKey($server, 'probe')] ?? null;
+        unset($this->providerProbeTokens[self::providerBreakerKey($server, 'probe')]);
+        if ($token === null) {
+            return;
+        }
         try {
-            Cache::forget(self::providerBreakerKey($server, 'probe'));
+            $this->withProviderStateLock($server, static function () use ($server, $token): void {
+                if (Cache::get(self::providerBreakerKey($server, 'probe')) === $token) {
+                    Cache::forget(self::providerBreakerKey($server, 'probe'));
+                }
+            }, false);
         } catch (Throwable) {
             // The claim expires with the job timeout.
+        }
+    }
+
+    /**
+     * @param  array{name: string, port: string, tls: bool}  $server
+     * @param  callable(): void  $update
+     */
+    private function withProviderStateLock(array $server, callable $update, bool $runWithoutLock): void
+    {
+        $lock = Cache::lock(self::providerBreakerKey($server, 'state-lock'), 10);
+        if ($lock->block(5)) {
+            try {
+                $update();
+            } finally {
+                $lock->release();
+            }
+        } elseif ($runWithoutLock) {
+            $update();
         }
     }
 
