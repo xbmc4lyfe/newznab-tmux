@@ -412,8 +412,20 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(0, DB::table('releases')->count());
     }
 
+    public function test_an_imported_partial_releases_its_inventory_because_no_late_headers_can_merge(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+
+        $releaseId = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3), source: 'import');
+
+        $candidate = DB::table('release_verification_candidates')->sole();
+        $this->assertSame($releaseId, (int) $candidate->release_id);
+        $this->assertSame(['', 0], [$candidate->manifest_path, (int) $candidate->manifest_bytes]);
+        $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+    }
+
     /** Archive a collection (unless null), let the upload stall past the hold, and publish it as partial. */
-    private function publishStalledPartial(?int $collectionId, bool $limits = true): ?int
+    private function publishStalledPartial(?int $collectionId, bool $limits = true, ?string $source = null): ?int
     {
         config(['release_verification.partial_after_hours' => 4]);
         $repository = app(CandidateRepository::class);
@@ -433,6 +445,9 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
             'verified_file_count' => 1, 'identity_hints' => [['name' => 'movie.mkv', 'source' => 'yenc-spot-check']],
             'spot_check' => ['articles' => 1, 'bytes' => 5, 'sampled_files' => 1, 'method' => 'yenc-crc-and-identity']];
         $manifest['partial'] = (new CandidateHeaderInventory)->completeness($manifest);
+        if ($source !== null) {
+            $manifest['metadata_source'] = $source;
+        }
         Search::shouldReceive('updateRelease')->zeroOrMoreTimes();
 
         return app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('sampled', 'Partial sample.', $manifest));

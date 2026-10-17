@@ -145,8 +145,9 @@ final class VerifiedReleasePublisher
                         $this->recordGroups($duplicateId, $manifest['groups']);
                         $this->replaceSupersededPartial($manifest, $duplicateId);
                         app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
-                        // Reusing a partial (such as a replay of its own headers) must keep the inventory late articles merge into.
-                        $this->markPublished($candidate->id, $duplicateId, $result, retainManifest: Release::hasPartialArticleCounts()
+                        // Reusing a partial must keep the inventory late articles merge into.
+                        $this->markPublished($candidate->id, $duplicateId, $result, retainManifest: $this->awaitsLateArticles($manifest)
+                            && Release::hasPartialArticleCounts()
                             && DB::table('releases')->where('id', $duplicateId)->whereNotNull('articles_expected')->exists());
 
                         $returned = true;
@@ -203,7 +204,7 @@ final class VerifiedReleasePublisher
                     $this->replaceSupersededPartial($manifest, (int) $id);
                     app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
                     // A partial release keeps its inventory so late articles can complete it.
-                    $this->markPublished($candidate->id, (int) $id, $result, retainManifest: isset($manifest['partial']));
+                    $this->markPublished($candidate->id, (int) $id, $result, retainManifest: isset($manifest['partial']) && $this->awaitsLateArticles($manifest));
 
                     $returned = true;
 
@@ -335,6 +336,17 @@ final class VerifiedReleasePublisher
         foreach (array_unique(app(ReleaseGroupResolver::class)->idsByName($names)) as $groupId) {
             DB::table('releases_groups')->insertOrIgnore(['releases_id' => $releaseId, 'groups_id' => $groupId]);
         }
+    }
+
+    /**
+     * Only Usenet-sourced inventories can grow: archive() merges late headers by collection hash, while an
+     * imported NZB's candidate is keyed by its full article fingerprint and never receives more articles.
+     *
+     * @param  array<string, mixed>  $manifest
+     */
+    private function awaitsLateArticles(array $manifest): bool
+    {
+        return ($manifest['metadata_source'] ?? null) !== 'import';
     }
 
     /**
