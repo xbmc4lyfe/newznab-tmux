@@ -32,10 +32,17 @@ scheduler_command() { compose exec -T scheduler python3 /app/docker/app/bin/sche
 # a one-off container, stops their verification workers, waits for them and keeps them out. It is
 # stopped only after a healthy rollout: a failed migration leaves remote workers held until the
 # repaired deployment (which reuses a running barrier) finishes, or an operator stops it.
-barrier_name="${COMPOSE_PROJECT_NAME:-nntmux}-verification-barrier"
+# Named after Compose's effective project, so installations never share or adopt each other's barrier.
+project=$(compose config --format json | python3 -c 'import json, sys; print(json.load(sys.stdin)["name"])')
+case "$project" in
+    ''|*[!a-z0-9_-]*) echo "Cannot resolve the Compose project for the verification barrier." >&2; exit 1 ;;
+esac
+barrier_name="$project-verification-barrier"
 barrier_held=0
 barrier_keep=0
-barrier_running() { [ "$(docker inspect --format '{{.State.Running}}' "$barrier_name" 2>/dev/null)" = true ]; }
+barrier_running() {
+    [ "$(docker inspect --format '{{.State.Running}} {{index .Config.Labels "com.docker.compose.project"}}' "$barrier_name" 2>/dev/null)" = "true $project" ]
+}
 hold_barrier() {
     # A barrier still running from a failed attempt is retained until this rollout is healthy.
     if barrier_running; then

@@ -31,7 +31,7 @@ case "$*" in
     *'releases:verification-barrier'*)
         if [ "${NNTMUX_BARRIER_FAIL:-0}" = 1 ]; then echo 'still running' > "$NNTMUX_REPO/barrier.log"; else echo 'barrier held' > "$NNTMUX_REPO/barrier.log"; : > "$NNTMUX_REPO/barrier.running"; fi
         echo barrier-container ;;
-    'inspect --format {{.State.Running}} '*'-verification-barrier') [ -f "$NNTMUX_REPO/barrier.running" ] && echo true || echo false ;;
+    'inspect --format {{.State.Running}} '*'-verification-barrier') [ -f "$NNTMUX_REPO/barrier.running" ] && echo 'true nntmux' || echo 'false nntmux' ;;
     'logs '*'-verification-barrier')
         cat "$NNTMUX_REPO/barrier.log" 2>/dev/null
         if [ "${NNTMUX_BARRIER_LOST:-}" != '' ] && grep -q "${NNTMUX_BARRIER_LOST}" "$NNTMUX_DEPLOY_EVENTS"; then echo 'barrier lost'; fi ;;
@@ -39,7 +39,7 @@ case "$*" in
         rm -f "$NNTMUX_REPO/barrier.running"; echo released >> "$NNTMUX_DEPLOY_EVENTS"
         [ "${NNTMUX_BARRIER_UNCLEAN:-0}" = 1 ] || echo 'barrier released' >> "$NNTMUX_REPO/barrier.log" ;;
     'rm -f '*'-verification-barrier') rm -f "$NNTMUX_REPO/barrier.running" ;;
-    *' config --format json'*) echo "${NNTMUX_CONFIG_ID:-fixture-config}" ;;
+    *' config --format json'*) printf '{"name":"nntmux","fixture":"%s"}\n' "${NNTMUX_CONFIG_ID:-fixture-config}" ;;
     *'image inspect --format'*) echo "${NNTMUX_IMAGE_ID:-sha256:fixture}" ;;
     *'image inspect'*) exit 0 ;;
     *'inspect --format {{.Image}}'*)

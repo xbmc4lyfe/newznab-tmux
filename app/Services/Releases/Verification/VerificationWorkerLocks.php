@@ -225,10 +225,12 @@ final class VerificationWorkerLocks
     }
 
     /** Checked on the holder's own connection, which may not be the default one. */
-    public static function paused(?string $connection = null, ?string $reason = null): bool
+    /** A current (locking) read sees a pause committed after an enclosing transaction's snapshot. */
+    public static function paused(?string $connection = null, ?string $reason = null, bool $current = false): bool
     {
         return self::pausesExist($connection) && DB::connection($connection)->table('release_verification_pauses')
-            ->when($reason !== null, static fn ($query) => $query->where('reason', $reason))->exists();
+            ->when($reason !== null, static fn ($query) => $query->where('reason', $reason))
+            ->when($current, static fn ($query) => $query->sharedLock())->exists();
     }
 
     /** @var \WeakMap<object, true>|null connections known to have the pause table */

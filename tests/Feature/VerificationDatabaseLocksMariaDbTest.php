@@ -409,6 +409,27 @@ class VerificationDatabaseLocksMariaDbTest extends TestCase
         }
     }
 
+    public function test_admission_in_an_older_snapshot_still_sees_a_committed_reset_pause(): void
+    {
+        (require database_path('migrations/2026_10_17_210000_create_release_verification_pauses_table.php'))->up();
+        DB::statement('SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+        DB::beginTransaction();
+        try {
+            $this->assertSame(0, DB::table('release_verification_pauses')->count());
+            DB::connection('verification_lock_other')->table('release_verification_pauses')
+                ->insert(['token' => 'interrupted-reset', 'reason' => 'reset']);
+            $this->assertSame(0, DB::table('release_verification_pauses')->count(), 'The snapshot predates the pause.');
+            try {
+                app(VerificationResetService::class)->withAdmission(static fn () => null);
+                $this->fail('Admission must see the committed reset pause.');
+            } catch (RuntimeException $error) {
+                $this->assertStringContainsString('retry reset later', $error->getMessage());
+            }
+        } finally {
+            DB::rollBack();
+        }
+    }
+
     public function test_lock_names_are_scoped_to_their_database(): void
     {
         $this->fixture('verification_lock_elsewhere');
