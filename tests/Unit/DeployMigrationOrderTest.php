@@ -981,6 +981,54 @@ SH);
         $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
     }
 
+    public function test_removing_a_service_from_compose_needs_no_app_rollout(): void
+    {
+        $services = '"web":{},"horizon":{},"scheduler":{},"indexer":{},"redis":{},"manticore":{},"proxy":{}';
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => '{"services":{'.$services.',"mailpit":{},"sidecar":{}}}'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => '{"services":{'.$services.'}}']);
+        $plan->mustRun();
+        $this->assertMatchesRegularExpression('/mailpit\s+infra\s+skip\s+removed from Compose/', $plan->getOutput());
+        $this->assertMatchesRegularExpression('/sidecar\s+infra\s+skip\s+removed from Compose/', $plan->getOutput());
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => '{"services":{'.$services.'}}'])->mustRun();
+        $events = $this->events();
+        $this->assertStringNotContainsString('drain', $events);
+        $this->assertStringNotContainsString('artisan migrate', $events);
+        $this->assertStringNotContainsString(' up -d', $events);
+        $this->assertStringNotContainsString('service:sidecar=', (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
+    }
+
+    public function test_plan_explanation_reports_the_writer_quiesce_a_data_reconcile_needs(): void
+    {
+        $config = ['NNTMUX_CONFIG_ID' => $this->composeJson()];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $stamp = $this->directory.'/docker/.deploy.stamp';
+        file_put_contents($stamp, preg_replace('/^service:redis=.*\n/m', '', (string) file_get_contents($stamp)));
+
+        $plan = $this->make(['deploy-plan'], $config);
+        $plan->mustRun();
+        $this->assertStringContainsString('Deployment Mode : full', $plan->getOutput());
+        $this->assertMatchesRegularExpression('/redis\s+data\s+reconcile/', $plan->getOutput());
+        $this->assertMatchesRegularExpression('/scheduler\s+app\s+quiesce\+restart\s+data service restart/', $plan->getOutput());
+    }
+
+    public function test_unreadable_env_file_fails_closed(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        file_put_contents($this->directory.'/docker/config/app.env', "APP_KEY=x\n");
+        chmod($this->directory.'/docker/config', 0000);
+        try {
+            $process = new Process([$this->directory.'/docker/bin/deploy-plan', '--fingerprint'], env: ['DEPLOY_REPO' => $this->directory, 'PYTHONDONTWRITEBYTECODE' => '1']);
+            $process->run();
+        } finally {
+            chmod($this->directory.'/docker/config', 0755);
+        }
+        $this->assertNotSame(0, $process->getExitCode());
+        $this->assertStringContainsString('cannot read', $process->getErrorOutput());
+    }
+
     public function test_host_system_paths_match_on_path_boundaries_only(): void
     {
         $script = 'import importlib.machinery, importlib.util, sys; l = importlib.machinery.SourceFileLoader("dp", sys.argv[1]); '

@@ -525,10 +525,18 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
 
     env_hashes: list[str] = []
     for env_file in (docker_dir / ".env", docker_dir / "config/app.env"):
-        if env_file.is_file():
-            env_hashes.append(sha256_bytes(env_file.read_bytes()))
-        else:
+        # os.stat, not is_file(): from Python 3.14 that hides permission errors as "missing".
+        try:
+            os.stat(env_file)
+        except FileNotFoundError:
             env_hashes.append("missing")
+            continue
+        except OSError as error:
+            sys.exit(f"deploy-plan: cannot read {env_file}: {error.strerror or error}")
+        try:
+            env_hashes.append(sha256_bytes(env_file.read_bytes()))
+        except OSError as error:
+            sys.exit(f"deploy-plan: cannot read {env_file}: {error.strerror or error}")
     base_img = os.environ.get("BASE_IMAGE", "nntmux/base:local")
     image_tags = [base_img, *(service_image_name(svc) for svc in APP_SERVICES)]
     configuration_hash = sha256_text("\n".join([*env_hashes, *image_tags]))
@@ -594,9 +602,14 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
 
 
 def parse_stamp(stamp_path: Path) -> dict[str, str]:
-    if not stamp_path.is_file():
+    try:
+        text = stamp_path.read_text(encoding="utf-8", errors="surrogateescape")
+    except FileNotFoundError:
         return {}
-    lines = [line.strip() for line in stamp_path.read_text(encoding="utf-8", errors="surrogateescape").splitlines() if line.strip()]
+    except OSError as error:
+        # An unreadable stamp is not a first deployment.
+        sys.exit(f"deploy-plan: cannot read {stamp_path}: {error.strerror or error}")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
         return {}
     parsed: dict[str, str] = {"fingerprint": lines[0]}
@@ -894,7 +907,21 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
 
     compose_global_changed = not first_deploy and stamped.get("effective") != state["effective"]
     reconciling = bool(reconcile_data or reconcile_infra)
-    global_fallback = compose_global_changed and not dirty_app and not dirty_data and not dirty_infra and not reconciling
+    # Services the stamp recorded as rendered that the effective Compose no longer renders: their
+    # removal explains a rendered-config change by itself (the container is left as an orphan, as
+    # Compose would), so it must not fall back to a full app rollout.
+    removed = sorted(
+        key.split(":", 1)[1]
+        for key, value in stamped.items()
+        if key.startswith("service:")
+        and key.split(":", 1)[1] not in APP_SERVICES
+        and (key not in state or (not compose_present(state, key.split(":", 1)[1]) and value != state[key]))
+    )
+    for svc in removed:
+        (data_reasons if svc in DATA_SERVICES else infra_reasons)[svc] = "removed from Compose"
+    global_fallback = (
+        compose_global_changed and not dirty_app and not dirty_data and not dirty_infra and not reconciling and not removed
+    )
     if global_fallback:
         for svc in APP_SERVICES:
             dirty_app.append(svc)
@@ -913,7 +940,8 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
     # Reconcile-only work (e.g. a service added to Compose) is a rollout, never a no-op skip.
     if not dirty_app and not dirty_data and not dirty_infra and not migrate and not reconciling:
         mode = "noop"
-    elif migrate or dirty_data:
+    elif migrate or dirty_data or reconcile_data:
+        # deploy-app stops every writer before touching a data service, reconcile included.
         mode = "full"
         for svc in APP_SERVICES:
             if svc not in dirty_app:
