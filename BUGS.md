@@ -395,6 +395,12 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom:** production sets 48 and runs 8 verification workers.
 - **Suggested fix:** make the ceiling configurable, after BUGS #52, because more workers only add waiters to the capacity row.
 
+### 55. Fingerprint metadata jobs retry a rejected alternate provider for every sample (Fixed)
+
+- **Where:** `ReleaseFingerprintCollector::collect()` queries every configured provider, independent of `NNTP_ALTERNATE_FALLBACK`.
+- **Symptom:** when the alternate rejects its login, each sample repeats the full connect and retry cycle. Horizon logs one "Authentication rejected" about every 2 minutes, and `CollectReleaseFingerprintMetadata` jobs run for minutes or hit their timeout.
+- **Fix:** connection failures raise `NntpProviderUnavailableException`. The collector then records the remaining alternate samples as unavailable without reconnecting. The primary still retries per sample.
+
 ## Issues in the docker/ stack itself (all fixed)
 
 | Issue | Fix |
