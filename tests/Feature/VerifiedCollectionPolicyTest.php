@@ -474,6 +474,45 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame('', DB::table('release_verification_candidates')->where('id', $retained->id)->value('manifest_path'));
     }
 
+    public function test_a_pending_upgrade_generation_holds_the_inventory_against_conflicting_posts(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('pending-holder', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+        $holder = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        $this->assertSame((int) $holder->id, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
+
+        // Another poster under the same hash, while the upgrade is pending.
+        $other = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 3, messageId: 'x@y');
+        DB::table('collections')->where('id', $other)->update(['fromname' => 'someone-else']);
+        app(CandidateRepository::class)->archive($other);
+        $after = DB::table('release_verification_candidates')->where('id', $holder->id)->first();
+        $this->assertSame([$holder->manifest_path, $holder->status], [$after->manifest_path, $after->status], 'The pending holder is untouched.');
+
+        // The original poster's next article joins the pending holder, not the newer post.
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 3, messageId: 'e@f'));
+        $holderManifest = app(ManifestStore::class)->read((string) DB::table('release_verification_candidates')->where('id', $holder->id)->value('manifest_path'));
+        $this->assertSame(['a@b', 'c@d', 'e@f'], array_column($holderManifest['files'][0]['segments'], 'messageid'));
+        $this->assertSame((int) $holder->id, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
+    }
+
+    public function test_a_header_rejected_holder_keeps_the_partial_fenced_until_it_ends(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('rejected-holder', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+        $holder = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        // Later headers may still repair it, so it is not over.
+        DB::table('release_verification_candidates')->where('id', $holder->id)->update(['status' => 'header_rejected']);
+
+        $this->limits();
+        app(CandidateRepository::class)->expire();
+
+        $this->assertSame((int) $holder->id, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
+    }
+
     public function test_late_articles_never_republish_a_deleted_partial(): void
     {
         $this->publicationSchema(partialColumns: true);
