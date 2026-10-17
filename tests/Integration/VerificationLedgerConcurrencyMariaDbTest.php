@@ -53,7 +53,7 @@ final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
         DB::purge();
         DB::statement('SET SESSION innodb_lock_wait_timeout = 1');
         foreach (['2026_10_11_154028_create_release_verification_candidates_table', '2026_10_17_000000_create_release_verification_manifests_table',
-            '2026_10_17_120000_create_release_verification_locks_table'] as $migration) {
+            '2026_10_17_120000_create_release_verification_locks_table', '2026_10_17_180000_add_release_verification_publication_stripes'] as $migration) {
             (require database_path('migrations/'.$migration.'.php'))->up();
         }
         DB::statement('CREATE TABLE collections (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -275,7 +275,12 @@ final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
         $other = $this->connection();
         DB::beginTransaction();
         try {
-            $ledger->enterPublication();
+            $ledger->enterPublication(['size:5']);
+            // Only this key's stripe is held; other stripes and the shared fallback row stay free.
+            $this->assertLocked($other, $this->stripeLock('size:5'));
+            $this->assertNotLocked($other, $this->stripeLock($this->keyOnAnotherStripe('size:5')));
+            // The shared row is held in share mode: other striped publications proceed, a keyless one waits.
+            $this->assertNotLocked($other, 'SELECT name FROM release_verification_locks WHERE name = \'publication\' LOCK IN SHARE MODE NOWAIT');
             $this->assertLocked($other, 'SELECT name FROM release_verification_locks WHERE name = \'publication\' FOR UPDATE NOWAIT');
             $this->assertNotLocked($other, 'SELECT id FROM release_verification_state WHERE id = 1 FOR UPDATE NOWAIT');
             $this->assertFalse($ledger->adjust(61), 'A delta beyond capacity changes nothing.');
@@ -289,6 +294,122 @@ final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
             }
         }
         $this->assertSame(70, (int) DB::table('release_verification_state')->value('pending_bytes'));
+    }
+
+    public function test_publications_fall_back_to_one_shared_row_before_the_stripes_exist(): void
+    {
+        DB::table('release_verification_locks')->where('name', 'like', 'publication:%')->delete();
+        $other = $this->connection();
+        DB::beginTransaction();
+        try {
+            app(VerificationLedger::class)->enterPublication(['size:5']);
+            $this->assertLocked($other, 'SELECT name FROM release_verification_locks WHERE name = \'publication\' FOR UPDATE NOWAIT');
+        } finally {
+            DB::rollBack();
+        }
+    }
+
+    public function test_a_keyless_publication_and_a_striped_publication_exclude_each_other(): void
+    {
+        $other = $this->connection();
+        // A publication whose keys could not be resolved holds the shared row exclusively.
+        $other->beginTransaction();
+        try {
+            $other->query("SELECT name FROM release_verification_locks WHERE name = 'publication' FOR UPDATE")->fetchAll();
+            $this->assertPublicationWaits(['size:5']);
+        } finally {
+            $other->rollBack();
+        }
+        // A striped publication holds the shared row in share mode and its stripes exclusively.
+        $other->beginTransaction();
+        try {
+            $other->query("SELECT name FROM release_verification_locks WHERE name = 'publication' LOCK IN SHARE MODE")->fetchAll();
+            $other->query($this->stripeLock('size:5'))->fetchAll();
+            $this->assertPublicationWaits([]);
+            DB::beginTransaction();
+            try {
+                app(VerificationLedger::class)->enterPublication([$this->keyOnAnotherStripe('size:5')]);
+                $this->addToAssertionCount(1);
+            } finally {
+                DB::rollBack();
+            }
+        } finally {
+            $other->rollBack();
+        }
+    }
+
+    public function test_entering_publication_leaves_the_read_view_for_the_duplicate_search(): void
+    {
+        $other = $this->connection();
+        DB::beginTransaction();
+        try {
+            app(VerificationLedger::class)->enterPublication(['size:5']);
+            // A release committed after the locks were granted (here, after entering) must be
+            // visible to the duplicate search's plain reads that follow.
+            $other->exec("INSERT INTO usenet_groups (id, name) VALUES (2, 'alt.committed.meanwhile')");
+            $this->assertTrue(DB::table('usenet_groups')->where('id', 2)->exists());
+        } finally {
+            DB::rollBack();
+        }
+    }
+
+    /** @param list<string> $keys */
+    private function assertPublicationWaits(array $keys): void
+    {
+        DB::beginTransaction();
+        try {
+            app(VerificationLedger::class)->enterPublication($keys);
+            $this->fail('The publication must wait for the conflicting one.');
+        } catch (QueryException $error) {
+            $this->assertSame(1205, (int) $error->errorInfo[1]);
+        } finally {
+            DB::rollBack();
+        }
+    }
+
+    public function test_identical_articles_with_different_sizes_serialize_on_their_shared_fingerprint(): void
+    {
+        $first = VerificationLedger::publicationKeys(1000, 'ABCDEF', 'Movie.2020', 'Movie 2020', 0);
+        $second = VerificationLedger::publicationKeys(1234, 'abcdef', 'Other.Upload', 'Other Upload', 0);
+        $this->assertNotSame(VerificationLedger::publicationStripe('size:1000'), VerificationLedger::publicationStripe('size:1234'));
+        $other = $this->connection();
+        $other->beginTransaction();
+        try {
+            $stripes = array_map(VerificationLedger::publicationStripe(...), $second);
+            $other->query("SELECT name FROM release_verification_locks WHERE name IN ('".implode("','", $stripes)."') FOR UPDATE")->fetchAll();
+            DB::beginTransaction();
+            try {
+                app(VerificationLedger::class)->enterPublication($first);
+                $this->fail('A publication sharing a duplicate-search key must wait for the other.');
+            } catch (QueryException $error) {
+                $this->assertSame(1205, (int) $error->errorInfo[1]);
+            } finally {
+                DB::rollBack();
+            }
+        } finally {
+            $other->rollBack();
+        }
+    }
+
+    public function test_names_equal_under_the_collation_share_a_publication_key(): void
+    {
+        $this->assertSame(VerificationLedger::publicationKeys(0, null, 'Café.Movie 2020 ', '', 0),
+            VerificationLedger::publicationKeys(0, null, 'CAFE.movie.2020', '', 0));
+        $this->assertSame(['name:moviex264'], VerificationLedger::publicationKeys(0, null, '', 'Movie-x264', 0));
+        $this->assertSame([], VerificationLedger::publicationKeys(0, null, '', '', 0));
+    }
+
+    private function stripeLock(string $key): string
+    {
+        return "SELECT name FROM release_verification_locks WHERE name = '".VerificationLedger::publicationStripe($key)."' FOR UPDATE NOWAIT";
+    }
+
+    private function keyOnAnotherStripe(string $key): string
+    {
+        for ($i = 0; VerificationLedger::publicationStripe('size:'.$i) === VerificationLedger::publicationStripe($key); $i++) {
+        }
+
+        return 'size:'.$i;
     }
 
     private function assertLocked(PDO $other, string $sql): void
