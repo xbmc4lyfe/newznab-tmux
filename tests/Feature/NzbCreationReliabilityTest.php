@@ -634,6 +634,38 @@ class NzbCreationReliabilityTest extends TestCase
         $this->assertFileExists($finalNzb);
     }
 
+    public function test_stale_temporary_cleanup_removes_only_aged_replaced_source_links(): void
+    {
+        $directory = $this->tempNzbPath.'/b';
+        mkdir($directory, 0777, true);
+
+        $guid = str_repeat('h', 36);
+        $canonical = $directory.'/'.$guid.'.nzb.gz';
+        $preserved = $canonical.'.'.str_repeat('c', 16).'.prev';
+        $lookalike = $canonical.'.'.str_repeat('c', 15).'.prev';
+
+        file_put_contents($canonical, 'live');
+        file_put_contents($lookalike, 'other');
+        link($canonical, $preserved);
+        // The hard link shares the replaced NZB's old mtime; only its link time is recent.
+        touch($canonical, time() - 7200);
+        touch($lookalike, time() - 7200);
+
+        $nzb = new NzbService(app(CollectionCleanupService::class));
+
+        $this->assertSame([], $nzb->findStaleTemporaryNzbPaths(3600), 'A just-linked backup is live.');
+        $this->assertSame(0, $nzb->cleanupStaleTemporaryNzbs(3600));
+        $this->assertFileExists($preserved);
+
+        sleep(2);
+
+        $this->assertSame([$preserved], $nzb->findStaleTemporaryNzbPaths(1));
+        $this->assertSame(1, $nzb->cleanupStaleTemporaryNzbs(1));
+        $this->assertFileDoesNotExist($preserved);
+        $this->assertSame('live', file_get_contents($canonical));
+        $this->assertFileExists($lookalike);
+    }
+
     private function releaseProcessingService(NzbCreationResult $result): ReleaseProcessingService
     {
         return (new ReleaseProcessingService(

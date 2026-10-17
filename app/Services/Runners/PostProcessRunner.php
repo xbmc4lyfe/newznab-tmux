@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Runners;
 
 use App\Models\Category;
+use App\Models\Release;
 use App\Services\AdditionalProcessing\AdditionalCandidateQuery;
 use App\Services\AdditionalProcessing\AdditionalProcessingOrchestrator;
 use App\Services\BookProcessingCandidateQuery;
@@ -182,6 +183,7 @@ class PostProcessRunner extends BaseRunner
             FROM releases
             WHERE categories_id IN ('.Category::MUSIC_MP3.', '.Category::MUSIC_LOSSLESS.', '.Category::MUSIC_OTHER.')
             AND musicinfo_id IS NULL
+            AND '.Release::nzbSettledSql().'
             LIMIT 16');
     }
 
@@ -198,6 +200,7 @@ class PostProcessRunner extends BaseRunner
             FROM releases
             WHERE categories_id BETWEEN '.Category::GAME_ROOT.' AND '.Category::GAME_OTHER.'
             AND consoleinfo_id IS NULL
+            AND '.Release::nzbSettledSql().'
             '.$renamedFilter.'
             LIMIT 16');
     }
@@ -215,6 +218,7 @@ class PostProcessRunner extends BaseRunner
             FROM releases
             WHERE categories_id = '.Category::PC_GAMES.'
             AND gamesinfo_id = 0
+            AND '.Release::nzbSettledSql().'
             '.$renamedFilter.'
             LIMIT 16');
     }
@@ -402,6 +406,7 @@ class PostProcessRunner extends BaseRunner
             FROM releases
             WHERE categories_id BETWEEN 2000 AND 2999
             AND '.imdb_id_needs_lookup_sql('imdbid').'
+            AND '.Release::nzbSettledSql().'
             '.$condLookup.' '.$condRenamedOnly.'
             LIMIT 1';
         if (count(DB::select($checkSql)) === 0) {
@@ -417,6 +422,7 @@ class PostProcessRunner extends BaseRunner
             FROM releases
             WHERE categories_id BETWEEN 2000 AND 2999
             AND '.imdb_id_needs_lookup_sql('imdbid').'
+            AND '.Release::nzbSettledSql().'
             '.$condLookup.' '.$condRenamedOnly.'
             LIMIT 16';
         $queue = DB::select($sql);
@@ -542,6 +548,7 @@ class PostProcessRunner extends BaseRunner
             FROM releases
             WHERE categories_id = 5070
             AND anidbid IS NULL
+            AND '.Release::nzbSettledSql().'
             LIMIT 1';
         if (count(DB::select($checkSql)) === 0) {
             $this->headerNone();
@@ -555,6 +562,7 @@ class PostProcessRunner extends BaseRunner
             FROM releases
             WHERE categories_id = 5070
             AND anidbid IS NULL
+            AND '.Release::nzbSettledSql().'
             LIMIT 16';
         $queue = DB::select($sql);
 
@@ -589,6 +597,7 @@ class PostProcessRunner extends BaseRunner
             FROM releases
             WHERE categories_id IN ('.Category::MUSIC_MP3.', '.Category::MUSIC_LOSSLESS.', '.Category::MUSIC_OTHER.')
             AND musicinfo_id IS NULL
+            AND '.Release::nzbSettledSql().'
             LIMIT 1';
         if (count(DB::select($checkSql)) === 0) {
             $this->headerNone();
@@ -615,6 +624,7 @@ class PostProcessRunner extends BaseRunner
             FROM releases
             WHERE categories_id BETWEEN '.Category::GAME_ROOT.' AND '.Category::GAME_OTHER.'
             AND consoleinfo_id IS NULL
+            AND '.Release::nzbSettledSql().'
             '.$renamedFilter.'
             LIMIT 1';
         if (count(DB::select($checkSql)) === 0) {
@@ -642,6 +652,7 @@ class PostProcessRunner extends BaseRunner
             FROM releases
             WHERE categories_id = '.Category::PC_GAMES.'
             AND gamesinfo_id = 0
+            AND '.Release::nzbSettledSql().'
             '.$renamedFilter.'
             LIMIT 1';
         if (count(DB::select($checkSql)) === 0) {

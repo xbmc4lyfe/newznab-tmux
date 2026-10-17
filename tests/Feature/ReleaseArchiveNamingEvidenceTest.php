@@ -14,6 +14,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
 use Mockery;
+use RuntimeException;
 use Tests\TestCase;
 
 final class ReleaseArchiveNamingEvidenceTest extends TestCase
@@ -238,7 +239,7 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
     {
         $this->record($this->digest(), 'complete_single', ['Show.S01E01.mkv'], true);
         DB::table('release_archive_naming_evidence')->update(['episode_files' => '{}']);
-        $this->expectException(\RuntimeException::class);
+        $this->expectException(RuntimeException::class);
         $this->allows('Show.S01E01');
     }
 
@@ -282,6 +283,53 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
         DB::rollBack();
 
         self::assertSame('original', gzdecode((string) file_get_contents($this->path())), 'The partial keeps its NZB.');
+        self::assertSame([], glob($this->path().'.*.prev'));
+    }
+
+    public function test_failed_preserving_install_after_the_move_restores_the_replaced_source(): void
+    {
+        $this->writeSource('original');
+        $temporary = $this->directory.'/upgrade.tmp';
+        file_put_contents($temporary, gzencode('upgraded'));
+        // The move succeeds with a file other than the staged one, so the identity check throws afterwards.
+        $move = function (string $from, string $to): bool {
+            $other = $this->directory.'/other.tmp';
+            file_put_contents($other, gzencode('intruder'));
+
+            return rename($other, $to);
+        };
+
+        DB::beginTransaction();
+        try {
+            $this->sources->install($this->release, $temporary, $this->path(), move: $move, preserve: true);
+            self::fail('The identity check must reject the swapped file.');
+        } catch (RuntimeException $exception) {
+            self::assertSame('Staged NZB installation identity changed.', $exception->getMessage());
+        } finally {
+            DB::rollBack();
+        }
+
+        self::assertSame('original', gzdecode((string) file_get_contents($this->path())), 'The only link to the old NZB is not lost.');
+        self::assertSame([], glob($this->path().'.*.prev'));
+    }
+
+    public function test_failed_preserving_install_before_the_move_drops_only_its_backup(): void
+    {
+        $this->writeSource('original');
+        $temporary = $this->directory.'/upgrade.tmp';
+        file_put_contents($temporary, gzencode('upgraded'));
+
+        DB::beginTransaction();
+        try {
+            $this->sources->install($this->release, $temporary, $this->path(), move: static fn (): bool => false, preserve: true);
+            self::fail('A failed move must be reported.');
+        } catch (RuntimeException $exception) {
+            self::assertSame('Unable to move temporary NZB into place.', $exception->getMessage());
+        } finally {
+            DB::rollBack();
+        }
+
+        self::assertSame('original', gzdecode((string) file_get_contents($this->path())));
         self::assertSame([], glob($this->path().'.*.prev'));
     }
 
@@ -486,7 +534,7 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
             try {
                 $this->sources->captureDeletionAnchor($this->release);
                 self::fail('Missing transaction manager must reject the audit receipt.');
-            } catch (\RuntimeException $exception) {
+            } catch (RuntimeException $exception) {
                 self::assertSame('Transactions Manager has not been set.', $exception->getMessage());
             }
             self::assertSame([], glob($this->directory.'/.archive-audit-*.anchor'));

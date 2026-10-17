@@ -22,6 +22,7 @@ use App\Services\Releases\Verification\ScratchInventory;
 use App\Services\Releases\Verification\SpotCheckVerifier;
 use App\Services\Releases\Verification\VerificationResult;
 use App\Services\Releases\Verification\VerificationWorkerLocks;
+use App\Services\Releases\Verification\VerifiedNzbWriter;
 use App\Services\Releases\Verification\VerifiedReleasePublisher;
 use App\Services\YencService;
 use App\Support\Configuration\IngestionConfigurationData;
@@ -897,7 +898,58 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
     }
 
     /** Archive a collection (unless null), let the upload stall past the hold, and publish it as partial. */
-    private function publishStalledPartial(?int $collectionId, bool $limits = true, ?string $source = null): ?int
+    public function test_a_covering_release_with_conflicting_metadata_sends_the_generation_to_review_not_an_upgrade(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('covered-conflict', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+        $generation = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        $merged = app(ManifestStore::class)->read($generation->manifest_path);
+        // A complete copy of the merged articles, published meanwhile under a different password assertion.
+        $copy = (array) DB::table('releases')->where('id', $first)->first();
+        $copy = ['id' => $first + 100, 'guid' => 'covering-copy', 'articles_found' => null, 'articles_expected' => null,
+            'files_found' => null, 'files_expected' => null, 'late_article_candidate_id' => null] + $copy;
+        DB::table('releases')->insert($copy);
+        app(VerifiedNzbWriter::class)->write(['passwords' => ['theirs']] + $merged, 'covering-copy');
+        $nzb = (string) app(NzbService::class)->readNzbContents(DB::table('releases')->where('id', $first)->value('guid'));
+
+        $this->assertNull($this->publishStalledPartial(null, passwords: ['ours']));
+
+        $this->assertSame('metadata_review', DB::table('release_verification_candidates')->where('id', $generation->id)->value('status'));
+        $this->assertSame([1, (int) $generation->id], [(int) DB::table('releases')->where('id', $first)->value('articles_found'),
+            (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id')], 'The partial is neither upgraded nor released.');
+        $this->assertSame($nzb, (string) app(NzbService::class)->readNzbContents(DB::table('releases')->where('id', $first)->value('guid')));
+        $this->assertSame(2, DB::table('releases')->count());
+    }
+
+    public function test_a_legacy_releases_late_headers_are_kept_apart_from_a_partial(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('legacy-late', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $retained = DB::table('release_verification_candidates')->sole();
+        $legacy = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d');
+        $legacyRelease = (array) DB::table('releases')->where('id', $first)->first();
+        DB::table('releases')->insert(['id' => $first + 100, 'guid' => 'legacy-release', 'nzbstatus' => NzbService::NZB_NONE,
+            'articles_found' => null, 'articles_expected' => null, 'files_found' => null, 'files_expected' => null, 'late_article_candidate_id' => null] + $legacyRelease);
+        if (! Schema::hasColumn('collections', 'releases_id')) {
+            Schema::table('collections', fn (Blueprint $table) => $table->unsignedBigInteger('releases_id')->nullable());
+        }
+        DB::table('collections')->where('id', $legacy)->update(['filecheck' => 4, 'releases_id' => $first + 100]);
+
+        app(CandidateRepository::class)->archive($legacy);
+
+        $this->assertSame([(int) $retained->id, $retained->manifest_path], [(int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'),
+            DB::table('release_verification_candidates')->where('id', $retained->id)->value('manifest_path')], 'The partial keeps its own inventory.');
+        $apart = DB::table('release_verification_candidates')->where('id', '>', $retained->id)->sole();
+        $manifest = app(ManifestStore::class)->read($apart->manifest_path);
+        $this->assertSame([$first + 100, null], [$manifest['legacy_release_id'] ?? null, $manifest['upgrades_release_id'] ?? null]);
+        $this->assertSame(['c@d'], array_column($manifest['files'][0]['segments'], 'messageid'));
+    }
+
+    /** @param  list<string>  $passwords */
+    private function publishStalledPartial(?int $collectionId, bool $limits = true, ?string $source = null, array $passwords = []): ?int
     {
         config(['release_verification.partial_after_hours' => 4]);
         $repository = app(CandidateRepository::class);
@@ -919,6 +971,9 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $manifest['partial'] = (new CandidateHeaderInventory)->completeness($manifest);
         if ($source !== null) {
             $manifest['metadata_source'] = $source;
+        }
+        if ($passwords !== []) {
+            $manifest['passwords'] = $passwords;
         }
         Search::shouldReceive('updateRelease')->zeroOrMoreTimes();
 

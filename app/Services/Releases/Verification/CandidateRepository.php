@@ -93,6 +93,11 @@ final class CandidateRepository
                             // A filtered newer post skipped the snapshot; these headers may still be a partial's.
                             $manifest ??= $this->snapshotHeaders($collection, $currentReads);
                             $holder = $this->partialOwner($holders, $manifest);
+                            if ($holder !== null && (int) $collection->filecheck === 4 && isset($collection->releases_id)) {
+                                // A legacy release's headers publish that release; merged into a partial, the
+                                // generation could upgrade neither, so they are kept apart.
+                                $holder = null;
+                            }
                             if ($holder !== null) {
                                 // An established repost under the same hash (pending, holding no partial) that also takes
                                 // these headers makes them ambiguous: never upgrade the partial with possibly mixed
@@ -286,7 +291,12 @@ final class CandidateRepository
                         + (self::tracksUpgrades() ? ['upgrades_release_id' => null] : []));
                     if ($existing !== null && Release::hasLateArticleFlag()) {
                         // An expired pending generation can no longer upgrade its partial.
-                        DB::table('releases')->where('late_article_candidate_id', $existing->id)->update(['late_article_candidate_id' => null]);
+                        // By primary key: an update through the pointer index would gap-lock it like a locking read.
+                        $pointed = self::tracksUpgrades() ? array_values(array_filter([(int) ($existing->release_id ?? 0), (int) ($existing->upgrades_release_id ?? 0)])) : null;
+                        if ($pointed === null || $pointed !== []) {
+                            DB::table('releases')->when($pointed !== null, static fn ($query) => $query->whereIn('id', $pointed))
+                                ->where('late_article_candidate_id', $existing->id)->update(['late_article_candidate_id' => null]);
+                        }
                     }
                 }
                 if ($existing === null) {
@@ -695,8 +705,19 @@ final class CandidateRepository
         if ($candidates->isEmpty()) {
             return [];
         }
-        $held = array_flip(array_map('intval', DB::table('releases')->whereIn('late_article_candidate_id', $candidates->pluck('id')->all())
-            ->sharedLock()->pluck('late_article_candidate_id')->all()));
+        $ids = array_flip(array_map('intval', $candidates->pluck('id')->all()));
+        if (self::tracksUpgrades()) {
+            // A holder is the published partial (release_id) or the generation upgrading it (upgrades_release_id):
+            // lock those release rows by primary key. Locking by the pointer index would gap-lock its top range
+            // and block, or deadlock with, every concurrent pointer move and new partial.
+            $releaseIds = array_values(array_unique(array_filter(array_map('intval', [...$candidates->pluck('release_id')->all(),
+                ...$candidates->pluck('upgrades_release_id')->all()]))));
+            $pointers = $releaseIds === [] ? [] : DB::table('releases')->whereIn('id', $releaseIds)->orderBy('id')->sharedLock()
+                ->pluck('late_article_candidate_id')->all();
+        } else {
+            $pointers = DB::table('releases')->whereIn('late_article_candidate_id', array_keys($ids))->sharedLock()->pluck('late_article_candidate_id')->all();
+        }
+        $held = array_intersect_key(array_flip(array_map('intval', array_filter($pointers, static fn (mixed $pointer): bool => $pointer !== null))), $ids);
 
         return array_values(array_filter($candidates->all(), static fn (object $candidate): bool => isset($held[(int) $candidate->id])));
     }

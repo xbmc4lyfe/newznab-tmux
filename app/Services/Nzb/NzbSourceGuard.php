@@ -432,10 +432,42 @@ final class NzbSourceGuard
             return new NzbSourceInstallation($this, $guid, $destination, $digest, $handle, DB::connection()->getPdo(), $previous);
         } catch (Throwable $exception) {
             fclose($handle);
-            if ($previous !== null && is_file($previous)) {
-                @unlink($previous);
+            if ($previous !== null) {
+                $this->discardPreservedSource($previous, $destination);
             }
             throw $exception;
+        }
+    }
+
+    /**
+     * A failed install must never leave the canonical path without the source it
+     * replaced. If the new file already went into place, put the preserved link
+     * back (atomic rename); drop the link only when the displaced inode is still
+     * the canonical one, i.e. the move never happened. A restore failure keeps
+     * the link for stale-leftover cleanup instead of losing the only reference.
+     */
+    private function discardPreservedSource(string $previous, string $destination): void
+    {
+        clearstatcache(true, $previous);
+        clearstatcache(true, $destination);
+        $kept = @lstat($previous);
+        if ($kept === false) {
+            return;
+        }
+        $current = @lstat($destination);
+        if ($current !== false && $current['dev'] === $kept['dev'] && $current['ino'] === $kept['ino']) {
+            @unlink($previous);
+
+            return;
+        }
+        if (! @rename($previous, $destination)) {
+            try {
+                Log::warning('Failed NZB replacement could not restore the source it displaced.', [
+                    'preserved_source' => $previous,
+                ]);
+            } catch (Throwable) {
+                // Preserve the original installation exception.
+            }
         }
     }
 }

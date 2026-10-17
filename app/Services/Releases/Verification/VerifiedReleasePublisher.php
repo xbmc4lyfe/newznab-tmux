@@ -157,6 +157,10 @@ final class VerifiedReleasePublisher
                         if ($duplicate['release_id'] !== null && $duplicate['release_id'] !== (int) $upgrade->id) {
                             DB::table('releases')->where('id', $upgrade->id)->update(['late_article_candidate_id' => null]);
                             $upgrade = null;
+                        } elseif ($duplicate['release_id'] === null && $duplicate['metadata_conflict']) {
+                            // A covering release with conflicting metadata: review it as a fresh candidate would be,
+                            // never upgrade the partial into a second copy of those articles. The partial stays held.
+                            $upgrade = null;
                         }
                     }
                     if ($upgrade !== null) {

@@ -575,12 +575,15 @@ class NzbService
                 }
 
                 $path = $file->getPathname();
-                if (! $this->isTemporaryNzbPath($path)) {
+                $isPreserved = self::isPreservedNzbPathName($path);
+                if (! $isPreserved && ! $this->isTemporaryNzbPath($path)) {
                     continue;
                 }
 
                 try {
-                    if ($file->getMTime() <= $cutoff) {
+                    // A preserved link shares the replaced NZB's mtime; its ctime is when it was linked.
+                    $age = $isPreserved ? max($file->getMTime(), $file->getCTime()) : $file->getMTime();
+                    if ($age <= $cutoff) {
                         $paths[] = $path;
                     }
                 } catch (Throwable $e) {
@@ -751,6 +754,33 @@ class NzbService
     public static function isTemporaryNzbPathName(string $path): bool
     {
         return preg_match('/\.nzb\.gz\.tmp\.\d+\.[0-9a-f]{12}$/', basename($path)) === 1;
+    }
+
+    /**
+     * A hard link kept while a partial release's NZB is replaced; only a crashed or
+     * failed rollback leaves one behind, and the canonical file is always the live NZB.
+     */
+    public static function isPreservedNzbPathName(string $path): bool
+    {
+        return preg_match('/\.nzb\.gz\.[0-9a-f]{16}\.prev$/D', basename($path)) === 1;
+    }
+
+    /** A stale replaced-source link is removable whether or not its release still exists. */
+    public function isStalePreservedNzb(string $path, int $olderThanSeconds = 86400): bool
+    {
+        if (! self::isPreservedNzbPathName($path)) {
+            return false;
+        }
+        clearstatcache(true, $path);
+        $stat = @lstat($path);
+
+        return $stat !== false && ($stat['mode'] & 0170000) === 0100000
+            && max($stat['mtime'], $stat['ctime']) <= time() - max(1, $olderThanSeconds);
+    }
+
+    public function deleteStalePreservedNzb(string $path, int $olderThanSeconds = 86400): bool
+    {
+        return $this->isStalePreservedNzb($path, $olderThanSeconds) && @unlink($path);
     }
 
     private function temporaryNzbPath(string $path): string

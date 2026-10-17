@@ -68,6 +68,15 @@ class CleanNZB extends Command
 
         // Checking filename GUIDs against the releases table
         foreach ($itr as $filePath) {
+            // Side files belong to --temps, which ages them out whether or not a release exists.
+            if (NzbService::isTemporaryNzbPathName((string) $filePath)) {
+                continue;
+            }
+            if (NzbService::isPreservedNzbPathName((string) $filePath)) {
+                $this->removeStalePreservedNzb((string) $filePath, $delete, $checked, $deleted);
+
+                continue;
+            }
             $guid = stristr($filePath->getFilename(), '.nzb.gz', true);
             if (File::isFile($filePath) && $guid) {
                 // If NZB file guid is not present in DB delete the file from disk
@@ -88,6 +97,25 @@ class CleanNZB extends Command
             echo "Checked: $checked / Deleted: $deleted\r";
         }
         $this->info("Checked: $checked / Deleted: $deleted");
+    }
+
+    private function removeStalePreservedNzb(string $path, mixed $delete, int &$checked, int &$deleted): void
+    {
+        $nzb = app(NzbService::class);
+        $olderThanSeconds = max(1, (int) $this->option('temp-age-hours')) * 3600;
+        $checked++;
+        if ($delete) {
+            if ($nzb->deleteStalePreservedNzb($path, $olderThanSeconds)) {
+                $deleted++;
+                $this->line("Deleted stale replaced NZB: $path");
+            }
+
+            return;
+        }
+        if ($nzb->isStalePreservedNzb($path, $olderThanSeconds)) {
+            $deleted++;
+            $this->line("Would delete stale replaced NZB: $path");
+        }
     }
 
     private function GetReleasesWithNoNZBOnDisk(mixed $delete = false): void
