@@ -15,6 +15,9 @@ return [
     'alternate_server_socket_timeout' => env('NNTP_SOCKET_TIMEOUT_A', 120),
     'main_nntp_connections' => env('NNTP_CONNECTIONS', 1),
     'alternate_nntp_connections' => env('NNTP_CONNECTIONS_A', 1),
+    // Seconds fingerprint jobs skip an alternate provider after one of them failed to connect to it;
+    // 0 makes every job probe it again.
+    'fingerprint_provider_breaker_seconds' => (int) env('NNTP_FINGERPRINT_BREAKER_SECONDS', 900),
     'compressed_headers' => env('NNTP_COMPRESSED_HEADERS', false),
     'use_alternate_nntp_server' => env('USE_ALTERNATE_NNTP_SERVER', false),
     // Retry articles missing on the primary against the alternate provider without moving header

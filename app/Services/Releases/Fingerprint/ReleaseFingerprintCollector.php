@@ -9,6 +9,7 @@ use App\Services\NNTP\NntpProviderUnavailableException;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
 use App\Services\YencService;
+use Illuminate\Support\Facades\Cache;
 use Throwable;
 
 final class ReleaseFingerprintCollector
@@ -75,6 +76,18 @@ final class ReleaseFingerprintCollector
         $par2SourceSampleOmittedCount = 0;
         foreach ($servers as $server) {
             $serverKey = ($server['alternate'] ? 'alternate ' : 'primary ').$server['name'];
+            if ($server['alternate'] && $this->alternateRecentlyUnavailable($server)) {
+                // Another job failed to reach this alternate moments ago; skip the probe instead of
+                // waiting out a full connect timeout in every job while the provider stays down.
+                $unavailable[$serverKey] = class_basename(NntpProviderUnavailableException::class);
+                $serverProfiles[] = $server + [
+                    'profile_error_type' => $unavailable[$serverKey],
+                    'profile_skipped_reason' => 'recent_provider_failure',
+                ];
+                $serverProfileMap[$serverKey] = [];
+
+                continue;
+            }
             try {
                 $profile = $nntp->getFingerprintServerProfile($server['alternate']);
                 $profileRow = $server + ['profile' => $profile];
@@ -83,6 +96,7 @@ final class ReleaseFingerprintCollector
                 $profileRow = $server + ['profile_error_type' => class_basename($exception)];
                 if ($server['alternate'] && $exception instanceof NntpProviderUnavailableException) {
                     $unavailable[$serverKey] = class_basename($exception);
+                    $this->rememberAlternateUnavailable($server);
                 }
             }
             $serverProfiles[] = $profileRow;
@@ -397,6 +411,7 @@ final class ReleaseFingerprintCollector
                     ];
                     if ($server['alternate'] && $exception instanceof NntpProviderUnavailableException) {
                         $unavailable[$serverKey] = class_basename($exception);
+                        $this->rememberAlternateUnavailable($server);
                     }
                 }
             }
@@ -2337,6 +2352,39 @@ final class ReleaseFingerprintCollector
         }
 
         return $servers;
+    }
+
+    /** @param array{name: string, port: string, tls: bool} $server */
+    private function alternateRecentlyUnavailable(array $server): bool
+    {
+        if ((int) config('nntmux_nntp.fingerprint_provider_breaker_seconds', 900) <= 0) {
+            return false;
+        }
+        try {
+            return Cache::has(self::providerBreakerKey($server));
+        } catch (Throwable) {
+            return false;
+        }
+    }
+
+    /** @param array{name: string, port: string, tls: bool} $server */
+    private function rememberAlternateUnavailable(array $server): void
+    {
+        $seconds = (int) config('nntmux_nntp.fingerprint_provider_breaker_seconds', 900);
+        if ($seconds <= 0) {
+            return;
+        }
+        try {
+            Cache::put(self::providerBreakerKey($server), true, $seconds);
+        } catch (Throwable) {
+            // Without the cache every job probes the provider itself, as before.
+        }
+    }
+
+    /** @param array{name: string, port: string, tls: bool} $server */
+    private static function providerBreakerKey(array $server): string
+    {
+        return 'release-fingerprint:provider-unavailable:'.sha1(strtolower($server['name']).'|'.$server['port'].'|'.($server['tls'] ? 'tls' : 'plain'));
     }
 
     /** @return array{string, string} */

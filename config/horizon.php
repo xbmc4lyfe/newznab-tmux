@@ -214,7 +214,8 @@ return [
             'connection' => 'release-fingerprint',
             'queue' => ['release-fingerprint'],
             'balance' => 'simple',
-            'maxProcesses' => 1,
+            // Each worker holds one primary NNTP connection (plus a short alternate probe).
+            'maxProcesses' => max(1, (int) env('HORIZON_FINGERPRINT_PROCESSES', 4)),
             'maxTime' => 0,
             'maxJobs' => 0,
             'memory' => 128,
