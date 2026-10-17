@@ -108,7 +108,7 @@ The memory caps add up to about 24 GB, which matches what OrbStack currently all
 
 **Shared app settings (x-app):**
 
-- Image: `nntmux/app:local`
+- Images: one per role, `nntmux/web:local`, `nntmux/horizon:local`, `nntmux/scheduler:local`, `nntmux/indexer:local` (or a shared `APP_IMAGE`)
 - `init: true`, user `33:33`, `SHELL=/bin/bash` (www-data's login shell is `nologin`; tmux panes spawn `$SHELL`)
 - `stop_grace_period: 120s`
 - `.env` comes from `docker/config/app.env`, bind-mounted read/write. `monitoring:install` writes to `.env`.
@@ -119,10 +119,9 @@ The memory caps add up to about 24 GB, which matches what OrbStack currently all
 ```
 docker/
 ├── docker-compose.yml          # the stack
-├── Makefile                    # lifecycle: env, build, init, up, down, logs, tmux, seed, backup
+├── Justfile                    # lifecycle: env, build, init, up, down, logs, tmux, seed, backup
 ├── .env.example / .env         # compose-level knobs (ports, memory caps, versions); .env is gitignored
 ├── app/
-│   ├── Dockerfile              # overlay FROM nntmux/base:local
 │   ├── Caddyfile               # FrankenPHP: :80 public, :8081 internal Grafana auth
 │   ├── php/zz-docker.ini       # opcache
 │   └── bin/indexer.sh          # tmux supervisor loop
@@ -355,7 +354,7 @@ Units, each with one job:
 
 1. `bin/generate-env` creates `docker/.env` and `config/app.env`.
 2. Create the `data/` and `logs/` trees, owned by 33:33 for app paths.
-3. `docker build` the root `Dockerfile`, tagged `nntmux/base:local`, then build `docker/app/Dockerfile`, tagged `nntmux/app:local`.
+3. Build the root `Dockerfile`: the cached `base` target (`nntmux/base:local`) and the per-role `selfhosted-<role>` targets (`nntmux/<role>:local`).
 4. Start `mariadb redis manticore mailpit` and wait until they are healthy.
 5. `compose run --rm web php artisan nntmux:deploy-init`. This step:
    - checks the configuration
