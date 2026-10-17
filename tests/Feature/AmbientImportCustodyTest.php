@@ -91,7 +91,7 @@ class AmbientImportCustodyTest extends ReleaseVerificationCandidatesTest
             $stored['conflict'] = true;
         }
         $storedPath = $store->write($stored);
-        $storedBytes = filesize($store->path($storedPath));
+        $storedBytes = $store->size($storedPath);
         DB::table('release_verification_candidates')->where('id', $first->id)->update(['manifest_path' => $storedPath, 'manifest_hash' => substr($storedPath, 0, 64), 'manifest_bytes' => $storedBytes, 'lease_token' => 'fixture-lease', 'lease_until' => now()->addHour()]);
         DB::table('release_verification_state')->update(['pending_bytes' => $storedBytes]);
         if ($mode === 'corrupt') {

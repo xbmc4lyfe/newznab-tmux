@@ -96,7 +96,7 @@ class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidates
             $stored['conflict'] = true;
         }
         $storedPath = $store->write($stored);
-        $storedBytes = filesize($store->path($storedPath));
+        $storedBytes = $store->size($storedPath);
         DB::table('release_verification_candidates')->where('id', $first->id)->update(['manifest_path' => $storedPath, 'manifest_hash' => substr($storedPath, 0, 64), 'manifest_bytes' => $storedBytes, 'lease_token' => 'fixture-lease', 'lease_until' => now()->addHour()]);
         DB::table('release_verification_state')->update(['pending_bytes' => $storedBytes]);
         if ($mode === 'corrupt') {
@@ -193,7 +193,7 @@ class ExistingImportPasswordEnrichmentTest extends ReleaseVerificationCandidates
             $assessment = (new CandidateHeaderInventory)->assessment($manifest);
             self::assertSame($assessment['status'], $candidate->status);
             self::assertSame($assessment['reason'], $candidate->reason);
-            self::assertSame(filesize($store->path($candidate->manifest_path)), (int) DB::table('release_verification_state')->value('pending_bytes'));
+            self::assertSame($store->size($candidate->manifest_path), (int) DB::table('release_verification_state')->value('pending_bytes'));
         } else {
             self::assertFileExists($path);
             self::assertSame($stored, $manifest);
