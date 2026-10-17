@@ -18,6 +18,9 @@ final class SpotCheckVerifier
     {
         try {
             return $this->verifySample($manifest, $heartbeat);
+        } catch (ArticleBudgetExceeded $error) {
+            // The bounded fetch stops before an oversized article is returned; its size is fixed.
+            return self::deterministic($error->getMessage());
         } catch (Throwable $error) {
             return new VerificationResult('unknown', $error->getMessage());
         }
