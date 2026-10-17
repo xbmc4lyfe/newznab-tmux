@@ -26,6 +26,7 @@ class DeployMigrationOrderTest extends TestCase
         file_put_contents($this->directory.'/bin/docker', <<<'SH'
 #!/bin/sh
 printf 'COMPOSE_FILE=%s %s\n' "$COMPOSE_FILE" "$*" >> "$NNTMUX_DEPLOY_EVENTS"
+for last in "$@"; do :; done
 default_config='{"services":{"web":{},"horizon":{},"scheduler":{},"indexer":{},"mariadb":{},"redis":{},"manticore":{},"proxy":{},"mailpit":{},"prometheus":{},"pushgateway":{},"grafana":{},"node-exporter":{},"mysqld-exporter":{},"redis-exporter":{}}}'
 case "$*" in
     *' config --format json'*) if [ -n "${NNTMUX_CONFIG_ID:-}" ]; then echo "$NNTMUX_CONFIG_ID"; else echo "$default_config"; fi ;;
@@ -40,8 +41,11 @@ case "$*" in
     *'inspect --format {{.State.StartedAt}}'*) echo "${NNTMUX_STARTED_AT:-2999-01-01T00:00:00.123456789Z}" ;;
     *'inspect --format {{.State.Status}}'*)
         case "$*" in *"fixture-container-${NNTMUX_UNHEALTHY:-none}") echo "running unhealthy" ;; *) echo "running ${NNTMUX_HEALTH_STATUS:-healthy}" ;; esac ;;
-    *' ps -a -q '*) [ "${NNTMUX_NO_EXISTING_APP:-0}" = 1 ] || echo fixture-container ;;
-    *' ps -q '*) [ "${NNTMUX_SERVICE_MISSING:-0}" = 1 ] || echo "fixture-container-${*##* }" ;;
+    *' ps -a -q '*)
+        [ "${NNTMUX_NO_EXISTING_APP:-0}" = 1 ] && exit 0
+        [ -n "${NNTMUX_NO_CONTAINER:-}" ] && [ "$last" = "$NNTMUX_NO_CONTAINER" ] && exit 0
+        echo fixture-container ;;
+    *' ps -q '*) [ "${NNTMUX_SERVICE_MISSING:-0}" = 1 ] || echo "fixture-container-$last" ;;
     *'scheduler python3 -c '*) [ "${NNTMUX_SCHEDULER_CAPABILITY_FAIL:-0}" != 1 ] || exit 48; echo "${NNTMUX_SCHEDULER_CAPABILITY:-native}" ;;
     *'scheduler.py drain --timeout='*)
         [ "${NNTMUX_SCHEDULER_DRAIN_FAIL:-0}" != 1 ] || exit 47
@@ -1077,13 +1081,34 @@ SH);
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => $without])->mustRun();
         file_put_contents($this->directory.'/events', '');
 
-        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => $with])->mustRun();
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => $with, 'NNTMUX_NO_CONTAINER' => 'mariadb'])->mustRun();
         $events = $this->events();
         $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 mariadb', $events);
         $this->assertStringNotContainsString('drain', $events);
         $this->assertStringNotContainsString(' stop ', $events);
         $this->assertStringNotContainsString('--wait-timeout 240 web', $events);
         $this->assertAttemptsClosed();
+    }
+
+    public function test_re_rendered_data_service_with_a_running_orphan_is_quiesced(): void
+    {
+        mkdir($this->directory.'/docker/config/redis', 0777, true);
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 1gb\n");
+        $with = json_decode($this->composeJson(), true);
+        $without = $with;
+        unset($without['services']['redis']);
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($without, JSON_UNESCAPED_SLASHES)])->mustRun();
+        $this->assertStringContainsString('compose:redis=absent', (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
+
+        // The orphaned redis kept running and was edited meanwhile: rendering it again must recreate
+        // it with writers stopped, never start or stamp it under live writers.
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($with, JSON_UNESCAPED_SLASHES), 'NNTMUX_STARTED_AT' => '2000-01-01T00:00:00Z'])->mustRun();
+        $events = $this->events();
+        $recreate = ' up -d --no-deps --force-recreate --wait --wait-timeout 240 redis';
+        $this->assertStringContainsString($recreate, $events);
+        $this->assertLessThan(strpos($events, $recreate), strpos($events, ' stop web scheduler indexer'));
+        $this->assertStringNotContainsString(' up -d --no-deps --wait --wait-timeout 240 redis', $events);
     }
 
     public function test_host_system_paths_match_on_path_boundaries_only(): void

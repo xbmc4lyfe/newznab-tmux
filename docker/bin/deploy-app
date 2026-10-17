@@ -138,6 +138,8 @@ resume() {
 }
 trap 'resume' EXIT
 trap 'exit 130' INT TERM
+# dash (Linux /bin/sh) skips EXIT traps on an untrapped SIGHUP, e.g. a dropped SSH session.
+trap 'exit 129' HUP
 
 if [ "$need_scheduler_drain" = 1 ]; then
     scheduler=$(compose ps -q scheduler)

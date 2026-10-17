@@ -882,15 +882,20 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
     for svc in DATA_SERVICES:
         if not compose_present(state, svc):
             data_reasons[svc] = "not rendered"
-        elif not force and (stamped.get(f"compose:{svc}") == "absent" or not container_exists(docker_dir, svc)):
-            # Newly rendered or never created: no writer uses it yet, so it starts without a quiesce.
+        elif not force and not container_exists(docker_dir, svc):
+            # No container at all: no writer can be using it, so it starts without a quiesce.
             start_data.append(svc)
             data_reasons[svc] = "start (no container)"
-        elif (first_deploy or legacy_stamp or f"service:{svc}" not in stamped) and mounts_changed_since_start(docker_dir, svc):
+        elif (no_record := (
+            first_deploy or legacy_stamp or f"service:{svc}" not in stamped
+            # Recorded as unrendered while an (orphaned) container kept running: nothing says
+            # which configuration that container loaded.
+            or stamped.get(f"compose:{svc}") == "absent"
+        )) and mounts_changed_since_start(docker_dir, svc):
             # A mounted file changed after the container started: only a recreate loads it.
             dirty_data.append(svc)
             data_reasons[svc] = "mounted config newer than container"
-        elif first_deploy or legacy_stamp or f"service:{svc}" not in stamped:
+        elif no_record:
             # No per-service record: Compose reconciles drift while writers are stopped, without
             # force-recreating stateful services.
             reconcile_data.append(svc)

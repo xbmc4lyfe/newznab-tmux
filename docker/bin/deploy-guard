@@ -247,11 +247,13 @@ cmd_run() {
         nested_owner || busy "invalid inherited guard ownership"
         trap 'guard_exit' EXIT
         trap 'exit 130' INT TERM
+        trap 'exit 129' HUP
     else
         acquire "$target"
         owned_info=$info
         trap 'guard_exit' EXIT
         trap 'exit 130' INT TERM
+        trap 'exit 129' HUP
         DEPLOY_GUARD_HELD=$$
         DEPLOY_GUARD_OWNER_SHA256=$(printf '%s\n' "$owned_info" | hash_stdin)
         DEPLOY_GUARD_LOCK=$LOCK
