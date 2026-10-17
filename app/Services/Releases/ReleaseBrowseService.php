@@ -265,6 +265,14 @@ class ReleaseBrowseService
             return (int) $count;
         }
 
+        // The search index counts filtered rows in milliseconds, so its total is exact and needs no pager cap.
+        $indexedCount = $this->getIndexedBrowseCount($cat, $maxAge, $excludedCats, $groupName);
+        if ($indexedCount !== null) {
+            Cache::put($cacheKey, $indexedCount, now()->addMinutes($cacheExpiry * 2));
+
+            return $indexedCount;
+        }
+
         // Build optimized count query - avoid JOINs when possible
         $conditions = ['r.passwordstatus '.$this->showPasswords()];
 
@@ -319,6 +327,44 @@ class ReleaseBrowseService
 
             return 0;
         }
+    }
+
+    /**
+     * Count browse rows through the search index, or null when the index cannot answer exactly.
+     *
+     * @param  array<string, mixed>  $cat
+     * @param  array<int, int>  $excludedCats
+     */
+    private function getIndexedBrowseCount(array $cat, int $maxAge, array $excludedCats, int|string $groupName): ?int
+    {
+        if (! Search::isAvailable()) {
+            return null;
+        }
+
+        $categoryIds = Category::getCategorySearch($cat, null, true);
+        $groupId = null;
+        if ((int) $groupName !== -1) {
+            $groupId = (int) UsenetGroup::getIDByName((string) $groupName);
+            if ($groupId <= 0) {
+                return null;
+            }
+        }
+
+        $result = Search::searchReleasesFiltered([
+            'phrases' => null,
+            'category_ids' => \is_array($categoryIds) ? array_map(static fn ($id): int => (int) $id, $categoryIds) : null,
+            'excluded_category_ids' => $excludedCats,
+            'max_age_days' => $maxAge,
+            'groups_id' => $groupId,
+            'password_allow_rar' => $this->passwordAllowRar(),
+            'try_fuzzy' => false,
+        ], 1);
+
+        if (($result['available'] ?? true) === false) {
+            return null;
+        }
+
+        return (int) $result['total'];
     }
 
     /**
