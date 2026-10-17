@@ -51,7 +51,11 @@ class ReleaseVerificationPublicationController extends Controller
             $candidate = DB::table('release_verification_candidates')->where('id', $claim->id)->first();
             if ($candidate === null || (int) $candidate->version !== $claim->version || $candidate->manifest_hash !== $claim->manifest_hash
                 || $candidate->lease_token !== $claim->lease_token || $candidate->manifest_path === '') {
-                return response()->json(['error' => 'Stale verification result cannot publish.'], 409);
+                // A concurrent first attempt may have published and cleared the lease since the check above.
+                $published = $this->publishedRelease($claim);
+
+                return $published !== null ? response()->json(['release_id' => $published])
+                    : response()->json(['error' => 'Stale verification result cannot publish.'], 409);
             }
             $manifest = SpotCheckVerifier::withEvidence($store->read($candidate->manifest_path), $evidence);
             // Publication writes as a worker does, so a reset, audit or deployment barrier that

@@ -707,6 +707,24 @@ PHP;
         $this->assertTrue((new VerificationWorkerLocks)->tryExclusive());
     }
 
+    public function test_a_reset_removes_its_own_pause_whether_it_finishes_or_throws(): void
+    {
+        (require database_path('migrations/2026_10_17_210000_create_release_verification_pauses_table.php'))->up();
+        $observed = null;
+        app(VerificationResetService::class)->run(static function () use (&$observed): void {
+            $observed = VerificationWorkerLocks::paused();
+        });
+        $this->assertTrue($observed);
+        $this->assertFalse(VerificationWorkerLocks::paused());
+        try {
+            app(VerificationResetService::class)->run(static fn () => throw new RuntimeException('Legacy reset failed.'));
+            $this->fail('The reset failure must escape.');
+        } catch (RuntimeException $error) {
+            $this->assertSame('Legacy reset failed.', $error->getMessage());
+        }
+        $this->assertFalse(VerificationWorkerLocks::paused());
+    }
+
     private function candidateScratch(int $id, string $status = 'complete'): string
     {
         DB::table('release_verification_candidates')->insert(['id' => $id, 'identity' => sha1('scratch-'.$id), 'groups_id' => 1,

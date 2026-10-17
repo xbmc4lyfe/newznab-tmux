@@ -217,6 +217,7 @@ class VerificationDatabaseLocksMariaDbTest extends TestCase
 
     public function test_a_reset_whose_lock_session_ends_stops_instead_of_reconnecting(): void
     {
+        (require database_path('migrations/2026_10_17_210000_create_release_verification_pauses_table.php'))->up();
         $continued = false;
         try {
             app(VerificationResetService::class)->run(function () use (&$continued): void {
@@ -229,6 +230,9 @@ class VerificationDatabaseLocksMariaDbTest extends TestCase
             $this->assertStringContainsString('Verification lock session was lost', $error->getMessage());
         }
         $this->assertFalse($continued);
+        // Its durable pause outlives the session and keeps every host's workers out.
+        $this->assertTrue(VerificationWorkerLocks::paused('verification_lock_other'));
+        $this->assertFalse((new VerificationWorkerLocks(new DatabaseVerificationLockStore('verification_lock_other')))->start());
 
         // The killed session released everything, and the connection reconnects once no lock is held.
         $other = new DatabaseVerificationLockStore('verification_lock_other');
@@ -237,6 +241,10 @@ class VerificationDatabaseLocksMariaDbTest extends TestCase
         $other->release($reset);
         $other->release($worker);
         $this->assertSame(1, (int) DB::selectOne('SELECT 1 AS v')->v);
+        $this->artisan('releases:verification-barrier', ['--release' => true])->assertSuccessful();
+        $this->assertTrue(VerificationWorkerLocks::paused());
+        $this->artisan('releases:verification-barrier', ['--release' => true, '--all' => true])->assertSuccessful();
+        $this->assertFalse(VerificationWorkerLocks::paused());
     }
 
     public function test_a_worker_whose_lock_session_ends_learns_it_and_cannot_reconnect_unprotected(): void

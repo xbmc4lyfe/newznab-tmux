@@ -160,6 +160,17 @@ final class VerificationWorkerLocks
      * A durable pause keeps every host's workers out even after the session that took it ends.
      * It needs its migration; before that, only the session-scoped gate applies.
      */
+    /** A pause when its table already exists; callers that may precede the migration use this. */
+    public static function pauseIfAvailable(string $token, string $reason): ?string
+    {
+        if (! self::pausesExist(null)) {
+            return null;
+        }
+        self::pause($token, $reason);
+
+        return $token;
+    }
+
     public static function pause(string $token, string $reason): void
     {
         self::ensurePauseTable();
@@ -195,21 +206,29 @@ final class VerificationWorkerLocks
         return DB::connection()->getSchemaBuilder()->hasTable('release_verification_pauses');
     }
 
-    /** Release pauses: one token, or every pause with the given reason (an earlier failed attempt's too). */
+    /**
+     * Release pauses: one token, every pause with the given reason (an earlier failed attempt's
+     * too), or with neither, every pause (operator recovery).
+     */
     public static function unpause(?string $token, ?string $reason = null): void
     {
         if (! self::pausesExist(null)) {
             return;
         }
         $query = DB::table('release_verification_pauses');
-        $token !== null ? $query->where('token', $token) : $query->where('reason', $reason);
+        if ($token !== null) {
+            $query->where('token', $token);
+        } elseif ($reason !== null) {
+            $query->where('reason', $reason);
+        }
         $query->delete();
     }
 
     /** Checked on the holder's own connection, which may not be the default one. */
-    public static function paused(?string $connection = null): bool
+    public static function paused(?string $connection = null, ?string $reason = null): bool
     {
-        return self::pausesExist($connection) && DB::connection($connection)->table('release_verification_pauses')->exists();
+        return self::pausesExist($connection) && DB::connection($connection)->table('release_verification_pauses')
+            ->when($reason !== null, static fn ($query) => $query->where('reason', $reason))->exists();
     }
 
     /** @var \WeakMap<object, true>|null connections known to have the pause table */

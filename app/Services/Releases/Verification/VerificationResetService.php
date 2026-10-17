@@ -26,8 +26,18 @@ final class VerificationResetService
                 if (VerificationWorkerLocks::paused()) {
                     throw new RuntimeException('A deployment pause holds verification workers; retry reset after it is released.');
                 }
-                $this->clearVerification();
-                $reset();
+                // A durable pause fences the whole reset, including filesystem cleanup that a lost
+                // session could not stop. Removing it needs the pinned session, so after a lost
+                // session it stays until an operator runs releases:verification-barrier --release --all.
+                $pause = VerificationWorkerLocks::pauseIfAvailable('reset-'.bin2hex(random_bytes(8)), 'reset');
+                try {
+                    $this->clearVerification();
+                    $reset();
+                } finally {
+                    if ($pause !== null) {
+                        VerificationWorkerLocks::unpause($pause);
+                    }
+                }
             } finally {
                 $store->release($workerLock);
             }

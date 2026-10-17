@@ -15,7 +15,7 @@ use Illuminate\Console\Command;
  */
 class ReleaseVerificationBarrier extends Command
 {
-    protected $signature = 'releases:verification-barrier {--timeout=900 : Seconds to wait for every host\'s workers to finish} {--release : Only clear deployment pauses left by a barrier that did not release}';
+    protected $signature = 'releases:verification-barrier {--timeout=900 : Seconds to wait for every host\'s workers to finish} {--release : Only clear deployment pauses left by a barrier that did not release} {--all : With --release, also clear pauses left by an interrupted reset}';
 
     protected $description = 'Hold verification workers on every host out until this command is stopped';
 
@@ -24,10 +24,11 @@ class ReleaseVerificationBarrier extends Command
     public function handle(): int
     {
         if ($this->option('release')) {
-            VerificationWorkerLocks::unpause(null, 'deployment');
+            $reason = $this->option('all') ? null : 'deployment';
+            VerificationWorkerLocks::unpause(null, $reason);
             $this->line('barrier released');
 
-            return VerificationWorkerLocks::paused() ? self::FAILURE : self::SUCCESS;
+            return VerificationWorkerLocks::paused(null, $reason) ? self::FAILURE : self::SUCCESS;
         }
         if (function_exists('pcntl_async_signals')) {
             pcntl_async_signals(true);

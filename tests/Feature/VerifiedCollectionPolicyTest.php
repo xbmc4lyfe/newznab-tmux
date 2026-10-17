@@ -333,6 +333,31 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame('verifying', DB::table('release_verification_candidates')->where('id', $claim->id)->value('status'));
     }
 
+    public function test_a_retry_racing_its_committed_first_attempt_gets_the_published_release(): void
+    {
+        config(['release_verification.publish_endpoint' => true]);
+        $repository = app(CandidateRepository::class);
+        $repository->archive($this->collectionForPolicy());
+        $claim = $repository->claim();
+        $this->publicationSchema();
+        $payload = ['claim' => ['id' => $claim->id, 'version' => $claim->version, 'manifest_hash' => $claim->manifest_hash,
+            'lease_token' => $claim->lease_token], 'reason' => 'Sampled.', 'evidence' => ['articles' => 1, 'bytes' => 256,
+                'sampled_files' => 1, 'verified_file_names' => ['movie.mkv'], 'identity_hints' => ['movie.mkv']]];
+        $raced = false;
+        // The first attempt commits right after this retry's initial published-release lookup.
+        DB::listen(static function (QueryExecuted $query) use ($claim, &$raced): void {
+            if (! $raced && str_contains($query->sql, '"release_id" is not null')) {
+                $raced = true;
+                DB::table('release_verification_candidates')->where('id', $claim->id)
+                    ->update(['release_id' => 4242, 'status' => 'sampled', 'lease_token' => null, 'lease_until' => null]);
+            }
+        });
+
+        $this->withServerVariables(['REMOTE_ADDR' => '192.168.1.113'])->postJson('/internal/release-verification/publish', $payload)
+            ->assertOk()->assertJson(['release_id' => 4242]);
+        $this->assertTrue($raced);
+    }
+
     public function test_remote_publisher_reports_the_primary_refusal(): void
     {
         config(['release_verification.publish_url' => 'http://primary.test/internal/release-verification/publish']);
