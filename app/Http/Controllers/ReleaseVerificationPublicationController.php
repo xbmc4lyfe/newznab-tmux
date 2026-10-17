@@ -8,6 +8,7 @@ use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\SpotCheckVerifier;
 use App\Services\Releases\Verification\VerificationLockStore;
 use App\Services\Releases\Verification\VerificationResult;
+use App\Services\Releases\Verification\VerificationWorkerLocks;
 use App\Services\Releases\Verification\VerifiedReleasePublisher;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -57,6 +58,10 @@ class ReleaseVerificationPublicationController extends Controller
             // holds the worker group excludes it even after the sending worker has gone.
             $locks = VerificationLockStore::make();
             $worker = $locks->shared('worker');
+            if ($worker !== null && VerificationWorkerLocks::paused()) {
+                $locks->release($worker);
+                $worker = null;
+            }
             if ($worker === null) {
                 return response()->json(['error' => 'Verification is paused for exclusive maintenance; retry later.'], 409);
             }

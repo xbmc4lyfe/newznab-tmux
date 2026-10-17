@@ -31,8 +31,15 @@ class ReleaseVerificationBarrier extends Command
                 });
             }
         }
+        // The durable pause first: workers on every host stop claiming, and it outlives this
+        // session, so losing the gate later cannot readmit them.
+        $token = bin2hex(random_bytes(16));
+        if (! VerificationWorkerLocks::pause($token, 'deployment')) {
+            $this->warn('The verification pause table is not migrated yet; holding only the session gate.');
+        }
         $locks = new VerificationWorkerLocks;
         if (! $locks->drain(max(1, (int) $this->option('timeout')))) {
+            VerificationWorkerLocks::unpause($token);
             $this->error('Verification workers are still running on a host; the barrier was not taken.');
 
             return self::FAILURE;
@@ -44,7 +51,7 @@ class ReleaseVerificationBarrier extends Command
                 if (time() - $checked >= 5) {
                     if (! $locks->protects(0)) {
                         $this->line('barrier lost');
-                        $this->error('The verification barrier was lost with its database session.');
+                        $this->error('The verification barrier lost its database session; the durable pause remains until released.');
 
                         return self::FAILURE;
                     }
@@ -52,6 +59,8 @@ class ReleaseVerificationBarrier extends Command
                 }
                 usleep(200000);
             }
+            // A healthy rollout also clears pauses left by earlier failed deployment attempts.
+            VerificationWorkerLocks::unpause(null, 'deployment');
             $this->line('barrier released');
 
             return self::SUCCESS;

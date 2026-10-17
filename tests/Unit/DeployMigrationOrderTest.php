@@ -143,6 +143,20 @@ SH);
         $this->assertFileDoesNotExist($this->directory.'/barrier.running');
     }
 
+    public function test_an_adopted_barrier_stays_held_when_the_repaired_deployment_fails_early(): void
+    {
+        $this->deploy(['NNTMUX_MIGRATION_FAIL' => '1'])->run();
+        $this->assertFileExists($this->directory.'/barrier.running');
+        file_put_contents($this->directory.'/events', '');
+
+        $process = $this->deploy(['NNTMUX_BARRIER_LOST' => ' stop web scheduler indexer']);
+        $process->run();
+
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringNotContainsString('released', $this->events());
+        $this->assertStringContainsString('stay held by container', $process->getErrorOutput());
+    }
+
     public function test_a_barrier_lost_before_migration_aborts_without_migrating(): void
     {
         $process = $this->deploy(['NNTMUX_BARRIER_LOST' => ' stop web scheduler indexer']);

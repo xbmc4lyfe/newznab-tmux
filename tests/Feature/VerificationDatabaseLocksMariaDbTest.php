@@ -337,6 +337,68 @@ class VerificationDatabaseLocksMariaDbTest extends TestCase
         }
     }
 
+    public function test_a_durable_pause_keeps_workers_out_after_the_barrier_session_ends(): void
+    {
+        (require database_path('migrations/2026_10_17_210000_create_release_verification_pauses_table.php'))->up();
+        $worker = new VerificationWorkerLocks(new DatabaseVerificationLockStore('verification_lock_other'));
+        $this->assertTrue($worker->start());
+        $this->assertTrue(VerificationWorkerLocks::pause('deploy-attempt', 'deployment'));
+        $this->assertFalse($worker->admitting());
+        $worker->close();
+
+        // The barrier's own session is gone, but the pause is durable.
+        DB::connection('verification_lock_third')->table('release_verification_pauses')->count();
+        DB::purge('verification_lock_third');
+        $this->assertFalse($worker->start());
+        $this->assertTrue(VerificationWorkerLocks::paused());
+
+        VerificationWorkerLocks::unpause(null, 'deployment');
+        $this->assertTrue($worker->start());
+        $this->assertTrue($worker->admitting());
+        $worker->close();
+    }
+
+    public function test_the_barrier_command_pauses_holds_and_releases_every_host_on_sigterm(): void
+    {
+        (require database_path('migrations/2026_10_17_210000_create_release_verification_pauses_table.php'))->up();
+        $connection = config('database.connections.mysql');
+        $output = $this->storage.'/barrier.out';
+        File::ensureDirectoryExists($this->storage);
+        $process = proc_open([PHP_BINARY, base_path('artisan'), 'releases:verification-barrier', '--timeout=10', '--no-interaction'],
+            [['file', '/dev/null', 'r'], ['file', $output, 'w'], ['file', $output, 'a']], $pipes, base_path(), [
+                'PATH' => (string) getenv('PATH'), 'APP_ENV' => 'testing', 'APP_CONFIG_CACHE' => $this->storage.'/unused-config.php',
+                'DB_CONNECTION' => 'mysql', 'DB_HOST' => (string) $connection['host'], 'DB_PORT' => (string) $connection['port'],
+                'DB_DATABASE' => (string) $connection['database'], 'DB_USERNAME' => (string) $connection['username'],
+                'DB_PASSWORD' => (string) $connection['password'], 'DB_URL' => '', 'DB_SOCKET' => '', 'CACHE_STORE' => 'array',
+                'RELEASE_VERIFICATION_LOCKS' => 'database']);
+        $this->assertIsResource($process);
+        $worker = new VerificationWorkerLocks(new DatabaseVerificationLockStore('verification_lock_other'));
+        try {
+            $deadline = microtime(true) + 20;
+            while (! str_contains((string) @file_get_contents($output), 'barrier held') && microtime(true) < $deadline) {
+                $this->assertTrue(proc_get_status($process)['running'], (string) @file_get_contents($output));
+                usleep(100000);
+            }
+            $this->assertStringContainsString('barrier held', (string) file_get_contents($output));
+            $this->assertTrue(VerificationWorkerLocks::paused());
+            $this->assertFalse($worker->start());
+
+            proc_terminate($process, SIGTERM);
+            while (proc_get_status($process)['running'] && microtime(true) < $deadline) {
+                usleep(100000);
+            }
+            $this->assertStringContainsString('barrier released', (string) file_get_contents($output));
+            $this->assertFalse(VerificationWorkerLocks::paused());
+            $this->assertTrue($worker->start());
+        } finally {
+            $worker->close();
+            if (proc_get_status($process)['running']) {
+                proc_terminate($process, SIGKILL);
+            }
+            proc_close($process);
+        }
+    }
+
     public function test_lock_names_are_scoped_to_their_database(): void
     {
         $this->fixture('verification_lock_elsewhere');

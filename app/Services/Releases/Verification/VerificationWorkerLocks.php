@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use Illuminate\Support\Facades\DB;
 use RuntimeException;
 
 /** Stable locks outlive database leases and manifest generations. */
@@ -40,7 +41,9 @@ final class VerificationWorkerLocks
     {
         $this->close();
         $this->global = $this->store()->shared('worker');
-        if ($this->global === null) {
+        if ($this->global === null || self::paused($this->store()->connection())) {
+            $this->close();
+
             return false;
         }
         foreach ($slot > 0 ? [$slot] : range(self::firstSlot(), self::lastSlot()) as $number) {
@@ -78,7 +81,7 @@ final class VerificationWorkerLocks
     {
         $this->close();
         $this->global = $this->store()->shared('worker');
-        if ($this->global !== null) {
+        if ($this->global !== null && ! self::paused($this->store()->connection())) {
             $this->slot = $this->store()->exclusive('preparation');
             if ($this->slot !== null) {
                 return true;
@@ -139,10 +142,60 @@ final class VerificationWorkerLocks
         return $this->exclusive;
     }
 
-    /** False while a drain holds the worker gate; a running worker then stops claiming. */
+    /** False while a drain holds the worker gate or a durable pause exists; a running worker stops claiming. */
     public function admitting(): bool
     {
-        return $this->store()->admitting('worker');
+        return self::pausesExist($this->store()->connection())
+            ? $this->store()->admittingUnpaused('worker', 'release_verification_pauses') : $this->store()->admitting('worker');
+    }
+
+    /**
+     * A durable pause keeps every host's workers out even after the session that took it ends.
+     * It needs its migration; before that, only the session-scoped gate applies.
+     */
+    public static function pause(string $token, string $reason): bool
+    {
+        if (! self::pausesExist(null)) {
+            return false;
+        }
+        DB::table('release_verification_pauses')->insertOrIgnore(['token' => $token, 'reason' => $reason]);
+
+        return true;
+    }
+
+    /** Release pauses: one token, or every pause with the given reason (an earlier failed attempt's too). */
+    public static function unpause(?string $token, ?string $reason = null): void
+    {
+        if (! self::pausesExist(null)) {
+            return;
+        }
+        $query = DB::table('release_verification_pauses');
+        $token !== null ? $query->where('token', $token) : $query->where('reason', $reason);
+        $query->delete();
+    }
+
+    /** Checked on the holder's own connection, which may not be the default one. */
+    public static function paused(?string $connection = null): bool
+    {
+        return self::pausesExist($connection) && DB::connection($connection)->table('release_verification_pauses')->exists();
+    }
+
+    /** @var \WeakMap<object, true>|null connections known to have the pause table */
+    private static ?\WeakMap $pauseTables = null;
+
+    private static function pausesExist(?string $name): bool
+    {
+        $connection = DB::connection($name);
+        self::$pauseTables ??= new \WeakMap;
+        if (isset(self::$pauseTables[$connection])) {
+            return true;
+        }
+        if (! $connection->getSchemaBuilder()->hasTable('release_verification_pauses')) {
+            return false;
+        }
+        self::$pauseTables[$connection] = true;
+
+        return true;
     }
 
     public function tryCandidate(int $id): bool
@@ -175,8 +228,7 @@ final class VerificationWorkerLocks
     /** Whether this worker still holds its group and slot locks. */
     public function held(): bool
     {
-        return $this->global !== null && $this->slot !== null
-            && $this->store()->holds($this->global) && $this->store()->holds($this->slot);
+        return $this->global !== null && $this->slot !== null && $this->store()->holdsAll($this->global, $this->slot);
     }
 
     /** Maintenance of this host's scratch; each worker host has its own turn. */

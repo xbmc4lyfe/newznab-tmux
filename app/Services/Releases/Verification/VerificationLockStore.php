@@ -56,6 +56,30 @@ abstract class VerificationLockStore
 
     abstract public function release(VerificationLock $lock): void;
 
+    /** Whether every lock is still held; database stores prove them in one round trip. */
+    public function holdsAll(VerificationLock ...$locks): bool
+    {
+        foreach ($locks as $lock) {
+            if (! $this->holds($lock)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /** Whether new shared holders may join and no row of $pauses exists, in one round trip where possible. */
+    public function admittingUnpaused(string $group, string $pauses): bool
+    {
+        return $this->admitting($group) && ! DB::connection($this->connection())->table($pauses)->exists();
+    }
+
+    /** The database connection this store's holder works on; null is the default connection. */
+    public function connection(): ?string
+    {
+        return null;
+    }
+
     /** Fairness state for a named lock lives on this host and is written only by its holder. */
     protected function statePath(string $name): string
     {

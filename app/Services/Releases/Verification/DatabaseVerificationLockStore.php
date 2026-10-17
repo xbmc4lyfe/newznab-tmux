@@ -116,6 +116,31 @@ final class DatabaseVerificationLockStore extends VerificationLockStore
         return new VerificationLock($group, [$gate]);
     }
 
+    public function holdsAll(VerificationLock ...$locks): bool
+    {
+        $keys = array_merge(...array_map(static fn (VerificationLock $lock): array => $lock->keys, $locks));
+        foreach ($keys as $key) {
+            if (! isset(self::$held[$this->connectionName()][$key])) {
+                return false;
+            }
+        }
+        if ($keys === []) {
+            return true;
+        }
+        try {
+            return $this->value('SELECT ('.implode(' AND ', array_fill(0, count($keys), 'IS_USED_LOCK(?) <=> CONNECTION_ID()')).') AS v, CONNECTION_ID() AS session', $keys) === 1;
+        } catch (Throwable) {
+            return false;
+        }
+    }
+
+    public function admittingUnpaused(string $group, string $pauses): bool
+    {
+        $table = $this->db()->getQueryGrammar()->wrapTable($pauses);
+
+        return $this->value('SELECT IS_FREE_LOCK(?) AND NOT EXISTS (SELECT 1 FROM '.$table.') AS v, CONNECTION_ID() AS session', [$this->key($group)]) === 1;
+    }
+
     public function admitting(string $group): bool
     {
         return $this->value('SELECT IS_FREE_LOCK(?) AS v, CONNECTION_ID() AS session', [$this->key($group)]) === 1;
@@ -142,6 +167,11 @@ final class DatabaseVerificationLockStore extends VerificationLockStore
         } catch (Throwable) {
             return false;
         }
+    }
+
+    public function connection(): ?string
+    {
+        return $this->connection;
     }
 
     public function release(VerificationLock $lock): void

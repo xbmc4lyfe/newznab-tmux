@@ -37,7 +37,10 @@ barrier_held=0
 barrier_keep=0
 barrier_running() { [ "$(docker inspect --format '{{.State.Running}}' "$barrier_name" 2>/dev/null)" = true ]; }
 hold_barrier() {
-    if ! barrier_running; then
+    # A barrier still running from a failed attempt is retained until this rollout is healthy.
+    if barrier_running; then
+        barrier_keep=1
+    else
         docker rm -f "$barrier_name" >/dev/null 2>&1 || true
         compose run -d --no-deps --name "$barrier_name" web php artisan releases:verification-barrier --timeout="${DEPLOY_REMOTE_DRAIN_TIMEOUT:-900}" --no-interaction >/dev/null
     fi

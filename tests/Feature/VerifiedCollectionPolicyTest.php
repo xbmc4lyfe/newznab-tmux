@@ -312,8 +312,15 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
             ->assertStatus(409)->assertJson(['error' => 'Stale verification result cannot publish.']);
         $this->withServerVariables(['REMOTE_ADDR' => '192.168.1.113'])->postJson('/internal/release-verification/publish',
             array_replace_recursive($payload, ['evidence' => ['articles' => 0]]))->assertUnprocessable();
-        // An exclusive holder of the worker group (reset, audit, deployment barrier) pauses publication.
+        // A durable deployment pause stops publication as it stops workers.
         $payload['claim']['lease_token'] = $claim->lease_token;
+        (require database_path('migrations/2026_10_17_210000_create_release_verification_pauses_table.php'))->up();
+        $this->assertTrue(VerificationWorkerLocks::pause('deploy', 'deployment'));
+        $this->withServerVariables(['REMOTE_ADDR' => '192.168.1.113'])->postJson('/internal/release-verification/publish', $payload)
+            ->assertStatus(409)->assertJson(['error' => 'Verification is paused for exclusive maintenance; retry later.']);
+        $this->assertFalse((new VerificationWorkerLocks)->start());
+        VerificationWorkerLocks::unpause('deploy');
+        // An exclusive holder of the worker group (reset, audit, deployment barrier) pauses publication.
         $exclusive = new VerificationWorkerLocks;
         try {
             $this->assertTrue($exclusive->tryExclusive());

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
 /**
@@ -32,6 +33,10 @@ return new class extends Migration
 
     public function down(): void
     {
+        // Without host ownership only the primary's records remain meaningful; other hosts'
+        // rows could duplicate a candidate version under the restored unique index.
+        DB::table('release_verification_scratch')->where('host', '<>', '')->delete();
+        DB::table('release_verification_scratch_budget')->where('host', '<>', '')->delete();
         Schema::table('release_verification_scratch_budget', function (Blueprint $table): void {
             $table->dropUnique('verification_scratch_budget_host');
         });
