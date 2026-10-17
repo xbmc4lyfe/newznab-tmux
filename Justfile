@@ -18,6 +18,9 @@ mod docker 'docker/Justfile'
 export SAIL := env("SAIL", "./sail")
 export DOCKER_COMPOSE := env("DOCKER_COMPOSE", "docker compose")
 SEARCH_DRIVER := env("SEARCH_DRIVER", `v=$(sed -n 's/^SEARCH_DRIVER=//p' .env 2>/dev/null | tail -n 1 | tr -d "\"'"); printf '%s' "${v:-manticore}"`)
+ENV_COMPOSE_PROFILES := `sed -n 's/^COMPOSE_PROFILES=//p' .env 2>/dev/null | tail -n 1 | tr -d "\"'"`
+# Like the former `export COMPOSE_PROFILES ?= $(SEARCH_DRIVER)` after `-include .env`.
+PROFILES := env("COMPOSE_PROFILES", if ENV_COMPOSE_PROFILES != "" { ENV_COMPOSE_PROFILES } else { SEARCH_DRIVER })
 MONITORING_ENABLED := env("MONITORING_ENABLED", `sed -n 's/^MONITORING_ENABLED=//p' .env 2>/dev/null | tail -n 1 | tr -d "\"'"`)
 FORWARD_PROMETHEUS_PORT := env("FORWARD_PROMETHEUS_PORT", `v=$(sed -n 's/^FORWARD_PROMETHEUS_PORT=//p' .env 2>/dev/null | tail -n 1 | tr -d "\"'"); printf '%s' "${v:-9090}"`)
 WWWUSER := env("WWWUSER", `sed -n 's/^WWWUSER=//p' .env 2>/dev/null | tail -n 1 | tr -d "\"'"`)
@@ -33,7 +36,7 @@ MONITORING_KEY := "storage/app/monitoring/public/grafana-jwt.pub"
 MONITORING_SERVICES := "prometheus pushgateway grafana node-exporter mysqld-exporter redis-exporter"
 # Every Compose call gets the search profile and, once monitoring is installed, its overlay (as the
 # former Makefile exported globally).
-COMPOSE_ENV := 'export COMPOSE_PROFILES="${COMPOSE_PROFILES:-' + SEARCH_DRIVER + '}"; if [ -z "${COMPOSE_FILE:-}" ] && [[ "' + MONITORING_ENABLED + '" =~ ^(true|1|yes)$ ]] && [ -f "' + MONITORING_KEY + '" ]; then export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"; fi'
+COMPOSE_ENV := 'export COMPOSE_PROFILES="${COMPOSE_PROFILES:-' + PROFILES + '}"; if [ -z "${COMPOSE_FILE:-}" ] && [[ "' + MONITORING_ENABLED + '" =~ ^(true|1|yes)$ ]] && [ -f "' + MONITORING_KEY + '" ]; then export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"; fi'
 MONITORING_COMPOSE := '$DOCKER_COMPOSE -f docker-compose.yml -f docker-compose.monitoring.yml $(IFS=,; for profile in $COMPOSE_PROFILES; do printf -- "--profile %s " "$profile"; done)'
 
 # Show available recipes
@@ -77,7 +80,7 @@ up *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{SEARCH_DRIVER}}}"
+    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
     if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
         export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
     fi
@@ -89,7 +92,7 @@ down *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{SEARCH_DRIVER}}}"
+    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
     if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
         export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
     fi
@@ -104,7 +107,7 @@ restart *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{SEARCH_DRIVER}}}"
+    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
     if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
         export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
     fi
@@ -115,7 +118,7 @@ recreate *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{SEARCH_DRIVER}}}"
+    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
     if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
         export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
     fi
@@ -127,7 +130,7 @@ pull *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{SEARCH_DRIVER}}}"
+    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
     if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
         export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
     fi
@@ -139,7 +142,7 @@ build *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{SEARCH_DRIVER}}}"
+    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
     if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
         export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
     fi
@@ -152,7 +155,7 @@ rebuild *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{SEARCH_DRIVER}}}"
+    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
     if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
         export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
     fi
@@ -160,13 +163,14 @@ rebuild *args:
     {{DOCKER_COMPOSE}} pull --ignore-buildable --policy always
     {{SAIL}} build --no-cache --pull
     {{SAIL}} up -d --force-recreate --remove-orphans
+    echo "✔ Rebuild complete."
 
 # Infra-only: pull base images, rebuild with --pull, restart
 update *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{SEARCH_DRIVER}}}"
+    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
     if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
         export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
     fi
@@ -174,13 +178,14 @@ update *args:
     {{DOCKER_COMPOSE}} pull --ignore-buildable --policy always
     {{SAIL}} build --pull
     {{SAIL}} up -d --remove-orphans
+    echo "✔ Infra updated."
 
 # Full app upgrade: update + perms + composer + npm + migrate + caches
 upgrade *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{SEARCH_DRIVER}}}"
+    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
     if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
         export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
     fi
@@ -193,13 +198,14 @@ upgrade *args:
     if [ "${MAINTENANCE:-}" = "1" ]; then {{SAIL}} artisan up; fi
     "$JUST" --justfile "{{justfile()}}" data-cache "$@"
     "$JUST" --justfile "{{justfile()}}" optimize "$@"
+    echo "✔ Upgrade complete."
 
 # Destroy ALL volumes, rebuild, and start clean (DATA LOSS!)
 fresh *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{SEARCH_DRIVER}}}"
+    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
     if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
         export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
     fi
@@ -270,11 +276,13 @@ cache-clear *args:
     @$SAIL artisan view:clear
     @$SAIL artisan cache:clear
     @rm -f bootstrap/cache/config.php bootstrap/cache/routes-v7.php bootstrap/cache/services.php bootstrap/cache/packages.php
+    @echo "✔ Caches cleared."
 
 # Dev-safe optimize: warm data structures + view cache only
 optimize *args:
     @$SAIL artisan view:cache
     @$SAIL artisan data:cache-structures
+    @echo "✔ Optimized (dev-safe)."
 
 # Production optimize: cache config / routes / views + data structures
 optimize-deploy *args:
@@ -283,6 +291,7 @@ optimize-deploy *args:
     @$SAIL artisan route:cache
     @$SAIL artisan view:cache
     @$SAIL artisan data:cache-structures
+    @echo "✔ Optimized for deploy."
 
 # Run a foreground queue worker
 queue-work *args:
@@ -387,6 +396,7 @@ redis-cli *args:
 
 # Align UIDs: remap sail to host UID, chown project, register git safe.directory
 fix-permissions *args:
+    @echo "→ Remapping container 'sail' user to UID {{HOST_UID}} and chowning /var/www/html…"
     @$DOCKER_COMPOSE exec -u root laravel.test usermod -u {{HOST_UID}} -o sail >/dev/null 2>&1 || true
     @$DOCKER_COMPOSE exec -u root laravel.test groupmod -g {{HOST_GID}} -o sail >/dev/null 2>&1 || true
     @$DOCKER_COMPOSE exec -u root laravel.test chown -R {{HOST_UID}}:{{HOST_GID}} /var/www/html
@@ -437,7 +447,7 @@ logs *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{SEARCH_DRIVER}}}"
+    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
     if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
         export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
     fi
@@ -452,7 +462,7 @@ status *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{SEARCH_DRIVER}}}"
+    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
     if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
         export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
     fi
@@ -488,13 +498,14 @@ health *args:
 # Remove stopped containers and dangling images
 clean *args:
     @docker system prune -f
+    @echo "✔ Cleaned up dangling resources."
 
 # Remove ALL project containers, images, and volumes (DATA LOSS!)
 nuke *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{SEARCH_DRIVER}}}"
+    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
     if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
         export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
     fi
@@ -506,3 +517,4 @@ nuke *args:
         echo "⚠  FORCE=1 set — skipping confirmation."
     fi
     $SAIL down -v --rmi all
+    echo "✔ All project Docker resources removed."

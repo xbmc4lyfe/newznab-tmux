@@ -27,7 +27,7 @@ Read the [personal fork documentation](https://xbmc4lyfe.github.io/newznab-tmux/
 
 The stack in [`docker/docker-compose.yml`](docker/docker-compose.yml) includes the web app, tmux indexer, Horizon workers, scheduler, MariaDB, Redis, Manticore, Caddy, Mailpit, and Prometheus/Grafana monitoring. Images build the PHP dependencies, frontend assets, and native decoder for you.
 
-You need Git, [just](https://github.com/casey/just), Python 3, a running Docker installation with Compose v2, and Usenet provider credentials. On macOS, use Docker Desktop or OrbStack; on Linux, use Docker Engine with the Compose plugin.
+You need Git, [just](https://github.com/casey/just) 1.43 or newer (distribution packages such as Ubuntu 24.04's 1.21 are too old), Python 3, a running Docker installation with Compose v2, and Usenet provider credentials. On macOS, use Docker Desktop or OrbStack; on Linux, use Docker Engine with the Compose plugin.
 
 The supplied settings target a substantial indexing workload: MariaDB has an 8 GiB buffer pool, and service memory limits total roughly 30 GiB. Allow enough Docker memory, or lower both the limits in `docker/.env` and the buffer pool in `docker/config/mariadb/conf.d/99-nntmux.cnf`. Verification allows up to 200 GiB of scratch space while keeping 10 GiB free; plan additional disk space for the database and NZBs, or adjust the verification limits in `docker/config/app.env`.
 

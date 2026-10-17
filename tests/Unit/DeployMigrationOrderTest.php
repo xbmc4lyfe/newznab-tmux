@@ -62,6 +62,7 @@ case "$*" in
     *'artisan migrate'*) [ "${NNTMUX_MIGRATION_FAIL:-0}" != 1 ] || exit 42 ;;
     *' up -d'*)
         [ "${NNTMUX_HEALTH_FAIL:-0}" != 1 ] || exit 44
+        case "$*" in *' proxy'*) [ "${NNTMUX_PROXY_FAIL:-0}" != 1 ] || exit 51 ;; esac
         if [ "${NNTMUX_STALE_UP:-0}" = 1 ]; then echo changed > "$NNTMUX_REPO/app.txt"; fi
         case "$*" in *' --force-recreate '*) : > "$NNTMUX_REPO/recreated" ;; esac ;;
 esac
@@ -225,8 +226,8 @@ SH);
         $process = $this->deploy(['NNTMUX_MIGRATION_FAIL' => '1']);
         $process->run();
         $this->assertFalse($process->isSuccessful());
-        // A first deployment may reconcile data services for the migration, never start new app containers.
-        $this->assertStringNotContainsString(' up -d --no-deps --force-recreate', $this->events());
+        // Infra (before any drain) and data reconciliation may run; new app containers never start.
+        $this->assertStringNotContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
         $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp');
         $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.time');
     }
@@ -292,7 +293,7 @@ SH);
         $process->run();
         $this->assertFalse($process->isSuccessful());
         $this->assertStringContainsString('artisan migrate', $this->events());
-        $this->assertStringNotContainsString(' up -d --no-deps --force-recreate', $this->events());
+        $this->assertStringNotContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
     }
 
     public function test_up_preserves_first_bringup_when_no_app_containers_exist(): void
@@ -348,7 +349,8 @@ SH);
         $this->assertFalse($process->isSuccessful());
         $this->assertStringContainsString(' stop web scheduler indexer', $this->events());
         $this->assertStringNotContainsString('artisan migrate', $this->events());
-        $this->assertStringNotContainsString(' up -d', $this->events());
+        $this->assertStringNotContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
+        $this->assertLessThan(strpos($this->events(), 'scheduler.py drain'), strrpos($this->events(), ' up -d') ?: -1, 'nothing may start after the writers stop');
         $this->assertStringNotContainsString('tmux:drain --resume', $this->events());
         $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp');
     }
@@ -1040,6 +1042,21 @@ SH);
         $events = $this->events();
         $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $events);
         $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 redis', $events);
+    }
+
+    public function test_failing_infra_service_aborts_before_any_writer_is_drained(): void
+    {
+        $head = trim((new Process(['git', 'rev-parse', 'HEAD'], $this->directory))->mustRun()->getOutput());
+        file_put_contents($this->directory.'/docker/.deploy.stamp', $head." e3b0 e3b0 c16c bb93\n");
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => $this->composeJson(), 'NNTMUX_PROXY_FAIL' => '1']);
+        $process->run();
+        $this->assertSame(51, $process->getExitCode());
+        $events = $this->events();
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 proxy', $events);
+        $this->assertStringNotContainsString('drain', $events);
+        $this->assertStringNotContainsString(' stop ', $events);
+        $this->assertStringNotContainsString('artisan migrate', $events);
+        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 web', $events);
     }
 
     public function test_real_repository_paths_reach_only_the_roles_whose_images_copy_them(): void

@@ -4,7 +4,7 @@
 
 ## Prerequisites
 
-- [just](https://github.com/casey/just) command runner
+- [just](https://github.com/casey/just) 1.43 or newer (older distribution packages lack modules and `module_directory()`)
 - Docker & **Docker Compose v2.22+** (the Justfile uses `pull --ignore-buildable`)
 - A GitHub (scopeless) token for Composer private packages
 - [Laravel Sail](https://laravel.com/docs/12.x/sail) (included as a dev dependency)

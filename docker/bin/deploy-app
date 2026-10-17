@@ -26,6 +26,21 @@ if [ "$MODE" = "noop" ]; then
     exit 0
 fi
 
+# Stateless infrastructure first, while every writer still runs: a failing infra service aborts
+# here, before any drain, instead of after a full app rollout that would then repeat every poll.
+if [ -n "$DIRTY_INFRA" ]; then
+    # shellcheck disable=SC2086
+    compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $DIRTY_INFRA
+    verify
+fi
+
+if [ -n "$RECONCILE_INFRA" ]; then
+    # Compose recreates only services whose rendered configuration drifted.
+    # shellcheck disable=SC2086
+    compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $RECONCILE_INFRA
+    verify
+fi
+
 in_list() {
     needle=$1
     shift
@@ -176,15 +191,4 @@ fi
 if [ -n "$up_app_services" ]; then
     # shellcheck disable=SC2086
     compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $up_app_services
-fi
-
-if [ -n "$DIRTY_INFRA" ]; then
-    # shellcheck disable=SC2086
-    compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $DIRTY_INFRA
-fi
-
-if [ -n "$RECONCILE_INFRA" ]; then
-    # Compose recreates only services whose rendered configuration drifted.
-    # shellcheck disable=SC2086
-    compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $RECONCILE_INFRA
 fi
