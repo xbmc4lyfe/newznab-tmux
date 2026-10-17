@@ -441,7 +441,7 @@ final class VerifiedReleasePublisher
         if ($naming !== []) {
             // Title-derived lookups (TV, movie, book, music, console, anime) ran on the old name; redo them,
             // as any rename does.
-            $naming += array_intersect_key([...TvProcessingCandidateQuery::resetColumns(), 'imdbid' => null, 'musicinfo_id' => null,
+            $naming += array_intersect_key([...TvProcessingCandidateQuery::resetColumns(), 'imdbid' => null, 'movieinfo_id' => null, 'musicinfo_id' => null,
                 'consoleinfo_id' => null, 'bookinfo_id' => null, 'book_lookup_attempts' => 0, 'book_lookup_retry_at' => null,
                 'book_name_normalized_at' => null, 'anidbid' => null, 'iscategorized' => 1], array_flip(Schema::getColumnListing('releases')));
         }

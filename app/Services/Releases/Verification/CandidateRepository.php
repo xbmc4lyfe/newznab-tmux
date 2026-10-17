@@ -74,7 +74,20 @@ final class CandidateRepository
                 }
                 $this->ledger->enter();
                 $existing = $this->lockLatestCandidate($sourceIdentity, $currentReads);
-                if ($existing !== null && $existing->status === 'filtered') {
+                // A conflicting post archived apart is newer than the partial it left alone; the partial's own
+                // late articles still belong with its retained inventory, whatever became of that newer post.
+                $holder = null;
+                if ($existing !== null && $snapshotFailure === null && ($existing->release_id === null || $existing->manifest_path === '')) {
+                    $holder = $this->lockRetainedPartial($sourceIdentity, (int) $existing->id);
+                    if ($holder !== null) {
+                        // A filtered newer post skipped the snapshot; these headers may still be the partial's.
+                        $manifest ??= $this->snapshotHeaders($collection, $currentReads);
+                        if ($this->merge($this->store->read($holder->manifest_path), $manifest)['conflict'] ?? false) {
+                            $holder = null;
+                        }
+                    }
+                }
+                if ($existing !== null && $existing->status === 'filtered' && $holder === null) {
                     if ($existing->release_id !== null || (int) $existing->groups_id !== (int) $collection->groups_id
                         || $existing->manifest_path !== '' || (int) $existing->manifest_bytes !== 0) {
                         return;
@@ -96,7 +109,12 @@ final class CandidateRepository
                 // merges it and upgrades that release in place, instead of publishing only the late fragment.
                 $previous = null;
                 $merges = false;
-                if ($existing !== null && $existing->release_id !== null) {
+                if ($holder !== null) {
+                    $identity = sha1($sourceIdentity.':generation:'.$existing->id);
+                    $previous = $holder;
+                    $merges = true;
+                    $existing = null;
+                } elseif ($existing !== null && $existing->release_id !== null) {
                     $identity = sha1($sourceIdentity.':generation:'.$existing->id);
                     // A retained inventory whose partial release is gone (deleted elsewhere) is released, not merged.
                     $previous = $existing->manifest_path !== '' ? $existing : null;
@@ -513,8 +531,9 @@ final class CandidateRepository
                 if ($this->articleIdentity($old) === $this->articleIdentity($merged) && ! ($merged['conflict'] ?? false)) {
                     continue;
                 }
-                if ($candidate->release_id !== null && ! $this->retainsLivePartial($candidate)) {
-                    // Its partial release is gone; the next archive() releases this inventory.
+                if ($candidate->release_id !== null && (! $this->retainsLivePartial($candidate) || ($merged['conflict'] ?? false))) {
+                    // Its partial is gone (the next archive() releases this inventory), or these headers are another
+                    // post under the same hash, which archive() keeps apart: nothing to fast-track.
                     continue;
                 }
                 if ($candidate->release_id !== null) {
@@ -531,6 +550,15 @@ final class CandidateRepository
                 DB::table('collections')->where('id', $collection->id)->where('filecheck', '!=', 4)->update(['filecheck' => 3]);
             }
         }
+    }
+
+    /** The newest older candidate of this upload still holding a live partial's retained inventory, locked. */
+    private function lockRetainedPartial(string $sourceIdentity, int $newerThan): ?object
+    {
+        $holder = DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)->where('id', '<', $newerThan)
+            ->whereNotNull('release_id')->where('manifest_path', '<>', '')->orderByDesc('id')->lockForUpdate()->first();
+
+        return $holder !== null && $this->retainsLivePartial($holder) ? $holder : null;
     }
 
     /** A published candidate's retained inventory still belongs to a live partial release. */
