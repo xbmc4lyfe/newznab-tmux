@@ -203,10 +203,13 @@ class VerifyReleaseCandidates extends Command
                         }
                     }
                     $phase = $diagnostics?->phase('status_write', $phase);
+                    $active = null;
                     $this->line($claim->id.': '.$result->verdict.' — '.$result->reason);
                 } catch (Throwable $error) {
                     // Time spent in the operation that threw, under its own phase.
-                    $diagnostics?->phase($active, $phase);
+                    if ($active !== null) {
+                        $diagnostics?->phase($active, $phase);
+                    }
                     $diagnostics?->candidateFailed();
                     $filtered = $this->filteredResult($claim);
                     if ($filtered !== null) {
