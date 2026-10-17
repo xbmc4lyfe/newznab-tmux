@@ -24,11 +24,12 @@ class ManifestDatabaseStorageTest extends TestCase
         config(['release_verification.storage_path' => $this->directory, 'release_verification.manifest_storage' => 'database']);
         (require database_path('migrations/2026_10_11_154028_create_release_verification_candidates_table.php'))->up();
         (require database_path('migrations/2026_10_17_000000_create_release_verification_manifests_table.php'))->up();
+        (require database_path('migrations/2026_10_17_120000_create_release_verification_locks_table.php'))->up();
     }
 
     protected function tearDown(): void
     {
-        foreach (['release_verification_manifests', 'release_verification_candidates', 'release_verification_state'] as $table) {
+        foreach (['release_verification_locks', 'release_verification_manifests', 'release_verification_candidates', 'release_verification_state'] as $table) {
             Schema::dropIfExists($table);
         }
         app('files')->deleteDirectory($this->directory);

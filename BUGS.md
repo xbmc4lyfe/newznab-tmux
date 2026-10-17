@@ -377,6 +377,24 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom:** `SQLSTATE[23000] 1062 Duplicate entry 'Less Than Evil-0-2018-12-03 00:00:00-KR' for key 'ix_videos_title'` escaped, killed the worker (exit 1) and failed the whole `postProcess_tv` batch on 2026-10-11 at 13:25 UTC (4 times that day).
 - **Fix (staged):** `add()` catches the unique violation, loads the row the other worker created and takes the normal update path. If the row can't be found the original exception is rethrown. Covered by `TvProviderVideoInsertRaceTest`, which fails without the change.
 
+### 52. Every verification writer waits on one capacity row, which caps ingestion (In progress)
+
+- **Where:** `release_verification_state` row 1. `CandidateRepository::archive()`/`enqueue()`/`expire()`/`rejectByPolicy()`, `VerifiedReleasePublisher::publish()`, `ManifestStore::deleteIfUnreferenced()`/`importLegacyFiles()`, `NzbUploadManifestService::resolveCandidate()` and `verification:audit` each take it `FOR UPDATE` first and hold it until commit, including archived-header deletion and NZB writing.
+- **Symptom (production 2026-10-17 02:20–02:45 UTC):** 16–20 connections were always queued on `select * from release_verification_state where id = 1 for update`. Holders were idle in PHP between statements in 51 of 60 samples, so ingestion, verification and publication ran one transaction at a time, whatever the worker count.
+- **Fix (branch `codex/verification-capacity-ledger`):** with database manifests, the capacity change is one conditional delta and the transaction's last lock request. Publications serialize on their own `release_verification_locks` row, and manifest cleanup locks the manifest row before reading references. File manifests keep the old global lock.
+
+### 53. `ReleaseVerificationMariaDbTest` errors in every test on master (Open)
+
+- **Where:** `tests/Feature/ReleaseVerificationCandidatesTest::setUp()` runs `2026_10_16_010000_create_release_archive_naming_evidence_table`, whose foreign key needs a `releases` table the MariaDB fixture never creates.
+- **Symptom:** all 15 tests fail with `1005 Can't create table ... release_archive_naming_evidence (errno: 150 "Foreign key constraint is incorrectly formed")`, so the MariaDB rerun of the candidate suite currently checks nothing.
+- **Suggested fix:** create a minimal `releases` table in the MariaDB fixture before that migration, or skip the foreign key outside production.
+
+### 54. `RELEASE_VERIFICATION_CANDIDATE_WORKERS` above 8 is silently ignored (Open)
+
+- **Where:** `routes/console.php` schedules `min(8, candidate_workers)` slots, and `VerificationWorkerLocks` clamps to the same 8.
+- **Symptom:** production sets 48 and runs 8 verification workers.
+- **Suggested fix:** make the ceiling configurable, after BUGS #52, because more workers only add waiters to the capacity row.
+
 ## Issues in the docker/ stack itself (all fixed)
 
 | Issue | Fix |
