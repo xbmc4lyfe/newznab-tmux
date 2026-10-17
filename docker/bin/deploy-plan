@@ -489,9 +489,8 @@ def get_compose_service_hashes(docker_dir: Path) -> tuple[str, dict[str, str]]:
             return global_hash, per_service
     except (ValueError, TypeError):
         pass
-    for svc in ALL_SERVICES:
-        per_service[svc] = global_hash
-    return global_hash, per_service
+    # Never guess per-service state (it would recreate every data service and hide mount changes).
+    sys.exit("deploy-plan: cannot parse the rendered Compose configuration (compose config --format json).")
 
 
 def service_image_name(svc: str) -> str:

@@ -291,7 +291,7 @@ cmd_run() {
     fi
     [ ! -e "$DEPLOY_NOOP_MARKER" ] || rm -f "$DEPLOY_NOOP_MARKER"
     if [ "${noop:-0}" = 1 ]; then
-        log "$target" "result=skipped (no service affected; stamped without a rollout)"
+        log "$target" "result=finished rc=$rc (no service affected; stamped without a rollout)"
     else
         log "$target" "result=finished rc=$rc"
     fi

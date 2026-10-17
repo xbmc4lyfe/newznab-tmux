@@ -26,8 +26,9 @@ class DeployMigrationOrderTest extends TestCase
         file_put_contents($this->directory.'/bin/docker', <<<'SH'
 #!/bin/sh
 printf 'COMPOSE_FILE=%s %s\n' "$COMPOSE_FILE" "$*" >> "$NNTMUX_DEPLOY_EVENTS"
+default_config='{"services":{"web":{},"horizon":{},"scheduler":{},"indexer":{},"mariadb":{},"redis":{},"manticore":{},"proxy":{},"mailpit":{},"prometheus":{},"pushgateway":{},"grafana":{},"node-exporter":{},"mysqld-exporter":{},"redis-exporter":{}}}'
 case "$*" in
-    *' config --format json'*) echo "${NNTMUX_CONFIG_ID:-fixture-config}" ;;
+    *' config --format json'*) if [ -n "${NNTMUX_CONFIG_ID:-}" ]; then echo "$NNTMUX_CONFIG_ID"; else echo "$default_config"; fi ;;
     *'image inspect --format'*) echo "${NNTMUX_IMAGE_ID:-sha256:fixture}" ;;
     *'image inspect'*) exit 0 ;;
     *'inspect --format {{.Image}}'*)
@@ -316,7 +317,7 @@ SH);
     {
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         file_put_contents($this->directory.'/events', '');
-        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => 'changed-config'])->mustRun();
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => substr('{"services":{"web":{},"horizon":{},"scheduler":{},"indexer":{},"mariadb":{},"redis":{},"manticore":{},"proxy":{},"mailpit":{},"prometheus":{},"pushgateway":{},"grafana":{},"node-exporter":{},"mysqld-exporter":{},"redis-exporter":{}}}', 0, -1).',"x-changed":1}'])->mustRun();
         $this->assertStringContainsString('artisan migrate', $this->events());
     }
 
@@ -1045,6 +1046,18 @@ SH);
         $this->assertSame($legacy, file_get_contents($this->directory.'/docker/.deploy.stamp'));
     }
 
+    public function test_unparseable_rendered_compose_aborts_the_plan(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => 'wrapper noise {"services":{}}']);
+        $process->run();
+        $this->assertNotSame(0, $process->getExitCode());
+        $this->assertStringContainsString('cannot parse the rendered Compose configuration', $process->getErrorOutput());
+        $this->assertStringNotContainsString(' up -d', $this->events());
+        $this->assertStringNotContainsString('drain', $this->events());
+    }
+
     public function test_host_system_paths_match_on_path_boundaries_only(): void
     {
         $script = 'import importlib.machinery, importlib.util, sys; l = importlib.machinery.SourceFileLoader("dp", sys.argv[1]); '
@@ -1221,7 +1234,7 @@ SH);
         $this->assertStringNotContainsString(' up -d', $this->events());
         $this->assertSame('1000', trim((string) file_get_contents($this->directory.'/docker/.deploy.time')));
         $log = (string) file_get_contents($this->directory.'/docker/.deploy.log');
-        $this->assertStringContainsString('result=skipped (no service affected; stamped without a rollout)', $log);
+        $this->assertStringContainsString('result=finished rc=0 (no service affected; stamped without a rollout)', $log);
         $this->assertSame([], glob($this->directory.'/docker/.deploy.stamp.noop.*') ?: []);
 
         // The new fingerprint is stamped, so the next poll skips outright.
