@@ -15,6 +15,7 @@ use App\Services\Releases\Verification\ScratchBudget;
 use App\Services\Releases\Verification\ScratchInventory;
 use App\Services\Releases\Verification\SpotCheckVerifier;
 use App\Services\Releases\Verification\VerificationLedger;
+use App\Services\Releases\Verification\VerificationWorkerLocks;
 use App\Services\YencService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
@@ -43,8 +44,8 @@ class VerifyExistingReleases extends Command
 
             return self::SUCCESS;
         }
-        $lock = fopen($root.'/worker.lock', 'c');
-        if ($lock === false || ! flock($lock, LOCK_EX | LOCK_NB)) {
+        $lock = new VerificationWorkerLocks;
+        if (! $lock->tryExclusive()) {
             $this->warn('The new-release verifier has priority; retry the audit later.');
 
             return self::SUCCESS;
@@ -163,8 +164,7 @@ class VerifyExistingReleases extends Command
                 $this->line($line);
             }
         } finally {
-            flock($lock, LOCK_UN);
-            fclose($lock);
+            $lock->close();
         }
 
         return self::SUCCESS;

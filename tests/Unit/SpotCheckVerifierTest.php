@@ -533,4 +533,20 @@ final class SpotCheckVerifierTest extends TestCase
 
         self::assertFalse($result->passed());
     }
+
+    public function test_remote_evidence_carries_a_partial_verdict_and_the_primary_recounts_it(): void
+    {
+        $stored = ['groups_id' => 1, 'expected_files' => 1, 'files' => [['key' => 'movie', 'subject' => 'Movie "movie.mkv"', 'totalparts' => 3,
+            'segments' => [['number' => 1, 'messageid' => 'a@b', 'bytes' => 5]]]]];
+        $sampled = SpotCheckVerifier::withEvidence($stored, ['articles' => 1, 'bytes' => 5, 'sampled_files' => 1,
+            'verified_file_names' => ['movie.mkv'], 'identity_hints' => ['movie.mkv'], 'partial' => true]);
+        $evidence = SpotCheckVerifier::evidence($sampled);
+
+        $this->assertTrue($evidence['partial']);
+        // A sender's claimed counts never travel; the primary derives them from its stored manifest.
+        $this->assertSame(['articles_found' => 1, 'articles_expected' => 3, 'files_found' => 1, 'files_expected' => 1],
+            SpotCheckVerifier::withEvidence($stored, $evidence)['partial']);
+        $this->assertFalse(SpotCheckVerifier::evidence(
+            SpotCheckVerifier::withEvidence($stored, [...$evidence, 'partial' => false]))['partial']);
+    }
 }
