@@ -8,6 +8,7 @@ use App\Services\Releases\Verification\DatabaseVerificationLockStore;
 use App\Services\Releases\Verification\VerificationLockStore;
 use App\Services\Releases\Verification\VerificationResetService;
 use App\Services\Releases\Verification\VerificationWorkerLocks;
+use Illuminate\Database\Connection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use RuntimeException;
@@ -197,6 +198,67 @@ class VerificationDatabaseLocksMariaDbTest extends TestCase
         }
         $this->assertNotNull($afterCommit = $remote->exclusiveGroup('reset'));
         $remote->release($afterCommit);
+    }
+
+    public function test_a_reset_whose_lock_session_ends_stops_instead_of_reconnecting(): void
+    {
+        $continued = false;
+        try {
+            app(VerificationResetService::class)->run(function () use (&$continued): void {
+                $this->killSession(DB::connection());
+                DB::selectOne('SELECT 1 AS v');
+                $continued = true;
+            });
+            $this->fail('Reset must not continue on a session without its locks.');
+        } catch (RuntimeException $error) {
+            $this->assertStringContainsString('Verification lock session was lost', $error->getMessage());
+        }
+        $this->assertFalse($continued);
+
+        // The killed session released everything, and the connection reconnects once no lock is held.
+        $other = new DatabaseVerificationLockStore('verification_lock_other');
+        $this->assertNotNull($reset = $other->exclusiveGroup('reset'));
+        $this->assertNotNull($worker = $other->exclusiveGroup('worker'));
+        $other->release($reset);
+        $other->release($worker);
+        $this->assertSame(1, (int) DB::selectOne('SELECT 1 AS v')->v);
+    }
+
+    public function test_a_worker_whose_lock_session_ends_learns_it_and_cannot_reconnect_unprotected(): void
+    {
+        $worker = new VerificationWorkerLocks(new DatabaseVerificationLockStore);
+        try {
+            $this->assertTrue($worker->start(1));
+            $this->assertTrue($worker->tryCandidate(9));
+            $this->killSession(DB::connection());
+
+            $this->assertFalse($worker->held());
+            $this->assertFalse($worker->protects(9));
+            try {
+                DB::table('migrations')->count();
+                $this->fail('A worker must not reconnect while it believes it holds locks.');
+            } catch (RuntimeException $error) {
+                $this->assertStringContainsString('Verification lock session was lost', $error->getMessage());
+            }
+        } finally {
+            $worker->close();
+        }
+        $this->assertNotNull($slot = (new DatabaseVerificationLockStore('verification_lock_other'))->exclusive('worker-1'));
+        (new DatabaseVerificationLockStore('verification_lock_other'))->release($slot);
+        $this->assertSame(1, (int) DB::selectOne('SELECT 1 AS v')->v);
+    }
+
+    private function killSession(Connection $connection): void
+    {
+        $session = (int) $connection->selectOne('SELECT CONNECTION_ID() AS id')->id;
+        DB::connection('verification_lock_admin')->statement('KILL CONNECTION '.$session);
+        for ($attempt = 0; $attempt < 50; $attempt++) {
+            if (DB::connection('verification_lock_admin')->selectOne('SELECT COUNT(*) AS c FROM information_schema.PROCESSLIST WHERE ID = ?', [$session])->c == 0) {
+                return;
+            }
+            usleep(20000);
+        }
+        $this->fail('The killed session did not end.');
     }
 
     public function test_lock_names_are_scoped_to_their_database(): void

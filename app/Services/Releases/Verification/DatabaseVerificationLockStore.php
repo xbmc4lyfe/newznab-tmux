@@ -12,7 +12,9 @@ use Throwable;
 /**
  * MariaDB user-level locks shared by every worker host on the database. Like flock, they belong
  * to a session and end with it, so a crashed or disconnected worker releases everything it held.
- * They are taken on the worker's own connection and need no extra connection per worker.
+ * They are taken on the worker's own connection and need no extra connection per worker. While
+ * any is held, that connection refuses to reconnect: protected work on a new session would run
+ * without the locks, so it fails instead.
  */
 final class DatabaseVerificationLockStore extends VerificationLockStore
 {
@@ -21,6 +23,9 @@ final class DatabaseVerificationLockStore extends VerificationLockStore
 
     /** @var array<string, array<string, true>> keys this process holds, per connection */
     private static array $held = [];
+
+    /** @var array<string, array{session: int, connection: \WeakReference<Connection>, reconnector: mixed}> */
+    private static array $sessions = [];
 
     public function __construct(private readonly ?string $connection = null) {}
 
@@ -42,7 +47,14 @@ final class DatabaseVerificationLockStore extends VerificationLockStore
             }
             // An exclusive holder takes the gate before proving every member free, so it either
             // sees this member or this check sees its gate.
-            if ($this->value('SELECT IS_FREE_LOCK(?) AS v', [$this->key($group)]) !== 1) {
+            try {
+                $free = $this->value('SELECT IS_FREE_LOCK(?) AS v, CONNECTION_ID() AS session', [$this->key($group)]) === 1;
+            } catch (Throwable $error) {
+                $this->drop($member);
+
+                throw $error;
+            }
+            if (! $free) {
                 $this->drop($member);
 
                 return null;
@@ -62,7 +74,7 @@ final class DatabaseVerificationLockStore extends VerificationLockStore
         }
         $members = array_map(fn (int $number): string => $this->key($group.'.'.$number), range(0, $this->members($group) - 1));
         try {
-            $holder = $this->value('SELECT COALESCE('.implode(', ', array_fill(0, count($members), 'IS_USED_LOCK(?)')).') AS v', $members);
+            $holder = $this->value('SELECT COALESCE('.implode(', ', array_fill(0, count($members), 'IS_USED_LOCK(?)')).') AS v, CONNECTION_ID() AS session', $members);
         } catch (Throwable $error) {
             $this->drop($gate);
 
@@ -82,7 +94,7 @@ final class DatabaseVerificationLockStore extends VerificationLockStore
         try {
             foreach ($lock->keys as $key) {
                 if (! isset(self::$held[$this->connectionName()][$key])
-                    || $this->value('SELECT IS_USED_LOCK(?) = CONNECTION_ID() AS v', [$key]) !== 1) {
+                    || $this->value('SELECT IS_USED_LOCK(?) = CONNECTION_ID() AS v, CONNECTION_ID() AS session', [$key]) !== 1) {
                     return false;
                 }
             }
@@ -111,12 +123,64 @@ final class DatabaseVerificationLockStore extends VerificationLockStore
         if (isset(self::$held[$this->connectionName()][$key])) {
             return false;
         }
-        if ($this->value('SELECT GET_LOCK(?, 0) AS v', [$key]) !== 1) {
+        $connection = $this->connectionName();
+        $pinned = (self::$held[$connection] ?? []) !== [];
+        $row = $this->db()->selectOne('SELECT GET_LOCK(?, 0) AS v, CONNECTION_ID() AS session', [$key]);
+        if ($pinned) {
+            try {
+                $this->assertSession((int) $row->session);
+            } catch (RuntimeException $error) {
+                if ((int) $row->v === 1) {
+                    // Not ours to keep: this session holds none of the locks it must accompany.
+                    $this->db()->selectOne('SELECT RELEASE_LOCK(?) AS v', [$key]);
+                }
+
+                throw $error;
+            }
+        }
+        if ((int) $row->v !== 1) {
             return false;
         }
-        self::$held[$this->connectionName()][$key] = true;
+        self::$held[$connection][$key] = true;
+        if (! $pinned) {
+            $this->pin((int) $row->session);
+        }
 
         return true;
+    }
+
+    /**
+     * Pin the session that took this connection's first lock and forbid reconnecting it until the
+     * last one is released.
+     */
+    private function pin(int $session): void
+    {
+        $db = $this->db();
+        $reconnector = (fn () => $this->reconnector)->call($db);
+        $db->setReconnector(static function (): never {
+            throw new RuntimeException('Verification lock session was lost; refusing to continue on a new session.');
+        });
+        self::$sessions[$this->connectionName()] = ['session' => $session, 'connection' => \WeakReference::create($db),
+            'reconnector' => $reconnector];
+    }
+
+    private function unpin(): void
+    {
+        $pinned = self::$sessions[$this->connectionName()] ?? null;
+        unset(self::$sessions[$this->connectionName()]);
+        $db = $pinned['connection']->get() ?? null;
+        if ($db !== null && is_callable($pinned['reconnector'])) {
+            $db->setReconnector($pinned['reconnector']);
+        }
+    }
+
+    /** Every held lock is gone once its statements run on another session or connection. */
+    private function assertSession(int $session): void
+    {
+        $pinned = self::$sessions[$this->connectionName()] ?? null;
+        if ($pinned === null || $pinned['session'] !== $session || $pinned['connection']->get() !== $this->db()) {
+            throw new RuntimeException('Verification lock session was lost; refusing to continue on a new session.');
+        }
     }
 
     private function drop(string $key): void
@@ -130,6 +194,11 @@ final class DatabaseVerificationLockStore extends VerificationLockStore
             $this->db()->selectOne('SELECT RELEASE_LOCK(?) AS v', [$key]);
         } catch (Throwable) {
             // A lost session has already released every lock it held.
+        } finally {
+            if ((self::$held[$connection] ?? []) === []) {
+                unset(self::$held[$connection]);
+                $this->unpin();
+            }
         }
     }
 
@@ -149,12 +218,19 @@ final class DatabaseVerificationLockStore extends VerificationLockStore
         return self::MEMBERS[$group] ?? throw new RuntimeException('Unknown verification lock group.');
     }
 
-    /** @param list<string> $bindings */
+    /**
+     * Read a lock function result, proving it ran on the session holding this process's locks.
+     *
+     * @param  list<string>  $bindings
+     */
     private function value(string $sql, array $bindings): ?int
     {
-        $value = $this->db()->selectOne($sql, $bindings)?->v;
+        $row = $this->db()->selectOne($sql, $bindings);
+        if ((self::$held[$this->connectionName()] ?? []) !== []) {
+            $this->assertSession((int) $row->session);
+        }
 
-        return $value === null ? null : (int) $value;
+        return $row->v === null ? null : (int) $row->v;
     }
 
     private function db(): Connection
