@@ -383,11 +383,22 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom (production 2026-10-17 02:20–02:45 UTC):** 16–20 connections were always queued on `select * from release_verification_state where id = 1 for update`. Holders were idle in PHP between statements in 51 of 60 samples, so ingestion, verification and publication ran one transaction at a time, whatever the worker count.
 - **Fix (branch `codex/verification-capacity-ledger`):** with database manifests, the capacity change is one conditional delta and the transaction's last lock request. Publications serialize on their own `release_verification_locks` row, and manifest cleanup locks the manifest row before reading references. File manifests keep the old global lock.
 
-### 53. `ReleaseVerificationMariaDbTest` errors in every test on master (Open)
+### 53. `ReleaseVerificationMariaDbTest` errors in every test on master (Fixed)
 
-- **Where:** `tests/Feature/ReleaseVerificationCandidatesTest::setUp()` runs `2026_10_16_010000_create_release_archive_naming_evidence_table`, whose foreign key needs a `releases` table the MariaDB fixture never creates.
-- **Symptom:** all 15 tests fail with `1005 Can't create table ... release_archive_naming_evidence (errno: 150 "Foreign key constraint is incorrectly formed")`, so the MariaDB rerun of the candidate suite currently checks nothing.
-- **Suggested fix:** create a minimal `releases` table in the MariaDB fixture before that migration, or skip the foreign key outside production.
+- **Where:** the MariaDB rerun of `ReleaseVerificationCandidatesTest`. The shared SQLite fixture had drifted from MariaDB.
+- **Symptom:** all 15 tests failed. Every one hit `1005 Can't create table ... release_archive_naming_evidence (errno: 150 ...)`: its foreign key references a `releases` table that some tests create later with a different id type. Underneath were:
+  - the missing `ix_collection_collectionhash` index that archive admission forces;
+  - a part-read counter that matched only SQLite quoting;
+  - non-strict `varchar(255)` truncating the oversized-metadata case;
+  - two upload tests written before the `accepted_capture` and `accepted_admission` requirements.
+- **Fix:** the MariaDB fixture now:
+  - disables foreign-key checks for its session;
+  - adds the hash index;
+  - raises the disposable server's `max_allowed_packet`;
+  - widens `parts.messageid` for the oversized case;
+  - tests `resolveCandidate()` directly, with a matching admission receipt.
+
+  The quote-insensitive counter benefits both drivers. `ReleaseVerificationDatabaseManifestMariaDbTest` reruns the suite with database manifests. Both pass all 15 tests.
 
 ### 54. `RELEASE_VERIFICATION_CANDIDATE_WORKERS` above 8 is silently ignored (Open)
 
