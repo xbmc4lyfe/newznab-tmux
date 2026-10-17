@@ -897,7 +897,8 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
 
     compose_global_changed = not first_deploy and stamped.get("effective") != state["effective"]
     reconciling = bool(reconcile_data or reconcile_infra)
-    if compose_global_changed and not dirty_app and not dirty_data and not dirty_infra and not reconciling:
+    global_fallback = compose_global_changed and not dirty_app and not dirty_data and not dirty_infra and not reconciling
+    if global_fallback:
         for svc in APP_SERVICES:
             dirty_app.append(svc)
             app_reasons[svc] = "compose config changed"
@@ -935,6 +936,7 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
         "dirty_data": dirty_data,
         "dirty_infra": dirty_infra,
         "reconcile_data": reconcile_data,
+        "global_fallback": global_fallback,
         "reconcile_infra": reconcile_infra,
         "build_targets": build_targets,
         "app_reasons": app_reasons,
@@ -965,7 +967,7 @@ def main() -> None:
         record = {} if "__legacy__" in stamped else {k: v for k, v in stamped.items() if k != "fingerprint"}
         items = sys.argv[2:]
         keys = [key for item in items for key in (
-            ("migration",) if item == "migration" else (f"service:{item}", f"compose:{item}", f"image:{item}", f"build:{item}"))]
+            (item,) if item in ("migration", "effective") else (f"service:{item}", f"compose:{item}", f"image:{item}", f"build:{item}"))]
         if cmd == "--forget":
             for key in keys:
                 record.pop(key, None)
@@ -1019,6 +1021,7 @@ def main() -> None:
         print(f"DIRTY_INFRA={shlex.quote(' '.join(plan['dirty_infra']))}")
         print(f"RECONCILE_DATA={shlex.quote(' '.join(plan['reconcile_data']))}")
         print(f"RECONCILE_INFRA={shlex.quote(' '.join(plan['reconcile_infra']))}")
+        print(f"GLOBAL_FALLBACK={'1' if plan['global_fallback'] else '0'}")
         print(f"BUILD_TARGETS={shlex.quote(' '.join(plan['build_targets']))}")
         return
 

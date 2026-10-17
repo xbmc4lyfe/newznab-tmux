@@ -880,6 +880,27 @@ SH);
         $this->assertStringNotContainsString(' up -d', $events);
     }
 
+    public function test_interrupted_infra_only_rollout_is_not_retried_as_a_full_app_rollout(): void
+    {
+        $base = json_decode($this->composeJson(), true);
+        $config = fn (string $image): array => ['NNTMUX_CONFIG_ID' => (string) json_encode(array_replace_recursive($base, ['services' => ['proxy' => ['image' => $image]]]), JSON_UNESCAPED_SLASHES)];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('caddy:1'))->mustRun();
+
+        // The proxy rollout completes, then the run is interrupted before the final stamp.
+        $interrupted = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('caddy:2') + ['NNTMUX_PROXY_EDIT' => $this->directory.'/app.txt']);
+        $interrupted->run();
+        $this->assertSame(76, $interrupted->getExitCode());
+        file_put_contents($this->directory.'/app.txt', "one\n");
+
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('caddy:2'))->mustRun();
+        $events = $this->events();
+        $this->assertStringNotContainsString('drain', $events);
+        $this->assertStringNotContainsString('artisan migrate', $events);
+        $this->assertStringNotContainsString('--wait-timeout 240 web', $events);
+        $this->assertStringNotContainsString(' proxy', $events);
+    }
+
     public function test_host_system_paths_match_on_path_boundaries_only(): void
     {
         $script = 'import importlib.machinery, importlib.util, sys; l = importlib.machinery.SourceFileLoader("dp", sys.argv[1]); '

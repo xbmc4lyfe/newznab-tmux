@@ -32,6 +32,9 @@ fi
 # something that is not running, and a retry repeats only what did not complete.
 plan() { "$DIR/bin/deploy-plan" "$@"; }
 plan --invalidate
+# The rendered-Compose change is explained by the per-service records unless the plan fell back to
+# a full app rollout for it; record it now so an interrupted run's retry is not a full rollout.
+[ "$GLOBAL_FALLBACK" = 1 ] || plan --record effective
 
 # Stateless infrastructure first, while every writer still runs: a failing infra service aborts
 # here, before any drain, instead of after a full app rollout that would then repeat every poll.
@@ -223,4 +226,5 @@ if [ -n "$up_app_services" ]; then
     compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $up_app_services
     # shellcheck disable=SC2086
     plan --record $up_app_services
+    [ "$GLOBAL_FALLBACK" != 1 ] || plan --record effective
 fi
