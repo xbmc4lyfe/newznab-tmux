@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Unit;
 
+use App\Services\Releases\Verification\ArticleBudgetExceeded;
 use App\Services\Releases\Verification\ArticleSource;
 use App\Services\Releases\Verification\NzbManifestReader;
 use App\Services\Releases\Verification\PayloadVerifier;
@@ -159,6 +160,16 @@ final class SpotCheckVerifierTest extends TestCase
             self::assertSame('unknown', $result->verdict, $case);
             self::assertSame($deterministic, $result->deterministic, $case.': '.$result->reason);
         }
+        $oversized = new class implements ArticleSource
+        {
+            public function fetch(string $messageId): string
+            {
+                throw new ArticleBudgetExceeded('Article exceeds verification memory budget.');
+            }
+        };
+        $result = (new SpotCheckVerifier($oversized, ['spot_check_articles' => 1]))->verify($manifest, static function (): void {});
+        self::assertTrue($result->deterministic, 'An oversized article stays oversized.');
+        self::assertSame('Article exceeds verification memory budget.', $result->reason);
         $failing = new class implements ArticleSource
         {
             public function fetch(string $messageId): string
