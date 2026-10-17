@@ -28,39 +28,50 @@ operation_token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 legacy_drain() { compose exec -T indexer php -- /app "$1" "${DEPLOY_LEGACY_DRAIN_TIMEOUT:-1800}" "$operation_token" < "$DIR/bin/legacy-drain.php"; }
 legacy_scheduler() { compose exec -T scheduler python3 - "$1" "$scheduler_timeout" "$operation_token" < "$DIR/bin/legacy-scheduler-drain.py"; }
 scheduler_command() { compose exec -T scheduler python3 /app/docker/app/bin/scheduler.py "$@"; }
-# Remote worker hosts share the database but not this Compose project. The new image's barrier
-# stops their verification workers, waits for them, and keeps them out until its stdin closes.
-barrier_pid=
-barrier_dir=
+# Remote worker hosts share the database but not this Compose project. The new image's barrier,
+# a one-off container, stops their verification workers, waits for them and keeps them out. It is
+# stopped only after a healthy rollout: a failed migration leaves remote workers held until the
+# repaired deployment (which reuses a running barrier) finishes, or an operator stops it.
+barrier_name="${COMPOSE_PROJECT_NAME:-nntmux}-verification-barrier"
+barrier_held=0
+barrier_keep=0
+barrier_running() { [ "$(docker inspect --format '{{.State.Running}}' "$barrier_name" 2>/dev/null)" = true ]; }
 hold_barrier() {
-    barrier_dir=$(mktemp -d)
-    mkfifo "$barrier_dir/in"
-    compose run --rm --no-deps -T web php artisan releases:verification-barrier --timeout="${DEPLOY_REMOTE_DRAIN_TIMEOUT:-900}" --no-interaction < "$barrier_dir/in" > "$barrier_dir/out" 2>&1 &
-    barrier_pid=$!
-    exec 9> "$barrier_dir/in"
-    until grep -q '^barrier held' "$barrier_dir/out"; do
-        if ! kill -0 "$barrier_pid" 2>/dev/null; then
-            cat "$barrier_dir/out" >&2
-            barrier_pid=
+    if ! barrier_running; then
+        docker rm -f "$barrier_name" >/dev/null 2>&1 || true
+        compose run -d --no-deps --name "$barrier_name" web php artisan releases:verification-barrier --timeout="${DEPLOY_REMOTE_DRAIN_TIMEOUT:-900}" --no-interaction >/dev/null
+    fi
+    barrier_held=1
+    until docker logs "$barrier_name" 2>&1 | grep -q '^barrier held'; do
+        if ! barrier_running; then
+            docker logs "$barrier_name" >&2 || true
+            docker rm -f "$barrier_name" >/dev/null 2>&1 || true
+            barrier_held=0
             echo "Remote verification workers did not drain; not stopping writers or migrating." >&2
             exit 1
         fi
         sleep 1
     done
 }
-release_barrier() {
-    if [ -n "$barrier_pid" ]; then
-        exec 9>&-
-        wait "$barrier_pid" || echo "Verification barrier exited abnormally; its session released it." >&2
-        barrier_pid=
+assert_barrier() {
+    if ! barrier_running || docker logs "$barrier_name" 2>&1 | grep -q '^barrier lost'; then
+        echo "The verification barrier was lost; remote verification workers may be writing." >&2
+        exit 1
     fi
-    if [ -n "$barrier_dir" ]; then
-        rm -rf "$barrier_dir"
-        barrier_dir=
+}
+release_barrier() {
+    if [ "$barrier_held" = 1 ]; then
+        docker stop --timeout 30 "$barrier_name" >/dev/null || echo "Verification barrier did not stop cleanly; its session released it." >&2
+        docker rm -f "$barrier_name" >/dev/null 2>&1 || true
+        barrier_held=0
     fi
 }
 resume() {
-    release_barrier
+    if [ "$barrier_held" = 1 ] && [ "$barrier_keep" = 1 ]; then
+        echo "Remote verification workers stay held by container $barrier_name until a repaired deployment completes or it is stopped." >&2
+    else
+        release_barrier
+    fi
     if [ "$horizon_stopped" = 1 ]; then
         compose start horizon || echo "Horizon restart failed; queued jobs wait until it runs." >&2
     fi
@@ -158,7 +169,12 @@ horizon_stopped=0
 drained=0
 scheduler_drained=0
 verify
+assert_barrier
+barrier_keep=1
 compose run --rm --no-deps web php artisan migrate --force --no-interaction
+assert_barrier
 verify
 compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" web horizon scheduler indexer
+assert_barrier
+barrier_keep=0
 release_barrier

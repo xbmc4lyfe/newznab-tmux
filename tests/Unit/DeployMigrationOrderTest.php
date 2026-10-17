@@ -21,17 +21,21 @@ class DeployMigrationOrderTest extends TestCase
             copy(__DIR__.'/../../docker/bin/'.$script, $this->directory.'/docker/bin/'.$script);
             chmod($this->directory.'/docker/bin/'.$script, 0755);
         }
-        file_put_contents($this->directory.'/.gitignore', "/docker/.build.stamp\n/docker/.deploy.stamp\n/docker/.deploy.time\n/docker/.deploy.log\n/docker/.deploy.lock*\n/events\n/recreated\n");
+        file_put_contents($this->directory.'/.gitignore', "/docker/.build.stamp\n/docker/.deploy.stamp\n/docker/.deploy.time\n/docker/.deploy.log\n/docker/.deploy.lock*\n/events\n/recreated\n/barrier.log\n/barrier.running\n");
         file_put_contents($this->directory.'/app.txt', "one\n");
         file_put_contents($this->directory.'/bin/docker', <<<'SH'
 #!/bin/sh
 printf 'COMPOSE_FILE=%s %s\n' "$COMPOSE_FILE" "$*" >> "$NNTMUX_DEPLOY_EVENTS"
 case "$*" in
     *'releases:verification-barrier'*)
-        [ "${NNTMUX_BARRIER_FAIL:-0}" != 1 ] || { echo 'Verification workers are still running on a host.'; exit 51; }
-        echo 'barrier held'
-        cat > /dev/null
-        echo released >> "$NNTMUX_DEPLOY_EVENTS" ;;
+        if [ "${NNTMUX_BARRIER_FAIL:-0}" = 1 ]; then echo 'still running' > "$NNTMUX_REPO/barrier.log"; else echo 'barrier held' > "$NNTMUX_REPO/barrier.log"; : > "$NNTMUX_REPO/barrier.running"; fi
+        echo barrier-container ;;
+    'inspect --format {{.State.Running}} '*'-verification-barrier') [ -f "$NNTMUX_REPO/barrier.running" ] && echo true || echo false ;;
+    'logs '*'-verification-barrier')
+        cat "$NNTMUX_REPO/barrier.log" 2>/dev/null
+        if [ "${NNTMUX_BARRIER_LOST:-}" != '' ] && grep -q "${NNTMUX_BARRIER_LOST}" "$NNTMUX_DEPLOY_EVENTS"; then echo 'barrier lost'; fi ;;
+    'stop --timeout 30 '*'-verification-barrier') rm -f "$NNTMUX_REPO/barrier.running"; echo released >> "$NNTMUX_DEPLOY_EVENTS" ;;
+    'rm -f '*'-verification-barrier') rm -f "$NNTMUX_REPO/barrier.running" ;;
     *' config --format json'*) echo "${NNTMUX_CONFIG_ID:-fixture-config}" ;;
     *'image inspect --format'*) echo "${NNTMUX_IMAGE_ID:-sha256:fixture}" ;;
     *'image inspect'*) exit 0 ;;
@@ -120,15 +124,43 @@ SH);
         $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp');
     }
 
-    public function test_a_failed_migration_releases_the_remote_worker_barrier(): void
+    public function test_a_failed_migration_keeps_remote_workers_held_for_the_repaired_deployment(): void
     {
         $process = $this->deploy(['NNTMUX_MIGRATION_FAIL' => '1']);
         $process->run();
 
         $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('stay held by container', $process->getErrorOutput());
+        $this->assertStringNotContainsString('released', $this->events());
+        $this->assertFileExists($this->directory.'/barrier.running');
+
+        // The repaired deployment reuses the running barrier and releases it after health.
+        file_put_contents($this->directory.'/events', '');
+        $this->deploy()->mustRun();
         $events = $this->events();
-        $this->assertGreaterThan(strpos($events, 'artisan migrate'), strpos($events, "released\n"));
-        $this->assertStringNotContainsString(' up -d', $events);
+        $this->assertSame(0, substr_count($events, 'releases:verification-barrier'));
+        $this->assertGreaterThan(strpos($events, ' up -d --no-deps --force-recreate'), strpos($events, 'released'));
+        $this->assertFileDoesNotExist($this->directory.'/barrier.running');
+    }
+
+    public function test_a_barrier_lost_before_migration_aborts_without_migrating(): void
+    {
+        $process = $this->deploy(['NNTMUX_BARRIER_LOST' => ' stop web scheduler indexer']);
+        $process->run();
+
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('The verification barrier was lost', $process->getErrorOutput());
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
+    }
+
+    public function test_a_barrier_lost_during_migration_fails_the_rollout(): void
+    {
+        $process = $this->deploy(['NNTMUX_BARRIER_LOST' => 'artisan migrate']);
+        $process->run();
+
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('The verification barrier was lost', $process->getErrorOutput());
+        $this->assertStringNotContainsString(' up -d --no-deps --force-recreate', $this->events());
     }
 
     public function test_native_indexer_abort_uses_the_same_unique_operation_token_as_its_drain(): void

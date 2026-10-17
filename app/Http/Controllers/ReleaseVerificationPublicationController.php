@@ -6,6 +6,7 @@ namespace App\Http\Controllers;
 
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\SpotCheckVerifier;
+use App\Services\Releases\Verification\VerificationLockStore;
 use App\Services\Releases\Verification\VerificationResult;
 use App\Services\Releases\Verification\VerifiedReleasePublisher;
 use Illuminate\Http\JsonResponse;
@@ -52,8 +53,18 @@ class ReleaseVerificationPublicationController extends Controller
                 return response()->json(['error' => 'Stale verification result cannot publish.'], 409);
             }
             $manifest = SpotCheckVerifier::withEvidence($store->read($candidate->manifest_path), $evidence);
-
-            return response()->json(['release_id' => $publisher->publish($claim, new VerificationResult('sampled', (string) $data['reason'], $manifest))]);
+            // Publication writes as a worker does, so a reset, audit or deployment barrier that
+            // holds the worker group excludes it even after the sending worker has gone.
+            $locks = VerificationLockStore::make();
+            $worker = $locks->shared('worker');
+            if ($worker === null) {
+                return response()->json(['error' => 'Verification is paused for exclusive maintenance; retry later.'], 409);
+            }
+            try {
+                return response()->json(['release_id' => $publisher->publish($claim, new VerificationResult('sampled', (string) $data['reason'], $manifest))]);
+            } finally {
+                $locks->release($worker);
+            }
         } catch (Throwable $error) {
             // The worker's retry after a lost response finds the release its first request published.
             $published = $this->publishedRelease($claim);

@@ -17,6 +17,7 @@ use App\Services\Releases\Verification\RemoteReleasePublisher;
 use App\Services\Releases\Verification\ScratchInventory;
 use App\Services\Releases\Verification\SpotCheckVerifier;
 use App\Services\Releases\Verification\VerificationResult;
+use App\Services\Releases\Verification\VerificationWorkerLocks;
 use App\Services\Releases\Verification\VerifiedReleasePublisher;
 use App\Services\YencService;
 use App\Support\Configuration\IngestionConfigurationData;
@@ -311,6 +312,16 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
             ->assertStatus(409)->assertJson(['error' => 'Stale verification result cannot publish.']);
         $this->withServerVariables(['REMOTE_ADDR' => '192.168.1.113'])->postJson('/internal/release-verification/publish',
             array_replace_recursive($payload, ['evidence' => ['articles' => 0]]))->assertUnprocessable();
+        // An exclusive holder of the worker group (reset, audit, deployment barrier) pauses publication.
+        $payload['claim']['lease_token'] = $claim->lease_token;
+        $exclusive = new VerificationWorkerLocks;
+        try {
+            $this->assertTrue($exclusive->tryExclusive());
+            $this->withServerVariables(['REMOTE_ADDR' => '192.168.1.113'])->postJson('/internal/release-verification/publish', $payload)
+                ->assertStatus(409)->assertJson(['error' => 'Verification is paused for exclusive maintenance; retry later.']);
+        } finally {
+            $exclusive->close();
+        }
         $this->assertSame(0, DB::table('releases')->count());
         $this->assertSame('verifying', DB::table('release_verification_candidates')->where('id', $claim->id)->value('status'));
     }
