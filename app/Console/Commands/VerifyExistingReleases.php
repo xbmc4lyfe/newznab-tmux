@@ -8,6 +8,7 @@ use App\Models\Release;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
 use App\Services\Releases\Verification\AuditReleaseDeletion;
+use App\Services\Releases\Verification\CandidateHeaderInventory;
 use App\Services\Releases\Verification\NntpArticleSource;
 use App\Services\Releases\Verification\NzbManifestReader;
 use App\Services\Releases\Verification\ScratchBudget;
@@ -101,10 +102,21 @@ class VerifyExistingReleases extends Command
                     if ($xml === false) {
                         throw new \RuntimeException('Release NZB is unavailable.');
                     }
-                    // A partial publication's NZB is knowingly incomplete and can never grow; audit what it has.
-                    $result = $verifier->verify($reader->read($xml, $release), static function (): void {},
-                        allowPartial: $release->getAttribute('articles_expected') !== null);
-                    $record = ['id' => $release->id, 'verdict' => $result->verdict, 'reason' => $result->reason];
+                    // A partial publication's NZB is knowingly incomplete and can never grow; audit what it has,
+                    // but only while it still holds every article and file recorded at publication.
+                    $manifest = $reader->read($xml, $release);
+                    $partial = $release->getAttribute('articles_expected') !== null;
+                    $found = $partial ? (new CandidateHeaderInventory)->completeness($manifest) : null;
+                    if ($found !== null && ($found['articles_found'] !== (int) $release->getAttribute('articles_found')
+                        || $found['files_found'] !== (int) $release->getAttribute('files_found'))) {
+                        $record = ['id' => $release->id, 'verdict' => 'unrepairable',
+                            'reason' => sprintf('Partial release NZB holds %d of %d recorded articles and %d of %d recorded files.',
+                                $found['articles_found'], (int) $release->getAttribute('articles_found'),
+                                $found['files_found'], (int) $release->getAttribute('files_found'))];
+                    } else {
+                        $result = $verifier->verify($manifest, static function (): void {}, allowPartial: $partial);
+                        $record = ['id' => $release->id, 'verdict' => $result->verdict, 'reason' => $result->reason];
+                    }
                 } catch (Throwable $error) {
                     $record = ['id' => $release->id, 'verdict' => 'unknown', 'reason' => $error->getMessage()];
                 }

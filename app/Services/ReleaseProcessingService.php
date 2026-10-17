@@ -1855,6 +1855,8 @@ final class ReleaseProcessingService
             Release::query()
                 ->where('categories_id', (int) $category->id)
                 ->where('size', '<', (int) $category->minsize) // @phpstan-ignore property.notFound
+                // A partial publication is knowingly short; late articles may still complete it.
+                ->when(Release::hasPartialArticleCounts(), static fn ($query) => $query->whereNull('articles_expected'))
                 ->select(['id', 'guid'])
                 ->limit(1000)
                 ->chunkById(self::BATCH_SIZE, function ($releases) use (&$stats): bool {

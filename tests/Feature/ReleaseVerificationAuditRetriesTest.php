@@ -98,12 +98,18 @@ class ReleaseVerificationAuditRetriesTest extends TestCase
     public function test_audit_samples_a_partial_publication_instead_of_retrying_it_forever(): void
     {
         Schema::table('releases', function (Blueprint $table): void {
-            $table->unsignedInteger('articles_expected')->nullable();
+            foreach (['articles_found', 'articles_expected', 'files_found', 'files_expected'] as $column) {
+                $table->unsignedInteger($column)->nullable();
+            }
         });
         $this->release(1);
         $this->release(2);
-        DB::table('releases')->where('id', 1)->update(['articles_expected' => 3]);
-        // Both NZBs declare three articles and contain one; only release 1 was published as partial.
+        $this->release(3);
+        $counts = ['articles_expected' => 3, 'files_found' => 1, 'files_expected' => 1];
+        DB::table('releases')->where('id', 1)->update($counts + ['articles_found' => 1]);
+        // Release 3 was published with two articles; its NZB has since lost one.
+        DB::table('releases')->where('id', 3)->update($counts + ['articles_found' => 2]);
+        // Every NZB declares three articles and contains one; releases 1 and 3 were published as partial.
         $xml = '<nzb><file subject="Release [1/1] &quot;movie.mkv&quot; (1/3)"><groups><group>alt.test</group></groups>'
             .'<segments><segment bytes="5" number="1">a@b</segment></segments></file></nzb>';
         $this->mock(NzbService::class, function ($mock) use ($xml): void {
@@ -115,9 +121,9 @@ class ReleaseVerificationAuditRetriesTest extends TestCase
             $mock->shouldReceive('doQuit')->andReturn(null);
         });
 
-        $this->audit(2);
+        $this->audit(3);
 
-        $this->assertSame([1 => 'sampled', 2 => 'unknown'], array_column($this->records(), 'verdict', 'id'));
+        $this->assertSame([1 => 'sampled', 2 => 'unknown', 3 => 'unrepairable'], array_column($this->records(), 'verdict', 'id'));
     }
 
     public function test_sample_budget_exhaustion_can_recover_on_a_later_resume(): void

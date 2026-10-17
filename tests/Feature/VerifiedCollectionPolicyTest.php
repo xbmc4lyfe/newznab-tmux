@@ -9,9 +9,7 @@ use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
 use App\Services\ReleaseCleaningService;
 use App\Services\ReleaseCreationService;
-use App\Services\ReleaseImageService;
 use App\Services\ReleaseProcessingService;
-use App\Services\Releases\ReleaseManagementService;
 use App\Services\Releases\Verification\CandidateHeaderInventory;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\CollectionReleasePolicy;
@@ -340,14 +338,30 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame((int) $rows[1]->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
         $this->assertNotSame($previous->identity, $rows[1]->identity);
 
-        $old = DB::table('releases')->where('id', $first)->first();
-        $this->mock(ReleaseManagementService::class)->shouldReceive('deleteSingle')->once()
-            ->withArgs(fn (array $identifiers, $nzb, $image): bool => $identifiers === ['g' => $old->guid, 'i' => $first]
-                && $nzb instanceof NzbService && $image instanceof ReleaseImageService);
+        Search::shouldReceive('deleteRelease')->once()->with($first);
         $second = $this->publishStalledPartial(null);
 
         $this->assertNotSame($first, $second);
+        $this->assertFalse(DB::table('releases')->where('id', $first)->exists(), 'The superseded partial leaves with the same commit.');
         $this->assertSame(2, (int) DB::table('releases')->where('id', $second)->value('articles_found'));
+    }
+
+    public function test_a_replay_reusing_the_partial_release_keeps_its_inventory(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        config(['nntmux.release_dedupe_enabled' => true]);
+        $hash = sha1('replayed-headers', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+
+        // The same header is seen again: the merged generation is covered by the published partial.
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $reused = $this->publishStalledPartial(null);
+
+        $this->assertSame($first, $reused);
+        $latest = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        $this->assertSame($first, (int) $latest->release_id);
+        $this->assertNotSame('', $latest->manifest_path, 'Late articles must still find the retained inventory.');
+        $this->assertTrue(DB::table('releases')->where('id', $first)->exists());
     }
 
     public function test_retained_partial_inventory_is_released_at_expiry(): void

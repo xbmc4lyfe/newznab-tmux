@@ -14,7 +14,6 @@ use App\Services\Nzb\NzbService;
 use App\Services\ReleaseImageService;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\ReleaseGroupResolver;
-use App\Services\Releases\ReleaseManagementService;
 use App\Support\NzbPasswordMetadata;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -145,7 +144,9 @@ final class VerifiedReleasePublisher
                         $this->recordGroups($duplicateId, $manifest['groups']);
                         $this->replaceSupersededPartial($manifest, $duplicateId);
                         app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
-                        $this->markPublished($candidate->id, $duplicateId, $result);
+                        // Reusing a partial (such as a replay of its own headers) must keep the inventory late articles merge into.
+                        $this->markPublished($candidate->id, $duplicateId, $result, retainManifest: Release::hasPartialArticleCounts()
+                            && DB::table('releases')->where('id', $duplicateId)->whereNotNull('articles_expected')->exists());
 
                         $returned = true;
 
@@ -350,13 +351,19 @@ final class VerifiedReleasePublisher
         if ($release === null) {
             return;
         }
+        // The row goes with this publication's commit, so it can never stay advertised without its NZB;
+        // only best-effort file and index cleanup follows.
+        DB::table('releases')->where('id', $release->id)->delete();
         DB::afterCommit(static function () use ($release, $releaseId): void {
-            try {
-                app(ReleaseManagementService::class)->deleteSingle(['g' => (string) $release->guid, 'i' => (int) $release->id],
-                    app(NzbService::class), app(ReleaseImageService::class));
-            } catch (Throwable $exception) {
-                Log::warning('Could not remove a superseded partial release.', ['release_id' => (int) $release->id,
-                    'replacement_id' => $releaseId, 'exception' => $exception::class]);
+            foreach ([static fn () => app(NzbService::class)->deleteNzb((string) $release->guid),
+                static fn () => app(ReleaseImageService::class)->delete((string) $release->guid),
+                static fn () => Search::deleteRelease((int) $release->id)] as $cleanup) {
+                try {
+                    $cleanup();
+                } catch (Throwable $exception) {
+                    Log::warning('Could not clean up a superseded partial release.', ['release_id' => (int) $release->id,
+                        'replacement_id' => $releaseId, 'exception' => $exception::class]);
+                }
             }
         });
     }
