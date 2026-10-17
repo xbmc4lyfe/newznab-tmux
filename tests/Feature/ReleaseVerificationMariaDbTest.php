@@ -15,10 +15,13 @@ use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Tests\Support\StoredManifests;
 use Throwable;
 
 class ReleaseVerificationMariaDbTest extends ReleaseVerificationCandidatesTest
 {
+    use StoredManifests;
+
     private string $fixtureDatabase = '';
 
     private bool $fixtureCreated = false;
@@ -43,8 +46,9 @@ class ReleaseVerificationMariaDbTest extends ReleaseVerificationCandidatesTest
             $this->markTestSkipped('Requires the isolated verification MariaDB test database.');
         }
         $endpoint = [
-            'driver' => 'mysql', 'url' => null, 'host' => 'nntmux-verify-db', 'port' => 3306,
-            'database' => 'mysql', 'username' => 'root', 'password' => '', 'unix_socket' => '',
+            'driver' => 'mysql', 'url' => null, 'host' => getenv('VERIFICATION_MARIADB_HOST') ?: 'nntmux-verify-db',
+            'port' => (int) (getenv('VERIFICATION_MARIADB_PORT') ?: 3306), 'database' => 'mysql',
+            'username' => getenv('VERIFICATION_MARIADB_USERNAME') ?: 'root', 'password' => (string) getenv('VERIFICATION_MARIADB_PASSWORD'), 'unix_socket' => '',
             'charset' => 'utf8mb4', 'collation' => 'utf8mb4_unicode_ci', 'prefix' => '',
             'strict' => false, 'engine' => 'InnoDB ROW_FORMAT=DYNAMIC', 'options' => [],
         ];
@@ -269,7 +273,7 @@ class ReleaseVerificationMariaDbTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(0, (int) $state->pending_bytes);
         $this->assertSame(0, (int) $state->audit_cursor);
         $this->assertFalse((bool) $state->audit_retry_turn);
-        $this->assertFileDoesNotExist(app(ManifestStore::class)->path($stored));
+        $this->assertManifestNotStored($stored);
         $this->assertNull($repository->claim());
         $repository->enqueue($manifest);
         $this->assertNotNull($repository->claim(), 'Fresh admissions must work after reset unlocks.');
