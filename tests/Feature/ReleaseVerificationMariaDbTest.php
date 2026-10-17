@@ -83,7 +83,7 @@ class ReleaseVerificationMariaDbTest extends ReleaseVerificationCandidatesTest
         }
     }
 
-    private function dropOwnedFixture(): void
+    protected function dropOwnedFixture(): void
     {
         if (! $this->fixtureCreated) {
             DB::purge('verification_fixture_admin');
