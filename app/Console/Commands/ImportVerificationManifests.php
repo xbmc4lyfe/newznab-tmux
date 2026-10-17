@@ -27,7 +27,7 @@ class ImportVerificationManifests extends Command
         $limit = max(0, (int) $this->option('limit'));
         $deleteFiles = (bool) $this->option('delete-files');
         $cursor = max(0, (int) $this->option('since-id'));
-        $counts = ['imported' => 0, 'already' => 0, 'missing' => 0, 'invalid' => 0];
+        $counts = ['imported' => 0, 'already' => 0, 'missing' => 0, 'invalid' => 0, 'conflict' => 0, 'unreferenced' => 0];
         $seen = 0;
 
         do {
@@ -46,8 +46,8 @@ class ImportVerificationManifests extends Command
             }
         } while ($rows->count() === $batch && ($limit === 0 || $seen < $limit));
 
-        $this->line(sprintf('imported=%d already=%d missing=%d invalid=%d last_candidate_id=%d',
-            $counts['imported'], $counts['already'], $counts['missing'], $counts['invalid'], $cursor));
+        $this->line(sprintf('imported=%d already=%d missing=%d invalid=%d conflict=%d unreferenced=%d last_candidate_id=%d',
+            $counts['imported'], $counts['already'], $counts['missing'], $counts['invalid'], $counts['conflict'], $counts['unreferenced'], $cursor));
 
         return self::SUCCESS;
     }

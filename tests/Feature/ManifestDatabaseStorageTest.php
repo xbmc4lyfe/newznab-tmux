@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tests\Feature;
 
 use App\Services\Releases\Verification\ManifestStore;
+use App\Services\Releases\Verification\VerificationResetService;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use RuntimeException;
@@ -135,13 +136,54 @@ class ManifestDatabaseStorageTest extends TestCase
         $this->candidate($corrupt->name);
 
         $this->artisan('verification:import-manifests', ['--delete-files' => true])
-            ->expectsOutputToContain('imported=1 already=0 missing=0 invalid=1')
+            ->expectsOutputToContain('imported=1 already=0 missing=0 invalid=1 conflict=0 unreferenced=0')
             ->assertExitCode(0);
 
         $this->assertSame($valid->compressed, DB::table('release_verification_manifests')->where('name', $valid->name)->value('body'));
         $this->assertFileDoesNotExist($store->path($valid->name));
         $this->assertSame(0, DB::table('release_verification_manifests')->where('name', $corrupt->name)->count());
         $this->assertFileExists($store->path($corrupt->name));
+    }
+
+    public function test_import_keeps_the_legacy_file_when_the_stored_row_is_corrupt(): void
+    {
+        $store = new ManifestStore;
+        $valid = $store->prepare($this->manifest('row is corrupt'));
+        file_put_contents($store->path($valid->name), $valid->compressed);
+        $this->candidate($valid->name);
+        $corrupt = gzencode('{"different":"bytes"}');
+        DB::table('release_verification_manifests')->insert(['name' => $valid->name, 'body' => $corrupt, 'bytes' => strlen($corrupt)]);
+
+        $counts = $store->importLegacyFiles([$valid->name], true);
+
+        $this->assertSame(1, $counts['conflict']);
+        $this->assertFileExists($store->path($valid->name));
+        $this->assertSame($corrupt, DB::table('release_verification_manifests')->where('name', $valid->name)->value('body'));
+    }
+
+    public function test_import_does_not_recreate_a_manifest_that_no_candidate_references(): void
+    {
+        $store = new ManifestStore;
+        $orphan = $store->prepare($this->manifest('cleanup already removed its candidate'));
+        file_put_contents($store->path($orphan->name), $orphan->compressed);
+
+        $counts = $store->importLegacyFiles([$orphan->name], true);
+
+        $this->assertSame(1, $counts['unreferenced']);
+        $this->assertSame(0, DB::table('release_verification_manifests')->where('name', $orphan->name)->count());
+        $this->assertFileExists($store->path($orphan->name));
+    }
+
+    public function test_verification_reset_removes_database_manifests(): void
+    {
+        $store = new ManifestStore;
+        $name = $store->write($this->manifest('reset me'));
+        $this->candidate($name);
+
+        app(VerificationResetService::class)->run(static function (): void {});
+
+        $this->assertSame(0, DB::table('release_verification_manifests')->count());
+        $this->assertSame(0, DB::table('release_verification_candidates')->count());
     }
 
     public function test_files_mode_keeps_writing_manifest_files(): void

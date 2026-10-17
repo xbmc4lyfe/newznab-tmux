@@ -47,7 +47,9 @@ final class ManifestStore
     private function writeRow(PreparedManifest $prepared): string
     {
         $name = $prepared->name;
-        $existing = DB::table(self::TABLE)->where('name', $name)->value('body');
+        // A current read: under REPEATABLE READ a plain read could still see a row that cleanup
+        // deleted after this transaction's snapshot, and admission would then reference nothing.
+        $existing = DB::table(self::TABLE)->where('name', $name)->lockForUpdate()->value('body');
         if ($existing === null) {
             try {
                 DB::table(self::TABLE)->insert(['name' => $name, 'body' => $prepared->compressed, 'bytes' => strlen($prepared->compressed)]);
@@ -55,7 +57,7 @@ final class ManifestStore
                 return $name;
             } catch (UniqueConstraintViolationException) {
                 // A concurrent writer committed the same name first; validate what it stored.
-                $existing = DB::table(self::TABLE)->where('name', $name)->value('body');
+                $existing = DB::table(self::TABLE)->where('name', $name)->lockForUpdate()->value('body');
             }
         }
         if (! is_string($existing)) {
@@ -204,7 +206,7 @@ final class ManifestStore
     {
         $this->assertName($name);
         if ($this->usesDatabase()) {
-            $bytes = DB::table(self::TABLE)->where('name', $name)->value('bytes');
+            $bytes = DB::table(self::TABLE)->where('name', $name)->lockForUpdate()->value('bytes');
             if ($bytes !== null) {
                 return (int) $bytes;
             }
@@ -227,50 +229,69 @@ final class ManifestStore
     }
 
     /**
-     * Copy legacy manifest files into the database after verifying each decodes to its name.
-     * Returns counts of imported, already (row present), missing (no file) and invalid files.
-     * A file is removed only once the database holds its row; invalid files are left in place.
+     * Copy legacy manifest files into the database. Each file must decode to its name; rows are
+     * inserted under the capacity-state lock (the same order as admission and cleanup) and only
+     * while a candidate still references the name, so a concurrent cleanup cannot be undone.
+     * A file is removed only after a committed row for its name has itself been validated.
      *
      * @param  list<string>  $names
-     * @return array{imported: int, already: int, missing: int, invalid: int}
+     * @return array{imported: int, already: int, missing: int, invalid: int, conflict: int, unreferenced: int}
      */
     public function importLegacyFiles(array $names, bool $deleteFiles): array
     {
-        $counts = ['imported' => 0, 'already' => 0, 'missing' => 0, 'invalid' => 0];
+        $counts = ['imported' => 0, 'already' => 0, 'missing' => 0, 'invalid' => 0, 'conflict' => 0, 'unreferenced' => 0];
         $names = array_values(array_unique($names));
+        $files = [];
         foreach ($names as $name) {
             $this->assertName($name);
-        }
-        $present = array_flip(DB::table(self::TABLE)->whereIn('name', $names)->pluck('name')->all());
-        $rows = [];
-        foreach ($names as $name) {
-            if (isset($present[$name])) {
-                $counts['already']++;
-
-                continue;
-            }
             $path = $this->path($name);
             $body = is_file($path) ? @file_get_contents($path) : false;
             if ($body === false) {
-                $counts['missing']++;
-
-                continue;
+                $files[$name] = null;
+            } elseif ($this->validBody($name, $body)) {
+                $files[$name] = $body;
+            } else {
+                $files[$name] = false;
             }
-            $json = @gzdecode($body);
-            if ($json === false || hash('sha256', $json).'.json.gz' !== $name || ! $this->consumesExactly($body, $json)) {
-                $counts['invalid']++;
-
-                continue;
-            }
-            $rows[] = ['name' => $name, 'body' => $body, 'bytes' => strlen($body)];
-            $counts['imported']++;
         }
-        foreach (array_chunk($rows, 50) as $chunk) {
-            DB::table(self::TABLE)->insertOrIgnore($chunk);
+        $verified = [];
+        foreach (array_chunk($names, 50) as $chunk) {
+            DB::transaction(function () use ($chunk, $files, &$counts, &$verified): void {
+                if (DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first() === null) {
+                    throw new RuntimeException('Verification capacity state is unavailable; manifests not imported.');
+                }
+                $referenced = array_flip(DB::table('release_verification_candidates')->whereIn('manifest_path', $chunk)
+                    ->lockForUpdate()->pluck('manifest_path')->map(static fn ($name): string => (string) $name)->all());
+                $stored = DB::table(self::TABLE)->whereIn('name', $chunk)->lockForUpdate()->pluck('body', 'name')->all();
+                $insert = [];
+                foreach ($chunk as $name) {
+                    if (array_key_exists($name, $stored)) {
+                        if (is_string($stored[$name]) && $this->validBody($name, $stored[$name])) {
+                            $counts['already']++;
+                            $verified[] = $name;
+                        } else {
+                            $counts['conflict']++;
+                        }
+                    } elseif ($files[$name] === null) {
+                        $counts['missing']++;
+                    } elseif ($files[$name] === false) {
+                        $counts['invalid']++;
+                    } elseif (! isset($referenced[$name])) {
+                        $counts['unreferenced']++;
+                    } else {
+                        $insert[] = ['name' => $name, 'body' => $files[$name], 'bytes' => strlen($files[$name])];
+                        $counts['imported']++;
+                        $verified[] = $name;
+                    }
+                }
+                if ($insert !== []) {
+                    DB::table(self::TABLE)->insert($insert);
+                }
+            }, 5);
         }
         if ($deleteFiles) {
-            foreach (DB::table(self::TABLE)->whereIn('name', $names)->pluck('name') as $stored) {
-                $path = $this->path((string) $stored);
+            foreach ($verified as $name) {
+                $path = $this->path($name);
                 if (is_file($path)) {
                     unlink($path);
                 }
@@ -278,6 +299,13 @@ final class ManifestStore
         }
 
         return $counts;
+    }
+
+    private function validBody(string $name, string $body): bool
+    {
+        $json = @gzdecode($body);
+
+        return $json !== false && hash('sha256', $json).'.json.gz' === $name && $this->consumesExactly($body, $json);
     }
 
     /**
