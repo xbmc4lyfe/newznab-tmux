@@ -245,9 +245,9 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         }
         $path = $store->write($manifest);
         DB::table('release_verification_candidates')->insert(['identity' => sha1('publish'), 'groups_id' => 1,
-            'manifest_path' => $path, 'manifest_hash' => substr($path, 0, 64), 'manifest_bytes' => filesize($store->path($path)),
+            'manifest_path' => $path, 'manifest_hash' => substr($path, 0, 64), 'manifest_bytes' => $store->size($path),
             'last_unique_at' => now(), 'next_attempt_at' => now()]);
-        DB::table('release_verification_state')->update(['pending_bytes' => filesize($store->path($path))]);
+        DB::table('release_verification_state')->update(['pending_bytes' => $store->size($path)]);
         $claim = app(CandidateRepository::class)->claim();
         if ($failure === 'legacy_forged') {
             $manifest['legacy_release_id'] = 778;

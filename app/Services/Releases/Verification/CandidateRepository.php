@@ -106,10 +106,7 @@ final class CandidateRepository
                     $headerAssessment = null;
                 }
                 $path = $prepared === null ? $this->store->write($manifest) : $this->store->writePrepared($prepared);
-                $size = filesize($this->store->path($path));
-                if ($size === false) {
-                    throw new RuntimeException('Cannot reserve manifest storage.');
-                }
+                $size = $this->store->size($path);
                 $arrivalAt = Carbon::parse($collection->last_seen_at ?? $collection->dateadded ?? $collection->added ?? now())->format('Y-m-d H:i:s');
                 $lastUniqueAt = $existing === null ? $arrivalAt : ($newArticles ? max($arrivalAt, $existing->last_unique_at) : $existing->last_unique_at);
                 $expired = $lastUniqueAt < now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
@@ -218,7 +215,7 @@ final class CandidateRepository
                         throw new RuntimeException('Verification migration has not initialized capacity state.');
                     }
                     $path = $prepared === null ? $this->store->write($manifest) : $this->store->writePrepared($prepared);
-                    $bytes = (int) filesize($this->store->path($path));
+                    $bytes = $this->store->size($path);
                     $pending = (int) $state->pending_bytes - (int) ($existing->manifest_bytes ?? 0) + $bytes;
                     if ($pending > (int) config('release_verification.pending_bytes')) {
                         if ($existing === null || $existing->manifest_path !== $path) {
@@ -360,7 +357,7 @@ final class CandidateRepository
         // its exact precomputed pair without compression under capacity ownership.
         $original = $manifest;
         $path = $this->store->writePrepared($prepared);
-        $bytes = (int) filesize($this->store->path($path));
+        $bytes = $this->store->size($path);
         $pending = (int) $state->pending_bytes - (int) $existing->manifest_bytes + $bytes;
         if ($pending > (int) config('release_verification.pending_bytes')) {
             $this->store->deleteIfUnreferenced($path);

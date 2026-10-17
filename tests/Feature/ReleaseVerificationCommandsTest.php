@@ -243,7 +243,7 @@ class ReleaseVerificationCommandsTest extends ReleaseVerificationCandidatesTest
         $now = now();
         $store = app(ManifestStore::class);
         $name = $store->write(['files' => [], 'expected_files' => 0]);
-        $bytes = filesize($store->path($name));
+        $bytes = $store->size($name);
         DB::table('release_verification_state')->update(['pending_bytes' => $bytes]);
         $id = DB::table('release_verification_candidates')->insertGetId(['identity' => sha1('expired'), 'groups_id' => 1,
             'manifest_path' => $name, 'manifest_bytes' => $bytes, 'manifest_hash' => substr($name, 0, 64),
