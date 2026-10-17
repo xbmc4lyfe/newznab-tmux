@@ -409,11 +409,15 @@ def bind_source_record(source: str, read_only: bool, project_dir: Path) -> str:
 
     path = Path(source)
     try:
-        if path.is_file():
-            return f"file {sha256_bytes(path.read_bytes())} {source}"
-        if not path.exists():
+        # os.stat, not Path.is_file()/exists(): from Python 3.14 those return False on permission
+        # errors, which would record an unreadable mount as missing instead of failing closed.
+        try:
+            mode = os.stat(path).st_mode
+        except FileNotFoundError:
             return f"missing {source}"
-        if not path.is_dir():
+        if stat.S_ISREG(mode):
+            return f"file {sha256_bytes(path.read_bytes())} {source}"
+        if not stat.S_ISDIR(mode):
             return f"other {source}"
         resolved = path.resolve()
         # Writable mounts are data or logs; host-system trees are observed, not configuration.
@@ -731,16 +735,24 @@ def mounts_changed_since_start(docker_dir: Path, svc: str) -> bool:
             continue
         path = Path(volume["source"])
         try:
-            if path.is_file():
-                newest = path.stat().st_mtime
-            elif path.is_dir() and volume.get("read_only"):
+            try:
+                info = os.stat(path)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                newest = info.st_mtime
+            elif stat.S_ISDIR(info.st_mode) and volume.get("read_only"):
                 if is_host_system(str(path.resolve())):
                     continue
+
+                def walk_error(error: OSError) -> None:
+                    raise error
+
                 # Directory mtimes too: deleting or renaming a nested file only touches its parent.
                 newest = max(
                     stamp
-                    for root, _, files in os.walk(path)
-                    for stamp in [Path(root).stat().st_mtime, *((Path(root) / name).stat().st_mtime for name in files)]
+                    for root, _, files in os.walk(path, onerror=walk_error)
+                    for stamp in [os.stat(root).st_mtime, *(os.stat(Path(root) / name).st_mtime for name in files)]
                 )
             else:
                 continue
@@ -841,15 +853,15 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
     for svc in DATA_SERVICES:
         if not compose_present(state, svc):
             data_reasons[svc] = "not rendered"
-        elif (first_deploy or legacy_stamp) and mounts_changed_since_start(docker_dir, svc):
+        elif (first_deploy or legacy_stamp or f"service:{svc}" not in stamped) and mounts_changed_since_start(docker_dir, svc):
             # A mounted file changed after the container started: only a recreate loads it.
             dirty_data.append(svc)
             data_reasons[svc] = "mounted config newer than container"
-        elif first_deploy or legacy_stamp:
+        elif first_deploy or legacy_stamp or f"service:{svc}" not in stamped:
             # No per-service record: Compose reconciles drift while writers are stopped, without
             # force-recreating stateful services.
             reconcile_data.append(svc)
-            data_reasons[svc] = "reconcile (no stamp)" if first_deploy else "reconcile (legacy stamp)"
+            data_reasons[svc] = "reconcile (no stamp)" if first_deploy else "reconcile (no record)"
         elif stamped.get(f"service:{svc}") != state[f"service:{svc}"]:
             dirty_data.append(svc)
             data_reasons[svc] = "config/compose changed"
@@ -862,15 +874,13 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
     for svc in infra_services(state):
         if not compose_present(state, svc):
             infra_reasons[svc] = "not rendered"
-        elif (first_deploy or legacy_stamp) and mounts_changed_since_start(docker_dir, svc):
+        elif (first_deploy or legacy_stamp or f"service:{svc}" not in stamped) and mounts_changed_since_start(docker_dir, svc):
             dirty_infra.append(svc)
             infra_reasons[svc] = "mounted config newer than container"
-        elif first_deploy or legacy_stamp:
+        elif first_deploy or legacy_stamp or f"service:{svc}" not in stamped:
+            # Also covers a service added to Compose: a non-forced up creates it.
             reconcile_infra.append(svc)
-            infra_reasons[svc] = "reconcile (no stamp)" if first_deploy else "reconcile (legacy stamp)"
-        elif f"service:{svc}" not in stamped:
-            dirty_infra.append(svc)
-            infra_reasons[svc] = "added to Compose"
+            infra_reasons[svc] = "reconcile (no stamp)" if first_deploy else "reconcile (no record)"
         elif stamped.get(f"service:{svc}") != state[f"service:{svc}"]:
             dirty_infra.append(svc)
             infra_reasons[svc] = "config/compose changed"
@@ -878,7 +888,8 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
             infra_reasons[svc] = "unchanged"
 
     compose_global_changed = not first_deploy and stamped.get("effective") != state["effective"]
-    if compose_global_changed and not dirty_app and not dirty_data and not dirty_infra:
+    reconciling = bool(reconcile_data or reconcile_infra)
+    if compose_global_changed and not dirty_app and not dirty_data and not dirty_infra and not reconciling:
         for svc in APP_SERVICES:
             dirty_app.append(svc)
             app_reasons[svc] = "compose config changed"
@@ -894,7 +905,8 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
         or all_app_compose_changed
     )
 
-    if not dirty_app and not dirty_data and not dirty_infra and not migrate:
+    # Reconcile-only work (e.g. a service added to Compose) is a rollout, never a no-op skip.
+    if not dirty_app and not dirty_data and not dirty_infra and not migrate and not reconciling:
         mode = "noop"
     elif migrate or dirty_data:
         mode = "full"
@@ -932,6 +944,27 @@ def main() -> None:
     stamp_path = Path(os.environ.get("DEPLOY_STAMP", docker_dir / ".deploy.stamp"))
 
     cmd = sys.argv[1] if len(sys.argv) > 1 else "--explain"
+
+    if cmd == "--record-service":
+        # After a data or infra service was successfully (re)created mid-run, record what it now runs
+        # so a later failure cannot leave a stamp that hides it. The fingerprint line stays invalid
+        # until the whole run succeeds and the guard publishes a complete stamp.
+        services = sys.argv[2:]
+        state = compute_state(repo, docker_dir, include_compose=True)
+        stamped = parse_stamp(stamp_path)
+        record = {k: v for k, v in stamped.items() if k not in ("fingerprint", "__legacy__")}
+        if "__legacy__" in stamped:
+            record = {}
+        for svc in services:
+            for key in (f"service:{svc}", f"compose:{svc}"):
+                if key in state:
+                    record[key] = state[key]
+                else:
+                    record.pop(key, None)
+        tmp = stamp_path.with_name(f"{stamp_path.name}.tmp.{os.getpid()}")
+        tmp.write_text("stale\n" + "".join(f"{key}={record[key]}\n" for key in sorted(record)))
+        os.replace(tmp, stamp_path)
+        return
 
     if cmd == "--classify":
         # Operator/test aid: print each path's ownership buckets ("-" when it cannot reach an image).

@@ -17,13 +17,13 @@ mod docker 'docker/Justfile'
 
 export SAIL := env("SAIL", "./sail")
 export DOCKER_COMPOSE := env("DOCKER_COMPOSE", "docker compose")
-SEARCH_DRIVER := env("SEARCH_DRIVER", `v=$(sed -n 's/^SEARCH_DRIVER=//p' .env 2>/dev/null | tail -n 1 | tr -d "\"'"); printf '%s' "${v:-manticore}"`)
-ENV_COMPOSE_PROFILES := `sed -n 's/^COMPOSE_PROFILES=//p' .env 2>/dev/null | tail -n 1 | tr -d "\"'"`
+SEARCH_DRIVER := env("SEARCH_DRIVER", `scripts/dotenv-get SEARCH_DRIVER manticore`)
+ENV_COMPOSE_PROFILES := `scripts/dotenv-get COMPOSE_PROFILES`
 # Like the former `export COMPOSE_PROFILES ?= $(SEARCH_DRIVER)` after `-include .env`.
 PROFILES := env("COMPOSE_PROFILES", if ENV_COMPOSE_PROFILES != "" { ENV_COMPOSE_PROFILES } else { SEARCH_DRIVER })
-MONITORING_ENABLED := env("MONITORING_ENABLED", `sed -n 's/^MONITORING_ENABLED=//p' .env 2>/dev/null | tail -n 1 | tr -d "\"'"`)
-FORWARD_PROMETHEUS_PORT := env("FORWARD_PROMETHEUS_PORT", `v=$(sed -n 's/^FORWARD_PROMETHEUS_PORT=//p' .env 2>/dev/null | tail -n 1 | tr -d "\"'"); printf '%s' "${v:-9090}"`)
-WWWUSER := env("WWWUSER", `sed -n 's/^WWWUSER=//p' .env 2>/dev/null | tail -n 1 | tr -d "\"'"`)
+MONITORING_ENABLED := env("MONITORING_ENABLED", `scripts/dotenv-get MONITORING_ENABLED`)
+FORWARD_PROMETHEUS_PORT := env("FORWARD_PROMETHEUS_PORT", `scripts/dotenv-get FORWARD_PROMETHEUS_PORT 9090`)
+WWWUSER := env("WWWUSER", `scripts/dotenv-get WWWUSER`)
 export SERVICE := env("SERVICE", "")
 export CMD := env("CMD", "")
 export cmd := env("cmd", "")

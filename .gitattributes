@@ -57,6 +57,7 @@ Justfile		-binary text eol=lf
 docker/bin/deploy-guard	-binary text eol=lf
 docker/Justfile		-binary text eol=lf
 /scripts/nzb_fingerprint.py	-binary text eol=lf
+/scripts/dotenv-get -binary text eol=lf
 /tests/Unit/test_nzb_fingerprint.py	-binary text eol=lf
 /scripts/benchmark-yenc-abi.py -binary text eol=lf
 /tests/Unit/test_yenc_abi_benchmark.py -binary text eol=lf

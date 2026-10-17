@@ -31,6 +31,8 @@ fi
 if [ -n "$DIRTY_INFRA" ]; then
     # shellcheck disable=SC2086
     compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $DIRTY_INFRA
+    # shellcheck disable=SC2086
+    "$DIR/bin/deploy-plan" --record-service $DIRTY_INFRA
     verify
 fi
 
@@ -38,6 +40,8 @@ if [ -n "$RECONCILE_INFRA" ]; then
     # Compose recreates only services whose rendered configuration drifted.
     # shellcheck disable=SC2086
     compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $RECONCILE_INFRA
+    # shellcheck disable=SC2086
+    "$DIR/bin/deploy-plan" --record-service $RECONCILE_INFRA
     verify
 fi
 
@@ -173,6 +177,8 @@ fi
 if [ -n "$DIRTY_DATA" ]; then
     # shellcheck disable=SC2086
     compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $DIRTY_DATA
+    # shellcheck disable=SC2086
+    "$DIR/bin/deploy-plan" --record-service $DIRTY_DATA
     verify
 fi
 
@@ -180,6 +186,8 @@ if [ -n "$RECONCILE_DATA" ]; then
     # Without a stamp, only Compose drift is reconciled; unchanged data services keep running.
     # shellcheck disable=SC2086
     compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $RECONCILE_DATA
+    # shellcheck disable=SC2086
+    "$DIR/bin/deploy-plan" --record-service $RECONCILE_DATA
     verify
 fi
 

@@ -188,6 +188,24 @@ class ViteDockerConfigurationTest extends TestCase
         $this->assertGreaterThan(30, $checked);
     }
 
+    public function test_root_env_values_are_read_like_compose_and_make(): void
+    {
+        $directory = sys_get_temp_dir().'/dotenv-get-'.bin2hex(random_bytes(4));
+        mkdir($directory);
+        file_put_contents($directory.'/.env', "SEARCH_DRIVER=elasticsearch # engine\nMONITORING_ENABLED=\"true\" # on\nWWWUSER = 501\nWWWUSER=502\nCOMPOSE_PROFILES=\n");
+        try {
+            $read = fn (string $key, string $default = ''): string => (new Process([__DIR__.'/../../scripts/dotenv-get', $key, $default], $directory))->mustRun()->getOutput();
+            $this->assertSame('elasticsearch', $read('SEARCH_DRIVER', 'manticore'));
+            $this->assertSame('true', $read('MONITORING_ENABLED'));
+            $this->assertSame('502', $read('WWWUSER'));
+            $this->assertSame('9090', $read('FORWARD_PROMETHEUS_PORT', '9090'));
+            $this->assertSame('', $read('COMPOSE_PROFILES'));
+        } finally {
+            unlink($directory.'/.env');
+            rmdir($directory);
+        }
+    }
+
     public function test_role_targets_copy_the_files_only_their_role_runs(): void
     {
         $dockerfile = $this->projectFile('Dockerfile');

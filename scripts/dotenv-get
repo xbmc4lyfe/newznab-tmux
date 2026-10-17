@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""Print KEY from ./.env (or DEFAULT when absent/empty) using the Compose-compatible rules that
+docker/bin/compose and docker/Justfile apply: optional `export`, spaces around `=`, quoted values
+with an optional trailing comment, unquoted values ending at an inline ` #` comment, last wins."""
+import re
+import sys
+from pathlib import Path
+
+key, default = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else "")
+value = ""
+try:
+    lines = Path(".env").read_text(encoding="utf-8", errors="surrogateescape").splitlines()
+except OSError:
+    lines = []
+for raw in lines:
+    m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", raw)
+    if m and m.group(1) == key:
+        quoted = re.match(r"""^(["'])(.*)\1\s*(?:#.*)?$""", m.group(2))
+        value = quoted.group(2) if quoted else re.sub(r"\s#.*$", "", m.group(2)).strip()
+sys.stdout.write(value or default)

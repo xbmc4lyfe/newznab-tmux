@@ -164,7 +164,7 @@ SH);
         $this->assertFalse($process->isSuccessful());
         $this->assertStringNotContainsString(' stop ', $this->events());
         $this->assertStringNotContainsString('artisan migrate', $this->events());
-        $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp');
+        $this->assertNotStamped();
     }
 
     public function test_legacy_image_requires_explicit_transition_opt_in(): void
@@ -228,7 +228,7 @@ SH);
         $this->assertFalse($process->isSuccessful());
         // Infra (before any drain) and data reconciliation may run; new app containers never start.
         $this->assertStringNotContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
-        $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp');
+        $this->assertNotStamped();
         $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.time');
     }
 
@@ -238,7 +238,7 @@ SH);
         $process->run();
         $this->assertFalse($process->isSuccessful());
         $this->assertFileExists($this->directory.'/docker/.build.stamp');
-        $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp');
+        $this->assertNotStamped();
         $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.time');
     }
 
@@ -339,7 +339,7 @@ SH);
         $this->assertStringContainsString('artisan tmux:drain --resume', $this->events());
         $this->assertStringNotContainsString(' stop web scheduler indexer', $this->events());
         $this->assertStringNotContainsString('artisan migrate', $this->events());
-        $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp');
+        $this->assertNotStamped();
     }
 
     public function test_checkout_changes_while_stopping_writers_abort_before_migration(): void
@@ -352,7 +352,7 @@ SH);
         $this->assertStringNotContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
         $this->assertLessThan(strpos($this->events(), 'scheduler.py drain'), strrpos($this->events(), ' up -d') ?: -1, 'nothing may start after the writers stop');
         $this->assertStringNotContainsString('tmux:drain --resume', $this->events());
-        $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp');
+        $this->assertNotStamped();
     }
 
     public function test_failed_scheduler_drain_keeps_all_services_live_and_never_migrates(): void
@@ -759,6 +759,55 @@ SH);
         $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 grafana', $this->events());
     }
 
+    public function test_infra_recreated_before_a_failed_drain_is_recorded_so_a_revert_or_retry_is_correct(): void
+    {
+        mkdir($this->directory.'/docker/config/caddy', 0777, true);
+        file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', "A\n");
+        $config = ['NNTMUX_CONFIG_ID' => $this->composeJson()];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+
+        // B is applied to proxy, then a code change's drain fails.
+        file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', "B\n");
+        file_put_contents($this->directory.'/app.txt', "two\n");
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_SCHEDULER_DRAIN_FAIL' => '1'])->run();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+        $this->assertSame('stale', strtok((string) file_get_contents($this->directory.'/docker/.deploy.stamp'), "\n"));
+
+        // A retry does not recreate proxy again; it is already on B.
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_SCHEDULER_DRAIN_FAIL' => '1'])->run();
+        $this->assertStringNotContainsString(' proxy', $this->events());
+
+        // Reverting both changes must put proxy back on A rather than skip.
+        file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', "A\n");
+        file_put_contents($this->directory.'/app.txt', "one\n");
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+
+        // And afterwards the stack is fully stamped again: the next poll skips.
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $this->assertStringNotContainsString(' up -d', $this->events());
+    }
+
+    public function test_mount_inside_an_unreadable_directory_fails_closed(): void
+    {
+        mkdir($this->directory.'/docker/config/redis', 0777, true);
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 1gb\n");
+        chmod($this->directory.'/docker/config/redis', 0000);
+        try {
+            $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => $this->composeJson()]);
+            $process->run();
+        } finally {
+            chmod($this->directory.'/docker/config/redis', 0755);
+        }
+        $this->assertNotSame(0, $process->getExitCode());
+        $this->assertStringContainsString('cannot fingerprint mounted configuration', $process->getErrorOutput());
+        $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp');
+    }
+
     public function test_host_system_paths_match_on_path_boundaries_only(): void
     {
         $script = 'import importlib.machinery, importlib.util, sys; l = importlib.machinery.SourceFileLoader("dp", sys.argv[1]); '
@@ -801,7 +850,8 @@ SH);
 
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => '{"services":{'.$services.',"sidecar":{}}}'])->mustRun();
         $events = $this->events();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 sidecar', $events);
+        // A service added to Compose is created by a non-forced up.
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 sidecar', $events);
         $this->assertStringNotContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $events);
         $this->assertStringNotContainsString('artisan migrate', $events);
         $this->assertFileExists($this->directory.'/docker/.deploy.stamp');
@@ -1147,6 +1197,17 @@ SH);
         $services['redis'] = ['volumes' => [$bind('config/redis/redis.conf', '/usr/local/etc/redis/redis.conf')]];
 
         return (string) json_encode(['services' => $services], JSON_UNESCAPED_SLASHES);
+    }
+
+    /** A failed run may record services it recreated, but never a valid fingerprint. */
+    private function assertNotStamped(): void
+    {
+        $stamp = $this->directory.'/docker/.deploy.stamp';
+        if (file_exists($stamp)) {
+            $this->assertSame('stale', strtok((string) file_get_contents($stamp), "\n"));
+        } else {
+            $this->addToAssertionCount(1);
+        }
     }
 
     private function events(): string
