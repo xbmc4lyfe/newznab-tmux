@@ -94,7 +94,7 @@ final class VerificationRunDiagnosticsCommandTest extends ReleaseVerificationCan
         $this->assertSame(0, $this->runDiagnostics());
         $this->assertTrue($released);
         $this->assertCount(1, $reports);
-        $this->assertSame('unknown', DB::table('release_verification_candidates')->value('status'));
+        $this->assertSame('header_rejected', DB::table('release_verification_candidates')->value('status'));
         $this->assertNull(DB::table('release_verification_candidates')->value('lease_token'));
     }
 
