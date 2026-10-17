@@ -64,7 +64,7 @@ final class VerificationWorkerLocks
     /** This host's first slot number; hosts sharing a database configure disjoint ranges. */
     public static function firstSlot(): int
     {
-        return max(0, min(self::MAX_SLOT_NUMBER - self::MAX_SLOTS, (int) config('release_verification.slot_offset', 0))) + 1;
+        return max(0, min(self::MAX_SLOT_NUMBER - self::slots(), (int) config('release_verification.slot_offset', 0))) + 1;
     }
 
     public static function lastSlot(): int

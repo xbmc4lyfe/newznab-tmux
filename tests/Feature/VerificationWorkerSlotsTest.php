@@ -52,8 +52,14 @@ class VerificationWorkerSlotsTest extends TestCase
         } finally {
             array_walk($locks, static fn (VerificationWorkerLocks $lock) => $lock->close());
         }
+        config(['release_verification.candidate_workers' => 16, 'release_verification.slot_offset' => 224]);
+        $this->assertSame(225, VerificationWorkerLocks::firstSlot());
+        $this->assertSame(240, VerificationWorkerLocks::lastSlot());
         config(['release_verification.candidate_workers' => 64, 'release_verification.slot_offset' => 500]);
         $this->assertSame(193, VerificationWorkerLocks::firstSlot());
+        $this->assertSame(VerificationWorkerLocks::MAX_SLOT_NUMBER, VerificationWorkerLocks::lastSlot());
+        config(['release_verification.candidate_workers' => 16, 'release_verification.slot_offset' => 500]);
+        $this->assertSame(241, VerificationWorkerLocks::firstSlot());
         $this->assertSame(VerificationWorkerLocks::MAX_SLOT_NUMBER, VerificationWorkerLocks::lastSlot());
     }
 
