@@ -37,7 +37,7 @@ final class ReleaseVerificationCollector implements MetricsCollector
         }
         yield MetricFamily::gauge('nntmux_release_verification_verified_bytes_per_second', 'Latest bounded verifier measurement.')
             ->add(is_numeric($snapshot['verified_bytes_per_second'] ?? null) ? (float) $snapshot['verified_bytes_per_second'] : 0);
-        $oldest = DB::table('release_verification_candidates')->whereNull('release_id')->whereIn('status', ['ready', 'waiting_upload', 'pending', 'unknown', 'verifying', 'dirty', 'unrepairable'])->min('last_unique_at');
+        $oldest = DB::table('release_verification_candidates')->whereNull('release_id')->whereIn('status', ['ready', 'waiting_upload', 'pending', 'unknown', 'header_rejected', 'verifying', 'dirty', 'unrepairable'])->min('last_unique_at');
         yield MetricFamily::gauge('nntmux_release_verification_backlog_age_seconds', 'Age of the oldest unverified candidate.')
             ->add($oldest === null ? 0 : max(0, now()->timestamp - strtotime($oldest)));
     }

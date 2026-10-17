@@ -7,7 +7,8 @@ namespace App\Services\Releases\Verification;
 final readonly class VerificationResult
 {
     /** @param array<string, mixed> $manifest */
-    public function __construct(public string $verdict, public string $reason, public array $manifest = [], public bool $waitingForHeaders = false) {}
+    public function __construct(public string $verdict, public string $reason, public array $manifest = [], public bool $waitingForHeaders = false,
+        public bool $headerRejected = false) {}
 
     public function passed(): bool
     {

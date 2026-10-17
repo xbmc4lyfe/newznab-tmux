@@ -43,7 +43,7 @@ class ReleaseVerificationMetricsTest extends ReleaseVerificationCandidatesTest
             $this->assertSame(2, $claims);
             $this->assertSame(0, $readsBeforeSecondClaim);
             $this->assertSame(0, VerificationMetricTreeProbe::$reads);
-            $this->assertSame(2, DB::table('release_verification_candidates')->where('status', 'unknown')->count());
+            $this->assertSame(2, DB::table('release_verification_candidates')->where('status', 'header_rejected')->count());
             config(['release_verification.storage_path' => $nativeRoot]);
             app(CandidateRepository::class)->enqueue(['identity' => sha1('native-metric-snapshot'), 'groups_id' => 1,
                 'conflict' => true, 'files' => []]);
