@@ -361,6 +361,8 @@ class ReleaseBrowseService
         ], 1);
 
         // An unavailable, estimated, or empty answer (for example a freshly rebuilt index) defers to SQL.
+        // A partially repopulated index still reports a smaller exact total until it catches up;
+        // the short count cache bounds that, and rebuilds can use the mysql_search_fallback mode.
         if (($result['available'] ?? true) === false
             || ($result['total_exact'] ?? false) !== true
             || (int) $result['total'] <= 0) {
