@@ -38,6 +38,7 @@ case "$*" in
         fi ;;
     *'inspect --format {{.State.Status}}'*) echo "running ${NNTMUX_HEALTH_STATUS:-healthy}" ;;
     *' ps -a -q '*) [ "${NNTMUX_NO_EXISTING_APP:-0}" = 1 ] || echo fixture-container ;;
+    *' ps -q horizon'*) [ "${NNTMUX_HORIZON_PS_FAIL:-0}" != 1 ] || exit 50; [ "${NNTMUX_SERVICE_MISSING:-0}" = 1 ] || echo fixture-container ;;
     *' ps -q '*) [ "${NNTMUX_SERVICE_MISSING:-0}" = 1 ] || echo fixture-container ;;
     *'scheduler python3 -c '*) [ "${NNTMUX_SCHEDULER_CAPABILITY_FAIL:-0}" != 1 ] || exit 48; echo "${NNTMUX_SCHEDULER_CAPABILITY:-native}" ;;
     *'scheduler.py drain --timeout='*)
@@ -342,6 +343,16 @@ SH);
         $this->assertStringNotContainsString(' stop web scheduler indexer', $this->events());
         $this->assertStringNotContainsString('artisan migrate', $this->events());
         $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp');
+    }
+
+    public function test_failed_horizon_lookup_aborts_before_any_drain_or_migration(): void
+    {
+        $process = $this->deploy(['NNTMUX_HORIZON_PS_FAIL' => '1']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringNotContainsString('scheduler.py drain', $this->events());
+        $this->assertStringNotContainsString(' stop ', $this->events());
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
     }
 
     public function test_writers_keep_running_while_horizon_drains(): void

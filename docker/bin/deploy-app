@@ -79,7 +79,9 @@ fi
 # work, which queues in Redis for the new Horizon. Waiting for Horizon after their
 # drains idled every writer for its whole grace. The explicit timeout also protects
 # containers created before the longer Compose grace.
-if [ -n "$(compose ps -q horizon)" ]; then
+# A checked assignment: a failed lookup must abort, never read as an absent Horizon.
+horizon=$(compose ps -q horizon)
+if [ -n "$horizon" ]; then
     horizon_stopped=1
     compose stop --timeout 1920 horizon
     verify
