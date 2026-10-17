@@ -209,6 +209,19 @@ class ReleaseVerificationCandidatesTest extends TestCase
         $this->assertTrue((bool) $row->header_check_pending);
     }
 
+    public function test_new_headers_requeue_a_candidate_waiting_out_a_deterministic_failure(): void
+    {
+        $this->freezeSecond();
+        $repository = app(CandidateRepository::class);
+        $repository->archive($this->collection('a@b'));
+        DB::table('release_verification_candidates')->update(['status' => 'unknown',
+            'reason' => 'Spot-check article identity differs from its header.', 'next_attempt_at' => now()->addDay()]);
+
+        $repository->archive($this->collection('c@d', 2));
+
+        $this->assertLessThanOrEqual(now()->format('Y-m-d H:i:s'), DB::table('release_verification_candidates')->value('next_attempt_at'));
+    }
+
     public function test_duplicate_arrivals_do_not_extend_expiry(): void
     {
         $repository = app(CandidateRepository::class);

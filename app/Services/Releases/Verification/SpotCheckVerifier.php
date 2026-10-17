@@ -46,7 +46,7 @@ final class SpotCheckVerifier
         $articleByteLimit = max(0, min($byteLimit, (int) ($this->options['spot_check_article_bytes'] ?? 1048576)));
         $sample = ($this->planner ?? new SpotCheckPlanner)->select($manifest, $articleLimit, $byteLimit, $articleByteLimit);
         if ($sample === []) {
-            return new VerificationResult('unknown', 'No article fits the configured spot-check budget.');
+            return self::deterministic('No article fits the configured spot-check budget.');
         }
         $inferredTotals = [];
         foreach ($manifest['files'] as $file) {
@@ -55,7 +55,7 @@ final class SpotCheckVerifier
             }
         }
         if (array_diff_key($inferredTotals, array_fill_keys(array_column($sample, 'file_key'), true)) !== []) {
-            return new VerificationResult('unknown', 'Inferred article totals cannot be proved within the spot-check budget.');
+            return self::deterministic('Inferred article totals cannot be proved within the spot-check budget.');
         }
 
         $bytes = 0;
@@ -68,13 +68,17 @@ final class SpotCheckVerifier
             $heartbeat();
             $remaining = min($articleByteLimit, $byteLimit - $bytes);
             if ($remaining < 1) {
-                return new VerificationResult('unknown', 'Spot-check transfer budget is exhausted.');
+                return self::deterministic('Spot-check transfer budget is exhausted.');
             }
             $raw = $this->source instanceof NntpArticleSource
                 ? $this->source->fetchBounded($segment['messageid'], $remaining)
                 : $this->source->fetch($segment['messageid']);
-            if ($raw === '' || strlen($raw) > $articleByteLimit || $bytes + strlen($raw) > $byteLimit) {
-                return new VerificationResult('unknown', 'Spot-check article exceeded the configured transfer budget.');
+            // An empty response is a fetch problem, not a property of the article.
+            if ($raw === '') {
+                return new VerificationResult('unknown', 'Spot-check article was empty; retry verification later.');
+            }
+            if (strlen($raw) > $articleByteLimit || $bytes + strlen($raw) > $byteLimit) {
+                return self::deterministic('Spot-check article exceeded the configured transfer budget.');
             }
             $article = VerifiedArticle::decode($raw, $this->decoder);
             if ($article->part !== $segment['number'] || $article->size < 1
@@ -86,7 +90,7 @@ final class SpotCheckVerifier
                 || ($article->part === $segment['totalparts'] && $article->offset + strlen($article->bytes) !== $article->size)
                 || ! $this->matchesHeaderFilename($manifest, $segment['file_key'], $article->name)
                 || ($article->totalParts !== null && $article->totalParts !== $segment['totalparts'])) {
-                return new VerificationResult('unknown', 'Spot-check article identity differs from its header.');
+                return self::deterministic('Spot-check article identity differs from its header.');
             }
             $fileKey = $segment['file_key'];
             if ($segment['totalparts_inferred'] && ($article->totalParts !== null || $article->part === $segment['totalparts'])) {
@@ -94,13 +98,13 @@ final class SpotCheckVerifier
             }
             $fileIdentity = [$article->name, $article->size];
             if (isset($fileIdentities[$fileKey]) && $fileIdentities[$fileKey] !== $fileIdentity) {
-                return new VerificationResult('unknown', 'Spot-check articles have conflicting file identities.');
+                return self::deterministic('Spot-check articles have conflicting file identities.');
             }
             $fileIdentities[$fileKey] = $fileIdentity;
             $ranges[$fileKey][$article->part] = [$article->offset, $article->offset + strlen($article->bytes)];
             $identity = mb_strtolower(\Normalizer::normalize($article->name) ?: $article->name);
             if (isset($identities[$identity]) && $identities[$identity] !== $article->name) {
-                return new VerificationResult('unknown', 'Spot-check filenames collide on the storage filesystem.');
+                return self::deterministic('Spot-check filenames collide on the storage filesystem.');
             }
             $identities[$identity] = $article->name;
             $bytes += strlen($raw);
@@ -108,7 +112,7 @@ final class SpotCheckVerifier
             $identityHints[] = ['name' => $article->name, 'source' => 'yenc-spot-check'];
         }
         if (in_array(false, $inferredTotals, true)) {
-            return new VerificationResult('unknown', 'Inferred article total has no body total or terminal endpoint proof.');
+            return self::deterministic('Inferred article total has no body total or terminal endpoint proof.');
         }
         foreach ($ranges as $fileRanges) {
             ksort($fileRanges);
@@ -117,7 +121,7 @@ final class SpotCheckVerifier
             foreach ($fileRanges as $part => [$begin, $end]) {
                 if ($previousEnd !== null && ($begin < $previousEnd
                     || ($part === $previousPart + 1 && $begin !== $previousEnd))) {
-                    return new VerificationResult('unknown', 'Spot-check articles expose a missing or overlapping byte range.');
+                    return self::deterministic('Spot-check articles expose a missing or overlapping byte range.');
                 }
                 $previousPart = $part;
                 $previousEnd = $end;
@@ -125,7 +129,7 @@ final class SpotCheckVerifier
         }
 
         if ($inventory->bytes($manifest) < 1) {
-            return new VerificationResult('unknown', 'Candidate has no positive declared size.');
+            return self::deterministic('Candidate has no positive declared size.');
         }
 
         $sampled = self::withEvidence($manifest, ['articles' => count($sample), 'bytes' => $bytes,
@@ -137,6 +141,16 @@ final class SpotCheckVerifier
         }
 
         return new VerificationResult('sampled', 'Sampled article checks passed; the full payload was not downloaded.', $sampled);
+    }
+
+    /**
+     * The manifest version, its deterministically planned sample and the configuration decide this
+     * outcome, so an immediate retry would fetch the same article and fail the same way. Transport
+     * and decoding errors are thrown instead and keep the ordinary retry interval.
+     */
+    private static function deterministic(string $reason): VerificationResult
+    {
+        return new VerificationResult('unknown', $reason, deterministic: true);
     }
 
     /**
