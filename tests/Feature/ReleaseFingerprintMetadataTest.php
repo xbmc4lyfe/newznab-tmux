@@ -268,7 +268,8 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         $upathExtra = pack('vvCV', 0x7075, 5 + strlen($utf8Override), 1, $legacyCrc).$utf8Override;
         $zipOverride = "PK\x03\x04".pack('vvvvvVVVvv', 20, 0x0000, 8, 0, 0, 0x1234_5678, 100, 200, strlen($legacyName), strlen($upathExtra))
             .$legacyName.$upathExtra;
-        $gzipLatin1 = "\x1f\x8b\x08\x18\x00\x00\x00\x00\x02\x03"."caf\xe9.tar\0"."packed by caf\xc3\xa9\0";
+        $gzipLatin1 = "\x1f\x8b\x08\x18\x00\x00\x00\x00\x02\x03"."caf\xe9.tar\0"."packed by caf\xc3\xa9\0"
+            ."\x1f\x8b\x08\x18\x00\x00\x00\x00\x02\x03"."\xc3\x89pisode.tar\0"."\xe2\x80\x93 note\0";
         $sample = $zipOverride.$gzipLatin1;
         if ((new NativeMetadataParser)->parseFormats($sample) === null) {
             self::markTestSkipped('Native Rust format metadata is required for ZIP/Gzip filename authority integration.');
@@ -278,7 +279,7 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         $analysis = (new NzbFingerprintAnalyzer(new YencService))->analyzeArticleAndDecodedBytes([], $body);
         self::assertSame($sample, $analysis['decoded_bytes']);
         $headers = $analysis['metadata']['decoded_format_metadata']['headers'];
-        self::assertCount(2, $headers);
+        self::assertCount(3, $headers);
 
         $zip = $headers[0];
         self::assertSame('zip', $zip['format']);
@@ -298,11 +299,26 @@ final class ReleaseFingerprintMetadataTest extends TestCase
         self::assertSame('iso_8859_1', $gzip['filename_encoding']);
         self::assertSame('café.tar', $gzip['filename']);
         self::assertFalse($gzip['filename_display_truncated']);
+        self::assertNull($gzip['filename_utf8_text']);
         self::assertTrue($gzip['comment_utf8_valid']);
         self::assertTrue($gzip['comment_latin1_printable']);
-        self::assertSame('utf8', $gzip['comment_encoding']);
-        self::assertSame('packed by café', $gzip['comment']);
+        // RFC 1952 mandates ISO-8859-1: UTF-8-looking bytes stay Latin-1 and the UTF-8
+        // reading is only an observed alternative.
+        self::assertSame('iso_8859_1', $gzip['comment_encoding']);
+        self::assertSame("packed by caf\u{c3}\u{a9}", $gzip['comment']);
+        self::assertSame('packed by café', $gzip['comment_utf8_text']);
         self::assertFalse($gzip['comment_display_truncated']);
+
+        // Valid UTF-8 with C1-range continuation bytes is text, never binary.
+        $utf8 = $headers[2];
+        self::assertSame('gzip', $utf8['format']);
+        self::assertTrue($utf8['filename_utf8_valid']);
+        self::assertFalse($utf8['filename_latin1_printable']);
+        self::assertSame('iso_8859_1', $utf8['filename_encoding']);
+        self::assertSame("\u{c3}\u{89}pisode.tar", $utf8['filename']);
+        self::assertSame('Épisode.tar', $utf8['filename_utf8_text']);
+        self::assertSame('iso_8859_1', $utf8['comment_encoding']);
+        self::assertSame('– note', $utf8['comment_utf8_text']);
     }
 
     #[Test]

@@ -617,6 +617,8 @@ pub enum FormatHeader {
         filename_encoding: Option<&'static str>,
         filename: Option<String>,
         filename_display_truncated: Option<bool>,
+        filename_utf8_text: Option<String>,
+        filename_utf8_text_display_truncated: Option<bool>,
         comment_present: Option<bool>,
         comment_terminated: Option<bool>,
         comment_byte_length: Option<usize>,
@@ -630,6 +632,8 @@ pub enum FormatHeader {
         comment_encoding: Option<&'static str>,
         comment: Option<String>,
         comment_display_truncated: Option<bool>,
+        comment_utf8_text: Option<String>,
+        comment_utf8_text_display_truncated: Option<bool>,
         header_crc16_expected: Option<u16>,
         header_crc16_calculated: Option<u16>,
         header_crc16_valid: Option<bool>,
@@ -1093,6 +1097,8 @@ struct GzipTextFieldObservation {
     encoding: &'static str,
     decoded_text: Option<String>,
     display_truncated: bool,
+    utf8_text: Option<String>,
+    utf8_text_display_truncated: Option<bool>,
     next_offset: usize,
     complete: bool,
 }
@@ -2133,19 +2139,18 @@ fn resolve_zip_filename_authority(
         return (Some(String::new()), Some(false), None, "empty_filename");
     }
 
+    // Common ZIP forbids duplicate 0x7075 tags and readers disagree on first/last
+    // handling, so any second Unicode Path record, usable or not, withholds
+    // authority. Count every complete record, including ones beyond the retained cap.
     let records = unicode_path_records.unwrap_or_default();
-    let usable_records: Vec<&ZipUnicodePathExtra> = records
+    let total_records = unicode_path_record_count.unwrap_or(0).max(records.len());
+    if total_records > 1 {
+        return (None, None, None, "unicode_path_extra_ambiguous");
+    }
+    if let Some(first) = records
         .iter()
-        .filter(|record| record.usable_as_filename_override)
-        .collect();
-    if let Some((first, rest)) = usable_records.split_first() {
-        let all_match = rest.iter().all(|other| {
-            other.unicode_filename_bytes_sha256 == first.unicode_filename_bytes_sha256
-        });
-        let truncated_records = unicode_path_record_count.unwrap_or(0) > records.len();
-        if !all_match || (truncated_records && !usable_records.is_empty()) {
-            return (None, None, None, "unicode_path_extra_ambiguous");
-        }
+        .find(|record| record.usable_as_filename_override)
+    {
         if efs_utf8_flag == Some(true) && first.unicode_filename_matches_efs_filename == Some(true)
         {
             return (
@@ -5170,6 +5175,8 @@ fn parse_gzip(data: &[u8], offset: usize) -> FormatHeader {
     let mut filename_encoding = None;
     let mut filename = None;
     let mut filename_display_truncated = None;
+    let mut filename_utf8_text = None;
+    let mut filename_utf8_text_display_truncated = None;
     let mut comment_terminated = None;
     let mut comment_byte_length = None;
     let mut comment_full_byte_length = None;
@@ -5182,6 +5189,8 @@ fn parse_gzip(data: &[u8], offset: usize) -> FormatHeader {
     let mut comment_encoding = None;
     let mut comment = None;
     let mut comment_display_truncated = None;
+    let mut comment_utf8_text = None;
+    let mut comment_utf8_text_display_truncated = None;
     let mut header_crc16_expected = None;
     let mut header_crc16_calculated = None;
     let mut header_crc16_valid = None;
@@ -5230,6 +5239,8 @@ fn parse_gzip(data: &[u8], offset: usize) -> FormatHeader {
             filename_encoding = Some(field.encoding);
             filename = field.decoded_text;
             filename_display_truncated = Some(field.display_truncated);
+            filename_utf8_text = field.utf8_text;
+            filename_utf8_text_display_truncated = field.utf8_text_display_truncated;
             cursor = field.next_offset;
             complete &= field.complete;
         }
@@ -5247,6 +5258,8 @@ fn parse_gzip(data: &[u8], offset: usize) -> FormatHeader {
             comment_encoding = Some(field.encoding);
             comment = field.decoded_text;
             comment_display_truncated = Some(field.display_truncated);
+            comment_utf8_text = field.utf8_text;
+            comment_utf8_text_display_truncated = field.utf8_text_display_truncated;
             cursor = field.next_offset;
             complete &= field.complete;
         }
@@ -5345,6 +5358,8 @@ fn parse_gzip(data: &[u8], offset: usize) -> FormatHeader {
         filename_encoding,
         filename,
         filename_display_truncated,
+        filename_utf8_text,
+        filename_utf8_text_display_truncated,
         comment_present: flags.map(|value| value & 0x10 != 0),
         comment_terminated,
         comment_byte_length,
@@ -5358,6 +5373,8 @@ fn parse_gzip(data: &[u8], offset: usize) -> FormatHeader {
         comment_encoding,
         comment,
         comment_display_truncated,
+        comment_utf8_text,
+        comment_utf8_text_display_truncated,
         header_crc16_expected,
         header_crc16_calculated,
         header_crc16_valid,
@@ -5469,51 +5486,85 @@ fn parse_gzip_extra_subfields(extra: &[u8]) -> GzipExtraSubfieldSummary {
     summary
 }
 
-fn decode_gzip_text_bytes(
-    observed: &[u8],
-    terminated: bool,
-) -> (bool, bool, &'static str, Option<String>, bool) {
-    let utf8_valid = std::str::from_utf8(observed).is_ok();
+/// Decoded view of one Gzip `FNAME` or `FCOMMENT` field.
+///
+/// RFC 1952 section 2.3.1 specifies ISO 8859-1 (Latin-1) for both fields, so the
+/// Latin-1 decoding in `decoded_text` is the only authoritative reading. Bytes that
+/// also happen to be valid UTF-8 (for example `caf\xc3\xa9`) decode to `cafÃ©` under
+/// that rule. Many writers emit UTF-8 regardless, so a clean UTF-8 reading is exposed
+/// separately in `utf8_text` as an observed, non-authoritative alternative; it never
+/// replaces `decoded_text`.
+///
+/// Neither reading is rejected because of C1 bytes (0x80..=0x9F): they are
+/// continuation bytes in most non-Latin UTF-8 text, so valid UTF-8 text is never
+/// classified as binary. Only bytes that no text reading can explain (C0 controls
+/// other than TAB/LF/CR, DEL, or C1 bytes that are not part of clean UTF-8 text) are
+/// reported as `binary_or_control_bytes` with no decoded text.
+struct GzipTextDecoding {
+    utf8_valid: bool,
+    /// True only when every byte is a printable Latin-1 character (no C0, DEL or C1).
+    latin1_printable: bool,
+    encoding: &'static str,
+    /// Authoritative RFC 1952 ISO 8859-1 decoding (may contain C1 characters when
+    /// `latin1_printable` is false but the bytes are clean UTF-8 text).
+    decoded_text: Option<String>,
+    display_truncated: bool,
+    /// Non-authoritative UTF-8 reading of non-ASCII bytes that are valid, control-free UTF-8.
+    utf8_text: Option<String>,
+    utf8_text_display_truncated: Option<bool>,
+}
+
+fn decode_gzip_text_bytes(observed: &[u8], terminated: bool) -> GzipTextDecoding {
+    let utf8 = std::str::from_utf8(observed).ok();
+    let utf8_valid = utf8.is_some();
     let latin1_printable = observed
         .iter()
         .all(|&b| matches!(b, 0x09 | 0x0a | 0x0d | 0x20..=0x7e | 0xa0..=0xff));
     let display_truncated = observed.len() > MAX_RETAINED_GZIP_TEXT_DISPLAY_BYTES;
+    let undecoded = |encoding: &'static str| GzipTextDecoding {
+        utf8_valid,
+        latin1_printable,
+        encoding,
+        decoded_text: None,
+        display_truncated,
+        utf8_text: None,
+        utf8_text_display_truncated: None,
+    };
     if !terminated {
-        return (
-            utf8_valid,
-            latin1_printable,
-            "unterminated",
-            None,
-            display_truncated,
-        );
-    }
-    if !latin1_printable {
-        return (
-            utf8_valid,
-            false,
-            "binary_or_control_bytes",
-            None,
-            display_truncated,
-        );
-    }
-    if observed.is_ascii() {
-        let prefix = &observed[..observed.len().min(MAX_RETAINED_GZIP_TEXT_DISPLAY_BYTES)];
-        return (
-            true,
-            true,
-            "ascii",
-            std::str::from_utf8(prefix).ok().map(str::to_owned),
-            display_truncated,
-        );
-    }
-    if utf8_valid {
-        let (decoded, trunc) =
-            bounded_utf8_prefix_string(observed, MAX_RETAINED_GZIP_TEXT_DISPLAY_BYTES);
-        return (true, true, "utf8", decoded, trunc);
+        return undecoded("unterminated");
     }
     let prefix = &observed[..observed.len().min(MAX_RETAINED_GZIP_TEXT_DISPLAY_BYTES)];
-    let decoded: String = prefix.iter().map(|&b| char::from(b)).collect();
-    (false, true, "iso_8859_1", Some(decoded), display_truncated)
+    if observed.is_ascii() {
+        if !latin1_printable {
+            return undecoded("binary_or_control_bytes");
+        }
+        return GzipTextDecoding {
+            decoded_text: std::str::from_utf8(prefix).ok().map(str::to_owned),
+            encoding: "ascii",
+            ..undecoded("ascii")
+        };
+    }
+    let clean_utf8 = utf8.filter(|text| {
+        text.chars()
+            .all(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r'))
+    });
+    if !latin1_printable && clean_utf8.is_none() {
+        return undecoded("binary_or_control_bytes");
+    }
+    let (utf8_text, utf8_text_display_truncated) = match clean_utf8 {
+        Some(text) => {
+            let (bounded, truncated) =
+                bounded_utf8_prefix_string(text.as_bytes(), MAX_RETAINED_GZIP_TEXT_DISPLAY_BYTES);
+            (bounded, Some(truncated))
+        }
+        None => (None, None),
+    };
+    GzipTextDecoding {
+        decoded_text: Some(prefix.iter().map(|&b| char::from(b)).collect()),
+        utf8_text,
+        utf8_text_display_truncated,
+        ..undecoded("iso_8859_1")
+    }
 }
 
 fn parse_gzip_text_field(data: &[u8], cursor: usize) -> GzipTextFieldObservation {
@@ -5534,6 +5585,8 @@ fn parse_gzip_text_field(data: &[u8], cursor: usize) -> GzipTextFieldObservation
             encoding: "unterminated",
             decoded_text: None,
             display_truncated: false,
+            utf8_text: None,
+            utf8_text_display_truncated: None,
             next_offset: cursor,
             complete: false,
         };
@@ -5552,6 +5605,8 @@ fn parse_gzip_text_field(data: &[u8], cursor: usize) -> GzipTextFieldObservation
             encoding: "unterminated",
             decoded_text: None,
             display_truncated: false,
+            utf8_text: None,
+            utf8_text_display_truncated: None,
             next_offset: cursor,
             complete: false,
         };
@@ -5561,8 +5616,15 @@ fn parse_gzip_text_field(data: &[u8], cursor: usize) -> GzipTextFieldObservation
     let observed = &field[..observed_length];
     let retained = &observed[..observed.len().min(MAX_RECORDED_GZIP_FIELD_HEX_BYTES)];
     let terminated = terminator.is_some();
-    let (utf8_valid, latin1_printable, encoding, decoded_text, display_truncated) =
-        decode_gzip_text_bytes(observed, terminated);
+    let GzipTextDecoding {
+        utf8_valid,
+        latin1_printable,
+        encoding,
+        decoded_text,
+        display_truncated,
+        utf8_text,
+        utf8_text_display_truncated,
+    } = decode_gzip_text_bytes(observed, terminated);
     let next = if terminated {
         cursor + observed_length + 1
     } else {
@@ -5587,6 +5649,8 @@ fn parse_gzip_text_field(data: &[u8], cursor: usize) -> GzipTextFieldObservation
         encoding,
         decoded_text,
         display_truncated,
+        utf8_text,
+        utf8_text_display_truncated,
         next_offset: next,
         complete: terminated,
     }
@@ -7764,8 +7828,11 @@ fn parse_zip_unicode_path_record(
     let unicode_filename_matches_efs_filename = efs_flag_set
         .zip(unicode_filename)
         .and_then(|(efs_set, unicode_name)| efs_set.then(|| filename == Some(unicode_name)));
+    // The record needs at least one UnicodeName byte (data size >= 6); a header-only
+    // record would otherwise resolve a non-empty local name to an empty string.
     let usable_as_filename_override = version == Some(1)
         && filename_crc32_matches == Some(true)
+        && unicode_filename.is_some_and(|bytes| !bytes.is_empty())
         && unicode_filename_utf8_valid == Some(true)
         && unicode_filename_bom_present == Some(false)
         && unicode_filename_matches_efs_filename != Some(false);
@@ -13146,21 +13213,255 @@ mod tests {
             "legacy_non_utf8_without_unicode_path_extra"
         );
 
-        // 6. Gzip with ISO-8859-1 FNAME and UTF-8 FCOMMENT
+        // 6. Gzip with ISO-8859-1 FNAME and UTF-8-looking FCOMMENT. RFC 1952 mandates
+        // Latin-1, so the comment's authoritative text is the Latin-1 reading and the
+        // UTF-8 reading is exposed only as a non-authoritative alternative.
         let mut gzip_buf = vec![0x1f, 0x8b, 0x08, 0x18, 0, 0, 0, 0, 0x02, 0x03];
         gzip_buf.extend_from_slice(b"caf\xe9.tar\0"); // ISO-8859-1 'é' (0xe9)
-        gzip_buf.extend_from_slice("packed by café\0".as_bytes()); // UTF-8
+        gzip_buf.extend_from_slice("packed by café\0".as_bytes()); // UTF-8 bytes
         let json_gzip = serde_json::to_value(parse(&gzip_buf)).unwrap();
         let h_gzip = &json_gzip["headers"][0];
         assert_eq!(h_gzip["filename_utf8_valid"], false);
         assert_eq!(h_gzip["filename_latin1_printable"], true);
         assert_eq!(h_gzip["filename_encoding"], "iso_8859_1");
         assert_eq!(h_gzip["filename"], "café.tar");
+        assert!(h_gzip["filename_utf8_text"].is_null());
         assert_eq!(h_gzip["filename_display_truncated"], false);
         assert_eq!(h_gzip["comment_utf8_valid"], true);
         assert_eq!(h_gzip["comment_latin1_printable"], true);
-        assert_eq!(h_gzip["comment_encoding"], "utf8");
-        assert_eq!(h_gzip["comment"], "packed by café");
+        assert_eq!(h_gzip["comment_encoding"], "iso_8859_1");
+        assert_eq!(h_gzip["comment"], "packed by caf\u{c3}\u{a9}");
+        assert_eq!(h_gzip["comment_utf8_text"], "packed by café");
+        assert_eq!(h_gzip["comment_utf8_text_display_truncated"], false);
         assert_eq!(h_gzip["comment_display_truncated"], false);
+    }
+
+    fn zip_upath_fixture(flags: u16, name: &[u8], extras: &[Vec<u8>]) -> serde_json::Value {
+        let extra: Vec<u8> = extras.concat();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(ZIP);
+        buf.extend_from_slice(&20u16.to_le_bytes());
+        buf.extend_from_slice(&flags.to_le_bytes());
+        buf.extend_from_slice(&8u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+        buf.extend_from_slice(&100u32.to_le_bytes());
+        buf.extend_from_slice(&200u32.to_le_bytes());
+        buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&(extra.len() as u16).to_le_bytes());
+        buf.extend_from_slice(name);
+        buf.extend_from_slice(&extra);
+        serde_json::to_value(parse(&buf)).unwrap()
+    }
+
+    fn zip_upath_record(version: u8, crc32: u32, unicode_name: &[u8]) -> Vec<u8> {
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&0x7075u16.to_le_bytes());
+        extra.extend_from_slice(&((5 + unicode_name.len()) as u16).to_le_bytes());
+        extra.push(version);
+        extra.extend_from_slice(&crc32.to_le_bytes());
+        extra.extend_from_slice(unicode_name);
+        extra
+    }
+
+    #[test]
+    fn zip_duplicate_unicode_path_records_are_ambiguous_even_when_one_is_invalid() {
+        let local = b"caf\x82.mkv";
+        let crc = crc32fast::hash(local);
+        let valid = zip_upath_record(1, crc, "café.mkv".as_bytes());
+        let stale_crc = zip_upath_record(1, crc ^ 1, "cafe-stale.mkv".as_bytes());
+        let bad_version = zip_upath_record(2, crc, "cafe-v2.mkv".as_bytes());
+        let invalid_utf8 = zip_upath_record(1, crc, b"caf\xe9.mkv");
+        let empty_name = zip_upath_record(1, crc, b"");
+
+        // A single valid record still resolves.
+        let single = zip_upath_fixture(0, local, std::slice::from_ref(&valid));
+        assert_eq!(single["headers"][0]["resolved_filename"], "café.mkv");
+        assert_eq!(single["headers"][0]["resolved_filename_status"], "resolved");
+
+        // Every ordering of a valid record and one unusable record is ambiguous.
+        for unusable in [&stale_crc, &bad_version, &invalid_utf8, &empty_name] {
+            for pair in [
+                [valid.clone(), unusable.clone()],
+                [unusable.clone(), valid.clone()],
+            ] {
+                let json = zip_upath_fixture(0, local, &pair);
+                let header = &json["headers"][0];
+                assert_eq!(header["zip_unicode_path_record_count"], 2);
+                assert!(header["resolved_filename"].is_null());
+                assert!(header["resolved_filename_source"].is_null());
+                assert_eq!(
+                    header["resolved_filename_status"],
+                    "unicode_path_extra_ambiguous"
+                );
+            }
+        }
+
+        // Identical duplicates are also withheld: duplicates are forbidden outright.
+        let identical = zip_upath_fixture(0, local, &[valid.clone(), valid.clone()]);
+        assert_eq!(
+            identical["headers"][0]["resolved_filename_status"],
+            "unicode_path_extra_ambiguous"
+        );
+
+        // Two unusable duplicates are ambiguous too, rather than silently falling
+        // back to the local name.
+        let both_bad = zip_upath_fixture(0, local, &[stale_crc.clone(), bad_version.clone()]);
+        assert_eq!(
+            both_bad["headers"][0]["resolved_filename_status"],
+            "unicode_path_extra_ambiguous"
+        );
+    }
+
+    #[test]
+    fn zip_empty_unicode_path_name_is_not_a_filename_override() {
+        let local = b"release.mkv";
+        let crc = crc32fast::hash(local);
+        let header_only = zip_upath_record(1, crc, b"");
+        let json = zip_upath_fixture(0, local, &[header_only]);
+        let header = &json["headers"][0];
+        let record = &header["zip_unicode_path_records"][0];
+        assert_eq!(record["payload_length"], 5);
+        assert_eq!(record["filename_crc32_matches"], true);
+        assert_eq!(record["unicode_filename_utf8_valid"], true);
+        assert_eq!(record["usable_as_filename_override"], false);
+        // The non-empty local name keeps authority instead of becoming "".
+        assert_eq!(header["resolved_filename"], "release.mkv");
+        assert_eq!(header["resolved_filename_source"], "local_header_ascii");
+        assert_eq!(header["resolved_filename_status"], "resolved");
+
+        // A one-byte name is the smallest usable record.
+        let minimal = zip_upath_record(1, crc, b"x");
+        let json = zip_upath_fixture(0, local, &[minimal]);
+        assert_eq!(
+            json["headers"][0]["zip_unicode_path_records"][0]["usable_as_filename_override"],
+            true
+        );
+        assert_eq!(json["headers"][0]["resolved_filename"], "x");
+    }
+
+    #[test]
+    fn concatenated_sample_yields_zip_and_both_gzip_text_cases_for_the_php_integration() {
+        // Mirrors the byte layout in ReleaseFingerprintMetadataTest so the Linux-only
+        // PHP integration assertions are also exercised by cargo test.
+        let local = b"caf\x82.mkv";
+        let zip = {
+            let record = zip_upath_record(1, crc32fast::hash(local), "café.mkv".as_bytes());
+            let mut buf = Vec::new();
+            buf.extend_from_slice(ZIP);
+            buf.extend_from_slice(&20u16.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&8u16.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+            buf.extend_from_slice(&100u32.to_le_bytes());
+            buf.extend_from_slice(&200u32.to_le_bytes());
+            buf.extend_from_slice(&(local.len() as u16).to_le_bytes());
+            buf.extend_from_slice(&(record.len() as u16).to_le_bytes());
+            buf.extend_from_slice(local);
+            buf.extend_from_slice(&record);
+            buf
+        };
+        let gzip_head = [0x1f, 0x8b, 0x08, 0x18, 0, 0, 0, 0, 0x02, 0x03];
+        let mut sample = zip;
+        sample.extend_from_slice(&gzip_head);
+        sample.extend_from_slice(b"caf\xe9.tar\0packed by caf\xc3\xa9\0");
+        sample.extend_from_slice(&gzip_head);
+        sample.extend_from_slice(b"\xc3\x89pisode.tar\0\xe2\x80\x93 note\0");
+        let json = serde_json::to_value(parse(&sample)).unwrap();
+        let headers = json["headers"].as_array().unwrap();
+        assert_eq!(headers.len(), 3);
+        assert_eq!(headers[0]["resolved_filename"], "café.mkv");
+        assert_eq!(headers[1]["comment_utf8_text"], "packed by café");
+        assert_eq!(headers[2]["filename_encoding"], "iso_8859_1");
+        assert_eq!(headers[2]["filename_utf8_text"], "Épisode.tar");
+        assert_eq!(headers[2]["comment_utf8_text"], "– note");
+    }
+
+    fn gzip_text_fixture(fname: &[u8], fcomment: &[u8]) -> serde_json::Value {
+        let mut buf = vec![0x1f, 0x8b, 0x08, 0x18, 0, 0, 0, 0, 0x02, 0x03];
+        buf.extend_from_slice(fname);
+        buf.push(0);
+        buf.extend_from_slice(fcomment);
+        buf.push(0);
+        serde_json::to_value(parse(&buf)).unwrap()
+    }
+
+    #[test]
+    fn gzip_text_fields_use_rfc_latin1_and_never_reject_valid_utf8_as_binary() {
+        // Valid UTF-8 whose continuation bytes fall in 0x80..=0x9F ("É" = C3 89) is
+        // text, not binary. RFC 1952 Latin-1 remains authoritative; UTF-8 is the
+        // observed alternative.
+        let json = gzip_text_fixture("Épisode.tar".as_bytes(), "– naïve 日本語".as_bytes());
+        let h = &json["headers"][0];
+        assert_eq!(h["filename_utf8_valid"], true);
+        assert_eq!(h["filename_latin1_printable"], false); // C1 control bytes present
+        assert_eq!(h["filename_encoding"], "iso_8859_1");
+        assert_eq!(h["filename"], "\u{c3}\u{89}pisode.tar");
+        assert_eq!(h["filename_utf8_text"], "Épisode.tar");
+        assert_eq!(h["filename_utf8_text_display_truncated"], false);
+        assert_eq!(h["comment_encoding"], "iso_8859_1");
+        assert_eq!(h["comment_utf8_text"], "– naïve 日本語");
+
+        // UTF-8-looking printable bytes are still recorded as Latin-1.
+        let json = gzip_text_fixture(b"caf\xc3\xa9", b"plain");
+        let h = &json["headers"][0];
+        assert_eq!(h["filename_utf8_valid"], true);
+        assert_eq!(h["filename_latin1_printable"], true);
+        assert_eq!(h["filename_encoding"], "iso_8859_1");
+        assert_eq!(h["filename"], "caf\u{c3}\u{a9}");
+        assert_ne!(h["filename"], "café");
+        assert_eq!(h["filename_utf8_text"], "café");
+        assert_eq!(h["comment_encoding"], "ascii");
+        assert_eq!(h["comment"], "plain");
+        assert!(h["comment_utf8_text"].is_null());
+
+        // Pure Latin-1 has no UTF-8 alternative.
+        let json = gzip_text_fixture(b"caf\xe9", b"");
+        let h = &json["headers"][0];
+        assert_eq!(h["filename_utf8_valid"], false);
+        assert_eq!(h["filename_encoding"], "iso_8859_1");
+        assert_eq!(h["filename"], "café");
+        assert!(h["filename_utf8_text"].is_null());
+
+        // Bytes no text reading explains stay binary with no decoded text: C0
+        // controls, DEL, and C1 bytes that are not clean UTF-8.
+        for bytes in [
+            &b"a\x01b"[..],
+            b"a\x7fb",
+            b"a\x85b",
+            b"\xff\x80\x90",
+            b"\xc3\x89\x01",
+        ] {
+            let json = gzip_text_fixture(bytes, b"ok");
+            let h = &json["headers"][0];
+            assert_eq!(
+                h["filename_encoding"], "binary_or_control_bytes",
+                "{bytes:?}"
+            );
+            assert!(h["filename"].is_null(), "{bytes:?}");
+            assert!(h["filename_utf8_text"].is_null(), "{bytes:?}");
+            assert_eq!(h["comment_encoding"], "ascii");
+        }
+        // UTF-8 whose scalar values are control characters is binary, not text.
+        let json = gzip_text_fixture(b"\xc2\x85\xc2\x9f", b"ok");
+        assert_eq!(
+            json["headers"][0]["filename_encoding"],
+            "binary_or_control_bytes"
+        );
+
+        // The alternative text is bounded on a char boundary.
+        let long = "é".repeat(4_000); // 8,000 bytes
+        let json = gzip_text_fixture(long.as_bytes(), b"");
+        let h = &json["headers"][0];
+        assert_eq!(h["filename_encoding"], "iso_8859_1");
+        assert_eq!(h["filename_display_truncated"], true);
+        assert_eq!(h["filename_utf8_text_display_truncated"], true);
+        assert_eq!(
+            h["filename_utf8_text"].as_str().unwrap().chars().count(),
+            2_048
+        );
     }
 }
