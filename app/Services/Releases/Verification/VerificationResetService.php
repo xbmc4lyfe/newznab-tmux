@@ -54,7 +54,7 @@ final class VerificationResetService
             if (Schema::hasTable('release_verification_state')) {
                 DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
             }
-            foreach (['release_verification_scratch', 'release_verification_candidates', 'release_verification_audit_retries'] as $table) {
+            foreach (['release_verification_scratch', 'release_verification_candidates', 'release_verification_audit_retries', 'release_verification_manifests'] as $table) {
                 if (Schema::hasTable($table)) {
                     DB::table($table)->delete();
                 }

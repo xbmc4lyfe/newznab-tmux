@@ -22,9 +22,12 @@ use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\DataProvider;
+use Tests\Support\StoredManifests;
 
 class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandidatesTest
 {
+    use StoredManifests;
+
     public function test_expiry_deadline_finishes_admitted_transaction_and_retains_later_candidates(): void
     {
         $repository = app(CandidateRepository::class);
@@ -42,7 +45,7 @@ class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandi
         $this->assertSame((int) $before[1]->manifest_bytes + (int) $before[2]->manifest_bytes,
             (int) DB::table('release_verification_state')->value('pending_bytes'));
         foreach ([$before[1], $before[2]] as $candidate) {
-            $this->assertFileExists(app(ManifestStore::class)->path($candidate->manifest_path));
+            $this->assertManifestStored($candidate->manifest_path);
         }
         $this->assertSame(0, DB::transactionLevel());
 
@@ -80,7 +83,7 @@ class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandi
         });
 
         $this->assertEquals($before, DB::table('release_verification_candidates')->sole());
-        $this->assertFileExists(app(ManifestStore::class)->path($before->manifest_path));
+        $this->assertManifestStored($before->manifest_path);
         $this->assertSame((int) $before->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
         $repository->expire();
         $this->assertSame('expired', DB::table('release_verification_candidates')->value('status'));
@@ -110,7 +113,7 @@ class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandi
                 return $remaining-- > 0;
             });
             $this->assertSame('expired', DB::table('release_verification_candidates')->where('id', $before[0]->id)->value('status'));
-            $this->assertFileExists(app(ManifestStore::class)->path($before[0]->manifest_path));
+            $this->assertManifestStored($before[0]->manifest_path);
             if ($commit) {
                 DB::commit();
             } else {
@@ -122,13 +125,13 @@ class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandi
             }
         }
         $this->assertEquals($before[1], DB::table('release_verification_candidates')->where('id', $before[1]->id)->sole());
-        $this->assertFileExists(app(ManifestStore::class)->path($before[1]->manifest_path));
+        $this->assertManifestStored($before[1]->manifest_path);
         if ($commit) {
-            $this->assertFileDoesNotExist(app(ManifestStore::class)->path($before[0]->manifest_path));
+            $this->assertManifestNotStored($before[0]->manifest_path);
             $this->assertSame($bytes - (int) $before[0]->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
         } else {
             $this->assertEquals($before[0], DB::table('release_verification_candidates')->where('id', $before[0]->id)->sole());
-            $this->assertFileExists(app(ManifestStore::class)->path($before[0]->manifest_path));
+            $this->assertManifestStored($before[0]->manifest_path);
             $this->assertSame($bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
         }
     }
@@ -363,7 +366,7 @@ class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandi
         $repository->expire();
         $this->assertSame('expired', DB::table('release_verification_candidates')->value('status'));
         $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
-        $this->assertFileDoesNotExist(app(ManifestStore::class)->path($claim->manifest_path));
+        $this->assertManifestNotStored($claim->manifest_path);
         $this->assertFileExists($scratch.'/payload');
         $this->artisan('releases:verify-candidates')->assertSuccessful();
         $this->assertDirectoryDoesNotExist($scratch);
