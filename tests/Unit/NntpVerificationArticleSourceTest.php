@@ -97,7 +97,7 @@ final class NntpVerificationArticleSourceTest extends TestCase
     {
         $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
         fwrite($pair[1], "222 0 <cut@example> body\r\npartial");
-        fclose($pair[1]);
+        stream_socket_shutdown($pair[1], STREAM_SHUT_WR);
         $primary = new PipelineSocketNntpHarness($pair[0]);
         $source = new NntpArticleSource($primary, maximumBytes: 1024, allowAlternateFallback: false);
         try {
@@ -105,9 +105,11 @@ final class NntpVerificationArticleSourceTest extends TestCase
             $this->fail('A truncated response must not be returned.');
         } catch (RuntimeException $error) {
             $this->assertNotInstanceOf(ArticleBudgetExceeded::class, $error);
+            $this->assertSame('Verification article line is truncated or oversized.', $error->getMessage());
         } finally {
             unset($source);
             $primary->closeFixture();
+            fclose($pair[1]);
         }
     }
 
@@ -116,7 +118,7 @@ final class NntpVerificationArticleSourceTest extends TestCase
         $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
         // 33 wire bytes unstuff to exactly the 32-byte budget, then the connection ends.
         fwrite($pair[1], "222 0 <stuffed@example> body\r\n..".str_repeat('a', 31));
-        fclose($pair[1]);
+        stream_socket_shutdown($pair[1], STREAM_SHUT_WR);
         $primary = new PipelineSocketNntpHarness($pair[0]);
         $source = new NntpArticleSource($primary, maximumBytes: 64, allowAlternateFallback: false);
         try {
@@ -124,9 +126,11 @@ final class NntpVerificationArticleSourceTest extends TestCase
             $this->fail('A truncated response must not be returned.');
         } catch (RuntimeException $error) {
             $this->assertNotInstanceOf(ArticleBudgetExceeded::class, $error);
+            $this->assertSame('Verification article line is truncated or oversized.', $error->getMessage());
         } finally {
             unset($source);
             $primary->closeFixture();
+            fclose($pair[1]);
         }
     }
 
@@ -142,6 +146,38 @@ final class NntpVerificationArticleSourceTest extends TestCase
             $this->fail('An article above the bounded budget must not be returned.');
         } catch (ArticleBudgetExceeded $error) {
             $this->assertFalse($primary->isConnected(), 'An unread remainder closes the session.');
+        } finally {
+            unset($source);
+            $primary->closeFixture();
+            fclose($pair[1]);
+        }
+    }
+
+    /** @return iterable<string, array{string, int, bool}> */
+    public static function smallRemainingBudgets(): iterable
+    {
+        yield 'one-byte budget, two body bytes then close' => ['aa', 1, true];
+        yield 'nothing left after a full line, one more byte' => ["0123456789abcdef\r\nx", 18, true];
+        yield 'nothing left, bare terminator prefix then close' => ["0123456789abcdef\r\n.", 18, false];
+        yield 'nothing left, terminator CR then close' => ["0123456789abcdef\r\n.\r", 18, false];
+        yield 'within budget then close' => ['abc', 8, false];
+    }
+
+    #[DataProvider('smallRemainingBudgets')]
+    public function test_partial_lines_below_the_minimum_read_are_classified_by_their_body_bytes(string $body, int $budget, bool $oversized): void
+    {
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        fwrite($pair[1], "222 0 <small@example> body\r\n".$body);
+        stream_socket_shutdown($pair[1], STREAM_SHUT_WR);
+        $primary = new PipelineSocketNntpHarness($pair[0]);
+        $source = new NntpArticleSource($primary, maximumBytes: 64, allowAlternateFallback: false);
+        try {
+            $source->fetchBounded('small@example', $budget);
+            $this->fail('A partial response must not be returned.');
+        } catch (RuntimeException $error) {
+            $this->assertSame($oversized, $error instanceof ArticleBudgetExceeded, $error->getMessage());
+            $this->assertSame($oversized ? 'Article exceeds verification memory budget.' : 'Verification article line is truncated or oversized.',
+                $error->getMessage());
         } finally {
             unset($source);
             $primary->closeFixture();
