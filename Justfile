@@ -227,15 +227,15 @@ fresh *args:
 
 # Open a bash shell in the app container
 shell *args:
-    @$SAIL shell
+    @{{COMPOSE_ENV}}; $SAIL shell
 
 # Open a root bash shell in the app container
 root-shell *args:
-    @$SAIL root-shell
+    @{{COMPOSE_ENV}}; $SAIL root-shell
 
 # Open a Laravel Tinker session
 tinker *args:
-    @$SAIL tinker
+    @{{COMPOSE_ENV}}; $SAIL tinker
 
 # ── Artisan / PHP ────────────────────────────────────────────
 
@@ -243,18 +243,20 @@ tinker *args:
 artisan *args:
     #!/usr/bin/env bash
     set -euo pipefail
+    {{COMPOSE_ENV}}
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
     target_cmd="${cmd:-${CMD:-}}"
     $SAIL artisan $target_cmd
 
 # Run pending database migrations
 migrate *args:
-    @$SAIL artisan migrate --force
+    @{{COMPOSE_ENV}}; $SAIL artisan migrate --force
 
 # Drop all tables and re-run migrations (DATA LOSS!)
 migrate-fresh *args:
     #!/usr/bin/env bash
     set -euo pipefail
+    {{COMPOSE_ENV}}
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
     if [ "${FORCE:-}" != "1" ]; then
         printf "⚠  This will DROP ALL TABLES and re-run every migration. Continue? [y/N] "
@@ -267,55 +269,55 @@ migrate-fresh *args:
 
 # Run database seeders
 seed *args:
-    @$SAIL artisan db:seed --force
+    @{{COMPOSE_ENV}}; $SAIL artisan db:seed --force
 
 # Clear config / route / view / application caches
 cache-clear *args:
-    @$SAIL artisan config:clear
-    @$SAIL artisan route:clear
-    @$SAIL artisan view:clear
-    @$SAIL artisan cache:clear
+    @{{COMPOSE_ENV}}; $SAIL artisan config:clear
+    @{{COMPOSE_ENV}}; $SAIL artisan route:clear
+    @{{COMPOSE_ENV}}; $SAIL artisan view:clear
+    @{{COMPOSE_ENV}}; $SAIL artisan cache:clear
     @rm -f bootstrap/cache/config.php bootstrap/cache/routes-v7.php bootstrap/cache/services.php bootstrap/cache/packages.php
     @echo "✔ Caches cleared."
 
 # Dev-safe optimize: warm data structures + view cache only
 optimize *args:
-    @$SAIL artisan view:cache
-    @$SAIL artisan data:cache-structures
+    @{{COMPOSE_ENV}}; $SAIL artisan view:cache
+    @{{COMPOSE_ENV}}; $SAIL artisan data:cache-structures
     @echo "✔ Optimized (dev-safe)."
 
 # Production optimize: cache config / routes / views + data structures
 optimize-deploy *args:
     @echo "⚠  This caches absolute paths from inside the container — only run on the deploy host."
-    @$SAIL artisan config:cache
-    @$SAIL artisan route:cache
-    @$SAIL artisan view:cache
-    @$SAIL artisan data:cache-structures
+    @{{COMPOSE_ENV}}; $SAIL artisan config:cache
+    @{{COMPOSE_ENV}}; $SAIL artisan route:cache
+    @{{COMPOSE_ENV}}; $SAIL artisan view:cache
+    @{{COMPOSE_ENV}}; $SAIL artisan data:cache-structures
     @echo "✔ Optimized for deploy."
 
 # Run a foreground queue worker
 queue-work *args:
-    @$SAIL artisan queue:work
+    @{{COMPOSE_ENV}}; $SAIL artisan queue:work
 
 # Signal all queue workers to restart gracefully
 queue-restart *args:
-    @$SAIL artisan queue:restart
+    @{{COMPOSE_ENV}}; $SAIL artisan queue:restart
 
 # Start the NNTmux tmux processing engine
 tmux-start *args:
-    @$SAIL artisan tmux:start
+    @{{COMPOSE_ENV}}; $SAIL artisan tmux:start
 
 # Stop the NNTmux tmux processing engine
 tmux-stop *args:
-    @$SAIL artisan tmux:stop
+    @{{COMPOSE_ENV}}; $SAIL artisan tmux:stop
 
 # Attach to the running tmux session
 tmux-attach *args:
-    @$SAIL artisan tmux:attach
+    @{{COMPOSE_ENV}}; $SAIL artisan tmux:attach
 
 # Show Horizon status
 horizon *args:
-    @$SAIL artisan horizon:status
+    @{{COMPOSE_ENV}}; $SAIL artisan horizon:status
 
 # ── Testing & Quality ────────────────────────────────────────
 
@@ -323,6 +325,7 @@ horizon *args:
 test *args:
     #!/usr/bin/env bash
     set -euo pipefail
+    {{COMPOSE_ENV}}
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
     if [ -n "${filter:-}" ]; then
         "$SAIL" test "--filter=${filter}"
@@ -332,75 +335,75 @@ test *args:
 
 # Run Laravel Pint code formatter on dirty files
 pint *args:
-    @$SAIL pint --dirty
+    @{{COMPOSE_ENV}}; $SAIL pint --dirty
 
 # Run Laravel Pint on all files
 pint-all *args:
-    @$SAIL pint
+    @{{COMPOSE_ENV}}; $SAIL pint
 
 # Run PHPStan static analysis
 phpstan *args:
-    @$SAIL php vendor/bin/phpstan analyse --memory-limit=2G
+    @{{COMPOSE_ENV}}; $SAIL php vendor/bin/phpstan analyse --memory-limit=2G
 
 # Run Rector in dry-run mode (no changes written)
 rector *args:
-    @$SAIL php vendor/bin/rector process --dry-run
+    @{{COMPOSE_ENV}}; $SAIL php vendor/bin/rector process --dry-run
 
 # Apply Rector refactorings
 rector-fix *args:
-    @$SAIL php vendor/bin/rector process
+    @{{COMPOSE_ENV}}; $SAIL php vendor/bin/rector process
 
 # ── Frontend ─────────────────────────────────────────────────
 
 # Run npm install and build inside the container
 npm-build *args:
-    @$SAIL npm install
-    @$SAIL npm run build
+    @{{COMPOSE_ENV}}; $SAIL npm install
+    @{{COMPOSE_ENV}}; $SAIL npm run build
 
 # Start Vite dev server inside the container
 npm-dev *args:
-    @$SAIL npm run dev
+    @{{COMPOSE_ENV}}; $SAIL npm run dev
 
 # Regenerate TypeScript types from PHP DTOs/Enums
 ts-types *args:
-    @$SAIL artisan typescript:transform
+    @{{COMPOSE_ENV}}; $SAIL artisan typescript:transform
 
 # CI: regenerate TS types and fail if working tree drifts
 ts-types-check *args:
-    @$SAIL artisan typescript:transform --quiet
+    @{{COMPOSE_ENV}}; $SAIL artisan typescript:transform --quiet
     @git diff --exit-code resources/js/types/generated.d.ts || (echo "❌ resources/js/types/generated.d.ts is out of date — run 'just ts-types' and commit." && exit 1)
 
 # Cache spatie/laravel-data structures (run on deploy)
 data-cache *args:
-    @$SAIL artisan data:cache-structures
+    @{{COMPOSE_ENV}}; $SAIL artisan data:cache-structures
 
 # ── Dependencies ─────────────────────────────────────────────
 
 # Run composer install inside the container
 composer-install *args:
-    @$SAIL composer install
+    @{{COMPOSE_ENV}}; $SAIL composer install
 
 # Run composer update inside the container
 composer-update *args:
-    @$SAIL composer update
+    @{{COMPOSE_ENV}}; $SAIL composer update
 
 # ── Database / Services ──────────────────────────────────────
 
 # Open a MariaDB CLI session
 db *args:
-    @$SAIL mariadb
+    @{{COMPOSE_ENV}}; $SAIL mariadb
 
 # Open a Redis CLI session
 redis-cli *args:
-    @$SAIL redis
+    @{{COMPOSE_ENV}}; $SAIL redis
 
 # Align UIDs: remap sail to host UID, chown project, register git safe.directory
 fix-permissions *args:
     @echo "→ Remapping container 'sail' user to UID {{HOST_UID}} and chowning /var/www/html…"
-    @$DOCKER_COMPOSE exec -u root laravel.test usermod -u {{HOST_UID}} -o sail >/dev/null 2>&1 || true
-    @$DOCKER_COMPOSE exec -u root laravel.test groupmod -g {{HOST_GID}} -o sail >/dev/null 2>&1 || true
-    @$DOCKER_COMPOSE exec -u root laravel.test chown -R {{HOST_UID}}:{{HOST_GID}} /var/www/html
-    @$DOCKER_COMPOSE exec -u root laravel.test git config --system --add safe.directory /var/www/html
+    @{{COMPOSE_ENV}}; $DOCKER_COMPOSE exec -u root laravel.test usermod -u {{HOST_UID}} -o sail >/dev/null 2>&1 || true
+    @{{COMPOSE_ENV}}; $DOCKER_COMPOSE exec -u root laravel.test groupmod -g {{HOST_GID}} -o sail >/dev/null 2>&1 || true
+    @{{COMPOSE_ENV}}; $DOCKER_COMPOSE exec -u root laravel.test chown -R {{HOST_UID}}:{{HOST_GID}} /var/www/html
+    @{{COMPOSE_ENV}}; $DOCKER_COMPOSE exec -u root laravel.test git config --system --add safe.directory /var/www/html
     @echo "✔ Permissions fixed."
     @if [ "{{WWWUSER}}" != "{{HOST_UID}}" ] || [ -z "{{WWWUSER}}" ]; then echo "⚠  WWWUSER ({{WWWUSER}}) ≠ host UID ({{HOST_UID}}). Set WWWUSER={{HOST_UID}} and WWWGROUP={{HOST_GID}} in .env, then run 'just rebuild' to align the container's sail user."; fi
 
@@ -410,8 +413,8 @@ fix-perms *args:
 
 # Register /var/www/html as a git safe.directory inside the container
 git-safe-directory *args:
-    @$DOCKER_COMPOSE exec -u root laravel.test git config --system --add safe.directory /var/www/html >/dev/null 2>&1 || true
-    @$DOCKER_COMPOSE exec laravel.test git config --global --add safe.directory /var/www/html >/dev/null 2>&1 || true
+    @{{COMPOSE_ENV}}; $DOCKER_COMPOSE exec -u root laravel.test git config --system --add safe.directory /var/www/html >/dev/null 2>&1 || true
+    @{{COMPOSE_ENV}}; $DOCKER_COMPOSE exec laravel.test git config --global --add safe.directory /var/www/html >/dev/null 2>&1 || true
 
 # ── Monitoring ───────────────────────────────────────────────
 
@@ -455,7 +458,7 @@ logs *args:
 
 # Tail storage/logs/laravel.log inside the app container
 tail-laravel *args:
-    @$SAIL exec laravel.test tail -f storage/logs/laravel.log
+    @{{COMPOSE_ENV}}; $SAIL exec laravel.test tail -f storage/logs/laravel.log
 
 # Show running containers and their status
 status *args:

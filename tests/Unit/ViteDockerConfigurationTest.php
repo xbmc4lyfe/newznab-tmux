@@ -167,6 +167,27 @@ class ViteDockerConfigurationTest extends TestCase
         }
     }
 
+    public function test_every_sail_or_compose_recipe_gets_the_profiles_and_monitoring_overlay(): void
+    {
+        $root = __DIR__.'/../..';
+        $summary = (new Process(['just', '--summary'], $root))->mustRun()->getOutput();
+        $checked = 0;
+        foreach (preg_split('/\s+/', trim($summary)) as $recipe) {
+            if (str_contains($recipe, '::')) {
+                continue;
+            }
+            $process = new Process(['just', '--dry-run', $recipe], $root);
+            $process->run();
+            $commands = $process->getOutput().$process->getErrorOutput();
+            if (! preg_match('/\$SAIL|\.\/sail|\$DOCKER_COMPOSE|docker compose/', $commands)) {
+                continue;
+            }
+            $checked++;
+            $this->assertStringContainsString('export COMPOSE_PROFILES=', $commands, "{$recipe} must export the Compose profiles like the old Makefile.");
+        }
+        $this->assertGreaterThan(30, $checked);
+    }
+
     public function test_role_targets_copy_the_files_only_their_role_runs(): void
     {
         $dockerfile = $this->projectFile('Dockerfile');
