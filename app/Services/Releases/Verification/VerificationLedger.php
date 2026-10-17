@@ -71,9 +71,13 @@ final class VerificationLedger
 
     /**
      * Serialize publications (and their duplicate detection) that share a duplicate-search key,
-     * not with admission or unrelated releases. One statement locks every stripe in primary-key
-     * order, so overlapping publications cannot deadlock. Without keys, or before the stripe rows
-     * exist, publications share one row.
+     * not with admission or unrelated releases.
+     *
+     * Every publication first locks the shared `publication` row: striped publications in share
+     * mode, which they hold together, and publications without keys (or before the stripe rows
+     * exist) exclusively, so those wait for, and exclude, every other publication. One statement
+     * then locks all of a publication's stripes in primary-key order, so overlapping publications
+     * cannot deadlock.
      *
      * @param  list<string>  $keys
      */
@@ -86,11 +90,15 @@ final class VerificationLedger
         }
         $stripes = array_values(array_unique(array_map(self::publicationStripe(...), $keys)));
         sort($stripes);
-        if ($stripes !== [] && DB::table(self::LOCKS_TABLE)->whereIn('name', $stripes)->orderBy('name')->lockForUpdate()->count() === count($stripes)) {
-            return;
-        }
-        if (DB::table(self::LOCKS_TABLE)->where('name', self::PUBLICATION_LOCK)->lockForUpdate()->first() === null) {
+        // Stripe rows only change with migrations, so a plain read decides the mode up front and
+        // no transaction ever upgrades its shared lock.
+        $striped = $stripes !== [] && DB::table(self::LOCKS_TABLE)->whereIn('name', $stripes)->count() === count($stripes);
+        $shared = DB::table(self::LOCKS_TABLE)->where('name', self::PUBLICATION_LOCK);
+        if (($striped ? $shared->sharedLock() : $shared->lockForUpdate())->first() === null) {
             throw new RuntimeException('Verification publication lock has not been initialized.');
+        }
+        if ($striped && DB::table(self::LOCKS_TABLE)->whereIn('name', $stripes)->orderBy('name')->lockForUpdate()->count() !== count($stripes)) {
+            throw new RuntimeException('Verification publication stripes changed during publication.');
         }
     }
 

@@ -279,7 +279,9 @@ final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
             // Only this key's stripe is held; other stripes and the shared fallback row stay free.
             $this->assertLocked($other, $this->stripeLock('size:5'));
             $this->assertNotLocked($other, $this->stripeLock($this->keyOnAnotherStripe('size:5')));
-            $this->assertNotLocked($other, 'SELECT name FROM release_verification_locks WHERE name = \'publication\' FOR UPDATE NOWAIT');
+            // The shared row is held in share mode: other striped publications proceed, a keyless one waits.
+            $this->assertNotLocked($other, 'SELECT name FROM release_verification_locks WHERE name = \'publication\' LOCK IN SHARE MODE NOWAIT');
+            $this->assertLocked($other, 'SELECT name FROM release_verification_locks WHERE name = \'publication\' FOR UPDATE NOWAIT');
             $this->assertNotLocked($other, 'SELECT id FROM release_verification_state WHERE id = 1 FOR UPDATE NOWAIT');
             $this->assertFalse($ledger->adjust(61), 'A delta beyond capacity changes nothing.');
             $this->assertTrue($ledger->adjust(60));
@@ -302,6 +304,49 @@ final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
         try {
             app(VerificationLedger::class)->enterPublication(['size:5']);
             $this->assertLocked($other, 'SELECT name FROM release_verification_locks WHERE name = \'publication\' FOR UPDATE NOWAIT');
+        } finally {
+            DB::rollBack();
+        }
+    }
+
+    public function test_a_keyless_publication_and_a_striped_publication_exclude_each_other(): void
+    {
+        $other = $this->connection();
+        // A publication whose keys could not be resolved holds the shared row exclusively.
+        $other->beginTransaction();
+        try {
+            $other->query("SELECT name FROM release_verification_locks WHERE name = 'publication' FOR UPDATE")->fetchAll();
+            $this->assertPublicationWaits(['size:5']);
+        } finally {
+            $other->rollBack();
+        }
+        // A striped publication holds the shared row in share mode and its stripes exclusively.
+        $other->beginTransaction();
+        try {
+            $other->query("SELECT name FROM release_verification_locks WHERE name = 'publication' LOCK IN SHARE MODE")->fetchAll();
+            $other->query($this->stripeLock('size:5'))->fetchAll();
+            $this->assertPublicationWaits([]);
+            DB::beginTransaction();
+            try {
+                app(VerificationLedger::class)->enterPublication([$this->keyOnAnotherStripe('size:5')]);
+                $this->addToAssertionCount(1);
+            } finally {
+                DB::rollBack();
+            }
+        } finally {
+            $other->rollBack();
+        }
+    }
+
+    /** @param list<string> $keys */
+    private function assertPublicationWaits(array $keys): void
+    {
+        DB::beginTransaction();
+        try {
+            app(VerificationLedger::class)->enterPublication($keys);
+            $this->fail('The publication must wait for the conflicting one.');
+        } catch (QueryException $error) {
+            $this->assertSame(1205, (int) $error->errorInfo[1]);
         } finally {
             DB::rollBack();
         }
