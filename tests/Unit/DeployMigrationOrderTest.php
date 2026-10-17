@@ -1029,6 +1029,22 @@ SH);
         $this->assertStringContainsString('cannot read', $process->getErrorOutput());
     }
 
+    public function test_unreadable_container_start_time_aborts_instead_of_recreating_data_services(): void
+    {
+        mkdir($this->directory.'/docker/config/redis', 0777, true);
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 1gb\n");
+        $head = trim((new Process(['git', 'rev-parse', 'HEAD'], $this->directory))->mustRun()->getOutput());
+        $legacy = $head." e3b0 e3b0 c16c bb93\n";
+        file_put_contents($this->directory.'/docker/.deploy.stamp', $legacy);
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => $this->composeJson(), 'NNTMUX_STARTED_AT' => 'not-a-time']);
+        $process->run();
+        $this->assertNotSame(0, $process->getExitCode());
+        $this->assertStringContainsString('cannot determine when redis started', $process->getErrorOutput());
+        $this->assertStringNotContainsString('--force-recreate', $this->events());
+        $this->assertStringNotContainsString('drain', $this->events());
+        $this->assertSame($legacy, file_get_contents($this->directory.'/docker/.deploy.stamp'));
+    }
+
     public function test_host_system_paths_match_on_path_boundaries_only(): void
     {
         $script = 'import importlib.machinery, importlib.util, sys; l = importlib.machinery.SourceFileLoader("dp", sys.argv[1]); '

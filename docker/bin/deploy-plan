@@ -741,14 +741,16 @@ def container_started_at(docker_dir: Path, svc: str) -> float | None:
 
 def mounts_changed_since_start(docker_dir: Path, svc: str) -> bool:
     """True when a mounted configuration source was modified after the container started, so the
-    running process cannot have loaded it. Used without a per-service stamp; fails safe to True."""
+    running process cannot have loaded it. Used without a per-service stamp. An unreadable mount
+    reports True; an unknown container start time aborts the plan."""
     cfg = RENDERED_SERVICES.get(svc)
     if not isinstance(cfg, dict) or not isinstance(cfg.get("volumes"), list):
         return False
     try:
         started = container_started_at(docker_dir, svc)
-    except ValueError:
-        return True
+    except ValueError as error:
+        # Fail closed without guessing: "changed" would force-recreate a data service.
+        sys.exit(f"deploy-plan: cannot determine when {svc} started: {error}")
     if started is None:
         return False
     for volume in cfg["volumes"]:
