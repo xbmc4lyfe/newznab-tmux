@@ -487,7 +487,12 @@ def get_compose_service_hashes(docker_dir: Path) -> tuple[str, dict[str, str]]:
                     per_service[svc] = "absent"
             # The residual: everything no per-service record explains (top-level sections, the
             # Compose command text and context). Per-service changes are tracked per service.
-            residual = {key: value for key, value in parsed.items() if key != "services"}
+            # Top-level networks/volumes/configs/secrets entries are already part of the record of
+            # every service that references them.
+            residual = {
+                key: value for key, value in parsed.items()
+                if key not in ("services", "networks", "volumes", "configs", "secrets")
+            }
             global_hash = sha256_text(f"{json.dumps(residual, sort_keys=True)}\n{context_meta}")
             return global_hash, per_service
     except (ValueError, TypeError):
@@ -963,6 +968,15 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
             if svc not in dirty_app:
                 dirty_app.append(svc)
                 app_reasons[svc] = "compose config changed"
+    # Roles sharing one image tag with a service whose image is rebuilt run that rebuilt image only
+    # once recreated, so they are recreated in the same drain rather than a later rollout.
+    rebuilt_tags = {
+        service_image_name(svc) for svc in dirty_app if stamped.get(f"build:{svc}") != state[f"build:{svc}"]
+    }
+    for svc in APP_SERVICES:
+        if svc not in dirty_app and service_image_name(svc) in rebuilt_tags:
+            dirty_app.append(svc)
+            app_reasons[svc] = "shares a rebuilt image"
     # A Compose change to all four app services (e.g. a database cutover) migrates too. Only recorded
     # app definitions count: a forgotten record means the migration record decides.
     all_app_compose_changed = global_fallback or all(

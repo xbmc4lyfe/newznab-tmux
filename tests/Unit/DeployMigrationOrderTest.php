@@ -1201,6 +1201,43 @@ SH);
         $this->assertStringNotContainsString(' up -d', $events);
     }
 
+    public function test_compose_driven_migration_survives_an_interruption_after_writers_stop(): void
+    {
+        $base = json_decode($this->composeJson(), true);
+        $config = function (string $host) use ($base): array {
+            foreach (['web', 'horizon', 'scheduler', 'indexer'] as $role) {
+                $base['services'][$role] = ['environment' => ['DB_HOST' => $host]];
+            }
+
+            return ['NNTMUX_CONFIG_ID' => (string) json_encode($base, JSON_UNESCAPED_SLASHES)];
+        };
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('old'))->mustRun();
+        file_put_contents($this->directory.'/events', '');
+        $failed = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('new') + ['NNTMUX_HORIZON_STOP_FAIL' => '1']);
+        $failed->run();
+        $this->assertSame(45, $failed->getExitCode());
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
+
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('new'))->mustRun();
+        $this->assertStringContainsString('artisan migrate --force --no-interaction', $this->events());
+    }
+
+    public function test_roles_sharing_a_rebuilt_image_tag_are_recreated_in_the_same_rollout(): void
+    {
+        $shared = ['WEB_IMAGE' => 'custom/app:1', 'HORIZON_IMAGE' => 'custom/app:1', 'SCHEDULER_IMAGE' => 'custom/app:1', 'INDEXER_IMAGE' => 'custom/indexer:1'];
+        mkdir($this->directory.'/resources/js', 0777, true);
+        file_put_contents($this->directory.'/resources/js/app.js', "1\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $shared)->mustRun();
+        file_put_contents($this->directory.'/resources/js/app.js', "2\n");
+
+        $plan = $this->make(['deploy-plan'], $shared);
+        $plan->mustRun();
+        $this->assertMatchesRegularExpression('/horizon\s+app\s+drain\+recreate\s+shares a rebuilt image/', $plan->getOutput());
+        $this->assertMatchesRegularExpression('/scheduler\s+app\s+drain\+recreate\s+shares a rebuilt image/', $plan->getOutput());
+        $this->assertMatchesRegularExpression('/indexer\s+app\s+skip\s+unchanged/', $plan->getOutput());
+    }
+
     public function test_host_system_paths_match_on_path_boundaries_only(): void
     {
         $script = 'import importlib.machinery, importlib.util, sys; l = importlib.machinery.SourceFileLoader("dp", sys.argv[1]); '

@@ -184,6 +184,9 @@ fi
 # replaces no longer match their records.
 # shellcheck disable=SC2086
 [ -z "$up_app_services" ] || plan --forget $up_app_services
+# The migration this run owes is no longer done once writers stop: an interruption from here on
+# must leave the retry migrating.
+[ "$MIGRATE" != 1 ] || plan --forget migration
 
 if [ "$need_horizon_stop" = 1 ]; then
     # Let active Horizon jobs finish while the existing web service remains available.
@@ -232,7 +235,6 @@ if [ -n "$RECONCILE_DATA" ]; then
 fi
 
 if [ "$MIGRATE" = 1 ]; then
-    plan --forget migration
     compose run --rm --no-deps web php artisan migrate --force --no-interaction
     plan --record migration effective
     verify
