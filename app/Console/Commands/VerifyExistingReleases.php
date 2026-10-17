@@ -109,8 +109,11 @@ class VerifyExistingReleases extends Command
                 $scratchInventory->recordAudit((int) $scratchEntry->id, $record['verdict'], $record['reason']);
                 $delete = ! $this->option('dry-run') && $this->option('delete') && $record['verdict'] === 'unrepairable';
                 DB::transaction(function () use ($id, $isRetry, $record, $scratchEntry, $scratchInventory, $delete, $release, $deletion): void {
-                    // Deletions serialize with publications; the shared ledger row is locked last.
-                    app(VerificationLedger::class)->enterPublication('Audit state is unavailable.');
+                    // Deletions serialize with publications that may choose this release as a
+                    // duplicate (they share a search key); the shared ledger row is locked last.
+                    app(VerificationLedger::class)->enterPublication(VerificationLedger::publicationKeys((int) $release->size,
+                        $release->getAttribute('article_fingerprint'), (string) $release->name, (string) $release->searchname,
+                        (int) $release->predb_id), 'Audit state is unavailable.');
                     if ($record['verdict'] === 'unknown') {
                         DB::table('release_verification_audit_retries')->updateOrInsert(['release_id' => $id], [
                             'next_attempt_at' => now()->addSeconds(max(1, (int) config('release_verification.retry_seconds'))),
