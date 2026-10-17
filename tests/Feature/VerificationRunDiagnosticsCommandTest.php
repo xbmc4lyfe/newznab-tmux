@@ -326,8 +326,9 @@ final class VerificationRunDiagnosticsCommandTest extends ReleaseVerificationCan
         $this->assertSame(0, array_sum($reports[0]['verifier_verdicts']));
         $this->assertSame('success', $reports[0]['command_result']);
         $this->assertArrayNotHasKey('persisted_outcomes', $reports[0]);
-        // The throwing phase and the recovery finish are both timed.
-        $this->assertSame(1, $reports[0]['phases']['failed']['count']);
+        // The throwing manifest read is charged to its own phase, and the recovery finish is timed.
+        $this->assertSame(1, $reports[0]['phases']['manifest_read']['count']);
+        $this->assertSame(0, $reports[0]['phases']['verify_other']['count']);
         $this->assertSame(1, $reports[0]['phases']['finish']['count']);
         $this->assertSame(1, $reports[0]['phases']['claim']['count']);
     }

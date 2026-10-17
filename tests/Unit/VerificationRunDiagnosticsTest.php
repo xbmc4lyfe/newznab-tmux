@@ -94,7 +94,7 @@ final class VerificationRunDiagnosticsTest extends TestCase
 
         $phases = $diagnostics->report(hrtime(true))['phases'];
 
-        self::assertSame(['claim', 'bookkeeping', 'manifest_read', 'verify_passed', 'verify_other', 'publish', 'finish', 'status_write', 'failed'], array_keys($phases));
+        self::assertSame(['claim', 'bookkeeping', 'manifest_read', 'verify_passed', 'verify_other', 'publish', 'finish', 'status_write'], array_keys($phases));
         self::assertSame(2, $phases['claim']['count']);
         self::assertGreaterThanOrEqual(3.0, $phases['claim']['ms']);
         self::assertSame(['ms' => 0.0, 'count' => 0], $phases['finish']);

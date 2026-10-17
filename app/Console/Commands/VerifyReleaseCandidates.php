@@ -131,6 +131,8 @@ class VerifyReleaseCandidates extends Command
                 }
                 $diagnostics?->claimed();
                 $directory = $root.'/scratch/'.$claim->id.'-'.$claim->version;
+                // The phase charged if an operation throws.
+                $active = 'bookkeeping';
                 try {
                     $phase = $diagnostics === null ? null : hrtime(true);
                     $heartbeat = static fn () => $repository->heartbeat((int) $claim->id, $claim->lease_token);
@@ -157,11 +159,14 @@ class VerifyReleaseCandidates extends Command
                     }
                     $heartbeat();
                     $phase = $diagnostics?->phase('bookkeeping', $phase);
+                    $active = 'manifest_read';
                     $manifest = $store->read($claim->manifest_path);
                     $phase = $diagnostics?->phase('manifest_read', $phase);
+                    $active = 'verify_other';
                     $started = microtime(true);
                     $result = $verifier->verify($manifest, $progressHeartbeat);
                     $phase = $diagnostics?->phase($result->passed() ? 'verify_passed' : 'verify_other', $phase);
+                    $active = $result->passed() ? 'publish' : 'finish';
                     $diagnostics?->verified($result->verdict);
                     if ($result->passed()) {
                         $published = $publisher->publish($claim, $result);
@@ -182,6 +187,7 @@ class VerifyReleaseCandidates extends Command
                         $diagnostics?->finished();
                     }
                     $phase = $diagnostics === null ? null : hrtime(true);
+                    $active = 'status_write';
                     $bytes = $result->passed()
                         ? (int) ($result->manifest['spot_check']['bytes'] ?? $result->manifest['verified_bytes'] ?? 0) : 0;
                     $snapshot = json_encode(['verified_bytes_per_second' => $bytes / max(0.001, microtime(true) - $started),
@@ -199,8 +205,8 @@ class VerifyReleaseCandidates extends Command
                     $phase = $diagnostics?->phase('status_write', $phase);
                     $this->line($claim->id.': '.$result->verdict.' — '.$result->reason);
                 } catch (Throwable $error) {
-                    // Time spent in the phase that threw.
-                    $diagnostics?->phase('failed', $phase);
+                    // Time spent in the operation that threw, under its own phase.
+                    $diagnostics?->phase($active, $phase);
                     $diagnostics?->candidateFailed();
                     $filtered = $this->filteredResult($claim);
                     if ($filtered !== null) {

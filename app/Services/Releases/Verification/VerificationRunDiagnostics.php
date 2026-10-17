@@ -52,10 +52,10 @@ final class VerificationRunDiagnostics
     private float $maintenanceMilliseconds = 0.0;
 
     /**
-     * Fixed phases of the claim loop. Passed verification includes article fetch and decode;
-     * failed is the time a candidate spent in the phase that threw.
+     * Fixed phases of the claim loop. Passed verification includes article fetch and decode; an
+     * operation that throws is charged to its own phase.
      */
-    private const array PHASES = ['claim', 'bookkeeping', 'manifest_read', 'verify_passed', 'verify_other', 'publish', 'finish', 'status_write', 'failed'];
+    private const array PHASES = ['claim', 'bookkeeping', 'manifest_read', 'verify_passed', 'verify_other', 'publish', 'finish', 'status_write'];
 
     /** @var array<string, array{ms: float, count: int}> */
     private array $phases = [];
