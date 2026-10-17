@@ -71,11 +71,11 @@ final class NzbSourceGuard
      *
      * @param  (callable(string, string): bool)|null  $move
      */
-    public function install(object $release, string $temporary, string $destination, ?string $expectedDigest = null, ?callable $move = null): NzbSourceInstallation
+    public function install(object $release, string $temporary, string $destination, ?string $expectedDigest = null, ?callable $move = null, bool $preserve = false): NzbSourceInstallation
     {
         $this->lockRelease($release);
 
-        return $this->withGuidLock((string) $release->guid, function () use ($release, $temporary, $destination, $expectedDigest, $move): NzbSourceInstallation {
+        return $this->withGuidLock((string) $release->guid, function () use ($release, $temporary, $destination, $expectedDigest, $move, $preserve): NzbSourceInstallation {
             if ($expectedDigest !== null && ($this->readCurrent((string) $release->guid)['digest'] ?? null) !== $expectedDigest) {
                 throw new RuntimeException('NZB source changed before replacement.');
             }
@@ -83,7 +83,7 @@ final class NzbSourceGuard
             return $this->installFile((string) $release->guid, $temporary, $destination,
                 static function (string $digest) use ($release): void {
                     app(ReleaseArchiveNamingEvidence::class)->sourceReplacedLocked($release, $digest);
-                }, $move);
+                }, $move, $preserve);
         });
     }
 
@@ -303,7 +303,15 @@ final class NzbSourceGuard
             $query->fetchAll();
             $query->closeCursor();
             $this->withGuidLock($installation->guid, static function () use ($installation): void {
-                if ($installation->ownsCurrentPath() && ! @unlink($installation->path)) {
+                if (! $installation->ownsCurrentPath()) {
+                    return;
+                }
+                // A rolled-back replacement restores the source it replaced; a new installation is removed.
+                if ($installation->previous !== null && is_file($installation->previous)) {
+                    if (! @rename($installation->previous, $installation->path)) {
+                        throw new RuntimeException('Cannot restore the NZB a rolled-back replacement displaced.');
+                    }
+                } elseif (! @unlink($installation->path)) {
                     throw new RuntimeException('Cannot remove owned rolled-back NZB installation.');
                 }
             });
@@ -385,8 +393,9 @@ final class NzbSourceGuard
      * @param  (callable(string): void)|null  $beforeRename
      * @param  (callable(string, string): bool)|null  $move
      */
-    private function installFile(string $guid, string $temporary, string $destination, ?callable $beforeRename = null, ?callable $move = null): NzbSourceInstallation
+    private function installFile(string $guid, string $temporary, string $destination, ?callable $beforeRename = null, ?callable $move = null, bool $preserve = false): NzbSourceInstallation
     {
+        $previous = null;
         $handle = @fopen($temporary, 'rb');
         if ($handle === false) {
             throw new RuntimeException('Cannot open staged NZB installation.');
@@ -403,6 +412,13 @@ final class NzbSourceGuard
             if ($beforeRename !== null) {
                 $beforeRename($digest);
             }
+            if ($preserve && is_file($destination)) {
+                // Keep the replaced source reachable so a rolled-back replacement can restore it.
+                $previous = $destination.'.'.bin2hex(random_bytes(8)).'.prev';
+                if (! @link($destination, $previous)) {
+                    throw new RuntimeException('Cannot preserve the NZB being replaced.');
+                }
+            }
             if (! ($move === null ? @rename($temporary, $destination) : $move($temporary, $destination))) {
                 throw new RuntimeException('Unable to move temporary NZB into place.');
             }
@@ -413,9 +429,12 @@ final class NzbSourceGuard
                 throw new RuntimeException('Staged NZB installation identity changed.');
             }
 
-            return new NzbSourceInstallation($this, $guid, $destination, $digest, $handle, DB::connection()->getPdo());
+            return new NzbSourceInstallation($this, $guid, $destination, $digest, $handle, DB::connection()->getPdo(), $previous);
         } catch (Throwable $exception) {
             fclose($handle);
+            if ($previous !== null && is_file($previous)) {
+                @unlink($previous);
+            }
             throw $exception;
         }
     }

@@ -34,6 +34,8 @@
 
             @include('details.partials.anime-info')
 
+            @include('details.partials.partial-info')
+
             @include('details.partials.password-info')
 
             @include('details.partials.media-metadata')

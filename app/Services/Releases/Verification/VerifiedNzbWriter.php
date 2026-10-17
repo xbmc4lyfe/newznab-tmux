@@ -33,7 +33,7 @@ final class VerifiedNzbWriter
     }
 
     /** @param array<string, mixed> $manifest */
-    public function writeWithReceipt(array $manifest, string $guid, object $release, ?PublicationTiming $timing = null): NzbSourceInstallation
+    public function writeWithReceipt(array $manifest, string $guid, object $release, ?PublicationTiming $timing = null, bool $replace = false): NzbSourceInstallation
     {
         $path = $this->nzb->getNzbPath($guid, createIfNotExist: true);
         $body = gzencode($this->document($manifest));
@@ -55,7 +55,7 @@ final class VerifiedNzbWriter
                 fclose($handle);
             }
             $sources = new NzbSourceGuard($this->nzb);
-            $receipt = $sources->install($release, $temporary, $path);
+            $receipt = $sources->install($release, $temporary, $path, preserve: $replace);
         } finally {
             if (is_file($temporary)) {
                 unlink($temporary);

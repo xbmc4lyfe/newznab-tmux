@@ -40,6 +40,11 @@ final class DetailsData extends Data
         public Optional|int|string|null $tvdbid = new Optional,
         public Optional|int|string|null $tvrageid = new Optional,
         public Optional|int|string|null $tvmazeid = new Optional,
+        // Partial publications only: verified articles and files present versus declared.
+        public Optional|int|null $articles_found = new Optional,
+        public Optional|int|null $articles_expected = new Optional,
+        public Optional|int|null $files_found = new Optional,
+        public Optional|int|null $files_expected = new Optional,
     ) {}
 
     public static function fromRelease(Release|\stdClass $release, User $user): self
@@ -79,6 +84,7 @@ final class DetailsData extends Data
             'password' => $get('passwordstatus'),
             'usenetdate' => Carbon::parse($get('postdate'))->toRssString(),
         ];
+        $base += ReleaseData::partialCounts($get);
 
         if (in_array($categoriesId, Category::MOVIES_GROUP, true)) {
             return $base + [

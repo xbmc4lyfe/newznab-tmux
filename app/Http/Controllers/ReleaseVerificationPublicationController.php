@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Http\Controllers;
 
 use App\Services\Releases\Verification\ManifestStore;
+use App\Services\Releases\Verification\PartialPublicationDeferredException;
 use App\Services\Releases\Verification\SpotCheckVerifier;
 use App\Services\Releases\Verification\VerificationLockStore;
 use App\Services\Releases\Verification\VerificationResult;
@@ -36,13 +37,15 @@ class ReleaseVerificationPublicationController extends Controller
             'evidence.verified_file_names.*' => ['string', 'max:1024'],
             'evidence.identity_hints' => ['present', 'array', 'max:16'],
             'evidence.identity_hints.*' => ['string', 'max:1024'],
+            'evidence.partial' => ['sometimes', 'boolean'],
         ]);
         $claim = (object) ['id' => (int) $data['claim']['id'], 'version' => (int) $data['claim']['version'],
             'manifest_hash' => (string) $data['claim']['manifest_hash'], 'lease_token' => (string) $data['claim']['lease_token']];
         $evidence = ['articles' => (int) $data['evidence']['articles'], 'bytes' => (int) $data['evidence']['bytes'],
             'sampled_files' => (int) $data['evidence']['sampled_files'],
             'verified_file_names' => array_values(array_map('strval', $data['evidence']['verified_file_names'])),
-            'identity_hints' => array_values(array_map('strval', $data['evidence']['identity_hints']))];
+            'identity_hints' => array_values(array_map('strval', $data['evidence']['identity_hints'])),
+            'partial' => (bool) ($data['evidence']['partial'] ?? false)];
         try {
             $published = $this->publishedRelease($claim);
             if ($published !== null) {
@@ -71,6 +74,9 @@ class ReleaseVerificationPublicationController extends Controller
             }
             try {
                 return response()->json(['release_id' => $publisher->publish($claim, new VerificationResult('sampled', (string) $data['reason'], $manifest))]);
+            } catch (PartialPublicationDeferredException $deferred) {
+                // The sending worker returns the partial to waiting for one more hold window.
+                return response()->json(['deferred' => $deferred->getMessage()], 409);
             } finally {
                 $locks->release($worker);
             }

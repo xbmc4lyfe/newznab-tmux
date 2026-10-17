@@ -12,6 +12,9 @@ return [
     'worker_limit' => (int) env('RELEASE_VERIFICATION_WORKER_LIMIT', 1000),
     'worker_seconds' => (int) env('RELEASE_VERIFICATION_WORKER_SECONDS', 300),
     'candidate_workers' => (int) env('RELEASE_VERIFICATION_CANDIDATE_WORKERS', 2),
+    // Publish an upload still missing files or articles once no new article has arrived for this many
+    // hours, recording how many of its declared articles were found; 0 waits for complete headers.
+    'partial_after_hours' => (int) env('RELEASE_VERIFICATION_PARTIAL_AFTER_HOURS', 4),
     // Hosts sharing one database schedule disjoint slots: this host runs slot_offset + 1 through
     // slot_offset + candidate_workers (at most slot 256).
     'slot_offset' => (int) env('RELEASE_VERIFICATION_SLOT_OFFSET', 0),

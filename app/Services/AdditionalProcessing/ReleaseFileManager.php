@@ -413,14 +413,15 @@ class ReleaseFileManager
                     $insertedReleaseFiles = $inserted;
                 };
                 $names = array_keys($context->archiveNamingWitnesses);
+                $authoritative = self::archiveNamingIsAuthoritative($context);
                 $scope = ($context->seasonPack || SeasonPackDetector::isMultiEpisodeSet($names))
                     ? 'multi_episode'
-                    : ($context->archiveNamingInspectionComplete && ! $context->archiveNameEvidenceIncomplete ? 'complete_single' : 'incomplete');
+                    : ($authoritative ? 'complete_single' : 'incomplete');
                 if (! app(ReleaseArchiveNamingEvidence::class)->recordLocked($context->release, $context->nzbSourceDigest,
-                    $scope, $names, $context->archiveNamingInspectionComplete && ! $context->archiveNameEvidenceIncomplete, $persist, $context->namingWitnessesOmitted)) {
+                    $scope, $names, $authoritative, $persist, $context->namingWitnessesOmitted)) {
                     return null;
                 }
-                if ($context->archiveNamingInspectionComplete && ! $context->archiveNameEvidenceIncomplete
+                if ($authoritative
                     && ! $context->namingWitnessesOmitted && ! $context->seasonPack
                     && ! SeasonPackDetector::hasDistinctEpisodeIdentities($names)) {
                     $candidates = array_values(array_filter($names, static fn (string $name): bool => ($context->archiveFilenameNamingAttempts[$name] ?? false)
@@ -456,6 +457,18 @@ class ReleaseFileManager
         if ($terminalNamingSnapshot !== null) {
             $this->matchFinalizedFileNames($terminalNamingSnapshot, $terminalNamingFiles, $sourceDigest);
         }
+    }
+
+    /**
+     * Whether a fully read archive inventory proves the release's naming scope. A partial publication's NZB
+     * lacks files that were never seen, so it proves nothing about the whole upload: one episode of a
+     * season pack is not a single-episode release.
+     */
+    public static function archiveNamingIsAuthoritative(ReleaseProcessingContext $context): bool
+    {
+        return $context->archiveNamingInspectionComplete && ! $context->archiveNameEvidenceIncomplete
+            && ! (Release::hasPartialArticleCounts()
+                && DB::table('releases')->where('id', $context->release->id)->whereNotNull('articles_expected')->exists());
     }
 
     /**

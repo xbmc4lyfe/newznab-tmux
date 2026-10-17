@@ -19,6 +19,7 @@ use Illuminate\Pagination\Paginator;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 
 /**
  * Properties from computed columns, joins, and subqueries.
@@ -199,6 +200,50 @@ class Release extends Model
     public function episode(): BelongsTo
     {
         return $this->belongsTo(TvEpisode::class, 'tv_episodes_id');
+    }
+
+    /** @var \WeakMap<\PDO, bool>|null */
+    private static ?\WeakMap $partialArticleCountSupport = null;
+
+    /** Whether releases record partial publications' found and declared article and file counts. */
+    public static function hasPartialArticleCounts(): bool
+    {
+        $pdo = DB::connection()->getPdo();
+        self::$partialArticleCountSupport ??= new \WeakMap;
+
+        return self::$partialArticleCountSupport[$pdo] ??= Schema::hasColumn('releases', 'articles_expected');
+    }
+
+    /** @var \WeakMap<\PDO, bool>|null */
+    private static ?\WeakMap $lateArticleFlagSupport = null;
+
+    /** Whether releases record which candidate may still upgrade a partial publication in place. */
+    public static function hasLateArticleFlag(): bool
+    {
+        $pdo = DB::connection()->getPdo();
+        self::$lateArticleFlagSupport ??= new \WeakMap;
+
+        return self::$lateArticleFlagSupport[$pdo] ??= Schema::hasColumn('releases', 'late_article_candidate_id');
+    }
+
+    /**
+     * Restrict a worker's selection to releases whose NZB can no longer change. A partial with a
+     * late-article candidate may be upgraded in place; the pointer only ever clears, so a release
+     * selected without one stays stable.
+     *
+     * @param  \Illuminate\Database\Query\Builder|Builder<self>  $query
+     */
+    public static function whereNzbSettled(\Illuminate\Database\Query\Builder|Builder $query, string $table = 'releases'): void
+    {
+        if (self::hasLateArticleFlag()) {
+            $query->whereNull($table.'.late_article_candidate_id');
+        }
+    }
+
+    /** The same predicate for raw SQL fragments; always true without the column. */
+    public static function nzbSettledSql(string $table = 'releases'): string
+    {
+        return self::hasLateArticleFlag() ? $table.'.late_article_candidate_id IS NULL' : '1 = 1';
     }
 
     /**
@@ -619,6 +664,10 @@ class Release extends Model
             'tve.episode',
             'tve.firstaired',
         ];
+
+        if (self::hasPartialArticleCounts()) {
+            array_push($columns, 'releases.articles_found', 'releases.articles_expected', 'releases.files_found', 'releases.files_expected');
+        }
 
         if ($includeV1CompatibilityFields) {
             array_push($columns,

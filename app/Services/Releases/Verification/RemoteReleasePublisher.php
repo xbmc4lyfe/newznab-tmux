@@ -32,6 +32,11 @@ final class RemoteReleasePublisher
             ->retry(3, 1000, static fn (\Throwable $error): bool => $error instanceof ConnectionException, throw: false)
             ->post((string) config('release_verification.publish_url'), $payload);
         if (! $response->successful()) {
+            $deferred = $response->json('deferred');
+            if (is_string($deferred)) {
+                // Handled as a local publication's deferral: back to waiting for late articles.
+                throw new PartialPublicationDeferredException($deferred);
+            }
             $error = $response->json('error');
             throw new RuntimeException('Remote publication failed: '
                 .mb_strcut(is_string($error) ? $error : 'HTTP '.$response->status(), 0, 500, 'UTF-8'));

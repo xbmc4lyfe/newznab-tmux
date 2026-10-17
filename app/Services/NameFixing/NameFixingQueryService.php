@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\NameFixing;
 
 use App\Models\Category;
+use App\Models\Release;
 use App\Support\Par2FileHashEvidence;
 use Carbon\CarbonImmutable;
 use Illuminate\Cache\DatabaseLock;
@@ -17,7 +18,7 @@ use RuntimeException;
 
 final class NameFixingQueryService
 {
-    public const PREDB_IDENTITY_POLICY = 'dff26e2821d76963df052e8c27f9b5db2fab767de5ee7ee9f75949e961f11a27';
+    public const PREDB_IDENTITY_POLICY = '3981b572b825b8d407229066fb972ae8288e86252c7363e687855f0f622c80bb';
 
     public const SOURCE_NFO = 'nfo';
 
@@ -100,7 +101,7 @@ final class NameFixingQueryService
         $condition = 'r.predb_id = 0 AND (r.isrenamed = 0 OR r.categories_id IN ('
             .Category::OTHER_MISC.', '.Category::OTHER_HASHED.'))'
             .$categoryFilter
-            .' AND (CASE WHEN r.proc_par2 = 0 AND ('.self::SOURCE_EXISTS[self::SOURCE_PAR2].') THEN 1'
+            .' AND (CASE WHEN r.proc_par2 = 0 AND ('.self::SOURCE_EXISTS[self::SOURCE_PAR2].') AND '.Release::nzbSettledSql('r').' THEN 1'
             .' WHEN '.implode(' OR ', $sources).' THEN 1 ELSE 0 END = 1)';
 
         if (! (bool) config('tmux.fix_names.full_backlog', true)) {
@@ -199,6 +200,7 @@ final class NameFixingQueryService
              AND r.predb_id = 0
              AND r.passwordstatus >= 0
              AND r.nfostatus > -1
+             AND '.Release::nzbSettledSql('r').'
              AND (
                 (r.nfostatus = 1 AND r.proc_nfo = 0)
                 OR r.proc_files = 0
@@ -734,6 +736,11 @@ final class NameFixingQueryService
 
         if ($categories === 1) {
             $where[] = 'r.categories_id IN ('.implode(',', Category::OTHERS_GROUP).')';
+        }
+
+        if ($source === self::SOURCE_PAR2) {
+            // PAR2 names come from the NZB; a partial awaiting late articles may still have it replaced.
+            $where[] = Release::nzbSettledSql('r');
         }
 
         if ($source === self::SOURCE_HASH) {
