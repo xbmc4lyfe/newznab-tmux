@@ -736,9 +736,12 @@ def mounts_changed_since_start(docker_dir: Path, svc: str) -> bool:
             elif path.is_dir() and volume.get("read_only"):
                 if is_host_system(str(path.resolve())):
                     continue
-                newest = max([path.stat().st_mtime] + [
-                    (Path(root) / name).stat().st_mtime for root, _, files in os.walk(path) for name in files
-                ])
+                # Directory mtimes too: deleting or renaming a nested file only touches its parent.
+                newest = max(
+                    stamp
+                    for root, _, files in os.walk(path)
+                    for stamp in [Path(root).stat().st_mtime, *((Path(root) / name).stat().st_mtime for name in files)]
+                )
             else:
                 continue
         except OSError:

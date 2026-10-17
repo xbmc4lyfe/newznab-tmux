@@ -742,6 +742,23 @@ SH);
         $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
     }
 
+    public function test_deleting_a_nested_file_from_a_read_only_mount_counts_as_newer_than_the_container(): void
+    {
+        $tree = $this->directory.'/docker/monitoring/provisioning';
+        mkdir($tree.'/datasources', 0777, true);
+        file_put_contents($tree.'/datasources/prometheus.yml', "a\n");
+        file_put_contents($tree.'/datasources/legacy.yml', "b\n");
+        foreach ([$tree.'/datasources/prometheus.yml', $tree.'/datasources', $tree] as $path) {
+            touch($path, 946684800);
+        }
+        $grafana = ['volumes' => [['type' => 'bind', 'source' => $tree, 'target' => '/etc/grafana/provisioning', 'read_only' => true]]];
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['web' => [], 'horizon' => [], 'scheduler' => [], 'indexer' => [], 'grafana' => $grafana]], JSON_UNESCAPED_SLASHES)];
+        unlink($tree.'/datasources/legacy.yml');
+        touch($tree, 946684800);
+        $this->deploy($config + ['NNTMUX_STARTED_AT' => '2001-01-01T00:00:00Z'])->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 grafana', $this->events());
+    }
+
     public function test_host_system_paths_match_on_path_boundaries_only(): void
     {
         $script = 'import importlib.machinery, importlib.util, sys; l = importlib.machinery.SourceFileLoader("dp", sys.argv[1]); '
