@@ -109,7 +109,17 @@ final class CandidateRepository
                     $retained = $this->store->read($previous->manifest_path);
                     // The publication consumed any legacy release; the next generation publishes anew.
                     $retained['legacy_release_id'] = null;
-                    $manifest = $this->merge($retained, $manifest);
+                    $merged = $this->merge($retained, $manifest);
+                    if (($merged['conflict'] ?? false) && ! ($retained['conflict'] ?? false)) {
+                        // Conflicting headers (another post under the same hash) would poison the retained
+                        // inventory; leave the partial and its inventory as they are and archive these apart.
+                        $previous = null;
+                        $merges = false;
+                    } else {
+                        $manifest = $merged;
+                    }
+                }
+                if ($merges) {
                     if ($this->articleIdentity($retained) === $this->articleIdentity($manifest) && ! ($manifest['conflict'] ?? false)) {
                         // A replay of headers the partial already holds changes nothing.
                         $this->cleanup->deleteCollectionsAndDescendants([$collectionId], 'Archived for verification', false, manifestArchived: true);
@@ -800,16 +810,19 @@ final class CandidateRepository
         if (! Release::hasLateArticleFlag()) {
             return;
         }
-        $held = DB::table('releases')->whereNotNull('late_article_candidate_id')->orderBy('id')->limit(500)
-            ->pluck('late_article_candidate_id', 'id');
-        foreach ($held as $releaseId => $candidateId) {
-            $holder = DB::table('release_verification_candidates')->where('id', $candidateId)->first(['release_id', 'manifest_path', 'status']);
-            $live = $holder !== null && ((int) $holder->release_id === (int) $releaseId
-                ? $holder->manifest_path !== ''
-                : $holder->release_id === null && ! in_array($holder->status, ['expired', 'filtered', 'metadata_expired'], true));
-            if (! $live) {
-                DB::table('releases')->where('id', $releaseId)->where('late_article_candidate_id', $candidateId)->update(['late_article_candidate_id' => null]);
-            }
+        // Select only settled holders, so live partials never crowd them out of the window; the join is by
+        // primary key and the held releases come from the late_article_candidate_id index.
+        $settled = DB::table('releases as r')->leftJoin('release_verification_candidates as c', 'c.id', '=', 'r.late_article_candidate_id')
+            ->whereNotNull('r.late_article_candidate_id')
+            ->where(function ($query): void {
+                $query->whereNull('c.id')
+                    ->orWhere(fn ($own) => $own->whereColumn('c.release_id', 'r.id')->where('c.manifest_path', ''))
+                    ->orWhere(fn ($other) => $other->whereNotNull('c.release_id')->whereColumn('c.release_id', '!=', 'r.id'))
+                    ->orWhere(fn ($ended) => $ended->whereNull('c.release_id')->whereIn('c.status', ['expired', 'filtered', 'metadata_expired']));
+            })
+            ->orderBy('r.id')->limit(500)->pluck('r.late_article_candidate_id', 'r.id');
+        foreach ($settled as $releaseId => $candidateId) {
+            DB::table('releases')->where('id', $releaseId)->where('late_article_candidate_id', $candidateId)->update(['late_article_candidate_id' => null]);
         }
     }
 

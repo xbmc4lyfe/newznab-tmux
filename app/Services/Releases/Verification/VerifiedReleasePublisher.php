@@ -449,15 +449,17 @@ final class VerifiedReleasePublisher
             'articles_found' => $partial['articles_found'] ?? null, 'articles_expected' => $partial['articles_expected'] ?? null,
             'files_found' => $partial['files_found'] ?? null, 'files_expected' => $partial['files_expected'] ?? null,
             'late_article_candidate_id' => $holder] + $naming + $this->freshPostProcessingState());
-        // Metadata collected from the smaller NZB is stale; a run in flight sees this and re-queues itself.
-        if (Schema::hasTable('release_fingerprint_metadata')) {
-            DB::table('release_fingerprint_metadata')->where('releases_id', $id)->update(['status' => 'stale']);
-        }
         ReleaseArticleFingerprintStore::store($id, $this->incomingFingerprint($manifest));
         $timing?->nextPhase('final_xml_gzip');
         $receipt = $this->writer->writeWithReceipt($manifest, (string) $release->guid, $release, $timing, replace: true);
         DB::afterRollBack(static fn () => $receipt->rollback());
         DB::afterCommit(static fn () => $receipt->close());
+        // After the replacement, and even if no collection has started yet: a run that read the smaller NZB
+        // can then only save while its record still says processing, which this (row-locked until commit) ends.
+        if (Schema::hasTable('release_fingerprint_metadata')) {
+            DB::table('release_fingerprint_metadata')->upsert([['releases_id' => $id, 'status' => 'stale', 'created_at' => now(), 'updated_at' => now()]],
+                ['releases_id'], ['status', 'updated_at']);
+        }
         DB::afterCommit(static function () use ($id): void {
             Search::updateRelease($id);
             try {

@@ -341,6 +341,8 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame((int) $rows[1]->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
         $this->assertNotSame($previous->identity, $rows[1]->identity);
         $this->assertSame((int) $rows[1]->id, $holder(), 'Only the merging generation may upgrade it.');
+        app(CandidateRepository::class)->expire();
+        $this->assertSame((int) $rows[1]->id, $holder(), 'The sweep leaves a live holder alone.');
 
         $guid = DB::table('releases')->where('id', $first)->value('guid');
         // Post-processing already ran on the smaller NZB; a title lookup ran on a later-normalized name.
@@ -417,6 +419,24 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(['c@d'], array_column($fresh['files'][0]['segments'], 'messageid'));
         $this->assertArrayNotHasKey('upgrades_release_id', $fresh);
         $this->assertSame((int) $rows[1]->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
+    }
+
+    public function test_conflicting_late_headers_leave_the_partial_and_its_inventory_untouched(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('conflicting-post', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $retained = DB::table('release_verification_candidates')->sole();
+        // Another poster under the same collection hash.
+        $other = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d');
+        DB::table('collections')->where('id', $other)->update(['fromname' => 'someone-else']);
+
+        app(CandidateRepository::class)->archive($other);
+
+        $rows = DB::table('release_verification_candidates')->orderBy('id')->get();
+        $this->assertSame($retained->manifest_path, $rows[0]->manifest_path, 'The clean inventory is kept.');
+        $this->assertSame((int) $retained->id, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
+        $this->assertArrayNotHasKey('upgrades_release_id', app(ManifestStore::class)->read($rows[1]->manifest_path));
     }
 
     public function test_retained_partial_inventory_is_released_at_expiry(): void
