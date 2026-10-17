@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Feature;
 
+use App\Jobs\CollectReleaseFingerprintMetadata;
 use App\Models\Release;
 use App\Services\NNTP\NntpProviderUnavailableException;
 use App\Services\NNTP\NNTPService;
@@ -142,6 +143,44 @@ final class ReleaseFingerprintProviderBreakerTest extends TestCase
         $this->collect();
 
         $this->assertSame('recent_provider_failure', $this->alternateProfile($this->collect()['data'])['profile_skipped_reason']);
+    }
+
+    #[Test]
+    public function a_reprobe_claim_outlasts_a_long_connect_retry_cycle(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->twice()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(true)
+            ->andThrow(new NntpProviderUnavailableException('Unable to connect to the requested NNTP provider.'));
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)
+            ->withArgs(fn (string $id, int $body, int $header, bool $alternate): bool => $alternate === false)
+            ->andThrow(new \RuntimeException('Article unavailable.'));
+
+        $this->collect();
+        $this->travel(901)->seconds();
+        // A worker claimed the re-probe and is still retrying ten 120-second connects.
+        $this->assertTrue(Cache::add($this->breakerKey('probe'), true, CollectReleaseFingerprintMetadata::TIMEOUT_SECONDS));
+        $this->travel(1200)->seconds();
+
+        $this->assertSame('provider_probe_in_progress', $this->alternateProfile($this->collect()['data'])['profile_skipped_reason']);
+    }
+
+    #[Test]
+    public function a_reprobe_whose_profile_fails_after_connecting_releases_its_claim(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->times(3)->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(true)
+            ->andThrow(new NntpProviderUnavailableException('Unable to connect to the requested NNTP provider.'));
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(true)->andThrow(new \RuntimeException('Profile failed.'));
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(true)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(15)->andThrow(new \RuntimeException('Article unavailable.'));
+
+        $this->collect();
+        $this->travel(901)->seconds();
+        $this->assertSame('RuntimeException', $this->alternateProfile($this->collect()['data'])['profile_error_type']);
+
+        $this->assertArrayHasKey('profile', $this->alternateProfile($this->collect()['data']));
     }
 
     #[Test]

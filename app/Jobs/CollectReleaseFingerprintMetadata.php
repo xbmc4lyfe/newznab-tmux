@@ -19,9 +19,11 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
+    public const TIMEOUT_SECONDS = 1800;
+
     public int $tries = 3;
 
-    public int $timeout = 1800;
+    public int $timeout = self::TIMEOUT_SECONDS;
 
     public int $uniqueFor = 3600;
 

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Fingerprint;
 
+use App\Jobs\CollectReleaseFingerprintMetadata;
 use App\Models\Release;
 use App\Services\NNTP\NntpProviderUnavailableException;
 use App\Services\NNTP\NNTPService;
@@ -101,6 +102,9 @@ final class ReleaseFingerprintCollector
                 if ($server['alternate'] && $exception instanceof NntpProviderUnavailableException) {
                     $unavailable[$serverKey] = class_basename($exception);
                     $this->rememberAlternateUnavailable($server);
+                } elseif ($server['alternate']) {
+                    // Connected but the profile failed: let the next job re-probe instead of waiting out the claim.
+                    $this->releaseAlternateProbe($server);
                 }
             }
             $serverProfiles[] = $profileRow;
@@ -2416,15 +2420,28 @@ final class ReleaseFingerprintCollector
         }
     }
 
+    /** @param array{name: string, port: string, tls: bool} $server */
+    private function releaseAlternateProbe(array $server): void
+    {
+        try {
+            Cache::forget(self::providerBreakerKey($server, 'probe'));
+        } catch (Throwable) {
+            // The claim expires with the job timeout.
+        }
+    }
+
     private static function providerBreakerSeconds(): int
     {
         return (int) config('nntmux_nntp.fingerprint_provider_breaker_seconds', 900);
     }
 
-    /** Long enough to cover one alternate connect attempt, so a crashed prober cannot block it for long. */
+    /**
+     * A connect can retry many times, so the claim lasts as long as the job may run. A finished probe
+     * releases it at once; only a crashed prober leaves it to expire.
+     */
     private static function providerProbeSeconds(): int
     {
-        return max(60, 2 * (int) config('nntmux_nntp.alternate_server_socket_timeout', 120));
+        return CollectReleaseFingerprintMetadata::TIMEOUT_SECONDS;
     }
 
     /** @param array{name: string, port: string, tls: bool} $server */
