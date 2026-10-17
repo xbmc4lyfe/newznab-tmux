@@ -540,6 +540,35 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertTrue(DB::table('collections')->where('id', $late)->exists(), 'They may be the partial\'s late articles.');
     }
 
+    public function test_another_posts_later_parts_join_its_own_candidate_past_a_newer_holder(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('two-posters', true);
+        $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $poster = function (int $part, string $messageId) use ($hash): int {
+            $id = $this->collectionForPolicy('movie.mkv', 3, $hash, part: $part, messageId: $messageId);
+            DB::table('collections')->where('id', $id)->update(['fromname' => 'poster-b']);
+
+            return $id;
+        };
+        app(CandidateRepository::class)->archive($poster(1, 'b1@b'));
+        $own = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        // Poster A's late article: a newer generation now holds the partial.
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+        $this->assertGreaterThan((int) $own->id, (int) DB::table('release_verification_candidates')->max('id'));
+
+        $second = $poster(2, 'b2@b');
+        DB::table('collections')->where('id', $second)->update(['filecheck' => 0]);
+        app(CandidateRepository::class)->invalidateHotCollections([$second]);
+        app(CandidateRepository::class)->archive($second);
+
+        $count = DB::table('release_verification_candidates')->count();
+        $this->assertSame(3, $count, 'No candidate is split off for poster B.');
+        $manifest = app(ManifestStore::class)->read((string) DB::table('release_verification_candidates')->where('id', $own->id)->value('manifest_path'));
+        $this->assertSame(['b1@b', 'b2@b'], array_column($manifest['files'][0]['segments'], 'messageid'));
+        $this->assertNotSame('dirty', DB::table('release_verification_candidates')->where('id', $own->id)->value('status'));
+    }
+
     public function test_late_articles_never_republish_a_deleted_partial(): void
     {
         $this->publicationSchema(partialColumns: true);

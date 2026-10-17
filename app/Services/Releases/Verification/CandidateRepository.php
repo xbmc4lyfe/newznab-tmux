@@ -94,6 +94,15 @@ final class CandidateRepository
                         $apart = $holder === null && in_array((int) $existing->id, array_map(static fn (object $held): int => (int) $held->id, $holders), true);
                     }
                 }
+                if ($holder === null && $holders !== [] && $existing !== null && ($apart || $existing->release_id !== null)) {
+                    // Not a partial's articles, and the newest candidate is a holder or published: these join the
+                    // newest pending candidate that isn't a holder (another post's own), or start a generation.
+                    $own = $this->lockLatestUnheld($sourceIdentity, array_map(static fn (object $held): int => (int) $held->id, $holders));
+                    if ($own !== null) {
+                        $existing = $own;
+                        $apart = false;
+                    }
+                }
                 if ($holder !== null && ($holder->release_id === null || (int) $holder->id === (int) $existing->id)) {
                     // A pending generation is merged like any candidate; the published partial itself as the
                     // newest candidate takes the usual path below.
@@ -569,13 +578,15 @@ final class CandidateRepository
                 }
                 $old = $this->store->read($candidate->manifest_path);
                 $merged = $this->merge($old, $snapshot);
-                if ($this->articleIdentity($old) === $this->articleIdentity($merged) && ! ($merged['conflict'] ?? false)) {
-                    continue;
+                if ($this->articleIdentity($old) !== $this->articleIdentity($merged) || ($merged['conflict'] ?? false)) {
+                    DB::table('release_verification_candidates')->where('id', $candidate->id)->update([
+                        'status' => 'dirty', 'lease_token' => null, 'lease_until' => null, 'version' => $candidate->version + 1,
+                        'last_unique_at' => $this->articleIdentity($old) !== $this->articleIdentity($merged) ? now() : $candidate->last_unique_at]);
+                    DB::table('collections')->where('id', $collection->id)->where('filecheck', '!=', 4)->update(['filecheck' => 3]);
                 }
-                DB::table('release_verification_candidates')->where('id', $candidate->id)->update([
-                    'status' => 'dirty', 'lease_token' => null, 'lease_until' => null, 'version' => $candidate->version + 1,
-                    'last_unique_at' => $this->articleIdentity($old) !== $this->articleIdentity($merged) ? now() : $candidate->last_unique_at]);
-                DB::table('collections')->where('id', $collection->id)->where('filecheck', '!=', 4)->update(['filecheck' => 3]);
+
+                // Only the newest pending candidate receives these headers in archive(); leave older ones alone.
+                break;
             }
         }
     }
@@ -600,6 +611,18 @@ final class CandidateRepository
 
         return DB::table('release_verification_candidates')->whereIn('id', $ids)->where('manifest_path', '<>', '')
             ->orderByDesc('id')->lockForUpdate()->get()->all();
+    }
+
+    /**
+     * The newest pending candidate of this upload that holds no partial's inventory, locked.
+     *
+     * @param  list<int>  $heldIds
+     */
+    private function lockLatestUnheld(string $sourceIdentity, array $heldIds): ?object
+    {
+        return DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)->whereNull('release_id')
+            ->whereNotIn('status', ['expired', 'filtered', 'metadata_expired'])->whereNotIn('id', $heldIds === [] ? [0] : $heldIds)
+            ->orderByDesc('id')->lockForUpdate()->first();
     }
 
     /**
