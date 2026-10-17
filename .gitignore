@@ -5,6 +5,7 @@ docker/composer-auth.json
 docker/php-overrides.local.ini
 docker-compose.yml
 !docker/docker-compose.yml
+!docker/worker/docker-compose.yml
 docker-compose.override.yml
 .env
 install.lock
