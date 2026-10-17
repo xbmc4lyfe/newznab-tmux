@@ -424,7 +424,10 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             $this->assertSame(3, DB::table('releases_groups')->where('releases_id', $id)->count());
         }
         $release = DB::table('releases')->where('id', $id)->first();
-        if (config('release_verification.manifest_storage') === 'database') {
+        if (config('release_verification.manifest_storage') === 'database' && $timingMode === 'nested') {
+            // Inside an outer transaction, publication takes the exclusive fallback before any read.
+            $this->assertSame([], $stripeLocks);
+        } elseif (config('release_verification.manifest_storage') === 'database') {
             // The publication locked every stripe its duplicate search could look this release up by.
             $this->assertNotSame([], $stripeLocks);
             foreach (VerificationLedger::publicationKeys((int) $release->size, null, (string) $release->name,

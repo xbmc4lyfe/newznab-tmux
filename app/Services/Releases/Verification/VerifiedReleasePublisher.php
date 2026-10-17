@@ -35,16 +35,20 @@ final class VerifiedReleasePublisher
         $timing = PublicationTiming::sample();
         $status = 'threw';
         // Resolve the duplicate-search keys once, before taking any lock, so the publication locks
-        // exactly the keys its search will use. Without them it falls back to the shared row.
+        // exactly the keys its search will use. Without them it falls back to the shared row. An
+        // outer transaction would take its REPEATABLE READ view from these reads, before the locks,
+        // so there metadata is resolved after the exclusive fallback, as before striping.
         $preResolved = null;
         $keys = [];
-        try {
-            $preResolved = $this->metadata->resolve($result->manifest);
-            $keys = VerificationLedger::publicationKeys($this->publicationSize($result->manifest), $this->incomingFingerprint($result->manifest),
-                (string) $preResolved['name'], (string) $preResolved['searchname'], (int) $preResolved['predb_id']);
-        } catch (Throwable) {
-            $preResolved = null;
-            $keys = [];
+        if (DB::transactionLevel() === 0) {
+            try {
+                $preResolved = $this->metadata->resolve($result->manifest);
+                $keys = VerificationLedger::publicationKeys($this->publicationSize($result->manifest), $this->incomingFingerprint($result->manifest),
+                    (string) $preResolved['name'], (string) $preResolved['searchname'], (int) $preResolved['predb_id']);
+            } catch (Throwable) {
+                $preResolved = null;
+                $keys = [];
+            }
         }
         try {
             $id = DB::transaction(function () use ($claim, $result, $timing, $preResolved, $keys): ?int {
