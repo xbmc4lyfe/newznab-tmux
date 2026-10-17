@@ -13,6 +13,10 @@ return [
     'worker_seconds' => (int) env('RELEASE_VERIFICATION_WORKER_SECONDS', 300),
     'candidate_workers' => (int) env('RELEASE_VERIFICATION_CANDIDATE_WORKERS', 2),
     'storage_path' => storage_path('app/release-verification'),
+    // database: manifests live in release_verification_manifests (shared by every worker host and
+    // written in the candidate's transaction), falling back to legacy files until they are imported.
+    // files: the previous per-host manifest files under storage_path/manifests.
+    'manifest_storage' => env('RELEASE_VERIFICATION_MANIFEST_STORAGE', 'database'),
     'scratch_bytes' => (int) env('RELEASE_VERIFICATION_SCRATCH_BYTES', 214748364800),
     'free_bytes' => (int) env('RELEASE_VERIFICATION_FREE_BYTES', 10737418240),
     'article_bytes' => (int) env('RELEASE_VERIFICATION_ARTICLE_BYTES', 16777216),

@@ -9,9 +9,12 @@ use App\Services\Releases\Verification\ManifestStore;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use PHPUnit\Framework\Attributes\DataProvider;
+use Tests\Support\StoredManifests;
 
 class OccupiedManifestImportCustodyTest extends ReleaseVerificationCandidatesTest
 {
+    use StoredManifests;
+
     public static function modes(): array
     {
         $rows = [];
@@ -38,7 +41,7 @@ class OccupiedManifestImportCustodyTest extends ReleaseVerificationCandidatesTes
         $initial = DB::table('release_verification_candidates')->first();
         self::assertNotNull($initial);
         $manifest = $store->read($initial->manifest_path);
-        $oldBytes = file_get_contents($store->path($initial->manifest_path));
+        $oldBytes = $this->storedManifestBody($initial->manifest_path);
         if ($enrich) {
             $incoming = [];
             foreach ($manifest as $key => $value) {
@@ -51,11 +54,11 @@ class OccupiedManifestImportCustodyTest extends ReleaseVerificationCandidatesTes
         } else {
             DB::table('release_verification_candidates')->delete();
             DB::table('release_verification_state')->update(['pending_bytes' => 0]);
-            unlink($store->path($initial->manifest_path));
+            $this->removeStoredManifest($initial->manifest_path);
         }
         $prepared = $store->prepare($manifest);
         $corrupt = gzencode('{"files":[]}');
-        file_put_contents($store->path($prepared->name), $corrupt);
+        $this->occupyManifest($prepared->name, $corrupt);
         $before = DB::table('release_verification_candidates')->get()->map(fn ($r) => (array) $r)->all();
         $state = (array) DB::table('release_verification_state')->first();
         $source = $this->passwordFixture(['synthetic assertion']);
@@ -71,9 +74,9 @@ class OccupiedManifestImportCustodyTest extends ReleaseVerificationCandidatesTes
         self::assertSame($source, file_get_contents($path));
         self::assertSame($before, DB::table('release_verification_candidates')->get()->map(fn ($r) => (array) $r)->all());
         self::assertSame($state, (array) DB::table('release_verification_state')->first());
-        self::assertSame($corrupt, file_get_contents($store->path($prepared->name)));
+        self::assertSame($corrupt, $this->storedManifestBody($prepared->name));
         if ($enrich) {
-            self::assertSame($oldBytes, file_get_contents($store->path($initial->manifest_path)));
+            self::assertSame($oldBytes, $this->storedManifestBody($initial->manifest_path));
         }
     }
 
@@ -129,7 +132,7 @@ class OccupiedManifestImportCustodyTest extends ReleaseVerificationCandidatesTes
         $before = (array) DB::table('release_verification_candidates')->sole();
         $state = (array) DB::table('release_verification_state')->sole();
         $store = app(ManifestStore::class);
-        $stored = file_get_contents($store->path($before['manifest_path']));
+        $stored = $this->storedManifestBody($before['manifest_path']);
         $statuses = [];
         $service->beginImport([$path], delete: $delete, deleteFailed: $failed, resultCallback: static function (array $result) use (&$statuses): void {
             $statuses[] = $result['status'];
@@ -139,7 +142,7 @@ class OccupiedManifestImportCustodyTest extends ReleaseVerificationCandidatesTes
         self::assertSame($source, file_get_contents($path));
         self::assertSame($before, (array) DB::table('release_verification_candidates')->sole());
         self::assertSame($state, (array) DB::table('release_verification_state')->sole());
-        self::assertSame($stored, file_get_contents($store->path($before['manifest_path'])));
+        self::assertSame($stored, $this->storedManifestBody($before['manifest_path']));
     }
 
     public function test_existing_valid_alternative_gzip_is_reusable(): void
@@ -149,10 +152,10 @@ class OccupiedManifestImportCustodyTest extends ReleaseVerificationCandidatesTes
         app('files')->ensureDirectoryExists(dirname($store->path($prepared->name)));
         $alternative = gzencode(gzdecode($prepared->compressed), 0);
         self::assertNotSame($prepared->compressed, $alternative);
-        file_put_contents($store->path($prepared->name), $alternative);
+        $this->occupyManifest($prepared->name, $alternative);
         self::assertSame($prepared->name, $store->writePrepared($prepared));
         self::assertSame(['files' => []], $store->read($prepared->name));
-        self::assertSame($alternative, file_get_contents($store->path($prepared->name)));
+        self::assertSame($alternative, $this->storedManifestBody($prepared->name));
     }
 
     private function offlineImportService(): NzbImportService
