@@ -50,6 +50,11 @@ final class ReleaseData extends Data
         public Optional|int|string|null $tvdbid = new Optional,
         public Optional|int|string|null $tvrageid = new Optional,
         public Optional|int|string|null $tvmazeid = new Optional,
+        // Partial publications only: verified articles and files present versus declared.
+        public Optional|int|null $articles_found = new Optional,
+        public Optional|int|null $articles_expected = new Optional,
+        public Optional|int|null $files_found = new Optional,
+        public Optional|int|null $files_expected = new Optional,
     ) {}
 
     /**
@@ -93,6 +98,7 @@ final class ReleaseData extends Data
             'password' => $get('passwordstatus'),
             'usenetdate' => Carbon::parse($get('postdate'))->toRssString(),
         ];
+        $base += self::partialCounts($get);
 
         if (in_array($categoriesId, Category::MOVIES_GROUP, true)) {
             return $base + [
@@ -118,6 +124,22 @@ final class ReleaseData extends Data
         }
 
         return $base;
+    }
+
+    /**
+     * The found and declared counts of a partially published release; empty for a complete one.
+     *
+     * @param  callable(string, mixed=): mixed  $get
+     * @return array<string, int>
+     */
+    public static function partialCounts(callable $get): array
+    {
+        if ($get('articles_expected') === null) {
+            return [];
+        }
+
+        return ['articles_found' => (int) $get('articles_found'), 'articles_expected' => (int) $get('articles_expected'),
+            'files_found' => (int) $get('files_found'), 'files_expected' => (int) $get('files_expected')];
     }
 
     private static function nullIfZero(mixed $value): mixed

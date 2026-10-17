@@ -10,6 +10,16 @@ use RuntimeException;
 
 final class CollectionReleasePolicy
 {
+    private const VERIFIED_OVERSIZE = 'Verified payload exceeds the configured maximum size.';
+
+    private const DECLARED_OVERSIZE = 'Declared collection size exceeds the configured maximum.';
+
+    /** A rejection more articles cannot cure: a collection's size only grows as they arrive. */
+    public static function irrecoverable(string $reason): bool
+    {
+        return $reason === self::VERIFIED_OVERSIZE || $reason === self::DECLARED_OVERSIZE;
+    }
+
     /** @param array<string, mixed> $manifest */
     public function verifiedRejection(array $manifest): ?string
     {
@@ -41,7 +51,7 @@ final class CollectionReleasePolicy
             return 'Verified payload is below the configured minimum size.';
         }
         if ($limits['max_size'] > 0 && $bytes > $limits['max_size']) {
-            return 'Verified payload exceeds the configured maximum size.';
+            return self::VERIFIED_OVERSIZE;
         }
         if (count($names) < $limits['min_files']) {
             return 'Verified inventory is below the configured minimum file count.';
@@ -71,7 +81,7 @@ final class CollectionReleasePolicy
             return 'Declared collection size is below the configured minimum.';
         }
         if ($limits['max_size'] > 0 && $bytes > $limits['max_size']) {
-            return 'Declared collection size exceeds the configured maximum.';
+            return self::DECLARED_OVERSIZE;
         }
         if ($fileCount < $limits['min_files']) {
             return 'Declared file count is below the configured minimum.';

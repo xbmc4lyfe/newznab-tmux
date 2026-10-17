@@ -4,8 +4,12 @@ declare(strict_types=1);
 
 namespace Tests\Unit;
 
+use App\Data\Api\DetailsData;
+use App\Data\Api\ReleaseData;
+use App\Models\User;
 use App\Services\Api\V1\ReleaseItemPayloadBuilder;
 use App\Services\Api\V1\ReleaseRows;
+use App\Services\Api\V2\ApiV2Presenter;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -44,6 +48,26 @@ class PartialReleaseApiAttributesTest extends TestCase
         $this->assertSame(934, (int) $rows[0]['articles_expected']);
         $this->assertSame(3, (int) $rows[0]['files_found']);
         $this->assertObjectNotHasProperty('articles_expected', $rows[1]);
+
+        $user = new User;
+        $user->api_token = 'token';
+        $results = app(ApiV2Presenter::class)->search([(object) $this->release('partial'), (object) $this->release('complete')], $user, [])->getData(true)['results'];
+        $this->assertSame(934, $results[0]['articles_expected']);
+        $this->assertArrayNotHasKey('articles_expected', $results[1]);
+    }
+
+    public function test_api_v2_search_and_details_report_the_counts_only_for_partial_releases(): void
+    {
+        $user = new User;
+        $user->api_token = 'token';
+        $partial = (object) ($this->release('partial') + ['articles_found' => 236, 'articles_expected' => 934, 'files_found' => 3, 'files_expected' => 4]);
+
+        foreach ([ReleaseData::class, DetailsData::class] as $data) {
+            $this->assertSame([236, 934, 3, 4], array_values(array_intersect_key($data::toArrayFromRelease($partial, $user),
+                array_flip(['articles_found', 'articles_expected', 'files_found', 'files_expected']))), $data);
+            $this->assertArrayNotHasKey('articles_expected', $data::toArrayFromRelease((object) $this->release('complete'), $user), $data);
+            $this->assertSame(934, $data::fromRelease($partial, $user)->toArray()['articles_expected'], $data);
+        }
     }
 
     /** @return array<string, mixed> */

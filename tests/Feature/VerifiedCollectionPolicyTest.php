@@ -9,7 +9,10 @@ use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
 use App\Services\ReleaseCleaningService;
 use App\Services\ReleaseCreationService;
+use App\Services\ReleaseImageService;
 use App\Services\ReleaseProcessingService;
+use App\Services\Releases\ReleaseManagementService;
+use App\Services\Releases\Verification\CandidateHeaderInventory;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\CollectionReleasePolicy;
 use App\Services\Releases\Verification\ManifestStore;
@@ -313,6 +316,92 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(1, (int) $release->files_found);
         $this->assertSame(1, (int) $release->files_expected);
         $this->assertSame($releaseId, (int) DB::table('release_verification_candidates')->where('id', $claim->id)->value('release_id'));
+        $this->assertNotSame('', DB::table('release_verification_candidates')->where('id', $claim->id)->value('manifest_path'),
+            'A partial publication keeps its inventory for late articles.');
+    }
+
+    public function test_late_articles_merge_the_retained_partial_inventory_and_replace_its_release(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('late-articles', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $previous = DB::table('release_verification_candidates')->sole();
+
+        // Backfill finds an earlier-posted article of the same upload.
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+
+        $rows = DB::table('release_verification_candidates')->orderBy('id')->get();
+        $this->assertCount(2, $rows);
+        $this->assertSame('', $rows[0]->manifest_path, 'The new generation holds the retained inventory.');
+        $this->assertSame($first, (int) $rows[0]->release_id);
+        $merged = app(ManifestStore::class)->read($rows[1]->manifest_path);
+        $this->assertSame(['a@b', 'c@d'], array_column($merged['files'][0]['segments'], 'messageid'));
+        $this->assertSame($first, $merged['replaces_release_id']);
+        $this->assertSame((int) $rows[1]->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        $this->assertNotSame($previous->identity, $rows[1]->identity);
+
+        $old = DB::table('releases')->where('id', $first)->first();
+        $this->mock(ReleaseManagementService::class)->shouldReceive('deleteSingle')->once()
+            ->withArgs(fn (array $identifiers, $nzb, $image): bool => $identifiers === ['g' => $old->guid, 'i' => $first]
+                && $nzb instanceof NzbService && $image instanceof ReleaseImageService);
+        $second = $this->publishStalledPartial(null);
+
+        $this->assertNotSame($first, $second);
+        $this->assertSame(2, (int) DB::table('releases')->where('id', $second)->value('articles_found'));
+    }
+
+    public function test_retained_partial_inventory_is_released_at_expiry(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $releaseId = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3));
+        $this->assertGreaterThan(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+
+        $this->travel((int) config('release_verification.expiry_hours') + 1)->hours();
+        $this->limits();
+        app(CandidateRepository::class)->expire();
+
+        $candidate = DB::table('release_verification_candidates')->sole();
+        $this->assertSame('', $candidate->manifest_path);
+        $this->assertSame(0, (int) $candidate->manifest_bytes);
+        $this->assertSame($releaseId, (int) $candidate->release_id);
+        $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+    }
+
+    public function test_oversized_partial_upload_is_filtered_instead_of_deferred(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+
+        // A 1-byte maximum: the stalled upload already exceeds it, and later articles only add bytes.
+        $this->assertNull($this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3), limits: false));
+
+        $this->assertSame('filtered', DB::table('release_verification_candidates')->value('status'));
+        $this->assertSame(0, DB::table('releases')->count());
+    }
+
+    /** Archive a collection (unless null), let the upload stall past the hold, and publish it as partial. */
+    private function publishStalledPartial(?int $collectionId, bool $limits = true): ?int
+    {
+        config(['release_verification.partial_after_hours' => 4]);
+        $repository = app(CandidateRepository::class);
+        $maximum = $limits ? 0 : 1;
+        $this->limits(max: $maximum);
+        if ($collectionId !== null) {
+            $repository->archive($collectionId);
+        }
+        $this->travel(5)->hours();
+        $this->limits(max: $maximum);
+        $this->assertSame(1, $repository->promotePartial(10));
+        $claim = $repository->claim();
+        $this->assertNotNull($claim);
+        $manifest = app(ManifestStore::class)->read($claim->manifest_path);
+        $manifest += ['verification_mode' => 'spot_check', 'declared_size' => 5,
+            'publication_size' => 5, 'publication_file_count' => 1, 'verified_file_names' => ['movie.mkv'],
+            'verified_file_count' => 1, 'identity_hints' => [['name' => 'movie.mkv', 'source' => 'yenc-spot-check']],
+            'spot_check' => ['articles' => 1, 'bytes' => 5, 'sampled_files' => 1, 'method' => 'yenc-crc-and-identity']];
+        $manifest['partial'] = (new CandidateHeaderInventory)->completeness($manifest);
+        Search::shouldReceive('updateRelease')->zeroOrMoreTimes();
+
+        return app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('sampled', 'Partial sample.', $manifest));
     }
 
     public function test_partial_upload_below_policy_keeps_waiting_instead_of_being_filtered(): void
@@ -415,27 +504,32 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         DB::table('usenet_groups')->where('id', 1)->update(['minsizetoformrelease' => $groupMin, 'minfilestoformrelease' => $groupFiles]);
     }
 
-    private function collectionForPolicy(string $name = 'movie.mkv', int $totalParts = 1): int
+    private function collectionForPolicy(string $name = 'movie.mkv', int $totalParts = 1, ?string $hash = null, int $part = 1, string $messageId = 'a@b'): int
     {
-        $id = DB::table('collections')->insertGetId(['collectionhash' => sha1(random_bytes(8), true), 'subject' => 'Movie', 'fromname' => 'poster',
+        $id = DB::table('collections')->insertGetId(['collectionhash' => $hash ?? sha1(random_bytes(8), true), 'subject' => 'Movie', 'fromname' => 'poster',
             'totalfiles' => 1, 'groups_id' => 1, 'date' => '2026-10-11 12:00:00', 'filecheck' => 3]);
         $binary = DB::table('binaries')->insertGetId(['collections_id' => $id, 'binaryhash' => md5('file', true), 'name' => $name, 'totalparts' => $totalParts]);
-        DB::table('parts')->insert(['binaries_id' => $binary, 'partnumber' => 1, 'messageid' => 'a@b', 'size' => 5]);
+        DB::table('parts')->insert(['binaries_id' => $binary, 'partnumber' => $part, 'messageid' => $messageId, 'size' => 5]);
 
         return $id;
     }
 
-    private function publicationSchema(): void
+    private function publicationSchema(bool $partialColumns = false): void
     {
         config(['nntmux.release_dedupe_enabled' => false, 'nntmux_settings.path_to_nzbs' => config('release_verification.storage_path').'/nzbs']);
         app('files')->ensureDirectoryExists(config('nntmux_settings.path_to_nzbs'));
-        Schema::create('releases', function (Blueprint $table): void {
+        Schema::create('releases', function (Blueprint $table) use ($partialColumns): void {
             $table->id();
             foreach (['name', 'searchname', 'guid', 'leftguid', 'fromname', 'postdate', 'adddate'] as $column) {
                 $table->string($column);
             }
             foreach (['totalpart', 'groups_id', 'size', 'passwordstatus', 'haspreview', 'categories_id', 'nfostatus', 'nzbstatus', 'isrenamed', 'iscategorized', 'predb_id'] as $column) {
                 $table->integer($column);
+            }
+            if ($partialColumns) {
+                foreach (['articles_found', 'articles_expected', 'files_found', 'files_expected'] as $column) {
+                    $table->unsignedInteger($column)->nullable();
+                }
             }
         });
         (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();

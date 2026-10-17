@@ -11,8 +11,10 @@ use App\Models\ReleaseRegex;
 use App\Services\Nzb\NzbArticleCoverage;
 use App\Services\Nzb\NzbArticleFingerprint;
 use App\Services\Nzb\NzbService;
+use App\Services\ReleaseImageService;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\ReleaseGroupResolver;
+use App\Services\Releases\ReleaseManagementService;
 use App\Support\NzbPasswordMetadata;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -93,7 +95,7 @@ final class VerifiedReleasePublisher
                         }
                     }
                     $filteredReason = app(CollectionReleasePolicy::class)->verifiedRejection($manifest);
-                    if ($filteredReason !== null && isset($manifest['partial'])) {
+                    if ($filteredReason !== null && isset($manifest['partial']) && ! CollectionReleasePolicy::irrecoverable($filteredReason)) {
                         // Missing files or articles may still satisfy the policy; never filter terminally.
                         throw new PartialPublicationDeferredException($filteredReason);
                     }
@@ -141,6 +143,7 @@ final class VerifiedReleasePublisher
                             return null;
                         }
                         $this->recordGroups($duplicateId, $manifest['groups']);
+                        $this->replaceSupersededPartial($manifest, $duplicateId);
                         app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
                         $this->markPublished($candidate->id, $duplicateId, $result);
 
@@ -195,8 +198,10 @@ final class VerifiedReleasePublisher
                         }
                     });
                     $this->recordGroups((int) $id, $manifest['groups']);
+                    $this->replaceSupersededPartial($manifest, (int) $id);
                     app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
-                    $this->markPublished($candidate->id, (int) $id, $result);
+                    // A partial release keeps its inventory so late articles can complete it.
+                    $this->markPublished($candidate->id, (int) $id, $result, retainManifest: isset($manifest['partial']));
 
                     $returned = true;
 
@@ -330,13 +335,43 @@ final class VerifiedReleasePublisher
         }
     }
 
-    private function markPublished(int $candidateId, int $releaseId, VerificationResult $result): void
+    /**
+     * Remove the partial release a merged later generation supersedes, after this publication commits.
+     *
+     * @param  array<string, mixed>  $manifest
+     */
+    private function replaceSupersededPartial(array $manifest, int $releaseId): void
+    {
+        $previous = $manifest['replaces_release_id'] ?? null;
+        if (! is_int($previous) || $previous === $releaseId) {
+            return;
+        }
+        $release = DB::table('releases')->where('id', $previous)->whereNotNull('articles_expected')->lockForUpdate()->first(['id', 'guid']);
+        if ($release === null) {
+            return;
+        }
+        DB::afterCommit(static function () use ($release, $releaseId): void {
+            try {
+                app(ReleaseManagementService::class)->deleteSingle(['g' => (string) $release->guid, 'i' => (int) $release->id],
+                    app(NzbService::class), app(ReleaseImageService::class));
+            } catch (Throwable $exception) {
+                Log::warning('Could not remove a superseded partial release.', ['release_id' => (int) $release->id,
+                    'replacement_id' => $releaseId, 'exception' => $exception::class]);
+            }
+        });
+    }
+
+    private function markPublished(int $candidateId, int $releaseId, VerificationResult $result, bool $retainManifest = false): void
     {
         $candidate = DB::table('release_verification_candidates')->where('id', $candidateId)->first();
-        DB::table('release_verification_candidates')->where('id', $candidateId)->update([
-            'release_id' => $releaseId, 'status' => $result->verdict, 'reason' => $result->reason,
-            'verified_at' => now(), 'lease_token' => null, 'lease_until' => null, 'manifest_bytes' => 0, 'manifest_path' => '',
-        ]);
+        $values = ['release_id' => $releaseId, 'status' => $result->verdict, 'reason' => $result->reason,
+            'verified_at' => now(), 'lease_token' => null, 'lease_until' => null];
+        if ($retainManifest) {
+            DB::table('release_verification_candidates')->where('id', $candidateId)->update($values);
+
+            return;
+        }
+        DB::table('release_verification_candidates')->where('id', $candidateId)->update($values + ['manifest_bytes' => 0, 'manifest_path' => '']);
         // Release capacity last so the shared ledger row is held only until commit.
         app(VerificationLedger::class)->adjust(-(int) $candidate->manifest_bytes);
         DB::afterCommit(function () use ($candidate): void {

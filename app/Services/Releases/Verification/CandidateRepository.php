@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Releases\Verification;
 
 use App\Exceptions\CandidateMetadataBudgetExceeded;
+use App\Models\Release;
 use App\Services\CollectionCleanupService;
 use App\Services\Nzb\NzbArticleCoverage;
 use App\Services\Nzb\NzbService;
@@ -88,12 +89,25 @@ final class CandidateRepository
                     throw $snapshotFailure;
                 }
                 $identity = $existing->identity ?? $sourceIdentity;
+                // A partial publication retains its inventory: late articles start a generation that
+                // merges it and replaces that release, instead of publishing only the late fragment.
+                $previous = null;
                 if ($existing !== null && $existing->release_id !== null) {
                     $identity = sha1($sourceIdentity.':generation:'.$existing->id);
+                    $previous = $existing->manifest_path !== '' && $existing->status === 'sampled'
+                        && Release::hasPartialArticleCounts()
+                        && DB::table('releases')->where('id', $existing->release_id)->whereNotNull('articles_expected')->exists() ? $existing : null;
                     $existing = null;
                 }
                 $manifest ??= $this->snapshotHeaders($collection, $currentReads);
                 $manifest['legacy_release_id'] = $this->legacyReleaseId($collection);
+                if ($previous !== null) {
+                    $retained = $this->store->read($previous->manifest_path);
+                    $manifest = $this->merge($retained, $manifest);
+                    $manifest['replaces_release_id'] = (int) $previous->release_id;
+                    $prepared = null;
+                    $headerAssessment = null;
+                }
                 $newArticles = true;
                 if ($existing !== null && $existing->manifest_path !== '') {
                     $oldManifest = $this->store->read($existing->manifest_path);
@@ -108,9 +122,9 @@ final class CandidateRepository
                 $arrivalAt = Carbon::parse($collection->last_seen_at ?? $collection->dateadded ?? $collection->added ?? now())->format('Y-m-d H:i:s');
                 $lastUniqueAt = $existing === null ? $arrivalAt : ($newArticles ? max($arrivalAt, $existing->last_unique_at) : $existing->last_unique_at);
                 $expired = $lastUniqueAt < now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
-                $delta = ($expired ? 0 : $size) - (int) ($existing->manifest_bytes ?? 0);
-                $full = function () use ($existing, $path): never {
-                    if ($existing === null || $existing->manifest_path !== $path) {
+                $delta = ($expired ? 0 : $size) - (int) ($existing->manifest_bytes ?? 0) - (int) ($previous->manifest_bytes ?? 0);
+                $full = function () use ($existing, $previous, $path): never {
+                    if (($existing === null || $existing->manifest_path !== $path) && $previous?->manifest_path !== $path) {
                         $this->store->deleteIfUnreferenced($path);
                     }
                     throw new RuntimeException('Pending verification capacity is full; original headers retained.');
@@ -135,6 +149,13 @@ final class CandidateRepository
                     DB::table('release_verification_candidates')->insert($values);
                 } else {
                     DB::table('release_verification_candidates')->where('id', $existing->id)->update($values);
+                }
+                if ($previous !== null) {
+                    // The new generation now holds the retained inventory and its capacity.
+                    DB::table('release_verification_candidates')->where('id', $previous->id)->update(['manifest_path' => '', 'manifest_bytes' => 0]);
+                    if ($previous->manifest_path !== $path) {
+                        DB::afterCommit(fn () => $this->store->deleteIfUnreferenced($previous->manifest_path));
+                    }
                 }
                 $this->cleanup->deleteCollectionsAndDescendants([$collectionId], 'Archived for verification', false, manifestArchived: true);
                 // Last lock request: a full ledger rolls back the deletion, retaining the original headers.
@@ -720,6 +741,36 @@ final class CandidateRepository
                 DB::table('release_verification_candidates')->where('id', $id)->update(['status' => in_array($row->status, ['metadata_deferred', 'metadata_review'], true) ? 'metadata_expired' : 'expired',
                     'version' => (int) $row->version + 1,
                     'manifest_path' => '', 'manifest_bytes' => 0, 'lease_token' => null, 'lease_until' => null]);
+                $this->ledger->adjust(-(int) $row->manifest_bytes);
+                DB::afterCommit(function () use ($row): void {
+                    $this->store->deleteIfUnreferenced($row->manifest_path);
+                });
+            }, 5);
+        }
+        $this->expireRetainedPartials($mayStart);
+    }
+
+    /**
+     * Release the inventory a partial publication kept for late articles once none arrive within the expiry window.
+     *
+     * @param  (callable(): bool)|null  $mayStart
+     */
+    private function expireRetainedPartials(?callable $mayStart): void
+    {
+        $cutoff = now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
+        $ids = DB::table('release_verification_candidates')->whereNotNull('release_id')->where('manifest_path', '<>', '')
+            ->where('last_unique_at', '<', $cutoff)->orderBy('id')->limit(100)->pluck('id');
+        foreach ($ids as $id) {
+            if ($mayStart !== null && ! $mayStart()) {
+                break;
+            }
+            DB::transaction(function () use ($id, $cutoff): void {
+                $this->ledger->enter();
+                $row = DB::table('release_verification_candidates')->where('id', $id)->lockForUpdate()->first();
+                if ($row === null || $row->release_id === null || $row->manifest_path === '' || $row->last_unique_at >= $cutoff) {
+                    return;
+                }
+                DB::table('release_verification_candidates')->where('id', $id)->update(['manifest_path' => '', 'manifest_bytes' => 0]);
                 $this->ledger->adjust(-(int) $row->manifest_bytes);
                 DB::afterCommit(function () use ($row): void {
                     $this->store->deleteIfUnreferenced($row->manifest_path);
