@@ -93,7 +93,7 @@ final class CandidateRepository
                 }
                 $identity = $existing->identity ?? $sourceIdentity;
                 // A partial publication retains its inventory: late articles start a generation that
-                // merges it and replaces that release, instead of publishing only the late fragment.
+                // merges it and upgrades that release in place, instead of publishing only the late fragment.
                 $previous = null;
                 $merges = false;
                 if ($existing !== null && $existing->release_id !== null) {
@@ -116,7 +116,7 @@ final class CandidateRepository
 
                         return;
                     }
-                    $manifest['replaces_release_id'] = (int) $previous->release_id;
+                    $manifest['upgrades_release_id'] = (int) $previous->release_id;
                     $prepared = null;
                     $headerAssessment = null;
                 }
@@ -503,7 +503,7 @@ final class CandidateRepository
                 }
                 if ($candidate->release_id !== null) {
                     // A published partial stays published: keep its inventory from expiring and archive
-                    // the late articles now, which starts the generation that merges and replaces it.
+                    // the late articles now, which starts the generation that merges and upgrades it.
                     DB::table('release_verification_candidates')->where('id', $candidate->id)->update(['last_unique_at' => now()]);
                     DB::table('collections')->where('id', $collection->id)->where('filecheck', '!=', 4)->update(['filecheck' => 3]);
 

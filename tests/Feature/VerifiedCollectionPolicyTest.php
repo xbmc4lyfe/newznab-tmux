@@ -319,7 +319,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
             'A partial publication keeps its inventory for late articles.');
     }
 
-    public function test_late_articles_merge_the_retained_partial_inventory_and_replace_its_release(): void
+    public function test_late_articles_merge_the_retained_partial_inventory_and_upgrade_its_release_in_place(): void
     {
         $this->publicationSchema(partialColumns: true);
         $hash = sha1('late-articles', true);
@@ -335,23 +335,21 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame($first, (int) $rows[0]->release_id);
         $merged = app(ManifestStore::class)->read($rows[1]->manifest_path);
         $this->assertSame(['a@b', 'c@d'], array_column($merged['files'][0]['segments'], 'messageid'));
-        $this->assertSame($first, $merged['replaces_release_id']);
+        $this->assertSame($first, $merged['upgrades_release_id']);
         $this->assertSame((int) $rows[1]->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
         $this->assertNotSame($previous->identity, $rows[1]->identity);
 
-        $old = DB::table('releases')->where('id', $first)->first();
-        $this->assertFileExists((string) app(NzbService::class)->nzbPath($old->guid));
-        Search::shouldReceive('deleteRelease')->once()->with($first);
-        $second = $this->publishStalledPartial(null);
+        $guid = DB::table('releases')->where('id', $first)->value('guid');
+        $upgraded = $this->publishStalledPartial(null);
 
-        $this->assertNotSame($first, $second);
-        $this->assertFalse(DB::table('releases')->where('id', $first)->exists(), 'The superseded partial leaves with the same commit.');
-        $this->assertFileDoesNotExist((string) app(NzbService::class)->nzbPath($old->guid), 'Its NZB is removed after commit.');
-        $this->assertSame(2, (int) DB::table('releases')->where('id', $second)->value('articles_found'));
-        $this->assertSame([$second, $second], DB::table('release_verification_candidates')->orderBy('id')->pluck('release_id')->map(fn ($id): int => (int) $id)->all(),
-            'Candidates of the superseded partial now point at its replacement.');
-        $this->assertSame(0, DB::table('releases_groups')->where('releases_id', $first)->count() - DB::table('releases_groups')->where('releases_id', $first)->whereIn('groups_id',
-            DB::table('releases_groups')->where('releases_id', $second)->pluck('groups_id'))->count(), 'Its groups carry over.');
+        $this->assertSame($first, $upgraded, 'The partial is upgraded in place, keeping its id and GUID.');
+        $this->assertSame([$guid, 2, 3], [DB::table('releases')->where('id', $first)->value('guid'),
+            (int) DB::table('releases')->where('id', $first)->value('articles_found'), (int) DB::table('releases')->where('id', $first)->value('articles_expected')]);
+        $nzb = (string) app(NzbService::class)->readNzbContents($guid);
+        $this->assertStringContainsString('a@b', $nzb);
+        $this->assertStringContainsString('c@d', $nzb, 'Its NZB now carries the late article.');
+        $this->assertSame(1, DB::table('releases')->count());
+        $this->assertSame([$first, $first], DB::table('release_verification_candidates')->orderBy('id')->pluck('release_id')->map(fn ($id): int => (int) $id)->all());
     }
 
     public function test_a_replay_of_headers_the_partial_holds_changes_nothing(): void
@@ -407,7 +405,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(['', 0], [$rows[0]->manifest_path, (int) $rows[0]->manifest_bytes]);
         $fresh = app(ManifestStore::class)->read($rows[1]->manifest_path);
         $this->assertSame(['c@d'], array_column($fresh['files'][0]['segments'], 'messageid'));
-        $this->assertArrayNotHasKey('replaces_release_id', $fresh);
+        $this->assertArrayNotHasKey('upgrades_release_id', $fresh);
         $this->assertSame((int) $rows[1]->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
     }
 

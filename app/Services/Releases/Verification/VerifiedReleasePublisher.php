@@ -11,8 +11,7 @@ use App\Models\ReleaseRegex;
 use App\Services\Nzb\NzbArticleCoverage;
 use App\Services\Nzb\NzbArticleFingerprint;
 use App\Services\Nzb\NzbService;
-use App\Services\Nzb\NzbSourceGuard;
-use App\Services\ReleaseImageService;
+use App\Services\Nzb\ReleaseArticleFingerprintStore;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\ReleaseGroupResolver;
 use App\Support\NzbPasswordMetadata;
@@ -55,8 +54,8 @@ final class VerifiedReleasePublisher
             }
         }
         if ($keys !== []) {
-            // Deleting a superseded partial must serialize with every publication or audit that can
-            // reach it, so hold its keys too; a key that changes before the lock forces a retry.
+            // Upgrading a partial in place must serialize with every publication or audit that can reach
+            // it under its current keys, so hold those too; a key that changes before the lock forces a retry.
             $keys = array_values(array_unique([...$keys, ...$this->supersededPartialKeys($result->manifest)]));
         }
         try {
@@ -132,6 +131,21 @@ final class VerifiedReleasePublisher
                             throw new RuntimeException('Legacy release identity changed before publication.');
                         }
                     }
+                    $totalParts = ($manifest['verification_mode'] ?? null) === 'spot_check'
+                        ? max(0, (int) ($manifest['publication_file_count'] ?? $manifest['expected_files'] ?? count($manifest['files'])))
+                        : (($manifest['metadata_source'] ?? null) !== 'import'
+                            ? count(array_unique($manifest['verified_file_names'])) : max((int) $manifest['expected_files'], count($manifest['files'])));
+                    $upgrade = $legacy === null ? $this->lockUpgradablePartial($manifest, $keys) : null;
+                    if ($upgrade !== null) {
+                        $id = $this->upgradePartial($upgrade, $manifest, $size, $totalParts, $timing);
+                        $this->recordGroups($id, $manifest['groups']);
+                        app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
+                        $this->markPublished($candidate->id, $id, $result, retainManifest: isset($manifest['partial']) && $this->awaitsLateArticles($manifest));
+
+                        $returned = true;
+
+                        return $id;
+                    }
                     $duplicate = $legacy === null ? $this->findCoveredDuplicate($claim, $manifest, $metadata, $size, $timing) : ['release_id' => null, 'metadata_conflict' => false];
                     $duplicateId = $duplicate['release_id'];
                     if ($duplicateId !== null || $duplicate['metadata_conflict']) {
@@ -148,7 +162,6 @@ final class VerifiedReleasePublisher
                             return null;
                         }
                         $this->recordGroups($duplicateId, $manifest['groups']);
-                        $this->replaceSupersededPartial($manifest, $duplicateId, $keys);
                         app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
                         // A covered candidate never keeps inventory: its articles are a subset of the reused release,
                         // and merging late articles into that subset could replace a more complete partial.
@@ -160,10 +173,7 @@ final class VerifiedReleasePublisher
                     }
                     $guid = $legacy === null ? (string) Str::uuid() : (string) $legacy->guid;
                     $parameters = $metadata + [
-                        'totalpart' => ($manifest['verification_mode'] ?? null) === 'spot_check'
-                            ? max(0, (int) ($manifest['publication_file_count'] ?? $manifest['expected_files'] ?? count($manifest['files'])))
-                            : (($manifest['metadata_source'] ?? null) !== 'import'
-                                ? count(array_unique($manifest['verified_file_names'])) : max((int) $manifest['expected_files'], count($manifest['files']))),
+                        'totalpart' => $totalParts,
                         'groups_id' => (int) $manifest['groups_id'], 'guid' => $guid, 'postdate' => $manifest['date'],
                         'size' => $size, 'nzbstatus' => NzbService::NZB_ADDED];
                     $timing?->nextPhase('release_identity_sql');
@@ -205,7 +215,6 @@ final class VerifiedReleasePublisher
                         }
                     });
                     $this->recordGroups((int) $id, $manifest['groups']);
-                    $this->replaceSupersededPartial($manifest, (int) $id, $keys);
                     app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
                     // A partial release keeps its inventory so late articles can complete it.
                     $this->markPublished($candidate->id, (int) $id, $result, retainManifest: isset($manifest['partial']) && $this->awaitsLateArticles($manifest));
@@ -343,14 +352,14 @@ final class VerifiedReleasePublisher
     }
 
     /**
-     * Publication keys of the partial release this manifest supersedes; empty when it supersedes none.
+     * Publication keys of the partial release this manifest upgrades; empty when it upgrades none.
      *
      * @param  array<string, mixed>  $manifest
      * @return list<string>
      */
     private function supersededPartialKeys(array $manifest): array
     {
-        $previous = $manifest['replaces_release_id'] ?? null;
+        $previous = $manifest['upgrades_release_id'] ?? null;
 
         return is_int($previous) ? ($this->releaseKeys($previous) ?? []) : [];
     }
@@ -381,47 +390,63 @@ final class VerifiedReleasePublisher
     }
 
     /**
-     * Remove the partial release a merged later generation supersedes, after this publication commits.
+     * Lock the published partial this manifest's generation upgrades, or return null to publish it as a new
+     * release (the partial was deleted or completed elsewhere).
      *
      * @param  array<string, mixed>  $manifest
      * @param  list<string>  $keys  the publication keys this transaction holds; empty under the keyless lock
      */
-    private function replaceSupersededPartial(array $manifest, int $releaseId, array $keys): void
+    private function lockUpgradablePartial(array $manifest, array $keys): ?object
     {
-        $previous = $manifest['replaces_release_id'] ?? null;
-        if (! is_int($previous) || $previous === $releaseId) {
-            return;
+        $releaseId = $manifest['upgrades_release_id'] ?? null;
+        if (! is_int($releaseId) || ! Release::hasPartialArticleCounts()) {
+            return null;
         }
-        $release = DB::table('releases')->where('id', $previous)->whereNotNull('articles_expected')->lockForUpdate()->first(['id', 'guid']);
+        $release = DB::table('releases')->where('id', $releaseId)->whereNotNull('articles_expected')
+            ->where('nzbstatus', NzbService::NZB_ADDED)->lockForUpdate()->first(['id', 'guid']);
         if ($release === null) {
-            return;
+            return null;
         }
-        $current = $this->releaseKeys($previous, current: true);
+        $current = $this->releaseKeys($releaseId, current: true);
         if ($keys !== [] && ($current === null || array_diff($current, $keys) !== [])) {
-            throw new RuntimeException('Superseded partial release changed before replacement; retry.');
+            throw new RuntimeException('Partial release changed before its upgrade; retry.');
         }
-        // Everything that pointed at the superseded partial now points at its replacement.
-        DB::table('release_verification_candidates')->where('release_id', $previous)->update(['release_id' => $releaseId]);
-        foreach (DB::table('releases_groups')->where('releases_id', $previous)->pluck('groups_id') as $groupId) {
-            DB::table('releases_groups')->insertOrIgnore(['releases_id' => $releaseId, 'groups_id' => (int) $groupId]);
-        }
-        // The row goes with this publication's commit, so it can never stay advertised without its NZB.
-        // The NZB is anchored first: once the row is gone, a by-GUID delete would find nothing to remove.
-        $receipt = (new NzbSourceGuard(app(NzbService::class)))->captureDeletionAnchor($release);
-        DB::table('releases')->where('id', $release->id)->delete();
-        DB::afterCommit(static function () use ($release, $releaseId, $receipt): void {
-            foreach ([static fn () => (new NzbSourceGuard(app(NzbService::class)))->deleteAnchoredSource($receipt)
-                ?: throw new RuntimeException('Superseded partial NZB was not removed.'),
-                static fn () => app(ReleaseImageService::class)->delete((string) $release->guid),
-                static fn () => Search::deleteRelease((int) $release->id)] as $cleanup) {
-                try {
-                    $cleanup();
-                } catch (Throwable $exception) {
-                    Log::warning('Could not clean up a superseded partial release.', ['release_id' => (int) $release->id,
-                        'replacement_id' => $releaseId, 'exception' => $exception::class]);
-                }
+
+        return $release;
+    }
+
+    /**
+     * Rewrite a published partial in place with the merged inventory: the same row and GUID, a replaced NZB
+     * (restored if this transaction rolls back), and counts cleared once nothing is missing.
+     *
+     * @param  array<string, mixed>  $manifest
+     */
+    private function upgradePartial(object $release, array $manifest, int $size, int $totalParts, ?PublicationTiming $timing): int
+    {
+        $id = (int) $release->id;
+        $timing?->nextPhase('release_identity_sql');
+        $partial = $manifest['partial'] ?? null;
+        DB::table('releases')->where('id', $id)->update(['size' => $size, 'totalpart' => $totalParts,
+            'articles_found' => $partial['articles_found'] ?? null, 'articles_expected' => $partial['articles_expected'] ?? null,
+            'files_found' => $partial['files_found'] ?? null, 'files_expected' => $partial['files_expected'] ?? null]);
+        ReleaseArticleFingerprintStore::store($id, $this->incomingFingerprint($manifest));
+        $timing?->nextPhase('final_xml_gzip');
+        $receipt = $this->writer->writeWithReceipt($manifest, (string) $release->guid, $release, $timing, replace: true);
+        DB::afterRollBack(static fn () => $receipt->rollback());
+        DB::afterCommit(static fn () => $receipt->close());
+        DB::afterCommit(static function () use ($id): void {
+            Search::updateRelease($id);
+            try {
+                CollectReleaseFingerprintMetadata::dispatch($id);
+            } catch (Throwable $dispatchException) {
+                Log::warning('Could not queue upgraded release fingerprint metadata collection.', [
+                    'release_id' => $id,
+                    'exception' => $dispatchException::class,
+                ]);
             }
         });
+
+        return $id;
     }
 
     private function markPublished(int $candidateId, int $releaseId, VerificationResult $result, bool $retainManifest = false): void

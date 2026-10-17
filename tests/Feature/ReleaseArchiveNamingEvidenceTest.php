@@ -269,6 +269,37 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
         self::assertSame($inode, fileinode($locks[0]));
     }
 
+    public function test_rolled_back_preserving_replacement_restores_the_replaced_source(): void
+    {
+        $this->writeSource('original');
+        $temporary = $this->directory.'/upgrade.tmp';
+        file_put_contents($temporary, gzencode('upgraded'));
+
+        DB::beginTransaction();
+        $receipt = $this->sources->install($this->release, $temporary, $this->path(), preserve: true);
+        DB::afterRollBack(fn () => $receipt->rollback());
+        self::assertSame('upgraded', gzdecode((string) file_get_contents($this->path())));
+        DB::rollBack();
+
+        self::assertSame('original', gzdecode((string) file_get_contents($this->path())), 'The partial keeps its NZB.');
+        self::assertSame([], glob($this->path().'.*.prev'));
+    }
+
+    public function test_committed_preserving_replacement_discards_its_backup(): void
+    {
+        $this->writeSource('original');
+        $temporary = $this->directory.'/upgrade.tmp';
+        file_put_contents($temporary, gzencode('upgraded'));
+
+        DB::transaction(function () use ($temporary): void {
+            $receipt = $this->sources->install($this->release, $temporary, $this->path(), preserve: true);
+            DB::afterCommit(static fn () => $receipt->close());
+        });
+
+        self::assertSame('upgraded', gzdecode((string) file_get_contents($this->path())));
+        self::assertSame([], glob($this->path().'.*.prev'));
+    }
+
     public function test_full_rollback_cleanup_does_not_corrupt_the_next_transaction_callbacks(): void
     {
         DB::beginTransaction();

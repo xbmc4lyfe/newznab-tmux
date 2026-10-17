@@ -22,6 +22,8 @@ final class NzbSourceInstallation
         public readonly string $digest,
         mixed $handle,
         public readonly PDO $pdo,
+        // A hard link to the source this installation replaced; rollback restores it, close discards it.
+        public readonly ?string $previous = null,
     ) {
         $this->handle = $handle;
     }
@@ -66,6 +68,9 @@ final class NzbSourceInstallation
             fclose($this->handle);
         }
         $this->handle = null;
+        if ($this->previous !== null && is_file($this->previous)) {
+            @unlink($this->previous);
+        }
     }
 
     public function __destruct()
