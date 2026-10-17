@@ -13,23 +13,31 @@ final class SpotCheckVerifier
     public function __construct(private readonly ArticleSource $source, private readonly array $options,
         private readonly ?YencService $decoder = null, private readonly ?SpotCheckPlanner $planner = null) {}
 
-    /** @param array<string, mixed> $manifest */
-    public function verify(array $manifest, callable $heartbeat): VerificationResult
+    /**
+     * @param  array<string, mixed>  $manifest
+     * @param  bool  $allowPartial  An upload whose missing files or articles stopped arriving may be
+     *                              spot checked on the articles it has and published as partial.
+     */
+    public function verify(array $manifest, callable $heartbeat, bool $allowPartial = false): VerificationResult
     {
         try {
-            return $this->verifySample($manifest, $heartbeat);
+            return $this->verifySample($manifest, $heartbeat, $allowPartial);
         } catch (Throwable $error) {
             return new VerificationResult('unknown', $error->getMessage());
         }
     }
 
     /** @param array<string, mixed> $manifest */
-    private function verifySample(array $manifest, callable $heartbeat): VerificationResult
+    private function verifySample(array $manifest, callable $heartbeat, bool $allowPartial): VerificationResult
     {
         $inventory = new CandidateHeaderInventory;
         $assessment = $inventory->assessment($manifest);
+        $partial = null;
         if ($assessment['reason'] !== null) {
-            return new VerificationResult('unknown', $assessment['reason'], waitingForHeaders: $assessment['status'] === 'waiting_upload');
+            if (! $allowPartial || $assessment['status'] !== 'waiting_upload') {
+                return new VerificationResult('unknown', $assessment['reason'], waitingForHeaders: $assessment['status'] === 'waiting_upload');
+            }
+            $partial = $inventory->completeness($manifest);
         }
 
         $articleLimit = max(0, min(16, (int) ($this->options['spot_check_articles'] ?? 1)));
@@ -131,6 +139,12 @@ final class SpotCheckVerifier
         $manifest['verified_file_names'] = array_keys($names);
         $manifest['verified_file_count'] = count($names);
         $manifest['identity_hints'] = $identityHints;
+        if ($partial !== null) {
+            $manifest['partial'] = $partial;
+
+            return new VerificationResult('sampled', sprintf('Sampled article checks passed on an incomplete upload: %d of %d articles found.',
+                $partial['articles_found'], $partial['articles_expected']), $manifest);
+        }
 
         return new VerificationResult('sampled', 'Sampled article checks passed; the full payload was not downloaded.', $manifest);
     }

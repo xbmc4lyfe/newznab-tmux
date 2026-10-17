@@ -250,6 +250,66 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertStringContainsString('spot-check', $contents);
     }
 
+    /** @return array<string, array{?string}> */
+    public static function partialPublications(): array
+    {
+        return ['stalled upload publishes with its article counts' => [null],
+            'new articles inside the hold window refuse partial publication' => ['recent'],
+            'counts that differ from the headers refuse partial publication' => ['tampered']];
+    }
+
+    #[DataProvider('partialPublications')]
+    public function test_stalled_incomplete_upload_publishes_as_partial_with_found_and_declared_articles(?string $refusal): void
+    {
+        config(['release_verification.partial_after_hours' => 4]);
+        $id = $this->collectionForPolicy('movie.mkv', 3);
+        $repository = app(CandidateRepository::class);
+        $repository->archive($id);
+        $this->assertSame('waiting_upload', DB::table('release_verification_candidates')->value('status'));
+        $this->assertSame(0, $repository->promotePartial(10), 'Inside the hold window the upload keeps waiting.');
+        $this->travel(5)->hours();
+        $this->limits();
+        $this->assertSame(1, $repository->promotePartial(10));
+        $claim = $repository->claim();
+        $this->assertNotNull($claim);
+        $this->assertTrue($repository->partialAllowed($claim));
+        $manifest = app(ManifestStore::class)->read($claim->manifest_path);
+        $manifest += ['verification_mode' => 'spot_check', 'declared_size' => 5,
+            'publication_size' => 5, 'publication_file_count' => 1, 'verified_file_names' => ['movie.mkv'],
+            'verified_file_count' => 1, 'identity_hints' => [['name' => 'movie.mkv', 'source' => 'yenc-spot-check']],
+            'spot_check' => ['articles' => 1, 'bytes' => 5, 'sampled_files' => 1, 'method' => 'yenc-crc-and-identity'],
+            'partial' => ['articles_found' => 1, 'articles_expected' => 3, 'files_found' => 1, 'files_expected' => 1]];
+        if ($refusal === 'recent') {
+            DB::table('release_verification_candidates')->where('id', $claim->id)->update(['last_unique_at' => now()->subHour()]);
+        } elseif ($refusal === 'tampered') {
+            $manifest['partial']['articles_expected'] = 1;
+        }
+        $this->publicationSchema();
+        Schema::table('releases', function (Blueprint $table): void {
+            $table->unsignedInteger('articles_found')->nullable();
+            $table->unsignedInteger('articles_expected')->nullable();
+        });
+        if ($refusal !== null) {
+            try {
+                app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('sampled', 'Partial sample.', $manifest));
+                $this->fail('An ineligible partial publication must be refused.');
+            } catch (\RuntimeException $error) {
+                $this->assertSame('Partial publication is no longer eligible.', $error->getMessage());
+            }
+            $this->assertSame(0, DB::table('releases')->count());
+
+            return;
+        }
+        Search::shouldReceive('updateRelease')->once();
+
+        $releaseId = app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('sampled', 'Partial sample.', $manifest));
+
+        $release = DB::table('releases')->where('id', $releaseId)->first();
+        $this->assertSame(1, (int) $release->articles_found);
+        $this->assertSame(3, (int) $release->articles_expected);
+        $this->assertSame($releaseId, (int) DB::table('release_verification_candidates')->where('id', $claim->id)->value('release_id'));
+    }
+
     public function test_passed_collection_without_authoritative_inventory_fails_closed(): void
     {
         app(CandidateRepository::class)->archive($this->collectionForPolicy());

@@ -77,7 +77,18 @@ final class VerifiedReleasePublisher
                         if (($manifest['verification_mode'] ?? null) !== 'spot_check') {
                             throw new RuntimeException('Sampled verdict has no spot-check evidence.');
                         }
-                        if (($rejection = (new CandidateHeaderInventory)->rejection($manifest)) !== null) {
+                        $inventory = new CandidateHeaderInventory;
+                        if (isset($manifest['partial'])) {
+                            // Recompute rather than trust the counts, and require the locked candidate to still qualify.
+                            if ($manifest['partial'] !== $inventory->completeness($manifest)
+                                || ! app(CandidateRepository::class)->partialAllowed($candidate)) {
+                                throw new RuntimeException('Partial publication is no longer eligible.');
+                            }
+                            $rejection = $inventory->partialRejection($manifest);
+                        } else {
+                            $rejection = $inventory->rejection($manifest);
+                        }
+                        if ($rejection !== null) {
                             throw new RuntimeException($rejection);
                         }
                     }
@@ -156,6 +167,10 @@ final class VerifiedReleasePublisher
                     $release = DB::table('releases')->where('id', $id)->where('guid', $guid)->lockForUpdate()->first(['id', 'guid']);
                     if ($release === null) {
                         throw new RuntimeException('Verified release identity disappeared before NZB installation.');
+                    }
+                    if (isset($manifest['partial'])) {
+                        DB::table('releases')->where('id', $id)->update(['articles_found' => $manifest['partial']['articles_found'],
+                            'articles_expected' => $manifest['partial']['articles_expected']]);
                     }
                     $timing?->nextPhase('final_xml_gzip');
                     $receipt = $this->writer->writeWithReceipt($manifest, $guid, $release, $timing);

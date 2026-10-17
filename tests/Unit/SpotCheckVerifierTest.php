@@ -18,6 +18,52 @@ use Tests\Fixtures\YencArticles;
 final class SpotCheckVerifierTest extends TestCase
 {
     #[Test]
+    public function it_spot_checks_an_incomplete_upload_only_when_partial_publication_is_allowed(): void
+    {
+        $articles = [];
+        $files = [];
+        foreach (['movie.mkv' => [1, 2, 3], 'extra.rar' => [1, 2]] as $name => $parts) {
+            $segments = [];
+            foreach ($parts as $part) {
+                $id = $name.'-'.$part.'@article';
+                $articles[$id] = YencArticles::part(str_repeat((string) $part, 5), $name, 15, $part, ($part - 1) * 5 + 1, 3);
+                $segments[] = ['number' => $part, 'messageid' => $id, 'bytes' => 5];
+            }
+            $files[] = ['key' => $name, 'subject' => 'Release "'.$name.'"', 'totalparts' => 3, 'segments' => $segments];
+        }
+        // extra.rar is missing its third article and a third file was declared but never seen.
+        $manifest = ['identity' => sha1('partial-upload'), 'subject' => 'Movie', 'fromname' => 'poster',
+            'date' => '2026-10-12 00:00:00', 'groups_id' => 1, 'groups' => ['alt.test'], 'expected_files' => 3, 'files' => $files];
+        $source = new class($articles) implements ArticleSource
+        {
+            public function __construct(private readonly array $articles) {}
+
+            public function fetch(string $messageId): string
+            {
+                return $this->articles[$messageId];
+            }
+        };
+        $verifier = new SpotCheckVerifier($source, ['spot_check_articles' => 1, 'spot_check_bytes' => 1024,
+            'spot_check_article_bytes' => 1024], new YencService);
+
+        $waiting = $verifier->verify($manifest, static function (): void {});
+        self::assertSame('unknown', $waiting->verdict);
+        self::assertTrue($waiting->waitingForHeaders);
+
+        $partial = $verifier->verify($manifest, static function (): void {}, allowPartial: true);
+        self::assertSame('sampled', $partial->verdict, $partial->reason);
+        self::assertSame(['articles_found' => 5, 'articles_expected' => 6, 'files_found' => 2, 'files_expected' => 3],
+            $partial->manifest['partial']);
+        self::assertStringContainsString('5 of 6 articles found', $partial->reason);
+        self::assertSame($files, $partial->manifest['files'], 'Only the articles that exist are published.');
+
+        $manifest['files'][1]['segments'][1]['messageid'] = $manifest['files'][1]['segments'][0]['messageid'];
+        $invalid = $verifier->verify($manifest, static function (): void {}, allowPartial: true);
+        self::assertSame('unknown', $invalid->verdict, 'Invalid headers are never published, even partially.');
+        self::assertFalse($invalid->waitingForHeaders);
+    }
+
+    #[Test]
     public function it_fetches_one_article_but_emits_every_article_for_every_file(): void
     {
         $files = [];

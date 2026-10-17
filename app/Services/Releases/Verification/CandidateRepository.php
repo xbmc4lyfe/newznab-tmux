@@ -484,6 +484,54 @@ final class CandidateRepository
         return hash('sha256', implode("\n", $ids));
     }
 
+    /** An upload whose missing files or articles have stopped arriving may publish as partial. */
+    public function partialAllowed(object $candidate): bool
+    {
+        $hours = (int) config('release_verification.partial_after_hours', 4);
+
+        return $hours > 0 && ($candidate->release_id ?? null) === null && is_string($candidate->last_unique_at ?? null)
+            && $candidate->last_unique_at < now()->subHours($hours)->format('Y-m-d H:i:s');
+    }
+
+    /**
+     * Queue uploads whose missing articles stopped arriving for partial publication. Uploads still
+     * inside the hold window are deferred to its end, so each is read about once per window.
+     */
+    public function promotePartial(int $limit): int
+    {
+        $hours = (int) config('release_verification.partial_after_hours', 4);
+        if ($hours < 1) {
+            return 0;
+        }
+        $now = now();
+        $cutoff = $now->copy()->subHours($hours)->format('Y-m-d H:i:s');
+        // The verification_due index serves the status / next_attempt_at order.
+        $rows = DB::table('release_verification_candidates')->where('status', 'waiting_upload')
+            ->where('next_attempt_at', '<=', $now)->whereNull('release_id')->whereNull('lease_token')
+            ->orderBy('next_attempt_at')->orderBy('id')->limit(max(1, $limit))
+            ->get(['id', 'last_unique_at', 'next_attempt_at']);
+        $eligible = [];
+        foreach ($rows as $row) {
+            if ($row->last_unique_at < $cutoff) {
+                $eligible[] = (int) $row->id;
+
+                continue;
+            }
+            DB::table('release_verification_candidates')->where('id', $row->id)->where('status', 'waiting_upload')
+                ->where('next_attempt_at', $row->next_attempt_at)->whereNull('release_id')->whereNull('lease_token')
+                ->update(['next_attempt_at' => Carbon::parse($row->last_unique_at)->addHours($hours)->format('Y-m-d H:i:s')]);
+        }
+        if ($eligible === []) {
+            return 0;
+        }
+
+        // Rechecked in the update itself: a new article since the read keeps the upload waiting.
+        return DB::table('release_verification_candidates')->whereIn('id', $eligible)->where('status', 'waiting_upload')
+            ->whereNull('release_id')->whereNull('lease_token')->where('last_unique_at', '<', $cutoff)
+            ->update(['status' => 'ready', 'next_attempt_at' => $now->format('Y-m-d H:i:s'),
+                'reason' => 'Upload stopped growing before it was complete; queued for partial publication.']);
+    }
+
     public function capacityAvailable(): bool
     {
         if (! config('release_verification.required', true) || ! Schema::hasTable('release_verification_state')) {

@@ -41,6 +41,20 @@ class CandidateHeaderInventoryTest extends TestCase
         }
     }
 
+    public function test_partial_publication_accepts_only_missing_articles_and_counts_them(): void
+    {
+        $inventory = new CandidateHeaderInventory;
+        $manifest = $this->manifest();
+        $manifest['files'][0]['totalparts'] = 4;
+        $manifest['expected_files'] = 2;
+        $this->assertNull($inventory->partialRejection($manifest));
+        $this->assertNotNull($inventory->rejection($manifest));
+        $this->assertSame(['articles_found' => 1, 'articles_expected' => 4, 'files_found' => 1, 'files_expected' => 2],
+            $inventory->completeness($manifest));
+        $manifest['conflict'] = true;
+        $this->assertSame('Conflicting header identities require resolution.', $inventory->partialRejection($manifest));
+    }
+
     private function manifest(): array
     {
         return ['expected_files' => 1, 'files' => [['key' => 'movie', 'totalparts' => 1,

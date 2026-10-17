@@ -98,6 +98,13 @@ final readonly class ReleaseItemPayloadBuilder
 
         $attributes['files'] = $this->value($release, 'totalpart');
 
+        // Published before the upload was complete: found of declared articles.
+        $articlesExpected = $this->value($release, 'articles_expected');
+        if ($articlesExpected !== null && (int) $articlesExpected > 0) {
+            $attributes['articles_found'] = $this->value($release, 'articles_found');
+            $attributes['articles_expected'] = $articlesExpected;
+        }
+
         if ($this->isNewznab && $this->hasVideoInfo($release)) {
             $attributes = array_merge($attributes, $this->tvAttributes($release));
         }

@@ -151,7 +151,7 @@ class VerifyReleaseCandidates extends Command
                     $heartbeat();
                     $manifest = $store->read($claim->manifest_path);
                     $started = microtime(true);
-                    $result = $verifier->verify($manifest, $progressHeartbeat);
+                    $result = $verifier->verify($manifest, $progressHeartbeat, $repository->partialAllowed($claim));
                     $diagnostics?->verified($result->verdict);
                     if ($result->passed()) {
                         if ($publisher->publish($claim, $result) === null) {

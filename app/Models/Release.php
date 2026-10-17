@@ -19,6 +19,7 @@ use Illuminate\Pagination\Paginator;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 
 /**
  * Properties from computed columns, joins, and subqueries.
@@ -199,6 +200,18 @@ class Release extends Model
     public function episode(): BelongsTo
     {
         return $this->belongsTo(TvEpisode::class, 'tv_episodes_id');
+    }
+
+    /** @var \WeakMap<\PDO, bool>|null */
+    private static ?\WeakMap $partialArticleCountSupport = null;
+
+    /** Whether releases record partial publications' found and declared article counts. */
+    public static function hasPartialArticleCounts(): bool
+    {
+        $pdo = DB::connection()->getPdo();
+        self::$partialArticleCountSupport ??= new \WeakMap;
+
+        return self::$partialArticleCountSupport[$pdo] ??= Schema::hasColumn('releases', 'articles_expected');
     }
 
     /**
@@ -619,6 +632,10 @@ class Release extends Model
             'tve.episode',
             'tve.firstaired',
         ];
+
+        if (self::hasPartialArticleCounts()) {
+            array_push($columns, 'releases.articles_found', 'releases.articles_expected');
+        }
 
         if ($includeV1CompatibilityFields) {
             array_push($columns,

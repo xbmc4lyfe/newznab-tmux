@@ -17,7 +17,9 @@ final class CollectionReleasePolicy
             return null;
         }
         if (($manifest['verification_mode'] ?? null) === 'spot_check') {
-            if (($rejection = (new CandidateHeaderInventory)->rejection($manifest)) !== null) {
+            // The publisher has already validated a partial block against the locked candidate.
+            $inventory = new CandidateHeaderInventory;
+            if (($rejection = isset($manifest['partial']) ? $inventory->partialRejection($manifest) : $inventory->rejection($manifest)) !== null) {
                 throw new RuntimeException($rejection);
             }
 

@@ -66,6 +66,41 @@ final class CandidateHeaderInventory
         return ['status' => 'ready', 'reason' => null];
     }
 
+    /**
+     * The rejection a partial publication still enforces: an upload that is only missing files or
+     * articles is accepted, while invalid or conflicting headers are not.
+     *
+     * @param  array<string, mixed>  $manifest
+     */
+    public function partialRejection(array $manifest): ?string
+    {
+        $assessment = $this->assessment($manifest);
+
+        return $assessment['status'] === 'waiting_upload' ? null : $assessment['reason'];
+    }
+
+    /**
+     * Articles and files found in the headers against those declared. Files never seen declare no
+     * article count, so they count only toward files.
+     *
+     * @param  array<string, mixed>  $manifest
+     * @return array{articles_found: int, articles_expected: int, files_found: int, files_expected: int}
+     */
+    public function completeness(array $manifest): array
+    {
+        $found = 0;
+        $expected = 0;
+        foreach ($manifest['files'] ?? [] as $file) {
+            $segments = is_array($file['segments'] ?? null) ? count($file['segments']) : 0;
+            $found += $segments;
+            $expected += max($segments, (int) ($file['totalparts'] ?? 0));
+        }
+        $files = count($manifest['files'] ?? []);
+
+        return ['articles_found' => $found, 'articles_expected' => $expected,
+            'files_found' => $files, 'files_expected' => max($files, (int) ($manifest['expected_files'] ?? 0))];
+    }
+
     /** @param array<string, mixed> $manifest */
     public function bytes(array $manifest): int
     {
