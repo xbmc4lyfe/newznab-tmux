@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Releases\Verification;
 
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 use RuntimeException;
 
 /**
@@ -20,6 +21,9 @@ final class VerificationLedger
     public const string LOCKS_TABLE = 'release_verification_locks';
 
     public const string PUBLICATION_LOCK = 'publication';
+
+    /** Publication lock rows `publication:0` … `publication:1023`, chosen by duplicate-search key. */
+    public const int PUBLICATION_STRIPES = 1024;
 
     /** Database manifests let verification writers run concurrently. */
     public function concurrent(): bool
@@ -38,15 +42,61 @@ final class VerificationLedger
         }
     }
 
-    /** Serialize publications (and their duplicate detection) with each other, not with admission. */
-    public function enterPublication(string $missing = 'Verification migration has not initialized capacity state.'): void
+    /**
+     * Keys a release's duplicate search looks up committed releases by: its article fingerprint,
+     * predb id, searchname, name and exact size. Two publications that could find each other as
+     * duplicates share at least one key. Names compare under a case- and accent-insensitive
+     * collation, so their keys keep only lowercase ASCII letters and digits: a coarser key only
+     * serializes more.
+     *
+     * @return list<string>
+     */
+    public static function publicationKeys(int $size, ?string $fingerprint, string $name, string $searchName, int $predbId): array
+    {
+        $fold = static fn (string $value): string => (string) preg_replace('/[^a-z0-9]+/', '', strtolower(Str::ascii($value)));
+
+        return array_values(array_filter([
+            $fingerprint !== null && $fingerprint !== '' ? 'fingerprint:'.strtolower($fingerprint) : null,
+            $predbId > 0 ? 'predb:'.$predbId : null,
+            $searchName !== '' ? 'name:'.$fold($searchName) : null,
+            $name !== '' ? 'name:'.$fold($name) : null,
+            $size > 0 ? 'size:'.$size : null,
+        ]));
+    }
+
+    public static function publicationStripe(string $key): string
+    {
+        return self::PUBLICATION_LOCK.':'.(crc32($key) % self::PUBLICATION_STRIPES);
+    }
+
+    /**
+     * Serialize publications (and their duplicate detection) that share a duplicate-search key,
+     * not with admission or unrelated releases.
+     *
+     * One statement locks all of a publication's stripes in primary-key order, so overlapping
+     * publications cannot deadlock. It then locks the shared `publication` row: in share mode,
+     * which striped publications hold together, or exclusively when it has no keys (or some
+     * stripes do not exist yet), so such a publication waits for, and excludes, every other.
+     *
+     * Only locking reads run here: the caller's first plain read, its duplicate search, must take
+     * its REPEATABLE READ view after these locks are granted to see the releases committed while
+     * it waited.
+     *
+     * @param  list<string>  $keys
+     */
+    public function enterPublication(array $keys, string $missing = 'Verification migration has not initialized capacity state.'): void
     {
         if (! $this->concurrent()) {
             $this->enter($missing);
 
             return;
         }
-        if (DB::table(self::LOCKS_TABLE)->where('name', self::PUBLICATION_LOCK)->lockForUpdate()->first() === null) {
+        $stripes = array_values(array_unique(array_map(self::publicationStripe(...), $keys)));
+        sort($stripes);
+        $striped = $stripes !== []
+            && DB::table(self::LOCKS_TABLE)->whereIn('name', $stripes)->orderBy('name')->lockForUpdate()->count() === count($stripes);
+        $shared = DB::table(self::LOCKS_TABLE)->where('name', self::PUBLICATION_LOCK);
+        if (($striped ? $shared->sharedLock() : $shared->lockForUpdate())->first() === null) {
             throw new RuntimeException('Verification publication lock has not been initialized.');
         }
     }

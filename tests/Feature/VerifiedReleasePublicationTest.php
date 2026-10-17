@@ -13,6 +13,7 @@ use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\PublicationTiming;
 use App\Services\Releases\Verification\ReleaseMetadataResolver;
+use App\Services\Releases\Verification\VerificationLedger;
 use App\Services\Releases\Verification\VerificationResult;
 use App\Services\Releases\Verification\VerifiedNzbWriter;
 use App\Services\Releases\Verification\VerifiedReleasePublisher;
@@ -281,6 +282,12 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
                 }
             });
         }
+        $stripeLocks = [];
+        DB::listen(function (QueryExecuted $event) use (&$stripeLocks): void {
+            if (str_contains($event->sql, 'from "release_verification_locks"') && str_contains($event->sql, ' in (')) {
+                $stripeLocks[] = $event->bindings;
+            }
+        });
         $pages = 0;
         DB::listen(function (QueryExecuted $event) use (&$pages): void {
             if (str_starts_with($event->sql, 'select "id", "guid"') && str_contains($event->sql, 'limit 128')) {
@@ -417,6 +424,17 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             $this->assertSame(3, DB::table('releases_groups')->where('releases_id', $id)->count());
         }
         $release = DB::table('releases')->where('id', $id)->first();
+        if (config('release_verification.manifest_storage') === 'database' && $timingMode === 'nested') {
+            // Inside an outer transaction, publication takes the exclusive fallback before any read.
+            $this->assertSame([], $stripeLocks);
+        } elseif (config('release_verification.manifest_storage') === 'database') {
+            // The publication locked every stripe its duplicate search could look this release up by.
+            $this->assertNotSame([], $stripeLocks);
+            foreach (VerificationLedger::publicationKeys((int) $release->size, null, (string) $release->name,
+                (string) $release->searchname, (int) $release->predb_id) as $key) {
+                $this->assertContains(VerificationLedger::publicationStripe($key), $stripeLocks[array_key_last($stripeLocks)], $key);
+            }
+        }
         $xml = app(NzbService::class)->readNzbContents($release->guid);
         $this->assertStringContainsString('verified@article', $xml);
         $this->assertSame(1, (int) $release->nzbstatus);

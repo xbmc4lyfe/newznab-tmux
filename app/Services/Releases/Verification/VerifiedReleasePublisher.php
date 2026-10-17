@@ -34,14 +34,32 @@ final class VerifiedReleasePublisher
 
         $timing = PublicationTiming::sample();
         $status = 'threw';
+        // Resolve the duplicate-search keys once, before taking any lock, so the publication locks
+        // exactly the keys its search will use. Without them it falls back to the shared row. An
+        // outer transaction would take its REPEATABLE READ view from these reads, before the locks,
+        // so there metadata is resolved after the exclusive fallback, as before striping.
+        $preResolved = null;
+        $keys = [];
+        // A plain read is harmless outside a transaction; it skips the work for a stale claim,
+        // which the locked validation below rejects anyway.
+        if (DB::transactionLevel() === 0 && $this->claimIsCurrent($claim)) {
+            try {
+                $preResolved = $this->metadata->resolve($result->manifest);
+                $keys = VerificationLedger::publicationKeys($this->publicationSize($result->manifest), $this->incomingFingerprint($result->manifest),
+                    (string) $preResolved['name'], (string) $preResolved['searchname'], (int) $preResolved['predb_id']);
+            } catch (Throwable) {
+                $preResolved = null;
+                $keys = [];
+            }
+        }
         try {
-            $id = DB::transaction(function () use ($claim, $result, $timing): ?int {
+            $id = DB::transaction(function () use ($claim, $result, $timing, $preResolved, $keys): ?int {
                 $timing?->beginAttempt();
                 $returned = false;
                 try {
-                    // Publications serialize so duplicate detection sees each committed release;
-                    // admissions and expiry no longer wait behind this lock.
-                    app(VerificationLedger::class)->enterPublication();
+                    // Duplicate detection must see each committed release sharing a search key;
+                    // admissions, expiry and unrelated releases no longer wait behind this lock.
+                    app(VerificationLedger::class)->enterPublication($keys);
                     $timing?->nextPhase('candidate_policy');
                     $candidate = DB::table('release_verification_candidates')->where('id', $claim->id)->lockForUpdate()->first();
                     if ($candidate === null || $candidate->version !== $claim->version
@@ -72,18 +90,10 @@ final class VerifiedReleasePublisher
                         return null;
                     }
                     $timing?->nextPhase('metadata_size');
-                    $metadata = $this->metadata->resolve($manifest);
-                    if (($manifest['verification_mode'] ?? null) === 'spot_check') {
-                        $size = (new CandidateHeaderInventory)->bytes($manifest);
-                        if ($size < 1) {
-                            throw new RuntimeException('Spot-checked release has no positive declared size.');
-                        }
-                    } else {
-                        $size = 0;
-                        foreach ($manifest['files'] as $file) {
-                            $size += (int) ($file['decoded_size'] ?? array_sum(array_column($file['segments'], 'bytes')));
-                        }
-                        $size = (int) ($manifest['verified_bytes'] ?? $size);
+                    $metadata = $preResolved ?? $this->metadata->resolve($manifest);
+                    $size = $this->publicationSize($manifest);
+                    if ($size < 1 && ($manifest['verification_mode'] ?? null) === 'spot_check') {
+                        throw new RuntimeException('Spot-checked release has no positive declared size.');
                     }
                     $timing?->nextPhase('archive_legacy');
                     $legacy = null;
@@ -253,6 +263,43 @@ final class VerifiedReleasePublisher
         } catch (Throwable) {
             return false;
         }
+    }
+
+    private function claimIsCurrent(object $claim): bool
+    {
+        return DB::table('release_verification_candidates')->where('id', $claim->id)->where('version', $claim->version)
+            ->where('manifest_hash', $claim->manifest_hash)->where('lease_token', $claim->lease_token)->whereNull('release_id')
+            ->where('lease_until', '>=', now()->format('Y-m-d H:i:s'))->exists();
+    }
+
+    /**
+     * The article fingerprint duplicate detection looks up, computed as {@see findCoveredDuplicate()} does.
+     *
+     * @param  array<string, mixed>  $manifest
+     */
+    private function incomingFingerprint(array $manifest): ?string
+    {
+        $xml = (new NzbArticleCoverage(app(NzbService::class), $this->duplicates))->parseXml($this->writer->document($manifest));
+
+        return $xml === null ? null : NzbArticleFingerprint::fromXml($xml);
+    }
+
+    /**
+     * The release size duplicate detection matches exactly.
+     *
+     * @param  array<string, mixed>  $manifest
+     */
+    private function publicationSize(array $manifest): int
+    {
+        if (($manifest['verification_mode'] ?? null) === 'spot_check') {
+            return (new CandidateHeaderInventory)->bytes($manifest);
+        }
+        $size = 0;
+        foreach ($manifest['files'] as $file) {
+            $size += (int) ($file['decoded_size'] ?? array_sum(array_column($file['segments'], 'bytes')));
+        }
+
+        return (int) ($manifest['verified_bytes'] ?? $size);
     }
 
     /** @param list<string> $names */
