@@ -540,7 +540,15 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertTrue(DB::table('collections')->where('id', $late)->exists(), 'They may be the partial\'s late articles.');
     }
 
-    public function test_another_posts_later_parts_join_its_own_candidate_past_a_newer_holder(): void
+    /** @return array<string, array{string}> */
+    public static function newerGenerationFates(): array
+    {
+        return ['generation still pending' => ['pending'], 'generation completed the upgrade' => ['published'],
+            'generation filtered' => ['filtered'], 'generation expired' => ['expired']];
+    }
+
+    #[DataProvider('newerGenerationFates')]
+    public function test_another_posts_later_parts_join_its_own_candidate_past_a_newer_holder(string $fate): void
     {
         $this->publicationSchema(partialColumns: true);
         $hash = sha1('two-posters', true);
@@ -556,6 +564,15 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         // Poster A's late article: a newer generation now holds the partial.
         app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
         $this->assertGreaterThan((int) $own->id, (int) DB::table('release_verification_candidates')->max('id'));
+        $generation = (int) DB::table('release_verification_candidates')->max('id');
+        $partial = (int) DB::table('releases')->value('id');
+        if ($fate === 'published') {
+            DB::table('release_verification_candidates')->where('id', $generation)->update(['release_id' => $partial, 'status' => 'sampled', 'manifest_path' => '', 'manifest_bytes' => 0]);
+            DB::table('releases')->where('id', $partial)->update(['late_article_candidate_id' => null]);
+        } elseif ($fate !== 'pending') {
+            DB::table('release_verification_candidates')->where('id', $generation)->update(['status' => $fate, 'manifest_path' => '', 'manifest_bytes' => 0]);
+            DB::table('releases')->where('id', $partial)->update(['late_article_candidate_id' => null]);
+        }
 
         $second = $poster(2, 'b2@b');
         DB::table('collections')->where('id', $second)->update(['filecheck' => 0]);

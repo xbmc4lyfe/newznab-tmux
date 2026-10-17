@@ -94,11 +94,12 @@ final class CandidateRepository
                         $apart = $holder === null && in_array((int) $existing->id, array_map(static fn (object $held): int => (int) $held->id, $holders), true);
                     }
                 }
-                if ($holder === null && $holders !== [] && $existing !== null && ($apart || $existing->release_id !== null)) {
-                    // Not a partial's articles, and the newest candidate is a holder or published: these join the
-                    // newest pending candidate that isn't a holder (another post's own), or start a generation.
+                if ($holder === null && $existing !== null) {
+                    // Not a partial's articles: they join the newest pending candidate that holds no partial's
+                    // inventory. Before partials that was always the newest row; posts kept apart from a
+                    // partial can leave one behind newer holders or generations, whatever became of them.
                     $own = $this->lockLatestUnheld($sourceIdentity, array_map(static fn (object $held): int => (int) $held->id, $holders));
-                    if ($own !== null) {
+                    if ($own !== null && (int) $own->id !== (int) $existing->id) {
                         $existing = $own;
                         $apart = false;
                     }
