@@ -769,6 +769,47 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(['e@f'], array_column($fresh['files'][0]['segments'], 'messageid'));
     }
 
+    public function test_headers_a_pending_repost_also_takes_follow_the_repost_not_the_partial(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('pending-repost', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $retained = DB::table('release_verification_candidates')->sole();
+        // The same poster's repost: its part 1 conflicts with the partial, so it is archived apart, unpublished.
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 1, messageId: 'b1@b'));
+        $repost = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+
+        // Part 3 fits both the partial's inventory and the repost.
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 3, messageId: 'e@f'));
+
+        $this->assertSame($retained->manifest_path, DB::table('release_verification_candidates')->where('id', $retained->id)->value('manifest_path'));
+        $this->assertSame((int) $retained->id, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
+        $repostManifest = app(ManifestStore::class)->read((string) DB::table('release_verification_candidates')->where('id', $repost->id)->value('manifest_path'));
+        $this->assertSame(['b1@b', 'e@f'], array_column($repostManifest['files'][0]['segments'], 'messageid'));
+    }
+
+    public function test_retained_expiry_pages_past_rows_held_by_pending_late_headers(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $this->limits();
+        $cutoff = now()->subHours((int) config('release_verification.expiry_hours') + 1)->format('Y-m-d H:i:s');
+        $row = static fn (int $n): array => ['identity' => sha1('held-'.$n), 'source_identity' => sha1('held-'.$n), 'groups_id' => 1,
+            'manifest_path' => hash('sha256', 'held-'.$n).'.json.gz', 'manifest_bytes' => 0, 'manifest_hash' => hash('sha256', 'held-'.$n), 'status' => 'sampled',
+            'version' => 1, 'last_unique_at' => $cutoff, 'next_attempt_at' => $cutoff, 'release_id' => 100000 + $n];
+        // A full page of retained partials whose uploads still have late headers waiting to be archived.
+        foreach (range(1, 100) as $n) {
+            DB::table('release_verification_candidates')->insert($row($n));
+            DB::table('collections')->insert(['collectionhash' => hex2bin(sha1('held-'.$n)), 'subject' => 'Movie', 'fromname' => 'poster',
+                'totalfiles' => 1, 'groups_id' => 1, 'date' => '2026-10-11 12:00:00', 'filecheck' => 0]);
+        }
+        DB::table('release_verification_candidates')->insert($row(101));
+
+        app(CandidateRepository::class)->expire();
+
+        $this->assertSame('', DB::table('release_verification_candidates')->where('release_id', 100101)->value('manifest_path'), 'Not starved behind them.');
+        $this->assertSame(100, DB::table('release_verification_candidates')->where('manifest_path', '<>', '')->count());
+    }
+
     public function test_late_articles_never_republish_a_deleted_partial(): void
     {
         $this->publicationSchema(partialColumns: true);

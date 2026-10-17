@@ -93,6 +93,16 @@ final class CandidateRepository
                             // A filtered newer post skipped the snapshot; these headers may still be a partial's.
                             $manifest ??= $this->snapshotHeaders($collection, $currentReads);
                             $holder = $this->partialOwner($holders, $manifest);
+                            if ($holder !== null) {
+                                // An established repost under the same hash (pending, holding no partial) that also takes
+                                // these headers makes them ambiguous: never upgrade the partial with possibly mixed
+                                // articles. They then follow the repost, as ordinary pending headers do.
+                                $repost = $this->lockLatestUnheld($sourceIdentity, array_map(static fn (object $held): int => (int) $held->id, $holders));
+                                if ($repost !== null && $repost->manifest_path !== ''
+                                    && ! $this->spoils($this->store->read($repost->manifest_path), $this->merge($this->store->read($repost->manifest_path), $manifest))) {
+                                    $holder = null;
+                                }
+                            }
                         } catch (CandidateMetadataBudgetExceeded $error) {
                             $snapshotFailure = $error;
                         }
@@ -1087,35 +1097,52 @@ final class CandidateRepository
     private function expireRetainedPartials(?callable $mayStart): void
     {
         $cutoff = now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
-        $ids = DB::table('release_verification_candidates')->whereNotNull('release_id')->where('manifest_path', '<>', '')
-            ->where('last_unique_at', '<', $cutoff)->orderBy('id')->limit(100)->pluck('source_identity', 'id');
-        foreach ($ids as $id => $sourceIdentity) {
-            if ($mayStart !== null && ! $mayStart()) {
-                break;
+        // Page by id: rows held back by late headers awaiting archive must not starve the ones behind them.
+        $after = 0;
+        $released = 0;
+        for ($page = 0; $page < 10 && $released < 100; $page++) {
+            $ids = DB::table('release_verification_candidates')->whereNotNull('release_id')->where('manifest_path', '<>', '')
+                ->where('last_unique_at', '<', $cutoff)->where('id', '>', $after)->orderBy('id')->limit(100)->pluck('source_identity', 'id');
+            if ($ids->isEmpty()) {
+                return;
             }
-            DB::transaction(function () use ($id, $sourceIdentity, $cutoff): void {
-                // Serialize with header storage and archive(), in their order (the upload's collections, the
-                // ledger, then the candidate): late headers still waiting to be archived keep the inventory.
-                $hash = is_string($sourceIdentity) && ctype_xdigit($sourceIdentity) ? hex2bin($sourceIdentity) : false;
-                if ($hash !== false && DB::table('collections')->where('collectionhash', $hash)->lockForUpdate()->exists()) {
+            $after = (int) $ids->keys()->last();
+            foreach ($ids as $id => $sourceIdentity) {
+                if ($mayStart !== null && ! $mayStart()) {
                     return;
                 }
-                $this->ledger->enter();
-                $row = DB::table('release_verification_candidates')->where('id', $id)->lockForUpdate()->first();
-                if ($row === null || $row->release_id === null || $row->manifest_path === '' || $row->last_unique_at >= $cutoff) {
-                    return;
-                }
-                DB::table('release_verification_candidates')->where('id', $id)->update(['manifest_path' => '', 'manifest_bytes' => 0]);
-                if (Release::hasLateArticleFlag()) {
-                    // No late articles can merge any more: workers that read NZBs may now process it.
-                    DB::table('releases')->where('id', $row->release_id)->where('late_article_candidate_id', $id)->update(['late_article_candidate_id' => null]);
-                }
-                $this->ledger->adjust(-(int) $row->manifest_bytes);
-                DB::afterCommit(function () use ($row): void {
-                    $this->store->deleteIfUnreferenced($row->manifest_path);
-                });
-            }, 5);
+                $released += $this->expireRetainedPartial((int) $id, $sourceIdentity, $cutoff) ? 1 : 0;
+            }
         }
+    }
+
+    /** Release one retained inventory unless its upload has late headers still waiting to be archived. */
+    private function expireRetainedPartial(int $id, mixed $sourceIdentity, string $cutoff): bool
+    {
+        return DB::transaction(function () use ($id, $sourceIdentity, $cutoff): bool {
+            // Serialize with header storage and archive(), in their order (the upload's collections, the
+            // ledger, then the candidate): late headers still waiting to be archived keep the inventory.
+            $hash = is_string($sourceIdentity) && ctype_xdigit($sourceIdentity) ? hex2bin($sourceIdentity) : false;
+            if ($hash !== false && DB::table('collections')->where('collectionhash', $hash)->lockForUpdate()->exists()) {
+                return false;
+            }
+            $this->ledger->enter();
+            $row = DB::table('release_verification_candidates')->where('id', $id)->lockForUpdate()->first();
+            if ($row === null || $row->release_id === null || $row->manifest_path === '' || $row->last_unique_at >= $cutoff) {
+                return false;
+            }
+            DB::table('release_verification_candidates')->where('id', $id)->update(['manifest_path' => '', 'manifest_bytes' => 0]);
+            if (Release::hasLateArticleFlag()) {
+                // No late articles can merge any more: workers that read NZBs may now process it.
+                DB::table('releases')->where('id', $row->release_id)->where('late_article_candidate_id', $id)->update(['late_article_candidate_id' => null]);
+            }
+            $this->ledger->adjust(-(int) $row->manifest_bytes);
+            DB::afterCommit(function () use ($row): void {
+                $this->store->deleteIfUnreferenced($row->manifest_path);
+            });
+
+            return true;
+        }, 5);
     }
 
     /**

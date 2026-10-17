@@ -13,6 +13,8 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Throwable;
 
 final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQueue
@@ -61,22 +63,37 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
         // re-queuing (which would spend a try). Upgrades are rare; a bounded loop always finishes.
         for ($round = 0; $round < 3; $round++) {
             // A query update: the model still believes it is processing, so a model update would write nothing.
-            ReleaseFingerprintMetadata::query()->whereKey($record->getKey())->update(['status' => 'processing', 'last_error' => null]);
+            // The run token makes this run the record's only writer until another run takes it over.
+            $token = bin2hex(random_bytes(8));
+            ReleaseFingerprintMetadata::query()->whereKey($record->getKey())->update(['status' => 'processing', 'last_error' => null]
+                + (self::tracksRuns() ? ['run_token' => $token] : []));
             $result = $collector->collect($release->refresh());
             $encodedMetadata = json_encode($result['data'], JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR);
             $safeMetadata = json_decode($encodedMetadata, true, 512, JSON_THROW_ON_ERROR);
-            $saved = ReleaseFingerprintMetadata::query()->whereKey($record->getKey())->where('status', 'processing')->update([
-                'status' => $result['status'],
-                // A builder update skips the model's array cast.
-                'metadata' => json_encode($safeMetadata, JSON_THROW_ON_ERROR),
-                'last_error' => $result['status'] === 'unavailable' ? ($result['data']['reason'] ?? 'NZB unavailable.') : null,
-                'collected_at' => now(),
-            ]);
+            $saved = ReleaseFingerprintMetadata::query()->whereKey($record->getKey())->where('status', 'processing')
+                ->when(self::tracksRuns(), fn ($query) => $query->where('run_token', $token))->update([
+                    'status' => $result['status'],
+                    // A builder update skips the model's array cast.
+                    'metadata' => json_encode($safeMetadata, JSON_THROW_ON_ERROR),
+                    'last_error' => $result['status'] === 'unavailable' ? ($result['data']['reason'] ?? 'NZB unavailable.') : null,
+                    'collected_at' => now(),
+                ]);
             if ($saved === 1) {
                 return;
             }
         }
         // Still preempted: leave it stale, which the backfill command and the next upgrade's dispatch pick up.
+    }
+
+    /** @var \WeakMap<\PDO, bool>|null */
+    private static ?\WeakMap $runTokenSupport = null;
+
+    private static function tracksRuns(): bool
+    {
+        $pdo = DB::connection()->getPdo();
+        self::$runTokenSupport ??= new \WeakMap;
+
+        return self::$runTokenSupport[$pdo] ??= Schema::hasColumn('release_fingerprint_metadata', 'run_token');
     }
 
     public function failed(?Throwable $exception): void
