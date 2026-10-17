@@ -3181,9 +3181,9 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
                 'ids' => $ids,
                 'total' => (int) $results->getTotal(),
                 // False when Manticore timed out, warned, or only estimated the total.
-                'total_exact' => ($rawResponse['timed_out'] ?? false) === false
+                'total_exact' => ($rawResponse['timed_out'] ?? null) === false
                     && empty($rawResponse['error']) && empty($rawResponse['warning'])
-                    && ($rawResponse['hits']['total_relation'] ?? 'eq') === 'eq',
+                    && ($rawResponse['hits']['total_relation'] ?? null) === 'eq',
                 'fuzzy' => $useFuzzy,
                 'available' => true,
                 // Manticore uses the compatible offset cursor until the PHP client

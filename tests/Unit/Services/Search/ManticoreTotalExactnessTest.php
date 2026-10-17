@@ -60,6 +60,8 @@ final class ManticoreTotalExactnessTest extends TestCase
             'exact' => [['timed_out' => false, 'hits' => ['total' => 2_700_000, 'total_relation' => 'eq', 'hits' => []]], true],
             'lower bound' => [['timed_out' => false, 'hits' => ['total' => 1000, 'total_relation' => 'gte', 'hits' => []]], false],
             'timed out' => [['timed_out' => true, 'hits' => ['total' => 5, 'total_relation' => 'eq', 'hits' => []]], false],
+            'missing timed_out' => [['hits' => ['total' => 5, 'total_relation' => 'eq', 'hits' => []]], false],
+            'missing relation' => [['timed_out' => false, 'hits' => ['total' => 5, 'hits' => []]], false],
             'warning' => [['timed_out' => false, 'warning' => 'partial', 'hits' => ['total' => 5, 'total_relation' => 'eq', 'hits' => []]], false],
         ];
     }
