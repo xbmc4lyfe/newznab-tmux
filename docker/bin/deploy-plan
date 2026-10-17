@@ -11,6 +11,7 @@ import shlex
 import stat
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 APP_SERVICES = ("web", "horizon", "scheduler", "indexer")
@@ -115,18 +116,6 @@ INDEXER_ONLY_EXACT = {
     "docker/app/bin/indexer.sh",
     "docker/app/php/yenc-ffi.ini",
 }
-
-# Bind-mounted service configuration. Deploy plans hash the files Compose actually mounts; these
-# repository paths are only used to interpret a legacy one-line stamp.
-LEGACY_CONFIG_OWNERS = (
-    ("docker/config/caddy/", "proxy"),
-    ("docker/config/prometheus/", "prometheus"),
-    ("docker/monitoring/grafana/", "grafana"),
-    ("docker/config/mariadb/", "mariadb"),
-    ("docker/config/redis/", "redis"),
-    ("docker/config/manticore/", "manticore"),
-)
-
 
 class BuildContext:
     """Which repository files can reach an image: inside the Docker build context (.dockerignore,
@@ -278,14 +267,6 @@ def classify_path(rel_path: str) -> tuple[str, ...]:
     return ("shared-app",)
 
 
-def legacy_owners(rel_path: str) -> tuple[str, ...]:
-    """Ownership for diffs against a legacy stamp, including mounted service configuration."""
-    for prefix, owner in LEGACY_CONFIG_OWNERS:
-        if rel_path.startswith(prefix):
-            return (owner,)
-    return classify_path(rel_path)
-
-
 def file_record(repo: Path, rel_path: str) -> str:
     """Compute a deterministic content+mode+symlink record for a working-tree file."""
     full = repo / rel_path
@@ -404,6 +385,9 @@ def project_directory(docker_dir: Path) -> Path:
     return docker_dir.resolve()
 
 
+# Rendered Compose service definitions from the last get_compose_service_hashes() call.
+RENDERED_SERVICES: dict[str, object] = {}
+
 HOST_SYSTEM_DIRS = {"/"}
 HOST_SYSTEM_PREFIXES = ("/proc", "/sys", "/dev", "/run", "/var/run", "/private/var/run")
 
@@ -484,6 +468,7 @@ def get_compose_service_hashes(docker_dir: Path) -> tuple[str, dict[str, str]]:
                 if svc in services_map:
                     # The Compose command text and context only feed the global hash: an equivalent
                     # rendering must not drain writers or recreate stateful services.
+                    RENDERED_SERVICES[svc] = services_map[svc]
                     svc_payload = {
                         "service": services_map[svc],
                         "top_level": service_top_level_compose_deps(parsed, services_map[svc]),
@@ -705,35 +690,59 @@ def running_image(docker_dir: Path, svc: str) -> str | None:
     return proc.stdout.strip() if proc.returncode == 0 else None
 
 
-def recent_dirty_buckets(repo: Path, stamped_fingerprint: str = "") -> set[str] | None:
-    """Ownership buckets modified since a legacy stamp's revision, or None when it cannot be diffed."""
-    tokens = stamped_fingerprint.split()
-    base_rev = tokens[0] if tokens else ""
-    if not base_rev:
+def container_started_at(docker_dir: Path, svc: str) -> float | None:
+    """Start time of the service's container as a POSIX timestamp, None when it has no container.
+    Raises ValueError when an existing container's start time cannot be read."""
+    env = dict(os.environ)
+    env.setdefault("COMPOSE_FILE", str(docker_dir / "docker-compose.yml"))
+    ps = subprocess.run([*compose_command(docker_dir), "ps", "-a", "-q", svc], capture_output=True, text=True, env=env, check=False)
+    if ps.returncode != 0:
+        raise ValueError(f"compose ps failed for {svc}")
+    if not ps.stdout.strip():
         return None
-    verify = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{base_rev}^{{commit}}"],
-        capture_output=True,
-        check=False,
-    )
-    if verify.returncode != 0:
-        return None
-    buckets: set[str] = set()
-    cmds = [
-        ["git", "-C", str(repo), "diff", "--name-only", "-z", base_rev, "HEAD"],
-        ["git", "-C", str(repo), "diff", "--name-only", "-z", "HEAD"],
-        ["git", "-C", str(repo), "ls-files", "-o", "--exclude-standard", "-z"],
-    ]
-    for cmd in cmds:
-        proc = subprocess.run(cmd, capture_output=True, check=False)
-        if proc.returncode != 0:
-            return None
-        if proc.stdout:
-            for raw in proc.stdout.split(b"\x00"):
-                if raw:
-                    rel_path = raw.decode("utf-8", errors="surrogateescape")
-                    buckets.update(legacy_owners(rel_path))
-    return buckets
+    container = ps.stdout.strip().splitlines()[0]
+    proc = subprocess.run(["docker", "inspect", "--format", "{{.State.StartedAt}}", container], capture_output=True, text=True, check=False)
+    match = re.match(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$", proc.stdout.strip())
+    if proc.returncode != 0 or not match:
+        raise ValueError(f"unreadable start time for {svc}")
+    offset = "+00:00" if match.group(3) == "Z" else match.group(3)
+    fraction = (match.group(2) or "0")[:6].ljust(6, "0")
+    return datetime.fromisoformat(f"{match.group(1)}.{fraction}{offset}").timestamp()
+
+
+def mounts_changed_since_start(docker_dir: Path, svc: str) -> bool:
+    """True when a mounted configuration source was modified after the container started, so the
+    running process cannot have loaded it. Used without a per-service stamp; fails safe to True."""
+    cfg = RENDERED_SERVICES.get(svc)
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("volumes"), list):
+        return False
+    try:
+        started = container_started_at(docker_dir, svc)
+    except ValueError:
+        return True
+    if started is None:
+        return False
+    for volume in cfg["volumes"]:
+        if not (isinstance(volume, dict) and volume.get("type") == "bind" and isinstance(volume.get("source"), str)):
+            continue
+        path = Path(volume["source"])
+        try:
+            if path.is_file():
+                newest = path.stat().st_mtime
+            elif path.is_dir() and volume.get("read_only"):
+                resolved = str(path.resolve())
+                if resolved in HOST_SYSTEM_DIRS or resolved.startswith(HOST_SYSTEM_PREFIXES):
+                    continue
+                newest = max([path.stat().st_mtime] + [
+                    (Path(root) / name).stat().st_mtime for root, _, files in os.walk(path) for name in files
+                ])
+            else:
+                continue
+        except OSError:
+            return True
+        if newest > started:
+            return True
+    return False
 
 
 def compute_build_targets(repo: Path, docker_dir: Path, stamp_path: Path) -> list[str]:
@@ -785,10 +794,10 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
     force = os.environ.get("FORCE", "0") == "1"
     first_deploy = not bool(stamped)
     legacy_stamp = "__legacy__" in stamped
-    legacy_buckets = recent_dirty_buckets(repo, stamped.get("fingerprint", "")) if legacy_stamp else set()
-    # A legacy stamp records neither per-service Compose state nor mounted file contents, so Compose
-    # reconciles every rendered data and infra service (recreating only real drift, never forcing).
-    # Repository edits to mounted configuration since a diffable stamped revision still force a recreate.
+    # Without a per-service stamp (none, or the legacy one-line format) nothing records which mounted
+    # configuration the running containers loaded. Compose reconciles every rendered data and infra
+    # service (recreating only rendered drift, never forcing); a service whose mounted file changed
+    # after its container started is recreated so the stamp never records unloaded configuration.
 
     dirty_app: list[str] = []
     app_reasons: dict[str, str] = {}
@@ -826,9 +835,10 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
     for svc in DATA_SERVICES:
         if not compose_present(state, svc):
             data_reasons[svc] = "not rendered"
-        elif legacy_stamp and legacy_buckets is not None and svc in legacy_buckets:
+        elif (first_deploy or legacy_stamp) and mounts_changed_since_start(docker_dir, svc):
+            # A mounted file changed after the container started: only a recreate loads it.
             dirty_data.append(svc)
-            data_reasons[svc] = "config changed since legacy stamp"
+            data_reasons[svc] = "mounted config newer than container"
         elif first_deploy or legacy_stamp:
             # No per-service record: Compose reconciles drift while writers are stopped, without
             # force-recreating stateful services.
@@ -850,9 +860,9 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
             # Stateless: recreate so mounted configuration matches what gets stamped.
             dirty_infra.append(svc)
             infra_reasons[svc] = "recreate (no stamp)"
-        elif legacy_stamp and legacy_buckets is not None and svc in legacy_buckets:
+        elif legacy_stamp and mounts_changed_since_start(docker_dir, svc):
             dirty_infra.append(svc)
-            infra_reasons[svc] = "config changed since legacy stamp"
+            infra_reasons[svc] = "mounted config newer than container"
         elif legacy_stamp:
             reconcile_infra.append(svc)
             infra_reasons[svc] = "reconcile (legacy stamp)"

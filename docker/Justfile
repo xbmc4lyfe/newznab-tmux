@@ -2,6 +2,8 @@
 # Run from repo root: just docker <recipe>  or: just -f docker/Justfile <recipe>
 set positional-arguments := true
 set shell := ["bash", "-cu"]
+# The running just binary, so nested calls work where just is not on PATH (noninteractive SSH).
+export JUST := just_executable()
 
 # module_directory() is this directory both standalone and when loaded as `mod docker` from the root.
 CURDIR := module_directory()
@@ -51,7 +53,7 @@ DATA_DIRS := "data/storage data/install data/mariadb data/redis data/manticore d
 
 # Show available stack recipes
 help *args:
-    @just --list --justfile "{{module_file()}}"
+    @"$JUST" --list --justfile "{{module_file()}}"
 
 # Generate docker/.env and config/app.env (secrets, NNTP creds); safe to re-run
 env *args:
@@ -59,7 +61,7 @@ env *args:
     set -euo pipefail
     {{LOAD_ENV}}
     "{{CURDIR}}/bin/generate-env"
-    just --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" perms "$@"
+    "$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" perms "$@"
 
 # Create bind-mount directories
 dirs *args:
@@ -73,7 +75,7 @@ perms *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    just --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" dirs "$@"
+    "$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" dirs "$@"
     if [ "$(uname -s)" = Linux ]; then
         docker run --rm -v "{{CURDIR}}:/stack" "$HELPER_IMAGE" sh -c \
             "chown -R 33:33 /stack/data/storage /stack/data/install && chown $(id -u):33 /stack/config/app.env && chmod 0640 /stack/config/app.env"
@@ -171,9 +173,9 @@ init *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    just --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" env "$@"
-    just --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" dirs "$@"
-    just --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" build "$@"
+    "$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" env "$@"
+    "$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" dirs "$@"
+    "$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" build "$@"
     "{{CURDIR}}/bin/compose" up -d --wait mariadb redis manticore mailpit
     if [ -f "{{CURDIR}}/data/install/install.lock" ]; then
         echo "install.lock present; skipping nntmux:deploy-init"
@@ -181,7 +183,7 @@ init *args:
         "{{CURDIR}}/bin/compose" run --rm --no-deps web php artisan nntmux:deploy-init --no-interaction
     fi
     "{{CURDIR}}/bin/compose" run --rm --no-deps web php artisan monitoring:install --sail --no-interaction
-    just --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" seed-db "$@"
+    "$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" seed-db "$@"
     "{{CURDIR}}/bin/compose" run --rm --no-deps web php artisan predb:import-feed --pages=20 || true
     "{{CURDIR}}/bin/compose" up -d
     echo "NNTmux: http://localhost:${APP_PORT:-8080}  (admin password: grep ADMIN_PASS docker/config/app.env)"
@@ -200,7 +202,7 @@ seed *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    just --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" seed-db "$@"
+    "$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" seed-db "$@"
     "{{CURDIR}}/bin/compose" restart indexer
 
 # First bringup, or safe guarded deploy when app containers already exist

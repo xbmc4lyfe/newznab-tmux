@@ -15,7 +15,7 @@ case "$scheduler_timeout" in
     ''|*[!0-9]*) echo "DEPLOY_SCHEDULER_DRAIN_TIMEOUT must be a nonnegative integer." >&2; exit 1 ;;
 esac
 
-just --justfile "$DIR/Justfile" --working-directory "$DIR" build
+"${JUST:-just}" --justfile "$DIR/Justfile" --working-directory "$DIR" build
 verify
 
 eval "$("$DIR/bin/deploy-plan" --deploy-actions)"

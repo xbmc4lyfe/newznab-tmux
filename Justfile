@@ -10,6 +10,8 @@
 # never shadow docker/.env in the production stack. Read only the keys these recipes need.
 set positional-arguments := true
 set shell := ["bash", "-cu"]
+# The running just binary, so nested calls work where just is not on PATH (noninteractive SSH).
+export JUST := just_executable()
 
 mod docker 'docker/Justfile'
 
@@ -17,6 +19,7 @@ export SAIL := env("SAIL", "./sail")
 export DOCKER_COMPOSE := env("DOCKER_COMPOSE", "docker compose")
 SEARCH_DRIVER := env("SEARCH_DRIVER", `v=$(sed -n 's/^SEARCH_DRIVER=//p' .env 2>/dev/null | tail -n 1 | tr -d "\"'"); printf '%s' "${v:-manticore}"`)
 MONITORING_ENABLED := env("MONITORING_ENABLED", `sed -n 's/^MONITORING_ENABLED=//p' .env 2>/dev/null | tail -n 1 | tr -d "\"'"`)
+FORWARD_PROMETHEUS_PORT := env("FORWARD_PROMETHEUS_PORT", `v=$(sed -n 's/^FORWARD_PROMETHEUS_PORT=//p' .env 2>/dev/null | tail -n 1 | tr -d "\"'"); printf '%s' "${v:-9090}"`)
 WWWUSER := env("WWWUSER", `sed -n 's/^WWWUSER=//p' .env 2>/dev/null | tail -n 1 | tr -d "\"'"`)
 export SERVICE := env("SERVICE", "")
 export CMD := env("CMD", "")
@@ -35,25 +38,25 @@ MONITORING_COMPOSE := '$DOCKER_COMPOSE -f docker-compose.yml -f docker-compose.m
 
 # Show available recipes
 help *args:
-    @just --list --justfile "{{justfile()}}"
+    @"$JUST" --list --justfile "{{justfile()}}"
 
 # ── Production Self-Hosted Stack Shortcuts (delegates to docker/Justfile) ──
 
 # Smart selective deploy of the production docker/ stack
 deploy *args:
-    @just --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" deploy "$@"
+    @"$JUST" --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" deploy "$@"
 
 # Show per-service change detection and selective deployment plan
 deploy-plan *args:
-    @just --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" deploy-plan "$@"
+    @"$JUST" --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" deploy-plan "$@"
 
 # Build dirty self-hosted service image targets
 build-stack *args:
-    @just --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" build "$@"
+    @"$JUST" --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" build "$@"
 
 # Build only the cached base OS/PHP-extension image (nntmux/base:local)
 build-base *args:
-    @just --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" build-base "$@"
+    @"$JUST" --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" build-base "$@"
 
 # ── Pre-flight ───────────────────────────────────────────────
 
@@ -78,7 +81,7 @@ up *args:
     if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
         export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
     fi
-    just --justfile "{{justfile()}}" check-env
+    "$JUST" --justfile "{{justfile()}}" check-env
     {{SAIL}} up -d
 
 # Stop all Sail services
@@ -94,7 +97,7 @@ down *args:
 
 # Alias for 'down'
 stop *args:
-    @just --justfile "{{justfile()}}" down "$@"
+    @"$JUST" --justfile "{{justfile()}}" down "$@"
 
 # Restart all Sail services
 restart *args:
@@ -116,7 +119,7 @@ recreate *args:
     if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
         export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
     fi
-    just --justfile "{{justfile()}}" check-env
+    "$JUST" --justfile "{{justfile()}}" check-env
     {{SAIL}} up -d --force-recreate --remove-orphans
 
 # Always pull latest service images for configured tags (skips buildable)
@@ -128,7 +131,7 @@ pull *args:
     if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
         export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
     fi
-    just --justfile "{{justfile()}}" check-env
+    "$JUST" --justfile "{{justfile()}}" check-env
     {{DOCKER_COMPOSE}} pull --ignore-buildable --policy always
 
 # Pull latest service and base images, then build (cached layers OK)
@@ -140,7 +143,7 @@ build *args:
     if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
         export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
     fi
-    just --justfile "{{justfile()}}" check-env
+    "$JUST" --justfile "{{justfile()}}" check-env
     {{DOCKER_COMPOSE}} pull --ignore-buildable --policy always
     {{SAIL}} build --pull
 
@@ -153,7 +156,7 @@ rebuild *args:
     if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
         export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
     fi
-    just --justfile "{{justfile()}}" check-env
+    "$JUST" --justfile "{{justfile()}}" check-env
     {{DOCKER_COMPOSE}} pull --ignore-buildable --policy always
     {{SAIL}} build --no-cache --pull
     {{SAIL}} up -d --force-recreate --remove-orphans
@@ -167,7 +170,7 @@ update *args:
     if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
         export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
     fi
-    just --justfile "{{justfile()}}" check-env
+    "$JUST" --justfile "{{justfile()}}" check-env
     {{DOCKER_COMPOSE}} pull --ignore-buildable --policy always
     {{SAIL}} build --pull
     {{SAIL}} up -d --remove-orphans
@@ -181,15 +184,15 @@ upgrade *args:
     if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
         export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
     fi
-    just --justfile "{{justfile()}}" update "$@"
-    just --justfile "{{justfile()}}" fix-permissions "$@"
-    just --justfile "{{justfile()}}" composer-install "$@"
-    just --justfile "{{justfile()}}" npm-build "$@"
+    "$JUST" --justfile "{{justfile()}}" update "$@"
+    "$JUST" --justfile "{{justfile()}}" fix-permissions "$@"
+    "$JUST" --justfile "{{justfile()}}" composer-install "$@"
+    "$JUST" --justfile "{{justfile()}}" npm-build "$@"
     if [ "${MAINTENANCE:-}" = "1" ]; then {{SAIL}} artisan down; fi
     {{SAIL}} artisan migrate --force
     if [ "${MAINTENANCE:-}" = "1" ]; then {{SAIL}} artisan up; fi
-    just --justfile "{{justfile()}}" data-cache "$@"
-    just --justfile "{{justfile()}}" optimize "$@"
+    "$JUST" --justfile "{{justfile()}}" data-cache "$@"
+    "$JUST" --justfile "{{justfile()}}" optimize "$@"
 
 # Destroy ALL volumes, rebuild, and start clean (DATA LOSS!)
 fresh *args:
@@ -200,16 +203,19 @@ fresh *args:
     if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
         export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
     fi
-    just --justfile "{{justfile()}}" check-env
+    "$JUST" --justfile "{{justfile()}}" check-env
     if [ "${FORCE:-}" != "1" ]; then
         printf "⚠  This will destroy all Docker volumes (database, redis, search index). Continue? [y/N] "
         read -r confirm
         [ "$confirm" = "y" ] || [ "$confirm" = "Y" ] || { echo "Aborted."; exit 1; }
+    else
+        echo "⚠  FORCE=1 set — skipping confirmation."
     fi
     {{SAIL}} down -v
     {{DOCKER_COMPOSE}} pull --ignore-buildable --policy always
     {{SAIL}} build --no-cache --pull
     {{SAIL}} up -d --force-recreate --remove-orphans
+    echo "✔ Fresh environment is up. Run 'just artisan cmd=nntmux:install' to initialise."
 
 # ── Shell Access ─────────────────────────────────────────────
 
@@ -248,6 +254,8 @@ migrate-fresh *args:
         printf "⚠  This will DROP ALL TABLES and re-run every migration. Continue? [y/N] "
         read -r confirm
         [ "$confirm" = "y" ] || [ "$confirm" = "Y" ] || { echo "Aborted."; exit 1; }
+    else
+        echo "⚠  FORCE=1 set — skipping confirmation."
     fi
     $SAIL artisan migrate:fresh --force
 
@@ -388,7 +396,7 @@ fix-permissions *args:
 
 # Alias for 'fix-permissions'
 fix-perms *args:
-    @just --justfile "{{justfile()}}" fix-permissions "$@"
+    @"$JUST" --justfile "{{justfile()}}" fix-permissions "$@"
 
 # Register /var/www/html as a git safe.directory inside the container
 git-safe-directory *args:
@@ -403,9 +411,10 @@ monitoring-up *args:
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
     {{COMPOSE_ENV}}
-    just --justfile "{{justfile()}}" check-env
+    "$JUST" --justfile "{{justfile()}}" check-env
     if [ ! -f "{{MONITORING_KEY}}" ]; then echo "✘ No Grafana JWT key. Run: php artisan monitoring:install --sail"; exit 1; fi
     {{MONITORING_COMPOSE}} up -d
+    echo "✔ Monitoring started. Open /admin/monitoring (Prometheus: http://127.0.0.1:${FORWARD_PROMETHEUS_PORT:-{{FORWARD_PROMETHEUS_PORT}}})."
 
 # Stop and remove only the monitoring containers
 monitoring-down *args:
@@ -451,7 +460,7 @@ status *args:
 
 # Alias for 'status'
 ps *args:
-    @just --justfile "{{justfile()}}" status "$@"
+    @"$JUST" --justfile "{{justfile()}}" status "$@"
 
 # Show running processes inside each container
 top *args:
@@ -493,5 +502,7 @@ nuke *args:
         printf "⚠  This will remove ALL project containers/images/volumes. Continue? [y/N] "
         read -r confirm
         [ "$confirm" = "y" ] || [ "$confirm" = "Y" ] || { echo "Aborted."; exit 1; }
+    else
+        echo "⚠  FORCE=1 set — skipping confirmation."
     fi
     $SAIL down -v --rmi all

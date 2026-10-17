@@ -36,6 +36,7 @@ case "$*" in
         else
             echo "${NNTMUX_CONTAINER_IMAGE_ID:-${NNTMUX_IMAGE_ID:-sha256:fixture}}"
         fi ;;
+    *'inspect --format {{.State.StartedAt}}'*) echo "${NNTMUX_STARTED_AT:-2999-01-01T00:00:00.123456789Z}" ;;
     *'inspect --format {{.State.Status}}'*) echo "running ${NNTMUX_HEALTH_STATUS:-healthy}" ;;
     *' ps -a -q '*) [ "${NNTMUX_NO_EXISTING_APP:-0}" = 1 ] || echo fixture-container ;;
     *' ps -q '*) [ "${NNTMUX_SERVICE_MISSING:-0}" = 1 ] || echo fixture-container ;;
@@ -1018,22 +1019,45 @@ SH);
         $this->assertStringContainsString('build --target selfhosted-web', $this->events());
     }
 
-    public function test_legacy_stamp_diffs_against_stamped_revision_across_multiple_commits(): void
+    public function test_legacy_stamp_recreates_only_services_whose_mounted_config_is_newer_than_their_container(): void
     {
-        $baseRev = trim((new Process(['git', 'rev-parse', 'HEAD'], $this->directory))->mustRun()->getOutput());
+        $head = trim((new Process(['git', 'rev-parse', 'HEAD'], $this->directory))->mustRun()->getOutput());
         mkdir($this->directory.'/docker/config/caddy', 0777, true);
         file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', ":8080\n");
-        (new Process(['git', 'add', '.'], $this->directory))->mustRun();
-        (new Process(['git', 'commit', '-q', '-m', 'commit 1: caddy change'], $this->directory))->mustRun();
+        $config = ['NNTMUX_CONFIG_ID' => $this->composeJson()];
 
-        file_put_contents($this->directory.'/app.txt', "commit 2\n");
-        (new Process(['git', 'add', '.'], $this->directory))->mustRun();
-        (new Process(['git', 'commit', '-q', '-m', 'commit 2: app change'], $this->directory))->mustRun();
+        // Containers started after the edit already run it: reconcile only.
+        file_put_contents($this->directory.'/docker/.deploy.stamp', $head." e3b0 e3b0 c16c bb93\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 proxy', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 proxy', $this->events());
 
-        file_put_contents($this->directory.'/docker/.deploy.stamp', $baseRev." oldcfg fixture-config\n");
+        // A container that started before the edit never loaded it, so the stamp must not claim it.
+        file_put_contents($this->directory.'/events', '');
+        @unlink($this->directory.'/docker/.deploy.time');
+        file_put_contents($this->directory.'/docker/.deploy.stamp', $head." e3b0 e3b0 c16c bb93\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_STARTED_AT' => '2000-01-01T00:00:00Z'])->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $events);
+        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 redis', $events);
+    }
 
-        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+    public function test_real_repository_paths_reach_only_the_roles_whose_images_copy_them(): void
+    {
+        $paths = [
+            'routes/web.php' => 'shared-app', 'app/Http/Kernel.php' => 'shared-app', 'resources/views/layouts/main.blade.php' => 'shared-app',
+            'resources/js/app.js' => 'web', 'resources/css/app.css' => 'web', 'package.json' => 'web', 'docker/app/Caddyfile' => 'web',
+            'docker/app/bin/scheduler.py' => 'scheduler', 'docker/app/bin/indexer.sh' => 'indexer', 'docker/app/php/yenc-ffi.ini' => 'indexer',
+            'docker/8.5/php.ini' => 'shared-app', 'tests/Fixtures/nzb-article-fingerprint/NzbArticleFingerprint.php' => 'shared-app',
+            'deploy/cloud/entrypoint.sh' => 'shared-app', 'database/migrations/x.php' => 'migrations,shared-app',
+            'deploy/cloud/compose.yaml' => '-', 'docs/x.md' => '-', 'README.md' => '-', 'tests/Unit/XTest.php' => '-',
+            'scripts/install-monitoring.sh' => '-', '.env.example' => '-', 'docker/docker-compose.yml' => '-', 'docker/config/caddy/Caddyfile' => '-',
+        ];
+        $root = dirname(__DIR__, 2);
+        $process = new Process([$root.'/docker/bin/deploy-plan', '--classify', ...array_keys($paths)], env: ['DEPLOY_REPO' => $root, 'PYTHONDONTWRITEBYTECODE' => '1']);
+        $process->mustRun();
+        $expected = array_map(fn (string $path, string $owner): string => $path.' '.$owner, array_keys($paths), $paths);
+        $this->assertSame($expected, explode("\n", trim($process->getOutput())));
     }
 
     /** Rendered Compose JSON whose proxy and redis bind-mount repository configuration files. */
