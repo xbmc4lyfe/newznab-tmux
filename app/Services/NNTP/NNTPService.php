@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\NNTP;
 
 use App\Services\Configuration\ConfigurationProvider;
+use App\Services\Releases\Verification\ArticleBudgetExceeded;
 use App\Services\Tmux\Tmux;
 use App\Services\Yenc\ArticleFrame;
 use App\Services\Yenc\YencPart;
@@ -57,11 +58,24 @@ class NNTPService extends NntpClient
             throw new \RuntimeException('Article is unavailable; retry verification later.');
         }
         $raw = '';
-        while (($line = fgets($this->_socket, max(4, min($maximumBytes - strlen($raw), 65534) + 2))) !== false) {
+        while (($line = fgets($this->_socket, $limit = max(4, min($maximumBytes - strlen($raw), 65534) + 2))) !== false) {
             if ($line === ".\r\n" || $line === ".\n") {
                 return $raw;
             }
             if (! str_ends_with($line, "\n")) {
+                // A partial body line proves the article too large when its unstuffed bytes already
+                // exceed the budget, or, when they exactly reach it after filling a budget-capped
+                // read, when the line continues at all (its terminator alone overflows). A bare
+                // terminator prefix, or a response that ends within budget, is truncated.
+                if ($maximumBytes - strlen($raw) < 65534 && $line !== '.' && $line !== ".\r") {
+                    $unstuffed = strlen($raw) + strlen($line) - (str_starts_with($line, '..') ? 1 : 0);
+                    $continues = static fn ($socket): bool => is_string($next = fread($socket, 1)) && $next !== '';
+                    if ($unstuffed > $maximumBytes
+                        || ($unstuffed === $maximumBytes && strlen($line) === $limit - 1 && $continues($this->_socket))) {
+                        $this->doQuit();
+                        throw new ArticleBudgetExceeded('Article exceeds verification memory budget.');
+                    }
+                }
                 $this->doQuit();
                 throw new \RuntimeException('Verification article line is truncated or oversized.');
             }
@@ -70,7 +84,7 @@ class NNTPService extends NntpClient
             }
             if (strlen($raw) + strlen($line) > $maximumBytes) {
                 $this->doQuit();
-                throw new \RuntimeException('Article exceeds verification memory budget.');
+                throw new ArticleBudgetExceeded('Article exceeds verification memory budget.');
             }
             $raw .= $line;
         }
