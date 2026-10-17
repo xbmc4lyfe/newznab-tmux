@@ -244,6 +244,10 @@ final class ManifestStore
      */
     public function importLegacyFiles(array $names, bool $deleteFiles): array
     {
+        if (DB::transactionLevel() > 0) {
+            // Files are deleted as each chunk commits; an outer rollback would undo the rows but not that.
+            throw new RuntimeException('Manifest import cannot run inside an open transaction.');
+        }
         $counts = ['imported' => 0, 'already' => 0, 'missing' => 0, 'invalid' => 0, 'conflict' => 0, 'unreferenced' => 0];
         $chunk = [];
         $chunkBytes = 0;
@@ -370,17 +374,28 @@ final class ManifestStore
 
     private function body(string $name): string|false
     {
-        if ($this->usesDatabase()) {
-            // Inside a transaction, read the committed row rather than the snapshot: the importer
-            // may have moved this manifest from its legacy file after the snapshot was taken.
-            $query = DB::table(self::TABLE)->where('name', $name);
-            $body = (DB::transactionLevel() > 0 ? $query->sharedLock() : $query)->value('body');
-            if (is_string($body)) {
-                return $body;
-            }
+        if (! $this->usesDatabase()) {
+            return @file_get_contents($this->path($name));
         }
+        $row = $this->rowBody($name);
+        if ($row !== null) {
+            return $row;
+        }
+        $file = @file_get_contents($this->path($name));
 
-        return @file_get_contents($this->path($name));
+        // The importer commits a row before deleting its file, so a file that vanished between the
+        // two lookups is now readable from the database.
+        return $file !== false ? $file : ($this->rowBody($name) ?? false);
+    }
+
+    private function rowBody(string $name): ?string
+    {
+        // Inside a transaction, read the committed row rather than the snapshot: the importer
+        // may have moved this manifest from its legacy file after the snapshot was taken.
+        $query = DB::table(self::TABLE)->where('name', $name);
+        $body = (DB::transactionLevel() > 0 ? $query->sharedLock() : $query)->value('body');
+
+        return is_string($body) ? $body : null;
     }
 
     private function assertName(string $name): void

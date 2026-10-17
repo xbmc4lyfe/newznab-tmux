@@ -165,6 +165,24 @@ class ManifestDatabaseStorageTest extends TestCase
         }
     }
 
+    public function test_import_refuses_to_run_inside_an_open_transaction(): void
+    {
+        $store = new ManifestStore;
+        $prepared = $store->prepare($this->manifest('ambient transaction'));
+        file_put_contents($store->path($prepared->name), $prepared->compressed);
+        $this->candidate($prepared->name);
+
+        try {
+            DB::transaction(static fn () => $store->importLegacyFiles([$prepared->name], true));
+            $this->fail('Import inside a transaction must be refused.');
+        } catch (RuntimeException $error) {
+            $this->assertSame('Manifest import cannot run inside an open transaction.', $error->getMessage());
+        }
+
+        $this->assertFileExists($store->path($prepared->name));
+        $this->assertSame(0, DB::table('release_verification_manifests')->count());
+    }
+
     public function test_import_keeps_the_legacy_file_when_the_stored_row_is_corrupt(): void
     {
         $store = new ManifestStore;
