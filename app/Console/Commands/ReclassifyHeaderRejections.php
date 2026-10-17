@@ -50,8 +50,16 @@ class ReclassifyHeaderRejections extends Command
 
         return DB::transaction(static function () use ($query): int {
             $ids = (clone $query)->lock('FOR UPDATE SKIP LOCKED')->pluck('id')->all();
+            if ($ids === []) {
+                return 0;
+            }
+            // UPDATE ignores SELECT index hints; bound its scan to the rows just locked, never a
+            // status-index range that could reach rows the read skipped.
+            $connection = DB::connection();
+            $table = DB::raw($connection->getQueryGrammar()->wrapTable('release_verification_candidates').' FORCE INDEX (PRIMARY)');
 
-            return $ids === [] ? 0 : $query->whereIn('id', $ids)->update(['status' => CandidateHeaderInventory::REJECTED]);
+            return $connection->table($table)->whereIn('id', $ids)->where('status', 'unknown')->whereNull('release_id')
+                ->whereNull('lease_token')->update(['status' => CandidateHeaderInventory::REJECTED]);
         }, 3);
     }
 }

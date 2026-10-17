@@ -439,7 +439,7 @@ final class CandidateRepository
         }
         DB::table('release_verification_candidates')->where('id', $existing->id)->update([
             'manifest_path' => $path, 'manifest_hash' => substr($path, 0, 64), 'manifest_bytes' => $bytes,
-            'version' => (int) $existing->version + 1, 'status' => $assessment['status'], 'reason' => $assessment['reason'],
+            'version' => (int) $existing->version + 1, 'status' => self::admittedStatus($assessment['status']), 'reason' => $assessment['reason'],
             'next_attempt_at' => now(), 'lease_token' => null, 'lease_until' => null,
         ]);
         DB::afterCommit(function () use ($existing): void {
