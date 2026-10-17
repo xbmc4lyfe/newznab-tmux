@@ -18,6 +18,7 @@ use App\Services\Releases\Verification\VerificationWorkerLocks;
 use App\Services\YencService;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Filesystem\Filesystem;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
@@ -594,6 +595,7 @@ PHP;
         try {
             $this->assertTrue(app(ScratchBudget::class)->initialize());
             $this->assertTrue($locks->start());
+            app(ScratchBudget::class)->join($locks);
             app(ScratchInventory::class)->register(1, 2);
             $remoteEntry = app(ScratchInventory::class)->entryId(1, 2);
             app(ScratchBudget::class)->reserve($remoteEntry, 5);
@@ -635,8 +637,15 @@ PHP;
         File::deleteDirectory($root.'/scratch');
         config(['release_verification.host' => 'm5air']);
         $this->assertTrue(app(ScratchBudget::class)->initialize());
-        app(ScratchInventory::class)->register(1, 1);
-        app(ScratchBudget::class)->reserve(app(ScratchInventory::class)->entryId(1, 1), 7);
+        $joining = new VerificationWorkerLocks;
+        try {
+            $this->assertTrue($joining->start());
+            app(ScratchBudget::class)->join($joining);
+            app(ScratchInventory::class)->register(1, 1);
+            app(ScratchBudget::class)->reserve(app(ScratchInventory::class)->entryId(1, 1), 7);
+        } finally {
+            $joining->close();
+        }
         config(['release_verification.host' => '']);
 
         app(VerificationResetService::class)->run(static fn () => null);
@@ -661,6 +670,41 @@ PHP;
         $this->assertDirectoryDoesNotExist($root.'/scratch/1-1');
         $this->assertSame(0, DB::table('release_verification_scratch')->count());
         $this->assertSame(0, (int) DB::table('release_verification_scratch_budget')->where('host', 'm5air')->value('reserved_bytes'));
+    }
+
+    public function test_a_joining_host_creates_its_budget_only_while_holding_a_worker_slot(): void
+    {
+        config(['release_verification.host' => 'm4']);
+        $this->assertTrue(app(ScratchBudget::class)->initialize());
+        $this->assertFalse(DB::table('release_verification_scratch_budget')->where('host', 'm4')->exists());
+        $idle = new VerificationWorkerLocks;
+        try {
+            app(ScratchBudget::class)->join($idle);
+            $this->fail('A host without a held worker slot must not join.');
+        } catch (RuntimeException $error) {
+            $this->assertStringContainsString('only while its worker slot is held', $error->getMessage());
+        }
+        $this->assertSame(0, Artisan::call('releases:verify-candidates', ['--no-summary' => true]));
+        $this->assertTrue((bool) DB::table('release_verification_scratch_budget')->where('host', 'm4')->value('initialized'));
+    }
+
+    public function test_a_durable_pause_refuses_audit_reset_and_worker_admission(): void
+    {
+        (require database_path('migrations/2026_10_17_210000_create_release_verification_pauses_table.php'))->up();
+        VerificationWorkerLocks::pause('deploy-attempt', 'deployment');
+        try {
+            $this->assertFalse((new VerificationWorkerLocks)->tryExclusive());
+            $this->assertFalse((new VerificationWorkerLocks)->start());
+            try {
+                app(VerificationResetService::class)->run(static fn () => null);
+                $this->fail('A reset must wait for the deployment pause.');
+            } catch (RuntimeException $error) {
+                $this->assertStringContainsString('deployment pause', $error->getMessage());
+            }
+        } finally {
+            VerificationWorkerLocks::unpause(null, 'deployment');
+        }
+        $this->assertTrue((new VerificationWorkerLocks)->tryExclusive());
     }
 
     private function candidateScratch(int $id, string $status = 'complete'): string

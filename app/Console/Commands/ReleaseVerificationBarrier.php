@@ -34,9 +34,7 @@ class ReleaseVerificationBarrier extends Command
         // The durable pause first: workers on every host stop claiming, and it outlives this
         // session, so losing the gate later cannot readmit them.
         $token = bin2hex(random_bytes(16));
-        if (! VerificationWorkerLocks::pause($token, 'deployment')) {
-            $this->warn('The verification pause table is not migrated yet; holding only the session gate.');
-        }
+        VerificationWorkerLocks::pause($token, 'deployment');
         $locks = new VerificationWorkerLocks;
         if (! $locks->drain(max(1, (int) $this->option('timeout')))) {
             VerificationWorkerLocks::unpause($token);

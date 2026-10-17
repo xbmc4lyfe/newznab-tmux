@@ -79,6 +79,7 @@ class VerifyReleaseCandidates extends Command
         }
         $diagnostics?->workerAcquired();
         try {
+            $scratchBudget->join($locks);
             if (! $this->scratchRootIsSafe($root.'/scratch')) {
                 $diagnostics?->stop('unsafe_scratch_root', hrtime(true));
                 $this->error('Verification scratch root must be an accessible directory, not a symlink.');

@@ -27,7 +27,8 @@ final class ScratchBudget
         $host = ScratchInventory::host();
         $state = DB::table('release_verification_scratch_budget')->where('host', $host)->first();
         if ($state === null && $host !== '') {
-            $state = $this->createHostBudget($host);
+            // A joining host creates its row in join(), under a worker slot and the deployment fence.
+            return true;
         }
         if ($state === null) {
             throw new RuntimeException('Shared scratch budget state is unavailable.');
@@ -142,6 +143,21 @@ final class ScratchBudget
         }
         DB::table('release_verification_scratch_budget')->where('host', $host)->update(['reserved_bytes' => DB::raw(
             'CASE WHEN reserved_bytes + ('.$delta.') > 0 THEN reserved_bytes + ('.$delta.') ELSE 0 END')]);
+    }
+
+    /** Create this worker host's budget row while its worker slot is held. */
+    public function join(VerificationWorkerLocks $worker): void
+    {
+        $host = ScratchInventory::host();
+        if ($host === '' || DB::table('release_verification_scratch_budget')->where('host', $host)->exists()) {
+            return;
+        }
+        if (! $worker->held()) {
+            throw new RuntimeException('A worker host joins the scratch budget only while its worker slot is held.');
+        }
+        if ($this->createHostBudget($host) === null) {
+            throw new RuntimeException('Shared scratch budget state is unavailable.');
+        }
     }
 
     /**

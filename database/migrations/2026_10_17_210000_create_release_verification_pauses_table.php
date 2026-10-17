@@ -2,8 +2,8 @@
 
 declare(strict_types=1);
 
+use App\Services\Releases\Verification\VerificationWorkerLocks;
 use Illuminate\Database\Migrations\Migration;
-use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
 
 /**
@@ -14,11 +14,8 @@ return new class extends Migration
 {
     public function up(): void
     {
-        Schema::create('release_verification_pauses', function (Blueprint $table): void {
-            $table->string('token', 64)->primary();
-            $table->string('reason', 64);
-            $table->timestamp('created_at')->useCurrent();
-        });
+        // A deployment barrier that ran before this migration has already created it.
+        VerificationWorkerLocks::ensurePauseTable();
     }
 
     public function down(): void

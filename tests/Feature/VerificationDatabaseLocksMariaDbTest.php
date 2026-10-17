@@ -342,7 +342,7 @@ class VerificationDatabaseLocksMariaDbTest extends TestCase
         (require database_path('migrations/2026_10_17_210000_create_release_verification_pauses_table.php'))->up();
         $worker = new VerificationWorkerLocks(new DatabaseVerificationLockStore('verification_lock_other'));
         $this->assertTrue($worker->start());
-        $this->assertTrue(VerificationWorkerLocks::pause('deploy-attempt', 'deployment'));
+        VerificationWorkerLocks::pause('deploy-attempt', 'deployment');
         $this->assertFalse($worker->admitting());
         $worker->close();
 
@@ -360,7 +360,8 @@ class VerificationDatabaseLocksMariaDbTest extends TestCase
 
     public function test_the_barrier_command_pauses_holds_and_releases_every_host_on_sigterm(): void
     {
-        (require database_path('migrations/2026_10_17_210000_create_release_verification_pauses_table.php'))->up();
+        // Before the pause migration, as on the first upgrade: the barrier creates the table itself.
+        $this->assertFalse(DB::getSchemaBuilder()->hasTable('release_verification_pauses'));
         $connection = config('database.connections.mysql');
         $output = $this->storage.'/barrier.out';
         File::ensureDirectoryExists($this->storage);
@@ -380,6 +381,7 @@ class VerificationDatabaseLocksMariaDbTest extends TestCase
                 usleep(100000);
             }
             $this->assertStringContainsString('barrier held', (string) file_get_contents($output));
+            $this->assertTrue(DB::getSchemaBuilder()->hasTable('release_verification_pauses'));
             $this->assertTrue(VerificationWorkerLocks::paused());
             $this->assertFalse($worker->start());
 

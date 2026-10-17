@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use RuntimeException;
 
@@ -123,9 +124,13 @@ final class VerificationWorkerLocks
         return $next !== 0;
     }
 
+    /** Audit and bootstrap exclusion; a durable deployment pause refuses it as it refuses workers. */
     public function tryExclusive(): bool
     {
         $this->close();
+        if (self::paused($this->store()->connection())) {
+            return false;
+        }
         $this->global = $this->store()->exclusiveGroup('worker');
         $this->exclusive = $this->global !== null;
 
@@ -153,14 +158,39 @@ final class VerificationWorkerLocks
      * A durable pause keeps every host's workers out even after the session that took it ends.
      * It needs its migration; before that, only the session-scoped gate applies.
      */
-    public static function pause(string $token, string $reason): bool
+    public static function pause(string $token, string $reason): void
     {
-        if (! self::pausesExist(null)) {
-            return false;
-        }
+        self::ensurePauseTable();
         DB::table('release_verification_pauses')->insertOrIgnore(['token' => $token, 'reason' => $reason]);
+    }
 
-        return true;
+    /**
+     * The barrier creates the pause table itself when it runs before the migration that adds it,
+     * so even the first upgrade has a durable fence. The migration then finds it in place.
+     */
+    public static function ensurePauseTable(): void
+    {
+        if (self::pauseTableCreated()) {
+            return;
+        }
+        try {
+            DB::connection()->getSchemaBuilder()->create('release_verification_pauses', static function (Blueprint $table): void {
+                $table->string('token', 64)->primary();
+                $table->string('reason', 64);
+                $table->timestamp('created_at')->useCurrent();
+            });
+        } catch (\Throwable $error) {
+            // Another process may have created it first.
+            if (! self::pauseTableCreated()) {
+                throw $error;
+            }
+        }
+    }
+
+    /** @phpstan-impure */
+    private static function pauseTableCreated(): bool
+    {
+        return DB::connection()->getSchemaBuilder()->hasTable('release_verification_pauses');
     }
 
     /** Release pauses: one token, or every pause with the given reason (an earlier failed attempt's too). */
