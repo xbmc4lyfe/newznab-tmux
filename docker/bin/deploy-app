@@ -42,7 +42,7 @@ barrier_running() {
 }
 hold_barrier() {
     # A barrier still running from a failed attempt is retained until this rollout is healthy.
-    if barrier_running; then
+    if barrier_running && ! docker logs "$barrier_name" 2>&1 | grep -q '^barrier lost'; then
         barrier_keep=1
     else
         docker rm -f "$barrier_name" >/dev/null 2>&1 || true
@@ -86,7 +86,11 @@ if [ "$MODE" = "noop" ]; then
     if barrier_running; then
         # A barrier left by an earlier failed attempt must not hold remote workers out forever.
         barrier_held=1
-        release_barrier
+        if ! release_barrier; then
+            # Owe the migration again: the next poll retakes the barrier and clears the pause.
+            "$DIR/bin/deploy-plan" --forget migration || true
+            exit 1
+        fi
     fi
     # Nothing rolled out: let the guard stamp the new fingerprint without recording a deployment.
     if [ -n "${DEPLOY_NOOP_MARKER:-}" ]; then : >"$DEPLOY_NOOP_MARKER"; fi
@@ -188,10 +192,17 @@ legacy_drain() { compose exec -T indexer php -- /app "$1" "${DEPLOY_LEGACY_DRAIN
 legacy_scheduler() { compose exec -T scheduler python3 - "$1" "$scheduler_timeout" "$operation_token" < "$DIR/bin/legacy-scheduler-drain.py"; }
 scheduler_command() { compose exec -T scheduler python3 /app/docker/app/bin/scheduler.py "$@"; }
 resume() {
-    if [ "$barrier_held" = 1 ] && [ "$barrier_keep" = 1 ]; then
+    rc=$?
+    if [ "$barrier_held" = 1 ] && [ "$rc" != 0 ]; then
+        # The barrier's durable pause can outlive its container (a lost session leaves it behind)
+        # and only a barrier's release clears it. Owe the migration again so the next poll, even
+        # with every service recorded, retakes a barrier and releases the pause after health.
+        plan --forget migration || echo "Could not mark the migration pending; clear the verification pause by hand." >&2
+    fi
+    if [ "$barrier_held" = 1 ] && [ "$barrier_keep" = 1 ] && barrier_running; then
         echo "Remote verification workers stay held by container $barrier_name until a repaired deployment completes or it is stopped." >&2
     else
-        release_barrier
+        release_barrier || true
     fi
     if [ "$horizon_stopped" = 1 ]; then
         compose start horizon || echo "Horizon restart failed; queued jobs wait until it runs." >&2
@@ -330,6 +341,17 @@ if [ -n "$RECONCILE_DATA" ]; then
     # Without a stamp, only Compose drift is reconciled; unchanged data services keep running.
     # shellcheck disable=SC2086
     apply_each --forget $RECONCILE_DATA
+    verify
+fi
+
+if [ "$barrier_held" = 1 ] && { [ -n "$DIRTY_DATA" ] || [ -n "$RECONCILE_DATA" ]; }; then
+    # A recreated database ends the barrier's lock session. Its durable pause keeps workers out
+    # meanwhile; take a fresh barrier on the healthy service before migrating or starting writers.
+    docker rm -f "$barrier_name" >/dev/null 2>&1 || true
+    keep=$barrier_keep
+    barrier_held=0
+    hold_barrier
+    barrier_keep=$keep
     verify
 fi
 

@@ -224,6 +224,62 @@ SH);
         $this->assertStringNotContainsString(' up -d --no-deps --force-recreate', $this->events());
     }
 
+    public function test_a_barrier_lost_after_every_service_is_recorded_still_owes_its_release(): void
+    {
+        $process = $this->deploy(['NNTMUX_BARRIER_LOST' => ' up -d --no-deps --force-recreate']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        // A barrier that lost its session exits; only its durable pause is left behind.
+        @unlink($this->directory.'/barrier.running');
+
+        // Every service came up and was recorded, yet the lost barrier's durable pause remains: the
+        // retry must not skip as a no-op but take a barrier again and release it after health.
+        file_put_contents($this->directory.'/events', '');
+        $this->deploy()->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('releases:verification-barrier --timeout=900', $events);
+        $this->assertStringContainsString('artisan migrate --force', $events);
+        $this->assertStringContainsString('released', $events);
+    }
+
+    public function test_a_no_op_run_that_cannot_clear_a_leftover_pause_makes_the_next_poll_retake_the_barrier(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/barrier.log', "barrier held\n");
+        touch($this->directory.'/barrier.running');
+        file_put_contents($this->directory.'/docker/.env', "DB_ROOTPASSWORD=rotated\n");
+
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_BARRIER_UNCLEAN' => '1', 'NNTMUX_FORCED_RELEASE_FAIL' => '1']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('forced-release', $this->events());
+
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('releases:verification-barrier --timeout=900', $events);
+        $this->assertStringContainsString('released', $events);
+    }
+
+    public function test_a_recreated_data_service_is_followed_by_a_fresh_barrier_before_writers_start(): void
+    {
+        mkdir($this->directory.'/docker/config/redis', 0777, true);
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 1gb\n");
+        $config = ['NNTMUX_CONFIG_ID' => $this->composeJson()];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 2gb\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $events = $this->events();
+        $recreate = strpos($events, ' up -d --no-deps --force-recreate --wait --wait-timeout 240 redis');
+        $this->assertNotFalse($recreate);
+        $this->assertSame(2, substr_count($events, 'releases:verification-barrier --timeout=900'));
+        $this->assertGreaterThan($recreate, strrpos($events, 'releases:verification-barrier --timeout=900'));
+        $this->assertGreaterThan(strrpos($events, 'releases:verification-barrier --timeout=900'), strpos($events, 'horizon scheduler indexer'));
+        $this->assertStringContainsString('released', $events);
+    }
+
     public function test_native_indexer_abort_uses_the_same_unique_operation_token_as_its_drain(): void
     {
         $process = $this->deploy(['NNTMUX_STALE_DRAIN' => '1']);
