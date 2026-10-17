@@ -22,7 +22,8 @@ final class CandidateRepository
 
     private int $claimSelections = 0;
 
-    public function __construct(private readonly ManifestStore $store, private readonly CollectionCleanupService $cleanup) {}
+    public function __construct(private readonly ManifestStore $store, private readonly CollectionCleanupService $cleanup,
+        private readonly VerificationLedger $ledger = new VerificationLedger) {}
 
     public function archive(int $collectionId): void
     {
@@ -66,12 +67,8 @@ final class CandidateRepository
                         $snapshotFailure = $error;
                     }
                 }
-                $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
-                if ($state === null) {
-                    throw new RuntimeException('Verification migration has not initialized capacity state.');
-                }
-                $existing = DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)
-                    ->orderByDesc('id')->lockForUpdate()->first();
+                $this->ledger->enter();
+                $existing = $this->lockLatestCandidate($sourceIdentity, $currentReads);
                 if ($existing !== null && $existing->status === 'filtered') {
                     if ($existing->release_id !== null || (int) $existing->groups_id !== (int) $collection->groups_id
                         || $existing->manifest_path !== '' || (int) $existing->manifest_bytes !== 0) {
@@ -110,12 +107,15 @@ final class CandidateRepository
                 $arrivalAt = Carbon::parse($collection->last_seen_at ?? $collection->dateadded ?? $collection->added ?? now())->format('Y-m-d H:i:s');
                 $lastUniqueAt = $existing === null ? $arrivalAt : ($newArticles ? max($arrivalAt, $existing->last_unique_at) : $existing->last_unique_at);
                 $expired = $lastUniqueAt < now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
-                $pending = (int) $state->pending_bytes - (int) ($existing->manifest_bytes ?? 0) + ($expired ? 0 : $size);
-                if ($pending > (int) config('release_verification.pending_bytes')) {
+                $delta = ($expired ? 0 : $size) - (int) ($existing->manifest_bytes ?? 0);
+                $full = function () use ($existing, $path): never {
                     if ($existing === null || $existing->manifest_path !== $path) {
                         $this->store->deleteIfUnreferenced($path);
                     }
                     throw new RuntimeException('Pending verification capacity is full; original headers retained.');
+                };
+                if (! $this->ledger->fits($delta)) {
+                    $full();
                 }
                 $changed = $existing === null || $existing->manifest_path !== $path;
                 $dirty = $existing !== null && $existing->status === 'dirty';
@@ -135,8 +135,11 @@ final class CandidateRepository
                 } else {
                     DB::table('release_verification_candidates')->where('id', $existing->id)->update($values);
                 }
-                DB::table('release_verification_state')->where('id', 1)->update(['pending_bytes' => $pending]);
                 $this->cleanup->deleteCollectionsAndDescendants([$collectionId], 'Archived for verification', false, manifestArchived: true);
+                // Last lock request: a full ledger rolls back the deletion, retaining the original headers.
+                if (! $this->ledger->adjust($delta)) {
+                    $full();
+                }
                 if ($expired) {
                     DB::afterCommit(function () use ($path): void {
                         $this->store->deleteIfUnreferenced($path);
@@ -149,6 +152,30 @@ final class CandidateRepository
                 }
             }, 5);
         });
+    }
+
+    /**
+     * Lock the newest candidate for an archived collection's source.
+     *
+     * A locking read of the source index also locks its gaps, and concurrent archives inserting new
+     * candidates into one gap then deadlock. The collection lock already serializes admissions of
+     * this source, and this transaction's read view was taken after acquiring it, so a plain read
+     * finds the newest committed candidate and the primary key locks only that row. Outer caller
+     * transactions and legacy file manifests keep the locking read.
+     */
+    private function lockLatestCandidate(string $sourceIdentity, bool $currentReads): ?object
+    {
+        $latest = static fn () => DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)->orderByDesc('id');
+        if ($currentReads || ! $this->ledger->concurrent()) {
+            return $latest()->lockForUpdate()->first();
+        }
+        $id = $latest()->value('id');
+        if ($id === null) {
+            return null;
+        }
+        $row = DB::table('release_verification_candidates')->where('id', $id)->lockForUpdate()->first();
+
+        return $row !== null && $row->source_identity === $sourceIdentity ? $row : $latest()->lockForUpdate()->first();
     }
 
     /** Lock through ingestion's unique hash index before taking the shared capacity row. */
@@ -187,7 +214,7 @@ final class CandidateRepository
                 $admit = function () use ($manifest, $prepared, $headerAssessment, $replayXml, &$capacityDeferred, &$publicationDeferred): bool {
                     $capacityDeferred = false;
                     $publicationDeferred = false;
-                    $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
+                    $this->ledger->enter();
                     $identity = (string) $manifest['identity'];
                     $existing = DB::table('release_verification_candidates')->where('identity', $identity)->lockForUpdate()->first();
                     $release = $existing?->release_id === null ? null
@@ -209,19 +236,19 @@ final class CandidateRepository
                             return $this->identicalPublishedReplay($existing, $release, $manifest, $prepared, $replayXml);
                         }
 
-                        return $this->enrichImportedPasswordMetadata($existing, $manifest, $state, $capacityDeferred, $prepared);
-                    }
-                    if ($state === null) {
-                        throw new RuntimeException('Verification migration has not initialized capacity state.');
+                        return $this->enrichImportedPasswordMetadata($existing, $manifest, $capacityDeferred, $prepared);
                     }
                     $path = $prepared === null ? $this->store->write($manifest) : $this->store->writePrepared($prepared);
                     $bytes = $this->store->size($path);
-                    $pending = (int) $state->pending_bytes - (int) ($existing->manifest_bytes ?? 0) + $bytes;
-                    if ($pending > (int) config('release_verification.pending_bytes')) {
+                    $delta = $bytes - (int) ($existing->manifest_bytes ?? 0);
+                    $full = function () use ($existing, $path): never {
                         if ($existing === null || $existing->manifest_path !== $path) {
                             $this->store->deleteIfUnreferenced($path);
                         }
                         throw new CandidateCapacityException('Candidate capacity is full; import retained for retry.');
+                    };
+                    if (! $this->ledger->fits($delta)) {
+                        $full();
                     }
                     $assessment = $headerAssessment ?? (new CandidateHeaderInventory)->assessment($manifest);
                     $values = ['identity' => $identity, 'source_identity' => $identity,
@@ -239,7 +266,9 @@ final class CandidateRepository
                             });
                         }
                     }
-                    DB::table('release_verification_state')->where('id', 1)->update(['pending_bytes' => $pending]);
+                    if (! $this->ledger->adjust($delta)) {
+                        $full();
+                    }
 
                     return true;
                 };
@@ -286,7 +315,7 @@ final class CandidateRepository
     /** @param array<string, mixed> $manifest */
     private function identicalPublishedReplay(object $existing, object $release, array $manifest, ?PreparedManifest $prepared, ?string $replayXml): bool
     {
-        // The caller owns admission, capacity, and candidate locks in that order.
+        // The caller owns the admission and candidate locks in that order.
         if ((string) $release->guid === '' || (int) $release->nzbstatus !== NzbService::NZB_ADDED
             || ! in_array($existing->status, ['complete', 'repaired', 'sampled'], true) || $existing->verified_at === null
             || $existing->manifest_path !== '' || (int) $existing->manifest_bytes !== 0
@@ -314,11 +343,11 @@ final class CandidateRepository
 
     /**
      * Fill explicit uploader metadata only for an otherwise identical unpublished import.
-     * Caller holds the capacity row and candidate locks in admission order.
+     * Caller holds the admission and candidate locks in admission order.
      *
      * @param  array<string, mixed>  $manifest
      */
-    private function enrichImportedPasswordMetadata(object $existing, array $manifest, ?object $state, bool &$capacityDeferred, ?PreparedManifest $prepared): bool
+    private function enrichImportedPasswordMetadata(object $existing, array $manifest, bool &$capacityDeferred, ?PreparedManifest $prepared): bool
     {
         if (! array_key_exists('passwords', $manifest) || $manifest['passwords'] === []) {
             $capacityDeferred = $existing->status === 'metadata_deferred';
@@ -347,19 +376,18 @@ final class CandidateRepository
         if (($original['passwords'] ?? []) !== []) {
             return $original['passwords'] === $passwords;
         }
-        if ($state === null) {
-            throw new RuntimeException('Verification migration has not initialized capacity state.');
-        }
         if ($prepared === null) {
             throw new RuntimeException('Explicit metadata must be prepared before admission.');
         }
         // Current locked metadata matches the complete incoming manifest. Install
-        // its exact precomputed pair without compression under capacity ownership.
+        // its exact precomputed pair without compression, then reserve its capacity.
         $original = $manifest;
         $path = $this->store->writePrepared($prepared);
         $bytes = $this->store->size($path);
-        $pending = (int) $state->pending_bytes - (int) $existing->manifest_bytes + $bytes;
-        if ($pending > (int) config('release_verification.pending_bytes')) {
+        $delta = $bytes - (int) $existing->manifest_bytes;
+        $assessment = (new CandidateHeaderInventory)->assessment($original);
+        // The reservation is this transaction's last lock request; only the held candidate row follows.
+        if (! $this->ledger->fits($delta) || ! $this->ledger->adjust($delta)) {
             $this->store->deleteIfUnreferenced($path);
             // Keep the original bounded manifest/capacity, but prevent its passwordless publication.
             // Expiry releases this reservation while retaining a metadata fence; the
@@ -372,13 +400,11 @@ final class CandidateRepository
 
             return false;
         }
-        $assessment = (new CandidateHeaderInventory)->assessment($original);
         DB::table('release_verification_candidates')->where('id', $existing->id)->update([
             'manifest_path' => $path, 'manifest_hash' => substr($path, 0, 64), 'manifest_bytes' => $bytes,
             'version' => (int) $existing->version + 1, 'status' => $assessment['status'], 'reason' => $assessment['reason'],
             'next_attempt_at' => now(), 'lease_token' => null, 'lease_until' => null,
         ]);
-        DB::table('release_verification_state')->where('id', 1)->update(['pending_bytes' => $pending]);
         DB::afterCommit(function () use ($existing): void {
             $this->store->deleteIfUnreferenced($existing->manifest_path);
         });
@@ -582,7 +608,7 @@ final class CandidateRepository
                 break;
             }
             DB::transaction(function () use ($id): void {
-                DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
+                $this->ledger->enter();
                 $row = DB::table('release_verification_candidates')->where('id', $id)->lockForUpdate()->first();
                 if ($row === null || $row->release_id !== null
                     || ! in_array($row->status, ['ready', 'waiting_upload', 'pending', 'unknown', 'unrepairable', 'verifying', 'dirty', 'metadata_deferred', 'metadata_review'], true)
@@ -590,14 +616,14 @@ final class CandidateRepository
                     || ($row->lease_until !== null && $row->lease_until >= now()->format('Y-m-d H:i:s'))) {
                     return;
                 }
-                DB::table('release_verification_state')->where('id', 1)->decrement('pending_bytes', (int) $row->manifest_bytes);
                 DB::table('release_verification_candidates')->where('id', $id)->update(['status' => in_array($row->status, ['metadata_deferred', 'metadata_review'], true) ? 'metadata_expired' : 'expired',
                     'version' => (int) $row->version + 1,
                     'manifest_path' => '', 'manifest_bytes' => 0, 'lease_token' => null, 'lease_until' => null]);
+                $this->ledger->adjust(-(int) $row->manifest_bytes);
                 DB::afterCommit(function () use ($row): void {
                     $this->store->deleteIfUnreferenced($row->manifest_path);
                 });
-            });
+            }, 5);
         }
     }
 
@@ -704,16 +730,16 @@ final class CandidateRepository
     public function rejectByPolicy(object $claim, string $reason): void
     {
         DB::transaction(function () use ($claim, $reason): void {
-            DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
+            $this->ledger->enter();
             $candidate = DB::table('release_verification_candidates')->where('id', $claim->id)
                 ->where('lease_token', $claim->lease_token)->where('version', $claim->version)->whereNull('release_id')->lockForUpdate()->first();
             if ($candidate === null) {
                 throw new RuntimeException('Stale verification result cannot filter a candidate.');
             }
-            DB::table('release_verification_state')->where('id', 1)->decrement('pending_bytes', (int) $candidate->manifest_bytes);
             DB::table('release_verification_candidates')->where('id', $claim->id)->update(['status' => 'filtered',
                 'reason' => mb_strcut($reason, 0, 2000, 'UTF-8'), 'lease_token' => null, 'lease_until' => null,
                 'manifest_path' => '', 'manifest_bytes' => 0]);
+            $this->ledger->adjust(-(int) $candidate->manifest_bytes);
             DB::afterCommit(function () use ($candidate): void {
                 $this->store->deleteIfUnreferenced($candidate->manifest_path);
             });

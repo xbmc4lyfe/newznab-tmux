@@ -1,0 +1,290 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Tests\Integration;
+
+use App\Services\Releases\Verification\CandidateRepository;
+use App\Services\Releases\Verification\ManifestStore;
+use App\Services\Releases\Verification\VerificationLedger;
+use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Database\QueryException;
+use Illuminate\Support\Facades\DB;
+use PDO;
+use PHPUnit\Framework\Attributes\DataProvider;
+use RuntimeException;
+use Tests\TestCase;
+
+/** Lock behavior of the capacity ledger against real InnoDB row locks. */
+final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
+{
+    private ?PDO $administrator = null;
+
+    private string $database = '';
+
+    private string $storagePath = '';
+
+    private string $host = '';
+
+    private string $username = '';
+
+    private string $password = '';
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        $this->host = (string) getenv('VERIFICATION_LOCK_TEST_HOST');
+        if ($this->host === '') {
+            $this->markTestSkipped('Set VERIFICATION_LOCK_TEST_HOST to an isolated MariaDB test server.');
+        }
+        $this->username = (string) (getenv('VERIFICATION_LOCK_TEST_USERNAME') ?: 'root');
+        $this->password = (string) getenv('VERIFICATION_LOCK_TEST_PASSWORD');
+        $this->administrator = new PDO('mysql:host='.$this->host.';port=3306;charset=utf8mb4', $this->username, $this->password);
+        $this->database = 'nntmux_ledger_test_'.bin2hex(random_bytes(8));
+        $this->administrator->exec('CREATE DATABASE `'.$this->database.'`');
+        $this->storagePath = storage_path('framework/testing/ledger-'.bin2hex(random_bytes(8)));
+        config(['database.default' => 'mariadb', 'database.connections.mariadb.host' => $this->host,
+            'database.connections.mariadb.port' => 3306, 'database.connections.mariadb.database' => $this->database,
+            'database.connections.mariadb.username' => $this->username, 'database.connections.mariadb.password' => $this->password,
+            'database.connections.mariadb.url' => null, 'database.connections.mariadb.unix_socket' => '',
+            'database.connections.mariadb.prefix' => '', 'release_verification.required' => true, 'nntmux.echocli' => false,
+            'release_verification.storage_path' => $this->storagePath, 'release_verification.manifest_storage' => 'database',
+            'release_verification.pending_bytes' => 1048576]);
+        DB::purge();
+        DB::statement('SET SESSION innodb_lock_wait_timeout = 1');
+        foreach (['2026_10_11_154028_create_release_verification_candidates_table', '2026_10_17_000000_create_release_verification_manifests_table',
+            '2026_10_17_120000_create_release_verification_locks_table'] as $migration) {
+            (require database_path('migrations/'.$migration.'.php'))->up();
+        }
+        DB::statement('CREATE TABLE collections (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            collectionhash BINARY(20) NOT NULL, subject VARCHAR(255) NOT NULL, fromname VARCHAR(255) NOT NULL,
+            totalfiles INT NOT NULL, groups_id INT NOT NULL, collection_regexes_id INT DEFAULT 0,
+            date DATETIME NOT NULL, filecheck INT DEFAULT 3, filesize BIGINT DEFAULT 5,
+            UNIQUE KEY ix_collection_collectionhash (collectionhash)) ENGINE=InnoDB');
+        DB::statement('CREATE TABLE binaries (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            collections_id BIGINT UNSIGNED NOT NULL, binaryhash BINARY(16) NOT NULL,
+            name VARCHAR(255) NOT NULL, totalparts INT NOT NULL,
+            FOREIGN KEY (collections_id) REFERENCES collections(id) ON DELETE CASCADE) ENGINE=InnoDB');
+        DB::statement('CREATE TABLE parts (binaries_id BIGINT UNSIGNED NOT NULL, partnumber INT NOT NULL,
+            messageid VARCHAR(255) NOT NULL, size INT NOT NULL, PRIMARY KEY (binaries_id, partnumber),
+            FOREIGN KEY (binaries_id) REFERENCES binaries(id) ON DELETE CASCADE) ENGINE=InnoDB');
+        DB::statement('CREATE TABLE usenet_groups (id INT PRIMARY KEY, name VARCHAR(255) NOT NULL) ENGINE=InnoDB');
+        DB::table('usenet_groups')->insert(['id' => 1, 'name' => 'alt.test']);
+    }
+
+    protected function tearDown(): void
+    {
+        try {
+            DB::purge('mariadb');
+            if ($this->administrator !== null && preg_match('/^nntmux_ledger_test_[a-f0-9]{16}$/D', $this->database) === 1) {
+                $this->administrator->exec('DROP DATABASE IF EXISTS `'.$this->database.'`');
+            }
+            if (preg_match('~/framework/testing/ledger-[a-f0-9]{16}$~D', $this->storagePath) === 1) {
+                app('files')->deleteDirectory($this->storagePath);
+            }
+        } finally {
+            parent::tearDown();
+        }
+    }
+
+    /** @return iterable<string, array{string, bool}> */
+    public static function storageModes(): iterable
+    {
+        yield 'database manifests run concurrently' => ['database', false];
+        yield 'file manifests keep the global lock' => ['files', true];
+    }
+
+    #[DataProvider('storageModes')]
+    public function test_archive_holds_the_capacity_row_only_in_legacy_file_mode(string $storage, bool $globalLock): void
+    {
+        config(['release_verification.manifest_storage' => $storage]);
+        $id = $this->arrival('concurrent');
+        $other = $this->connection();
+        $probed = false;
+        DB::listen(function (QueryExecuted $query) use ($other, $globalLock, &$probed): void {
+            if ($probed || preg_match('/^delete from [`"]?collections[`"]?/i', $query->sql) !== 1) {
+                return;
+            }
+            $probed = true;
+            // A concurrent writer applies its own delta while the archive deletes its headers.
+            try {
+                $other->exec('UPDATE release_verification_state SET pending_bytes = pending_bytes + 7 WHERE id = 1');
+                $this->assertFalse($globalLock, 'Legacy file manifests must hold the capacity row for the whole archive.');
+            } catch (\PDOException $error) {
+                $this->assertSame(1205, (int) $error->errorInfo[1]);
+                $this->assertTrue($globalLock, 'Database manifests must not hold the capacity row while deleting headers.');
+            }
+        });
+
+        app(CandidateRepository::class)->archive($id);
+
+        $this->assertTrue($probed);
+        $candidate = DB::table('release_verification_candidates')->sole();
+        $this->assertSame((int) $candidate->manifest_bytes + ($globalLock ? 0 : 7), (int) DB::table('release_verification_state')->value('pending_bytes'));
+        $this->assertSame(0, DB::table('collections')->count());
+        $this->assertSame(0, DB::table('parts')->count());
+    }
+
+    public function test_archive_leaves_candidate_and_manifest_gaps_open_for_concurrent_admissions(): void
+    {
+        $id = $this->arrival('gap-owner');
+        $other = $this->connection();
+        $inserted = [];
+        DB::listen(function (QueryExecuted $query) use ($other, &$inserted): void {
+            // After the candidate lookup and the manifest insert, a second admission inserts its own
+            // candidate and manifest; a gap lock from either lookup would make it wait (and deadlock).
+            if ($inserted !== [] || preg_match('/^insert into [`"]?release_verification_manifests[`"]?/i', $query->sql) !== 1) {
+                return;
+            }
+            $other->beginTransaction();
+            try {
+                $other->prepare("INSERT INTO release_verification_candidates (identity, source_identity, groups_id, manifest_path, manifest_bytes,
+                    manifest_hash, status, last_unique_at, next_attempt_at) VALUES (?, ?, 1, '', 0, ?, 'ready', NOW(), NOW())")
+                    ->execute([sha1('gap-other'), sha1('gap-other'), str_repeat('0', 64)]);
+                $other->prepare('INSERT INTO release_verification_manifests (name, body, bytes) VALUES (?, ?, 1)')
+                    ->execute([str_repeat('f', 64).'.json.gz', 'x']);
+                $inserted[] = 'both';
+            } catch (\PDOException $error) {
+                $inserted[] = (int) $error->errorInfo[1];
+            } finally {
+                $other->rollBack();
+            }
+        });
+
+        app(CandidateRepository::class)->archive($id);
+
+        $this->assertSame(['both'], $inserted, 'Concurrent admissions must not wait on gap locks.');
+        $this->assertSame(1, DB::table('release_verification_candidates')->count());
+    }
+
+    public function test_capacity_refused_at_commit_rolls_back_the_archive_and_keeps_its_headers(): void
+    {
+        $id = $this->arrival('late-full');
+        $other = $this->connection();
+        $filled = false;
+        DB::listen(function (QueryExecuted $query) use ($other, &$filled): void {
+            if ($filled || preg_match('/^delete from [`"]?collections[`"]?/i', $query->sql) !== 1) {
+                return;
+            }
+            $filled = true;
+            // Another admission fills the ledger after this one's advisory capacity check.
+            $other->exec('UPDATE release_verification_state SET pending_bytes = 1048570 WHERE id = 1');
+        });
+
+        try {
+            app(CandidateRepository::class)->archive($id);
+            $this->fail('An archive that no longer fits must be refused.');
+        } catch (RuntimeException $error) {
+            $this->assertSame('Pending verification capacity is full; original headers retained.', $error->getMessage());
+        }
+
+        $this->assertTrue($filled);
+        $this->assertSame(1048570, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        $this->assertSame(0, DB::table('release_verification_candidates')->count());
+        $this->assertSame(0, DB::table('release_verification_manifests')->count());
+        $this->assertSame(1, DB::table('collections')->count());
+        $this->assertSame(1, DB::table('parts')->count());
+    }
+
+    public function test_manifest_cleanup_waits_for_an_uncommitted_reference_and_then_keeps_it(): void
+    {
+        $store = app(ManifestStore::class);
+        $prepared = $store->prepare(['identity' => 'cleanup-race', 'files' => [], 'note' => str_repeat('compressible ', 20)]);
+        $name = $store->writePrepared($prepared);
+        app('files')->ensureDirectoryExists(dirname($store->path($name)), 0700);
+        file_put_contents($store->path($name), $prepared->compressed);
+        $other = $this->connection();
+        // An admission reusing this manifest locks its row, then commits a candidate that references it.
+        $other->beginTransaction();
+        $other->prepare('SELECT name FROM release_verification_manifests WHERE name = ? FOR UPDATE')->execute([$name]);
+        $other->prepare("INSERT INTO release_verification_candidates (identity, source_identity, groups_id, manifest_path, manifest_bytes,
+            manifest_hash, status, last_unique_at, next_attempt_at) VALUES (?, ?, 1, ?, ?, ?, 'ready', NOW(), NOW())")
+            ->execute([sha1('cleanup-race'), sha1('cleanup-race'), $name, strlen($prepared->compressed), substr($name, 0, 64)]);
+        try {
+            $store->deleteIfUnreferenced($name);
+            $this->fail('Cleanup must wait for the admission that holds the manifest row.');
+        } catch (QueryException $error) {
+            $this->assertSame(1205, (int) $error->errorInfo[1]);
+        } finally {
+            $other->commit();
+        }
+
+        $store->deleteIfUnreferenced($name);
+        $this->assertSame(1, DB::table('release_verification_manifests')->where('name', $name)->count());
+        $this->assertFileExists($store->path($name));
+
+        $other->exec('DELETE FROM release_verification_candidates');
+        $store->deleteIfUnreferenced($name);
+        $this->assertSame(0, DB::table('release_verification_manifests')->where('name', $name)->count());
+        $this->assertFileDoesNotExist($store->path($name));
+    }
+
+    public function test_publications_serialize_on_their_own_row_and_take_capacity_last(): void
+    {
+        config(['release_verification.pending_bytes' => 100]);
+        DB::table('release_verification_state')->where('id', 1)->update(['pending_bytes' => 40]);
+        $ledger = app(VerificationLedger::class);
+        $other = $this->connection();
+        DB::beginTransaction();
+        try {
+            $ledger->enterPublication();
+            $this->assertLocked($other, 'SELECT name FROM release_verification_locks WHERE name = \'publication\' FOR UPDATE NOWAIT');
+            $this->assertNotLocked($other, 'SELECT id FROM release_verification_state WHERE id = 1 FOR UPDATE NOWAIT');
+            $this->assertFalse($ledger->adjust(61), 'A delta beyond capacity changes nothing.');
+            $this->assertTrue($ledger->adjust(60));
+            $this->assertLocked($other, 'SELECT id FROM release_verification_state WHERE id = 1 FOR UPDATE NOWAIT');
+            $this->assertTrue($ledger->adjust(-30));
+            DB::commit();
+        } finally {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+        }
+        $this->assertSame(70, (int) DB::table('release_verification_state')->value('pending_bytes'));
+    }
+
+    private function assertLocked(PDO $other, string $sql): void
+    {
+        $other->beginTransaction();
+        try {
+            $other->query($sql)->fetchAll();
+            $this->fail('Expected a held row lock: '.$sql);
+        } catch (\PDOException $error) {
+            $this->assertSame(1205, (int) $error->errorInfo[1]);
+        } finally {
+            $other->rollBack();
+        }
+    }
+
+    private function assertNotLocked(PDO $other, string $sql): void
+    {
+        $other->beginTransaction();
+        try {
+            $other->query($sql)->fetchAll();
+            $this->addToAssertionCount(1);
+        } finally {
+            $other->rollBack();
+        }
+    }
+
+    private function connection(): PDO
+    {
+        $pdo = new PDO('mysql:host='.$this->host.';port=3306;dbname='.$this->database.';charset=utf8mb4', $this->username, $this->password);
+        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $pdo->exec('SET SESSION innodb_lock_wait_timeout = 1');
+
+        return $pdo;
+    }
+
+    private function arrival(string $identity): int
+    {
+        $id = DB::table('collections')->insertGetId(['collectionhash' => sha1($identity, true),
+            'subject' => 'Movie', 'fromname' => 'poster', 'totalfiles' => 1, 'groups_id' => 1,
+            'date' => now()->format('Y-m-d H:i:s')]);
+        $binary = DB::table('binaries')->insertGetId(['collections_id' => $id, 'binaryhash' => md5($identity, true),
+            'name' => 'movie.mkv', 'totalparts' => 1]);
+        DB::table('parts')->insert(['binaries_id' => $binary, 'partnumber' => 1, 'messageid' => $identity.'@article', 'size' => 5]);
+
+        return $id;
+    }
+}
