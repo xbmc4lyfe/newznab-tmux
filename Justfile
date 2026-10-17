@@ -17,6 +17,7 @@ export SAIL := env("SAIL", "./sail")
 export DOCKER_COMPOSE := env("DOCKER_COMPOSE", "docker compose")
 SEARCH_DRIVER := env("SEARCH_DRIVER", `v=$(sed -n 's/^SEARCH_DRIVER=//p' .env 2>/dev/null | tail -n 1 | tr -d "\"'"); printf '%s' "${v:-manticore}"`)
 MONITORING_ENABLED := env("MONITORING_ENABLED", `sed -n 's/^MONITORING_ENABLED=//p' .env 2>/dev/null | tail -n 1 | tr -d "\"'"`)
+WWWUSER := env("WWWUSER", `sed -n 's/^WWWUSER=//p' .env 2>/dev/null | tail -n 1 | tr -d "\"'"`)
 export SERVICE := env("SERVICE", "")
 export CMD := env("CMD", "")
 export cmd := env("cmd", "")
@@ -381,6 +382,8 @@ fix-permissions *args:
     @$DOCKER_COMPOSE exec -u root laravel.test groupmod -g {{HOST_GID}} -o sail >/dev/null 2>&1 || true
     @$DOCKER_COMPOSE exec -u root laravel.test chown -R {{HOST_UID}}:{{HOST_GID}} /var/www/html
     @$DOCKER_COMPOSE exec -u root laravel.test git config --system --add safe.directory /var/www/html
+    @echo "✔ Permissions fixed."
+    @if [ "{{WWWUSER}}" != "{{HOST_UID}}" ] || [ -z "{{WWWUSER}}" ]; then echo "⚠  WWWUSER ({{WWWUSER}}) ≠ host UID ({{HOST_UID}}). Set WWWUSER={{HOST_UID}} and WWWGROUP={{HOST_GID}} in .env, then run 'just rebuild' to align the container's sail user."; fi
 
 # Alias for 'fix-permissions'
 fix-perms *args:

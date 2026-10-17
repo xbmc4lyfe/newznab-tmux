@@ -384,7 +384,7 @@ These bugs turned up while building and running the self-hosted stack in `docker
 | Manticore restart loop: the image entrypoint `chown`s its config file, which fails on a read-only mount | Mounted the config read/write |
 | tmux panes died with "This account is currently not available": `www-data`'s login shell is `nologin` | Set `SHELL=/bin/bash` for the app services |
 | Grafana showed its own login page because Caddy's default directive order ran `request_header -X-JWT-Assertion` after `forward_auth`, deleting the JWT `forward_auth` had just added | Wrapped the handler in `route { }` |
-| Bulk-deleting groups while the indexer was running left 7,072 collections behind | Second cleanup pass. Prefer pausing the indexer (`make -C docker down` or `restart`) before large deletes |
+| Bulk-deleting groups while the indexer was running left 7,072 collections behind | Second cleanup pass. Prefer pausing the indexer (`just --justfile docker/Justfile down` or `restart`) before large deletes |
 | `make backup` reported success and rotated out good backups when `mariadb-dump` failed (no `pipefail`); dumps were world-readable under umask 022 | `pipefail`, write to a `.partial` file, publish and prune only on success; backups dir `0700`, files `0600` |
 | `make init` stopped before `docker compose up -d` whenever every public PreDB feed was down | The PreDB seed is best effort (the scheduler polls every 5 minutes) |
 | `APP_URL` and Grafana's root URL were pinned to `localhost:8080`, so a changed `APP_PORT` or LAN access produced wrong absolute links and Grafana redirects | `APP_URL` in `docker/.env` (blank = `http://localhost:$APP_PORT`); `generate-env` syncs it into `config/app.env`, and `GF_SERVER_ROOT_URL` uses it |

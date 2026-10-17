@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import stat
 import subprocess
@@ -127,6 +128,99 @@ LEGACY_CONFIG_OWNERS = (
 )
 
 
+class BuildContext:
+    """Which repository files can reach an image: inside the Docker build context (.dockerignore,
+    with Docker's matching rules) and named by a Dockerfile COPY/ADD from that context."""
+
+    def __init__(self, repo: Path) -> None:
+        self.ignore = [self._compile(line) for line in self._lines(repo / ".dockerignore")]
+        self.sources = [self._compile(src)[1] for src in self._copy_sources(repo / "Dockerfile")]
+
+    @staticmethod
+    def _lines(path: Path) -> list[str]:
+        try:
+            text = path.read_text(encoding="utf-8", errors="surrogateescape")
+        except OSError:
+            return []
+        return [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+
+    @staticmethod
+    def _compile(pattern: str) -> tuple[bool, re.Pattern[str]]:
+        negate = pattern.startswith("!")
+        pattern = os.path.normpath(pattern[1:] if negate else pattern).lstrip("/")
+        regex = ""
+        i = 0
+        while i < len(pattern):
+            char = pattern[i]
+            if pattern.startswith("**", i):
+                i += 2
+                if pattern.startswith("/", i):
+                    regex += "(?:.*/)?"
+                    i += 1
+                else:
+                    regex += ".*"
+                continue
+            if char == "*":
+                regex += "[^/]*"
+            elif char == "?":
+                regex += "[^/]"
+            elif char == "[":
+                end = pattern.find("]", i + 1)
+                if end == -1:
+                    regex += re.escape(char)
+                else:
+                    body = pattern[i + 1:end]
+                    regex += "[" + ("^" + body[1:] if body.startswith("^") else body) + "]"
+                    i = end
+            else:
+                regex += re.escape(char)
+            i += 1
+        return negate, re.compile(regex)
+
+    @staticmethod
+    def _copy_sources(dockerfile: Path) -> list[str]:
+        try:
+            text = dockerfile.read_text(encoding="utf-8", errors="surrogateescape")
+        except OSError:
+            return ["."]
+        sources: list[str] = []
+        for instruction in re.sub(r"\\\n", " ", text).splitlines():
+            words = instruction.strip().split(None, 1)
+            if len(words) < 2 or words[0].upper() not in ("COPY", "ADD"):
+                continue
+            try:
+                args = shlex.split(words[1])
+            except ValueError:
+                return ["."]
+            if any(arg.startswith("--from") for arg in args):
+                continue
+            paths = [arg for arg in args if not arg.startswith("--")]
+            sources.extend(paths[:-1])
+        return sources
+
+    @staticmethod
+    def _matches(regex: re.Pattern[str], rel_path: str) -> bool:
+        parts = rel_path.split("/")
+        return any(regex.fullmatch("/".join(parts[:end])) for end in range(len(parts), 0, -1))
+
+    def in_context(self, rel_path: str) -> bool:
+        excluded = False
+        for negate, regex in self.ignore:
+            if self._matches(regex, rel_path):
+                excluded = not negate
+        return not excluded
+
+    def copied(self, rel_path: str) -> bool:
+        return any(source.pattern == "\\." or self._matches(source, rel_path) for source in self.sources)
+
+    def image_input(self, rel_path: str) -> bool:
+        return self.in_context(rel_path) and self.copied(rel_path)
+
+
+# Set by main(); without it every path is treated as a possible image input (fail safe).
+BUILD_CONTEXT: BuildContext | None = None
+
+
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -139,7 +233,13 @@ def classify_path(rel_path: str) -> tuple[str, ...]:
     """Return the logical ownership bucket(s) for a repository-relative path."""
     if rel_path == "tests/Fixtures/nzb-article-fingerprint/NzbArticleFingerprint.php":
         return ("shared-app",)
+    if rel_path in ("Dockerfile", ".dockerignore"):
+        return ("shared-app",)
     if rel_path.endswith(".md") or rel_path in IGNORED_EXACT:
+        return ()
+    # Mounted service configuration is fingerprinted through the rendered Compose bind sources,
+    # and runtime env files through the configuration hashes; neither can change an image.
+    if BUILD_CONTEXT is not None and not BUILD_CONTEXT.image_input(rel_path):
         return ()
     if rel_path.startswith("install") and rel_path.endswith(".sh"):
         return ()
@@ -305,27 +405,38 @@ def project_directory(docker_dir: Path) -> Path:
 
 def bind_source_record(source: str, read_only: bool, project_dir: Path) -> str:
     """Content of a bind-mounted configuration source: any file, or a read-only directory inside the
-    Compose project (data, log and host-system directories are not configuration)."""
+    Compose project (data, log and host-system directories are not configuration). Anything that
+    cannot be hashed completely aborts the plan, so an unreadable edit is never stamped as deployed."""
+
+    def fail(reason: str) -> None:
+        sys.exit(f"deploy-plan: cannot fingerprint mounted configuration {source}: {reason}")
+
+    def walk_error(error: OSError) -> None:
+        raise error
+
     path = Path(source)
     try:
         if path.is_file():
             return f"file {sha256_bytes(path.read_bytes())} {source}"
-        if not path.is_dir():
+        if not path.exists():
             return f"missing {source}"
+        if not path.is_dir():
+            return f"other {source}"
         resolved = path.resolve()
         if not read_only or not resolved.is_relative_to(project_dir):
             return f"dir {source}"
         lines: list[str] = []
-        for root, dirs, files in os.walk(resolved):
+        for root, dirs, files in os.walk(resolved, onerror=walk_error):
             dirs.sort()
             for name in sorted(files):
                 full = Path(root) / name
                 if len(lines) >= 2000:
-                    return f"dir-too-large {source}"
+                    fail("more than 2000 files")
                 lines.append(f"{full.relative_to(resolved).as_posix()} {sha256_bytes(full.read_bytes())}")
         return f"tree {sha256_text(chr(10).join(lines))} {source}"
     except OSError as error:
-        return f"unreadable {source} {error.errno}"
+        fail(error.strerror or str(error))
+    raise AssertionError("unreachable")
 
 
 def service_bind_records(svc_cfg: object, project_dir: Path) -> list[str]:
@@ -796,8 +907,10 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
 
 
 def main() -> None:
+    global BUILD_CONTEXT
     docker_dir = Path(__file__).resolve().parent.parent
     repo = Path(os.environ.get("DEPLOY_REPO", docker_dir.parent)).resolve()
+    BUILD_CONTEXT = BuildContext(repo)
     stamp_path = Path(os.environ.get("DEPLOY_STAMP", docker_dir / ".deploy.stamp"))
 
     cmd = sys.argv[1] if len(sys.argv) > 1 else "--explain"

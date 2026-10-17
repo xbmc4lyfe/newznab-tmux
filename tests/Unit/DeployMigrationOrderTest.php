@@ -874,6 +874,93 @@ SH);
         $this->assertStringNotContainsString('build --target', $this->events());
     }
 
+    public function test_split_production_layout_hashes_runtime_mounts_and_keeps_history_in_the_runtime(): void
+    {
+        // m5stephen: a candidate checkout deploys a stack whose Compose project, .env, mounted
+        // configuration and deployment history live in a separate persistent runtime directory.
+        $runtime = $this->directory.'/runtime';
+        file_put_contents($this->directory.'/.gitignore', "/runtime\n", FILE_APPEND);
+        (new Process(['git', 'commit', '-q', '-am', 'runtime lives outside the candidate'], $this->directory))->mustRun();
+        mkdir($runtime.'/config/redis', 0777, true);
+        file_put_contents($runtime.'/.env', "APP_IMAGE=\nWEB_IMAGE=\nREDIS_IMAGE=\n");
+        symlink($runtime.'/.env', $this->directory.'/docker/.env');
+        file_put_contents($runtime.'/config/redis/redis.conf', "maxmemory 1gb\n");
+        $head = trim((new Process(['git', 'rev-parse', 'HEAD'], $this->directory))->mustRun()->getOutput());
+        file_put_contents($runtime.'/.deploy.stamp', $head." e3b0 e3b0 c16c bb93\n");
+        $redis = ['volumes' => [['type' => 'bind', 'source' => $runtime.'/config/redis/redis.conf', 'target' => '/usr/local/etc/redis/redis.conf', 'read_only' => true]]];
+        $json = (string) json_encode(['services' => ['web' => [], 'horizon' => [], 'scheduler' => [], 'indexer' => [], 'redis' => $redis, 'manticore' => [], 'proxy' => []], 'x-app' => ['tmpfs' => ['/tmp']]], JSON_UNESCAPED_SLASHES);
+        $environment = [
+            'NNTMUX_CONFIG_ID' => $json, 'DEPLOY_REPO' => $this->directory,
+            'DEPLOY_LOCK_DIR' => $runtime.'/.deploy.lock', 'DEPLOY_LOG' => $runtime.'/.deploy.log',
+            'DEPLOY_STAMP' => $runtime.'/.deploy.stamp', 'DEPLOY_SUCCESS_TIME' => $runtime.'/.deploy.time',
+        ];
+        $deploy = fn (): Process => $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0', 'DC=docker compose --project-directory '.$runtime], $environment)->mustRun();
+
+        $deploy();
+        $events = $this->events();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $events);
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 redis manticore', $events);
+        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 redis', $events);
+        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 proxy', $events);
+        $this->assertStringContainsString('compose --project-directory '.$runtime, $events);
+        $this->assertStringContainsString('service:redis=', (string) file_get_contents($runtime.'/.deploy.stamp'));
+        $this->assertFileExists($runtime.'/.deploy.time');
+        $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp');
+        $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.log');
+
+        file_put_contents($this->directory.'/events', '');
+        $deploy();
+        $this->assertStringNotContainsString(' up -d', $this->events());
+        $this->assertStringContainsString('result=skipped', (string) file_get_contents($runtime.'/.deploy.log'));
+
+        // The candidate's copy is not what Compose mounts: editing it changes nothing.
+        file_put_contents($this->directory.'/events', '');
+        mkdir($this->directory.'/docker/config/redis', 0777, true);
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 2gb\n");
+        $deploy();
+        $this->assertStringNotContainsString(' up -d', $this->events());
+
+        // The mounted runtime file is what matters.
+        file_put_contents($this->directory.'/events', '');
+        file_put_contents($runtime.'/config/redis/redis.conf', "maxmemory 2gb\n");
+        $deploy();
+        $events = $this->events();
+        $recreate = ' up -d --no-deps --force-recreate --wait --wait-timeout 240 redis';
+        $this->assertStringContainsString($recreate, $events);
+        $this->assertLessThan(strpos($events, $recreate), strpos($events, ' stop web scheduler indexer'));
+        $this->assertStringNotContainsString('manticore', $events);
+
+        // A docs-only commit skips.
+        file_put_contents($this->directory.'/events', '');
+        file_put_contents($this->directory.'/README.md', "# docs\n");
+        (new Process(['git', 'add', 'README.md'], $this->directory))->mustRun();
+        (new Process(['git', 'commit', '-q', '-m', 'docs'], $this->directory))->mustRun();
+        $deploy();
+        $this->assertStringNotContainsString(' up -d', $this->events());
+        $this->assertStringNotContainsString('build --target', $this->events());
+    }
+
+    public function test_unreadable_mounted_configuration_aborts_instead_of_stamping(): void
+    {
+        mkdir($this->directory.'/docker/config/redis', 0777, true);
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 1gb\n");
+        $config = ['NNTMUX_CONFIG_ID' => $this->composeJson()];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $stamp = (string) file_get_contents($this->directory.'/docker/.deploy.stamp');
+
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 2gb\n");
+        chmod($this->directory.'/docker/config/redis/redis.conf', 0000);
+        try {
+            $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config);
+            $process->run();
+        } finally {
+            chmod($this->directory.'/docker/config/redis/redis.conf', 0644);
+        }
+        $this->assertNotSame(0, $process->getExitCode());
+        $this->assertStringContainsString('cannot fingerprint mounted configuration', $process->getErrorOutput());
+        $this->assertSame($stamp, (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
+    }
+
     public function test_external_image_replacement_or_tag_change_invalidates_build_stamp(): void
     {
         $this->make(['build'], ['NNTMUX_IMAGE_ID' => 'sha256:first-build'])->mustRun();
