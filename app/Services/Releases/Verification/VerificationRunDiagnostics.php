@@ -51,8 +51,27 @@ final class VerificationRunDiagnostics
 
     private float $maintenanceMilliseconds = 0.0;
 
+    /** Fixed phases of the claim loop; passed verification includes article fetch and decode. */
+    private const array PHASES = ['claim', 'bookkeeping', 'manifest_read', 'verify_passed', 'verify_other', 'publish', 'finish', 'status_write'];
+
+    /** @var array<string, array{ms: float, count: int}> */
+    private array $phases = [];
+
     public function __construct(private readonly int $started, private readonly string $startedAt,
         private readonly int $limit, private readonly int $maxSeconds, private readonly int $requestedSlot) {}
+
+    /** Add the time since $started to a phase and return the current time for the next one. */
+    public function phase(string $name, ?int $started): int
+    {
+        $now = hrtime(true);
+        if ($started !== null && in_array($name, self::PHASES, true)) {
+            $this->phases[$name] ??= ['ms' => 0.0, 'count' => 0];
+            $this->phases[$name]['ms'] += ($now - $started) / 1_000_000.0;
+            $this->phases[$name]['count']++;
+        }
+
+        return $now;
+    }
 
     public function workerAcquired(): void
     {
@@ -154,7 +173,7 @@ final class VerificationRunDiagnostics
     public function report(int $finished): array
     {
         return [
-            'schema_version' => 1,
+            'schema_version' => 2,
             'started_at' => $this->startedAt,
             'requested_slot' => $this->requestedSlot,
             'limit' => $this->limit,
@@ -180,6 +199,9 @@ final class VerificationRunDiagnostics
                 'maintenance' => $this->maintenanceMilliseconds,
                 'claim_loop' => $this->loopStarted === null ? null : (($this->stopped ?? $finished) - $this->loopStarted) / 1_000_000.0,
             ],
+            'phases' => array_combine(self::PHASES, array_map(fn (string $phase): array => [
+                'ms' => round($this->phases[$phase]['ms'] ?? 0.0, 3), 'count' => $this->phases[$phase]['count'] ?? 0,
+            ], self::PHASES)),
         ];
     }
 
