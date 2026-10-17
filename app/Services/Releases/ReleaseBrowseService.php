@@ -360,7 +360,10 @@ class ReleaseBrowseService
             'try_fuzzy' => false,
         ], 1);
 
-        if (($result['available'] ?? true) === false) {
+        // An unavailable, estimated, or empty answer (for example a freshly rebuilt index) defers to SQL.
+        if (($result['available'] ?? true) === false
+            || ($result['total_exact'] ?? true) === false
+            || (int) $result['total'] <= 0) {
             return null;
         }
 

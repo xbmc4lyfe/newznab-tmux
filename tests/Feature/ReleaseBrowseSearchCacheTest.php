@@ -141,6 +141,23 @@ final class ReleaseBrowseSearchCacheTest extends TestCase
     }
 
     #[Test]
+    public function it_falls_back_to_the_database_count_when_the_index_total_is_estimated_or_empty(): void
+    {
+        Search::shouldReceive('isAvailable')->twice()->andReturnTrue();
+        Search::shouldReceive('searchReleasesFiltered')
+            ->once()
+            ->andReturn(['ids' => [1], 'total' => 5_000, 'total_exact' => false, 'fuzzy' => false, 'available' => true]);
+        Search::shouldReceive('searchReleasesFiltered')
+            ->once()
+            ->andReturn(['ids' => [], 'total' => 0, 'total_exact' => true, 'fuzzy' => false, 'available' => true]);
+
+        $service = new ReleaseBrowseService;
+
+        $this->assertSame(0, $service->getBrowseCount([], -1, [], -1));
+        $this->assertSame(0, $service->getBrowseCount([], 30, [], -1));
+    }
+
+    #[Test]
     public function it_falls_back_to_the_database_count_when_the_index_query_fails(): void
     {
         Search::shouldReceive('isAvailable')->once()->andReturnTrue();
