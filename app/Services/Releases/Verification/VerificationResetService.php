@@ -17,14 +17,15 @@ final class VerificationResetService
         if (DB::transactionLevel() !== 0) {
             throw new RuntimeException('Database reset cannot run inside an open transaction.');
         }
-        if (VerificationWorkerLocks::paused()) {
-            throw new RuntimeException('A deployment pause holds verification workers; retry reset after it is released.');
-        }
         $store = VerificationLockStore::make();
         $admissionLock = $this->lock($store->exclusiveGroup('reset'));
         try {
             $workerLock = $this->lock($store->exclusiveGroup('worker'));
             try {
+                // Checked while holding both gates, so a pause cannot appear unseen before the work.
+                if (VerificationWorkerLocks::paused()) {
+                    throw new RuntimeException('A deployment pause holds verification workers; retry reset after it is released.');
+                }
                 $this->clearVerification();
                 $reset();
             } finally {

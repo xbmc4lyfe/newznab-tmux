@@ -64,9 +64,16 @@ assert_barrier() {
 }
 release_barrier() {
     if [ "$barrier_held" = 1 ]; then
-        docker stop --timeout 30 "$barrier_name" >/dev/null || echo "Verification barrier did not stop cleanly; its session released it." >&2
+        docker stop --timeout 30 "$barrier_name" >/dev/null || true
+        released=0
+        docker logs "$barrier_name" 2>&1 | grep -q '^barrier released' && released=1
         docker rm -f "$barrier_name" >/dev/null 2>&1 || true
         barrier_held=0
+        # Its durable pause would otherwise keep every host's workers out after a healthy rollout.
+        if [ "$released" != 1 ] && ! compose run --rm --no-deps -T web php artisan releases:verification-barrier --release --no-interaction; then
+            echo "The verification deployment pause could not be cleared; every host's workers stay paused." >&2
+            return 1
+        fi
     fi
 }
 resume() {
@@ -180,4 +187,4 @@ verify
 compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" web horizon scheduler indexer
 assert_barrier
 barrier_keep=0
-release_barrier
+release_barrier || exit 1

@@ -27,6 +27,7 @@ class DeployMigrationOrderTest extends TestCase
 #!/bin/sh
 printf 'COMPOSE_FILE=%s %s\n' "$COMPOSE_FILE" "$*" >> "$NNTMUX_DEPLOY_EVENTS"
 case "$*" in
+    *'releases:verification-barrier --release'*) echo forced-release >> "$NNTMUX_DEPLOY_EVENTS"; [ "${NNTMUX_FORCED_RELEASE_FAIL:-0}" != 1 ] || exit 52 ;;
     *'releases:verification-barrier'*)
         if [ "${NNTMUX_BARRIER_FAIL:-0}" = 1 ]; then echo 'still running' > "$NNTMUX_REPO/barrier.log"; else echo 'barrier held' > "$NNTMUX_REPO/barrier.log"; : > "$NNTMUX_REPO/barrier.running"; fi
         echo barrier-container ;;
@@ -34,7 +35,9 @@ case "$*" in
     'logs '*'-verification-barrier')
         cat "$NNTMUX_REPO/barrier.log" 2>/dev/null
         if [ "${NNTMUX_BARRIER_LOST:-}" != '' ] && grep -q "${NNTMUX_BARRIER_LOST}" "$NNTMUX_DEPLOY_EVENTS"; then echo 'barrier lost'; fi ;;
-    'stop --timeout 30 '*'-verification-barrier') rm -f "$NNTMUX_REPO/barrier.running"; echo released >> "$NNTMUX_DEPLOY_EVENTS" ;;
+    'stop --timeout 30 '*'-verification-barrier')
+        rm -f "$NNTMUX_REPO/barrier.running"; echo released >> "$NNTMUX_DEPLOY_EVENTS"
+        [ "${NNTMUX_BARRIER_UNCLEAN:-0}" = 1 ] || echo 'barrier released' >> "$NNTMUX_REPO/barrier.log" ;;
     'rm -f '*'-verification-barrier') rm -f "$NNTMUX_REPO/barrier.running" ;;
     *' config --format json'*) echo "${NNTMUX_CONFIG_ID:-fixture-config}" ;;
     *'image inspect --format'*) echo "${NNTMUX_IMAGE_ID:-sha256:fixture}" ;;
@@ -155,6 +158,23 @@ SH);
         $this->assertFalse($process->isSuccessful());
         $this->assertStringNotContainsString('released', $this->events());
         $this->assertStringContainsString('stay held by container', $process->getErrorOutput());
+    }
+
+    public function test_an_unclean_barrier_stop_clears_the_durable_pause_explicitly(): void
+    {
+        $this->deploy(['NNTMUX_BARRIER_UNCLEAN' => '1'])->mustRun();
+
+        $this->assertGreaterThan(strpos($this->events(), 'released'), strpos($this->events(), 'forced-release'));
+    }
+
+    public function test_a_durable_pause_that_cannot_be_cleared_fails_the_rollout(): void
+    {
+        $process = $this->deploy(['NNTMUX_BARRIER_UNCLEAN' => '1', 'NNTMUX_FORCED_RELEASE_FAIL' => '1']);
+        $process->run();
+
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('deployment pause could not be cleared', $process->getErrorOutput());
+        $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp');
     }
 
     public function test_a_barrier_lost_before_migration_aborts_without_migrating(): void

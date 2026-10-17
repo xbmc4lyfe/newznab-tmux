@@ -128,10 +128,12 @@ final class VerificationWorkerLocks
     public function tryExclusive(): bool
     {
         $this->close();
-        if (self::paused($this->store()->connection())) {
-            return false;
-        }
         $this->global = $this->store()->exclusiveGroup('worker');
+        // Checked while holding the gate: a pause written before it is seen, and a barrier
+        // cannot start draining until this holder releases it.
+        if ($this->global !== null && self::paused($this->store()->connection())) {
+            $this->close();
+        }
         $this->exclusive = $this->global !== null;
 
         return $this->exclusive;
