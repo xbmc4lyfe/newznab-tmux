@@ -22,7 +22,7 @@ Every container keeps its persistent files in bind mounts under `docker/`.
 
 **Success criteria**
 
-- `make -C docker up` brings every service to `healthy`.
+- `just --justfile docker/Justfile up` brings every service to `healthy`.
 - The web UI answers on `http://localhost:8080` and an administrator can log in.
 - Within the first hour: active groups gain headers, then releases, and post-processing panes are working.
 - `predb` rows arrive from IRC (`source` like `#PreNNTmux`) and from the feed importer (`source` like `predb.club`).
@@ -108,7 +108,7 @@ The memory caps add up to about 24 GB, which matches what OrbStack currently all
 
 **Shared app settings (x-app):**
 
-- Image: `nntmux/app:local`
+- Images: one per role, `nntmux/web:local`, `nntmux/horizon:local`, `nntmux/scheduler:local`, `nntmux/indexer:local` (or a shared `APP_IMAGE`)
 - `init: true`, user `33:33`, `SHELL=/bin/bash` (www-data's login shell is `nologin`; tmux panes spawn `$SHELL`)
 - `stop_grace_period: 120s`
 - `.env` comes from `docker/config/app.env`, bind-mounted read/write. `monitoring:install` writes to `.env`.
@@ -119,10 +119,9 @@ The memory caps add up to about 24 GB, which matches what OrbStack currently all
 ```
 docker/
 ├── docker-compose.yml          # the stack
-├── Makefile                    # lifecycle: env, build, init, up, down, logs, tmux, seed, backup
+├── Justfile                    # lifecycle: env, build, init, up, down, logs, tmux, seed, backup
 ├── .env.example / .env         # compose-level knobs (ports, memory caps, versions); .env is gitignored
 ├── app/
-│   ├── Dockerfile              # overlay FROM nntmux/base:local
 │   ├── Caddyfile               # FrankenPHP: :80 public, :8081 internal Grafana auth
 │   ├── php/zz-docker.ini       # opcache
 │   └── bin/indexer.sh          # tmux supervisor loop
@@ -351,11 +350,11 @@ Units, each with one job:
 - The JWT never reaches the browser, the same guarantee the nginx setup gives.
 - No app code changes are needed.
 
-## 7. Bootstrap flow (`make -C docker init`)
+## 7. Bootstrap flow (`just --justfile docker/Justfile init`)
 
 1. `bin/generate-env` creates `docker/.env` and `config/app.env`.
 2. Create the `data/` and `logs/` trees, owned by 33:33 for app paths.
-3. `docker build` the root `Dockerfile`, tagged `nntmux/base:local`, then build `docker/app/Dockerfile`, tagged `nntmux/app:local`.
+3. Build the root `Dockerfile`: the cached `base` target (`nntmux/base:local`) and the per-role `selfhosted-<role>` targets (`nntmux/<role>:local`).
 4. Start `mariadb redis manticore mailpit` and wait until they are healthy.
 5. `compose run --rm web php artisan nntmux:deploy-init`. This step:
    - checks the configuration
@@ -384,11 +383,11 @@ alt.binaries.ath           alt.binaries.sounds.lossless  alt.binaries.sounds.mp3
 
 | Task | Command |
 |---|---|
-| Start / stop | `make -C docker up` / `make -C docker down` (the tmux session stops cleanly on SIGTERM) |
-| Watch the indexer | `make -C docker tmux`, which attaches to the tmux session (detach with Ctrl-a d) |
-| Logs | `make -C docker logs s=indexer`; Laravel logs are in `docker/data/storage/logs` |
-| Backup | `make -C docker backup`: `mariadb-dump --single-transaction` piped through gzip into `docker/backups/`, keeping 7. Manticore can be rebuilt with `nntmux:populate --manticore --all`. |
-| Add groups | The Groups page of the administrator UI, or extend `groups.sql` and run `make -C docker seed` |
+| Start / stop | `just --justfile docker/Justfile up` / `just --justfile docker/Justfile down` (the tmux session stops cleanly on SIGTERM) |
+| Watch the indexer | `just --justfile docker/Justfile tmux`, which attaches to the tmux session (detach with Ctrl-a d) |
+| Logs | `just --justfile docker/Justfile logs s=indexer`; Laravel logs are in `docker/data/storage/logs` |
+| Backup | `just --justfile docker/Justfile backup`: `mariadb-dump --single-transaction` piped through gzip into `docker/backups/`, keeping 7. Manticore can be rebuilt with `nntmux:populate --manticore --all`. |
+| Add groups | The Groups page of the administrator UI, or extend `groups.sql` and run `just --justfile docker/Justfile seed` |
 | Grafana | `http://localhost:8080/grafana/` (administrator session required), or the Monitoring page under System in the administrator UI |
 | Mail | `http://localhost:8025` |
 

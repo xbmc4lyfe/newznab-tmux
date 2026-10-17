@@ -2,7 +2,7 @@
 -- Sized to stay under the primary provider's connection limit: binaries (12) + backfill (30) +
 -- additional (16) + NFO (4) post-processing hold about 60 of its 73 NNTP connections. Those workers
 -- mostly wait on NNTP rather than CPU, so they run more threads than the 10 cores.
--- Settings are cached for 300s; `make -C docker seed` clears the cache afterwards.
+-- Settings are cached for 300s; `just --justfile docker/Justfile seed` clears the cache afterwards.
 UPDATE ingestion_configurations SET
     binary_threads = 12,
     backfill_threads = 30,

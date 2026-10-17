@@ -25,9 +25,9 @@ Read repository `AGENTS.md` and matching `.ai/rules` first. Deployment and resta
 
 ## Deploy ownership
 
-- Only one session deploys the shared stack. Feature sessions test and prepare changes; they do not run `make build`, `make up`, `make deploy`, or `make restart`.
-- A full build/up recreates web, Horizon, scheduler, and indexer together, restarting tmux and IRC scrapers. Batch merged changes for one deployment.
-- The deploy owner uses `make -C docker deploy DEPLOY_BY=<session name>`. `bin/deploy-guard` serializes deploys via `docker/.deploy.lock`, records them in `docker/.deploy.log`, and skips a rebuild when nothing changed (`FORCE=1` overrides).
+- Only one session deploys the shared stack. Feature sessions test and prepare changes; they do not run `just build`, `just up`, `just deploy`, or `just restart`.
+- Deployments use per-service input fingerprinting (`just --justfile docker/Justfile deploy-plan` to inspect): non-runtime edits (such as documentation or tests) skip rebuilds and container restarts entirely, and scoped changes rebuild/recreate only the affected service(s). Batch merged changes for one deployment.
+- The deploy owner uses `just --justfile docker/Justfile deploy DEPLOY_BY=<session name>`. `bin/deploy-guard` serializes deploys via `docker/.deploy.lock`, records them in `docker/.deploy.log`, and skips a rebuild or rollout when nothing affecting runtime services changed (`FORCE=1` overrides).
 - A guard refusal exits with status 75. Report the active deployment and wait for its owner to finish before retrying an authorized deploy; do not bypass the guard. Do not remove a lock for a live PID (the guard clears stale locks).
-- For an authorized single-service repair by the deployment owner, use `make -C docker restart s=<service>`, not a full rebuild.
+- For an authorized single-service repair by the deployment owner, use `just --justfile docker/Justfile restart s=<service>`, not a full rebuild.
 - Existing Git authorization and deployment-guard requirements still apply.

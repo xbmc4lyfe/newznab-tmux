@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Unit;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Process\Process;
@@ -42,6 +43,32 @@ final class DockerDeployGuardTest extends TestCase
         (new Process(['rm', '-rf', $this->dir]))->run();
 
         parent::tearDown();
+    }
+
+    /** @return iterable<string, array{int, int}> */
+    public static function interruptions(): iterable
+    {
+        yield 'SIGTERM' => [15, 130];
+        yield 'SIGHUP (dropped SSH session)' => [1, 129];
+        yield 'SIGINT' => [2, 130];
+    }
+
+    #[Test]
+    #[DataProvider('interruptions')]
+    public function an_interrupted_run_closes_its_attempt_and_releases_the_lock(int $signal, int $code): void
+    {
+        $ready = $this->dir.'/command-started';
+        $process = $this->guardProcess(['run', 'deploy', '--', 'sh', '-c', 'touch '.escapeshellarg($ready).'; sleep 2']);
+        $process->start();
+        $this->waitFor(fn (): bool => file_exists($ready));
+        $process->signal($signal);
+        $this->waitFor(fn (): bool => ! $process->isRunning());
+
+        $log = (string) file_get_contents($this->dir.'/deploy.log');
+        $this->assertStringContainsString('result=started', $log);
+        $this->assertStringContainsString("result=finished rc={$code} (interrupted)", $log);
+        $this->assertSame(substr_count($log, 'result=started'), substr_count($log, 'result=finished'));
+        $this->assertFalse(is_link($this->dir.'/lock'), 'the lock is released after an interruption');
     }
 
     #[Test]
@@ -673,6 +700,37 @@ PHP);
         $second = $this->guard(['run', 'build', '--', 'true'], $flags);
         $this->assertSame(0, $second->getExitCode());
         $this->assertFileExists($this->dir.'/stamp');
+    }
+
+    #[Test]
+    public function documentation_and_test_changes_do_not_invalidate_the_runtime_fingerprint(): void
+    {
+        $build = ['run', 'build', '--', 'sh', '-c', 'echo x >> '.$this->dir.'/builds'];
+        $flags = ['SKIP_IF_UNCHANGED' => '1', 'STAMP_ON_SUCCESS' => '1'];
+        $builds = fn (): int => is_file($this->dir.'/builds') ? count(file($this->dir.'/builds')) : 0;
+
+        $this->guard($build, $flags);
+        $this->assertSame(1, $builds());
+
+        mkdir($this->repo.'/docs', 0777, true);
+        mkdir($this->repo.'/.ai/rules', 0777, true);
+        mkdir($this->repo.'/tests/Feature', 0777, true);
+        file_put_contents($this->repo.'/README.md', "# Updated docs\n");
+        file_put_contents($this->repo.'/AGENTS.md', "# Agent rules\n");
+        file_put_contents($this->repo.'/docs/guide.md', "Guide\n");
+        file_put_contents($this->repo.'/.ai/rules/index.md', "Rule\n");
+        file_put_contents($this->repo.'/tests/Feature/ExampleTest.php', "<?php\n");
+        file_put_contents($this->repo.'/phpstan.neon', "parameters:\n");
+
+        // Uncommitted non-runtime changes must skip
+        $this->guard($build, $flags);
+        $this->assertSame(1, $builds());
+
+        // Committed non-runtime changes (changing git HEAD) must also skip
+        $this->git('add', '.');
+        $this->git('commit', '-q', '-m', 'docs and tests only');
+        $this->guard($build, $flags);
+        $this->assertSame(1, $builds());
     }
 
     /**

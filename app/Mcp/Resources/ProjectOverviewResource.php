@@ -41,7 +41,7 @@ class ProjectOverviewResource extends Resource
             ],
             'command_policy' => [
                 'default' => 'Run PHP, Artisan, Composer, npm, Pint, PHPStan, and tests on the WSL host.',
-                'containers' => 'Use Sail or make only for Compose lifecycle or when explicitly requested.',
+                'containers' => 'Use Sail or just only for Compose lifecycle or when explicitly requested.',
             ],
             'companion' => 'Use Laravel Boost for generic Laravel documentation, schema and read-only queries, logs, browser logs, and Tinker.',
             'warnings' => ['Runtime probes may be unavailable. NNTP is never probed unless explicitly requested.'],

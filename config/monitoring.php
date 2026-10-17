@@ -10,7 +10,7 @@ return [
     |
     | Installed on Ubuntu hosts by scripts/install-monitoring.sh (see
     | `php artisan monitoring:install`) or in Sail via docker-compose.monitoring.yml
-    | (`make monitoring-up`). Grafana is reverse proxied under the main hostname and
+    | (`just monitoring-up`). Grafana is reverse proxied under the main hostname and
     | trusts short-lived RS256 JWTs signed with the private key below.
     |
     */

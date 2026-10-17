@@ -7,6 +7,6 @@ export COMPOSE_FILE
 compose() { "$DIR/bin/compose" "$@"; }
 existing=$(compose ps -a -q web horizon scheduler indexer)
 if [ -n "$existing" ]; then
-    exec make --no-print-directory -C "$DIR" deploy
+    exec "${JUST:-just}" --justfile "$DIR/Justfile" --working-directory "$DIR" deploy
 fi
 compose up -d

@@ -87,8 +87,38 @@ class ViteDockerConfigurationTest extends TestCase
         }
         $this->assertDoesNotMatchRegularExpression(
             '~^COPY[^\n]+yenc-ffi\.ini[^\n]+/conf\.d/~m',
-            $this->projectFile('docker/app/Dockerfile'),
+            $this->projectFile('Dockerfile'),
         );
+        $this->assertFileDoesNotExist(__DIR__.'/../../docker/app/Dockerfile');
+    }
+
+    public function test_dockerfile_separates_cached_base_isolated_builders_and_per_service_targets(): void
+    {
+        $dockerfile = $this->projectFile('Dockerfile');
+        $compose = Yaml::parse($this->projectFile('docker/docker-compose.yml'))['services'];
+
+        $basePos = strpos($dockerfile, 'FROM base-os AS base');
+        $firstCopyPos = strpos($dockerfile, 'COPY docker/app/nzb-yenc-ffi/');
+        $this->assertNotFalse($basePos);
+        $this->assertNotFalse($firstCopyPos);
+        $this->assertLessThan($firstCopyPos, $basePos, 'OS base stage must precede repository COPY layers');
+
+        // A shared Cargo target cache trusts COPY-preserved mtimes and can ship another checkout's artifacts.
+        $this->assertStringNotContainsString('--mount=type=cache,target=/src/docker/app/nzb-yenc-ffi/target', $dockerfile);
+        $this->assertStringContainsString('--mount=type=cache,target=/usr/local/cargo/registry', $dockerfile);
+        $this->assertStringContainsString('COPY app/Support/AdminReleaseNames.php /app/app/Support/AdminReleaseNames.php', $dockerfile);
+        $this->assertStringContainsString('COPY resources/forum /app/resources/forum', $dockerfile);
+        $this->assertMatchesRegularExpression('/^FROM base-os AS vendor$/m', $dockerfile);
+        $this->assertMatchesRegularExpression('/^FROM node AS frontend$/m', $dockerfile);
+        $this->assertMatchesRegularExpression('/^FROM selfhost-runtime AS app-core$/m', $dockerfile);
+        foreach (['selfhosted-web', 'selfhosted-horizon', 'selfhosted-scheduler', 'selfhosted-indexer', 'selfhosted', 'production'] as $target) {
+            $this->assertMatchesRegularExpression('/^FROM [^\r\n]+ AS '.preg_quote($target, '/').'$/m', $dockerfile);
+        }
+
+        $this->assertSame('${WEB_IMAGE:-nntmux/web:local}', $compose['web']['image']);
+        $this->assertSame('${HORIZON_IMAGE:-nntmux/horizon:local}', $compose['horizon']['image']);
+        $this->assertSame('${SCHEDULER_IMAGE:-nntmux/scheduler:local}', $compose['scheduler']['image']);
+        $this->assertSame('${INDEXER_IMAGE:-nntmux/indexer:local}', $compose['indexer']['image']);
     }
 
     /**
@@ -113,14 +143,18 @@ class ViteDockerConfigurationTest extends TestCase
 
     public function test_docker_build_targets_always_pull_images_before_building(): void
     {
+        $this->assertFileDoesNotExist(__DIR__.'/../../Makefile');
+        $this->assertFileDoesNotExist(__DIR__.'/../../docker/Makefile');
+        $this->assertFileExists(__DIR__.'/../../Justfile');
+        $this->assertFileExists(__DIR__.'/../../docker/Justfile');
+
         foreach (['build', 'rebuild', 'update', 'fresh'] as $target) {
             $process = new Process([
-                'make', '--dry-run', '--no-print-directory', $target,
-                'SAIL=mock-sail', 'DOCKER_COMPOSE=mock-compose',
+                'just', '--dry-run', 'SAIL=mock-sail', 'DOCKER_COMPOSE=mock-compose', $target,
             ], __DIR__.'/../..');
             $process->mustRun();
 
-            $commands = $process->getOutput();
+            $commands = $process->getOutput().$process->getErrorOutput();
             $pullPosition = strpos($commands, 'mock-compose pull --ignore-buildable --policy always');
             $buildCommand = in_array($target, ['rebuild', 'fresh'], true)
                 ? 'mock-sail build --no-cache --pull'
@@ -131,6 +165,88 @@ class ViteDockerConfigurationTest extends TestCase
             $this->assertNotFalse($buildPosition, "{$target} must refresh build base images.");
             $this->assertLessThan($buildPosition, $pullPosition, "{$target} must pull before building.");
         }
+    }
+
+    public function test_every_sail_or_compose_recipe_gets_the_profiles_and_monitoring_overlay(): void
+    {
+        $root = __DIR__.'/../..';
+        $summary = (new Process(['just', '--summary'], $root))->mustRun()->getOutput();
+        $checked = 0;
+        foreach (preg_split('/\s+/', trim($summary)) as $recipe) {
+            if (str_contains($recipe, '::')) {
+                continue;
+            }
+            $process = new Process(['just', '--dry-run', $recipe], $root);
+            $process->run();
+            $commands = $process->getOutput().$process->getErrorOutput();
+            if (! preg_match('/\$SAIL|\.\/sail|\$DOCKER_COMPOSE|docker compose/', $commands)) {
+                continue;
+            }
+            $checked++;
+            $this->assertStringContainsString('export COMPOSE_PROFILES=', $commands, "{$recipe} must export the Compose profiles like the old Makefile.");
+        }
+        $this->assertGreaterThan(30, $checked);
+    }
+
+    public function test_root_env_values_are_read_like_compose_and_make(): void
+    {
+        $directory = sys_get_temp_dir().'/dotenv-get-'.bin2hex(random_bytes(4));
+        mkdir($directory);
+        file_put_contents($directory.'/.env', "SEARCH_DRIVER=elasticsearch # engine\nMONITORING_ENABLED=\"true\" # on\nWWWUSER = 501\nWWWUSER=502\nCOMPOSE_PROFILES=\n");
+        try {
+            $read = fn (string $key, string $default = ''): string => (new Process([__DIR__.'/../../scripts/dotenv-get', $key, $default], $directory))->mustRun()->getOutput();
+            $this->assertSame('elasticsearch', $read('SEARCH_DRIVER', 'manticore'));
+            $this->assertSame('true', $read('MONITORING_ENABLED'));
+            $this->assertSame('502', $read('WWWUSER'));
+            $this->assertSame('9090', $read('FORWARD_PROMETHEUS_PORT', '9090'));
+            $this->assertSame('', $read('COMPOSE_PROFILES'));
+            // make's `?=`: an empty COMPOSE_PROFILES line still counts as set; only a missing key falls back.
+            $raw = fn (string $key, string $default): string => (new Process([__DIR__.'/../../scripts/dotenv-get', '--raw', $key, $default], $directory))->mustRun()->getOutput();
+            $this->assertSame('', $raw('COMPOSE_PROFILES', '__absent__'));
+            $this->assertSame('__absent__', $raw('MISSING_KEY', '__absent__'));
+        } finally {
+            unlink($directory.'/.env');
+            rmdir($directory);
+        }
+    }
+
+    public function test_role_targets_copy_the_files_only_their_role_runs(): void
+    {
+        $dockerfile = $this->projectFile('Dockerfile');
+        $stage = function (string $name) use ($dockerfile): string {
+            $start = strpos($dockerfile, " AS {$name}\n");
+            $this->assertNotFalse($start, $name);
+            $next = strpos($dockerfile, "\nFROM ", $start);
+
+            return substr($dockerfile, $start, $next === false ? null : $next - $start);
+        };
+        $this->assertStringContainsString('COPY docker/app/Caddyfile /etc/frankenphp/nntmux.Caddyfile', $stage('selfhosted-web'));
+        $this->assertStringContainsString('COPY --from=frontend --chown=www-data:www-data /app/public/build /app/public/build', $stage('selfhosted-web'));
+        $this->assertStringContainsString('docker/app/bin/scheduler.py /app/docker/app/bin/scheduler.py', $stage('selfhosted-scheduler'));
+        $this->assertStringContainsString('COPY docker/app/php/yenc-ffi.ini /usr/local/etc/php/indexer-conf.d/99-yenc-ffi.ini', $stage('selfhosted-indexer'));
+        $this->assertStringContainsString('docker/app/bin/indexer.sh /usr/local/bin/nntmux-indexer', $stage('selfhosted-indexer'));
+        foreach (['selfhosted-horizon', 'selfhosted-scheduler', 'selfhosted-indexer'] as $role) {
+            $this->assertStringNotContainsString('public/build', $stage($role), "{$role} must not depend on Vite output");
+        }
+        $allInOne = $stage('selfhosted');
+        foreach (['scheduler.py', 'yenc-ffi.ini', 'indexer.sh'] as $file) {
+            $this->assertStringContainsString($file, $allInOne);
+        }
+        $this->assertStringContainsString('FROM selfhosted-web AS selfhosted', $dockerfile);
+        $this->assertStringContainsString('/app/public/build', $stage('production'));
+    }
+
+    public function test_container_quality_and_dependency_recipes_still_run_through_sail(): void
+    {
+        foreach (['test', 'pint', 'pint-all', 'phpstan', 'rector', 'rector-fix', 'npm-build', 'npm-dev', 'ts-types', 'ts-types-check', 'data-cache', 'composer-install', 'composer-update'] as $recipe) {
+            $process = new Process(['just', '--dry-run', $recipe], __DIR__.'/../..');
+            $process->mustRun();
+            $this->assertMatchesRegularExpression('/\$SAIL"? /', $process->getOutput().$process->getErrorOutput(), "{$recipe} must run inside the Sail container.");
+        }
+
+        $process = new Process(['just', '--dry-run', 'optimize-deploy'], __DIR__.'/../..');
+        $process->mustRun();
+        $this->assertStringContainsString('only run on the deploy host', $process->getOutput().$process->getErrorOutput());
     }
 
     public function test_vite_uses_the_docker_published_port_without_fallback(): void
