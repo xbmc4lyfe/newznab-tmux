@@ -53,7 +53,7 @@ final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
         DB::purge();
         DB::statement('SET SESSION innodb_lock_wait_timeout = 1');
         foreach (['2026_10_11_154028_create_release_verification_candidates_table', '2026_10_17_000000_create_release_verification_manifests_table',
-            '2026_10_17_120000_create_release_verification_locks_table'] as $migration) {
+            '2026_10_17_120000_create_release_verification_locks_table', '2026_10_17_180000_add_release_verification_publication_stripes'] as $migration) {
             (require database_path('migrations/'.$migration.'.php'))->up();
         }
         DB::statement('CREATE TABLE collections (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -275,8 +275,11 @@ final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
         $other = $this->connection();
         DB::beginTransaction();
         try {
-            $ledger->enterPublication();
-            $this->assertLocked($other, 'SELECT name FROM release_verification_locks WHERE name = \'publication\' FOR UPDATE NOWAIT');
+            $ledger->enterPublication(5);
+            // Only this size's stripe is held; other stripes and the shared fallback row stay free.
+            $this->assertLocked($other, 'SELECT name FROM release_verification_locks WHERE name = \'publication:5\' FOR UPDATE NOWAIT');
+            $this->assertNotLocked($other, 'SELECT name FROM release_verification_locks WHERE name = \'publication:6\' FOR UPDATE NOWAIT');
+            $this->assertNotLocked($other, 'SELECT name FROM release_verification_locks WHERE name = \'publication\' FOR UPDATE NOWAIT');
             $this->assertNotLocked($other, 'SELECT id FROM release_verification_state WHERE id = 1 FOR UPDATE NOWAIT');
             $this->assertFalse($ledger->adjust(61), 'A delta beyond capacity changes nothing.');
             $this->assertTrue($ledger->adjust(60));
@@ -289,6 +292,19 @@ final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
             }
         }
         $this->assertSame(70, (int) DB::table('release_verification_state')->value('pending_bytes'));
+    }
+
+    public function test_publications_fall_back_to_one_shared_row_before_the_stripes_exist(): void
+    {
+        DB::table('release_verification_locks')->where('name', 'like', 'publication:%')->delete();
+        $other = $this->connection();
+        DB::beginTransaction();
+        try {
+            app(VerificationLedger::class)->enterPublication(5);
+            $this->assertLocked($other, 'SELECT name FROM release_verification_locks WHERE name = \'publication\' FOR UPDATE NOWAIT');
+        } finally {
+            DB::rollBack();
+        }
     }
 
     private function assertLocked(PDO $other, string $sql): void

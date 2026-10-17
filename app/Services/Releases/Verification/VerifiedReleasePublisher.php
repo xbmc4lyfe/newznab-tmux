@@ -34,14 +34,21 @@ final class VerifiedReleasePublisher
 
         $timing = PublicationTiming::sample();
         $status = 'threw';
+        // Exact duplicates (crossposts of the same articles) share this size, so they serialize
+        // on one publication stripe while releases of other sizes publish concurrently.
         try {
-            $id = DB::transaction(function () use ($claim, $result, $timing): ?int {
+            $stripe = $this->publicationSize($result->manifest);
+        } catch (Throwable) {
+            $stripe = 0;
+        }
+        try {
+            $id = DB::transaction(function () use ($claim, $result, $timing, $stripe): ?int {
                 $timing?->beginAttempt();
                 $returned = false;
                 try {
-                    // Publications serialize so duplicate detection sees each committed release;
-                    // admissions and expiry no longer wait behind this lock.
-                    app(VerificationLedger::class)->enterPublication();
+                    // Duplicate detection must see each committed release of the same size;
+                    // admissions, expiry and other sizes no longer wait behind this lock.
+                    app(VerificationLedger::class)->enterPublication($stripe);
                     $timing?->nextPhase('candidate_policy');
                     $candidate = DB::table('release_verification_candidates')->where('id', $claim->id)->lockForUpdate()->first();
                     if ($candidate === null || $candidate->version !== $claim->version
@@ -73,17 +80,9 @@ final class VerifiedReleasePublisher
                     }
                     $timing?->nextPhase('metadata_size');
                     $metadata = $this->metadata->resolve($manifest);
-                    if (($manifest['verification_mode'] ?? null) === 'spot_check') {
-                        $size = (new CandidateHeaderInventory)->bytes($manifest);
-                        if ($size < 1) {
-                            throw new RuntimeException('Spot-checked release has no positive declared size.');
-                        }
-                    } else {
-                        $size = 0;
-                        foreach ($manifest['files'] as $file) {
-                            $size += (int) ($file['decoded_size'] ?? array_sum(array_column($file['segments'], 'bytes')));
-                        }
-                        $size = (int) ($manifest['verified_bytes'] ?? $size);
+                    $size = $this->publicationSize($manifest);
+                    if ($size < 1 && ($manifest['verification_mode'] ?? null) === 'spot_check') {
+                        throw new RuntimeException('Spot-checked release has no positive declared size.');
                     }
                     $timing?->nextPhase('archive_legacy');
                     $legacy = null;
@@ -253,6 +252,24 @@ final class VerifiedReleasePublisher
         } catch (Throwable) {
             return false;
         }
+    }
+
+    /**
+     * The release size duplicate detection matches exactly.
+     *
+     * @param  array<string, mixed>  $manifest
+     */
+    private function publicationSize(array $manifest): int
+    {
+        if (($manifest['verification_mode'] ?? null) === 'spot_check') {
+            return (new CandidateHeaderInventory)->bytes($manifest);
+        }
+        $size = 0;
+        foreach ($manifest['files'] as $file) {
+            $size += (int) ($file['decoded_size'] ?? array_sum(array_column($file['segments'], 'bytes')));
+        }
+
+        return (int) ($manifest['verified_bytes'] ?? $size);
     }
 
     /** @param list<string> $names */

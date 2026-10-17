@@ -21,6 +21,9 @@ final class VerificationLedger
 
     public const string PUBLICATION_LOCK = 'publication';
 
+    /** Publication lock rows `publication:0` … `publication:63`, chosen by release size. */
+    public const int PUBLICATION_STRIPES = 64;
+
     /** Database manifests let verification writers run concurrently. */
     public function concurrent(): bool
     {
@@ -38,12 +41,19 @@ final class VerificationLedger
         }
     }
 
-    /** Serialize publications (and their duplicate detection) with each other, not with admission. */
-    public function enterPublication(string $missing = 'Verification migration has not initialized capacity state.'): void
+    /**
+     * Serialize publications (and their duplicate detection) of one release size with each other,
+     * not with admission or other sizes. Before the stripe rows exist, every size shares one row.
+     */
+    public function enterPublication(int $size, string $missing = 'Verification migration has not initialized capacity state.'): void
     {
         if (! $this->concurrent()) {
             $this->enter($missing);
 
+            return;
+        }
+        $stripe = self::PUBLICATION_LOCK.':'.(abs($size) % self::PUBLICATION_STRIPES);
+        if (DB::table(self::LOCKS_TABLE)->where('name', $stripe)->lockForUpdate()->first() !== null) {
             return;
         }
         if (DB::table(self::LOCKS_TABLE)->where('name', self::PUBLICATION_LOCK)->lockForUpdate()->first() === null) {
