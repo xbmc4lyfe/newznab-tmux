@@ -39,7 +39,9 @@ final class VerifiedReleasePublisher
                 $timing?->beginAttempt();
                 $returned = false;
                 try {
-                    DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
+                    // Publications serialize so duplicate detection sees each committed release;
+                    // admissions and expiry no longer wait behind this lock.
+                    app(VerificationLedger::class)->enterPublication();
                     $timing?->nextPhase('candidate_policy');
                     $candidate = DB::table('release_verification_candidates')->where('id', $claim->id)->lockForUpdate()->first();
                     if ($candidate === null || $candidate->version !== $claim->version
@@ -264,11 +266,12 @@ final class VerifiedReleasePublisher
     private function markPublished(int $candidateId, int $releaseId, VerificationResult $result): void
     {
         $candidate = DB::table('release_verification_candidates')->where('id', $candidateId)->first();
-        DB::table('release_verification_state')->where('id', 1)->decrement('pending_bytes', (int) $candidate->manifest_bytes);
         DB::table('release_verification_candidates')->where('id', $candidateId)->update([
             'release_id' => $releaseId, 'status' => $result->verdict, 'reason' => $result->reason,
             'verified_at' => now(), 'lease_token' => null, 'lease_until' => null, 'manifest_bytes' => 0, 'manifest_path' => '',
         ]);
+        // Release capacity last so the shared ledger row is held only until commit.
+        app(VerificationLedger::class)->adjust(-(int) $candidate->manifest_bytes);
         DB::afterCommit(function () use ($candidate): void {
             app(ManifestStore::class)->deleteIfUnreferenced($candidate->manifest_path);
         });

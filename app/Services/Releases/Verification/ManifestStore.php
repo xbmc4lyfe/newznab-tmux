@@ -56,6 +56,17 @@ final class ManifestStore
     private function writeRow(PreparedManifest $prepared): string
     {
         $name = $prepared->name;
+        // Insert a name this transaction's view lacks without a locking read first: locking an absent
+        // key gap-locks the primary index, and concurrent admissions inserting into one gap deadlock.
+        if (! DB::table(self::TABLE)->where('name', $name)->exists()) {
+            try {
+                DB::table(self::TABLE)->insert(['name' => $name, 'body' => $prepared->compressed, 'bytes' => strlen($prepared->compressed)]);
+
+                return $name;
+            } catch (UniqueConstraintViolationException) {
+                // A concurrent writer committed the same name first; validate what it stored.
+            }
+        }
         // A current read: under REPEATABLE READ a plain read could still see a row that cleanup
         // deleted after this transaction's snapshot, and admission would then reference nothing.
         $existing = DB::table(self::TABLE)->where('name', $name)->lockForUpdate()->value('body');
@@ -65,7 +76,6 @@ final class ManifestStore
 
                 return $name;
             } catch (UniqueConstraintViolationException) {
-                // A concurrent writer committed the same name first; validate what it stored.
                 $existing = DB::table(self::TABLE)->where('name', $name)->lockForUpdate()->value('body');
             }
         }
@@ -286,7 +296,8 @@ final class ManifestStore
 
     /**
      * Import one bounded chunk (at most IMPORT_CHUNK_NAMES names or about IMPORT_CHUNK_BYTES of
-     * files) in one capacity-locked transaction, one row per statement to stay under the packet limit.
+     * files) in one transaction, one row per statement to stay under the packet limit. Locking the
+     * referencing candidates and then each manifest row follows admission's lock order.
      *
      * @param  array<string, string|false|null>  $files  name => verified body, false (invalid) or null (missing)
      * @param  array{imported: int, already: int, missing: int, invalid: int, conflict: int, unreferenced: int}  $counts
@@ -299,9 +310,7 @@ final class ManifestStore
         DB::transaction(function () use ($files, $names, &$verified, &$outcomes): void {
             $verified = [];
             $outcomes = [];
-            if (DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first() === null) {
-                throw new RuntimeException('Verification capacity state is unavailable; manifests not imported.');
-            }
+            (new VerificationLedger)->enter('Verification capacity state is unavailable; manifests not imported.');
             $referenced = array_flip(DB::table('release_verification_candidates')->whereIn('manifest_path', $names)
                 ->lockForUpdate()->pluck('manifest_path')->map(static fn ($name): string => (string) $name)->all());
             foreach ($names as $name) {
@@ -348,6 +357,11 @@ final class ManifestStore
     /**
      * Serialize deletion with admissions and retain every manifest still referenced by a candidate.
      * Wait for open transactions to finish so a later rollback cannot restore a deleted reference.
+     *
+     * Database manifests lock the manifest row (or its gap) first. Every admission that adds a
+     * reference writes that row under the same lock, so none can add one until this commits, and the
+     * reference check below takes its read view only after the lock is granted, so it sees every
+     * committed reference without locking candidates out of admission's candidate-then-manifest order.
      */
     public function deleteIfUnreferenced(string $name): void
     {
@@ -363,13 +377,17 @@ final class ManifestStore
         }
 
         DB::transaction(function () use ($name): void {
-            $state = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
-            if ($state === null) {
-                throw new RuntimeException('Verification capacity state is unavailable; manifest retained.');
-            }
-            $reference = DB::table('release_verification_candidates')->where('manifest_path', $name)->lockForUpdate()->first(['id']);
-            if ($reference !== null) {
-                return;
+            if ($this->usesDatabase()) {
+                DB::table(self::TABLE)->where('name', $name)->lockForUpdate()->value('name');
+                if (DB::table('release_verification_candidates')->where('manifest_path', $name)->exists()) {
+                    return;
+                }
+            } else {
+                (new VerificationLedger)->enter('Verification capacity state is unavailable; manifest retained.');
+                $reference = DB::table('release_verification_candidates')->where('manifest_path', $name)->lockForUpdate()->first(['id']);
+                if ($reference !== null) {
+                    return;
+                }
             }
             if ($this->tableAvailable()) {
                 DB::table(self::TABLE)->where('name', $name)->delete();

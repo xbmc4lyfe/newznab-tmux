@@ -13,6 +13,7 @@ use App\Services\Releases\Verification\NzbManifestReader;
 use App\Services\Releases\Verification\ScratchBudget;
 use App\Services\Releases\Verification\ScratchInventory;
 use App\Services\Releases\Verification\SpotCheckVerifier;
+use App\Services\Releases\Verification\VerificationLedger;
 use App\Services\YencService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
@@ -108,10 +109,8 @@ class VerifyExistingReleases extends Command
                 $scratchInventory->recordAudit((int) $scratchEntry->id, $record['verdict'], $record['reason']);
                 $delete = ! $this->option('dry-run') && $this->option('delete') && $record['verdict'] === 'unrepairable';
                 DB::transaction(function () use ($id, $isRetry, $record, $scratchEntry, $scratchInventory, $delete, $release, $deletion): void {
-                    $current = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
-                    if ($current === null) {
-                        throw new \RuntimeException('Audit state is unavailable.');
-                    }
+                    // Deletions serialize with publications; the shared ledger row is locked last.
+                    app(VerificationLedger::class)->enterPublication('Audit state is unavailable.');
                     if ($record['verdict'] === 'unknown') {
                         DB::table('release_verification_audit_retries')->updateOrInsert(['release_id' => $id], [
                             'next_attempt_at' => now()->addSeconds(max(1, (int) config('release_verification.retry_seconds'))),
@@ -123,6 +122,10 @@ class VerifyExistingReleases extends Command
                         }
                         DB::table('release_verification_audit_retries')->where('release_id', $id)->delete();
                         $scratchInventory->finishAudit((int) $scratchEntry->id);
+                    }
+                    $current = DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
+                    if ($current === null) {
+                        throw new \RuntimeException('Audit state is unavailable.');
                     }
                     DB::table('release_verification_state')->where('id', 1)->update([
                         'audit_cursor' => max((int) $current->audit_cursor, $id), 'audit_retry_turn' => ! $isRetry,
