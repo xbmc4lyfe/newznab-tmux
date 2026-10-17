@@ -213,7 +213,9 @@ unchanged() {
             docker image inspect "$req_img" >/dev/null 2>&1 || return 1
         done
         if [ "${target:-}" = "build" ]; then
-            [ -z "$(DEPLOY_STAMP="$STAMP" "$DIR/bin/deploy-plan" --build-targets)" ] || return 1
+            # A failing planner is not "nothing to build".
+            build_targets=$(DEPLOY_STAMP="$STAMP" "$DIR/bin/deploy-plan" --build-targets) || return 1
+            [ -z "$build_targets" ] || return 1
         fi
     fi
     if [ -n "${CHECK_UNCHANGED_COMMAND:-}" ]; then

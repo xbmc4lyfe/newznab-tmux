@@ -6,7 +6,8 @@ set shell := ["bash", "-cu"]
 export JUST := just_executable()
 
 # module_directory() is this directory both standalone and when loaded as `mod docker` from the root.
-CURDIR := module_directory()
+# Physical path, as `make -C docker` used: a symlinked justfile path must not change DC/COMPOSE_FILE.
+CURDIR := canonicalize(module_directory())
 REPO := parent_directory(CURDIR)
 
 # No dotenv-load: just searches parent directories when docker/.env is absent (fresh installs)

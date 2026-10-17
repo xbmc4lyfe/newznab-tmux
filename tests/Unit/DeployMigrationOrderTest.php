@@ -1250,6 +1250,53 @@ SH);
         $this->assertStringContainsString('cannot inspect image', $process->getErrorOutput());
     }
 
+    public function test_failing_build_planner_is_never_reported_as_nothing_to_build(): void
+    {
+        $this->make(['build'])->mustRun();
+        $process = $this->make(['build'], ['NNTMUX_IMAGE_INSPECT_FAIL' => '1']);
+        $process->run();
+        $this->assertNotSame(0, $process->getExitCode());
+        $this->assertStringNotContainsString('nothing changed', $process->getOutput());
+    }
+
+    public function test_symlinked_justfile_path_uses_the_physical_stack_directory(): void
+    {
+        $link = $this->directory.'-link';
+        symlink($this->directory, $link);
+        try {
+            $process = new Process(['just', '--justfile', $link.'/docker/Justfile', '--working-directory', $link.'/docker', 'deploy-plan', 'DEPLOY_BY=fixture'], env: [
+                'PATH' => $this->directory.'/bin:'.getenv('PATH'), 'NNTMUX_DEPLOY_EVENTS' => $this->directory.'/events', 'NNTMUX_REPO' => $this->directory,
+            ]);
+            $process->mustRun();
+        } finally {
+            unlink($link);
+        }
+        $this->assertStringContainsString('COMPOSE_FILE='.realpath($this->directory).'/docker/docker-compose.yml', $this->events());
+        $this->assertStringNotContainsString($link, $this->events());
+    }
+
+    public function test_all_app_compose_change_after_a_partial_failure_still_migrates(): void
+    {
+        $base = json_decode($this->composeJson(), true);
+        $config = function (string $host) use ($base): array {
+            foreach (['web', 'horizon', 'scheduler', 'indexer'] as $role) {
+                $base['services'][$role] = ['environment' => ['DB_HOST' => $host]];
+            }
+
+            return ['NNTMUX_CONFIG_ID' => (string) json_encode($base, JSON_UNESCAPED_SLASHES)];
+        };
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('a'))->mustRun();
+        // A code change whose app start partly fails: web never comes up healthy.
+        file_put_contents($this->directory.'/app.txt', "two\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('a') + ['NNTMUX_APP_UP_FAIL' => '1', 'NNTMUX_UNHEALTHY' => 'web'])->run();
+
+        // Then a database cutover reaches all four app services.
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('b'))->mustRun();
+        $this->assertStringContainsString('artisan migrate --force --no-interaction', $this->events());
+    }
+
     public function test_host_system_paths_match_on_path_boundaries_only(): void
     {
         $script = 'import importlib.machinery, importlib.util, sys; l = importlib.machinery.SourceFileLoader("dp", sys.argv[1]); '

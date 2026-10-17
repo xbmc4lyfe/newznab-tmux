@@ -1052,6 +1052,10 @@ def main() -> None:
             (item,) if item in ("migration", "effective") else (f"service:{item}", f"compose:{item}", f"image:{item}", f"build:{item}"))]
         if cmd == "--forget":
             for key in keys:
+                # An app service's compose record is the definition the migration state matches; it
+                # survives the recreate and moves only when the migration (or rollout) completes.
+                if key.startswith("compose:") and key.split(":", 1)[1] in APP_SERVICES:
+                    continue
                 record.pop(key, None)
         elif cmd == "--pending":
             # A service whose recreate is about to start: if the run stops before it is healthy,
@@ -1076,6 +1080,9 @@ def main() -> None:
             snapshot = parse_stamp(Path(f"{stamp_path}.plan"))
             if not snapshot:
                 sys.exit("deploy-plan: no plan snapshot to record from.")
+            if "migration" in items:
+                # The completed migration covers the app definitions this run deploys.
+                keys += [f"compose:{svc}" for svc in APP_SERVICES]
             for key in keys:
                 if key in snapshot:
                     record[key] = snapshot[key]
