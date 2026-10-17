@@ -130,6 +130,25 @@ final class NntpVerificationArticleSourceTest extends TestCase
         }
     }
 
+    public function test_a_dot_stuffed_line_that_continues_past_the_budget_is_oversized(): void
+    {
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        // The unstuffed body is 34 bytes; the capped read sees exactly 32 of them before more arrive.
+        fwrite($pair[1], "222 0 <stuffed@example> body\r\n..".str_repeat('a', 31)."\r\n.\r\n");
+        $primary = new PipelineSocketNntpHarness($pair[0]);
+        $source = new NntpArticleSource($primary, maximumBytes: 64, allowAlternateFallback: false);
+        try {
+            $source->fetchBounded('stuffed@example', 32);
+            $this->fail('An article above the bounded budget must not be returned.');
+        } catch (ArticleBudgetExceeded $error) {
+            $this->assertFalse($primary->isConnected(), 'An unread remainder closes the session.');
+        } finally {
+            unset($source);
+            $primary->closeFixture();
+            fclose($pair[1]);
+        }
+    }
+
     public function test_article_unavailable_response_keeps_the_session_aligned_for_the_next_request(): void
     {
         $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);

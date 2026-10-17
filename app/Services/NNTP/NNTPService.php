@@ -63,14 +63,19 @@ class NNTPService extends NntpClient
                 return $raw;
             }
             if (! str_ends_with($line, "\n")) {
-                $this->doQuit();
                 // A partial line that filled a read capped by the remaining budget proves the article
-                // too large only when its unstuffed bytes already exceed the budget; anything else
-                // (including a dot-stuffed line that exactly fills the cap) is a truncated response.
-                $unstuffed = strlen($line) - (str_starts_with($line, '..') ? 1 : 0);
-                if (strlen($line) === $limit - 1 && $maximumBytes - strlen($raw) < 65534 && strlen($raw) + $unstuffed > $maximumBytes) {
-                    throw new ArticleBudgetExceeded('Article exceeds verification memory budget.');
+                // too large when its unstuffed bytes exceed the budget, or, when they exactly reach it
+                // (a dot-stuffed line), when the line continues at all: its terminator alone overflows.
+                // A response that ends there instead is truncated.
+                if (strlen($line) === $limit - 1 && $maximumBytes - strlen($raw) < 65534) {
+                    $unstuffed = strlen($raw) + strlen($line) - (str_starts_with($line, '..') ? 1 : 0);
+                    $continues = static fn ($socket): bool => is_string($next = fread($socket, 1)) && $next !== '';
+                    if ($unstuffed > $maximumBytes || ($unstuffed === $maximumBytes && $continues($this->_socket))) {
+                        $this->doQuit();
+                        throw new ArticleBudgetExceeded('Article exceeds verification memory budget.');
+                    }
                 }
+                $this->doQuit();
                 throw new \RuntimeException('Verification article line is truncated or oversized.');
             }
             if (str_starts_with($line, '..')) {
