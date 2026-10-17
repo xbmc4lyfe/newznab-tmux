@@ -49,7 +49,8 @@ class ReclassifyHeaderRejections extends Command
         }
 
         return DB::transaction(static function () use ($query): int {
-            $ids = (clone $query)->lock('FOR UPDATE SKIP LOCKED')->pluck('id')->all();
+            // Both the locking read and the update stay on the primary key, inside this id range.
+            $ids = (clone $query)->forceIndex('PRIMARY')->lock('FOR UPDATE SKIP LOCKED')->pluck('id')->all();
             if ($ids === []) {
                 return 0;
             }
