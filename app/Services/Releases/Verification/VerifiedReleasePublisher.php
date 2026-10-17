@@ -11,6 +11,7 @@ use App\Models\ReleaseRegex;
 use App\Services\Nzb\NzbArticleCoverage;
 use App\Services\Nzb\NzbArticleFingerprint;
 use App\Services\Nzb\NzbService;
+use App\Services\Nzb\NzbSourceGuard;
 use App\Services\ReleaseImageService;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\ReleaseGroupResolver;
@@ -351,11 +352,13 @@ final class VerifiedReleasePublisher
         if ($release === null) {
             return;
         }
-        // The row goes with this publication's commit, so it can never stay advertised without its NZB;
-        // only best-effort file and index cleanup follows.
+        // The row goes with this publication's commit, so it can never stay advertised without its NZB.
+        // The NZB is anchored first: once the row is gone, a by-GUID delete would find nothing to remove.
+        $receipt = (new NzbSourceGuard(app(NzbService::class)))->captureDeletionAnchor($release);
         DB::table('releases')->where('id', $release->id)->delete();
-        DB::afterCommit(static function () use ($release, $releaseId): void {
-            foreach ([static fn () => app(NzbService::class)->deleteNzb((string) $release->guid),
+        DB::afterCommit(static function () use ($release, $releaseId, $receipt): void {
+            foreach ([static fn () => (new NzbSourceGuard(app(NzbService::class)))->deleteAnchoredSource($receipt)
+                ?: throw new RuntimeException('Superseded partial NZB was not removed.'),
                 static fn () => app(ReleaseImageService::class)->delete((string) $release->guid),
                 static fn () => Search::deleteRelease((int) $release->id)] as $cleanup) {
                 try {

@@ -23,6 +23,7 @@ use App\Services\YencService;
 use App\Support\Configuration\IngestionConfigurationData;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -338,30 +339,49 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame((int) $rows[1]->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
         $this->assertNotSame($previous->identity, $rows[1]->identity);
 
+        $old = DB::table('releases')->where('id', $first)->first();
+        $this->assertFileExists((string) app(NzbService::class)->nzbPath($old->guid));
         Search::shouldReceive('deleteRelease')->once()->with($first);
         $second = $this->publishStalledPartial(null);
 
         $this->assertNotSame($first, $second);
         $this->assertFalse(DB::table('releases')->where('id', $first)->exists(), 'The superseded partial leaves with the same commit.');
+        $this->assertFileDoesNotExist((string) app(NzbService::class)->nzbPath($old->guid), 'Its NZB is removed after commit.');
         $this->assertSame(2, (int) DB::table('releases')->where('id', $second)->value('articles_found'));
     }
 
-    public function test_a_replay_reusing_the_partial_release_keeps_its_inventory(): void
+    public function test_a_replay_of_headers_the_partial_holds_changes_nothing(): void
     {
         $this->publicationSchema(partialColumns: true);
-        config(['nntmux.release_dedupe_enabled' => true]);
         $hash = sha1('replayed-headers', true);
         $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $before = DB::table('release_verification_candidates')->sole();
 
-        // The same header is seen again: the merged generation is covered by the published partial.
-        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash));
-        $reused = $this->publishStalledPartial(null);
+        $replay = $this->collectionForPolicy('movie.mkv', 3, $hash);
+        app(CandidateRepository::class)->archive($replay);
 
-        $this->assertSame($first, $reused);
-        $latest = DB::table('release_verification_candidates')->orderByDesc('id')->first();
-        $this->assertSame($first, (int) $latest->release_id);
-        $this->assertNotSame('', $latest->manifest_path, 'Late articles must still find the retained inventory.');
-        $this->assertTrue(DB::table('releases')->where('id', $first)->exists());
+        $after = DB::table('release_verification_candidates')->sole();
+        $this->assertSame([$before->manifest_path, $before->last_unique_at, $first], [$after->manifest_path, $after->last_unique_at, (int) $after->release_id]);
+        $this->assertFalse(DB::table('collections')->where('id', $replay)->exists(), 'The replayed headers are already retained.');
+    }
+
+    public function test_late_articles_for_a_published_partial_are_archived_promptly(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('hot-late-articles', true);
+        $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $late = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d');
+        DB::table('collections')->where('id', $late)->update(['filecheck' => 0]);
+        $this->travel(1)->hours();
+        $this->limits();
+
+        app(CandidateRepository::class)->invalidateHotCollections([$late]);
+
+        $candidate = DB::table('release_verification_candidates')->sole();
+        $this->assertSame(3, (int) DB::table('collections')->where('id', $late)->value('filecheck'));
+        $this->assertSame(now()->format('Y-m-d H:i:s'), Carbon::parse($candidate->last_unique_at)->format('Y-m-d H:i:s'));
+        $this->assertNotNull($candidate->release_id, 'The published partial is not reopened.');
+        $this->assertSame('sampled', $candidate->status);
     }
 
     public function test_retained_partial_inventory_is_released_at_expiry(): void

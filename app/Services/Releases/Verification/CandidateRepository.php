@@ -106,7 +106,15 @@ final class CandidateRepository
                 $manifest['legacy_release_id'] = $this->legacyReleaseId($collection);
                 if ($previous !== null) {
                     $retained = $this->store->read($previous->manifest_path);
+                    // The publication consumed any legacy release; the next generation publishes anew.
+                    $retained['legacy_release_id'] = null;
                     $manifest = $this->merge($retained, $manifest);
+                    if ($this->articleIdentity($retained) === $this->articleIdentity($manifest) && ! ($manifest['conflict'] ?? false)) {
+                        // A replay of headers the partial already holds changes nothing.
+                        $this->cleanup->deleteCollectionsAndDescendants([$collectionId], 'Archived for verification', false, manifestArchived: true);
+
+                        return;
+                    }
                     $manifest['replaces_release_id'] = (int) $previous->release_id;
                     $prepared = null;
                     $headerAssessment = null;
@@ -123,7 +131,8 @@ final class CandidateRepository
                 $path = $prepared === null ? $this->store->write($manifest) : $this->store->writePrepared($prepared);
                 $size = $this->store->size($path);
                 $arrivalAt = Carbon::parse($collection->last_seen_at ?? $collection->dateadded ?? $collection->added ?? now())->format('Y-m-d H:i:s');
-                $lastUniqueAt = $existing === null ? $arrivalAt : ($newArticles ? max($arrivalAt, $existing->last_unique_at) : $existing->last_unique_at);
+                $lastUniqueAt = $existing === null ? ($previous === null ? $arrivalAt : max($arrivalAt, $previous->last_unique_at))
+                    : ($newArticles ? max($arrivalAt, $existing->last_unique_at) : $existing->last_unique_at);
                 $expired = $lastUniqueAt < now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
                 $delta = ($expired ? 0 : $size) - (int) ($existing->manifest_bytes ?? 0) - (int) ($previous->manifest_bytes ?? 0);
                 $full = function () use ($existing, $previous, $path): never {
@@ -476,7 +485,8 @@ final class CandidateRepository
         foreach (DB::table('collections')->whereIn('id', $ids)->orderBy('id')->get() as $collection) {
             $identity = bin2hex($collection->collectionhash);
             $candidates = DB::table('release_verification_candidates')->where('source_identity', $identity)
-                ->whereNull('release_id')->whereNotIn('status', ['expired'])->lockForUpdate()->get();
+                ->where(fn ($query) => $query->whereNull('release_id')->orWhere('manifest_path', '<>', ''))
+                ->whereNotIn('status', ['expired'])->lockForUpdate()->get();
             foreach ($candidates as $candidate) {
                 if ($candidate->manifest_path === '') {
                     continue;
@@ -484,6 +494,14 @@ final class CandidateRepository
                 $old = $this->store->read($candidate->manifest_path);
                 $merged = $this->merge($old, $this->snapshot($collection));
                 if ($this->articleIdentity($old) === $this->articleIdentity($merged) && ! ($merged['conflict'] ?? false)) {
+                    continue;
+                }
+                if ($candidate->release_id !== null) {
+                    // A published partial stays published: keep its inventory from expiring and archive
+                    // the late articles now, which starts the generation that merges and replaces it.
+                    DB::table('release_verification_candidates')->where('id', $candidate->id)->update(['last_unique_at' => now()]);
+                    DB::table('collections')->where('id', $collection->id)->where('filecheck', '!=', 4)->update(['filecheck' => 3]);
+
                     continue;
                 }
                 DB::table('release_verification_candidates')->where('id', $candidate->id)->update([
