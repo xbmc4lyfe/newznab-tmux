@@ -6,8 +6,11 @@ import re
 import sys
 from pathlib import Path
 
-key, default = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else "")
-value = ""
+# --raw: an empty value is returned as empty; DEFAULT only replaces a missing key (make's ?=).
+raw_mode = len(sys.argv) > 1 and sys.argv[1] == "--raw"
+args = sys.argv[2:] if raw_mode else sys.argv[1:]
+key, default = args[0], (args[1] if len(args) > 1 else "")
+value = None
 try:
     lines = Path(".env").read_text(encoding="utf-8", errors="surrogateescape").splitlines()
 except OSError:
@@ -17,4 +20,7 @@ for raw in lines:
     if m and m.group(1) == key:
         quoted = re.match(r"""^(["'])(.*)\1\s*(?:#.*)?$""", m.group(2))
         value = quoted.group(2) if quoted else re.sub(r"\s#.*$", "", m.group(2)).strip()
-sys.stdout.write(value or default)
+if raw_mode:
+    sys.stdout.write(default if value is None else value)
+else:
+    sys.stdout.write(value or default)

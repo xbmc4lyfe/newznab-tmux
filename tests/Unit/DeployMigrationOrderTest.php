@@ -30,7 +30,9 @@ for last in "$@"; do :; done
 default_config='{"services":{"web":{},"horizon":{},"scheduler":{},"indexer":{},"mariadb":{},"redis":{},"manticore":{},"proxy":{},"mailpit":{},"prometheus":{},"pushgateway":{},"grafana":{},"node-exporter":{},"mysqld-exporter":{},"redis-exporter":{}}}'
 case "$*" in
     *' config --format json'*) if [ -n "${NNTMUX_CONFIG_ID:-}" ]; then echo "$NNTMUX_CONFIG_ID"; else echo "$default_config"; fi ;;
-    *'image inspect --format'*) echo "${NNTMUX_IMAGE_ID:-sha256:fixture}" ;;
+    *'image inspect --format'*)
+        [ "${NNTMUX_IMAGE_INSPECT_FAIL:-0}" != 1 ] || { echo "Error response from daemon: request timed out" >&2; exit 1; }
+        echo "${NNTMUX_IMAGE_ID:-sha256:fixture}" ;;
     *'image inspect'*) exit 0 ;;
     *'inspect --format {{.Image}}'*)
         if [ -f "$NNTMUX_REPO/recreated" ]; then
@@ -1236,6 +1238,16 @@ SH);
         $this->assertMatchesRegularExpression('/horizon\s+app\s+drain\+recreate\s+shares a rebuilt image/', $plan->getOutput());
         $this->assertMatchesRegularExpression('/scheduler\s+app\s+drain\+recreate\s+shares a rebuilt image/', $plan->getOutput());
         $this->assertMatchesRegularExpression('/indexer\s+app\s+skip\s+unchanged/', $plan->getOutput());
+    }
+
+    public function test_failed_image_inspection_aborts_instead_of_reading_as_a_missing_image(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+        $process = $this->make(['deploy-plan'], ['NNTMUX_IMAGE_INSPECT_FAIL' => '1']);
+        $process->run();
+        $this->assertNotSame(0, $process->getExitCode());
+        $this->assertStringContainsString('cannot inspect image', $process->getErrorOutput());
     }
 
     public function test_host_system_paths_match_on_path_boundaries_only(): void

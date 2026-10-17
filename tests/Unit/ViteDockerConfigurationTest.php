@@ -200,6 +200,10 @@ class ViteDockerConfigurationTest extends TestCase
             $this->assertSame('502', $read('WWWUSER'));
             $this->assertSame('9090', $read('FORWARD_PROMETHEUS_PORT', '9090'));
             $this->assertSame('', $read('COMPOSE_PROFILES'));
+            // make's `?=`: an empty COMPOSE_PROFILES line still counts as set; only a missing key falls back.
+            $raw = fn (string $key, string $default): string => (new Process([__DIR__.'/../../scripts/dotenv-get', '--raw', $key, $default], $directory))->mustRun()->getOutput();
+            $this->assertSame('', $raw('COMPOSE_PROFILES', '__absent__'));
+            $this->assertSame('__absent__', $raw('MISSING_KEY', '__absent__'));
         } finally {
             unlink($directory.'/.env');
             rmdir($directory);

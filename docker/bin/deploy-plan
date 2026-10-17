@@ -675,7 +675,10 @@ def image_id(image: str) -> str | None:
         check=False,
     )
     if proc.returncode != 0:
-        return None
+        # Only a missing image is "no image"; any other failure must not read as one.
+        if "no such image" in proc.stderr.lower():
+            return None
+        sys.exit(f"deploy-plan: cannot inspect image {image}: {proc.stderr.strip()}")
     return proc.stdout.strip()
 
 

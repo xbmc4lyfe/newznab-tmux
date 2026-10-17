@@ -17,10 +17,11 @@ mod docker 'docker/Justfile'
 
 export SAIL := env("SAIL", "./sail")
 export DOCKER_COMPOSE := env("DOCKER_COMPOSE", "docker compose")
-SEARCH_DRIVER := env("SEARCH_DRIVER", `scripts/dotenv-get SEARCH_DRIVER manticore`)
-ENV_COMPOSE_PROFILES := `scripts/dotenv-get COMPOSE_PROFILES`
-# Like the former `export COMPOSE_PROFILES ?= $(SEARCH_DRIVER)` after `-include .env`.
-PROFILES := env("COMPOSE_PROFILES", if ENV_COMPOSE_PROFILES != "" { ENV_COMPOSE_PROFILES } else { SEARCH_DRIVER })
+SEARCH_DRIVER := env("SEARCH_DRIVER", `scripts/dotenv-get --raw SEARCH_DRIVER`)
+ENV_COMPOSE_PROFILES := `scripts/dotenv-get --raw COMPOSE_PROFILES __absent__`
+# Like the former `export COMPOSE_PROFILES ?= $(SEARCH_DRIVER)` after `-include .env`: a COMPOSE_PROFILES
+# line (even empty) wins, otherwise SEARCH_DRIVER.
+PROFILES := env("COMPOSE_PROFILES", if ENV_COMPOSE_PROFILES != "__absent__" { ENV_COMPOSE_PROFILES } else { SEARCH_DRIVER })
 MONITORING_ENABLED := env("MONITORING_ENABLED", `scripts/dotenv-get MONITORING_ENABLED`)
 FORWARD_PROMETHEUS_PORT := env("FORWARD_PROMETHEUS_PORT", `scripts/dotenv-get FORWARD_PROMETHEUS_PORT 9090`)
 WWWUSER := env("WWWUSER", `scripts/dotenv-get WWWUSER`)
