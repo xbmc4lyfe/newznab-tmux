@@ -3,12 +3,13 @@
 set positional-arguments := true
 set shell := ["bash", "-cu"]
 
-CURDIR := justfile_directory()
+# module_directory() is this directory both standalone and when loaded as `mod docker` from the root.
+CURDIR := module_directory()
 REPO := parent_directory(CURDIR)
 
 # No dotenv-load: just searches parent directories when docker/.env is absent (fresh installs)
 # and would export the Laravel root .env into Compose. LOAD_ENV reads only this directory's .env.
-export COMPOSE_FILE := env("COMPOSE_FILE", CURDIR + "/docker-compose.yml")
+export COMPOSE_FILE := env("COMPOSE_FILE", "")
 export DC := env("DC", "docker compose --project-directory " + quote(CURDIR))
 # Empty defaults let docker/.env supply these; LOAD_ENV applies the real defaults afterwards.
 export HELPER_IMAGE := env("HELPER_IMAGE", "")
@@ -30,9 +31,9 @@ ENV_FILE := CURDIR + "/.env"
 LOAD_ENV := '''for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
     if [ -f "''' + ENV_FILE + '''" ]; then
         while IFS= read -r line || [ -n "$line" ]; do
-            [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?(APP_PORT|DB_DATABASE|DB_ROOTPASSWORD|HELPER_IMAGE|BASE_IMAGE|APP_IMAGE|WEB_IMAGE|HORIZON_IMAGE|SCHEDULER_IMAGE|INDEXER_IMAGE|DEPLOY_MIN_INTERVAL|DEPLOY_DRAIN_TIMEOUT|DEPLOY_SCHEDULER_DRAIN_TIMEOUT|DEPLOY_HEALTH_TIMEOUT|DEPLOY_LEGACY_DRAIN_TIMEOUT)=(.*)$ ]] || continue
+            [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?(COMPOSE_FILE|DEPLOY_BY|APP_PORT|DB_DATABASE|DB_ROOTPASSWORD|HELPER_IMAGE|BASE_IMAGE|APP_IMAGE|WEB_IMAGE|HORIZON_IMAGE|SCHEDULER_IMAGE|INDEXER_IMAGE|DEPLOY_MIN_INTERVAL|DEPLOY_DRAIN_TIMEOUT|DEPLOY_SCHEDULER_DRAIN_TIMEOUT|DEPLOY_HEALTH_TIMEOUT|DEPLOY_LEGACY_DRAIN_TIMEOUT)=(.*)$ ]] || continue
             key=${BASH_REMATCH[2]} value=${BASH_REMATCH[3]}
-            if [[ "$value" =~ ^\"(.*)\"[[:space:]]*$ || "$value" =~ ^\'(.*)\'[[:space:]]*$ ]]; then
+            if [[ "$value" =~ ^\"(.*)\"[[:space:]]*(#.*)?$ || "$value" =~ ^\'(.*)\'[[:space:]]*(#.*)?$ ]]; then
                 value=${BASH_REMATCH[1]}
             else
                 value=${value%%[[:space:]]#*}
@@ -41,16 +42,16 @@ LOAD_ENV := '''for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && e
             [ -n "${!key:-}" ] || printf -v "$key" '%s' "$value"
         done < "''' + ENV_FILE + '''"
     fi
-    : "${HELPER_IMAGE:=alpine:3.22.2}" "${BASE_IMAGE:=nntmux/base:local}" "${APP_IMAGE:=nntmux/app:local}"
+    : "${COMPOSE_FILE:=''' + CURDIR + '''/docker-compose.yml}" "${HELPER_IMAGE:=alpine:3.22.2}" "${BASE_IMAGE:=nntmux/base:local}" "${APP_IMAGE:=nntmux/app:local}"
     : "${DEPLOY_MIN_INTERVAL:=900}" "${DEPLOY_DRAIN_TIMEOUT:=90}" "${DEPLOY_SCHEDULER_DRAIN_TIMEOUT:=1800}" "${DEPLOY_HEALTH_TIMEOUT:=240}"
-    export HELPER_IMAGE BASE_IMAGE APP_IMAGE DEPLOY_MIN_INTERVAL DEPLOY_DRAIN_TIMEOUT DEPLOY_SCHEDULER_DRAIN_TIMEOUT DEPLOY_HEALTH_TIMEOUT
+    export COMPOSE_FILE DEPLOY_BY HELPER_IMAGE BASE_IMAGE APP_IMAGE DEPLOY_MIN_INTERVAL DEPLOY_DRAIN_TIMEOUT DEPLOY_SCHEDULER_DRAIN_TIMEOUT DEPLOY_HEALTH_TIMEOUT
     for key in WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE DEPLOY_LEGACY_DRAIN_TIMEOUT; do [ -z "${!key:-}" ] || export "$key"; done'''
 
 DATA_DIRS := "data/storage data/install data/mariadb data/redis data/manticore data/caddy/data data/caddy/config data/prometheus data/grafana logs/mariadb logs/manticore logs/caddy backups"
 
 # Show available stack recipes
 help *args:
-    @just --list --justfile "{{justfile()}}"
+    @just --list --justfile "{{module_file()}}"
 
 # Generate docker/.env and config/app.env (secrets, NNTP creds); safe to re-run
 env *args:
@@ -58,7 +59,7 @@ env *args:
     set -euo pipefail
     {{LOAD_ENV}}
     "{{CURDIR}}/bin/generate-env"
-    just --justfile "{{justfile()}}" --working-directory "{{CURDIR}}" perms "$@"
+    just --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" perms "$@"
 
 # Create bind-mount directories
 dirs *args:
@@ -72,7 +73,7 @@ perms *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    just --justfile "{{justfile()}}" --working-directory "{{CURDIR}}" dirs "$@"
+    just --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" dirs "$@"
     if [ "$(uname -s)" = Linux ]; then
         docker run --rm -v "{{CURDIR}}:/stack" "$HELPER_IMAGE" sh -c \
             "chown -R 33:33 /stack/data/storage /stack/data/install && chown $(id -u):33 /stack/config/app.env && chmod 0640 /stack/config/app.env"
@@ -170,9 +171,9 @@ init *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    just --justfile "{{justfile()}}" --working-directory "{{CURDIR}}" env "$@"
-    just --justfile "{{justfile()}}" --working-directory "{{CURDIR}}" dirs "$@"
-    just --justfile "{{justfile()}}" --working-directory "{{CURDIR}}" build "$@"
+    just --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" env "$@"
+    just --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" dirs "$@"
+    just --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" build "$@"
     "{{CURDIR}}/bin/compose" up -d --wait mariadb redis manticore mailpit
     if [ -f "{{CURDIR}}/data/install/install.lock" ]; then
         echo "install.lock present; skipping nntmux:deploy-init"
@@ -180,7 +181,7 @@ init *args:
         "{{CURDIR}}/bin/compose" run --rm --no-deps web php artisan nntmux:deploy-init --no-interaction
     fi
     "{{CURDIR}}/bin/compose" run --rm --no-deps web php artisan monitoring:install --sail --no-interaction
-    just --justfile "{{justfile()}}" --working-directory "{{CURDIR}}" seed-db "$@"
+    just --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" seed-db "$@"
     "{{CURDIR}}/bin/compose" run --rm --no-deps web php artisan predb:import-feed --pages=20 || true
     "{{CURDIR}}/bin/compose" up -d
     echo "NNTmux: http://localhost:${APP_PORT:-8080}  (admin password: grep ADMIN_PASS docker/config/app.env)"
@@ -199,7 +200,7 @@ seed *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    just --justfile "{{justfile()}}" --working-directory "{{CURDIR}}" seed-db "$@"
+    just --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" seed-db "$@"
     "{{CURDIR}}/bin/compose" restart indexer
 
 # First bringup, or safe guarded deploy when app containers already exist

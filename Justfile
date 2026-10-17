@@ -27,6 +27,10 @@ HOST_UID := `id -u`
 HOST_GID := `id -g`
 MONITORING_KEY := "storage/app/monitoring/public/grafana-jwt.pub"
 MONITORING_SERVICES := "prometheus pushgateway grafana node-exporter mysqld-exporter redis-exporter"
+# Every Compose call gets the search profile and, once monitoring is installed, its overlay (as the
+# former Makefile exported globally).
+COMPOSE_ENV := 'export COMPOSE_PROFILES="${COMPOSE_PROFILES:-' + SEARCH_DRIVER + '}"; if [ -z "${COMPOSE_FILE:-}" ] && [[ "' + MONITORING_ENABLED + '" =~ ^(true|1|yes)$ ]] && [ -f "' + MONITORING_KEY + '" ]; then export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"; fi'
+MONITORING_COMPOSE := '$DOCKER_COMPOSE -f docker-compose.yml -f docker-compose.monitoring.yml $(IFS=,; for profile in $COMPOSE_PROFILES; do printf -- "--profile %s " "$profile"; done)'
 
 # Show available recipes
 help *args:
@@ -302,64 +306,64 @@ test *args:
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
     if [ -n "${filter:-}" ]; then
-        php artisan test --compact "--filter=${filter}"
+        "$SAIL" test "--filter=${filter}"
     else
-        php artisan test --compact
+        "$SAIL" test
     fi
 
 # Run Laravel Pint code formatter on dirty files
 pint *args:
-    @./vendor/bin/pint --dirty
+    @$SAIL pint --dirty
 
 # Run Laravel Pint on all files
 pint-all *args:
-    @./vendor/bin/pint
+    @$SAIL pint
 
 # Run PHPStan static analysis
 phpstan *args:
-    @./vendor/bin/phpstan analyse --memory-limit=2G
+    @$SAIL php vendor/bin/phpstan analyse --memory-limit=2G
 
 # Run Rector in dry-run mode (no changes written)
 rector *args:
-    @./vendor/bin/rector process --dry-run
+    @$SAIL php vendor/bin/rector process --dry-run
 
 # Apply Rector refactorings
 rector-fix *args:
-    @./vendor/bin/rector process
+    @$SAIL php vendor/bin/rector process
 
 # ── Frontend ─────────────────────────────────────────────────
 
-# Run npm install and build
+# Run npm install and build inside the container
 npm-build *args:
-    @npm install
-    @npm run build
+    @$SAIL npm install
+    @$SAIL npm run build
 
-# Start Vite dev server
+# Start Vite dev server inside the container
 npm-dev *args:
-    @npm run dev
+    @$SAIL npm run dev
 
 # Regenerate TypeScript types from PHP DTOs/Enums
 ts-types *args:
-    @php artisan typescript:transform
+    @$SAIL artisan typescript:transform
 
 # CI: regenerate TS types and fail if working tree drifts
 ts-types-check *args:
-    @php artisan typescript:transform --quiet
+    @$SAIL artisan typescript:transform --quiet
     @git diff --exit-code resources/js/types/generated.d.ts || (echo "❌ resources/js/types/generated.d.ts is out of date — run 'just ts-types' and commit." && exit 1)
 
-# Cache spatie/laravel-data structures
+# Cache spatie/laravel-data structures (run on deploy)
 data-cache *args:
-    @php artisan data:cache-structures
+    @$SAIL artisan data:cache-structures
 
 # ── Dependencies ─────────────────────────────────────────────
 
-# Run composer install
+# Run composer install inside the container
 composer-install *args:
-    @composer install
+    @$SAIL composer install
 
-# Run composer update
+# Run composer update inside the container
 composer-update *args:
-    @composer update
+    @$SAIL composer update
 
 # ── Database / Services ──────────────────────────────────────
 
@@ -394,18 +398,24 @@ monitoring-up *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{SEARCH_DRIVER}}}"
+    {{COMPOSE_ENV}}
     just --justfile "{{justfile()}}" check-env
     if [ ! -f "{{MONITORING_KEY}}" ]; then echo "✘ No Grafana JWT key. Run: php artisan monitoring:install --sail"; exit 1; fi
-    $DOCKER_COMPOSE -f docker-compose.yml -f docker-compose.monitoring.yml up -d
+    {{MONITORING_COMPOSE}} up -d
 
 # Stop and remove only the monitoring containers
 monitoring-down *args:
-    @$DOCKER_COMPOSE -f docker-compose.yml -f docker-compose.monitoring.yml rm --stop --force {{MONITORING_SERVICES}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{COMPOSE_ENV}}
+    {{MONITORING_COMPOSE}} rm --stop --force {{MONITORING_SERVICES}}
 
 # Follow logs of the monitoring containers
 monitoring-logs *args:
-    @$DOCKER_COMPOSE -f docker-compose.yml -f docker-compose.monitoring.yml logs -f --tail=100 {{MONITORING_SERVICES}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{COMPOSE_ENV}}
+    {{MONITORING_COMPOSE}} logs -f --tail=100 {{MONITORING_SERVICES}}
 
 # ── Logs & Status ────────────────────────────────────────────
 
@@ -441,15 +451,24 @@ ps *args:
 
 # Show running processes inside each container
 top *args:
-    @$DOCKER_COMPOSE top
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{COMPOSE_ENV}}
+    $DOCKER_COMPOSE top
 
 # Show images used by each service
 images *args:
-    @$DOCKER_COMPOSE images
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{COMPOSE_ENV}}
+    $DOCKER_COMPOSE images
 
 # Show healthcheck status for each service
 health *args:
-    @$DOCKER_COMPOSE ps --format json 2>/dev/null | awk -F'"' '/"Service"/ {svc=$4} /"Health"/ {print svc": "$4}' | sort -u || $DOCKER_COMPOSE ps
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{COMPOSE_ENV}}
+    $DOCKER_COMPOSE ps --format json 2>/dev/null | awk -F'"' '/"Service"/ {svc=$4} /"Health"/ {print svc": "$4}' | sort -u || $DOCKER_COMPOSE ps
 
 # ── Cleanup ──────────────────────────────────────────────────
 

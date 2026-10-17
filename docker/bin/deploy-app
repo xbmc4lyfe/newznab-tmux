@@ -21,6 +21,8 @@ verify
 eval "$("$DIR/bin/deploy-plan" --deploy-actions)"
 
 if [ "$MODE" = "noop" ]; then
+    # Nothing rolled out: let the guard stamp the new fingerprint without recording a deployment.
+    if [ -n "${DEPLOY_NOOP_MARKER:-}" ]; then : >"$DEPLOY_NOOP_MARKER"; fi
     exit 0
 fi
 

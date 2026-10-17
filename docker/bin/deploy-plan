@@ -155,8 +155,9 @@ def classify_path(rel_path: str) -> tuple[str, ...]:
         # Tracked via rendered compose config --format json per service.
         return ()
 
-    # Mounted service configuration is fingerprinted through the rendered Compose bind sources.
-    if any(rel_path.startswith(prefix) for prefix, _ in LEGACY_CONFIG_OWNERS):
+    # Outside the image build context (.dockerignore). Runtime env files feed the configuration
+    # hashes and mounted service configuration the rendered Compose bind sources.
+    if rel_path.startswith(("docker/.env", "docker/config/", "docker/monitoring/")):
         return ()
 
     if rel_path.startswith("database/migrations/"):
@@ -277,7 +278,9 @@ def service_top_level_compose_deps(parsed: dict[str, object], svc_cfg: object) -
         if referenced:
             deps[section] = {k: top_sec[k] for k in sorted(referenced) if k in top_sec}
     for key, val in parsed.items():
-        if key not in ("services", "networks", "volumes", "configs", "secrets"):
+        # `x-*` extension blocks are already merged into the services that reference them; hashing
+        # them for every service would make an app-only edit recreate stateful services.
+        if key not in ("services", "networks", "volumes", "configs", "secrets") and not key.startswith("x-"):
             deps[f"top:{key}"] = val
     return deps
 

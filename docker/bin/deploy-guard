@@ -259,7 +259,9 @@ cmd_run() {
     # shared checkout did not change in the meantime; otherwise the image holds older bytes than the stamp.
     before=$(fingerprint)
     DEPLOY_EXPECTED_FINGERPRINT="$before"
-    export DEPLOY_EXPECTED_FINGERPRINT
+    DEPLOY_NOOP_MARKER="$STAMP.noop.$$"
+    [ ! -e "$DEPLOY_NOOP_MARKER" ] || rm -f "$DEPLOY_NOOP_MARKER"
+    export DEPLOY_EXPECTED_FINGERPRINT DEPLOY_NOOP_MARKER
     check_recovery_hold
     if "$@"; then rc=0; else rc=$?; fi
     if [ "$rc" -eq 0 ] && [ "${STAMP_ON_SUCCESS:-0}" = 1 ]; then
@@ -269,7 +271,11 @@ cmd_run() {
         if "$DIR/bin/deploy-plan" --stamp-data "$target" >"$stamp_tmp" \
             && [ "$(head -n 1 "$stamp_tmp")" = "$before" ]; then
             mv -f "$stamp_tmp" "$STAMP"
-            if [ "${RECORD_DEPLOY_TIME:-0}" = 1 ]; then date +%s >"$SUCCESS_TIME"; fi
+            if [ -f "$DEPLOY_NOOP_MARKER" ]; then
+                noop=1
+            elif [ "${RECORD_DEPLOY_TIME:-0}" = 1 ]; then
+                date +%s >"$SUCCESS_TIME"
+            fi
         else
             # Keep the previous per-service record so the next run redeploys only what changed instead
             # of treating the stack as a first installation, but invalidate its fingerprint so it can
@@ -283,7 +289,12 @@ cmd_run() {
             rc=76
         fi
     fi
-    log "$target" "result=finished rc=$rc"
+    [ ! -e "$DEPLOY_NOOP_MARKER" ] || rm -f "$DEPLOY_NOOP_MARKER"
+    if [ "${noop:-0}" = 1 ]; then
+        log "$target" "result=skipped (no service affected; stamped without a rollout)"
+    else
+        log "$target" "result=finished rc=$rc"
+    fi
     exit "$rc"
 }
 

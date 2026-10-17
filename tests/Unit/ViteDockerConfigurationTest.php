@@ -165,6 +165,15 @@ class ViteDockerConfigurationTest extends TestCase
         }
     }
 
+    public function test_container_quality_and_dependency_recipes_still_run_through_sail(): void
+    {
+        foreach (['test', 'pint', 'pint-all', 'phpstan', 'rector', 'rector-fix', 'npm-build', 'npm-dev', 'ts-types', 'ts-types-check', 'data-cache', 'composer-install', 'composer-update'] as $recipe) {
+            $process = new Process(['just', '--dry-run', $recipe], __DIR__.'/../..');
+            $process->mustRun();
+            $this->assertMatchesRegularExpression('/\$SAIL"? /', $process->getOutput().$process->getErrorOutput(), "{$recipe} must run inside the Sail container.");
+        }
+    }
+
     public function test_vite_uses_the_docker_published_port_without_fallback(): void
     {
         $viteConfig = $this->projectFile('vite.config.js');

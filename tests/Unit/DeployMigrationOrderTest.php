@@ -786,6 +786,66 @@ SH);
         }
     }
 
+    public function test_root_module_invocation_uses_the_docker_directory_and_never_the_laravel_env(): void
+    {
+        file_put_contents($this->directory.'/Justfile', "mod docker 'docker/Justfile'\n");
+        file_put_contents($this->directory.'/.env', "WEB_IMAGE=leaked/web:1\nDB_ROOTPASSWORD=leaked\n");
+        $process = new Process(['just', 'docker', 'build', 'DEPLOY_BY=fixture'], $this->directory, [
+            'PATH' => $this->directory.'/bin:'.getenv('PATH'), 'NNTMUX_DEPLOY_EVENTS' => $this->directory.'/events',
+            'NNTMUX_REPO' => $this->directory,
+        ]);
+        $process->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('build --target selfhosted-web -t nntmux/web:local', $events);
+        $this->assertStringContainsString('COMPOSE_FILE='.realpath($this->directory).'/docker/docker-compose.yml', $events);
+        $this->assertStringNotContainsString('leaked', $events);
+        $this->assertFileExists($this->directory.'/docker/.build.stamp');
+    }
+
+    public function test_compose_file_from_docker_env_is_used_below_the_environment(): void
+    {
+        file_put_contents($this->directory.'/docker/.env', "COMPOSE_FILE=/stack/base.yml:/stack/override.yml\n");
+        $this->make(['deploy-plan'])->mustRun();
+        $this->assertStringContainsString('COMPOSE_FILE=/stack/base.yml:/stack/override.yml ', $this->events());
+
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy-plan'], ['COMPOSE_FILE' => '/caller.yml'])->mustRun();
+        $this->assertStringContainsString('COMPOSE_FILE=/caller.yml ', $this->events());
+        $this->assertStringNotContainsString('override.yml', $this->events());
+    }
+
+    public function test_shared_app_extension_block_changes_never_recreate_data_or_infra(): void
+    {
+        $config = fn (string $value): array => ['NNTMUX_CONFIG_ID' => substr($this->composeJson(), 0, -1).',"x-app":{"environment":{"PULSE_ENABLED":"'.$value.'"}}}'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('false'))->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('true'))->mustRun();
+        $events = $this->events();
+        $this->assertStringNotContainsString('redis', $events);
+        $this->assertStringNotContainsString('proxy', $events);
+    }
+
+    public function test_fingerprint_change_without_an_affected_service_is_not_logged_as_a_rollout(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/docker/.deploy.time', '1000');
+        file_put_contents($this->directory.'/events', '');
+        file_put_contents($this->directory.'/docker/.env', "DB_ROOTPASSWORD=rotated\n");
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->assertStringNotContainsString(' up -d', $this->events());
+        $this->assertSame('1000', trim((string) file_get_contents($this->directory.'/docker/.deploy.time')));
+        $log = (string) file_get_contents($this->directory.'/docker/.deploy.log');
+        $this->assertStringContainsString('result=skipped (no service affected; stamped without a rollout)', $log);
+        $this->assertSame([], glob($this->directory.'/docker/.deploy.stamp.noop.*') ?: []);
+
+        // The new fingerprint is stamped, so the next poll skips outright.
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->assertStringNotContainsString('build --target', $this->events());
+    }
+
     public function test_external_image_replacement_or_tag_change_invalidates_build_stamp(): void
     {
         $this->make(['build'], ['NNTMUX_IMAGE_ID' => 'sha256:first-build'])->mustRun();
