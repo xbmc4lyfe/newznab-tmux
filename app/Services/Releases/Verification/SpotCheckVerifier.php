@@ -29,7 +29,8 @@ final class SpotCheckVerifier
         $inventory = new CandidateHeaderInventory;
         $assessment = $inventory->assessment($manifest);
         if ($assessment['reason'] !== null) {
-            return new VerificationResult('unknown', $assessment['reason'], waitingForHeaders: $assessment['status'] === 'waiting_upload');
+            return new VerificationResult('unknown', $assessment['reason'], waitingForHeaders: $assessment['status'] === 'waiting_upload',
+                headerRejected: $assessment['status'] === CandidateHeaderInventory::REJECTED);
         }
 
         $articleLimit = max(0, min(16, (int) ($this->options['spot_check_articles'] ?? 1)));

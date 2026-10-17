@@ -128,16 +128,25 @@ class VerifyReleaseCandidates extends Command
                     $diagnostics?->stop('draining', hrtime(true));
                     break;
                 }
-                $preferReady = $locks->preferReady();
-                $diagnostics?->claimCalled();
-                $claim = $repository->claim(fn (int $id): bool => $locks->tryCandidate($id), $preferReady);
+                $phase = $diagnostics === null ? null : hrtime(true);
+                try {
+                    $preferReady = $locks->preferReady();
+                    $diagnostics?->claimCalled();
+                    $claim = $repository->claim(fn (int $id): bool => $locks->tryCandidate($id), $preferReady);
+                } finally {
+                    // Also on a throwing claim, which the outer handler reports as fatal.
+                    $diagnostics?->phase('claim', $phase);
+                }
                 if ($claim === null) {
                     $diagnostics?->stop('no_claim', hrtime(true));
                     break;
                 }
                 $diagnostics?->claimed();
                 $directory = $root.'/scratch/'.$claim->id.'-'.$claim->version;
+                // The phase charged if an operation throws.
+                $active = 'bookkeeping';
                 try {
+                    $phase = $diagnostics === null ? null : hrtime(true);
                     $heartbeat = static fn () => $repository->heartbeat((int) $claim->id, $claim->lease_token);
                     $heartbeat();
                     $progressHeartbeat = new LeaseHeartbeat($heartbeat, max(0.1, min(30, (int) config('release_verification.lease_seconds') / 3)));
@@ -160,14 +169,20 @@ class VerifyReleaseCandidates extends Command
                         $scratchInventory->forget((int) $old->id);
                     }
                     $heartbeat();
+                    $phase = $diagnostics?->phase('bookkeeping', $phase);
+                    $active = 'manifest_read';
                     $manifest = $store->read($claim->manifest_path);
+                    $phase = $diagnostics?->phase('manifest_read', $phase);
+                    $active = 'verify_other';
                     $started = microtime(true);
                     $result = $verifier->verify($manifest, $progressHeartbeat);
+                    $phase = $diagnostics?->phase($result->passed() ? 'verify_passed' : 'verify_other', $phase);
+                    $active = $result->passed() ? 'publish' : 'finish';
                     $diagnostics?->verified($result->verdict);
                     if ($result->passed()) {
-                        $released = config('release_verification.publish_url')
+                        $published = config('release_verification.publish_url')
                             ? app(RemoteReleasePublisher::class)->publish($claim, $result) : $publisher->publish($claim, $result);
-                        if ($released === null) {
+                        if ($published === null) {
                             $result = $this->filteredResult($claim) ?? throw new RuntimeException('Publication did not produce a verified current release.');
                             $diagnostics?->filtered();
                         } else {
@@ -176,10 +191,15 @@ class VerifyReleaseCandidates extends Command
                         if (File::deleteDirectory($directory) || (! file_exists($directory) && ! is_link($directory))) {
                             $scratchInventory->forget($scratchEntryId);
                         }
+                        // Publication includes its filtered-result recovery and scratch removal.
+                        $phase = $diagnostics?->phase('publish', $phase);
                     } else {
                         $repository->finish($claim, $result);
+                        $phase = $diagnostics?->phase('finish', $phase);
                         $diagnostics?->finished();
                     }
+                    $phase = $diagnostics === null ? null : hrtime(true);
+                    $active = 'status_write';
                     $bytes = $result->passed()
                         ? (int) ($result->manifest['spot_check']['bytes'] ?? $result->manifest['verified_bytes'] ?? 0) : 0;
                     $snapshot = json_encode(['verified_bytes_per_second' => $bytes / max(0.001, microtime(true) - $started),
@@ -194,15 +214,26 @@ class VerifyReleaseCandidates extends Command
                             unlink($statusTemporary);
                         }
                     }
+                    $phase = $diagnostics?->phase('status_write', $phase);
+                    $active = null;
                     $this->line($claim->id.': '.$result->verdict.' — '.$result->reason);
                 } catch (Throwable $error) {
+                    // Time spent in the operation that threw, under its own phase.
+                    if ($active !== null) {
+                        $diagnostics?->phase($active, $phase);
+                    }
                     $diagnostics?->candidateFailed();
                     $filtered = $this->filteredResult($claim);
                     if ($filtered !== null) {
                         $diagnostics?->filtered();
                         $this->line($claim->id.': '.$filtered->verdict.' — '.$filtered->reason);
                     } else {
-                        $repository->finish($claim, new VerificationResult('unknown', $error->getMessage()));
+                        $recovery = $diagnostics === null ? null : hrtime(true);
+                        try {
+                            $repository->finish($claim, new VerificationResult('unknown', $error->getMessage()));
+                        } finally {
+                            $diagnostics?->phase('finish', $recovery);
+                        }
                         $diagnostics?->finished();
                         $this->warn($claim->id.': retry pending — '.$error->getMessage());
                     }
