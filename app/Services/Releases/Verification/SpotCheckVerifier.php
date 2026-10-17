@@ -60,13 +60,17 @@ final class SpotCheckVerifier
             $heartbeat();
             $remaining = min($articleByteLimit, $byteLimit - $bytes);
             if ($remaining < 1) {
-                return new VerificationResult('unknown', 'Spot-check transfer budget is exhausted.');
+                return self::deterministic('Spot-check transfer budget is exhausted.');
             }
             $raw = $this->source instanceof NntpArticleSource
                 ? $this->source->fetchBounded($segment['messageid'], $remaining)
                 : $this->source->fetch($segment['messageid']);
-            if ($raw === '' || strlen($raw) > $articleByteLimit || $bytes + strlen($raw) > $byteLimit) {
-                return new VerificationResult('unknown', 'Spot-check article exceeded the configured transfer budget.');
+            // An empty response is a fetch problem, not a property of the article.
+            if ($raw === '') {
+                return new VerificationResult('unknown', 'Spot-check article was empty; retry verification later.');
+            }
+            if (strlen($raw) > $articleByteLimit || $bytes + strlen($raw) > $byteLimit) {
+                return self::deterministic('Spot-check article exceeded the configured transfer budget.');
             }
             $article = VerifiedArticle::decode($raw, $this->decoder);
             if ($article->part !== $segment['number'] || $article->size < 1
