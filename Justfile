@@ -270,6 +270,7 @@ optimize *args:
 
 # Production optimize: cache config / routes / views + data structures
 optimize-deploy *args:
+    @echo "⚠  This caches absolute paths from inside the container — only run on the deploy host."
     @$SAIL artisan config:cache
     @$SAIL artisan route:cache
     @$SAIL artisan view:cache

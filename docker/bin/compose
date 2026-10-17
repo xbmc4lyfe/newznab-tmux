@@ -13,9 +13,13 @@ env_file = stack / ".env"
 file_env: dict[str, str] = {}
 if env_file.is_file():
     for raw in env_file.read_text(encoding="utf-8", errors="surrogateescape").splitlines():
-        m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$", raw)
+        # Same rules as the Justfile's LOAD_ENV: optional `export`, quoted values with an optional
+        # trailing comment, and unquoted values ending at an inline ` #` comment.
+        m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", raw)
         if m:
-            file_env[m.group(1)] = m.group(2).strip()
+            value = m.group(2)
+            quoted = re.match(r"""^(["'])(.*)\1\s*(?:#.*)?$""", value)
+            file_env[m.group(1)] = quoted.group(2) if quoted else re.sub(r"\s#.*$", "", value).strip()
 
 app_img = os.environ.get("APP_IMAGE") or file_env.get("APP_IMAGE") or "nntmux/app:local"
 if app_img != "nntmux/app:local":

@@ -961,6 +961,54 @@ SH);
         $this->assertSame($stamp, (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
     }
 
+    public function test_dockerignore_and_copy_rules_match_docker_semantics(): void
+    {
+        file_put_contents($this->directory.'/.dockerignore', "*.md\nsecret/\napp/**/*.cache\napp/**x*\n!app/keep/x.cache\n/storage\n");
+        file_put_contents($this->directory.'/Dockerfile', "FROM scratch\nCOPY app /app/app\nCOPY --from=build /x /y\nCOPY \\\n  docker/app/bin/scheduler.py /s.py\n");
+        $process = new Process([$this->directory.'/docker/bin/deploy-plan', '--classify',
+            'README.md', 'app/README.md', 'app/a/b.cache', 'app/b.cache', 'app/keep/x.cache', 'app/fooxbar.php', 'app/sub/x.php',
+            'app/Http/Kernel.php', 'secret/app.php', 'storage/logs/x', 'routes/web.php', 'docker/app/bin/scheduler.py', 'Dockerfile',
+        ], env: ['DEPLOY_REPO' => $this->directory]);
+        $process->mustRun();
+        $expected = [
+            'README.md -', // root-level docs
+            'app/README.md shared-app', // nested docs inside a copied tree are image inputs
+            'app/a/b.cache -', 'app/b.cache -', // `**/` matches zero or more directories
+            'app/keep/x.cache shared-app', // `!` re-includes, last match wins
+            'app/fooxbar.php shared-app', 'app/sub/x.php -', // `**x*` is (.*/)?x[^/]*, as in moby
+            'app/Http/Kernel.php shared-app', 'secret/app.php -', 'storage/logs/x -',
+            'routes/web.php -', // in the context but never copied
+            'docker/app/bin/scheduler.py scheduler', 'Dockerfile shared-app',
+        ];
+        $this->assertSame($expected, explode("\n", trim($process->getOutput())));
+    }
+
+    public function test_read_only_directory_mounted_from_outside_the_project_is_content_hashed(): void
+    {
+        mkdir($this->directory.'/outside/certs', 0777, true);
+        file_put_contents($this->directory.'/outside/certs/ca.pem', "one\n");
+        $proxy = ['volumes' => [['type' => 'bind', 'source' => $this->directory.'/outside/certs', 'target' => '/certs', 'read_only' => true]]];
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['web' => [], 'horizon' => [], 'scheduler' => [], 'indexer' => [], 'proxy' => $proxy]], JSON_UNESCAPED_SLASHES)];
+        file_put_contents($this->directory.'/.gitignore', "/outside\n", FILE_APPEND);
+        (new Process(['git', 'commit', '-q', '-am', 'outside mounts'], $this->directory))->mustRun();
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        file_put_contents($this->directory.'/outside/certs/ca.pem', "two\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+    }
+
+    public function test_compose_wrapper_parses_docker_env_like_compose(): void
+    {
+        file_put_contents($this->directory.'/docker/.env', "APP_IMAGE=\"registry/app:1\" # pinned\nexport HORIZON_IMAGE='registry/horizon:2'\n");
+        $process = new Process([$this->directory.'/docker/bin/compose'], env: ['DC' => 'env', 'PATH' => getenv('PATH')]);
+        $process->mustRun();
+        $this->assertStringContainsString("\nWEB_IMAGE=registry/app:1\n", "\n".$process->getOutput());
+        // An explicit role tag is left for Compose to read from .env, never replaced by APP_IMAGE.
+        $this->assertStringNotContainsString("\nHORIZON_IMAGE=", "\n".$process->getOutput());
+    }
+
     public function test_external_image_replacement_or_tag_change_invalidates_build_stamp(): void
     {
         $this->make(['build'], ['NNTMUX_IMAGE_ID' => 'sha256:first-build'])->mustRun();

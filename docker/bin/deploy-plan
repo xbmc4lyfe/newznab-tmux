@@ -154,11 +154,11 @@ class BuildContext:
             char = pattern[i]
             if pattern.startswith("**", i):
                 i += 2
+                # moby/patternmatcher: `**` (and a following separator) matches any directories,
+                # or everything when it ends the pattern.
                 if pattern.startswith("/", i):
-                    regex += "(?:.*/)?"
                     i += 1
-                else:
-                    regex += ".*"
+                regex += ".*" if i >= len(pattern) else "(?:.*/)?"
                 continue
             if char == "*":
                 regex += "[^/]*"
@@ -235,7 +235,8 @@ def classify_path(rel_path: str) -> tuple[str, ...]:
         return ("shared-app",)
     if rel_path in ("Dockerfile", ".dockerignore"):
         return ("shared-app",)
-    if rel_path.endswith(".md") or rel_path in IGNORED_EXACT:
+    # Root-level documentation only; nested .md files inside copied directories are image inputs.
+    if ("/" not in rel_path and rel_path.endswith(".md")) or rel_path in IGNORED_EXACT:
         return ()
     # Mounted service configuration is fingerprinted through the rendered Compose bind sources,
     # and runtime env files through the configuration hashes; neither can change an image.
@@ -403,6 +404,10 @@ def project_directory(docker_dir: Path) -> Path:
     return docker_dir.resolve()
 
 
+HOST_SYSTEM_DIRS = {"/"}
+HOST_SYSTEM_PREFIXES = ("/proc", "/sys", "/dev", "/run", "/var/run", "/private/var/run")
+
+
 def bind_source_record(source: str, read_only: bool, project_dir: Path) -> str:
     """Content of a bind-mounted configuration source: any file, or a read-only directory inside the
     Compose project (data, log and host-system directories are not configuration). Anything that
@@ -423,7 +428,8 @@ def bind_source_record(source: str, read_only: bool, project_dir: Path) -> str:
         if not path.is_dir():
             return f"other {source}"
         resolved = path.resolve()
-        if not read_only or not resolved.is_relative_to(project_dir):
+        # Writable mounts are data or logs; host-system trees are observed, not configuration.
+        if not read_only or str(resolved) in HOST_SYSTEM_DIRS or str(resolved).startswith(HOST_SYSTEM_PREFIXES):
             return f"dir {source}"
         lines: list[str] = []
         for root, dirs, files in os.walk(resolved, onerror=walk_error):
@@ -888,7 +894,7 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path) -> dict[
     else:
         mode = "selective"
 
-    build_targets = compute_build_targets(repo, docker_dir, Path(os.environ.get("DEPLOY_BUILD_STAMP", docker_dir / ".build.stamp")))
+    build_targets = compute_build_targets(repo, docker_dir, docker_dir / ".build.stamp")
 
     return {
         "mode": mode,
@@ -914,6 +920,12 @@ def main() -> None:
     stamp_path = Path(os.environ.get("DEPLOY_STAMP", docker_dir / ".deploy.stamp"))
 
     cmd = sys.argv[1] if len(sys.argv) > 1 else "--explain"
+
+    if cmd == "--classify":
+        # Operator/test aid: print each path's ownership buckets ("-" when it cannot reach an image).
+        for rel_path in sys.argv[2:]:
+            print(f"{rel_path} {','.join(classify_path(rel_path)) or '-'}")
+        return
 
     if cmd == "--fingerprint":
         state = compute_state(repo, docker_dir, include_compose=False)

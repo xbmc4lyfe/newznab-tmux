@@ -68,20 +68,20 @@ Each step is independent and reversible. Take them in order, and check the metri
 
 **Step 1: settings only (no code).**
 - Lower `min_size_to_post_process` from 50 MB to 10 MB. Watch load and NNTP connection use for an hour before going lower.
-- Lower the full-backlog interval from 60 to 30 minutes by setting `TMUX_FIX_NAMES_FULL_INTERVAL=30`. This is read from the environment at bootstrap by the long-lived `tmux:monitor`, so it only takes effect after the indexer restarts (`make -C docker restart s=indexer`, as part of a single deploy). (Raising `fix_names_per_run` only speeds the PreDB full-text pass, so it is not part of this step.)
+- Lower the full-backlog interval from 60 to 30 minutes by setting `TMUX_FIX_NAMES_FULL_INTERVAL=30`. This is read from the environment at bootstrap by the long-lived `tmux:monitor`, so it only takes effect after the indexer restarts (`just --justfile docker/Justfile restart s=indexer`, as part of a single deploy). (Raising `fix_names_per_run` only speeds the PreDB full-text pass, so it is not part of this step.)
 - Rollback is operational only: restoring the 50 MB gate stops the newly admitted 10 to 50 MB candidates and the extra load. It does not undo work already done in the meantime (`passwordstatus` and `haspreview` updates, release-file and media rows), which stay.
 
 **Step 2: let fix-names cover all categories (small code change).**
 - Make the category in `TmuxTaskRunner.php` configurable: `tmux.fix_names.category` in `config/tmux.php`, backed by a new `TMUX_FIX_NAMES_CATEGORY` key (default `other`, so behavior is unchanged until set to `all`). Add the key with that default and a short comment to `.env.example`.
 - Run a one-off pass outside peak load, then switch the setting. It runs inside the Docker stack (the app environment is `docker/config/app.env` and `mariadb` only resolves on the Compose network). `releases:fix-names` takes one method number from 3 to 20 per call, so loop, and stop at the first failure so a skipped source (methods 7 and 8 need NNTP) is never reported as done:
-  `for level in 11 12 17 18 3 4 5 6 7 8 9 10 13 14 15 16 19 20; do make -C docker artisan cmd="releases:fix-names $level --update --category=all --set-status" || exit 1; done`
+  `for level in 11 12 17 18 3 4 5 6 7 8 9 10 13 14 15 16 19 20; do just --justfile docker/Justfile artisan cmd="releases:fix-names $level --update --category=all --set-status" || exit 1; done`
 - Order matters: with `--set-status`, the generic file and uid passes (methods 5, 6, 9, 10) set `proc_files` and `proc_uid` flags that the specialized passes (11, 12, 17, 18) also use to pick candidates, so the specialized ones run first in this loop. Confirm the exact flag dependencies in the implementation PR, and check the scheduled order in `TmuxTaskRunner` (ascending 3 to 20) for the same issue.
 - Change the work predicate too. `Tmux::getTableCount(1)` computes `processrenames` from `Category::getCategoryOthersGroup()`, and `TmuxTaskRunner::runFixNamesTask()` only adds the recent (odd) passes when that count is nonzero. With `all`, count candidates across all categories (or run the recent passes unconditionally), otherwise non-Other work waits for a full-backlog slot.
 - Tests: the task builds the right command for each value, and the recent passes are scheduled when only a non-Other release is pending.
 
 **Step 3: relieve CPU.**
 - Decide the trade-off with the owner: more CPU for the indexer, or fewer backfill and post-processing threads while the backlog clears.
-- Apply any change that needs a container restart through one deploy. `make -C docker deploy` comes from the deploy guard PR (xbmc4lyfe/newznab-tmux#27); until that merges, a single designated session runs `make -C docker build` and then `make -C docker up` (not the root Makefile, which is the Sail stack).
+- Apply any change that needs a container restart through one deploy. The deployment owner runs `just --justfile docker/Justfile deploy` (not the root Justfile, which is the Sail stack).
 
 **Step 4: optional tuning after the backlog shrinks.**
 - Raise `max_additional_processed` and `max_nfo_processed` from 100 to 250 only after re-forecasting load with the per-cycle figure from bottleneck 5 (up to about 16,000 releases per cycle).
