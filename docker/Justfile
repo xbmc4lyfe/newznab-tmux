@@ -53,7 +53,7 @@ LOAD_ENV := '''for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && e
     # Like the former Makefile, a DC line in docker/.env replaces the default Compose command.
     : "${DC:=docker compose --project-directory ''' + quote(CURDIR) + '''}"
     : "${COMPOSE_FILE:=''' + CURDIR + '''/docker-compose.yml}" "${HELPER_IMAGE:=alpine:3.22.2}" "${BASE_IMAGE:=nntmux/base:local}" "${APP_IMAGE:=nntmux/app:local}"
-    : "${DEPLOY_MIN_INTERVAL:=900}" "${DEPLOY_DRAIN_TIMEOUT:=90}" "${DEPLOY_SCHEDULER_DRAIN_TIMEOUT:=1800}" "${DEPLOY_HEALTH_TIMEOUT:=240}"
+    : "${DEPLOY_MIN_INTERVAL:=900}" "${DEPLOY_DRAIN_TIMEOUT:=900}" "${DEPLOY_SCHEDULER_DRAIN_TIMEOUT:=1800}" "${DEPLOY_HEALTH_TIMEOUT:=240}"
     export COMPOSE_FILE DC DEPLOY_BY HELPER_IMAGE BASE_IMAGE APP_IMAGE DEPLOY_MIN_INTERVAL DEPLOY_DRAIN_TIMEOUT DEPLOY_SCHEDULER_DRAIN_TIMEOUT DEPLOY_HEALTH_TIMEOUT
     for key in WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE DEPLOY_LEGACY_DRAIN_TIMEOUT; do [ -z "${!key:-}" ] || export "$key"; done'''
 

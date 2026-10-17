@@ -47,6 +47,9 @@ case "$*" in
         [ "${NNTMUX_NO_EXISTING_APP:-0}" = 1 ] && exit 0
         [ -n "${NNTMUX_NO_CONTAINER:-}" ] && [ "$last" = "$NNTMUX_NO_CONTAINER" ] && exit 0
         echo fixture-container ;;
+    *' ps -q horizon'*)
+        [ "${NNTMUX_HORIZON_PS_FAIL:-0}" != 1 ] || exit 50
+        [ "${NNTMUX_SERVICE_MISSING:-0}" = 1 ] || echo "fixture-container-horizon" ;;
     *' ps -q '*)
         [ "${NNTMUX_PS_FAIL:-0}" != 1 ] || { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
         [ "${NNTMUX_SERVICE_MISSING:-0}" = 1 ] || echo "fixture-container-$last" ;;
@@ -101,7 +104,7 @@ SH);
     {
         $this->deploy()->mustRun();
         $events = $this->events();
-        $steps = ['build --target selfhosted', 'scheduler.py drain --timeout=1800', 'artisan tmux:drain --timeout=90', ' stop --timeout 1920 horizon', ' stop web scheduler indexer', 'artisan migrate --force --no-interaction', ' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer'];
+        $steps = ['build --target selfhosted', 'artisan list --raw', ' stop --timeout 1920 horizon', 'scheduler.py drain --timeout=1800', 'artisan tmux:drain --timeout=900', ' stop web scheduler indexer', 'artisan migrate --force --no-interaction', ' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer'];
         $previous = -1;
         foreach ($steps as $step) {
             $position = strpos($events, $step);
@@ -117,13 +120,13 @@ SH);
 
     public function test_native_indexer_abort_uses_the_same_unique_operation_token_as_its_drain(): void
     {
-        $process = $this->deploy(['NNTMUX_HORIZON_STOP_FAIL' => '1']);
+        $process = $this->deploy(['NNTMUX_STALE_DRAIN' => '1']);
         $process->run();
         $this->assertFalse($process->isSuccessful());
         $events = $this->events();
         $this->assertSame(1, preg_match('/scheduler.py drain --timeout=1800 --token=([a-f0-9]{32})/', $events, $matches));
         $token = $matches[1];
-        $this->assertStringContainsString('tmux:drain --timeout=90 --session=nntmux --token='.$token, $events);
+        $this->assertStringContainsString('tmux:drain --timeout=900 --session=nntmux --token='.$token, $events);
         $this->assertStringContainsString('tmux:drain --resume --session=nntmux --token='.$token, $events);
     }
 
@@ -216,7 +219,8 @@ SH);
         $process = $this->deploy(['NNTMUX_DRAIN_FAIL' => '1']);
         $process->run();
         $this->assertFalse($process->isSuccessful());
-        $this->assertStringNotContainsString(' stop ', $this->events());
+        $this->assertStringNotContainsString(' stop web', $this->events());
+        $this->assertStringContainsString(' start horizon', $this->events());
         $this->assertStringNotContainsString('artisan migrate', $this->events());
         $this->assertNotStamped();
     }
@@ -243,7 +247,7 @@ SH);
     {
         $this->deploy(['NNTMUX_LEGACY_IMAGE' => '1', 'DEPLOY_LEGACY_DRAIN' => '1'])->mustRun();
         $events = $this->events();
-        $this->assertLessThan(strpos($events, ' stop --timeout'), strpos($events, 'php -- /app drain 1800'));
+        $this->assertLessThan(strpos($events, ' stop web scheduler indexer'), strpos($events, 'php -- /app drain 1800'));
         $this->assertStringContainsString('artisan migrate', $events);
     }
 
@@ -252,7 +256,8 @@ SH);
         $process = $this->deploy(['NNTMUX_LEGACY_IMAGE' => '1', 'DEPLOY_LEGACY_DRAIN' => '1', 'NNTMUX_DRAIN_FAIL' => '1']);
         $process->run();
         $this->assertFalse($process->isSuccessful());
-        $this->assertStringNotContainsString(' stop ', $this->events());
+        $this->assertStringNotContainsString(' stop web', $this->events());
+        $this->assertStringContainsString(' start horizon', $this->events());
         $this->assertStringNotContainsString('artisan migrate', $this->events());
     }
 
@@ -262,7 +267,8 @@ SH);
         $process->run();
         $this->assertFalse($process->isSuccessful());
         $this->assertStringContainsString('php -- /app resume', $this->events());
-        $this->assertStringNotContainsString(' stop ', $this->events());
+        $this->assertStringNotContainsString(' stop web', $this->events());
+        $this->assertStringContainsString(' start horizon', $this->events());
     }
 
     public function test_stale_checkout_after_drain_resumes_the_old_indexer_without_stopping_writers(): void
@@ -271,7 +277,8 @@ SH);
         $process->run();
         $this->assertFalse($process->isSuccessful());
         $this->assertStringContainsString('artisan tmux:drain --resume', $this->events());
-        $this->assertStringNotContainsString(' stop ', $this->events());
+        $this->assertStringNotContainsString(' stop web', $this->events());
+        $this->assertStringContainsString(' start horizon', $this->events());
         $this->assertStringNotContainsString('artisan migrate', $this->events());
     }
 
@@ -336,7 +343,7 @@ SH);
     {
         $this->make(['build'])->mustRun();
         $this->make(['up'])->mustRun();
-        $this->assertStringContainsString('artisan tmux:drain --timeout=90', $this->events());
+        $this->assertStringContainsString('artisan tmux:drain --timeout=900', $this->events());
         $this->assertStringContainsString('artisan migrate --force --no-interaction', $this->events());
         $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait', $this->events());
     }
@@ -367,7 +374,7 @@ SH);
             $this->assertStringStartsWith('COMPOSE_FILE='.$files.' compose ', $call);
         }
         $this->assertStringContainsString(' config --format json', $this->events());
-        $this->assertStringContainsString('artisan tmux:drain --timeout=90', $this->events());
+        $this->assertStringContainsString('artisan tmux:drain --timeout=900', $this->events());
         $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait', $this->events());
     }
 
@@ -384,18 +391,6 @@ SH);
         $this->assertStringContainsString('artisan migrate', $this->events());
     }
 
-    public function test_failed_horizon_shutdown_preserves_web_and_resumes_the_indexer_before_any_migration(): void
-    {
-        $process = $this->deploy(['NNTMUX_HORIZON_STOP_FAIL' => '1']);
-        $process->run();
-        $this->assertFalse($process->isSuccessful());
-        $this->assertStringContainsString(' stop --timeout 1920 horizon', $this->events());
-        $this->assertStringContainsString('artisan tmux:drain --resume', $this->events());
-        $this->assertStringNotContainsString(' stop web scheduler indexer', $this->events());
-        $this->assertStringNotContainsString('artisan migrate', $this->events());
-        $this->assertNotStamped();
-    }
-
     public function test_checkout_changes_while_stopping_writers_abort_before_migration(): void
     {
         $process = $this->deploy(['NNTMUX_STALE_STOP' => '1']);
@@ -407,24 +402,6 @@ SH);
         $this->assertLessThan(strpos($this->events(), 'scheduler.py drain'), strrpos($this->events(), ' up -d') ?: -1, 'nothing may start after the writers stop');
         $this->assertStringNotContainsString('tmux:drain --resume', $this->events());
         $this->assertNotStamped();
-    }
-
-    public function test_failed_scheduler_drain_keeps_all_services_live_and_never_migrates(): void
-    {
-        $process = $this->deploy(['NNTMUX_SCHEDULER_DRAIN_FAIL' => '1']);
-        $process->run();
-        $this->assertFalse($process->isSuccessful());
-        $this->assertStringNotContainsString(' stop ', $this->events());
-        $this->assertStringNotContainsString('artisan migrate', $this->events());
-    }
-
-    public function test_indexer_drain_failure_resumes_an_already_drained_scheduler(): void
-    {
-        $process = $this->deploy(['NNTMUX_DRAIN_FAIL' => '1']);
-        $process->run();
-        $this->assertFalse($process->isSuccessful());
-        $this->assertStringContainsString('scheduler.py restore', $this->events());
-        $this->assertStringNotContainsString(' stop ', $this->events());
     }
 
     public function test_legacy_scheduler_requires_opt_in_before_any_service_stops(): void
@@ -448,7 +425,7 @@ SH);
     public function test_legacy_scheduler_is_reverified_then_stopped_without_reopening_admission(): void
     {
         $this->deploy(['NNTMUX_SCHEDULER_CAPABILITY' => 'legacy', 'DEPLOY_LEGACY_DRAIN' => '1'])->mustRun();
-        $steps = ['scheduler python3 - drain 1800', ' stop --timeout 1920 horizon', 'scheduler python3 - check', ' stop --timeout 1 scheduler', ' stop web scheduler indexer', 'artisan migrate'];
+        $steps = [' stop --timeout 1920 horizon', 'scheduler python3 - drain 1800', 'scheduler python3 - check', ' stop --timeout 1 scheduler', ' stop web scheduler indexer', 'artisan migrate'];
         $previous = -1;
         foreach ($steps as $step) {
             $position = strpos($this->events(), $step);
@@ -476,7 +453,7 @@ SH);
         $process->run();
         $this->assertFalse($process->isSuccessful());
         $this->assertStringContainsString('scheduler.py restore', $this->events());
-        $this->assertStringNotContainsString(' stop ', $this->events());
+        $this->assertStringNotContainsString(' stop web', $this->events());
         $this->assertStringNotContainsString('artisan migrate', $this->events());
     }
 
@@ -498,6 +475,69 @@ SH);
         $this->assertStringNotContainsString('scheduler.py drain', $this->events());
         $this->assertStringNotContainsString('scheduler.py restore', $this->events());
         $this->assertStringNotContainsString(' stop ', $this->events());
+    }
+
+    public function test_failed_horizon_shutdown_restarts_it_before_any_drain_or_migration(): void
+    {
+        $process = $this->deploy(['NNTMUX_HORIZON_STOP_FAIL' => '1']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString(' stop --timeout 1920 horizon', $this->events());
+        $this->assertStringContainsString(' start horizon', $this->events());
+        $this->assertStringNotContainsString('scheduler.py drain', $this->events());
+        $this->assertStringNotContainsString('tmux:drain', $this->events());
+        $this->assertStringNotContainsString(' stop web scheduler indexer', $this->events());
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
+        $this->assertNotStamped();
+    }
+
+    public function test_failed_horizon_lookup_aborts_before_any_drain_or_migration(): void
+    {
+        $process = $this->deploy(['NNTMUX_HORIZON_PS_FAIL' => '1']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringNotContainsString('scheduler.py drain', $this->events());
+        $this->assertStringNotContainsString(' stop ', $this->events());
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
+    }
+
+    public function test_writers_keep_running_while_horizon_drains(): void
+    {
+        $this->deploy()->mustRun();
+        $events = $this->events();
+        $horizon = strpos($events, ' stop --timeout 1920 horizon');
+        $this->assertNotFalse($horizon);
+        $this->assertGreaterThan($horizon, strpos($events, 'scheduler.py drain'));
+        $this->assertGreaterThan($horizon, strpos($events, 'artisan tmux:drain --timeout='));
+    }
+
+    public function test_failed_scheduler_drain_restarts_horizon_keeps_writers_live_and_never_migrates(): void
+    {
+        $process = $this->deploy(['NNTMUX_SCHEDULER_DRAIN_FAIL' => '1']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString(' start horizon', $this->events());
+        $this->assertStringNotContainsString(' stop web', $this->events());
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
+    }
+
+    public function test_indexer_drain_failure_resumes_an_already_drained_scheduler_and_horizon(): void
+    {
+        $process = $this->deploy(['NNTMUX_DRAIN_FAIL' => '1']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('scheduler.py restore', $this->events());
+        $this->assertStringContainsString(' start horizon', $this->events());
+        $this->assertStringNotContainsString(' stop web', $this->events());
+    }
+
+    public function test_legacy_indexer_without_opt_in_never_stops_horizon(): void
+    {
+        $process = $this->deploy(['NNTMUX_LEGACY_IMAGE' => '1']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringNotContainsString(' stop ', $this->events());
+        $this->assertStringNotContainsString('scheduler.py drain', $this->events());
     }
 
     public function test_documentation_and_test_changes_skip_all_builds_drains_and_restarts(): void
@@ -612,7 +652,7 @@ SH);
         $this->assertStringNotContainsString('build --target selfhosted-web', $events);
         $this->assertStringNotContainsString('build --target selfhosted-horizon', $events);
         $this->assertStringNotContainsString('build --target selfhosted-scheduler', $events);
-        $this->assertStringContainsString('artisan tmux:drain --timeout=90', $events);
+        $this->assertStringContainsString('artisan tmux:drain --timeout=900', $events);
         $this->assertStringContainsString(' stop indexer', $events);
         $this->assertStringNotContainsString('scheduler.py drain', $events);
         $this->assertStringNotContainsString(' stop --timeout 1920 horizon', $events);
@@ -641,7 +681,7 @@ SH);
                 $this->assertStringContainsString('build --target selfhosted-'.$role, $events, $path);
             }
             $this->assertStringContainsString('scheduler.py drain --timeout=1800', $events, $path);
-            $this->assertStringContainsString('artisan tmux:drain --timeout=90', $events, $path);
+            $this->assertStringContainsString('artisan tmux:drain --timeout=900', $events, $path);
             $this->assertStringContainsString(' stop --timeout 1920 horizon', $events, $path);
             $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $events, $path);
         }
@@ -658,7 +698,7 @@ SH);
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         $events = $this->events();
         $this->assertStringContainsString('scheduler.py drain --timeout=1800', $events);
-        $this->assertStringContainsString('artisan tmux:drain --timeout=90', $events);
+        $this->assertStringContainsString('artisan tmux:drain --timeout=900', $events);
         $this->assertStringContainsString(' stop --timeout 1920 horizon', $events);
         $this->assertStringContainsString(' stop web scheduler indexer', $events);
         $this->assertStringContainsString('artisan migrate --force --no-interaction', $events);
@@ -750,7 +790,7 @@ SH);
         $events = $this->events();
         $recreate = ' up -d --no-deps --force-recreate --wait --wait-timeout 240 redis';
         $this->assertStringContainsString('scheduler.py drain --timeout=1800', $events);
-        $this->assertStringContainsString('artisan tmux:drain --timeout=90', $events);
+        $this->assertStringContainsString('artisan tmux:drain --timeout=900', $events);
         $this->assertStringContainsString(' stop web scheduler indexer', $events);
         $this->assertStringContainsString($recreate, $events);
         $this->assertDoesNotMatchRegularExpression('/ up -d[^\\n]* manticore\\b/', $events);
