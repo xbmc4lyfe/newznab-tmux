@@ -362,7 +362,7 @@ class ReleaseBrowseService
 
         // An unavailable, estimated, or empty answer (for example a freshly rebuilt index) defers to SQL.
         if (($result['available'] ?? true) === false
-            || ($result['total_exact'] ?? true) === false
+            || ($result['total_exact'] ?? false) !== true
             || (int) $result['total'] <= 0) {
             return null;
         }

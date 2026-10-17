@@ -122,7 +122,7 @@ final class ReleaseBrowseSearchCacheTest extends TestCase
                 && $criteria['max_age_days'] === 7
                 && $criteria['excluded_category_ids'] === [2030]
                 && $criteria['groups_id'] === null)
-            ->andReturn(['ids' => [1], 'total' => 2_697_382, 'fuzzy' => false, 'available' => true]);
+            ->andReturn(['ids' => [1], 'total' => 2_697_382, 'total_exact' => true, 'fuzzy' => false, 'available' => true]);
 
         $service = new ReleaseBrowseService;
 
@@ -143,7 +143,10 @@ final class ReleaseBrowseSearchCacheTest extends TestCase
     #[Test]
     public function it_falls_back_to_the_database_count_when_the_index_total_is_estimated_or_empty(): void
     {
-        Search::shouldReceive('isAvailable')->twice()->andReturnTrue();
+        Search::shouldReceive('isAvailable')->times(3)->andReturnTrue();
+        Search::shouldReceive('searchReleasesFiltered')
+            ->once()
+            ->andReturn(['ids' => [1], 'total' => 5_000, 'fuzzy' => false, 'available' => true]);
         Search::shouldReceive('searchReleasesFiltered')
             ->once()
             ->andReturn(['ids' => [1], 'total' => 5_000, 'total_exact' => false, 'fuzzy' => false, 'available' => true]);
@@ -155,6 +158,7 @@ final class ReleaseBrowseSearchCacheTest extends TestCase
 
         $this->assertSame(0, $service->getBrowseCount([], -1, [], -1));
         $this->assertSame(0, $service->getBrowseCount([], 30, [], -1));
+        $this->assertSame(0, $service->getBrowseCount([], 60, [], -1));
     }
 
     #[Test]
