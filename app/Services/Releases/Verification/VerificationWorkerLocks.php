@@ -25,6 +25,8 @@ final class VerificationWorkerLocks
 
     private ?VerificationLock $gc = null;
 
+    private ?VerificationLock $expiry = null;
+
     private ?int $candidateId = null;
 
     private bool $exclusive = false;
@@ -161,11 +163,24 @@ final class VerificationWorkerLocks
             && $this->store()->holds($this->global) && $this->store()->holds($this->slot);
     }
 
+    /** Maintenance of this host's scratch; each worker host has its own turn. */
     public function tryGc(): bool
     {
-        $this->gc = $this->store()->exclusive('gc');
+        $host = ScratchInventory::host();
+        $this->gc = $this->store()->exclusive($host === '' ? 'gc' : 'gc-'.substr(sha1($host), 0, 12));
 
         return $this->gc !== null;
+    }
+
+    /** Candidate expiry is shared by every host; a maintenance holder that misses it skips it. */
+    public function tryExpiry(): bool
+    {
+        if ($this->gc === null) {
+            throw new RuntimeException('Expiry requires this host\'s maintenance lock.');
+        }
+        $this->expiry ??= $this->store()->exclusive('expiry');
+
+        return $this->expiry !== null;
     }
 
     /** Alternate the first maintenance task across exclusively held GC turns. */
@@ -193,6 +208,7 @@ final class VerificationWorkerLocks
 
     public function releaseGc(): void
     {
+        $this->release($this->expiry);
         $this->release($this->gc);
     }
 

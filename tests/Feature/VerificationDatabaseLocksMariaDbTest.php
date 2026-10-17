@@ -144,6 +144,15 @@ class VerificationDatabaseLocksMariaDbTest extends TestCase
             $this->assertFalse($there->tryGc());
             $this->assertFalse($here->preferExpiry());
             $this->assertTrue($here->preferExpiry());
+            // Another host cleans its own scratch at the same time, but expiry runs on one host at once.
+            config(['release_verification.host' => 'm4']);
+            $this->assertTrue($there->tryGc());
+            config(['release_verification.host' => '']);
+            $this->assertTrue($here->tryExpiry());
+            $this->assertFalse($there->tryExpiry());
+            $here->releaseGc();
+            $this->assertTrue($there->tryExpiry());
+            $there->releaseGc();
             $this->assertFalse($audit->tryExclusive());
 
             $here->close();

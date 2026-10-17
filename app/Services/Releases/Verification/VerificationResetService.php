@@ -56,14 +56,31 @@ final class VerificationResetService
             if (Schema::hasTable('release_verification_state')) {
                 DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
             }
+            // Other worker hosts keep their scratch records and budgets, marked terminal: only they
+            // can remove their directories.
+            $hosts = Schema::hasTable('release_verification_scratch') && Schema::hasColumn('release_verification_scratch', 'host');
+            if ($hosts) {
+                DB::table('release_verification_scratch')->where('host', '<>', ScratchInventory::host())->update(['terminal' => true]);
+            }
             foreach (['release_verification_scratch', 'release_verification_candidates', 'release_verification_audit_retries', 'release_verification_manifests'] as $table) {
                 if (Schema::hasTable($table)) {
-                    DB::table($table)->delete();
+                    $query = DB::table($table);
+                    if ($table === 'release_verification_scratch' && $hosts) {
+                        $query->where('host', ScratchInventory::host());
+                    }
+                    $query->delete();
                 }
             }
             if (Schema::hasTable('release_verification_scratch_budget')) {
-                DB::table('release_verification_scratch_budget')->delete();
-                DB::table('release_verification_scratch_budget')->insert(['id' => 1]);
+                if (Schema::hasColumn('release_verification_scratch_budget', 'host')) {
+                    DB::table('release_verification_scratch_budget')->where('host', ScratchInventory::host())->delete();
+                    if (ScratchInventory::host() === '') {
+                        DB::table('release_verification_scratch_budget')->insert(['id' => 1]);
+                    }
+                } else {
+                    DB::table('release_verification_scratch_budget')->delete();
+                    DB::table('release_verification_scratch_budget')->insert(['id' => 1]);
+                }
             }
             if (Schema::hasTable('release_verification_state')) {
                 DB::table('release_verification_state')->delete();

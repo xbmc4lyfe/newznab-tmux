@@ -95,11 +95,13 @@ class VerifyReleaseCandidates extends Command
                     $expiryFirst = $locks->preferExpiry();
                     $maintenanceDeadline = hrtime(true) + 5_000_000_000;
                     $mayMaintain = static fn (): bool => hrtime(true) < $maintenanceDeadline;
-                    if ($expiryFirst) {
+                    // Each host cleans its own scratch; expiry is shared, so another host may hold it.
+                    $expire = $locks->tryExpiry();
+                    if ($expiryFirst && $expire) {
                         $repository->expire($mayMaintain);
-                        $this->cleanupTerminalScratch($root, $locks, $mayMaintain);
-                    } else {
-                        $this->cleanupTerminalScratch($root, $locks, $mayMaintain);
+                    }
+                    $this->cleanupTerminalScratch($root, $locks, $mayMaintain);
+                    if (! $expiryFirst && $expire) {
                         $repository->expire($mayMaintain);
                     }
                     $maintenanceSuccessful = true;
@@ -278,8 +280,9 @@ class VerifyReleaseCandidates extends Command
                 if (! file_exists($directory) && ! is_link($directory)) {
                     app(ScratchInventory::class)->forget((int) $entry->id);
                 } elseif (is_dir($directory) && ! is_link($directory)) {
+                    // A reset marks the scratch records it keeps for other hosts terminal.
                     $terminal = $entry->audit_release_id !== null ? (bool) $entry->terminal
-                        : DB::table('release_verification_candidates')->where('id', $entry->candidate_id)
+                        : (bool) $entry->terminal || DB::table('release_verification_candidates')->where('id', $entry->candidate_id)
                             ->where('version', '>=', $entry->version)
                             ->where(function ($query): void {
                                 $query->whereIn('status', ['expired', 'filtered', 'metadata_review', 'metadata_deferred', 'metadata_expired'])

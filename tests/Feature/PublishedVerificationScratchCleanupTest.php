@@ -13,6 +13,7 @@ use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\ReleaseMetadataResolver;
 use App\Services\Releases\Verification\ScratchBudget;
 use App\Services\Releases\Verification\ScratchInventory;
+use App\Services\Releases\Verification\VerificationResetService;
 use App\Services\Releases\Verification\VerificationWorkerLocks;
 use App\Services\YencService;
 use Illuminate\Database\Schema\Blueprint;
@@ -624,6 +625,42 @@ PHP;
         $this->assertSame(11, (int) DB::table('release_verification_scratch_budget')->where('host', '')->value('reserved_bytes'));
         $this->assertDirectoryDoesNotExist($root.'/scratch/1-2');
         $this->assertDirectoryDoesNotExist($primaryDirectory);
+    }
+
+    public function test_a_reset_keeps_remote_scratch_records_until_their_host_removes_the_directories(): void
+    {
+        $root = (string) config('release_verification.storage_path');
+        $this->candidateScratch(1, 'pending');
+        // The remote host's disk does not hold the primary's directory.
+        File::deleteDirectory($root.'/scratch');
+        config(['release_verification.host' => 'm5air']);
+        $this->assertTrue(app(ScratchBudget::class)->initialize());
+        app(ScratchInventory::class)->register(1, 1);
+        app(ScratchBudget::class)->reserve(app(ScratchInventory::class)->entryId(1, 1), 7);
+        config(['release_verification.host' => '']);
+
+        app(VerificationResetService::class)->run(static fn () => null);
+
+        $this->assertSame(['m5air'], DB::table('release_verification_scratch')->pluck('host')->all());
+        $this->assertSame(7, (int) DB::table('release_verification_scratch_budget')->where('host', 'm5air')->value('reserved_bytes'));
+        $this->assertSame(0, (int) DB::table('release_verification_scratch_budget')->where('host', '')->value('reserved_bytes'));
+        $this->assertSame(0, DB::table('release_verification_candidates')->count());
+
+        // On the remote host the directory still exists; the reset marked its record terminal.
+        config(['release_verification.host' => 'm5air']);
+        mkdir($root.'/scratch/1-1', 0700, true);
+        file_put_contents($root.'/scratch/1-1/payload', 'remote');
+        $command = app(VerifyReleaseCandidates::class);
+        $locks = new VerificationWorkerLocks;
+        try {
+            $this->assertTrue($locks->start());
+            (new \ReflectionMethod($command, 'cleanupTerminalScratch'))->invoke($command, $root, $locks);
+        } finally {
+            $locks->close();
+        }
+        $this->assertDirectoryDoesNotExist($root.'/scratch/1-1');
+        $this->assertSame(0, DB::table('release_verification_scratch')->count());
+        $this->assertSame(0, (int) DB::table('release_verification_scratch_budget')->where('host', 'm5air')->value('reserved_bytes'));
     }
 
     private function candidateScratch(int $id, string $status = 'complete'): string
