@@ -1167,6 +1167,26 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertNull(DB::table('releases')->where('id', $first)->value('late_article_candidate_id'), 'Without waiting for an expiry pass.');
     }
 
+    public function test_a_collection_archive_never_took_stops_holding_a_retained_partial_after_an_expiry_window(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        Schema::table('collections', fn (Blueprint $table) => $table->dateTime('dateadded')->nullable());
+        $hash = sha1('unarchivable-late', true);
+        // An over-budget (unarchivable) collection under the hash arrived before the partial published.
+        $stuck = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 3, messageId: 'e@f');
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, sha1('unarchivable-late-own', true)));
+        DB::table('release_verification_candidates')->update(['source_identity' => bin2hex($hash)]);
+        $retained = DB::table('release_verification_candidates')->sole();
+        DB::table('collections')->where('id', $stuck)->update(['dateadded' => now()]);
+        $this->travel((int) config('release_verification.expiry_hours') + 1)->hours();
+        $this->limits();
+
+        app(CandidateRepository::class)->expire();
+
+        $this->assertSame('', DB::table('release_verification_candidates')->where('id', $retained->id)->value('manifest_path'), 'Released at expiry.');
+        $this->assertNull(DB::table('releases')->where('id', $first)->value('late_article_candidate_id'), 'Workers may process it.');
+    }
+
     public function test_a_covering_release_with_conflicting_metadata_sends_the_generation_to_review_not_an_upgrade(): void
     {
         $this->publicationSchema(partialColumns: true);

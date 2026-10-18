@@ -807,6 +807,18 @@ final class CandidateRepository
     private static ?\WeakMap $upgradeColumnSupport = null;
 
     /** @var \WeakMap<\PDO, bool>|null */
+    private static ?\WeakMap $collectionAgeSupport = null;
+
+    /** Whether collections record when they were added. */
+    private static function tracksCollectionAge(): bool
+    {
+        $pdo = DB::connection()->getPdo();
+        self::$collectionAgeSupport ??= new \WeakMap;
+
+        return self::$collectionAgeSupport[$pdo] ??= Schema::hasColumn('collections', 'dateadded');
+    }
+
+    /** @var \WeakMap<\PDO, bool>|null */
     private static ?\WeakMap $retentionColumnSupport = null;
 
     /** Whether candidates record the release their retained inventory awaits late articles for. */
@@ -1345,9 +1357,12 @@ final class CandidateRepository
     {
         return DB::transaction(function () use ($id, $sourceIdentity, $cutoff): bool {
             // Serialize with header storage and archive(), in their order (the upload's collections, the
-            // ledger, then the candidate): late headers still waiting to be archived keep the inventory.
+            // ledger, then the candidate): late headers still waiting to be archived keep the inventory. A
+            // collection added a whole expiry window ago and still unarchived never will be (archive() cannot
+            // take it, as when it exceeds the metadata budget), so it no longer holds the inventory back.
             $hash = is_string($sourceIdentity) && ctype_xdigit($sourceIdentity) ? hex2bin($sourceIdentity) : false;
-            if ($hash !== false && DB::table('collections')->where('collectionhash', $hash)->lockForUpdate()->exists()) {
+            if ($hash !== false && DB::table('collections')->where('collectionhash', $hash)
+                ->when(self::tracksCollectionAge(), fn ($query) => $query->where('dateadded', '>=', $cutoff))->lockForUpdate()->exists()) {
                 return false;
             }
             $this->ledger->enter();
