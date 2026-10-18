@@ -84,19 +84,28 @@ final class VerificationLedger
      *
      * @param  list<string>  $keys
      */
-    public function enterPublication(array $keys, string $missing = 'Verification migration has not initialized capacity state.'): void
+    public function enterPublication(array $keys, string $missing = 'Verification migration has not initialized capacity state.',
+        ?PublicationTiming $timing = null): void
     {
         if (! $this->concurrent()) {
+            $started = $timing === null ? 0 : hrtime(true);
             $this->enter($missing);
+            $timing?->recordLock(['path' => 'legacy_state', 'stripe_count' => 0, 'stripe_lock_ns' => 0,
+                'publication_row_lock_ns' => hrtime(true) - $started]);
 
             return;
         }
         $stripes = array_values(array_unique(array_map(self::publicationStripe(...), $keys)));
         sort($stripes);
+        $started = $timing === null ? 0 : hrtime(true);
         $striped = $stripes !== []
             && DB::table(self::LOCKS_TABLE)->whereIn('name', $stripes)->orderBy('name')->lockForUpdate()->count() === count($stripes);
+        $stripeEnded = $timing === null ? 0 : hrtime(true);
         $shared = DB::table(self::LOCKS_TABLE)->where('name', self::PUBLICATION_LOCK);
-        if (($striped ? $shared->sharedLock() : $shared->lockForUpdate())->first() === null) {
+        $row = ($striped ? $shared->sharedLock() : $shared->lockForUpdate())->first();
+        $timing?->recordLock(['path' => $striped ? 'striped' : 'exclusive', 'stripe_count' => count($stripes),
+            'stripe_lock_ns' => $stripeEnded - $started, 'publication_row_lock_ns' => hrtime(true) - $stripeEnded]);
+        if ($row === null) {
             throw new RuntimeException('Verification publication lock has not been initialized.');
         }
     }
