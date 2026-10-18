@@ -707,8 +707,8 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         }
         $before = $this->candidateRow($due)->lease_until;
         // The handed-off file is older than a third of the lease for $due only.
-        touch($this->pendingPath($fresh), time() + 110);
-        touch($this->pendingPath($due), time() - 120);
+        $this->changeEntry($this->pendingPath($fresh), static fn (array $document): array => ['heartbeat_at' => microtime(true) + 110] + $document);
+        $this->changeEntry($this->pendingPath($due), static fn (array $document): array => ['heartbeat_at' => microtime(true) - 120] + $document);
         $this->travel(110)->seconds();
         $this->servePrimary();
 
@@ -728,7 +728,7 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->handOff($claim);
         $this->outbox()->prepare(1);
         rename($this->pendingPath($claim), $this->inflightPath($claim));
-        touch($this->inflightPath($claim), time() - 150);
+        $this->changeEntry($this->inflightPath($claim), static fn (array $document): array => ['heartbeat_at' => microtime(true) - 150] + $document);
         $before = $this->candidateRow($claim)->lease_until;
         $this->travel(120)->seconds();
         $heartbeats = [];
@@ -753,7 +753,7 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         foreach ([$lost, $expired] as $claim) {
             $this->handOff($claim);
             $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['not_before' => time() + 3600] + $document);
-            touch($this->pendingPath($claim), time() - 200);
+            $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['heartbeat_at' => microtime(true) - 200] + $document);
         }
         DB::table('release_verification_candidates')->where('id', $lost->id)->update(['lease_token' => 'new-owner']);
         DB::table('release_verification_candidates')->where('id', $expired->id)->update(['lease_until' => now()->subSeconds(5)]);
@@ -928,7 +928,7 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $claim = $this->claimedCandidate('one@article');
         $this->handOff($claim);
         $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['not_before' => time() + 3600] + $document);
-        touch($this->pendingPath($claim), time() - 200);
+        $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['heartbeat_at' => microtime(true) - 200] + $document);
         $before = $this->candidateRow($claim)->lease_until;
         $this->travel(150)->seconds();
         $this->servePrimary();
@@ -1035,7 +1035,7 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->assertSame($newDocument, file_get_contents($this->pendingPath($new)));
         $this->assertSame(1, $this->entryDocument($this->pendingPath($old))['attempts']);
         $this->assertFileDoesNotExist($this->inflightPath($old));
-        touch($this->pendingPath($old), time() - 200);
+        $this->changeEntry($this->pendingPath($old), static fn (array $document): array => ['heartbeat_at' => microtime(true) - 200] + $document);
         $this->servePrimary();
 
         $this->forward();
@@ -1424,6 +1424,122 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(array_fill(0, 3, 'sampled'), array_map($this->candidateStatus(...), $claims));
         // Entries already published are not renewed (that would find their lease gone and drop them).
         $this->assertSame(0, $summaries[0]['lease_lost']);
+    }
+
+    public function test_repeated_retry_requeues_do_not_postpone_lease_renewal(): void
+    {
+        $this->batchSchema();
+        $this->configureAsync();
+        $claim = $this->claimedCandidate('one@article');
+        $this->handOff($claim);
+        // Renewed long ago; every pass below requeues the entry, rewriting its file and so its mtime.
+        $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['heartbeat_at' => microtime(true) - 150] + $document);
+        $this->servePrimary(fn (HttpRequest $request) => $this->answerAll($request, 'retry', 'Batch time budget exhausted; resend this item.'));
+        $leases = [];
+
+        foreach ([1, 2, 3] as $round) {
+            if ($round > 1) {
+                $this->travel(110)->seconds();
+            }
+            $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['not_before' => 0] + $document);
+            $this->forward();
+            $leases[] = $this->candidateRow($claim)->lease_until;
+            $document = $this->entryDocument($this->pendingPath($claim));
+            $this->assertSame($round, $document['deferrals']);
+            // The requeued document remembers the real renewal, which is what the schedule follows.
+            $this->assertGreaterThan(now()->getTimestamp() - 5, $document['heartbeat_at']);
+            $this->assertGreaterThan(time() - 5, filemtime($this->pendingPath($claim)));
+        }
+
+        // Each round, 110 s later, renewed the lease again although the file was always fresh.
+        $this->assertLessThan($leases[1], $leases[0]);
+        $this->assertLessThan($leases[2], $leases[1]);
+    }
+
+    public function test_an_outbox_of_only_malformed_documents_is_cleaned_inside_the_group(): void
+    {
+        Sleep::fake();
+        $this->batchSchema();
+        $this->configureAsync();
+        $this->outbox()->prepare(1);
+        $directory = $this->outbox()->directory();
+        file_put_contents($directory.'/pending/1-1-aaaaaaaaaaaa.json', 'not json at all');
+        file_put_contents($directory.'/pending/2-1-bbbbbbbbbbbb.json', '{"claim":{"id":"x"},"evidence":[]}');
+        file_put_contents($directory.'/pending/3-1-cccccccccccc.json', '');
+        file_put_contents($directory.'/inflight/1/4-1-dddddddddddd.json', '[1,2');
+        $this->assertSame(4, $this->outbox()->depth());
+        VerificationWorkerLocks::pause('test-barrier', 'maintenance');
+        $this->servePrimary();
+
+        // Refused the group, the forwarder deletes nothing.
+        $this->forward(['--passes' => 3]);
+        $this->assertSame(4, $this->outbox()->depth());
+
+        VerificationWorkerLocks::unpause('test-barrier');
+        $summaries = [];
+        $this->captureSummaries($summaries, 'Publication forwarder run summary.');
+        $this->forward(['--passes' => 3, '--diagnostics' => true]);
+
+        $this->assertSame(0, $this->outbox()->depth());
+        $this->assertSame([], $this->requested);
+        $this->assertSame(0, $summaries[0]['quarantined']);
+    }
+
+    public function test_cancellation_starts_no_further_request_and_defers_the_unsent_items(): void
+    {
+        $this->batchSchema(releases: 1);
+        $this->configureAsync(batch: false);
+        $claims = [$this->claimedCandidate('one@article'), $this->claimedCandidate('two@article'), $this->claimedCandidate('three@article')];
+        $items = array_map(fn (object $claim): RemotePublishItem => new RemotePublishItem($claim, $this->sampled($claim)), $claims);
+        $this->servePrimary();
+        $publisher = app(RemoteReleasePublisher::class);
+
+        $outcomes = $publisher->publishMany($items, null, fn (): bool => count($this->requested) >= 1);
+
+        $this->assertSame([self::SINGLE], $this->requested);
+        $this->assertSame(['published', 'retry', 'retry'], array_map(static fn (PublicationOutcome $outcome): string => $outcome->status, $outcomes));
+        // Already cancelled before the batch request: nothing is sent at all.
+        $this->configureAsync();
+        $outcomes = $publisher->publishMany(array_slice($items, 1), null, fn (): bool => true);
+        $this->assertSame([], $this->requested);
+        $this->assertSame(['retry', 'retry'], array_map(static fn (PublicationOutcome $outcome): string => $outcome->status, $outcomes));
+    }
+
+    public function test_sigterm_in_the_one_by_one_fallback_sends_no_further_request_and_requeues_the_rest(): void
+    {
+        if (! function_exists('posix_kill') || ! defined('SIGTERM')) {
+            $this->markTestSkipped('Requires pcntl and posix.');
+        }
+        $this->batchSchema(releases: 1);
+        $this->configureAsync(batch: false);
+        $claims = [];
+        foreach (range(1, 3) as $number) {
+            $claims[] = $claim = $this->claimedCandidate($number.'@article');
+            $this->handOff($claim);
+            $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['enqueued_at' => time() - 100 + $number] + $document);
+        }
+        Signals::resolveAvailabilityUsing(static fn (): bool => true);
+        Http::fake(function (HttpRequest $request) {
+            $this->requested[] = $request->url();
+            posix_kill(getmypid(), SIGTERM);
+
+            return Http::response($this->withServerVariables(self::PEER)->postJson('/internal/release-verification/publish', $request->data())->json());
+        });
+        $summaries = [];
+        $this->captureSummaries($summaries, 'Publication forwarder run summary.');
+
+        try {
+            $this->assertSame(0, Artisan::call('releases:forward-verified-publications', ['--slot' => 1, '--max-seconds' => 60, '--diagnostics' => true]));
+        } finally {
+            Signals::resolveAvailabilityUsing(static fn (): bool => false);
+        }
+
+        $this->assertCount(1, $this->requested);
+        $this->assertSame(['sampled', 'verifying', 'verifying'], array_map($this->candidateStatus(...), $claims));
+        foreach ([$claims[1], $claims[2]] as $claim) {
+            $this->assertSame(1, $this->entryDocument($this->pendingPath($claim))['deferrals']);
+        }
+        $this->assertSame('terminated', $summaries[0]['stop_reason']);
     }
 
     public function test_a_forwarder_run_stops_at_its_deadline(): void
