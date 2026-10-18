@@ -34,6 +34,7 @@ use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -216,6 +217,37 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $id = app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('repaired', 'PAR2 sources verified.', $manifest));
         $this->assertIsInt($id);
         $this->assertSame(2, (int) DB::table('releases')->where('id', $id)->value('totalpart'));
+    }
+
+    public function test_a_failed_pre_lock_step_is_timed_under_the_step_that_threw(): void
+    {
+        config(['release_verification.publication_timing_sample_every' => 1]);
+        app(CandidateRepository::class)->archive($this->collectionForPolicy());
+        $claim = app(CandidateRepository::class)->claim();
+        $manifest = app(ManifestStore::class)->read($claim->manifest_path);
+        $this->mock(ReleaseMetadataResolver::class, function ($mock): void {
+            $mock->shouldReceive('resolve')->andThrow(new \RuntimeException('Resolver unavailable.'));
+        });
+        $reports = [];
+        Log::shouldReceive('info')->andReturnUsing(function (string $message, array $context = []) use (&$reports): void {
+            if ($message === 'Verified release publication timing.') {
+                $reports[] = $context;
+            }
+        });
+        Log::shouldReceive('warning', 'debug', 'error')->andReturnNull();
+
+        try {
+            app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('complete', 'Verified.', $manifest + ['verified_bytes' => 100,
+                'verified_file_names' => ['movie.mkv'], 'verified_file_count' => 1]));
+            $this->fail('The resolver failure must propagate from the in-lock fallback.');
+        } catch (\RuntimeException $error) {
+            $this->assertSame('Resolver unavailable.', $error->getMessage());
+        }
+
+        $this->assertCount(1, $reports);
+        $this->assertSame(['claim_check', 'metadata_resolve', 'key_derivation'], array_keys($reports[0]['pre_lock_phases_ns']));
+        $this->assertFalse($reports[0]['keys_present']);
+        $this->assertSame('threw', $reports[0]['outcome']);
     }
 
     public function test_only_a_sampled_body_name_with_an_extension_proves_a_parity_only_header_has_a_payload(): void
@@ -1451,6 +1483,109 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $contents = app(NzbService::class)->readNzbContents((string) DB::table('releases')->where('id', $releaseId)->value('guid'));
         $this->assertIsString($contents);
         $this->assertStringContainsString('spot-check', $contents);
+    }
+
+    public function test_filtered_publication_timing_splits_the_ledger_adjustment_out_of_the_policy_phase(): void
+    {
+        config(['release_verification.publication_timing_sample_every' => 1]);
+        $repository = app(CandidateRepository::class);
+        $repository->archive($this->collectionForPolicy(totalParts: 2));
+        DB::table('release_verification_candidates')->update(['status' => 'pending']);
+        $claim = $repository->claim();
+        $manifest = app(ManifestStore::class)->read($claim->manifest_path);
+        $manifest['verified_bytes'] = 5;
+        $manifest['verified_file_names'] = ['movie.mkv'];
+        $manifest['verified_file_count'] = 1;
+        $this->limits(10, 0, 0, 0, 0);
+        $this->publicationSchema();
+        $reports = [];
+        Log::shouldReceive('warning')->andReturnNull();
+        Log::shouldReceive('info')->andReturnUsing(function (string $message, array $context) use (&$reports): void {
+            $reports[] = [$message, $context];
+        });
+
+        $this->assertNull(app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('complete', 'Verified payload.', $manifest)));
+
+        $this->assertCount(1, $reports);
+        $report = $reports[0][1];
+        $this->assertSame('Verified release publication timing.', $reports[0][0]);
+        $this->assertSame('filtered', $report['outcome']);
+        $this->assertSame('local', $report['source']);
+        $this->assertSame(['state_lock_acquisition', 'candidate_policy', 'ledger_adjust'], array_keys($report['attempts'][0]['phases_ns']));
+        $this->assertArrayNotHasKey('request_phases_ns', $report);
+        $this->assertSame('legacy_state', $report['attempts'][0]['lock']['path']);
+        $this->assertSame(0, $report['attempts'][0]['lock']['stripe_count']);
+    }
+
+    public function test_remote_publication_logs_request_phases_once_and_the_worker_round_trip(): void
+    {
+        config(['release_verification.publish_endpoint' => true, 'release_verification.publish_url' => 'http://primary.test/internal/release-verification/publish',
+            'release_verification.publication_timing_sample_every' => 1]);
+        $id = $this->collectionForPolicy();
+        DB::table('collections')->where('id', $id)->update(['filesize' => 100000]);
+        DB::table('parts')->update(['size' => 100000]);
+        $repository = app(CandidateRepository::class);
+        $repository->archive($id);
+        $claim = $repository->claim();
+        $local = SpotCheckVerifier::withEvidence(app(ManifestStore::class)->read($claim->manifest_path), ['articles' => 1, 'bytes' => 256,
+            'sampled_files' => 1, 'verified_file_names' => ['movie.mkv'], 'identity_hints' => ['movie.mkv']]);
+        $this->publicationSchema();
+        Search::shouldReceive('updateRelease')->once();
+        Http::fake(function (HttpRequest $request) {
+            $response = $this->postJson('/internal/release-verification/publish', $request->data());
+
+            return Http::response($response->json(), $response->status());
+        });
+        $reports = [];
+        Log::shouldReceive('warning')->andReturnNull();
+        Log::shouldReceive('info')->andReturnUsing(function (string $message, array $context) use (&$reports): void {
+            $reports[$message][] = $context;
+        });
+
+        $releaseId = app(RemoteReleasePublisher::class)->publish($claim, new VerificationResult('sampled', 'Sampled.', $local));
+
+        $this->assertIsInt($releaseId);
+        // Sampled once by the controller and passed to publish(): one publication line, no double count.
+        $this->assertCount(1, $reports['Verified release publication timing.']);
+        $report = $reports['Verified release publication timing.'][0];
+        $this->assertSame('remote', $report['source']);
+        $this->assertSame('published', $report['outcome']);
+        $this->assertSame(['validation', 'published_check', 'candidate_read', 'manifest_read', 'worker_lock'], array_keys($report['request_phases_ns']));
+        $this->assertSame($report['request_ns'], array_sum($report['request_phases_ns']));
+        $this->assertGreaterThanOrEqual($report['request_ns'] + $report['pre_lock_ns'], $report['total_ns']);
+        $this->assertIsBool($report['keys_present']);
+        $this->assertIsInt($report['segment_count']);
+        $this->assertCount(1, $reports['Remote publication round trip timing.']);
+        $trip = $reports['Remote publication round trip timing.'][0];
+        $this->assertSame(['status', 'http_status', 'round_trip_ns'], array_keys($trip));
+        $this->assertSame('returned', $trip['status']);
+        $this->assertSame(200, $trip['http_status']);
+        $this->assertGreaterThanOrEqual($report['total_ns'], $trip['round_trip_ns']);
+    }
+
+    public function test_remote_publisher_round_trip_timing_reports_a_refusal(): void
+    {
+        config(['release_verification.publish_url' => 'http://primary.test/internal/release-verification/publish',
+            'release_verification.publication_timing_sample_every' => 1]);
+        Http::fake(['primary.test/*' => Http::response(['error' => 'Stale.'], 409)]);
+        $claim = (object) ['id' => 1, 'version' => 1, 'manifest_hash' => str_repeat('a', 64), 'lease_token' => 'lease'];
+        $manifest = SpotCheckVerifier::withEvidence(['files' => [], 'groups_id' => 1], ['articles' => 1, 'bytes' => 1,
+            'sampled_files' => 1, 'verified_file_names' => [], 'identity_hints' => []]);
+        $trips = [];
+        Log::shouldReceive('info')->andReturnUsing(function (string $message, array $context) use (&$trips): void {
+            $trips[] = [$message, $context];
+        });
+
+        try {
+            app(RemoteReleasePublisher::class)->publish($claim, new VerificationResult('sampled', 'Sampled.', $manifest));
+            $this->fail('A refused remote publication must fail.');
+        } catch (\RuntimeException) {
+        }
+
+        $this->assertCount(1, $trips);
+        $this->assertSame('Remote publication round trip timing.', $trips[0][0]);
+        $this->assertSame('failed', $trips[0][1]['status']);
+        $this->assertSame(409, $trips[0][1]['http_status']);
     }
 
     public function test_remote_publication_endpoint_refuses_disabled_public_and_stale_requests(): void

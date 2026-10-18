@@ -15,6 +15,7 @@ use App\Services\YencService;
 use App\Support\ReleaseArchiveNamingEvidence;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\TestCase;
@@ -202,5 +203,71 @@ final class ReleaseFingerprintStaleUpgradeTest extends TestCase
         DB::table('release_fingerprint_metadata')->update(['run_token' => $ownToken]);
         $legacy()->failed(new \RuntimeException('exhausted'));
         $this->assertSame('failed', DB::table('release_fingerprint_metadata')->value('status'), 'Its own run, claimed in an earlier attempt, is ended.');
+    }
+
+    #[Test]
+    public function a_run_that_only_ever_reads_an_uncommitted_replacement_hands_the_record_back_as_stale(): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:',
+            'database.connections.sqlite.url' => null]);
+        DB::purge();
+        DB::reconnect();
+        Schema::create('releases', static function (Blueprint $table): void {
+            $table->increments('id');
+            $table->string('guid');
+        });
+        (require database_path('migrations/2026_10_12_120000_create_release_fingerprint_metadata_table.php'))->up();
+        (require database_path('migrations/2026_10_18_000000_add_run_token_to_release_fingerprint_metadata.php'))->up();
+        (require database_path('migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
+        DB::table('releases')->insert(['id' => 1, 'guid' => 'never-committed']);
+        $committed = '<nzb><file subject="one.rar"><segments><segment bytes="5" number="1">one@example.net</segment></segments></file></nzb>';
+        $replacement = '<nzb><file subject="two.rar"><segments><segment bytes="5" number="1">two@example.net</segment></segments></file></nzb>';
+        config(['nntmux_nntp.server' => 'news.primary.invalid', 'nntmux_nntp.alternate_server' => '']);
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->andThrow(new \RuntimeException('Article unavailable.'));
+        DB::table('release_archive_naming_evidence')->insert(['releases_id' => 1, 'release_guid' => 'never-committed',
+            'source_sha256' => NzbSourceGuard::digest($committed), 'proof_version' => ReleaseArchiveNamingEvidence::PROOF_VERSION,
+            'scope' => 'unknown', 'episode_files' => '[]', 'updated_at' => now()]);
+        $nzb = \Mockery::mock(NzbService::class);
+        $nzb->shouldReceive('readNzbContents')->times(3)->with('never-committed')->andReturn($replacement);
+        $yenc = new YencService;
+
+        (new CollectReleaseFingerprintMetadata(1))->withFakeQueueInteractions()
+            ->handle(new ReleaseFingerprintCollector($nzb, new NzbFingerprintAnalyzer($yenc), new Par2MetadataParser, $yenc));
+
+        $this->assertSame('stale', DB::table('release_fingerprint_metadata')->value('status'), 'The scheduled stale sweep collects it again.');
+    }
+
+    #[Test]
+    public function the_stale_sweep_queues_stale_and_stuck_records_only(): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:',
+            'database.connections.sqlite.url' => null]);
+        DB::purge();
+        DB::reconnect();
+        Schema::create('releases', static function (Blueprint $table): void {
+            $table->increments('id');
+            $table->string('guid');
+            $table->integer('nzbstatus')->default(1);
+        });
+        (require database_path('migrations/2026_10_12_120000_create_release_fingerprint_metadata_table.php'))->up();
+        foreach ([1 => ['stale', 0], 2 => ['processing', 3], 3 => ['processing', 0], 4 => ['complete', 0]] as $id => [$status, $hoursAgo]) {
+            DB::table('releases')->insert(['id' => $id, 'guid' => 'g'.$id]);
+            DB::table('release_fingerprint_metadata')->insert(['releases_id' => $id, 'status' => $status,
+                'created_at' => now()->subHours($hoursAgo), 'updated_at' => now()->subHours($hoursAgo)]);
+        }
+        Queue::fake();
+
+        $this->artisan('releases:fingerprint-backfill', ['--stale' => true])->assertSuccessful();
+
+        $queued = [];
+        Queue::assertPushed(CollectReleaseFingerprintMetadata::class, function (CollectReleaseFingerprintMetadata $job) use (&$queued): bool {
+            $queued[] = (int) $job->uniqueId();
+
+            return true;
+        });
+        sort($queued);
+        $this->assertSame([1, 2], $queued, 'Stale, and processing long past the job timeout; not a live run or a complete one.');
     }
 }

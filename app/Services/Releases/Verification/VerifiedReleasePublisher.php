@@ -30,13 +30,19 @@ final class VerifiedReleasePublisher
         private readonly ReleaseMetadataResolver $metadata,
         private readonly ReleaseDuplicateFinder $duplicates) {}
 
-    public function publish(object $claim, VerificationResult $result): ?int
+    /**
+     * @param  PublicationTiming|false|null  $timing  A sample the caller already drew (the remote controller, which
+     *                                                times its own request work first); false when it drew none; null to draw here.
+     */
+    public function publish(object $claim, VerificationResult $result, string $source = 'local', PublicationTiming|false|null $timing = null): ?int
     {
         if (! $result->passed()) {
             return null;
         }
 
-        $timing = PublicationTiming::sample();
+        $timing = $timing === false ? null : ($timing ?? PublicationTiming::sample());
+        $timing?->setSource($source);
+        $outcome = 'threw';
         $status = 'threw';
         // Resolve the duplicate-search keys once, before taking any lock, so the publication locks
         // exactly the keys its search will use. Without them it falls back to the shared row. An
@@ -49,13 +55,24 @@ final class VerifiedReleasePublisher
         $incoming = null;
         // A plain read is harmless outside a transaction; it skips the work for a stale claim,
         // which the locked validation below rejects anyway.
-        if (DB::transactionLevel() === 0 && $this->claimIsCurrent($claim)) {
+        $current = DB::transactionLevel() === 0 && $this->claimIsCurrent($claim);
+        $timing?->preLockPhase('claim_check');
+        if ($current) {
+            // The step in progress, so a failure is timed under the step that threw.
+            $step = 'metadata_resolve';
             try {
                 $preResolved = $this->metadata->resolve($result->manifest);
+                $timing?->preLockPhase($step);
+                $step = 'incoming_document';
                 $incoming = $this->incomingDocument($result->manifest);
+                $timing?->preLockPhase($step);
+                $step = 'key_derivation';
                 $keys = VerificationLedger::publicationKeys($this->publicationSize($result->manifest), $incoming['fingerprint'],
                     (string) $preResolved['name'], (string) $preResolved['searchname'], (int) $preResolved['predb_id']);
             } catch (Throwable) {
+                if ($step !== 'key_derivation') {
+                    $timing?->preLockPhase($step);
+                }
                 $preResolved = null;
                 $incoming = null;
                 $keys = [];
@@ -66,23 +83,35 @@ final class VerifiedReleasePublisher
             // it under its current keys, so hold those too; a key that changes before the lock forces a retry.
             $keys = array_values(array_unique([...$keys, ...$this->supersededPartialKeys($result->manifest)]));
         }
+        if ($timing !== null) {
+            $timing->preLockPhase('key_derivation');
+            $segments = 0;
+            foreach ((array) ($result->manifest['files'] ?? []) as $file) {
+                $segments += is_array($file) ? count((array) ($file['segments'] ?? [])) : 0;
+            }
+            $timing->setManifestFacts($segments, $keys !== []);
+        }
         try {
-            $id = DB::transaction(function () use ($claim, $result, $timing, $preResolved, $keys, $incoming): ?int {
+            $id = DB::transaction(function () use ($claim, $result, $timing, $preResolved, $keys, $incoming, &$outcome): ?int {
                 $timing?->beginAttempt();
                 $returned = false;
+                $outcome = 'threw';
                 try {
                     // Duplicate detection must see each committed release sharing a search key;
                     // admissions, expiry and unrelated releases no longer wait behind this lock.
-                    app(VerificationLedger::class)->enterPublication($keys);
+                    app(VerificationLedger::class)->enterPublication($keys, timing: $timing);
                     $timing?->nextPhase('candidate_policy');
                     $candidate = DB::table('release_verification_candidates')->where('id', $claim->id)->lockForUpdate()->first();
                     if ($candidate === null || $candidate->version !== $claim->version
                         || $candidate->manifest_hash !== $claim->manifest_hash || $candidate->lease_token !== $claim->lease_token
                         || $candidate->lease_until === null || $candidate->lease_until < now()->format('Y-m-d H:i:s')) {
+                        $outcome = 'stale';
+
                         throw new RuntimeException('Stale verification result cannot publish.');
                     }
                     if ($candidate->release_id !== null) {
                         $returned = true;
+                        $outcome = 'duplicate';
 
                         return (int) $candidate->release_id;
                     }
@@ -112,9 +141,10 @@ final class VerifiedReleasePublisher
                         throw new PartialPublicationDeferredException($filteredReason);
                     }
                     if ($filteredReason !== null) {
-                        app(CandidateRepository::class)->rejectByPolicy($claim, $filteredReason);
+                        app(CandidateRepository::class)->rejectByPolicy($claim, $filteredReason, $timing);
 
                         $returned = true;
+                        $outcome = 'filtered';
 
                         return null;
                     }
@@ -149,9 +179,10 @@ final class VerifiedReleasePublisher
                         // generation: publishing its retained articles anew would undo the deletion or duplicate it.
                         app(CandidateRepository::class)->abandonUpgrade($claim, DB::table('releases')->where('id', $manifest['upgrades_release_id'])->exists()
                             ? 'The partial release these articles would upgrade no longer awaits them.'
-                            : 'The partial release these articles would upgrade was deleted.');
+                            : 'The partial release these articles would upgrade was deleted.', $timing);
 
                         $returned = true;
+                        $outcome = 'abandoned';
 
                         return null;
                     }
@@ -174,9 +205,10 @@ final class VerifiedReleasePublisher
                         $id = $this->upgradePartial($upgrade, $manifest, $metadata, $size, $totalParts, (int) $candidate->id, $retain, $timing, $incoming);
                         $this->recordGroups($id, $manifest['groups']);
                         app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
-                        $this->markPublished($candidate->id, $id, $result, retainManifest: $retain);
+                        $this->markPublished($candidate->id, $id, $result, $timing, retainManifest: $retain);
 
                         $returned = true;
+                        $outcome = 'upgraded';
 
                         return $id;
                     }
@@ -192,6 +224,7 @@ final class VerifiedReleasePublisher
                             ]);
 
                             $returned = true;
+                            $outcome = 'metadata_review';
 
                             return null;
                         }
@@ -199,9 +232,10 @@ final class VerifiedReleasePublisher
                         app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
                         // A covered candidate never keeps inventory: its articles are a subset of the reused release,
                         // and merging late articles into that subset could replace a more complete partial.
-                        $this->markPublished($candidate->id, $duplicateId, $result);
+                        $this->markPublished($candidate->id, $duplicateId, $result, $timing);
 
                         $returned = true;
+                        $outcome = 'duplicate';
 
                         return $duplicateId;
                     }
@@ -253,9 +287,10 @@ final class VerifiedReleasePublisher
                     $this->recordGroups((int) $id, $manifest['groups']);
                     app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
                     // A partial release keeps its inventory so late articles can complete it.
-                    $this->markPublished($candidate->id, (int) $id, $result, retainManifest: isset($manifest['partial']) && $this->awaitsLateArticles($manifest));
+                    $this->markPublished($candidate->id, (int) $id, $result, $timing, retainManifest: isset($manifest['partial']) && $this->awaitsLateArticles($manifest));
 
                     $returned = true;
+                    $outcome = 'published';
 
                     return (int) $id;
                 } finally {
@@ -266,6 +301,8 @@ final class VerifiedReleasePublisher
 
             return $id;
         } finally {
+            // An exception after the callback (a failed commit or after-commit hook) is a throw, not a publication.
+            $timing?->setOutcome($status === 'returned' || $outcome === 'stale' ? $outcome : 'threw');
             $timing?->report($status);
         }
     }
@@ -545,7 +582,8 @@ final class VerifiedReleasePublisher
         return array_intersect_key($state, array_flip(Schema::getColumnListing('releases')));
     }
 
-    private function markPublished(int $candidateId, int $releaseId, VerificationResult $result, bool $retainManifest = false): void
+    private function markPublished(int $candidateId, int $releaseId, VerificationResult $result, ?PublicationTiming $timing = null,
+        bool $retainManifest = false): void
     {
         $candidate = DB::table('release_verification_candidates')->where('id', $candidateId)->first();
         $values = ['release_id' => $releaseId, 'status' => $result->verdict, 'reason' => $result->reason,
@@ -558,7 +596,9 @@ final class VerifiedReleasePublisher
         }
         DB::table('release_verification_candidates')->where('id', $candidateId)->update($values + ['manifest_bytes' => 0, 'manifest_path' => '']);
         // Release capacity last so the shared ledger row is held only until commit.
+        $previous = $timing?->enterNestedPhase('ledger_adjust');
         app(VerificationLedger::class)->adjust(-(int) $candidate->manifest_bytes);
+        $timing?->nextPhase((string) $previous);
         DB::afterCommit(function () use ($candidate): void {
             app(ManifestStore::class)->deleteIfUnreferenced($candidate->manifest_path);
         });

@@ -6,6 +6,7 @@ namespace App\Http\Controllers;
 
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\PartialPublicationDeferredException;
+use App\Services\Releases\Verification\PublicationTiming;
 use App\Services\Releases\Verification\SpotCheckVerifier;
 use App\Services\Releases\Verification\VerificationLockStore;
 use App\Services\Releases\Verification\VerificationResult;
@@ -24,6 +25,9 @@ class ReleaseVerificationPublicationController extends Controller
 {
     public function __invoke(Request $request, VerifiedReleasePublisher $publisher, ManifestStore $store): JsonResponse
     {
+        // One sample decision per request: this timing is handed to publish(), which logs it as a
+        // single line whose request_phases_ns hold the work done here before the publication.
+        $timing = PublicationTiming::sample();
         $data = $request->validate([
             'claim.id' => ['required', 'integer', 'min:1'],
             'claim.version' => ['required', 'integer', 'min:0'],
@@ -39,6 +43,7 @@ class ReleaseVerificationPublicationController extends Controller
             'evidence.identity_hints.*' => ['string', 'max:1024'],
             'evidence.partial' => ['sometimes', 'boolean'],
         ]);
+        $timing?->requestPhase('validation');
         $claim = (object) ['id' => (int) $data['claim']['id'], 'version' => (int) $data['claim']['version'],
             'manifest_hash' => (string) $data['claim']['manifest_hash'], 'lease_token' => (string) $data['claim']['lease_token']];
         $evidence = ['articles' => (int) $data['evidence']['articles'], 'bytes' => (int) $data['evidence']['bytes'],
@@ -48,6 +53,7 @@ class ReleaseVerificationPublicationController extends Controller
             'partial' => (bool) ($data['evidence']['partial'] ?? false)];
         try {
             $published = $this->publishedRelease($claim);
+            $timing?->requestPhase('published_check');
             if ($published !== null) {
                 return response()->json(['release_id' => $published]);
             }
@@ -60,7 +66,9 @@ class ReleaseVerificationPublicationController extends Controller
                 return $published !== null ? response()->json(['release_id' => $published])
                     : response()->json(['error' => 'Stale verification result cannot publish.'], 409);
             }
+            $timing?->requestPhase('candidate_read');
             $manifest = SpotCheckVerifier::withEvidence($store->read($candidate->manifest_path), $evidence);
+            $timing?->requestPhase('manifest_read');
             // Publication writes as a worker does, so a reset, audit or deployment barrier that
             // holds the worker group excludes it even after the sending worker has gone.
             $locks = VerificationLockStore::make();
@@ -72,8 +80,10 @@ class ReleaseVerificationPublicationController extends Controller
             if ($worker === null) {
                 return response()->json(['error' => 'Verification is paused for exclusive maintenance; retry later.'], 409);
             }
+            $timing?->requestPhase('worker_lock');
             try {
-                return response()->json(['release_id' => $publisher->publish($claim, new VerificationResult('sampled', (string) $data['reason'], $manifest))]);
+                return response()->json(['release_id' => $publisher->publish($claim,
+                    new VerificationResult('sampled', (string) $data['reason'], $manifest), 'remote', $timing ?? false)]);
             } catch (PartialPublicationDeferredException $deferred) {
                 // The sending worker returns the partial to waiting for one more hold window.
                 return response()->json(['deferred' => $deferred->getMessage()], 409);

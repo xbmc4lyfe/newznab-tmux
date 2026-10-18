@@ -1524,23 +1524,23 @@ final class CandidateRepository
                     ? 'release_verification.deterministic_retry_seconds' : 'release_verification.retry_seconds'))]);
     }
 
-    public function rejectByPolicy(object $claim, string $reason): void
+    public function rejectByPolicy(object $claim, string $reason, ?PublicationTiming $timing = null): void
     {
-        $this->retire($claim, $reason, 'filtered');
+        $this->retire($claim, $reason, 'filtered', $timing);
     }
 
     /**
      * End an upgrade generation whose partial was deleted or no longer awaits it. It is not filtered: a filtered
      * newest candidate would make archive() discard later uploads under the same hash as replays.
      */
-    public function abandonUpgrade(object $claim, string $reason): void
+    public function abandonUpgrade(object $claim, string $reason, ?PublicationTiming $timing = null): void
     {
-        $this->retire($claim, $reason, 'expired');
+        $this->retire($claim, $reason, 'expired', $timing);
     }
 
-    private function retire(object $claim, string $reason, string $status): void
+    private function retire(object $claim, string $reason, string $status, ?PublicationTiming $timing): void
     {
-        DB::transaction(function () use ($claim, $reason, $status): void {
+        DB::transaction(function () use ($claim, $reason, $status, $timing): void {
             $this->ledger->enter();
             $candidate = DB::table('release_verification_candidates')->where('id', $claim->id)
                 ->where('lease_token', $claim->lease_token)->where('version', $claim->version)->whereNull('release_id')->lockForUpdate()->first();
@@ -1555,7 +1555,9 @@ final class CandidateRepository
                 DB::table('releases')->where('id', $candidate->upgrades_release_id)->where('late_article_candidate_id', $candidate->id)
                     ->update(['late_article_candidate_id' => null]);
             }
+            $previous = $timing?->enterNestedPhase('ledger_adjust');
             $this->ledger->adjust(-(int) $candidate->manifest_bytes);
+            $timing?->nextPhase((string) $previous);
             DB::afterCommit(function () use ($candidate): void {
                 $this->store->deleteIfUnreferenced($candidate->manifest_path);
             });

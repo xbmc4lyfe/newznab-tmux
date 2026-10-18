@@ -528,10 +528,10 @@ class MusicService
                     } else {
                         $albumId = $musicCheck['id'];
                     }
-                    Release::query()->where('id', $arr->id)->update(['musicinfo_id' => $albumId]);
+                    $this->recordMusicMatch((int) $arr->id, (int) $albumId, (string) $arr->searchname);
                 } else {
                     // No album found.
-                    Release::query()->where('id', $arr->id)->update(['musicinfo_id' => -2]);
+                    $this->recordMusicMatch((int) $arr->id, -2, (string) $arr->searchname);
                     echo '.';
                 }
 
@@ -688,5 +688,14 @@ class MusicService
             'musicgenre' => $genreName,
             'musicgenres_id' => $genreKey,
         ];
+    }
+
+    /** Record the album match, only while the release still carries the title it was looked up with. */
+    protected function recordMusicMatch(int $releaseId, int $albumId, ?string $searchname = null): int
+    {
+        // Only for the title it was matched on: an upgrade may have renamed it meanwhile.
+        return Release::query()->where('id', $releaseId)
+            ->when($searchname !== null, static fn ($q) => $q->where('searchname', $searchname))
+            ->update(['musicinfo_id' => $albumId]);
     }
 }

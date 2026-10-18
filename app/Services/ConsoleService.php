@@ -558,7 +558,7 @@ class ConsoleService
                 }
 
                 // Update release.
-                Release::query()->where('id', $arr['id'])->update(['consoleinfo_id' => $gameId]);
+                $this->recordConsoleMatch((int) $arr['id'], (int) $gameId, (string) $arr['searchname']);
 
                 // Throttle external lookups using the legacy amazonsleep setting.
                 $diff = floor((now()->timestamp - $startTime) * 1000000);
@@ -769,5 +769,14 @@ class ConsoleService
         $gen = new GenreService;
 
         return $gen->loadGenres((string) GenreService::CONSOLE_TYPE);
+    }
+
+    /** Record the console match, only while the release still carries the title it was looked up with. */
+    protected function recordConsoleMatch(int $releaseId, int $gameId, ?string $searchname = null): int
+    {
+        // Only for the title it was matched on: an upgrade may have renamed it meanwhile.
+        return Release::query()->where('id', $releaseId)
+            ->when($searchname !== null, static fn ($q) => $q->where('searchname', $searchname))
+            ->update(['consoleinfo_id' => $gameId]);
     }
 }

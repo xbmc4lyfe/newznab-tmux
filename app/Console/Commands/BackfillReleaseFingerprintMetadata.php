@@ -9,6 +9,7 @@ use App\Models\Release;
 use App\Services\Releases\Fingerprint\ReleaseFingerprintCollector;
 use Illuminate\Console\Command;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Support\Facades\DB;
 
 final class BackfillReleaseFingerprintMetadata extends Command
 {
@@ -16,7 +17,8 @@ final class BackfillReleaseFingerprintMetadata extends Command
                             {--limit=100 : Maximum number of releases to queue}
                             {--after-id=0 : Resume after this release ID}
                             {--delay-ms=0 : Delay between queue submissions in milliseconds}
-                            {--dry-run : Show matching releases without queueing jobs}';
+                            {--dry-run : Show matching releases without queueing jobs}
+                            {--stale : Only re-queue records left stale (an upgrade replaced their NZB) or stuck processing}';
 
     protected $description = 'Queue resumable collection of public release format and NNTP metadata';
 
@@ -25,20 +27,26 @@ final class BackfillReleaseFingerprintMetadata extends Command
         $limit = max(1, min(10_000, (int) $this->option('limit')));
         $afterId = max(0, (int) $this->option('after-id'));
         $delayMs = max(0, min(60_000, (int) $this->option('delay-ms')));
-        $releaseIds = Release::query()
-            ->where('nzbstatus', 1)
-            ->where('id', '>', $afterId)
-            ->where(function (Builder $query): void {
-                $query->whereDoesntHave('fingerprintMetadata')
-                    ->orWhereHas('fingerprintMetadata', static function (Builder $metadata): void {
-                        $metadata->where('status', '!=', 'complete')
-                            ->orWhere('metadata->schema_version', '<', ReleaseFingerprintCollector::SCHEMA_VERSION)
-                            ->orWhereNull('metadata->schema_version');
-                    });
-            })
-            ->orderBy('id')
-            ->limit($limit)
-            ->pluck('id');
+        $releaseIds = $this->option('stale') ? DB::table('release_fingerprint_metadata')
+            // The status index serves both ranges. A run still processing after twice the job timeout died.
+            ->where(fn ($query) => $query->where('status', 'stale')
+                ->orWhere(fn ($stuck) => $stuck->where('status', 'processing')
+                    ->where('updated_at', '<', now()->subSeconds(2 * CollectReleaseFingerprintMetadata::TIMEOUT_SECONDS))))
+            ->where('releases_id', '>', $afterId)->orderBy('releases_id')->limit($limit)->pluck('releases_id')
+            : Release::query()
+                ->where('nzbstatus', 1)
+                ->where('id', '>', $afterId)
+                ->where(function (Builder $query): void {
+                    $query->whereDoesntHave('fingerprintMetadata')
+                        ->orWhereHas('fingerprintMetadata', static function (Builder $metadata): void {
+                            $metadata->where('status', '!=', 'complete')
+                                ->orWhere('metadata->schema_version', '<', ReleaseFingerprintCollector::SCHEMA_VERSION)
+                                ->orWhereNull('metadata->schema_version');
+                        });
+                })
+                ->orderBy('id')
+                ->limit($limit)
+                ->pluck('id');
 
         if ($this->option('dry-run')) {
             $this->table(['release_id'], $releaseIds->map(static fn (int|string $id): array => [(string) $id])->all());

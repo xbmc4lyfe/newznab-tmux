@@ -109,7 +109,10 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
                 return;
             }
         }
-        // Still preempted: leave it stale, which the backfill command and the next upgrade's dispatch pick up.
+        // Still preempted, or it only ever read an uncommitted replacement: hand the record back as stale (only while
+        // this run still owns it), which the scheduled stale sweep and the next upgrade's dispatch pick up.
+        ReleaseFingerprintMetadata::query()->whereKey($record->getKey())->where('status', 'processing')
+            ->when(self::tracksRuns(), fn ($query) => $query->where('run_token', $this->claimToken()))->update(['status' => 'stale']);
     }
 
     /**

@@ -44,6 +44,9 @@ class BookService
 
     public ?string $parsedIsbn;
 
+    /** Searchname the release being processed carries after parseTitle(); the lookup outcome is written only against it. */
+    protected ?string $lookupSearchname = null;
+
     public ?BookParseResult $parsedBookResult;
 
     private ObfuscatedSubjectExtractor $obfuscatedSubjectExtractor;
@@ -471,8 +474,11 @@ class BookService
                 $updates['isrenamed'] = 1;
             }
 
-            Release::query()->where('id', (int) $release->id)->update($updates);
-            if ($nameChanged) {
+            // Only for the title it was matched on: an upgrade may have renamed it meanwhile.
+            $applied = Release::query()->where('id', (int) $release->id)
+                ->where('searchname', $release->searchname)
+                ->update($updates);
+            if ($nameChanged && $applied > 0) {
                 Search::updateRelease((int) $release->id);
             }
         }
@@ -536,7 +542,7 @@ class BookService
                         echo '.';
                     }
                 }
-                $this->recordLookupOutcome((int) $arr['id'], $bookId === null ? null : (int) $bookId);
+                $this->recordLookupOutcome((int) $arr['id'], $bookId === null ? null : (int) $bookId, $this->lookupSearchname);
                 // Sleep to avoid flooding external book metadata providers.
                 $diff = floor((now()->timestamp - $startTime) * 1000000);
                 if ($this->sleeptime * 1000 - $diff > 0 && $usedExternalApi === true) {
@@ -548,10 +554,11 @@ class BookService
         }
     }
 
-    private function recordLookupOutcome(int $releaseId, ?int $bookId): void
+    protected function recordLookupOutcome(int $releaseId, ?int $bookId, ?string $searchname = null): void
     {
-        DB::transaction(function () use ($releaseId, $bookId): void {
+        DB::transaction(function () use ($releaseId, $bookId, $searchname): void {
             $release = Release::query()->where('id', $releaseId)
+                ->when($searchname !== null, static fn ($q) => $q->where('searchname', $searchname))
                 ->whereRaw(BookProcessingCandidateQuery::metadataCondition($this->lookupMode))
                 ->lockForUpdate()->first(['id', 'book_lookup_attempts']);
             if ($release === null) {
@@ -585,12 +592,19 @@ class BookService
         $rawReleaseName = (string) $release_name;
         $parsed = $this->parseReleaseName($rawReleaseName, (string) $releasetype);
         $normalizedReleaseName = $this->determineReadableBookSearchName($rawReleaseName, $parsed) ?? $rawReleaseName;
+        $this->lookupSearchname = $rawReleaseName;
         if ($normalizedReleaseName !== $rawReleaseName) {
-            Release::query()->where('id', (int) $releaseID)->update([
-                'searchname' => $normalizedReleaseName,
-                'isrenamed' => 1,
-            ]);
-            Search::updateRelease((int) $releaseID);
+            // Only for the title it was matched on: an upgrade may have renamed it meanwhile.
+            $renamed = Release::query()->where('id', (int) $releaseID)
+                ->where('searchname', $rawReleaseName)
+                ->update([
+                    'searchname' => $normalizedReleaseName,
+                    'isrenamed' => 1,
+                ]);
+            if ($renamed > 0) {
+                $this->lookupSearchname = $normalizedReleaseName;
+                Search::updateRelease((int) $releaseID);
+            }
         }
         $this->parsedBookResult = $parsed;
         $this->parsedIsbn = $parsed->isbn;

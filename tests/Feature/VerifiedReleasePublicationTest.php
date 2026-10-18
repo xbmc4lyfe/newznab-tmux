@@ -446,13 +446,33 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             } else {
                 $this->assertCount(1, $timingReports);
                 $report = $timingReports[0];
-                $this->assertSame(['status', 'total_ns', 'attempts'], array_keys($report));
+                $this->assertSame(['status', 'total_ns', 'outcome', 'segment_count', 'keys_present', 'source',
+                    'pre_lock_ns', 'pre_lock_phases_ns', 'attempts'], array_keys($report));
+                $this->assertSame('local', $report['source']);
+                $this->assertSame($failure === 'after_commit' ? 'threw' : ($duplicateKind === 'exact' ? 'duplicate' : 'published'), $report['outcome']);
+                $this->assertIsInt($report['segment_count']);
+                $this->assertGreaterThan(0, $report['segment_count']);
+                $this->assertIsBool($report['keys_present']);
+                $this->assertSame(['claim_check', 'metadata_resolve', 'incoming_document', 'key_derivation'], array_keys($report['pre_lock_phases_ns']));
+                $this->assertSame($report['pre_lock_ns'], array_sum($report['pre_lock_phases_ns']));
+                $this->assertGreaterThanOrEqual($report['pre_lock_ns'] + array_sum($report['attempts'][0]['phases_ns']), $report['total_ns']);
                 $this->assertSame($failure === 'after_commit' ? 'threw' : 'returned', $report['status']);
                 $this->assertCount($failure === 'retry' ? 2 : 1, $report['attempts']);
                 $attempt = $report['attempts'][array_key_last($report['attempts'])];
                 $this->assertSame(['state_lock_acquisition', 'candidate_policy', 'metadata_size', 'archive_legacy',
                     'incoming_xml_fingerprint', 'duplicate_search_revalidation', ...($duplicateKind === 'exact' ? [] : ['release_identity_sql', 'final_xml_gzip', 'durable_install']),
-                    'sql_accounting'], array_keys($attempt['phases_ns']));
+                    'sql_accounting', 'ledger_adjust'], array_keys($attempt['phases_ns']));
+                $this->assertSame(array_sum($attempt['phases_ns']) - $attempt['phases_ns']['state_lock_acquisition'],
+                    $attempt['callback_after_state_lock_ns'], 'Pre-lock work must not count as in-lock time.');
+                if (config('release_verification.manifest_storage') === 'database') {
+                    $this->assertSame(['path', 'stripe_count', 'stripe_lock_ns', 'publication_row_lock_ns', 'completed'], array_keys($attempt['lock']));
+                    $this->assertSame('striped', $attempt['lock']['path']);
+                    $this->assertGreaterThan(0, $attempt['lock']['stripe_count']);
+                    $this->assertGreaterThanOrEqual(0, $attempt['lock']['stripe_lock_ns']);
+                    $this->assertGreaterThanOrEqual(0, $attempt['lock']['publication_row_lock_ns']);
+                    $this->assertLessThanOrEqual($attempt['phases_ns']['state_lock_acquisition'],
+                        $attempt['lock']['stripe_lock_ns'] + $attempt['lock']['publication_row_lock_ns']);
+                }
                 $this->assertSame('returned', $attempt['callback_status']);
                 $this->assertGreaterThanOrEqual(0, $attempt['transaction_finalization_ns']);
                 $this->assertGreaterThanOrEqual(array_sum($attempt['phases_ns']), $report['total_ns']);
@@ -479,6 +499,7 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             if ($timingMode === 'enabled') {
                 $this->assertCount(2, $timingReports);
                 $this->assertSame('threw', $timingReports[1]['status']);
+                $this->assertSame('stale', $timingReports[1]['outcome']);
                 $this->assertSame(['state_lock_acquisition', 'candidate_policy'], array_keys($timingReports[1]['attempts'][0]['phases_ns']));
             }
             $this->assertSame('Stale verification result cannot publish.', $error->getMessage());

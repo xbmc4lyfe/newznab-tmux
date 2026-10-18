@@ -108,7 +108,7 @@ class AnimeProcessor
                 $matched = $this->matchAnimeRelease($release);
                 if ($matched === false) {
                     // Persist status so we do not keep retrying hopeless releases immediately.
-                    Release::query()->where('id', $release->id)->update(['anidbid' => $this->status]);
+                    $this->updateRelease($this->status, (int) $release->id, (string) $release->searchname);
                 }
             }
         } else {
@@ -417,7 +417,7 @@ class AnimeProcessor
                 }
             }
 
-            $this->updateRelease($anidbId, (int) $release->id);
+            $this->updateRelease($anidbId, (int) $release->id, (string) $release->searchname);
 
             if ($this->echooutput) {
                 cli()->headerOver('Matched '.$type.' AniList ID: ');
@@ -433,9 +433,12 @@ class AnimeProcessor
         return $matched;
     }
 
-    private function updateRelease(int $anidbId, int $relId): void
+    private function updateRelease(?int $anidbId, int $relId, ?string $searchname = null): int
     {
-        Release::query()->where('id', $relId)->update(['anidbid' => $anidbId]);
+        // Only for the title it was matched on: an upgrade may have renamed it meanwhile.
+        return Release::query()->where('id', $relId)
+            ->when($searchname !== null, static fn ($q) => $q->where('searchname', $searchname))
+            ->update(['anidbid' => $anidbId]);
     }
 
     /**
