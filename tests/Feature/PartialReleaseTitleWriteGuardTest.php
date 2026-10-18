@@ -4,8 +4,10 @@ declare(strict_types=1);
 
 namespace Tests\Feature;
 
+use App\Facades\Search;
 use App\Models\Category;
 use App\Services\AnimeProcessor;
+use App\Services\BookService;
 use App\Services\ConsoleService;
 use App\Services\GamesService;
 use App\Services\MovieService;
@@ -126,5 +128,24 @@ final class PartialReleaseTitleWriteGuardTest extends TestCase
         $this->renamed();
         $this->assertSame(0, $this->invoke($service, 'updateRelease', 42, 1, self::OLD));
         $this->assertNull(DB::table('releases')->where('id', 1)->value('anidbid'));
+    }
+
+    public function test_book_junk_reclassification_applies_only_to_the_title_it_parsed(): void
+    {
+        Schema::table('releases', static function (Blueprint $table): void {
+            $table->unsignedInteger('isrenamed')->default(0);
+        });
+        $title = 'Old.Book.Title.1080p';
+        Search::shouldReceive('updateRelease')->zeroOrMoreTimes();
+        $book = app(BookService::class);
+        (fn () => $this->echooutput = false)->call($book);
+        DB::table('releases')->update(['searchname' => 'Renamed.By.An.Upgrade', 'categories_id' => Category::BOOKS_EBOOK]);
+
+        $book->parseTitle($title, 1, 'ebook');
+        $this->assertSame(Category::BOOKS_EBOOK, (int) DB::table('releases')->value('categories_id'), 'Renamed meanwhile: left alone.');
+
+        DB::table('releases')->update(['searchname' => $title]);
+        $book->parseTitle($title, 1, 'ebook');
+        $this->assertSame(Category::BOOKS_UNKNOWN, (int) DB::table('releases')->value('categories_id'));
     }
 }

@@ -34,7 +34,8 @@ final class BackfillReleaseFingerprintMetadata extends Command
         }
 
         foreach ($releaseIds as $releaseId) {
-            CollectReleaseFingerprintMetadata::dispatch((int) $releaseId);
+            // A recovered refresh keeps its intent: one that exhausts its tries returns to stale, not failed.
+            CollectReleaseFingerprintMetadata::dispatch((int) $releaseId, $this->option('stale') ? 'stale-sweep' : '');
             if ($delayMs > 0) {
                 usleep($delayMs * 1000);
             }
@@ -97,7 +98,9 @@ final class BackfillReleaseFingerprintMetadata extends Command
     private function interruptedReleaseIds(int $afterId, int $limit): array
     {
         return DB::table('release_fingerprint_metadata')
-            ->where(fn ($query) => $query->where('status', 'stale')
+            // Stale for an hour: an upgrade queues its own refresh first, and a refresh that keeps failing (which
+            // returns to stale) is retried hourly rather than every pass.
+            ->where(fn ($query) => $query->where(fn ($stale) => $stale->where('status', 'stale')->where('updated_at', '<', now()->subHour()))
                 ->orWhere(fn ($stuck) => $stuck->where('status', 'processing')
                     ->where('updated_at', '<', now()->subSeconds(2 * CollectReleaseFingerprintMetadata::TIMEOUT_SECONDS))))
             ->where('releases_id', '>', $afterId)->orderBy('releases_id')->limit($limit)

@@ -1217,6 +1217,29 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'), 'Its capacity is released.');
     }
 
+    public function test_headers_a_since_published_repost_could_own_never_upgrade_the_partial(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('published-repost', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $retained = DB::table('release_verification_candidates')->sole();
+        // The same poster's conflicting repost, archived apart, then published complete: its inventory is gone.
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 1, messageId: 'b1@b'));
+        $repost = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        $copy = (array) DB::table('releases')->where('id', $first)->first();
+        DB::table('releases')->insert(['id' => $first + 100, 'guid' => 'repost', 'articles_found' => null, 'articles_expected' => null,
+            'files_found' => null, 'files_expected' => null, 'late_article_candidate_id' => null] + $copy);
+        DB::table('release_verification_candidates')->where('id', $repost->id)->update(['release_id' => $first + 100, 'status' => 'sampled',
+            'manifest_path' => '', 'manifest_bytes' => 0]);
+
+        // An unseen segment that fits the partial, and may equally be the published repost's.
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 3, messageId: 'b3@b'));
+
+        $this->assertSame((int) $retained->id, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'), 'No generation upgrades it.');
+        $this->assertSame(['a@b'], array_column(app(ManifestStore::class)->read((string) DB::table('release_verification_candidates')->where('id', $retained->id)->value('manifest_path'))['files'][0]['segments'], 'messageid'));
+        $this->assertSame(0, DB::table('release_verification_candidates')->whereNotNull('upgrades_release_id')->count());
+    }
+
     public function test_headers_an_older_pending_repost_also_takes_never_upgrade_the_partial(): void
     {
         $this->publicationSchema(partialColumns: true);

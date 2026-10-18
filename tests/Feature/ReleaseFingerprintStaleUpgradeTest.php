@@ -252,7 +252,7 @@ final class ReleaseFingerprintStaleUpgradeTest extends TestCase
             $table->integer('nzbstatus')->default(1);
         });
         (require database_path('migrations/2026_10_12_120000_create_release_fingerprint_metadata_table.php'))->up();
-        foreach ([1 => ['stale', 0], 2 => ['processing', 3], 3 => ['processing', 0], 4 => ['complete', 0]] as $id => [$status, $hoursAgo]) {
+        foreach ([1 => ['stale', 2], 2 => ['processing', 3], 3 => ['processing', 0], 4 => ['complete', 0], 5 => ['stale', 0]] as $id => [$status, $hoursAgo]) {
             DB::table('releases')->insert(['id' => $id, 'guid' => 'g'.$id]);
             DB::table('release_fingerprint_metadata')->insert(['releases_id' => $id, 'status' => $status,
                 'created_at' => now()->subHours($hoursAgo), 'updated_at' => now()->subHours($hoursAgo)]);
@@ -268,7 +268,9 @@ final class ReleaseFingerprintStaleUpgradeTest extends TestCase
             return true;
         });
         sort($queued);
-        $this->assertSame([1, 2], $queued, 'Stale, and processing long past the job timeout; not a live run or a complete one.');
+        Queue::assertPushed(CollectReleaseFingerprintMetadata::class,
+            static fn (CollectReleaseFingerprintMetadata $job): bool => str_ends_with($job->uniqueId(), ':stale-sweep'));
+        $this->assertSame([1, 2], $queued, 'Stale for an hour, and processing long past the job timeout; not a live run, a just-marked one or a complete one.');
     }
 
     #[Test]

@@ -776,6 +776,14 @@ final class CandidateRepository
                 return null;
             }
         }
+        // A newer post under the hash published since (a release created after the partial's): its inventory is
+        // gone, so these headers' compatibility with it can no longer be checked. Keep them apart.
+        $partial = (int) ($holder->release_id ?? ($holder->upgrades_release_id ?? 0));
+        $published = $this->lockSourceCandidates($sourceIdentity, $currentReads, static fn (object $row): bool => $row->release_id !== null
+            && (int) $row->release_id > $partial && ! in_array((int) $row->id, $heldIds, true));
+        if ($published->isNotEmpty()) {
+            return null;
+        }
 
         return $holder;
     }

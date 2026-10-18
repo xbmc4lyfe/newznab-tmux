@@ -616,8 +616,10 @@ class BookService
                 if ($this->echooutput) {
                     cli()->headerOver('Changing category to misc books: ').cli()->primary($releasename);
                 }
-                Release::query()->where('id', $releaseID)->update(['categories_id' => Category::BOOKS_UNKNOWN]);
-                Search::updateRelease((int) $releaseID);
+                if (Release::query()->where('id', $releaseID)->where('searchname', $this->lookupSearchname)
+                    ->update(['categories_id' => Category::BOOKS_UNKNOWN]) > 0) {
+                    Search::updateRelease((int) $releaseID);
+                }
 
                 return false;
             }
@@ -626,8 +628,10 @@ class BookService
                 if ($this->echooutput) {
                     cli()->headerOver('Changing category to magazines: ').cli()->primary($releasename);
                 }
-                Release::query()->where('id', $releaseID)->update(['categories_id' => Category::BOOKS_MAGAZINES]);
-                Search::updateRelease((int) $releaseID);
+                if (Release::query()->where('id', $releaseID)->where('searchname', $this->lookupSearchname)
+                    ->update(['categories_id' => Category::BOOKS_MAGAZINES]) > 0) {
+                    Search::updateRelease((int) $releaseID);
+                }
 
                 return false;
             }
