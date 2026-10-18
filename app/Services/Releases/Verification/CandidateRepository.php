@@ -785,7 +785,7 @@ final class CandidateRepository
         $changed = DB::table('release_verification_candidates')->where('id', $id)->where('lease_token', $token)
             ->where('lease_until', '>=', now())->update(['lease_until' => now()->addSeconds((int) config('release_verification.lease_seconds'))]);
         if ($changed !== 1 && ! DB::table('release_verification_candidates')->where('id', $id)->where('lease_token', $token)->where('lease_until', '>=', now())->exists()) {
-            throw new RuntimeException('Verification lease was lost.');
+            throw new LeaseLostException('Verification lease was lost.');
         }
     }
 

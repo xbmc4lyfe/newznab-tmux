@@ -61,6 +61,80 @@ final class VerificationWorkerLocks
         return false;
     }
 
+    /**
+     * A publication forwarder holds one exclusive lock per forwarder number and host for its whole
+     * run; that lock fences nothing but a second copy of itself. It joins the shared worker group
+     * only while it writes (see {@see joinWorkers()}), so an idle forwarder never delays a barrier.
+     */
+    public function startForwarder(int $number): bool
+    {
+        $this->close();
+        $this->slot = $this->store()->exclusive(self::forwarderLockName($number));
+        if ($this->slot !== null) {
+            return true;
+        }
+        $this->close();
+
+        return false;
+    }
+
+    private static function forwarderLockName(int $number): string
+    {
+        return 'publication-forwarder-'.substr(sha1(ScratchInventory::host()), 0, 12).'-'.$number;
+    }
+
+    /**
+     * A running forwarder becomes a writer like a worker: it joins the shared worker group, which a
+     * drain, an exclusive holder or a durable pause refuses. Join before writing, leave when done.
+     */
+    public function joinWorkers(): bool
+    {
+        if ($this->slot === null) {
+            throw new RuntimeException('Joining the worker group requires a forwarder lock.');
+        }
+        if ($this->global !== null) {
+            return true;
+        }
+        $this->global = $this->store()->shared('worker');
+        if ($this->global !== null && self::paused($this->store()->connection())) {
+            $this->leaveWorkers();
+        }
+
+        return $this->global !== null;
+    }
+
+    public function leaveWorkers(): void
+    {
+        $this->release($this->global);
+    }
+
+    /** Whether the forwarder still holds its own lock; a database lock ends with its session. */
+    public function forwarderHeld(): bool
+    {
+        return $this->slot !== null && $this->store()->holds($this->slot);
+    }
+
+    /**
+     * Run $callback while holding forwarder number $number's lock, so no forwarder of that number is
+     * running. False when another process holds it.
+     *
+     * @param  callable(): void  $callback
+     */
+    public function withForwarderNumber(int $number, callable $callback): bool
+    {
+        $lock = $this->store()->exclusive(self::forwarderLockName($number));
+        if ($lock === null) {
+            return false;
+        }
+        try {
+            $callback();
+        } finally {
+            $this->store()->release($lock);
+        }
+
+        return true;
+    }
+
     /** Configured candidate worker slots on this host, from 1 to MAX_SLOTS. */
     public static function slots(): int
     {
@@ -149,7 +223,11 @@ final class VerificationWorkerLocks
         return $this->exclusive;
     }
 
-    /** False while a drain holds the worker gate or a durable pause exists; a running worker stops claiming. */
+    /**
+     * False while a drain holds the worker gate or a durable pause exists; a running worker stops claiming.
+     *
+     * @phpstan-impure
+     */
     public function admitting(): bool
     {
         return self::pausesExist($this->store()->connection())
