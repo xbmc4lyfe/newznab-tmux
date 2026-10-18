@@ -32,14 +32,15 @@ final class VerifiedNzbWriter
         });
     }
 
-    /** @param array<string, mixed> $manifest */
-    public function writeWithReceipt(array $manifest, string $guid, object $release, ?PublicationTiming $timing = null): NzbSourceInstallation
+    /**
+     * @param  array<string, mixed>  $manifest
+     * @param  string|null  $body  compress(document($manifest)) when the caller rendered it earlier, outside any lock;
+     *                             it must come from this same manifest. Null renders and compresses here.
+     */
+    public function writeWithReceipt(array $manifest, string $guid, object $release, ?PublicationTiming $timing = null, ?string $body = null): NzbSourceInstallation
     {
         $path = $this->nzb->getNzbPath($guid, createIfNotExist: true);
-        $body = gzencode($this->document($manifest));
-        if ($body === false) {
-            throw new RuntimeException('Cannot compress verified NZB.');
-        }
+        $body ??= $this->compress($this->document($manifest));
         $timing?->nextPhase('durable_install');
         $temporary = $path.'.'.bin2hex(random_bytes(8)).'.tmp';
         $handle = fopen($temporary, 'xb');
@@ -63,6 +64,17 @@ final class VerifiedNzbWriter
         }
 
         return $receipt;
+    }
+
+    /** The stored form of a rendered document. */
+    public function compress(string $document): string
+    {
+        $body = gzencode($document);
+        if ($body === false) {
+            throw new RuntimeException('Cannot compress verified NZB.');
+        }
+
+        return $body;
     }
 
     /** @param array<string, mixed> $manifest */

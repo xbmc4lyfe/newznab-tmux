@@ -27,10 +27,19 @@ final class RemoteReleasePublisher
             'manifest_hash' => (string) $claim->manifest_hash, 'lease_token' => (string) $claim->lease_token],
             'reason' => $result->reason, 'evidence' => SpotCheckVerifier::evidence($result->manifest)];
         // A repeated request after a lost response returns the release it already published.
-        $response = Http::acceptJson()->asJson()->connectTimeout(5)
-            ->timeout(max(10, (int) config('release_verification.publish_timeout', 120)))
-            ->retry(3, 1000, static fn (\Throwable $error): bool => $error instanceof ConnectionException, throw: false)
-            ->post((string) config('release_verification.publish_url'), $payload);
+        // Sampled like the primary's publication timing; includes connection retries and their delay.
+        $timing = PublicationTiming::sample();
+        try {
+            $response = Http::acceptJson()->asJson()->connectTimeout(5)
+                ->timeout(max(10, (int) config('release_verification.publish_timeout', 120)))
+                ->retry(3, 1000, static fn (\Throwable $error): bool => $error instanceof ConnectionException, throw: false)
+                ->post((string) config('release_verification.publish_url'), $payload);
+        } catch (\Throwable $error) {
+            $timing?->reportRoundTrip('threw', null);
+
+            throw $error;
+        }
+        $timing?->reportRoundTrip($response->successful() ? 'returned' : 'failed', $response->status());
         if (! $response->successful()) {
             $error = $response->json('error');
             throw new RuntimeException('Remote publication failed: '
