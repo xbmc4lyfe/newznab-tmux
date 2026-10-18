@@ -37,10 +37,6 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
             $table->unsignedInteger('id')->primary();
             $table->string('guid');
         });
-        Schema::create('release_verification_candidates', static function (Blueprint $table): void {
-            $table->unsignedInteger('id')->primary();
-            $table->unsignedInteger('release_id')->nullable();
-        });
         Schema::create('release_files', static function (Blueprint $table): void {
             $table->unsignedInteger('releases_id');
             $table->string('name');
@@ -557,11 +553,11 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
         return $this->sources->install($this->release, $temporary, $this->path());
     }
 
-    public function test_reconcile_deletes_a_stale_backup_whose_upgrade_committed(): void
+    public function test_reconcile_deletes_the_backup_when_evidence_matches_the_canonical_source(): void
     {
         $this->writeSource('upgraded');
         $backup = $this->tagBackup(5, 'original');
-        DB::table('release_verification_candidates')->insert(['id' => 5, 'release_id' => 1]);
+        $this->commitEvidence('upgraded');
 
         self::assertSame('deleted', $this->sources->reconcilePreserved($backup));
 
@@ -569,11 +565,11 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
         self::assertSame('upgraded', gzdecode((string) file_get_contents($this->path())));
     }
 
-    public function test_reconcile_restores_the_backup_when_the_upgrade_did_not_commit(): void
+    public function test_reconcile_restores_the_backup_when_evidence_matches_it(): void
     {
         $this->writeSource('upgraded');
         $backup = $this->tagBackup(5, 'original');
-        DB::table('release_verification_candidates')->insert(['id' => 5, 'release_id' => null]);
+        $this->commitEvidence('original');
 
         self::assertSame('restored', $this->sources->reconcilePreserved($backup));
 
@@ -581,38 +577,52 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
         self::assertSame('original', gzdecode((string) file_get_contents($this->path())));
     }
 
-    public function test_reconcile_deletes_when_a_later_generation_committed(): void
-    {
-        $this->writeSource('later upgrade');
-        $backup = $this->tagBackup(5, 'original');
-        DB::table('release_verification_candidates')->insert([['id' => 5, 'release_id' => null], ['id' => 9, 'release_id' => 1]]);
-
-        self::assertSame('deleted', $this->sources->reconcilePreserved($backup));
-
-        self::assertFileDoesNotExist($backup);
-        self::assertSame('later upgrade', gzdecode((string) file_get_contents($this->path())));
-    }
-
-    public function test_reconcile_ignores_an_earlier_generation_and_other_releases(): void
+    public function test_reconcile_restores_the_backup_when_no_installation_ever_committed(): void
     {
         $this->writeSource('upgraded');
         $backup = $this->tagBackup(5, 'original');
-        DB::table('release_verification_candidates')->insert([['id' => 3, 'release_id' => 1], ['id' => 9, 'release_id' => 2]]);
+        self::assertSame(0, DB::table('release_archive_naming_evidence')->count());
 
         self::assertSame('restored', $this->sources->reconcilePreserved($backup));
 
+        self::assertFileDoesNotExist($backup);
         self::assertSame('original', gzdecode((string) file_get_contents($this->path())));
+    }
+
+    public function test_reconcile_keeps_both_files_when_evidence_matches_neither(): void
+    {
+        $this->writeSource('newer source');
+        $backup = $this->tagBackup(5, 'original');
+        $this->commitEvidence('something else');
+
+        self::assertSame('kept', $this->sources->reconcilePreserved($backup));
+
+        self::assertSame('original', gzdecode((string) file_get_contents($backup)));
+        self::assertSame('newer source', gzdecode((string) file_get_contents($this->path())));
     }
 
     public function test_reconcile_deletes_the_backup_of_a_release_that_no_longer_exists(): void
     {
         $this->writeSource('upgraded');
         $backup = $this->tagBackup(5, 'original');
+        DB::table('release_archive_naming_evidence')->delete();
         DB::table('releases')->where('id', 1)->delete();
 
         self::assertSame('deleted', $this->sources->reconcilePreserved($backup));
 
         self::assertFileDoesNotExist($backup);
+        self::assertSame('upgraded', gzdecode((string) file_get_contents($this->path())));
+    }
+
+    public function test_reconcile_dry_run_changes_nothing(): void
+    {
+        $this->writeSource('upgraded');
+        $backup = $this->tagBackup(5, 'original');
+        $this->commitEvidence('original');
+
+        self::assertSame('restored', $this->sources->reconcilePreserved($backup, false));
+
+        self::assertFileExists($backup);
         self::assertSame('upgraded', gzdecode((string) file_get_contents($this->path())));
     }
 
@@ -625,6 +635,19 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
         self::assertSame('kept', $this->sources->reconcilePreserved($backup));
 
         self::assertFileExists($backup);
+    }
+
+    private function commitEvidence(string $decodedSource): void
+    {
+        DB::table('release_archive_naming_evidence')->insert([
+            'releases_id' => 1,
+            'release_guid' => 'fixture-guid',
+            'source_sha256' => NzbSourceGuard::digest($decodedSource),
+            'proof_version' => ReleaseArchiveNamingEvidence::PROOF_VERSION,
+            'scope' => 'unknown',
+            'episode_files' => '[]',
+            'updated_at' => now(),
+        ]);
     }
 
     private function tagBackup(int $candidateId, string $contents): string

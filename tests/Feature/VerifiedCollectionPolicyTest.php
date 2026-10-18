@@ -1038,20 +1038,15 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $version = (int) Cache::get('releases:cache_version', 1);
         Queue::fake();
 
-        try {
-            $this->publishStalledPartial(null, searchFails: true);
-        } catch (\RuntimeException $error) {
-            // The upgrade itself has committed; the sync failure surfaces after it.
-            $this->assertSame('Search backend unavailable.', $error->getMessage());
-        }
-        $this->assertTrue(isset($error), 'The search sync really failed.');
+        // Logged, not thrown, so the after-commit callbacks registered after it (manifest cleanup) still run.
+        $this->assertSame($first, $this->publishStalledPartial(null, searchFails: true));
 
         $this->assertSame(2, (int) DB::table('releases')->where('id', $first)->value('articles_found'), 'The upgrade committed.');
         Queue::assertPushed(CollectReleaseFingerprintMetadata::class);
         $this->assertSame($version + 1, (int) Cache::get('releases:cache_version', 1), 'Cached API rows no longer describe the smaller inventory.');
     }
 
-    public function test_an_oversized_hot_snapshot_revokes_unpublished_posts_under_its_hash(): void
+    public function test_an_oversized_hot_snapshot_fences_verifications_under_way_and_leaves_posts_claimable(): void
     {
         $this->publicationSchema(partialColumns: true);
         $hash = sha1('over-budget-hot', true);
@@ -1068,8 +1063,14 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         DB::transaction(fn () => app(CandidateRepository::class)->invalidateHotCollections([$late]));
 
         $after = DB::table('release_verification_candidates')->where('id', $pending->id)->first();
-        $this->assertSame(['dirty', null, (int) $pending->version + 1], [$after->status, $after->lease_token, (int) $after->version],
-            'A worker cannot publish it without these headers.');
+        $this->assertSame([$pending->status, null, (int) $pending->version + 1], [$after->status, $after->lease_token, (int) $after->version],
+            'The verification under way cannot publish; the post is verified again.');
+        try {
+            app(CandidateRepository::class)->archive($late);
+        } catch (CandidateMetadataBudgetExceeded) {
+            // archive() cannot merge it either.
+        }
+        $this->assertSame($pending->status, DB::table('release_verification_candidates')->where('id', $pending->id)->value('status'), 'Never stranded.');
     }
 
     public function test_a_covering_release_with_conflicting_metadata_sends_the_generation_to_review_not_an_upgrade(): void

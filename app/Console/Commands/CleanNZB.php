@@ -150,6 +150,12 @@ class CleanNZB extends Command
         if (! $delete) {
             $paths = $nzb->findStaleTemporaryNzbPaths($olderThanSeconds);
             foreach ($paths as $path) {
+                if (NzbService::isPreservedNzbPathName($path)) {
+                    $outcome = $nzb->reconcileStalePreservedNzb($path, $olderThanSeconds, apply: false);
+                    $this->line($outcome === 'kept' ? "Would keep replaced NZB (needs review): {$path}" : "Would {$outcome} stale replaced NZB: {$path}");
+
+                    continue;
+                }
                 $this->line("Would delete stale temporary NZB: {$path}");
             }
 

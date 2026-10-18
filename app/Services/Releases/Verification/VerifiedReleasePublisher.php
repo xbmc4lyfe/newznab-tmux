@@ -487,8 +487,8 @@ final class VerifiedReleasePublisher
                 ['releases_id'], ['status', 'updated_at']);
         }
         $holderLabel = bin2hex(random_bytes(4));
-        // The search sync runs last: a failing one stops later after-commit callbacks, and must not keep the
-        // stale fingerprint from being collected or cached API rows from being invalidated.
+        // A failing search sync must not keep the stale fingerprint from being collected, cached API rows
+        // from being invalidated, or later callbacks from running.
         DB::afterCommit(static function (): void {
             // Cached API rows still describe the smaller inventory.
             try {
@@ -508,7 +508,14 @@ final class VerifiedReleasePublisher
                 ]);
             }
         });
-        DB::afterCommit(static fn () => Search::updateRelease($id));
+        DB::afterCommit(static function () use ($id): void {
+            // Logged, not thrown: later after-commit callbacks (the consumed manifest's cleanup) must still run.
+            try {
+                Search::updateRelease($id);
+            } catch (Throwable $searchException) {
+                Log::warning('Could not sync an upgraded partial release to the search index.', ['release_id' => $id, 'exception' => $searchException::class]);
+            }
+        });
 
         return $id;
     }

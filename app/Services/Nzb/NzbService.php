@@ -610,7 +610,12 @@ class NzbService
             }
             if (self::isPreservedNzbPathName($path)) {
                 // Never just deleted: it may be the only copy matching a rolled-back release row.
-                $deleted += $this->reconcileStalePreservedNzb($path, $olderThanSeconds) !== 'kept' ? 1 : 0;
+                $outcome = $this->reconcileStalePreservedNzb($path, $olderThanSeconds);
+                if ($outcome === 'deleted') {
+                    $deleted++;
+                } elseif ($outcome === 'restored') {
+                    Log::channel('nzb_creation')->warning('Restored a preserved NZB source whose replacement rolled back', ['path' => $path]);
+                }
 
                 continue;
             }

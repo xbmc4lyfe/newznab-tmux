@@ -90,35 +90,49 @@ final class NzbSourceGuard
     }
 
     /**
-     * Settle a replaced source a crash or failed rollback left behind, in installation's lock order. The
-     * upgrading candidate's publication commits with the replacement: if it holds the release, or a later
-     * generation does, the canonical source is current and the preserved one goes; otherwise the replacement
-     * rolled back and the preserved source, which matches the release row, is put back.
+     * Settle a replaced source a crash or failed rollback left behind, in installation's lock order. Every
+     * installation records its source digest in its own transaction, so that evidence names the source the
+     * committed release row describes: the preserved link goes when the canonical file is that source (the
+     * replacement committed), and is put back when it is (the replacement rolled back) or when no installation
+     * ever committed. Anything else is kept for an operator; a release that no longer exists takes its link.
      *
      * @return 'deleted'|'restored'|'kept'
      */
     public function reconcilePreserved(string $path, bool $apply = true): string
     {
-        if (preg_match('/^(.+)\.nzb\.gz\.c(\d+)-[0-9a-f]{16}\.prev$/D', basename($path), $match) !== 1) {
+        if (preg_match('/^(.+)\.nzb\.gz\.c\d+-[0-9a-f]{16}\.prev$/D', basename($path), $match) !== 1) {
             return 'kept';
         }
-        [$guid, $candidateId] = [$match[1], (int) $match[2]];
+        $guid = $match[1];
         $canonical = dirname($path).DIRECTORY_SEPARATOR.$guid.'.nzb.gz';
 
-        return DB::transaction(function () use ($path, $guid, $candidateId, $canonical, $apply): string {
+        return DB::transaction(function () use ($path, $guid, $canonical, $apply): string {
             $release = DB::table('releases')->where('guid', $guid)->lockForUpdate()->first(['id', 'guid']);
 
-            return $this->withGuidLock($guid, function () use ($release, $path, $candidateId, $canonical, $apply): string {
-                $committed = $release === null || DB::table('release_verification_candidates')->where('release_id', $release->id)
-                    ->where('id', '>=', $candidateId)->exists();
-                if (! $apply) {
-                    return $committed ? 'deleted' : 'restored';
+            return $this->withGuidLock($guid, function () use ($release, $path, $canonical, $apply): string {
+                if ($release === null) {
+                    return ! $apply || @unlink($path) ? 'deleted' : 'kept';
                 }
-                if ($committed) {
-                    return @unlink($path) ? 'deleted' : 'kept';
-                }
+                $committed = app(ReleaseArchiveNamingEvidence::class)->committedSourceDigestLocked($release);
+                $digestOf = static function (string $file): ?string {
+                    $contents = @file_get_contents($file);
+                    $decoded = $contents === false ? false : @gzdecode($contents);
 
-                return @rename($path, $canonical) ? 'restored' : 'kept';
+                    return $decoded === false || $decoded === '' ? null : self::digest($decoded);
+                };
+                $current = is_file($canonical) ? $digestOf($canonical) : null;
+                if ($committed !== null && $current !== null && hash_equals($committed, $current)) {
+                    return ! $apply || @unlink($path) ? 'deleted' : 'kept';
+                }
+                $preserved = $digestOf($path);
+                if ($preserved !== null && ($committed === null || hash_equals($committed, $preserved))) {
+                    return ! $apply || @rename($path, $canonical) ? 'restored' : 'kept';
+                }
+                Log::warning('Preserved NZB source matches neither the committed release nor its current source; kept.', [
+                    'preserved_source' => $path,
+                ]);
+
+                return 'kept';
             });
         });
     }
