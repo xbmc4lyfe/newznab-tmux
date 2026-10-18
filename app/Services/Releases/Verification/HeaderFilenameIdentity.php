@@ -48,7 +48,9 @@ final class HeaderFilenameIdentity
         if (in_array($actual, $quoted, true)) {
             return true;
         }
-        if (self::executable($actual) && ! self::executable($declared)) {
+        // An executable body must be exactly the executable type its subject declares.
+        if (self::executable($actual) && (! self::executable($declared)
+            || strtolower(self::extension(self::bare($actual))) !== strtolower(self::extension(self::bare($declared))))) {
             return false;
         }
         if (self::opaque($declared)) {
@@ -99,7 +101,13 @@ final class HeaderFilenameIdentity
 
     private static function executable(string $name): bool
     {
-        return preg_match(self::EXECUTABLE, rtrim($name, ". \t")) === 1;
+        return preg_match(self::EXECUTABLE, self::bare($name)) === 1;
+    }
+
+    /** The name a filesystem writes: without an NTFS stream suffix or trailing dots and spaces. */
+    private static function bare(string $name): string
+    {
+        return rtrim((string) preg_replace('/:.*\z/s', '', $name), ". \t");
     }
 
     private static function extension(string $name): string

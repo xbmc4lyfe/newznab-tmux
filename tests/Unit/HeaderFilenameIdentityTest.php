@@ -92,6 +92,9 @@ class HeaderFilenameIdentityTest extends TestCase
             'executable inside another unquoted name' => ['Game Setup.exe yEnc (1/2)', 'p.exe', false],
             'script component under an opaque subject' => ['[1/9] - "Xk29dPq8LmZ0Yt5R.mkv" yEnc', 'evil.wsc', false],
             'disk image under an opaque subject' => ['[1/9] - "Xk29dPq8LmZ0Yt5R.mkv" yEnc', 'evil.iso', false],
+            'executable body under an opaque disk image' => ['[1/9] - "Xk29dPq8LmZ0Yt5R.iso" yEnc', 'setup.exe', false],
+            'disk image under an opaque disk image' => ['[1/9] - "Xk29dPq8LmZ0Yt5R.iso" yEnc', 'b7Qe1ZrT9wXy.ISO', true],
+            'executable behind an NTFS stream suffix' => ['[1/9] - "Xk29dPq8LmZ0Yt5R.mkv" yEnc', 'setup.exe::$DATA', false],
             'opaque subject with an extensionless body' => ['[3/8] - "o9aeI3YpDwgHGoJ2ZsCm.vol00+01.par2" yEnc', '148f76878d7732b981734a9e0c51a348', true],
         ];
     }
