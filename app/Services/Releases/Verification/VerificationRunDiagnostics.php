@@ -33,6 +33,12 @@ final class VerificationRunDiagnostics
 
     private int $publishReturned = 0;
 
+    private int $handedOff = 0;
+
+    private int $outboxFallbacks = 0;
+
+    private float $outboxWaitMilliseconds = 0.0;
+
     private int $finishReturned = 0;
 
     private int $filteredRecoveries = 0;
@@ -126,6 +132,23 @@ final class VerificationRunDiagnostics
         $this->publishReturned++;
     }
 
+    /** A verified result went to the publication outbox instead of the primary. */
+    public function handedOff(): void
+    {
+        $this->handedOff++;
+    }
+
+    /** A result that would have gone to the outbox was published synchronously instead. */
+    public function outboxFallback(): void
+    {
+        $this->outboxFallbacks++;
+    }
+
+    public function outboxWaited(int $started, int $finished): void
+    {
+        $this->outboxWaitMilliseconds += ($finished - $started) / 1_000_000.0;
+    }
+
     public function finished(): void
     {
         $this->finishReturned++;
@@ -176,7 +199,7 @@ final class VerificationRunDiagnostics
     public function report(int $finished): array
     {
         return [
-            'schema_version' => 2,
+            'schema_version' => 3,
             'started_at' => $this->startedAt,
             'requested_slot' => $this->requestedSlot,
             'limit' => $this->limit,
@@ -190,6 +213,9 @@ final class VerificationRunDiagnostics
             'deadline_reached_at_stop' => $this->deadlineReached,
             'verifier_verdicts' => $this->verdicts,
             'publish_returned' => $this->publishReturned,
+            'handed_off' => $this->handedOff,
+            'outbox_fallbacks' => $this->outboxFallbacks,
+            'outbox_wait_ms' => round($this->outboxWaitMilliseconds, 3),
             'finish_returned' => $this->finishReturned,
             'filtered_recoveries' => $this->filteredRecoveries,
             'candidate_errors' => $this->candidateErrors,
