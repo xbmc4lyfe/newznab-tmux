@@ -555,6 +555,18 @@ final class CompactFingerprintCollector
         if (($yenc['payload_escape_state_valid'] ?? null) === false) {
             $errors[] = 'YencFramingInvalid';
         }
+        // Every structural failure or ambiguity the analyzer establishes keeps the record partial.
+        $structureInvalid = in_array($yenc['multipart_structure_status'] ?? null, ['invalid', 'incomplete', 'ambiguous'], true)
+            || ($yenc['integrity_checks_ambiguous'] ?? null) === true
+            || (is_array($yenc['conflicting_control_fields'] ?? null) && $yenc['conflicting_control_fields'] !== []);
+        foreach (['ypart_range_valid', 'header_numeric_fields_valid', 'header_numeric_fields_representable',
+            'trailer_numeric_fields_valid', 'trailer_numeric_fields_representable',
+            'trailer_part_matches_header', 'trailer_total_matches_header'] as $check) {
+            $structureInvalid = $structureInvalid || ($yenc[$check] ?? null) === false;
+        }
+        if ($structureInvalid) {
+            $errors[] = 'YencStructureInvalid';
+        }
 
         return $errors;
     }

@@ -13,6 +13,7 @@ use App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer;
 use App\Services\Releases\Fingerprint\Par2MetadataParser;
 use App\Services\Releases\Fingerprint\ReleaseFingerprintCollector;
 use App\Services\YencService;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\Fixtures\ArchiveParsingBenchmarkFixtures;
 use Tests\Fixtures\YencArticles;
@@ -305,6 +306,50 @@ final class CompactFingerprintCollectorTest extends TestCase
         $this->assertSame([['account' => 'primary', 'error_type' => 'YencSizeMismatch', 'count' => 1]], $result['data']['errors']);
         $article = $result['data']['articles'][array_search(2, array_column($result['data']['articles'], 'file_index'), true)];
         $this->assertSame([true, false], [$article['yenc']['crc_ok'], $article['yenc']['size_ok']]);
+    }
+
+    /** @return array<string, array{callable(string): string}> */
+    public static function invalidMultipartBodies(): array
+    {
+        return [
+            'range outside the file' => [static fn (string $body): string => str_replace('=ypart begin=1 end=16', '=ypart begin=90 end=105', $body)],
+            'trailer part disagrees' => [static fn (string $body): string => str_replace('=yend size=16 part=1', '=yend size=16 part=2', $body)],
+            'non-numeric header size' => [static fn (string $body): string => str_replace('size=32 name=', 'size=abc name=', $body)],
+        ];
+    }
+
+    /** @param callable(string): string $corrupt */
+    #[Test]
+    #[DataProvider('invalidMultipartBodies')]
+    public function invalid_yenc_structure_keeps_the_record_partial(callable $corrupt): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(function (string $id) use ($corrupt): array {
+            $body = YencArticles::part('0123456789abcdef', 'multi.bin', 32, 1, 1, 2);
+
+            return ['body' => str_starts_with($id, 'f1-') ? $corrupt($body) : $body] + self::article($id);
+        });
+
+        $result = $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7);
+
+        $this->assertSame('partial', $result['status']);
+        $this->assertContains('YencStructureInvalid', array_column($result['data']['errors'], 'error_type'));
+    }
+
+    #[Test]
+    public function a_valid_multipart_article_is_not_reported(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(fn (string $id): array => [
+            'body' => YencArticles::part('0123456789abcdef', 'multi.bin', 32, 1, 1, 2),
+        ] + self::article($id));
+
+        $result = $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7);
+
+        $this->assertSame([], $result['data']['errors']);
+        $this->assertSame('complete', $result['status']);
     }
 
     #[Test]
