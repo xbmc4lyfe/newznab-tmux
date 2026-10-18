@@ -400,7 +400,7 @@ final class SpotCheckVerifierTest extends TestCase
         $token = str_repeat('a1', 16);
         foreach (['"'.$token.'"' => 'sampled', "'".strtoupper($token)."'" => 'sampled',
             '"'.substr($token, 1).'"' => 'sampled', '"'.$token.'.rar"' => 'sampled',
-            '"Xk29dPq8LmZ0.part01.rar" yEnc' => 'sampled', '"password" - [1/2] - "actual.rar" yEnc' => 'sampled',
+            '"Xk29dPq8LmZ0Yt5RbW3q.part01.rar" yEnc' => 'sampled', '"Xk29dPq8LmZ0.part01.rar" yEnc' => 'unknown', '"password" - [1/2] - "actual.rar" yEnc' => 'sampled',
             '"literal-extensionless-name"' => 'unknown', '"'.$token.'" "other.rar"' => 'unknown',
             '"Movie2026.rar"' => 'unknown', '"other.rar" yEnc' => 'unknown',
             '"Xk29dPq8LmZ0Yt5R.par2" yEnc' => 'unknown'] as $subject => $verdict) {

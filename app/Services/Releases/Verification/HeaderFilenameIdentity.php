@@ -15,7 +15,7 @@ final class HeaderFilenameIdentity
 
     private const string SUFFIX = '/\A(?:part\d+|vol\d+[+-]\d+|par2|rar|r\d{2,3}|\d{3}|7z|zip|mkv|avi|mp4|m4v|ts|nfo|sfv|nzb|epub|pdf|flac|mp3|iso|srt|txt|jpg|png)\z/i';
 
-    private const string EXECUTABLE = '/\.(?:exe|scr|bat|cmd|com|msi|msix|msp|lnk|pif|cpl|hta|reg|scf|js|jse|vbs|vbe|wsf|wsh|ps1|psm1|jar|apk|dll|sh|command|app|dmg|pkg|chm|msc|ps1xml|psd1|cab|appx|appxbundle|msixbundle|application|gadget|inf|url|xll|ws|wsc|sct|vb|ocx|sys|iso|img|vhd|vhdx|desktop|appimage)\z/i';
+    private const string EXECUTABLE = '/\.(?:exe|scr|bat|cmd|com|msi|msix|msp|lnk|pif|cpl|hta|reg|scf|js|jse|vbs|vbe|wsf|wsh|ps1|psm1|jar|apk|dll|sh|command|app|dmg|pkg|chm|msc|ps1xml|psd1|cab|appx|appxbundle|msixbundle|application|gadget|inf|url|xll|ws|wsc|sct|vb|ocx|sys|iso|img|vhd|vhdx|desktop|appimage|deb|rpm|snap|run|msu|py|pyw|pl|rb|php)\z/i';
 
     public static function matches(string $subject, string $actual): bool
     {
@@ -58,16 +58,23 @@ final class HeaderFilenameIdentity
             || strtolower(self::extension(self::trimmed($actual))) !== strtolower(self::extension(self::trimmed($declared))))) {
             return false;
         }
-        // A declared PAR2 file is not payload evidence, even when another quoted value names the body.
+        // Parity and payload are not interchangeable: a declared PAR2 file is not payload evidence, and a
+        // declared payload file is not satisfied by a PAR2 body, even when another quoted value names it.
         $bodyExtension = strtolower(self::extension(self::trimmed($actual)));
-        if (preg_match('/\.par2\z/i', $declared) === 1 && $bodyExtension !== '' && $bodyExtension !== 'par2') {
+        $declaredExtension = strtolower(self::extension(self::trimmed($declared)));
+        if (($declaredExtension === 'par2') !== ($bodyExtension === 'par2') && $bodyExtension !== '' && $declaredExtension !== '') {
             return false;
         }
         if (in_array($actual, $quoted, true)) {
             return true;
         }
+        // A long or hexadecimal random token is plainly obfuscated. A shorter one could be a misread title, so it admits
+        // only a body that is random too or extends the declared token, never a different readable name.
         if (self::opaque($declared)) {
-            return true;
+            $token = self::token($declared);
+
+            return strlen($token) >= 20 || preg_match('/\A[0-9a-f]{16,}\z/i', $token) === 1 || self::opaque($actual)
+                || str_starts_with(strtolower(self::bare($actual)), strtolower($token));
         }
         // A readable declared name must agree on its volume and extension chain, and on its final
         // extension when that chain does not cover it, as well as its stem.
@@ -81,22 +88,21 @@ final class HeaderFilenameIdentity
         if ($expected === '' || $body === '' || self::numbers($declared) !== self::numbers($actual)) {
             return false;
         }
-        if ($expected === $body) {
-            return true;
-        }
-        [$shorter, $longer] = mb_strlen($expected) <= mb_strlen($body)
-            ? [self::words($declared), self::words($actual)] : [self::words($actual), self::words($declared)];
 
-        // Only whole words may follow (the number check above already rules out added numbers): VI is not VII.
-        return mb_strlen(implode('', $shorter)) >= 8 && array_slice($longer, 0, count($shorter)) === $shorter
-            && preg_match('/\p{N}\p{M}*\z/u', (string) end($shorter)) !== 1;
+        // Only separators and case may differ: an added, removed or changed word (VI, Part A) is another file.
+        return $expected === $body;
+    }
+
+    /** The stem without an unlisted final extension, such as .wmv. */
+    private static function token(string $name): string
+    {
+        return (string) preg_replace('/\.[A-Za-z0-9]{1,8}\z/', '', self::stem($name));
     }
 
     /** A single random-looking token, such as an obfuscated posting name, makes no filename claim. */
     private static function opaque(string $name): bool
     {
-        // An unlisted final extension, such as .wmv, is not part of the token.
-        $stem = (string) preg_replace('/\.[A-Za-z0-9]{1,8}\z/', '', self::stem($name));
+        $stem = self::token($name);
         if (preg_match('/\A[A-Za-z0-9]+\z/', $stem) !== 1) {
             return false;
         }
@@ -156,12 +162,6 @@ final class HeaderFilenameIdentity
         preg_match_all('/\p{N}+/u', self::stem($name), $matches);
 
         return $matches[0];
-    }
-
-    /** @return list<string> */
-    private static function words(string $name): array
-    {
-        return preg_split('/[^\p{L}\p{M}\p{N}]+/u', self::folded($name), -1, PREG_SPLIT_NO_EMPTY) ?: [];
     }
 
     private static function normalized(string $name): string
