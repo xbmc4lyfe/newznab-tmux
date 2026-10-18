@@ -38,6 +38,9 @@ final class PublicationOutbox
 
     private readonly string $root;
 
+    /** Names this process's alive marker, so only its owner removes it (a replacement forwarder's is left alone). */
+    private readonly string $markerToken;
+
     /** @var array<string, true> Entries that could neither be removed nor moved; this process leaves them alone. */
     private array $stuck = [];
 
@@ -47,6 +50,7 @@ final class PublicationOutbox
     public function __construct(?string $root = null)
     {
         $this->root = $root ?? (string) config('release_verification.storage_path').'/publication-outbox';
+        $this->markerToken = bin2hex(random_bytes(8));
     }
 
     /** Whether this host hands verified results to a forwarder: flag on, publishing remotely, worker-only. */
@@ -165,6 +169,9 @@ final class PublicationOutbox
     /** Whether some forwarder touched its alive file within $window seconds. */
     public function forwarderAlive(?int $now = null, ?int $window = null): bool
     {
+        if ($this->linked($this->root)) {
+            return false;
+        }
         $now ??= time();
         $window ??= max(1, (int) config('release_verification.publish_forwarder_alive_seconds', self::ALIVE_SECONDS));
         clearstatcache();
@@ -183,7 +190,12 @@ final class PublicationOutbox
     public function touchAlive(int $slot): void
     {
         $path = $this->root.'/forwarder-'.$slot.'.alive';
-        if (is_link($path) || (! touch($path))) {
+        if ($this->linked($this->root) || is_link($path)) {
+            throw new RuntimeException('Cannot mark the publication forwarder alive through a symlink.');
+        }
+        // The marker carries its owner's token, written when it is first claimed and left alone while it matches.
+        $written = @file_get_contents($path) === $this->markerToken ? touch($path) : (file_put_contents($path, $this->markerToken) !== false);
+        if (! $written) {
             throw new RuntimeException('Cannot mark the publication forwarder alive.');
         }
     }
@@ -198,9 +210,14 @@ final class PublicationOutbox
         }
     }
 
+    /** Remove this process's own marker; one a replacement forwarder wrote, or one behind a link, is left alone. */
     public function clearAlive(int $slot): void
     {
-        @unlink($this->root.'/forwarder-'.$slot.'.alive');
+        $path = $this->root.'/forwarder-'.$slot.'.alive';
+        if ($this->linked($this->root) || is_link($path) || @file_get_contents($path) !== $this->markerToken) {
+            return;
+        }
+        @unlink($path);
     }
 
     /**
@@ -403,16 +420,20 @@ final class PublicationOutbox
      * Seconds forwarder $number runs before the scheduler restarts it: never more than the configured
      * period (so a container stop need not wait for it), 10 s short of whole minutes so the restart tick
      * follows at once, and staggered by whole minutes inside that period so the forwarders do not all
-     * restart together. A period under {@see MINIMUM_PERIOD_SECONDS} counts as that.
+     * restart together. The period counts in whole minutes (131 s is two), because the scheduler ticks once a
+     * minute, and is at least {@see MINIMUM_PERIOD_SECONDS}.
      */
     public static function forwarderLifetime(int $number): int
     {
         // The scheduler starts forwarders once a minute, so a run must span a whole tick and the restart after it:
         // below two minutes, a forwarder would leave a gap of most of every minute with none running.
         $period = max(self::MINIMUM_PERIOD_SECONDS, (int) config('release_verification.publish_forwarder_seconds', 300));
-        $lives = max(1, intdiv($period, 60) - 1);
+        // Whole minutes only: a run that ends 10 s before a tick is restarted by it at once, while one that ends
+        // between ticks waits for the next, and the forwarders sharing such a length would all be gone together.
+        $minutes = intdiv($period, 60);
+        $lives = max(1, $minutes - 1);
 
-        return max(20, $period - 10 - 60 * ((max(1, $number) - 1) % $lives));
+        return 60 * ($minutes - ((max(1, $number) - 1) % $lives)) - 10;
     }
 
     /**

@@ -7,6 +7,7 @@ namespace App\Services\Releases\Verification;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
+use Psr\Http\Message\RequestInterface;
 use RuntimeException;
 
 /**
@@ -54,6 +55,7 @@ final class RemoteReleasePublisher
             $response = Http::acceptJson()->asJson()->connectTimeout(5)
                 ->timeout(max(10, (int) config('release_verification.publish_timeout', 120)))
                 ->withOptions($this->progressOptions())
+                ->withRequestMiddleware($this->cancellationGate())
                 ->retry(3, 1000, fn (\Throwable $error): bool => $error instanceof ConnectionException && ! $this->cancelledNow(), throw: false)
                 ->post((string) config('release_verification.publish_url'), $payload);
         } catch (\Throwable $error) {
@@ -213,6 +215,7 @@ final class RemoteReleasePublisher
             $response = Http::acceptJson()->asJson()->connectTimeout(5)
                 ->timeout(max(10, (int) config('release_verification.publish_timeout', 120)))
                 ->withOptions($this->progressOptions())
+                ->withRequestMiddleware($this->cancellationGate())
                 ->retry(3, 1000, fn (\Throwable $error): bool => $error instanceof ConnectionException && ! $this->cancelledNow(), throw: false)
                 ->post((string) config('release_verification.publish_batch_url'),
                     ['protocol' => RemotePublicationService::BATCH_PROTOCOL, 'items' => array_values($payloads)]);
@@ -324,6 +327,24 @@ final class RemoteReleasePublisher
     private function progressOptions(): array
     {
         return $this->progress === null ? [] : ['progress' => fn () => $this->tick()];
+    }
+
+    /**
+     * Request middleware that runs before every transport attempt, retries included. The retry predicate
+     * is asked before the delay, so a cancellation during the delay is only seen here; the attempt then
+     * fails as an unreachable primary, without a request. Without a cancellation check it does nothing.
+     *
+     * @return callable(RequestInterface): RequestInterface
+     */
+    private function cancellationGate(): callable
+    {
+        return function (RequestInterface $request): RequestInterface {
+            if ($this->cancelledNow()) {
+                throw new ConnectionException('Publication was cancelled before this attempt was sent.');
+            }
+
+            return $request;
+        };
     }
 
     private function cancelledNow(): bool

@@ -146,8 +146,12 @@ class ForwardVerifiedPublications extends Command
             $this->diagnostics?->adopted(count($this->outbox->inflight($this->slot)));
             $this->loop($publisher, $maxSeconds);
         } finally {
-            // Workers must not hand off to a forwarder that is gone. Removing the marker only deletes.
-            $this->outbox->clearAlive($this->slot);
+            // Workers must not hand off to a forwarder that is gone. Only a marker this process wrote, and only
+            // while it still provably holds the slot lock, is removed: after a lost session a replacement
+            // forwarder may already have taken the slot and its marker.
+            if ($this->locks->forwarderHeld()) {
+                $this->outbox->clearAlive($this->slot);
+            }
             $this->locks->close();
         }
 
@@ -344,7 +348,9 @@ class ForwardVerifiedPublications extends Command
             foreach ($foreign as $other) {
                 // Only a number whose lock is free is orphaned; a running forwarder keeps its own folder.
                 $this->locks->withForwarderNumber($other, function () use ($other): void {
-                    $this->diagnostics?->orphansAdopted($this->outbox->adopt($other));
+                    // Adoption is the work; only recording its count depends on the diagnostics.
+                    $adopted = $this->outbox->adopt($other);
+                    $this->diagnostics?->orphansAdopted($adopted);
                 });
             }
             $this->renewLeases($due);
