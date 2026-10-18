@@ -2170,11 +2170,20 @@ SH);
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         file_put_contents($this->directory.'/events', '');
 
-        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0', 'FORCE=1'], ['NNTMUX_NO_CONTAINER' => 'mariadb'])->mustRun();
-        $events = $this->events();
-        $start = strpos($events, 'up -d --no-deps --wait --wait-timeout 240 mariadb');
-        $this->assertNotFalse($start);
-        $this->assertLessThan(strpos($events, 'releases:verification-barrier --timeout'), $start);
+        foreach ([['FORCE=1'], []] as $arguments) {
+            // Forced, or a cutover that changed the missing database: writers stop, then it starts,
+            // then the barrier is taken on it.
+            if ($arguments === []) {
+                file_put_contents($this->directory.'/docker/.env', "MARIADB_IMAGE=mariadb:restored\n");
+            }
+            file_put_contents($this->directory.'/events', '');
+            $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0', ...$arguments], ['NNTMUX_NO_CONTAINER' => 'mariadb', 'NNTMUX_CONFIG_ID' => $arguments === [] ? '{"services":{"web":{},"horizon":{},"scheduler":{},"indexer":{},"mariadb":{"image":"mariadb:restored"},"redis":{},"manticore":{},"proxy":{}}}' : ''])->mustRun();
+            $events = $this->events();
+            $start = strpos($events, 'up -d --no-deps --wait --wait-timeout 240 mariadb');
+            $this->assertNotFalse($start, implode(' ', $arguments));
+            $this->assertLessThan($start, strpos($events, ' stop web scheduler indexer'));
+            $this->assertLessThan(strpos($events, 'releases:verification-barrier --timeout'), $start);
+        }
     }
 
     public function test_a_pending_base_rebuild_is_not_skipped_as_unchanged(): void

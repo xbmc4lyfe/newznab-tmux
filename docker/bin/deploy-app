@@ -350,18 +350,29 @@ elif [ "$scheduler_drained" = 1 ]; then
     verify
 fi
 
-# The barrier runs against the database. An unchanged database service with no container (e.g.
-# FORCE=1 after it was removed) is started first; nothing could use it before. A changed one stays in
-# the quiesced path, and every record is written by the apply. A checked assignment: a failed lookup
-# must abort, never read as a missing container.
-for svc in $RECONCILE_DATA; do
+# The barrier runs against the database. When the database service this run applies has no
+# container (removed, or a cutover to a restored copy), nothing local or remote can be writing:
+# stop the writers first so none reaches the new database early, then start it, then take the
+# barrier on it; the apply below still recreates and records it. A checked assignment: a failed
+# lookup must abort, never read as a missing container.
+database_missing=0
+for svc in $DIRTY_DATA $RECONCILE_DATA; do
     [ "$svc" = mariadb ] || continue
     existing=$(compose ps -a -q "$svc")
-    if [ -z "$existing" ]; then
-        compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" "$svc"
+    [ -n "$existing" ] || database_missing=1
+done
+if [ "$database_missing" = 1 ]; then
+    if [ -n "$stop_services" ]; then
+        # shellcheck disable=SC2086
+        compose stop $stop_services
+        drained=0
+        scheduler_drained=0
+        horizon_stopped=0
         verify
     fi
-done
+    compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" mariadb
+    verify
+fi
 
 # Remote workers are held out whenever the database's writers stop for a schema or data-service
 # change; a barrier left running by an earlier failed attempt is adopted and released on success.
