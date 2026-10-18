@@ -507,6 +507,10 @@ def bind_source_record(source: str, read_only: bool, project_dir: Path) -> str:
                         fail("more than 2000 files")
                     lines.append(f"{full.relative_to(resolved).as_posix()} -> {os.readlink(full)}")
             for name in sorted(files):
+                # Finder metadata (.DS_Store, AppleDouble ._*) appears whenever a macOS host browses
+                # the directory; no service reads it, and it must not drain writers.
+                if name == ".DS_Store" or name.startswith("._"):
+                    continue
                 full = Path(root) / name
                 if len(lines) >= 2000:
                     fail("more than 2000 files")

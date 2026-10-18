@@ -53,7 +53,7 @@ case "$*" in
     *'com.docker.compose.service'*)
         shift 3
         for container in "$@"; do
-            svc=${container#r-}; svc=${svc#fixture-container-}
+            svc=${container##*fixture-container-}
             if [ "$svc" = "${NNTMUX_STALE_SERVICE_IMAGE:-}" ] && [ ! -f "$NNTMUX_REPO/recreated-$svc" ]; then id=sha256:stale; else id=${NNTMUX_IMAGE_ID:-sha256:fixture}; fi
             echo "$svc $id fixture/$svc:tag"
         done ;;
@@ -82,7 +82,7 @@ case "$*" in
     *' ps -a -q '*)
         [ "${NNTMUX_NO_EXISTING_APP:-0}" = 1 ] && exit 0
         [ -n "${NNTMUX_NO_CONTAINER:-}" ] && [ "$last" = "$NNTMUX_NO_CONTAINER" ] && exit 0
-        [ ! -f "$NNTMUX_REPO/recreated-$last" ] || printf r-
+        [ ! -f "$NNTMUX_REPO/recreated-$last" ] || printf 'r%s-' "$(wc -c < "$NNTMUX_REPO/recreated-$last" | tr -d ' ')"
         echo "fixture-container-$last" ;;
     *' ps -q')
         [ "${NNTMUX_PS_FAIL:-0}" != 1 ] || { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
@@ -90,11 +90,11 @@ case "$*" in
             | python3 -c 'import json, sys; print("\n".join("fixture-container-" + s for s in json.load(sys.stdin)["services"]))' 2>/dev/null ;;
     *' ps -q horizon'*)
         [ "${NNTMUX_HORIZON_PS_FAIL:-0}" != 1 ] || exit 50
-        [ "$missing" = 1 ] || { [ ! -f "$NNTMUX_REPO/recreated-horizon" ] || printf r-; echo "fixture-container-horizon"; } ;;
+        [ "$missing" = 1 ] || { [ ! -f "$NNTMUX_REPO/recreated-horizon" ] || printf 'r%s-' "$(wc -c < "$NNTMUX_REPO/recreated-horizon" | tr -d ' ')"; echo "fixture-container-horizon"; } ;;
     *' ps -q '*)
         [ "${NNTMUX_PS_FAIL:-0}" != 1 ] || { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
         # A recreated container gets a new ID, as Docker gives it.
-        [ "$missing" = 1 ] || { [ ! -f "$NNTMUX_REPO/recreated-$last" ] || printf r-; echo "fixture-container-$last"; } ;;
+        [ "$missing" = 1 ] || { [ ! -f "$NNTMUX_REPO/recreated-$last" ] || printf 'r%s-' "$(wc -c < "$NNTMUX_REPO/recreated-$last" | tr -d ' ')"; echo "fixture-container-$last"; } ;;
     *'scheduler python3 -c '*) [ "${NNTMUX_SCHEDULER_CAPABILITY_FAIL:-0}" != 1 ] || exit 48; echo "${NNTMUX_SCHEDULER_CAPABILITY:-native}" ;;
     *'scheduler.py drain --timeout='*)
         [ "${NNTMUX_SCHEDULER_DRAIN_FAIL:-0}" != 1 ] || exit 47
@@ -124,14 +124,17 @@ case "$*" in
             if [ "${NNTMUX_APP_UP_FAIL:-0}" = 1 ]; then
                 # Compose replaced the containers before the health wait failed, unless it failed first.
                 if [ "${NNTMUX_APP_UP_NO_REPLACE:-0}" != 1 ]; then
-                    for svc in "$@"; do case "$svc" in web|horizon|scheduler|indexer) : > "$NNTMUX_REPO/recreated-$svc" ;; esac; done
+                    for svc in "$@"; do case "$svc" in web|horizon|scheduler|indexer) printf x >> "$NNTMUX_REPO/recreated-$svc" ;; esac; done
                 fi
                 exit 52
             fi ;; esac
         case "$*" in *'--force-recreate'*' redis'*) [ "${NNTMUX_REDIS_FAIL:-0}" != 1 ] || exit 53 ;; esac
         [ -z "${NNTMUX_UP_FAIL_SERVICE:-}" ] || [ "$last" != "$NNTMUX_UP_FAIL_SERVICE" ] || exit 54
         if [ "${NNTMUX_STALE_UP:-0}" = 1 ]; then echo changed > "$NNTMUX_REPO/app.txt"; fi
-        case "$*" in *' --force-recreate '*) : > "$NNTMUX_REPO/recreated"; : > "$NNTMUX_REPO/recreated-$last" ;; esac ;;
+        case "$*" in *' --force-recreate '*)
+            : > "$NNTMUX_REPO/recreated"
+            # Every service named after the options gets a new container, not only the last one.
+            for svc in "$@"; do case "$svc" in -*|*/*|compose|up|[0-9]*) ;; *) printf x >> "$NNTMUX_REPO/recreated-$svc" ;; esac; done ;; esac ;;
 esac
 exit 0
 SH);
@@ -1988,6 +1991,12 @@ SH);
         (new Process(['git', 'commit', '-q', '-am', 'outside mounts'], $this->directory))->mustRun();
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
         file_put_contents($this->directory.'/events', '');
+
+        // Finder metadata is no configuration change.
+        file_put_contents($this->directory.'/outside/certs/.DS_Store', "finder\n");
+        file_put_contents($this->directory.'/outside/certs/._ca.pem', "appledouble\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $this->assertStringNotContainsString(' up -d', $this->events());
 
         file_put_contents($this->directory.'/outside/certs/ca.pem', "two\n");
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
