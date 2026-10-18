@@ -30,15 +30,17 @@ final class HeaderFilenameIdentity
             // Invalid UTF-8 cannot be parsed for a declared name, so it cannot be compared.
             return false;
         }
-        if ($count === 0) {
-            // An unquoted subject declares a file only by naming it before its single yEnc marker.
-            if (preg_match_all('/(?<![\p{L}\p{N}_])yEnc(?![\p{L}\p{N}_])/iu', $subject) > 1) {
-                return false;
-            }
-            $head = (string) preg_replace('/(?<![\p{L}\p{N}_])yEnc(?![\p{L}\p{N}_]).*\z/isu', '', $subject);
-
-            // The subject must name the body itself, not a longer file such as body.exe.mkv.
-            return preg_match('/(?<![\p{L}\p{N}_])'.preg_quote(self::trimmed($actual), '/').'(?![\p{L}\p{N}_]|[.\-]+[\p{L}\p{N}])/iu', $head) === 1;
+        // One yEnc marker ends the declaration: a second marker is ambiguous, and quotes after it are metadata.
+        if (preg_match_all('/(?<![\p{L}\p{M}\p{N}_])yEnc(?![\p{L}\p{M}\p{N}_])/iu', $subject, $markers, PREG_OFFSET_CAPTURE) > 1) {
+            return false;
+        }
+        $marker = $markers[0][0][1] ?? strlen($subject);
+        $matches = array_values(array_filter($matches, static fn (array $match): bool => $match[0][1] + strlen($match[0][0]) <= $marker));
+        if ($matches === []) {
+            // An unquoted subject declares a file only by naming it before the marker, not a longer file such
+            // as body.exe.mkv.
+            return preg_match('/(?<![\p{L}\p{M}\p{N}_])'.preg_quote(self::trimmed($actual), '/')
+                .'(?![\p{L}\p{M}\p{N}_]|[.\-]+[\p{L}\p{N}])/iu', substr($subject, 0, $marker)) === 1;
         }
         $quoted = [];
         $declared = null;
@@ -122,6 +124,10 @@ final class HeaderFilenameIdentity
             $declaredExtension = strtolower($declaredExtension);
             foreach ([self::trimmed($actual), self::bare($actual)] as $form) {
                 $bodyExtension = strtolower(self::extension($form));
+                // A readable extensionless body such as README is payload evidence, so it is not parity.
+                if ($bodyExtension === '' && self::provesPayload($form)) {
+                    $bodyExtension = 'payload';
+                }
                 if ($declaredExtension !== '' && $bodyExtension !== '' && ($declaredExtension === 'par2') !== ($bodyExtension === 'par2')) {
                     return false;
                 }
@@ -149,8 +155,9 @@ final class HeaderFilenameIdentity
         // Random tokens switch between lowercase, uppercase and digits at nearly every other character.
         $switches = preg_match_all('/[a-z](?=[A-Z0-9])|[A-Z](?=[a-z0-9])|[0-9](?=[A-Za-z])/', $token);
 
-        return self::opaque($name) && (strlen($token) >= 20 || preg_match('/\A[0-9a-f]{16,}\z/i', $token) === 1
-            || $switches >= 0.4 * strlen($token));
+        // A long token counts only with digits inside it; a long title keeps its number at the end.
+        return self::opaque($name) && (preg_match('/\A[0-9a-f]{16,}\z/i', $token) === 1 || $switches >= 0.4 * strlen($token)
+            || (strlen($token) >= 20 && preg_match('/[0-9][A-Za-z]/', $token) === 1));
     }
 
     /** A single random-looking token, such as an obfuscated posting name, makes no filename claim. */

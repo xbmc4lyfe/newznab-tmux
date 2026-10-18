@@ -187,6 +187,13 @@ class HeaderFilenameIdentityTest extends TestCase
             'apostrophes inside a matching single-quoted name' => ["[1/1] - 'O'Brien's Movie.mkv' yEnc", "O'Brien's Movie.mkv", true],
             'two yEnc-marked names are ambiguous' => ['"setup.exe" yEnc - [1/1] - "movie.mkv" yEnc', 'setup.exe', false],
             'unquoted executable after the yEnc marker' => ['movie.mkv yEnc (1/2) setup.exe', 'setup.exe', false],
+            'quote after the yEnc marker is metadata' => ['movie.mkv yEnc (1/2) "setup.exe"', 'setup.exe', false],
+            'quoted and unquoted yEnc markers are ambiguous' => ['"setup.exe" yEnc - movie.mkv yEnc', 'setup.exe', false],
+            'long initial-led title' => ['"XFilesDocumentary2026.mkv" yEnc', 'Totally.Different.mkv', false],
+            'long abbreviated title' => ['"MrRobotDocumentary2026.mkv" yEnc', 'Totally.Different.mkv', false],
+            'readable extensionless body under a parity subject' => ['[1/1] - "Xk29dPq8LmZ0Yt5R.par2" yEnc', 'README', false],
+            'combining mark extends an unquoted executable name' => ["Release setup.exe\u{301}.mkv yEnc", 'setup.exe', false],
+            'long lowercase random token with inner digits' => ['"cxjzxhjlgr3djfprozg6.rar" yEnc', 'Readable.Name.rar', true],
             'opaque subject with an extensionless body' => ['[3/8] - "o9aeI3YpDwgHGoJ2ZsCm.vol00+01.par2" yEnc', '148f76878d7732b981734a9e0c51a348', true],
         ];
     }
