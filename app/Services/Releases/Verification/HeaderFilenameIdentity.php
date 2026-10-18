@@ -11,9 +11,10 @@ namespace App\Services\Releases\Verification;
  */
 final class HeaderFilenameIdentity
 {
-    // A single-quoted name may contain apostrophes (O'Brien's, Guns N' Roses): it closes at the first quote
-    // followed by a field boundary (the end, yEnc, a counter, a dash or another quote).
-    private const string QUOTED = '/"([^"\r\n]+)"|(?<![\p{L}\p{N}_])\'([^\r\n]+?)\'(?=\s*+(?:\z|yEnc(?![\p{L}\p{M}\p{N}_])|[\[(\-"\']))/u';
+    // A single-quoted name may contain apostrophes (O'Brien's, Guns N' Roses, Directors' (2026) Cut): it closes
+    // at the first quote followed by a field boundary: the end, yEnc, an (n/m) or [n/m] counter, a dash before
+    // another field, or another quote.
+    private const string QUOTED = '/"([^"\r\n]+)"|(?<![\p{L}\p{N}_])\'([^\r\n]+?)\'(?=\s*+(?:\z|yEnc(?![\p{L}\p{M}\p{N}_])|\(\d+\/\d+\)|\[\d+\/\d+\]|-\s*+(?:[\[(\"\']|\z)|[\"\']))/u';
 
     private const string SUFFIX = '/\A(?:part\d+|vol\d+[+-]\d+|par2|rar|r\d{2,3}|\d{3}|7z|zip|tar|gz|tgz|xz|txz|bz2|tbz2|zst|zstd|lz|lz4|lzma|br|mkv|avi|mp4|m4v|ts|nfo|sfv|nzb|epub|pdf|flac|mp3|iso|srt|txt|jpg|png)\z/i';
 
@@ -111,10 +112,13 @@ final class HeaderFilenameIdentity
         return $expected === $body;
     }
 
-    /** The stem without an unlisted final extension, such as .wmv. */
+    /** The stem, or the name without an unlisted final extension such as .wmv when no known suffix applies. */
     private static function token(string $name): string
     {
-        return (string) preg_replace('/\.[A-Za-z0-9]{1,8}\z/', '', self::stem($name));
+        $stem = self::stem($name);
+
+        // Only the original terminal extension may be unlisted; a dotted component such as .S01E01 stays.
+        return $stem !== $name ? $stem : (string) preg_replace('/\.[A-Za-z0-9]{1,8}\z/', '', $stem);
     }
 
     /**
@@ -188,8 +192,9 @@ final class HeaderFilenameIdentity
         preg_match_all('/[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+/', $stem, $matches);
         $acronyms = 0;
         foreach ($matches[0] as $index => $part) {
-            // A one-letter label before a number (S01E02, Part X1) is a title component.
-            if (ctype_digit($part) || (strlen($part) === 1 && ctype_upper($part) && ctype_digit($matches[0][$index + 1] ?? ''))) {
+            // A one-letter label beside a number (S01E02, 4K, 3D) is a title component.
+            if (ctype_digit($part) || (strlen($part) === 1 && ctype_upper($part)
+                && (ctype_digit($matches[0][$index + 1] ?? '') || ctype_digit($matches[0][$index - 1] ?? '')))) {
                 continue;
             }
             if (ctype_upper($part) && strlen($part) > 1) {
@@ -254,7 +259,8 @@ final class HeaderFilenameIdentity
 
     private static function normalized(string $name): string
     {
-        return (string) preg_replace('/[^\p{L}\p{M}\p{N}]/u', '', self::folded($name));
+        // Separators are interchangeable, but symbols such as + # & distinguish titles (C++, F#).
+        return (string) preg_replace('/[^\p{L}\p{M}\p{N}+#&]/u', '', self::folded($name));
     }
 
     /** The lowercased stem in canonical composition, so composed and decomposed accents compare equal. */

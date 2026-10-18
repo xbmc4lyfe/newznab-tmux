@@ -210,6 +210,11 @@ class HeaderFilenameIdentityTest extends TestCase
             'compound lz4 archive on an opaque subject' => ['"Xk29dPq8LmZ0Yt5R.tar.lz4" yEnc', 'b7Qe1ZrT9wXy4KpL.tar.lz4', true],
             'separate single-quoted fields' => ["'movie.mkv' yEnc (1/2) 'Tag'", 'movie.mkv', true],
             'single-quoted fields separated by a dash' => ["'Tag Name' - 'movie.mkv' yEnc", 'movie.mkv', true],
+            'apostrophe before parenthesized text in a single-quoted name' => ["[1/1] - 'Directors' (2026) Cut.mkv' yEnc", "Directors' (2026) Cut.mkv", true],
+            'resolution label in a long title' => ['"BBC4KDocumentary2026.mkv" yEnc', 'Totally.Different.mkv', false],
+            'dotted episode after a known suffix' => ['"MrRobotDocumentary.S01E01.mkv" yEnc', 'MrRobotDocumentary.S09E99.mkv', false],
+            'symbols distinguish readable titles' => ['"C++.Primer.pdf" yEnc', 'C.Primer.pdf', false],
+            'sharp distinguishes readable titles' => ['"F#.Tutorial.mkv" yEnc', 'F.Tutorial.mkv', false],
             'opaque subject with an extensionless body' => ['[3/8] - "o9aeI3YpDwgHGoJ2ZsCm.vol00+01.par2" yEnc', '148f76878d7732b981734a9e0c51a348', true],
         ];
     }
