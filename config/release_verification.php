@@ -42,6 +42,8 @@ return [
     'pending_bytes' => (int) env('RELEASE_VERIFICATION_PENDING_BYTES', 10737418240),
     'lease_seconds' => 300,
     'retry_seconds' => 900,
+    // Spot-check failures decided by the manifest and its fixed sample, not by transport.
+    'deterministic_retry_seconds' => (int) env('RELEASE_VERIFICATION_DETERMINISTIC_RETRY_SECONDS', 86400),
     'expiry_hours' => 48,
     'par2_binary' => env('RELEASE_VERIFICATION_PAR2_BINARY', 'par2'),
 ];

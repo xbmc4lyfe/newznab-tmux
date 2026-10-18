@@ -109,6 +109,37 @@ class VerificationWorkerConnectionReuseTest extends ReleaseVerificationCandidate
         $this->assertSame(2, DB::table('release_verification_candidates')->where('status', 'sampled')->count());
     }
 
+    public function test_a_deterministic_spot_check_mismatch_waits_for_new_headers_but_transport_errors_retry_soon(): void
+    {
+        $articles = $this->publicationFixture(2, 0);
+        // Candidate 1's first article is really its second part; candidate 2's fetch fails in transport.
+        $articles['candidate1-1@example'] = $articles['candidate1-2@example'];
+        $this->mock(NNTPService::class, static function ($mock) use ($articles): void {
+            $mock->shouldReceive('doConnect')->with(false)->andReturn(true);
+            $mock->shouldReceive('verificationArticle')->andReturnUsing(static function (string $id) use ($articles): string {
+                if (str_starts_with($id, 'candidate2-')) {
+                    throw new RuntimeException('Fixture transport disconnected.');
+                }
+
+                return $articles[$id];
+            });
+            $mock->shouldReceive('isConnected')->andReturn(true);
+            $mock->shouldReceive('doQuit')->andReturn(null);
+        });
+        $this->freezeSecond();
+
+        $this->artisan('releases:verify-candidates', ['--limit' => 2])->assertSuccessful();
+
+        $rows = DB::table('release_verification_candidates')->orderBy('id')->get()->keyBy('identity');
+        $mismatch = $rows[sha1('candidate1')];
+        $transport = $rows[sha1('candidate2')];
+        $this->assertSame('unknown', $mismatch->status);
+        $this->assertSame('Spot-check article identity differs from its header.', $mismatch->reason);
+        $this->assertSame(now()->addSeconds(86400)->format('Y-m-d H:i:s'), $mismatch->next_attempt_at);
+        $this->assertSame('unknown', $transport->status);
+        $this->assertSame(now()->addSeconds(900)->format('Y-m-d H:i:s'), $transport->next_attempt_at);
+    }
+
     /** @return array<string, string> */
     private function publicationFixture(int $candidates, int $published): array
     {

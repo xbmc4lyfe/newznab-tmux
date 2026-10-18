@@ -795,7 +795,9 @@ final class CandidateRepository
             ->where('version', $claim->version)->update(['status' => $result->waitingForHeaders ? 'waiting_upload'
                 : ($result->headerRejected ? CandidateHeaderInventory::REJECTED : ($result->verdict === 'unrepairable' ? 'unrepairable' : 'unknown')), 'reason' => mb_strcut($result->reason, 0, 2000, 'UTF-8'),
                 'lease_token' => null, 'lease_until' => null, 'header_check_pending' => false,
-                'next_attempt_at' => now()->addSeconds((int) config('release_verification.retry_seconds'))]);
+                // A deterministic failure only changes with new headers, which requeue it at once.
+                'next_attempt_at' => now()->addSeconds((int) config($result->deterministic
+                    ? 'release_verification.deterministic_retry_seconds' : 'release_verification.retry_seconds'))]);
     }
 
     public function rejectByPolicy(object $claim, string $reason): void
