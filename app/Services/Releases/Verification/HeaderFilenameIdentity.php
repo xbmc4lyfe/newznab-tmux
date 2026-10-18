@@ -11,12 +11,13 @@ namespace App\Services\Releases\Verification;
  */
 final class HeaderFilenameIdentity
 {
-    // A single-quoted name may contain apostrophes (O'Brien's): only a quote not followed by a word character closes it.
-    private const string QUOTED = '/"([^"\r\n]+)"|(?<![\p{L}\p{N}_])\'([^\r\n]+?)\'(?![\p{L}\p{N}_])/u';
+    // A single-quoted name may contain apostrophes (O'Brien's, Guns N' Roses): it closes at the last quote on
+    // the line that is not followed by a word character.
+    private const string QUOTED = '/"([^"\r\n]+)"|(?<![\p{L}\p{N}_])\'([^\r\n]+)\'(?![\p{L}\p{N}_])/u';
 
-    private const string SUFFIX = '/\A(?:part\d+|vol\d+[+-]\d+|par2|rar|r\d{2,3}|\d{3}|7z|zip|tar|gz|tgz|xz|bz2|zst|mkv|avi|mp4|m4v|ts|nfo|sfv|nzb|epub|pdf|flac|mp3|iso|srt|txt|jpg|png)\z/i';
+    private const string SUFFIX = '/\A(?:part\d+|vol\d+[+-]\d+|par2|rar|r\d{2,3}|\d{3}|7z|zip|tar|gz|tgz|xz|txz|bz2|tbz2|zst|zstd|lz|lz4|lzma|br|mkv|avi|mp4|m4v|ts|nfo|sfv|nzb|epub|pdf|flac|mp3|iso|srt|txt|jpg|png)\z/i';
 
-    private const string EXECUTABLE = '/\.(?:exe|scr|bat|cmd|com|msi|msix|msp|lnk|pif|cpl|hta|reg|scf|js|jse|vbs|vbe|wsf|wsh|ps1|psm1|jar|apk|dll|sh|command|app|dmg|pkg|chm|msc|ps1xml|psd1|cab|appx|appxbundle|msixbundle|application|gadget|inf|url|xll|ws|wsc|sct|vb|ocx|sys|iso|img|vhd|vhdx|desktop|appimage|deb|rpm|snap|run|msu|py|pyw|pl|rb|php|so|dylib|bundle|ko)\z/i';
+    private const string EXECUTABLE = '/\.(?:exe|scr|bat|cmd|com|msi|msix|msp|lnk|pif|cpl|hta|reg|scf|js|jse|vbs|vbe|wsf|wsh|ps1|psm1|jar|apk|dll|sh|command|app|dmg|pkg|chm|msc|ps1xml|psd1|cab|appx|appxbundle|msixbundle|application|gadget|inf|url|xll|ws|wsc|sct|vb|ocx|sys|iso|img|vhd|vhdx|desktop|appimage|deb|rpm|snap|run|msu|py|pyw|pl|rb|php|so|dylib|bundle|ko|node|class|wasm|pyc|pyo)\z/i';
 
     public static function matches(string $subject, string $actual): bool
     {
@@ -56,7 +57,7 @@ final class HeaderFilenameIdentity
             $end = $match[0][1] + strlen($match[0][0]);
             // The filename is the quoted value that "yEnc" follows (optionally after an (n/m) or [n/m]
             // counter), else the one after a [n/m] counter.
-            if (preg_match('/\A\s*(?:(?:\(\d+\/\d+\)|\[\d+\/\d+\])\s*)?yEnc(?![\p{L}\p{N}_])/iu', substr($subject, $end)) === 1) {
+            if (preg_match('/\A\s*(?:(?:\(\d+\/\d+\)|\[\d+\/\d+\])\s*)?yEnc(?![\p{L}\p{M}\p{N}_])/iu', substr($subject, $end)) === 1) {
                 // Two quoted names each marked by yEnc leave the article's filename ambiguous.
                 if ($declared !== null) {
                     return false;
@@ -71,14 +72,14 @@ final class HeaderFilenameIdentity
         // An executable body must be exactly the executable type its subject declares, even when
         // another quoted value names it.
         if (self::executable($actual) && (! self::executable($declared)
-            || strtolower(self::extension(self::bare($actual))) !== strtolower(self::extension(self::bare($declared)))
-            || strtolower(self::extension(self::trimmed($actual))) !== strtolower(self::extension(self::trimmed($declared))))) {
+            || self::fold(self::extension(self::bare($actual))) !== self::fold(self::extension(self::bare($declared)))
+            || self::fold(self::extension(self::trimmed($actual))) !== self::fold(self::extension(self::trimmed($declared))))) {
             return false;
         }
         // Parity and payload are not interchangeable: a declared PAR2 file is not payload evidence, and a
         // declared payload file is not satisfied by a PAR2 body, even when another quoted value names it.
-        $declaredClass = self::parityClass($declared, false);
-        $bodyClass = self::parityClass($actual, true);
+        $declaredClass = self::parityClass($declared);
+        $bodyClass = self::parityClass($actual);
         if ($declaredClass !== null && $bodyClass !== null && $declaredClass !== $bodyClass) {
             return false;
         }
@@ -95,8 +96,8 @@ final class HeaderFilenameIdentity
         }
         // A readable declared name must agree on its volume and extension chain, and on its final
         // extension when that chain does not cover it, as well as its stem.
-        if (strtolower(self::suffix($declared)) !== strtolower(self::suffix($actual))
-            || strtolower(self::extension($declared)) !== strtolower(self::extension($actual))) {
+        if (self::fold(self::suffix($declared)) !== self::fold(self::suffix($actual))
+            || self::fold(self::extension($declared)) !== self::fold(self::extension($actual))) {
             return false;
         }
         $expected = self::normalized($declared);
@@ -121,15 +122,15 @@ final class HeaderFilenameIdentity
      * a readable extensionless name such as README, but never an obfuscated extensionless token.
      */
     /**
-     * Parity when either filesystem form is a PAR2 name, payload when the name has another extension (or, for
-     * a body, is a readable extensionless payload such as README), and null when it declares neither.
+     * Parity when either filesystem form is a PAR2 name, payload when the name has another extension or is a
+     * readable extensionless payload such as README, and null when it declares neither.
      */
-    private static function parityClass(string $name, bool $body): ?string
+    private static function parityClass(string $name): ?string
     {
         if (preg_match('/\.par2\z/i', self::trimmed($name)) === 1 || preg_match('/\.par2\z/i', self::bare($name)) === 1) {
             return 'parity';
         }
-        if (self::extension(self::trimmed($name)) !== '' || self::extension(self::bare($name)) !== '' || ($body && self::provesPayload($name))) {
+        if (self::extension(self::trimmed($name)) !== '' || self::extension(self::bare($name)) !== '' || self::provesPayload($name)) {
             return 'payload';
         }
 
@@ -178,16 +179,17 @@ final class HeaderFilenameIdentity
     }
 
     /**
-     * Whether a token reads as a run-together title (BBC2Documentary, 13GoingOn30, iPhoneMovie): it splits
-     * into an optional leading lowercase word, capitalized words, numbers and at most one short acronym, and
-     * every word has a vowel. Random tokens break one of these almost immediately.
+     * Whether a token reads as a run-together title (BBC2Documentary, 13GoingOn30, S01E02Movie): it splits
+     * into an optional leading lowercase word, capitalized words, numbers, one-letter labels before numbers and
+     * at most one short acronym, and every word has a vowel. Random tokens break one of these almost immediately.
      */
     private static function titled(string $stem): bool
     {
         preg_match_all('/[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+/', $stem, $matches);
         $acronyms = 0;
         foreach ($matches[0] as $index => $part) {
-            if (ctype_digit($part)) {
+            // A one-letter label before a number (S01E02, Part X1) is a title component.
+            if (ctype_digit($part) || (strlen($part) === 1 && ctype_upper($part) && ctype_digit($matches[0][$index + 1] ?? ''))) {
                 continue;
             }
             if (ctype_upper($part) && strlen($part) > 1) {
@@ -258,8 +260,11 @@ final class HeaderFilenameIdentity
     /** The lowercased stem in canonical composition, so composed and decomposed accents compare equal. */
     private static function folded(string $name): string
     {
-        $stem = self::stem($name);
+        return self::fold(self::stem($name));
+    }
 
-        return mb_strtolower(\Normalizer::normalize($stem, \Normalizer::FORM_C) ?: $stem);
+    private static function fold(string $text): string
+    {
+        return mb_strtolower(\Normalizer::normalize($text, \Normalizer::FORM_C) ?: $text);
     }
 }

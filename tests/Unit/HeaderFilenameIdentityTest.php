@@ -28,7 +28,7 @@ class HeaderFilenameIdentityTest extends TestCase
                 str_repeat("'", 1000), '"'.str_repeat('Ab1', 330).'" yEnc',
                 '[1/1]'.str_repeat(' ', 667).'x'.str_repeat('"a"', 111), '"a'.str_repeat('.ts', 332).'x" yEnc',
                 '"a'.str_repeat('.7z', 332).'x" yEnc', '"a'.str_repeat('.r00', 249).'x" yEnc', '"'.str_repeat('A', 990).'b" yEnc',
-                str_repeat(" 'a", 333), str_repeat("'a ", 333)] as $subject) {
+                str_repeat(" 'a", 333), str_repeat("'a ", 333), str_repeat(" ' x", 250)] as $subject) {
                 HeaderFilenameIdentity::matches($subject, 'Readable.Name.mkv');
                 self::assertSame(PREG_NO_ERROR, preg_last_error(), substr($subject, 0, 20));
             }
@@ -198,6 +198,16 @@ class HeaderFilenameIdentityTest extends TestCase
             'long all-caps title with a number' => ['"TERMINATOR2JUDGMENTDAY.mkv" yEnc', 'Totally.Different.mkv', false],
             'native library under an opaque subject' => ['"0123456789abcdef0123456789abcdef.mkv" yEnc', 'payload.dylib', false],
             'yEnc inside a quoted filename' => ['"Movie yEnc Documentary.mkv" yEnc', 'Movie yEnc Documentary.mkv', true],
+            'combining mark inside the yEnc word' => ['"setup.exe" yEnć - "movie.mkv"', 'setup.exe', false],
+            'apostrophe before a space in a single-quoted name' => ["[1/1] - 'Guns N' Roses.mkv' yEnc", "Guns N' Roses.mkv", true],
+            'several apostrophes in a single-quoted name' => ["[1/1] - 'Rock 'n' Roll.mkv' yEnc", "Rock 'n' Roll.mkv", true],
+            'node add-on under an opaque subject' => ['"0123456789abcdef0123456789abcdef.mkv" yEnc', 'payload.node', false],
+            'WebAssembly under an opaque subject' => ['"0123456789abcdef0123456789abcdef.mkv" yEnc', 'payload.wasm', false],
+            'readable extensionless declaration with a parity body' => ['"set.par2" - [1/1] - "README" yEnc', 'set.par2', false],
+            'composed and decomposed Unicode extension' => ['"Resume.café" yEnc', "Resume.cafe\u{301}", true],
+            'Unicode extension case' => ['"文档.ΔΕΔ" yEnc', '文档.δεδ', true],
+            'season and episode title' => ['"S01E02Movie.mkv" yEnc', 'Totally.Different.mkv', false],
+            'compound lz4 archive on an opaque subject' => ['"Xk29dPq8LmZ0Yt5R.tar.lz4" yEnc', 'b7Qe1ZrT9wXy4KpL.tar.lz4', true],
             'opaque subject with an extensionless body' => ['[3/8] - "o9aeI3YpDwgHGoJ2ZsCm.vol00+01.par2" yEnc', '148f76878d7732b981734a9e0c51a348', true],
         ];
     }
