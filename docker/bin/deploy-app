@@ -20,7 +20,7 @@ verify
 
 # Capture first: a failing plan inside eval "$(...)" would be ignored, and a stale MODE in the
 # caller's environment must never stand in for the plan's output.
-unset MODE MIGRATE DIRTY_APP DIRTY_DATA DIRTY_INFRA RECONCILE_DATA RECONCILE_INFRA START_DATA PRE_DRAIN POST_DRAIN BUILD_TARGETS GLOBAL_FALLBACK
+unset MODE MIGRATE DIRTY_APP DIRTY_DATA DIRTY_INFRA RECONCILE_DATA RECONCILE_INFRA START_DATA PRE_DRAIN POST_DRAIN AFTER_APP BUILD_TARGETS GLOBAL_FALLBACK
 actions=$("$DIR/bin/deploy-plan" --deploy-actions)
 eval "$actions"
 # The plan's build targets ignore FORCE (the build above already honoured it): any target still
@@ -446,6 +446,11 @@ if [ -n "$up_app_services" ]; then
     # shellcheck disable=SC2086
     plan --record $up_app_services
 fi
+# Infrastructure whose app provider had no container (AFTER_APP, mark:service) now that it runs.
+for item in $AFTER_APP; do
+    apply_each "--${item%%:*}" "${item#*:}"
+    verify
+done
 # Success is recorded only when the whole stack is current, not just the services this run touched:
 # all four app services healthy on their expected images, and no data/infra container stale. This
 # runs before the barrier is released, so remote workers resume only on a verified stack; a failure

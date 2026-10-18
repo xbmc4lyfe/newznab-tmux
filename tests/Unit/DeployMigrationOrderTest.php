@@ -1504,6 +1504,47 @@ SH);
         $this->assertLessThan($cache, $redis);
     }
 
+    public function test_retargeting_a_symlinked_config_file_to_identical_bytes_recreates_the_service(): void
+    {
+        foreach (['a', 'b'] as $name) {
+            file_put_contents($this->directory.'/conf-'.$name, "same\n");
+        }
+        symlink($this->directory.'/conf-a', $this->directory.'/conf');
+        file_put_contents($this->directory.'/.gitignore', "/conf-a\n/conf-b\n/conf\n", FILE_APPEND);
+        file_put_contents($this->directory.'/.dockerignore', "conf-a\nconf-b\nconf\n", FILE_APPEND);
+        (new Process(['git', 'commit', '-q', '-am', 'conf'], $this->directory))->mustRun();
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['proxy'] = ['volumes' => [['type' => 'bind', 'source' => $this->directory.'/conf', 'target' => '/etc/conf', 'read_only' => true]]];
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+
+        unlink($this->directory.'/conf');
+        symlink($this->directory.'/conf-b', $this->directory.'/conf');
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+    }
+
+    public function test_infrastructure_whose_app_provider_has_no_container_starts_after_the_apps(): void
+    {
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['sidecar'] = ['labels' => ['nntmux.deploy.stateless' => 'true'], 'depends_on' => ['web' => ['condition' => 'service_healthy']]];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        $json['services']['sidecar']['environment'] = ['CHANGED' => '1'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0', 'FORCE=1'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES), 'NNTMUX_NO_CONTAINER' => 'web'])->mustRun();
+        $events = $this->events();
+        $this->assertGreaterThan(strpos($events, 'web horizon scheduler indexer'), strpos($events, '--wait-timeout 240 sidecar'));
+
+        // A data service cannot wait for an app provider.
+        $json['services']['cache2'] = ['depends_on' => ['web' => ['condition' => 'service_healthy']]];
+        $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES), 'NNTMUX_NO_CONTAINER' => 'cache2']);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('data service cache2 depends on app service web', $plan->getErrorOutput());
+    }
+
     public function test_unreadable_env_file_fails_closed(): void
     {
         mkdir($this->directory.'/docker/config', 0777, true);
@@ -2711,6 +2752,14 @@ SH);
         $this->assertStringContainsString('NNTMUX_SITE_CONFIG behind config site uses interpolation', $plan->getErrorOutput());
         file_put_contents($this->directory.'/docker/.env', "NNTMUX_SITE_CONFIG='\${literal}'\n");
         $this->make(['deploy-plan'], $config)->mustRun();
+
+        // Double quotes decode escapes, single quotes do not: the same text is two values.
+        file_put_contents($this->directory.'/docker/.env', "NNTMUX_SITE_CONFIG='a\\nb'\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        file_put_contents($this->directory.'/docker/.env', "NNTMUX_SITE_CONFIG=\"a\\nb\"\n");
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $this->assertStringContainsString($recreate, $this->events());
 
         // A multi-line value cannot be read whole by the line parser.
         file_put_contents($this->directory.'/docker/.env', "NNTMUX_SITE_CONFIG='first line\nsecond line'\n");

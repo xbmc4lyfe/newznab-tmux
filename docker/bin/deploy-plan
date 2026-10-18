@@ -519,7 +519,11 @@ def bind_source_record(source: str, read_only: bool, project_dir: Path) -> str:
         except FileNotFoundError:
             return f"missing {source}"
         if stat.S_ISREG(mode):
-            return f"file {sha256_bytes(path.read_bytes())} {source}"
+            # A symlinked file is mounted as its resolved target; retargeting it to identical bytes
+            # still changes what a new container would mount. A plain file keeps its earlier record.
+            resolved_file = path.resolve()
+            target = f" -> {resolved_file}" if str(resolved_file) != os.path.abspath(source) else ""
+            return f"file {sha256_bytes(path.read_bytes())} {source}{target}"
         if not stat.S_ISDIR(mode):
             return f"other {source}"
         resolved = path.resolve()
@@ -583,6 +587,10 @@ def read_dotenv(path: Path, interpolated: set[str] | None = None) -> dict[str, s
             value = m.group(2)
             quoted = re.match(r"""^(["'])((?:(?!\1).)*)\1\s*(?:#.*)?$""", value)
             values[m.group(1)] = quoted.group(2) if quoted else re.sub(r"\s#.*$", "", value).strip()
+            if quoted and quoted.group(1) == '"':
+                # Compose and phpdotenv decode escapes inside double quotes only: `"a\nb"` installs a
+                # newline while `'a\nb'` stays literal, so the two must not hash alike.
+                values[m.group(1)] = re.sub(r"\\([nrt\\\"$])", lambda e: {"n": "\n", "r": "\r", "t": "\t"}.get(e.group(1), e.group(1)), values[m.group(1)])
             if interpolated is not None:
                 interpolated.discard(m.group(1))
                 # An opening quote with no closing one starts a multi-line value, which this
@@ -1235,6 +1243,21 @@ def infra_services(state: dict[str, str]) -> list[str]:
     return [*INFRA_SERVICES, *(svc for svc in extra_services(state) if declared_stateless(svc))]
 
 
+def transitive_dependencies(svc: str) -> set[str]:
+    """Every rendered service `svc` depends on, directly or through others."""
+    found: set[str] = set()
+    pending = [svc]
+    while pending:
+        cfg = RENDERED_SERVICES.get(pending.pop())
+        deps = cfg.get("depends_on") if isinstance(cfg, dict) else None
+        names = list(deps) if isinstance(deps, (dict, list)) else []
+        for dep in names:
+            if isinstance(dep, str) and dep not in found:
+                found.add(dep)
+                pending.append(dep)
+    return found
+
+
 def dependency_order(services: list[str]) -> list[str]:
     """Order services so each comes after the rendered services it `depends_on` (transitively),
     keeping the given order otherwise; a dependency cycle keeps the given order unchanged."""
@@ -1462,6 +1485,12 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
     # deploy-app applies each list one service at a time with `--no-deps`: providers first.
     dirty_data, reconcile_data, start_data = (dependency_order(lst) for lst in (dirty_data, reconcile_data, start_data))
     dirty_infra, reconcile_infra = (dependency_order(lst) for lst in (dirty_infra, reconcile_infra))
+    # A stateful service changes only with every writer stopped, so it cannot wait for an app provider.
+    for svc in [*dirty_data, *reconcile_data, *start_data]:
+        app_providers = sorted(dep for dep in transitive_dependencies(svc) if dep in APP_SERVICES)
+        if app_providers:
+            sys.exit(f"deploy-plan: data service {svc} depends on app service {app_providers[0]}; selective deployment "
+                     "changes data services only with every writer stopped. Remove that dependency.")
 
     # build_force=False (deploy-app, after its build): FORCE already rebuilt everything, so any
     # target still dirty means an image tag changed after the build.
@@ -1625,7 +1654,18 @@ def main() -> None:
         marks = {**{svc: "forget" for svc in plan["start_data"]}, **{svc: "forget" for svc in plan["reconcile_infra"]},
                  **{svc: "pending" for svc in plan["dirty_infra"]}}
         pre_drain = dependency_order([*plan["start_data"], *plan["reconcile_infra"], *plan["dirty_infra"]])
+        # A stateful service cannot wait for an app provider (writers are quiesced around it), and
+        # infrastructure whose app provider has no container yet waits until the apps are up.
+        after_app: list[str] = []
+        for svc in pre_drain:
+            app_providers = [dep for dep in transitive_dependencies(svc) if dep in APP_SERVICES]
+            if not app_providers:
+                continue
+            if any(not container_exists(docker_dir, dep) for dep in app_providers):
+                after_app.append(svc)
+        pre_drain = [svc for svc in pre_drain if svc not in after_app]
         print(f"PRE_DRAIN={shlex.quote(' '.join(f'{marks[svc]}:{svc}' for svc in pre_drain))}")
+        print(f"AFTER_APP={shlex.quote(' '.join(f'{marks[svc]}:{svc}' for svc in after_app))}")
         # The data services applied after the writers stop, likewise in one depends_on order.
         post_marks = {**{svc: "pending" for svc in plan["dirty_data"]}, **{svc: "forget" for svc in plan["reconcile_data"]}}
         post_drain = dependency_order([*plan["dirty_data"], *plan["reconcile_data"]])
