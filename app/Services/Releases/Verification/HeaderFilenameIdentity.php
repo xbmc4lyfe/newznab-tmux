@@ -15,7 +15,7 @@ final class HeaderFilenameIdentity
 
     private const string SUFFIXES = '/(?:\.(?:part\d+|vol\d+[+-]\d+|par2|rar|r\d{2,3}|\d{3}|7z|zip|mkv|avi|mp4|m4v|ts|nfo|sfv|nzb|epub|pdf|flac|mp3|iso|srt|txt|jpg|png))+\z/i';
 
-    private const string EXECUTABLE = '/\.(?:exe|scr|bat|cmd|com|msi|msix|msp|lnk|pif|cpl|hta|reg|scf|js|jse|vbs|vbe|wsf|wsh|ps1|psm1|jar|apk|dll|sh|command|app|dmg|pkg)\z/i';
+    private const string EXECUTABLE = '/\.(?:exe|scr|bat|cmd|com|msi|msix|msp|lnk|pif|cpl|hta|reg|scf|js|jse|vbs|vbe|wsf|wsh|ps1|psm1|jar|apk|dll|sh|command|app|dmg|pkg|chm|msc|ps1xml|psd1|cab|appx|appxbundle|msixbundle|application|gadget|inf|url|xll|ws)\z/i';
 
     public static function matches(string $subject, string $actual): bool
     {
@@ -26,7 +26,7 @@ final class HeaderFilenameIdentity
             return false;
         }
         if ($count === 0) {
-            return true;
+            return ! self::executable($actual) || stripos($subject, $actual) !== false;
         }
         $quoted = [];
         $declared = null;
@@ -53,8 +53,10 @@ final class HeaderFilenameIdentity
         if (self::opaque($declared)) {
             return true;
         }
-        // A readable declared name must agree on its volume and extension chain as well as its stem.
-        if (strtolower(self::suffix($declared)) !== strtolower(self::suffix($actual))) {
+        // A readable declared name must agree on its volume and extension chain, and on its final
+        // extension when that chain does not cover it, as well as its stem.
+        if (strtolower(self::suffix($declared)) !== strtolower(self::suffix($actual))
+            || strtolower(self::extension($declared)) !== strtolower(self::extension($actual))) {
             return false;
         }
         $expected = self::normalized($declared);
@@ -62,9 +64,14 @@ final class HeaderFilenameIdentity
         if ($expected === '' || $body === '') {
             return false;
         }
+        if ($expected === $body) {
+            return true;
+        }
+        [$shorter, $longer] = mb_strlen($expected) <= mb_strlen($body) ? [$expected, $body] : [$body, $expected];
 
-        return $expected === $body || (min(mb_strlen($expected), mb_strlen($body)) >= 8
-            && (str_starts_with($body, $expected) || str_starts_with($expected, $body)));
+        // A prefix may not extend a trailing number: Part 1 is not Part 10.
+        return mb_strlen($shorter) >= 8 && str_starts_with($longer, $shorter)
+            && ! (ctype_digit(substr($shorter, -1)) && ctype_digit(mb_substr($longer, mb_strlen($shorter), 1)));
     }
 
     /** A single random-looking token, such as an obfuscated posting name, makes no filename claim. */
@@ -77,14 +84,20 @@ final class HeaderFilenameIdentity
         if (preg_match('/\A[0-9a-f]{16,}\z/i', $stem) === 1) {
             return true;
         }
-        $classes = preg_match('/[a-z]/', $stem) + preg_match('/[A-Z]/', $stem) + preg_match('/[0-9]/', $stem);
+        // Random tokens switch between lowercase, uppercase and digits far more often than words do.
+        $switches = preg_match_all('/[a-z](?=[A-Z0-9])|[A-Z](?=[a-z0-9])|[0-9](?=[A-Za-z])/', $stem);
 
-        return strlen($stem) >= 20 || (strlen($stem) >= 10 && $classes >= 2);
+        return strlen($stem) >= 20 || (strlen($stem) >= 10 && $switches >= 5);
     }
 
     private static function executable(string $name): bool
     {
         return preg_match(self::EXECUTABLE, rtrim($name, ". \t")) === 1;
+    }
+
+    private static function extension(string $name): string
+    {
+        return preg_match('/\.([A-Za-z0-9]{1,5})\z/', $name, $match) === 1 ? $match[1] : '';
     }
 
     private static function stem(string $name): string
