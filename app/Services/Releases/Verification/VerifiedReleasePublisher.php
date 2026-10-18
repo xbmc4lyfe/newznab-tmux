@@ -40,20 +40,25 @@ final class VerifiedReleasePublisher
         // so there metadata is resolved after the exclusive fallback, as before striping.
         $preResolved = null;
         $keys = [];
+        // The incoming NZB parse and fingerprint depend only on the manifest; computing them here,
+        // before any lock, keeps that CPU work out of the serialized publication section.
+        $incoming = null;
         // A plain read is harmless outside a transaction; it skips the work for a stale claim,
         // which the locked validation below rejects anyway.
         if (DB::transactionLevel() === 0 && $this->claimIsCurrent($claim)) {
             try {
                 $preResolved = $this->metadata->resolve($result->manifest);
-                $keys = VerificationLedger::publicationKeys($this->publicationSize($result->manifest), $this->incomingFingerprint($result->manifest),
+                $incoming = $this->incomingDocument($result->manifest);
+                $keys = VerificationLedger::publicationKeys($this->publicationSize($result->manifest), $incoming['fingerprint'],
                     (string) $preResolved['name'], (string) $preResolved['searchname'], (int) $preResolved['predb_id']);
             } catch (Throwable) {
                 $preResolved = null;
+                $incoming = null;
                 $keys = [];
             }
         }
         try {
-            $id = DB::transaction(function () use ($claim, $result, $timing, $preResolved, $keys): ?int {
+            $id = DB::transaction(function () use ($claim, $result, $timing, $preResolved, $keys, $incoming): ?int {
                 $timing?->beginAttempt();
                 $returned = false;
                 try {
@@ -110,7 +115,7 @@ final class VerifiedReleasePublisher
                             throw new RuntimeException('Legacy release identity changed before publication.');
                         }
                     }
-                    $duplicate = $legacy === null ? $this->findCoveredDuplicate($claim, $manifest, $metadata, $size, $timing) : ['release_id' => null, 'metadata_conflict' => false];
+                    $duplicate = $legacy === null ? $this->findCoveredDuplicate($claim, $manifest, $metadata, $size, $timing, $incoming) : ['release_id' => null, 'metadata_conflict' => false];
                     $duplicateId = $duplicate['release_id'];
                     if ($duplicateId !== null || $duplicate['metadata_conflict']) {
                         $timing?->nextPhase('sql_accounting');
@@ -196,9 +201,11 @@ final class VerifiedReleasePublisher
     /**
      * @param  array<string, mixed>  $manifest
      * @param  array<string, mixed>  $metadata
+     * @param  array{xml: ?\SimpleXMLElement, fingerprint: ?string}|null  $incoming  The pre-lock parse, when it ran.
      * @return array{release_id: ?int, metadata_conflict: bool}
      */
-    private function findCoveredDuplicate(object $claim, array $manifest, array $metadata, int $size, ?PublicationTiming $timing): array
+    private function findCoveredDuplicate(object $claim, array $manifest, array $metadata, int $size, ?PublicationTiming $timing,
+        ?array $incoming = null): array
     {
         $lastHeartbeat = 0.0;
         $repository = app(CandidateRepository::class);
@@ -213,8 +220,7 @@ final class VerifiedReleasePublisher
         };
         $coverage = new NzbArticleCoverage(app(NzbService::class), $this->duplicates);
         $timing?->nextPhase('incoming_xml_fingerprint');
-        $xml = $coverage->parseXml($this->writer->document($manifest));
-        $fingerprint = $xml === null ? null : NzbArticleFingerprint::fromXml($xml);
+        ['xml' => $xml, 'fingerprint' => $fingerprint] = $incoming ?? $this->incomingDocument($manifest);
         $timing?->nextPhase('duplicate_search_revalidation');
         $metadataConflict = false;
         $acceptCovered = function (Release $duplicate, \SimpleXMLElement $snapshot) use ($manifest, &$metadataConflict): bool {
@@ -273,15 +279,16 @@ final class VerifiedReleasePublisher
     }
 
     /**
-     * The article fingerprint duplicate detection looks up, computed as {@see findCoveredDuplicate()} does.
+     * The incoming NZB that duplicate detection compares, parsed once, and its article fingerprint.
      *
      * @param  array<string, mixed>  $manifest
+     * @return array{xml: ?\SimpleXMLElement, fingerprint: ?string}
      */
-    private function incomingFingerprint(array $manifest): ?string
+    private function incomingDocument(array $manifest): array
     {
         $xml = (new NzbArticleCoverage(app(NzbService::class), $this->duplicates))->parseXml($this->writer->document($manifest));
 
-        return $xml === null ? null : NzbArticleFingerprint::fromXml($xml);
+        return ['xml' => $xml, 'fingerprint' => $xml === null ? null : NzbArticleFingerprint::fromXml($xml)];
     }
 
     /**
