@@ -88,12 +88,12 @@ final class CandidateRepository
                 $apart = false;
                 $holders = [];
                 if ($existing !== null) {
-                    $holders = $this->lockPartialHolders($sourceIdentity);
+                    $holders = $this->lockPartialHolders($sourceIdentity, $currentReads);
                     if ($holders !== [] && $snapshotFailure === null) {
                         try {
                             // A filtered newer post skipped the snapshot; these headers may still be a partial's.
                             $manifest ??= $this->snapshotHeaders($collection, $currentReads);
-                            $holder = $this->lateArticleOwner($collection, $sourceIdentity, $holders, $manifest);
+                            $holder = $this->lateArticleOwner($collection, $sourceIdentity, $holders, $manifest, $currentReads);
                         } catch (CandidateMetadataBudgetExceeded $error) {
                             $snapshotFailure = $error;
                         }
@@ -105,12 +105,11 @@ final class CandidateRepository
                 $retiredBytes = 0;
                 $identityAfter = null;
                 if ($existing !== null && self::tracksUpgrades()) {
-                    $orphans = DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)->whereNull('release_id')
-                        ->whereNotNull('upgrades_release_id')->where('manifest_path', '<>', '')
-                        ->whereNotIn('id', array_map(static fn (object $held): int => (int) $held->id, $holders) ?: [0])
+                    $held = array_map(static fn (object $held): int => (int) $held->id, $holders);
+                    $orphans = $this->lockSourceCandidates($sourceIdentity, $currentReads, fn (object $row): bool => $row->release_id === null
+                        && $row->upgrades_release_id !== null && $row->manifest_path !== '' && ! in_array((int) $row->id, $held, true)
                         // One a worker is verifying is left to it: the publisher abandons it.
-                        ->where(fn ($query) => $query->whereNull('lease_until')->orWhere('lease_until', '<', now()))
-                        ->orderByDesc('id')->lockForUpdate()->get();
+                        && ($row->lease_until === null || $row->lease_until < now()->format('Y-m-d H:i:s')));
                     foreach ($orphans as $orphan) {
                         // The version stays, as when a worker retires a candidate, so an outcome is still recognized.
                         DB::table('release_verification_candidates')->where('id', $orphan->id)->update(['status' => 'expired',
@@ -130,7 +129,7 @@ final class CandidateRepository
                     // inventory. Before partials that was always the newest row; posts kept apart from a
                     // partial can leave one behind newer holders or generations, whatever became of them.
                     // Where partials share the hash, headers that would spoil that candidate are kept apart too.
-                    $own = $this->lockLatestUnheld($sourceIdentity, array_map(static fn (object $held): int => (int) $held->id, $holders));
+                    $own = $this->lockLatestUnheld($sourceIdentity, array_map(static fn (object $held): int => (int) $held->id, $holders), $currentReads);
                     $shared = $holders !== [] || $identityAfter !== null || ($own !== null && (int) $own->id !== (int) ($existing->id ?? 0));
                     if ($own !== null && $shared && $snapshotFailure === null) {
                         $manifest ??= $this->snapshotHeaders($collection, $currentReads);
@@ -626,7 +625,7 @@ final class CandidateRepository
             $identity = bin2hex($collection->collectionhash);
             $candidates = DB::table('release_verification_candidates')->where('source_identity', $identity)
                 ->where(fn ($query) => $query->whereNull('release_id')->orWhere('manifest_path', '<>', ''))
-                ->whereNotIn('status', ['expired'])->orderByDesc('id')->lockForUpdate()->get();
+                ->whereNotIn('status', ['expired'])->orderBy('id')->lockForUpdate()->get()->sortByDesc('id')->values();
             if ($candidates->every(static fn (object $candidate): bool => $candidate->manifest_path === '')) {
                 continue;
             }
@@ -636,9 +635,9 @@ final class CandidateRepository
                 // Too large to compare here; archive() handles it on its own pass, without aborting this chunk.
                 continue;
             }
-            $heldIds = array_map(static fn (object $held): int => (int) $held->id, $this->lockPartialHolders($identity));
+            $heldIds = array_map(static fn (object $held): int => (int) $held->id, $this->lockPartialHolders($identity, true));
             $holders = array_values(array_filter($candidates->all(), static fn (object $candidate): bool => in_array((int) $candidate->id, $heldIds, true)));
-            $owner = $holders === [] ? null : $this->lateArticleOwner($collection, $identity, $holders, $snapshot);
+            $owner = $holders === [] ? null : $this->lateArticleOwner($collection, $identity, $holders, $snapshot, true);
             if ($owner !== null) {
                 // A partial's late articles: refresh its holder and archive them now, which merges them into the
                 // generation that upgrades it. Other posts under the hash are left alone.
@@ -688,7 +687,7 @@ final class CandidateRepository
      * @param  list<object>  $holders
      * @param  array<string, mixed>  $manifest
      */
-    private function lateArticleOwner(object $collection, string $sourceIdentity, array $holders, array $manifest): ?object
+    private function lateArticleOwner(object $collection, string $sourceIdentity, array $holders, array $manifest, bool $currentReads): ?object
     {
         $holder = $this->partialOwner($holders, $manifest);
         if ($holder === null || ((int) $collection->filecheck === 4 && isset($collection->releases_id))) {
@@ -699,7 +698,7 @@ final class CandidateRepository
         // An established repost under the same hash (pending, holding no partial) that also takes these headers
         // makes them ambiguous: never upgrade the partial with possibly mixed articles. They then follow the
         // repost, as ordinary pending headers do.
-        $repost = $this->lockLatestUnheld($sourceIdentity, array_map(static fn (object $held): int => (int) $held->id, $holders));
+        $repost = $this->lockLatestUnheld($sourceIdentity, array_map(static fn (object $held): int => (int) $held->id, $holders), $currentReads);
         if ($repost !== null && $repost->manifest_path !== ''
             && ! $this->spoils($this->store->read($repost->manifest_path), $this->merge($this->store->read($repost->manifest_path), $manifest))) {
             return null;
@@ -714,15 +713,14 @@ final class CandidateRepository
      *
      * @return list<object>
      */
-    private function lockPartialHolders(string $sourceIdentity): array
+    private function lockPartialHolders(string $sourceIdentity, bool $currentReads): array
     {
         if (! Release::hasLateArticleFlag()) {
             return [];
         }
         // Lock the upload's candidates, then read the pointers with a current (locking) read: a plain read
         // would use this transaction's older REPEATABLE READ snapshot and miss a just-published partial.
-        $candidates = DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)->where('manifest_path', '<>', '')
-            ->orderByDesc('id')->lockForUpdate()->get();
+        $candidates = $this->lockSourceCandidates($sourceIdentity, $currentReads, static fn (object $row): bool => $row->manifest_path !== '');
         if ($candidates->isEmpty()) {
             return [];
         }
@@ -790,14 +788,39 @@ final class CandidateRepository
      *
      * @param  list<int>  $heldIds
      */
-    private function lockLatestUnheld(string $sourceIdentity, array $heldIds): ?object
+    private function lockLatestUnheld(string $sourceIdentity, array $heldIds, bool $currentReads): ?object
     {
         // An unheld upgrade generation is orphaned (its partial was deleted): never admit new uploads into it,
         // even while a worker's lease keeps it from being retired.
-        return DB::table('release_verification_candidates')->where('source_identity', $sourceIdentity)->whereNull('release_id')
-            ->whereNotIn('status', ['expired', 'filtered', 'metadata_expired'])->whereNotIn('id', $heldIds === [] ? [0] : $heldIds)
-            ->when(self::tracksUpgrades(), fn ($query) => $query->whereNull('upgrades_release_id'))
-            ->orderByDesc('id')->lockForUpdate()->first();
+        $upgrades = self::tracksUpgrades();
+
+        return $this->lockSourceCandidates($sourceIdentity, $currentReads, static fn (object $row): bool => $row->release_id === null
+            && ! in_array($row->status, ['expired', 'filtered', 'metadata_expired'], true) && ! in_array((int) $row->id, $heldIds, true)
+            && (! $upgrades || $row->upgrades_release_id === null))->first();
+    }
+
+    /**
+     * The upload's candidates matching $keep, newest first, locked. Rows for a collection hash are only
+     * inserted under that collection's lock, which archive() holds, so with database manifests and no
+     * caller snapshot a plain read finds them all, and they are locked by primary key: a locking read of
+     * the source index would also lock its neighbours, blocking or deadlocking other uploads' admissions.
+     *
+     * @param  callable(object): bool  $keep
+     * @return Collection<int, object>
+     */
+    private function lockSourceCandidates(string $sourceIdentity, bool $currentReads, callable $keep): Collection
+    {
+        $table = static fn () => DB::table('release_verification_candidates');
+        if ($currentReads || ! $this->ledger->concurrent()) {
+            $rows = $table()->where('source_identity', $sourceIdentity)->orderBy('id')->lockForUpdate()->get();
+        } else {
+            $ids = $table()->where('source_identity', $sourceIdentity)->pluck('id')->all();
+            $rows = $ids === [] ? collect() : $table()
+                ->when(in_array(DB::getDriverName(), ['mysql', 'mariadb'], true), fn ($query) => $query->forceIndex('PRIMARY'))
+                ->whereIn('id', $ids)->orderBy('id')->lockForUpdate()->get();
+        }
+
+        return $rows->filter(static fn (object $row): bool => $row->source_identity === $sourceIdentity && $keep($row))->sortByDesc('id')->values();
     }
 
     /**

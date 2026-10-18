@@ -132,7 +132,8 @@ class PartialHolderLocksMariaDbTest extends TestCase
     /** @return list<object> */
     private function lockPartialHolders(string $sourceIdentity): array
     {
-        return (fn (string $identity): array => $this->lockPartialHolders($identity))->call(app(CandidateRepository::class), $sourceIdentity);
+        // As archive() reads them in its own transaction.
+        return (fn (string $identity): array => $this->lockPartialHolders($identity, false))->call(app(CandidateRepository::class), $sourceIdentity);
     }
 
     private function rollBack(Connection $connection): void
