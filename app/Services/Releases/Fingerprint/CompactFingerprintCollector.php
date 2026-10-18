@@ -33,7 +33,12 @@ final class CompactFingerprintCollector
 
     private const MAX_LISTED_FILES = 200;
 
-    private const MAX_NAME_LENGTH = 200;
+    private const MAX_NAME_LENGTH = 120;
+
+    private const MAX_LISTED_GROUPS = 20;
+
+    /** Serialized record budget; file lists are shortened until the record fits. */
+    public const MAX_RECORD_BYTES = 20_480;
 
     private readonly FingerprintProviderBreaker $breaker;
 
@@ -66,6 +71,7 @@ final class CompactFingerprintCollector
 
         $providers = [];
         $unavailable = [];
+        $errors = [];
         foreach ($servers as $server) {
             $account = $server['account'];
             $providers[$account] = [
@@ -96,6 +102,7 @@ final class CompactFingerprintCollector
                 }
             } catch (Throwable $exception) {
                 $providers[$account]['profile'] = class_basename($exception);
+                $errors[$account][class_basename($exception)] = ($errors[$account][class_basename($exception)] ?? 0) + 1;
                 if ($server['alternate'] && $exception instanceof NntpProviderUnavailableException) {
                     $unavailable[$account] = class_basename($exception);
                     $this->breaker->recordUnavailable($server);
@@ -106,7 +113,6 @@ final class CompactFingerprintCollector
         }
 
         $articles = [];
-        $errors = [];
         $softwareCandidates = [];
         $firstPrefixMd5 = [];
         $par2 = null;
@@ -142,13 +148,18 @@ final class CompactFingerprintCollector
                         'bytes' => strlen($fetched['body']),
                         'ms' => $ms,
                     ];
+                    // Each provider's copy is decoded so corruption on any of them is reported.
+                    $analysis = $this->analyzer->analyzeArticleAndDecodedBytes($fetched['headers'], $fetched['body']);
+                    $metadata = $analysis['metadata'];
+                    $yenc = self::yencSummary($metadata['yenc'] ?? null);
+                    if (($yenc['crc_ok'] ?? null) === false) {
+                        $errors[$account]['YencCrcMismatch'] = ($errors[$account]['YencCrcMismatch'] ?? 0) + 1;
+                    }
                     if ($article['yenc'] !== null) {
                         continue;
                     }
-                    // Decode and summarise once per article; the first provider that returns it wins.
-                    $analysis = $this->analyzer->analyzeArticleAndDecodedBytes($fetched['headers'], $fetched['body']);
-                    $metadata = $analysis['metadata'];
-                    $article['yenc'] = self::yencSummary($metadata['yenc'] ?? null);
+                    // The article summary comes from the first provider that returned it.
+                    $article['yenc'] = $yenc;
                     $article['date_utc'] = self::dateUtc($metadata['headers']['date'] ?? null);
                     $article['xref_group_count'] = self::xrefGroupCount($metadata['headers']['xref'] ?? null);
                     foreach (array_keys($metadata['uploader_software_candidates'] ?? []) as $candidate) {
@@ -158,7 +169,8 @@ final class CompactFingerprintCollector
                     if ($sample['segment_number'] === 1 && is_string($prefixMd5)) {
                         $firstPrefixMd5[$sample['file_index']] ??= strtolower($prefixMd5);
                     }
-                    if ($par2 === null && $sample['role'] === 'par2' && is_string($analysis['decoded_bytes'] ?? null)) {
+                    if ($par2 === null && $sample['kind'] === 'par2' && ($yenc['crc_ok'] ?? null) !== false
+                        && is_string($analysis['decoded_bytes'] ?? null)) {
                         $par2 = $this->par2Summary($analysis['decoded_bytes'], $files);
                     }
                 } catch (Throwable $exception) {
@@ -202,7 +214,7 @@ final class CompactFingerprintCollector
             && $primary['articles']['found'] === count($samples)
             && $errorRows === [] ? 'complete' : 'partial';
 
-        return ['status' => $status, 'data' => [
+        return ['status' => $status, 'data' => self::withinBudget([
             'schema_version' => self::SCHEMA_VERSION,
             'format' => self::FORMAT,
             'collector' => ['engine' => 'php', 'version' => self::SCHEMA_VERSION],
@@ -215,7 +227,34 @@ final class CompactFingerprintCollector
             'posting' => self::posting($files),
             'uploader_software_candidates' => $softwareCandidates,
             'errors' => $errorRows,
-        ]];
+            'truncated' => false,
+        ])];
+    }
+
+    /**
+     * Halve the NZB and PAR2 file lists until the record fits MAX_RECORD_BYTES; every other field is
+     * already bounded by sample, group and name limits.
+     *
+     * @param  array<string, mixed>  $record
+     * @return array<string, mixed>
+     */
+    private static function withinBudget(array $record): array
+    {
+        while (strlen((string) json_encode($record, JSON_INVALID_UTF8_SUBSTITUTE)) > self::MAX_RECORD_BYTES) {
+            $files = count($record['files']);
+            $par2Files = is_array($record['par2']) ? count($record['par2']['files']) : 0;
+            if ($files === 0 && $par2Files === 0) {
+                break;
+            }
+            $record['truncated'] = true;
+            if ($files >= $par2Files) {
+                $record['files'] = array_slice($record['files'], 0, intdiv($files, 2));
+            } else {
+                $record['par2']['files'] = array_slice($record['par2']['files'], 0, intdiv($par2Files, 2));
+            }
+        }
+
+        return $record;
     }
 
     /**
@@ -392,7 +431,7 @@ final class CompactFingerprintCollector
             'file_count' => (int) $manifest['file_count'],
             'segment_count' => $segments,
             'total_bytes' => $bytes,
-            'groups' => array_slice($groups, 0, 50),
+            'groups' => array_map(self::bounded(...), array_slice($groups, 0, self::MAX_LISTED_GROUPS)),
             'poster' => self::bounded(array_key_first($posters)),
             'kinds' => $kinds,
         ];

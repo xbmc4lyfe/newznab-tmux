@@ -126,6 +126,7 @@ final class CompactFingerprintCollectorTest extends TestCase
         $this->assertSame(['primary', 'alternate'], array_column($first['providers'], 'account'));
         $this->assertSame('NntpProviderUnavailableException', $first['providers'][1]['profile']);
         $this->assertSame('recent_provider_failure', $second['providers'][1]['skipped_reason']);
+        $this->assertSame([['account' => 'alternate', 'error_type' => 'NntpProviderUnavailableException', 'count' => 4]], $first['errors']);
         $this->assertSame([['account' => 'alternate', 'error_type' => 'NntpProviderUnavailableException', 'count' => 3]], $second['errors']);
     }
 
@@ -153,6 +154,87 @@ final class CompactFingerprintCollectorTest extends TestCase
             ['name' => 'offline-0000.bin', 'size' => 19_200, 'md5' => md5($data), 'md5_16k' => md5(substr($data, 0, 16384))],
             ['name' => 'offline-0001.bin', 'size' => 19_200, 'md5' => md5($data), 'md5_16k' => md5(substr($data, 0, 16384))],
         ], $summary['files']);
+    }
+
+    #[Test]
+    public function long_names_and_huge_releases_stay_within_the_record_budget(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->andReturnUsing(fn (string $id): array => self::article($id));
+        $xml = '<?xml version="1.0" encoding="UTF-8"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">';
+        for ($index = 0; $index < 400; $index++) {
+            $xml .= '<file poster="p@example" date="1790812800" subject="&quot;'.str_repeat('n', 300).$index.'.rar&quot; yEnc (1/1)">'
+                .'<groups><group>'.str_repeat('g', 5_000).'</group><group>alt.binaries.'.$index.'</group></groups>'
+                .'<segments><segment bytes="1000" number="1">f'.$index.'@fixture</segment></segments></file>';
+        }
+
+        $data = $this->collector()->collectFromNzb($xml.'</nzb>', 7)['data'];
+
+        $this->assertLessThanOrEqual(CompactFingerprintCollector::MAX_RECORD_BYTES, strlen(json_encode($data, JSON_THROW_ON_ERROR)));
+        $this->assertTrue($data['truncated']);
+        $this->assertNotEmpty($data['files']);
+        $this->assertLessThanOrEqual(120, max(array_map(mb_strlen(...), $data['nzb']['groups'])));
+    }
+
+    #[Test]
+    public function a_crc_mismatch_is_reported_and_keeps_the_record_partial(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(function (string $id): array {
+            $article = self::article($id);
+            if (str_starts_with($id, 'f1-')) {
+                $article['body'] = (string) preg_replace('/crc32=[0-9a-f]{8}/', 'crc32=00000000', $article['body']);
+            }
+
+            return $article;
+        });
+
+        $result = $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7);
+
+        $this->assertSame('partial', $result['status']);
+        $this->assertSame([['account' => 'primary', 'error_type' => 'YencCrcMismatch', 'count' => 1]], $result['data']['errors']);
+        $this->assertFalse($result['data']['articles'][array_search(1, array_column($result['data']['articles'], 'file_index'), true)]['yenc']['crc_ok']);
+    }
+
+    #[Test]
+    public function a_failed_provider_profile_keeps_the_record_partial(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andThrow(new \RuntimeException('CAPABILITIES failed.'));
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(fn (string $id): array => self::article($id));
+
+        $result = $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7);
+
+        $this->assertSame('partial', $result['status']);
+        $this->assertSame('RuntimeException', $result['data']['providers'][0]['profile']);
+        $this->assertSame([['account' => 'primary', 'error_type' => 'RuntimeException', 'count' => 1]], $result['data']['errors']);
+    }
+
+    #[Test]
+    public function a_later_par2_volume_supplies_the_summary_when_the_index_is_missing(): void
+    {
+        $par2 = ArchiveParsingBenchmarkFixtures::par2(1);
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(function (string $id) use ($par2): array {
+            if ($id === 'index@fixture') {
+                throw new \RuntimeException('Article headers are unavailable.');
+            }
+
+            return ['body' => YencArticles::article($id === 'volume@fixture' ? $par2 : 'payload')] + self::article($id);
+        });
+        $xml = '<?xml version="1.0" encoding="UTF-8"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">';
+        foreach (['index' => ['movie.par2', 100], 'volume' => ['movie.vol00+01.par2', 900], 'data' => ['offline-0000.bin', 5000]] as $id => [$name, $bytes]) {
+            $xml .= '<file poster="p@example" date="1790812800" subject="&quot;'.$name.'&quot; yEnc (1/1)"><groups><group>a.b.test</group></groups>'
+                .'<segments><segment bytes="'.$bytes.'" number="1">'.$id.'@fixture</segment></segments></file>';
+        }
+
+        $summary = $this->collector()->collectFromNzb($xml.'</nzb>', 7)['data']['par2'];
+
+        $this->assertSame(['offline-0000.bin'], array_column($summary['files'], 'name'));
+        $this->assertSame(1, $summary['nzb_matches']);
     }
 
     #[Test]
