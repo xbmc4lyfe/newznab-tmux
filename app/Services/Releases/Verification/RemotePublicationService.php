@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Validator;
 use Throwable;
 
 /**
@@ -16,6 +18,15 @@ use Throwable;
 final class RemotePublicationService
 {
     public const string STALE_MESSAGE = 'Stale verification result cannot publish.';
+
+    /** Version of the batch request and response; a mismatch makes the worker fall back to single requests. */
+    public const int BATCH_PROTOCOL = 1;
+
+    /** No configuration raises the item count above this. */
+    public const int BATCH_HARD_MAX_ITEMS = 64;
+
+    /** Seconds past the batch budget that one started item may still run, for set_time_limit(). */
+    public const int BATCH_TIME_MARGIN = 60;
 
     public const string PAUSED_MESSAGE = 'Verification is paused for exclusive maintenance; retry later.';
 
@@ -42,6 +53,87 @@ final class RemotePublicationService
             'evidence.identity_hints' => ['present', 'array', 'max:16'],
             'evidence.identity_hints.*' => ['string', 'max:1024'],
         ];
+    }
+
+    /** @return array{items: int, bytes: int, seconds: float} */
+    public static function batchLimits(): array
+    {
+        return [
+            'items' => max(1, min(self::BATCH_HARD_MAX_ITEMS, (int) config('release_verification.publish_batch_max_items', 16))),
+            'bytes' => max(1, (int) config('release_verification.publish_batch_max_bytes', 1048576)),
+            'seconds' => max(0.0, (float) config('release_verification.publish_batch_seconds', 15)),
+        ];
+    }
+
+    /**
+     * Publish a batch one item at a time, each in its own transaction exactly as a single request
+     * publishes it. Items are validated independently; one invalid or failed item never affects
+     * another. The worker lock is taken once, on the first item that needs it, and kept to the end.
+     *
+     * Items not started when the time budget ends are answered "retry" without being read, and the
+     * first item always starts so a tiny budget cannot starve a worker. The budget is measured on
+     * the application clock.
+     *
+     * @param  list<mixed>  $items  Raw request items.
+     * @return list<array{index: int, claim_id: ?int, claim_version: ?int, status: string, release_id: ?int, error: ?string}>
+     */
+    public function publishBatch(array $items, float $budgetSeconds): array
+    {
+        $size = count($items);
+        $startedAt = $this->clock();
+        // One sample decision per batch; each sampled item then reports its own timing.
+        $sampled = PublicationTiming::sample() !== null;
+        $gate = new PublicationWorkerGate(retain: true);
+        $results = [];
+        $exhausted = false;
+        try {
+            foreach ($items as $index => $item) {
+                $item = is_array($item) ? $item : [];
+                $exhausted = $exhausted || ($index > 0 && $this->clock() - $startedAt >= $budgetSeconds);
+                $outcome = $exhausted
+                    ? new PublicationOutcome(PublicationOutcome::RETRY, null, 'Batch time budget exhausted; resend this item.')
+                    : $this->publishBatchItem($item, $sampled ? PublicationTiming::start() : null, $size, $index, $gate);
+                $results[] = ['index' => $index, 'claim_id' => $this->integerAt($item, 'id'), 'claim_version' => $this->integerAt($item, 'version'),
+                    'status' => $outcome->status, 'release_id' => $outcome->releaseId, 'error' => $outcome->error];
+                unset($outcome);
+                // A manifest, its parse and the compressed body are large; none outlives its item.
+                gc_collect_cycles();
+            }
+        } finally {
+            $gate->close();
+        }
+
+        return $results;
+    }
+
+    /** @param array<mixed> $item */
+    private function publishBatchItem(array $item, ?PublicationTiming $timing, int $size, int $index, PublicationWorkerGate $gate): PublicationOutcome
+    {
+        $timing?->setBatch($size, $index);
+        $validator = Validator::make($item, self::itemRules());
+        if ($validator->fails()) {
+            return new PublicationOutcome(PublicationOutcome::INVALID, null, mb_strcut(implode(' ', $validator->errors()->all()), 0, 500, 'UTF-8'));
+        }
+        $timing?->requestPhase('validation');
+        try {
+            return $this->publishItem($validator->validated(), $timing, $gate, replayResolved: true);
+        } catch (Throwable $error) {
+            // Even the recovery lookup failed; the item may or may not have published, and a resend decides.
+            return new PublicationOutcome(PublicationOutcome::ERROR, null, mb_strcut($error->getMessage(), 0, 500, 'UTF-8'));
+        }
+    }
+
+    /** @param array<mixed> $item */
+    private function integerAt(array $item, string $key): ?int
+    {
+        $value = is_array($item['claim'] ?? null) ? ($item['claim'][$key] ?? null) : null;
+
+        return is_int($value) || (is_string($value) && ctype_digit($value) && strlen($value) < 19) ? (int) $value : null;
+    }
+
+    private function clock(): float
+    {
+        return Carbon::now()->getPreciseTimestamp(6) / 1_000_000;
     }
 
     /**

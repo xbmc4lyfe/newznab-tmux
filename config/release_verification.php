@@ -23,6 +23,12 @@ return [
     'locks' => env('RELEASE_VERIFICATION_LOCKS', 'auto'),
     // Remote workers publish through the primary host's internal endpoint at this URL.
     'publish_url' => env('RELEASE_VERIFICATION_PUBLISH_URL'),
+    // Primary: most items one batch request may carry (hard cap 64); more is refused with HTTP 422.
+    'publish_batch_max_items' => (int) env('RELEASE_VERIFICATION_PUBLISH_BATCH_MAX_ITEMS', 16),
+    // Primary: largest batch request body in bytes; more is refused with HTTP 413.
+    'publish_batch_max_bytes' => (int) env('RELEASE_VERIFICATION_PUBLISH_BATCH_MAX_BYTES', 1048576),
+    // Primary: seconds after which a batch starts no further item; the rest answer "retry".
+    'publish_batch_seconds' => (float) env('RELEASE_VERIFICATION_PUBLISH_BATCH_SECONDS', 15),
     'publish_timeout' => (int) env('RELEASE_VERIFICATION_PUBLISH_TIMEOUT', 120),
     // The primary host serves that endpoint, without authentication, to these networks only.
     'publish_endpoint' => (bool) env('RELEASE_VERIFICATION_PUBLISH_ENDPOINT', false),
