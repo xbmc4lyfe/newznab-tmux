@@ -45,6 +45,9 @@ hold_barrier() {
     # one that leaves no barrier container, makes the next run take a barrier and release it.
     owe_barrier
     # A barrier still running from a failed attempt is retained until this rollout is healthy.
+    # So is one taken while an earlier attempt's release is still owed: that attempt may have failed
+    # mid-migration, and this barrier's release would clear the durable pause it left behind.
+    [ "$owed_at_start" != 1 ] || barrier_keep=1
     if barrier_running && ! docker logs "$barrier_name" 2>&1 | grep -q '^barrier lost'; then
         barrier_keep=1
     else
@@ -89,6 +92,8 @@ release_barrier() {
 # a barrier's release clears it. A failed run that held a barrier marks it owed: the next run, even
 # a no-op or selective one, takes a barrier and releases it, without repeating a completed migration.
 barrier_owed="${DEPLOY_STAMP:-$DIR/.deploy.stamp}.barrier-owed"
+owed_at_start=0
+[ ! -e "$barrier_owed" ] || owed_at_start=1
 owe_barrier() { : >"$barrier_owed" || echo "Could not record the owed barrier release; clear the verification pause by hand." >&2; }
 settle_barrier() {
     if ! release_barrier; then

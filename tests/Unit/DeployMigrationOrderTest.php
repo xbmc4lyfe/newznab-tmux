@@ -317,6 +317,28 @@ SH);
         $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp.barrier-owed');
     }
 
+    public function test_a_failed_retry_never_clears_the_pause_left_by_an_earlier_failed_migration(): void
+    {
+        $this->deploy(['NNTMUX_MIGRATION_FAIL' => '1'])->run();
+        // That barrier then lost its session and exited; only its durable pause holds remote workers.
+        unlink($this->directory.'/barrier.running');
+        file_put_contents($this->directory.'/barrier.log', "barrier held\nbarrier lost\n");
+        file_put_contents($this->directory.'/events', '');
+
+        $process = $this->deploy(['NNTMUX_STALE_STOP' => '1']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('releases:verification-barrier --timeout=900', $this->events());
+        $this->assertStringNotContainsString('released', $this->events());
+        $this->assertStringNotContainsString('forced-release', $this->events());
+
+        file_put_contents($this->directory.'/events', '');
+        $this->deploy()->mustRun();
+        $this->assertStringContainsString('artisan migrate --force', $this->events());
+        $this->assertStringContainsString('released', $this->events());
+        $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp.barrier-owed');
+    }
+
     public function test_native_indexer_abort_uses_the_same_unique_operation_token_as_its_drain(): void
     {
         $process = $this->deploy(['NNTMUX_STALE_DRAIN' => '1']);
