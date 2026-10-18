@@ -105,12 +105,12 @@ class CleanNZB extends Command
         $olderThanSeconds = max(1, (int) $this->option('temp-age-hours')) * 3600;
         $checked++;
         $outcome = $nzb->reconcileStalePreservedNzb($path, $olderThanSeconds, apply: (bool) $delete);
-        if ($outcome === 'kept') {
-            return;
+        if ($outcome === 'deleted') {
+            $deleted++;
+            $this->line(($delete ? 'Deleted' : 'Would delete').' replaced NZB source: '.$path);
+        } elseif ($outcome === 'restored') {
+            $this->line(($delete ? 'Restored' : 'Would restore').' replaced NZB source: '.$path);
         }
-        $deleted++;
-        $verb = $outcome === 'restored' ? 'restore' : 'delete';
-        $this->line(($delete ? ucfirst($verb).'d' : 'Would '.$verb).' stale replaced NZB: '.$path);
     }
 
     private function GetReleasesWithNoNZBOnDisk(mixed $delete = false): void
@@ -146,32 +146,39 @@ class CleanNZB extends Command
         $nzb = app(NzbService::class);
         $ageHours = max(1, (int) $this->option('temp-age-hours'));
         $olderThanSeconds = $ageHours * 3600;
+        $outcomes = ['deleted' => 0, 'restored' => 0, 'kept' => 0];
 
-        if (! $delete) {
-            $paths = $nzb->findStaleTemporaryNzbPaths($olderThanSeconds);
-            foreach ($paths as $path) {
-                if (NzbService::isPreservedNzbPathName($path)) {
-                    $outcome = $nzb->reconcileStalePreservedNzb($path, $olderThanSeconds, apply: false);
-                    $this->line($outcome === 'kept' ? "Would keep replaced NZB (needs review): {$path}" : "Would {$outcome} stale replaced NZB: {$path}");
+        foreach ($nzb->findStaleTemporaryNzbPaths($olderThanSeconds) as $path) {
+            if (NzbService::isPreservedNzbPathName($path)) {
+                // A replaced source is settled by its upgrade's outcome, never just deleted.
+                $outcome = $nzb->reconcileStalePreservedNzb($path, $olderThanSeconds, apply: (bool) $delete);
+                $outcomes[$outcome]++;
+                $this->line(match ($outcome) {
+                    'deleted' => ($delete ? 'Deleted' : 'Would delete').' replaced NZB source: '.$path,
+                    'restored' => ($delete ? 'Restored' : 'Would restore').' replaced NZB source: '.$path,
+                    default => 'Kept replaced NZB source for review: '.$path,
+                });
 
-                    continue;
-                }
-                $this->line("Would delete stale temporary NZB: {$path}");
+                continue;
             }
+            if (! $delete) {
+                $outcomes['deleted']++;
+                $this->line("Would delete stale temporary NZB: {$path}");
 
-            $this->info('Checked stale temporary NZBs: '.count($paths).' would be deleted.');
-
-            return;
+                continue;
+            }
+            if ($nzb->deleteStaleTemporaryNzb($path)) {
+                $outcomes['deleted']++;
+            } else {
+                $outcomes['kept']++;
+                $this->warn("Could not delete stale temporary NZB: {$path}");
+            }
         }
 
-        $deleted = $nzb->cleanupStaleTemporaryNzbs($olderThanSeconds);
-        if ($deleted > 0) {
-            Log::channel('nzb_creation')->warning('Deleted stale temporary NZB files', [
-                'count' => $deleted,
-                'older_than_hours' => $ageHours,
-            ]);
+        if ($delete && $outcomes['deleted'] + $outcomes['restored'] > 0) {
+            Log::channel('nzb_creation')->warning('Cleaned stale temporary NZB files', $outcomes + ['older_than_hours' => $ageHours]);
         }
-
-        $this->info("Deleted stale temporary NZBs: {$deleted}");
+        $this->info(sprintf('%s stale temporary NZBs: %d deleted, %d restored, %d kept.', $delete ? 'Cleaned' : 'Checked (dry run)',
+            $outcomes['deleted'], $outcomes['restored'], $outcomes['kept']));
     }
 }

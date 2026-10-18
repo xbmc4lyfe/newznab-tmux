@@ -620,25 +620,34 @@ class NzbService
                 continue;
             }
 
-            try {
-                if (File::delete($path)) {
-                    $deleted++;
-
-                    continue;
-                }
-
-                Log::channel('nzb_creation')->warning('Failed to delete stale temporary NZB file', [
-                    'path' => $path,
-                ]);
-            } catch (Throwable $e) {
-                Log::channel('nzb_creation')->warning('Failed to delete stale temporary NZB file', [
-                    'path' => $path,
-                    'error' => $e->getMessage(),
-                ]);
-            }
+            $deleted += $this->deleteStaleTemporaryNzb($path) ? 1 : 0;
         }
 
         return $deleted;
+    }
+
+    /** Remove one stale temporary NZB (never a preserved source; see reconcileStalePreservedNzb()). */
+    public function deleteStaleTemporaryNzb(string $path): bool
+    {
+        if (self::isPreservedNzbPathName($path) || ! File::isFile($path)) {
+            return false;
+        }
+        try {
+            if (File::delete($path)) {
+                return true;
+            }
+
+            Log::channel('nzb_creation')->warning('Failed to delete stale temporary NZB file', [
+                'path' => $path,
+            ]);
+        } catch (Throwable $e) {
+            Log::channel('nzb_creation')->warning('Failed to delete stale temporary NZB file', [
+                'path' => $path,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        return false;
     }
 
     /**

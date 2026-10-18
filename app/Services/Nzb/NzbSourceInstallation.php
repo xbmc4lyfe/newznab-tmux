@@ -63,23 +63,45 @@ final class NzbSourceInstallation
                 // Logging failure must not recursively reenter rollback either.
             }
         } finally {
+            // Inside Laravel's rollback unwind: never settle here. Anything left is reconciled later.
+            $this->keepPrevious = true;
             $this->close();
         }
     }
 
+    /**
+     * After commit: the displaced source is settled by the committed digest, not unlinked outright. A failed
+     * COMMIT can still run after-commit callbacks, and then the preserved source is the one to keep.
+     */
     public function close(): void
     {
-        if (is_resource($this->handle)) {
-            fclose($this->handle);
-        }
-        $this->handle = null;
+        $this->release();
         if ($this->previous !== null && ! $this->keepPrevious && is_file($this->previous)) {
-            @unlink($this->previous);
+            try {
+                $this->sources->reconcilePreserved($this->previous);
+            } catch (Throwable $exception) {
+                try {
+                    Log::warning('Could not settle a preserved NZB source after commit.', [
+                        'preserved_source' => $this->previous, 'exception' => $exception::class,
+                    ]);
+                } catch (Throwable) {
+                    // Reconciled later by nzbclean.
+                }
+            }
         }
     }
 
     public function __destruct()
     {
-        $this->close();
+        // Only the descriptor: an unfinished transaction's preserved source is left for reconciliation.
+        $this->release();
+    }
+
+    private function release(): void
+    {
+        if (is_resource($this->handle)) {
+            fclose($this->handle);
+        }
+        $this->handle = null;
     }
 }
