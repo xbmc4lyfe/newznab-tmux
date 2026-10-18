@@ -6,6 +6,7 @@ namespace App\Jobs;
 
 use App\Models\Release;
 use App\Models\ReleaseFingerprintMetadata;
+use App\Services\Releases\Fingerprint\CompactFingerprintCollector;
 use App\Services\Releases\Fingerprint\ReleaseFingerprintCollector;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
@@ -39,8 +40,33 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
         return (string) $this->releaseId;
     }
 
-    public function handle(ReleaseFingerprintCollector $collector): void
+    /** Format marker of the configured collector's records; null for the legacy full collector. */
+    public static function currentFormat(): ?string
     {
+        return self::compactFormat() ? CompactFingerprintCollector::FORMAT : null;
+    }
+
+    /** Schema version the configured collector writes; older or missing versions are collected again. */
+    public static function currentSchemaVersion(): int
+    {
+        return self::compactFormat() ? CompactFingerprintCollector::SCHEMA_VERSION : ReleaseFingerprintCollector::SCHEMA_VERSION;
+    }
+
+    /** @param array<string, mixed>|null $metadata */
+    public static function isCurrent(?array $metadata): bool
+    {
+        return is_array($metadata) && ($metadata['format'] ?? null) === self::currentFormat()
+            && (int) ($metadata['schema_version'] ?? 0) >= self::currentSchemaVersion();
+    }
+
+    private static function compactFormat(): bool
+    {
+        return config('nntmux.fingerprint_format', 'compact') !== 'full';
+    }
+
+    public function handle(CompactFingerprintCollector|ReleaseFingerprintCollector|null $collector = null): void
+    {
+        $collector ??= self::compactFormat() ? app(CompactFingerprintCollector::class) : app(ReleaseFingerprintCollector::class);
         $release = Release::query()->find($this->releaseId);
         if ($release === null) {
             return;
@@ -50,8 +76,7 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
             ['releases_id' => $this->releaseId],
             ['status' => 'pending'],
         );
-        $metadataSchemaVersion = (int) ($record->metadata['schema_version'] ?? 0);
-        if ($record->status === 'complete' && $metadataSchemaVersion >= ReleaseFingerprintCollector::SCHEMA_VERSION) {
+        if ($record->status === 'complete' && self::isCurrent($record->metadata)) {
             return;
         }
         $record->update(['status' => 'processing', 'last_error' => null]);
