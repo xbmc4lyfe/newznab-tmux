@@ -27,7 +27,7 @@ class HeaderFilenameIdentityTest extends TestCase
             foreach (['[1/1]'.str_repeat(' ', 990).'"a"', str_repeat('"a" ', 250), '"a'.str_repeat('.rar', 248).'"',
                 str_repeat("'", 1000), '"'.str_repeat('Ab1', 330).'" yEnc',
                 '[1/1]'.str_repeat(' ', 667).'x'.str_repeat('"a"', 111), '"a'.str_repeat('.ts', 332).'x" yEnc',
-                '"a'.str_repeat('.7z', 332).'x" yEnc', '"a'.str_repeat('.r00', 249).'x" yEnc'] as $subject) {
+                '"a'.str_repeat('.7z', 332).'x" yEnc', '"a'.str_repeat('.r00', 249).'x" yEnc', '"'.str_repeat('A', 990).'b" yEnc'] as $subject) {
                 HeaderFilenameIdentity::matches($subject, 'Readable.Name.mkv');
                 self::assertSame(PREG_NO_ERROR, preg_last_error(), substr($subject, 0, 20));
             }
@@ -151,6 +151,12 @@ class HeaderFilenameIdentityTest extends TestCase
             'square-bracket counter before yEnc rejects another body' => ['"Readable.Name.rar" [1/5] yEnc - "Tag Name"', 'Other.Words.rar', false],
             'opaque parity subject with a trailing-space payload body' => ['[1/1] - "Xk29dPq8LmZ0Yt5R.par2" yEnc', 'payload.mkv ', false],
             'opaque parity subject with a trailing-dot payload body' => ['[1/1] - "Xk29dPq8LmZ0Yt5R.par2" yEnc', 'payload.mkv.', false],
+            'acronym title' => ['"BBCDocumentary.mkv" yEnc', 'totally-different.mkv', false],
+            'lower-camel title' => ['"iPhoneMovie2026.mkv" yEnc', 'totally-different.mkv', false],
+            'parity declared beside a quoted payload' => ['"payload.mkv" - [1/1] - "Xk29dPq8LmZ0Yt5R.par2" yEnc', 'payload.mkv', false],
+            'opaque subject with an unlisted media extension' => ['[1/9] - "Xk29dPq8LmZ0Yt5R.wmv" yEnc', 'b7Qe1ZrT9wXy4K.wmv', true],
+            'composed and decomposed accents agree' => ['"Résumé Ultimate.mkv" yEnc', "Re\u{301}sume\u{301} Ultimate.mkv", true],
+            'random letters without digits stay opaque' => ['"camjQoMXQvVmpZMR" yEnc', '0SDtjNqVpAyF7Orb', true],
             'opaque subject with an extensionless body' => ['[3/8] - "o9aeI3YpDwgHGoJ2ZsCm.vol00+01.par2" yEnc', '148f76878d7732b981734a9e0c51a348', true],
         ];
     }

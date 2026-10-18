@@ -225,6 +225,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
                 $policy->verifiedRejection(['verified_file_names' => $names] + $manifest), $names[0]);
         }
         $this->assertNull($policy->verifiedRejection(['verified_file_names' => ['9d3276d357227b78.mkv']] + $manifest));
+        $this->assertNull($policy->verifiedRejection(['verified_file_names' => ['metadata.torrent']] + $manifest));
     }
 
     public function test_manual_import_preserves_legacy_bypass_of_collection_size_and_count_filters(): void

@@ -78,7 +78,7 @@ final class CollectionReleasePolicy
         // An obfuscated, extensionless body name is not evidence of a source payload.
         $sampledNames = array_filter($manifest['verified_file_names'] ?? [],
             static fn (mixed $name): bool => is_string($name) && preg_match('/\.par2\z/i', $name) !== 1
-                && preg_match('/\.[A-Za-z0-9]{1,5}\z/', $name) === 1);
+                && preg_match('/\.[A-Za-z0-9]{1,8}\z/', $name) === 1);
         if (! $hasPayload && $sampledNames === []) {
             return 'Header inventory contains only PAR2 files without a declared source payload.';
         }

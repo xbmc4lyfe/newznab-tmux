@@ -58,13 +58,16 @@ final class HeaderFilenameIdentity
             || strtolower(self::extension(self::trimmed($actual))) !== strtolower(self::extension(self::trimmed($declared))))) {
             return false;
         }
+        // A declared PAR2 file is not payload evidence, even when another quoted value names the body.
+        $bodyExtension = strtolower(self::extension(self::trimmed($actual)));
+        if (preg_match('/\.par2\z/i', $declared) === 1 && $bodyExtension !== '' && $bodyExtension !== 'par2') {
+            return false;
+        }
         if (in_array($actual, $quoted, true)) {
             return true;
         }
         if (self::opaque($declared)) {
-            // An opaque recovery-file name still declares parity, which is not payload evidence.
-            return ! (preg_match('/\.par2\z/i', $declared) === 1 && self::extension(self::trimmed($actual)) !== ''
-                && strtolower(self::extension(self::trimmed($actual))) !== 'par2');
+            return true;
         }
         // A readable declared name must agree on its volume and extension chain, and on its final
         // extension when that chain does not cover it, as well as its stem.
@@ -92,16 +95,17 @@ final class HeaderFilenameIdentity
     /** A single random-looking token, such as an obfuscated posting name, makes no filename claim. */
     private static function opaque(string $name): bool
     {
-        $stem = self::stem($name);
+        // An unlisted final extension, such as .wmv, is not part of the token.
+        $stem = (string) preg_replace('/\.[A-Za-z0-9]{1,8}\z/', '', self::stem($name));
         if (preg_match('/\A[A-Za-z0-9]+\z/', $stem) !== 1) {
             return false;
         }
         if (preg_match('/\A[0-9a-f]{16,}\z/i', $stem) === 1) {
             return true;
         }
-        // Capitalized words, or one run of single-case letters, with an optional trailing number read
-        // as a run-together title rather than a random token.
-        if (preg_match('/\A(?:(?:[A-Z][a-z]+)+|[a-z]+|[A-Z]+)[0-9]*\z/', $stem) === 1) {
+        // Capitalized words, optionally after a leading acronym or lowercase word, or one single-case run,
+        // with only trailing digits, read as a run-together title (BBCDocumentary, iPhoneMovie2026).
+        if (preg_match('/\A(?:[A-Z]+|(?:[A-Z]{2,}(?=[A-Z][a-z])|[a-z]+)?(?:[A-Z][a-z]+)*)[0-9]*\z/', $stem) === 1) {
             return false;
         }
         $classes = preg_match('/[a-z]/', $stem) + preg_match('/[A-Z]/', $stem) + preg_match('/[0-9]/', $stem);
@@ -157,11 +161,19 @@ final class HeaderFilenameIdentity
     /** @return list<string> */
     private static function words(string $name): array
     {
-        return preg_split('/[^\p{L}\p{M}\p{N}]+/u', mb_strtolower(self::stem($name)), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        return preg_split('/[^\p{L}\p{M}\p{N}]+/u', self::folded($name), -1, PREG_SPLIT_NO_EMPTY) ?: [];
     }
 
     private static function normalized(string $name): string
     {
-        return (string) preg_replace('/[^\p{L}\p{M}\p{N}]/u', '', mb_strtolower(self::stem($name)));
+        return (string) preg_replace('/[^\p{L}\p{M}\p{N}]/u', '', self::folded($name));
+    }
+
+    /** The lowercased stem in canonical composition, so composed and decomposed accents compare equal. */
+    private static function folded(string $name): string
+    {
+        $stem = self::stem($name);
+
+        return mb_strtolower(\Normalizer::normalize($stem, \Normalizer::FORM_C) ?: $stem);
     }
 }
