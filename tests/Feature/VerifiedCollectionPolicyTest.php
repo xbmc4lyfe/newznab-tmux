@@ -228,6 +228,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertNull($policy->verifiedRejection(['verified_file_names' => ['metadata.torrent']] + $manifest));
         $this->assertNull($policy->verifiedRejection(['verified_file_names' => ['README']] + $manifest));
         $this->assertNull($policy->verifiedRejection(['verified_file_names' => ['README.']] + $manifest));
+        $this->assertNull($policy->verifiedRejection(['verified_file_names' => ['payload.mkv:stream']] + $manifest));
         $this->assertNull($policy->verifiedRejection(['verified_file_names' => ['payload.mkv ']] + $manifest));
         $this->assertSame('Header inventory contains only PAR2 files without a declared source payload.',
             $policy->verifiedRejection(['verified_file_names' => ['set.vol00+01.par2:payload.mkv']] + $manifest));

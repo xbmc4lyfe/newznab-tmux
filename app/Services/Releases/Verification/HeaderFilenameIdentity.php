@@ -38,7 +38,7 @@ final class HeaderFilenameIdentity
 
             return self::sameParity([$unquoted], $actual) && (! self::executable($actual)
                 // The subject must name the body itself, not a longer file such as body.exe.mkv.
-                || preg_match('/(?<![\p{L}\p{N}_])'.preg_quote($actual, '/').'(?![\p{L}\p{N}_]|[.\-]+[\p{L}\p{N}])/iu', $subject) === 1);
+                || preg_match('/(?<![\p{L}\p{N}_])'.preg_quote($actual, '/').'(?![\p{L}\p{N}_]|[.\-]+[\p{L}\p{N}])/iu', $head) === 1);
         }
         $quoted = [];
         $declared = null;
@@ -49,7 +49,11 @@ final class HeaderFilenameIdentity
             $end = $match[0][1] + strlen($match[0][0]);
             // The filename is the quoted value that "yEnc" follows (optionally after an (n/m) or [n/m]
             // counter), else the one after a [n/m] counter.
-            if ($declared === null && preg_match('/\A\s*(?:(?:\(\d+\/\d+\)|\[\d+\/\d+\])\s*)?yEnc(?![\p{L}\p{N}_])/iu', substr($subject, $end)) === 1) {
+            if (preg_match('/\A\s*(?:(?:\(\d+\/\d+\)|\[\d+\/\d+\])\s*)?yEnc(?![\p{L}\p{N}_])/iu', substr($subject, $end)) === 1) {
+                // Two quoted names each marked by yEnc leave the article's filename ambiguous.
+                if ($declared !== null) {
+                    return false;
+                }
                 $declared = $value;
             }
             if ($afterCounter === null && preg_match('/\[\d+\/\d+\]\s*+(?:-\s*+)?\z/', substr($subject, 0, $match[0][1])) === 1) {
@@ -133,7 +137,7 @@ final class HeaderFilenameIdentity
             return false;
         }
 
-        return preg_match('/\.[A-Za-z0-9]{1,8}\z/', self::trimmed($name)) === 1
+        return preg_match('/\.[A-Za-z0-9]{1,8}\z/', self::trimmed($name)) === 1 || preg_match('/\.[A-Za-z0-9]{1,8}\z/', self::bare($name)) === 1
             || (($bare = self::trimmed($name)) !== '' && ! str_contains($bare, '.') && ! self::opaque($bare) && preg_match('/\p{L}/u', $bare) === 1);
     }
 
