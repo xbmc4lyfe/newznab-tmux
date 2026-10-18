@@ -31,14 +31,14 @@ final class HeaderFilenameIdentity
             return false;
         }
         if ($count === 0) {
-            // The last extension before the yEnc marker is the unquoted subject's declared file type.
+            // An unquoted subject declares a file only by naming it before its single yEnc marker.
+            if (preg_match_all('/(?<![\p{L}\p{N}_])yEnc(?![\p{L}\p{N}_])/iu', $subject) > 1) {
+                return false;
+            }
             $head = (string) preg_replace('/(?<![\p{L}\p{N}_])yEnc(?![\p{L}\p{N}_]).*\z/isu', '', $subject);
-            $unquoted = preg_match_all('/\.([A-Za-z0-9+]{1,8})(?![\p{L}\p{N}_])/u', $head, $extensions) > 0
-                ? (string) end($extensions[1]) : '';
 
-            return self::sameParity([$unquoted], $actual) && (! self::executable($actual)
-                // The subject must name the body itself, not a longer file such as body.exe.mkv.
-                || preg_match('/(?<![\p{L}\p{N}_])'.preg_quote($actual, '/').'(?![\p{L}\p{N}_]|[.\-]+[\p{L}\p{N}])/iu', $head) === 1);
+            // The subject must name the body itself, not a longer file such as body.exe.mkv.
+            return preg_match('/(?<![\p{L}\p{N}_])'.preg_quote(self::trimmed($actual), '/').'(?![\p{L}\p{N}_]|[.\-]+[\p{L}\p{N}])/iu', $head) === 1;
         }
         $quoted = [];
         $declared = null;
@@ -76,12 +76,12 @@ final class HeaderFilenameIdentity
         if (in_array($actual, $quoted, true)) {
             return true;
         }
-        // A long or hexadecimal random token is plainly obfuscated. A shorter one could be a misread title
-        // (12AngryMen), so it admits only a plainly random body or one that extends the declared token.
+        // A long, hexadecimal or densely mixed token is plainly random. A weaker one could be a misread title
+        // (XFilesMovie), so it admits only a plainly random body or one that extends the declared token.
         if (self::opaque($declared)) {
             $token = self::token($declared);
 
-            return self::random($declared) || self::opaque($actual)
+            return self::random($declared) || self::random($actual)
                 || str_starts_with(strtolower(self::bare($actual)), strtolower($token));
         }
         // A readable declared name must agree on its volume and extension chain, and on its final
@@ -138,15 +138,19 @@ final class HeaderFilenameIdentity
         }
 
         return preg_match('/\.[A-Za-z0-9]{1,8}\z/', self::trimmed($name)) === 1 || preg_match('/\.[A-Za-z0-9]{1,8}\z/', self::bare($name)) === 1
-            || (($bare = self::trimmed($name)) !== '' && ! str_contains($bare, '.') && ! self::opaque($bare) && preg_match('/\p{L}/u', $bare) === 1);
+            || (($bare = self::bare($name)) !== '' && ! str_contains($bare, '.') && ! self::opaque($bare) && preg_match('/\p{L}/u', $bare) === 1);
     }
 
-    /** An opaque token that is long or hexadecimal, too random to be a misread title. */
+    /** An opaque token that is long, hexadecimal or densely mixed, too random to be a misread title. */
     private static function random(string $name): bool
     {
         $token = self::token($name);
 
-        return self::opaque($name) && (strlen($token) >= 20 || preg_match('/\A[0-9a-f]{16,}\z/i', $token) === 1);
+        // Random tokens switch between lowercase, uppercase and digits at nearly every other character.
+        $switches = preg_match_all('/[a-z](?=[A-Z0-9])|[A-Z](?=[a-z0-9])|[0-9](?=[A-Za-z])/', $token);
+
+        return self::opaque($name) && (strlen($token) >= 20 || preg_match('/\A[0-9a-f]{16,}\z/i', $token) === 1
+            || $switches >= 0.4 * strlen($token));
     }
 
     /** A single random-looking token, such as an obfuscated posting name, makes no filename claim. */
