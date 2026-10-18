@@ -13,7 +13,9 @@ use App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer;
 use App\Services\Releases\Fingerprint\Par2MetadataParser;
 use App\Services\Releases\Fingerprint\ReleaseFingerprintCollector;
 use App\Services\YencService;
+use Illuminate\Cache\Events\CacheMissed;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Event;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\TestCase;
 
@@ -209,6 +211,50 @@ final class ReleaseFingerprintProviderBreakerTest extends TestCase
 
         $this->assertTrue(Cache::has($this->breakerKey('suspect')));
         $this->assertTrue(Cache::has($this->breakerKey('open')));
+    }
+
+    #[Test]
+    public function a_failure_recorded_while_another_job_was_admitted_keeps_the_reprobe_serialised(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->twice()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(true)
+            ->andThrow(new NntpProviderUnavailableException('Unable to connect to the requested NNTP provider.'));
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)
+            ->withArgs(fn (string $id, int $body, int $header, bool $alternate): bool => $alternate === false)
+            ->andThrow(new \RuntimeException('Article unavailable.'));
+
+        $this->collect();
+        $this->travel(901)->seconds();
+        $injected = false;
+        Event::listen(CacheMissed::class, function (CacheMissed $event) use (&$injected): void {
+            // Another worker records a new failure right after this job saw the breaker closed.
+            if (! $injected && $event->key === $this->breakerKey('open')) {
+                $injected = true;
+                Cache::put($this->breakerKey('open'), true, 900);
+            }
+        });
+
+        $this->assertSame('recent_provider_failure', $this->alternateProfile($this->collect()['data'])['profile_skipped_reason']);
+        $this->assertFalse(Cache::has($this->breakerKey('probe')));
+    }
+
+    #[Test]
+    public function a_failure_is_recorded_even_while_the_state_lock_is_stuck(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(true)
+            ->andThrow(new NntpProviderUnavailableException('Unable to connect to the requested NNTP provider.'));
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)
+            ->withArgs(fn (string $id, int $body, int $header, bool $alternate): bool => $alternate === false)
+            ->andThrow(new \RuntimeException('Article unavailable.'));
+        $this->assertTrue(Cache::lock($this->breakerKey('state-lock'), 60)->get());
+
+        $this->collect();
+
+        $this->assertTrue(Cache::has($this->breakerKey('open')));
+        $this->assertTrue(Cache::has($this->breakerKey('suspect')));
     }
 
     #[Test]

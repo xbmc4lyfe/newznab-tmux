@@ -10,6 +10,7 @@ use App\Services\NNTP\NntpProviderUnavailableException;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
 use App\Services\YencService;
+use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Support\Facades\Cache;
 use Throwable;
 
@@ -2382,11 +2383,28 @@ final class ReleaseFingerprintCollector
                 return 'recent_provider_failure';
             }
             if (Cache::has(self::providerBreakerKey($server, 'suspect'))) {
-                $token = bin2hex(random_bytes(16));
-                if (! Cache::add(self::providerBreakerKey($server, 'probe'), $token, self::providerProbeSeconds())) {
-                    return 'provider_probe_in_progress';
-                }
-                $this->providerProbeTokens[self::providerBreakerKey($server, 'probe')] = $token;
+                // Admission shares the state lock with failures, so a claim always belongs to the
+                // failure generation it observed; a newer failure drops it before it can clear anything.
+                $reason = 'provider_probe_in_progress';
+                $this->withProviderStateLock($server, function () use ($server, &$reason): void {
+                    if (Cache::has(self::providerBreakerKey($server, 'open'))) {
+                        $reason = 'recent_provider_failure';
+
+                        return;
+                    }
+                    if (! Cache::has(self::providerBreakerKey($server, 'suspect'))) {
+                        $reason = null;
+
+                        return;
+                    }
+                    $token = bin2hex(random_bytes(16));
+                    if (Cache::add(self::providerBreakerKey($server, 'probe'), $token, self::providerProbeSeconds())) {
+                        $this->providerProbeTokens[self::providerBreakerKey($server, 'probe')] = $token;
+                        $reason = null;
+                    }
+                }, false);
+
+                return $reason;
             }
         } catch (Throwable) {
             // Without the cache every job probes the provider itself, as before.
@@ -2466,14 +2484,20 @@ final class ReleaseFingerprintCollector
     private function withProviderStateLock(array $server, callable $update, bool $runWithoutLock): void
     {
         $lock = Cache::lock(self::providerBreakerKey($server, 'state-lock'), 10);
-        if ($lock->block(5)) {
-            try {
+        try {
+            $lock->block(5);
+        } catch (LockTimeoutException) {
+            // A stalled holder must not discard a failure; other transitions keep their safe default.
+            if ($runWithoutLock) {
                 $update();
-            } finally {
-                $lock->release();
             }
-        } elseif ($runWithoutLock) {
+
+            return;
+        }
+        try {
             $update();
+        } finally {
+            $lock->release();
         }
     }
 
