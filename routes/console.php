@@ -37,8 +37,9 @@ $scheduleVerificationWorkers = static function (): void {
 };
 
 // With asynchronous publication a remote worker hands verified results to a per-host outbox, and
-// these forwarders (numbered from 1) send them to the primary in batches. Forwarder N runs N-1
-// extra minutes so their restarts stagger and workers nearly always find one alive.
+// these forwarders (numbered from 1) send them to the primary in batches. Every run lasts at most
+// the configured period, staggered by whole minutes inside it, so a container stop never waits long
+// and the forwarders do not all restart at once.
 $scheduleVerificationForwarders = static function (): void {
     if (! PublicationOutbox::enabled()) {
         return;
@@ -46,7 +47,7 @@ $scheduleVerificationForwarders = static function (): void {
     for ($forwarder = 1; $forwarder <= PublicationOutbox::forwarders(); $forwarder++) {
         $forwarderCommand = escapeshellarg(PHP_BINARY).' -d memory_limit=256M '.escapeshellarg(base_path('artisan'))
             .' releases:forward-verified-publications --slot='.$forwarder
-            .' --max-seconds='.(max(1, (int) config('release_verification.publish_forwarder_seconds', 300)) + ($forwarder - 1) * 60).' --diagnostics';
+            .' --max-seconds='.PublicationOutbox::forwarderLifetime($forwarder).' --diagnostics';
         Schedule::exec($forwarderCommand)->everyMinute()->runInBackground()
             ->when(static fn (): bool => (bool) config('release_verification.scheduled'));
     }

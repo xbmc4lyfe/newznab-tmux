@@ -46,7 +46,9 @@ return [
     'publish_forward_items' => (int) env('RELEASE_VERIFICATION_PUBLISH_FORWARD_ITEMS', 16),
     // Failed sends after which a forwarder finishes an entry unknown, to be verified again.
     'publish_forward_max_attempts' => (int) env('RELEASE_VERIFICATION_PUBLISH_FORWARD_MAX_ATTEMPTS', 5),
-    // Seconds a forwarder runs before the scheduler restarts it (forwarder N runs (N-1) extra minutes, so restarts stagger).
+    // Period in seconds after which the scheduler restarts a forwarder. No run lasts longer (forwarder N runs
+    // 10 s short of it, less (N-1) whole minutes, wrapping inside it), so a container stop does not wait long;
+    // keep it well under the container's stop grace period.
     'publish_forwarder_seconds' => (int) env('RELEASE_VERIFICATION_PUBLISH_FORWARDER_SECONDS', 300),
     // A forwarder counts as alive to workers for this many seconds after it last touched its marker. It touches
     // before and after each request, so this must outlast a batch round trip: the primary's batch budget
