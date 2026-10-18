@@ -402,7 +402,8 @@ final class SpotCheckVerifierTest extends TestCase
             '"'.substr($token, 1).'"' => 'sampled', '"'.$token.'.rar"' => 'sampled',
             '"Xk29dPq8LmZ0.part01.rar" yEnc' => 'sampled', '"password" - [1/2] - "actual.rar" yEnc' => 'sampled',
             '"literal-extensionless-name"' => 'unknown', '"'.$token.'" "other.rar"' => 'unknown',
-            '"Movie2026.rar"' => 'unknown', '"other.rar" yEnc' => 'unknown'] as $subject => $verdict) {
+            '"Movie2026.rar"' => 'unknown', '"other.rar" yEnc' => 'unknown',
+            '"Xk29dPq8LmZ0Yt5R.par2" yEnc' => 'unknown'] as $subject => $verdict) {
             $articles = ['first@article' => YencArticles::part('hello', 'actual.rar', 10, 1, 1, 2),
                 'last@article' => YencArticles::part('world', 'actual.rar', 10, 2, 6, 2)];
             $source = new class($articles) implements ArticleSource

@@ -18,6 +18,22 @@ class HeaderFilenameIdentityTest extends TestCase
         self::assertSame($expected, HeaderFilenameIdentity::matches($subject, $actual));
     }
 
+    #[Test]
+    public function hostile_subjects_stay_within_the_regex_limits_without_jit(): void
+    {
+        $jit = ini_get('pcre.jit');
+        ini_set('pcre.jit', '0');
+        try {
+            foreach (['[1/1]'.str_repeat(' ', 990).'"a"', str_repeat('"a" ', 250), '"a'.str_repeat('.rar', 248).'"',
+                str_repeat("'", 1000), '"'.str_repeat('Ab1', 330).'" yEnc'] as $subject) {
+                HeaderFilenameIdentity::matches($subject, 'Readable.Name.mkv');
+                self::assertSame(PREG_NO_ERROR, preg_last_error(), substr($subject, 0, 20));
+            }
+        } finally {
+            ini_set('pcre.jit', (string) $jit);
+        }
+    }
+
     /** @return array<string, array{string, string, bool}> */
     public static function subjects(): array
     {
@@ -31,7 +47,8 @@ class HeaderFilenameIdentityTest extends TestCase
             'opaque mixed-case subject' => ['[2/8] - "MdssqdkDoi1PGOHU3zIVNathiyE3zsFK.par2" yEnc', '39eba263b2397e84879c8185ca984e04.par2', true],
             'opaque recovery-volume subject' => ['[7/10] - "wtpFcbMsiTODbAh4RiaG.vol015+016.par2" yEnc', 'wtpFcbMsiTODbAh4RiaG-o1on5HdR2Y.par2', true],
             'opaque hexadecimal subject' => ['"'.str_repeat('a1', 8).'"', 'Readable.Name.mkv', true],
-            'long single-case token' => ['"'.str_repeat('k', 20).'.rar" yEnc', 'other.rar', true],
+            'long single-case token' => ['"'.str_repeat('k', 20).'.rar" yEnc', 'other.rar', false],
+            'long lowercase token with digits' => ['"cxjzxhjlgr3djfprozg6.rar" yEnc', 'other.rar', true],
             'same stem, different separators' => ['[2/9] - "SubsPlease Show - 01 1080p ABCD1234 .mkv.par2" yEnc', '[SubsPlease] Show - 01 (1080p) [ABCD1234].mkv.par2', true],
             'same stem prefix' => ['[1/9] - "Readable.Release.Name.mkv" yEnc', 'Readable.Release.Name.Extra.mkv', true],
             'readable names differ' => ['[1/9] - "Readable.Release.Name.mkv" yEnc', 'Different.Release.mkv', false],
@@ -65,6 +82,16 @@ class HeaderFilenameIdentityTest extends TestCase
             'unlisted script under an opaque subject' => ['[1/9] - "Xk29dPq8LmZ0Yt5R.mkv" yEnc', 'setup.msc', false],
             'executable under an unquoted subject' => ['Readable Release yEnc (1/2)', 'setup.exe', false],
             'executable named in an unquoted subject' => ['Readable setup.exe yEnc (1/2)', 'setup.exe', true],
+            'opaque parity subject with a payload body' => ['[1/1] - "Xk29dPq8LmZ0Yt5R.par2" yEnc', 'Xk29dPq8LmZ0Yt5R.mkv', false],
+            'opaque recovery volume with a payload body' => ['[1/1] - "Xk29dPq8LmZ0Yt5R.vol00+01.par2" yEnc', 'payload.mkv', false],
+            'opaque parity subject with a parity body' => ['[1/1] - "Xk29dPq8LmZ0Yt5R.par2" yEnc', 'b7Qe1ZrT9wXy.vol03+04.PAR2', true],
+            'long camel-case title' => ['"TheLordOfTheRingsReturnOfTheKing.mkv" yEnc', 'Totally.Different.mkv', false],
+            'long single-case title' => ['"thelordoftheringsreturn.mkv" yEnc', 'Totally.Different.mkv', false],
+            'appended sequel number' => ['"Movie.Name.Long.mkv" yEnc', 'Movie.Name.Long.2.mkv', false],
+            'appended episode' => ['"Readable.Show.S01E01.mkv" yEnc', 'Readable.Show.S01E01E02.mkv', false],
+            'executable inside another unquoted name' => ['Game Setup.exe yEnc (1/2)', 'p.exe', false],
+            'script component under an opaque subject' => ['[1/9] - "Xk29dPq8LmZ0Yt5R.mkv" yEnc', 'evil.wsc', false],
+            'disk image under an opaque subject' => ['[1/9] - "Xk29dPq8LmZ0Yt5R.mkv" yEnc', 'evil.iso', false],
             'opaque subject with an extensionless body' => ['[3/8] - "o9aeI3YpDwgHGoJ2ZsCm.vol00+01.par2" yEnc', '148f76878d7732b981734a9e0c51a348', true],
         ];
     }

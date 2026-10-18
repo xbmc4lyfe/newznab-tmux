@@ -15,7 +15,7 @@ final class HeaderFilenameIdentity
 
     private const string SUFFIXES = '/(?:\.(?:part\d+|vol\d+[+-]\d+|par2|rar|r\d{2,3}|\d{3}|7z|zip|mkv|avi|mp4|m4v|ts|nfo|sfv|nzb|epub|pdf|flac|mp3|iso|srt|txt|jpg|png))+\z/i';
 
-    private const string EXECUTABLE = '/\.(?:exe|scr|bat|cmd|com|msi|msix|msp|lnk|pif|cpl|hta|reg|scf|js|jse|vbs|vbe|wsf|wsh|ps1|psm1|jar|apk|dll|sh|command|app|dmg|pkg|chm|msc|ps1xml|psd1|cab|appx|appxbundle|msixbundle|application|gadget|inf|url|xll|ws)\z/i';
+    private const string EXECUTABLE = '/\.(?:exe|scr|bat|cmd|com|msi|msix|msp|lnk|pif|cpl|hta|reg|scf|js|jse|vbs|vbe|wsf|wsh|ps1|psm1|jar|apk|dll|sh|command|app|dmg|pkg|chm|msc|ps1xml|psd1|cab|appx|appxbundle|msixbundle|application|gadget|inf|url|xll|ws|wsc|sct|vb|ocx|sys|iso|img|vhd|vhdx)\z/i';
 
     public static function matches(string $subject, string $actual): bool
     {
@@ -26,7 +26,8 @@ final class HeaderFilenameIdentity
             return false;
         }
         if ($count === 0) {
-            return ! self::executable($actual) || stripos($subject, $actual) !== false;
+            return ! self::executable($actual)
+                || preg_match('/(?<![\p{L}\p{N}_])'.preg_quote($actual, '/').'(?![\p{L}\p{N}_])/iu', $subject) === 1;
         }
         $quoted = [];
         $declared = null;
@@ -51,7 +52,9 @@ final class HeaderFilenameIdentity
             return false;
         }
         if (self::opaque($declared)) {
-            return true;
+            // An opaque recovery-file name still declares parity, which is not payload evidence.
+            return ! (preg_match('/\.par2\z/i', $declared) === 1 && self::extension($actual) !== ''
+                && strtolower(self::extension($actual)) !== 'par2');
         }
         // A readable declared name must agree on its volume and extension chain, and on its final
         // extension when that chain does not cover it, as well as its stem.
@@ -69,9 +72,9 @@ final class HeaderFilenameIdentity
         }
         [$shorter, $longer] = mb_strlen($expected) <= mb_strlen($body) ? [$expected, $body] : [$body, $expected];
 
-        // A prefix may not extend a trailing number: Part 1 is not Part 10.
+        // A prefix may not add or extend a number: Part 1 is not Part 10, and Movie is not Movie 2.
         return mb_strlen($shorter) >= 8 && str_starts_with($longer, $shorter)
-            && ! (ctype_digit(substr($shorter, -1)) && ctype_digit(mb_substr($longer, mb_strlen($shorter), 1)));
+            && ! ctype_digit(substr($shorter, -1)) && preg_match('/\p{N}/u', mb_substr($longer, mb_strlen($shorter))) !== 1;
     }
 
     /** A single random-looking token, such as an obfuscated posting name, makes no filename claim. */
@@ -84,10 +87,14 @@ final class HeaderFilenameIdentity
         if (preg_match('/\A[0-9a-f]{16,}\z/i', $stem) === 1) {
             return true;
         }
-        // Random tokens switch between lowercase, uppercase and digits far more often than words do.
-        $switches = preg_match_all('/[a-z](?=[A-Z0-9])|[A-Z](?=[a-z0-9])|[0-9](?=[A-Za-z])/', $stem);
+        // Capitalized words, or one run of single-case letters, with an optional trailing number read
+        // as a run-together title rather than a random token.
+        if (preg_match('/\A(?:(?:[A-Z][a-z]+)+|[a-z]+|[A-Z]+)[0-9]*\z/', $stem) === 1) {
+            return false;
+        }
+        $classes = preg_match('/[a-z]/', $stem) + preg_match('/[A-Z]/', $stem) + preg_match('/[0-9]/', $stem);
 
-        return strlen($stem) >= 20 || (strlen($stem) >= 10 && $switches >= 5);
+        return strlen($stem) >= 20 || (strlen($stem) >= 10 && $classes >= 2);
     }
 
     private static function executable(string $name): bool
