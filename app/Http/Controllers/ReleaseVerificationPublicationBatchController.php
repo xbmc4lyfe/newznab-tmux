@@ -37,8 +37,10 @@ class ReleaseVerificationPublicationBatchController extends Controller
             return response()->json(['error' => 'A batch holds at most '.$limits['items'].' items.', 'max_items' => $limits['items']], 422);
         }
         // The budget bounds when new items start; one started item may still run past it.
-        if (function_exists('set_time_limit')) {
-            @set_time_limit((int) ceil($limits['seconds']) + RemotePublicationService::BATCH_TIME_MARGIN);
+        // Only ever raised: a lower limit than the host allows could kill a transaction mid-publication.
+        $limit = RemotePublicationService::raisedTimeLimit((int) ini_get('max_execution_time'), $limits['seconds']);
+        if ($limit !== null && function_exists('set_time_limit')) {
+            @set_time_limit($limit);
         }
 
         return response()->json(['protocol' => RemotePublicationService::BATCH_PROTOCOL,

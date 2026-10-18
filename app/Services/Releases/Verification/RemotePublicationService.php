@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
-use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
 use Throwable;
@@ -30,7 +29,9 @@ final class RemotePublicationService
 
     public const string PAUSED_MESSAGE = 'Verification is paused for exclusive maintenance; retry later.';
 
-    public function __construct(private readonly VerifiedReleasePublisher $publisher, private readonly ManifestStore $store) {}
+    /** @param (\Closure(): float)|null $clock Seconds on a monotonic clock; tests inject one, production uses hrtime(). */
+    public function __construct(private readonly VerifiedReleasePublisher $publisher, private readonly ManifestStore $store,
+        private readonly ?\Closure $clock = null) {}
 
     /**
      * The validation rules for one publication, as the single endpoint's request and each batch item.
@@ -72,7 +73,7 @@ final class RemotePublicationService
      *
      * Items not started when the time budget ends are answered "retry" without being read, and the
      * first item always starts so a tiny budget cannot starve a worker. The budget is measured on
-     * the application clock.
+     * a monotonic clock.
      *
      * @param  list<mixed>  $items  Raw request items.
      * @return list<array{index: int, claim_id: ?int, claim_version: ?int, status: string, release_id: ?int, error: ?string}>
@@ -116,7 +117,11 @@ final class RemotePublicationService
         }
         $timing?->requestPhase('validation');
         try {
-            return $this->publishItem($validator->validated(), $timing, $gate, replayResolved: true);
+            $outcome = $this->publishItem($validator->validated(), $timing, $gate, replayResolved: true);
+
+            // UNRESOLVED is the single endpoint's bare null; a batch item names it an error.
+            return $outcome->status === PublicationOutcome::UNRESOLVED
+                ? new PublicationOutcome(PublicationOutcome::ERROR, null, $outcome->error ?? 'Publication produced no release.') : $outcome;
         } catch (Throwable $error) {
             // Even the recovery lookup failed; the item may or may not have published, and a resend decides.
             return new PublicationOutcome(PublicationOutcome::ERROR, null, mb_strcut($error->getMessage(), 0, 500, 'UTF-8'));
@@ -133,7 +138,22 @@ final class RemotePublicationService
 
     private function clock(): float
     {
-        return Carbon::now()->getPreciseTimestamp(6) / 1_000_000;
+        return $this->clock !== null ? ($this->clock)() : hrtime(true) / 1_000_000_000;
+    }
+
+    /**
+     * The execution limit a batch needs, or null to leave it alone: only ever a raise, so a
+     * transaction is never cut short by a limit lower than the host already allows. A limit of 0
+     * is already unlimited.
+     */
+    public static function raisedTimeLimit(int $current, float $budgetSeconds): ?int
+    {
+        if ($current === 0) {
+            return null;
+        }
+        $needed = (int) ceil($budgetSeconds) + self::BATCH_TIME_MARGIN;
+
+        return $needed > $current ? $needed : null;
     }
 
     /**
@@ -183,15 +203,17 @@ final class RemotePublicationService
                 return new PublicationOutcome(PublicationOutcome::PUBLISHED, $releaseId);
             }
             // No release: policy filtered the candidate, or a covered release lacks its metadata.
-            $status = $this->resolvedStatus($claim);
+            // The single endpoint reports both as a bare null and reads nothing more.
+            $status = $replayResolved ? $this->resolvedStatus($claim) : null;
 
             return new PublicationOutcome($status ?? PublicationOutcome::UNRESOLVED, null,
-                $status === null ? 'Publication produced no release.' : null);
+                $status === null && $replayResolved ? 'Publication produced no release.' : null);
         } catch (Throwable $error) {
             // The worker's retry after a lost response finds the release its first request published.
-            $published = $this->publishedRelease($claim);
-            if ($published !== null) {
-                return new PublicationOutcome(PublicationOutcome::PUBLISHED, $published);
+            // A batch item also settles when an overlapping attempt filtered it or sent it to review.
+            $settled = $this->settled($claim, $replayResolved);
+            if ($settled !== null) {
+                return $settled;
             }
             $message = mb_strcut($error->getMessage(), 0, 500, 'UTF-8');
 

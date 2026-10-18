@@ -4,10 +4,14 @@ declare(strict_types=1);
 
 namespace Tests\Feature;
 
+use App\Services\Releases\Verification\ManifestStore;
+use App\Services\Releases\Verification\RemotePublicationService;
 use App\Services\Releases\Verification\VerificationWorkerLocks;
+use App\Services\Releases\Verification\VerifiedReleasePublisher;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\Support\PublicationBatchFixtures;
 
 class ReleaseVerificationPublicationBatchTest extends ReleaseVerificationCandidatesTest
@@ -104,12 +108,17 @@ class ReleaseVerificationPublicationBatchTest extends ReleaseVerificationCandida
         config(['release_verification.publish_batch_seconds' => 15]);
         $claims = [$this->claimedCandidate('one@article'), $this->claimedCandidate('two@article'), $this->claimedCandidate('three@article')];
         $before = [DB::table('release_verification_candidates')->where('id', $claims[1]->id)->first(), DB::table('release_verification_candidates')->where('id', $claims[2]->id)->first()];
-        $travelled = false;
-        // The first publication takes twenty seconds of application time.
-        DB::listen(function (QueryExecuted $query) use (&$travelled): void {
-            if (! $travelled && str_starts_with($query->sql, 'insert into "releases"')) {
-                $travelled = true;
-                $this->travel(20)->seconds();
+        $now = 1000.0;
+        $this->app->instance(RemotePublicationService::class, new RemotePublicationService(app(VerifiedReleasePublisher::class),
+            app(ManifestStore::class), static function () use (&$now): float {
+                return $now;
+            }));
+        $advanced = false;
+        // The first publication takes twenty seconds on the injected monotonic clock.
+        DB::listen(static function (QueryExecuted $query) use (&$advanced, &$now): void {
+            if (! $advanced && str_starts_with($query->sql, 'insert into "releases"')) {
+                $advanced = true;
+                $now += 20;
             }
         });
 
@@ -122,7 +131,6 @@ class ReleaseVerificationPublicationBatchTest extends ReleaseVerificationCandida
         $this->assertSame(1, $this->installedNzbs());
         $this->assertLedgerMatchesCandidates();
         // The worker resends what was not started; the first item is already published.
-        $this->travelBack();
         $again = $this->postBatch(array_map($this->item(...), $claims))->assertOk()->json('results');
         $this->assertSame(['published', 'published', 'published'], array_column($again, 'status'));
         $this->assertSame($results[0]['release_id'], $again[0]['release_id']);
@@ -310,5 +318,106 @@ class ReleaseVerificationPublicationBatchTest extends ReleaseVerificationCandida
         // Only the batch endpoint replays a terminal status; the single endpoint's contract is unchanged.
         $this->withServerVariables(self::PEER)->postJson('/internal/release-verification/publish', $this->item($filtered))
             ->assertStatus(409)->assertJson(['error' => 'Stale verification result cannot publish.']);
+    }
+
+    /** @return array<string, array{?int, float, ?int}> */
+    public static function timeLimits(): array
+    {
+        return [
+            'unlimited stays unlimited' => [0, 15.0, null],
+            'a higher limit is never lowered' => [300, 15.0, null],
+            'an equal limit is left alone' => [75, 15.0, null],
+            'a lower limit is raised to cover the budget and one item' => [30, 15.0, 75],
+            'a fractional budget rounds up' => [10, 14.2, 75],
+        ];
+    }
+
+    #[DataProvider('timeLimits')]
+    public function test_the_batch_only_ever_raises_the_execution_limit(int $current, float $budget, ?int $expected): void
+    {
+        $this->assertSame($expected, RemotePublicationService::raisedTimeLimit($current, $budget));
+    }
+
+    public function test_a_batch_request_does_not_lower_the_hosts_execution_limit(): void
+    {
+        $this->batchSchema(releases: 2);
+        $claims = [$this->claimedCandidate('one@article'), $this->claimedCandidate('two@article')];
+        $original = (string) ini_get('max_execution_time');
+        try {
+            ini_set('max_execution_time', '300');
+            $this->postBatch([$this->item($claims[0])])->assertOk();
+            $this->assertSame('300', ini_get('max_execution_time'));
+
+            ini_set('max_execution_time', '30');
+            $this->postBatch([$this->item($claims[1])])->assertOk();
+            $this->assertSame('75', ini_get('max_execution_time'));
+        } finally {
+            ini_set('max_execution_time', $original);
+        }
+    }
+
+    /** @return array<string, array{string}> */
+    public static function terminalStatuses(): array
+    {
+        return ['filtered' => ['filtered'], 'sent to metadata review' => ['metadata_review']];
+    }
+
+    #[DataProvider('terminalStatuses')]
+    public function test_a_resend_overlapping_a_first_attempt_that_resolved_the_item_gets_that_status(string $status): void
+    {
+        $this->batchSchema();
+        $claim = $this->claimedCandidate('one@article');
+        $raced = false;
+        // The first attempt resolves the candidate right after this request's candidate read.
+        DB::listen(static function (QueryExecuted $query) use (&$raced, $claim, $status): void {
+            if (! $raced && DB::transactionLevel() === 0 && str_starts_with($query->sql, 'select * from "release_verification_candidates" where "id" = ?')
+                && $query->bindings[0] === (int) $claim->id) {
+                $raced = true;
+                DB::table('release_verification_candidates')->where('id', $claim->id)
+                    ->update(['status' => $status, 'lease_token' => null, 'lease_until' => null]);
+            }
+        });
+
+        $result = $this->postBatch([$this->item($claim)])->assertOk()->json('results.0');
+
+        $this->assertTrue($raced);
+        $this->assertSame($status, $result['status']);
+        $this->assertNull($result['release_id']);
+        $this->assertSame(0, DB::table('releases')->count());
+    }
+
+    public function test_the_single_endpoint_keeps_reporting_an_overlapped_resolution_as_stale(): void
+    {
+        $this->batchSchema();
+        $claim = $this->claimedCandidate('one@article');
+        $raced = false;
+        DB::listen(static function (QueryExecuted $query) use (&$raced, $claim): void {
+            if (! $raced && DB::transactionLevel() === 0 && str_starts_with($query->sql, 'select * from "release_verification_candidates" where "id" = ?')
+                && $query->bindings[0] === (int) $claim->id) {
+                $raced = true;
+                DB::table('release_verification_candidates')->where('id', $claim->id)
+                    ->update(['status' => 'filtered', 'lease_token' => null, 'lease_until' => null]);
+            }
+        });
+
+        $this->withServerVariables(self::PEER)->postJson('/internal/release-verification/publish', $this->item($claim))
+            ->assertStatus(409)->assertJson(['error' => 'Stale verification result cannot publish.']);
+        $this->assertTrue($raced);
+    }
+
+    public function test_the_single_endpoint_reads_nothing_more_after_a_filtered_publication(): void
+    {
+        $this->batchSchema();
+        $claim = $this->claimedCandidate('filtered@article', groupId: 2);
+        $statusReads = 0;
+        DB::listen(static function (QueryExecuted $query) use (&$statusReads): void {
+            $statusReads += str_contains($query->sql, '"status" in (') ? 1 : 0;
+        });
+
+        $this->withServerVariables(self::PEER)->postJson('/internal/release-verification/publish', $this->item($claim))
+            ->assertOk()->assertExactJson(['release_id' => null]);
+
+        $this->assertSame(0, $statusReads);
+        $this->assertSame('filtered', $this->candidateRow($claim)->status);
     }
 }
