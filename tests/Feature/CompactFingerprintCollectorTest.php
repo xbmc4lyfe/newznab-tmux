@@ -329,6 +329,7 @@ final class CompactFingerprintCollectorTest extends TestCase
             'missing trailer' => [static fn (string $body): string => (string) preg_replace('/\r\n=yend[^\r\n]*/', '', $body)],
             'trailer without size' => [static fn (string $body): string => str_replace('=yend size=16 ', '=yend ', $body)],
             'not yEnc at all' => [static fn (string $body): string => "plain text body\r\n"],
+            'malformed secondary CRC' => [static fn (string $body): string => $body.' pcrc32=XYZ'],
         ];
     }
 

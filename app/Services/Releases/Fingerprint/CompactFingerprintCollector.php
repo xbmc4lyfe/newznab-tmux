@@ -559,6 +559,7 @@ final class CompactFingerprintCollector
             $errors[] = 'YencFramingInvalid';
         }
         $verified = ($yenc['declared_crc32_matches'] ?? null) === true
+            && ($yenc['all_declared_crc32_fields_are_hex'] ?? null) !== false
             && in_array($yenc['multipart_structure_status'] ?? null, ['single-part', 'complete'], true)
             && ($yenc['payload_escape_state_valid'] ?? null) === true
             && ($yenc['integrity_checks_ambiguous'] ?? null) !== true
