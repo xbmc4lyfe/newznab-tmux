@@ -249,6 +249,32 @@ final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
         }
     }
 
+    public function test_promotion_takes_later_stalled_uploads_past_a_prefix_another_session_holds(): void
+    {
+        $this->partialSchema();
+        config(['release_verification.partial_after_hours' => 4]);
+        $stalled = now()->subHours(5)->format('Y-m-d H:i:s');
+        foreach (['held-first' => 2, 'free-later' => 1] as $name => $minutesDue) {
+            DB::table('release_verification_candidates')->insert(['identity' => sha1($name), 'source_identity' => sha1($name), 'groups_id' => 1,
+                'manifest_path' => '', 'manifest_bytes' => 0, 'manifest_hash' => str_repeat('0', 64), 'status' => 'waiting_upload',
+                'last_unique_at' => $stalled, 'next_attempt_at' => now()->subMinutes($minutesDue)->format('Y-m-d H:i:s')]);
+        }
+        $other = $this->connection();
+        $other->beginTransaction();
+        $other->prepare('SELECT id FROM release_verification_candidates WHERE identity = ? FOR UPDATE')->execute([sha1('held-first')]);
+        try {
+            // A one-row window: the oldest due row is busy, so the next one is taken instead.
+            $promoted = app(CandidateRepository::class)->promotePartial(1);
+        } finally {
+            $other->rollBack();
+        }
+
+        $this->assertSame(1, $promoted);
+        $this->assertSame(['held-first' => 'waiting_upload', 'free-later' => 'ready'],
+            ['held-first' => DB::table('release_verification_candidates')->where('identity', sha1('held-first'))->value('status'),
+                'free-later' => DB::table('release_verification_candidates')->where('identity', sha1('free-later'))->value('status')]);
+    }
+
     /** The late-article columns partial publication adds, as deployed. */
     private function partialSchema(): void
     {

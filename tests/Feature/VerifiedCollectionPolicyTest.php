@@ -1217,6 +1217,26 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         self::assertGreaterThan(max($candidates), min($ledger), 'The capacity row is the last lock taken.');
     }
 
+    public function test_hot_invalidation_takes_the_legacy_writer_lock_before_any_candidate_lock(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('legacy-hot', true);
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $late = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d');
+        config(['release_verification.manifest_storage' => 'files']);
+        $queries = [];
+        DB::listen(static function ($query) use (&$queries): void {
+            $queries[] = $query->sql;
+        });
+
+        DB::transaction(fn () => app(CandidateRepository::class)->invalidateHotCollections([$late]));
+
+        $state = array_keys(array_filter($queries, static fn (string $sql): bool => str_contains($sql, '"release_verification_state"')));
+        $candidates = array_keys(array_filter($queries, static fn (string $sql): bool => str_contains($sql, '"release_verification_candidates"')));
+        self::assertNotSame([], $state);
+        self::assertLessThan(min($candidates), min($state), 'As archive() does with file manifests.');
+    }
+
     public function test_a_covering_release_with_conflicting_metadata_sends_the_generation_to_review_not_an_upgrade(): void
     {
         $this->publicationSchema(partialColumns: true);

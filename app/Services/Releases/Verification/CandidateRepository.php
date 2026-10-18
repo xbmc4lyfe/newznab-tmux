@@ -632,8 +632,17 @@ final class CandidateRepository
     public function invalidateHotCollections(array $ids): void
     {
         // Capacity released by settled holders is returned once every collection's candidates are locked: the
-        // ledger row is the last lock, as for archive() and publication.
+        // ledger row is the last lock, as for archive() and publication. With file manifests the global writer
+        // lock comes first instead, as archive() takes it before any candidate lock.
         $released = 0;
+        if (! $this->ledger->concurrent()) {
+            try {
+                $this->ledger->enter();
+            } catch (RuntimeException) {
+                // Verification capacity was never initialized, so nothing was archived to invalidate.
+                return;
+            }
+        }
         foreach (DB::table('collections')->whereIn('id', $ids)->orderBy('id')->get() as $collection) {
             $identity = bin2hex($collection->collectionhash);
             $candidates = DB::table('release_verification_candidates')->where('source_identity', $identity)
@@ -989,19 +998,14 @@ final class CandidateRepository
         }
         $now = now();
         $cutoff = $now->copy()->subHours($hours)->format('Y-m-d H:i:s');
-        // The verification_due index serves the status / next_attempt_at order.
-        $ids = DB::table('release_verification_candidates')->where('status', 'waiting_upload')
-            ->where('next_attempt_at', '<=', $now)->whereNull('release_id')->whereNull('lease_token')
-            ->orderBy('next_attempt_at')->orderBy('id')->limit(max(1, $limit))->pluck('id')->all();
-        if ($ids === []) {
-            return 0;
-        }
 
-        return DB::transaction(function () use ($ids, $cutoff, $now, $hours): int {
-            // Skip rows ingestion holds rather than wait on them in an order it does not share. The
-            // predicates are rechecked under the lock: a new article since the read keeps it waiting.
-            $query = DB::table('release_verification_candidates')->whereIn('id', $ids)->where('status', 'waiting_upload')
-                ->where('next_attempt_at', '<=', $now)->whereNull('release_id')->whereNull('lease_token')->orderBy('id');
+        // The verification_due index serves the status / next_attempt_at order.
+        return DB::transaction(function () use ($limit, $cutoff, $now, $hours): int {
+            // Skip rows ingestion holds rather than wait on them, and take the next due ones instead, so a busy
+            // prefix never hides later stalled uploads. Each row's predicates hold under its lock.
+            $query = DB::table('release_verification_candidates')->where('status', 'waiting_upload')
+                ->where('next_attempt_at', '<=', $now)->whereNull('release_id')->whereNull('lease_token')
+                ->orderBy('next_attempt_at')->orderBy('id')->limit(max(1, $limit));
             $rows = (in_array(DB::getDriverName(), ['mysql', 'mariadb'], true) ? $query->lock('for update skip locked') : $query->lockForUpdate())
                 ->get(['id', 'last_unique_at', 'reason']);
             $eligible = [];
