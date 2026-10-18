@@ -155,11 +155,11 @@ final class HeaderFilenameIdentity
     /** @return list<string> */
     private static function words(string $name): array
     {
-        return preg_split('/[^\p{L}\p{N}]+/u', mb_strtolower(self::stem($name)), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        return preg_split('/[^\p{L}\p{M}\p{N}]+/u', mb_strtolower(self::stem($name)), -1, PREG_SPLIT_NO_EMPTY) ?: [];
     }
 
     private static function normalized(string $name): string
     {
-        return (string) preg_replace('/[^\p{L}\p{N}]/u', '', mb_strtolower(self::stem($name)));
+        return (string) preg_replace('/[^\p{L}\p{M}\p{N}]/u', '', mb_strtolower(self::stem($name)));
     }
 }
