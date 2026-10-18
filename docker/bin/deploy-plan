@@ -550,7 +550,10 @@ def read_dotenv(path: Path, interpolated: set[str] | None = None) -> dict[str, s
             values[m.group(1)] = quoted.group(2) if quoted else re.sub(r"\s#.*$", "", value).strip()
             if interpolated is not None:
                 interpolated.discard(m.group(1))
-                if "$" in values[m.group(1)] and not (quoted and quoted.group(1) == "'"):
+                # An opening quote with no closing one starts a multi-line value, which this
+                # line-based parser cannot read whole.
+                multiline = not quoted and value[:1] in ("'", '"')
+                if multiline or ("$" in values[m.group(1)] and not (quoted and quoted.group(1) == "'")):
                     interpolated.add(m.group(1))
     return values
 
@@ -584,8 +587,9 @@ def service_resource_sources(parsed: dict[str, object], svc_cfg: object, docker_
                     if value is not None and source_env in dotenv_interpolated:
                         # Compose installs the interpolated value; hashing the literal reference
                         # would miss a rotation of what it points at.
-                        sys.exit(f"deploy-plan: {source_env} behind {section[:-1]} {name} uses interpolation in a .env "
-                                 "file; export it in the environment or give it a literal (single-quoted) value.")
+                        sys.exit(f"deploy-plan: {source_env} behind {section[:-1]} {name} uses interpolation or a multi-line "
+                                 "value in a .env file; export it in the environment or give it a single-line literal "
+                                 "(single-quoted) value.")
                 if value is None:
                     sys.exit(f"deploy-plan: cannot resolve environment variable {source_env} behind {section[:-1]} {name}; "
                              "set it in the environment or docker/.env.")
@@ -732,6 +736,11 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
     image_tags = [base_img, *(service_image_name(svc) for svc in APP_SERVICES)]
     configuration_hash = sha256_text("\n".join([*env_hashes, *image_tags]))
     app_env_hash = env_hashes[1]
+    # The database the app connects to: pointing app.env at another (e.g. a restored copy) migrates.
+    app_env_values = read_dotenv(docker_dir / "config/app.env")
+    database_hash = sha256_text("\n".join(
+        f"{key}={app_env_values.get(key, '')}" for key in ("DB_CONNECTION", "DB_HOST", "DB_PORT", "DB_SOCKET", "DB_DATABASE")
+    ))
 
     effective_hash = "none"
     fingerprint_effective = ""
@@ -771,6 +780,7 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
         "migration": migration_hash,
         "shared_app": shared_app_hash,
         "app_env": app_env_hash,
+        "database": database_hash,
         "effective": effective_hash,
     }
 
@@ -1373,6 +1383,8 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
         # schema; the idempotent migration always follows it, and its forgotten record makes a retry
         # repeat it until it completes.
         or "mariadb" in dirty_data
+        # The app now connects to another database. Stamps from before this record never migrate for it.
+        or ("database" in stamped and stamped["database"] != state["database"])
     )
 
     # Reconcile-only work (e.g. a service added to Compose) is a rollout, never a no-op skip.
@@ -1485,8 +1497,8 @@ def main() -> None:
             if not snapshot:
                 sys.exit("deploy-plan: no plan snapshot to record from.")
             if "migration" in items:
-                # The completed migration covers the app definitions this run deploys.
-                keys += [f"compose:{svc}" for svc in APP_SERVICES]
+                # The completed migration covers the app definitions and the database this run deploys.
+                keys += [f"compose:{svc}" for svc in APP_SERVICES] + ["database"]
             for key in keys:
                 if key in snapshot:
                     record[key] = snapshot[key]
@@ -1545,6 +1557,12 @@ def main() -> None:
         print(f"RECONCILE_DATA={shlex.quote(' '.join(plan['reconcile_data']))}")
         print(f"RECONCILE_INFRA={shlex.quote(' '.join(plan['reconcile_infra']))}")
         print(f"START_DATA={shlex.quote(' '.join(plan['start_data']))}")
+        # Everything applied before the drain, in one depends_on order across the three lists:
+        # `up --no-deps` never starts a provider, whichever list it is in.
+        marks = {**{svc: "forget" for svc in plan["start_data"]}, **{svc: "forget" for svc in plan["reconcile_infra"]},
+                 **{svc: "pending" for svc in plan["dirty_infra"]}}
+        pre_drain = dependency_order([*plan["start_data"], *plan["reconcile_infra"], *plan["dirty_infra"]])
+        print(f"PRE_DRAIN={shlex.quote(' '.join(f'{marks[svc]}:{svc}' for svc in pre_drain))}")
         print(f"GLOBAL_FALLBACK={'1' if plan['global_fallback'] else '0'}")
         print(f"BUILD_TARGETS={shlex.quote(' '.join(plan['build_targets']))}")
         return

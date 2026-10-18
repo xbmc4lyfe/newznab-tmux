@@ -1367,6 +1367,45 @@ SH);
         $this->assertMatchesRegularExpression('/scheduler\s+app\s+quiesce\+restart\s+data service restart/', $plan->getOutput());
     }
 
+    public function test_pointing_the_app_at_another_database_runs_the_migration(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=192.0.2.10\nDB_DATABASE=nntmux\nAPP_DEBUG=false\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+
+        // An unrelated app.env key restarts the apps but does not migrate.
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=192.0.2.10\nDB_DATABASE=nntmux\nAPP_DEBUG=true\n");
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
+
+        // Another database (e.g. a restored copy) migrates.
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=192.0.2.20\nDB_DATABASE=nntmux\nAPP_DEBUG=true\n");
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->assertStringContainsString('artisan migrate --force', $this->events());
+    }
+
+    public function test_infrastructure_a_new_data_service_needs_starts_first(): void
+    {
+        $base = json_decode($this->composeJson(), true);
+        unset($base['services']['redis']);
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($base, JSON_UNESCAPED_SLASHES)])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        // A new redis (no container) depends on a newly added stateless sidecar.
+        $with = $base;
+        $with['services']['redis'] = ['depends_on' => ['tunnel' => ['condition' => 'service_started']]];
+        $with['services']['tunnel'] = ['labels' => ['nntmux.deploy.stateless' => 'true']];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($with, JSON_UNESCAPED_SLASHES), 'NNTMUX_NO_CONTAINER' => 'redis'])->mustRun();
+        $events = $this->events();
+        $tunnel = strpos($events, '--wait-timeout 240 tunnel');
+        $redis = strpos($events, '--wait-timeout 240 redis');
+        $this->assertNotFalse($tunnel);
+        $this->assertNotFalse($redis);
+        $this->assertLessThan($redis, $tunnel);
+    }
+
     public function test_unreadable_env_file_fails_closed(): void
     {
         mkdir($this->directory.'/docker/config', 0777, true);
@@ -2524,6 +2563,13 @@ SH);
         $this->assertStringContainsString('NNTMUX_SITE_CONFIG behind config site uses interpolation', $plan->getErrorOutput());
         file_put_contents($this->directory.'/docker/.env', "NNTMUX_SITE_CONFIG='\${literal}'\n");
         $this->make(['deploy-plan'], $config)->mustRun();
+
+        // A multi-line value cannot be read whole by the line parser.
+        file_put_contents($this->directory.'/docker/.env', "NNTMUX_SITE_CONFIG='first line\nsecond line'\n");
+        $plan = $this->make(['deploy-plan'], $config);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('multi-line', $plan->getErrorOutput());
     }
 
     public function test_service_definitions_no_fingerprint_can_represent_fail_closed(): void

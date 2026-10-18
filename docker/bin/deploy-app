@@ -20,7 +20,7 @@ verify
 
 # Capture first: a failing plan inside eval "$(...)" would be ignored, and a stale MODE in the
 # caller's environment must never stand in for the plan's output.
-unset MODE MIGRATE DIRTY_APP DIRTY_DATA DIRTY_INFRA RECONCILE_DATA RECONCILE_INFRA START_DATA BUILD_TARGETS GLOBAL_FALLBACK
+unset MODE MIGRATE DIRTY_APP DIRTY_DATA DIRTY_INFRA RECONCILE_DATA RECONCILE_INFRA START_DATA PRE_DRAIN BUILD_TARGETS GLOBAL_FALLBACK
 actions=$("$DIR/bin/deploy-plan" --deploy-actions)
 eval "$actions"
 # The plan's build targets ignore FORCE (the build above already honoured it): any target still
@@ -162,26 +162,12 @@ apply_each() {
 
 # Everything before the drain, while every writer still runs: a failing service aborts here instead
 # of after a full app rollout that would then repeat every poll. `up --no-deps` never starts a
-# dependency, so providers come first: new data services (nothing uses them before this run), then
-# added or drifted infrastructure, then changed infrastructure; each list is in depends_on order.
-if [ -n "$START_DATA" ]; then
-    # shellcheck disable=SC2086
-    apply_each --forget $START_DATA
+# dependency, so the plan orders new data services, added or drifted infrastructure and changed
+# infrastructure together by depends_on (PRE_DRAIN, mark:service).
+for item in $PRE_DRAIN; do
+    apply_each "--${item%%:*}" "${item#*:}"
     verify
-fi
-
-if [ -n "$RECONCILE_INFRA" ]; then
-    # Compose recreates only services whose rendered configuration drifted.
-    # shellcheck disable=SC2086
-    apply_each --forget $RECONCILE_INFRA
-    verify
-fi
-
-if [ -n "$DIRTY_INFRA" ]; then
-    # shellcheck disable=SC2086
-    apply_each --pending $DIRTY_INFRA
-    verify
-fi
+done
 
 in_list() {
     needle=$1
