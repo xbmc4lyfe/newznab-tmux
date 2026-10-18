@@ -286,6 +286,22 @@ SH);
         $this->assertStringContainsString('released', $events);
     }
 
+    public function test_a_no_op_barrier_recovery_verifies_the_stack_before_releasing(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/docker/.deploy.stamp.barrier-owed', '');
+        file_put_contents($this->directory.'/docker/.env', "DB_ROOTPASSWORD=rotated\n");
+        file_put_contents($this->directory.'/events', '');
+
+        // Horizon turns unhealthy while the barrier drains remote workers.
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_UNHEALTHY_AFTER' => 'releases:verification-barrier --timeout', 'NNTMUX_UNHEALTHY_LATE' => 'horizon']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('keeping remote verification workers held', $process->getErrorOutput());
+        $this->assertStringNotContainsString('released', $this->events());
+        $this->assertFileExists($this->directory.'/docker/.deploy.stamp.barrier-owed');
+    }
+
     public function test_a_no_op_run_that_cannot_clear_a_leftover_pause_makes_the_next_poll_retake_the_barrier(): void
     {
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
@@ -1384,6 +1400,13 @@ SH);
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         $this->assertStringContainsString('artisan migrate --force', $this->events());
+
+        // DB_URL replaces the host and database settings.
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_URL=mysql://u:p@192.0.2.30:3306/nntmux\nDB_HOST=192.0.2.20\nDB_DATABASE=nntmux\nAPP_DEBUG=true\n");
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->assertStringContainsString('artisan migrate --force', $this->events());
+        $this->assertStringNotContainsString('u:p@', (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
     }
 
     public function test_infrastructure_a_new_data_service_needs_starts_first(): void
@@ -1404,6 +1427,48 @@ SH);
         $this->assertNotFalse($tunnel);
         $this->assertNotFalse($redis);
         $this->assertLessThan($redis, $tunnel);
+    }
+
+    public function test_retargeting_a_symlinked_data_directory_recreates_the_service(): void
+    {
+        mkdir($this->directory.'/storage-a', 0777, true);
+        mkdir($this->directory.'/storage-b', 0777, true);
+        symlink($this->directory.'/storage-a', $this->directory.'/current');
+        file_put_contents($this->directory.'/.gitignore', "/storage-a\n/storage-b\n/current\n", FILE_APPEND);
+        file_put_contents($this->directory.'/.dockerignore', "storage-a\nstorage-b\ncurrent\n", FILE_APPEND);
+        (new Process(['git', 'commit', '-q', '-am', 'storage'], $this->directory))->mustRun();
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['redis'] = ['volumes' => [['type' => 'bind', 'source' => $this->directory.'/current', 'target' => '/data']]];
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+
+        unlink($this->directory.'/current');
+        symlink($this->directory.'/storage-b', $this->directory.'/current');
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 redis', $this->events());
+    }
+
+    public function test_data_services_after_the_drain_follow_depends_on_across_both_lists(): void
+    {
+        // Legacy stamp: redis has no record (reconcile) while a changed sidecar database depends on it.
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['cache2'] = ['depends_on' => ['redis' => ['condition' => 'service_healthy']]];
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $stamp = (string) file_get_contents($this->directory.'/docker/.deploy.stamp');
+        file_put_contents($this->directory.'/docker/.deploy.stamp', preg_replace('/^service:redis=.*\n/m', '', $stamp));
+        $json['services']['cache2']['environment'] = ['CHANGED' => '1'];
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+        file_put_contents($this->directory.'/events', '');
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $events = $this->events();
+        $redis = strpos($events, '--wait-timeout 240 redis');
+        $cache = strpos($events, '--wait-timeout 240 cache2');
+        $this->assertNotFalse($redis);
+        $this->assertNotFalse($cache);
+        $this->assertLessThan($cache, $redis);
     }
 
     public function test_unreadable_env_file_fails_closed(): void

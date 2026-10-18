@@ -20,7 +20,7 @@ verify
 
 # Capture first: a failing plan inside eval "$(...)" would be ignored, and a stale MODE in the
 # caller's environment must never stand in for the plan's output.
-unset MODE MIGRATE DIRTY_APP DIRTY_DATA DIRTY_INFRA RECONCILE_DATA RECONCILE_INFRA START_DATA PRE_DRAIN BUILD_TARGETS GLOBAL_FALLBACK
+unset MODE MIGRATE DIRTY_APP DIRTY_DATA DIRTY_INFRA RECONCILE_DATA RECONCILE_INFRA START_DATA PRE_DRAIN POST_DRAIN BUILD_TARGETS GLOBAL_FALLBACK
 actions=$("$DIR/bin/deploy-plan" --deploy-actions)
 eval "$actions"
 # The plan's build targets ignore FORCE (the build above already honoured it): any target still
@@ -128,6 +128,12 @@ if [ "$MODE" = "noop" ]; then
     if barrier_running || [ -e "$barrier_owed" ]; then
         # A barrier or pause left by an earlier failed attempt must not hold remote workers out forever.
         hold_barrier
+        # The barrier's drain can take minutes: verify the stack again before releasing remote
+        # workers and stamping. A failure exits with the barrier still running, for the next run.
+        if ! "$DIR/bin/deploy-current"; then
+            echo "deploy-app: not every app service is running healthy on its expected image; keeping remote verification workers held." >&2
+            exit 1
+        fi
         settle_barrier
     fi
     # Nothing rolled out: let the guard stamp the new fingerprint without recording a deployment.
@@ -378,18 +384,12 @@ assert_barrier
 # Past this point Horizon is replaced, never restarted on its old container.
 horizon_stopped=0
 
-if [ -n "$DIRTY_DATA" ]; then
-    # shellcheck disable=SC2086
-    apply_each --pending $DIRTY_DATA
+# Changed data services are recreated, unrecorded ones reconciled (only Compose drift changes),
+# together in depends_on order (POST_DRAIN, mark:service) so a provider is up before its consumer.
+for item in $POST_DRAIN; do
+    apply_each "--${item%%:*}" "${item#*:}"
     verify
-fi
-
-if [ -n "$RECONCILE_DATA" ]; then
-    # Without a stamp, only Compose drift is reconciled; unchanged data services keep running.
-    # shellcheck disable=SC2086
-    apply_each --forget $RECONCILE_DATA
-    verify
-fi
+done
 
 if [ "$barrier_held" = 1 ] && { [ -n "$DIRTY_DATA" ] || [ -n "$RECONCILE_DATA" ]; }; then
     # A recreated database ends the barrier's lock session. Its durable pause keeps workers out

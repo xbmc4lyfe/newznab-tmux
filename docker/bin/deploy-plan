@@ -494,6 +494,10 @@ def bind_source_record(source: str, read_only: bool, project_dir: Path) -> str:
         resolved = path.resolve()
         # Writable mounts are data or logs; host-system trees are observed, not configuration.
         if not read_only or is_host_system(str(resolved)):
+            # Contents are state, but where a symlinked source points (e.g. a cutover to restored
+            # storage) is configuration. A source that is no symlink keeps its earlier record.
+            if str(resolved) != os.path.abspath(source):
+                return f"dir {source} -> {resolved}"
             return f"dir {source}"
         lines: list[str] = []
         for root, dirs, files in os.walk(resolved, onerror=walk_error):
@@ -739,7 +743,7 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
     # The database the app connects to: pointing app.env at another (e.g. a restored copy) migrates.
     app_env_values = read_dotenv(docker_dir / "config/app.env")
     database_hash = sha256_text("\n".join(
-        f"{key}={app_env_values.get(key, '')}" for key in ("DB_CONNECTION", "DB_HOST", "DB_PORT", "DB_SOCKET", "DB_DATABASE")
+        f"{key}={app_env_values.get(key, '')}" for key in ("DB_URL", "DB_CONNECTION", "DB_HOST", "DB_PORT", "DB_SOCKET", "DB_DATABASE")
     ))
 
     effective_hash = "none"
@@ -1064,6 +1068,10 @@ def mounts_changed_since_start(docker_dir: Path, svc: str) -> bool:
     running process cannot have loaded it. Used without a per-service stamp. An unreadable or
     missing mount source reports True; an unknown container start time aborts the plan."""
     cfg = RENDERED_SERVICES.get(svc)
+    if isinstance(cfg, dict) and (cfg.get("configs") or cfg.get("secrets")):
+        # Compose copies config and secret sources in at creation; with no record of what the
+        # running container got, recreate it rather than guess from timestamps.
+        return True
     if not isinstance(cfg, dict) or not isinstance(cfg.get("volumes"), list):
         return False
     try:
@@ -1563,6 +1571,10 @@ def main() -> None:
                  **{svc: "pending" for svc in plan["dirty_infra"]}}
         pre_drain = dependency_order([*plan["start_data"], *plan["reconcile_infra"], *plan["dirty_infra"]])
         print(f"PRE_DRAIN={shlex.quote(' '.join(f'{marks[svc]}:{svc}' for svc in pre_drain))}")
+        # The data services applied after the writers stop, likewise in one depends_on order.
+        post_marks = {**{svc: "pending" for svc in plan["dirty_data"]}, **{svc: "forget" for svc in plan["reconcile_data"]}}
+        post_drain = dependency_order([*plan["dirty_data"], *plan["reconcile_data"]])
+        print(f"POST_DRAIN={shlex.quote(' '.join(f'{post_marks[svc]}:{svc}' for svc in post_drain))}")
         print(f"GLOBAL_FALLBACK={'1' if plan['global_fallback'] else '0'}")
         print(f"BUILD_TARGETS={shlex.quote(' '.join(plan['build_targets']))}")
         return
