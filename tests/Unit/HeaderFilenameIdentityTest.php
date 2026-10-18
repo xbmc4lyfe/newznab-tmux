@@ -145,6 +145,12 @@ class HeaderFilenameIdentityTest extends TestCase
             'digit with a combining mark ends the shorter stem' => ["\"Readable Name 2\u{20E3}.mkv\" yEnc", "Readable Name 2\u{20E3} Extra.mkv", false],
             'executable quoted beside a declared payload' => ['"tag.mkv" - [1/1] - "setup.exe" - "movie.mkv" yEnc', 'setup.exe', false],
             'payload quoted beside the declared filename' => ['"Tag Name" - [1/1] - "readable.name.rar" yEnc', 'Tag Name', true],
+            'desktop launcher under an opaque subject' => ['[1/9] - "Xk29dPq8LmZ0Yt5R.mkv" yEnc', 'payload.desktop', false],
+            'yEnc must be a whole word' => ['"setup.exe" yEncoded - [1/1] - "movie.mkv" yEnc', 'setup.exe', false],
+            'square-bracket counter before yEnc' => ['"setup.exe" [1/1] yEnc - "Tag Name"', 'setup.exe', true],
+            'square-bracket counter before yEnc rejects another body' => ['"Readable.Name.rar" [1/5] yEnc - "Tag Name"', 'Other.Words.rar', false],
+            'opaque parity subject with a trailing-space payload body' => ['[1/1] - "Xk29dPq8LmZ0Yt5R.par2" yEnc', 'payload.mkv ', false],
+            'opaque parity subject with a trailing-dot payload body' => ['[1/1] - "Xk29dPq8LmZ0Yt5R.par2" yEnc', 'payload.mkv.', false],
             'opaque subject with an extensionless body' => ['[3/8] - "o9aeI3YpDwgHGoJ2ZsCm.vol00+01.par2" yEnc', '148f76878d7732b981734a9e0c51a348', true],
         ];
     }

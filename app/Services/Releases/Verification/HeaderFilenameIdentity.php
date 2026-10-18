@@ -15,7 +15,7 @@ final class HeaderFilenameIdentity
 
     private const string SUFFIX = '/\A(?:part\d+|vol\d+[+-]\d+|par2|rar|r\d{2,3}|\d{3}|7z|zip|mkv|avi|mp4|m4v|ts|nfo|sfv|nzb|epub|pdf|flac|mp3|iso|srt|txt|jpg|png)\z/i';
 
-    private const string EXECUTABLE = '/\.(?:exe|scr|bat|cmd|com|msi|msix|msp|lnk|pif|cpl|hta|reg|scf|js|jse|vbs|vbe|wsf|wsh|ps1|psm1|jar|apk|dll|sh|command|app|dmg|pkg|chm|msc|ps1xml|psd1|cab|appx|appxbundle|msixbundle|application|gadget|inf|url|xll|ws|wsc|sct|vb|ocx|sys|iso|img|vhd|vhdx)\z/i';
+    private const string EXECUTABLE = '/\.(?:exe|scr|bat|cmd|com|msi|msix|msp|lnk|pif|cpl|hta|reg|scf|js|jse|vbs|vbe|wsf|wsh|ps1|psm1|jar|apk|dll|sh|command|app|dmg|pkg|chm|msc|ps1xml|psd1|cab|appx|appxbundle|msixbundle|application|gadget|inf|url|xll|ws|wsc|sct|vb|ocx|sys|iso|img|vhd|vhdx|desktop|appimage)\z/i';
 
     public static function matches(string $subject, string $actual): bool
     {
@@ -41,8 +41,9 @@ final class HeaderFilenameIdentity
             $value = ($match[1][1] ?? -1) >= 0 ? $match[1][0] : $match[2][0];
             $quoted[] = $value;
             $end = $match[0][1] + strlen($match[0][0]);
-            // The filename is the quoted value that "yEnc" follows, else the one after the [n/m] counter.
-            if ($declared === null && preg_match('/\A\s*(?:\(\d+\/\d+\)\s*)?yEnc/i', substr($subject, $end)) === 1) {
+            // The filename is the quoted value that "yEnc" follows (optionally after an (n/m) or [n/m]
+            // counter), else the one after a [n/m] counter.
+            if ($declared === null && preg_match('/\A\s*(?:(?:\(\d+\/\d+\)|\[\d+\/\d+\])\s*)?yEnc(?![\p{L}\p{N}_])/iu', substr($subject, $end)) === 1) {
                 $declared = $value;
             }
             if ($afterCounter === null && preg_match('/\[\d+\/\d+\]\s*+(?:-\s*+)?\z/', substr($subject, 0, $match[0][1])) === 1) {
@@ -62,8 +63,8 @@ final class HeaderFilenameIdentity
         }
         if (self::opaque($declared)) {
             // An opaque recovery-file name still declares parity, which is not payload evidence.
-            return ! (preg_match('/\.par2\z/i', $declared) === 1 && self::extension($actual) !== ''
-                && strtolower(self::extension($actual)) !== 'par2');
+            return ! (preg_match('/\.par2\z/i', $declared) === 1 && self::extension(self::trimmed($actual)) !== ''
+                && strtolower(self::extension(self::trimmed($actual))) !== 'par2');
         }
         // A readable declared name must agree on its volume and extension chain, and on its final
         // extension when that chain does not cover it, as well as its stem.
