@@ -30,7 +30,10 @@ final class PublicationWorkerGate
         $this->store ??= VerificationLockStore::make();
         if ($this->lock !== null && ! $this->store->holds($this->lock)) {
             // A database lock ends with its session; protection must be proved, not assumed.
+            // Dropping it clears the store's bookkeeping before the group is joined afresh.
+            $lost = $this->lock;
             $this->lock = null;
+            $this->store->release($lost);
         }
         $this->lock ??= $this->store->shared('worker');
         if ($this->lock !== null && VerificationWorkerLocks::paused()) {
