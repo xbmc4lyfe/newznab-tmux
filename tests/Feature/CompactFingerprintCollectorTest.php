@@ -404,6 +404,27 @@ final class CompactFingerprintCollectorTest extends TestCase
         $this->assertSame('complete', $result['status']);
     }
 
+    /** @return array<string, array{string}> */
+    public static function invalidEmptyFileHeaders(): array
+    {
+        return ['zero line length' => ['line=0'], 'non-numeric line length' => ['line=abc']];
+    }
+
+    #[Test]
+    #[DataProvider('invalidEmptyFileHeaders')]
+    public function an_empty_file_with_another_invalid_numeric_field_is_partial(string $line): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)
+            ->andReturnUsing(fn (string $id): array => ['body' => str_replace('line=128', $line, YencArticles::article(''))] + self::article($id));
+
+        $result = $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7);
+
+        $this->assertSame('partial', $result['status']);
+        $this->assertNotSame([], $result['data']['errors']);
+    }
+
     #[Test]
     public function size_ok_requires_affirmative_size_agreement(): void
     {

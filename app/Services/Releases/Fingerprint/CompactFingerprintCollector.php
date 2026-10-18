@@ -644,15 +644,24 @@ final class CompactFingerprintCollector
     }
 
     /**
-     * A valid empty file: single part, declared size 0, nothing decoded. The analyzer treats size 0 as
-     * a non-positive numeric field, which is only wrong in this exact case.
+     * A valid empty file: single part, declared size 0, nothing decoded, and every other numeric header
+     * field valid. The analyzer treats size 0 as a non-positive numeric field, which is only wrong here.
      *
      * @param  array<string, mixed>  $yenc
      */
     private static function emptySinglePart(array $yenc): bool
     {
+        $header = is_array($yenc['header_fields'] ?? null) ? $yenc['header_fields'] : [];
+        // Only size may be zero; every other numeric header field must still be a positive decimal.
+        foreach (['line', 'part', 'total'] as $field) {
+            if (array_key_exists($field, $header)
+                && (! is_string($header[$field]) || preg_match('/\A[1-9][0-9]{0,18}\z/', $header[$field]) !== 1)) {
+                return false;
+            }
+        }
+
         return ($yenc['multipart'] ?? null) === false
-            && (($yenc['header_fields'] ?? [])['size'] ?? null) === '0'
+            && ($header['size'] ?? null) === '0'
             && ($yenc['decoded_segment_size'] ?? null) === 0
             && ($yenc['decoded_size_matches_yend_size'] ?? null) === true;
     }
