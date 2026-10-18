@@ -38,7 +38,9 @@ final class PublicationForwarderDiagnostics
 
     private int $leaseLost = 0;
 
-    private int $drainFinished = 0;
+    private int $lockBlocked = 0;
+
+    private int $orphansAdopted = 0;
 
     private int $finishFailures = 0;
 
@@ -56,7 +58,7 @@ final class PublicationForwarderDiagnostics
 
     public function stop(string $reason): void
     {
-        $this->stopReason ??= in_array($reason, ['deadline', 'passes', 'draining', 'locks_lost', 'worker_unavailable', 'disabled', 'slot_unavailable', 'error'], true)
+        $this->stopReason ??= in_array($reason, ['deadline', 'passes', 'terminated', 'locks_lost', 'worker_unavailable', 'disabled', 'slot_unavailable', 'error'], true)
             ? $reason : 'error';
     }
 
@@ -112,9 +114,16 @@ final class PublicationForwarderDiagnostics
         $this->leaseLost++;
     }
 
-    public function drainFinished(): void
+    /** The worker group refused this forwarder (a drain, an exclusive holder or a pause); its entries wait. */
+    public function blocked(): void
     {
-        $this->drainFinished++;
+        $this->lockBlocked++;
+    }
+
+    /** Entries moved back to pending from the in-flight folder of a forwarder number nobody runs. */
+    public function orphansAdopted(int $count): void
+    {
+        $this->orphansAdopted += $count;
     }
 
     public function finishFailed(): void
@@ -148,7 +157,8 @@ final class PublicationForwarderDiagnostics
             'requeued' => $this->requeued,
             'expired' => $this->expired,
             'lease_lost' => $this->leaseLost,
-            'finished_for_drain' => $this->drainFinished,
+            'lock_blocked' => $this->lockBlocked,
+            'orphans_adopted' => $this->orphansAdopted,
             'finish_failures' => $this->finishFailures,
             'round_trip_ms' => ['total' => round($this->roundTripMilliseconds, 3), 'max' => round($this->slowestRoundTripMilliseconds, 3),
                 'mean' => $this->batches === 0 ? 0.0 : round($this->roundTripMilliseconds / $this->batches, 3)],

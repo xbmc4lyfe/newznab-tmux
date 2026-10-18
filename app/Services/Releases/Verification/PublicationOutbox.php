@@ -94,7 +94,7 @@ final class PublicationOutbox
     public function enqueue(object $claim, string $reason, array $evidence): string
     {
         $this->prepare();
-        $name = PublicationOutboxEntry::nameFor((int) $claim->id, (int) $claim->version);
+        $name = PublicationOutboxEntry::nameFor((int) $claim->id, (int) $claim->version, (string) $claim->lease_token);
         $entry = new PublicationOutboxEntry($name, $this->root.'/pending/'.$name, ['id' => (int) $claim->id, 'version' => (int) $claim->version,
             'manifest_hash' => (string) $claim->manifest_hash, 'lease_token' => (string) $claim->lease_token], $reason, $evidence, microtime(true));
         $this->write($entry, $this->root.'/pending');
@@ -239,16 +239,68 @@ final class PublicationOutbox
         return $taken;
     }
 
-    /** Return a claimed entry to the pending queue after a failed send, atomically replacing its document. */
+    /**
+     * Return a claimed entry to the pending queue after a failed send: its document is replaced in
+     * place, atomically, and then renamed into pending. The name carries the lease token, so no
+     * other hand-off can have that name; a crash between the two steps leaves the entry in flight,
+     * where its forwarder (or an orphan adopter) finds it.
+     */
     public function requeue(PublicationOutboxEntry $entry): void
     {
-        // A newer hand-off of the same candidate generation (after this lease expired) is not replaced by a dead one.
-        if (! file_exists($this->root.'/pending/'.$entry->name)) {
-            $this->write($entry, $this->root.'/pending');
+        $this->write($entry, dirname($entry->path));
+        if (! @rename($entry->path, $this->root.'/pending/'.$entry->name)) {
+            throw new RuntimeException('Cannot return the publication outbox entry to pending.');
         }
-        if ($entry->path !== $this->root.'/pending/'.$entry->name) {
-            @unlink($entry->path);
+    }
+
+    /**
+     * In-flight folders of other forwarder numbers that hold entries.
+     *
+     * @return list<int>
+     */
+    public function foreignSlots(int $except): array
+    {
+        $slots = [];
+        foreach (@scandir($this->root.'/inflight') ?: [] as $folder) {
+            if (preg_match('/\A[1-9]\d*\z/D', $folder) === 1 && (int) $folder !== $except && $this->names($this->root.'/inflight/'.$folder) !== []) {
+                $slots[] = (int) $folder;
+            }
         }
+
+        return $slots;
+    }
+
+    /**
+     * Move the entries of a forwarder number nobody runs back to pending. The caller holds that
+     * number's lock, so no forwarder is using the folder.
+     */
+    public function adopt(int $slot): int
+    {
+        $moved = 0;
+        $directory = $this->inflightDirectory($slot);
+        foreach ($this->names($directory) as $name) {
+            if (@rename($directory.'/'.$name, $this->root.'/pending/'.$name)) {
+                $moved++;
+            }
+        }
+        if ($slot > self::forwarders()) {
+            @rmdir($directory);
+        }
+
+        return $moved;
+    }
+
+    /**
+     * Seconds forwarder $number runs before the scheduler restarts it: never more than the configured
+     * period (so a container stop need not wait for it), and staggered by whole minutes inside that
+     * period so the forwarders do not all restart at once.
+     */
+    public static function forwarderLifetime(int $number): int
+    {
+        $period = max(30, (int) config('release_verification.publish_forwarder_seconds', 300));
+        $lives = max(1, intdiv($period, 60) - 1);
+
+        return max(20, $period - 10 - 60 * ((max(1, $number) - 1) % $lives));
     }
 
     public function remove(PublicationOutboxEntry $entry): void
