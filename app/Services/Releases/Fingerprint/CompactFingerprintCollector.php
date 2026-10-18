@@ -516,9 +516,9 @@ final class CompactFingerprintCollector
                 $posters[(string) $file['poster']] = ($posters[(string) $file['poster']] ?? 0) + 1;
             }
             $segments += (int) ($file['segment_count'] ?? 0);
-            $fileBytes = is_int($file['advertised_bytes'] ?? null) ? $file['advertised_bytes'] : 0;
-            // Checked addition: an unrepresentable total is unknown, never a rounded float.
-            $bytes = $bytes === null || $fileBytes > PHP_INT_MAX - $bytes ? null : $bytes + $fileBytes;
+            $fileBytes = $file['advertised_bytes'] ?? null;
+            // Checked addition: an unknown file size or an unrepresentable total makes the total unknown.
+            $bytes = $bytes === null || ! is_int($fileBytes) || $fileBytes > PHP_INT_MAX - $bytes ? null : $bytes + $fileBytes;
             $kind = (string) ($file['kind'] ?? 'other');
             $kinds[$kind] = ($kinds[$kind] ?? 0) + 1;
         }
@@ -774,8 +774,8 @@ final class CompactFingerprintCollector
 
         $total = 0;
         foreach ($manifest['files'] as $file) {
-            $fileBytes = is_int($file['advertised_bytes'] ?? null) ? $file['advertised_bytes'] : 0;
-            $total = $total === null || $fileBytes > PHP_INT_MAX - $total ? null : $total + $fileBytes;
+            $fileBytes = $file['advertised_bytes'] ?? null;
+            $total = $total === null || ! is_int($fileBytes) || $fileBytes > PHP_INT_MAX - $total ? null : $total + $fileBytes;
         }
         $totalInvalid = ($manifest['advertised_byte_totals_valid'] ?? true) === false || $total === null;
 

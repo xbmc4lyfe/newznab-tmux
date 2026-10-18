@@ -796,6 +796,24 @@ final class CompactFingerprintCollectorTest extends TestCase
     }
 
     #[Test]
+    public function an_unknown_file_size_makes_the_nzb_total_unknown(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->andReturnUsing(fn (string $id): array => self::article($id));
+        // One file's segment bytes overflow, so the analyzer reports its size as unknown.
+        $xml = '<?xml version="1.0" encoding="UTF-8"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">'
+            .'<file poster="p@example" date="1790812800" subject="&quot;a.rar&quot; yEnc (1/2)"><groups><group>a.b.test</group></groups><segments>'
+            .'<segment bytes="'.PHP_INT_MAX.'" number="1">f0-s1@fixture</segment><segment bytes="'.PHP_INT_MAX.'" number="2">f0-s2@fixture</segment>'
+            .'</segments></file></nzb>';
+
+        $data = $this->collector()->collectFromNzb($xml, 7)['data'];
+
+        $this->assertNull($data['nzb']['total_bytes']);
+        $this->assertContains('NzbManifestInvalid', array_column($data['errors'], 'error_type'));
+    }
+
+    #[Test]
     public function scalar_metadata_is_never_current(): void
     {
         foreach ([1, true, 'bad', null] as $metadata) {
