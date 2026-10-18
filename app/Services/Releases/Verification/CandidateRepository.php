@@ -176,6 +176,11 @@ final class CandidateRepository
                 if ($existing !== null && $existing->status === 'filtered' && $holder === null) {
                     if ($existing->release_id !== null || (int) $existing->groups_id !== (int) $collection->groups_id
                         || $existing->manifest_path !== '' || (int) $existing->manifest_bytes !== 0) {
+                        // Orphans retired above still give back their capacity.
+                        if ($retiredBytes > 0) {
+                            $this->ledger->adjust(-$retiredBytes);
+                        }
+
                         return;
                     }
                     $usablePart = DB::table('binaries as b')->join('parts as p', 'p.binaries_id', '=', 'b.id')

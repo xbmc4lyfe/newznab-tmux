@@ -647,7 +647,14 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame((int) $row->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
     }
 
-    public function test_retiring_an_orphan_before_a_filtered_replay_still_releases_its_capacity(): void
+    /** @return array<string, array{int}> */
+    public static function replayGroups(): array
+    {
+        return ['same group' => [1], 'another group' => [2]];
+    }
+
+    #[DataProvider('replayGroups')]
+    public function test_retiring_an_orphan_before_a_filtered_replay_still_releases_its_capacity(int $replayGroup): void
     {
         $this->publicationSchema(partialColumns: true);
         $hash = sha1('orphan-then-filtered', true);
@@ -661,7 +668,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
 
         // A replay of the filtered post: the orphan is retired before the replay returns early.
         $replay = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 3, messageId: 'x@y');
-        DB::table('collections')->where('id', $replay)->update(['fromname' => 'someone-else']);
+        DB::table('collections')->where('id', $replay)->update(['fromname' => 'someone-else', 'groups_id' => $replayGroup]);
         app(CandidateRepository::class)->archive($replay);
 
         $this->assertSame((int) DB::table('release_verification_candidates')->sum('manifest_bytes'),
