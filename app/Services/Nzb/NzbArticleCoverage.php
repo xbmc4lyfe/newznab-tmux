@@ -29,10 +29,11 @@ final class NzbArticleCoverage
      *
      * @param  (callable(Release): void)|null  $onCandidate
      * @param  (callable(Release, \SimpleXMLElement): bool)|null  $acceptCovered
+     * @param  array<string, true>|null  $requiredIds  coverageIds($incoming), when the caller already computed it
      */
-    public function findCoveredUpload(int $totalSize, ?string $fingerprint, ?\SimpleXMLElement $incoming = null, string $name = '', string $searchName = '', int $predbId = 0, bool $publishedOnly = false, ?callable $onCandidate = null, ?callable $acceptCovered = null): ?Release
+    public function findCoveredUpload(int $totalSize, ?string $fingerprint, ?\SimpleXMLElement $incoming = null, string $name = '', string $searchName = '', int $predbId = 0, bool $publishedOnly = false, ?callable $onCandidate = null, ?callable $acceptCovered = null, ?array $requiredIds = null): ?Release
     {
-        if ($incoming === null || ($required = $this->coverageIds($incoming)) === null) {
+        if ($incoming === null || ($required = $requiredIds ?? $this->coverageIds($incoming)) === null) {
             return null;
         }
         $seen = [];
@@ -160,8 +161,12 @@ final class NzbArticleCoverage
             ->value('guid') === (string) $candidate->guid;
     }
 
-    /** @return array<string, true>|null */
-    private function coverageIds(\SimpleXMLElement $xml): ?array
+    /**
+     * The exact article IDs a document requires, or null when it is not a well-formed NZB inventory.
+     *
+     * @return array<string, true>|null
+     */
+    public function coverageIds(\SimpleXMLElement $xml): ?array
     {
         $serialized = $xml->asXML();
         if ($serialized === false || strlen($serialized) > self::COVERAGE_DECODED_BYTES) {

@@ -71,6 +71,44 @@ final class NzbArticleCoverageImportTest extends TestCase
         }
     }
 
+    public function test_precomputed_required_ids_replace_the_incoming_documents_own_inventory(): void
+    {
+        Schema::create('releases', static function (Blueprint $table): void {
+            $table->increments('id');
+            foreach (['guid', 'name', 'searchname', 'fromname'] as $column) {
+                $table->string($column)->default('');
+            }
+            $table->integer('size')->default(0);
+            $table->integer('predb_id')->default(0);
+            $table->integer('nzbstatus')->default(1);
+            $table->char('article_fingerprint', 40)->nullable();
+        });
+        $fingerprint = str_repeat('c', 40);
+        DB::table('releases')->insert(['guid' => 'retained', 'article_fingerprint' => $fingerprint]);
+        $retained = '<nzb><file><segments><segment bytes="1" number="1">retained@example.test</segment></segments></file></nzb>';
+        $nzb = $this->getMockBuilder(NzbService::class)->disableOriginalConstructor()->onlyMethods(['readNzbContentsBounded'])->getMock();
+        $nzb->method('readNzbContentsBounded')->willReturnCallback(static function (string $guid, int $compressed, int $decoded, int &$used) use ($retained): string {
+            $used = strlen($retained);
+
+            return $retained;
+        });
+        $coverage = new NzbArticleCoverage($nzb, new ReleaseDuplicateFinder);
+        $incoming = simplexml_load_string('<nzb><file><segments><segment bytes="1" number="1">incoming@example.test</segment></segments></file></nzb>');
+        $inventory = simplexml_load_string($retained);
+        self::assertNotFalse($incoming);
+        self::assertNotFalse($inventory);
+
+        self::assertSame(["\0incoming@example.test" => true], $coverage->coverageIds($incoming));
+        self::assertNull($coverage->coverageIds(simplexml_load_string('<nzb/>')));
+        self::assertNull($coverage->findCoveredUpload(0, $fingerprint, $incoming, publishedOnly: true));
+        // The caller's ID set decides coverage; the document only has to be present.
+        self::assertSame('retained', $coverage->findCoveredUpload(0, $fingerprint, $incoming, publishedOnly: true,
+            requiredIds: $coverage->coverageIds($inventory))?->guid);
+        self::assertSame($coverage->findCoveredUpload(0, $fingerprint, $inventory, publishedOnly: true)?->id,
+            $coverage->findCoveredUpload(0, $fingerprint, $inventory, publishedOnly: true, requiredIds: $coverage->coverageIds($inventory))?->id);
+        self::assertNull($coverage->findCoveredUpload(0, $fingerprint, null, publishedOnly: true, requiredIds: $coverage->coverageIds($inventory)));
+    }
+
     /** @return array<string, array{list<string>, bool, int, NzbImportStatus, bool, string}> */
     public static function articleSetCases(): array
     {

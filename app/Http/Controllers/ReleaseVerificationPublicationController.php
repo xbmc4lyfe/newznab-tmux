@@ -64,7 +64,8 @@ class ReleaseVerificationPublicationController extends Controller
                     : response()->json(['error' => 'Stale verification result cannot publish.'], 409);
             }
             $timing?->requestPhase('candidate_read');
-            $manifest = SpotCheckVerifier::withEvidence($store->read($candidate->manifest_path), $evidence);
+            $archived = $store->read($candidate->manifest_path);
+            $manifest = SpotCheckVerifier::withEvidence($archived, $evidence);
             $timing?->requestPhase('manifest_read');
             // Publication writes as a worker does, so a reset, audit or deployment barrier that
             // holds the worker group excludes it even after the sending worker has gone.
@@ -80,7 +81,8 @@ class ReleaseVerificationPublicationController extends Controller
             $timing?->requestPhase('worker_lock');
             try {
                 return response()->json(['release_id' => $publisher->publish($claim,
-                    new VerificationResult('sampled', (string) $data['reason'], $manifest), 'remote', $timing ?? false)]);
+                    new VerificationResult('sampled', (string) $data['reason'], $manifest), 'remote', $timing ?? false,
+                    ['path' => (string) $candidate->manifest_path, 'manifest' => $archived])]);
             } finally {
                 $locks->release($worker);
             }
