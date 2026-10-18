@@ -22,7 +22,12 @@ final class PublicationTiming
 {
     private static int $sampleCounter = 0;
 
-    /** @var list<array{phases_ns: array<string, int>, callback_status: string, callback_after_state_lock_ns: int, transaction_finalization_ns: int}> */
+    /**
+     * `lock` is recorded by VerificationLedger::enterPublication, also when a lock statement throws
+     * (`completed` false); a thrown stripe statement reports its elapsed time as stripe_lock_ns.
+     *
+     * @var list<array{phases_ns: array<string, int>, callback_status: string, callback_after_state_lock_ns: int, transaction_finalization_ns: int, lock?: array{path: string, stripe_count: int, stripe_lock_ns: int, publication_row_lock_ns: int, completed: bool}}>
+     */
     private array $attempts = [];
 
     /** @var array<string, int> */
@@ -88,7 +93,7 @@ final class PublicationTiming
         $this->facts['keys_present'] = $keysPresent;
     }
 
-    /** @param array{path: string, stripe_count: int, stripe_lock_ns: int, publication_row_lock_ns: int} $lock */
+    /** @param array{path: string, stripe_count: int, stripe_lock_ns: int, publication_row_lock_ns: int, completed: bool} $lock */
     public function recordLock(array $lock): void
     {
         $this->attempts[array_key_last($this->attempts)]['lock'] = $lock;

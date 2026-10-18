@@ -465,7 +465,7 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
                 $this->assertSame(array_sum($attempt['phases_ns']) - $attempt['phases_ns']['state_lock_acquisition'],
                     $attempt['callback_after_state_lock_ns'], 'Pre-lock work must not count as in-lock time.');
                 if (config('release_verification.manifest_storage') === 'database') {
-                    $this->assertSame(['path', 'stripe_count', 'stripe_lock_ns', 'publication_row_lock_ns'], array_keys($attempt['lock']));
+                    $this->assertSame(['path', 'stripe_count', 'stripe_lock_ns', 'publication_row_lock_ns', 'completed'], array_keys($attempt['lock']));
                     $this->assertSame('striped', $attempt['lock']['path']);
                     $this->assertGreaterThan(0, $attempt['lock']['stripe_count']);
                     $this->assertGreaterThanOrEqual(0, $attempt['lock']['stripe_lock_ns']);
