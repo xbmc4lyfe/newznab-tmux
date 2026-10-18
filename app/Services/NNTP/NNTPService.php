@@ -67,7 +67,8 @@ class NNTPService extends NntpClient
                 // exceed the budget, or, when they exactly reach it after filling a budget-capped
                 // read, when the line continues at all (its terminator alone overflows). A bare
                 // terminator prefix, or a response that ends within budget, is truncated.
-                if ($maximumBytes - strlen($raw) < 65534 && $line !== '.' && $line !== ".\r") {
+                // At exactly 65,534 remaining bytes the budget and the line limit cap the read equally.
+                if ($maximumBytes - strlen($raw) <= 65534 && $line !== '.' && $line !== ".\r") {
                     $unstuffed = strlen($raw) + strlen($line) - (str_starts_with($line, '..') ? 1 : 0);
                     $continues = static fn ($socket): bool => is_string($next = fread($socket, 1)) && $next !== '';
                     if ($unstuffed > $maximumBytes
