@@ -55,6 +55,8 @@ pub const NNTMUX_EXPORTS: &[&str] = &[
     "nntmux_article_identity_json",
     "nntmux_metadata_string_free",
     "nntmux_spot_check_sample_v1_json",
+    "nntmux_header_filename_identity_v1",
+    "nntmux_header_filename_identity_tables_v1",
     "nntmux_yenc_decode_span_v1",
     "nntmux_yenc_payload_kernel_v1",
     "nntmux_release_names_html",
@@ -500,7 +502,7 @@ mod tests {
         ] {
             assert!(NNTMUX_EXPORTS.contains(&symbol), "missing {symbol}");
         }
-        assert_eq!(NNTMUX_EXPORTS.len(), 24);
+        assert_eq!(NNTMUX_EXPORTS.len(), 26);
     }
 
     #[test]

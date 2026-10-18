@@ -647,6 +647,8 @@ def coverage(root):
             label, detail = 'Native caller diagnostics', 'Correctness-gated bounded range fixtures with FFI and JSON costs; no equivalent PHP range baseline or exhaustive archive coverage.'
         elif name in ('sample_plan', 'spotcheck_plan'):
             label, detail = 'Comparative public caller benchmark', 'Exact serialized PHP/native output, cold/warm calls, common median and uncommon p99 qualification mode; small/unsupported inputs remain PHP controls.'
+        elif name in ('header_filename_identity', 'header_filename_unicode'):
+            label, detail = 'Comparative public caller benchmark', 'Guarded candidate for HeaderFilenameIdentity, not wired into production. Per-call and 16-call release-batch PHP versus Rust+FFI on a synthetic corpus runs in the archive-sample-performance filename-identity job (x86 and ARM, step summary); not collected on this page and no adoption qualification.'
         elif name in ('article_identity', 'article_xref', 'article_dates', 'iso_primary_copies', 'rar5_copy_checksums', 'rar5_quick_open'):
             label, detail = 'Shared independent PHP reference comparison', 'New bounded PHP references compare declared shared projections only; actual native wrapper includes FFI, allocation, JSON decoding and the full richer native result before projection. Cold/warm common median and uncommon p99 gates do not qualify adoption or historical PHP speedups.'
         elif name in ('iso_path_tables', 'zstd_frame', 'xz', 'xz_frame', 'xz_first_block'):
