@@ -101,7 +101,8 @@ case "$*" in
     *'scheduler python3 -c '*) [ "${NNTMUX_SCHEDULER_CAPABILITY_FAIL:-0}" != 1 ] || exit 48; echo "${NNTMUX_SCHEDULER_CAPABILITY:-native}" ;;
     *'scheduler.py drain --timeout='*)
         [ "${NNTMUX_SCHEDULER_DRAIN_FAIL:-0}" != 1 ] || exit 47
-        if [ "${NNTMUX_STALE_SCHEDULER_DRAIN:-0}" = 1 ]; then echo two > "$NNTMUX_REPO/app.txt"; fi ;;
+        if [ "${NNTMUX_STALE_SCHEDULER_DRAIN:-0}" = 1 ]; then echo two > "$NNTMUX_REPO/app.txt"; fi
+        if [ "${NNTMUX_REPLACE_DURING_DRAIN:-0}" = 1 ]; then : > "$NNTMUX_REPO/replaced"; fi ;;
     *'scheduler.py check'*) [ "${NNTMUX_SCHEDULER_CHECK_FAIL:-0}" != 1 ] || exit 49 ;;
     *'scheduler python3 - drain '*) [ "${NNTMUX_SCHEDULER_DRAIN_FAIL:-0}" != 1 ] || exit 47 ;;
     *'scheduler python3 - check '*) [ "${NNTMUX_SCHEDULER_CHECK_FAIL:-0}" != 1 ] || exit 49 ;;
@@ -627,7 +628,7 @@ SH);
     {
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         file_put_contents($this->directory.'/events', '');
-        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => substr('{"services":{"web":{},"horizon":{},"scheduler":{},"indexer":{},"mariadb":{},"redis":{},"manticore":{},"proxy":{},"mailpit":{},"prometheus":{},"pushgateway":{},"grafana":{},"node-exporter":{},"mysqld-exporter":{},"redis-exporter":{}}}', 0, -1).',"x-changed":1}'])->mustRun();
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => substr('{"services":{"web":{},"horizon":{},"scheduler":{},"indexer":{},"mariadb":{},"redis":{},"manticore":{},"proxy":{},"mailpit":{},"prometheus":{},"pushgateway":{},"grafana":{},"node-exporter":{},"mysqld-exporter":{},"redis-exporter":{}}}', 0, -1).',"version":"changed"}'])->mustRun();
         $this->assertStringContainsString('artisan migrate', $this->events());
     }
 
@@ -2330,6 +2331,40 @@ SH);
         $this->assertStringContainsString('ps -a -q mariadb', $this->events());
         $this->assertStringNotContainsString('up -d --no-deps --wait --wait-timeout 240 mariadb', $this->events());
         $this->assertStringNotContainsString(' stop web scheduler indexer', $this->events());
+    }
+
+    public function test_an_image_tag_replaced_during_the_drain_is_never_rolled_out(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/app.txt', "two\n");
+        (new Process(['git', 'commit', '-q', '-am', 'change'], $this->directory))->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_REPLACE_DURING_DRAIN' => '1']);
+        $process->run();
+        @unlink($this->directory.'/replaced');
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('not rolling out a replaced image', $process->getErrorOutput());
+        $this->assertStringNotContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web', $this->events());
+        $this->assertNotStamped();
+    }
+
+    public function test_extension_blocks_never_force_a_global_rollout(): void
+    {
+        $config = fn (string $value): array => ['NNTMUX_CONFIG_ID' => substr($this->composeJson(), 0, -1).',"x-note":{"v":"'.$value.'"}}'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('one'))->mustRun();
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('two'))->mustRun();
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
+        $this->assertStringNotContainsString(' up -d', $this->events());
+    }
+
+    public function test_an_alternate_compose_env_file_fails_closed(): void
+    {
+        $plan = $this->make(['deploy-plan', 'DC=docker compose --env-file /tmp/other.env']);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('DC passes --env-file', $plan->getErrorOutput());
     }
 
     public function test_image_tag_replaced_after_the_build_aborts_before_any_change(): void

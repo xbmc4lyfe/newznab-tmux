@@ -445,6 +445,33 @@ def service_top_level_compose_deps(parsed: dict[str, object], svc_cfg: object) -
     return deps
 
 
+def reject_alternate_env_file() -> None:
+    """Configs and secrets resolve variables from the default .env files; an alternate one would be
+    read by Compose but not by the fingerprint."""
+    try:
+        argv = shlex.split(os.environ.get("DC", ""))
+    except ValueError:
+        return
+    if any(arg == "--env-file" or arg.startswith("--env-file=") for arg in argv):
+        sys.exit("deploy-plan: DC passes --env-file; selective deployment fingerprints only the default .env files. "
+                 "Put those values in docker/.env or the environment instead.")
+
+
+def verify_planned_images(docker_dir: Path, stamp_path: Path, services: list[str], running: bool) -> None:
+    """Exit non-zero unless each app service's image tag (or, with running, its container) is still
+    the image this run planned; a tag replaced during the drain must never be rolled out or stamped."""
+    snapshot = parse_stamp(Path(f"{stamp_path}.plan"))
+    for svc in services:
+        planned = snapshot.get(f"image:{svc}", "")
+        if "@" not in planned:
+            sys.exit(f"deploy-plan: no planned image for {svc}")
+        tag, planned_id = planned.rsplit("@", 1)
+        current = running_image(docker_dir, svc) if running else image_id(tag)
+        if current != planned_id:
+            where = "its container runs" if running else f"{tag} now names"
+            sys.exit(f"deploy-plan: {svc}: {where} {current or 'nothing'}, not the planned {planned_id}; not rolling out a replaced image.")
+
+
 def project_directory(docker_dir: Path) -> Path:
     try:
         argv = shlex.split(os.environ.get("DC", ""))
@@ -634,6 +661,7 @@ RENDERED_PROJECT: str | None = None
 def get_compose_service_hashes(docker_dir: Path) -> tuple[str, dict[str, str]]:
     """Return (global_config_hash, per_service_config_hashes)."""
     global RENDERED_PROJECT
+    reject_alternate_env_file()
     env = dict(os.environ)
     env.setdefault("COMPOSE_FILE", str(docker_dir / "docker-compose.yml"))
     proc = subprocess.run(
@@ -682,9 +710,11 @@ def get_compose_service_hashes(docker_dir: Path) -> tuple[str, dict[str, str]]:
             # Compose command text and context). Per-service changes are tracked per service.
             # Top-level networks/volumes/configs/secrets entries are already part of the record of
             # every service that references them.
+            # `x-*` extension blocks are ignored by Compose; their merged effects are already in the
+            # services that use them.
             residual = {
                 key: value for key, value in parsed.items()
-                if key not in ("services", "networks", "volumes", "configs", "secrets")
+                if key not in ("services", "networks", "volumes", "configs", "secrets") and not key.startswith("x-")
             }
             global_hash = sha256_text(f"{json.dumps(residual, sort_keys=True)}\n{context_meta}")
             return global_hash, per_service
@@ -1551,6 +1581,11 @@ def main() -> None:
         build_stamp = Path(os.environ.get("DEPLOY_STAMP", docker_dir / ".build.stamp"))
         targets = compute_build_targets(repo, docker_dir, build_stamp)
         print(" ".join(targets))
+        return
+
+    if cmd == "--verify-images":
+        running = len(sys.argv) > 2 and sys.argv[2] == "--running"
+        verify_planned_images(docker_dir, stamp_path, sys.argv[3 if running else 2:], running)
         return
 
     if cmd == "--stale-images":

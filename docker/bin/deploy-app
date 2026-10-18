@@ -405,6 +405,8 @@ fi
 if [ "$MIGRATE" = 1 ]; then
     assert_barrier
     [ "$barrier_held" != 1 ] || barrier_keep=1
+    # The migration runs from web's tag: it must still be the image this run planned.
+    plan --verify-images web
     compose run --rm --no-deps web php artisan migrate --force --no-interaction
     assert_barrier
     plan --record migration effective
@@ -420,6 +422,10 @@ if [ -n "$up_app_services" ]; then
         previous_containers="$previous_containers $svc=$(printf '%s' "$id" | head -n 1)"
     done
     export DEPLOY_PREVIOUS_CONTAINERS="$previous_containers"
+    # A tag replaced during the drain must never be rolled out: check right before, and the running
+    # containers right after, against the image IDs this run planned.
+    # shellcheck disable=SC2086
+    plan --verify-images $up_app_services
     # shellcheck disable=SC2086
     if compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $up_app_services; then
         :
@@ -430,6 +436,8 @@ if [ -n "$up_app_services" ]; then
         plan --record-healthy $up_app_services || true
         exit "$up_rc"
     fi
+    # shellcheck disable=SC2086
+    plan --verify-images --running $up_app_services
     # shellcheck disable=SC2086
     plan --record $up_app_services
 fi
