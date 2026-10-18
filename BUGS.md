@@ -425,6 +425,12 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Mitigation:** killed the six sessions at about 14:50 UTC, and binaries recovered at once. Set `idle_transaction_timeout = 600` on the DB host (live, and persisted in `conf.d/98-idle-transactions.cnf`), so an abandoned transaction rolls back after 10 minutes.
 - **Open question:** why the client side's FIN or RST never reached the server. TCP keepalive on the DB host would also reap the idle half-open sessions.
 
+### 58. Fingerprint collection raises a PHP 8.5 null-offset deprecation for releases without PAR2 sets (Fixed)
+
+- **Where:** `ReleaseFingerprintCollector::collect()` reads `$par2RecoveryExponentsBySet[array_key_first($par2SetIds)]` even when `$par2SetIds` is empty, so the key is `null`.
+- **Symptom:** PHP 8.5 reports "Using null as an array offset is deprecated" for every release whose sampled articles contain no PAR2 set. The metadata was already correct; only the deprecation was emitted.
+- **Fix:** an empty set list now yields empty recovery exponents without the lookup. `ReleaseFingerprintEmptyPar2SetTest` fails on the previous code and passes now.
+
 ## Issues in the docker/ stack itself (all fixed)
 
 | Issue | Fix |
