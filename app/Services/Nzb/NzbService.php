@@ -608,6 +608,12 @@ class NzbService
             if (! File::isFile($path)) {
                 continue;
             }
+            if (self::isPreservedNzbPathName($path)) {
+                // Never just deleted: it may be the only copy matching a rolled-back release row.
+                $deleted += $this->reconcileStalePreservedNzb($path, $olderThanSeconds) !== 'kept' ? 1 : 0;
+
+                continue;
+            }
 
             try {
                 if (File::delete($path)) {
@@ -757,12 +763,12 @@ class NzbService
     }
 
     /**
-     * A hard link kept while a partial release's NZB is replaced; only a crashed or
-     * failed rollback leaves one behind, and the canonical file is always the live NZB.
+     * A hard link to the source a partial release's in-place upgrade replaced, tagged with the upgrading
+     * candidate; only a crash or a failed rollback leaves one behind.
      */
     public static function isPreservedNzbPathName(string $path): bool
     {
-        return preg_match('/\.nzb\.gz\.[0-9a-f]{16}\.prev$/D', basename($path)) === 1;
+        return preg_match('/\.nzb\.gz\.c\d+-[0-9a-f]{16}\.prev$/D', basename($path)) === 1;
     }
 
     /** A stale replaced-source link is removable whether or not its release still exists. */
@@ -778,9 +784,24 @@ class NzbService
             && max($stat['mtime'], $stat['ctime']) <= time() - max(1, $olderThanSeconds);
     }
 
-    public function deleteStalePreservedNzb(string $path, int $olderThanSeconds = 86400): bool
+    /**
+     * Settle a stale preserved source by its upgrade's outcome: removed when the upgrade committed, put back
+     * when it rolled back (see NzbSourceGuard::reconcilePreserved()).
+     *
+     * @return 'deleted'|'restored'|'kept'
+     */
+    public function reconcileStalePreservedNzb(string $path, int $olderThanSeconds = 86400, bool $apply = true): string
     {
-        return $this->isStalePreservedNzb($path, $olderThanSeconds) && @unlink($path);
+        if (! $this->isStalePreservedNzb($path, $olderThanSeconds)) {
+            return 'kept';
+        }
+        try {
+            return (new NzbSourceGuard($this))->reconcilePreserved($path, $apply);
+        } catch (Throwable $e) {
+            Log::channel('nzb_creation')->warning('Failed to reconcile a preserved NZB source', ['path' => $path, 'error' => $e->getMessage()]);
+
+            return 'kept';
+        }
     }
 
     private function temporaryNzbPath(string $path): string

@@ -104,18 +104,13 @@ class CleanNZB extends Command
         $nzb = app(NzbService::class);
         $olderThanSeconds = max(1, (int) $this->option('temp-age-hours')) * 3600;
         $checked++;
-        if ($delete) {
-            if ($nzb->deleteStalePreservedNzb($path, $olderThanSeconds)) {
-                $deleted++;
-                $this->line("Deleted stale replaced NZB: $path");
-            }
-
+        $outcome = $nzb->reconcileStalePreservedNzb($path, $olderThanSeconds, apply: (bool) $delete);
+        if ($outcome === 'kept') {
             return;
         }
-        if ($nzb->isStalePreservedNzb($path, $olderThanSeconds)) {
-            $deleted++;
-            $this->line("Would delete stale replaced NZB: $path");
-        }
+        $deleted++;
+        $verb = $outcome === 'restored' ? 'restore' : 'delete';
+        $this->line(($delete ? ucfirst($verb).'d' : 'Would '.$verb).' stale replaced NZB: '.$path);
     }
 
     private function GetReleasesWithNoNZBOnDisk(mixed $delete = false): void

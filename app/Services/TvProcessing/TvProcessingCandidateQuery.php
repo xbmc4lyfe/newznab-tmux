@@ -47,7 +47,8 @@ final class TvProcessingCandidateQuery
     public static function episodeRetryCondition(bool $ignoreSchedule = false): string
     {
         $condition = self::categoryCondition()
-            .' AND videos_id > 0 AND tv_episodes_id = '.TvLookupStatus::EpisodeMissing->value;
+            .' AND videos_id > 0 AND tv_episodes_id = '.TvLookupStatus::EpisodeMissing->value
+            .' AND '.self::settledCondition();
 
         if ($ignoreSchedule) {
             return $condition;
@@ -93,7 +94,7 @@ final class TvProcessingCandidateQuery
     }
 
     /** A partial awaiting a late-article upgrade may be renamed and reset, so a lookup on its title would go stale. */
-    private static function settledCondition(): string
+    public static function settledCondition(): string
     {
         return Release::hasLateArticleFlag() ? 'late_article_candidate_id IS NULL' : '1 = 1';
     }

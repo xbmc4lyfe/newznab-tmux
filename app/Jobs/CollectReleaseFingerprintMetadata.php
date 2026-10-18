@@ -36,9 +36,16 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
      */
     private string $generation = '';
 
+    /**
+     * This job's claim on the metadata record, kept across its queue attempts so failed() only ends its own run.
+     * Empty for a job queued before claims existed.
+     */
+    private string $runToken = '';
+
     public function __construct(private readonly int $releaseId, string $generation = '')
     {
         $this->generation = $generation;
+        $this->runToken = bin2hex(random_bytes(8));
         // Enrichment must stay asynchronous even when the default queue uses sync.
         $this->onConnection('release-fingerprint');
         $this->onQueue('release-fingerprint');
@@ -70,7 +77,7 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
         for ($round = 0; $round < 3; $round++) {
             // A query update: the model still believes it is processing, so a model update would write nothing.
             // The run token makes this run the record's only writer until another run takes it over.
-            $token = bin2hex(random_bytes(8));
+            $token = $this->runToken !== '' ? $this->runToken : bin2hex(random_bytes(8));
             ReleaseFingerprintMetadata::query()->whereKey($record->getKey())->update(['status' => 'processing', 'last_error' => null]
                 + (self::tracksRuns() ? ['run_token' => $token] : []));
             $result = $collector->collect($release->refresh());
@@ -107,6 +114,8 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
         ReleaseFingerprintMetadata::query()
             ->where('releases_id', $this->releaseId)
             ->where('status', 'processing')
+            // Never end a run that took the record over meanwhile.
+            ->when(self::tracksRuns() && $this->runToken !== '', fn ($query) => $query->where('run_token', $this->runToken))
             ->update([
                 'status' => 'failed',
                 'last_error' => $exception === null ? 'QueueJobFailed' : class_basename($exception),

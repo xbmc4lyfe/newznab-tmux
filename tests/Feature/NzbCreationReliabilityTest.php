@@ -641,9 +641,12 @@ class NzbCreationReliabilityTest extends TestCase
 
         $guid = str_repeat('h', 36);
         $canonical = $directory.'/'.$guid.'.nzb.gz';
-        $preserved = $canonical.'.'.str_repeat('c', 16).'.prev';
+        $preserved = $canonical.'.c7-'.str_repeat('c', 16).'.prev';
         $lookalike = $canonical.'.'.str_repeat('c', 15).'.prev';
 
+        $this->insertRelease(31, 'h');
+        DB::table('releases')->where('id', 31)->update(['guid' => $guid]);
+        DB::table('release_verification_candidates')->insert(['id' => 7, 'release_id' => 31]);
         file_put_contents($canonical, 'live');
         file_put_contents($lookalike, 'other');
         link($canonical, $preserved);
@@ -664,6 +667,75 @@ class NzbCreationReliabilityTest extends TestCase
         $this->assertFileDoesNotExist($preserved);
         $this->assertSame('live', file_get_contents($canonical));
         $this->assertFileExists($lookalike);
+    }
+
+    public function test_stale_preserved_link_of_a_committed_upgrade_is_deleted_and_an_uncommitted_one_restored(): void
+    {
+        $directory = $this->tempNzbPath.'/c';
+        mkdir($directory, 0777, true);
+        $nzb = new NzbService(app(CollectionCleanupService::class));
+
+        // Candidate 7 committed (release_id set): the canonical is the upgrade, the backup goes.
+        $committed = $this->stalePreservedFixture($directory, 'i', 7, 31);
+        // Candidate 8 never committed, but a later generation 12 did: still delete.
+        $later = $this->stalePreservedFixture($directory, 'j', 8, null, 12);
+        // Candidate 9 rolled back: the backup goes back over the canonical.
+        $rolledBack = $this->stalePreservedFixture($directory, 'k', 9, null);
+        // The release row is gone.
+        $orphan = $this->stalePreservedFixture($directory, 'l', 10, null, null, false);
+
+        sleep(2);
+
+        $this->assertSame('deleted', $nzb->reconcileStalePreservedNzb($committed['preserved'], 1));
+        $this->assertFileDoesNotExist($committed['preserved']);
+        $this->assertSame('upgraded', file_get_contents($committed['canonical']));
+
+        $this->assertSame('deleted', $nzb->reconcileStalePreservedNzb($later['preserved'], 1));
+        $this->assertFileDoesNotExist($later['preserved']);
+        $this->assertSame('upgraded', file_get_contents($later['canonical']));
+
+        $this->assertSame('restored', $nzb->reconcileStalePreservedNzb($rolledBack['preserved'], 1));
+        $this->assertFileDoesNotExist($rolledBack['preserved']);
+        $this->assertSame('original', file_get_contents($rolledBack['canonical']));
+
+        $this->assertSame('deleted', $nzb->reconcileStalePreservedNzb($orphan['preserved'], 1));
+        $this->assertFileDoesNotExist($orphan['preserved']);
+        $this->assertSame('upgraded', file_get_contents($orphan['canonical']));
+    }
+
+    public function test_fresh_preserved_link_is_kept_by_reconciliation_even_when_the_upgrade_rolled_back(): void
+    {
+        $directory = $this->tempNzbPath.'/d';
+        mkdir($directory, 0777, true);
+        $fixture = $this->stalePreservedFixture($directory, 'm', 9, null);
+        $nzb = new NzbService(app(CollectionCleanupService::class));
+
+        $this->assertSame('kept', $nzb->reconcileStalePreservedNzb($fixture['preserved'], 3600));
+        $this->assertFileExists($fixture['preserved']);
+        $this->assertSame('upgraded', file_get_contents($fixture['canonical']));
+    }
+
+    /**
+     * @return array{canonical: string, preserved: string}
+     */
+    private function stalePreservedFixture(string $directory, string $char, int $candidateId, ?int $releaseId, ?int $laterCandidateId = null, bool $releaseExists = true): array
+    {
+        $guid = str_repeat($char, 36);
+        $canonical = $directory.'/'.$guid.'.nzb.gz';
+        $preserved = $canonical.'.c'.$candidateId.'-'.str_repeat('a', 16).'.prev';
+        $id = 100 + $candidateId;
+        if ($releaseExists) {
+            $this->insertRelease($id, $char);
+            DB::table('releases')->where('id', $id)->update(['guid' => $guid]);
+        }
+        DB::table('release_verification_candidates')->insert(['id' => $candidateId, 'release_id' => $releaseId === null ? null : $id]);
+        if ($laterCandidateId !== null) {
+            DB::table('release_verification_candidates')->insert(['id' => $laterCandidateId, 'release_id' => $id]);
+        }
+        file_put_contents($preserved, 'original');
+        file_put_contents($canonical, 'upgraded');
+
+        return ['canonical' => $canonical, 'preserved' => $preserved];
     }
 
     private function releaseProcessingService(NzbCreationResult $result): ReleaseProcessingService
@@ -749,7 +821,7 @@ class NzbCreationReliabilityTest extends TestCase
 
     private function createSchema(): void
     {
-        foreach (['release_archive_naming_evidence', 'parts', 'binaries', 'collections', 'release_nzb_creation_failures', 'releases', 'categories', 'root_categories', 'usenet_groups'] as $table) {
+        foreach (['release_verification_candidates', 'release_archive_naming_evidence', 'parts', 'binaries', 'collections', 'release_nzb_creation_failures', 'releases', 'categories', 'root_categories', 'usenet_groups'] as $table) {
             DB::statement("DROP TABLE IF EXISTS {$table}");
         }
         DB::statement('CREATE TABLE root_categories (id INTEGER PRIMARY KEY, title VARCHAR(255), status INTEGER DEFAULT 1, disablepreview INTEGER DEFAULT 0)');
@@ -769,6 +841,7 @@ class NzbCreationReliabilityTest extends TestCase
             article_fingerprint CHAR(40) NULL
         )');
         (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
+        DB::statement('CREATE TABLE release_verification_candidates (id INTEGER PRIMARY KEY, release_id INTEGER NULL)');
         DB::statement('CREATE TABLE release_nzb_creation_failures (
             releases_id INTEGER PRIMARY KEY,
             attempts INTEGER DEFAULT 0,

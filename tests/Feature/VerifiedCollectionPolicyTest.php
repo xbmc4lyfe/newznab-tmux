@@ -6,6 +6,7 @@ namespace Tests\Feature;
 
 use App\Exceptions\CandidateMetadataBudgetExceeded;
 use App\Facades\Search;
+use App\Jobs\CollectReleaseFingerprintMetadata;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
 use App\Services\ReleaseCleaningService;
@@ -33,6 +34,7 @@ use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\DataProvider;
 
@@ -1027,6 +1029,49 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
     }
 
     /** Archive a collection (unless null), let the upload stall past the hold, and publish it as partial. */
+    public function test_an_upgrade_queues_its_fingerprint_and_invalidates_cached_rows_even_when_search_sync_fails(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('search-down', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+        $version = (int) Cache::get('releases:cache_version', 1);
+        Queue::fake();
+
+        try {
+            $this->publishStalledPartial(null, searchFails: true);
+        } catch (\RuntimeException $error) {
+            // The upgrade itself has committed; the sync failure surfaces after it.
+            $this->assertSame('Search backend unavailable.', $error->getMessage());
+        }
+        $this->assertTrue(isset($error), 'The search sync really failed.');
+
+        $this->assertSame(2, (int) DB::table('releases')->where('id', $first)->value('articles_found'), 'The upgrade committed.');
+        Queue::assertPushed(CollectReleaseFingerprintMetadata::class);
+        $this->assertSame($version + 1, (int) Cache::get('releases:cache_version', 1), 'Cached API rows no longer describe the smaller inventory.');
+    }
+
+    public function test_an_oversized_hot_snapshot_revokes_unpublished_posts_under_its_hash(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('over-budget-hot', true);
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $pending = DB::table('release_verification_candidates')->sole();
+        DB::table('release_verification_candidates')->where('id', $pending->id)->update(['lease_token' => 'worker', 'lease_until' => now()->addMinutes(5)]);
+        $late = $this->collectionForPolicy('movie.mkv', 20000, $hash, part: 3, messageId: 'e@f');
+        $binary = (int) DB::table('binaries')->where('collections_id', $late)->value('id');
+        foreach (array_chunk(range(4, 15003), 500) as $numbers) {
+            DB::table('parts')->insert(array_map(static fn (int $number): array => ['binaries_id' => $binary, 'partnumber' => $number,
+                'messageid' => str_pad((string) $number, 1000, 'm').'@late', 'size' => 5], $numbers));
+        }
+
+        DB::transaction(fn () => app(CandidateRepository::class)->invalidateHotCollections([$late]));
+
+        $after = DB::table('release_verification_candidates')->where('id', $pending->id)->first();
+        $this->assertSame(['dirty', null, (int) $pending->version + 1], [$after->status, $after->lease_token, (int) $after->version],
+            'A worker cannot publish it without these headers.');
+    }
+
     public function test_a_covering_release_with_conflicting_metadata_sends_the_generation_to_review_not_an_upgrade(): void
     {
         $this->publicationSchema(partialColumns: true);
@@ -1117,7 +1162,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
     }
 
     /** @param  list<string>  $passwords */
-    private function publishStalledPartial(?int $collectionId, bool $limits = true, ?string $source = null, array $passwords = []): ?int
+    private function publishStalledPartial(?int $collectionId, bool $limits = true, ?string $source = null, array $passwords = [], bool $searchFails = false): ?int
     {
         config(['release_verification.partial_after_hours' => 4]);
         $repository = app(CandidateRepository::class);
@@ -1143,7 +1188,11 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         if ($passwords !== []) {
             $manifest['passwords'] = $passwords;
         }
-        Search::shouldReceive('updateRelease')->zeroOrMoreTimes();
+        if ($searchFails) {
+            Search::swap(\Mockery::mock()->shouldReceive('updateRelease')->andThrow(new \RuntimeException('Search backend unavailable.'))->getMock());
+        } else {
+            Search::shouldReceive('updateRelease')->zeroOrMoreTimes();
+        }
 
         return app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('sampled', 'Partial sample.', $manifest));
     }

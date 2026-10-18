@@ -642,7 +642,17 @@ final class CandidateRepository
             try {
                 $snapshot = $this->snapshot($collection);
             } catch (CandidateMetadataBudgetExceeded) {
-                // Too large to compare here; archive() handles it on its own pass, without aborting this chunk.
+                // Too large to compare here, so conservatively revoke every unpublished post under the hash (a
+                // worker must not publish one without these headers); archive() handles them on its own pass,
+                // and this chunk is not aborted.
+                foreach ($candidates as $candidate) {
+                    if ($candidate->release_id === null && $candidate->manifest_path !== '') {
+                        DB::table('release_verification_candidates')->where('id', $candidate->id)->update([
+                            'status' => 'dirty', 'lease_token' => null, 'lease_until' => null, 'version' => $candidate->version + 1]);
+                    }
+                }
+                DB::table('collections')->where('id', $collection->id)->where('filecheck', '!=', 4)->update(['filecheck' => 3]);
+
                 continue;
             }
             $heldIds = array_map(static fn (object $held): int => (int) $held->id, $this->lockPartialHolders($identity, true));

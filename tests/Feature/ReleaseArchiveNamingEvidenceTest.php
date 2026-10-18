@@ -37,6 +37,10 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
             $table->unsignedInteger('id')->primary();
             $table->string('guid');
         });
+        Schema::create('release_verification_candidates', static function (Blueprint $table): void {
+            $table->unsignedInteger('id')->primary();
+            $table->unsignedInteger('release_id')->nullable();
+        });
         Schema::create('release_files', static function (Blueprint $table): void {
             $table->unsignedInteger('releases_id');
             $table->string('name');
@@ -277,7 +281,7 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
         file_put_contents($temporary, gzencode('upgraded'));
 
         DB::beginTransaction();
-        $receipt = $this->sources->install($this->release, $temporary, $this->path(), preserve: true);
+        $receipt = $this->sources->install($this->release, $temporary, $this->path(), preserveFor: 5);
         DB::afterRollBack(fn () => $receipt->rollback());
         self::assertSame('upgraded', gzdecode((string) file_get_contents($this->path())));
         DB::rollBack();
@@ -301,7 +305,7 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
 
         DB::beginTransaction();
         try {
-            $this->sources->install($this->release, $temporary, $this->path(), move: $move, preserve: true);
+            $this->sources->install($this->release, $temporary, $this->path(), move: $move, preserveFor: 5);
             self::fail('The identity check must reject the swapped file.');
         } catch (RuntimeException $exception) {
             self::assertSame('Staged NZB installation identity changed.', $exception->getMessage());
@@ -321,7 +325,7 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
 
         DB::beginTransaction();
         try {
-            $this->sources->install($this->release, $temporary, $this->path(), move: static fn (): bool => false, preserve: true);
+            $this->sources->install($this->release, $temporary, $this->path(), move: static fn (): bool => false, preserveFor: 5);
             self::fail('A failed move must be reported.');
         } catch (RuntimeException $exception) {
             self::assertSame('Unable to move temporary NZB into place.', $exception->getMessage());
@@ -340,7 +344,7 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
         file_put_contents($temporary, gzencode('upgraded'));
 
         DB::transaction(function () use ($temporary): void {
-            $receipt = $this->sources->install($this->release, $temporary, $this->path(), preserve: true);
+            $receipt = $this->sources->install($this->release, $temporary, $this->path(), preserveFor: 5);
             DB::afterCommit(static fn () => $receipt->close());
         });
 
@@ -551,6 +555,84 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
         file_put_contents($temporary, gzencode($contents));
 
         return $this->sources->install($this->release, $temporary, $this->path());
+    }
+
+    public function test_reconcile_deletes_a_stale_backup_whose_upgrade_committed(): void
+    {
+        $this->writeSource('upgraded');
+        $backup = $this->tagBackup(5, 'original');
+        DB::table('release_verification_candidates')->insert(['id' => 5, 'release_id' => 1]);
+
+        self::assertSame('deleted', $this->sources->reconcilePreserved($backup));
+
+        self::assertFileDoesNotExist($backup);
+        self::assertSame('upgraded', gzdecode((string) file_get_contents($this->path())));
+    }
+
+    public function test_reconcile_restores_the_backup_when_the_upgrade_did_not_commit(): void
+    {
+        $this->writeSource('upgraded');
+        $backup = $this->tagBackup(5, 'original');
+        DB::table('release_verification_candidates')->insert(['id' => 5, 'release_id' => null]);
+
+        self::assertSame('restored', $this->sources->reconcilePreserved($backup));
+
+        self::assertFileDoesNotExist($backup);
+        self::assertSame('original', gzdecode((string) file_get_contents($this->path())));
+    }
+
+    public function test_reconcile_deletes_when_a_later_generation_committed(): void
+    {
+        $this->writeSource('later upgrade');
+        $backup = $this->tagBackup(5, 'original');
+        DB::table('release_verification_candidates')->insert([['id' => 5, 'release_id' => null], ['id' => 9, 'release_id' => 1]]);
+
+        self::assertSame('deleted', $this->sources->reconcilePreserved($backup));
+
+        self::assertFileDoesNotExist($backup);
+        self::assertSame('later upgrade', gzdecode((string) file_get_contents($this->path())));
+    }
+
+    public function test_reconcile_ignores_an_earlier_generation_and_other_releases(): void
+    {
+        $this->writeSource('upgraded');
+        $backup = $this->tagBackup(5, 'original');
+        DB::table('release_verification_candidates')->insert([['id' => 3, 'release_id' => 1], ['id' => 9, 'release_id' => 2]]);
+
+        self::assertSame('restored', $this->sources->reconcilePreserved($backup));
+
+        self::assertSame('original', gzdecode((string) file_get_contents($this->path())));
+    }
+
+    public function test_reconcile_deletes_the_backup_of_a_release_that_no_longer_exists(): void
+    {
+        $this->writeSource('upgraded');
+        $backup = $this->tagBackup(5, 'original');
+        DB::table('releases')->where('id', 1)->delete();
+
+        self::assertSame('deleted', $this->sources->reconcilePreserved($backup));
+
+        self::assertFileDoesNotExist($backup);
+        self::assertSame('upgraded', gzdecode((string) file_get_contents($this->path())));
+    }
+
+    public function test_reconcile_keeps_an_untagged_backup(): void
+    {
+        $this->writeSource('upgraded');
+        $backup = $this->path().'.'.str_repeat('a', 16).'.prev';
+        file_put_contents($backup, gzencode('original'));
+
+        self::assertSame('kept', $this->sources->reconcilePreserved($backup));
+
+        self::assertFileExists($backup);
+    }
+
+    private function tagBackup(int $candidateId, string $contents): string
+    {
+        $backup = $this->path().'.c'.$candidateId.'-'.str_repeat('a', 16).'.prev';
+        file_put_contents($backup, gzencode($contents));
+
+        return $backup;
     }
 
     private function path(): string

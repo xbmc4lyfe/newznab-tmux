@@ -73,4 +73,22 @@ final class PartialReleaseTitleFenceTest extends TestCase
         $this->assertSame([2], DB::table('releases')->whereRaw(TvProcessingCandidateQuery::workCondition(1))->pluck('id')->all());
         $this->assertSame([4], DB::table('releases')->whereRaw(BookProcessingCandidateQuery::workCondition(1))->pluck('id')->all());
     }
+
+    public function test_tv_retry_and_reprocessing_skip_a_partial(): void
+    {
+        Schema::table('releases', static function (Blueprint $table): void {
+            $table->unsignedInteger('tv_lookup_attempts')->default(0);
+            $table->string('guid')->default('g');
+            $table->dateTime('adddate')->nullable();
+            $table->dateTime('postdate')->nullable();
+        });
+        DB::table('releases')->insert([
+            ['id' => 1, 'categories_id' => Category::TV_HD, 'videos_id' => 5, 'tv_episodes_id' => TvLookupStatus::EpisodeMissing->value, 'late_article_candidate_id' => 7],
+            ['id' => 2, 'categories_id' => Category::TV_HD, 'videos_id' => 5, 'tv_episodes_id' => TvLookupStatus::EpisodeMissing->value, 'late_article_candidate_id' => null],
+            ['id' => 3, 'categories_id' => Category::TV_HD, 'videos_id' => 0, 'tv_episodes_id' => TvLookupStatus::Pending->value, 'late_article_candidate_id' => 7],
+        ]);
+
+        $this->assertSame([2], DB::table('releases')->whereRaw(TvProcessingCandidateQuery::episodeRetryCondition(true))->pluck('id')->all());
+        $this->artisan('tv:reprocess-unmatched', ['--dry-run' => true])->expectsOutput('No unmatched TV releases found.')->assertSuccessful();
+    }
 }

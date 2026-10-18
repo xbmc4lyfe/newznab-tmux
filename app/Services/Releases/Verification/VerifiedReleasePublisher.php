@@ -12,6 +12,7 @@ use App\Services\Nzb\NzbArticleCoverage;
 use App\Services\Nzb\NzbArticleFingerprint;
 use App\Services\Nzb\NzbService;
 use App\Services\Nzb\ReleaseArticleFingerprintStore;
+use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\ReleaseGroupResolver;
 use App\Services\TvProcessing\TvProcessingCandidateQuery;
@@ -165,7 +166,7 @@ final class VerifiedReleasePublisher
                     }
                     if ($upgrade !== null) {
                         $retain = isset($manifest['partial']) && $this->awaitsLateArticles($manifest);
-                        $id = $this->upgradePartial($upgrade, $manifest, $metadata, $size, $totalParts, $retain ? (int) $candidate->id : null, $timing);
+                        $id = $this->upgradePartial($upgrade, $manifest, $metadata, $size, $totalParts, (int) $candidate->id, $retain, $timing);
                         $this->recordGroups($id, $manifest['groups']);
                         app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
                         $this->markPublished($candidate->id, $id, $result, retainManifest: $retain);
@@ -454,7 +455,7 @@ final class VerifiedReleasePublisher
      * @param  array<string, mixed>  $manifest
      * @param  array<string, mixed>  $metadata
      */
-    private function upgradePartial(object $release, array $manifest, array $metadata, int $size, int $totalParts, ?int $holder, ?PublicationTiming $timing): int
+    private function upgradePartial(object $release, array $manifest, array $metadata, int $size, int $totalParts, int $candidateId, bool $retain, ?PublicationTiming $timing): int
     {
         $id = (int) $release->id;
         $timing?->nextPhase('release_identity_sql');
@@ -473,10 +474,10 @@ final class VerifiedReleasePublisher
         DB::table('releases')->where('id', $id)->update(['size' => $size, 'totalpart' => $totalParts,
             'articles_found' => $partial['articles_found'] ?? null, 'articles_expected' => $partial['articles_expected'] ?? null,
             'files_found' => $partial['files_found'] ?? null, 'files_expected' => $partial['files_expected'] ?? null,
-            'late_article_candidate_id' => $holder] + $naming + $this->freshPostProcessingState());
+            'late_article_candidate_id' => $retain ? $candidateId : null] + $naming + $this->freshPostProcessingState());
         ReleaseArticleFingerprintStore::store($id, $this->incomingFingerprint($manifest));
         $timing?->nextPhase('final_xml_gzip');
-        $receipt = $this->writer->writeWithReceipt($manifest, (string) $release->guid, $release, $timing, replace: true);
+        $receipt = $this->writer->writeWithReceipt($manifest, (string) $release->guid, $release, $timing, replaceFor: $candidateId);
         DB::afterRollBack(static fn () => $receipt->rollback());
         DB::afterCommit(static fn () => $receipt->close());
         // After the replacement, and even if no collection has started yet: a run that read the smaller NZB
@@ -486,8 +487,17 @@ final class VerifiedReleasePublisher
                 ['releases_id'], ['status', 'updated_at']);
         }
         $holderLabel = bin2hex(random_bytes(4));
+        // The search sync runs last: a failing one stops later after-commit callbacks, and must not keep the
+        // stale fingerprint from being collected or cached API rows from being invalidated.
+        DB::afterCommit(static function (): void {
+            // Cached API rows still describe the smaller inventory.
+            try {
+                ReleaseBrowseService::bumpCacheVersion();
+            } catch (Throwable $cacheException) {
+                Log::warning('Could not invalidate cached release rows after a partial upgrade.', ['exception' => $cacheException::class]);
+            }
+        });
         DB::afterCommit(static function () use ($id, $holderLabel): void {
-            Search::updateRelease($id);
             try {
                 // Its own unique key: a collection still holding the release's lock would drop a plain dispatch.
                 CollectReleaseFingerprintMetadata::dispatch($id, 'upgrade-'.$holderLabel);
@@ -498,6 +508,7 @@ final class VerifiedReleasePublisher
                 ]);
             }
         });
+        DB::afterCommit(static fn () => Search::updateRelease($id));
 
         return $id;
     }

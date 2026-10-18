@@ -52,6 +52,8 @@ class ReprocessUnmatchedTvReleases extends Command
         $query = Release::query()
             ->select(['id', 'guid', 'searchname', 'videos_id', 'tv_episodes_id', 'categories_id', 'adddate', 'postdate'])
             ->whereRaw(TvProcessingCandidateQuery::categoryCondition())
+            // A partial awaiting late articles is renamed when they arrive; look it up once it settles.
+            ->whereRaw(TvProcessingCandidateQuery::settledCondition())
             ->where('videos_id', 0)
             ->whereIn('tv_episodes_id', $statuses)
             ->orderBy('adddate', 'desc')

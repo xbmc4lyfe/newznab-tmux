@@ -70,12 +70,14 @@ final class NzbSourceGuard
      * The optional digest is a compare-and-swap for parser repairs.
      *
      * @param  (callable(string, string): bool)|null  $move
+     * @param  int|null  $preserveFor  The candidate whose upgrade replaces this source: the replaced source is kept,
+     *                                 tagged with it, so a rollback, or later reconcilePreserved(), can restore it.
      */
-    public function install(object $release, string $temporary, string $destination, ?string $expectedDigest = null, ?callable $move = null, bool $preserve = false): NzbSourceInstallation
+    public function install(object $release, string $temporary, string $destination, ?string $expectedDigest = null, ?callable $move = null, ?int $preserveFor = null): NzbSourceInstallation
     {
         $this->lockRelease($release);
 
-        return $this->withGuidLock((string) $release->guid, function () use ($release, $temporary, $destination, $expectedDigest, $move, $preserve): NzbSourceInstallation {
+        return $this->withGuidLock((string) $release->guid, function () use ($release, $temporary, $destination, $expectedDigest, $move, $preserveFor): NzbSourceInstallation {
             if ($expectedDigest !== null && ($this->readCurrent((string) $release->guid)['digest'] ?? null) !== $expectedDigest) {
                 throw new RuntimeException('NZB source changed before replacement.');
             }
@@ -83,7 +85,41 @@ final class NzbSourceGuard
             return $this->installFile((string) $release->guid, $temporary, $destination,
                 static function (string $digest) use ($release): void {
                     app(ReleaseArchiveNamingEvidence::class)->sourceReplacedLocked($release, $digest);
-                }, $move, $preserve);
+                }, $move, $preserveFor);
+        });
+    }
+
+    /**
+     * Settle a replaced source a crash or failed rollback left behind, in installation's lock order. The
+     * upgrading candidate's publication commits with the replacement: if it holds the release, or a later
+     * generation does, the canonical source is current and the preserved one goes; otherwise the replacement
+     * rolled back and the preserved source, which matches the release row, is put back.
+     *
+     * @return 'deleted'|'restored'|'kept'
+     */
+    public function reconcilePreserved(string $path, bool $apply = true): string
+    {
+        if (preg_match('/^(.+)\.nzb\.gz\.c(\d+)-[0-9a-f]{16}\.prev$/D', basename($path), $match) !== 1) {
+            return 'kept';
+        }
+        [$guid, $candidateId] = [$match[1], (int) $match[2]];
+        $canonical = dirname($path).DIRECTORY_SEPARATOR.$guid.'.nzb.gz';
+
+        return DB::transaction(function () use ($path, $guid, $candidateId, $canonical, $apply): string {
+            $release = DB::table('releases')->where('guid', $guid)->lockForUpdate()->first(['id', 'guid']);
+
+            return $this->withGuidLock($guid, function () use ($release, $path, $candidateId, $canonical, $apply): string {
+                $committed = $release === null || DB::table('release_verification_candidates')->where('release_id', $release->id)
+                    ->where('id', '>=', $candidateId)->exists();
+                if (! $apply) {
+                    return $committed ? 'deleted' : 'restored';
+                }
+                if ($committed) {
+                    return @unlink($path) ? 'deleted' : 'kept';
+                }
+
+                return @rename($path, $canonical) ? 'restored' : 'kept';
+            });
         });
     }
 
@@ -393,7 +429,7 @@ final class NzbSourceGuard
      * @param  (callable(string): void)|null  $beforeRename
      * @param  (callable(string, string): bool)|null  $move
      */
-    private function installFile(string $guid, string $temporary, string $destination, ?callable $beforeRename = null, ?callable $move = null, bool $preserve = false): NzbSourceInstallation
+    private function installFile(string $guid, string $temporary, string $destination, ?callable $beforeRename = null, ?callable $move = null, ?int $preserveFor = null): NzbSourceInstallation
     {
         $previous = null;
         $handle = @fopen($temporary, 'rb');
@@ -412,9 +448,9 @@ final class NzbSourceGuard
             if ($beforeRename !== null) {
                 $beforeRename($digest);
             }
-            if ($preserve && is_file($destination)) {
+            if ($preserveFor !== null && is_file($destination)) {
                 // Keep the replaced source reachable so a rolled-back replacement can restore it.
-                $previous = $destination.'.'.bin2hex(random_bytes(8)).'.prev';
+                $previous = $destination.'.c'.$preserveFor.'-'.bin2hex(random_bytes(8)).'.prev';
                 if (! @link($destination, $previous)) {
                     throw new RuntimeException('Cannot preserve the NZB being replaced.');
                 }

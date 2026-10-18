@@ -98,4 +98,31 @@ final class ReleaseFingerprintStaleUpgradeTest extends TestCase
 
         $this->assertSame(2, $reads, 'The overtaken run did not save; it collected again as the new owner.');
     }
+
+    #[Test]
+    public function a_failing_job_never_ends_a_run_that_took_the_record_over(): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:',
+            'database.connections.sqlite.url' => null]);
+        DB::purge();
+        DB::reconnect();
+        Schema::create('releases', static function (Blueprint $table): void {
+            $table->increments('id');
+            $table->string('guid');
+        });
+        DB::table('releases')->insert(['id' => 1, 'guid' => 'overlapping']);
+        (require database_path('migrations/2026_10_12_120000_create_release_fingerprint_metadata_table.php'))->up();
+        (require database_path('migrations/2026_10_18_000000_add_run_token_to_release_fingerprint_metadata.php'))->up();
+        $older = unserialize(serialize(new CollectReleaseFingerprintMetadata(1)));
+        $token = (fn (): string => $this->runToken)->call($older);
+        DB::table('release_fingerprint_metadata')->insert(['releases_id' => 1, 'status' => 'processing', 'run_token' => 'upgraderun000000',
+            'created_at' => now(), 'updated_at' => now()]);
+
+        $older->failed(new \RuntimeException('exhausted'));
+        $this->assertSame('processing', DB::table('release_fingerprint_metadata')->value('status'), 'The upgrade run still owns it.');
+
+        DB::table('release_fingerprint_metadata')->update(['run_token' => $token]);
+        $older->failed(new \RuntimeException('exhausted'));
+        $this->assertSame('failed', DB::table('release_fingerprint_metadata')->value('status'), 'Its own run is ended.');
+    }
 }
