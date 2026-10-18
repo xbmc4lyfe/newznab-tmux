@@ -30,6 +30,9 @@ final class PublicationOutbox
      */
     public const int ALIVE_SECONDS = 30;
 
+    /** The shortest forwarder restart period: the one-minute scheduler cadence, twice over (a run, then its restart). */
+    public const int MINIMUM_PERIOD_SECONDS = 120;
+
     /** Seconds a quarantined entry is kept for inspection. */
     private const int QUARANTINE_SECONDS = 3600;
 
@@ -81,6 +84,10 @@ final class PublicationOutbox
             }
             File::ensureDirectoryExists($directory, 0700);
         }
+        // Optional, but never to be followed: sweeping and quarantining act on it.
+        if (is_link($this->root.'/failed')) {
+            throw new RuntimeException('The publication outbox cannot be a symlink.');
+        }
         if ($slot !== null) {
             $inflight = $this->inflightDirectory($slot);
             if (is_link($inflight)) {
@@ -88,6 +95,15 @@ final class PublicationOutbox
             }
             File::ensureDirectoryExists($inflight, 0700);
         }
+    }
+
+    /**
+     * Whether a directory of the outbox, its parent or the outbox itself is a symlink. Links are never
+     * followed: scanning, sweeping and quarantining through one would act outside the outbox.
+     */
+    private function linked(string $directory): bool
+    {
+        return is_link($directory) || is_link(dirname($directory)) || is_link($this->root);
     }
 
     public function inflightDirectory(int $slot): string
@@ -133,6 +149,9 @@ final class PublicationOutbox
     private function slotDirectories(): array
     {
         $directories = [];
+        if ($this->linked($this->root.'/inflight')) {
+            return [];
+        }
         foreach (@scandir($this->root.'/inflight') ?: [] as $slot) {
             $path = $this->root.'/inflight/'.$slot;
             if ($slot !== '.' && $slot !== '..' && ! is_link($path) && is_dir($path)) {
@@ -344,6 +363,9 @@ final class PublicationOutbox
     public function foreignSlots(int $except): array
     {
         $slots = [];
+        if ($this->linked($this->root.'/inflight')) {
+            return [];
+        }
         foreach (@scandir($this->root.'/inflight') ?: [] as $folder) {
             if (preg_match('/\A[1-9]\d*\z/D', $folder) === 1 && (int) $folder !== $except && ! is_link($this->root.'/inflight/'.$folder)
                 && $this->names($this->root.'/inflight/'.$folder) !== []) {
@@ -362,7 +384,7 @@ final class PublicationOutbox
     {
         $moved = 0;
         $directory = $this->inflightDirectory($slot);
-        if (is_link($directory)) {
+        if ($this->linked($directory) || $this->linked($this->root.'/pending')) {
             return 0;
         }
         foreach ($this->names($directory) as $name) {
@@ -379,12 +401,15 @@ final class PublicationOutbox
 
     /**
      * Seconds forwarder $number runs before the scheduler restarts it: never more than the configured
-     * period (so a container stop need not wait for it), and staggered by whole minutes inside that
-     * period so the forwarders do not all restart at once.
+     * period (so a container stop need not wait for it), 10 s short of whole minutes so the restart tick
+     * follows at once, and staggered by whole minutes inside that period so the forwarders do not all
+     * restart together. A period under {@see MINIMUM_PERIOD_SECONDS} counts as that.
      */
     public static function forwarderLifetime(int $number): int
     {
-        $period = max(30, (int) config('release_verification.publish_forwarder_seconds', 300));
+        // The scheduler starts forwarders once a minute, so a run must span a whole tick and the restart after it:
+        // below two minutes, a forwarder would leave a gap of most of every minute with none running.
+        $period = max(self::MINIMUM_PERIOD_SECONDS, (int) config('release_verification.publish_forwarder_seconds', 300));
         $lives = max(1, intdiv($period, 60) - 1);
 
         return max(20, $period - 10 - 60 * ((max(1, $number) - 1) % $lives));
@@ -432,7 +457,7 @@ final class PublicationOutbox
         }
         $this->stuck[$path] = true;
         $failed = $this->root.'/failed';
-        if ((is_dir($failed) || @mkdir($failed, 0700)) && @rename($path, $failed.'/'.$name)) {
+        if (! $this->linked($failed) && ! $this->linked(dirname($path)) && (is_dir($failed) || @mkdir($failed, 0700)) && @rename($path, $failed.'/'.$name)) {
             unset($this->stuck[$path]);
         }
 
@@ -449,7 +474,7 @@ final class PublicationOutbox
     {
         $now = time();
         $stale = [];
-        foreach (@scandir($this->root.'/failed') ?: [] as $file) {
+        foreach ($this->linked($this->root.'/failed') ? [] : (@scandir($this->root.'/failed') ?: []) as $file) {
             $path = $this->root.'/failed/'.$file;
             if ($file !== '.' && $file !== '..' && ! is_link($path) && is_file($path) && ($modified = @filemtime($path)) !== false
                 && $now - $modified > self::QUARANTINE_SECONDS) {
@@ -457,7 +482,7 @@ final class PublicationOutbox
             }
         }
         foreach ([$this->root.'/pending', ...$this->slotDirectories()] as $directory) {
-            foreach (@scandir($directory) ?: [] as $file) {
+            foreach ($this->linked($directory) ? [] : (@scandir($directory) ?: []) as $file) {
                 $path = $directory.'/'.$file;
                 if (str_starts_with($file, '.') && str_ends_with($file, '.tmp') && is_file($path) && ! is_link($path)
                     && ($modified = @filemtime($path)) !== false && $now - $modified > $olderThanSeconds) {
@@ -481,7 +506,7 @@ final class PublicationOutbox
     private function names(string $directory): array
     {
         $names = [];
-        foreach (@scandir($directory) ?: [] as $file) {
+        foreach ($this->linked($directory) ? [] : (@scandir($directory) ?: []) as $file) {
             if (! str_starts_with($file, '.') && str_ends_with($file, '.json')) {
                 $names[] = $file;
             }

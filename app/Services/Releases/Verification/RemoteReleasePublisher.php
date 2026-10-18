@@ -30,6 +30,9 @@ final class RemoteReleasePublisher
     /** @var (callable(): bool)|null Asked before each request of a {@see publishMany()} call whether to start no more. */
     private $cancelled = null;
 
+    /** @var list<array{items: int, started: int, finished: int, failed: bool}> HTTP requests of the last {@see publishMany()} call. */
+    private array $requests = [];
+
     /** Items of the current {@see publishMany()} call that already have an outcome. */
     private int $completed = 0;
 
@@ -112,12 +115,26 @@ final class RemoteReleasePublisher
         $this->progress = $progress;
         $this->cancelled = $cancelled;
         $this->completed = 0;
+        $this->requests = [];
         try {
             return $this->publishItems($items);
         } finally {
             $this->progress = null;
             $this->cancelled = null;
         }
+    }
+
+    /**
+     * Every HTTP request the last {@see publishMany()} call made, one by one: the batch request, then
+     * (when it was refused or unavailable) each single request. `failed` marks a request that produced
+     * no usable answer (a connection failure or timeout, or an unusable batch response). Times are
+     * hrtime() nanoseconds. Not recorded: items that were not attempted.
+     *
+     * @return list<array{items: int, started: int, finished: int, failed: bool}>
+     */
+    public function requests(): array
+    {
+        return $this->requests;
     }
 
     /**
@@ -155,7 +172,7 @@ final class RemoteReleasePublisher
             }
         }
         if ($payloads !== []) {
-            $sent = $this->cancelledNow() ? $this->notSent(array_keys($payloads)) : ($this->batchAvailable() ? $this->sendBatch($payloads) : null);
+            $sent = $this->cancelledNow() ? $this->notSent(array_keys($payloads)) : ($this->batchAvailable() ? $this->timedBatch($payloads) : null);
             foreach ($sent ?? $this->publishEach($items, array_keys($payloads)) as $position => $outcome) {
                 $outcomes[$position] = $outcome;
             }
@@ -163,6 +180,25 @@ final class RemoteReleasePublisher
         ksort($outcomes);
 
         return array_values($outcomes);
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $payloads  By the item's position in the caller's list.
+     * @return array<int, PublicationOutcome>|null By position; null when the single endpoint must publish instead.
+     */
+    private function timedBatch(array $payloads): ?array
+    {
+        $started = hrtime(true);
+        try {
+            $sent = $this->sendBatch($payloads);
+        } catch (\Throwable $error) {
+            $this->requests[] = ['items' => count($payloads), 'started' => $started, 'finished' => hrtime(true), 'failed' => true];
+
+            throw $error;
+        }
+        $this->requests[] = ['items' => count($payloads), 'started' => $started, 'finished' => hrtime(true), 'failed' => false];
+
+        return $sent;
     }
 
     /**
@@ -262,18 +298,23 @@ final class RemoteReleasePublisher
 
                 continue;
             }
+            $started = hrtime(true);
+            $failed = false;
             try {
                 $releaseId = $this->publish($items[$position]->claim, $items[$position]->result);
                 $outcomes[$position] = $releaseId === null ? new PublicationOutcome(PublicationOutcome::NO_RELEASE)
                     : new PublicationOutcome(PublicationOutcome::PUBLISHED, $releaseId);
             } catch (ConnectionException $error) {
+                $failed = true;
                 // A refused or dropped connection or a timeout is no answer from the primary; an error
                 // response (a RuntimeException from publish()) is, and stays an ERROR below.
                 $unreachable = mb_strcut('Remote publication could not reach the primary: '.$error->getMessage(), 0, 500, 'UTF-8');
                 $outcomes[$position] = new PublicationOutcome(PublicationOutcome::TRANSPORT, null, $unreachable);
             } catch (\Throwable $error) {
+                // An error response is an answer, not a transport failure.
                 $outcomes[$position] = new PublicationOutcome(PublicationOutcome::ERROR, null, mb_strcut($error->getMessage(), 0, 500, 'UTF-8'));
             }
+            $this->requests[] = ['items' => 1, 'started' => $started, 'finished' => hrtime(true), 'failed' => $failed];
         }
 
         return $outcomes;

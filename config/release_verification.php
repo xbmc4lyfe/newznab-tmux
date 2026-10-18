@@ -48,7 +48,8 @@ return [
     'publish_forward_max_attempts' => (int) env('RELEASE_VERIFICATION_PUBLISH_FORWARD_MAX_ATTEMPTS', 5),
     // Period in seconds after which the scheduler restarts a forwarder. No run lasts longer (forwarder N runs
     // 10 s short of it, less (N-1) whole minutes, wrapping inside it), so a container stop does not wait long;
-    // keep it well under the container's stop grace period.
+    // keep it well under the container's stop grace period. The scheduler starts forwarders once a minute, so
+    // anything under 120 is treated as 120 (a shorter run would leave minutes with no forwarder running).
     'publish_forwarder_seconds' => (int) env('RELEASE_VERIFICATION_PUBLISH_FORWARDER_SECONDS', 300),
     // A forwarder counts as alive to workers for this many seconds after it last touched its marker. It touches
     // it every few seconds, idle or while a request waits for the primary (up to publish_timeout, through cURL's

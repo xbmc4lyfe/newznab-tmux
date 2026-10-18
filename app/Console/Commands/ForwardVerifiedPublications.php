@@ -464,7 +464,6 @@ class ForwardVerifiedPublications extends Command
             return;
         }
         $this->outbox->touchAlive($this->slot);
-        $started = hrtime(true);
         $failure = null;
         $outcomes = [];
         try {
@@ -476,7 +475,10 @@ class ForwardVerifiedPublications extends Command
         } catch (Throwable $error) {
             $failure = $error;
         }
-        $this->diagnostics?->batch(count($live), $started, hrtime(true), $failure !== null);
+        // One entry per HTTP request, so a one-by-one fallback is not mistaken for one big batch.
+        foreach ($publisher->requests() as $request) {
+            $this->diagnostics?->batch($request['items'], $request['started'], $request['finished'], $request['failed']);
+        }
         // The request may have outlived the database session that held the locks. Then nothing may be
         // written: the entries stay in flight, to be replayed (the primary treats a resend idempotently)
         // or left to lease expiry, once the storage has an owner again.
