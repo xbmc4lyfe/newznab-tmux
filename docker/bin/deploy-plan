@@ -1524,6 +1524,8 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
         # schema; the idempotent migration always follows it, and its forgotten record makes a retry
         # repeat it until it completes.
         or "mariadb" in dirty_data
+        # Reconciling it may recreate it on a changed definition too (e.g. restored storage).
+        or "mariadb" in reconcile_data
         # The app now connects to another database. Stamps from before this record never migrate for it.
         or ("database" in stamped and stamped["database"] != state["database"])
     )

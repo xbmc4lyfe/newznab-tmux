@@ -365,6 +365,20 @@ SH);
         $this->assertFileExists($this->directory.'/docker/.deploy.stamp.barrier-owed');
     }
 
+    public function test_reconciling_an_unrecorded_database_migrates(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $stamp = (string) file_get_contents($this->directory.'/docker/.deploy.stamp');
+        // A lost record (and a stamp left unfinished) makes the next run reconcile it.
+        file_put_contents($this->directory.'/docker/.deploy.stamp', preg_replace(['/^[^\n]*\n/', '/^service:mariadb=.*\n/m'], ["stale\n", ''], $stamp, 1));
+        file_put_contents($this->directory.'/events', '');
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('--wait-timeout 240 mariadb', $events);
+        $this->assertGreaterThan(strpos($events, '--wait-timeout 240 mariadb'), strpos($events, 'artisan migrate --force'));
+    }
+
     public function test_another_data_service_keeps_the_existing_barrier(): void
     {
         mkdir($this->directory.'/docker/config/redis', 0777, true);
