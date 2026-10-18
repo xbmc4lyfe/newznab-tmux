@@ -19,6 +19,21 @@ use Tests\TestCase;
 final class ReleaseFingerprintStaleUpgradeTest extends TestCase
 {
     #[Test]
+    public function a_job_queued_before_upgrade_generations_existed_still_releases_its_unique_lock(): void
+    {
+        // The payload such a job was queued with: the release id alone.
+        $payload = ['releaseId' => 42, 'connection' => 'release-fingerprint', 'queue' => 'release-fingerprint'];
+        $payload = array_combine(array_map(static fn (string $key): string => $key === 'releaseId'
+            ? "\0".CollectReleaseFingerprintMetadata::class."\0releaseId" : $key, array_keys($payload)), $payload);
+        $job = (new \ReflectionClass(CollectReleaseFingerprintMetadata::class))->newInstanceWithoutConstructor();
+        $job->__unserialize($payload);
+
+        $this->assertSame('42', $job->uniqueId());
+        $upgrade = unserialize(serialize(new CollectReleaseFingerprintMetadata(42, 'upgrade-x')));
+        $this->assertSame('42:upgrade-x', $upgrade->uniqueId());
+    }
+
+    #[Test]
     public function a_run_overtaken_by_an_in_place_upgrade_collects_again_instead_of_saving_old_metadata(): void
     {
         config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:',

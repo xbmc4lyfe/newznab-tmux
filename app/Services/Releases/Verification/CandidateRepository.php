@@ -92,22 +92,7 @@ final class CandidateRepository
                         try {
                             // A filtered newer post skipped the snapshot; these headers may still be a partial's.
                             $manifest ??= $this->snapshotHeaders($collection, $currentReads);
-                            $holder = $this->partialOwner($holders, $manifest);
-                            if ($holder !== null && (int) $collection->filecheck === 4 && isset($collection->releases_id)) {
-                                // A legacy release's headers publish that release; merged into a partial, the
-                                // generation could upgrade neither, so they are kept apart.
-                                $holder = null;
-                            }
-                            if ($holder !== null) {
-                                // An established repost under the same hash (pending, holding no partial) that also takes
-                                // these headers makes them ambiguous: never upgrade the partial with possibly mixed
-                                // articles. They then follow the repost, as ordinary pending headers do.
-                                $repost = $this->lockLatestUnheld($sourceIdentity, array_map(static fn (object $held): int => (int) $held->id, $holders));
-                                if ($repost !== null && $repost->manifest_path !== ''
-                                    && ! $this->spoils($this->store->read($repost->manifest_path), $this->merge($this->store->read($repost->manifest_path), $manifest))) {
-                                    $holder = null;
-                                }
-                            }
+                            $holder = $this->lateArticleOwner($collection, $sourceIdentity, $holders, $manifest);
                         } catch (CandidateMetadataBudgetExceeded $error) {
                             $snapshotFailure = $error;
                         }
@@ -651,7 +636,7 @@ final class CandidateRepository
             }
             $heldIds = array_map(static fn (object $held): int => (int) $held->id, $this->lockPartialHolders($identity));
             $holders = array_values(array_filter($candidates->all(), static fn (object $candidate): bool => in_array((int) $candidate->id, $heldIds, true)));
-            $owner = $holders === [] ? null : $this->partialOwner($holders, $snapshot);
+            $owner = $holders === [] ? null : $this->lateArticleOwner($collection, $identity, $holders, $snapshot);
             if ($owner !== null) {
                 // A partial's late articles: refresh its holder and archive them now, which merges them into the
                 // generation that upgrades it. Other posts under the hash are left alone.
@@ -690,6 +675,33 @@ final class CandidateRepository
                 break;
             }
         }
+    }
+
+    /**
+     * The holder these headers are a partial's late articles for, as archive() routes them; hot-collection
+     * invalidation must pick the same one, or it marks a candidate archive() never merges into.
+     *
+     * @param  list<object>  $holders
+     * @param  array<string, mixed>  $manifest
+     */
+    private function lateArticleOwner(object $collection, string $sourceIdentity, array $holders, array $manifest): ?object
+    {
+        $holder = $this->partialOwner($holders, $manifest);
+        if ($holder === null || ((int) $collection->filecheck === 4 && isset($collection->releases_id))) {
+            // A legacy release's headers publish that release; merged into a partial, the generation could
+            // upgrade neither, so they are kept apart.
+            return null;
+        }
+        // An established repost under the same hash (pending, holding no partial) that also takes these headers
+        // makes them ambiguous: never upgrade the partial with possibly mixed articles. They then follow the
+        // repost, as ordinary pending headers do.
+        $repost = $this->lockLatestUnheld($sourceIdentity, array_map(static fn (object $held): int => (int) $held->id, $holders));
+        if ($repost !== null && $repost->manifest_path !== ''
+            && ! $this->spoils($this->store->read($repost->manifest_path), $this->merge($this->store->read($repost->manifest_path), $manifest))) {
+            return null;
+        }
+
+        return $holder;
     }
 
     /**

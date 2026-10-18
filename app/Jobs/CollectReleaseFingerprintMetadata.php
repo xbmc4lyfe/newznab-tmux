@@ -28,11 +28,15 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
     public int $uniqueFor = 3600;
 
     /**
-     * @param  string  $generation  Distinguishes the run an in-place partial upgrade requests from one already
-     *                              queued or running, whose unique lock would otherwise drop it.
+     * Distinguishes the run an in-place partial upgrade requests from one already queued or running, whose
+     * unique lock would otherwise drop it. A class default, not a promoted one: jobs queued before it existed
+     * unserialize without it.
      */
-    public function __construct(private readonly int $releaseId, private readonly string $generation = '')
+    private string $generation = '';
+
+    public function __construct(private readonly int $releaseId, string $generation = '')
     {
+        $this->generation = $generation;
         // Enrichment must stay asynchronous even when the default queue uses sync.
         $this->onConnection('release-fingerprint');
         $this->onQueue('release-fingerprint');

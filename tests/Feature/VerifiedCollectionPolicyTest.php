@@ -930,6 +930,45 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(2, DB::table('releases')->count());
     }
 
+    /** @return array<string, array{string}> */
+    public static function divertedLateHeaders(): array
+    {
+        return ['a pending repost also takes them' => ['repost'], 'a legacy release' => ['legacy']];
+    }
+
+    #[DataProvider('divertedLateHeaders')]
+    public function test_hot_invalidation_never_marks_a_generation_archive_will_not_merge_into(string $case): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('hot-'.$case, true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+        $generation = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        if ($case === 'repost') {
+            // The same poster's conflicting part 1 is archived apart, unpublished.
+            app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 1, messageId: 'b1@b'));
+        }
+        $late = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 3, messageId: 'e@f');
+        if ($case === 'legacy') {
+            $release = (array) DB::table('releases')->where('id', $first)->first();
+            DB::table('releases')->insert(['id' => $first + 100, 'guid' => 'legacy-hot', 'nzbstatus' => NzbService::NZB_NONE,
+                'articles_found' => null, 'articles_expected' => null, 'files_found' => null, 'files_expected' => null, 'late_article_candidate_id' => null] + $release);
+            if (! Schema::hasColumn('collections', 'releases_id')) {
+                Schema::table('collections', fn (Blueprint $table) => $table->unsignedBigInteger('releases_id')->nullable());
+            }
+            DB::table('collections')->where('id', $late)->update(['filecheck' => 4, 'releases_id' => $first + 100]);
+        }
+
+        DB::transaction(fn () => app(CandidateRepository::class)->invalidateHotCollections([$late]));
+        app(CandidateRepository::class)->archive($late);
+
+        $after = DB::table('release_verification_candidates')->where('id', $generation->id)->first();
+        $this->assertSame([$generation->status, (int) $generation->version], [$after->status, (int) $after->version],
+            'The generation is left claimable: these headers went elsewhere.');
+        $this->assertSame(['a@b', 'c@d'], array_column(app(ManifestStore::class)->read($after->manifest_path)['files'][0]['segments'], 'messageid'));
+        $this->assertSame((int) $generation->id, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
+    }
+
     public function test_a_legacy_releases_late_headers_are_kept_apart_from_a_partial(): void
     {
         $this->publicationSchema(partialColumns: true);
