@@ -533,14 +533,17 @@ final class CompactFingerprintCollector
     }
 
     /**
-     * Integrity failures the analyzer established for one provider's copy of an article.
+     * Integrity errors for one provider's copy of an article. The copy is clean only on positive
+     * evidence: yEnc framing parsed, the declared CRC matches, the structure is single-part or a
+     * complete multipart, escaping is valid and no size disagrees. Anything else is reported, with a
+     * specific error where the analyzer established one and YencUnverified otherwise.
      *
      * @return list<string>
      */
     private static function yencIntegrityErrors(mixed $yenc): array
     {
         if (! is_array($yenc)) {
-            return [];
+            return ['YencUnverified'];
         }
         $errors = [];
         if (($yenc['declared_crc32_matches'] ?? null) === false) {
@@ -555,17 +558,19 @@ final class CompactFingerprintCollector
         if (($yenc['payload_escape_state_valid'] ?? null) === false) {
             $errors[] = 'YencFramingInvalid';
         }
-        // Every structural failure or ambiguity the analyzer establishes keeps the record partial.
-        $structureInvalid = in_array($yenc['multipart_structure_status'] ?? null, ['invalid', 'incomplete', 'ambiguous'], true)
-            || ($yenc['integrity_checks_ambiguous'] ?? null) === true
-            || (is_array($yenc['conflicting_control_fields'] ?? null) && $yenc['conflicting_control_fields'] !== []);
-        foreach (['ypart_range_valid', 'header_numeric_fields_valid', 'header_numeric_fields_representable',
-            'trailer_numeric_fields_valid', 'trailer_numeric_fields_representable',
-            'trailer_part_matches_header', 'trailer_total_matches_header'] as $check) {
-            $structureInvalid = $structureInvalid || ($yenc[$check] ?? null) === false;
-        }
-        if ($structureInvalid) {
-            $errors[] = 'YencStructureInvalid';
+        $verified = ($yenc['declared_crc32_matches'] ?? null) === true
+            && in_array($yenc['multipart_structure_status'] ?? null, ['single-part', 'complete'], true)
+            && ($yenc['payload_escape_state_valid'] ?? null) === true
+            && ($yenc['integrity_checks_ambiguous'] ?? null) !== true
+            && ($yenc['decoded_size_matches_yend_size'] ?? null) === true
+            && ! in_array(false, array_map(static fn (string $check): mixed => $yenc[$check] ?? null, [
+                'decoded_size_matches_yenc', 'decoded_size_matches_ypart_range', 'ypart_range_valid',
+                'header_numeric_fields_valid', 'header_numeric_fields_representable', 'trailer_numeric_fields_valid',
+                'trailer_numeric_fields_representable', 'trailer_part_matches_header', 'trailer_total_matches_header',
+            ]), true)
+            && (! is_array($yenc['conflicting_control_fields'] ?? null) || $yenc['conflicting_control_fields'] === []);
+        if (! $verified && $errors === []) {
+            $errors[] = 'YencUnverified';
         }
 
         return $errors;

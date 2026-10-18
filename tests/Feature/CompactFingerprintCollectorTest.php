@@ -315,7 +315,43 @@ final class CompactFingerprintCollectorTest extends TestCase
             'range outside the file' => [static fn (string $body): string => str_replace('=ypart begin=1 end=16', '=ypart begin=90 end=105', $body)],
             'trailer part disagrees' => [static fn (string $body): string => str_replace('=yend size=16 part=1', '=yend size=16 part=2', $body)],
             'non-numeric header size' => [static fn (string $body): string => str_replace('size=32 name=', 'size=abc name=', $body)],
+            'malformed part CRC' => [static fn (string $body): string => (string) preg_replace('/pcrc32=[0-9a-f]{8}/', 'pcrc32=XYZ', $body)],
+            'missing trailer' => [static fn (string $body): string => (string) preg_replace('/\r\n=yend[^\r\n]*/', '', $body)],
         ];
+    }
+
+    /** @return array<string, array{callable(string): string}> */
+    public static function unverifiableSinglePartBodies(): array
+    {
+        return [
+            'malformed CRC' => [static fn (string $body): string => (string) preg_replace('/crc32=[0-9a-f]{8}/', 'crc32=XYZ', $body)],
+            'missing CRC' => [static fn (string $body): string => (string) preg_replace('/ crc32=[0-9a-f]{8}/', '', $body)],
+            'missing trailer' => [static fn (string $body): string => (string) preg_replace('/\r\n=yend[^\r\n]*/', '', $body)],
+            'trailer without size' => [static fn (string $body): string => str_replace('=yend size=16 ', '=yend ', $body)],
+            'not yEnc at all' => [static fn (string $body): string => "plain text body\r\n"],
+        ];
+    }
+
+    /** @param callable(string): string $corrupt */
+    #[Test]
+    #[DataProvider('unverifiableSinglePartBodies')]
+    public function an_unverifiable_single_part_article_keeps_the_record_partial(callable $corrupt): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(function (string $id) use ($corrupt): array {
+            $article = self::article($id);
+            if (str_starts_with($id, 'f1-')) {
+                $article['body'] = $corrupt($article['body']);
+            }
+
+            return $article;
+        });
+
+        $result = $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7);
+
+        $this->assertSame('partial', $result['status']);
+        $this->assertNotSame([], $result['data']['errors']);
     }
 
     /** @param callable(string): string $corrupt */
@@ -334,7 +370,7 @@ final class CompactFingerprintCollectorTest extends TestCase
         $result = $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7);
 
         $this->assertSame('partial', $result['status']);
-        $this->assertContains('YencStructureInvalid', array_column($result['data']['errors'], 'error_type'));
+        $this->assertNotSame([], $result['data']['errors']);
     }
 
     #[Test]
@@ -428,6 +464,9 @@ final class CompactFingerprintCollectorTest extends TestCase
         $this->assertFalse(CollectReleaseFingerprintMetadata::isCurrent($full));
         $this->assertFalse(CollectReleaseFingerprintMetadata::isCurrent(['format' => CompactFingerprintCollector::FORMAT, 'schema_version' => 0]));
         $this->assertFalse(CollectReleaseFingerprintMetadata::isCurrent(null));
+        foreach ([1.9, true, '1', '1garbage'] as $loose) {
+            $this->assertFalse(CollectReleaseFingerprintMetadata::isCurrent(['format' => CompactFingerprintCollector::FORMAT, 'schema_version' => $loose]));
+        }
         // A newer version left behind by a rollback is collected again too.
         $this->assertFalse(CollectReleaseFingerprintMetadata::isCurrent(['format' => CompactFingerprintCollector::FORMAT, 'schema_version' => CompactFingerprintCollector::SCHEMA_VERSION + 1]));
 

@@ -56,7 +56,7 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
     public static function isCurrent(?array $metadata): bool
     {
         return is_array($metadata) && ($metadata['format'] ?? null) === self::currentFormat()
-            && (int) ($metadata['schema_version'] ?? 0) === self::currentSchemaVersion();
+            && ($metadata['schema_version'] ?? null) === self::currentSchemaVersion();
     }
 
     private static function compactFormat(): bool
