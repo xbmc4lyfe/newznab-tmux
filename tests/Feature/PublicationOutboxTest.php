@@ -1718,6 +1718,144 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->assertFileExists($this->inflightPath($claim));
     }
 
+    public function test_a_period_shorter_than_the_scheduler_cadence_is_clamped_so_no_minute_is_left_uncovered(): void
+    {
+        foreach ([30, 60, 90, 119] as $period) {
+            config(['release_verification.publish_forwarder_seconds' => $period]);
+            foreach (range(1, 8) as $number) {
+                // Exits 10 s before the second tick after its start; the restart follows at once.
+                $this->assertSame(110, PublicationOutbox::forwarderLifetime($number));
+            }
+        }
+        config(['release_verification.publish_forwarder_seconds' => 30, 'release_verification.publish_forwarders' => 4,
+            'release_verification.worker_only' => true, 'release_verification.publish_url' => self::SINGLE, 'release_verification.publish_async' => true]);
+        $commands = $this->forwarderCommands($this->scheduledCommands());
+        $this->assertCount(4, $commands);
+        foreach ($commands as $command) {
+            $this->assertStringContainsString('--max-seconds=110 ', $command);
+        }
+    }
+
+    public function test_a_symlinked_quarantine_directory_is_never_swept_or_filled(): void
+    {
+        $this->configureAsync();
+        $this->outbox()->prepare(1);
+        $outside = config('release_verification.storage_path').'/outside';
+        mkdir($outside);
+        file_put_contents($outside.'/precious.json', 'keep');
+        touch($outside.'/precious.json', time() - 90000);
+        symlink($outside, $this->outbox()->directory().'/failed');
+
+        // Looking, sweeping and parking all refuse; prepare() names the problem.
+        $this->assertSame([], $this->outbox()->staleFiles());
+        $this->outbox()->sweepTemporaryFiles();
+        $this->assertFileExists($outside.'/precious.json');
+        $this->expectException(\RuntimeException::class);
+        $this->outbox()->prepare(1);
+    }
+
+    public function test_outbox_directories_that_are_symlinks_are_neither_read_swept_nor_moved_into(): void
+    {
+        $this->configureAsync();
+        $this->outbox()->prepare(1);
+        $directory = $this->outbox()->directory();
+        $outside = config('release_verification.storage_path').'/outside';
+        mkdir($outside);
+        mkdir($outside.'/1');
+        $name = '9-1-abcdef123456.json';
+        $document = json_encode(['claim' => ['id' => 9, 'version' => 1, 'manifest_hash' => str_repeat('a', 64), 'lease_token' => 't'],
+            'reason' => 'r', 'evidence' => $this->evidence(), 'enqueued_at' => microtime(true)], JSON_THROW_ON_ERROR);
+        foreach (['/pending', '/inflight/1', '/inflight'] as $linked) {
+            // Swap one directory for a link to a folder holding a valid entry and an old temporary file.
+            $original = $directory.$linked;
+            rename($original, $original.'.real');
+            $target = $outside.str_replace('/', '_', $linked);
+            mkdir($target);
+            file_put_contents($target.'/'.$name, $document);
+            file_put_contents($target.'/.x.tmp', 'keep');
+            touch($target.'/.x.tmp', time() - 5000);
+            symlink($target, $original);
+
+            $this->assertSame(0, $this->outbox()->depth(), $linked);
+            $this->assertSame([], $this->outbox()->pending(), $linked);
+            $this->assertSame([], $this->outbox()->foreignSlots(5), $linked);
+            $this->assertSame([], $this->outbox()->staleFiles(), $linked);
+            $this->outbox()->sweepTemporaryFiles();
+            $this->assertFileExists($target.'/.x.tmp');
+            $this->assertFileExists($target.'/'.$name);
+
+            unlink($original);
+            rename($original.'.real', $original);
+        }
+        // The whole outbox, replaced by a link, is no better.
+        rename($directory, $directory.'.real');
+        symlink($outside, $directory);
+        $this->assertSame(0, $this->outbox()->depth());
+        $this->assertSame([], $this->outbox()->staleFiles());
+        $this->assertSame(0, $this->outbox()->adopt(1));
+        unlink($directory);
+        rename($directory.'.real', $directory);
+    }
+
+    public function test_each_fallback_request_is_reported_as_its_own_request(): void
+    {
+        $this->batchSchema(releases: 3);
+        $this->configureAsync(batch: false);
+        foreach (range(1, 3) as $number) {
+            $this->handOff($this->claimedCandidate($number.'@article'));
+        }
+        $this->servePrimary();
+        $summaries = [];
+        $this->captureSummaries($summaries, 'Publication forwarder run summary.');
+
+        $this->forward(['--diagnostics' => true]);
+
+        $this->assertSame(3, $summaries[0]['batches_sent']);
+        $this->assertSame(3, $summaries[0]['items_sent']);
+        $this->assertSame(['min' => 1, 'max' => 1, 'mean' => 1.0], $summaries[0]['items_per_batch']);
+        $this->assertSame(0, $summaries[0]['transport_failures']);
+        $this->assertSame(3, $summaries[0]['outcomes']['published']);
+        // Three round trips, each its own: the longest is not the whole call.
+        $this->assertGreaterThan($summaries[0]['round_trip_ms']['max'], $summaries[0]['round_trip_ms']['total']);
+    }
+
+    public function test_a_refused_batch_followed_by_single_requests_reports_all_of_them(): void
+    {
+        $this->batchSchema(releases: 2);
+        $this->configureAsync();
+        $claims = [$this->claimedCandidate('one@article'), $this->claimedCandidate('two@article')];
+        array_map($this->handOff(...), $claims);
+        $this->servePrimary(fn () => Http::response(['message' => 'Not found.'], 404));
+        $summaries = [];
+        $this->captureSummaries($summaries, 'Publication forwarder run summary.');
+
+        $this->forward(['--diagnostics' => true]);
+
+        // The refused batch request of two, then one request for each.
+        $this->assertSame(3, $summaries[0]['batches_sent']);
+        $this->assertSame(['min' => 1, 'max' => 2, 'mean' => 1.33], $summaries[0]['items_per_batch']);
+    }
+
+    public function test_a_connection_failure_in_the_fallback_counts_as_a_transport_failure(): void
+    {
+        Sleep::fake();
+        $this->batchSchema();
+        $this->configureAsync(batch: false);
+        foreach (range(1, 3) as $number) {
+            $this->handOff($this->claimedCandidate($number.'@article'));
+        }
+        Http::fake(static fn () => throw new ConnectionException('Connection refused.'));
+        $summaries = [];
+        $this->captureSummaries($summaries, 'Publication forwarder run summary.');
+
+        $this->forward(['--diagnostics' => true]);
+
+        // One request was attempted and failed; the other two items were not tried against a dead primary.
+        $this->assertSame(1, $summaries[0]['batches_sent']);
+        $this->assertSame(1, $summaries[0]['transport_failures']);
+        $this->assertSame(3, $summaries[0]['outcomes']['transport']);
+    }
+
     public function test_a_forwarder_run_stops_at_its_deadline(): void
     {
         $this->batchSchema();
@@ -1758,8 +1896,9 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         foreach ([300, 600, 120, 60, 30, 3600] as $period) {
             config(['release_verification.publish_forwarder_seconds' => $period]);
             $lifetimes = array_map(PublicationOutbox::forwarderLifetime(...), range(1, 64));
-            $this->assertLessThanOrEqual($period, max($lifetimes));
-            $this->assertGreaterThanOrEqual(20, min($lifetimes));
+            $this->assertLessThanOrEqual(max($period, PublicationOutbox::MINIMUM_PERIOD_SECONDS), max($lifetimes));
+            // Long enough to span a scheduler tick and the restart after it.
+            $this->assertGreaterThanOrEqual(100, min($lifetimes));
         }
         config(['release_verification.publish_forwarder_seconds' => 300]);
         $this->assertSame([290, 230, 170, 110, 290, 230], array_map(PublicationOutbox::forwarderLifetime(...), range(1, 6)));
