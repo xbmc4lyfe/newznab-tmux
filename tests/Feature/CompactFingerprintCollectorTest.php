@@ -226,6 +226,44 @@ final class CompactFingerprintCollectorTest extends TestCase
     }
 
     #[Test]
+    public function a_creator_only_par2_volume_does_not_block_a_later_volume(): void
+    {
+        $setId = md5('creator-only', true);
+        $body = str_pad('Creator fixture', 16, "\0");
+        $hashed = $setId."PAR 2.0\0Creator\0".$body;
+        $creatorOnly = "PAR2\0PKT".pack('V2', strlen($body) + 64, 0).md5($hashed, true).$hashed;
+        $par2 = ArchiveParsingBenchmarkFixtures::par2(1);
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(fn (string $id): array => [
+            'body' => YencArticles::article(match ($id) {
+                'index@fixture' => $creatorOnly,
+                'volume@fixture' => $par2,
+                default => 'payload',
+            }),
+        ] + self::article($id));
+
+        $summary = $this->collector()->collectFromNzb(self::par2Nzb(['offline-0000.bin']), 7)['data']['par2'];
+
+        $this->assertSame(['offline-0000.bin'], array_column($summary['files'], 'name'));
+    }
+
+    #[Test]
+    public function par2_names_match_nzb_files_exactly_and_before_shortening(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(4)->andReturnUsing(fn (string $id): array => [
+            'body' => YencArticles::article($id === 'index@fixture' ? ArchiveParsingBenchmarkFixtures::par2(1) : 'payload'),
+        ] + self::article($id));
+
+        // The PAR2 describes offline-0000.bin; the NZB only has names sharing a prefix or suffix with it.
+        $summary = $this->collector()->collectFromNzb(self::par2Nzb(['offline-0000.bin.nfo', 'xoffline-0000.bin']), 7)['data']['par2'];
+
+        $this->assertSame(0, $summary['nzb_matches']);
+    }
+
+    #[Test]
     public function a_crc_mismatch_is_reported_and_keeps_the_record_partial(): void
     {
         $nntp = $this->mock(NNTPService::class);
@@ -359,6 +397,26 @@ final class CompactFingerprintCollectorTest extends TestCase
                 $xml .= '<segment bytes="'.intdiv($bytes, $count).'" number="'.$segment.'">f'.$position.'-s'.$segment.'@fixture</segment>';
             }
             $xml .= '</segments></file>';
+        }
+
+        return $xml.'</nzb>';
+    }
+
+    /**
+     * NZB with a PAR2 index (index@fixture), a PAR2 volume (volume@fixture) and the given data files.
+     *
+     * @param  list<string>  $dataFiles
+     */
+    private static function par2Nzb(array $dataFiles): string
+    {
+        $files = ['index' => ['movie.par2', 100], 'volume' => ['movie.vol00+01.par2', 900]];
+        foreach ($dataFiles as $position => $name) {
+            $files['data'.$position] = [$name, 5_000 + $position];
+        }
+        $xml = '<?xml version="1.0" encoding="UTF-8"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">';
+        foreach ($files as $id => [$name, $bytes]) {
+            $xml .= '<file poster="p@example" date="1790812800" subject="&quot;'.$name.'&quot; yEnc (1/1)"><groups><group>a.b.test</group></groups>'
+                .'<segments><segment bytes="'.$bytes.'" number="1">'.$id.'@fixture</segment></segments></file>';
         }
 
         return $xml.'</nzb>';

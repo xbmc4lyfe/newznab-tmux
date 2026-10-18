@@ -117,6 +117,7 @@ final class CompactFingerprintCollector
         $softwareCandidates = [];
         $firstPrefixMd5 = [];
         $par2 = null;
+        $par2Fallback = null;
         foreach ($samples as $sample) {
             $article = [
                 'file_index' => $sample['file_index'],
@@ -173,8 +174,13 @@ final class CompactFingerprintCollector
                     if ($par2 === null && $sample['kind'] === 'par2' && ($yenc['crc_ok'] ?? null) !== false
                         && is_string($analysis['decoded_bytes'] ?? null)) {
                         $summary = $this->par2Summary($analysis['decoded_bytes'], $files);
-                        // A body without usable PAR2 packets must not block later volumes.
-                        $par2 = $summary !== null && ($summary['set_id'] !== null || $summary['files'] !== []) ? $summary : null;
+                        // Only a summary with file descriptions ends the search; a set ID alone (e.g. a
+                        // Creator-only volume) is kept as a fallback while later volumes are examined.
+                        if ($summary !== null && $summary['files'] !== []) {
+                            $par2 = $summary;
+                        } elseif ($summary !== null && $summary['set_id'] !== null) {
+                            $par2Fallback ??= $summary;
+                        }
                     }
                 } catch (Throwable $exception) {
                     $providers[$account]['retrieval_ms'][] = (int) round((hrtime(true) - $started) / 1_000_000);
@@ -226,7 +232,7 @@ final class CompactFingerprintCollector
             'providers' => $providerRows,
             'articles' => $articles,
             'files' => self::fileRows($files, $firstPrefixMd5),
-            'par2' => $par2,
+            'par2' => $par2 ?? $par2Fallback,
             'posting' => self::posting($files),
             'uploader_software_candidates' => $softwareCandidates,
             'errors' => $errorRows,
@@ -384,28 +390,26 @@ final class CompactFingerprintCollector
         } catch (Throwable) {
             return null;
         }
+        $nzbNames = [];
+        foreach ($files as $file) {
+            $nzbNames[self::subjectFilename((string) ($file['subject'] ?? ''))] = true;
+        }
         $sources = [];
+        $matches = 0;
         foreach ($parsed['source_files'] ?? [] as $source) {
+            $name = is_string($source['filename'] ?? null) ? $source['filename'] : null;
+            // Match complete names before they are shortened for output.
+            if ($name !== null && $name !== '' && isset($nzbNames[$name])) {
+                $matches++;
+            }
             $sources[] = [
-                'name' => self::bounded($source['filename'] ?? null),
+                'name' => self::bounded($name),
                 'size' => is_int($source['file_length'] ?? null) ? $source['file_length'] : null,
                 'md5' => $source['md5'] ?? null,
                 'md5_16k' => $source['md5_first_16k'] ?? null,
             ];
         }
         usort($sources, static fn (array $a, array $b): int => [(string) $a['name'], (string) $a['md5']] <=> [(string) $b['name'], (string) $b['md5']]);
-        $matches = 0;
-        foreach ($sources as $source) {
-            if (! is_string($source['name']) || $source['name'] === '') {
-                continue;
-            }
-            foreach ($files as $file) {
-                if (str_contains((string) ($file['subject'] ?? ''), $source['name'])) {
-                    $matches++;
-                    break;
-                }
-            }
-        }
 
         return [
             'set_id' => $parsed['recovery_set_ids'][0] ?? null,
