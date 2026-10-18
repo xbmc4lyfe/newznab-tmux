@@ -97,6 +97,8 @@ case "$*" in
     *' ps -q '*)
         [ "${NNTMUX_PS_FAIL:-0}" != 1 ] || { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
         # A recreated container gets a new ID, as Docker gives it.
+        # NNTMUX_NO_CONTAINER: missing until this run (re)creates it.
+        if [ -n "${NNTMUX_NO_CONTAINER:-}" ] && [ "$last" = "$NNTMUX_NO_CONTAINER" ] && ! grep -q -- " up -d .* $last\( \|\$\)" "$NNTMUX_DEPLOY_EVENTS"; then exit 0; fi
         [ "$missing" = 1 ] || { [ ! -f "$NNTMUX_REPO/recreated-$last" ] || printf 'r%s-' "$(wc -c < "$NNTMUX_REPO/recreated-$last" | tr -d ' ')"; echo "fixture-container-$last"; } ;;
     *'scheduler python3 -c '*) [ "${NNTMUX_SCHEDULER_CAPABILITY_FAIL:-0}" != 1 ] || exit 48; echo "${NNTMUX_SCHEDULER_CAPABILITY:-native}" ;;
     *'scheduler.py drain --timeout='*)
@@ -322,7 +324,25 @@ SH);
         $this->assertStringContainsString('released', $events);
     }
 
-    public function test_a_recreated_data_service_is_followed_by_a_fresh_barrier_before_writers_start(): void
+    public function test_a_recreated_database_is_fenced_by_a_fresh_barrier_at_once(): void
+    {
+        $services = json_decode($this->composeJson(), true);
+        $services['services']['mariadb'] = ['image' => 'mariadb:one'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($services, JSON_UNESCAPED_SLASHES)])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        $services['services']['mariadb'] = ['image' => 'mariadb:two'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($services, JSON_UNESCAPED_SLASHES)])->mustRun();
+        $events = $this->events();
+        $recreate = strpos($events, ' up -d --no-deps --force-recreate --wait --wait-timeout 240 mariadb');
+        $this->assertNotFalse($recreate);
+        $this->assertSame(2, substr_count($events, 'releases:verification-barrier --timeout=900'));
+        $this->assertGreaterThan($recreate, strrpos($events, 'releases:verification-barrier --timeout=900'));
+        $this->assertGreaterThan(strrpos($events, 'releases:verification-barrier --timeout=900'), strpos($events, 'artisan migrate'));
+        $this->assertStringContainsString('released', $events);
+    }
+
+    public function test_another_data_service_keeps_the_existing_barrier(): void
     {
         mkdir($this->directory.'/docker/config/redis', 0777, true);
         file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 1gb\n");
@@ -332,13 +352,7 @@ SH);
 
         file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 2gb\n");
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
-        $events = $this->events();
-        $recreate = strpos($events, ' up -d --no-deps --force-recreate --wait --wait-timeout 240 redis');
-        $this->assertNotFalse($recreate);
-        $this->assertSame(2, substr_count($events, 'releases:verification-barrier --timeout=900'));
-        $this->assertGreaterThan($recreate, strrpos($events, 'releases:verification-barrier --timeout=900'));
-        $this->assertGreaterThan(strrpos($events, 'releases:verification-barrier --timeout=900'), strpos($events, 'horizon scheduler indexer'));
-        $this->assertStringContainsString('released', $events);
+        $this->assertSame(1, substr_count($this->events(), 'releases:verification-barrier --timeout=900'));
     }
 
     public function test_a_failed_migration_never_releases_the_pause_of_a_barrier_that_exited(): void
@@ -1045,7 +1059,7 @@ SH);
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
         file_put_contents($this->directory.'/events', '');
 
-        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['DOCKER_CONTEXT' => 'other-spelling'])->mustRun();
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0', 'DC=docker compose --project-directory '.$this->directory.'/docker --ansi never'], $config)->mustRun();
         $events = $this->events();
         $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 redis', $events);
         $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 proxy', $events);
@@ -1335,15 +1349,15 @@ SH);
     public function test_retry_after_a_fallback_rollout_failed_past_its_migration_does_not_migrate_again(): void
     {
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
-        $context = ['DOCKER_CONTEXT' => 'other-context'];
+        $dc = 'DC=docker compose --project-directory '.$this->directory.'/docker --ansi never';
         file_put_contents($this->directory.'/events', '');
-        $failed = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $context + ['NNTMUX_APP_UP_FAIL' => '1']);
+        $failed = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0', $dc], ['NNTMUX_APP_UP_FAIL' => '1']);
         $failed->run();
         $this->assertSame(52, $failed->getExitCode());
         $this->assertStringContainsString('artisan migrate', $this->events());
 
         file_put_contents($this->directory.'/events', '');
-        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $context)->mustRun();
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0', $dc])->mustRun();
         $this->assertStringNotContainsString('artisan migrate', $this->events());
         // Every service came up healthy despite the failed wait: nothing is repeated.
         $this->assertStringNotContainsString('--wait-timeout 240 web', $this->events());
@@ -1543,6 +1557,70 @@ SH);
         $plan->run();
         $this->assertNotSame(0, $plan->getExitCode());
         $this->assertStringContainsString('data service cache2 depends on app service web', $plan->getErrorOutput());
+    }
+
+    public function test_a_docker_daemon_change_aborts_before_any_change(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['DOCKER_CONTEXT' => 'one'])->mustRun();
+        $this->assertStringContainsString("\ndaemon=context:one\n", (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
+        file_put_contents($this->directory.'/events', '');
+
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['DOCKER_CONTEXT' => 'two']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('Docker daemon changed from context:one to context:two', $process->getErrorOutput());
+        $this->assertStringNotContainsString(' up -d', $this->events());
+    }
+
+    public function test_infrastructure_that_needs_a_changed_data_service_follows_it_after_the_drain(): void
+    {
+        mkdir($this->directory.'/docker/config/redis', 0777, true);
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 1gb\n");
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['redis-exporter'] = ['depends_on' => ['redis'], 'environment' => ['V' => '1']];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 2gb\n");
+        $json['services']['redis-exporter']['environment'] = ['V' => '2'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
+        $events = $this->events();
+        $this->assertLessThan(strpos($events, '--wait-timeout 240 redis-exporter'), strpos($events, '--wait-timeout 240 redis'."\n"));
+    }
+
+    public function test_infrastructure_whose_app_provider_is_stopped_or_unhealthy_follows_the_apps(): void
+    {
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['sidecar'] = ['labels' => ['nntmux.deploy.stateless' => 'true'], 'depends_on' => ['web' => ['condition' => 'service_healthy']]];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        $json['services']['sidecar']['environment'] = ['CHANGED' => '1'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0', 'FORCE=1'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES), 'NNTMUX_UNHEALTHY' => 'web'])->run();
+        $events = $this->events();
+        $this->assertGreaterThan(strpos($events, 'web horizon scheduler indexer'), strpos($events, '--wait-timeout 240 sidecar'));
+    }
+
+    public function test_retargeting_a_symlinked_read_only_directory_recreates_the_service(): void
+    {
+        foreach (['a', 'b'] as $name) {
+            mkdir($this->directory.'/tree-'.$name);
+            file_put_contents($this->directory.'/tree-'.$name.'/x.conf', "same\n");
+        }
+        symlink($this->directory.'/tree-a', $this->directory.'/tree');
+        file_put_contents($this->directory.'/.gitignore', "/tree-a\n/tree-b\n/tree\n", FILE_APPEND);
+        file_put_contents($this->directory.'/.dockerignore', "tree-a\ntree-b\ntree\n", FILE_APPEND);
+        (new Process(['git', 'commit', '-q', '-am', 'tree'], $this->directory))->mustRun();
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['proxy'] = ['volumes' => [['type' => 'bind', 'source' => $this->directory.'/tree', 'target' => '/etc/tree', 'read_only' => true]]];
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+
+        unlink($this->directory.'/tree');
+        symlink($this->directory.'/tree-b', $this->directory.'/tree');
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
     }
 
     public function test_unreadable_env_file_fails_closed(): void
@@ -2791,6 +2869,12 @@ SH);
         $process->run();
         $this->assertNotSame(0, $process->getExitCode());
         $this->assertStringNotContainsString(' up -d', $this->events());
+
+        // Compose would restart a dependent after its provider's update; deploy-app cannot.
+        $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['web' => ['depends_on' => ['proxy' => ['condition' => 'service_started', 'restart' => true]]]] + $services], JSON_UNESCAPED_SLASHES)]);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('depends_on.proxy.restart', $plan->getErrorOutput());
 
         // Health and recreation checks inspect one container per app service.
         foreach ([['deploy' => ['replicas' => 2]], ['scale' => 3]] as $scaled) {

@@ -54,6 +54,22 @@ final class DockerDeployGuardTest extends TestCase
     }
 
     #[Test]
+    public function a_closed_stdin_still_runs_the_payload(): void
+    {
+        foreach (['sh', 'dash', 'bash'] as $shell) {
+            if ((new Process(['sh', '-c', 'command -v '.$shell]))->run() !== 0) {
+                continue;
+            }
+            $ran = $this->dir.'/ran-'.$shell;
+            $process = new Process(['sh', '-c', 'exec "$0" "$@" <&-', $shell, dirname(__DIR__, 2).'/docker/bin/deploy-guard', 'run', 'resume-scheduler', '--', 'sh', '-c', 'touch '.escapeshellarg($ran)], null, [
+                'DEPLOY_LOCK_DIR' => $this->dir.'/lock', 'DEPLOY_LOG' => $this->dir.'/deploy.log', 'DEPLOY_STAMP' => $this->dir.'/stamp', 'DEPLOY_REPO' => $this->repo,
+            ]);
+            $process->mustRun();
+            $this->assertFileExists($ran, $shell);
+        }
+    }
+
+    #[Test]
     public function the_payload_reads_the_guards_stdin_under_every_posix_shell(): void
     {
         foreach (['sh', 'dash', 'bash'] as $shell) {

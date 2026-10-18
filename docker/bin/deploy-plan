@@ -554,7 +554,8 @@ def bind_source_record(source: str, read_only: bool, project_dir: Path) -> str:
                 if len(lines) >= 2000:
                     fail("more than 2000 files")
                 lines.append(f"{full.relative_to(resolved).as_posix()} {sha256_bytes(full.read_bytes())}")
-        return f"tree {sha256_text(chr(10).join(lines))} {source}"
+        root_target = f" -> {resolved}" if str(resolved) != os.path.abspath(source) else ""
+        return f"tree {sha256_text(chr(10).join(lines))} {source}{root_target}"
     except OSError as error:
         fail(error.strerror or str(error))
     raise AssertionError("unreachable")
@@ -654,6 +655,14 @@ def reject_unsupported_service(svc: str, cfg: object) -> None:
         if isinstance(value, str) and value.startswith(("service:", "container:")):
             sys.exit(f"deploy-plan: service {svc} uses {key}: {value}; selective deployment cannot recreate "
                      "consumers of another container's namespace. Remove it from the effective Compose files.")
+    depends = cfg.get("depends_on")
+    if isinstance(depends, dict):
+        for provider, condition in depends.items():
+            if isinstance(condition, dict) and condition.get("restart"):
+                # Compose would restart this service after an update of the provider; deploy-app
+                # recreates the provider alone with --no-deps.
+                sys.exit(f"deploy-plan: service {svc} sets depends_on.{provider}.restart; selective deployment "
+                         "recreates a provider without restarting its dependents. Remove `restart: true`.")
     deploy = cfg.get("deploy")
     replicas = deploy.get("replicas") if isinstance(deploy, dict) else None
     if svc in APP_SERVICES and ((isinstance(replicas, int) and replicas > 1) or (isinstance(cfg.get("scale"), int) and cfg["scale"] > 1)):
@@ -858,6 +867,8 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
     if compose_rendered and RENDERED_PROJECT:
         # The project identity every `compose ps` and `up` resolves containers in (see the planner).
         state["project"] = RENDERED_PROJECT
+        # And the daemon they run on: another one sees every container as absent.
+        state["daemon"] = docker_daemon_identity()
     extra = sorted(set(per_service_compose) - set(ALL_SERVICES)) if compose_rendered else []
     for svc in (*DATA_SERVICES, *INFRA_SERVICES, *extra):
         svc_files_hash = sha256_text("\n".join(buckets.get(svc, [])))
@@ -1132,6 +1143,13 @@ def mounts_changed_since_start(docker_dir: Path, svc: str) -> bool:
         return True
     if not isinstance(cfg, dict) or not isinstance(cfg.get("volumes"), list):
         return False
+    for volume in cfg["volumes"]:
+        if isinstance(volume, dict) and volume.get("type") == "bind" and isinstance(volume.get("source"), str):
+            source = volume["source"]
+            if not volume.get("read_only") and os.path.islink(source.rstrip("/")):
+                # A symlinked data source may have been retargeted; with no record of what the
+                # container mounted, recreate it rather than reconcile it in place.
+                return True
     try:
         started = container_started_at(docker_dir, svc)
     except ValueError as error:
@@ -1243,6 +1261,20 @@ def infra_services(state: dict[str, str]) -> list[str]:
     return [*INFRA_SERVICES, *(svc for svc in extra_services(state) if declared_stateless(svc))]
 
 
+def docker_daemon_identity() -> str:
+    """The daemon selection Docker resolves: DOCKER_HOST wins over DOCKER_CONTEXT, which wins over
+    the default context."""
+    host = os.environ.get("DOCKER_HOST", "")
+    if host:
+        return f"host:{host}"
+    context = os.environ.get("DOCKER_CONTEXT", "")
+    if not context:
+        # The current context, so an exported DOCKER_CONTEXT naming it compares equal.
+        proc = subprocess.run(["docker", "context", "show"], capture_output=True, text=True, check=False)
+        context = proc.stdout.strip() if proc.returncode == 0 else ""
+    return f"context:{context}" if context else "default"
+
+
 def transitive_dependencies(svc: str) -> set[str]:
     """Every rendered service `svc` depends on, directly or through others."""
     found: set[str] = set()
@@ -1300,6 +1332,12 @@ def compose_present(state: dict[str, str], svc: str) -> bool:
 def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_force: bool | None = None) -> dict[str, object]:
     state = compute_state(repo, docker_dir, include_compose=True)
     stamped = parse_stamp(stamp_path)
+    if stamped.get("daemon") and state.get("daemon") and stamped["daemon"] != state["daemon"]:
+        sys.exit(
+            f"deploy-plan: the Docker daemon changed from {stamped['daemon']} to {state['daemon']} since the last "
+            "deployment (DOCKER_CONTEXT/DOCKER_HOST); refusing to start a second stack. Select the original daemon, "
+            "or move the stamp aside under the guard after stopping the old stack."
+        )
     if stamped.get("project") and state.get("project") and stamped["project"] != state["project"]:
         # Every `compose ps` would resolve the new project and see the old project's still-running
         # writers and data services as absent, then start a second stack on the same data.
@@ -1591,9 +1629,10 @@ def main() -> None:
                     record[key] = snapshot[key]
                 else:
                     record.pop(key, None)
-            if "project" in snapshot:
-                # Partial records belong to this project, even before the run's final stamp.
-                record["project"] = snapshot["project"]
+            for identity in ("project", "daemon"):
+                if identity in snapshot:
+                    # Partial records belong to this project and daemon, even before the final stamp.
+                    record[identity] = snapshot[identity]
         tmp = stamp_path.with_name(f"{stamp_path.name}.tmp.{os.getpid()}")
         tmp.write_text("stale\n" + "".join(f"{key}={record[key]}\n" for key in sorted(record)))
         os.replace(tmp, stamp_path)
@@ -1656,19 +1695,26 @@ def main() -> None:
         pre_drain = dependency_order([*plan["start_data"], *plan["reconcile_infra"], *plan["dirty_infra"]])
         # A stateful service cannot wait for an app provider (writers are quiesced around it), and
         # infrastructure whose app provider has no container yet waits until the apps are up.
+        post_services = set(plan["dirty_data"]) | set(plan["reconcile_data"])
         after_app: list[str] = []
+        after_data: list[str] = []
         for svc in pre_drain:
-            app_providers = [dep for dep in transitive_dependencies(svc) if dep in APP_SERVICES]
-            if not app_providers:
-                continue
-            if any(not container_exists(docker_dir, dep) for dep in app_providers):
+            deps = transitive_dependencies(svc)
+            app_providers = [dep for dep in deps if dep in APP_SERVICES]
+            # An app provider that is missing, stopped or unhealthy (e.g. writers stopped by a failed
+            # run) is up again only after the app rollout.
+            if any(not check_app_container(docker_dir, dep, verify_image=False)[0] for dep in app_providers):
                 after_app.append(svc)
-        pre_drain = [svc for svc in pre_drain if svc not in after_app]
+            elif deps & post_services:
+                # Its data provider changes only after the drain; apply it right after that provider.
+                after_data.append(svc)
+        pre_drain = [svc for svc in pre_drain if svc not in after_app and svc not in after_data]
         print(f"PRE_DRAIN={shlex.quote(' '.join(f'{marks[svc]}:{svc}' for svc in pre_drain))}")
         print(f"AFTER_APP={shlex.quote(' '.join(f'{marks[svc]}:{svc}' for svc in after_app))}")
         # The data services applied after the writers stop, likewise in one depends_on order.
-        post_marks = {**{svc: "pending" for svc in plan["dirty_data"]}, **{svc: "forget" for svc in plan["reconcile_data"]}}
-        post_drain = dependency_order([*plan["dirty_data"], *plan["reconcile_data"]])
+        post_marks = {**{svc: "pending" for svc in plan["dirty_data"]}, **{svc: "forget" for svc in plan["reconcile_data"]},
+                      **{svc: marks[svc] for svc in after_data}}
+        post_drain = dependency_order([*plan["dirty_data"], *plan["reconcile_data"], *after_data])
         print(f"POST_DRAIN={shlex.quote(' '.join(f'{post_marks[svc]}:{svc}' for svc in post_drain))}")
         print(f"GLOBAL_FALLBACK={'1' if plan['global_fallback'] else '0'}")
         print(f"BUILD_TARGETS={shlex.quote(' '.join(plan['build_targets']))}")

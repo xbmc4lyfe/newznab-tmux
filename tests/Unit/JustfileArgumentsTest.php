@@ -112,6 +112,15 @@ SH);
         $this->assertStringNotContainsString('arg:[', $wrapper->getOutput());
     }
 
+    public function test_interpolated_database_values_fail_closed_for_shell_recipes(): void
+    {
+        file_put_contents($this->directory.'/docker/.env', "DB_ROOTPASSWORD=\${ROOT_SECRET}\n");
+        $process = $this->just('docker/Justfile', ['ps'], ['DC' => $this->directory.'/bin/fake']);
+        $process->run();
+        $this->assertNotSame(0, $process->getExitCode());
+        $this->assertStringContainsString('DB_ROOTPASSWORD must be literal', $process->getErrorOutput());
+    }
+
     public function test_only_the_last_assignment_of_a_literal_key_can_be_interpolated(): void
     {
         file_put_contents($this->directory.'/docker/.env', "APP_IMAGE=\${REGISTRY}/app\nAPP_IMAGE=registry/app:2\n");

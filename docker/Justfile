@@ -55,7 +55,7 @@ LOAD_ENV := '''preset=" "
             # Compose interpolates unquoted and double-quoted values; this parser does not. The last
             # assignment wins, so only it can be interpolated. Single-quoted values are literal in Compose.
             case "$key" in
-                COMPOSE_FILE|DC|HELPER_IMAGE|BASE_IMAGE|APP_IMAGE|WEB_IMAGE|HORIZON_IMAGE|SCHEDULER_IMAGE|INDEXER_IMAGE)
+                COMPOSE_FILE|DC|DB_DATABASE|DB_ROOTPASSWORD|HELPER_IMAGE|BASE_IMAGE|APP_IMAGE|WEB_IMAGE|HORIZON_IMAGE|SCHEDULER_IMAGE|INDEXER_IMAGE)
                     interpolated=${interpolated// $key / }
                     if [ "$quote" != "'" ] && [[ "$value" == *'$'* ]]; then interpolated="$interpolated$key "; fi ;;
             esac

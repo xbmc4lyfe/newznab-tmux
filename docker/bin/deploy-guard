@@ -308,7 +308,13 @@ cmd_run() {
     # In the background so a trapped signal interrupts `wait` and can be forwarded. A non-interactive
     # shell gives a background job /dev/null as stdin (dash applies that before any `0<&0`), so the
     # guard's stdin travels on descriptor 3, e.g. for `... run resume-scheduler -- python3 - < script`.
-    { "$@" <&3 3<&- & } 3<&0
+    # A closed stdin (`<&-`) cannot be duplicated: the payload then reads /dev/null, as a foreground
+    # command with nothing to read would.
+    if ( exec 3<&0 ) 2>/dev/null; then
+        { "$@" <&3 3<&- & } 3<&0
+    else
+        "$@" </dev/null &
+    fi
     payload=$!
     if wait "$payload"; then rc=0; else rc=$?; fi
     payload=

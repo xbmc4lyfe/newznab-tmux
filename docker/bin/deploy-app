@@ -394,18 +394,18 @@ horizon_stopped=0
 for item in $POST_DRAIN; do
     apply_each "--${item%%:*}" "${item#*:}"
     verify
+    if [ "${item#*:}" = mariadb ] && [ "$barrier_held" = 1 ]; then
+        # A recreated database ends the barrier's lock session, and replacement storage lacks its
+        # durable pause: fence the new database at once, before any other step can fail and leave
+        # remote workers admitted to it ahead of the migration.
+        docker rm -f "$barrier_name" >/dev/null 2>&1 || true
+        keep=$barrier_keep
+        barrier_held=0
+        hold_barrier
+        barrier_keep=$keep
+        verify
+    fi
 done
-
-if [ "$barrier_held" = 1 ] && { [ -n "$DIRTY_DATA" ] || [ -n "$RECONCILE_DATA" ]; }; then
-    # A recreated database ends the barrier's lock session. Its durable pause keeps workers out
-    # meanwhile; take a fresh barrier on the healthy service before migrating or starting writers.
-    docker rm -f "$barrier_name" >/dev/null 2>&1 || true
-    keep=$barrier_keep
-    barrier_held=0
-    hold_barrier
-    barrier_keep=$keep
-    verify
-fi
 
 if [ "$MIGRATE" = 1 ]; then
     assert_barrier
