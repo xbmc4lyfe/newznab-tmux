@@ -20,6 +20,10 @@ final class HeaderFilenameIdentity
     public static function matches(string $subject, string $actual): bool
     {
         $subject = trim($subject);
+        // Article names are validated as UTF-8 before this check; anything else cannot be compared.
+        if (! mb_check_encoding($actual, 'UTF-8')) {
+            return false;
+        }
         $count = preg_match_all(self::QUOTED, $subject, $matches, PREG_SET_ORDER | PREG_OFFSET_CAPTURE);
         if ($count === false) {
             // Invalid UTF-8 cannot be parsed for a declared name, so it cannot be compared.

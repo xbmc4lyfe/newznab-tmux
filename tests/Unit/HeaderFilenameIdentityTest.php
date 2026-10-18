@@ -136,6 +136,8 @@ class HeaderFilenameIdentityTest extends TestCase
             'unquoted executable ignores case' => ['Readable SETUP.EXE yEnc', 'setup.exe', true],
             'digit before a single quote' => ["[1/1] - 1'movie.mkv' yEnc", 'other.mkv', true],
             'underscore after a single quote' => ["[1/1] - 'movie.mkv'_ yEnc", 'other.mkv', true],
+            'invalid UTF-8 executable under an unquoted subject' => ['Readable Release yEnc (1/2)', "setup\xff.exe", false],
+            'invalid UTF-8 body under an opaque subject' => ['[1/9] - "Xk29dPq8LmZ0Yt5R.mkv" yEnc', "payload\xff.mkv", false],
             'opaque subject with an extensionless body' => ['[3/8] - "o9aeI3YpDwgHGoJ2ZsCm.vol00+01.par2" yEnc', '148f76878d7732b981734a9e0c51a348', true],
         ];
     }
