@@ -43,6 +43,9 @@ final class PublicationTiming
 
     private ?int $callbackEndedAt = null;
 
+    /** @var array{batch_size: int, batch_index: int}|null */
+    private ?array $batch = null;
+
     private string $phase = 'state_lock_acquisition';
 
     private function __construct(private readonly int $startedAt)
@@ -60,14 +63,29 @@ final class PublicationTiming
             if ($every > 1 && PHP_SAPI !== 'cli') {
                 // Web servers such as classic-mode FrankenPHP reset static state per request, so a
                 // counter would never reach $every there; draw per request at the same rate.
-                return random_int(1, $every) === 1 ? new self(hrtime(true)) : null;
+                return random_int(1, $every) === 1 ? self::start() : null;
             }
             self::$sampleCounter = (self::$sampleCounter + 1) % $every;
 
-            return self::$sampleCounter === 0 ? new self(hrtime(true)) : null;
+            return self::$sampleCounter === 0 ? self::start() : null;
         } catch (Throwable) {
             return null;
         }
+    }
+
+    /**
+     * A sample the caller already decided on, such as one batch endpoint request that sampled once
+     * and times each of its items separately.
+     */
+    public static function start(): self
+    {
+        return new self(hrtime(true));
+    }
+
+    /** Mark this publication as item $index of a batch of $size, which the report then names. */
+    public function setBatch(int $size, int $index): void
+    {
+        $this->batch = ['batch_size' => $size, 'batch_index' => $index];
     }
 
     /** Close the span since the previous mark as a controller-side phase (before publish()). */
@@ -114,11 +132,12 @@ final class PublicationTiming
     }
 
     /** One line for the worker side of a remote publication: the HTTP round trip. */
-    public function reportRoundTrip(string $status, ?int $httpStatus): void
+    public function reportRoundTrip(string $status, ?int $httpStatus, ?int $batchSize = null): void
     {
         try {
             Log::info('Remote publication round trip timing.', ['status' => $status,
-                'http_status' => $httpStatus, 'round_trip_ns' => hrtime(true) - $this->startedAt]);
+                'http_status' => $httpStatus, 'round_trip_ns' => hrtime(true) - $this->startedAt]
+                + ($batchSize === null ? [] : ['batch_size' => $batchSize]));
         } catch (Throwable) {
             // Diagnostics must preserve the publication result.
         }
@@ -173,7 +192,7 @@ final class PublicationTiming
             }
             $now = hrtime(true);
             $this->finalizeAttempt($now);
-            $report = ['status' => $status, 'total_ns' => $now - $this->startedAt] + $this->facts;
+            $report = ['status' => $status, 'total_ns' => $now - $this->startedAt] + $this->facts + ($this->batch ?? []);
             if ($this->requestPhases !== []) {
                 $report['request_ns'] = array_sum($this->requestPhases);
                 $report['request_phases_ns'] = $this->requestPhases;
