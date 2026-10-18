@@ -441,13 +441,15 @@ final class SpotCheckVerifierTest extends TestCase
     }
 
     #[Test]
-    public function only_a_sole_quoted_32_hex_posting_token_has_unknown_filename_identity(): void
+    public function obfuscated_subject_filenames_have_unknown_identity_but_readable_ones_must_agree(): void
     {
         $token = str_repeat('a1', 16);
         foreach (['"'.$token.'"' => 'sampled', "'".strtoupper($token)."'" => 'sampled',
-            '"'.substr($token, 1).'"' => 'unknown', '"'.$token.'a"' => 'unknown',
-            '"'.str_repeat('g', 32).'"' => 'unknown', '"'.$token.'.rar"' => 'unknown',
-            '"literal-extensionless-name"' => 'unknown', '"'.$token.'" "other.rar"' => 'unknown'] as $subject => $verdict) {
+            '"'.substr($token, 1).'"' => 'sampled', '"'.$token.'.rar"' => 'sampled',
+            '"Xk29dPq8LmZ0Yt5RbW3q.part01.rar" yEnc' => 'sampled', '"LWgrwkDekU9VMNAO.part01.rar" yEnc' => 'unknown', '"password" - [1/2] - "actual.rar" yEnc' => 'sampled',
+            '"literal-extensionless-name"' => 'unknown', '"'.$token.'" "other.rar"' => 'unknown',
+            '"Movie2026.rar"' => 'unknown', '"other.rar" yEnc' => 'unknown',
+            '"Xk29dPq8LmZ0Yt5R.par2" yEnc' => 'unknown'] as $subject => $verdict) {
             $articles = ['first@article' => YencArticles::part('hello', 'actual.rar', 10, 1, 1, 2),
                 'last@article' => YencArticles::part('world', 'actual.rar', 10, 2, 6, 2)];
             $source = new class($articles) implements ArticleSource
@@ -562,6 +564,30 @@ final class SpotCheckVerifierTest extends TestCase
             'spot_check_article_bytes' => 1024], new YencService))->verify($manifest, static function (): void {});
 
         self::assertSame('unknown', $result->verdict);
+    }
+
+    #[Test]
+    public function an_obfuscated_subject_does_not_admit_an_undeclared_executable_body(): void
+    {
+        $raw = (new YencService)->encode('hello', 'setup.exe');
+        $source = new class($raw) implements ArticleSource
+        {
+            public function __construct(private readonly string $raw) {}
+
+            public function fetch(string $messageId): string
+            {
+                return $this->raw;
+            }
+        };
+        $manifest = ['identity' => str_repeat('f', 40), 'declared_size' => 5,
+            'files' => [['key' => 'movie', 'subject' => '[1/1] - "Xk29dPq8LmZ0Yt5R.mkv" yEnc', 'totalparts' => 1,
+                'segments' => [['number' => 1, 'messageid' => 'sample@article', 'bytes' => 5]]]]];
+
+        $result = (new SpotCheckVerifier($source, ['spot_check_articles' => 1, 'spot_check_bytes' => 1024,
+            'spot_check_article_bytes' => 1024], new YencService))->verify($manifest, static function (): void {});
+
+        self::assertSame('unknown', $result->verdict);
+        self::assertSame('Spot-check article identity differs from its header.', $result->reason);
     }
 
     #[Test]
