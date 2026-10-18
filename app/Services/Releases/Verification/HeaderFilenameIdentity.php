@@ -28,7 +28,7 @@ final class HeaderFilenameIdentity
         if ($count === 0) {
             return ! self::executable($actual)
                 // The subject must name the body itself, not a longer file such as body.exe.mkv.
-                || preg_match('/(?<![\p{L}\p{N}_])'.preg_quote($actual, '/').'(?![\p{L}\p{N}_]|[.\-][\p{L}\p{N}])/iu', $subject) === 1;
+                || preg_match('/(?<![\p{L}\p{N}_])'.preg_quote($actual, '/').'(?![\p{L}\p{N}_]|[.\-]+[\p{L}\p{N}])/iu', $subject) === 1;
         }
         $quoted = [];
         $declared = null;
@@ -75,11 +75,13 @@ final class HeaderFilenameIdentity
         if ($expected === $body) {
             return true;
         }
-        [$shorter, $longer] = mb_strlen($expected) <= mb_strlen($body) ? [$expected, $body] : [$body, $expected];
+        [$shorter, $longer] = mb_strlen($expected) <= mb_strlen($body)
+            ? [self::words($declared), self::words($actual)] : [self::words($actual), self::words($declared)];
+        $remainder = array_slice($longer, count($shorter));
 
-        // A prefix may not add or extend a number: Part 1 is not Part 10, and Movie is not Movie 2.
-        return mb_strlen($shorter) >= 8 && str_starts_with($longer, $shorter)
-            && preg_match('/\p{N}\z/u', $shorter) !== 1 && preg_match('/\p{N}/u', mb_substr($longer, mb_strlen($shorter))) !== 1;
+        // Only whole words may follow, and never a number: VI is not VII, Part 1 is not Part 10, Movie is not Movie 2.
+        return mb_strlen(implode('', $shorter)) >= 8 && array_slice($longer, 0, count($shorter)) === $shorter
+            && preg_match('/\p{N}\z/u', (string) end($shorter)) !== 1 && preg_match('/\p{N}/u', implode(' ', $remainder)) !== 1;
     }
 
     /** A single random-looking token, such as an obfuscated posting name, makes no filename claim. */
@@ -145,6 +147,12 @@ final class HeaderFilenameIdentity
         preg_match_all('/\p{N}+/u', self::stem($name), $matches);
 
         return $matches[0];
+    }
+
+    /** @return list<string> */
+    private static function words(string $name): array
+    {
+        return preg_split('/[^\p{L}\p{N}]+/u', mb_strtolower(self::stem($name)), -1, PREG_SPLIT_NO_EMPTY) ?: [];
     }
 
     private static function normalized(string $name): string

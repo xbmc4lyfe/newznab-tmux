@@ -121,6 +121,13 @@ class HeaderFilenameIdentityTest extends TestCase
             'unquoted subject names a longer file' => ['Movie.2026.1080p.exe.mkv yEnc (1/50)', 'Movie.2026.1080p.exe', false],
             'unquoted subject names a sample file' => ['Movie.2026.1080p.exe-sample.mkv yEnc (1/50)', 'Movie.2026.1080p.exe', false],
             'unquoted subject names the executable before a dash' => ['Readable setup.exe - yEnc (1/2)', 'setup.exe', true],
+            'roman numeral volume' => ['"Final.Fantasy.VI.iso" yEnc', 'Final.Fantasy.VII.iso', false],
+            'letter part' => ['"Season.Finale.Part.A.mkv" yEnc', 'Season.Finale.Part.AB.mkv', false],
+            'whole extra word' => ['"Readable.Release.Name.mkv" yEnc', 'Readable Release Name Extended.mkv', true],
+            'unquoted subject names a file after a double dot' => ['Readable setup.exe..mkv yEnc', 'setup.exe', false],
+            'unquoted executable after an underscore' => ['Readable _setup.exe yEnc', 'setup.exe', false],
+            'unquoted executable before an underscore' => ['Readable setup.exe_ yEnc', 'setup.exe', false],
+            'counter without a dash or yEnc' => ['[1/5]"Readable.Name.mkv"', 'Other.Thing.mkv', false],
             'opaque subject with an extensionless body' => ['[3/8] - "o9aeI3YpDwgHGoJ2ZsCm.vol00+01.par2" yEnc', '148f76878d7732b981734a9e0c51a348', true],
         ];
     }
