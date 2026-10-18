@@ -232,11 +232,7 @@ class ForwardVerifiedPublications extends Command
 
                 continue;
             }
-            if (! $this->locks->held() || ! $this->locks->forwarderHeld()) {
-                $this->diagnostics?->stop('locks_lost');
-
-                throw new RuntimeException('Publication forwarder locks were lost.');
-            }
+            $this->assertOwnership();
             if (! $this->locks->admitting()) {
                 $this->refuse();
 
@@ -291,6 +287,8 @@ class ForwardVerifiedPublications extends Command
 
             return false;
         }
+        // A cached join proves nothing once a database session has dropped: prove both locks before every write.
+        $this->assertOwnership();
         try {
             $work();
         } finally {
@@ -434,6 +432,16 @@ class ForwardVerifiedPublications extends Command
         }
     }
 
+    /** Stop, writing nothing more, unless the worker group and the forwarder lock are still held. */
+    private function assertOwnership(): void
+    {
+        if (! $this->ownsLocks()) {
+            $this->diagnostics?->stop('locks_lost');
+
+            throw new RuntimeException('Publication forwarder locks were lost.');
+        }
+    }
+
     /** Whether this process still holds the worker group and its forwarder lock (a database lock ends with its session). */
     private function ownsLocks(): bool
     {
@@ -488,11 +496,7 @@ class ForwardVerifiedPublications extends Command
         // The request may have outlived the database session that held the locks. Then nothing may be
         // written: the entries stay in flight, to be replayed (the primary treats a resend idempotently)
         // or left to lease expiry, once the storage has an owner again.
-        if (! $this->ownsLocks()) {
-            $this->diagnostics?->stop('locks_lost');
-
-            throw new RuntimeException('Publication forwarder locks were lost.');
-        }
+        $this->assertOwnership();
         $this->outbox->touchAlive($this->slot);
         $this->adaptToPrimary($publisher);
         if ($failure !== null) {
@@ -546,6 +550,12 @@ class ForwardVerifiedPublications extends Command
             case PublicationOutcome::RETRY:
                 // The primary's batch budget ran out before it started this item.
                 $this->retry($entry, $outcome->error ?? 'The primary did not start this item; sending it again.', counted: false, delay: 1.0);
+
+                return;
+            case PublicationOutcome::PAUSED:
+                // Maintenance on the primary is transient: the entry keeps its lease and waits, with the usual
+                // backoff, until the pause lifts or the age limit ends it. Nothing was published or read for it.
+                $this->retry($entry, $outcome->error ?? RemotePublicationService::PAUSED_MESSAGE, counted: false);
 
                 return;
             default:
