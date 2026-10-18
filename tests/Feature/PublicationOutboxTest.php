@@ -2186,7 +2186,52 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->assertLessThan(5.0, microtime(true) - $started);
         $this->assertSame('deadline', $summaries[0]['stop_reason']);
         $this->assertSame(0, $summaries[0]['batches_sent']);
+        // A scheduled exit leaves the marker, touched on the way out, for the replacement to take over.
+        $this->assertFileExists($this->outbox()->directory().'/forwarder-1.alive');
+        $this->assertTrue($this->outbox()->forwarderAlive());
+        // Ten seconds on (the gap before the next tick) it still counts as alive.
+        $this->assertTrue($this->outbox()->forwarderAlive(time() + 10));
+        // The replacement process takes the marker over rather than finding a stranger's.
+        $this->assertSame(0, $this->forward());
         $this->assertFileDoesNotExist($this->outbox()->directory().'/forwarder-1.alive');
+    }
+
+    public function test_a_deadline_exit_that_was_refused_the_group_leaves_no_marker(): void
+    {
+        Sleep::fake();
+        $this->batchSchema();
+        $this->configureAsync();
+        VerificationWorkerLocks::pause('test-barrier', 'maintenance');
+        $this->outbox()->prepare(1);
+
+        $this->assertSame(0, Artisan::call('releases:forward-verified-publications', ['--slot' => 1, '--max-seconds' => 1]));
+
+        $this->assertFileDoesNotExist($this->outbox()->directory().'/forwarder-1.alive');
+    }
+
+    public function test_the_alive_window_has_a_floor_that_outlasts_the_restart_gap(): void
+    {
+        $this->configureAsync();
+        config(['release_verification.publish_forwarder_alive_seconds' => 5]);
+        $this->markForwarderAlive(1, 15);
+        $this->assertTrue($this->outbox()->forwarderAlive());
+        $this->markForwarderAlive(1, 25);
+        $this->assertFalse($this->outbox()->forwarderAlive());
+        $this->assertGreaterThan(10, PublicationOutbox::MINIMUM_ALIVE_SECONDS);
+    }
+
+    public function test_a_symlinked_marker_is_not_a_live_forwarder(): void
+    {
+        $this->configureAsync();
+        $this->outbox()->prepare(1);
+        $outside = config('release_verification.storage_path').'/outside-marker';
+        file_put_contents($outside, 'fresh');
+        symlink($outside, $this->outbox()->directory().'/forwarder-1.alive');
+
+        $this->assertFalse($this->outbox()->forwarderAlive());
+        // A real marker beside it still counts.
+        $this->markForwarderAlive(2);
+        $this->assertTrue($this->outbox()->forwarderAlive());
     }
 
     public function test_an_entry_reproduces_the_evidence_it_was_handed_off_with(): void
