@@ -847,6 +847,17 @@ def image_id(image: str) -> str | None:
     return proc.stdout.strip()
 
 
+def current_container_id(docker_dir: Path, svc: str) -> str:
+    """The running container of a service, or "" when none runs. A failed query exits."""
+    env = dict(os.environ)
+    env.setdefault("COMPOSE_FILE", str(docker_dir / "docker-compose.yml"))
+    ps = subprocess.run([*compose_command(docker_dir), "ps", "-q", svc], capture_output=True, text=True, env=env, check=False)
+    if ps.returncode != 0:
+        sys.exit(f"deploy-plan: cannot list the {svc} container: {ps.stderr.strip()}")
+    lines = ps.stdout.strip().splitlines()
+    return lines[0] if lines else ""
+
+
 def check_app_container(docker_dir: Path, svc: str, verify_image: bool = True) -> tuple[bool, str]:
     """Return (is_ok, reason) for a running app service container."""
     env = dict(os.environ)
@@ -1418,7 +1429,17 @@ def main() -> None:
             # replacing a container leaves the old one healthy on the same image; only its Compose
             # configuration-hash label tells it apart. Any failed query exits before writing.
             snapshot = parse_stamp(Path(f"{stamp_path}.plan"))
+            # The container IDs deploy-app captured before `compose up`: one still running under the
+            # same ID was never replaced (its bind-mounted inputs are outside Compose's hash).
+            previous = dict(
+                entry.split("=", 1) for entry in os.environ.get("DEPLOY_PREVIOUS_CONTAINERS", "").split() if "=" in entry
+            )
             for item in items:
+                if item not in previous:
+                    continue
+                current = current_container_id(docker_dir, item)
+                if not current or current == previous[item]:
+                    continue
                 planned = snapshot.get(f"image:{item}", "").rsplit("@", 1)[-1]
                 ok, _ = check_app_container(docker_dir, item, verify_image=False)
                 if not (ok and planned and running_image(docker_dir, item) == planned):

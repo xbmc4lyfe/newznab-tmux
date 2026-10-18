@@ -389,6 +389,14 @@ if [ "$MIGRATE" = 1 ]; then
 fi
 
 if [ -n "$up_app_services" ]; then
+    # The containers before the recreate: one that keeps its ID was never replaced, whatever its
+    # health, image and Compose hash say (bind-mounted inputs are outside that hash).
+    previous_containers=""
+    for svc in $up_app_services; do
+        id=$(compose ps -a -q "$svc")
+        previous_containers="$previous_containers $svc=$(printf '%s' "$id" | head -n 1)"
+    done
+    export DEPLOY_PREVIOUS_CONTAINERS="$previous_containers"
     # shellcheck disable=SC2086
     if compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $up_app_services; then
         :

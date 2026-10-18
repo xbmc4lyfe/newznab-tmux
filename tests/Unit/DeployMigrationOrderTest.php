@@ -53,7 +53,7 @@ case "$*" in
     *'com.docker.compose.service'*)
         shift 3
         for container in "$@"; do
-            svc=${container#fixture-container-}
+            svc=${container#r-}; svc=${svc#fixture-container-}
             if [ "$svc" = "${NNTMUX_STALE_SERVICE_IMAGE:-}" ] && [ ! -f "$NNTMUX_REPO/recreated-$svc" ]; then id=sha256:stale; else id=${NNTMUX_IMAGE_ID:-sha256:fixture}; fi
             echo "$svc $id fixture/$svc:tag"
         done ;;
@@ -82,17 +82,19 @@ case "$*" in
     *' ps -a -q '*)
         [ "${NNTMUX_NO_EXISTING_APP:-0}" = 1 ] && exit 0
         [ -n "${NNTMUX_NO_CONTAINER:-}" ] && [ "$last" = "$NNTMUX_NO_CONTAINER" ] && exit 0
-        echo fixture-container ;;
+        [ ! -f "$NNTMUX_REPO/recreated-$last" ] || printf r-
+        echo "fixture-container-$last" ;;
     *' ps -q')
         [ "${NNTMUX_PS_FAIL:-0}" != 1 ] || { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
         [ "$missing" = 1 ] || printf '%s\n' "${NNTMUX_CONFIG_ID:-$default_config}" \
             | python3 -c 'import json, sys; print("\n".join("fixture-container-" + s for s in json.load(sys.stdin)["services"]))' 2>/dev/null ;;
     *' ps -q horizon'*)
         [ "${NNTMUX_HORIZON_PS_FAIL:-0}" != 1 ] || exit 50
-        [ "$missing" = 1 ] || echo "fixture-container-horizon" ;;
+        [ "$missing" = 1 ] || { [ ! -f "$NNTMUX_REPO/recreated-horizon" ] || printf r-; echo "fixture-container-horizon"; } ;;
     *' ps -q '*)
         [ "${NNTMUX_PS_FAIL:-0}" != 1 ] || { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
-        [ "$missing" = 1 ] || echo "fixture-container-$last" ;;
+        # A recreated container gets a new ID, as Docker gives it.
+        [ "$missing" = 1 ] || { [ ! -f "$NNTMUX_REPO/recreated-$last" ] || printf r-; echo "fixture-container-$last"; } ;;
     *'scheduler python3 -c '*) [ "${NNTMUX_SCHEDULER_CAPABILITY_FAIL:-0}" != 1 ] || exit 48; echo "${NNTMUX_SCHEDULER_CAPABILITY:-native}" ;;
     *'scheduler.py drain --timeout='*)
         [ "${NNTMUX_SCHEDULER_DRAIN_FAIL:-0}" != 1 ] || exit 47
@@ -118,7 +120,14 @@ case "$*" in
         case "$*" in *' proxy'*)
             if [ -n "${NNTMUX_PROXY_EDIT:-}" ]; then echo C > "$NNTMUX_PROXY_EDIT"; fi
             [ "${NNTMUX_PROXY_FAIL:-0}" != 1 ] || exit 51 ;; esac
-        case "$*" in *'--wait-timeout 240 web'*) [ "${NNTMUX_APP_UP_FAIL:-0}" != 1 ] || exit 52 ;; esac
+        case "$*" in *'--wait-timeout 240 web'*)
+            if [ "${NNTMUX_APP_UP_FAIL:-0}" = 1 ]; then
+                # Compose replaced the containers before the health wait failed, unless it failed first.
+                if [ "${NNTMUX_APP_UP_NO_REPLACE:-0}" != 1 ]; then
+                    for svc in "$@"; do case "$svc" in web|horizon|scheduler|indexer) : > "$NNTMUX_REPO/recreated-$svc" ;; esac; done
+                fi
+                exit 52
+            fi ;; esac
         case "$*" in *'--force-recreate'*' redis'*) [ "${NNTMUX_REDIS_FAIL:-0}" != 1 ] || exit 53 ;; esac
         [ -z "${NNTMUX_UP_FAIL_SERVICE:-}" ] || [ "$last" != "$NNTMUX_UP_FAIL_SERVICE" ] || exit 54
         if [ "${NNTMUX_STALE_UP:-0}" = 1 ]; then echo changed > "$NNTMUX_REPO/app.txt"; fi
@@ -428,6 +437,21 @@ SH);
         $this->assertStringNotContainsString(' stop ', $events);
         $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web', $events);
         $this->assertStringNotContainsString('web horizon', $events);
+    }
+
+    public function test_a_failed_app_start_that_replaced_no_container_records_none_of_them(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/app.txt', "two\n");
+        $failed = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_APP_UP_FAIL' => '1', 'NNTMUX_APP_UP_NO_REPLACE' => '1']);
+        $failed->run();
+        $this->assertSame(52, $failed->getExitCode());
+
+        // The old containers stayed healthy on the same image and Compose hash; none was replaced, so
+        // the retry must recreate all of them instead of stamping a no-op.
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
     }
 
     public function test_retry_after_a_failed_app_start_does_not_repeat_a_completed_migration(): void
@@ -2041,7 +2065,7 @@ SH);
             'docker/8.5/php.ini' => 'shared-app', 'tests/Fixtures/nzb-article-fingerprint/NzbArticleFingerprint.php' => 'shared-app',
             'deploy/cloud/entrypoint.sh' => 'shared-app', 'database/migrations/x.php' => 'migrations,shared-app',
             'deploy/cloud/compose.yaml' => '-', 'docs/x.md' => '-', 'README.md' => '-', 'tests/Unit/XTest.php' => '-',
-            'scripts/install-monitoring.sh' => '-', '.env.example' => '-', 'docker/docker-compose.yml' => '-', 'docker/config/caddy/Caddyfile' => '-',
+            'scripts/install-monitoring.sh' => '-', '.env.example' => '-', 'docker/docker-compose.yml' => '-', 'docker/config/caddy/Caddyfile' => '-', 'app/.DS_Store' => '-', 'public/.DS_Store' => '-',
         ];
         $root = dirname(__DIR__, 2);
         $process = new Process([$root.'/docker/bin/deploy-plan', '--classify', ...array_keys($paths)], env: ['DEPLOY_REPO' => $root, 'PYTHONDONTWRITEBYTECODE' => '1']);

@@ -110,3 +110,5 @@ docker/.build.stamp.*
 # Separate successful image builds from healthy application rollouts.
 docker/.build.stamp
 docker/.deploy.time
+# Finder metadata is never an image input (it would rebuild every role).
+**/.DS_Store
