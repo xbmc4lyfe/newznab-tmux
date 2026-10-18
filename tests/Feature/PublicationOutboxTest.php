@@ -12,6 +12,7 @@ use App\Services\Releases\Verification\PublicationOutcome;
 use App\Services\Releases\Verification\RemotePublishItem;
 use App\Services\Releases\Verification\RemoteReleasePublisher;
 use App\Services\Releases\Verification\SpotCheckVerifier;
+use App\Services\Releases\Verification\VerificationResetService;
 use App\Services\Releases\Verification\VerificationWorkerLocks;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Console\Signals;
@@ -21,6 +22,7 @@ use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Facade;
+use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Sleep;
@@ -705,7 +707,7 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         }
         $before = $this->candidateRow($due)->lease_until;
         // The handed-off file is older than a third of the lease for $due only.
-        touch($this->pendingPath($fresh));
+        touch($this->pendingPath($fresh), time() + 110);
         touch($this->pendingPath($due), time() - 120);
         $this->travel(110)->seconds();
         $this->servePrimary();
@@ -827,7 +829,8 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->assertSame('verifying', $this->candidateStatus($second));
         $this->assertNotNull($this->candidateRow($second)->lease_token);
         $this->assertSame(1, count($this->requested));
-        $this->assertFileExists($this->inflightPath($second));
+        // Refused the group, it did not even move the entry into its in-flight folder.
+        $this->assertFileExists($this->pendingPath($second));
         $this->assertGreaterThanOrEqual(1, $summaries[0]['lock_blocked']);
         // A refused forwarder does not advertise itself, so workers publish for themselves.
         $this->assertFileDoesNotExist($this->outbox()->directory().'/forwarder-1.alive');
@@ -853,7 +856,7 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->assertSame([], $this->requested);
         $this->assertSame('verifying', $this->candidateStatus($claim));
         $this->assertNotNull($this->candidateRow($claim)->lease_token);
-        $this->assertFileExists($this->inflightPath($claim));
+        $this->assertFileExists($this->pendingPath($claim));
         $this->assertFileDoesNotExist($this->outbox()->directory().'/forwarder-1.alive');
     }
 
@@ -862,10 +865,12 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->batchSchema();
         $this->configureAsync();
         $queries = 0;
+        $afterFirstSleep = null;
         $probing = false;
         $probes = [];
         Sleep::fake();
-        Sleep::whenFakingSleep(function () use (&$probes, &$probing): void {
+        Sleep::whenFakingSleep(function () use (&$probes, &$probing, &$queries, &$afterFirstSleep): void {
+            $afterFirstSleep ??= $queries;
             $probing = true;
             $barrier = new VerificationWorkerLocks;
             try {
@@ -882,7 +887,9 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
 
         $this->forward(['--passes' => 4]);
 
-        $this->assertSame(0, $queries);
+        // The first pass advertises the forwarder (a join and a leave); the idle passes after it query nothing.
+        $this->assertLessThanOrEqual(6, $afterFirstSleep);
+        $this->assertSame($afterFirstSleep, $queries);
         $this->assertCount(8, $probes);
         foreach ($probes as $probe) {
             $this->assertTrue(current($probe), key($probe));
@@ -1227,6 +1234,196 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->assertFalse($unreachable[0]->published());
         $this->assertSame(['error', 'error'], array_map(static fn (PublicationOutcome $outcome): string => $outcome->status, $refused));
         $this->assertSame('Remote publication failed: Database unavailable.', $refused[0]->error);
+    }
+
+    public function test_a_forwarder_writes_nothing_while_a_reset_holds_the_worker_gate(): void
+    {
+        Sleep::fake();
+        $this->batchSchema();
+        $this->configureAsync();
+        $this->handOff($this->claimedCandidate('one@article'));
+        $this->markForwarderAlive();
+        $reset = new VerificationWorkerLocks;
+        $this->assertTrue($reset->tryExclusive());
+        // A reset clears the verification storage, outbox included, while it holds the gate.
+        File::deleteDirectory($this->outbox()->directory());
+        $summaries = [];
+        $this->captureSummaries($summaries, 'Publication forwarder run summary.');
+        $this->servePrimary();
+
+        try {
+            $this->forward(['--passes' => 6, '--diagnostics' => true]);
+            // No marker, no folder, no claim: the forwarder did not touch the storage the reset is emptying.
+            $this->assertDirectoryDoesNotExist($this->outbox()->directory());
+            $this->assertSame([], $this->requested);
+            $this->assertGreaterThanOrEqual(1, $summaries[0]['lock_blocked']);
+        } finally {
+            $reset->close();
+        }
+    }
+
+    public function test_a_reset_between_an_idle_forwarders_passes_clears_the_outbox_and_the_forwarder_stays_out(): void
+    {
+        $this->batchSchema();
+        $this->configureAsync();
+        $claim = $this->claimedCandidate('one@article');
+        $this->handOff($claim);
+        $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['not_before' => time() + 3600] + $document);
+        $resets = 0;
+        $present = [];
+        Sleep::fake();
+        Sleep::whenFakingSleep(function () use (&$resets, &$present): void {
+            if ($resets++ === 0) {
+                app(VerificationResetService::class)->run(static fn () => null);
+            }
+            $present[] = is_dir($this->outbox()->directory());
+        });
+
+        $this->forward(['--passes' => 4]);
+
+        // The idle forwarder held no group, so the reset ran; its later passes wrote nothing back.
+        $this->assertGreaterThanOrEqual(1, $resets);
+        $this->assertSame([false, false, false, false], $present);
+    }
+
+    public function test_the_marker_is_refreshed_while_a_request_waits_for_the_primary(): void
+    {
+        $this->batchSchema(releases: 1);
+        $this->configureAsync();
+        $claim = $this->claimedCandidate('one@article');
+        $this->handOff($claim);
+        $ages = [];
+        Http::fake(function (HttpRequest $request, array $options) use (&$ages) {
+            $marker = $this->outbox()->directory().'/forwarder-1.alive';
+            // A request that has waited 20 s: the marker is that old, until cURL's progress callback fires.
+            touch($marker, time() - 20);
+            $ages['before'] = time() - filemtime($marker);
+            ($options['progress'] ?? static fn () => null)(0, 0, 0, 0);
+            clearstatcache();
+            $ages['after'] = time() - filemtime($marker);
+            $ages['alive'] = $this->outbox()->forwarderAlive(null, 5);
+
+            return Http::response($this->withServerVariables(self::PEER)->postJson('/internal/release-verification/publish-batch', $request->data())->json());
+        });
+
+        $this->forward();
+
+        $this->assertGreaterThanOrEqual(20, $ages['before']);
+        $this->assertLessThanOrEqual(1, $ages['after']);
+        $this->assertTrue($ages['alive']);
+        $this->assertSame('sampled', $this->candidateStatus($claim));
+    }
+
+    public function test_the_forwarder_claims_no_more_than_the_limit_the_primary_advertises(): void
+    {
+        $this->batchSchema(releases: 6);
+        $this->configureAsync();
+        config(['release_verification.publish_forward_items' => 3, 'release_verification.publish_batch_max_items' => 2]);
+        $claims = [];
+        foreach (range(1, 6) as $number) {
+            $claims[] = $claim = $this->claimedCandidate($number.'@article');
+            $this->handOff($claim);
+            $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['enqueued_at' => time() - 100 + $number] + $document);
+        }
+        $this->servePrimary();
+        $summaries = [];
+        $this->captureSummaries($summaries, 'Publication forwarder run summary.');
+
+        $this->forward(['--passes' => 3, '--diagnostics' => true]);
+
+        // The first batch of three is refused with max_items 2 (and goes out one by one); the rest respect it.
+        $this->assertSame([3, 2, 1], $this->batchSizes);
+        $this->assertSame(array_fill(0, 6, 'sampled'), array_map($this->candidateStatus(...), $claims));
+        $this->assertSame(2, $summaries[0]['advertised_item_limit']);
+        $this->assertSame([], $this->pendingNames());
+    }
+
+    public function test_an_entry_that_cannot_be_removed_is_set_aside_not_sent_again(): void
+    {
+        $this->configureAsync();
+        $this->outbox()->prepare(1);
+        $directory = $this->outbox()->directory();
+        // An unremovable file, as a directory: unlink fails, rename can still move it.
+        mkdir($directory.'/pending/9-1-abcdef123456.json');
+        $entry = new PublicationOutboxEntry('9-1-abcdef123456.json', $directory.'/pending/9-1-abcdef123456.json',
+            ['id' => 9, 'version' => 1, 'manifest_hash' => str_repeat('a', 64), 'lease_token' => 't'], 'r', $this->evidence(), microtime(true));
+
+        $this->assertFalse($this->outbox()->remove($entry));
+
+        $this->assertDirectoryDoesNotExist($directory.'/pending/9-1-abcdef123456.json');
+        $this->assertDirectoryExists($directory.'/failed/9-1-abcdef123456.json');
+        $this->assertSame(0, $this->outbox()->depth());
+    }
+
+    public function test_an_entry_that_cannot_even_be_moved_is_counted_and_never_claimed_again(): void
+    {
+        if (! function_exists('posix_geteuid') || posix_geteuid() === 0) {
+            $this->markTestSkipped('Needs a user that file permissions bind.');
+        }
+        Sleep::fake();
+        $this->batchSchema(releases: 1);
+        $this->configureAsync();
+        $claim = $this->claimedCandidate('one@article');
+        $this->handOff($claim);
+        $this->outbox()->prepare(1);
+        rename($this->pendingPath($claim), $this->inflightPath($claim));
+        $summaries = [];
+        $this->captureSummaries($summaries, 'Publication forwarder run summary.');
+        $folder = $this->outbox()->inflightDirectory(1);
+        // The folder becomes read-only once the entry is in hand, so removing and moving it both fail.
+        $locked = false;
+        Http::fake(function (HttpRequest $request) use (&$locked, $folder) {
+            $this->requested[] = $request->url();
+            $locked = chmod($folder, 0500);
+
+            return Http::response($this->withServerVariables(self::PEER)->postJson('/internal/release-verification/publish-batch', $request->data())->json());
+        });
+
+        try {
+            $this->forward(['--passes' => 4, '--diagnostics' => true]);
+        } finally {
+            chmod($folder, 0700);
+        }
+
+        $this->assertTrue($locked);
+        $this->assertSame('sampled', $this->candidateStatus($claim));
+        $this->assertCount(1, $this->requested);
+        $this->assertSame(1, $summaries[0]['quarantined']);
+        $this->assertFileExists($this->inflightPath($claim));
+    }
+
+    public function test_leases_of_entries_waiting_for_the_one_by_one_fallback_are_renewed_between_requests(): void
+    {
+        $this->batchSchema(releases: 3);
+        $this->configureAsync(batch: false);
+        $claims = [];
+        foreach (range(1, 3) as $number) {
+            $claims[] = $claim = $this->claimedCandidate($number.'@article');
+            $this->handOff($claim);
+            $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['enqueued_at' => time() - 100 + $number] + $document);
+        }
+        $leases = [];
+        $summaries = [];
+        $this->captureSummaries($summaries, 'Publication forwarder run summary.');
+        Http::fake(function (HttpRequest $request, array $options) use (&$leases, $claims) {
+            $this->requested[] = $request->url();
+            $leases[] = $this->candidateRow($claims[2])->lease_until;
+            if (count($this->requested) === 1) {
+                // The first slow request has taken longer than a third of the lease.
+                $this->travel(150)->seconds();
+            }
+
+            return Http::response($this->withServerVariables(self::PEER)->postJson('/internal/release-verification/publish', $request->data())->json());
+        });
+
+        $this->forward(['--diagnostics' => true]);
+
+        $this->assertCount(3, $this->requested);
+        // The third entry's lease was renewed before the second request, though nothing had sent it yet.
+        $this->assertGreaterThan($leases[0], $leases[1]);
+        $this->assertSame(array_fill(0, 3, 'sampled'), array_map($this->candidateStatus(...), $claims));
+        // Entries already published are not renewed (that would find their lease gone and drop them).
+        $this->assertSame(0, $summaries[0]['lease_lost']);
     }
 
     public function test_a_forwarder_run_stops_at_its_deadline(): void
