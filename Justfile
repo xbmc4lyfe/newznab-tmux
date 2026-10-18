@@ -51,7 +51,7 @@ except ValueError as error:
     sys.exit("Invalid quoting in cmd: " + str(error))
 argv = sys.argv[2:] + extra
 os.execvp(argv[0], argv)'''
-COMPOSE_ENV := 'export COMPOSE_PROFILES="${COMPOSE_PROFILES:-' + PROFILES + '}"; if [ -z "${COMPOSE_FILE:-}" ] && [[ "${MONITORING_ENABLED-$MONITORING_DEFAULT}" =~ ^(true|1|yes)$ ]] && [ -f "' + MONITORING_KEY + '" ]; then export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"; fi'
+COMPOSE_ENV := 'export COMPOSE_PROFILES="${COMPOSE_PROFILES-' + PROFILES + '}"; if [ -z "${COMPOSE_FILE:-}" ] && [[ "${MONITORING_ENABLED-$MONITORING_DEFAULT}" =~ ^(true|1|yes)$ ]] && [ -f "' + MONITORING_KEY + '" ]; then export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"; fi'
 MONITORING_COMPOSE := '$DOCKER_COMPOSE -f docker-compose.yml -f docker-compose.monitoring.yml $(IFS=,; for profile in $COMPOSE_PROFILES; do printf -- "--profile %s " "$profile"; done)'
 
 # Show available recipes

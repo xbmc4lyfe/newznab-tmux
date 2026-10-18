@@ -87,7 +87,8 @@ case "$*" in
     *' ps -q')
         [ "${NNTMUX_PS_FAIL:-0}" != 1 ] || { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
         [ "$missing" = 1 ] || printf '%s\n' "${NNTMUX_CONFIG_ID:-$default_config}" \
-            | python3 -c 'import json, sys; print("\n".join("fixture-container-" + s for s in json.load(sys.stdin)["services"]))' 2>/dev/null ;;
+            | python3 -c 'import json, sys; print("\n".join("fixture-container-" + s for s in json.load(sys.stdin)["services"]))' 2>/dev/null
+        [ -z "${NNTMUX_ORPHAN:-}" ] || echo "fixture-container-$NNTMUX_ORPHAN" ;;
     *' ps -q horizon'*)
         [ "${NNTMUX_HORIZON_PS_FAIL:-0}" != 1 ] || exit 50
         [ "$missing" = 1 ] || { [ ! -f "$NNTMUX_REPO/recreated-horizon" ] || printf 'r%s-' "$(wc -c < "$NNTMUX_REPO/recreated-horizon" | tr -d ' ')"; echo "fixture-container-horizon"; } ;;
@@ -2103,6 +2104,63 @@ SH);
         $this->assertNotStamped();
         $this->assertSame('1000', trim((string) file_get_contents($this->directory.'/docker/.deploy.time')));
         $this->assertAttemptsClosed();
+    }
+
+    public function test_a_failed_final_check_keeps_remote_workers_paused(): void
+    {
+        $process = $this->deploy(['NNTMUX_UNHEALTHY_AFTER' => ' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', 'NNTMUX_UNHEALTHY_LATE' => 'horizon']);
+        $process->run();
+
+        $this->assertNotSame(0, $process->getExitCode());
+        $this->assertStringContainsString('not every app service is running healthy', $process->getErrorOutput());
+        // The stack was never verified, so the barrier is neither released nor cleared.
+        $this->assertStringNotContainsString('released', $this->events());
+        $this->assertFileExists($this->directory.'/docker/.deploy.stamp.barrier-owed');
+    }
+
+    public function test_an_unrecordable_owed_release_never_pauses_remote_workers(): void
+    {
+        mkdir($this->directory.'/docker/.deploy.stamp.barrier-owed');
+        $process = $this->deploy();
+        $process->run();
+
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('Cannot record the owed barrier release', $process->getErrorOutput());
+        $this->assertStringNotContainsString('releases:verification-barrier', $this->events());
+        $this->assertStringNotContainsString(' stop web scheduler indexer', $this->events());
+    }
+
+    public function test_an_orphaned_data_container_with_a_replaced_image_never_blocks_rollouts(): void
+    {
+        $orphan = ['NNTMUX_ORPHAN' => 'oldcache', 'NNTMUX_STALE_SERVICE_IMAGE' => 'oldcache'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $orphan)->mustRun();
+        $this->assertNotSame('stale', strtok((string) file_get_contents($this->directory.'/docker/.deploy.stamp'), "\n"));
+
+        // The unrendered orphan is not stale for the guard's unchanged check either.
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $orphan)->mustRun();
+        $this->assertStringContainsString('result=skipped (nothing changed', (string) file_get_contents($this->directory.'/docker/.deploy.log'));
+    }
+
+    public function test_a_new_data_service_starts_before_the_infrastructure_that_now_needs_it(): void
+    {
+        mkdir($this->directory.'/docker/config/caddy', 0777, true);
+        file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', "one\n");
+        $without = json_decode($this->composeJson(), true);
+        unset($without['services']['redis']);
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($without, JSON_UNESCAPED_SLASHES)])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        // The proxy changes and now depends on a newly rendered redis that has no container yet.
+        $with = json_decode($this->composeJson(), true);
+        $with['services']['proxy']['depends_on'] = ['redis' => ['condition' => 'service_healthy']];
+        file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', "two\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($with, JSON_UNESCAPED_SLASHES), 'NNTMUX_NO_CONTAINER' => 'redis'])->mustRun();
+        $events = $this->events();
+        $redis = strpos($events, '--wait-timeout 240 redis');
+        $proxy = strpos($events, '--wait-timeout 240 proxy');
+        $this->assertNotFalse($redis);
+        $this->assertNotFalse($proxy);
+        $this->assertLessThan($proxy, $redis);
     }
 
     public function test_image_tag_replaced_after_the_build_aborts_before_any_change(): void

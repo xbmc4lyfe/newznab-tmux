@@ -102,7 +102,13 @@ release_barrier() {
 barrier_owed="${DEPLOY_STAMP:-$DIR/.deploy.stamp}.barrier-owed"
 owed_at_start=0
 [ ! -e "$barrier_owed" ] || owed_at_start=1
-owe_barrier() { : >"$barrier_owed" || echo "Could not record the owed barrier release; clear the verification pause by hand." >&2; }
+# Without the marker a crash could leave a durable pause nothing ever clears: never pause unrecorded.
+owe_barrier() {
+    if ! : >"$barrier_owed"; then
+        echo "Cannot record the owed barrier release in $barrier_owed; not pausing remote verification workers." >&2
+        exit 1
+    fi
+}
 settle_barrier() {
     if ! release_barrier; then
         owe_barrier
@@ -147,17 +153,11 @@ apply_each() {
 # The rendered-Compose `effective` record covers only what no service record explains; a change to
 # it always migrates, so it is recorded together with the completed migration.
 
-# Stateless infrastructure first, while every writer still runs: a failing infra service aborts
-# here, before any drain, instead of after a full app rollout that would then repeat every poll.
-if [ -n "$DIRTY_INFRA" ]; then
-    # shellcheck disable=SC2086
-    apply_each --pending $DIRTY_INFRA
-    verify
-fi
-
+# Everything before the drain, while every writer still runs: a failing service aborts here instead
+# of after a full app rollout that would then repeat every poll. `up --no-deps` never starts a
+# dependency, so providers come first: new data services (nothing uses them before this run), then
+# added or drifted infrastructure, then changed infrastructure; each list is in depends_on order.
 if [ -n "$START_DATA" ]; then
-    # Data services that have no container yet (e.g. newly rendered) are started without
-    # quiescing writers: nothing uses them before this run.
     # shellcheck disable=SC2086
     apply_each --forget $START_DATA
     verify
@@ -167,6 +167,12 @@ if [ -n "$RECONCILE_INFRA" ]; then
     # Compose recreates only services whose rendered configuration drifted.
     # shellcheck disable=SC2086
     apply_each --forget $RECONCILE_INFRA
+    verify
+fi
+
+if [ -n "$DIRTY_INFRA" ]; then
+    # shellcheck disable=SC2086
+    apply_each --pending $DIRTY_INFRA
     verify
 fi
 
@@ -410,12 +416,15 @@ if [ -n "$up_app_services" ]; then
     # shellcheck disable=SC2086
     plan --record $up_app_services
 fi
-assert_barrier
-barrier_keep=0
-settle_barrier || exit 1
 # Success is recorded only when the whole stack is current, not just the services this run touched:
-# all four app services healthy on their expected images, and no data/infra container stale.
+# all four app services healthy on their expected images, and no data/infra container stale. This
+# runs before the barrier is released, so remote workers resume only on a verified stack; a failure
+# leaves the release owed (and kept when a migration began), and the retry clears it once healthy.
+[ "$barrier_held" != 1 ] || barrier_keep=1
 if ! "$DIR/bin/deploy-current"; then
     echo "deploy-app: the rollout finished, but not every app service is running healthy on its expected image (or a data/infrastructure container runs a stale image); not recording a successful deployment." >&2
     exit 1
 fi
+assert_barrier
+barrier_keep=0
+settle_barrier || exit 1

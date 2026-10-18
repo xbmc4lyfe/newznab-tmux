@@ -240,6 +240,20 @@ SH);
         }
     }
 
+    public function test_an_explicit_empty_profile_override_clears_the_env_profile(): void
+    {
+        file_put_contents($this->directory.'/.env', "SEARCH_DRIVER=manticore\n");
+        $environment = ['SAIL' => $this->directory.'/bin/fake'];
+
+        $default = $this->just('Justfile', ['up'], $environment);
+        $default->mustRun();
+        $this->assertStringContainsString('COMPOSE_PROFILES=[manticore]', $default->getOutput());
+
+        $cleared = $this->just('Justfile', ['up', 'COMPOSE_PROFILES='], $environment);
+        $cleared->mustRun();
+        $this->assertStringContainsString('COMPOSE_PROFILES=[]', $cleared->getOutput());
+    }
+
     public function test_check_env_honours_the_trailing_monitoring_override(): void
     {
         unlink($this->directory.'/storage/app/monitoring/public/grafana-jwt.pub');

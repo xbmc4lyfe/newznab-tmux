@@ -952,6 +952,10 @@ def stale_service_images(docker_dir: Path, rendered: dict[str, object] | None = 
         if svc in APP_SERVICES:
             # App services are compared with their stamped/role image elsewhere.
             continue
+        if rendered is not None and svc not in rendered:
+            # An orphan of a service removed from Compose: the planner leaves it running and can
+            # never reconcile it, so it must not hold every later rollout unstamped.
+            continue
         cfg = (rendered or {}).get(svc)
         if isinstance(cfg, dict) and isinstance(cfg.get("image"), str):
             tag = cfg["image"]
@@ -1499,7 +1503,9 @@ def main() -> None:
 
     if cmd == "--stale-images":
         # deploy-current: running data/infra services whose image tag now names another image.
-        print(" ".join(stale_service_images(docker_dir)))
+        # Only services the effective Compose configuration renders (`ps` also lists orphans).
+        get_compose_service_hashes(docker_dir)
+        print(" ".join(stale_service_images(docker_dir, RENDERED_SERVICES)))
         return
 
     if cmd == "--deploy-actions":
