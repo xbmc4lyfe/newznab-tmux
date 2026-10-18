@@ -59,6 +59,10 @@ final class VerificationRunDiagnosticsTest extends TestCase
         $diagnostics->claimed();
         $diagnostics->verified('sampled');
         $diagnostics->published();
+        $diagnostics->handedOff();
+        $diagnostics->handedOff();
+        $diagnostics->outboxFallback();
+        $diagnostics->outboxWaited(1_000_000_000, 1_250_000_000);
         $diagnostics->candidateFailed();
         $diagnostics->finished();
         $diagnostics->verified('private unrecognized verdict');
@@ -68,6 +72,10 @@ final class VerificationRunDiagnosticsTest extends TestCase
         $report = $diagnostics->report(2_000_000_000);
 
         self::assertSame(1, $report['publish_returned']);
+        self::assertSame(3, $report['schema_version']);
+        self::assertSame(2, $report['handed_off']);
+        self::assertSame(1, $report['outbox_fallbacks']);
+        self::assertSame(250.0, $report['outbox_wait_ms']);
         self::assertSame(1, $report['candidate_errors']);
         self::assertSame(1, $report['finish_returned']);
         self::assertSame(1, $report['verifier_verdicts']['sampled']);
@@ -77,7 +85,7 @@ final class VerificationRunDiagnosticsTest extends TestCase
         self::assertSame(['schema_version', 'started_at', 'requested_slot', 'limit', 'max_seconds',
             'worker_acquired', 'loop_started', 'claim_calls', 'claims_admitted', 'stop_reason',
             'limit_reached', 'deadline_reached_at_stop', 'verifier_verdicts', 'publish_returned',
-            'finish_returned', 'filtered_recoveries', 'candidate_errors', 'fatal_error',
+            'handed_off', 'outbox_fallbacks', 'outbox_wait_ms', 'finish_returned', 'filtered_recoveries', 'candidate_errors', 'fatal_error',
             'command_result', 'exit_code', 'maintenance_state', 'durations_ms', 'phases'], array_keys($report));
         array_walk_recursive($report, static function (mixed $value): void {
             self::assertTrue($value === null || is_scalar($value));
