@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Nzb;
 
+use App\Models\Release;
 use App\Support\ReleaseArchiveNamingEvidence;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -35,12 +36,16 @@ final class NzbSourceGuard
     public function snapshot(string $guid, bool $beginNamingInspection = false): ?array
     {
         return DB::transaction(function () use ($guid, $beginNamingInspection): ?array {
-            $release = DB::table('releases')->where('guid', $guid)->lockForUpdate()->first(['id', 'guid']);
+            $partialCounts = $beginNamingInspection && Release::hasPartialArticleCounts();
+            $release = DB::table('releases')->where('guid', $guid)->lockForUpdate()->first($partialCounts ? ['id', 'guid', 'articles_expected'] : ['id', 'guid']);
 
             if ($release === null) {
                 return null;
             }
-            if ($beginNamingInspection) {
+            // Only an in-place upgrade of a partial preserves a source, and it leaves the counts set unless it
+            // committed a complete inventory (after which the canonical file is the committed source). So only a
+            // release still recorded as partial can have one to settle; others skip the directory scan.
+            if ($partialCounts && ($release->articles_expected ?? null) !== null) {
                 // A replacement a crash or failed commit left behind is settled first: its evidence must name
                 // the source the committed row describes, never an uncommitted one still on disk.
                 $this->lockRelease($release);

@@ -1000,6 +1000,12 @@ final class CandidateRepository
         $cutoff = $now->copy()->subHours($hours)->format('Y-m-d H:i:s');
 
         // The verification_due index serves the status / next_attempt_at order.
+        if (DB::transactionLevel() === 0 && in_array(DB::getDriverName(), ['mysql', 'mariadb'], true)) {
+            // READ COMMITTED for this transaction only: the locking scan of the due range then takes no gap
+            // locks, so admissions into the queue never wait behind promotion either.
+            DB::statement('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+        }
+
         return DB::transaction(function () use ($limit, $cutoff, $now, $hours): int {
             // Skip rows ingestion holds rather than wait on them, and take the next due ones instead, so a busy
             // prefix never hides later stalled uploads. Each row's predicates hold under its lock.

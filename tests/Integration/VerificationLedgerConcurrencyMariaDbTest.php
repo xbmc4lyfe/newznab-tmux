@@ -275,6 +275,39 @@ final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
                 'free-later' => DB::table('release_verification_candidates')->where('identity', sha1('free-later'))->value('status')]);
     }
 
+    public function test_admissions_into_the_due_queue_never_wait_behind_promotion(): void
+    {
+        $this->partialSchema();
+        config(['release_verification.partial_after_hours' => 4]);
+        $row = static fn (string $name, string $status, string $due, string $last): array => ['identity' => sha1($name), 'source_identity' => sha1($name),
+            'groups_id' => 1, 'manifest_path' => '', 'manifest_bytes' => 0, 'manifest_hash' => str_repeat('0', 64), 'status' => $status,
+            'last_unique_at' => $last, 'next_attempt_at' => $due];
+        $stalled = now()->subHours(5)->format('Y-m-d H:i:s');
+        DB::table('release_verification_candidates')->insert([
+            $row('due', 'waiting_upload', now()->subMinute()->format('Y-m-d H:i:s'), $stalled),
+            $row('later', 'waiting_upload', now()->addHour()->format('Y-m-d H:i:s'), now()->format('Y-m-d H:i:s')),
+            $row('arriving', 'pending', now()->format('Y-m-d H:i:s'), now()->format('Y-m-d H:i:s')),
+        ]);
+        $other = $this->connection();
+        $result = [];
+        DB::listen(function (QueryExecuted $query) use ($other, &$result): void {
+            if ($result !== [] || ! str_contains(strtolower($query->sql), 'skip locked')) {
+                return;
+            }
+            // Mid-promotion: an incomplete upload is admitted into the due range.
+            try {
+                $other->prepare("UPDATE release_verification_candidates SET status = 'waiting_upload', next_attempt_at = NOW() WHERE identity = ?")
+                    ->execute([sha1('arriving')]);
+                $result[] = 'admitted';
+            } catch (\PDOException $error) {
+                $result[] = (int) $error->errorInfo[1];
+            }
+        });
+
+        $this->assertSame(1, app(CandidateRepository::class)->promotePartial(10));
+        $this->assertSame(['admitted'], $result, 'Promotion takes no gap locks on the due queue.');
+    }
+
     /** The late-article columns partial publication adds, as deployed. */
     private function partialSchema(): void
     {

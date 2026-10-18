@@ -110,6 +110,8 @@ class CleanNZB extends Command
             $this->line(($delete ? 'Deleted' : 'Would delete').' replaced NZB source: '.$path);
         } elseif ($outcome === 'restored') {
             $this->line(($delete ? 'Restored' : 'Would restore').' replaced NZB source: '.$path);
+        } elseif ($nzb->isStalePreservedNzb($path, $olderThanSeconds)) {
+            $this->line('Kept replaced NZB source for review: '.$path);
         }
     }
 

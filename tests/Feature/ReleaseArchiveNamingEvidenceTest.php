@@ -36,6 +36,7 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
         Schema::create('releases', static function (Blueprint $table): void {
             $table->unsignedInteger('id')->primary();
             $table->string('guid');
+            $table->unsignedInteger('articles_expected')->nullable();
         });
         Schema::create('release_files', static function (Blueprint $table): void {
             $table->unsignedInteger('releases_id');
@@ -694,6 +695,8 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
 
     public function test_naming_inspection_settles_a_rolled_back_replacement_before_recording_evidence(): void
     {
+        // A partial: only those can be mid-upgrade.
+        DB::table('releases')->update(['articles_expected' => 3]);
         $this->writeSource('upgraded');
         $backup = $this->tagBackup(5, 'original');
         $this->commitEvidence('original');
@@ -709,6 +712,8 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
 
     public function test_naming_inspection_records_nothing_while_a_backup_is_unresolved(): void
     {
+        // A partial: only those can be mid-upgrade.
+        DB::table('releases')->update(['articles_expected' => 3]);
         $this->writeSource('upgraded');
         $backup = $this->tagBackup(5, 'original');
         // The committed source is neither file: the backup cannot be settled.
@@ -723,6 +728,18 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
 
         self::assertFileExists($backup);
         self::assertSame(NzbSourceGuard::digest('another'), DB::table('release_archive_naming_evidence')->value('source_sha256'), 'No evidence was recorded.');
+    }
+
+    public function test_naming_inspection_of_a_complete_release_skips_the_backup_scan(): void
+    {
+        $this->writeSource('upgraded');
+        $backup = $this->tagBackup(5, 'original');
+        $this->commitEvidence('upgraded');
+
+        $snapshot = $this->sources->snapshot('fixture-guid', beginNamingInspection: true);
+
+        self::assertSame(NzbSourceGuard::digest('upgraded'), $snapshot['digest']);
+        self::assertFileExists($backup, 'Left to nzbclean: a complete release has no upgrade in flight.');
     }
 
     public function test_plain_snapshot_does_not_settle_backups(): void
