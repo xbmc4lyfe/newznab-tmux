@@ -11,6 +11,7 @@ use App\Services\ReleaseCleaningService;
 use App\Services\ReleaseCreationService;
 use App\Services\ReleaseProcessingService;
 use App\Services\Releases\Verification\CandidateRepository;
+use App\Services\Releases\Verification\CollectionReleasePolicy;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\ReleaseMetadataResolver;
 use App\Services\Releases\Verification\RemoteReleasePublisher;
@@ -208,6 +209,30 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $id = app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('repaired', 'PAR2 sources verified.', $manifest));
         $this->assertIsInt($id);
         $this->assertSame(2, (int) DB::table('releases')->where('id', $id)->value('totalpart'));
+    }
+
+    public function test_only_a_sampled_body_name_with_an_extension_proves_a_parity_only_header_has_a_payload(): void
+    {
+        app(CandidateRepository::class)->archive($this->collectionForPolicy(name: 'Xk29dPq8LmZ0Yt5R.par2'));
+        $claim = app(CandidateRepository::class)->claim();
+        $manifest = app(ManifestStore::class)->read($claim->manifest_path);
+        $manifest += ['verification_mode' => 'spot_check',
+            'spot_check' => ['articles' => 1, 'bytes' => 256, 'sampled_files' => 1, 'method' => 'yenc-crc-and-identity']];
+        $policy = app(CollectionReleasePolicy::class);
+
+        foreach ([['9d3276d357227b7811b97dfd'], ['148f76878d7732b981734a9e0c51a348:stream'], ['Xk29dPq8LmZ0Yt5R.par2'], ['Xk29dPq8LmZ0Yt5R.'], ['Xk29dPq8.LmZ0Yt5RabCdEf'], ['x.mk-v']] as $names) {
+            $this->assertSame('Header inventory contains only PAR2 files without a declared source payload.',
+                $policy->verifiedRejection(['verified_file_names' => $names] + $manifest), $names[0]);
+        }
+        $this->assertNull($policy->verifiedRejection(['verified_file_names' => ['9d3276d357227b78.mkv']] + $manifest));
+        $this->assertNull($policy->verifiedRejection(['verified_file_names' => ['metadata.torrent']] + $manifest));
+        $this->assertNull($policy->verifiedRejection(['verified_file_names' => ['README']] + $manifest));
+        $this->assertNull($policy->verifiedRejection(['verified_file_names' => ['README.']] + $manifest));
+        $this->assertNull($policy->verifiedRejection(['verified_file_names' => ['payload.mkv:stream']] + $manifest));
+        $this->assertNull($policy->verifiedRejection(['verified_file_names' => ['文档.数据']] + $manifest));
+        $this->assertNull($policy->verifiedRejection(['verified_file_names' => ['payload.mkv ']] + $manifest));
+        $this->assertSame('Header inventory contains only PAR2 files without a declared source payload.',
+            $policy->verifiedRejection(['verified_file_names' => ['set.vol00+01.par2:payload.mkv']] + $manifest));
     }
 
     public function test_manual_import_preserves_legacy_bypass_of_collection_size_and_count_filters(): void
