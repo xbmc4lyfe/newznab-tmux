@@ -23,8 +23,12 @@ use RuntimeException;
  */
 final class PublicationOutbox
 {
-    /** Seconds within which a forwarder's alive file proves it is running, when not configured. */
-    public const int ALIVE_SECONDS = 5;
+    /**
+     * Seconds within which a forwarder's alive file proves it is running, when not configured: longer
+     * than a batch round trip (the primary's 15 s budget plus the item in flight), since a forwarder
+     * touches its file before and after a request, not during it.
+     */
+    public const int ALIVE_SECONDS = 30;
 
     private readonly string $root;
 

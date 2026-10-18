@@ -48,8 +48,10 @@ return [
     'publish_forward_max_attempts' => (int) env('RELEASE_VERIFICATION_PUBLISH_FORWARD_MAX_ATTEMPTS', 5),
     // Seconds a forwarder runs before the scheduler restarts it (forwarder N runs (N-1) extra minutes, so restarts stagger).
     'publish_forwarder_seconds' => (int) env('RELEASE_VERIFICATION_PUBLISH_FORWARDER_SECONDS', 300),
-    // A forwarder counts as alive to workers for this many seconds after it last touched its marker.
-    'publish_forwarder_alive_seconds' => (int) env('RELEASE_VERIFICATION_PUBLISH_FORWARDER_ALIVE_SECONDS', 5),
+    // A forwarder counts as alive to workers for this many seconds after it last touched its marker. It touches
+    // before and after each request, so this must outlast a batch round trip: the primary's batch budget
+    // (publish_batch_seconds, 15) plus the item it has in flight, with a margin.
+    'publish_forwarder_alive_seconds' => (int) env('RELEASE_VERIFICATION_PUBLISH_FORWARDER_ALIVE_SECONDS', 30),
     // The primary host serves that endpoint, without authentication, to these networks only.
     'publish_endpoint' => (bool) env('RELEASE_VERIFICATION_PUBLISH_ENDPOINT', false),
     'publish_allowed_networks' => env('RELEASE_VERIFICATION_PUBLISH_ALLOWED_NETWORKS', '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8'),
