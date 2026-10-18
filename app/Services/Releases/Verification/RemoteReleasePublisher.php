@@ -21,6 +21,15 @@ final class RemoteReleasePublisher
 
     private const string BATCH_FALLBACK_KEY = 'release_verification:publish_batch_fallback';
 
+    /** The most items per request the primary last advertised in a 422 answer, if it ever did. */
+    private ?int $advertisedMaxItems = null;
+
+    /** @var (callable(int): void)|null Called while a {@see publishMany()} call waits for the primary. */
+    private $progress = null;
+
+    /** Items of the current {@see publishMany()} call that already have an outcome. */
+    private int $completed = 0;
+
     public function publish(object $claim, VerificationResult $result): ?int
     {
         if (! $result->passed()) {
@@ -38,6 +47,7 @@ final class RemoteReleasePublisher
         try {
             $response = Http::acceptJson()->asJson()->connectTimeout(5)
                 ->timeout(max(10, (int) config('release_verification.publish_timeout', 120)))
+                ->withOptions($this->progressOptions())
                 ->retry(3, 1000, static fn (\Throwable $error): bool => $error instanceof ConnectionException, throw: false)
                 ->post((string) config('release_verification.publish_url'), $payload);
         } catch (\Throwable $error) {
@@ -81,10 +91,39 @@ final class RemoteReleasePublisher
      * A transport failure or an unusable batch response throws instead, and the primary treats a
      * resent item idempotently, so the whole list may simply be sent again.
      *
+     * $progress, when given, is called with the number of items that already have an outcome: before
+     * each request and while one waits for the primary (about once a second). A caller uses it to keep
+     * its own markers and its items' leases alive; a failure inside it never affects publication.
+     *
+     * @param  list<RemotePublishItem>  $items
+     * @param  (callable(int): void)|null  $progress
+     * @return list<PublicationOutcome>
+     */
+    public function publishMany(array $items, ?callable $progress = null): array
+    {
+        $this->progress = $progress;
+        $this->completed = 0;
+        try {
+            return $this->publishItems($items);
+        } finally {
+            $this->progress = null;
+        }
+    }
+
+    /**
+     * The most items per request the primary last advertised when it refused a batch as too large.
+     * A caller that builds batches should send no more than this.
+     */
+    public function advertisedMaxItems(): ?int
+    {
+        return $this->advertisedMaxItems;
+    }
+
+    /**
      * @param  list<RemotePublishItem>  $items
      * @return list<PublicationOutcome>
      */
-    public function publishMany(array $items): array
+    private function publishItems(array $items): array
     {
         $outcomes = [];
         $payloads = [];
@@ -127,6 +166,7 @@ final class RemoteReleasePublisher
         try {
             $response = Http::acceptJson()->asJson()->connectTimeout(5)
                 ->timeout(max(10, (int) config('release_verification.publish_timeout', 120)))
+                ->withOptions($this->progressOptions())
                 ->retry(3, 1000, static fn (\Throwable $error): bool => $error instanceof ConnectionException, throw: false)
                 ->post((string) config('release_verification.publish_batch_url'),
                     ['protocol' => RemotePublicationService::BATCH_PROTOCOL, 'items' => array_values($payloads)]);
@@ -145,6 +185,11 @@ final class RemoteReleasePublisher
         }
         if ($status === 413 || ($status === 422 && $response->json('max_items') !== null)) {
             // This batch is too big for the primary's limits; the endpoint itself works.
+            $advertised = $response->json('max_items');
+            if ($status === 422 && is_int($advertised) && $advertised >= 1) {
+                $this->advertisedMaxItems = $advertised;
+            }
+
             return null;
         }
         if (! $response->successful()) {
@@ -193,6 +238,9 @@ final class RemoteReleasePublisher
         $outcomes = [];
         $unreachable = null;
         foreach ($positions as $position) {
+            // Items before this position, in order, already have their outcomes.
+            $this->completed = $position;
+            $this->tick();
             if ($unreachable !== null) {
                 // The primary just proved unreachable; waiting out the same timeouts for each item helps no one.
                 $outcomes[$position] = new PublicationOutcome(PublicationOutcome::TRANSPORT, null, $unreachable);
@@ -214,6 +262,24 @@ final class RemoteReleasePublisher
         }
 
         return $outcomes;
+    }
+
+    /** @return array{progress?: callable} Guzzle's progress option, which cURL calls about once a second while waiting. */
+    private function progressOptions(): array
+    {
+        return $this->progress === null ? [] : ['progress' => fn () => $this->tick()];
+    }
+
+    private function tick(): void
+    {
+        if ($this->progress === null) {
+            return;
+        }
+        try {
+            ($this->progress)($this->completed);
+        } catch (\Throwable) {
+            // Keeping markers and leases fresh is best effort; it must not turn a publication into a failure.
+        }
     }
 
     private function markBatchUnavailable(): void
