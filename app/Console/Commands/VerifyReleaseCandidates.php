@@ -146,6 +146,8 @@ class VerifyReleaseCandidates extends Command
                 $directory = $root.'/scratch/'.$claim->id.'-'.$claim->version;
                 // The phase charged if an operation throws.
                 $active = 'bookkeeping';
+                // Once true, the forwarder owns the live lease: nothing after that may finish the candidate.
+                $handedOff = false;
                 try {
                     $phase = $diagnostics === null ? null : hrtime(true);
                     $heartbeat = static fn () => $repository->heartbeat((int) $claim->id, $claim->lease_token);
@@ -183,6 +185,7 @@ class VerifyReleaseCandidates extends Command
                     if ($result->passed()) {
                         if ($this->handOff($claim, $result, $directory, $scratchEntryId, $scratchInventory, $heartbeat, $progressHeartbeat, $diagnostics)) {
                             // The forwarder publishes it; this worker has already freed its scratch and moves on.
+                            $handedOff = true;
                             $diagnostics?->handedOff();
                         } else {
                             $published = config('release_verification.publish_url')
@@ -229,8 +232,12 @@ class VerifyReleaseCandidates extends Command
                         $diagnostics?->phase($active, $phase);
                     }
                     $diagnostics?->candidateFailed();
-                    $filtered = $this->filteredResult($claim);
-                    if ($filtered !== null) {
+                    $filtered = $handedOff ? null : $this->filteredResult($claim);
+                    if ($handedOff) {
+                        // A later step failed (such as the status file); the verified result is still queued, and
+                        // finishing the candidate would clear the lease that its forwarder is keeping alive.
+                        $this->warn($claim->id.': handed off for publication; a later step failed — '.$error->getMessage());
+                    } elseif ($filtered !== null) {
                         $diagnostics?->filtered();
                         $this->line($claim->id.': '.$filtered->verdict.' — '.$filtered->reason);
                     } else {
