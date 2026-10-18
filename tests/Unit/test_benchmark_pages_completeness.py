@@ -96,7 +96,7 @@ class CompletenessTest(unittest.TestCase):
         def unavailable(_):
             raise OSError('offline')
         report = pages.collect(SHA, ROOT, unavailable)
-        self.assertEqual(41, len(report.get('rust_exports', [])))
+        self.assertEqual(43, len(report.get('rust_exports', [])))
         self.assertIn('Public Rust interfaces', pages.render(report))
         self.assertIn('nntmux_nntp_header_pair_comparison_json', pages.render(report))
 

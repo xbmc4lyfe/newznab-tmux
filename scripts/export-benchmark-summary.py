@@ -46,7 +46,7 @@ SOURCE_PATHS = {
 RUST_SOURCE_PATHS = {"docker/app/nzb-yenc-ffi/src/" + name + ".rs" for name in (
     "abi_crc", "abi_decoder", "abi_decoder_arm", "abi_decoder_x86", "abi_receipts",
     "article_dates", "article_fingerprint", "article_identity", "article_xref", "benchmark", "cpu_snapshot", "formats",
-    "iso_path_tables", "iso_primary_copies", "lib", "nntp_body", "nntp_headers", "par2", "par2_source_ranges", "payload_decoder",
+    "header_filename_identity", "header_filename_unicode", "iso_path_tables", "iso_primary_copies", "lib", "nntp_body", "nntp_headers", "par2", "par2_source_ranges", "payload_decoder",
     "payload_decoder_arm", "payload_decoder_x86", "rar5_copy_checksums", "rar5_quick_open", "release_names",
     "sample_plan", "seven_zip_ranges", "xz_first_block", "yenc_framing", "zstd_frame",
     "tooling", "evidence", "installation",
