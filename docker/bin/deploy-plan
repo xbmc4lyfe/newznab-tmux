@@ -1369,6 +1369,10 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
         or legacy_stamp
         or stamped.get("migration") != state["migration"]
         or all_app_compose_changed
+        # A changed database service (e.g. storage swapped for a restored copy) may hold an older
+        # schema; the idempotent migration always follows it, and its forgotten record makes a retry
+        # repeat it until it completes.
+        or "mariadb" in dirty_data
     )
 
     # Reconcile-only work (e.g. a service added to Compose) is a rollout, never a no-op skip.

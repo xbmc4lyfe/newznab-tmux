@@ -2324,6 +2324,21 @@ SH);
         $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
     }
 
+    public function test_replacing_the_database_storage_runs_the_migration(): void
+    {
+        $bind = fn (string $source): array => ['volumes' => [['type' => 'bind', 'source' => $this->directory.'/'.$source, 'target' => '/var/lib/mysql']]];
+        $services = ['web' => [], 'horizon' => [], 'scheduler' => [], 'indexer' => [], 'redis' => [], 'manticore' => [], 'proxy' => []];
+        $config = fn (string $source): array => ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => $services + ['mariadb' => $bind($source)]], JSON_UNESCAPED_SLASHES)];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('data/live'))->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        // A cutover points MariaDB at a restored copy; no migration file or app definition changed.
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('data/restored'))->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 mariadb', $events);
+        $this->assertGreaterThan(strpos($events, '240 mariadb'), strpos($events, 'artisan migrate --force'));
+    }
+
     public function test_missing_data_service_whose_record_changed_is_recreated_with_writers_quiesced(): void
     {
         $this->composeFiles();
