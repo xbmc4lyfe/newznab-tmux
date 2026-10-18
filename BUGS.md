@@ -435,7 +435,7 @@ These bugs turned up while building and running the self-hosted stack in `docker
 
 - **Where:** `RELEASE_VERIFICATION_PUBLISH_ENDPOINT` defaults to `false`, and the worker template and notes never said the primary must enable it.
 - **Symptom:** every remote publish failed with "Remote publication failed: HTTP 404".
-- **Fix:** fixed by branch `codex/worker-template-fixups`. The worker template and `.env.example` now say the primary needs `RELEASE_VERIFICATION_PUBLISH_ENDPOINT=true` and an `INTERNAL_BIND` on a LAN address.
+- **Fix:** fixed by branch `codex/worker-template-fixups`. The worker template now says the primary needs `RELEASE_VERIFICATION_PUBLISH_ENDPOINT=true` and an `INTERNAL_BIND` on a LAN address (already in `docker/.env.example`); `.env.example` now says the endpoint flag must be true on the primary.
 
 ### 60. The remote worker template omitted the native yEnc library path (Fixed)
 
