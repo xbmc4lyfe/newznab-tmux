@@ -154,8 +154,8 @@ final class CompactFingerprintCollector
                     $analysis = $this->analyzer->analyzeArticleAndDecodedBytes($fetched['headers'], $fetched['body']);
                     $metadata = $analysis['metadata'];
                     $yenc = self::yencSummary($metadata['yenc'] ?? null);
-                    if (($yenc['crc_ok'] ?? null) === false) {
-                        $errors[$account]['YencCrcMismatch'] = ($errors[$account]['YencCrcMismatch'] ?? 0) + 1;
+                    foreach (self::yencIntegrityErrors($metadata['yenc'] ?? null) as $integrityError) {
+                        $errors[$account][$integrityError] = ($errors[$account][$integrityError] ?? 0) + 1;
                     }
                     if ($article['yenc'] !== null) {
                         continue;
@@ -171,7 +171,7 @@ final class CompactFingerprintCollector
                     if ($sample['segment_number'] === 1 && is_string($prefixMd5)) {
                         $firstPrefixMd5[$sample['file_index']] ??= strtolower($prefixMd5);
                     }
-                    if ($par2 === null && $sample['kind'] === 'par2' && ($yenc['crc_ok'] ?? null) !== false
+                    if ($par2 === null && $sample['kind'] === 'par2' && self::yencIntegrityErrors($metadata['yenc'] ?? null) === []
                         && is_string($analysis['decoded_bytes'] ?? null)) {
                         $summary = $this->par2Summary($analysis['decoded_bytes'], $files);
                         // Only a summary with file descriptions ends the search; a set ID alone (e.g. a
@@ -236,7 +236,10 @@ final class CompactFingerprintCollector
             'posting' => self::posting($files),
             'uploader_software_candidates' => $softwareCandidates,
             'errors' => $errorRows,
-            'truncated' => false,
+            // Also true when a list cap below omitted entries before the byte budget applied.
+            'truncated' => count($files) > self::MAX_LISTED_FILES
+                || (($par2 ?? $par2Fallback) !== null && ($par2 ?? $par2Fallback)['file_count'] > count(($par2 ?? $par2Fallback)['files']))
+                || count(self::nzbGroups($files)) > self::MAX_LISTED_GROUPS,
         ])];
     }
 
@@ -415,6 +418,7 @@ final class CompactFingerprintCollector
             'set_id' => $parsed['recovery_set_ids'][0] ?? null,
             'block_size' => $parsed['source_block_size'] ?? null,
             'recovery_blocks' => $parsed['unique_recovery_slice_count'] ?? null,
+            'file_count' => count($sources),
             'files' => array_slice($sources, 0, self::MAX_LISTED_FILES),
             'nzb_matches' => $matches,
         ];
@@ -426,15 +430,12 @@ final class CompactFingerprintCollector
      */
     private static function nzbSummary(array $manifest): array
     {
-        $groups = [];
+        $groups = self::nzbGroups($manifest['files']);
         $posters = [];
         $segments = 0;
         $bytes = 0;
         $kinds = [];
         foreach ($manifest['files'] as $file) {
-            foreach ($file['groups'] ?? [] as $group) {
-                $groups[(string) $group] = true;
-            }
             if (($file['poster'] ?? '') !== '') {
                 $posters[(string) $file['poster']] = ($posters[(string) $file['poster']] ?? 0) + 1;
             }
@@ -443,8 +444,6 @@ final class CompactFingerprintCollector
             $kind = (string) ($file['kind'] ?? 'other');
             $kinds[$kind] = ($kinds[$kind] ?? 0) + 1;
         }
-        $groups = array_keys($groups);
-        sort($groups);
         ksort($kinds);
         arsort($posters);
 
@@ -456,6 +455,24 @@ final class CompactFingerprintCollector
             'poster' => self::bounded(array_key_first($posters)),
             'kinds' => $kinds,
         ];
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $files
+     * @return list<string>
+     */
+    private static function nzbGroups(array $files): array
+    {
+        $groups = [];
+        foreach ($files as $file) {
+            foreach ($file['groups'] ?? [] as $group) {
+                $groups[(string) $group] = true;
+            }
+        }
+        $groups = array_map('strval', array_keys($groups));
+        sort($groups);
+
+        return $groups;
     }
 
     /**
@@ -511,7 +528,35 @@ final class CompactFingerprintCollector
             'begin' => is_int($yenc['begin'] ?? null) ? $yenc['begin'] : null,
             'end' => is_int($yenc['end'] ?? null) ? $yenc['end'] : null,
             'crc_ok' => is_bool($yenc['declared_crc32_matches'] ?? null) ? $yenc['declared_crc32_matches'] : null,
+            'size_ok' => ! in_array('YencSizeMismatch', self::yencIntegrityErrors($yenc), true),
         ];
+    }
+
+    /**
+     * Integrity failures the analyzer established for one provider's copy of an article.
+     *
+     * @return list<string>
+     */
+    private static function yencIntegrityErrors(mixed $yenc): array
+    {
+        if (! is_array($yenc)) {
+            return [];
+        }
+        $errors = [];
+        if (($yenc['declared_crc32_matches'] ?? null) === false) {
+            $errors[] = 'YencCrcMismatch';
+        }
+        foreach (['decoded_size_matches_yenc', 'decoded_size_matches_ypart_range', 'decoded_size_matches_yend_size'] as $check) {
+            if (($yenc[$check] ?? null) === false) {
+                $errors[] = 'YencSizeMismatch';
+                break;
+            }
+        }
+        if (($yenc['payload_escape_state_valid'] ?? null) === false) {
+            $errors[] = 'YencFramingInvalid';
+        }
+
+        return $errors;
     }
 
     private static function dateUtc(mixed $date): ?string

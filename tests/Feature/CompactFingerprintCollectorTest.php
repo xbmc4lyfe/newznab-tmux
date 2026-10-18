@@ -75,7 +75,7 @@ final class CompactFingerprintCollectorTest extends TestCase
         $this->assertSame('IMPLEMENTATION Fixture', $data['providers'][0]['implementation']);
         $this->assertCount(12, $data['articles']);
         // Single-part yEnc carries no part, total or range fields.
-        $this->assertSame(['name' => 'fixture file.bin', 'size' => 16, 'part' => null, 'total' => null, 'begin' => null, 'end' => null, 'crc_ok' => true], $data['articles'][1]['yenc']);
+        $this->assertSame(['name' => 'fixture file.bin', 'size' => 16, 'part' => null, 'total' => null, 'begin' => null, 'end' => null, 'crc_ok' => true, 'size_ok' => true], $data['articles'][1]['yenc']);
         $this->assertSame('2026-10-01T12:00:00Z', $data['articles'][1]['date_utc']);
         $this->assertSame(2, $data['articles'][1]['xref_group_count']);
         $this->assertSame(['ngPost'], $data['uploader_software_candidates']);
@@ -151,6 +151,7 @@ final class CompactFingerprintCollectorTest extends TestCase
         $this->assertSame(16384, $summary['block_size']);
         $this->assertSame(2, $summary['nzb_matches']);
         $this->assertMatchesRegularExpression('/\\A[0-9a-f]{32}\\z/', (string) $summary['set_id']);
+        $this->assertSame(2, $summary['file_count']);
         $this->assertSame([
             ['name' => 'offline-0000.bin', 'size' => 19_200, 'md5' => md5($data), 'md5_16k' => md5(substr($data, 0, 16384))],
             ['name' => 'offline-0001.bin', 'size' => 19_200, 'md5' => md5($data), 'md5_16k' => md5(substr($data, 0, 16384))],
@@ -282,6 +283,42 @@ final class CompactFingerprintCollectorTest extends TestCase
         $this->assertSame('partial', $result['status']);
         $this->assertSame([['account' => 'primary', 'error_type' => 'YencCrcMismatch', 'count' => 1]], $result['data']['errors']);
         $this->assertFalse($result['data']['articles'][array_search(1, array_column($result['data']['articles'], 'file_index'), true)]['yenc']['crc_ok']);
+    }
+
+    #[Test]
+    public function a_yenc_size_mismatch_is_reported_even_with_a_valid_crc(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(function (string $id): array {
+            $article = self::article($id);
+            if (str_starts_with($id, 'f2-')) {
+                $article['body'] = (string) preg_replace('/=yend size=16/', '=yend size=999', $article['body']);
+            }
+
+            return $article;
+        });
+
+        $result = $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7);
+
+        $this->assertSame('partial', $result['status']);
+        $this->assertSame([['account' => 'primary', 'error_type' => 'YencSizeMismatch', 'count' => 1]], $result['data']['errors']);
+        $article = $result['data']['articles'][array_search(2, array_column($result['data']['articles'], 'file_index'), true)];
+        $this->assertSame([true, false], [$article['yenc']['crc_ok'], $article['yenc']['size_ok']]);
+    }
+
+    #[Test]
+    public function capped_file_lists_set_the_truncated_flag(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->twice()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->andReturnUsing(fn (string $id): array => self::article($id));
+
+        $data = $this->collector()->collectFromNzb(self::nzb(201, 1, false), 7)['data'];
+
+        $this->assertLessThan(201, count($data['files']));
+        $this->assertTrue($data['truncated']);
+        $this->assertFalse($this->collector()->collectFromNzb(self::nzb(3, 1, false), 8)['data']['truncated']);
     }
 
     #[Test]
