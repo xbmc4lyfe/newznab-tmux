@@ -78,8 +78,7 @@ final class CompactFingerprintCollectorTest extends TestCase
         $this->assertCount(12, $data['articles']);
         // Single-part yEnc carries no part, total or range fields.
         $this->assertSame(['name' => 'fixture file.bin', 'size' => 16, 'part' => null, 'total' => null, 'begin' => null, 'end' => null, 'crc_ok' => true, 'size_ok' => true], $data['articles'][1]['yenc']);
-        $this->assertSame('2026-10-01T12:00:00Z', $data['articles'][1]['date_utc']);
-        $this->assertSame(2, $data['articles'][1]['xref_group_count']);
+        $this->assertArrayNotHasKey('date_utc', $data['articles'][1]);
         $this->assertSame(['ngPost'], $data['uploader_software_candidates']);
         // Two single-segment PAR2 files plus 120 five-segment RAR volumes.
         $this->assertSame(['file_count' => 122, 'segment_count' => 2 + 120 * 5], array_intersect_key($data['nzb'], ['file_count' => 1, 'segment_count' => 1]));
@@ -447,39 +446,6 @@ final class CompactFingerprintCollectorTest extends TestCase
         $this->assertNull($byFile[1]['size_ok']);
     }
 
-    /** @return array<string, array{string, string|null}> */
-    public static function dateHeaders(): array
-    {
-        return [
-            'RFC 5322 with offset' => ['Thu, 01 Oct 2026 14:30:05 +0200', '2026-10-01T12:30:05Z'],
-            'no weekday, GMT' => ['1 Oct 2026 12:00:00 GMT', '2026-10-01T12:00:00Z'],
-            'mismatched weekday' => ['Wed, 01 Oct 2026 12:00:00 +0000', '2026-10-01T12:00:00Z'],
-            'zone comment' => ['Thu, 01 Oct 2026 12:00 -0500 (EST)', '2026-10-01T17:00:00Z'],
-            'relative' => ['tomorrow', null],
-            'time only' => ['12:00:00', null],
-            'no zone' => ['Thu, 01 Oct 2026 12:00:00', null],
-            'impossible day' => ['31 Feb 2026 12:00:00 +0000', null],
-        ];
-    }
-
-    #[Test]
-    #[DataProvider('dateHeaders')]
-    public function only_absolute_dates_with_a_zone_are_recorded(string $header, ?string $expected): void
-    {
-        $nntp = $this->mock(NNTPService::class);
-        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->once()->andReturnUsing(function (string $id) use ($header): array {
-            $article = self::article($id);
-            $article['headers'][1] = 'Date: '.$header;
-
-            return $article;
-        });
-
-        $data = $this->collector()->collectFromNzb(self::nzb(1, 1, false), 7)['data'];
-
-        $this->assertSame($expected, $data['articles'][0]['date_utc']);
-    }
-
     #[Test]
     public function retrieval_timings_do_not_change_what_a_record_keeps(): void
     {
@@ -664,6 +630,56 @@ final class CompactFingerprintCollectorTest extends TestCase
         $summary = $this->collector()->collectFromNzb(self::par2Nzb(['offline-0000.bin']), 7)['data']['par2'];
 
         $this->assertSame(['offline-0000.bin'], array_column($summary['files'], 'name'));
+    }
+
+    #[Test]
+    public function a_copy_that_identifies_as_another_article_is_rejected(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(fn (string $id): array => str_starts_with($id, 'f1-')
+            ? self::article('wrong@fixture') : self::article($id));
+
+        $result = $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7);
+        $foreign = $result['data']['articles'][array_search(1, array_column($result['data']['articles'], 'file_index'), true)];
+
+        $this->assertSame('partial', $result['status']);
+        $this->assertSame([['account' => 'primary', 'error_type' => 'ArticleIdentityMismatch', 'count' => 1]], $result['data']['errors']);
+        $this->assertNull($foreign['yenc']);
+    }
+
+    #[Test]
+    public function par2_data_from_several_recovery_sets_is_not_merged_into_one_summary(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(fn (string $id): array => [
+            'body' => YencArticles::article($id === 'index@fixture'
+                ? ArchiveParsingBenchmarkFixtures::par2(1).str_replace('offline-', 'other-', ArchiveParsingBenchmarkFixtures::par2(2))
+                : 'payload'),
+        ] + self::article($id));
+
+        $summary = $this->collector()->collectFromNzb(self::par2Nzb(['offline-0000.bin']), 7)['data']['par2'];
+
+        $this->assertTrue($summary === null || $summary['files'] === []);
+    }
+
+    #[Test]
+    public function an_unrepresentable_nzb_byte_total_is_unknown_and_invalid(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->andReturnUsing(fn (string $id): array => self::article($id));
+        $xml = '<?xml version="1.0" encoding="UTF-8"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">';
+        foreach (['a.rar', 'b.nfo'] as $position => $name) {
+            $xml .= '<file poster="p@example" date="1790812800" subject="&quot;'.$name.'&quot; yEnc (1/1)"><groups><group>a.b.test</group></groups>'
+                .'<segments><segment bytes="'.PHP_INT_MAX.'" number="1">f'.$position.'@fixture</segment></segments></file>';
+        }
+
+        $data = $this->collector()->collectFromNzb($xml.'</nzb>', 7)['data'];
+
+        $this->assertNull($data['nzb']['total_bytes']);
+        $this->assertContains('NzbManifestInvalid', array_column($data['errors'], 'error_type'));
     }
 
     /** @return array<string, mixed> */

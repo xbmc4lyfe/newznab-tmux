@@ -135,8 +135,6 @@ final class CompactFingerprintCollector
                 'role' => $sample['role'],
                 'provider_results' => [],
                 'yenc' => null,
-                'date_utc' => null,
-                'xref_group_count' => null,
             ];
             foreach ($servers as $server) {
                 $account = $server['account'];
@@ -163,6 +161,12 @@ final class CompactFingerprintCollector
                     // Each provider's copy is decoded so corruption on any of them is reported.
                     $analysis = $this->analyzer->analyzeArticleAndDecodedBytes($fetched['headers'], $fetched['body']);
                     $metadata = $analysis['metadata'];
+                    // A copy that identifies as another article must not supply evidence for this one.
+                    if (! self::identityMatches($sample['messageid'], $metadata['headers']['message-id'] ?? null, $fetched)) {
+                        $errors[$account]['ArticleIdentityMismatch'] = ($errors[$account]['ArticleIdentityMismatch'] ?? 0) + 1;
+
+                        continue;
+                    }
                     $yenc = self::yencSummary($metadata['yenc'] ?? null);
                     foreach (self::yencIntegrityErrors($metadata['yenc'] ?? null) as $integrityError) {
                         $errors[$account][$integrityError] = ($errors[$account][$integrityError] ?? 0) + 1;
@@ -184,8 +188,6 @@ final class CompactFingerprintCollector
                     }
                     // The article summary comes from the first provider that returned it.
                     $article['yenc'] = $yenc;
-                    $article['date_utc'] = self::dateUtc($metadata['headers']['date'] ?? null);
-                    $article['xref_group_count'] = self::xrefGroupCount($metadata['headers']['xref'] ?? null);
                     foreach (array_keys($metadata['uploader_software_candidates'] ?? []) as $candidate) {
                         $softwareCandidates[$candidate] = true;
                     }
@@ -449,8 +451,20 @@ final class CompactFingerprintCollector
         }
         usort($sources, static fn (array $a, array $b): int => [(string) $a['name'], (string) $a['md5']] <=> [(string) $b['name'], (string) $b['md5']]);
 
+        $setIds = is_array($parsed['recovery_set_ids'] ?? null) ? array_values($parsed['recovery_set_ids']) : [];
+        $coherent = count($setIds) === 1
+            && ($parsed['source_descriptions_valid'] ?? false) === true
+            && ($parsed['main_definition_conflict'] ?? false) !== true
+            && ($parsed['conflicting_file_description_ids'] ?? []) === []
+            && ($parsed['source_definition_conflicts'] ?? []) === [];
+        if (! $coherent) {
+            // Multiple sets or contradictory descriptions: keep only a set ID fallback (no files).
+            return count($setIds) === 1 ? ['set_id' => $setIds[0], 'block_size' => null, 'recovery_blocks' => null,
+                'file_count' => 0, 'files' => [], 'nzb_matches' => 0] : null;
+        }
+
         return [
-            'set_id' => $parsed['recovery_set_ids'][0] ?? null,
+            'set_id' => $setIds[0],
             'block_size' => $parsed['source_block_size'] ?? null,
             'recovery_blocks' => $parsed['unique_recovery_slice_count'] ?? null,
             'file_count' => count($sources),
@@ -475,7 +489,9 @@ final class CompactFingerprintCollector
                 $posters[(string) $file['poster']] = ($posters[(string) $file['poster']] ?? 0) + 1;
             }
             $segments += (int) ($file['segment_count'] ?? 0);
-            $bytes += is_int($file['advertised_bytes'] ?? null) ? $file['advertised_bytes'] : 0;
+            $fileBytes = is_int($file['advertised_bytes'] ?? null) ? $file['advertised_bytes'] : 0;
+            // Checked addition: an unrepresentable total is unknown, never a rounded float.
+            $bytes = $bytes === null || $fileBytes > PHP_INT_MAX - $bytes ? null : $bytes + $fileBytes;
             $kind = (string) ($file['kind'] ?? 'other');
             $kinds[$kind] = ($kinds[$kind] ?? 0) + 1;
         }
@@ -679,48 +695,6 @@ final class CompactFingerprintCollector
             && ($yenc['decoded_size_matches_yend_size'] ?? null) === true;
     }
 
-    /**
-     * An absolute RFC 5322 date with an explicit zone; relative or zone-less values would depend on
-     * when and where the job ran.
-     */
-    private static function dateUtc(mixed $date): ?string
-    {
-        if (! is_string($date)) {
-            return null;
-        }
-        $pattern = '/\A\s*(?:[A-Za-z]{3},\s*)?(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})\s+'
-            .'(\d{2}):(\d{2})(?::(\d{2}))?\s+([+-]\d{4}|UT|GMT|Z|[ECMP][SD]T)(?:\s*\(.*\))?\s*\z/i';
-        if (preg_match($pattern, $date, $match) !== 1) {
-            return null;
-        }
-        $zone = strtoupper($match[7]);
-        $offset = match ($zone) {
-            'UT', 'GMT', 'Z' => '+0000',
-            'EST' => '-0500', 'EDT' => '-0400', 'CST' => '-0600', 'CDT' => '-0500',
-            'MST' => '-0700', 'MDT' => '-0600', 'PST' => '-0800', 'PDT' => '-0700',
-            default => $zone,
-        };
-        $parsed = \DateTimeImmutable::createFromFormat('!j M Y H:i:s O',
-            sprintf('%d %s %s %s:%s:%s %s', $match[1], ucfirst(strtolower($match[2])), $match[3], $match[4], $match[5], $match[6] !== '' ? $match[6] : '00', $offset));
-        $errors = \DateTimeImmutable::getLastErrors();
-        if ($parsed === false || ($errors !== false && ($errors['warning_count'] > 0 || $errors['error_count'] > 0))) {
-            return null;
-        }
-
-        return $parsed->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d\TH:i:s\Z');
-    }
-
-    private static function xrefGroupCount(mixed $xref): ?int
-    {
-        if (! is_string($xref) || trim($xref) === '') {
-            return null;
-        }
-        $parts = preg_split('/\s+/', trim($xref)) ?: [];
-
-        // The first token is the server name; each further token is group:number.
-        return max(0, count($parts) - 1);
-    }
-
     private static function subjectFilename(string $subject): string
     {
         return preg_match('/"([^"]+)"/', $subject, $match) === 1 ? $match[1] : $subject;
@@ -752,7 +726,8 @@ final class CompactFingerprintCollector
     }
 
     /**
-     * Files whose NZB records the analyzer found corrupt (or 1 for an invalid release byte total).
+     * Files whose NZB records the analyzer found corrupt (or 1 when the release byte total is invalid
+     * or not representable).
      *
      * @param  array<string, mixed>  $manifest
      */
@@ -770,7 +745,37 @@ final class CompactFingerprintCollector
             }
         }
 
-        return $invalid === 0 && ($manifest['advertised_byte_totals_valid'] ?? true) === false ? 1 : $invalid;
+        $total = 0;
+        foreach ($manifest['files'] as $file) {
+            $fileBytes = is_int($file['advertised_bytes'] ?? null) ? $file['advertised_bytes'] : 0;
+            $total = $total === null || $fileBytes > PHP_INT_MAX - $total ? null : $total + $fileBytes;
+        }
+        $totalInvalid = ($manifest['advertised_byte_totals_valid'] ?? true) === false || $total === null;
+
+        return $invalid === 0 && $totalInvalid ? 1 : $invalid;
+    }
+
+    /**
+     * The copy must identify as the requested article: the HEAD Message-ID header and any Message-ID
+     * in the HEAD/BODY status lines must equal it.
+     *
+     * @param  array<string, mixed>  $fetched
+     */
+    private static function identityMatches(string $requested, mixed $headerMessageId, array $fetched): bool
+    {
+        $normalize = static fn (string $id): string => strtolower(trim(trim($id), '<>'));
+        $want = $normalize($requested);
+        if (is_string($headerMessageId) && $normalize($headerMessageId) !== $want) {
+            return false;
+        }
+        foreach (['head_response', 'body_response'] as $response) {
+            $text = $fetched[$response]['response_text'] ?? null;
+            if (is_string($text) && preg_match('/<([^>]+)>/', $text, $match) === 1 && $normalize($match[1]) !== $want) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /** @param array<string, mixed> $profile */
