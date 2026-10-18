@@ -54,7 +54,7 @@ final class RemoteReleasePublisher
             $response = Http::acceptJson()->asJson()->connectTimeout(5)
                 ->timeout(max(10, (int) config('release_verification.publish_timeout', 120)))
                 ->withOptions($this->progressOptions())
-                ->retry(3, 1000, static fn (\Throwable $error): bool => $error instanceof ConnectionException, throw: false)
+                ->retry(3, 1000, fn (\Throwable $error): bool => $error instanceof ConnectionException && ! $this->cancelledNow(), throw: false)
                 ->post((string) config('release_verification.publish_url'), $payload);
         } catch (\Throwable $error) {
             $timing?->reportRoundTrip('threw', null);
@@ -213,7 +213,7 @@ final class RemoteReleasePublisher
             $response = Http::acceptJson()->asJson()->connectTimeout(5)
                 ->timeout(max(10, (int) config('release_verification.publish_timeout', 120)))
                 ->withOptions($this->progressOptions())
-                ->retry(3, 1000, static fn (\Throwable $error): bool => $error instanceof ConnectionException, throw: false)
+                ->retry(3, 1000, fn (\Throwable $error): bool => $error instanceof ConnectionException && ! $this->cancelledNow(), throw: false)
                 ->post((string) config('release_verification.publish_batch_url'),
                     ['protocol' => RemotePublicationService::BATCH_PROTOCOL, 'items' => array_values($payloads)]);
         } catch (\Throwable $error) {

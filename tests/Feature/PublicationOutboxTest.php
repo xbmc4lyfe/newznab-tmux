@@ -1505,6 +1505,40 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(['retry', 'retry'], array_map(static fn (PublicationOutcome $outcome): string => $outcome->status, $outcomes));
     }
 
+    public function test_cancellation_after_a_failed_attempt_stops_the_transport_retries(): void
+    {
+        Sleep::fake();
+        $this->batchSchema();
+        $claim = $this->claimedCandidate('one@article');
+        $items = [new RemotePublishItem($claim, $this->sampled($claim))];
+        $publisher = app(RemoteReleasePublisher::class);
+
+        foreach ([false, true] as $batch) {
+            $this->configureAsync(batch: $batch);
+            Http::fake(function (HttpRequest $request) {
+                $this->requested[] = $request->url();
+                throw new ConnectionException('cURL error 28: Operation timed out.');
+            });
+
+            // Without a cancellation check the client keeps its three attempts, as before.
+            try {
+                $publisher->publishMany($items);
+            } catch (ConnectionException) {
+            }
+            $this->assertCount(3, $this->requested);
+
+            // Cancelled once the first attempt has failed: it is the only one.
+            $this->requested = [];
+            try {
+                $outcomes = $publisher->publishMany($items, null, fn (): bool => count($this->requested) >= 1);
+                $this->assertSame(['transport'], array_map(static fn (PublicationOutcome $outcome): string => $outcome->status, $outcomes));
+            } catch (ConnectionException) {
+                $this->assertTrue($batch, 'only the batch request throws');
+            }
+            $this->assertCount(1, $this->requested);
+        }
+    }
+
     public function test_sigterm_in_the_one_by_one_fallback_sends_no_further_request_and_requeues_the_rest(): void
     {
         if (! function_exists('posix_kill') || ! defined('SIGTERM')) {
