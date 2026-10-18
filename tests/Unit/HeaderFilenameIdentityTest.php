@@ -26,7 +26,8 @@ class HeaderFilenameIdentityTest extends TestCase
         try {
             foreach (['[1/1]'.str_repeat(' ', 990).'"a"', str_repeat('"a" ', 250), '"a'.str_repeat('.rar', 248).'"',
                 str_repeat("'", 1000), '"'.str_repeat('Ab1', 330).'" yEnc',
-                '[1/1]'.str_repeat(' ', 667).'x'.str_repeat('"a"', 111)] as $subject) {
+                '[1/1]'.str_repeat(' ', 667).'x'.str_repeat('"a"', 111), '"a'.str_repeat('.ts', 332).'x" yEnc',
+                '"a'.str_repeat('.7z', 332).'x" yEnc', '"a'.str_repeat('.r00', 249).'x" yEnc'] as $subject) {
                 HeaderFilenameIdentity::matches($subject, 'Readable.Name.mkv');
                 self::assertSame(PREG_NO_ERROR, preg_last_error(), substr($subject, 0, 20));
             }
@@ -117,6 +118,9 @@ class HeaderFilenameIdentityTest extends TestCase
             'colon inside a readable payload name' => ['[1/2] - "Movie: The Title.mkv" yEnc', 'Movie- The Title.mkv', true],
             'separators merge different numbers' => ['"Show 1 10.mkv" yEnc', 'Show 11 0.mkv', false],
             'dotted numbers merge differently' => ['"Readable.Name.1.10.mkv" yEnc', 'Readable.Name.11.0.mkv', false],
+            'unquoted subject names a longer file' => ['Movie.2026.1080p.exe.mkv yEnc (1/50)', 'Movie.2026.1080p.exe', false],
+            'unquoted subject names a sample file' => ['Movie.2026.1080p.exe-sample.mkv yEnc (1/50)', 'Movie.2026.1080p.exe', false],
+            'unquoted subject names the executable before a dash' => ['Readable setup.exe - yEnc (1/2)', 'setup.exe', true],
             'opaque subject with an extensionless body' => ['[3/8] - "o9aeI3YpDwgHGoJ2ZsCm.vol00+01.par2" yEnc', '148f76878d7732b981734a9e0c51a348', true],
         ];
     }

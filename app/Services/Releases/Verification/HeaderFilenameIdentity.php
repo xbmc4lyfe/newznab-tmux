@@ -13,7 +13,7 @@ final class HeaderFilenameIdentity
 {
     private const string QUOTED = '/"([^"\r\n]+)"|(?<![\p{L}\p{N}_])\'([^\'\r\n]+)\'(?![\p{L}\p{N}_])/u';
 
-    private const string SUFFIXES = '/(?:\.(?:part\d+|vol\d+[+-]\d+|par2|rar|r\d{2,3}|\d{3}|7z|zip|mkv|avi|mp4|m4v|ts|nfo|sfv|nzb|epub|pdf|flac|mp3|iso|srt|txt|jpg|png))+\z/i';
+    private const string SUFFIX = '/\A(?:part\d+|vol\d+[+-]\d+|par2|rar|r\d{2,3}|\d{3}|7z|zip|mkv|avi|mp4|m4v|ts|nfo|sfv|nzb|epub|pdf|flac|mp3|iso|srt|txt|jpg|png)\z/i';
 
     private const string EXECUTABLE = '/\.(?:exe|scr|bat|cmd|com|msi|msix|msp|lnk|pif|cpl|hta|reg|scf|js|jse|vbs|vbe|wsf|wsh|ps1|psm1|jar|apk|dll|sh|command|app|dmg|pkg|chm|msc|ps1xml|psd1|cab|appx|appxbundle|msixbundle|application|gadget|inf|url|xll|ws|wsc|sct|vb|ocx|sys|iso|img|vhd|vhdx)\z/i';
 
@@ -27,7 +27,8 @@ final class HeaderFilenameIdentity
         }
         if ($count === 0) {
             return ! self::executable($actual)
-                || preg_match('/(?<![\p{L}\p{N}_])'.preg_quote($actual, '/').'(?![\p{L}\p{N}_])/iu', $subject) === 1;
+                // The subject must name the body itself, not a longer file such as body.exe.mkv.
+                || preg_match('/(?<![\p{L}\p{N}_])'.preg_quote($actual, '/').'(?![\p{L}\p{N}_]|[.\-][\p{L}\p{N}])/iu', $subject) === 1;
         }
         $quoted = [];
         $declared = null;
@@ -123,9 +124,14 @@ final class HeaderFilenameIdentity
         return preg_match('/\.([^.\s]+)\z/u', $name, $match) === 1 ? $match[1] : '';
     }
 
+    /** The name without its trailing chain of known archive and media suffixes, stripped in linear time. */
     private static function stem(string $name): string
     {
-        return (string) preg_replace(self::SUFFIXES, '', $name);
+        while (($dot = strrpos($name, '.')) !== false && preg_match(self::SUFFIX, substr($name, $dot + 1)) === 1) {
+            $name = substr($name, 0, $dot);
+        }
+
+        return $name;
     }
 
     private static function suffix(string $name): string
