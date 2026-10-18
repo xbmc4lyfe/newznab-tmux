@@ -8,7 +8,10 @@ use App\Services\NNTP\NNTPService;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\PublicationOutbox;
 use App\Services\Releases\Verification\PublicationOutboxEntry;
+use App\Services\Releases\Verification\PublicationOutcome;
 use App\Services\Releases\Verification\RemotePublicationService;
+use App\Services\Releases\Verification\RemotePublishItem;
+use App\Services\Releases\Verification\RemoteReleasePublisher;
 use App\Services\Releases\Verification\SpotCheckVerifier;
 use App\Services\Releases\Verification\VerificationWorkerLocks;
 use Illuminate\Console\Scheduling\Schedule;
@@ -276,8 +279,41 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->assertFalse($this->outbox()->forwarderAlive());
         $this->markForwarderAlive(2, 0);
         $this->assertTrue($this->outbox()->forwarderAlive());
-        $this->assertFalse($this->outbox()->forwarderAlive(time() + 30));
-        $this->assertTrue($this->outbox()->forwarderAlive(time() + 30, 120));
+        $this->assertFalse($this->outbox()->forwarderAlive(time() + 60));
+        $this->assertTrue($this->outbox()->forwarderAlive(time() + 60, 120));
+    }
+
+    public function test_a_forwarder_in_the_middle_of_a_batch_round_trip_still_counts_as_alive(): void
+    {
+        $this->configureAsync();
+        // The default window outlasts the primary's batch budget plus the item it has in flight.
+        $this->assertSame(30, (int) config('release_verification.publish_forwarder_alive_seconds'));
+        $this->assertGreaterThanOrEqual((int) ceil((float) config('release_verification.publish_batch_seconds')) + 10,
+            (int) config('release_verification.publish_forwarder_alive_seconds'));
+        $this->markForwarderAlive(1, 29);
+        $this->assertTrue($this->outbox()->forwarderAlive());
+        $this->markForwarderAlive(1, 45);
+        $this->assertFalse($this->outbox()->forwarderAlive());
+        // The window follows the configuration.
+        config(['release_verification.publish_forwarder_alive_seconds' => 60]);
+        $this->assertTrue($this->outbox()->forwarderAlive());
+    }
+
+    public function test_a_worker_hands_off_while_every_forwarder_is_mid_send(): void
+    {
+        $this->batchSchema();
+        $this->configureAsync();
+        $this->workerCandidate();
+        // Both forwarders touched their markers before sending a 15 s batch; neither has touched since.
+        $this->markForwarderAlive(1, 20);
+        $this->markForwarderAlive(2, 25);
+        Http::fake();
+
+        $report = $this->runWorker();
+
+        Http::assertNothingSent();
+        $this->assertSame(1, $report['handed_off']);
+        $this->assertSame(0, $report['outbox_fallbacks']);
     }
 
     public function test_a_full_outbox_holds_the_worker_with_heartbeats_until_there_is_room(): void
@@ -855,6 +891,91 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->assertSame('filtered', $this->candidateStatus($filtered));
         $this->assertSame([], $this->pendingNames());
         $this->assertSame([], glob($this->outbox()->inflightDirectory(1).'/*') ?: []);
+    }
+
+    public function test_a_connection_failure_on_the_single_endpoint_requeues_every_entry_with_backoff(): void
+    {
+        Sleep::fake();
+        $this->batchSchema(releases: 2);
+        $this->configureAsync(batch: false);
+        $claims = [$this->claimedCandidate('one@article'), $this->claimedCandidate('two@article')];
+        array_map($this->handOff(...), $claims);
+        $failing = true;
+        Http::fake(function (HttpRequest $request) use (&$failing) {
+            $this->requested[] = $request->url();
+            if ($failing) {
+                throw new ConnectionException('cURL error 28: Operation timed out.');
+            }
+
+            return Http::response($this->withServerVariables(self::PEER)->postJson('/internal/release-verification/publish', $request->data())->json());
+        });
+        $summaries = [];
+        $this->captureSummaries($summaries, 'Publication forwarder run summary.');
+
+        $this->forward(['--diagnostics' => true]);
+
+        // The primary was not reached: nothing is finished, both are queued again with a delay, and the
+        // second item did not wait out the same timeouts (the tries were the first item's alone).
+        $this->assertSame(array_fill(0, 3, self::SINGLE), $this->requested);
+        foreach ($claims as $claim) {
+            $document = $this->entryDocument($this->pendingPath($claim));
+            $this->assertSame(1, $document['attempts']);
+            $this->assertGreaterThan(microtime(true), $document['not_before']);
+            $this->assertSame('verifying', $this->candidateStatus($claim));
+            $this->assertNotNull($this->candidateRow($claim)->lease_token);
+        }
+        $this->assertSame(2, $summaries[0]['outcomes']['transport']);
+        $this->assertSame(2, $summaries[0]['requeued']);
+        $this->assertSame(0, $summaries[0]['outcomes']['error']);
+        $failing = false;
+        foreach ($claims as $claim) {
+            $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['not_before' => 0] + $document);
+        }
+
+        $this->forward();
+
+        $this->assertSame(['sampled', 'sampled'], array_map($this->candidateStatus(...), $claims));
+        $this->assertSame([], $this->pendingNames());
+    }
+
+    public function test_an_error_response_on_the_single_endpoint_still_finishes_the_candidate_unknown(): void
+    {
+        $this->batchSchema();
+        $this->configureAsync(batch: false);
+        $claim = $this->claimedCandidate('one@article');
+        $this->handOff($claim);
+        Http::fake(['primary.test/*' => Http::response(['error' => 'Stale verification result cannot publish.'], 409)]);
+
+        $this->forward();
+
+        $row = $this->candidateRow($claim);
+        $this->assertSame('unknown', $row->status);
+        $this->assertStringContainsString('Stale verification result cannot publish.', $row->reason);
+        $this->assertSame([], $this->pendingNames());
+    }
+
+    public function test_publish_many_reports_an_unreachable_primary_as_transport_and_an_error_response_as_error(): void
+    {
+        Sleep::fake();
+        $this->batchSchema();
+        $this->configureAsync(batch: false);
+        $claims = [$this->claimedCandidate('one@article'), $this->claimedCandidate('two@article')];
+        $items = array_map(fn (object $claim): RemotePublishItem => new RemotePublishItem($claim, $this->sampled($claim)), $claims);
+        $publisher = app(RemoteReleasePublisher::class);
+        $answer = 'unreachable';
+        Http::fake(static function () use (&$answer) {
+            return $answer === 'unreachable' ? throw new ConnectionException('Connection refused.') : Http::response(['error' => 'Database unavailable.'], 500);
+        });
+
+        $unreachable = $publisher->publishMany($items);
+        $answer = 'refused';
+        $refused = $publisher->publishMany($items);
+
+        $this->assertSame(['transport', 'transport'], array_map(static fn (PublicationOutcome $outcome): string => $outcome->status, $unreachable));
+        $this->assertStringContainsString('Connection refused.', (string) $unreachable[0]->error);
+        $this->assertFalse($unreachable[0]->published());
+        $this->assertSame(['error', 'error'], array_map(static fn (PublicationOutcome $outcome): string => $outcome->status, $refused));
+        $this->assertSame('Remote publication failed: Database unavailable.', $refused[0]->error);
     }
 
     public function test_a_forwarder_run_stops_at_its_deadline(): void

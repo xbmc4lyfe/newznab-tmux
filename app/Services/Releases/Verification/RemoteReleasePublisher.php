@@ -191,11 +191,23 @@ final class RemoteReleasePublisher
     private function publishEach(array $items, array $positions): array
     {
         $outcomes = [];
+        $unreachable = null;
         foreach ($positions as $position) {
+            if ($unreachable !== null) {
+                // The primary just proved unreachable; waiting out the same timeouts for each item helps no one.
+                $outcomes[$position] = new PublicationOutcome(PublicationOutcome::TRANSPORT, null, $unreachable);
+
+                continue;
+            }
             try {
                 $releaseId = $this->publish($items[$position]->claim, $items[$position]->result);
                 $outcomes[$position] = $releaseId === null ? new PublicationOutcome(PublicationOutcome::NO_RELEASE)
                     : new PublicationOutcome(PublicationOutcome::PUBLISHED, $releaseId);
+            } catch (ConnectionException $error) {
+                // A refused or dropped connection or a timeout is no answer from the primary; an error
+                // response (a RuntimeException from publish()) is, and stays an ERROR below.
+                $unreachable = mb_strcut('Remote publication could not reach the primary: '.$error->getMessage(), 0, 500, 'UTF-8');
+                $outcomes[$position] = new PublicationOutcome(PublicationOutcome::TRANSPORT, null, $unreachable);
             } catch (\Throwable $error) {
                 $outcomes[$position] = new PublicationOutcome(PublicationOutcome::ERROR, null, mb_strcut($error->getMessage(), 0, 500, 'UTF-8'));
             }

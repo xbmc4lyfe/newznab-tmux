@@ -262,6 +262,12 @@ class ForwardVerifiedPublications extends Command
                 }
 
                 return;
+            case PublicationOutcome::TRANSPORT:
+                // No answer from the primary (the single-endpoint path reports a failed connection per item):
+                // back off like a failed batch request rather than give up the verified result.
+                $this->retry($entry, $outcome->error ?? 'The primary could not be reached.', min(30.0, 2.0 ** ($entry->attempts + 1)));
+
+                return;
             case PublicationOutcome::RETRY:
                 $this->retry($entry, $outcome->error ?? 'The primary did not start this item; sending it again.', 1.0);
 

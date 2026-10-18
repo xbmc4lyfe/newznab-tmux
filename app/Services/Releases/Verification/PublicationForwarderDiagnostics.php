@@ -16,7 +16,7 @@ final class PublicationForwarderDiagnostics
     public const int SCHEMA_VERSION = 1;
 
     /** Outcome labels counted per item; anything else is "other". */
-    private const array OUTCOMES = ['published', 'filtered', 'metadata_review', 'stale', 'invalid', 'error', 'paused', 'retry', 'no_release'];
+    private const array OUTCOMES = ['published', 'filtered', 'metadata_review', 'stale', 'invalid', 'error', 'paused', 'retry', 'transport', 'no_release'];
 
     private ?string $stopReason = null;
 
