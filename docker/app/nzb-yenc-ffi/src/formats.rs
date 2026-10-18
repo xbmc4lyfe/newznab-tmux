@@ -2150,6 +2150,12 @@ fn resolve_zip_filename_authority(
     if extra_fields_fully_inspected != Some(true) {
         return (None, None, None, "extra_fields_incomplete");
     }
+    // Readers truncate at an embedded NUL (`visible.txt\0hidden.mkv` is `visible.txt`),
+    // so the full byte string is not a filename any reader agrees on. The raw bytes
+    // stay available through the existing observations.
+    if filename_bytes.contains(&0) {
+        return (None, None, None, "local_filename_contains_nul");
+    }
     if filename_bytes.is_empty() {
         return (Some(String::new()), Some(false), None, "empty_filename");
     }
@@ -7847,7 +7853,7 @@ fn parse_zip_unicode_path_record(
     // record would otherwise resolve a non-empty local name to an empty string.
     let usable_as_filename_override = version == Some(1)
         && filename_crc32_matches == Some(true)
-        && unicode_filename.is_some_and(|bytes| !bytes.is_empty())
+        && unicode_filename.is_some_and(|bytes| !bytes.is_empty() && !bytes.contains(&0))
         && unicode_filename_utf8_valid == Some(true)
         && unicode_filename_bom_present == Some(false)
         && unicode_filename_matches_efs_filename != Some(false);
@@ -13397,6 +13403,43 @@ mod tests {
         assert_eq!(headers[2]["filename_encoding"], "iso_8859_1");
         assert_eq!(headers[2]["filename_utf8_text"], "Épisode.tar");
         assert_eq!(headers[2]["comment_utf8_text"], "– note");
+    }
+
+    #[test]
+    fn zip_filename_authority_is_withheld_for_embedded_nul_names() {
+        // Readers stop at the NUL, so the full byte string is not a shared filename.
+        let local = b"visible.txt\0hidden.mkv";
+        for flags in [0u16, 0x0800] {
+            let json = zip_upath_fixture(flags, local, &[]);
+            let header = &json["headers"][0];
+            assert!(header["resolved_filename"].is_null());
+            assert!(header["resolved_filename_source"].is_null());
+            assert_eq!(
+                header["resolved_filename_status"],
+                "local_filename_contains_nul"
+            );
+            assert_eq!(header["filename_bytes_length"], local.len());
+        }
+
+        // A Unicode Path name with an embedded NUL is not an override either; the
+        // clean local name keeps authority.
+        let clean = b"release.mkv";
+        let record = zip_upath_record(1, crc32fast::hash(clean), b"a.mkv\0b.mkv");
+        let json = zip_upath_fixture(0, clean, std::slice::from_ref(&record));
+        let header = &json["headers"][0];
+        assert_eq!(
+            header["zip_unicode_path_records"][0]["usable_as_filename_override"],
+            false
+        );
+        assert_eq!(header["resolved_filename"], "release.mkv");
+
+        // An NUL-bearing local name cannot be rescued by a valid Unicode Path record.
+        let record = zip_upath_record(1, crc32fast::hash(local), b"real.mkv");
+        let json = zip_upath_fixture(0, local, std::slice::from_ref(&record));
+        assert_eq!(
+            json["headers"][0]["resolved_filename_status"],
+            "local_filename_contains_nul"
+        );
     }
 
     #[test]
