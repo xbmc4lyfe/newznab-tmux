@@ -1,5 +1,7 @@
 #!/bin/sh
-# A matching source stamp only skips a deploy while every app service is healthy and on its expected image.
+# A matching source stamp only skips a deploy while every app service is healthy and on its expected
+# image, and no running data/infrastructure container runs an image other than its tag's local one.
+# --healthy checks app health only. deploy-app also runs this after a rollout before success.
 set -eu
 DIR=$(cd "$(dirname "$0")/.." && pwd)
 COMPOSE_FILE="${COMPOSE_FILE:-$DIR/docker-compose.yml}"
@@ -44,3 +46,8 @@ for service in web horizon scheduler indexer; do
         [ "$image" = "$expected" ] || exit 1
     fi
 done
+if [ "${1:-}" != --healthy ]; then
+    # A pulled or rebuilt data/infra tag never changes the fingerprint; its container is stale.
+    stale=$("$DIR/bin/deploy-plan" --stale-images) || exit 1
+    [ -z "$stale" ] || exit 1
+fi

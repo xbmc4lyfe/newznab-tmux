@@ -23,12 +23,20 @@ verify
 unset MODE MIGRATE DIRTY_APP DIRTY_DATA DIRTY_INFRA RECONCILE_DATA RECONCILE_INFRA START_DATA BUILD_TARGETS GLOBAL_FALLBACK
 actions=$("$DIR/bin/deploy-plan" --deploy-actions)
 eval "$actions"
+# The plan's build targets ignore FORCE (the build above already honoured it): any target still
+# dirty means an image tag was replaced after the build, which no .build.stamp vouches for.
+if [ -n "$BUILD_TARGETS" ]; then
+    echo "deploy-app: image tags changed after the build (dirty targets: $BUILD_TARGETS); aborting before any change. Run the deployment again." >&2
+    exit 1
+fi
 
 # Remote worker hosts share the database but not this Compose project. The new image's barrier,
 # a one-off container, stops their verification workers, waits for them and keeps them out while
-# writers are stopped, data services change or migrations run. It is stopped only after a healthy
-# rollout: a failed migration leaves remote workers held until the repaired deployment (which
-# reuses a running barrier, whatever it then has to do) finishes, or an operator stops it.
+# writers are stopped, data services change or migrations run. A healthy rollout releases it. A
+# failed run keeps it (and its durable pause) only once a migration began, or when it was adopted
+# from or inherited from an earlier failed attempt; remote workers then stay held until the
+# repaired deployment (which reuses a running barrier, whatever it then has to do) finishes, or an
+# operator stops it. Any other failure releases it, and a release that fails is owed to the next run.
 # Named after Compose's effective project, so installations never share or adopt each other's barrier.
 project=$(compose config --format json | python3 -c 'import json, sys; print(json.load(sys.stdin)["name"])')
 case "$project" in
@@ -397,3 +405,9 @@ fi
 assert_barrier
 barrier_keep=0
 settle_barrier || exit 1
+# Success is recorded only when the whole stack is current, not just the services this run touched:
+# all four app services healthy on their expected images, and no data/infra container stale.
+if ! "$DIR/bin/deploy-current"; then
+    echo "deploy-app: the rollout finished, but not every app service is running healthy on its expected image (or a data/infrastructure container runs a stale image); not recording a successful deployment." >&2
+    exit 1
+fi

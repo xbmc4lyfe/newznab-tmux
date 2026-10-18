@@ -31,24 +31,41 @@ export cmd := env("cmd", "")
 # then defaults. Like Make's former `-include .env`, only the keys these recipes use are read, and
 # the database credentials stay unexported shell variables (Compose parses .env itself).
 ENV_FILE := CURDIR + "/.env"
-LOAD_ENV := '''for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    preset=" "
+LOAD_ENV := '''preset=" "
+    for arg in "$@"; do
+        if [[ "$arg" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]]; then export "$arg"; preset="$preset${BASH_REMATCH[1]} "; fi
+    done
     for key in COMPOSE_FILE DC DEPLOY_BY APP_PORT DB_DATABASE DB_ROOTPASSWORD HELPER_IMAGE BASE_IMAGE APP_IMAGE WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE DEPLOY_MIN_INTERVAL DEPLOY_DRAIN_TIMEOUT DEPLOY_SCHEDULER_DRAIN_TIMEOUT DEPLOY_HEALTH_TIMEOUT DEPLOY_LEGACY_DRAIN_TIMEOUT; do
         [ -z "${!key:-}" ] || preset="$preset$key "
     done
+    interpolated=" "
     if [ -f "''' + ENV_FILE + '''" ]; then
         while IFS= read -r line || [ -n "$line" ]; do
             [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?(COMPOSE_FILE|DC|DEPLOY_BY|APP_PORT|DB_DATABASE|DB_ROOTPASSWORD|HELPER_IMAGE|BASE_IMAGE|APP_IMAGE|WEB_IMAGE|HORIZON_IMAGE|SCHEDULER_IMAGE|INDEXER_IMAGE|DEPLOY_MIN_INTERVAL|DEPLOY_DRAIN_TIMEOUT|DEPLOY_SCHEDULER_DRAIN_TIMEOUT|DEPLOY_HEALTH_TIMEOUT|DEPLOY_LEGACY_DRAIN_TIMEOUT)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
             key=${BASH_REMATCH[2]} value=${BASH_REMATCH[3]}
-            if [[ "$value" =~ ^\"(.*)\"[[:space:]]*(#.*)?$ || "$value" =~ ^\'(.*)\'[[:space:]]*(#.*)?$ ]]; then
-                value=${BASH_REMATCH[1]}
+            quote=
+            if [[ "$value" =~ ^\"(.*)\"[[:space:]]*(#.*)?$ ]]; then
+                quote='"' value=${BASH_REMATCH[1]}
+            elif [[ "$value" =~ ^\'(.*)\'[[:space:]]*(#.*)?$ ]]; then
+                quote="'" value=${BASH_REMATCH[1]}
             else
                 value=${value%%[[:space:]]#*}
                 value=${value%"${value##*[![:space:]]}"}
             fi
+            # Compose interpolates unquoted and double-quoted values; this parser does not. The last
+            # assignment wins, so only it can be interpolated. Single-quoted values are literal in Compose.
+            case "$key" in
+                COMPOSE_FILE|DC|HELPER_IMAGE|BASE_IMAGE|APP_IMAGE|WEB_IMAGE|HORIZON_IMAGE|SCHEDULER_IMAGE|INDEXER_IMAGE)
+                    interpolated=${interpolated// $key / }
+                    if [ "$quote" != "'" ] && [[ "$value" == *'$'* ]]; then interpolated="$interpolated$key "; fi ;;
+            esac
             # Arguments and the environment win; within the file the last assignment wins (as Compose).
             case "$preset" in *" $key "*) ;; *) printf -v "$key" '%s' "$value" ;; esac
         done < "''' + ENV_FILE + '''"
+        if [ "$interpolated" != " " ]; then
+            printf '%s\n' "docker/.env:${interpolated% } must be literal but uses \$ interpolation, which the Justfile and docker/bin/compose do not evaluate. Write the final value or single-quote it." >&2
+            exit 1
+        fi
     fi
     # Like the former Makefile, a DC line in docker/.env replaces the default Compose command.
     : "${DC:=docker compose --project-directory ''' + quote(CURDIR) + '''}"
@@ -56,6 +73,17 @@ LOAD_ENV := '''for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && e
     : "${DEPLOY_MIN_INTERVAL:=900}" "${DEPLOY_DRAIN_TIMEOUT:=900}" "${DEPLOY_SCHEDULER_DRAIN_TIMEOUT:=1800}" "${DEPLOY_HEALTH_TIMEOUT:=240}"
     export COMPOSE_FILE DC DEPLOY_BY HELPER_IMAGE BASE_IMAGE APP_IMAGE DEPLOY_MIN_INTERVAL DEPLOY_DRAIN_TIMEOUT DEPLOY_SCHEDULER_DRAIN_TIMEOUT DEPLOY_HEALTH_TIMEOUT
     for key in WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE DEPLOY_LEGACY_DRAIN_TIMEOUT; do [ -z "${!key:-}" ] || export "$key"; done'''
+
+# Runs argv[2:] followed by argv[1] parsed with shell quoting (shlex): no eval, no word splitting of
+# the parsed words and no globbing, so `cmd='some:command --label="two words" *'` reaches Artisan as
+# `some:command`, `--label=two words`, `*`. An empty string adds no arguments.
+EXEC_SPLIT := '''import os, shlex, sys
+try:
+    extra = shlex.split(sys.argv[1])
+except ValueError as error:
+    sys.exit("Invalid quoting in cmd: " + str(error))
+argv = sys.argv[2:] + extra
+os.execvp(argv[0], argv)'''
 
 DATA_DIRS := "data/storage data/install data/mariadb data/redis data/manticore data/caddy/data data/caddy/config data/prometheus data/grafana logs/mariadb logs/manticore logs/caddy backups"
 
@@ -271,7 +299,7 @@ artisan *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    "{{CURDIR}}/bin/compose" exec web php artisan ${cmd}
+    exec python3 -I -c '{{EXEC_SPLIT}}' "${cmd:-}" "{{CURDIR}}/bin/compose" exec web php artisan
 
 # MariaDB client as root
 mysql *args:

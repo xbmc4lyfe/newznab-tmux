@@ -23,6 +23,9 @@ ENV_COMPOSE_PROFILES := `scripts/dotenv-get --raw COMPOSE_PROFILES __absent__`
 # line (even empty) wins, otherwise SEARCH_DRIVER.
 PROFILES := env("COMPOSE_PROFILES", if ENV_COMPOSE_PROFILES != "__absent__" { ENV_COMPOSE_PROFILES } else { SEARCH_DRIVER })
 MONITORING_ENABLED := env("MONITORING_ENABLED", `scripts/dotenv-get MONITORING_ENABLED`)
+# Recipes read the live value as ${MONITORING_ENABLED-$MONITORING_DEFAULT}, after parsing trailing
+# KEY=VAL arguments, so `just up MONITORING_ENABLED=true` (or =false, or =) overrides the .env value.
+export MONITORING_DEFAULT := MONITORING_ENABLED
 FORWARD_PROMETHEUS_PORT := env("FORWARD_PROMETHEUS_PORT", `scripts/dotenv-get FORWARD_PROMETHEUS_PORT 9090`)
 WWWUSER := env("WWWUSER", `scripts/dotenv-get WWWUSER`)
 export SERVICE := env("SERVICE", "")
@@ -38,7 +41,17 @@ MONITORING_KEY := "storage/app/monitoring/public/grafana-jwt.pub"
 MONITORING_SERVICES := "prometheus pushgateway grafana node-exporter mysqld-exporter redis-exporter"
 # Every Compose call gets the search profile and, once monitoring is installed, its overlay (as the
 # former Makefile exported globally).
-COMPOSE_ENV := 'export COMPOSE_PROFILES="${COMPOSE_PROFILES:-' + PROFILES + '}"; if [ -z "${COMPOSE_FILE:-}" ] && [[ "' + MONITORING_ENABLED + '" =~ ^(true|1|yes)$ ]] && [ -f "' + MONITORING_KEY + '" ]; then export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"; fi'
+# Runs argv[2:] followed by argv[1] parsed with shell quoting (shlex): no eval, no re-splitting or
+# globbing of the parsed words, so `cmd='some:command --label="two words" *'` reaches Artisan as
+# `some:command`, `--label=two words`, `*`. An empty string adds no arguments.
+EXEC_SPLIT := '''import os, shlex, sys
+try:
+    extra = shlex.split(sys.argv[1])
+except ValueError as error:
+    sys.exit("Invalid quoting in cmd: " + str(error))
+argv = sys.argv[2:] + extra
+os.execvp(argv[0], argv)'''
+COMPOSE_ENV := 'export COMPOSE_PROFILES="${COMPOSE_PROFILES:-' + PROFILES + '}"; if [ -z "${COMPOSE_FILE:-}" ] && [[ "${MONITORING_ENABLED-$MONITORING_DEFAULT}" =~ ^(true|1|yes)$ ]] && [ -f "' + MONITORING_KEY + '" ]; then export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"; fi'
 MONITORING_COMPOSE := '$DOCKER_COMPOSE -f docker-compose.yml -f docker-compose.monitoring.yml $(IFS=,; for profile in $COMPOSE_PROFILES; do printf -- "--profile %s " "$profile"; done)'
 
 # Show available recipes
@@ -71,7 +84,7 @@ check-env *args:
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
     if [ ! -f .env ]; then echo "✘ .env not found. Run: cp .env.example .env"; exit 1; fi
-    if [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ ! -f "{{MONITORING_KEY}}" ]; then
+    if [[ "${MONITORING_ENABLED-$MONITORING_DEFAULT}" =~ ^(true|1|yes)$ ]] && [ ! -f "{{MONITORING_KEY}}" ]; then
         echo "⚠  MONITORING_ENABLED=true but {{MONITORING_KEY}} is missing; monitoring stays off. Run: php artisan monitoring:install --sail"
     fi
 
@@ -82,10 +95,7 @@ up *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
-    if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
-        export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
-    fi
+    {{COMPOSE_ENV}}
     "$JUST" --justfile "{{justfile()}}" check-env
     {{SAIL}} up -d
 
@@ -94,10 +104,7 @@ down *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
-    if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
-        export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
-    fi
+    {{COMPOSE_ENV}}
     {{SAIL}} down
 
 # Alias for 'down'
@@ -109,10 +116,7 @@ restart *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
-    if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
-        export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
-    fi
+    {{COMPOSE_ENV}}
     {{SAIL}} restart
 
 # Force-recreate Sail containers without rebuilding
@@ -120,10 +124,7 @@ recreate *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
-    if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
-        export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
-    fi
+    {{COMPOSE_ENV}}
     "$JUST" --justfile "{{justfile()}}" check-env
     {{SAIL}} up -d --force-recreate --remove-orphans
 
@@ -132,10 +133,7 @@ pull *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
-    if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
-        export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
-    fi
+    {{COMPOSE_ENV}}
     "$JUST" --justfile "{{justfile()}}" check-env
     {{DOCKER_COMPOSE}} pull --ignore-buildable --policy always
 
@@ -144,10 +142,7 @@ build *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
-    if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
-        export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
-    fi
+    {{COMPOSE_ENV}}
     "$JUST" --justfile "{{justfile()}}" check-env
     {{DOCKER_COMPOSE}} pull --ignore-buildable --policy always
     {{SAIL}} build --pull
@@ -157,10 +152,7 @@ rebuild *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
-    if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
-        export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
-    fi
+    {{COMPOSE_ENV}}
     "$JUST" --justfile "{{justfile()}}" check-env
     {{DOCKER_COMPOSE}} pull --ignore-buildable --policy always
     {{SAIL}} build --no-cache --pull
@@ -172,10 +164,7 @@ update *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
-    if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
-        export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
-    fi
+    {{COMPOSE_ENV}}
     "$JUST" --justfile "{{justfile()}}" check-env
     {{DOCKER_COMPOSE}} pull --ignore-buildable --policy always
     {{SAIL}} build --pull
@@ -187,10 +176,7 @@ upgrade *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
-    if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
-        export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
-    fi
+    {{COMPOSE_ENV}}
     "$JUST" --justfile "{{justfile()}}" update "$@"
     "$JUST" --justfile "{{justfile()}}" fix-permissions "$@"
     "$JUST" --justfile "{{justfile()}}" composer-install "$@"
@@ -207,10 +193,7 @@ fresh *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
-    if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
-        export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
-    fi
+    {{COMPOSE_ENV}}
     "$JUST" --justfile "{{justfile()}}" check-env
     if [ "${FORCE:-}" != "1" ]; then
         printf "⚠  This will destroy all Docker volumes (database, redis, search index). Continue? [y/N] "
@@ -245,10 +228,10 @@ tinker *args:
 artisan *args:
     #!/usr/bin/env bash
     set -euo pipefail
-    {{COMPOSE_ENV}}
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
+    {{COMPOSE_ENV}}
     target_cmd="${cmd:-${CMD:-}}"
-    $SAIL artisan $target_cmd
+    exec python3 -I -c '{{EXEC_SPLIT}}' "$target_cmd" $SAIL artisan
 
 # Run pending database migrations
 migrate *args:
@@ -258,8 +241,8 @@ migrate *args:
 migrate-fresh *args:
     #!/usr/bin/env bash
     set -euo pipefail
-    {{COMPOSE_ENV}}
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
+    {{COMPOSE_ENV}}
     if [ "${FORCE:-}" != "1" ]; then
         printf "⚠  This will DROP ALL TABLES and re-run every migration. Continue? [y/N] "
         read -r confirm
@@ -327,8 +310,8 @@ horizon *args:
 test *args:
     #!/usr/bin/env bash
     set -euo pipefail
-    {{COMPOSE_ENV}}
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
+    {{COMPOSE_ENV}}
     if [ -n "${filter:-}" ]; then
         "$SAIL" test "--filter=${filter}"
     else
@@ -457,10 +440,7 @@ logs *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
-    if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
-        export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
-    fi
+    {{COMPOSE_ENV}}
     $DOCKER_COMPOSE logs -f --tail=100 ${SERVICE:-}
 
 # Tail storage/logs/laravel.log inside the app container
@@ -472,10 +452,7 @@ status *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
-    if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
-        export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
-    fi
+    {{COMPOSE_ENV}}
     $DOCKER_COMPOSE ps
 
 # Alias for 'status'
@@ -501,7 +478,12 @@ health *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{COMPOSE_ENV}}
-    $DOCKER_COMPOSE ps --format json 2>/dev/null | awk -F'"' '/"Service"/ {svc=$4} /"Health"/ {print svc": "$4}' | sort -u || $DOCKER_COMPOSE ps
+    # A Go template yields one `service: health` line per container (health is empty without a healthcheck).
+    if ! health=$($DOCKER_COMPOSE ps --format '{{{{.Service}}: {{{{.Health}}' 2>/dev/null); then
+        $DOCKER_COMPOSE ps
+        exit
+    fi
+    printf '%s\n' "$health" | sort -u
 
 # ── Cleanup ──────────────────────────────────────────────────
 
@@ -515,10 +497,7 @@ nuke *args:
     #!/usr/bin/env bash
     set -euo pipefail
     for arg in "$@"; do [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && export "$arg"; done
-    export COMPOSE_PROFILES="${COMPOSE_PROFILES:-{{PROFILES}}}"
-    if [ -z "${COMPOSE_FILE:-}" ] && [[ "{{MONITORING_ENABLED}}" =~ ^(true|1|yes)$ ]] && [ -f "{{MONITORING_KEY}}" ]; then
-        export COMPOSE_FILE="docker-compose.yml:docker-compose.monitoring.yml"
-    fi
+    {{COMPOSE_ENV}}
     if [ "${FORCE:-}" != "1" ]; then
         printf "⚠  This will remove ALL project containers/images/volumes. Continue? [y/N] "
         read -r confirm

@@ -21,12 +21,17 @@ class DeployMigrationOrderTest extends TestCase
             copy(__DIR__.'/../../docker/bin/'.$script, $this->directory.'/docker/bin/'.$script);
             chmod($this->directory.'/docker/bin/'.$script, 0755);
         }
-        file_put_contents($this->directory.'/.gitignore', "/docker/.build.stamp\n/docker/.deploy.stamp\n/docker/.deploy.time\n/docker/.deploy.log\n/docker/.deploy.lock*\n/events\n/recreated\n/barrier.log\n/barrier.running\n");
+        file_put_contents($this->directory.'/.gitignore', "/docker/.build.stamp\n/docker/.deploy.stamp\n/docker/.deploy.time\n/docker/.deploy.log\n/docker/.deploy.lock*\n/events\n/recreated*\n/replaced\n/barrier.log\n/barrier.running\n");
+        // Docker ignores .gitignore: the fixture's own state must also stay out of the build context.
+        file_put_contents($this->directory.'/.dockerignore', "events\nrecreated*\nreplaced\nbarrier.log\nbarrier.running\n");
         file_put_contents($this->directory.'/app.txt', "one\n");
         file_put_contents($this->directory.'/bin/docker', <<<'SH'
 #!/bin/sh
 printf 'COMPOSE_FILE=%s %s\n' "$COMPOSE_FILE" "$*" >> "$NNTMUX_DEPLOY_EVENTS"
 for last in "$@"; do :; done
+# Missing app containers stay missing until this run recreates them.
+missing=0
+if [ "${NNTMUX_SERVICE_MISSING:-0}" = 1 ] && ! grep -q -- ' up -d --no-deps --force-recreate' "$NNTMUX_DEPLOY_EVENTS"; then missing=1; fi
 default_config='{"services":{"web":{},"horizon":{},"scheduler":{},"indexer":{},"mariadb":{},"redis":{},"manticore":{},"proxy":{},"mailpit":{},"prometheus":{},"pushgateway":{},"grafana":{},"node-exporter":{},"mysqld-exporter":{},"redis-exporter":{}}}'
 case "$*" in
     *'releases:verification-barrier --release'*) echo forced-release >> "$NNTMUX_DEPLOY_EVENTS"; [ "${NNTMUX_FORCED_RELEASE_FAIL:-0}" != 1 ] || exit 52 ;;
@@ -43,11 +48,23 @@ case "$*" in
         rm -f "$NNTMUX_REPO/barrier.running"; echo released >> "$NNTMUX_DEPLOY_EVENTS"
         [ "${NNTMUX_BARRIER_UNCLEAN:-0}" = 1 ] || echo 'barrier released' >> "$NNTMUX_REPO/barrier.log" ;;
     'rm -f '*'-verification-barrier') rm -f "$NNTMUX_REPO/barrier.running" ;;
+    *' config --hash '*) echo "$last ${NNTMUX_CONFIG_HASH:-fixture-hash}" ;;
+    *'com.docker.compose.config-hash'*) echo "${NNTMUX_CONTAINER_CONFIG_HASH:-${NNTMUX_CONFIG_HASH:-fixture-hash}}" ;;
+    *'com.docker.compose.service'*)
+        shift 3
+        for container in "$@"; do
+            svc=${container#fixture-container-}
+            if [ "$svc" = "${NNTMUX_STALE_SERVICE_IMAGE:-}" ] && [ ! -f "$NNTMUX_REPO/recreated-$svc" ]; then id=sha256:stale; else id=${NNTMUX_IMAGE_ID:-sha256:fixture}; fi
+            echo "$svc $id fixture/$svc:tag"
+        done ;;
     *' config --format json'*) printf '%s\n' "${NNTMUX_CONFIG_ID:-$default_config}" | sed 's/^{/{"name":"nntmux",/' ;;
     *'image inspect --format'*)
-        if [ "${NNTMUX_INSPECT_FAIL_AFTER_UP:-0}" = 1 ] && [ -f "$NNTMUX_REPO/recreated" ]; then echo "Error response from daemon: timeout" >&2; exit 1; fi
+        # After the rollout, while the guard writes the stamp.
+        if [ "${NNTMUX_INSPECT_FAIL_AFTER_UP:-0}" = 1 ] && [ -f "$NNTMUX_REPO/recreated" ] && ls "$NNTMUX_REPO"/docker/.deploy.stamp.tmp.* >/dev/null 2>&1; then echo "Error response from daemon: timeout" >&2; exit 1; fi
         [ "${NNTMUX_IMAGE_INSPECT_FAIL:-0}" != 1 ] || { echo "Error response from daemon: request timed out" >&2; exit 1; }
-        echo "${NNTMUX_IMAGE_ID:-sha256:fixture}" ;;
+        if [ -f "$NNTMUX_REPO/replaced" ]; then echo sha256:replaced
+        elif [ "$last" = nntmux/base:local ] && [ -n "${NNTMUX_BASE_IMAGE_ID:-}" ]; then echo "$NNTMUX_BASE_IMAGE_ID"
+        else echo "${NNTMUX_IMAGE_ID:-sha256:fixture}"; fi ;;
     *'image inspect'*) exit 0 ;;
     *'inspect --format {{.Image}}'*)
         if [ -f "$NNTMUX_REPO/recreated" ]; then
@@ -57,17 +74,25 @@ case "$*" in
         fi ;;
     *'inspect --format {{.State.StartedAt}}'*) echo "${NNTMUX_STARTED_AT:-2999-01-01T00:00:00.123456789Z}" ;;
     *'inspect --format {{.State.Status}}'*)
-        case "$*" in *"fixture-container-${NNTMUX_UNHEALTHY:-none}") echo "running unhealthy" ;; *) echo "running ${NNTMUX_HEALTH_STATUS:-healthy}" ;; esac ;;
+        # A tag replaced in place once planning starts inspecting containers (after the build).
+        [ "${NNTMUX_REPLACE_TAG_ON_STATUS:-0}" != 1 ] || : > "$NNTMUX_REPO/replaced"
+        late=none
+        if [ -n "${NNTMUX_UNHEALTHY_AFTER:-}" ] && grep -q -- "$NNTMUX_UNHEALTHY_AFTER" "$NNTMUX_DEPLOY_EVENTS"; then late=${NNTMUX_UNHEALTHY_LATE:-none}; fi
+        case "$*" in *"fixture-container-${NNTMUX_UNHEALTHY:-none}"|*"fixture-container-$late") echo "running unhealthy" ;; *) echo "running ${NNTMUX_HEALTH_STATUS:-healthy}" ;; esac ;;
     *' ps -a -q '*)
         [ "${NNTMUX_NO_EXISTING_APP:-0}" = 1 ] && exit 0
         [ -n "${NNTMUX_NO_CONTAINER:-}" ] && [ "$last" = "$NNTMUX_NO_CONTAINER" ] && exit 0
         echo fixture-container ;;
+    *' ps -q')
+        [ "${NNTMUX_PS_FAIL:-0}" != 1 ] || { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
+        [ "$missing" = 1 ] || printf '%s\n' "${NNTMUX_CONFIG_ID:-$default_config}" \
+            | python3 -c 'import json, sys; print("\n".join("fixture-container-" + s for s in json.load(sys.stdin)["services"]))' 2>/dev/null ;;
     *' ps -q horizon'*)
         [ "${NNTMUX_HORIZON_PS_FAIL:-0}" != 1 ] || exit 50
-        [ "${NNTMUX_SERVICE_MISSING:-0}" = 1 ] || echo "fixture-container-horizon" ;;
+        [ "$missing" = 1 ] || echo "fixture-container-horizon" ;;
     *' ps -q '*)
         [ "${NNTMUX_PS_FAIL:-0}" != 1 ] || { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
-        [ "${NNTMUX_SERVICE_MISSING:-0}" = 1 ] || echo "fixture-container-$last" ;;
+        [ "$missing" = 1 ] || echo "fixture-container-$last" ;;
     *'scheduler python3 -c '*) [ "${NNTMUX_SCHEDULER_CAPABILITY_FAIL:-0}" != 1 ] || exit 48; echo "${NNTMUX_SCHEDULER_CAPABILITY:-native}" ;;
     *'scheduler.py drain --timeout='*)
         [ "${NNTMUX_SCHEDULER_DRAIN_FAIL:-0}" != 1 ] || exit 47
@@ -97,7 +122,7 @@ case "$*" in
         case "$*" in *'--force-recreate'*' redis'*) [ "${NNTMUX_REDIS_FAIL:-0}" != 1 ] || exit 53 ;; esac
         [ -z "${NNTMUX_UP_FAIL_SERVICE:-}" ] || [ "$last" != "$NNTMUX_UP_FAIL_SERVICE" ] || exit 54
         if [ "${NNTMUX_STALE_UP:-0}" = 1 ]; then echo changed > "$NNTMUX_REPO/app.txt"; fi
-        case "$*" in *' --force-recreate '*) : > "$NNTMUX_REPO/recreated" ;; esac ;;
+        case "$*" in *' --force-recreate '*) : > "$NNTMUX_REPO/recreated"; : > "$NNTMUX_REPO/recreated-$last" ;; esac ;;
 esac
 exit 0
 SH);
@@ -992,7 +1017,7 @@ SH);
         $this->assertStringContainsString('build --target selfhosted-web', $this->events());
 
         file_put_contents($this->directory.'/events', '');
-        file_put_contents($this->directory.'/.dockerignore', "vendor\n");
+        file_put_contents($this->directory.'/.dockerignore', "vendor\n", FILE_APPEND);
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         $events = $this->events();
         $this->assertStringContainsString('build --target selfhosted-web', $events);
@@ -1298,6 +1323,8 @@ SH);
 
     public function test_plan_explanation_reports_the_writer_quiesce_a_data_reconcile_needs(): void
     {
+        // Mounted files present: a missing one would be a change, not a reconcile.
+        $this->composeFiles();
         $config = ['NNTMUX_CONFIG_ID' => $this->composeJson()];
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
         $stamp = $this->directory.'/docker/.deploy.stamp';
@@ -1662,10 +1689,12 @@ SH);
         $this->assertStringNotContainsString('mariadb', $this->events());
         file_put_contents($this->directory.'/events', '');
 
-        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => '{"services":{'.$services.',"sidecar":{}}}'])->mustRun();
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => '{"services":{'.$services.',"sidecar":{}}}', 'NNTMUX_NO_CONTAINER' => 'sidecar'])->mustRun();
         $events = $this->events();
-        // A service added to Compose is created by a non-forced up.
+        // A service added to Compose (with no container yet) is created by a non-forced up, without a drain.
         $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 sidecar', $events);
+        $this->assertStringNotContainsString('drain', $events);
+        $this->assertStringNotContainsString(' stop ', $events);
         $this->assertStringNotContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $events);
         $this->assertStringNotContainsString('artisan migrate', $events);
         $this->assertFileExists($this->directory.'/docker/.deploy.stamp');
@@ -1694,7 +1723,8 @@ SH);
         // Not a first installation: infra is left alone, and the app is redeployed.
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
-        $this->assertStringNotContainsString('proxy', $this->events());
+        // Read-only image queries may name it; nothing recreates or reconciles it.
+        $this->assertDoesNotMatchRegularExpression('/ up -d[^\n]* proxy\b/', $this->events());
         $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
     }
 
@@ -1730,6 +1760,7 @@ SH);
 
     public function test_production_legacy_stamp_reconciles_data_and_infra_without_forcing(): void
     {
+        $this->composeFiles();
         $head = trim((new Process(['git', 'rev-parse', 'HEAD'], $this->directory))->mustRun()->getOutput());
         foreach ([$head, str_repeat('0', 40)] as $revision) {
             file_put_contents($this->directory.'/events', '');
@@ -1814,6 +1845,8 @@ SH);
         // configuration and deployment history live in a separate persistent runtime directory.
         $runtime = $this->directory.'/runtime';
         file_put_contents($this->directory.'/.gitignore', "/runtime\n", FILE_APPEND);
+        // In production the runtime is outside the candidate checkout, so outside its build context too.
+        file_put_contents($this->directory.'/.dockerignore', "runtime\n", FILE_APPEND);
         (new Process(['git', 'commit', '-q', '-am', 'runtime lives outside the candidate'], $this->directory))->mustRun();
         mkdir($runtime.'/config/redis', 0777, true);
         file_put_contents($runtime.'/.env', "APP_IMAGE=\nWEB_IMAGE=\nREDIS_IMAGE=\n");
@@ -1927,6 +1960,7 @@ SH);
         $proxy = ['volumes' => [['type' => 'bind', 'source' => $this->directory.'/outside/certs', 'target' => '/certs', 'read_only' => true]]];
         $config = ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['web' => [], 'horizon' => [], 'scheduler' => [], 'indexer' => [], 'proxy' => $proxy]], JSON_UNESCAPED_SLASHES)];
         file_put_contents($this->directory.'/.gitignore', "/outside\n", FILE_APPEND);
+        file_put_contents($this->directory.'/.dockerignore', "outside\n", FILE_APPEND);
         (new Process(['git', 'commit', '-q', '-am', 'outside mounts'], $this->directory))->mustRun();
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
         file_put_contents($this->directory.'/events', '');
@@ -1960,6 +1994,10 @@ SH);
         $head = trim((new Process(['git', 'rev-parse', 'HEAD'], $this->directory))->mustRun()->getOutput());
         mkdir($this->directory.'/docker/config/caddy', 0777, true);
         file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', ":8080\n");
+        // Redis's mounted file predates both container start times.
+        mkdir($this->directory.'/docker/config/redis', 0777, true);
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 1gb\n");
+        touch($this->directory.'/docker/config/redis/redis.conf', 900000000);
         $config = ['NNTMUX_CONFIG_ID' => $this->composeJson()];
 
         // Containers started after the edit already run it: reconcile only.
@@ -1980,6 +2018,7 @@ SH);
 
     public function test_failing_infra_service_aborts_before_any_writer_is_drained(): void
     {
+        $this->composeFiles();
         $head = trim((new Process(['git', 'rev-parse', 'HEAD'], $this->directory))->mustRun()->getOutput());
         file_put_contents($this->directory.'/docker/.deploy.stamp', $head." e3b0 e3b0 c16c bb93\n");
         $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => $this->composeJson(), 'NNTMUX_PROXY_FAIL' => '1']);
@@ -2009,6 +2048,344 @@ SH);
         $process->mustRun();
         $expected = array_map(fn (string $path, string $owner): string => $path.' '.$owner, array_keys($paths), $paths);
         $this->assertSame($expected, explode("\n", trim($process->getOutput())));
+    }
+
+    public function test_success_requires_every_app_service_healthy_after_a_selective_rollout(): void
+    {
+        mkdir($this->directory.'/resources/js', 0777, true);
+        file_put_contents($this->directory.'/resources/js/app.js', "1\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/docker/.deploy.time', '1000');
+        file_put_contents($this->directory.'/resources/js/app.js', "2\n");
+        file_put_contents($this->directory.'/events', '');
+
+        // Horizon, untouched by this web-only rollout, becomes unhealthy while web is recreated.
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], [
+            'NNTMUX_UNHEALTHY_AFTER' => ' up -d --no-deps --force-recreate --wait --wait-timeout 240 web', 'NNTMUX_UNHEALTHY_LATE' => 'horizon',
+        ]);
+        $process->run();
+        $this->assertNotSame(0, $process->getExitCode());
+        $this->assertStringContainsString('not every app service is running healthy', $process->getErrorOutput());
+        $this->assertStringNotContainsString('web horizon', $this->events());
+        $this->assertNotStamped();
+        $this->assertSame('1000', trim((string) file_get_contents($this->directory.'/docker/.deploy.time')));
+        $this->assertAttemptsClosed();
+    }
+
+    public function test_image_tag_replaced_after_the_build_aborts_before_any_change(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $stamp = (string) file_get_contents($this->directory.'/docker/.deploy.stamp');
+        file_put_contents($this->directory.'/app.txt', "two\n");
+        file_put_contents($this->directory.'/events', '');
+
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_REPLACE_TAG_ON_STATUS' => '1']);
+        $process->run();
+        $this->assertNotSame(0, $process->getExitCode());
+        $this->assertStringContainsString('image tags changed after the build', $process->getErrorOutput());
+        $events = $this->events();
+        $this->assertStringContainsString('build --target selfhosted-web', $events);
+        $this->assertStringNotContainsString(' up -d', $events);
+        $this->assertStringNotContainsString('drain', $events);
+        $this->assertStringNotContainsString(' stop ', $events);
+        $this->assertSame($stamp, (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
+    }
+
+    public function test_forced_rollout_with_freshly_built_images_is_not_mistaken_for_a_replaced_tag(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'FORCE=1'])->mustRun();
+        $this->assertStringContainsString('build --target', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
+    }
+
+    public function test_unknown_service_with_a_container_but_no_record_changes_only_with_writers_quiesced(): void
+    {
+        $services = '"web":{},"horizon":{},"scheduler":{},"indexer":{},"redis":{},"manticore":{},"proxy":{}';
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => '{"services":{'.$services.'}}'])->mustRun();
+        $config = ['NNTMUX_CONFIG_ID' => '{"services":{'.$services.',"replacement-db":{}}}'];
+
+        $plan = $this->make(['deploy-plan'], $config);
+        $plan->mustRun();
+        $this->assertMatchesRegularExpression('/replacement-db\s+data\s+reconcile/', $plan->getOutput());
+
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $events = $this->events();
+        $up = ' up -d --no-deps --wait --wait-timeout 240 replacement-db';
+        $this->assertStringContainsString($up, $events);
+        $this->assertLessThan(strpos($events, $up), strpos($events, ' stop web scheduler indexer'));
+    }
+
+    public function test_unknown_service_labelled_stateless_is_reconciled_as_infrastructure_before_any_drain(): void
+    {
+        $services = '"web":{},"horizon":{},"scheduler":{},"indexer":{},"redis":{},"manticore":{},"proxy":{}';
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => '{"services":{'.$services.'}}'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => '{"services":{'.$services.',"sidecar":{"labels":{"nntmux.deploy.stateless":"true"}}}}'])->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 sidecar', $events);
+        $this->assertStringNotContainsString('drain', $events);
+        $this->assertStringNotContainsString(' stop ', $events);
+    }
+
+    public function test_added_services_are_applied_in_dependency_order(): void
+    {
+        $base = ['web' => [], 'horizon' => [], 'scheduler' => [], 'indexer' => [], 'redis' => [], 'manticore' => [], 'proxy' => []];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => $base])])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        $stateless = ['nntmux.deploy.stateless' => 'true'];
+        $services = $base + [
+            'aaa-consumer' => ['labels' => $stateless, 'depends_on' => ['zzz-provider' => ['condition' => 'service_healthy']]],
+            'zzz-provider' => ['labels' => $stateless],
+        ];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => $services])])->mustRun();
+        $events = $this->events();
+        $provider = strpos($events, ' up -d --no-deps --wait --wait-timeout 240 zzz-provider');
+        $this->assertNotFalse($provider);
+        $this->assertGreaterThan($provider, strpos($events, ' up -d --no-deps --wait --wait-timeout 240 aaa-consumer'));
+    }
+
+    public function test_legacy_stamp_recreates_a_service_whose_mounted_file_was_deleted(): void
+    {
+        // The proxy's Caddyfile no longer exists while its container keeps running.
+        mkdir($this->directory.'/docker/config/redis', 0777, true);
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 1gb\n");
+        $head = trim((new Process(['git', 'rev-parse', 'HEAD'], $this->directory))->mustRun()->getOutput());
+        file_put_contents($this->directory.'/docker/.deploy.stamp', $head." e3b0 e3b0 c16c bb93\n");
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => $this->composeJson()])->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $events);
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 redis', $events);
+        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 redis', $events);
+    }
+
+    public function test_retargeted_directory_symlink_in_a_read_only_mount_recreates_the_service(): void
+    {
+        $tree = $this->directory.'/docker/config/proxy-conf';
+        foreach (['v1', 'v2'] as $version) {
+            mkdir($tree.'/'.$version, 0777, true);
+            file_put_contents($tree.'/'.$version.'/site.conf', "same\n");
+        }
+        symlink('v1', $tree.'/current');
+        $proxy = ['volumes' => [['type' => 'bind', 'source' => $tree, 'target' => '/etc/caddy/conf', 'read_only' => true]]];
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['web' => [], 'horizon' => [], 'scheduler' => [], 'indexer' => [], 'proxy' => $proxy]], JSON_UNESCAPED_SLASHES)];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        unlink($tree.'/current');
+        symlink('v2', $tree.'/current');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+    }
+
+    public function test_missing_data_service_whose_record_changed_is_recreated_with_writers_quiesced(): void
+    {
+        $this->composeFiles();
+        $config = ['NNTMUX_CONFIG_ID' => $this->composeJson()];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 2gb\n");
+        file_put_contents($this->directory.'/events', '');
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_NO_CONTAINER' => 'redis'])->mustRun();
+        $events = $this->events();
+        $recreate = ' up -d --no-deps --force-recreate --wait --wait-timeout 240 redis';
+        $this->assertStringContainsString($recreate, $events);
+        $this->assertLessThan(strpos($events, $recreate), strpos($events, ' stop web scheduler indexer'));
+        $this->assertStringNotContainsString(' up -d --no-deps --wait --wait-timeout 240 redis', $events);
+    }
+
+    public function test_compose_project_name_change_aborts_before_any_change(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $stamp = (string) file_get_contents($this->directory.'/docker/.deploy.stamp');
+        $this->assertStringContainsString("\nproject=nntmux\n", $stamp);
+        $renamed = ['NNTMUX_CONFIG_ID' => '{"name":"other","services":{"web":{},"horizon":{},"scheduler":{},"indexer":{},"redis":{},"manticore":{},"proxy":{}}}'];
+
+        $plan = $this->make(['deploy-plan'], $renamed);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('effective Compose project changed from nntmux to other', $plan->getErrorOutput());
+
+        file_put_contents($this->directory.'/events', '');
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $renamed);
+        $process->run();
+        $this->assertNotSame(0, $process->getExitCode());
+        $this->assertStringNotContainsString(' up -d', $this->events());
+        $this->assertStringNotContainsString('drain', $this->events());
+        $this->assertSame($stamp, (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
+
+        // A stamp written before the project was recorded is still accepted.
+        file_put_contents($this->directory.'/docker/.deploy.stamp', str_replace("project=nntmux\n", '', $stamp));
+        $this->make(['deploy-plan'], $renamed)->mustRun();
+    }
+
+    public function test_failed_recreate_that_left_the_old_container_healthy_is_not_recorded(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $config = ['NNTMUX_CONFIG_ID' => '{"services":{"web":{"environment":{"FEATURE":"on"}},"horizon":{},"scheduler":{},"indexer":{},"redis":{},"manticore":{},"proxy":{}}}', 'NNTMUX_CONFIG_HASH' => 'new-config'];
+
+        // compose up fails before replacing web: the old container stays healthy on the same image.
+        $failed = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_APP_UP_FAIL' => '1', 'NNTMUX_CONTAINER_CONFIG_HASH' => 'old-config']);
+        $failed->run();
+        $this->assertSame(52, $failed->getExitCode());
+        $this->assertStringNotContainsString('service:web=', (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
+
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web', $this->events());
+    }
+
+    public function test_data_and_infra_containers_running_a_replaced_image_tag_are_recreated(): void
+    {
+        $this->composeFiles();
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['redis']['image'] = 'redis:7.4.2-alpine';
+        $json['services']['proxy']['image'] = 'caddy:2.10.2-alpine';
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $stamp = (string) file_get_contents($this->directory.'/docker/.deploy.stamp');
+
+        // `docker pull redis:7.4.2-alpine` replaced the tag; the rendered configuration is unchanged.
+        file_put_contents($this->directory.'/events', '');
+        $plan = $this->make(['deploy-plan'], $config + ['NNTMUX_STALE_SERVICE_IMAGE' => 'redis']);
+        $plan->mustRun();
+        $this->assertMatchesRegularExpression('/redis\s+data\s+drain\+recreate\s+running image differs from its tag/', $plan->getOutput());
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_STALE_SERVICE_IMAGE' => 'redis'])->mustRun();
+        $events = $this->events();
+        $recreate = ' up -d --no-deps --force-recreate --wait --wait-timeout 240 redis';
+        $this->assertStringContainsString($recreate, $events);
+        $this->assertLessThan(strpos($events, $recreate), strpos($events, ' stop web scheduler indexer'));
+        // Image IDs never enter the fingerprint.
+        $this->assertSame(strtok($stamp, "\n"), strtok((string) file_get_contents($this->directory.'/docker/.deploy.stamp'), "\n"));
+
+        // Recreated on the new image: the next poll skips.
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_STALE_SERVICE_IMAGE' => 'redis'])->mustRun();
+        $this->assertStringNotContainsString(' up -d', $this->events());
+
+        // A stale stateless service is recreated without draining any writer.
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_STALE_SERVICE_IMAGE' => 'proxy'])->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+        $this->assertStringNotContainsString('drain', $this->events());
+    }
+
+    public function test_rebuilt_base_image_rebuilds_every_role_image(): void
+    {
+        $this->make(['build'], ['NNTMUX_BASE_IMAGE_ID' => 'sha256:base-1'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        $this->make(['build'], ['NNTMUX_BASE_IMAGE_ID' => 'sha256:base-2'])->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('build --target base ', $events);
+        foreach (['web', 'horizon', 'scheduler', 'indexer'] as $role) {
+            $this->assertStringContainsString('build --target selfhosted-'.$role, $events);
+        }
+    }
+
+    public function test_git_ignored_files_the_build_context_copies_are_fingerprinted(): void
+    {
+        file_put_contents($this->directory.'/.gitignore', "error_log\nvendor/\n", FILE_APPEND);
+        file_put_contents($this->directory.'/.dockerignore', "vendor/\n", FILE_APPEND);
+        (new Process(['git', 'commit', '-q', '-am', 'ignore logs and dependencies'], $this->directory))->mustRun();
+        mkdir($this->directory.'/public', 0777, true);
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+
+        // Ignored by both Git and Docker: never an image input.
+        file_put_contents($this->directory.'/events', '');
+        mkdir($this->directory.'/vendor/pkg', 0777, true);
+        file_put_contents($this->directory.'/vendor/pkg/x.php', "<?php\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->assertStringNotContainsString('build --target', $this->events());
+        $this->assertStringNotContainsString(' up -d', $this->events());
+
+        // Ignored by Git only: `COPY public` still copies it.
+        file_put_contents($this->directory.'/events', '');
+        file_put_contents($this->directory.'/public/error_log', "x\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        foreach (['web', 'horizon', 'scheduler', 'indexer'] as $role) {
+            $this->assertStringContainsString('build --target selfhosted-'.$role, $this->events());
+        }
+    }
+
+    public function test_config_and_secret_sources_are_fingerprinted_without_logging_values(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        file_put_contents($this->directory.'/docker/config/tls.pem', "one\n");
+        $json = ['services' => ['web' => [], 'horizon' => [], 'scheduler' => [], 'indexer' => [], 'redis' => [], 'manticore' => [],
+            'proxy' => ['secrets' => [['source' => 'tls', 'target' => 'tls']], 'configs' => [['source' => 'site', 'target' => '/etc/site']]]],
+            'secrets' => ['tls' => ['file' => $this->directory.'/docker/config/tls.pem']],
+            'configs' => ['site' => ['environment' => 'NNTMUX_SITE_CONFIG']]];
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+        $recreate = ' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy';
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_SITE_CONFIG' => 'site-value-one'])->mustRun();
+
+        // The secret's file content changes; its rendered definition does not.
+        file_put_contents($this->directory.'/events', '');
+        file_put_contents($this->directory.'/docker/config/tls.pem', "two\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_SITE_CONFIG' => 'site-value-one'])->mustRun();
+        $this->assertStringContainsString($recreate, $this->events());
+        $this->assertStringNotContainsString('drain', $this->events());
+
+        // The config's environment value changes.
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_SITE_CONFIG' => 'site-value-two'])->mustRun();
+        $this->assertStringContainsString($recreate, $this->events());
+        foreach (['/docker/.deploy.stamp', '/docker/.deploy.log', '/events'] as $file) {
+            $this->assertStringNotContainsString('site-value', (string) file_get_contents($this->directory.$file));
+        }
+
+        // docker/.env supplies an unset variable; an unresolvable one fails closed.
+        file_put_contents($this->directory.'/events', '');
+        file_put_contents($this->directory.'/docker/.env', "NNTMUX_SITE_CONFIG=site-value-two\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $this->assertStringNotContainsString(' up -d', $this->events());
+        unlink($this->directory.'/docker/.env');
+        $plan = $this->make(['deploy-plan'], $config);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('cannot resolve environment variable NNTMUX_SITE_CONFIG behind config site', $plan->getErrorOutput());
+    }
+
+    public function test_service_definitions_no_fingerprint_can_represent_fail_closed(): void
+    {
+        $services = ['web' => [], 'horizon' => [], 'scheduler' => [], 'indexer' => [], 'proxy' => []];
+        $definitions = [
+            'build' => ['build' => ['context' => $this->directory.'/helper']],
+            'network_mode' => ['network_mode' => 'service:proxy'],
+            'ipc' => ['ipc' => 'container:abc123'],
+            'pid' => ['pid' => 'service:proxy'],
+            'volumes_from' => ['volumes_from' => ['proxy']],
+        ];
+        foreach ($definitions as $label => $definition) {
+            $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => $services + ['helper' => $definition]], JSON_UNESCAPED_SLASHES)]);
+            $plan->run();
+            $this->assertNotSame(0, $plan->getExitCode(), $label);
+            $this->assertStringContainsString('service helper', $plan->getErrorOutput(), $label);
+            $this->assertStringContainsString('selective deployment cannot', $plan->getErrorOutput(), $label);
+        }
+
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => $services + ['helper' => $definitions['build']]], JSON_UNESCAPED_SLASHES)]);
+        $process->run();
+        $this->assertNotSame(0, $process->getExitCode());
+        $this->assertStringNotContainsString(' up -d', $this->events());
+
+        // node-exporter's `pid: host` names no other container.
+        $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => $services + ['node-exporter' => ['pid' => 'host']]])])->mustRun();
+    }
+
+    /** Create the files composeJson() bind-mounts, older than every fixture container. */
+    private function composeFiles(): void
+    {
+        foreach (['caddy/Caddyfile' => ":8080\n", 'redis/redis.conf' => "maxmemory 1gb\n"] as $file => $content) {
+            @mkdir(dirname($this->directory.'/docker/config/'.$file), 0777, true);
+            file_put_contents($this->directory.'/docker/config/'.$file, $content);
+        }
     }
 
     /** Rendered Compose JSON whose proxy and redis bind-mount repository configuration files. */

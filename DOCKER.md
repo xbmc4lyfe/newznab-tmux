@@ -193,6 +193,7 @@ These can be combined with the recipes above:
 | `MAINTENANCE=1`| Wrap `upgrade` migrations in `artisan down` / `artisan up`            |
 | `SERVICE=name` | Restrict `logs` to a specific compose service                         |
 | `CMD="…"`      | Free-form command for `artisan` (alternative to `cmd=`)               |
+| `MONITORING_ENABLED=true\|false` | Override `.env` for this run of any lifecycle recipe (`up`, `down`, `restart`, `recreate`, `pull`, `build`, `rebuild`, `update`, `upgrade`, `fresh`, `logs`, `status`, `nuke`, `check-env`) |
 | `filter=Name`  | Pass `--filter=Name` to `just test`                                   |
 
 Examples:
@@ -202,7 +203,28 @@ just fresh FORCE=1                      # non-interactive teardown + rebuild
 just upgrade MAINTENANCE=1              # zero-downtime-ish upgrade with maint mode
 just logs SERVICE=mariadb               # tail only mariadb
 just test filter=ReleaseSearchTest      # run a single test
+just up MONITORING_ENABLED=true         # include the monitoring overlay even though .env disables it
+just artisan cmd='some:command --label="two words"'   # cmd is parsed with shell quoting, never globbed
 ```
+
+`cmd=` (and `CMD`) is split with shell quoting rules into a real argument array, so quoted words
+stay together and `*` is passed literally; an unbalanced quote is an error. The same applies to
+`just docker artisan cmd=…`.
+
+### Trailing `KEY=VALUE` arguments for `docker/Justfile`
+
+Precedence is trailing arguments, then the environment, then `docker/.env`, then defaults. An
+explicitly empty trailing argument counts as supplied: `just deploy COMPOSE_FILE= WEB_IMAGE=`
+discards the `docker/.env` values and uses the defaults (`docker/docker-compose.yml`, and the
+`nntmux/web:local` or `APP_IMAGE`-derived tag). An empty `COMPOSE_FILE` therefore means "the default
+stack file", not "no file". Only arguments can clear a value; an empty variable in the environment is
+indistinguishable from an unset one and does not override `docker/.env`.
+
+`DC`, `COMPOSE_FILE` and the `HELPER_`/`BASE_`/`APP_`/`WEB_`/`HORIZON_`/`SCHEDULER_`/`INDEXER_IMAGE` keys
+in `docker/.env` must be literal values. The Justfile and `docker/bin/compose` read them without
+Compose's `$` interpolation, so an unquoted or double-quoted value containing `$` (for example
+`APP_IMAGE=${REGISTRY}/nntmux:${TAG}`) stops the recipe with an error; single-quote the value for a
+verbatim `$`. Other keys, such as `MARIADB_IMAGE`, are left to Compose and may interpolate.
 
 > **Note:** `just pull` / `update` / `rebuild` use `docker compose pull --ignore-buildable`,
 > which only pulls images for services in the active `COMPOSE_PROFILES` and skips images
