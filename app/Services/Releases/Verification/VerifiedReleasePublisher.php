@@ -525,7 +525,7 @@ final class VerifiedReleasePublisher
             'verified_at' => now(), 'lease_token' => null, 'lease_until' => null];
         if ($retainManifest) {
             DB::table('release_verification_candidates')->where('id', $candidateId)->update($values
-                + (CandidateRepository::tracksRetention() ? ['retained_for_release_id' => $releaseId] : []));
+                + (CandidateRepository::tracksRetention() ? ['retained_for_release_id' => $releaseId, 'retained_last_unique_at' => $candidate->last_unique_at] : []));
 
             return;
         }

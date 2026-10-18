@@ -862,6 +862,38 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
             'A promotion backlog cannot keep its inventory indefinitely.');
     }
 
+    public function test_the_settle_sweep_pages_through_held_releases_across_passes(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $this->limits();
+        $now = now()->format('Y-m-d H:i:s');
+        $release = static fn (int $id, int $holder): array => ['id' => $id, 'late_article_candidate_id' => $holder, 'guid' => 'held-'.$id]
+            + array_fill_keys(['name', 'searchname', 'leftguid', 'fromname', 'postdate', 'adddate'], 'x')
+            + array_fill_keys(['totalpart', 'groups_id', 'size', 'passwordstatus', 'haspreview', 'categories_id', 'nfostatus', 'nzbstatus', 'isrenamed', 'iscategorized', 'predb_id'], 0);
+        // A full page of live partials, each held by its own retaining candidate, then one whose holder ended.
+        $live = [];
+        foreach (range(1, 1000) as $n) {
+            $live[] = ['identity' => sha1('live-'.$n), 'source_identity' => sha1('live-'.$n), 'groups_id' => 1, 'manifest_path' => 'live-'.$n.'.json.gz',
+                'manifest_bytes' => 0, 'manifest_hash' => hash('sha256', 'live-'.$n), 'status' => 'sampled', 'version' => 1,
+                'last_unique_at' => $now, 'next_attempt_at' => $now, 'release_id' => $n];
+        }
+        foreach (array_chunk($live, 200) as $chunk) {
+            DB::table('release_verification_candidates')->insert($chunk);
+        }
+        $ids = DB::table('release_verification_candidates')->orderBy('id')->pluck('id')->all();
+        foreach (array_chunk(array_map(fn (int $n): array => $release($n, (int) $ids[$n - 1]), range(1, 1000)), 200) as $chunk) {
+            DB::table('releases')->insert($chunk);
+        }
+        DB::table('releases')->insert($release(5000, 999999));
+
+        app(CandidateRepository::class)->expire();
+        $this->assertSame(999999, (int) DB::table('releases')->where('id', 5000)->value('late_article_candidate_id'), 'Beyond this pass\'s page.');
+        app(CandidateRepository::class)->expire();
+
+        $this->assertNull(DB::table('releases')->where('id', 5000)->value('late_article_candidate_id'), 'The next pass resumes and settles it.');
+        $this->assertSame(1000, DB::table('releases')->whereNotNull('late_article_candidate_id')->count(), 'Live partials stay held.');
+    }
+
     public function test_a_deleted_partials_retained_inventory_is_still_released_at_expiry(): void
     {
         $this->publicationSchema(partialColumns: true);
@@ -873,8 +905,9 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->limits();
         app(CandidateRepository::class)->expire();
 
-        $this->assertSame(['', 0, null], [DB::table('release_verification_candidates')->value('manifest_path'),
-            (int) DB::table('release_verification_candidates')->value('manifest_bytes'), DB::table('release_verification_candidates')->value('retained_for_release_id')]);
+        $this->assertSame(['', 0, null, null], [DB::table('release_verification_candidates')->value('manifest_path'),
+            (int) DB::table('release_verification_candidates')->value('manifest_bytes'), DB::table('release_verification_candidates')->value('retained_for_release_id'),
+            DB::table('release_verification_candidates')->value('retained_last_unique_at')]);
         $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'), 'No capacity leaks with the release.');
     }
 
@@ -885,7 +918,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $cutoff = now()->subHours((int) config('release_verification.expiry_hours') + 1)->format('Y-m-d H:i:s');
         $row = static fn (int $n): array => ['identity' => sha1('held-'.$n), 'source_identity' => sha1('held-'.$n), 'groups_id' => 1,
             'manifest_path' => hash('sha256', 'held-'.$n).'.json.gz', 'manifest_bytes' => 0, 'manifest_hash' => hash('sha256', 'held-'.$n), 'status' => 'sampled',
-            'version' => 1, 'last_unique_at' => $cutoff, 'next_attempt_at' => $cutoff, 'release_id' => 100000 + $n, 'retained_for_release_id' => 100000 + $n];
+            'version' => 1, 'last_unique_at' => $cutoff, 'next_attempt_at' => $cutoff, 'release_id' => 100000 + $n, 'retained_for_release_id' => 100000 + $n, 'retained_last_unique_at' => $cutoff];
         // Each retained partial is the candidate its release's late-article pointer names.
         $retain = function (int $n) use ($row): void {
             $id = DB::table('release_verification_candidates')->insertGetId($row($n));

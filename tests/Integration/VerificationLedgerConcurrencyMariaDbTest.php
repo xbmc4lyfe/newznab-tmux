@@ -192,6 +192,30 @@ final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
         $this->assertSame(1, DB::table('release_verification_candidates')->count());
     }
 
+    public function test_re_archiving_locks_the_uploads_candidates_in_primary_key_order_first(): void
+    {
+        $this->partialSchema();
+        app(CandidateRepository::class)->archive($this->arrival('lock-order', totalParts: 3));
+        // A second, older-looking row of the same upload, as a conflicting post archived apart leaves.
+        $first = DB::table('release_verification_candidates')->sole();
+        DB::table('release_verification_candidates')->insert(['identity' => sha1('lock-order-apart'), 'source_identity' => $first->source_identity,
+            'groups_id' => 1, 'manifest_path' => '', 'manifest_bytes' => 0, 'manifest_hash' => str_repeat('0', 64), 'status' => 'pending',
+            'last_unique_at' => now(), 'next_attempt_at' => now()]);
+        $locks = [];
+        DB::listen(function (QueryExecuted $query) use (&$locks): void {
+            if (preg_match('/release_verification_candidates.* for update/i', $query->sql) === 1 && ! str_contains($query->sql, 'skip locked')) {
+                $locks[] = $query->sql;
+            }
+        });
+
+        app(CandidateRepository::class)->archive($this->arrival('lock-order', part: 2, totalParts: 3));
+
+        // Batched candidate updates lock in primary-key order: so must archive(), before it locks the newest row
+        // alone, or the two wait on each other.
+        $this->assertNotEmpty($locks);
+        $this->assertMatchesRegularExpression('/force index \(`?primary`?\).* in \(.*order by `?id`? asc .*for update/i', $locks[0]);
+    }
+
     public function test_promotion_skips_rows_another_session_holds_without_waiting(): void
     {
         $this->partialSchema();

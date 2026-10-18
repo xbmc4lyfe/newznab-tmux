@@ -26,10 +26,17 @@ return new class extends Migration
                 $table->unsignedBigInteger('retained_for_release_id')->nullable();
             });
         }
-        // A separate statement keeps the column additions instant.
-        if (! Schema::hasIndex('release_verification_candidates', 'verification_retained_for_release')) {
+        // last_unique_at, set only while a candidate retains inventory, so its index holds just those rows
+        // in expiry order.
+        if (! Schema::hasColumn('release_verification_candidates', 'retained_last_unique_at')) {
             Schema::table('release_verification_candidates', function (Blueprint $table): void {
-                $table->index('retained_for_release_id', 'verification_retained_for_release');
+                $table->dateTime('retained_last_unique_at')->nullable();
+            });
+        }
+        // A separate statement keeps the column additions instant.
+        if (! Schema::hasIndex('release_verification_candidates', 'verification_retained_expiry')) {
+            Schema::table('release_verification_candidates', function (Blueprint $table): void {
+                $table->index('retained_last_unique_at', 'verification_retained_expiry');
             });
         }
     }
@@ -37,7 +44,10 @@ return new class extends Migration
     public function down(): void
     {
         Schema::table('release_verification_candidates', function (Blueprint $table): void {
-            $table->dropIndex('verification_retained_for_release');
+            $table->dropIndex('verification_retained_expiry');
+        });
+        Schema::table('release_verification_candidates', function (Blueprint $table): void {
+            $table->dropColumn('retained_last_unique_at');
         });
         Schema::table('release_verification_candidates', function (Blueprint $table): void {
             $table->dropColumn(['upgrades_release_id', 'retained_for_release_id']);

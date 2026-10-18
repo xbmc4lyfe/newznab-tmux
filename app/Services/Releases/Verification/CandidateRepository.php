@@ -15,10 +15,12 @@ use Illuminate\Database\Query\Builder;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use RuntimeException;
+use Throwable;
 
 final class CandidateRepository
 {
@@ -79,6 +81,9 @@ final class CandidateRepository
                     }
                 }
                 $this->ledger->enter();
+                // Lock all of the upload's candidates first, in primary-key order like every batched candidate
+                // update; the lookups below then only re-read rows this transaction already holds.
+                $this->lockSourceCandidates($sourceIdentity, $currentReads, static fn (): bool => true);
                 $existing = $this->lockLatestCandidate($sourceIdentity, $currentReads);
                 // A partial's inventory is held by the candidate its release points at: the published partial
                 // itself, or the pending generation late articles moved it to. Late articles join the newest
@@ -289,6 +294,11 @@ final class CandidateRepository
                         }
                     }
                 }
+                if ($existing !== null && self::tracksRetention() && ($existing->retained_for_release_id ?? null) !== null) {
+                    // A retaining row keeps its expiry stamp in step with last_unique_at.
+                    $values += $expired ? ['retained_for_release_id' => null, 'retained_last_unique_at' => null]
+                        : (array_key_exists('last_unique_at', $values) ? ['retained_last_unique_at' => $values['last_unique_at']] : []);
+                }
                 if ($existing === null) {
                     $holderId = (int) DB::table('release_verification_candidates')->insertGetId($values);
                 } else {
@@ -299,7 +309,7 @@ final class CandidateRepository
                     // The new generation now holds the retained inventory and its capacity, and becomes the
                     // only candidate that may upgrade the partial; an already expired one settles it.
                     DB::table('release_verification_candidates')->where('id', $previous->id)->update(['manifest_path' => '', 'manifest_bytes' => 0]
-                        + (self::tracksRetention() ? ['retained_for_release_id' => null] : []));
+                        + (self::tracksRetention() ? ['retained_for_release_id' => null, 'retained_last_unique_at' => null] : []));
                     if ($merges && Release::hasLateArticleFlag()) {
                         DB::table('releases')->where('id', $previous->release_id)->where('late_article_candidate_id', $previous->id)
                             ->update(['late_article_candidate_id' => $expired ? null : $holderId]);
@@ -646,7 +656,7 @@ final class CandidateRepository
                 if ($this->articleIdentity($old) !== $this->articleIdentity($merged)) {
                     DB::table('release_verification_candidates')->where('id', $owner->id)->update($owner->release_id === null
                         ? ['status' => 'dirty', 'lease_token' => null, 'lease_until' => null, 'version' => $owner->version + 1, 'last_unique_at' => now()]
-                        : ['last_unique_at' => now()]);
+                        : ['last_unique_at' => now()] + (self::tracksRetention() && ($owner->retained_for_release_id ?? null) !== null ? ['retained_last_unique_at' => now()] : []));
                     DB::table('collections')->where('id', $collection->id)->where('filecheck', '!=', 4)->update(['filecheck' => 3]);
                 }
 
@@ -753,7 +763,7 @@ final class CandidateRepository
         $pdo = DB::connection()->getPdo();
         self::$retentionColumnSupport ??= new \WeakMap;
 
-        return self::$retentionColumnSupport[$pdo] ??= Schema::hasColumn('release_verification_candidates', 'retained_for_release_id');
+        return self::$retentionColumnSupport[$pdo] ??= Schema::hasColumn('release_verification_candidates', 'retained_last_unique_at');
     }
 
     /** Whether candidates record the partial release a pending generation upgrades. */
@@ -1173,19 +1183,38 @@ final class CandidateRepository
         if (! Release::hasLateArticleFlag()) {
             return;
         }
-        // Select only settled holders, so live partials never crowd them out of the window; the join is by
-        // primary key and the held releases come from the late_article_candidate_id index.
-        $settled = DB::table('releases as r')->leftJoin('release_verification_candidates as c', 'c.id', '=', 'r.late_article_candidate_id')
-            ->whereNotNull('r.late_article_candidate_id')
-            ->where(function ($query): void {
-                $query->whereNull('c.id')
-                    ->orWhere(fn ($own) => $own->whereColumn('c.release_id', 'r.id')->where('c.manifest_path', ''))
-                    ->orWhere(fn ($other) => $other->whereNotNull('c.release_id')->whereColumn('c.release_id', '!=', 'r.id'))
-                    ->orWhere(fn ($ended) => $ended->whereNull('c.release_id')->whereIn('c.status', ['expired', 'filtered', 'metadata_expired']));
-            })
-            ->orderBy('r.id')->limit(500)->pluck('r.late_article_candidate_id', 'r.id');
-        foreach ($settled as $releaseId => $candidateId) {
-            DB::table('releases')->where('id', $releaseId)->where('late_article_candidate_id', $candidateId)->update(['late_article_candidate_id' => null]);
+        // A bounded page of the late_article_candidate_id index per pass (index-only: the pointer and the
+        // release id), resuming where the last pass stopped, so live partials never make it a table scan.
+        $cursorKey = 'release_verification:settle_cursor';
+        try {
+            $after = (int) Cache::get($cursorKey, 0);
+        } catch (Throwable) {
+            $after = 0;
+        }
+        $held = DB::table('releases')
+            ->when(in_array(DB::getDriverName(), ['mysql', 'mariadb'], true), fn ($query) => $query->forceIndex('releases_late_article_candidate_id_index'))
+            ->where('late_article_candidate_id', '>', $after)->orderBy('late_article_candidate_id')->limit(1000)
+            ->get(['id', 'late_article_candidate_id']);
+        try {
+            Cache::put($cursorKey, $held->count() < 1000 ? 0 : (int) $held->last()->late_article_candidate_id, now()->addDay());
+        } catch (Throwable) {
+            // The next pass starts over.
+        }
+        if ($held->isEmpty()) {
+            return;
+        }
+        $candidates = DB::table('release_verification_candidates')->whereIn('id', $held->pluck('late_article_candidate_id')->unique()->all())
+            ->get(['id', 'release_id', 'manifest_path', 'status'])->keyBy('id');
+        foreach ($held as $release) {
+            $candidate = $candidates->get((int) $release->late_article_candidate_id);
+            // Settled once its holder ended unpublished, was published elsewhere, or released its inventory.
+            $settled = $candidate === null
+                || ($candidate->release_id !== null && ((int) $candidate->release_id !== (int) $release->id || $candidate->manifest_path === ''))
+                || ($candidate->release_id === null && in_array($candidate->status, ['expired', 'filtered', 'metadata_expired'], true));
+            if ($settled) {
+                DB::table('releases')->where('id', $release->id)->where('late_article_candidate_id', $release->late_article_candidate_id)
+                    ->update(['late_article_candidate_id' => null]);
+            }
         }
     }
 
@@ -1197,37 +1226,49 @@ final class CandidateRepository
     private function expireRetainedPartials(?callable $mayStart): void
     {
         $cutoff = now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
-        // Page by id: rows held back by late headers awaiting archive must not starve the ones behind them.
-        $after = 0;
+        // Page in expiry order: rows held back by late headers awaiting archive must not starve the ones behind them.
+        $after = null;
         $released = 0;
         for ($page = 0; $page < 10 && $released < 100; $page++) {
-            $ids = $this->retainedPartials($cutoff, $after);
-            if ($ids->isEmpty()) {
+            $rows = $this->retainedPartials($cutoff, $after);
+            if ($rows->isEmpty()) {
                 return;
             }
-            $after = (int) $ids->keys()->last();
-            foreach ($ids as $id => $sourceIdentity) {
+            $last = $rows->last();
+            $after = [(string) $last->retained_at, (int) $last->id];
+            foreach ($rows as $row) {
                 if ($mayStart !== null && ! $mayStart()) {
                     return;
                 }
-                $released += $this->expireRetainedPartial((int) $id, $sourceIdentity, $cutoff) ? 1 : 0;
+                $released += $this->expireRetainedPartial((int) $row->id, $row->source_identity, $cutoff) ? 1 : 0;
             }
         }
     }
 
     /**
-     * Published candidates still retaining a partial's inventory, past the cutoff, after this id. Each records
-     * the release it retains for, so its index finds the few there are, including those whose release was
-     * deleted meanwhile, instead of a scan of every candidate.
+     * Published candidates still retaining a partial's inventory with no new article since the cutoff, in
+     * expiry order after the given position. retained_last_unique_at is set only on retaining rows, so its
+     * index reads just the expirable ones, including those whose release was deleted meanwhile.
      *
-     * @return Collection<int, string|null>
+     * @param  array{string, int}|null  $after
+     * @return Collection<int, \stdClass>
      */
-    private function retainedPartials(string $cutoff, int $after): Collection
+    private function retainedPartials(string $cutoff, ?array $after): Collection
     {
+        if (! self::tracksRetention()) {
+            return DB::table('release_verification_candidates')->whereNotNull('release_id')->where('manifest_path', '<>', '')
+                ->where('last_unique_at', '<', $cutoff)->where('id', '>', $after[1] ?? 0)->orderBy('id')->limit(100)
+                ->get(['id', 'source_identity', 'id as retained_at']);
+        }
+
         return DB::table('release_verification_candidates')
-            ->when(self::tracksRetention(), fn ($query) => $query->whereNotNull('retained_for_release_id'))
+            ->when(in_array(DB::getDriverName(), ['mysql', 'mariadb'], true), fn ($query) => $query->forceIndex('verification_retained_expiry'))
+            ->where('retained_last_unique_at', '<', $cutoff)
+            ->when($after !== null, fn ($query) => $query->where(fn ($position) => $position->where('retained_last_unique_at', '>', $after[0])
+                ->orWhere(fn ($tie) => $tie->where('retained_last_unique_at', $after[0])->where('id', '>', $after[1]))))
             ->whereNotNull('release_id')->where('manifest_path', '<>', '')
-            ->where('last_unique_at', '<', $cutoff)->where('id', '>', $after)->orderBy('id')->limit(100)->pluck('source_identity', 'id');
+            ->orderBy('retained_last_unique_at')->orderBy('id')->limit(100)
+            ->get(['id', 'source_identity', 'retained_last_unique_at as retained_at']);
     }
 
     /** Release one retained inventory unless its upload has late headers still waiting to be archived. */
@@ -1246,7 +1287,7 @@ final class CandidateRepository
                 return false;
             }
             DB::table('release_verification_candidates')->where('id', $id)->update(['manifest_path' => '', 'manifest_bytes' => 0]
-                + (self::tracksRetention() ? ['retained_for_release_id' => null] : []));
+                + (self::tracksRetention() ? ['retained_for_release_id' => null, 'retained_last_unique_at' => null] : []));
             if (Release::hasLateArticleFlag()) {
                 // No late articles can merge any more: workers that read NZBs may now process it.
                 DB::table('releases')->where('id', $row->release_id)->where('late_article_candidate_id', $id)->update(['late_article_candidate_id' => null]);
