@@ -1085,7 +1085,7 @@ final class ReleaseFingerprintCollector
             $par2Complete = false;
         }
         $multiplePar2Sets = count($par2SetIds) > 1;
-        $par2RecoveryExponents = $multiplePar2Sets ? [] : ($par2RecoveryExponentsBySet[array_key_first($par2SetIds)] ?? []);
+        $par2RecoveryExponents = $multiplePar2Sets || $par2SetIds === [] ? [] : ($par2RecoveryExponentsBySet[array_key_first($par2SetIds)] ?? []);
         $recoveryCount = count($par2RecoveryExponents);
         $parsedRecoveryAcrossSets = array_sum(array_map('count', $par2RecoveryExponentsBySet));
         $par2SourceBlocks = null;
