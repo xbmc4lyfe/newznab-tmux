@@ -197,11 +197,13 @@ SH);
         $this->assertStringContainsString('deployment pause could not be cleared', $process->getErrorOutput());
         $this->assertSame('stale', strtok((string) file_get_contents($this->directory.'/docker/.deploy.stamp'), "\n"));
 
-        // The healthy stack must not make the retry skip: it owes the migration, which retakes the barrier.
+        // The healthy stack must not make the retry skip: it owes a barrier, never the completed migration.
         file_put_contents($this->directory.'/events', '');
         $this->deploy()->mustRun();
-        $this->assertStringContainsString('artisan migrate --force', $this->events());
+        $this->assertStringContainsString('releases:verification-barrier --timeout=900', $this->events());
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
         $this->assertStringContainsString('released', $this->events());
+        $this->assertSame([], glob($this->directory.'/docker/.deploy.stamp.barrier-owed') ?: []);
     }
 
     public function test_a_barrier_lost_before_migration_aborts_without_migrating(): void
@@ -238,7 +240,7 @@ SH);
         $this->deploy()->mustRun();
         $events = $this->events();
         $this->assertStringContainsString('releases:verification-barrier --timeout=900', $events);
-        $this->assertStringContainsString('artisan migrate --force', $events);
+        $this->assertStringNotContainsString('artisan migrate', $events);
         $this->assertStringContainsString('released', $events);
     }
 

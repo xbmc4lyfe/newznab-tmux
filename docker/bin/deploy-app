@@ -82,15 +82,24 @@ release_barrier() {
     fi
 }
 
+# The barrier's durable pause can outlive its container (a lost session leaves it behind) and only
+# a barrier's release clears it. A failed run that held a barrier marks it owed: the next run, even
+# a no-op or selective one, takes a barrier and releases it, without repeating a completed migration.
+barrier_owed="${DEPLOY_STAMP:-$DIR/.deploy.stamp}.barrier-owed"
+owe_barrier() { : >"$barrier_owed" || echo "Could not record the owed barrier release; clear the verification pause by hand." >&2; }
+settle_barrier() {
+    if ! release_barrier; then
+        owe_barrier
+        return 1
+    fi
+    rm -f "$barrier_owed"
+}
+
 if [ "$MODE" = "noop" ]; then
-    if barrier_running; then
-        # A barrier left by an earlier failed attempt must not hold remote workers out forever.
-        barrier_held=1
-        if ! release_barrier; then
-            # Owe the migration again: the next poll retakes the barrier and clears the pause.
-            "$DIR/bin/deploy-plan" --forget migration || true
-            exit 1
-        fi
+    if barrier_running || [ -e "$barrier_owed" ]; then
+        # A barrier or pause left by an earlier failed attempt must not hold remote workers out forever.
+        hold_barrier
+        settle_barrier
     fi
     # Nothing rolled out: let the guard stamp the new fingerprint without recording a deployment.
     if [ -n "${DEPLOY_NOOP_MARKER:-}" ]; then : >"$DEPLOY_NOOP_MARKER"; fi
@@ -194,10 +203,7 @@ scheduler_command() { compose exec -T scheduler python3 /app/docker/app/bin/sche
 resume() {
     rc=$?
     if [ "$barrier_held" = 1 ] && [ "$rc" != 0 ]; then
-        # The barrier's durable pause can outlive its container (a lost session leaves it behind)
-        # and only a barrier's release clears it. Owe the migration again so the next poll, even
-        # with every service recorded, retakes a barrier and releases the pause after health.
-        plan --forget migration || echo "Could not mark the migration pending; clear the verification pause by hand." >&2
+        owe_barrier
     fi
     if [ "$barrier_held" = 1 ] && [ "$barrier_keep" = 1 ] && barrier_running; then
         echo "Remote verification workers stay held by container $barrier_name until a repaired deployment completes or it is stopped." >&2
@@ -315,7 +321,7 @@ fi
 
 # Remote workers are held out whenever the database's writers stop for a schema or data-service
 # change; a barrier left running by an earlier failed attempt is adopted and released on success.
-if [ "$need_barrier" = 1 ] || barrier_running; then
+if [ "$need_barrier" = 1 ] || barrier_running || [ -e "$barrier_owed" ]; then
     hold_barrier
     verify
 fi
@@ -380,9 +386,4 @@ if [ -n "$up_app_services" ]; then
 fi
 assert_barrier
 barrier_keep=0
-if ! release_barrier; then
-    # Every service is healthy, so the next poll would otherwise skip and leave the pause in
-    # place: owe the (idempotent) migration again, whose run takes and clears the barrier.
-    plan --forget migration || true
-    exit 1
-fi
+settle_barrier || exit 1
