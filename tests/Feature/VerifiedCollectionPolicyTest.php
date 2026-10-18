@@ -9,6 +9,7 @@ use App\Facades\Search;
 use App\Jobs\CollectReleaseFingerprintMetadata;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
+use App\Services\Nzb\NzbSourceGuard;
 use App\Services\ReleaseCleaningService;
 use App\Services\ReleaseCreationService;
 use App\Services\ReleaseProcessingService;
@@ -455,6 +456,31 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertStringContainsString('c@d', $seen[0][1]);
         $this->assertStringContainsString('c@d', (string) app(NzbService::class)->readNzbContents($guid), 'Swapped in after commit.');
         $this->assertSame([], glob($canonical.'.c*-*.next') ?: []);
+    }
+
+    public function test_a_completed_upgrade_stays_fenced_until_its_staged_nzb_is_installed(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('completed-fence', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $holder = DB::table('release_verification_candidates')->sole();
+        // As a completing upgrade leaves it when its post-commit swap did not happen: published, inventory released,
+        // the release still fenced, and its staged generation still beside the canonical NZB.
+        DB::table('release_verification_candidates')->where('id', $holder->id)->update(['manifest_path' => '', 'manifest_bytes' => 0]);
+        $guid = (string) DB::table('releases')->where('id', $first)->value('guid');
+        $staged = app(NzbService::class)->getNzbPath($guid).'.c'.$holder->id.'-'.str_repeat('a', 16).'.next';
+        file_put_contents($staged, gzencode('<nzb>unresolvable</nzb>'));
+        // The committed evidence names neither file, so the staged generation cannot be settled yet.
+        DB::table('release_archive_naming_evidence')->where('releases_id', $first)->update(['source_sha256' => NzbSourceGuard::digest('another')]);
+
+        app(CandidateRepository::class)->expire();
+        $this->assertSame((int) $holder->id, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'),
+            'Workers that read the NZB wait while the staged generation is unresolved.');
+
+        unlink($staged);
+        Cache::forget('release_verification:settle_cursor');
+        app(CandidateRepository::class)->expire();
+        $this->assertNull(DB::table('releases')->where('id', $first)->value('late_article_candidate_id'), 'Released once it is settled.');
     }
 
     public function test_a_rolled_back_upgrade_leaves_the_published_nzb_untouched(): void

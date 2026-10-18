@@ -9,6 +9,7 @@ use App\Models\Release;
 use App\Services\CollectionCleanupService;
 use App\Services\Nzb\NzbArticleCoverage;
 use App\Services\Nzb\NzbService;
+use App\Services\Nzb\NzbSourceGuard;
 use App\Services\Releases\ReleaseGroupResolver;
 use App\Support\NzbPasswordMetadata;
 use Illuminate\Database\Query\Builder;
@@ -1295,6 +1296,15 @@ final class CandidateRepository
             $settled = $candidate === null
                 || ($candidate->release_id !== null && ((int) $candidate->release_id !== (int) $release->id || $candidate->manifest_path === ''))
                 || ($candidate->release_id === null && in_array($candidate->status, ['expired', 'filtered', 'metadata_expired'], true));
+            if ($settled && $candidate !== null && (int) $candidate->release_id === (int) $release->id && $candidate->manifest_path === '') {
+                // Its own completing upgrade: only once that upgrade's staged NZB is in place.
+                $guid = DB::table('releases')->where('id', $release->id)->value('guid');
+                try {
+                    $settled = is_string($guid) && app(NzbSourceGuard::class)->settleStagedGenerations($guid);
+                } catch (Throwable) {
+                    $settled = false;
+                }
+            }
             if ($settled) {
                 DB::table('releases')->where('id', $release->id)->where('late_article_candidate_id', $release->late_article_candidate_id)
                     ->update(['late_article_candidate_id' => null]);

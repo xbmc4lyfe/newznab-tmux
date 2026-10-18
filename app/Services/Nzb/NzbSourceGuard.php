@@ -202,6 +202,19 @@ final class NzbSourceGuard
         return 'kept';
     }
 
+    /**
+     * Settle every staged generation left beside this release's NZB (see reconcileStaged()); true when none remains,
+     * so the canonical file is the committed source.
+     */
+    public function settleStagedGenerations(string $guid): bool
+    {
+        foreach ($this->stagedSiblings($guid) as $path) {
+            $this->reconcileStaged($path);
+        }
+
+        return $this->stagedSiblings($guid) === [];
+    }
+
     /** @return list<string> */
     private function stagedSiblings(string $guid): array
     {

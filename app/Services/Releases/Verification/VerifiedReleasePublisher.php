@@ -597,13 +597,24 @@ final class VerifiedReleasePublisher
         DB::table('releases')->where('id', $id)->update(['size' => $size, 'totalpart' => $totalParts,
             'articles_found' => $partial['articles_found'] ?? null, 'articles_expected' => $partial['articles_expected'] ?? null,
             'files_found' => $partial['files_found'] ?? null, 'files_expected' => $partial['files_expected'] ?? null,
-            'late_article_candidate_id' => $retain ? $candidateId : null] + $naming + $this->freshPostProcessingState());
+            // Fenced until the staged NZB is installed after commit, even when no late articles can follow: workers
+            // that read the NZB must not take the partial's file for the upgraded release.
+            'late_article_candidate_id' => $candidateId] + $naming + $this->freshPostProcessingState());
         ReleaseArticleFingerprintStore::store($id, ($incoming ?? $this->incomingDocument($manifest))['fingerprint']);
         $timing?->nextPhase('final_xml_gzip');
         $receipt = $this->writer->writeWithReceipt($manifest, (string) $release->guid, $release, $timing, $body, replaceFor: $candidateId);
         DB::afterRollBack(static fn () => $receipt->rollback());
         // The first after-commit callback: the swap precedes the fingerprint dispatch and search sync below.
         DB::afterCommit(static fn () => $receipt->close());
+        if (! $retain && Release::hasLateArticleFlag()) {
+            // Complete now: release the fence once the upgraded NZB is in place. A swap left undone (a crash or a
+            // failed close) keeps it fenced until the settle sweep installs the staged generation.
+            DB::afterCommit(static function () use ($receipt, $id, $candidateId): void {
+                if ($receipt->staged === null || ! is_file($receipt->staged)) {
+                    DB::table('releases')->where('id', $id)->where('late_article_candidate_id', $candidateId)->update(['late_article_candidate_id' => null]);
+                }
+            });
+        }
         // After the replacement, and even if no collection has started yet: a run that read the smaller NZB
         // can then only save while its record still says processing, which this (row-locked until commit) ends.
         if (Schema::hasTable('release_fingerprint_metadata')) {
