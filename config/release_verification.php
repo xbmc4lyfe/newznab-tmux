@@ -15,6 +15,9 @@ return [
     // Publish an upload still missing files or articles once no new article has arrived for this many
     // hours, recording how many of its declared articles were found; 0 waits for complete headers.
     'partial_after_hours' => (int) env('RELEASE_VERIFICATION_PARTIAL_AFTER_HOURS', 4),
+    // Promote stalled uploads only while fewer than this many candidates are ready, so partial attempts
+    // use idle verification capacity and never queue ahead of a large backlog of new uploads.
+    'partial_ready_limit' => (int) env('RELEASE_VERIFICATION_PARTIAL_READY_LIMIT', 500),
     // Hosts sharing one database schedule disjoint slots: this host runs slot_offset + 1 through
     // slot_offset + candidate_workers (at most slot 256).
     'slot_offset' => (int) env('RELEASE_VERIFICATION_SLOT_OFFSET', 0),

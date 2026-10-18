@@ -14,6 +14,7 @@ use App\Support\NzbPasswordMetadata;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
@@ -660,8 +661,10 @@ final class CandidateRepository
                 }
                 $old = $this->store->read($candidate->manifest_path);
                 $merged = $this->merge($old, $snapshot);
-                if ($heldIds !== [] && $this->spoils($old, $merged)) {
-                    // Where partials share the hash, archive() keeps spoiling headers apart from this post too.
+                // archive() keeps spoiling headers apart from this post wherever it shares the hash: with partials,
+                // or behind a newer row (another post, or an orphaned generation it retires).
+                if ($this->spoils($old, $merged) && ($heldIds !== [] || (int) DB::table('release_verification_candidates')
+                    ->where('source_identity', $identity)->orderByDesc('id')->lockForUpdate()->value('id') !== (int) $candidate->id)) {
                     break;
                 }
                 if ($this->articleIdentity($old) !== $this->articleIdentity($merged) || ($merged['conflict'] ?? false)) {
@@ -751,11 +754,22 @@ final class CandidateRepository
         return self::$upgradeColumnSupport[$pdo] ??= Schema::hasColumn('release_verification_candidates', 'upgrades_release_id');
     }
 
-    /** A stalled upload not yet tried as a partial, or queued for that try, which expiry must leave. */
+    /**
+     * A stalled upload not yet tried as a partial, or queued for that try, which expiry must leave: for one
+     * expiry window past its hold, so a promotion backlog cannot keep inventory indefinitely.
+     */
     private static function owedPartialAttempt(object $row): bool
     {
-        return ($row->status === 'waiting_upload' && ! str_starts_with((string) ($row->reason ?? ''), self::PARTIAL_DEFERRED))
-            || ($row->status === 'ready' && $row->reason === self::PARTIAL_QUEUED);
+        return $row->last_unique_at >= self::owedPartialCutoff()
+            && (($row->status === 'waiting_upload' && ! str_starts_with((string) ($row->reason ?? ''), self::PARTIAL_DEFERRED))
+                || ($row->status === 'ready' && $row->reason === self::PARTIAL_QUEUED));
+    }
+
+    /** Uploads whose last new article is older than this are no longer owed a partial attempt. */
+    private static function owedPartialCutoff(): string
+    {
+        return now()->subHours((int) config('release_verification.expiry_hours') + max(0, (int) config('release_verification.partial_after_hours', 4)))
+            ->format('Y-m-d H:i:s');
     }
 
     /**
@@ -852,6 +866,13 @@ final class CandidateRepository
     {
         $hours = (int) config('release_verification.partial_after_hours', 4);
         if ($hours < 1) {
+            return 0;
+        }
+        // Only into idle capacity: a ready backlog is worked first. The verification_due index bounds this count.
+        $cap = max(0, (int) config('release_verification.partial_ready_limit', 500));
+        $ready = DB::query()->fromSub(DB::table('release_verification_candidates')->where('status', 'ready')->select('id')->limit($cap), 'ready')->count();
+        $limit = min($limit, $cap - $ready);
+        if ($limit < 1) {
             return 0;
         }
         $now = now();
@@ -1066,7 +1087,8 @@ final class CandidateRepository
             ->where(fn ($q) => $q->whereNull('lease_until')->orWhere('lease_until', '<', now()))
             // A stalled upload still owed its partial attempt is published, not expired (it would otherwise lose
             // the race with promotion, and always lose it when the hold reaches the expiry window).
-            ->when($partials, fn ($query) => $query->where(fn ($owed) => $owed->whereNotIn('status', ['waiting_upload', 'ready'])
+            ->when($partials, fn ($query) => $query->where(fn ($owed) => $owed->where('last_unique_at', '<', self::owedPartialCutoff())
+                ->orWhereNotIn('status', ['waiting_upload', 'ready'])
                 ->orWhere(fn ($waiting) => $waiting->where('status', 'waiting_upload')->where('reason', 'like', self::PARTIAL_DEFERRED.'%'))
                 ->orWhere(fn ($ready) => $ready->where('status', 'ready')->where(fn ($r) => $r->whereNull('reason')->orWhere('reason', '!=', self::PARTIAL_QUEUED)))))
             ->orderBy('id')->limit(100)->pluck('id');
@@ -1139,8 +1161,7 @@ final class CandidateRepository
         $after = 0;
         $released = 0;
         for ($page = 0; $page < 10 && $released < 100; $page++) {
-            $ids = DB::table('release_verification_candidates')->whereNotNull('release_id')->where('manifest_path', '<>', '')
-                ->where('last_unique_at', '<', $cutoff)->where('id', '>', $after)->orderBy('id')->limit(100)->pluck('source_identity', 'id');
+            $ids = $this->retainedPartials($cutoff, $after);
             if ($ids->isEmpty()) {
                 return;
             }
@@ -1152,6 +1173,26 @@ final class CandidateRepository
                 $released += $this->expireRetainedPartial((int) $id, $sourceIdentity, $cutoff) ? 1 : 0;
             }
         }
+    }
+
+    /**
+     * Published candidates still retaining a partial's inventory, past the cutoff, after this id. Each is the
+     * candidate its release's late-article pointer names, so the pointer index finds the few there are
+     * instead of a scan of every candidate.
+     *
+     * @return Collection<int, string|null>
+     */
+    private function retainedPartials(string $cutoff, int $after): Collection
+    {
+        if (! Release::hasLateArticleFlag()) {
+            return DB::table('release_verification_candidates')->whereNotNull('release_id')->where('manifest_path', '<>', '')
+                ->where('last_unique_at', '<', $cutoff)->where('id', '>', $after)->orderBy('id')->limit(100)->pluck('source_identity', 'id');
+        }
+
+        return DB::table('releases as r')->join('release_verification_candidates as c', 'c.id', '=', 'r.late_article_candidate_id')
+            ->where('r.late_article_candidate_id', '>', $after)->whereColumn('c.release_id', 'r.id')->where('c.manifest_path', '<>', '')
+            ->where('c.last_unique_at', '<', $cutoff)->orderBy('r.late_article_candidate_id')->limit(100)
+            ->pluck('c.source_identity', 'c.id');
     }
 
     /** Release one retained inventory unless its upload has late headers still waiting to be archived. */

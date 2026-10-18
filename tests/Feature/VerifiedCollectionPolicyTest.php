@@ -647,6 +647,31 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame((int) $row->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'));
     }
 
+    public function test_hot_invalidation_leaves_a_post_alone_that_archive_keeps_spoiling_headers_apart_from(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('orphan-then-spoiling', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $b = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 1, messageId: 'b1@b');
+        DB::table('collections')->where('id', $b)->update(['fromname' => 'poster-b']);
+        app(CandidateRepository::class)->archive($b);
+        $own = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+        $orphan = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        $this->assertSame($first, (int) $orphan->upgrades_release_id);
+        DB::table('releases')->where('id', $first)->delete();
+        // Poster B's conflicting part 1: archive() retires the orphan and keeps these apart from B's post.
+        $late = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 1, messageId: 'b2@b');
+        DB::table('collections')->where('id', $late)->update(['fromname' => 'poster-b']);
+
+        DB::transaction(fn () => app(CandidateRepository::class)->invalidateHotCollections([$late]));
+        app(CandidateRepository::class)->archive($late);
+
+        $after = DB::table('release_verification_candidates')->where('id', $own->id)->first();
+        $this->assertSame([$own->status, (int) $own->version], [$after->status, (int) $after->version], 'B\'s post stays claimable.');
+        $this->assertSame(['b1@b'], array_column(app(ManifestStore::class)->read($after->manifest_path)['files'][0]['segments'], 'messageid'));
+    }
+
     /** @return array<string, array{int}> */
     public static function replayGroups(): array
     {
@@ -796,6 +821,47 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(['b1@b', 'e@f'], array_column($repostManifest['files'][0]['segments'], 'messageid'));
     }
 
+    public function test_stalled_uploads_are_promoted_only_into_idle_ready_capacity(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $this->limits();
+        config(['release_verification.partial_after_hours' => 4, 'release_verification.partial_ready_limit' => 2]);
+        $stalled = now()->subHours(5)->format('Y-m-d H:i:s');
+        $row = static fn (string $name, string $status): array => ['identity' => sha1($name), 'source_identity' => sha1($name), 'groups_id' => 1,
+            'manifest_path' => hash('sha256', $name).'.json.gz', 'manifest_bytes' => 0, 'manifest_hash' => hash('sha256', $name), 'status' => $status,
+            'version' => 1, 'last_unique_at' => $stalled, 'next_attempt_at' => $stalled];
+        DB::table('release_verification_candidates')->insert($row('fresh-a', 'ready'));
+        DB::table('release_verification_candidates')->insert($row('fresh-b', 'ready'));
+        foreach (range(1, 3) as $n) {
+            DB::table('release_verification_candidates')->insert($row('stalled-'.$n, 'waiting_upload'));
+        }
+        $repository = app(CandidateRepository::class);
+
+        $this->assertSame(0, $repository->promotePartial(10), 'New uploads ready for verification are worked first.');
+        DB::table('release_verification_candidates')->where('source_identity', sha1('fresh-a'))->update(['status' => 'sampled']);
+        $this->assertSame(1, $repository->promotePartial(10), 'Only up to the ready limit.');
+        $this->assertSame(2, DB::table('release_verification_candidates')->where('status', 'ready')->count());
+    }
+
+    public function test_a_stalled_upload_is_owed_its_partial_attempt_for_one_expiry_window_only(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $this->limits();
+        config(['release_verification.partial_after_hours' => 4]);
+        $expiry = (int) config('release_verification.expiry_hours');
+        $row = static fn (string $name, int $hoursAgo): array => ['identity' => sha1($name), 'source_identity' => sha1($name), 'groups_id' => 1,
+            'manifest_path' => hash('sha256', $name).'.json.gz', 'manifest_bytes' => 0, 'manifest_hash' => hash('sha256', $name), 'status' => 'waiting_upload',
+            'version' => 1, 'last_unique_at' => now()->subHours($hoursAgo)->format('Y-m-d H:i:s'), 'next_attempt_at' => now()->addHour()->format('Y-m-d H:i:s')];
+        DB::table('release_verification_candidates')->insert($row('owed', $expiry + 1));
+        DB::table('release_verification_candidates')->insert($row('overdue', $expiry + 5));
+
+        app(CandidateRepository::class)->expire();
+
+        $this->assertSame('waiting_upload', DB::table('release_verification_candidates')->where('source_identity', sha1('owed'))->value('status'));
+        $this->assertSame('expired', DB::table('release_verification_candidates')->where('source_identity', sha1('overdue'))->value('status'),
+            'A promotion backlog cannot keep its inventory indefinitely.');
+    }
+
     public function test_retained_expiry_pages_past_rows_held_by_pending_late_headers(): void
     {
         $this->publicationSchema(partialColumns: true);
@@ -804,13 +870,20 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $row = static fn (int $n): array => ['identity' => sha1('held-'.$n), 'source_identity' => sha1('held-'.$n), 'groups_id' => 1,
             'manifest_path' => hash('sha256', 'held-'.$n).'.json.gz', 'manifest_bytes' => 0, 'manifest_hash' => hash('sha256', 'held-'.$n), 'status' => 'sampled',
             'version' => 1, 'last_unique_at' => $cutoff, 'next_attempt_at' => $cutoff, 'release_id' => 100000 + $n];
+        // Each retained partial is the candidate its release's late-article pointer names.
+        $retain = function (int $n) use ($row): void {
+            $id = DB::table('release_verification_candidates')->insertGetId($row($n));
+            DB::table('releases')->insert(['id' => 100000 + $n, 'late_article_candidate_id' => $id, 'guid' => 'held-'.$n]
+                + array_fill_keys(['name', 'searchname', 'leftguid', 'fromname', 'postdate', 'adddate'], 'x')
+                + array_fill_keys(['totalpart', 'groups_id', 'size', 'passwordstatus', 'haspreview', 'categories_id', 'nfostatus', 'nzbstatus', 'isrenamed', 'iscategorized', 'predb_id'], 0));
+        };
         // A full page of retained partials whose uploads still have late headers waiting to be archived.
         foreach (range(1, 100) as $n) {
-            DB::table('release_verification_candidates')->insert($row($n));
+            $retain($n);
             DB::table('collections')->insert(['collectionhash' => hex2bin(sha1('held-'.$n)), 'subject' => 'Movie', 'fromname' => 'poster',
                 'totalfiles' => 1, 'groups_id' => 1, 'date' => '2026-10-11 12:00:00', 'filecheck' => 0]);
         }
-        DB::table('release_verification_candidates')->insert($row(101));
+        $retain(101);
 
         app(CandidateRepository::class)->expire();
 
