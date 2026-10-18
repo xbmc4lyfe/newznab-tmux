@@ -220,7 +220,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
             'spot_check' => ['articles' => 1, 'bytes' => 256, 'sampled_files' => 1, 'method' => 'yenc-crc-and-identity']];
         $policy = app(CollectionReleasePolicy::class);
 
-        foreach ([['9d3276d357227b7811b97dfd'], ['Xk29dPq8LmZ0Yt5R.par2'], ['Payload.Name.']] as $names) {
+        foreach ([['9d3276d357227b7811b97dfd'], ['Xk29dPq8LmZ0Yt5R.par2'], ['Payload.Name.'], ['Xk29dPq8.LmZ0Yt5RabCdEf'], ['x.mk-v']] as $names) {
             $this->assertSame('Header inventory contains only PAR2 files without a declared source payload.',
                 $policy->verifiedRejection(['verified_file_names' => $names] + $manifest), $names[0]);
         }

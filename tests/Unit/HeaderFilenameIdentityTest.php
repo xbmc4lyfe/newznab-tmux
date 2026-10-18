@@ -128,6 +128,14 @@ class HeaderFilenameIdentityTest extends TestCase
             'unquoted executable after an underscore' => ['Readable _setup.exe yEnc', 'setup.exe', false],
             'unquoted executable before an underscore' => ['Readable setup.exe_ yEnc', 'setup.exe', false],
             'counter without a dash or yEnc' => ['[1/5]"Readable.Name.mkv"', 'Other.Thing.mkv', false],
+            'stream form hides an executable under an opaque disk image' => ['[1/1] - "Xk29dPq8LmZ0Yt5R.iso" yEnc', 'evil.exe:x.iso', false],
+            'trimmed form hides an executable under an opaque disk image' => ['[1/1] - "Xk29dPq8LmZ0Yt5R.iso" yEnc', 'evil.iso:x.exe', false],
+            'word prefix needs eight characters' => ['"Movie.mkv" yEnc', 'Movie Extra.mkv', false],
+            'symbol-only stems do not match' => ['"★★★.mkv" yEnc', '☆☆.mkv', false],
+            'uppercase opaque parity subject with a payload body' => ['[1/1] - "Xk29dPq8LmZ0Yt5R.PAR2" yEnc', 'payload.mkv', false],
+            'unquoted executable ignores case' => ['Readable SETUP.EXE yEnc', 'setup.exe', true],
+            'digit before a single quote' => ["[1/1] - 1'movie.mkv' yEnc", 'other.mkv', true],
+            'underscore after a single quote' => ["[1/1] - 'movie.mkv'_ yEnc", 'other.mkv', true],
             'opaque subject with an extensionless body' => ['[3/8] - "o9aeI3YpDwgHGoJ2ZsCm.vol00+01.par2" yEnc', '148f76878d7732b981734a9e0c51a348', true],
         ];
     }

@@ -77,11 +77,10 @@ final class HeaderFilenameIdentity
         }
         [$shorter, $longer] = mb_strlen($expected) <= mb_strlen($body)
             ? [self::words($declared), self::words($actual)] : [self::words($actual), self::words($declared)];
-        $remainder = array_slice($longer, count($shorter));
 
-        // Only whole words may follow, and never a number: VI is not VII, Part 1 is not Part 10, Movie is not Movie 2.
+        // Only whole words may follow (the number check above already rules out added numbers): VI is not VII.
         return mb_strlen(implode('', $shorter)) >= 8 && array_slice($longer, 0, count($shorter)) === $shorter
-            && preg_match('/\p{N}\z/u', (string) end($shorter)) !== 1 && preg_match('/\p{N}/u', implode(' ', $remainder)) !== 1;
+            && preg_match('/\p{N}\z/u', (string) end($shorter)) !== 1;
     }
 
     /** A single random-looking token, such as an obfuscated posting name, makes no filename claim. */
