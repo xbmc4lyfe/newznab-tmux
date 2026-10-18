@@ -91,4 +91,14 @@ final class PartialReleaseTitleFenceTest extends TestCase
         $this->assertSame([2], DB::table('releases')->whereRaw(TvProcessingCandidateQuery::episodeRetryCondition(true))->pluck('id')->all());
         $this->artisan('tv:reprocess-unmatched', ['--dry-run' => true])->expectsOutput('No unmatched TV releases found.')->assertSuccessful();
     }
+
+    public function test_anime_refresh_skips_a_partial(): void
+    {
+        Schema::table('releases', static function (Blueprint $table): void {
+            $table->integer('anidbid')->nullable();
+        });
+        DB::table('releases')->insert(['id' => 1, 'categories_id' => Category::TV_ANIME, 'searchname' => 'Some.Anime.01', 'late_article_candidate_id' => 7]);
+
+        $this->artisan('anime:refresh')->expectsOutput('No anime releases found to process.')->assertSuccessful();
+    }
 }
