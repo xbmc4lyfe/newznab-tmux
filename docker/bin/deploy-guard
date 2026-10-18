@@ -305,9 +305,10 @@ cmd_run() {
     [ ! -e "$DEPLOY_NOOP_MARKER" ] || rm -f "$DEPLOY_NOOP_MARKER"
     export DEPLOY_EXPECTED_FINGERPRINT DEPLOY_NOOP_MARKER
     check_recovery_hold
-    # In the background so a trapped signal interrupts `wait` and can be forwarded; stdin stays the
-    # guard's own (a non-interactive shell would otherwise give it /dev/null).
-    "$@" 0<&0 &
+    # In the background so a trapped signal interrupts `wait` and can be forwarded. A non-interactive
+    # shell gives a background job /dev/null as stdin (dash applies that before any `0<&0`), so the
+    # guard's stdin travels on descriptor 3, e.g. for `... run resume-scheduler -- python3 - < script`.
+    { "$@" <&3 3<&- & } 3<&0
     payload=$!
     if wait "$payload"; then rc=0; else rc=$?; fi
     payload=

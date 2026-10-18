@@ -54,6 +54,21 @@ final class DockerDeployGuardTest extends TestCase
     }
 
     #[Test]
+    public function the_payload_reads_the_guards_stdin_under_every_posix_shell(): void
+    {
+        foreach (['sh', 'dash', 'bash'] as $shell) {
+            if ((new Process(['sh', '-c', 'command -v '.$shell]))->run() !== 0) {
+                continue;
+            }
+            $out = $this->dir.'/stdin-'.$shell;
+            $process = $this->guardProcess(['run', 'resume-scheduler', '--', 'sh', '-c', 'cat > '.escapeshellarg($out)], [], $shell);
+            $process->setInput("recovery script\n");
+            $process->mustRun();
+            $this->assertSame("recovery script\n", (string) file_get_contents($out), $shell);
+        }
+    }
+
+    #[Test]
     #[DataProvider('interruptions')]
     public function a_signal_to_the_guard_reaches_the_payload_and_waits_for_its_recovery(int $signal, int $code): void
     {
@@ -768,10 +783,10 @@ PHP);
      * @param  list<string>  $arguments
      * @param  array<string, string>  $env
      */
-    private function guardProcess(array $arguments, array $env = []): Process
+    private function guardProcess(array $arguments, array $env = [], string $shell = 'sh'): Process
     {
         return new Process(
-            ['sh', dirname(__DIR__, 2).'/docker/bin/deploy-guard', ...$arguments],
+            [$shell, dirname(__DIR__, 2).'/docker/bin/deploy-guard', ...$arguments],
             null,
             $env + [
                 'DEPLOY_LOCK_DIR' => $this->dir.'/lock',

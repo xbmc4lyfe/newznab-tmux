@@ -146,7 +146,7 @@ build *args:
         DEPLOY_STAMP="{{CURDIR}}/.build.stamp" FORCE="$FORCE" \
         DEPLOY_MIN_INTERVAL=0 RECORD_DEPLOY_TIME=0 \
         DEPLOY_CONFIG_COMMAND= CHECK_UNCHANGED_COMMAND= CHECK_HEALTH_COMMAND= \
-        DEPLOY_BY="$DEPLOY_BY" "{{CURDIR}}/bin/deploy-guard" run build -- \
+        DEPLOY_BY="$DEPLOY_BY" exec "{{CURDIR}}/bin/deploy-guard" run build -- \
         "{{CURDIR}}/bin/build-images"
 
 # Internal: build dirty service image targets without acquiring a second guard
@@ -201,7 +201,7 @@ deploy *args:
         DEPLOY_HEALTH_TIMEOUT="$DEPLOY_HEALTH_TIMEOUT" \
         APP_IMAGE="$APP_IMAGE" WEB_IMAGE="$WEB_IMAGE" HORIZON_IMAGE="$HORIZON_IMAGE" \
         SCHEDULER_IMAGE="$SCHEDULER_IMAGE" INDEXER_IMAGE="$INDEXER_IMAGE" FORCE="$FORCE" \
-        DEPLOY_BY="$DEPLOY_BY" "{{CURDIR}}/bin/deploy-guard" run deploy -- \
+        DEPLOY_BY="$DEPLOY_BY" exec "{{CURDIR}}/bin/deploy-guard" run deploy -- \
         "{{CURDIR}}/bin/deploy-app"
 
 # First-time install: build, migrate+seed, indexes, groups, tuning, predb seed, start
@@ -246,7 +246,7 @@ up *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    DEPLOY_BY="$DEPLOY_BY" "{{CURDIR}}/bin/deploy-guard" run up -- "{{CURDIR}}/bin/up-app"
+    DEPLOY_BY="$DEPLOY_BY" exec "{{CURDIR}}/bin/deploy-guard" run up -- "{{CURDIR}}/bin/up-app"
 
 # Stop the stack (tmux session stops cleanly)
 down *args:

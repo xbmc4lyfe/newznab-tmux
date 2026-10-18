@@ -782,8 +782,8 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
         db_url_identity = urlunsplit((db_url.scheme, db_url.hostname or "", db_url.path, db_url.query, "")) + (
             f"|{db_url.port}" if db_url.netloc and db_url.port else "")
     except ValueError:
-        # Unparseable (e.g. a bad port): compare its digest whole rather than guess.
-        db_url_identity = sha256_text(app_env_values.get("DB_URL", ""))
+        # Unparseable (e.g. a bad or `${PORT}` port): compare everything after the credentials.
+        db_url_identity = "unparsed " + app_env_values.get("DB_URL", "").rsplit("@", 1)[-1]
     identity_keys = ("DB_URL", "DB_CONNECTION", "DB_HOST", "DB_PORT", "DB_SOCKET", "DB_DATABASE")
     # phpdotenv (which reads app.env as /app/.env) only expands `${NAME}`; a bare `$`, e.g. in a
     # password, is literal. DB_URL is checked after its credentials are stripped.

@@ -1425,6 +1425,14 @@ SH);
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         $this->assertStringNotContainsString('artisan migrate', $this->events());
 
+        // So can a reference in DB_URL's port.
+        file_put_contents($this->directory.'/docker/config/app.env', "CUTOVER_PORT=3306\nDB_URL=mysql://u:p@192.0.2.50:\${CUTOVER_PORT}/nntmux\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/docker/config/app.env', "CUTOVER_PORT=3307\nDB_URL=mysql://u:p@192.0.2.50:\${CUTOVER_PORT}/nntmux\n");
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->assertStringContainsString('artisan migrate --force', $this->events());
+
         // A nested reference can switch databases without changing DB_HOST's text.
         file_put_contents($this->directory.'/docker/config/app.env', "DB_TARGET=192.0.2.40\nDB_HOST=\${DB_TARGET}\nDB_DATABASE=nntmux\n");
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
