@@ -342,6 +342,28 @@ SH);
         $this->assertStringContainsString('released', $events);
     }
 
+    public function test_a_failure_after_replacing_the_database_keeps_remote_workers_out(): void
+    {
+        mkdir($this->directory.'/docker/config/redis', 0777, true);
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 1gb\n");
+        $services = json_decode($this->composeJson(), true);
+        $services['services']['mariadb'] = ['image' => 'mariadb:one'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($services, JSON_UNESCAPED_SLASHES)])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        // The database is replaced, then a later data service fails before the migration.
+        $services['services']['mariadb'] = ['image' => 'mariadb:two'];
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 2gb\n");
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($services, JSON_UNESCAPED_SLASHES), 'NNTMUX_UP_FAIL_SERVICE' => 'redis']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $events = $this->events();
+        $this->assertStringNotContainsString('artisan migrate', $events);
+        $this->assertStringNotContainsString('released', $events);
+        $this->assertStringNotContainsString('forced-release', $events);
+        $this->assertFileExists($this->directory.'/docker/.deploy.stamp.barrier-owed');
+    }
+
     public function test_another_data_service_keeps_the_existing_barrier(): void
     {
         mkdir($this->directory.'/docker/config/redis', 0777, true);

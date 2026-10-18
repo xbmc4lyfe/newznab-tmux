@@ -402,7 +402,9 @@ for item in $POST_DRAIN; do
         keep=$barrier_keep
         barrier_held=0
         hold_barrier
-        barrier_keep=$keep
+        # The replacement database still awaits the migration: from here a failure must keep
+        # remote workers out (its release stays owed), not readmit them to an unmigrated schema.
+        if [ "$MIGRATE" = 1 ]; then barrier_keep=1; else barrier_keep=$keep; fi
         verify
     fi
 done

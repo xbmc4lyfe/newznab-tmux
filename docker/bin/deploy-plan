@@ -1146,7 +1146,7 @@ def mounts_changed_since_start(docker_dir: Path, svc: str) -> bool:
     for volume in cfg["volumes"]:
         if isinstance(volume, dict) and volume.get("type") == "bind" and isinstance(volume.get("source"), str):
             source = volume["source"]
-            if not volume.get("read_only") and os.path.islink(source.rstrip("/")):
+            if not volume.get("read_only") and symlinked_below(source, project_directory(docker_dir)):
                 # A symlinked data source may have been retargeted; with no record of what the
                 # container mounted, recreate it rather than reconcile it in place.
                 return True
@@ -1259,6 +1259,21 @@ def data_services(state: dict[str, str]) -> list[str]:
 def infra_services(state: dict[str, str]) -> list[str]:
     """Known infrastructure plus every added service labelled `nntmux.deploy.stateless: "true"`."""
     return [*INFRA_SERVICES, *(svc for svc in extra_services(state) if declared_stateless(svc))]
+
+
+def symlinked_below(source: str, root: Path) -> bool:
+    """True when the source, or a directory between the project root and it, is a symlink (e.g.
+    `docker/data -> /Volumes/disk1`). Links above the project (macOS `/var`) do not count."""
+    real_root = os.path.realpath(root)
+    path = os.path.abspath(source).rstrip("/")
+    while path and path != os.path.dirname(path):
+        parent = os.path.dirname(path)
+        real_parent = os.path.realpath(parent)
+        inside = real_parent == real_root or real_parent.startswith(real_root + os.sep)
+        if inside and os.path.islink(path):
+            return True
+        path = parent
+    return False
 
 
 def docker_daemon_identity() -> str:
