@@ -29,8 +29,11 @@ final class VerifiedReleasePublisher
     /**
      * @param  PublicationTiming|false|null  $timing  A sample the caller already drew (the remote controller, which
      *                                                times its own request work first); false when it drew none; null to draw here.
+     * @param  array{path: string, manifest: array<string, mixed>}|null  $archived  The archived manifest the caller already read, and its path.
+     *                                                                              Manifests are named by the hash of their contents, so it is
+     *                                                                              reused only while the claim's row names that same path.
      */
-    public function publish(object $claim, VerificationResult $result, string $source = 'local', PublicationTiming|false|null $timing = null): ?int
+    public function publish(object $claim, VerificationResult $result, string $source = 'local', PublicationTiming|false|null $timing = null, ?array $archived = null): ?int
     {
         if (! $result->passed()) {
             return null;
@@ -49,9 +52,11 @@ final class VerifiedReleasePublisher
         // The incoming NZB parse and fingerprint depend only on the manifest; computing them here,
         // before any lock, keeps that CPU work out of the serialized publication section.
         $incoming = null;
+        $size = null;
         // A plain read is harmless outside a transaction; it skips the work for a stale claim,
         // which the locked validation below rejects anyway.
-        $current = DB::transactionLevel() === 0 && $this->claimIsCurrent($claim);
+        $claimedPath = DB::transactionLevel() === 0 ? $this->currentManifestPath($claim) : null;
+        $current = $claimedPath !== null;
         $timing?->preLockPhase('claim_check');
         if ($current) {
             // The step in progress, so a failure is timed under the step that threw.
@@ -63,7 +68,8 @@ final class VerifiedReleasePublisher
                 $incoming = $this->incomingDocument($result->manifest);
                 $timing?->preLockPhase($step);
                 $step = 'key_derivation';
-                $keys = VerificationLedger::publicationKeys($this->publicationSize($result->manifest), $incoming['fingerprint'],
+                $size = $this->publicationSize($result->manifest);
+                $keys = VerificationLedger::publicationKeys($size, $incoming['fingerprint'],
                     (string) $preResolved['name'], (string) $preResolved['searchname'], (int) $preResolved['predb_id']);
             } catch (Throwable) {
                 if ($step !== 'key_derivation') {
@@ -71,11 +77,15 @@ final class VerifiedReleasePublisher
                 }
                 $preResolved = null;
                 $incoming = null;
+                $size = null;
                 $keys = [];
             }
         }
+        $timing?->preLockPhase('key_derivation');
+        // Everything below depends only on the manifest and unlocked reads, so it runs before the
+        // locks; the locked section applies each result exactly where it used to compute it.
+        $prelock = $current ? $this->prelock($result, (string) $claimedPath, $archived, $incoming, $size, $timing) : new PublicationPrelock;
         if ($timing !== null) {
-            $timing->preLockPhase('key_derivation');
             $segments = 0;
             foreach ((array) ($result->manifest['files'] ?? []) as $file) {
                 $segments += is_array($file) ? count((array) ($file['segments'] ?? [])) : 0;
@@ -83,7 +93,7 @@ final class VerifiedReleasePublisher
             $timing->setManifestFacts($segments, $keys !== []);
         }
         try {
-            $id = DB::transaction(function () use ($claim, $result, $timing, $preResolved, $keys, $incoming, &$outcome): ?int {
+            $id = DB::transaction(function () use ($claim, $result, $timing, $preResolved, $keys, $incoming, $prelock, &$outcome): ?int {
                 $timing?->beginAttempt();
                 $returned = false;
                 $outcome = 'threw';
@@ -115,7 +125,8 @@ final class VerifiedReleasePublisher
                             throw new RuntimeException($rejection);
                         }
                     }
-                    $filteredReason = app(CollectionReleasePolicy::class)->verifiedRejection($manifest);
+                    $filteredReason = $prelock->policyKnown ? $prelock->policyRejection
+                        : app(CollectionReleasePolicy::class)->verifiedRejection($manifest);
                     if ($filteredReason !== null) {
                         app(CandidateRepository::class)->rejectByPolicy($claim, $filteredReason, $timing);
 
@@ -126,13 +137,15 @@ final class VerifiedReleasePublisher
                     }
                     $timing?->nextPhase('metadata_size');
                     $metadata = $preResolved ?? $this->metadata->resolve($manifest);
-                    $size = $this->publicationSize($manifest);
+                    $size = $prelock->size ?? $this->publicationSize($manifest);
                     if ($size < 1 && ($manifest['verification_mode'] ?? null) === 'spot_check') {
                         throw new RuntimeException('Spot-checked release has no positive declared size.');
                     }
                     $timing?->nextPhase('archive_legacy');
                     $legacy = null;
-                    $archived = app(ManifestStore::class)->read($candidate->manifest_path);
+                    // The archived manifest is content-addressed: the pre-lock copy is this row's only if the row still names its path.
+                    $archived = $prelock->archived !== null && $prelock->archivedPath === $candidate->manifest_path
+                        ? $prelock->archived : app(ManifestStore::class)->read($candidate->manifest_path);
                     $legacyId = $archived['legacy_release_id'] ?? null;
                     if ($legacyId !== ($manifest['legacy_release_id'] ?? null)
                         || ($legacyId !== null && ($archived['metadata_source'] ?? null) === 'import')) {
@@ -145,7 +158,7 @@ final class VerifiedReleasePublisher
                             throw new RuntimeException('Legacy release identity changed before publication.');
                         }
                     }
-                    $duplicate = $legacy === null ? $this->findCoveredDuplicate($claim, $manifest, $metadata, $size, $timing, $incoming) : ['release_id' => null, 'metadata_conflict' => false];
+                    $duplicate = $legacy === null ? $this->findCoveredDuplicate($claim, $manifest, $metadata, $size, $timing, $incoming, $prelock->coverageIds) : ['release_id' => null, 'metadata_conflict' => false];
                     $duplicateId = $duplicate['release_id'];
                     if ($duplicateId !== null || $duplicate['metadata_conflict']) {
                         $timing?->nextPhase('sql_accounting');
@@ -195,7 +208,7 @@ final class VerifiedReleasePublisher
                         throw new RuntimeException('Verified release identity disappeared before NZB installation.');
                     }
                     $timing?->nextPhase('final_xml_gzip');
-                    $receipt = $this->writer->writeWithReceipt($manifest, $guid, $release, $timing);
+                    $receipt = $this->writer->writeWithReceipt($manifest, $guid, $release, $timing, $prelock->body);
                     DB::afterRollBack(static fn () => $receipt->rollback());
                     DB::afterCommit(static fn () => $receipt->close());
                     $timing?->nextPhase('sql_accounting');
@@ -236,11 +249,12 @@ final class VerifiedReleasePublisher
     /**
      * @param  array<string, mixed>  $manifest
      * @param  array<string, mixed>  $metadata
-     * @param  array{xml: ?\SimpleXMLElement, fingerprint: ?string}|null  $incoming  The pre-lock parse, when it ran.
+     * @param  array{document: string, xml: ?\SimpleXMLElement, fingerprint: ?string}|null  $incoming  The pre-lock parse, when it ran.
+     * @param  array<string, true>|null  $coverageIds  coverageIds() of that parse, when computed before the lock.
      * @return array{release_id: ?int, metadata_conflict: bool}
      */
     private function findCoveredDuplicate(object $claim, array $manifest, array $metadata, int $size, ?PublicationTiming $timing,
-        ?array $incoming = null): array
+        ?array $incoming = null, ?array $coverageIds = null): array
     {
         $lastHeartbeat = 0.0;
         $repository = app(CandidateRepository::class);
@@ -274,7 +288,7 @@ final class VerifiedReleasePublisher
         };
         $duplicate = $xml === null ? null : $coverage->findCoveredUpload($size, $fingerprint, $xml,
             $metadata['name'], $metadata['searchname'], $metadata['predb_id'], publishedOnly: true,
-            onCandidate: $heartbeat, acceptCovered: $acceptCovered);
+            onCandidate: $heartbeat, acceptCovered: $acceptCovered, requiredIds: $coverageIds);
         $repository->heartbeat((int) $claim->id, $claim->lease_token);
 
         return ['release_id' => $duplicate === null ? null : (int) $duplicate->id, 'metadata_conflict' => $metadataConflict];
@@ -306,24 +320,76 @@ final class VerifiedReleasePublisher
         }
     }
 
-    private function claimIsCurrent(object $claim): bool
+    /** The manifest path of the candidate row this claim still owns, or null when the claim is stale. */
+    private function currentManifestPath(object $claim): ?string
     {
-        return DB::table('release_verification_candidates')->where('id', $claim->id)->where('version', $claim->version)
+        $row = DB::table('release_verification_candidates')->where('id', $claim->id)->where('version', $claim->version)
             ->where('manifest_hash', $claim->manifest_hash)->where('lease_token', $claim->lease_token)->whereNull('release_id')
-            ->where('lease_until', '>=', now()->format('Y-m-d H:i:s'))->exists();
+            ->where('lease_until', '>=', now()->format('Y-m-d H:i:s'))->first(['manifest_path']);
+
+        return $row === null ? null : (string) $row->manifest_path;
+    }
+
+    /**
+     * Compute, before any lock, what the locked section would otherwise compute. Each step is
+     * independent and best effort: one that throws stays unset and is recomputed (and throws
+     * again, as it always did) in the locked section, in its original order.
+     *
+     * @param  array{path: string, manifest: array<string, mixed>}|null  $supplied
+     * @param  array{document: string, xml: ?\SimpleXMLElement, fingerprint: ?string}|null  $incoming
+     */
+    private function prelock(VerificationResult $result, string $claimedPath, ?array $supplied, ?array $incoming, ?int $size, ?PublicationTiming $timing): PublicationPrelock
+    {
+        $manifest = $result->manifest;
+        $archived = null;
+        try {
+            $archived = $supplied !== null && $supplied['path'] === $claimedPath ? $supplied['manifest']
+                : app(ManifestStore::class)->read($claimedPath);
+        } catch (Throwable) {
+        }
+        $timing?->preLockPhase('archive_read');
+        $policyKnown = false;
+        $rejection = null;
+        try {
+            // Reads only the group's and the settings' size and file-count limits, which no publication lock guards.
+            $rejection = app(CollectionReleasePolicy::class)->verifiedRejection($manifest);
+            $policyKnown = true;
+        } catch (Throwable) {
+        }
+        $timing?->preLockPhase('policy_check');
+        $body = null;
+        $coverageIds = null;
+        // A filtered candidate never writes or compares an NZB, and a legacy row is never searched for covering releases.
+        if ($incoming !== null && $rejection === null) {
+            try {
+                $body = $this->writer->compress($incoming['document']);
+            } catch (Throwable) {
+            }
+            $timing?->preLockPhase('document_gzip');
+            try {
+                if ($incoming['xml'] !== null && ($manifest['legacy_release_id'] ?? null) === null) {
+                    $coverageIds = (new NzbArticleCoverage(app(NzbService::class), $this->duplicates))->coverageIds($incoming['xml']);
+                }
+            } catch (Throwable) {
+            }
+            $timing?->preLockPhase('coverage_ids');
+        }
+
+        return new PublicationPrelock($size, $claimedPath, $archived, $policyKnown, $rejection, $body, $coverageIds);
     }
 
     /**
      * The incoming NZB that duplicate detection compares, parsed once, and its article fingerprint.
      *
      * @param  array<string, mixed>  $manifest
-     * @return array{xml: ?\SimpleXMLElement, fingerprint: ?string}
+     * @return array{document: string, xml: ?\SimpleXMLElement, fingerprint: ?string}
      */
     private function incomingDocument(array $manifest): array
     {
-        $xml = (new NzbArticleCoverage(app(NzbService::class), $this->duplicates))->parseXml($this->writer->document($manifest));
+        $document = $this->writer->document($manifest);
+        $xml = (new NzbArticleCoverage(app(NzbService::class), $this->duplicates))->parseXml($document);
 
-        return ['xml' => $xml, 'fingerprint' => $xml === null ? null : NzbArticleFingerprint::fromXml($xml)];
+        return ['document' => $document, 'xml' => $xml, 'fingerprint' => $xml === null ? null : NzbArticleFingerprint::fromXml($xml)];
     }
 
     /**

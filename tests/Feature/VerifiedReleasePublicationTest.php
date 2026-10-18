@@ -24,9 +24,12 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\DataProvider;
+use Tests\Support\StoredManifests;
 
 class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
 {
+    use StoredManifests;
+
     public function test_timing_does_not_log_after_a_failed_commit_leaves_pdo_in_a_transaction(): void
     {
         config(['release_verification.publication_timing_sample_every' => 1]);
@@ -119,6 +122,9 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
             'timing logger failure preserves committed publication' => [12345, 12345, null, null, ['alt.test'], 'throw_logger'],
             'timing logger failure preserves after commit exception' => [12345, 12345, null, 'after_commit', ['alt.test'], 'throw_logger'],
             'publication timing skips outer transactions' => [12345, 12345, null, null, ['alt.test'], 'nested'],
+            'outer transaction computes the exact duplicate in the locked section' => [12345, 12345, 'exact', null, ['alt.test'], 'nested'],
+            'outer transaction computes covered subset in the locked section' => [12345, 12345, 'covered_subset', null, ['alt.test'], 'nested'],
+            'outer transaction still refuses a nonmatching duplicate' => [12345, 12345, 'different', null, ['alt.test'], 'nested'],
         ];
     }
 
@@ -453,7 +459,8 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
                 $this->assertIsInt($report['segment_count']);
                 $this->assertGreaterThan(0, $report['segment_count']);
                 $this->assertIsBool($report['keys_present']);
-                $this->assertSame(['claim_check', 'metadata_resolve', 'incoming_document', 'key_derivation'], array_keys($report['pre_lock_phases_ns']));
+                $this->assertSame(['claim_check', 'metadata_resolve', 'incoming_document', 'key_derivation',
+                    'archive_read', 'policy_check', 'document_gzip', 'coverage_ids'], array_keys($report['pre_lock_phases_ns']));
                 $this->assertSame($report['pre_lock_ns'], array_sum($report['pre_lock_phases_ns']));
                 $this->assertGreaterThanOrEqual($report['pre_lock_ns'] + array_sum($report['attempts'][0]['phases_ns']), $report['total_ns']);
                 $this->assertSame($failure === 'after_commit' ? 'threw' : 'returned', $report['status']);
@@ -506,6 +513,336 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
 
             throw $error;
         }
+    }
+
+    /**
+     * A claimed candidate with a publishable manifest, and the tables a publication writes.
+     *
+     * @return array{claim: object, manifest: array<string, mixed>, path: string, store: ManifestStore}
+     */
+    private function publishableCandidate(): array
+    {
+        config(['nntmux.release_dedupe_enabled' => true, 'nntmux_settings.path_to_nzbs' => config('release_verification.storage_path').'/nzbs']);
+        app('files')->ensureDirectoryExists(config('nntmux_settings.path_to_nzbs'));
+        Schema::create('releases', function (Blueprint $table): void {
+            $table->id();
+            foreach (['name', 'searchname', 'guid', 'leftguid', 'fromname', 'postdate', 'adddate'] as $column) {
+                $table->string($column);
+            }
+            foreach (['totalpart', 'groups_id', 'size', 'passwordstatus', 'haspreview', 'categories_id', 'nfostatus', 'nzbstatus', 'isrenamed', 'iscategorized', 'predb_id'] as $column) {
+                $table->integer($column);
+            }
+        });
+        Schema::create('release_regexes', function (Blueprint $table): void {
+            $table->integer('releases_id');
+            $table->integer('collection_regex_id');
+            $table->integer('naming_regex_id');
+        });
+        Schema::create('releases_groups', function (Blueprint $table): void {
+            $table->integer('releases_id');
+            $table->integer('groups_id');
+        });
+        Schema::table('usenet_groups', function (Blueprint $table): void {
+            $table->string('description')->default('');
+            foreach (['backfill_target', 'first_record', 'last_record', 'active', 'backfill'] as $column) {
+                $table->integer($column)->default(0);
+            }
+            $table->string('minfilestoformrelease')->default('');
+            $table->string('minsizetoformrelease')->default('');
+        });
+        Search::shouldReceive('updateRelease')->andReturnNull();
+        $this->app->instance(ReleaseMetadataResolver::class,
+            new class(app(ReleaseCleaningService::class)) extends ReleaseMetadataResolver
+            {
+                public function resolve(array $manifest): array
+                {
+                    return ['name' => 'Movie', 'searchname' => 'Movie', 'fromname' => 'poster', 'predb_id' => 0,
+                        'isrenamed' => 1, 'categories_id' => 2000, 'naming_regex_id' => 0];
+                }
+            });
+        $store = app(ManifestStore::class);
+        $manifest = ['subject' => 'Movie', 'fromname' => 'poster', 'date' => '2026-10-11 12:00:00', 'groups_id' => 1,
+            'groups' => ['alt.test'], 'expected_files' => 1, 'regex_id' => 0, 'verified_bytes' => 12345,
+            'verified_file_names' => ['movie.mkv'], 'verified_file_count' => 1,
+            'files' => [['key' => 'file', 'subject' => 'movie.mkv', 'totalparts' => 1, 'segments' => [['number' => 1, 'messageid' => 'verified@article', 'bytes' => 5]]]]];
+        $path = $store->write($manifest);
+        DB::table('release_verification_candidates')->insert(['identity' => sha1('publish'), 'groups_id' => 1,
+            'manifest_path' => $path, 'manifest_hash' => substr($path, 0, 64), 'manifest_bytes' => $store->size($path),
+            'last_unique_at' => now(), 'next_attempt_at' => now()]);
+        DB::table('release_verification_state')->update(['pending_bytes' => $store->size($path)]);
+
+        return ['claim' => app(CandidateRepository::class)->claim(), 'manifest' => $manifest, 'path' => $path, 'store' => $store];
+    }
+
+    /** Run $change once, right after the first statement of the publication transaction (its lock request). */
+    private function afterFirstLockedStatement(callable $change): void
+    {
+        $done = false;
+        DB::listen(static function (QueryExecuted $event) use (&$done, $change): void {
+            if ($done || DB::transactionLevel() < 1) {
+                return;
+            }
+            $done = true;
+            $change();
+        });
+    }
+
+    /** Collect each publication timing report's context, in order. */
+    private function captureTimingReports(): \ArrayObject
+    {
+        $reports = new \ArrayObject;
+        Log::shouldReceive('warning')->andReturnNull();
+        Log::shouldReceive('info')->andReturnUsing(static function (string $message, array $context) use ($reports): void {
+            $reports[] = $context;
+        });
+
+        return $reports;
+    }
+
+    public function test_prelock_work_is_reused_by_the_locked_section_and_the_nzb_bytes_are_unchanged(): void
+    {
+        config(['release_verification.publication_timing_sample_every' => 1]);
+        ['claim' => $claim, 'manifest' => $manifest, 'path' => $path] = $this->publishableCandidate();
+        $expected = gzencode(app(VerifiedNzbWriter::class)->document($manifest));
+        $zone = date_default_timezone_get();
+        $reports = $this->captureTimingReports();
+        // Each change would alter the outcome if the locked section computed its item itself.
+        $this->afterFirstLockedStatement(function () use ($path): void {
+            $this->removeStoredManifest($path);
+            DB::table('usenet_groups')->update(['minsizetoformrelease' => '1000000000']);
+            date_default_timezone_set('Pacific/Honolulu');
+        });
+
+        try {
+            $id = app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('complete', 'Downloaded and verified', $manifest));
+        } finally {
+            date_default_timezone_set($zone);
+        }
+
+        $this->assertIsInt($id);
+        $release = DB::table('releases')->where('id', $id)->first();
+        // The archived manifest was not read again, the policy verdict stands, and the document was not rendered again.
+        $this->assertSame($expected, file_get_contents(app(NzbService::class)->getNzbPath($release->guid)));
+        $this->assertSame($id, (int) DB::table('release_verification_candidates')->value('release_id'));
+        $this->assertSame(1, DB::table('releases')->count());
+        $this->assertCount(1, $reports);
+        $this->assertSame('published', $reports[0]['outcome']);
+        $this->assertSame(['claim_check', 'metadata_resolve', 'incoming_document', 'key_derivation',
+            'archive_read', 'policy_check', 'document_gzip', 'coverage_ids'], array_keys($reports[0]['pre_lock_phases_ns']));
+        $this->assertSame(['state_lock_acquisition', 'candidate_policy', 'metadata_size', 'archive_legacy',
+            'incoming_xml_fingerprint', 'duplicate_search_revalidation', 'release_identity_sql', 'final_xml_gzip', 'durable_install',
+            'sql_accounting', 'ledger_adjust'], array_keys($reports[0]['attempts'][0]['phases_ns']));
+    }
+
+    /** @return array<string, array{0: string}> */
+    public static function lockedSectionFallbacks(): array
+    {
+        return ['policy verdict' => ['policy'], 'archived manifest' => ['manifest'], 'rendered document' => ['document']];
+    }
+
+    #[DataProvider('lockedSectionFallbacks')]
+    public function test_without_the_prelock_step_the_locked_section_computes_each_item_itself(string $item): void
+    {
+        ['claim' => $claim, 'manifest' => $manifest, 'path' => $path] = $this->publishableCandidate();
+        $original = gzencode(app(VerifiedNzbWriter::class)->document($manifest));
+        $zone = date_default_timezone_get();
+        $this->afterFirstLockedStatement(function () use ($item, $path): void {
+            match ($item) {
+                'policy' => DB::table('usenet_groups')->update(['minsizetoformrelease' => '1000000000']),
+                'manifest' => $this->removeStoredManifest($path),
+                'document' => date_default_timezone_set('Pacific/Honolulu'),
+            };
+        });
+
+        // An outer transaction takes the shared view before any lock, so the publication skips its pre-lock step.
+        DB::beginTransaction();
+        try {
+            try {
+                $id = app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('complete', 'Downloaded and verified', $manifest));
+            } catch (\RuntimeException $error) {
+                $this->assertSame('manifest', $item);
+                $this->assertSame('Manifest integrity check failed.', $error->getMessage());
+                DB::rollBack();
+                $this->assertSame(0, DB::table('releases')->count());
+
+                return;
+            }
+            if ($item === 'document') {
+                $this->assertNotSame($original, gzencode(app(VerifiedNzbWriter::class)->document($manifest)));
+                $this->assertSame(gzencode(app(VerifiedNzbWriter::class)->document($manifest)),
+                    file_get_contents(app(NzbService::class)->getNzbPath(DB::table('releases')->where('id', $id)->value('guid'))));
+            }
+            DB::commit();
+        } finally {
+            date_default_timezone_set($zone);
+        }
+
+        $this->assertNotSame('manifest', $item);
+        if ($item === 'policy') {
+            $this->assertNull($id);
+            $this->assertSame('filtered', DB::table('release_verification_candidates')->value('status'));
+            $this->assertSame(0, DB::table('releases')->count());
+        } else {
+            $this->assertIsInt($id);
+        }
+    }
+
+    /** @return array<string, array{0: string, 1: string}> */
+    public static function changedManifestPaths(): array
+    {
+        return ['a manifest naming an untrusted legacy release' => ['legacy', 'Legacy release identity is not trusted.'],
+            'a manifest that no longer exists' => ['missing', 'Manifest integrity check failed.']];
+    }
+
+    #[DataProvider('changedManifestPaths')]
+    public function test_a_manifest_path_changed_after_the_prelock_read_is_read_again_under_the_lock(string $change, string $message): void
+    {
+        ['claim' => $claim, 'manifest' => $manifest, 'store' => $store] = $this->publishableCandidate();
+        $replacement = $change === 'legacy' ? $store->write($manifest + ['legacy_release_id' => 5]) : str_repeat('a', 64).'.json.gz';
+        $this->afterFirstLockedStatement(static function () use ($replacement): void {
+            DB::table('release_verification_candidates')->update(['manifest_path' => $replacement]);
+        });
+
+        try {
+            app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('complete', 'Downloaded and verified', $manifest));
+            $this->fail('The manifest the locked row names must be read and trusted before publishing.');
+        } catch (\RuntimeException $error) {
+            $this->assertSame($message, $error->getMessage());
+        }
+
+        $this->assertSame(0, DB::table('releases')->count());
+        $this->assertNull(DB::table('release_verification_candidates')->value('release_id'));
+        $this->assertCount(0, app('files')->allFiles(config('nntmux_settings.path_to_nzbs')));
+    }
+
+    /** @return array<string, array{0: bool}> */
+    public static function suppliedManifestPaths(): array
+    {
+        return ['the claim\'s own path is reused' => [true], 'another path is ignored' => [false]];
+    }
+
+    #[DataProvider('suppliedManifestPaths')]
+    public function test_a_supplied_archived_manifest_is_reused_only_for_the_path_it_was_read_from(bool $ownPath): void
+    {
+        ['claim' => $claim, 'manifest' => $manifest, 'path' => $path] = $this->publishableCandidate();
+        // Not the stored content: a marker the trust check rejects, to show which copy the publication consults.
+        $marked = $manifest + ['legacy_release_id' => 5];
+
+        $publish = fn (): ?int => app(VerifiedReleasePublisher::class)->publish($claim,
+            new VerificationResult('complete', 'Downloaded and verified', $manifest), archived: [
+                'path' => $ownPath ? $path : str_repeat('b', 64).'.json.gz', 'manifest' => $marked]);
+
+        if (! $ownPath) {
+            $this->assertIsInt($publish(), 'A manifest read from another path must be ignored in favor of the claim\'s own.');
+
+            return;
+        }
+        try {
+            $publish();
+            $this->fail('A supplied manifest for the claim\'s own path must be the one trusted.');
+        } catch (\RuntimeException $error) {
+            $this->assertSame('Legacy release identity is not trusted.', $error->getMessage());
+        }
+        $this->assertSame(0, DB::table('releases')->count());
+    }
+
+    /** @return array<string, array{0: bool}> */
+    public static function prelockModes(): array
+    {
+        return ['pre-lock step ran' => [false], 'outer transaction skipped it' => [true]];
+    }
+
+    #[DataProvider('prelockModes')]
+    public function test_policy_filtered_publication_has_the_same_outcome_and_ledger_effects(bool $outerTransaction): void
+    {
+        config(['release_verification.publication_timing_sample_every' => 1]);
+        ['claim' => $claim, 'manifest' => $manifest, 'path' => $path] = $this->publishableCandidate();
+        DB::table('usenet_groups')->update(['minsizetoformrelease' => '1000000000']);
+        $this->assertGreaterThan(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        $reports = $this->captureTimingReports();
+        $limitReads = [];
+        DB::listen(static function (QueryExecuted $event) use (&$limitReads): void {
+            if (str_contains($event->sql, 'from "usenet_groups" where "id" =')) {
+                $limitReads[] = DB::transactionLevel();
+            }
+        });
+        if ($outerTransaction) {
+            DB::beginTransaction();
+        }
+
+        $result = app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('complete', 'Downloaded and verified', $manifest));
+
+        if ($outerTransaction) {
+            DB::commit();
+        }
+        $this->assertNull($result);
+        $candidate = DB::table('release_verification_candidates')->first();
+        $this->assertSame('filtered', $candidate->status);
+        $this->assertSame('Verified payload is below the configured minimum size.', $candidate->reason);
+        $this->assertSame('', $candidate->manifest_path);
+        $this->assertSame(0, (int) $candidate->manifest_bytes);
+        $this->assertNull($candidate->lease_token);
+        $this->assertNull($candidate->release_id);
+        $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        $this->assertSame(0, DB::table('releases')->count());
+        $this->assertManifestNotStored($path);
+        $this->assertCount(0, app('files')->allFiles(config('nntmux_settings.path_to_nzbs')));
+        if ($outerTransaction) {
+            $this->assertSame([], $reports->getArrayCopy());
+            $this->assertSame([2], $limitReads, 'Without a pre-lock step the locked section reads the limits itself.');
+
+            return;
+        }
+        $this->assertSame([0], $limitReads, 'The limits are read once, before the transaction.');
+        $this->assertCount(1, $reports);
+        $this->assertSame('filtered', $reports[0]['outcome']);
+        // A filtered candidate never renders, compresses or compares an NZB.
+        $this->assertSame(['claim_check', 'metadata_resolve', 'incoming_document', 'key_derivation', 'archive_read', 'policy_check'],
+            array_keys($reports[0]['pre_lock_phases_ns']));
+        $this->assertSame(['state_lock_acquisition', 'candidate_policy', 'ledger_adjust'], array_keys($reports[0]['attempts'][0]['phases_ns']));
+    }
+
+    public function test_a_prelock_policy_failure_is_raised_again_by_the_locked_section(): void
+    {
+        ['claim' => $claim, 'manifest' => $manifest] = $this->publishableCandidate();
+        unset($manifest['verified_file_names']);
+
+        try {
+            app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('complete', 'Downloaded and verified', $manifest));
+            $this->fail('A manifest without an authoritative inventory cannot publish.');
+        } catch (\RuntimeException $error) {
+            $this->assertSame('Authoritative verified size and inventory are required for collection publication.', $error->getMessage());
+        }
+
+        $this->assertSame(0, DB::table('releases')->count());
+        $this->assertNull(DB::table('release_verification_candidates')->value('release_id'));
+    }
+
+    public function test_the_writer_installs_a_supplied_body_verbatim_and_otherwise_renders_the_same_bytes(): void
+    {
+        ['manifest' => $manifest] = $this->publishableCandidate();
+        $writer = app(VerifiedNzbWriter::class);
+        $other = $manifest;
+        $other['files'][0]['segments'][0]['messageid'] = 'other@article';
+        $supplied = $writer->compress($writer->document($other));
+        $this->assertSame(gzencode($writer->document($manifest)), $writer->compress($writer->document($manifest)));
+        $install = function (string $guid, ?string $body) use ($writer, $manifest): string {
+            $id = DB::table('releases')->insertGetId(['name' => 'Movie', 'searchname' => 'Movie', 'guid' => $guid, 'leftguid' => '1',
+                'fromname' => 'poster', 'postdate' => '2026-10-11', 'adddate' => '2026-10-11', 'totalpart' => 1, 'groups_id' => 1,
+                'size' => 1, 'passwordstatus' => -1, 'haspreview' => -1, 'categories_id' => 2000, 'nfostatus' => -1, 'nzbstatus' => 0,
+                'isrenamed' => 1, 'iscategorized' => 1, 'predb_id' => 0]);
+            DB::transaction(function () use ($writer, $manifest, $guid, $body, $id): void {
+                $release = DB::table('releases')->where('id', $id)->lockForUpdate()->first(['id', 'guid']);
+                $receipt = $writer->writeWithReceipt($manifest, $guid, $release, null, $body);
+                DB::afterRollBack(static fn () => $receipt->rollback());
+                DB::afterCommit(static fn () => $receipt->close());
+            });
+
+            return (string) file_get_contents(app(NzbService::class)->getNzbPath($guid));
+        };
+
+        $this->assertSame($supplied, $install(str_repeat('1', 32), $supplied));
+        $this->assertSame(gzencode($writer->document($manifest)), $install(str_repeat('2', 32), null));
     }
 
     public function test_published_candidate_scan_uses_fixed_upper_id_when_new_matches_arrive(): void
