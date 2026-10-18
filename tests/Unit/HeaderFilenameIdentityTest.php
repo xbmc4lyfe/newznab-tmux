@@ -1,0 +1,47 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Tests\Unit;
+
+use App\Services\Releases\Verification\HeaderFilenameIdentity;
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\Test;
+use PHPUnit\Framework\TestCase;
+
+class HeaderFilenameIdentityTest extends TestCase
+{
+    #[Test]
+    #[DataProvider('subjects')]
+    public function it_compares_the_declared_subject_filename_with_the_article_filename(string $subject, string $actual, bool $expected): void
+    {
+        self::assertSame($expected, HeaderFilenameIdentity::matches($subject, $actual));
+    }
+
+    /** @return array<string, array{string, string, bool}> */
+    public static function subjects(): array
+    {
+        return [
+            'no quoted filename' => ['Release name yEnc (1/2)', 'anything.bin', true],
+            'exact filename' => ['[1/8] - "Show.S01E01.mkv" yEnc', 'Show.S01E01.mkv', true],
+            'filename before yEnc after a quoted tag' => ['"Tag Name" - [10/53] - "show.part10.rar" yEnc', 'show.part10.rar', true],
+            'filename after the counter without yEnc' => ['"Tag Name" - [10/53] - "show.part10.rar"', 'show.part10.rar', true],
+            'any quoted value equals the body name' => ['"show.part10.rar" - [10/53] - "Tag Name" yEnc', 'show.part10.rar', true],
+            'apostrophe inside a double-quoted name' => ['Show\'s Title [2/8] - "Show\'s Title.par2" yEnc', 'Show\'s Title.par2', true],
+            'opaque mixed-case subject' => ['[2/8] - "MdssqdkDoi1PGOHU3zIVNathiyE3zsFK.par2" yEnc', '39eba263b2397e84879c8185ca984e04.par2', true],
+            'opaque recovery-volume subject' => ['[7/10] - "wtpFcbMsiTODbAh4RiaG.vol015+016.par2" yEnc', 'wtpFcbMsiTODbAh4RiaG-o1on5HdR2Y.par2', true],
+            'opaque hexadecimal subject' => ['"'.str_repeat('a1', 8).'"', 'Readable.Name.mkv', true],
+            'long single-case token' => ['"'.str_repeat('k', 20).'.rar" yEnc', 'other.rar', true],
+            'same stem, different separators' => ['[2/9] - "SubsPlease Show - 01 1080p ABCD1234 .mkv.par2" yEnc', '[SubsPlease] Show - 01 (1080p) [ABCD1234].mkv.par2', true],
+            'same stem prefix' => ['[1/9] - "Readable.Release.Name.mkv" yEnc', 'Readable.Release.Name.Extra.mkv', true],
+            'readable names differ' => ['[1/9] - "Readable.Release.Name.mkv" yEnc', 'Different.Release.mkv', false],
+            'short tokens are readable claims' => ['"Movie2026.mkv" yEnc', 'Something.Else.mkv', false],
+            'short stem prefixes do not match' => ['"abc.mkv" yEnc', 'abcdefghij.mkv', false],
+            'opaque body under a readable subject' => ['[1/9] - "Readable.Release.Name.mkv" yEnc', 'Xk29dPq8LmZ0Yt5R.mkv', false],
+            'executable body under an opaque subject' => ['[1/9] - "Xk29dPq8LmZ0Yt5R.mkv" yEnc', 'setup.exe', false],
+            'declared executable' => ['[1/1] - "setup.exe" yEnc', 'setup.exe', true],
+            'single-quoted filename' => ["[1/1] - 'movie.mkv' yEnc", 'movie.mkv', true],
+            'single-quoted mismatch' => ["[1/1] - 'movie.mkv' yEnc", 'other.mkv', false],
+        ];
+    }
+}

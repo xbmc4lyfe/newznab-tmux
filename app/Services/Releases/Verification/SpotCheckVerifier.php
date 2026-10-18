@@ -199,19 +199,8 @@ final class SpotCheckVerifier
             if (($file['key'] ?? null) !== $key) {
                 continue;
             }
-            $subject = trim((string) ($file['subject'] ?? ''));
-            if (preg_match_all('/"([^"\r\n]+)"|\'([^\'\r\n]+)\'/u', $subject, $matches, PREG_SET_ORDER) > 0) {
-                $match = $matches[0];
-                $expected = $match[1] !== '' ? $match[1] : ($match[2] ?? '');
-                // A sole opaque posting hash does not declare the payload filename.
-                if (count($matches) === 1 && preg_match('/\A[0-9a-f]{32}\z/i', $expected) === 1) {
-                    return true;
-                }
 
-                return $expected !== '' && hash_equals($expected, $actual);
-            }
-
-            return true;
+            return HeaderFilenameIdentity::matches((string) ($file['subject'] ?? ''), $actual);
         }
 
         return false;

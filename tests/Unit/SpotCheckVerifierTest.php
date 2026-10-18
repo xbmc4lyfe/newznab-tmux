@@ -395,13 +395,14 @@ final class SpotCheckVerifierTest extends TestCase
     }
 
     #[Test]
-    public function only_a_sole_quoted_32_hex_posting_token_has_unknown_filename_identity(): void
+    public function obfuscated_subject_filenames_have_unknown_identity_but_readable_ones_must_agree(): void
     {
         $token = str_repeat('a1', 16);
         foreach (['"'.$token.'"' => 'sampled', "'".strtoupper($token)."'" => 'sampled',
-            '"'.substr($token, 1).'"' => 'unknown', '"'.$token.'a"' => 'unknown',
-            '"'.str_repeat('g', 32).'"' => 'unknown', '"'.$token.'.rar"' => 'unknown',
-            '"literal-extensionless-name"' => 'unknown', '"'.$token.'" "other.rar"' => 'unknown'] as $subject => $verdict) {
+            '"'.substr($token, 1).'"' => 'sampled', '"'.$token.'.rar"' => 'sampled',
+            '"Xk29dPq8LmZ0.part01.rar" yEnc' => 'sampled', '"password" - [1/2] - "actual.rar" yEnc' => 'sampled',
+            '"literal-extensionless-name"' => 'unknown', '"'.$token.'" "other.rar"' => 'unknown',
+            '"Movie2026.rar"' => 'unknown', '"other.rar" yEnc' => 'unknown'] as $subject => $verdict) {
             $articles = ['first@article' => YencArticles::part('hello', 'actual.rar', 10, 1, 1, 2),
                 'last@article' => YencArticles::part('world', 'actual.rar', 10, 2, 6, 2)];
             $source = new class($articles) implements ArticleSource
