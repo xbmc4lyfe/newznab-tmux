@@ -75,8 +75,9 @@ final class CollectionReleasePolicy
         $subjects = array_map(static fn (array $file): string => (string) ($file['subject'] ?? ''), $manifest['files'] ?? []);
         $hasPayload = array_filter($subjects,
             static fn (string $subject): bool => preg_match('/\.par2(?:["\'\s]|$)/i', $subject) !== 1) !== [];
+        // An obfuscated, extensionless body name is not evidence of a source payload.
         $sampledNames = array_filter($manifest['verified_file_names'] ?? [],
-            static fn (mixed $name): bool => is_string($name) && preg_match('/\.par2\z/i', $name) !== 1);
+            static fn (mixed $name): bool => is_string($name) && HeaderFilenameIdentity::provesPayload($name));
         if (! $hasPayload && $sampledNames === []) {
             return 'Header inventory contains only PAR2 files without a declared source payload.';
         }
