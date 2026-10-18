@@ -212,6 +212,37 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(2, (int) DB::table('releases')->where('id', $id)->value('totalpart'));
     }
 
+    public function test_a_failed_pre_lock_step_is_timed_under_the_step_that_threw(): void
+    {
+        config(['release_verification.publication_timing_sample_every' => 1]);
+        app(CandidateRepository::class)->archive($this->collectionForPolicy());
+        $claim = app(CandidateRepository::class)->claim();
+        $manifest = app(ManifestStore::class)->read($claim->manifest_path);
+        $this->mock(ReleaseMetadataResolver::class, function ($mock): void {
+            $mock->shouldReceive('resolve')->andThrow(new \RuntimeException('Resolver unavailable.'));
+        });
+        $reports = [];
+        Log::shouldReceive('info')->andReturnUsing(function (string $message, array $context = []) use (&$reports): void {
+            if ($message === 'Verified release publication timing.') {
+                $reports[] = $context;
+            }
+        });
+        Log::shouldReceive('warning', 'debug', 'error')->andReturnNull();
+
+        try {
+            app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('complete', 'Verified.', $manifest + ['verified_bytes' => 100,
+                'verified_file_names' => ['movie.mkv'], 'verified_file_count' => 1]));
+            $this->fail('The resolver failure must propagate from the in-lock fallback.');
+        } catch (\RuntimeException $error) {
+            $this->assertSame('Resolver unavailable.', $error->getMessage());
+        }
+
+        $this->assertCount(1, $reports);
+        $this->assertSame(['claim_check', 'metadata_resolve', 'key_derivation'], array_keys($reports[0]['pre_lock_phases_ns']));
+        $this->assertFalse($reports[0]['keys_present']);
+        $this->assertSame('threw', $reports[0]['outcome']);
+    }
+
     public function test_only_a_sampled_body_name_with_an_extension_proves_a_parity_only_header_has_a_payload(): void
     {
         app(CandidateRepository::class)->archive($this->collectionForPolicy(name: 'Xk29dPq8LmZ0Yt5R.par2'));

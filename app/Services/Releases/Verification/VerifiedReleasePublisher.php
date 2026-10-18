@@ -54,14 +54,21 @@ final class VerifiedReleasePublisher
         $current = DB::transactionLevel() === 0 && $this->claimIsCurrent($claim);
         $timing?->preLockPhase('claim_check');
         if ($current) {
+            // The step in progress, so a failure is timed under the step that threw.
+            $step = 'metadata_resolve';
             try {
                 $preResolved = $this->metadata->resolve($result->manifest);
-                $timing?->preLockPhase('metadata_resolve');
+                $timing?->preLockPhase($step);
+                $step = 'incoming_document';
                 $incoming = $this->incomingDocument($result->manifest);
-                $timing?->preLockPhase('incoming_document');
+                $timing?->preLockPhase($step);
+                $step = 'key_derivation';
                 $keys = VerificationLedger::publicationKeys($this->publicationSize($result->manifest), $incoming['fingerprint'],
                     (string) $preResolved['name'], (string) $preResolved['searchname'], (int) $preResolved['predb_id']);
             } catch (Throwable) {
+                if ($step !== 'key_derivation') {
+                    $timing?->preLockPhase($step);
+                }
                 $preResolved = null;
                 $incoming = null;
                 $keys = [];

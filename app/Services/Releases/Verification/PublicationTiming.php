@@ -57,6 +57,11 @@ final class PublicationTiming
             if ($every < 1 || DB::transactionLevel() !== 0) {
                 return null;
             }
+            if ($every > 1 && PHP_SAPI !== 'cli') {
+                // Web servers such as classic-mode FrankenPHP reset static state per request, so a
+                // counter would never reach $every there; draw per request at the same rate.
+                return random_int(1, $every) === 1 ? new self(hrtime(true)) : null;
+            }
             self::$sampleCounter = (self::$sampleCounter + 1) % $every;
 
             return self::$sampleCounter === 0 ? new self(hrtime(true)) : null;
