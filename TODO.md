@@ -6,6 +6,7 @@
 
 - [ ] Port the rule to the Rust FFI crate, prove verdict parity against the PHP rule on shared fixtures, and wire a paired caller benchmark into the Rust CI performance jobs and `scripts/benchmark_rust_inventory.py`. Adopt Rust only if it meets the 1.5x common-path and p99 thresholds including FFI overhead; otherwise keep PHP and record the evidence.
 - [ ] Evaluate richer evidence: PAR2 file descriptions as filename authority, subjects with an odd number of quote marks, underscore-separated opaque tokens, and multi-quoted subjects whose first value is the opaque filename.
+- [ ] Decide whether an unquoted subject that names a `.par2` file should still admit a non-PAR2 body as payload evidence; this predates the obfuscated-name rule.
 - [ ] Measure false acceptance against a labelled set of known-mismatched articles before relaxing the readable-subject or executable rules further.
 
 ## Replace the RapidYenc C++ build path with qualified Rust

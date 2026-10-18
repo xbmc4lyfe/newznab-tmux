@@ -76,7 +76,7 @@ final class HeaderFilenameIdentity
 
         // A prefix may not add or extend a number: Part 1 is not Part 10, and Movie is not Movie 2.
         return mb_strlen($shorter) >= 8 && str_starts_with($longer, $shorter)
-            && ! ctype_digit(substr($shorter, -1)) && preg_match('/\p{N}/u', mb_substr($longer, mb_strlen($shorter))) !== 1;
+            && preg_match('/\p{N}\z/u', $shorter) !== 1 && preg_match('/\p{N}/u', mb_substr($longer, mb_strlen($shorter))) !== 1;
     }
 
     /** A single random-looking token, such as an obfuscated posting name, makes no filename claim. */
@@ -96,7 +96,7 @@ final class HeaderFilenameIdentity
         }
         $classes = preg_match('/[a-z]/', $stem) + preg_match('/[A-Z]/', $stem) + preg_match('/[0-9]/', $stem);
 
-        return strlen($stem) >= 20 || (strlen($stem) >= 10 && $classes >= 2);
+        return strlen($stem) >= 10 && $classes >= 2;
     }
 
     private static function executable(string $name): bool
@@ -112,7 +112,7 @@ final class HeaderFilenameIdentity
 
     private static function extension(string $name): string
     {
-        return preg_match('/\.([A-Za-z0-9]{1,5})\z/', $name, $match) === 1 ? $match[1] : '';
+        return preg_match('/\.([^.\s]+)\z/u', $name, $match) === 1 ? $match[1] : '';
     }
 
     private static function stem(string $name): string
