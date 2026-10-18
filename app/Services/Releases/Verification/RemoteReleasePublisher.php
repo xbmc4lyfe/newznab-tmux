@@ -27,6 +27,9 @@ final class RemoteReleasePublisher
     /** @var (callable(int): void)|null Called while a {@see publishMany()} call waits for the primary. */
     private $progress = null;
 
+    /** @var (callable(): bool)|null Asked before each request of a {@see publishMany()} call whether to start no more. */
+    private $cancelled = null;
+
     /** Items of the current {@see publishMany()} call that already have an outcome. */
     private int $completed = 0;
 
@@ -95,18 +98,25 @@ final class RemoteReleasePublisher
      * each request and while one waits for the primary (about once a second). A caller uses it to keep
      * its own markers and its items' leases alive; a failure inside it never affects publication.
      *
+     * $cancelled, when given, is asked before each request starts; once it answers true no further
+     * request is sent, and every item not yet sent returns RETRY, which only defers it. A request
+     * already under way is not interrupted.
+     *
      * @param  list<RemotePublishItem>  $items
      * @param  (callable(int): void)|null  $progress
+     * @param  (callable(): bool)|null  $cancelled
      * @return list<PublicationOutcome>
      */
-    public function publishMany(array $items, ?callable $progress = null): array
+    public function publishMany(array $items, ?callable $progress = null, ?callable $cancelled = null): array
     {
         $this->progress = $progress;
+        $this->cancelled = $cancelled;
         $this->completed = 0;
         try {
             return $this->publishItems($items);
         } finally {
             $this->progress = null;
+            $this->cancelled = null;
         }
     }
 
@@ -145,7 +155,7 @@ final class RemoteReleasePublisher
             }
         }
         if ($payloads !== []) {
-            $sent = $this->batchAvailable() ? $this->sendBatch($payloads) : null;
+            $sent = $this->cancelledNow() ? $this->notSent(array_keys($payloads)) : ($this->batchAvailable() ? $this->sendBatch($payloads) : null);
             foreach ($sent ?? $this->publishEach($items, array_keys($payloads)) as $position => $outcome) {
                 $outcomes[$position] = $outcome;
             }
@@ -241,6 +251,11 @@ final class RemoteReleasePublisher
             // Items before this position, in order, already have their outcomes.
             $this->completed = $position;
             $this->tick();
+            if ($this->cancelledNow()) {
+                $outcomes += $this->notSent(array_slice($positions, array_search($position, $positions, true)));
+
+                break;
+            }
             if ($unreachable !== null) {
                 // The primary just proved unreachable; waiting out the same timeouts for each item helps no one.
                 $outcomes[$position] = new PublicationOutcome(PublicationOutcome::TRANSPORT, null, $unreachable);
@@ -268,6 +283,32 @@ final class RemoteReleasePublisher
     private function progressOptions(): array
     {
         return $this->progress === null ? [] : ['progress' => fn () => $this->tick()];
+    }
+
+    private function cancelledNow(): bool
+    {
+        if ($this->cancelled === null) {
+            return false;
+        }
+        try {
+            return (bool) ($this->cancelled)();
+        } catch (\Throwable) {
+            return false;
+        }
+    }
+
+    /**
+     * @param  list<int>  $positions
+     * @return array<int, PublicationOutcome>
+     */
+    private function notSent(array $positions): array
+    {
+        $outcomes = [];
+        foreach ($positions as $position) {
+            $outcomes[$position] = new PublicationOutcome(PublicationOutcome::RETRY, null, 'Publication was cancelled before this item was sent.');
+        }
+
+        return $outcomes;
     }
 
     private function tick(): void

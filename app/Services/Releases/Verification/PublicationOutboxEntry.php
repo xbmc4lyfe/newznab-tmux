@@ -17,10 +17,12 @@ final readonly class PublicationOutboxEntry
      * @param  int  $attempts  Failed sends so far that count toward the attempt limit.
      * @param  int  $deferrals  Sends that never reached the primary's processing (unreachable, or not started); they only back off.
      * @param  float  $notBefore  Unix seconds before which a requeued entry is not sent again.
-     * @param  int  $modifiedAt  Unix seconds of the file's last modification.
+     * @param  int  $modifiedAt  Unix seconds of the file's last modification (not a lease signal: requeues rewrite the file).
+     * @param  float  $heartbeatAt  Unix seconds of the last time the candidate's lease was really renewed; the hand-off
+     *                              renews it, so it starts at $enqueuedAt. Only the lease/3 renewal schedule reads it.
      */
     public function __construct(public string $name, public string $path, public array $claim, public string $reason, public array $evidence,
-        public float $enqueuedAt, public int $attempts = 0, public float $notBefore = 0.0, public int $modifiedAt = 0, public int $deferrals = 0) {}
+        public float $enqueuedAt, public int $attempts = 0, public float $notBefore = 0.0, public int $modifiedAt = 0, public int $deferrals = 0, public float $heartbeatAt = 0.0) {}
 
     /**
      * The name of an entry's file: one per lease of a candidate generation. A candidate that is claimed
@@ -36,7 +38,7 @@ final readonly class PublicationOutboxEntry
     public function toArray(): array
     {
         return ['claim' => $this->claim, 'reason' => $this->reason, 'evidence' => $this->evidence,
-            'enqueued_at' => $this->enqueuedAt, 'attempts' => $this->attempts, 'deferrals' => $this->deferrals, 'not_before' => $this->notBefore];
+            'enqueued_at' => $this->enqueuedAt, 'heartbeat_at' => $this->heartbeatAt, 'attempts' => $this->attempts, 'deferrals' => $this->deferrals, 'not_before' => $this->notBefore];
     }
 
     public function claim(): object
@@ -64,11 +66,13 @@ final readonly class PublicationOutboxEntry
     /**
      * The same entry after one more failed send, not to be sent again before $notBefore. A send the
      * primary never processed ($counted false) does not use up an attempt; only the age limit ends those.
+     * $heartbeatAt carries the newest known lease renewal into the rewritten document.
      */
-    public function withFailure(float $notBefore, bool $counted): self
+    public function withFailure(float $notBefore, bool $counted, ?float $heartbeatAt = null): self
     {
         return new self($this->name, $this->path, $this->claim, $this->reason, $this->evidence, $this->enqueuedAt,
-            $this->attempts + ($counted ? 1 : 0), $notBefore, $this->modifiedAt, $this->deferrals + ($counted ? 0 : 1));
+            $this->attempts + ($counted ? 1 : 0), $notBefore, $this->modifiedAt, $this->deferrals + ($counted ? 0 : 1),
+            max($this->heartbeatAt, $heartbeatAt ?? 0.0));
     }
 
     /** Failed sends of either kind, for the backoff. */
@@ -98,6 +102,7 @@ final readonly class PublicationOutboxEntry
             ['articles' => $evidence['articles'], 'bytes' => $evidence['bytes'], 'sampled_files' => $evidence['sampled_files'],
                 'verified_file_names' => array_values(array_map('strval', $evidence['verified_file_names'])),
                 'identity_hints' => array_values(array_map('strval', $evidence['identity_hints']))],
-            (float) ($data['enqueued_at'] ?? 0), max(0, (int) ($data['attempts'] ?? 0)), (float) ($data['not_before'] ?? 0), $modifiedAt, max(0, (int) ($data['deferrals'] ?? 0)));
+            (float) ($data['enqueued_at'] ?? 0), max(0, (int) ($data['attempts'] ?? 0)), (float) ($data['not_before'] ?? 0), $modifiedAt, max(0, (int) ($data['deferrals'] ?? 0)),
+            (float) ($data['heartbeat_at'] ?? $data['enqueued_at'] ?? 0));
     }
 }

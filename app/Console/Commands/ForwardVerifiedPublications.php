@@ -200,7 +200,17 @@ class ForwardVerifiedPublications extends Command
                 $nextMark = $now + self::MARKER_SECONDS;
                 $this->advertise();
             }
-            if ($this->blocked || ! $this->outbox->hasDue($this->slot, $now)) {
+            if ($this->blocked) {
+                Sleep::usleep(self::IDLE_MICROSECONDS);
+
+                continue;
+            }
+            $due = $this->outbox->hasDue($this->slot, $now);
+            // Documents that cannot be decoded are removed even when no valid entry is waiting.
+            if ($this->outbox->hasInvalid()) {
+                $this->purgeInvalid();
+            }
+            if ($this->blocked || ! $due) {
                 $this->leave();
                 Sleep::usleep(self::IDLE_MICROSECONDS);
 
@@ -282,6 +292,20 @@ class ForwardVerifiedPublications extends Command
         return true;
     }
 
+    /** Remove the undecodable documents the last reads met, inside the group. */
+    private function purgeInvalid(): void
+    {
+        $this->inGroup(function (): void {
+            $result = $this->outbox->purgeInvalid();
+            for ($parked = 0; $parked < $result['parked']; $parked++) {
+                $this->diagnostics?->quarantined();
+            }
+            if ($result['parked'] > 0) {
+                Log::warning('Publication outbox documents could not be removed; they were set aside.', ['count' => $result['parked']]);
+            }
+        });
+    }
+
     /** Create the outbox folders if a reset removed them, and touch the marker workers look for. */
     private function advertise(): void
     {
@@ -330,7 +354,8 @@ class ForwardVerifiedPublications extends Command
         $now = now()->getTimestamp();
         $due = [];
         foreach ($entries as $entry) {
-            if ($now - max($this->beats[$entry->name] ?? 0, $entry->modifiedAt) >= $interval) {
+            // The schedule follows real renewals only; a requeue rewrites the file but renews nothing.
+            if ($now - max($this->beats[$entry->name] ?? 0, $entry->heartbeatAt) >= $interval) {
                 $due[] = $entry;
             }
         }
@@ -385,6 +410,16 @@ class ForwardVerifiedPublications extends Command
         }
     }
 
+    /** Whether SIGTERM or SIGINT arrived: no further request should start. */
+    private function shouldStop(): bool
+    {
+        if (function_exists('pcntl_signal_dispatch')) {
+            pcntl_signal_dispatch();
+        }
+
+        return $this->terminate;
+    }
+
     /** @param list<PublicationOutboxEntry> $batch */
     private function forwardBatch(RemoteReleasePublisher $publisher, array $batch, float $now): void
     {
@@ -404,7 +439,7 @@ class ForwardVerifiedPublications extends Command
         $started = hrtime(true);
         try {
             $outcomes = $publisher->publishMany(array_map(static fn (PublicationOutboxEntry $entry) => $entry->item(), $live),
-                fn (int $completed) => $this->tick($live, $completed));
+                fn (int $completed) => $this->tick($live, $completed), fn (): bool => $this->shouldStop());
             if (count($outcomes) !== count($live)) {
                 throw new RuntimeException('The primary answered a different number of results than were sent.');
             }
@@ -489,7 +524,8 @@ class ForwardVerifiedPublications extends Command
             return;
         }
         $this->diagnostics?->requeued();
-        $this->outbox->requeue($entry->withFailure($now + ($delay ?? min(30.0, 2.0 ** ($entry->failures() + 1))), $counted));
+        $this->outbox->requeue($entry->withFailure($now + ($delay ?? min(30.0, 2.0 ** ($entry->failures() + 1))), $counted,
+            heartbeatAt: isset($this->beats[$entry->name]) ? (float) $this->beats[$entry->name] : null));
     }
 
     /**

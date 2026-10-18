@@ -104,8 +104,10 @@ final class PublicationOutbox
     {
         $this->prepare();
         $name = PublicationOutboxEntry::nameFor((int) $claim->id, (int) $claim->version, (string) $claim->lease_token);
+        $now = microtime(true);
+        // The worker renewed the lease just before handing off, so the schedule starts here.
         $entry = new PublicationOutboxEntry($name, $this->root.'/pending/'.$name, ['id' => (int) $claim->id, 'version' => (int) $claim->version,
-            'manifest_hash' => (string) $claim->manifest_hash, 'lease_token' => (string) $claim->lease_token], $reason, $evidence, microtime(true));
+            'manifest_hash' => (string) $claim->manifest_hash, 'lease_token' => (string) $claim->lease_token], $reason, $evidence, $now, heartbeatAt: $now);
         $this->write($entry, $this->root.'/pending');
 
         return $name;
@@ -257,7 +259,6 @@ final class PublicationOutbox
     public function claim(int $slot, int $limit, float $now): array
     {
         $this->prepare($slot);
-        $this->purgeInvalid();
         $taken = array_slice($this->inflight($slot), 0, max(1, $limit));
         $room = $limit - count($taken);
         $maxAge = self::maxAgeSeconds();
@@ -357,18 +358,29 @@ final class PublicationOutbox
         return $this->discard($entry->path, $entry->name);
     }
 
-    /** Remove the documents that could not be decoded. */
-    public function purgeInvalid(): int
+    /** Whether a read has met documents that could not be decoded and {@see purgeInvalid()} has yet to remove. */
+    public function hasInvalid(): bool
     {
-        $removed = 0;
+        return $this->invalid !== [];
+    }
+
+    /**
+     * Remove the documents that could not be decoded, which can never be published (the caller must
+     * hold the worker group). Those that could not be removed are parked, as {@see remove()} does.
+     *
+     * @return array{removed: int, parked: int}
+     */
+    public function purgeInvalid(): array
+    {
+        $count = ['removed' => 0, 'parked' => 0];
         foreach (array_keys($this->invalid) as $path) {
             unset($this->invalid[$path]);
             if (file_exists($path) || is_link($path)) {
-                $removed += $this->discard($path, basename($path)) ? 1 : 0;
+                $count[$this->discard($path, basename($path)) ? 'removed' : 'parked']++;
             }
         }
 
-        return $removed;
+        return $count;
     }
 
     private function discard(string $path, string $name): bool
