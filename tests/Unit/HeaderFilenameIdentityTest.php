@@ -143,6 +143,8 @@ class HeaderFilenameIdentityTest extends TestCase
             'decomposed accents differ from plain letters' => ["\"Re\u{301}sume\u{301} Ultimate.mkv\" yEnc", 'Resume Ultimate.mkv', false],
             'Thai name with punctuation differences' => ['"ปูเป็นสัตว์ (2026).mkv" yEnc', 'ปูเป็นสัตว์ 2026.mkv', true],
             'digit with a combining mark ends the shorter stem' => ["\"Readable Name 2\u{20E3}.mkv\" yEnc", "Readable Name 2\u{20E3} Extra.mkv", false],
+            'executable quoted beside a declared payload' => ['"tag.mkv" - [1/1] - "setup.exe" - "movie.mkv" yEnc', 'setup.exe', false],
+            'payload quoted beside the declared filename' => ['"Tag Name" - [1/1] - "readable.name.rar" yEnc', 'Tag Name', true],
             'opaque subject with an extensionless body' => ['[3/8] - "o9aeI3YpDwgHGoJ2ZsCm.vol00+01.par2" yEnc', '148f76878d7732b981734a9e0c51a348', true],
         ];
     }

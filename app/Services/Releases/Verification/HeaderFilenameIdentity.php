@@ -50,14 +50,15 @@ final class HeaderFilenameIdentity
             }
         }
         $declared ??= $afterCounter ?? $quoted[array_key_last($quoted)];
-        if (in_array($actual, $quoted, true)) {
-            return true;
-        }
-        // An executable body must be exactly the executable type its subject declares.
+        // An executable body must be exactly the executable type its subject declares, even when
+        // another quoted value names it.
         if (self::executable($actual) && (! self::executable($declared)
             || strtolower(self::extension(self::bare($actual))) !== strtolower(self::extension(self::bare($declared)))
             || strtolower(self::extension(self::trimmed($actual))) !== strtolower(self::extension(self::trimmed($declared))))) {
             return false;
+        }
+        if (in_array($actual, $quoted, true)) {
+            return true;
         }
         if (self::opaque($declared)) {
             // An opaque recovery-file name still declares parity, which is not payload evidence.
