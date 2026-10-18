@@ -167,8 +167,11 @@ final class NzbSourceGuard
         $canonical = $this->nzb->nzbPath((string) $release->guid);
         $directory = $canonical === false ? rtrim($this->nzb->buildNzbPath((string) $release->guid, 0, true), DIRECTORY_SEPARATOR) : dirname($canonical);
         foreach (glob($directory.DIRECTORY_SEPARATOR.$release->guid.'.nzb.gz.c*-*.prev') ?: [] as $path) {
-            if (preg_match(self::PRESERVED_NAME, basename($path)) === 1) {
-                $this->settlePreservedLocked($release, (string) $release->guid, $path, true);
+            if (preg_match(self::PRESERVED_NAME, basename($path)) === 1
+                && $this->settlePreservedLocked($release, (string) $release->guid, $path, true) === 'kept') {
+                // Unresolved (a failed restore, or a source matching neither side): recording the current file's
+                // digest now could later cost the only copy of the committed source.
+                throw new RuntimeException('A preserved NZB source is unresolved; naming inspection deferred.');
             }
         }
     }

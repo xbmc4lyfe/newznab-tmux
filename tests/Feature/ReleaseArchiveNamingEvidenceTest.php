@@ -707,6 +707,24 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
         self::assertSame(NzbSourceGuard::digest('original'), DB::table('release_archive_naming_evidence')->value('source_sha256'));
     }
 
+    public function test_naming_inspection_records_nothing_while_a_backup_is_unresolved(): void
+    {
+        $this->writeSource('upgraded');
+        $backup = $this->tagBackup(5, 'original');
+        // The committed source is neither file: the backup cannot be settled.
+        $this->commitEvidence('another');
+
+        try {
+            $this->sources->snapshot('fixture-guid', beginNamingInspection: true);
+            self::fail('Inspection must wait for the backup to be resolved.');
+        } catch (RuntimeException $error) {
+            self::assertStringContainsString('unresolved', $error->getMessage());
+        }
+
+        self::assertFileExists($backup);
+        self::assertSame(NzbSourceGuard::digest('another'), DB::table('release_archive_naming_evidence')->value('source_sha256'), 'No evidence was recorded.');
+    }
+
     public function test_plain_snapshot_does_not_settle_backups(): void
     {
         $this->writeSource('upgraded');

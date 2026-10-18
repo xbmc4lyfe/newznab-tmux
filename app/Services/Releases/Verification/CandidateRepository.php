@@ -631,6 +631,9 @@ final class CandidateRepository
     /** @param list<int> $ids */
     public function invalidateHotCollections(array $ids): void
     {
+        // Capacity released by settled holders is returned once every collection's candidates are locked: the
+        // ledger row is the last lock, as for archive() and publication.
+        $released = 0;
         foreach (DB::table('collections')->whereIn('id', $ids)->orderBy('id')->get() as $collection) {
             $identity = bin2hex($collection->collectionhash);
             $candidates = DB::table('release_verification_candidates')->where('source_identity', $identity)
@@ -648,7 +651,6 @@ final class CandidateRepository
                 // not aborted. A partial under the hash can never take these late headers, and its retained
                 // inventory would otherwise wait on this collection forever: it is settled as it stands.
                 $heldIds = array_map(static fn (object $held): int => (int) $held->id, $this->lockPartialHolders($identity, true));
-                $released = 0;
                 foreach ($candidates as $candidate) {
                     if ($candidate->manifest_path === '') {
                         continue;
@@ -660,9 +662,6 @@ final class CandidateRepository
                         DB::table('release_verification_candidates')->where('id', $candidate->id)->update([
                             'lease_token' => null, 'lease_until' => null, 'version' => $candidate->version + 1]);
                     }
-                }
-                if ($released > 0) {
-                    $this->ledger->adjust(-$released);
                 }
                 DB::table('collections')->where('id', $collection->id)->where('filecheck', '!=', 4)->update(['filecheck' => 3]);
 
@@ -710,6 +709,9 @@ final class CandidateRepository
                 // Only the newest pending candidate receives these headers in archive(); leave older ones alone.
                 break;
             }
+        }
+        if ($released > 0) {
+            $this->ledger->adjust(-$released);
         }
     }
 

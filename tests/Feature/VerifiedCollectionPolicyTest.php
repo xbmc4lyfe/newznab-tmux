@@ -1187,6 +1187,36 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertNull(DB::table('releases')->where('id', $first)->value('late_article_candidate_id'), 'Workers may process it.');
     }
 
+    public function test_capacity_released_by_hot_invalidation_is_returned_after_every_collection_is_locked(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('over-budget-first', true);
+        $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $late = $this->collectionForPolicy('movie.mkv', 20000, $hash, part: 3, messageId: 'e@f');
+        $binary = (int) DB::table('binaries')->where('collections_id', $late)->value('id');
+        foreach (array_chunk(range(4, 15003), 500) as $numbers) {
+            DB::table('parts')->insert(array_map(static fn (int $number): array => ['binaries_id' => $binary, 'partnumber' => $number,
+                'messageid' => str_pad((string) $number, 1000, 'm').'@late', 'size' => 5], $numbers));
+        }
+        // A later tracked collection in the same chunk, with its own pending post.
+        $otherHash = sha1('later-collection', true);
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $otherHash));
+        $other = $this->collectionForPolicy('movie.mkv', 3, $otherHash, part: 2, messageId: 'o@p');
+        $queries = [];
+        DB::listen(static function ($query) use (&$queries): void {
+            $queries[] = $query->sql;
+        });
+
+        DB::transaction(fn () => app(CandidateRepository::class)->invalidateHotCollections([$late, $other]));
+
+        $ledger = array_keys(array_filter($queries, static fn (string $sql): bool => str_contains($sql, 'release_verification_state') && str_starts_with(strtolower($sql), 'update')));
+        // The candidate lookups by upload (the manifest cleanup after commit looks rows up by path).
+        $candidates = array_keys(array_filter($queries, static fn (string $sql): bool => str_contains($sql, '"release_verification_candidates"')
+            && str_contains($sql, '"source_identity"')));
+        self::assertNotSame([], $ledger, 'The settled partial\'s capacity is returned.');
+        self::assertGreaterThan(max($candidates), min($ledger), 'The capacity row is the last lock taken.');
+    }
+
     public function test_a_covering_release_with_conflicting_metadata_sends_the_generation_to_review_not_an_upgrade(): void
     {
         $this->publicationSchema(partialColumns: true);
