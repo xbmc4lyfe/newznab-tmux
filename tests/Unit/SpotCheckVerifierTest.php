@@ -520,6 +520,30 @@ final class SpotCheckVerifierTest extends TestCase
     }
 
     #[Test]
+    public function an_obfuscated_subject_does_not_admit_an_undeclared_executable_body(): void
+    {
+        $raw = (new YencService)->encode('hello', 'setup.exe');
+        $source = new class($raw) implements ArticleSource
+        {
+            public function __construct(private readonly string $raw) {}
+
+            public function fetch(string $messageId): string
+            {
+                return $this->raw;
+            }
+        };
+        $manifest = ['identity' => str_repeat('f', 40), 'declared_size' => 5,
+            'files' => [['key' => 'movie', 'subject' => '[1/1] - "Xk29dPq8LmZ0Yt5R.mkv" yEnc', 'totalparts' => 1,
+                'segments' => [['number' => 1, 'messageid' => 'sample@article', 'bytes' => 5]]]]];
+
+        $result = (new SpotCheckVerifier($source, ['spot_check_articles' => 1, 'spot_check_bytes' => 1024,
+            'spot_check_article_bytes' => 1024], new YencService))->verify($manifest, static function (): void {});
+
+        self::assertSame('unknown', $result->verdict);
+        self::assertSame('Spot-check article identity differs from its header.', $result->reason);
+    }
+
+    #[Test]
     public function it_returns_unknown_without_fetching_when_no_article_fits_the_budget(): void
     {
         $source = new class implements ArticleSource

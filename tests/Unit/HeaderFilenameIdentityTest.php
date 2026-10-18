@@ -42,6 +42,17 @@ class HeaderFilenameIdentityTest extends TestCase
             'declared executable' => ['[1/1] - "setup.exe" yEnc', 'setup.exe', true],
             'single-quoted filename' => ["[1/1] - 'movie.mkv' yEnc", 'movie.mkv', true],
             'single-quoted mismatch' => ["[1/1] - 'movie.mkv' yEnc", 'other.mkv', false],
+            'readable name with a different volume' => ['[10/53] - "show.part10.rar" yEnc', 'show.part11.rar', false],
+            'readable name with a different split index' => ['"Readable.Release.r00"', 'Readable.Release.r01', false],
+            'readable name with a different extension' => ['"Readable.Release.Name.par2"', 'Readable.Release.Name.mkv', false],
+            'readable recovery volume padding differs' => ['[8/9] - "Readable Release Name.vol007+008.par2" yEnc', 'Readable Release Name.vol031+032.par2', false],
+            'non-Latin readable names differ' => ['[1/2] - "Фильм (2026) 1080p.mkv" yEnc', 'Другой (2026) 1080p.mkv', false],
+            'non-Latin readable names agree' => ['[1/2] - "Фильм (2026) 1080p.mkv" yEnc', '[Фильм] 2026 1080p.mkv', true],
+            'invalid UTF-8 subject' => ["[1/2] - \"Readable.Release.Name\xff.mkv\" yEnc", 'Different.mkv', false],
+            'readable mismatch through the last quoted value' => ['"Tag" "Readable.Release.Name.mkv"', 'Different.Release.mkv', false],
+            'executable with a trailing dot' => ['[1/9] - "Xk29dPq8LmZ0Yt5R.mkv" yEnc', 'setup.exe.', false],
+            'script extension appended to a readable name' => ['[1/9] - "Readable.Release.Name.mkv" yEnc', 'Readable.Release.Name.mkv.hta', false],
+            'opaque subject with an extensionless body' => ['[3/8] - "o9aeI3YpDwgHGoJ2ZsCm.vol00+01.par2" yEnc', '148f76878d7732b981734a9e0c51a348', true],
         ];
     }
 }

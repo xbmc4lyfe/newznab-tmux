@@ -2,7 +2,7 @@
 
 ## Evaluate richer spot-check filename identity (2026-10-18)
 
-`HeaderFilenameIdentity` treats an opaque declared subject filename as no claim, selects the quoted value next to `yEnc` or the `[n/m]` counter, and accepts normalized stem agreement. On 752 production mismatches it recovered 98.7% while still rejecting readable-versus-readable disagreement, an opaque body under a readable subject and an undeclared executable body.
+`HeaderFilenameIdentity` treats an opaque declared subject filename as no claim, selects the quoted value next to `yEnc` or the `[n/m]` counter, and accepts a readable name only when its suffix chain agrees and its normalized stems match. On 752 production mismatches it recovered 98.3% while still rejecting readable-versus-readable disagreement (including another volume or extension), an opaque body under a readable subject, an undeclared executable body and invalid UTF-8 subjects. An extensionless sampled body no longer proves that a PAR2-only header inventory has a payload.
 
 - [ ] Port the rule to the Rust FFI crate, prove verdict parity against the PHP rule on shared fixtures, and wire a paired caller benchmark into the Rust CI performance jobs and `scripts/benchmark_rust_inventory.py`. Adopt Rust only if it meets the 1.5x common-path and p99 thresholds including FFI overhead; otherwise keep PHP and record the evidence.
 - [ ] Evaluate richer evidence: PAR2 file descriptions as filename authority, subjects with an odd number of quote marks, underscore-separated opaque tokens, and multi-quoted subjects whose first value is the opaque filename.
