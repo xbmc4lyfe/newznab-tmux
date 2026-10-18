@@ -33,6 +33,23 @@ return [
     // Primary: seconds after which a batch starts no further item; the rest answer "retry".
     'publish_batch_seconds' => (float) env('RELEASE_VERIFICATION_PUBLISH_BATCH_SECONDS', 15),
     'publish_timeout' => (int) env('RELEASE_VERIFICATION_PUBLISH_TIMEOUT', 120),
+    // Remote workers hand verified results to a per-host outbox and move on; forwarder processes send
+    // them to the primary in batches. Off keeps every worker publishing synchronously.
+    'publish_async' => (bool) env('RELEASE_VERIFICATION_PUBLISH_ASYNC', false),
+    // Forwarder processes per host (1-64); more forwarders overlap more batches.
+    'publish_forwarders' => (int) env('RELEASE_VERIFICATION_PUBLISH_FORWARDERS', 4),
+    // Entries (waiting or being sent) at which a worker stops handing off and waits for room.
+    'publish_outbox_max' => (int) env('RELEASE_VERIFICATION_PUBLISH_OUTBOX_MAX', 256),
+    // Seconds a worker waits for room in a full outbox before publishing synchronously instead.
+    'publish_outbox_wait_seconds' => (int) env('RELEASE_VERIFICATION_PUBLISH_OUTBOX_WAIT_SECONDS', 30),
+    // Items a forwarder sends per request; the primary refuses more than its publish_batch_max_items.
+    'publish_forward_items' => (int) env('RELEASE_VERIFICATION_PUBLISH_FORWARD_ITEMS', 16),
+    // Failed sends after which a forwarder finishes an entry unknown, to be verified again.
+    'publish_forward_max_attempts' => (int) env('RELEASE_VERIFICATION_PUBLISH_FORWARD_MAX_ATTEMPTS', 5),
+    // Seconds a forwarder runs before the scheduler restarts it (forwarder N runs (N-1) extra minutes, so restarts stagger).
+    'publish_forwarder_seconds' => (int) env('RELEASE_VERIFICATION_PUBLISH_FORWARDER_SECONDS', 300),
+    // A forwarder counts as alive to workers for this many seconds after it last touched its marker.
+    'publish_forwarder_alive_seconds' => (int) env('RELEASE_VERIFICATION_PUBLISH_FORWARDER_ALIVE_SECONDS', 5),
     // The primary host serves that endpoint, without authentication, to these networks only.
     'publish_endpoint' => (bool) env('RELEASE_VERIFICATION_PUBLISH_ENDPOINT', false),
     'publish_allowed_networks' => env('RELEASE_VERIFICATION_PUBLISH_ALLOWED_NETWORKS', '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8'),

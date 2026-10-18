@@ -61,6 +61,29 @@ final class VerificationWorkerLocks
         return false;
     }
 
+    /**
+     * A publication forwarder is a writer like a worker: it joins the shared worker group, so a
+     * barrier, reset or audit waits for it, and it holds one exclusive lock per forwarder number
+     * and host. It claims no candidate and uses no verification slot.
+     */
+    public function startForwarder(int $number): bool
+    {
+        $this->close();
+        $this->global = $this->store()->shared('worker');
+        if ($this->global === null || self::paused($this->store()->connection())) {
+            $this->close();
+
+            return false;
+        }
+        $this->slot = $this->store()->exclusive('publication-forwarder-'.substr(sha1(ScratchInventory::host()), 0, 12).'-'.$number);
+        if ($this->slot !== null) {
+            return true;
+        }
+        $this->close();
+
+        return false;
+    }
+
     /** Configured candidate worker slots on this host, from 1 to MAX_SLOTS. */
     public static function slots(): int
     {
@@ -149,7 +172,11 @@ final class VerificationWorkerLocks
         return $this->exclusive;
     }
 
-    /** False while a drain holds the worker gate or a durable pause exists; a running worker stops claiming. */
+    /**
+     * False while a drain holds the worker gate or a durable pause exists; a running worker stops claiming.
+     *
+     * @phpstan-impure
+     */
     public function admitting(): bool
     {
         return self::pausesExist($this->store()->connection())

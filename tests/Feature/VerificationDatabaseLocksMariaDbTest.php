@@ -330,6 +330,42 @@ class VerificationDatabaseLocksMariaDbTest extends TestCase
         $late->close();
     }
 
+    public function test_publication_forwarders_are_fenced_by_number_and_hold_the_worker_group_across_hosts(): void
+    {
+        config(['database.connections.verification_lock_child' => config('database.connections.mysql')]);
+        $here = new VerificationWorkerLocks(new DatabaseVerificationLockStore);
+        $same = new VerificationWorkerLocks(new DatabaseVerificationLockStore('verification_lock_other'));
+        $barrier = new VerificationWorkerLocks(new DatabaseVerificationLockStore('verification_lock_third'));
+        $other = new VerificationWorkerLocks(new DatabaseVerificationLockStore('verification_lock_child'));
+        try {
+            $this->assertTrue($here->startForwarder(1));
+            $this->assertTrue($here->held());
+            $this->assertTrue($here->admitting());
+            // The same number on the same host is one process; another number joins.
+            $this->assertFalse($same->startForwarder(1));
+            $this->assertTrue($same->startForwarder(2));
+            // Another host's forwarder with the same number does not collide.
+            config(['release_verification.host' => 'm4']);
+            $this->assertTrue($other->startForwarder(1));
+            config(['release_verification.host' => '']);
+            $other->close();
+            // A barrier or reset waits for forwarders as for workers, and does not abandon them.
+            $this->assertFalse($barrier->tryExclusive());
+            $this->assertFalse($barrier->drain(0.5));
+            $this->assertTrue($here->admitting());
+            $this->assertTrue($here->held());
+            $here->close();
+            $same->close();
+            $this->assertTrue($barrier->tryExclusive());
+            $this->assertFalse($here->startForwarder(1));
+        } finally {
+            $here->close();
+            $same->close();
+            $other->close();
+            $barrier->close();
+        }
+    }
+
     public function test_a_barrier_gives_up_and_reopens_admission_while_a_worker_stays_active(): void
     {
         $worker = new VerificationWorkerLocks(new DatabaseVerificationLockStore('verification_lock_other'));
