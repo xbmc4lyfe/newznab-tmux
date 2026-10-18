@@ -37,7 +37,7 @@ trait PublicationBatchFixtures
             $table->id();
         });
         DB::table('usenet_groups')->insert(['id' => 2, 'name' => 'alt.strict', 'minsizetoformrelease' => 10000000]);
-        Cache::put('configuration:ingestion', new IngestionConfigurationData(...IngestionConfigurationData::defaults()->toArray()), 300);
+        Cache::put('configuration:ingestion', new IngestionConfigurationData(...IngestionConfigurationData::defaults()->toArray()), 86400);
         Schema::create('releases', function (Blueprint $table): void {
             $table->id();
             foreach (['name', 'searchname', 'guid', 'leftguid', 'fromname', 'postdate', 'adddate'] as $column) {

@@ -23,6 +23,9 @@ return [
     'locks' => env('RELEASE_VERIFICATION_LOCKS', 'auto'),
     // Remote workers publish through the primary host's internal endpoint at this URL.
     'publish_url' => env('RELEASE_VERIFICATION_PUBLISH_URL'),
+    // Remote workers may publish several candidates per request through this batch endpoint URL
+    // (e.g. http://primary:8090/internal/release-verification/publish-batch); empty keeps one request each.
+    'publish_batch_url' => env('RELEASE_VERIFICATION_PUBLISH_BATCH_URL'),
     // Primary: most items one batch request may carry (hard cap 64); more is refused with HTTP 422.
     'publish_batch_max_items' => (int) env('RELEASE_VERIFICATION_PUBLISH_BATCH_MAX_ITEMS', 16),
     // Primary: largest batch request body in bytes; more is refused with HTTP 413.
