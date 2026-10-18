@@ -6,6 +6,10 @@ return [
     'items_per_cover_page' => env('ITEMS_PER_COVER_PAGE', 20),
     'max_pager_results' => env('MAX_PAGER_RESULTS', 125000),
     'echocli' => env('ECHOCLI', true),
+    // Release fingerprint record format: 'compact' (bounded samples, compact-v1) or 'full' (legacy schema 39).
+    'fingerprint_format' => env('FINGERPRINT_FORMAT', 'compact'),
+    // Percentage of releases whose compact fingerprint also samples the alternate NNTP provider.
+    'fingerprint_alternate_percent' => (int) env('FINGERPRINT_ALTERNATE_PERCENT', 10),
     'rename_par2' => env('RENAME_PAR2', true),
     'rename_music_mediainfo' => env('RENAME_MUSIC_MEDIAINFO', true),
     'cache_expiry_short' => (int) env('CACHE_EXPIRY_SHORT', 5),

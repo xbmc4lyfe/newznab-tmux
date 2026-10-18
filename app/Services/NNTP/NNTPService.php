@@ -55,7 +55,9 @@ class NNTPService extends NntpClient
             if ($response !== ResponseCode::NoSuchArticleId->value) {
                 $this->doQuit();
             }
-            throw new \RuntimeException('Article is unavailable; retry verification later.');
+            throw in_array($response, [ResponseCode::NoSuchArticleId->value, ResponseCode::NoSuchArticleNumber->value], true)
+                ? new NntpArticleMissingException('Article is unavailable; retry verification later.')
+                : new \RuntimeException('Article is unavailable; retry verification later.');
         }
         $raw = '';
         while (($line = fgets($this->_socket, $limit = max(4, min($maximumBytes - strlen($raw), 65534) + 2))) !== false) {
@@ -1547,7 +1549,9 @@ class NNTPService extends NntpClient
         $response = $this->_sendCommand('HEAD <'.$identifier.'>');
         $responseMetadata = $this->fingerprintResponseMetadata($response);
         if ($response !== 221) {
-            throw new \RuntimeException('Article headers are unavailable.');
+            throw in_array($response, [ResponseCode::NoSuchArticleId->value, ResponseCode::NoSuchArticleNumber->value], true)
+                ? new NntpArticleMissingException('Article headers are unavailable.')
+                : new \RuntimeException('Article headers are unavailable.');
         }
 
         $headers = [];
