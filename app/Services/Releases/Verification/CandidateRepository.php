@@ -800,9 +800,9 @@ final class CandidateRepository
                     ? 'release_verification.deterministic_retry_seconds' : 'release_verification.retry_seconds'))]);
     }
 
-    public function rejectByPolicy(object $claim, string $reason): void
+    public function rejectByPolicy(object $claim, string $reason, ?PublicationTiming $timing = null): void
     {
-        DB::transaction(function () use ($claim, $reason): void {
+        DB::transaction(function () use ($claim, $reason, $timing): void {
             $this->ledger->enter();
             $candidate = DB::table('release_verification_candidates')->where('id', $claim->id)
                 ->where('lease_token', $claim->lease_token)->where('version', $claim->version)->whereNull('release_id')->lockForUpdate()->first();
@@ -812,7 +812,9 @@ final class CandidateRepository
             DB::table('release_verification_candidates')->where('id', $claim->id)->update(['status' => 'filtered',
                 'reason' => mb_strcut($reason, 0, 2000, 'UTF-8'), 'lease_token' => null, 'lease_until' => null,
                 'manifest_path' => '', 'manifest_bytes' => 0]);
+            $previous = $timing?->enterNestedPhase('ledger_adjust');
             $this->ledger->adjust(-(int) $candidate->manifest_bytes);
+            $timing?->nextPhase((string) $previous);
             DB::afterCommit(function () use ($candidate): void {
                 $this->store->deleteIfUnreferenced($candidate->manifest_path);
             });
