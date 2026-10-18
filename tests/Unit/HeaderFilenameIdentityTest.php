@@ -208,6 +208,8 @@ class HeaderFilenameIdentityTest extends TestCase
             'Unicode extension case' => ['"文档.ΔΕΔ" yEnc', '文档.δεδ', true],
             'season and episode title' => ['"S01E02Movie.mkv" yEnc', 'Totally.Different.mkv', false],
             'compound lz4 archive on an opaque subject' => ['"Xk29dPq8LmZ0Yt5R.tar.lz4" yEnc', 'b7Qe1ZrT9wXy4KpL.tar.lz4', true],
+            'separate single-quoted fields' => ["'movie.mkv' yEnc (1/2) 'Tag'", 'movie.mkv', true],
+            'single-quoted fields separated by a dash' => ["'Tag Name' - 'movie.mkv' yEnc", 'movie.mkv', true],
             'opaque subject with an extensionless body' => ['[3/8] - "o9aeI3YpDwgHGoJ2ZsCm.vol00+01.par2" yEnc', '148f76878d7732b981734a9e0c51a348', true],
         ];
     }

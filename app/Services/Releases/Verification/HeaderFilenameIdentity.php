@@ -11,9 +11,9 @@ namespace App\Services\Releases\Verification;
  */
 final class HeaderFilenameIdentity
 {
-    // A single-quoted name may contain apostrophes (O'Brien's, Guns N' Roses): it closes at the last quote on
-    // the line that is not followed by a word character.
-    private const string QUOTED = '/"([^"\r\n]+)"|(?<![\p{L}\p{N}_])\'([^\r\n]+)\'(?![\p{L}\p{N}_])/u';
+    // A single-quoted name may contain apostrophes (O'Brien's, Guns N' Roses): it closes at the first quote
+    // followed by a field boundary (the end, yEnc, a counter, a dash or another quote).
+    private const string QUOTED = '/"([^"\r\n]+)"|(?<![\p{L}\p{N}_])\'([^\r\n]+?)\'(?=\s*+(?:\z|yEnc(?![\p{L}\p{M}\p{N}_])|[\[(\-"\']))/u';
 
     private const string SUFFIX = '/\A(?:part\d+|vol\d+[+-]\d+|par2|rar|r\d{2,3}|\d{3}|7z|zip|tar|gz|tgz|xz|txz|bz2|tbz2|zst|zstd|lz|lz4|lzma|br|mkv|avi|mp4|m4v|ts|nfo|sfv|nzb|epub|pdf|flac|mp3|iso|srt|txt|jpg|png)\z/i';
 
