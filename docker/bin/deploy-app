@@ -223,6 +223,8 @@ legacy_scheduler() { compose exec -T scheduler python3 - "$1" "$scheduler_timeou
 scheduler_command() { compose exec -T scheduler python3 /app/docker/app/bin/scheduler.py "$@"; }
 resume() {
     rc=$?
+    # Recovery must finish even if a second signal arrives (e.g. a terminal's INT plus the guard's).
+    trap '' INT TERM HUP
     if [ "$barrier_held" = 1 ] && [ "$rc" != 0 ]; then
         owe_barrier held
     fi
@@ -354,6 +356,9 @@ for svc in $DIRTY_DATA $RECONCILE_DATA; do
     [ -n "$existing" ] || database_missing=1
 done
 if [ "$database_missing" = 1 ]; then
+    # The first change to it: a retry after any failure from here must recreate it, even if its
+    # configuration is reverted meanwhile.
+    plan --pending mariadb
     if [ -n "$stop_services" ]; then
         # shellcheck disable=SC2086
         compose stop $stop_services

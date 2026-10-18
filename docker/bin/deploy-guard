@@ -241,6 +241,17 @@ cooldown() {
     echo "deploy-guard: batching changes for $((interval - elapsed)) more seconds (FORCE=1 to deploy now)."
 }
 
+# A signal to the guard alone (e.g. a supervisor stopping it) reaches the payload too, and the guard
+# waits for the payload's own recovery (drain restore, barrier hold) before releasing ownership.
+payload=
+forward_signal() {
+    if [ -n "$payload" ]; then
+        kill -"$1" "$payload" 2>/dev/null || true
+        wait "$payload" 2>/dev/null || true
+    fi
+    exit "$2"
+}
+
 cmd_run() {
     [ "$#" -ge 3 ] || { echo "usage: deploy-guard run <target> -- <command...>" >&2; exit 64; }
     target=$1
@@ -251,14 +262,18 @@ cmd_run() {
     if [ -n "${DEPLOY_GUARD_HELD:-}${DEPLOY_GUARD_OWNER_SHA256:-}${DEPLOY_GUARD_LOCK:-}" ]; then
         nested_owner || busy "invalid inherited guard ownership"
         trap 'guard_exit' EXIT
-        trap 'exit 130' INT TERM
-        trap 'exit 129' HUP
+        # A background payload starts with SIGINT ignored (POSIX); TERM is what reaches it.
+        trap 'forward_signal TERM 130' INT
+        trap 'forward_signal TERM 130' TERM
+        trap 'forward_signal HUP 129' HUP
     else
         acquire "$target"
         owned_info=$info
         trap 'guard_exit' EXIT
-        trap 'exit 130' INT TERM
-        trap 'exit 129' HUP
+        # A background payload starts with SIGINT ignored (POSIX); TERM is what reaches it.
+        trap 'forward_signal TERM 130' INT
+        trap 'forward_signal TERM 130' TERM
+        trap 'forward_signal HUP 129' HUP
         DEPLOY_GUARD_HELD=$$
         DEPLOY_GUARD_OWNER_SHA256=$(printf '%s\n' "$owned_info" | hash_stdin)
         DEPLOY_GUARD_LOCK=$LOCK
@@ -290,7 +305,12 @@ cmd_run() {
     [ ! -e "$DEPLOY_NOOP_MARKER" ] || rm -f "$DEPLOY_NOOP_MARKER"
     export DEPLOY_EXPECTED_FINGERPRINT DEPLOY_NOOP_MARKER
     check_recovery_hold
-    if "$@"; then rc=0; else rc=$?; fi
+    # In the background so a trapped signal interrupts `wait` and can be forwarded; stdin stays the
+    # guard's own (a non-interactive shell would otherwise give it /dev/null).
+    "$@" 0<&0 &
+    payload=$!
+    if wait "$payload"; then rc=0; else rc=$?; fi
+    payload=
     if [ "$rc" -eq 0 ] && [ "${STAMP_ON_SUCCESS:-0}" = 1 ]; then
         # One snapshot supplies both the comparison and the stamp, so a checkout change between
         # them cannot stamp per-service data that was never built or verified.

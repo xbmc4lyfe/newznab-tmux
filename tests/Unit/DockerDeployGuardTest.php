@@ -55,6 +55,25 @@ final class DockerDeployGuardTest extends TestCase
 
     #[Test]
     #[DataProvider('interruptions')]
+    public function a_signal_to_the_guard_reaches_the_payload_and_waits_for_its_recovery(int $signal, int $code): void
+    {
+        $ready = $this->dir.'/command-started';
+        $restored = $this->dir.'/payload-restored';
+        $payload = 'trap "sleep 0.5; touch '.escapeshellarg($restored).'; exit 3" INT TERM HUP; touch '.escapeshellarg($ready).'; while :; do sleep 0.1; done';
+        $process = $this->guardProcess(['run', 'deploy', '--', 'sh', '-c', $payload]);
+        $process->start();
+        $this->waitFor(fn (): bool => file_exists($ready));
+        $process->signal($signal);
+        $this->waitFor(fn (): bool => ! $process->isRunning());
+
+        // The guard released ownership only after the payload finished its own recovery.
+        $this->assertFileExists($restored);
+        $this->assertSame($code, $process->getExitCode());
+        $this->assertFalse(is_link($this->dir.'/lock'));
+    }
+
+    #[Test]
+    #[DataProvider('interruptions')]
     public function an_interrupted_run_closes_its_attempt_and_releases_the_lock(int $signal, int $code): void
     {
         $ready = $this->dir.'/command-started';

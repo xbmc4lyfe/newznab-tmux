@@ -2339,6 +2339,17 @@ SH);
         $this->assertStringContainsString('tmux:drain --resume', $events);
     }
 
+    public function test_a_failed_run_after_starting_a_missing_database_forces_its_recreate_on_retry(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0', 'FORCE=1'], ['NNTMUX_NO_CONTAINER' => 'mariadb', 'NNTMUX_BARRIER_FAIL' => '1']);
+        $process->run();
+
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('up -d --no-deps --wait --wait-timeout 240 mariadb', $this->events());
+        $this->assertStringContainsString('service:mariadb=pending', (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
+    }
+
     public function test_a_failed_database_lookup_before_the_barrier_aborts_instead_of_starting_it(): void
     {
         // First deploy: mariadb has no record and is reconciled, so its container is looked up.
