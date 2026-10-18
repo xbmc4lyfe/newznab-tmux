@@ -751,13 +751,19 @@ final class CandidateRepository
             // upgrade neither, so they are kept apart.
             return null;
         }
-        // An established repost under the same hash (pending, holding no partial) that also takes these headers
+        // Any established repost under the same hash (pending, holding no partial) that also takes these headers
         // makes them ambiguous: never upgrade the partial with possibly mixed articles. They then follow the
-        // repost, as ordinary pending headers do.
-        $repost = $this->lockLatestUnheld($sourceIdentity, array_map(static fn (object $held): int => (int) $held->id, $holders), $currentReads);
-        if ($repost !== null && $repost->manifest_path !== ''
-            && ! $this->spoils($this->store->read($repost->manifest_path), $this->merge($this->store->read($repost->manifest_path), $manifest))) {
-            return null;
+        // newest repost, as ordinary pending headers do.
+        $heldIds = array_map(static fn (object $held): int => (int) $held->id, $holders);
+        $upgrades = self::tracksUpgrades();
+        $reposts = $this->lockSourceCandidates($sourceIdentity, $currentReads, static fn (object $row): bool => $row->release_id === null
+            && $row->manifest_path !== '' && ! in_array($row->status, ['expired', 'filtered', 'metadata_expired'], true)
+            && ! in_array((int) $row->id, $heldIds, true) && (! $upgrades || $row->upgrades_release_id === null));
+        foreach ($reposts as $repost) {
+            $old = $this->store->read($repost->manifest_path);
+            if (! $this->spoils($old, $this->merge($old, $manifest))) {
+                return null;
+            }
         }
 
         return $holder;
@@ -1272,21 +1278,38 @@ final class CandidateRepository
     private function expireRetainedPartials(?callable $mayStart): void
     {
         $cutoff = now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
-        // Page in expiry order: rows held back by late headers awaiting archive must not starve the ones behind them.
-        $after = null;
+        // Page in expiry order, resuming where the last pass stopped: rows held back by late headers awaiting
+        // archive must not starve the ones behind them, however many there are.
+        $cursorKey = 'release_verification:retained_expiry_cursor';
+        try {
+            $stored = Cache::get($cursorKey);
+        } catch (Throwable) {
+            $stored = null;
+        }
+        $after = is_array($stored) && count($stored) === 2 ? [(string) $stored[0], (int) $stored[1]] : null;
         $released = 0;
-        for ($page = 0; $page < 10 && $released < 100; $page++) {
-            $rows = $this->retainedPartials($cutoff, $after);
-            if ($rows->isEmpty()) {
-                return;
-            }
-            $last = $rows->last();
-            $after = [(string) $last->retained_at, (int) $last->id];
-            foreach ($rows as $row) {
-                if ($mayStart !== null && ! $mayStart()) {
+        try {
+            for ($page = 0; $page < 10 && $released < 100; $page++) {
+                $rows = $this->retainedPartials($cutoff, $after);
+                if ($rows->isEmpty()) {
+                    // The end: the next pass starts over from the oldest.
+                    $after = null;
+
                     return;
                 }
-                $released += $this->expireRetainedPartial((int) $row->id, $row->source_identity, $cutoff) ? 1 : 0;
+                foreach ($rows as $row) {
+                    if ($mayStart !== null && ! $mayStart()) {
+                        return;
+                    }
+                    $released += $this->expireRetainedPartial((int) $row->id, $row->source_identity, $cutoff) ? 1 : 0;
+                    $after = [(string) $row->retained_at, (int) $row->id];
+                }
+            }
+        } finally {
+            try {
+                Cache::put($cursorKey, $after, now()->addDay());
+            } catch (Throwable) {
+                // The next pass starts over.
             }
         }
     }
@@ -1500,6 +1523,11 @@ final class CandidateRepository
             DB::table('release_verification_candidates')->where('id', $claim->id)->update(['status' => $status,
                 'reason' => mb_strcut($reason, 0, 2000, 'UTF-8'), 'lease_token' => null, 'lease_until' => null,
                 'manifest_path' => '', 'manifest_bytes' => 0] + (self::tracksUpgrades() ? ['upgrades_release_id' => null] : []));
+            if (($candidate->upgrades_release_id ?? null) !== null && Release::hasLateArticleFlag()) {
+                // A retired generation can no longer upgrade its partial: workers may process it now.
+                DB::table('releases')->where('id', $candidate->upgrades_release_id)->where('late_article_candidate_id', $candidate->id)
+                    ->update(['late_article_candidate_id' => null]);
+            }
             $this->ledger->adjust(-(int) $candidate->manifest_bytes);
             DB::afterCommit(function () use ($candidate): void {
                 $this->store->deleteIfUnreferenced($candidate->manifest_path);

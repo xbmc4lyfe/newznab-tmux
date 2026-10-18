@@ -937,7 +937,14 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'), 'No capacity leaks with the release.');
     }
 
-    public function test_retained_expiry_pages_past_rows_held_by_pending_late_headers(): void
+    /** @return array<string, array{int, int}> */
+    public static function blockedRetainedPrefixes(): array
+    {
+        return ['one page' => [100, 1], 'past the per-pass page cap' => [1000, 2]];
+    }
+
+    #[DataProvider('blockedRetainedPrefixes')]
+    public function test_retained_expiry_pages_past_rows_held_by_pending_late_headers(int $blocked, int $passes): void
     {
         $this->publicationSchema(partialColumns: true);
         $this->limits();
@@ -953,17 +960,20 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
                 + array_fill_keys(['totalpart', 'groups_id', 'size', 'passwordstatus', 'haspreview', 'categories_id', 'nfostatus', 'nzbstatus', 'isrenamed', 'iscategorized', 'predb_id'], 0));
         };
         // A full page of retained partials whose uploads still have late headers waiting to be archived.
-        foreach (range(1, 100) as $n) {
+        foreach (range(1, $blocked) as $n) {
             $retain($n);
             DB::table('collections')->insert(['collectionhash' => hex2bin(sha1('held-'.$n)), 'subject' => 'Movie', 'fromname' => 'poster',
                 'totalfiles' => 1, 'groups_id' => 1, 'date' => '2026-10-11 12:00:00', 'filecheck' => 0]);
         }
-        $retain(101);
+        $retain($blocked + 1);
 
-        app(CandidateRepository::class)->expire();
+        foreach (range(1, $passes) as $pass) {
+            app(CandidateRepository::class)->expire();
+        }
 
-        $this->assertSame('', DB::table('release_verification_candidates')->where('release_id', 100101)->value('manifest_path'), 'Not starved behind them.');
-        $this->assertSame(100, DB::table('release_verification_candidates')->where('manifest_path', '<>', '')->count());
+        $this->assertSame('', DB::table('release_verification_candidates')->where('release_id', 100000 + $blocked + 1)->value('manifest_path'),
+            'Not starved behind them: each pass resumes where the last stopped.');
+        $this->assertSame($blocked, DB::table('release_verification_candidates')->where('manifest_path', '<>', '')->count());
     }
 
     public function test_late_articles_never_republish_a_deleted_partial(): void
@@ -1117,6 +1127,44 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $after = DB::table('release_verification_candidates')->where('id', $retained->id)->first();
         $this->assertSame(['', 0, null], [$after->manifest_path, (int) $after->manifest_bytes, $after->retained_for_release_id]);
         $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'), 'Its capacity is released.');
+    }
+
+    public function test_headers_an_older_pending_repost_also_takes_never_upgrade_the_partial(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('two-reposts-pending', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $retained = DB::table('release_verification_candidates')->sole();
+        // Repost B, then repost C, each archived apart by its conflicting part 1; C then gains its part 2.
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 1, messageId: 'b1@b'));
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 1, messageId: 'c1@c'));
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c2@c'));
+
+        // B's part 2 conflicts with C but fits both B and the partial.
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'b2@b'));
+
+        $this->assertSame((int) $retained->id, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'), 'No generation upgrades it.');
+        $this->assertSame(['a@b'], array_column(app(ManifestStore::class)->read((string) DB::table('release_verification_candidates')->where('id', $retained->id)->value('manifest_path'))['files'][0]['segments'], 'messageid'));
+        $this->assertSame(0, DB::table('release_verification_candidates')->whereNotNull('upgrades_release_id')->count());
+    }
+
+    public function test_a_generation_filtered_by_policy_releases_its_partial_to_workers_at_once(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('generation-filtered', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+        $generation = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        $this->assertSame((int) $generation->id, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
+        $this->travel(5)->hours();
+        $this->limits();
+        app(CandidateRepository::class)->promotePartial(10);
+        $claim = app(CandidateRepository::class)->claim();
+        $this->assertSame((int) $generation->id, (int) $claim->id);
+
+        app(CandidateRepository::class)->rejectByPolicy($claim, 'Merged inventory exceeds the maximum size.');
+
+        $this->assertNull(DB::table('releases')->where('id', $first)->value('late_article_candidate_id'), 'Without waiting for an expiry pass.');
     }
 
     public function test_a_covering_release_with_conflicting_metadata_sends_the_generation_to_review_not_an_upgrade(): void
