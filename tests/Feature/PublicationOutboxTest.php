@@ -1542,6 +1542,182 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->assertSame('terminated', $summaries[0]['stop_reason']);
     }
 
+    public function test_the_run_deadline_stops_the_one_by_one_fallback_after_the_request_under_way(): void
+    {
+        $this->batchSchema(releases: 1);
+        $this->configureAsync(batch: false);
+        $claims = [];
+        foreach (range(1, 3) as $number) {
+            $claims[] = $claim = $this->claimedCandidate($number.'@article');
+            $this->handOff($claim);
+            $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['enqueued_at' => time() - 100 + $number] + $document);
+        }
+        Http::fake(function (HttpRequest $request) {
+            $this->requested[] = $request->url();
+            // The first request outlasts the run's one second.
+            usleep(1_200_000);
+
+            return Http::response($this->withServerVariables(self::PEER)->postJson('/internal/release-verification/publish', $request->data())->json());
+        });
+
+        $this->assertSame(0, Artisan::call('releases:forward-verified-publications', ['--slot' => 1, '--max-seconds' => 1]));
+
+        $this->assertCount(1, $this->requested);
+        $this->assertSame(['sampled', 'verifying', 'verifying'], array_map($this->candidateStatus(...), $claims));
+        foreach ([$claims[1], $claims[2]] as $claim) {
+            $this->assertSame(1, $this->entryDocument($this->pendingPath($claim))['deferrals']);
+        }
+    }
+
+    /** Close the running forwarder's locks, as the end of a database lock session would. */
+    private function loseForwarderLocks(): void
+    {
+        $command = Artisan::all()['releases:forward-verified-publications'];
+        $property = new \ReflectionProperty($command, 'locks');
+        $property->getValue($command)->close();
+    }
+
+    public function test_a_forwarder_that_lost_its_locks_during_a_request_writes_nothing_afterwards(): void
+    {
+        $this->batchSchema(releases: 1);
+        $this->configureAsync(batch: false);
+        $claims = [$this->claimedCandidate('one@article'), $this->claimedCandidate('two@article')];
+        foreach ($claims as $index => $claim) {
+            $this->handOff($claim);
+            $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['enqueued_at' => time() - 100 + $index] + $document);
+        }
+        $markerWritten = null;
+        Http::fake(function (HttpRequest $request, array $options) use (&$markerWritten) {
+            $this->requested[] = $request->url();
+            $marker = $this->outbox()->directory().'/forwarder-1.alive';
+            $this->loseForwarderLocks();
+            touch($marker, time() - 20);
+            ($options['progress'] ?? static fn () => null)(0, 0, 0, 0);
+            clearstatcache();
+            $markerWritten = time() - filemtime($marker) < 10;
+
+            return Http::response($this->withServerVariables(self::PEER)->postJson('/internal/release-verification/publish', $request->data())->json());
+        });
+        $summaries = [];
+        $this->captureSummaries($summaries, 'Publication forwarder run summary.');
+
+        try {
+            Artisan::call('releases:forward-verified-publications', ['--slot' => 1, '--passes' => 1, '--diagnostics' => true]);
+            $this->fail('A forwarder without its locks must stop.');
+        } catch (\RuntimeException $error) {
+            $this->assertSame('Publication forwarder locks were lost.', $error->getMessage());
+        }
+
+        $this->assertFalse($markerWritten);
+        // The second request never started, and neither entry was settled or requeued.
+        $this->assertCount(1, $this->requested);
+        foreach ($claims as $claim) {
+            $this->assertFileExists($this->inflightPath($claim));
+        }
+        $this->assertSame('locks_lost', $summaries[0]['stop_reason']);
+    }
+
+    public function test_leases_of_entries_beyond_the_claimed_batch_are_renewed_during_a_long_fallback(): void
+    {
+        $this->batchSchema(releases: 2);
+        $this->configureAsync(batch: false);
+        config(['release_verification.publish_forward_items' => 2]);
+        $claims = [];
+        foreach (range(1, 3) as $number) {
+            $claims[] = $claim = $this->claimedCandidate($number.'@article');
+            $this->handOff($claim);
+            $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['enqueued_at' => time() - 100 + $number] + $document);
+        }
+        $leases = [];
+        Http::fake(function (HttpRequest $request) use (&$leases, $claims) {
+            $this->requested[] = $request->url();
+            // The third entry is not in the claimed batch of two.
+            $leases[] = $this->candidateRow($claims[2])->lease_until;
+            if (count($this->requested) === 1) {
+                $this->travel(150)->seconds();
+            }
+
+            return Http::response($this->withServerVariables(self::PEER)->postJson('/internal/release-verification/publish', $request->data())->json());
+        });
+
+        $this->forward();
+
+        $this->assertCount(2, $this->requested);
+        $this->assertGreaterThan($leases[0], $leases[1]);
+        $this->assertSame(['sampled', 'sampled', 'verifying'], array_map($this->candidateStatus(...), $claims));
+    }
+
+    public function test_stray_temporary_and_quarantined_files_are_swept_even_with_nothing_else_to_do(): void
+    {
+        Sleep::fake();
+        $this->configureAsync();
+        $this->outbox()->prepare(1);
+        $directory = $this->outbox()->directory();
+        mkdir($directory.'/failed');
+        file_put_contents($directory.'/pending/.9-1-abc.json.old.tmp', 'x');
+        file_put_contents($directory.'/pending/.9-1-abc.json.new.tmp', 'x');
+        file_put_contents($directory.'/failed/9-1-abc.json', 'x');
+        file_put_contents($directory.'/failed/9-2-abc.json', 'x');
+        touch($directory.'/pending/.9-1-abc.json.old.tmp', time() - 700);
+        touch($directory.'/failed/9-1-abc.json', time() - 4000);
+
+        $this->forward(['--passes' => 2]);
+
+        $this->assertFileDoesNotExist($directory.'/pending/.9-1-abc.json.old.tmp');
+        $this->assertFileDoesNotExist($directory.'/failed/9-1-abc.json');
+        $this->assertFileExists($directory.'/pending/.9-1-abc.json.new.tmp');
+        $this->assertFileExists($directory.'/failed/9-2-abc.json');
+    }
+
+    public function test_a_symlinked_foreign_slot_is_never_scanned_swept_or_adopted(): void
+    {
+        Sleep::fake();
+        $this->batchSchema();
+        $this->configureAsync();
+        $this->outbox()->prepare(1);
+        $outside = config('release_verification.storage_path').'/outside';
+        mkdir($outside);
+        file_put_contents($outside.'/.old.tmp', 'keep');
+        touch($outside.'/.old.tmp', time() - 5000);
+        $claim = $this->claimedCandidate('one@article');
+        $this->handOff($claim);
+        rename($this->pendingPath($claim), $outside.'/'.basename($this->pendingPath($claim)));
+        symlink($outside, $this->outbox()->directory().'/inflight/7');
+        $this->servePrimary();
+
+        $this->forward(['--passes' => 2]);
+
+        $this->assertFileExists($outside.'/.old.tmp');
+        $this->assertFileExists($outside.'/'.basename($this->pendingPath($claim)));
+        $this->assertSame([], $this->requested);
+        $this->assertSame([], $this->outbox()->foreignSlots(1));
+        $this->assertSame(0, $this->outbox()->depth());
+        $this->assertSame(0, $this->outbox()->adopt(7));
+    }
+
+    public function test_a_claim_won_after_the_entry_was_requeued_with_a_backoff_puts_it_back(): void
+    {
+        $this->batchSchema();
+        $this->configureAsync();
+        $claim = $this->claimedCandidate('one@article');
+        $this->handOff($claim);
+        // What the first forwarder listed: due. What is on disk by the time its rename lands: backing off.
+        $listed = current($this->outbox()->pending());
+        $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['not_before' => microtime(true) + 60, 'attempts' => 1] + $document);
+        $this->outbox()->prepare(1);
+
+        $claimed = $this->outbox()->claimOne(1, $listed, microtime(true));
+
+        $this->assertNull($claimed);
+        $this->assertFileExists($this->pendingPath($claim));
+        $this->assertFileDoesNotExist($this->inflightPath($claim));
+        $this->assertSame(1, $this->entryDocument($this->pendingPath($claim))['attempts']);
+        // Once due, the same call wins it.
+        $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['not_before' => 0] + $document);
+        $this->assertNotNull($this->outbox()->claimOne(1, $listed, microtime(true)));
+        $this->assertFileExists($this->inflightPath($claim));
+    }
+
     public function test_a_forwarder_run_stops_at_its_deadline(): void
     {
         $this->batchSchema();
