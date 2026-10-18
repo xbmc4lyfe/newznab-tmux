@@ -51,8 +51,8 @@ return [
     // keep it well under the container's stop grace period.
     'publish_forwarder_seconds' => (int) env('RELEASE_VERIFICATION_PUBLISH_FORWARDER_SECONDS', 300),
     // A forwarder counts as alive to workers for this many seconds after it last touched its marker. It touches
-    // before and after each request, so this must outlast a batch round trip: the primary's batch budget
-    // (publish_batch_seconds, 15) plus the item it has in flight, with a margin.
+    // it every few seconds, idle or while a request waits for the primary (up to publish_timeout, through cURL's
+    // progress callback), so this only has to cover a stall; a hung or crashed forwarder is noticed after this long.
     'publish_forwarder_alive_seconds' => (int) env('RELEASE_VERIFICATION_PUBLISH_FORWARDER_ALIVE_SECONDS', 30),
     // The primary host serves that endpoint, without authentication, to these networks only.
     'publish_endpoint' => (bool) env('RELEASE_VERIFICATION_PUBLISH_ENDPOINT', false),

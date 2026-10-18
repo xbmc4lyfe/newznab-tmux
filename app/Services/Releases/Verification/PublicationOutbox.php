@@ -30,7 +30,16 @@ final class PublicationOutbox
      */
     public const int ALIVE_SECONDS = 30;
 
+    /** Seconds a quarantined entry is kept for inspection. */
+    private const int QUARANTINE_SECONDS = 3600;
+
     private readonly string $root;
+
+    /** @var array<string, true> Entries that could neither be removed nor moved; this process leaves them alone. */
+    private array $stuck = [];
+
+    /** @var array<string, true> Documents that could not be decoded; {@see purgeInvalid()} removes them. */
+    private array $invalid = [];
 
     public function __construct(?string $root = null)
     {
@@ -141,6 +150,16 @@ final class PublicationOutbox
         }
     }
 
+    /** Touch the marker unless it was touched within $seconds, as when called many times during one request. */
+    public function touchAliveIfStale(int $slot, int $seconds): void
+    {
+        clearstatcache(true, $this->root.'/forwarder-'.$slot.'.alive');
+        $modified = @filemtime($this->root.'/forwarder-'.$slot.'.alive');
+        if ($modified === false || time() - $modified >= $seconds) {
+            $this->touchAlive($slot);
+        }
+    }
+
     public function clearAlive(int $slot): void
     {
         @unlink($this->root.'/forwarder-'.$slot.'.alive');
@@ -172,8 +191,9 @@ final class PublicationOutbox
     }
 
     /**
-     * Every valid entry of a directory, oldest hand-off first. A document that cannot be decoded can
-     * never be published, so it is removed; its candidate is re-verified once the lease expires.
+     * Every valid entry of a directory, oldest hand-off first. Reading changes nothing on disk. A
+     * document that cannot be decoded can never be published; {@see purgeInvalid()} removes it, and
+     * its candidate is re-verified once the lease expires.
      *
      * @return list<PublicationOutboxEntry>
      */
@@ -182,6 +202,9 @@ final class PublicationOutbox
         $entries = [];
         clearstatcache();
         foreach ($this->names($directory) as $name) {
+            if (isset($this->stuck[$directory.'/'.$name])) {
+                continue;
+            }
             $entry = $this->read($directory.'/'.$name);
             if ($entry !== null) {
                 $entries[] = $entry;
@@ -205,6 +228,25 @@ final class PublicationOutbox
     }
 
     /**
+     * Whether {@see claim()} would take anything: this forwarder owns an entry already, or a pending
+     * one is due or has outlived its age limit. Reads only.
+     */
+    public function hasDue(int $slot, float $now): bool
+    {
+        if ($this->inflight($slot) !== []) {
+            return true;
+        }
+        $maxAge = self::maxAgeSeconds();
+        foreach ($this->pending() as $entry) {
+            if ($entry->notBefore <= $now || $entry->olderThan($maxAge, $now)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
      * Take the entries forwarder $slot sends next: those it already owns (left by an interrupted
      * run), then up to $limit - owned of the oldest pending entries that are due. Entries that have
      * outlived their age limit are claimed too, without counting against the limit, so that one
@@ -214,6 +256,8 @@ final class PublicationOutbox
      */
     public function claim(int $slot, int $limit, float $now): array
     {
+        $this->prepare($slot);
+        $this->purgeInvalid();
         $taken = array_slice($this->inflight($slot), 0, max(1, $limit));
         $room = $limit - count($taken);
         $maxAge = self::maxAgeSeconds();
@@ -303,15 +347,54 @@ final class PublicationOutbox
         return max(20, $period - 10 - 60 * ((max(1, $number) - 1) % $lives));
     }
 
-    public function remove(PublicationOutboxEntry $entry): void
+    /**
+     * Drop an entry. False when it could not be removed and was parked instead: moved to failed/, or,
+     * if even that failed, remembered so this process never claims it again. Either way it no longer
+     * counts as work, and the candidate's lease decides its fate.
+     */
+    public function remove(PublicationOutboxEntry $entry): bool
     {
-        @unlink($entry->path);
+        return $this->discard($entry->path, $entry->name);
     }
 
-    /** Delete stray temporary files that a crashed writer left behind. */
+    /** Remove the documents that could not be decoded. */
+    public function purgeInvalid(): int
+    {
+        $removed = 0;
+        foreach (array_keys($this->invalid) as $path) {
+            unset($this->invalid[$path]);
+            if (file_exists($path) || is_link($path)) {
+                $removed += $this->discard($path, basename($path)) ? 1 : 0;
+            }
+        }
+
+        return $removed;
+    }
+
+    private function discard(string $path, string $name): bool
+    {
+        if (@unlink($path) || (! file_exists($path) && ! is_link($path))) {
+            return true;
+        }
+        $this->stuck[$path] = true;
+        $failed = $this->root.'/failed';
+        if ((is_dir($failed) || @mkdir($failed, 0700)) && @rename($path, $failed.'/'.$name)) {
+            unset($this->stuck[$path]);
+        }
+
+        return false;
+    }
+
+    /** Delete stray temporary files that a crashed writer left behind, and old quarantined entries. */
     public function sweepTemporaryFiles(int $olderThanSeconds = 600): void
     {
         $now = time();
+        foreach (@scandir($this->root.'/failed') ?: [] as $file) {
+            $path = $this->root.'/failed/'.$file;
+            if ($file !== '.' && $file !== '..' && is_file($path) && ($modified = @filemtime($path)) !== false && $now - $modified > self::QUARANTINE_SECONDS) {
+                @unlink($path);
+            }
+        }
         $directories = [$this->root.'/pending'];
         foreach (@scandir($this->root.'/inflight') ?: [] as $slot) {
             if ($slot !== '.' && $slot !== '..' && is_dir($this->root.'/inflight/'.$slot)) {
@@ -345,7 +428,7 @@ final class PublicationOutbox
     private function read(string $path): ?PublicationOutboxEntry
     {
         if (is_link($path)) {
-            @unlink($path);
+            $this->invalid[$path] = true;
 
             return null;
         }
@@ -356,7 +439,7 @@ final class PublicationOutbox
         }
         $entry = PublicationOutboxEntry::decode(basename($path), $path, $json, (int) @filemtime($path));
         if ($entry === null) {
-            @unlink($path);
+            $this->invalid[$path] = true;
         }
 
         return $entry;

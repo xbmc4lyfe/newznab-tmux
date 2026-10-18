@@ -40,6 +40,10 @@ final class PublicationForwarderDiagnostics
 
     private int $lockBlocked = 0;
 
+    private int $quarantined = 0;
+
+    private ?int $itemLimit = null;
+
     private int $orphansAdopted = 0;
 
     private int $finishFailures = 0;
@@ -120,6 +124,18 @@ final class PublicationForwarderDiagnostics
         $this->lockBlocked++;
     }
 
+    /** An entry could not be removed and was parked (or, failing that, left alone) instead. */
+    public function quarantined(): void
+    {
+        $this->quarantined++;
+    }
+
+    /** The primary refused a batch as too large and advertised this item limit. */
+    public function itemLimit(int $limit): void
+    {
+        $this->itemLimit = $limit;
+    }
+
     /** Entries moved back to pending from the in-flight folder of a forwarder number nobody runs. */
     public function orphansAdopted(int $count): void
     {
@@ -158,6 +174,8 @@ final class PublicationForwarderDiagnostics
             'expired' => $this->expired,
             'lease_lost' => $this->leaseLost,
             'lock_blocked' => $this->lockBlocked,
+            'quarantined' => $this->quarantined,
+            'advertised_item_limit' => $this->itemLimit,
             'orphans_adopted' => $this->orphansAdopted,
             'finish_failures' => $this->finishFailures,
             'round_trip_ms' => ['total' => round($this->roundTripMilliseconds, 3), 'max' => round($this->slowestRoundTripMilliseconds, 3),

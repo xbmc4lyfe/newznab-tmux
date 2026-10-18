@@ -26,11 +26,12 @@ use Throwable;
  * Sends the verified candidates that this host's workers left in the publication outbox to the
  * primary, in batches. Several forwarders (numbered from 1) may run.
  *
- * A forwarder is a writer only while it works: it joins the shared worker group to claim, send and
- * settle entries and to renew their leases, and leaves it whenever the outbox is quiet, so an
- * idle forwarder never delays a barrier, reset or audit and costs no database queries. A drain,
- * an exclusive holder or a pause refuses it the group; it then leaves its entries alone (their
- * leases are fenced, and lapse if nobody renews them) and tries again every few seconds.
+ * A forwarder is a writer only while it works, and it writes only inside the shared worker group:
+ * every change to the outbox (claiming, settling, adopting, sweeping and even touching its alive
+ * marker) and every lease renewal happens while it holds the group, which a drain, an exclusive
+ * holder such as a reset, or a pause refuses it. Idle, it merely reads the outbox directory. A
+ * refused forwarder writes nothing: it leaves its entries alone (their leases are fenced, and lapse
+ * if nobody renews them), stops advertising itself, and tries to rejoin every few seconds.
  */
 class ForwardVerifiedPublications extends Command
 {
@@ -43,11 +44,16 @@ class ForwardVerifiedPublications extends Command
     /** Seconds between attempts to rejoin the worker group after it was refused. */
     private const float REJOIN_SECONDS = 2.0;
 
+    /** Seconds between touches of the alive marker, idle or in the middle of a request. */
+    private const int MARKER_SECONDS = 5;
+
     protected $signature = 'releases:forward-verified-publications {--slot=1 : Forwarder number, 1 to RELEASE_VERIFICATION_PUBLISH_FORWARDERS} {--max-seconds=0 : Stop taking work after this duration; zero uses RELEASE_VERIFICATION_PUBLISH_FORWARDER_SECONDS} {--passes=0 : Stop after this many loop passes (zero runs until the deadline)} {--diagnostics : Log a bounded run summary}';
 
     protected $description = 'Publish verified candidates handed off by this host\'s workers to the primary in batches';
 
     private PublicationOutbox $outbox;
+
+    private VerificationWorkerLocks $locks;
 
     private ?CandidateRepository $repository = null;
 
@@ -57,8 +63,19 @@ class ForwardVerifiedPublications extends Command
 
     private bool $terminate = false;
 
+    /** Whether this process currently holds the shared worker group. */
+    private bool $joined = false;
+
     /** Whether the worker group last refused this forwarder: workers should then publish for themselves. */
     private bool $blocked = false;
+
+    private float $nextJoin = 0.0;
+
+    /** Items per request; lowered when the primary advertises a smaller limit. */
+    private int $limit = 16;
+
+    /** @var array<string, int> Unix seconds of each entry's last lease renewal, by file name. */
+    private array $beats = [];
 
     public function handle(RemoteReleasePublisher $publisher): int
     {
@@ -107,39 +124,37 @@ class ForwardVerifiedPublications extends Command
 
             return self::SUCCESS;
         }
-        $locks = new VerificationWorkerLocks;
-        if (! $locks->startForwarder($this->slot)) {
+        $this->locks = new VerificationWorkerLocks;
+        if (! $this->locks->startForwarder($this->slot)) {
             $this->diagnostics?->stop('worker_unavailable');
             $this->info('This forwarder is already running.');
 
             return self::SUCCESS;
         }
         $this->outbox = new PublicationOutbox;
+        $this->joined = false;
         $this->blocked = false;
+        $this->nextJoin = 0.0;
+        $this->beats = [];
+        $this->limit = max(1, min(RemotePublicationService::BATCH_HARD_MAX_ITEMS, (int) config('release_verification.publish_forward_items', 16)));
         try {
-            $this->outbox->prepare($this->slot);
-            $this->outbox->touchAlive($this->slot);
             $this->diagnostics?->adopted(count($this->outbox->inflight($this->slot)));
-            $this->loop($locks, $publisher, $maxSeconds);
+            $this->loop($publisher, $maxSeconds);
         } finally {
-            // Workers must not hand off to a forwarder that is gone.
+            // Workers must not hand off to a forwarder that is gone. Removing the marker only deletes.
             $this->outbox->clearAlive($this->slot);
-            $locks->close();
+            $this->locks->close();
         }
 
         return self::SUCCESS;
     }
 
-    private function loop(VerificationWorkerLocks $locks, RemoteReleasePublisher $publisher, int $maxSeconds): void
+    private function loop(RemoteReleasePublisher $publisher, int $maxSeconds): void
     {
         $started = hrtime(true);
         $maxPasses = max(0, (int) $this->option('passes'));
-        $limit = max(1, min(RemotePublicationService::BATCH_HARD_MAX_ITEMS, (int) config('release_verification.publish_forward_items', 16)));
-        /** @var array<string, int> $beats */
-        $beats = [];
         $nextMaintenance = 0.0;
-        $nextJoin = 0.0;
-        $joined = false;
+        $nextMark = 0.0;
         for ($pass = 0; ; $pass++) {
             if (function_exists('pcntl_signal_dispatch')) {
                 pcntl_signal_dispatch();
@@ -160,63 +175,189 @@ class ForwardVerifiedPublications extends Command
                 return;
             }
             $now = microtime(true);
+            if ($this->blocked) {
+                // Refused: no filesystem writes at all until the group admits writers again.
+                if ($now < $this->nextJoin) {
+                    Sleep::usleep(self::IDLE_MICROSECONDS);
+
+                    continue;
+                }
+                $this->nextJoin = $now + self::REJOIN_SECONDS;
+                if (! $this->enter()) {
+                    Sleep::usleep(self::IDLE_MICROSECONDS);
+
+                    continue;
+                }
+                $this->leave();
+                $this->blocked = false;
+                $nextMark = 0.0;
+            }
             if ($now >= $nextMaintenance) {
                 $nextMaintenance = $now + self::MAINTENANCE_SECONDS;
-                $this->maintain($locks, $beats, $joined);
+                $this->maintain();
             }
-            // Moving due entries into this forwarder's in-flight folder touches only the filesystem.
-            $batch = $this->outbox->claim($this->slot, $limit, $now);
-            if ($batch === []) {
-                if ($joined) {
-                    $locks->leaveWorkers();
-                    $joined = false;
-                } elseif ($this->blocked && $now >= $nextJoin) {
-                    // Nothing to do, but find out whether the group has reopened, so workers may hand off again.
-                    $nextJoin = $now + self::REJOIN_SECONDS;
-                    $this->blocked = ! $locks->joinWorkers();
-                    $locks->leaveWorkers();
-                }
-                $this->mark();
+            if (! $this->blocked && $now >= $nextMark) {
+                $nextMark = $now + self::MARKER_SECONDS;
+                $this->advertise();
+            }
+            if ($this->blocked || ! $this->outbox->hasDue($this->slot, $now)) {
+                $this->leave();
                 Sleep::usleep(self::IDLE_MICROSECONDS);
 
                 continue;
             }
-            if (! $joined) {
-                if ($this->blocked && $now < $nextJoin) {
-                    $this->mark();
-                    Sleep::usleep(self::IDLE_MICROSECONDS);
+            if (! $this->enter()) {
+                $this->refuse();
+                Sleep::usleep(self::IDLE_MICROSECONDS);
 
-                    continue;
-                }
-                $joined = $locks->joinWorkers();
-                if (! $joined) {
-                    // The entries stay in flight, untouched, until the group admits writers again.
-                    $this->blocked = true;
-                    $nextJoin = $now + self::REJOIN_SECONDS;
-                    $this->diagnostics?->blocked();
-                    $this->mark();
-                    Sleep::usleep(self::IDLE_MICROSECONDS);
-
-                    continue;
-                }
+                continue;
             }
-            if (! $locks->held() || ! $locks->forwarderHeld()) {
+            if (! $this->locks->held() || ! $this->locks->forwarderHeld()) {
                 $this->diagnostics?->stop('locks_lost');
 
                 throw new RuntimeException('Publication forwarder locks were lost.');
             }
-            if (! $locks->admitting()) {
-                $locks->leaveWorkers();
-                $joined = false;
-                $this->blocked = true;
-                $nextJoin = $now + self::REJOIN_SECONDS;
-                $this->diagnostics?->blocked();
-                $this->mark();
+            if (! $this->locks->admitting()) {
+                $this->refuse();
 
                 continue;
             }
-            $this->blocked = false;
+            $batch = $this->outbox->claim($this->slot, $this->limit, $now);
+            if ($batch === []) {
+                $this->leave();
+                Sleep::usleep(self::IDLE_MICROSECONDS);
+
+                continue;
+            }
             $this->forwardBatch($publisher, $batch, $now);
+        }
+    }
+
+    /** Join the shared worker group, which a drain, an exclusive holder or a pause refuses. */
+    private function enter(): bool
+    {
+        return $this->joined = $this->joined || $this->locks->joinWorkers();
+    }
+
+    private function leave(): void
+    {
+        if ($this->joined) {
+            $this->locks->leaveWorkers();
+            $this->joined = false;
+        }
+    }
+
+    /** The group refused us: workers should publish for themselves, and we write nothing until it reopens. */
+    private function refuse(): void
+    {
+        $this->leave();
+        $this->blocked = true;
+        $this->nextJoin = microtime(true) + self::REJOIN_SECONDS;
+        $this->diagnostics?->blocked();
+        $this->outbox->clearAlive($this->slot);
+    }
+
+    /**
+     * Run $work while holding the worker group, joining it for the occasion. False, with the
+     * forwarder marked refused, when the group would not admit it; $work then did not run.
+     *
+     * @param  callable(): void  $work
+     */
+    private function inGroup(callable $work): bool
+    {
+        $joinedHere = ! $this->joined;
+        if (! $this->enter()) {
+            $this->refuse();
+
+            return false;
+        }
+        try {
+            $work();
+        } finally {
+            if ($joinedHere) {
+                $this->leave();
+            }
+        }
+
+        return true;
+    }
+
+    /** Create the outbox folders if a reset removed them, and touch the marker workers look for. */
+    private function advertise(): void
+    {
+        $this->inGroup(function (): void {
+            $this->outbox->prepare($this->slot);
+            $this->outbox->touchAlive($this->slot);
+        });
+    }
+
+    /**
+     * Housekeeping that reads the filesystem and writes only inside the group, and only when
+     * something is due: move back the entries of forwarder numbers nobody runs, renew leases every
+     * lease/3 seconds, and sweep stray temporary files.
+     */
+    private function maintain(): void
+    {
+        $foreign = $this->outbox->foreignSlots($this->slot);
+        $queued = [...$this->outbox->pending(), ...$this->outbox->inflight($this->slot)];
+        // Forget the renewals of entries that have left the outbox.
+        $this->beats = array_intersect_key($this->beats, array_flip(array_map(static fn (PublicationOutboxEntry $entry): string => $entry->name, $queued)));
+        $due = $this->leasesDue($queued);
+        if ($foreign === [] && $due === []) {
+            return;
+        }
+        $this->inGroup(function () use ($foreign, $due): void {
+            $this->outbox->sweepTemporaryFiles();
+            foreach ($foreign as $other) {
+                // Only a number whose lock is free is orphaned; a running forwarder keeps its own folder.
+                $this->locks->withForwarderNumber($other, function () use ($other): void {
+                    $this->diagnostics?->orphansAdopted($this->outbox->adopt($other));
+                });
+            }
+            $this->renewLeases($due);
+        });
+    }
+
+    /**
+     * The entries whose lease is older than a third of the lease, by their last renewal.
+     *
+     * @param  list<PublicationOutboxEntry>  $entries
+     * @return list<PublicationOutboxEntry>
+     */
+    private function leasesDue(array $entries): array
+    {
+        $interval = max(1.0, (int) config('release_verification.lease_seconds') / 3);
+        $now = now()->getTimestamp();
+        $due = [];
+        foreach ($entries as $entry) {
+            if ($now - max($this->beats[$entry->name] ?? 0, $entry->modifiedAt) >= $interval) {
+                $due[] = $entry;
+            }
+        }
+
+        return $due;
+    }
+
+    /**
+     * A lost lease means a newer attempt owns the candidate, so the entry can never publish and is
+     * dropped; any other failure is not proof the lease is gone, and the next pass tries again.
+     *
+     * @param  list<PublicationOutboxEntry>  $due
+     */
+    private function renewLeases(array $due): void
+    {
+        $now = now()->getTimestamp();
+        foreach ($due as $entry) {
+            try {
+                $this->repository()->heartbeat($entry->claim['id'], $entry->claim['lease_token']);
+                $this->beats[$entry->name] = $now;
+            } catch (LeaseLostException) {
+                $this->drop($entry);
+                unset($this->beats[$entry->name]);
+                $this->diagnostics?->leaseLost();
+            } catch (Throwable $error) {
+                Log::warning('Publication outbox lease renewal failed.', ['error' => $error->getMessage()]);
+            }
         }
     }
 
@@ -226,81 +367,21 @@ class ForwardVerifiedPublications extends Command
         return $this->repository ??= app(CandidateRepository::class);
     }
 
-    /** Workers hand off only to a forwarder that can work, so a refused one stops advertising itself. */
-    private function mark(): void
-    {
-        if ($this->blocked) {
-            $this->outbox->clearAlive($this->slot);
-        } else {
-            $this->outbox->touchAlive($this->slot);
-        }
-    }
-
     /**
-     * Housekeeping that needs the filesystem, and the database only when something is due: move
-     * back the entries of forwarder numbers nobody runs, and renew leases every lease/3 seconds.
+     * Called by the publisher before each request and about once a second while one waits for the
+     * primary, inside the group. Keeps the alive marker fresh through a request that takes up to the
+     * publication timeout, and renews the leases of the entries still waiting their turn, which a
+     * one-at-a-time fallback can leave unsent for longer than the lease lasts.
      *
-     * @param  array<string, int>  $beats  Unix seconds of each entry's last renewal, by file name.
+     * @param  list<PublicationOutboxEntry>  $live
      */
-    private function maintain(VerificationWorkerLocks $locks, array &$beats, bool &$joined): void
+    private function tick(array $live, int $completed): void
     {
-        $this->outbox->sweepTemporaryFiles();
-        foreach ($this->outbox->foreignSlots($this->slot) as $other) {
-            // Only a number whose lock is free is orphaned; a running forwarder keeps its own folder.
-            $locks->withForwarderNumber($other, function () use ($other): void {
-                $this->diagnostics?->orphansAdopted($this->outbox->adopt($other));
-            });
-        }
-        $interval = max(1.0, (int) config('release_verification.lease_seconds') / 3);
-        $now = time();
-        $seen = [];
-        $due = [];
-        foreach ([...$this->outbox->pending(), ...$this->outbox->inflight($this->slot)] as $entry) {
-            $seen[$entry->name] = true;
-            if ($now - max($beats[$entry->name] ?? 0, $entry->modifiedAt) >= $interval) {
-                $due[] = $entry;
-            }
-        }
-        $beats = array_intersect_key($beats, $seen);
-        if ($due === []) {
-            return;
-        }
-        $wasJoined = $joined;
-        $joined = $joined || $locks->joinWorkers();
-        if (! $joined) {
-            // Refused (a barrier is running): renewing now would be a write it is waiting out. Try next time.
-            return;
-        }
         try {
-            $this->renewLeases($due, $beats, $now);
-        } finally {
-            if (! $wasJoined) {
-                $locks->leaveWorkers();
-                $joined = false;
-            }
-        }
-    }
-
-    /**
-     * A lost lease means a newer attempt owns the candidate, so the entry can never publish and is
-     * dropped; any other failure is not proof the lease is gone, and the next pass tries again.
-     *
-     * @param  list<PublicationOutboxEntry>  $due
-     * @param  array<string, int>  $beats
-     */
-    private function renewLeases(array $due, array &$beats, int $now): void
-    {
-        foreach ($due as $entry) {
-            try {
-                $this->repository()->heartbeat($entry->claim['id'], $entry->claim['lease_token']);
-                $beats[$entry->name] = $now;
-            } catch (LeaseLostException) {
-                $this->outbox->remove($entry);
-                unset($beats[$entry->name]);
-                $this->diagnostics?->leaseLost();
-            } catch (Throwable $error) {
-                Log::warning('Publication outbox lease renewal failed.', ['error' => $error->getMessage()]);
-            }
+            $this->outbox->touchAliveIfStale($this->slot, self::MARKER_SECONDS);
+            $this->renewLeases($this->leasesDue(array_slice($live, $completed)));
+        } catch (Throwable) {
+            // Best effort; the request itself is what matters.
         }
     }
 
@@ -322,7 +403,8 @@ class ForwardVerifiedPublications extends Command
         $this->outbox->touchAlive($this->slot);
         $started = hrtime(true);
         try {
-            $outcomes = $publisher->publishMany(array_map(static fn (PublicationOutboxEntry $entry) => $entry->item(), $live));
+            $outcomes = $publisher->publishMany(array_map(static fn (PublicationOutboxEntry $entry) => $entry->item(), $live),
+                fn (int $completed) => $this->tick($live, $completed));
             if (count($outcomes) !== count($live)) {
                 throw new RuntimeException('The primary answered a different number of results than were sent.');
             }
@@ -331,6 +413,7 @@ class ForwardVerifiedPublications extends Command
             // An unreachable primary processed nothing, which is no failure of the entry.
             $this->diagnostics?->batch(count($live), $started, hrtime(true), true);
             $this->outbox->touchAlive($this->slot);
+            $this->adaptToPrimary($publisher);
             foreach ($live as $entry) {
                 $this->retry($entry, $error->getMessage(), counted: ! $error instanceof ConnectionException);
             }
@@ -339,8 +422,19 @@ class ForwardVerifiedPublications extends Command
         }
         $this->diagnostics?->batch(count($live), $started, hrtime(true), false);
         $this->outbox->touchAlive($this->slot);
+        $this->adaptToPrimary($publisher);
         foreach ($live as $position => $entry) {
             $this->settle($entry, $outcomes[$position]);
+        }
+    }
+
+    /** Claim no more items per request than the primary said it takes. */
+    private function adaptToPrimary(RemoteReleasePublisher $publisher): void
+    {
+        $advertised = $publisher->advertisedMaxItems();
+        if ($advertised !== null && $advertised < $this->limit) {
+            $this->limit = max(1, $advertised);
+            $this->diagnostics?->itemLimit($this->limit);
         }
     }
 
@@ -351,13 +445,13 @@ class ForwardVerifiedPublications extends Command
             case PublicationOutcome::PUBLISHED:
             case PublicationOutcome::FILTERED:
             case PublicationOutcome::METADATA_REVIEW:
-                $this->outbox->remove($entry);
+                $this->drop($entry);
 
                 return;
             case PublicationOutcome::NO_RELEASE:
                 // The single endpoint reports a filtered or reviewed candidate as a bare null; the row says which.
                 if ($this->resolvedWithoutRelease($entry)) {
-                    $this->outbox->remove($entry);
+                    $this->drop($entry);
                 } else {
                     $this->finishUnknown($entry, 'Publication did not produce a verified current release.');
                 }
@@ -411,7 +505,19 @@ class ForwardVerifiedPublications extends Command
             $this->diagnostics?->finishFailed();
             Log::warning('Publication outbox entry could not be finished; its lease will expire.', ['error' => $error->getMessage()]);
         }
-        $this->outbox->remove($entry);
+        $this->drop($entry);
+    }
+
+    /**
+     * Drop an entry that is done with. If it cannot be removed it is parked, not forgotten: it is
+     * logged once and counted, and never claimed again, so it cannot be sent in a loop.
+     */
+    private function drop(PublicationOutboxEntry $entry): void
+    {
+        if (! $this->outbox->remove($entry)) {
+            $this->diagnostics?->quarantined();
+            Log::warning('Publication outbox entry could not be removed; it was set aside.', ['entry' => $entry->name]);
+        }
     }
 
     private function resolvedWithoutRelease(PublicationOutboxEntry $entry): bool
