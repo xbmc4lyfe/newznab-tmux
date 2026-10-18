@@ -431,6 +431,18 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom:** PHP 8.5 reports "Using null as an array offset is deprecated" for every release whose sampled articles contain no PAR2 set. The metadata was already correct; only the deprecation was emitted.
 - **Fix:** an empty set list now yields empty recovery exponents without the lookup. `ReleaseFingerprintEmptyPar2SetTest` fails on the previous code and passes now.
 
+### 59. Remote workers' publish fails with HTTP 404 because the primary's endpoint flag defaults off (Fixed)
+
+- **Where:** `RELEASE_VERIFICATION_PUBLISH_ENDPOINT` defaults to `false`, and the worker template and notes never said the primary must enable it.
+- **Symptom:** every remote publish failed with "Remote publication failed: HTTP 404".
+- **Fix:** fixed by branch `codex/worker-template-fixups`. The worker template and `.env.example` now say the primary needs `RELEASE_VERIFICATION_PUBLISH_ENDPOINT=true` and an `INTERNAL_BIND` on a LAN address.
+
+### 60. The remote worker template omitted the native yEnc library path (Fixed)
+
+- **Where:** `docker/worker/config/app.env.example` set no `YENC_DECODER` or `YENC_NATIVE_LIBRARY`.
+- **Symptom:** workers fell back to the PHP yEnc decoder, which made each passing verification about 10x slower.
+- **Fix:** fixed by branch `codex/worker-template-fixups`. The template sets `YENC_DECODER=auto` and `YENC_NATIVE_LIBRARY=/usr/local/lib/nntmux/libnzbyenc.so`.
+
 ## Issues in the docker/ stack itself (all fixed)
 
 | Issue | Fix |
