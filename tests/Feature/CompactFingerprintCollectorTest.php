@@ -330,6 +330,7 @@ final class CompactFingerprintCollectorTest extends TestCase
             'trailer without size' => [static fn (string $body): string => str_replace('=yend size=16 ', '=yend ', $body)],
             'not yEnc at all' => [static fn (string $body): string => "plain text body\r\n"],
             'malformed secondary CRC' => [static fn (string $body): string => $body.' pcrc32=XYZ'],
+            'contradictory secondary CRC' => [static fn (string $body): string => $body.' pcrc32=00000000'],
         ];
     }
 
@@ -387,6 +388,101 @@ final class CompactFingerprintCollectorTest extends TestCase
 
         $this->assertSame([], $result['data']['errors']);
         $this->assertSame('complete', $result['status']);
+    }
+
+    #[Test]
+    public function an_empty_single_part_file_is_complete(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)
+            ->andReturnUsing(fn (string $id): array => ['body' => YencArticles::article('')] + self::article($id));
+
+        $result = $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7);
+
+        $this->assertSame([], $result['data']['errors']);
+        $this->assertSame('complete', $result['status']);
+    }
+
+    #[Test]
+    public function size_ok_requires_affirmative_size_agreement(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(function (string $id): array {
+            $article = self::article($id);
+            if (str_starts_with($id, 'f1-')) {
+                $article['body'] = str_replace('=yend size=16 ', '=yend ', $article['body']);
+            }
+
+            return $article;
+        });
+
+        $articles = $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7)['data']['articles'];
+        $byFile = array_column($articles, 'yenc', 'file_index');
+
+        $this->assertTrue($byFile[0]['size_ok']);
+        $this->assertNull($byFile[1]['size_ok']);
+    }
+
+    /** @return array<string, array{string, string|null}> */
+    public static function dateHeaders(): array
+    {
+        return [
+            'RFC 5322 with offset' => ['Thu, 01 Oct 2026 14:30:05 +0200', '2026-10-01T12:30:05Z'],
+            'no weekday, GMT' => ['1 Oct 2026 12:00:00 GMT', '2026-10-01T12:00:00Z'],
+            'mismatched weekday' => ['Wed, 01 Oct 2026 12:00:00 +0000', '2026-10-01T12:00:00Z'],
+            'zone comment' => ['Thu, 01 Oct 2026 12:00 -0500 (EST)', '2026-10-01T17:00:00Z'],
+            'relative' => ['tomorrow', null],
+            'time only' => ['12:00:00', null],
+            'no zone' => ['Thu, 01 Oct 2026 12:00:00', null],
+            'impossible day' => ['31 Feb 2026 12:00:00 +0000', null],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('dateHeaders')]
+    public function only_absolute_dates_with_a_zone_are_recorded(string $header, ?string $expected): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->once()->andReturnUsing(function (string $id) use ($header): array {
+            $article = self::article($id);
+            $article['headers'][1] = 'Date: '.$header;
+
+            return $article;
+        });
+
+        $data = $this->collector()->collectFromNzb(self::nzb(1, 1, false), 7)['data'];
+
+        $this->assertSame($expected, $data['articles'][0]['date_utc']);
+    }
+
+    #[Test]
+    public function retrieval_timings_do_not_change_what_a_record_keeps(): void
+    {
+        $budget = new \ReflectionMethod(CompactFingerprintCollector::class, 'withinBudget');
+        $record = static function (int $ms, int $files): array {
+            return [
+                'providers' => [['account' => 'primary', 'retrieval_ms' => ['p50' => $ms, 'max' => $ms, 'total' => $ms * 12]]],
+                'articles' => array_fill(0, 12, ['provider_results' => ['primary' => ['code' => 222, 'bytes' => 1, 'ms' => $ms]], 'yenc' => null]),
+                'files' => array_map(static fn (int $index): array => ['file_index' => $index, 'name' => str_repeat('x', 60)], range(1, $files)),
+                'par2' => null,
+                'nzb' => ['groups' => []],
+                'truncated' => false,
+            ];
+        };
+        // Grow the file list until a fast run (0 ms) only just fits the budget.
+        $files = 1;
+        while (strlen(json_encode($record(0, $files + 1), JSON_THROW_ON_ERROR)) <= CompactFingerprintCollector::MAX_RECORD_BYTES) {
+            $files++;
+        }
+
+        $fast = $budget->invoke(null, $record(0, $files));
+        $slow = $budget->invoke(null, $record(987_654, $files));
+
+        $this->assertSame(count($fast['files']), count($slow['files']));
+        $this->assertSame($fast['truncated'], $slow['truncated']);
     }
 
     #[Test]

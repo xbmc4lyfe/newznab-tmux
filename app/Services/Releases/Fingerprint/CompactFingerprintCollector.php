@@ -253,7 +253,9 @@ final class CompactFingerprintCollector
      */
     private static function withinBudget(array $record): array
     {
-        $fits = static fn (array $candidate): bool => strlen((string) json_encode($candidate, JSON_INVALID_UTF8_SUBSTITUTE)) <= self::MAX_RECORD_BYTES;
+        // Timings vary between runs; measure them at a fixed worst-case width so the same release
+        // always keeps the same content.
+        $fits = static fn (array $candidate): bool => strlen((string) json_encode(self::withWorstCaseTimings($candidate), JSON_INVALID_UTF8_SUBSTITUTE)) <= self::MAX_RECORD_BYTES;
         while (! $fits($record)) {
             $record['truncated'] = true;
             $files = count($record['files']);
@@ -279,6 +281,28 @@ final class CompactFingerprintCollector
                 break;
             }
         }
+
+        return $record;
+    }
+
+    /**
+     * @param  array<string, mixed>  $record
+     * @return array<string, mixed>
+     */
+    private static function withWorstCaseTimings(array $record): array
+    {
+        $widest = PHP_INT_MAX;
+        foreach ($record['providers'] as &$provider) {
+            $provider['retrieval_ms'] = ['p50' => $widest, 'max' => $widest, 'total' => $widest];
+        }
+        unset($provider);
+        foreach ($record['articles'] as &$article) {
+            foreach ($article['provider_results'] as &$result) {
+                $result['ms'] = $widest;
+            }
+            unset($result);
+        }
+        unset($article);
 
         return $record;
     }
@@ -528,7 +552,7 @@ final class CompactFingerprintCollector
             'begin' => is_int($yenc['begin'] ?? null) ? $yenc['begin'] : null,
             'end' => is_int($yenc['end'] ?? null) ? $yenc['end'] : null,
             'crc_ok' => is_bool($yenc['declared_crc32_matches'] ?? null) ? $yenc['declared_crc32_matches'] : null,
-            'size_ok' => ! in_array('YencSizeMismatch', self::yencIntegrityErrors($yenc), true),
+            'size_ok' => self::sizesAgree($yenc),
         ];
     }
 
@@ -558,34 +582,110 @@ final class CompactFingerprintCollector
         if (($yenc['payload_escape_state_valid'] ?? null) === false) {
             $errors[] = 'YencFramingInvalid';
         }
+        if (self::declaredCrcsContradict($yenc)) {
+            $errors[] = 'YencCrcMismatch';
+        }
         $verified = ($yenc['declared_crc32_matches'] ?? null) === true
             && ($yenc['all_declared_crc32_fields_are_hex'] ?? null) !== false
+            && (self::sizesAgree($yenc) === true || self::emptySinglePart($yenc))
             && in_array($yenc['multipart_structure_status'] ?? null, ['single-part', 'complete'], true)
             && ($yenc['payload_escape_state_valid'] ?? null) === true
             && ($yenc['integrity_checks_ambiguous'] ?? null) !== true
             && ($yenc['decoded_size_matches_yend_size'] ?? null) === true
-            && ! in_array(false, array_map(static fn (string $check): mixed => $yenc[$check] ?? null, [
+            && ! in_array(false, array_map(static fn (string $check): mixed => $yenc[$check] ?? null, array_values(array_diff([
                 'decoded_size_matches_yenc', 'decoded_size_matches_ypart_range', 'ypart_range_valid',
                 'header_numeric_fields_valid', 'header_numeric_fields_representable', 'trailer_numeric_fields_valid',
                 'trailer_numeric_fields_representable', 'trailer_part_matches_header', 'trailer_total_matches_header',
-            ]), true)
+            ], self::emptySinglePart($yenc) ? ['header_numeric_fields_valid'] : []))), true)
             && (! is_array($yenc['conflicting_control_fields'] ?? null) || $yenc['conflicting_control_fields'] === []);
         if (! $verified && $errors === []) {
             $errors[] = 'YencUnverified';
         }
 
-        return $errors;
+        return array_values(array_unique($errors));
     }
 
+    /**
+     * True only when every size the article declares agrees with the decoded bytes, false when one
+     * disagrees, and null when the evidence is missing or malformed.
+     *
+     * @param  array<string, mixed>  $yenc
+     */
+    private static function sizesAgree(array $yenc): ?bool
+    {
+        $checks = ['decoded_size_matches_yend_size', ($yenc['multipart'] ?? false) === true ? 'decoded_size_matches_ypart_range' : 'decoded_size_matches_yenc'];
+        $values = array_map(static fn (string $check): mixed => $yenc[$check] ?? null, $checks);
+        if (in_array(false, $values, true)) {
+            return false;
+        }
+
+        return $values === [true, true] ? true : null;
+    }
+
+    /**
+     * Every CRC an article declares must agree with its decoded bytes: both crc32 and pcrc32 for a
+     * single-part article, and pcrc32 for a part (whose crc32 covers the whole file).
+     *
+     * @param  array<string, mixed>  $yenc
+     */
+    private static function declaredCrcsContradict(array $yenc): bool
+    {
+        $observed = strtolower((string) ($yenc['observed_decoded_crc32'] ?? ''));
+        $trailer = is_array($yenc['trailer_fields'] ?? null) ? $yenc['trailer_fields'] : [];
+        $fields = ($yenc['multipart'] ?? false) === true ? ['pcrc32'] : ['crc32', 'pcrc32'];
+        foreach ($fields as $field) {
+            $declared = $trailer[$field] ?? null;
+            if (is_string($declared) && $observed !== '' && strtolower(str_pad(ltrim(trim($declared), '0'), 8, '0', STR_PAD_LEFT)) !== str_pad(ltrim($observed, '0'), 8, '0', STR_PAD_LEFT)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * A valid empty file: single part, declared size 0, nothing decoded. The analyzer treats size 0 as
+     * a non-positive numeric field, which is only wrong in this exact case.
+     *
+     * @param  array<string, mixed>  $yenc
+     */
+    private static function emptySinglePart(array $yenc): bool
+    {
+        return ($yenc['multipart'] ?? null) === false
+            && (($yenc['header_fields'] ?? [])['size'] ?? null) === '0'
+            && ($yenc['decoded_segment_size'] ?? null) === 0
+            && ($yenc['decoded_size_matches_yend_size'] ?? null) === true;
+    }
+
+    /**
+     * An absolute RFC 5322 date with an explicit zone; relative or zone-less values would depend on
+     * when and where the job ran.
+     */
     private static function dateUtc(mixed $date): ?string
     {
-        if (! is_string($date) || trim($date) === '') {
+        if (! is_string($date)) {
             return null;
         }
-        // strtotime() moves a date whose weekday disagrees to the next matching weekday; ignore the weekday.
-        $timestamp = strtotime((string) preg_replace('/\A\s*[A-Za-z]{3},\s*/', '', $date));
+        $pattern = '/\A\s*(?:[A-Za-z]{3},\s*)?(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})\s+'
+            .'(\d{2}):(\d{2})(?::(\d{2}))?\s+([+-]\d{4}|UT|GMT|Z|[ECMP][SD]T)(?:\s*\(.*\))?\s*\z/i';
+        if (preg_match($pattern, $date, $match) !== 1) {
+            return null;
+        }
+        $zone = strtoupper($match[7]);
+        $offset = match ($zone) {
+            'UT', 'GMT', 'Z' => '+0000',
+            'EST' => '-0500', 'EDT' => '-0400', 'CST' => '-0600', 'CDT' => '-0500',
+            'MST' => '-0700', 'MDT' => '-0600', 'PST' => '-0800', 'PDT' => '-0700',
+            default => $zone,
+        };
+        $parsed = \DateTimeImmutable::createFromFormat('!j M Y H:i:s O',
+            sprintf('%d %s %s %s:%s:%s %s', $match[1], ucfirst(strtolower($match[2])), $match[3], $match[4], $match[5], $match[6] !== '' ? $match[6] : '00', $offset));
+        $errors = \DateTimeImmutable::getLastErrors();
+        if ($parsed === false || ($errors !== false && ($errors['warning_count'] > 0 || $errors['error_count'] > 0))) {
+            return null;
+        }
 
-        return $timestamp === false ? null : gmdate('Y-m-d\TH:i:s\Z', $timestamp);
+        return $parsed->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d\TH:i:s\Z');
     }
 
     private static function xrefGroupCount(mixed $xref): ?int
