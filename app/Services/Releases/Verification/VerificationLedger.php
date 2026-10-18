@@ -84,19 +84,46 @@ final class VerificationLedger
      *
      * @param  list<string>  $keys
      */
-    public function enterPublication(array $keys, string $missing = 'Verification migration has not initialized capacity state.'): void
+    public function enterPublication(array $keys, string $missing = 'Verification migration has not initialized capacity state.',
+        ?PublicationTiming $timing = null): void
     {
         if (! $this->concurrent()) {
-            $this->enter($missing);
+            $started = $timing === null ? 0 : hrtime(true);
+            $completed = false;
+            try {
+                $this->enter($missing);
+                $completed = true;
+            } finally {
+                $timing?->recordLock(['path' => 'legacy_state', 'stripe_count' => 0, 'stripe_lock_ns' => 0,
+                    'publication_row_lock_ns' => hrtime(true) - $started, 'completed' => $completed]);
+            }
 
             return;
         }
         $stripes = array_values(array_unique(array_map(self::publicationStripe(...), $keys)));
         sort($stripes);
-        $striped = $stripes !== []
-            && DB::table(self::LOCKS_TABLE)->whereIn('name', $stripes)->orderBy('name')->lockForUpdate()->count() === count($stripes);
-        $shared = DB::table(self::LOCKS_TABLE)->where('name', self::PUBLICATION_LOCK);
-        if (($striped ? $shared->sharedLock() : $shared->lockForUpdate())->first() === null) {
+        $started = $timing === null ? 0 : hrtime(true);
+        $stripeEnded = null;
+        $striped = false;
+        $completed = false;
+        // Recorded even when a lock statement throws (a deadlock or lock-wait timeout retries the
+        // transaction), so the contended attempts keep their stripe and publication-row split.
+        try {
+            $striped = $stripes !== []
+                && DB::table(self::LOCKS_TABLE)->whereIn('name', $stripes)->orderBy('name')->lockForUpdate()->count() === count($stripes);
+            $stripeEnded = $timing === null ? 0 : hrtime(true);
+            $shared = DB::table(self::LOCKS_TABLE)->where('name', self::PUBLICATION_LOCK);
+            $row = ($striped ? $shared->sharedLock() : $shared->lockForUpdate())->first();
+            $completed = true;
+        } finally {
+            if ($timing !== null) {
+                $now = hrtime(true);
+                $timing->recordLock(['path' => $stripeEnded === null ? 'striped' : ($striped ? 'striped' : 'exclusive'),
+                    'stripe_count' => count($stripes), 'stripe_lock_ns' => ($stripeEnded ?? $now) - $started,
+                    'publication_row_lock_ns' => $stripeEnded === null ? 0 : $now - $stripeEnded, 'completed' => $completed]);
+            }
+        }
+        if ($row === null) {
             throw new RuntimeException('Verification publication lock has not been initialized.');
         }
     }
