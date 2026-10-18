@@ -804,8 +804,10 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
 
     public function test_a_prelock_policy_failure_is_raised_again_by_the_locked_section(): void
     {
+        config(['release_verification.publication_timing_sample_every' => 1]);
         ['claim' => $claim, 'manifest' => $manifest] = $this->publishableCandidate();
         unset($manifest['verified_file_names']);
+        $reports = $this->captureTimingReports();
 
         try {
             app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('complete', 'Downloaded and verified', $manifest));
@@ -813,6 +815,11 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         } catch (\RuntimeException $error) {
             $this->assertSame('Authoritative verified size and inventory are required for collection publication.', $error->getMessage());
         }
+
+        // The failed pre-lock policy step is timed under its own phase, and the other steps still ran.
+        $this->assertCount(1, $reports);
+        $this->assertSame(['claim_check', 'metadata_resolve', 'incoming_document', 'key_derivation', 'archive_read', 'policy_check', 'document_gzip', 'coverage_ids'],
+            array_keys($reports[0]['pre_lock_phases_ns']));
 
         $this->assertSame(0, DB::table('releases')->count());
         $this->assertNull(DB::table('release_verification_candidates')->value('release_id'));

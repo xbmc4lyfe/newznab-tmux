@@ -238,7 +238,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         }
 
         $this->assertCount(1, $reports);
-        $this->assertSame(['claim_check', 'metadata_resolve', 'key_derivation'], array_keys($reports[0]['pre_lock_phases_ns']));
+        $this->assertSame(['claim_check', 'metadata_resolve', 'key_derivation', 'archive_read', 'policy_check'], array_keys($reports[0]['pre_lock_phases_ns']));
         $this->assertFalse($reports[0]['keys_present']);
         $this->assertSame('threw', $reports[0]['outcome']);
     }
