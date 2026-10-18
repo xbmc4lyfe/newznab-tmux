@@ -635,6 +635,37 @@ final class CompactFingerprintCollectorTest extends TestCase
         $this->assertNull($this->collector()->collectFromNzb($allZero, 8)['data']['posting']);
     }
 
+    #[Test]
+    public function a_corrupt_nzb_manifest_keeps_the_record_partial(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->andReturnUsing(fn (string $id): array => self::article($id));
+        // Two segments of file 0 claim the same number.
+        $xml = str_replace('number="2">f0-s2@fixture', 'number="1">f0-s2@fixture', self::nzb(2, 3, false));
+
+        $result = $this->collector()->collectFromNzb($xml, 7);
+
+        $this->assertSame('partial', $result['status']);
+        $this->assertContains(['account' => 'nzb', 'error_type' => 'NzbManifestInvalid', 'count' => 1], $result['data']['errors']);
+    }
+
+    #[Test]
+    public function the_alternate_copy_supplies_par2_metadata_when_the_primary_copy_has_none(): void
+    {
+        config(['nntmux.fingerprint_alternate_percent' => 100]);
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->twice()->andReturn(self::profile());
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')
+            ->andReturnUsing(fn (string $id, int $body, int $header, bool $alternate): array => [
+                'body' => YencArticles::article($id === 'index@fixture' && $alternate ? ArchiveParsingBenchmarkFixtures::par2(1) : 'not par2'),
+            ] + self::article($id));
+
+        $summary = $this->collector()->collectFromNzb(self::par2Nzb(['offline-0000.bin']), 7)['data']['par2'];
+
+        $this->assertSame(['offline-0000.bin'], array_column($summary['files'], 'name'));
+    }
+
     /** @return array<string, mixed> */
     private static function profile(): array
     {

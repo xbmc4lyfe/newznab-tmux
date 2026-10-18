@@ -119,6 +119,10 @@ final class CompactFingerprintCollector
             }
         }
 
+        $manifestInvalidFiles = self::manifestInvalidFileCount($manifest);
+        if ($manifestInvalidFiles > 0) {
+            $errors['nzb']['NzbManifestInvalid'] = $manifestInvalidFiles;
+        }
         $articles = [];
         $softwareCandidates = [];
         $firstPrefixMd5 = [];
@@ -163,6 +167,18 @@ final class CompactFingerprintCollector
                     foreach (self::yencIntegrityErrors($metadata['yenc'] ?? null) as $integrityError) {
                         $errors[$account][$integrityError] = ($errors[$account][$integrityError] ?? 0) + 1;
                     }
+                    // Every verified provider copy may supply PAR2 metadata until a usable summary is found.
+                    if ($par2 === null && $sample['kind'] === 'par2' && self::yencIntegrityErrors($metadata['yenc'] ?? null) === []
+                        && is_string($analysis['decoded_bytes'] ?? null)) {
+                        $summary = $this->par2Summary($analysis['decoded_bytes'], $files);
+                        // Only a summary with file descriptions ends the search; a set ID alone (e.g. a
+                        // Creator-only volume) is kept as a fallback while later volumes are examined.
+                        if ($summary !== null && $summary['files'] !== []) {
+                            $par2 = $summary;
+                        } elseif ($summary !== null && $summary['set_id'] !== null) {
+                            $par2Fallback ??= $summary;
+                        }
+                    }
                     if ($article['yenc'] !== null) {
                         continue;
                     }
@@ -176,17 +192,6 @@ final class CompactFingerprintCollector
                     $prefixMd5 = $metadata['yenc']['par2_first_16k_md5_candidate'] ?? null;
                     if ($sample['segment_number'] === 1 && is_string($prefixMd5)) {
                         $firstPrefixMd5[$sample['file_index']] ??= strtolower($prefixMd5);
-                    }
-                    if ($par2 === null && $sample['kind'] === 'par2' && self::yencIntegrityErrors($metadata['yenc'] ?? null) === []
-                        && is_string($analysis['decoded_bytes'] ?? null)) {
-                        $summary = $this->par2Summary($analysis['decoded_bytes'], $files);
-                        // Only a summary with file descriptions ends the search; a set ID alone (e.g. a
-                        // Creator-only volume) is kept as a fallback while later volumes are examined.
-                        if ($summary !== null && $summary['files'] !== []) {
-                            $par2 = $summary;
-                        } elseif ($summary !== null && $summary['set_id'] !== null) {
-                            $par2Fallback ??= $summary;
-                        }
                     }
                 } catch (Throwable $exception) {
                     $providers[$account]['retrieval_ms'][] = (int) round((hrtime(true) - $started) / 1_000_000);
@@ -744,6 +749,28 @@ final class CompactFingerprintCollector
     private static function responseCode(mixed $response): ?int
     {
         return is_array($response) && is_numeric($response['response_code'] ?? null) ? (int) $response['response_code'] : null;
+    }
+
+    /**
+     * Files whose NZB records the analyzer found corrupt (or 1 for an invalid release byte total).
+     *
+     * @param  array<string, mixed>  $manifest
+     */
+    private static function manifestInvalidFileCount(array $manifest): int
+    {
+        $invalid = 0;
+        foreach ($manifest['files'] as $file) {
+            if ((int) ($file['invalid_segment_record_count'] ?? 0) > 0
+                || (int) ($file['invalid_segment_metadata_count'] ?? 0) > 0
+                || (int) ($file['duplicate_message_id_count'] ?? 0) > 0
+                || (int) ($file['duplicate_segment_number_count'] ?? 0) > 0
+                || ($file['segment_number_sequence_valid'] ?? null) === false
+                || ($file['advertised_bytes_overflow'] ?? false) === true) {
+                $invalid++;
+            }
+        }
+
+        return $invalid === 0 && ($manifest['advertised_byte_totals_valid'] ?? true) === false ? 1 : $invalid;
     }
 
     /** @param array<string, mixed> $profile */
