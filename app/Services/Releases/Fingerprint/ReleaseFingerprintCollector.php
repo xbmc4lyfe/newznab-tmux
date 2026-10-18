@@ -4,14 +4,12 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Fingerprint;
 
-use App\Jobs\CollectReleaseFingerprintMetadata;
 use App\Models\Release;
 use App\Services\NNTP\NntpProviderUnavailableException;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
 use App\Services\Nzb\NzbSourceGuard;
 use App\Services\YencService;
-use Illuminate\Support\Facades\Cache;
 use Throwable;
 
 final class ReleaseFingerprintCollector
@@ -42,11 +40,13 @@ final class ReleaseFingerprintCollector
 
     private const MAX_RELEASE_IFSC_PREVIEW_RECORDS = 4096;
 
-    /** @var array<string, string> Failure generations whose re-probe this job claimed, keyed by provider. */
-    private array $providerProbeClaims = [];
+    private readonly FingerprintProviderBreaker $breaker;
 
     public function __construct(private readonly NzbService $nzb, private readonly NzbFingerprintAnalyzer $analyzer,
-        private readonly Par2MetadataParser $par2, private readonly YencService $yenc) {}
+        private readonly Par2MetadataParser $par2, private readonly YencService $yenc, ?FingerprintProviderBreaker $breaker = null)
+    {
+        $this->breaker = $breaker ?? new FingerprintProviderBreaker;
+    }
 
     /**
      * source_digest identifies the NZB generation read (NzbSourceGuard::digest()), so a caller can tell
@@ -86,7 +86,7 @@ final class ReleaseFingerprintCollector
         $par2SourceSampleOmittedCount = 0;
         foreach ($servers as $server) {
             $serverKey = ($server['alternate'] ? 'alternate ' : 'primary ').$server['name'];
-            $skipReason = $server['alternate'] ? $this->alternateSkipReason($server) : null;
+            $skipReason = $server['alternate'] ? $this->breaker->skipReason($server) : null;
             if ($skipReason !== null) {
                 // Another job failed to reach this alternate moments ago, or is re-probing it now; skip
                 // instead of waiting out a full connect timeout in every job while the provider stays down.
@@ -103,17 +103,17 @@ final class ReleaseFingerprintCollector
                 $profile = $nntp->getFingerprintServerProfile($server['alternate']);
                 $profileRow = $server + ['profile' => $profile];
                 if ($server['alternate']) {
-                    $this->rememberAlternateReachable($server);
+                    $this->breaker->recordReachable($server);
                 }
             } catch (Throwable $exception) {
                 $profile = [];
                 $profileRow = $server + ['profile_error_type' => class_basename($exception)];
                 if ($server['alternate'] && $exception instanceof NntpProviderUnavailableException) {
                     $unavailable[$serverKey] = class_basename($exception);
-                    $this->rememberAlternateUnavailable($server);
+                    $this->breaker->recordUnavailable($server);
                 } elseif ($server['alternate']) {
                     // Connected but the profile failed: let the next job re-probe instead of waiting out the claim.
-                    $this->releaseAlternateProbe($server);
+                    $this->breaker->releaseProbe($server);
                 }
             }
             $serverProfiles[] = $profileRow;
@@ -428,7 +428,7 @@ final class ReleaseFingerprintCollector
                     ];
                     if ($server['alternate'] && $exception instanceof NntpProviderUnavailableException) {
                         $unavailable[$serverKey] = class_basename($exception);
-                        $this->rememberAlternateUnavailable($server);
+                        $this->breaker->recordUnavailable($server);
                     }
                 }
             }
@@ -2370,114 +2370,6 @@ final class ReleaseFingerprintCollector
         }
 
         return $servers;
-    }
-
-    /**
-     * Null when this job should probe the alternate. Each failure starts a new generation: during its
-     * window every job skips; afterwards one job claims the re-probe until it succeeds (marking that
-     * generation recovered) or fails (starting the next). Keys are only ever added per generation, so
-     * a late success or claim from an older generation cannot unfence a newer failure.
-     *
-     * @param  array{name: string, port: string, tls: bool}  $server
-     */
-    private function alternateSkipReason(array $server): ?string
-    {
-        unset($this->providerProbeClaims[self::providerBreakerKey($server)]);
-        if (self::providerBreakerSeconds() <= 0) {
-            return null;
-        }
-        try {
-            $generation = Cache::get(self::providerBreakerKey($server));
-            if (! is_string($generation) || $generation === ''
-                || Cache::has(self::providerBreakerKey($server, 'recovered', $generation))) {
-                return null;
-            }
-            if (Cache::has(self::providerBreakerKey($server, 'open', $generation))) {
-                return 'recent_provider_failure';
-            }
-            if (! Cache::add(self::providerBreakerKey($server, 'probe', $generation), true, self::providerProbeSeconds())) {
-                return 'provider_probe_in_progress';
-            }
-            $this->providerProbeClaims[self::providerBreakerKey($server)] = $generation;
-        } catch (Throwable) {
-            // Without the cache every job probes the provider itself, as before.
-        }
-
-        return null;
-    }
-
-    /** @param array{name: string, port: string, tls: bool} $server */
-    private function rememberAlternateUnavailable(array $server): void
-    {
-        unset($this->providerProbeClaims[self::providerBreakerKey($server)]);
-        $seconds = self::providerBreakerSeconds();
-        if ($seconds <= 0) {
-            return;
-        }
-        try {
-            $generation = bin2hex(random_bytes(16));
-            Cache::put(self::providerBreakerKey($server, 'open', $generation), true, $seconds);
-            Cache::put(self::providerBreakerKey($server), $generation, self::providerSuspectSeconds());
-        } catch (Throwable) {
-            // Without the cache every job probes the provider itself, as before.
-        }
-    }
-
-    /** @param array{name: string, port: string, tls: bool} $server */
-    private function rememberAlternateReachable(array $server): void
-    {
-        $generation = $this->providerProbeClaims[self::providerBreakerKey($server)] ?? null;
-        unset($this->providerProbeClaims[self::providerBreakerKey($server)]);
-        if ($generation === null) {
-            return;
-        }
-        try {
-            Cache::put(self::providerBreakerKey($server, 'recovered', $generation), true, self::providerSuspectSeconds());
-        } catch (Throwable) {
-            // The claim expires with the job timeout and another job re-probes.
-        }
-    }
-
-    /** @param array{name: string, port: string, tls: bool} $server */
-    private function releaseAlternateProbe(array $server): void
-    {
-        $generation = $this->providerProbeClaims[self::providerBreakerKey($server)] ?? null;
-        unset($this->providerProbeClaims[self::providerBreakerKey($server)]);
-        if ($generation === null) {
-            return;
-        }
-        try {
-            // Only this job could claim this generation, so dropping its claim affects no other job.
-            Cache::forget(self::providerBreakerKey($server, 'probe', $generation));
-        } catch (Throwable) {
-            // The claim expires with the job timeout.
-        }
-    }
-
-    private static function providerSuspectSeconds(): int
-    {
-        return max(3600, self::providerBreakerSeconds() * 4);
-    }
-
-    private static function providerBreakerSeconds(): int
-    {
-        return (int) config('nntmux_nntp.fingerprint_provider_breaker_seconds', 900);
-    }
-
-    /**
-     * A connect can retry many times, so the claim lasts as long as the job may run. A finished probe
-     * releases it at once; only a crashed prober leaves it to expire.
-     */
-    private static function providerProbeSeconds(): int
-    {
-        return CollectReleaseFingerprintMetadata::TIMEOUT_SECONDS;
-    }
-
-    /** @param array{name: string, port: string, tls: bool} $server */
-    private static function providerBreakerKey(array $server, string $state = 'generation', string $generation = ''): string
-    {
-        return 'release-fingerprint:provider-breaker:'.sha1(strtolower($server['name']).'|'.$server['port'].'|'.($server['tls'] ? 'tls' : 'plain'))
-            .':'.$state.($generation === '' ? '' : ':'.$generation);
     }
 
     /** @return array{string, string} */
