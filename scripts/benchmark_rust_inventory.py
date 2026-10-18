@@ -75,6 +75,11 @@ DECLARATIONS = {
     'nntmux_spot_check_sample_v1_json': ('caller-comparison', ('sample-planning',),
         ('app/Services/Releases/Verification/NativeSpotCheckPlanner.php',),
         'Public sample planner comparison includes native JSON bridge and setup.'),
+    'nntmux_header_filename_identity_v1': ('caller-comparison', ('filename-identity',),
+        ('app/Services/Releases/Verification/NativeHeaderFilenameIdentity.php',),
+        'Guarded candidate for HeaderFilenameIdentity::matches, not wired into production. The paired '
+        'PHP-versus-Rust+FFI benchmark (scripts/benchmark-filename-identity.php) runs in CI on x86 and ARM; '
+        'PHP stays authoritative until common-median and uncommon-p99 reach 1.5x.'),
     'rapidyenc_decode_ex': ('caller-comparison', ('php',), (DECODER,),
         'PHP decoder caller comparison; optional native ABI diagnostics are separate.'),
     'nntmux_yenc_decode_span_v1': ('caller-comparison', ('php',), (DECODER,),

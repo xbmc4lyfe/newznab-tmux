@@ -11,7 +11,11 @@ on:
       - 'scripts/composer-install-ci.sh'
       - 'app/Services/Releases/Fingerprint/**'
       - 'app/Services/Releases/Verification/*SpotCheckPlanner.php'
+      - 'app/Services/Releases/Verification/*HeaderFilenameIdentity.php'
       - 'docker/app/nzb-yenc-ffi/**'
+      - 'scripts/generate-header-filename-*'
+      - 'tests/Support/HeaderFilenameIdentityCorpus.php'
+      - 'tests/Unit/*FilenameIdentity*'
       - 'tests/Fixtures/*BenchmarkFixtures.php'
       - 'tests/Fixtures/par2/**'
       - 'tests/Unit/*BenchmarkTest.php'
@@ -249,5 +253,96 @@ jobs:
         with:
           name: native-utility-${{ matrix.kind }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: utility-evidence/
+          retention-days: 14
+          if-no-files-found: warn
+
+  # Continuous monitoring of the Rust candidate for HeaderFilenameIdentity::matches. A missed
+  # 1.5x threshold is a valid, reported result; only a parity or setup failure fails the job.
+  filename-identity:
+    name: filename-identity (${{ matrix.runner }})
+    if: github.event_name != 'workflow_dispatch' || inputs.comparison != 'date-cpp-screen'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    env:
+      RUST_TOOLCHAIN: '1.98.0'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: bcmath, dom, curl, exif, ffi, gd, intl, mbstring, mysqlnd, pdo, pdo_mysql, sqlite, pdo_sqlite, simplexml, sockets, xmlwriter, zip
+          coverage: none
+      - name: Cache Composer archives without authentication files
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/nntmux-composer-archives/files
+          key: composer-archives-v1-${{ hashFiles('composer.lock') }}
+      - name: Install locked dependencies without application boot
+        run: bash scripts/composer-install-ci.sh utility-evidence/install
+        env:
+          COMPOSER_CACHE_DIR: ${{ runner.temp }}/nntmux-composer-archives
+      - name: Verify the PHP rule, the golden corpus and the benchmark harness
+        run: |
+          php vendor/bin/phpunit --fail-on-skipped tests/Unit/HeaderFilenameIdentityTest.php tests/Unit/FilenameIdentityBenchmarkTest.php
+          php vendor/bin/phpunit --fail-on-skipped --filter='test_golden_fixture|test_corpus_is_deterministic|test_missing_library' tests/Unit/HeaderFilenameIdentityNativeTest.php
+      - name: Build and test optimized locked native library
+        shell: bash
+        run: |
+          mkdir -p filename-identity-evidence/build
+          source scripts/benchmark-rust-toolchain.sh
+          cargo +"$RUST_TOOLCHAIN" test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml header_filename 2>&1 | tee filename-identity-evidence/build/test.log
+          cargo +"$RUST_TOOLCHAIN" build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml --lib 2>&1 | tee filename-identity-evidence/build/build.log
+          python3 - <<'PY'
+          import json, os, pathlib, platform, subprocess
+          def run(*args):
+              return subprocess.check_output(args, text=True).strip()
+          pathlib.Path('filename-identity-evidence/runtime.json').write_text(json.dumps({
+              'rustc': run('rustup', 'run', os.environ['RUST_TOOLCHAIN'], 'rustc', '-Vv'),
+              'cargo': run('rustup', 'run', os.environ['RUST_TOOLCHAIN'], 'cargo', '-V'),
+              'architecture': platform.machine(),
+              'runner_image_version': os.environ.get('ImageVersion', ''),
+              'build_profile': 'release opt-level=3 lto=true codegen-units=1; cargo --locked; default features',
+          }, indent=2) + '\n')
+          PY
+      - name: Verify native verdict parity through the guarded PHP wrapper
+        env:
+          NNTMUX_TEST_NATIVE_LIBRARY: ${{ github.workspace }}/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so
+        run: php -d ffi.enable=true -d memory_limit=1G vendor/bin/phpunit --fail-on-skipped tests/Unit/HeaderFilenameIdentityNativeTest.php 2>&1 | tee filename-identity-evidence/parity.log
+      - name: Measure PHP versus Rust including FFI and report the result
+        shell: bash
+        run: |
+          set +e
+          php -d ffi.enable=true scripts/benchmark-filename-identity.php \
+            --native="$GITHUB_WORKSPACE/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so" \
+            --runtime-manifest="$GITHUB_WORKSPACE/filename-identity-evidence/runtime.json" \
+            --source-dir="$GITHUB_WORKSPACE" \
+            --output-dir="$GITHUB_WORKSPACE/filename-identity-evidence/benchmark" \
+            > filename-identity-evidence/console.log 2>&1
+          status=$?
+          set -e
+          echo "$status" > filename-identity-evidence/exit.txt
+          {
+            echo "### Runner: ${{ matrix.runner }}"
+            if [[ -f filename-identity-evidence/benchmark/summary.md ]]; then
+              cat filename-identity-evidence/benchmark/summary.md
+            else
+              echo 'Benchmark produced no summary; see the retained console log.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          # A missed threshold exits 0; 2 is an invalid run (parity or setup failure).
+          exit "$status"
+      - name: Retain observations and frozen evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: filename-identity-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: filename-identity-evidence/
           retention-days: 14
           if-no-files-found: warn

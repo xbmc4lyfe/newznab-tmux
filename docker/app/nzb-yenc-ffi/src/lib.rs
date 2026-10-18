@@ -17,6 +17,8 @@ mod article_identity;
 mod article_xref;
 pub mod cpu_snapshot;
 mod formats;
+mod header_filename_identity;
+mod header_filename_unicode;
 mod nntp_body;
 mod nntp_headers;
 mod par2;
@@ -45,6 +47,7 @@ const MAX_PAR2_SOURCE_RANGE_INPUT_BYTES: usize = 16 * 1024 * 1024 + 16 * 1024;
 const MAX_ARTICLE_IDENTITY_INPUT_BYTES: usize = 131_072;
 const MAX_ARTICLE_XREF_INPUT_BYTES: usize = 196_608;
 const MAX_NNTP_HEADER_INPUT_BYTES: usize = 131_072;
+const MAX_HEADER_FILENAME_INPUT_BYTES: usize = 4_096;
 
 /// Render bounded UTF-8 HTML rows separated by 0xFF (impossible inside UTF-8).
 /// The explicit byte length preserves embedded NULs. Free through the matching
@@ -821,6 +824,47 @@ pub unsafe extern "C" fn nntmux_spot_check_sample_v1_json(
             .unwrap_or(ptr::null_mut()),
         _ => ptr::null_mut(),
     }
+}
+
+/// Rust candidate for `HeaderFilenameIdentity::matches`. Returns 1 when the article filename is
+/// accepted, 0 when the declared subject filename contradicts it, and -1 for unusable input
+/// (null with a nonzero length, or an argument over 4 KiB, or a shape the port
+/// declines such as a valid non-ASCII executable name checked against an unquoted subject) so the
+/// caller keeps the PHP verdict.
+/// An invalid UTF-8 subject is a valid input: PHP's `/u` pattern fails there and rejects (0).
+///
+/// # Safety
+/// Each pointer must be readable for its length when that length is nonzero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_header_filename_identity_v1(
+    subject: *const u8,
+    subject_len: usize,
+    actual: *const u8,
+    actual_len: usize,
+) -> c_int {
+    if subject_len > MAX_HEADER_FILENAME_INPUT_BYTES
+        || actual_len > MAX_HEADER_FILENAME_INPUT_BYTES
+        || (subject_len > 0 && subject.is_null())
+        || (actual_len > 0 && actual.is_null())
+    {
+        return -1;
+    }
+    let subject: &[u8] = if subject_len == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller supplies readable input of the checked length.
+        unsafe { slice::from_raw_parts(subject, subject_len) }
+    };
+    let actual: &[u8] = if actual_len == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller supplies readable input of the checked length.
+        unsafe { slice::from_raw_parts(actual, actual_len) }
+    };
+    catch_unwind(|| header_filename_identity::matches(subject, actual))
+        .ok()
+        .flatten()
+        .map_or(-1, c_int::from)
 }
 
 /// Decode `src_length` bytes from `src` into `dest` and return the decoded length.
@@ -1897,6 +1941,50 @@ mod tests {
             assert!(!result.is_null());
             assert_eq!(std::ffi::CStr::from_ptr(result).to_bytes(), br#"[{"file_key":"f","totalparts":0,"totalparts_inferred":false,"number":1,"messageid":"m","bytes":2}]"#);
             nntmux_metadata_string_free(result);
+        }
+    }
+
+    #[test]
+    fn header_filename_identity_abi_checks_input_bounds_and_returns_verdicts() {
+        unsafe {
+            let subject = br#"[1/9] - "Readable.Release.Name.mkv" yEnc"#;
+            let same = b"Readable.Release.Name.mkv";
+            let other = b"Different.Release.mkv";
+            let call = |s: &[u8], a: &[u8]| {
+                nntmux_header_filename_identity_v1(s.as_ptr(), s.len(), a.as_ptr(), a.len())
+            };
+            assert_eq!(call(subject, same), 1);
+            assert_eq!(call(subject, other), 0);
+            // Empty arguments need no pointer; an invalid UTF-8 subject is rejected like PHP.
+            assert_eq!(
+                nntmux_header_filename_identity_v1(ptr::null(), 0, ptr::null(), 0),
+                1
+            );
+            assert_eq!(call(b"\"a\xff.mkv\"", other), 0);
+            assert_eq!(
+                nntmux_header_filename_identity_v1(ptr::null(), 1, same.as_ptr(), same.len()),
+                -1
+            );
+            assert_eq!(
+                nntmux_header_filename_identity_v1(subject.as_ptr(), subject.len(), ptr::null(), 1),
+                -1
+            );
+            let oversized = vec![b'a'; MAX_HEADER_FILENAME_INPUT_BYTES + 1];
+            assert_eq!(call(&oversized, same), -1);
+            assert_eq!(call(subject, &oversized), -1);
+            assert_eq!(call(&oversized[..MAX_HEADER_FILENAME_INPUT_BYTES], same), 0);
+            // A valid non-ASCII executable name against an unquoted subject needs PCRE's Unicode
+            // case folding, so the port declines; ASCII and invalid UTF-8 names are decided.
+            assert_eq!(
+                call(
+                    "Release \u{e9}.exe yEnc".as_bytes(),
+                    "\u{e9}.exe".as_bytes()
+                ),
+                -1
+            );
+            assert_eq!(call(b"Release yEnc", b"a\xff.exe"), 0);
+            assert_eq!(call(b"Release setup.exe yEnc", b"SETUP.EXE"), 1);
+            assert_eq!(call(b"Release yEnc", b"setup.exe"), 0);
         }
     }
 }
