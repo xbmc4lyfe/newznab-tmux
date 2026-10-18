@@ -11,7 +11,8 @@ namespace App\Services\Releases\Verification;
  */
 final class HeaderFilenameIdentity
 {
-    private const string QUOTED = '/"([^"\r\n]+)"|(?<![\p{L}\p{N}_])\'([^\'\r\n]+)\'(?![\p{L}\p{N}_])/u';
+    // A single-quoted name may contain apostrophes (O'Brien's): only a quote not followed by a word character closes it.
+    private const string QUOTED = '/"([^"\r\n]+)"|(?<![\p{L}\p{N}_])\'([^\r\n]+?)\'(?![\p{L}\p{N}_])/u';
 
     private const string SUFFIX = '/\A(?:part\d+|vol\d+[+-]\d+|par2|rar|r\d{2,3}|\d{3}|7z|zip|tar|gz|tgz|xz|bz2|zst|mkv|avi|mp4|m4v|ts|nfo|sfv|nzb|epub|pdf|flac|mp3|iso|srt|txt|jpg|png)\z/i';
 
@@ -35,7 +36,7 @@ final class HeaderFilenameIdentity
             $unquoted = preg_match_all('/\.([A-Za-z0-9+]{1,8})(?![\p{L}\p{N}_])/u', $head, $extensions) > 0
                 ? (string) end($extensions[1]) : '';
 
-            return self::sameParity($unquoted, $actual) && (! self::executable($actual)
+            return self::sameParity([$unquoted], $actual) && (! self::executable($actual)
                 // The subject must name the body itself, not a longer file such as body.exe.mkv.
                 || preg_match('/(?<![\p{L}\p{N}_])'.preg_quote($actual, '/').'(?![\p{L}\p{N}_]|[.\-]+[\p{L}\p{N}])/iu', $subject) === 1);
         }
@@ -65,7 +66,7 @@ final class HeaderFilenameIdentity
         }
         // Parity and payload are not interchangeable: a declared PAR2 file is not payload evidence, and a
         // declared payload file is not satisfied by a PAR2 body, even when another quoted value names it.
-        if (! self::sameParity(self::extension(self::trimmed($declared)), $actual)) {
+        if (! self::sameParity([self::extension(self::trimmed($declared)), self::extension(self::bare($declared))], $actual)) {
             return false;
         }
         if (in_array($actual, $quoted, true)) {
@@ -106,14 +107,20 @@ final class HeaderFilenameIdentity
      * Whether a sampled article name is evidence of a source payload: a non-PAR2 name with an extension, or
      * a readable extensionless name such as README, but never an obfuscated extensionless token.
      */
-    /** Whether a body agrees with a declared extension on being parity or payload, in every filesystem form. */
-    private static function sameParity(string $declaredExtension, string $actual): bool
+    /**
+     * Whether a body agrees with every declared extension on being parity or payload, in every filesystem form.
+     *
+     * @param  list<string>  $declaredExtensions
+     */
+    private static function sameParity(array $declaredExtensions, string $actual): bool
     {
-        $declaredExtension = strtolower($declaredExtension);
-        foreach ([self::trimmed($actual), self::bare($actual)] as $form) {
-            $bodyExtension = strtolower(self::extension($form));
-            if ($declaredExtension !== '' && $bodyExtension !== '' && ($declaredExtension === 'par2') !== ($bodyExtension === 'par2')) {
-                return false;
+        foreach ($declaredExtensions as $declaredExtension) {
+            $declaredExtension = strtolower($declaredExtension);
+            foreach ([self::trimmed($actual), self::bare($actual)] as $form) {
+                $bodyExtension = strtolower(self::extension($form));
+                if ($declaredExtension !== '' && $bodyExtension !== '' && ($declaredExtension === 'par2') !== ($bodyExtension === 'par2')) {
+                    return false;
+                }
             }
         }
 
@@ -127,7 +134,7 @@ final class HeaderFilenameIdentity
         }
 
         return preg_match('/\.[A-Za-z0-9]{1,8}\z/', self::trimmed($name)) === 1
-            || ($name !== '' && ! str_contains($name, '.') && ! self::opaque($name) && preg_match('/[\p{L}]/u', $name) === 1);
+            || (($bare = self::trimmed($name)) !== '' && ! str_contains($bare, '.') && ! self::opaque($bare) && preg_match('/\p{L}/u', $bare) === 1);
     }
 
     /** An opaque token that is long or hexadecimal, too random to be a misread title. */

@@ -27,7 +27,8 @@ class HeaderFilenameIdentityTest extends TestCase
             foreach (['[1/1]'.str_repeat(' ', 990).'"a"', str_repeat('"a" ', 250), '"a'.str_repeat('.rar', 248).'"',
                 str_repeat("'", 1000), '"'.str_repeat('Ab1', 330).'" yEnc',
                 '[1/1]'.str_repeat(' ', 667).'x'.str_repeat('"a"', 111), '"a'.str_repeat('.ts', 332).'x" yEnc',
-                '"a'.str_repeat('.7z', 332).'x" yEnc', '"a'.str_repeat('.r00', 249).'x" yEnc', '"'.str_repeat('A', 990).'b" yEnc'] as $subject) {
+                '"a'.str_repeat('.7z', 332).'x" yEnc', '"a'.str_repeat('.r00', 249).'x" yEnc', '"'.str_repeat('A', 990).'b" yEnc',
+                str_repeat(" 'a", 333), str_repeat("'a ", 333)] as $subject) {
                 HeaderFilenameIdentity::matches($subject, 'Readable.Name.mkv');
                 self::assertSame(PREG_NO_ERROR, preg_last_error(), substr($subject, 0, 20));
             }
@@ -175,6 +176,9 @@ class HeaderFilenameIdentityTest extends TestCase
             'unquoted payload subject with a parity body' => ['[1/5] - payload.part1.rar yEnc (1/50)', 'set.vol00+01.par2', false],
             'unquoted parity subject with a parity body' => ['[2/5] - set.vol00+01.par2 yEnc (1/2)', 'set.vol00+01.par2', true],
             'unquoted payload subject with a payload body' => ['Movie 2026 [1/5] - payload.part1.rar yEnc (1/50)', 'payload.part1.rar', true],
+            'declared stream form hides a parity file' => ['"set.par2:payload.mkv" yEnc - "payload.mkv"', 'payload.mkv', false],
+            'apostrophes inside a single-quoted name' => ["[1/1] - 'O'Brien's Movie.mkv' yEnc", 'Unrelated.Title.mkv', false],
+            'apostrophes inside a matching single-quoted name' => ["[1/1] - 'O'Brien's Movie.mkv' yEnc", "O'Brien's Movie.mkv", true],
             'opaque subject with an extensionless body' => ['[3/8] - "o9aeI3YpDwgHGoJ2ZsCm.vol00+01.par2" yEnc', '148f76878d7732b981734a9e0c51a348', true],
         ];
     }
