@@ -117,13 +117,30 @@ final class PublicationOutbox
     public function depth(): int
     {
         $count = count($this->names($this->root.'/pending'));
-        foreach (@scandir($this->root.'/inflight') ?: [] as $slot) {
-            if ($slot !== '.' && $slot !== '..' && is_dir($this->root.'/inflight/'.$slot)) {
-                $count += count($this->names($this->root.'/inflight/'.$slot));
-            }
+        foreach ($this->slotDirectories() as $directory) {
+            $count += count($this->names($directory));
         }
 
         return $count;
+    }
+
+    /**
+     * The in-flight folders, never following a link: a symlinked slot would lead scans, sweeps and
+     * adoption outside the outbox.
+     *
+     * @return list<string>
+     */
+    private function slotDirectories(): array
+    {
+        $directories = [];
+        foreach (@scandir($this->root.'/inflight') ?: [] as $slot) {
+            $path = $this->root.'/inflight/'.$slot;
+            if ($slot !== '.' && $slot !== '..' && ! is_link($path) && is_dir($path)) {
+                $directories[] = $path;
+            }
+        }
+
+        return $directories;
     }
 
     /** Whether some forwarder touched its alive file within $window seconds. */
@@ -267,11 +284,7 @@ final class PublicationOutbox
             if (! $expired && ($room <= 0 || $entry->notBefore > $now)) {
                 continue;
             }
-            $path = $this->inflightDirectory($slot).'/'.$entry->name;
-            if (! @rename($entry->path, $path)) {
-                continue;
-            }
-            $claimed = $this->read($path);
+            $claimed = $this->claimOne($slot, $entry, $now);
             if ($claimed === null) {
                 continue;
             }
@@ -282,6 +295,31 @@ final class PublicationOutbox
         }
 
         return $taken;
+    }
+
+    /**
+     * Claim one listed entry by renaming it into forwarder $slot's folder. The listing may be stale:
+     * between it and the rename another forwarder can have claimed the entry, failed it and requeued
+     * it with a backoff. The document that was actually won is read again, and one that is not yet due
+     * (and not expired) goes straight back to pending, unpublished.
+     */
+    public function claimOne(int $slot, PublicationOutboxEntry $listed, float $now): ?PublicationOutboxEntry
+    {
+        $path = $this->inflightDirectory($slot).'/'.$listed->name;
+        if (! @rename($listed->path, $path)) {
+            return null;
+        }
+        $claimed = $this->read($path);
+        if ($claimed === null) {
+            return null;
+        }
+        if ($claimed->notBefore > $now && ! $claimed->olderThan(self::maxAgeSeconds(), $now)) {
+            @rename($path, $listed->path);
+
+            return null;
+        }
+
+        return $claimed;
     }
 
     /**
@@ -307,7 +345,8 @@ final class PublicationOutbox
     {
         $slots = [];
         foreach (@scandir($this->root.'/inflight') ?: [] as $folder) {
-            if (preg_match('/\A[1-9]\d*\z/D', $folder) === 1 && (int) $folder !== $except && $this->names($this->root.'/inflight/'.$folder) !== []) {
+            if (preg_match('/\A[1-9]\d*\z/D', $folder) === 1 && (int) $folder !== $except && ! is_link($this->root.'/inflight/'.$folder)
+                && $this->names($this->root.'/inflight/'.$folder) !== []) {
                 $slots[] = (int) $folder;
             }
         }
@@ -323,6 +362,9 @@ final class PublicationOutbox
     {
         $moved = 0;
         $directory = $this->inflightDirectory($slot);
+        if (is_link($directory)) {
+            return 0;
+        }
         foreach ($this->names($directory) as $name) {
             if (@rename($directory.'/'.$name, $this->root.'/pending/'.$name)) {
                 $moved++;
@@ -397,30 +439,41 @@ final class PublicationOutbox
         return false;
     }
 
-    /** Delete stray temporary files that a crashed writer left behind, and old quarantined entries. */
-    public function sweepTemporaryFiles(int $olderThanSeconds = 600): void
+    /**
+     * Stray temporary files that a crashed writer left behind for longer than $olderThanSeconds, and
+     * quarantined entries past their retention. Reads only; links are never followed.
+     *
+     * @return list<string>
+     */
+    public function staleFiles(int $olderThanSeconds = 600): array
     {
         $now = time();
+        $stale = [];
         foreach (@scandir($this->root.'/failed') ?: [] as $file) {
             $path = $this->root.'/failed/'.$file;
-            if ($file !== '.' && $file !== '..' && is_file($path) && ($modified = @filemtime($path)) !== false && $now - $modified > self::QUARANTINE_SECONDS) {
-                @unlink($path);
+            if ($file !== '.' && $file !== '..' && ! is_link($path) && is_file($path) && ($modified = @filemtime($path)) !== false
+                && $now - $modified > self::QUARANTINE_SECONDS) {
+                $stale[] = $path;
             }
         }
-        $directories = [$this->root.'/pending'];
-        foreach (@scandir($this->root.'/inflight') ?: [] as $slot) {
-            if ($slot !== '.' && $slot !== '..' && is_dir($this->root.'/inflight/'.$slot)) {
-                $directories[] = $this->root.'/inflight/'.$slot;
-            }
-        }
-        foreach ($directories as $directory) {
+        foreach ([$this->root.'/pending', ...$this->slotDirectories()] as $directory) {
             foreach (@scandir($directory) ?: [] as $file) {
                 $path = $directory.'/'.$file;
                 if (str_starts_with($file, '.') && str_ends_with($file, '.tmp') && is_file($path) && ! is_link($path)
                     && ($modified = @filemtime($path)) !== false && $now - $modified > $olderThanSeconds) {
-                    @unlink($path);
+                    $stale[] = $path;
                 }
             }
+        }
+
+        return $stale;
+    }
+
+    /** Delete what {@see staleFiles()} lists (the caller must hold the worker group). */
+    public function sweepTemporaryFiles(int $olderThanSeconds = 600): void
+    {
+        foreach ($this->staleFiles($olderThanSeconds) as $path) {
+            @unlink($path);
         }
     }
 

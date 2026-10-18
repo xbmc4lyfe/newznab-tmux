@@ -71,6 +71,11 @@ class ForwardVerifiedPublications extends Command
 
     private float $nextJoin = 0.0;
 
+    /** Monotonic start of the run and its length, so a request loop stops when the run's time is up. */
+    private int $runStarted = 0;
+
+    private int $runSeconds = 0;
+
     /** Items per request; lowered when the primary advertises a smaller limit. */
     private int $limit = 16;
 
@@ -151,7 +156,8 @@ class ForwardVerifiedPublications extends Command
 
     private function loop(RemoteReleasePublisher $publisher, int $maxSeconds): void
     {
-        $started = hrtime(true);
+        $started = $this->runStarted = hrtime(true);
+        $this->runSeconds = $maxSeconds;
         $maxPasses = max(0, (int) $this->option('passes'));
         $nextMaintenance = 0.0;
         $nextMark = 0.0;
@@ -327,11 +333,14 @@ class ForwardVerifiedPublications extends Command
         // Forget the renewals of entries that have left the outbox.
         $this->beats = array_intersect_key($this->beats, array_flip(array_map(static fn (PublicationOutboxEntry $entry): string => $entry->name, $queued)));
         $due = $this->leasesDue($queued);
-        if ($foreign === [] && $due === []) {
+        $stale = $this->outbox->staleFiles();
+        if ($foreign === [] && $due === [] && $stale === []) {
             return;
         }
-        $this->inGroup(function () use ($foreign, $due): void {
-            $this->outbox->sweepTemporaryFiles();
+        $this->inGroup(function () use ($foreign, $due, $stale): void {
+            if ($stale !== []) {
+                $this->outbox->sweepTemporaryFiles();
+            }
             foreach ($foreign as $other) {
                 // Only a number whose lock is free is orphaned; a running forwarder keeps its own folder.
                 $this->locks->withForwarderNumber($other, function () use ($other): void {
@@ -403,21 +412,40 @@ class ForwardVerifiedPublications extends Command
     private function tick(array $live, int $completed): void
     {
         try {
+            // A lost database session means a reset or another forwarder may own the storage now.
+            if (! $this->ownsLocks()) {
+                return;
+            }
             $this->outbox->touchAliveIfStale($this->slot, self::MARKER_SECONDS);
-            $this->renewLeases($this->leasesDue(array_slice($live, $completed)));
+            // Everything queued, not just this batch: a long fallback keeps the whole loop from running.
+            // Items of this batch that already have an outcome need no renewal.
+            $done = array_flip(array_map(static fn (PublicationOutboxEntry $entry): string => $entry->name, array_slice($live, 0, $completed)));
+            $queued = array_filter([...$this->outbox->pending(), ...$this->outbox->inflight($this->slot)],
+                static fn (PublicationOutboxEntry $entry): bool => ! isset($done[$entry->name]));
+            $this->renewLeases($this->leasesDue(array_values($queued)));
         } catch (Throwable) {
             // Best effort; the request itself is what matters.
         }
     }
 
-    /** Whether SIGTERM or SIGINT arrived: no further request should start. */
+    /** Whether this process still holds the worker group and its forwarder lock (a database lock ends with its session). */
+    private function ownsLocks(): bool
+    {
+        return $this->joined && $this->locks->held() && $this->locks->forwarderHeld();
+    }
+
+    /**
+     * Whether no further request should start: SIGTERM or SIGINT arrived, the run's time is up (only
+     * the request under way may finish, so the group is never held far past the lifetime), or the
+     * locks were lost.
+     */
     private function shouldStop(): bool
     {
         if (function_exists('pcntl_signal_dispatch')) {
             pcntl_signal_dispatch();
         }
 
-        return $this->terminate;
+        return $this->terminate || (hrtime(true) - $this->runStarted) / 1e9 >= $this->runSeconds || ! $this->ownsLocks();
     }
 
     /** @param list<PublicationOutboxEntry> $batch */
@@ -437,6 +465,8 @@ class ForwardVerifiedPublications extends Command
         }
         $this->outbox->touchAlive($this->slot);
         $started = hrtime(true);
+        $failure = null;
+        $outcomes = [];
         try {
             $outcomes = $publisher->publishMany(array_map(static fn (PublicationOutboxEntry $entry) => $entry->item(), $live),
                 fn (int $completed) => $this->tick($live, $completed), fn (): bool => $this->shouldStop());
@@ -444,20 +474,28 @@ class ForwardVerifiedPublications extends Command
                 throw new RuntimeException('The primary answered a different number of results than were sent.');
             }
         } catch (Throwable $error) {
+            $failure = $error;
+        }
+        $this->diagnostics?->batch(count($live), $started, hrtime(true), $failure !== null);
+        // The request may have outlived the database session that held the locks. Then nothing may be
+        // written: the entries stay in flight, to be replayed (the primary treats a resend idempotently)
+        // or left to lease expiry, once the storage has an owner again.
+        if (! $this->ownsLocks()) {
+            $this->diagnostics?->stop('locks_lost');
+
+            throw new RuntimeException('Publication forwarder locks were lost.');
+        }
+        $this->outbox->touchAlive($this->slot);
+        $this->adaptToPrimary($publisher);
+        if ($failure !== null) {
             // No per-item answer: the primary treats a resent item idempotently, so all of them may be sent again.
             // An unreachable primary processed nothing, which is no failure of the entry.
-            $this->diagnostics?->batch(count($live), $started, hrtime(true), true);
-            $this->outbox->touchAlive($this->slot);
-            $this->adaptToPrimary($publisher);
             foreach ($live as $entry) {
-                $this->retry($entry, $error->getMessage(), counted: ! $error instanceof ConnectionException);
+                $this->retry($entry, $failure->getMessage(), counted: ! $failure instanceof ConnectionException);
             }
 
             return;
         }
-        $this->diagnostics?->batch(count($live), $started, hrtime(true), false);
-        $this->outbox->touchAlive($this->slot);
-        $this->adaptToPrimary($publisher);
         foreach ($live as $position => $entry) {
             $this->settle($entry, $outcomes[$position]);
         }
