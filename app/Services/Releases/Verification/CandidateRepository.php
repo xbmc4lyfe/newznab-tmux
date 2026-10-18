@@ -299,7 +299,8 @@ final class CandidateRepository
                 if ($previous !== null) {
                     // The new generation now holds the retained inventory and its capacity, and becomes the
                     // only candidate that may upgrade the partial; an already expired one settles it.
-                    DB::table('release_verification_candidates')->where('id', $previous->id)->update(['manifest_path' => '', 'manifest_bytes' => 0]);
+                    DB::table('release_verification_candidates')->where('id', $previous->id)->update(['manifest_path' => '', 'manifest_bytes' => 0]
+                        + (self::tracksRetention() ? ['retained_for_release_id' => null] : []));
                     if ($merges && Release::hasLateArticleFlag()) {
                         DB::table('releases')->where('id', $previous->release_id)->where('late_article_candidate_id', $previous->id)
                             ->update(['late_article_candidate_id' => $expired ? null : $holderId]);
@@ -745,6 +746,18 @@ final class CandidateRepository
     /** @var \WeakMap<\PDO, bool>|null */
     private static ?\WeakMap $upgradeColumnSupport = null;
 
+    /** @var \WeakMap<\PDO, bool>|null */
+    private static ?\WeakMap $retentionColumnSupport = null;
+
+    /** Whether candidates record the release their retained inventory awaits late articles for. */
+    public static function tracksRetention(): bool
+    {
+        $pdo = DB::connection()->getPdo();
+        self::$retentionColumnSupport ??= new \WeakMap;
+
+        return self::$retentionColumnSupport[$pdo] ??= Schema::hasColumn('release_verification_candidates', 'retained_for_release_id');
+    }
+
     /** Whether candidates record the partial release a pending generation upgrades. */
     private static function tracksUpgrades(): bool
     {
@@ -878,37 +891,39 @@ final class CandidateRepository
         $now = now();
         $cutoff = $now->copy()->subHours($hours)->format('Y-m-d H:i:s');
         // The verification_due index serves the status / next_attempt_at order.
-        $rows = DB::table('release_verification_candidates')->where('status', 'waiting_upload')
+        $ids = DB::table('release_verification_candidates')->where('status', 'waiting_upload')
             ->where('next_attempt_at', '<=', $now)->whereNull('release_id')->whereNull('lease_token')
-            ->orderBy('next_attempt_at')->orderBy('id')->limit(max(1, $limit))
-            ->get(['id', 'last_unique_at', 'next_attempt_at']);
-        $eligible = [];
-        foreach ($rows as $row) {
-            if ($row->last_unique_at < $cutoff) {
-                $eligible[] = (int) $row->id;
-
-                continue;
-            }
-            DB::table('release_verification_candidates')->where('id', $row->id)->where('status', 'waiting_upload')
-                ->where('next_attempt_at', $row->next_attempt_at)->whereNull('release_id')->whereNull('lease_token')
-                ->update(['next_attempt_at' => Carbon::parse($row->last_unique_at)->addHours($hours)->format('Y-m-d H:i:s')]);
-        }
-        if ($eligible === []) {
+            ->orderBy('next_attempt_at')->orderBy('id')->limit(max(1, $limit))->pluck('id')->all();
+        if ($ids === []) {
             return 0;
         }
 
-        return DB::transaction(function () use ($eligible, $cutoff, $now): int {
+        return DB::transaction(function () use ($ids, $cutoff, $now, $hours): int {
             // Skip rows ingestion holds rather than wait on them in an order it does not share. The
             // predicates are rechecked under the lock: a new article since the read keeps it waiting.
-            $query = DB::table('release_verification_candidates')->whereIn('id', $eligible)->where('status', 'waiting_upload')
-                ->whereNull('release_id')->whereNull('lease_token')->where('last_unique_at', '<', $cutoff)->orderBy('id');
-            $locked = (in_array(DB::getDriverName(), ['mysql', 'mariadb'], true) ? $query->lock('for update skip locked') : $query->lockForUpdate())
-                ->pluck('id')->all();
-            if ($locked === []) {
+            $query = DB::table('release_verification_candidates')->whereIn('id', $ids)->where('status', 'waiting_upload')
+                ->where('next_attempt_at', '<=', $now)->whereNull('release_id')->whereNull('lease_token')->orderBy('id');
+            $rows = (in_array(DB::getDriverName(), ['mysql', 'mariadb'], true) ? $query->lock('for update skip locked') : $query->lockForUpdate())
+                ->get(['id', 'last_unique_at', 'reason']);
+            $eligible = [];
+            foreach ($rows as $row) {
+                if (str_starts_with((string) ($row->reason ?? ''), self::PARTIAL_DEFERRED)) {
+                    // Already tried and refused by policy: only new headers change that.
+                    DB::table('release_verification_candidates')->where('id', $row->id)
+                        ->update(['next_attempt_at' => $now->copy()->addHours(max(1, (int) config('release_verification.expiry_hours')))->format('Y-m-d H:i:s')]);
+                } elseif ($row->last_unique_at < $cutoff) {
+                    $eligible[] = (int) $row->id;
+                } else {
+                    // Still inside the hold window: due again at its end, so each is read about once per window.
+                    DB::table('release_verification_candidates')->where('id', $row->id)
+                        ->update(['next_attempt_at' => Carbon::parse($row->last_unique_at)->addHours($hours)->format('Y-m-d H:i:s')]);
+                }
+            }
+            if ($eligible === []) {
                 return 0;
             }
 
-            return DB::table('release_verification_candidates')->whereIn('id', $locked)->update(['status' => 'ready',
+            return DB::table('release_verification_candidates')->whereIn('id', $eligible)->update(['status' => 'ready',
                 'next_attempt_at' => $now->format('Y-m-d H:i:s'),
                 'reason' => self::PARTIAL_QUEUED]);
         });
@@ -920,7 +935,9 @@ final class CandidateRepository
         DB::table('release_verification_candidates')->where('id', $claim->id)->where('lease_token', $claim->lease_token)
             ->where('version', $claim->version)->whereNull('release_id')->update(['status' => 'waiting_upload',
                 'reason' => mb_strcut(self::PARTIAL_DEFERRED.$reason, 0, 2000, 'UTF-8'), 'lease_token' => null, 'lease_until' => null,
-                'next_attempt_at' => now()->addHours(max(1, (int) config('release_verification.partial_after_hours', 4)))]);
+                // Its policy outcome depends only on its headers and configuration: retrying it each hold window
+                // would spot check it again for the same result. New headers requeue it; expiry ends it.
+                'next_attempt_at' => now()->addHours(max(1, (int) config('release_verification.expiry_hours')))]);
     }
 
     /**
@@ -1176,23 +1193,18 @@ final class CandidateRepository
     }
 
     /**
-     * Published candidates still retaining a partial's inventory, past the cutoff, after this id. Each is the
-     * candidate its release's late-article pointer names, so the pointer index finds the few there are
-     * instead of a scan of every candidate.
+     * Published candidates still retaining a partial's inventory, past the cutoff, after this id. Each records
+     * the release it retains for, so its index finds the few there are, including those whose release was
+     * deleted meanwhile, instead of a scan of every candidate.
      *
      * @return Collection<int, string|null>
      */
     private function retainedPartials(string $cutoff, int $after): Collection
     {
-        if (! Release::hasLateArticleFlag()) {
-            return DB::table('release_verification_candidates')->whereNotNull('release_id')->where('manifest_path', '<>', '')
-                ->where('last_unique_at', '<', $cutoff)->where('id', '>', $after)->orderBy('id')->limit(100)->pluck('source_identity', 'id');
-        }
-
-        return DB::table('releases as r')->join('release_verification_candidates as c', 'c.id', '=', 'r.late_article_candidate_id')
-            ->where('r.late_article_candidate_id', '>', $after)->whereColumn('c.release_id', 'r.id')->where('c.manifest_path', '<>', '')
-            ->where('c.last_unique_at', '<', $cutoff)->orderBy('r.late_article_candidate_id')->limit(100)
-            ->pluck('c.source_identity', 'c.id');
+        return DB::table('release_verification_candidates')
+            ->when(self::tracksRetention(), fn ($query) => $query->whereNotNull('retained_for_release_id'))
+            ->whereNotNull('release_id')->where('manifest_path', '<>', '')
+            ->where('last_unique_at', '<', $cutoff)->where('id', '>', $after)->orderBy('id')->limit(100)->pluck('source_identity', 'id');
     }
 
     /** Release one retained inventory unless its upload has late headers still waiting to be archived. */
@@ -1210,7 +1222,8 @@ final class CandidateRepository
             if ($row === null || $row->release_id === null || $row->manifest_path === '' || $row->last_unique_at >= $cutoff) {
                 return false;
             }
-            DB::table('release_verification_candidates')->where('id', $id)->update(['manifest_path' => '', 'manifest_bytes' => 0]);
+            DB::table('release_verification_candidates')->where('id', $id)->update(['manifest_path' => '', 'manifest_bytes' => 0]
+                + (self::tracksRetention() ? ['retained_for_release_id' => null] : []));
             if (Release::hasLateArticleFlag()) {
                 // No late articles can merge any more: workers that read NZBs may now process it.
                 DB::table('releases')->where('id', $row->release_id)->where('late_article_candidate_id', $id)->update(['late_article_candidate_id' => null]);

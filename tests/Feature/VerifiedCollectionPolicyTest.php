@@ -862,6 +862,22 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
             'A promotion backlog cannot keep its inventory indefinitely.');
     }
 
+    public function test_a_deleted_partials_retained_inventory_is_still_released_at_expiry(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, sha1('deleted-retained', true)));
+        $this->assertGreaterThan(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
+        DB::table('releases')->where('id', $first)->delete();
+
+        $this->travel((int) config('release_verification.expiry_hours') + 1)->hours();
+        $this->limits();
+        app(CandidateRepository::class)->expire();
+
+        $this->assertSame(['', 0, null], [DB::table('release_verification_candidates')->value('manifest_path'),
+            (int) DB::table('release_verification_candidates')->value('manifest_bytes'), DB::table('release_verification_candidates')->value('retained_for_release_id')]);
+        $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'), 'No capacity leaks with the release.');
+    }
+
     public function test_retained_expiry_pages_past_rows_held_by_pending_late_headers(): void
     {
         $this->publicationSchema(partialColumns: true);
@@ -869,7 +885,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $cutoff = now()->subHours((int) config('release_verification.expiry_hours') + 1)->format('Y-m-d H:i:s');
         $row = static fn (int $n): array => ['identity' => sha1('held-'.$n), 'source_identity' => sha1('held-'.$n), 'groups_id' => 1,
             'manifest_path' => hash('sha256', 'held-'.$n).'.json.gz', 'manifest_bytes' => 0, 'manifest_hash' => hash('sha256', 'held-'.$n), 'status' => 'sampled',
-            'version' => 1, 'last_unique_at' => $cutoff, 'next_attempt_at' => $cutoff, 'release_id' => 100000 + $n];
+            'version' => 1, 'last_unique_at' => $cutoff, 'next_attempt_at' => $cutoff, 'release_id' => 100000 + $n, 'retained_for_release_id' => 100000 + $n];
         // Each retained partial is the candidate its release's late-article pointer names.
         $retain = function (int $n) use ($row): void {
             $id = DB::table('release_verification_candidates')->insertGetId($row($n));
@@ -1125,8 +1141,16 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame('waiting_upload', $candidate->status, 'Later articles may still satisfy the policy.');
         $this->assertNotSame('', $candidate->manifest_path);
         $this->assertNull($candidate->lease_token);
-        $this->assertSame(0, $repository->promotePartial(10), 'It waits one more hold window.');
+        $this->assertSame(0, $repository->promotePartial(10));
+        $this->travel(5)->hours();
+        $this->assertSame(0, $repository->promotePartial(10), 'Not spot checked again for the same policy outcome.');
         $this->assertSame(0, DB::table('releases')->count());
+
+        // New headers requeue it.
+        $repository->archive($this->collectionForPolicy('movie.mkv', 3, hex2bin($candidate->source_identity), part: 2, messageId: 'c@d'));
+        $requeued = DB::table('release_verification_candidates')->where('id', $candidate->id)->first();
+        $this->assertFalse(str_starts_with((string) $requeued->reason, 'Partial publication deferred:'));
+        $this->assertLessThanOrEqual(now()->format('Y-m-d H:i:s'), $requeued->next_attempt_at);
     }
 
     public function test_partial_policy_counts_only_files_written_to_the_nzb(): void

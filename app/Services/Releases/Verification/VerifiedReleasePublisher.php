@@ -524,7 +524,8 @@ final class VerifiedReleasePublisher
         $values = ['release_id' => $releaseId, 'status' => $result->verdict, 'reason' => $result->reason,
             'verified_at' => now(), 'lease_token' => null, 'lease_until' => null];
         if ($retainManifest) {
-            DB::table('release_verification_candidates')->where('id', $candidateId)->update($values);
+            DB::table('release_verification_candidates')->where('id', $candidateId)->update($values
+                + (CandidateRepository::tracksRetention() ? ['retained_for_release_id' => $releaseId] : []));
 
             return;
         }
