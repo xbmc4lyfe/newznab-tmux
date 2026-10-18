@@ -32,7 +32,7 @@ final class BackfillReleaseFingerprintMetadata extends Command
                     ->orWhereHas('fingerprintMetadata', static function (Builder $metadata): void {
                         $format = CollectReleaseFingerprintMetadata::currentFormat();
                         $metadata->where('status', '!=', 'complete')
-                            ->orWhere('metadata->schema_version', '<', CollectReleaseFingerprintMetadata::currentSchemaVersion())
+                            ->orWhere('metadata->schema_version', '!=', CollectReleaseFingerprintMetadata::currentSchemaVersion())
                             ->orWhereNull('metadata->schema_version');
                         if ($format === null) {
                             $metadata->orWhereNotNull('metadata->format');

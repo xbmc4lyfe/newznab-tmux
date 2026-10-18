@@ -33,6 +33,7 @@ final class CompactFingerprintCollector
 
     private const MAX_LISTED_FILES = 200;
 
+    /** Maximum UTF-8 bytes kept from any name. */
     private const MAX_NAME_LENGTH = 120;
 
     private const MAX_LISTED_GROUPS = 20;
@@ -171,7 +172,9 @@ final class CompactFingerprintCollector
                     }
                     if ($par2 === null && $sample['kind'] === 'par2' && ($yenc['crc_ok'] ?? null) !== false
                         && is_string($analysis['decoded_bytes'] ?? null)) {
-                        $par2 = $this->par2Summary($analysis['decoded_bytes'], $files);
+                        $summary = $this->par2Summary($analysis['decoded_bytes'], $files);
+                        // A body without usable PAR2 packets must not block later volumes.
+                        $par2 = $summary !== null && ($summary['set_id'] !== null || $summary['files'] !== []) ? $summary : null;
                     }
                 } catch (Throwable $exception) {
                     $providers[$account]['retrieval_ms'][] = (int) round((hrtime(true) - $started) / 1_000_000);
@@ -232,25 +235,39 @@ final class CompactFingerprintCollector
     }
 
     /**
-     * Halve the NZB and PAR2 file lists until the record fits MAX_RECORD_BYTES; every other field is
-     * already bounded by sample, group and name limits.
+     * Shrink the record in stages until it fits MAX_RECORD_BYTES as stored (default JSON escaping):
+     * halve the file lists, then drop groups, then drop per-article names, then halve the article
+     * list. The last stage always terminates, and everything left is bounded by count.
      *
      * @param  array<string, mixed>  $record
      * @return array<string, mixed>
      */
     private static function withinBudget(array $record): array
     {
-        while (strlen((string) json_encode($record, JSON_INVALID_UTF8_SUBSTITUTE)) > self::MAX_RECORD_BYTES) {
+        $fits = static fn (array $candidate): bool => strlen((string) json_encode($candidate, JSON_INVALID_UTF8_SUBSTITUTE)) <= self::MAX_RECORD_BYTES;
+        while (! $fits($record)) {
+            $record['truncated'] = true;
             $files = count($record['files']);
             $par2Files = is_array($record['par2']) ? count($record['par2']['files']) : 0;
-            if ($files === 0 && $par2Files === 0) {
-                break;
-            }
-            $record['truncated'] = true;
-            if ($files >= $par2Files) {
-                $record['files'] = array_slice($record['files'], 0, intdiv($files, 2));
+            if ($files > 0 || $par2Files > 0) {
+                if ($files >= $par2Files) {
+                    $record['files'] = array_slice($record['files'], 0, intdiv($files, 2));
+                } else {
+                    $record['par2']['files'] = array_slice($record['par2']['files'], 0, intdiv($par2Files, 2));
+                }
+            } elseif ($record['nzb']['groups'] !== []) {
+                $record['nzb']['groups'] = [];
+            } elseif (array_filter($record['articles'], static fn (array $article): bool => ($article['yenc']['name'] ?? null) !== null) !== []) {
+                foreach ($record['articles'] as &$article) {
+                    if (is_array($article['yenc'])) {
+                        $article['yenc']['name'] = null;
+                    }
+                }
+                unset($article);
+            } elseif ($record['articles'] !== []) {
+                $record['articles'] = array_slice($record['articles'], 0, intdiv(count($record['articles']), 2));
             } else {
-                $record['par2']['files'] = array_slice($record['par2']['files'], 0, intdiv($par2Files, 2));
+                break;
             }
         }
 
@@ -530,7 +547,8 @@ final class CompactFingerprintCollector
             $value = mb_convert_encoding($value, 'UTF-8', 'UTF-8');
         }
 
-        return mb_substr($value, 0, self::MAX_NAME_LENGTH);
+        // Cut on a UTF-8 boundary by bytes, so multibyte names cannot inflate the record.
+        return mb_strcut($value, 0, self::MAX_NAME_LENGTH, 'UTF-8');
     }
 
     /** @param array<string, mixed> $file */

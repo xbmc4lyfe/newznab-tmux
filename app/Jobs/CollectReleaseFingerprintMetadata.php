@@ -46,7 +46,7 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
         return self::compactFormat() ? CompactFingerprintCollector::FORMAT : null;
     }
 
-    /** Schema version the configured collector writes; older or missing versions are collected again. */
+    /** Schema version the configured collector writes; any other or missing version is collected again. */
     public static function currentSchemaVersion(): int
     {
         return self::compactFormat() ? CompactFingerprintCollector::SCHEMA_VERSION : ReleaseFingerprintCollector::SCHEMA_VERSION;
@@ -56,7 +56,7 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
     public static function isCurrent(?array $metadata): bool
     {
         return is_array($metadata) && ($metadata['format'] ?? null) === self::currentFormat()
-            && (int) ($metadata['schema_version'] ?? 0) >= self::currentSchemaVersion();
+            && (int) ($metadata['schema_version'] ?? 0) === self::currentSchemaVersion();
     }
 
     private static function compactFormat(): bool

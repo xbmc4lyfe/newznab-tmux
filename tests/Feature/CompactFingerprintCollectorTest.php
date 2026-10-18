@@ -11,6 +11,7 @@ use App\Services\Nzb\NzbService;
 use App\Services\Releases\Fingerprint\CompactFingerprintCollector;
 use App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer;
 use App\Services\Releases\Fingerprint\Par2MetadataParser;
+use App\Services\Releases\Fingerprint\ReleaseFingerprintCollector;
 use App\Services\YencService;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\Fixtures\ArchiveParsingBenchmarkFixtures;
@@ -178,6 +179,53 @@ final class CompactFingerprintCollectorTest extends TestCase
     }
 
     #[Test]
+    public function multibyte_names_cannot_push_a_record_past_the_budget(): void
+    {
+        $name = str_repeat('名', 2_000);
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(['capabilities_raw' => [], 'implementation' => $name]);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(12)->andReturnUsing(fn (string $id): array => [
+            'body' => str_replace('name=fixture file.bin', 'name='.$name, YencArticles::article('0123456789abcdef')),
+        ] + self::article($id));
+        $xml = '<?xml version="1.0" encoding="UTF-8"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">';
+        for ($index = 0; $index < 12; $index++) {
+            $xml .= '<file poster="'.$name.'" date="1790812800" subject="&quot;'.$name.$index.'.rar&quot; yEnc (1/1)"><groups>';
+            for ($group = 0; $group < 30; $group++) {
+                $xml .= '<group>'.$name.$group.'</group>';
+            }
+            $xml .= '</groups><segments><segment bytes="1000" number="1">f'.$index.'@fixture</segment></segments></file>';
+        }
+
+        $data = $this->collector()->collectFromNzb($xml.'</nzb>', 7)['data'];
+
+        // Names are cut by UTF-8 bytes, so even escaped multibyte text stays far inside the budget.
+        $this->assertLessThanOrEqual(CompactFingerprintCollector::MAX_RECORD_BYTES, strlen(json_encode($data, JSON_THROW_ON_ERROR)));
+        $this->assertLessThanOrEqual(120, strlen((string) $data['providers'][0]['implementation']));
+        $this->assertLessThanOrEqual(120, strlen((string) $data['articles'][0]['yenc']['name']));
+        $this->assertTrue(mb_check_encoding((string) $data['articles'][0]['yenc']['name'], 'UTF-8'));
+    }
+
+    #[Test]
+    public function an_unusable_par2_index_does_not_block_a_later_volume(): void
+    {
+        $par2 = ArchiveParsingBenchmarkFixtures::par2(1);
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(fn (string $id): array => [
+            'body' => YencArticles::article($id === 'volume@fixture' ? $par2 : 'not a par2 packet stream'),
+        ] + self::article($id));
+        $xml = '<?xml version="1.0" encoding="UTF-8"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">';
+        foreach (['index' => ['movie.par2', 100], 'volume' => ['movie.vol00+01.par2', 900], 'data' => ['offline-0000.bin', 5000]] as $id => [$fileName, $bytes]) {
+            $xml .= '<file poster="p@example" date="1790812800" subject="&quot;'.$fileName.'&quot; yEnc (1/1)"><groups><group>a.b.test</group></groups>'
+                .'<segments><segment bytes="'.$bytes.'" number="1">'.$id.'@fixture</segment></segments></file>';
+        }
+
+        $summary = $this->collector()->collectFromNzb($xml.'</nzb>', 7)['data']['par2'];
+
+        $this->assertSame(['offline-0000.bin'], array_column($summary['files'], 'name'));
+    }
+
+    #[Test]
     public function a_crc_mismatch_is_reported_and_keeps_the_record_partial(): void
     {
         $nntp = $this->mock(NNTPService::class);
@@ -253,13 +301,15 @@ final class CompactFingerprintCollectorTest extends TestCase
     public function only_records_of_the_configured_format_and_version_are_current(): void
     {
         $compact = ['format' => CompactFingerprintCollector::FORMAT, 'schema_version' => CompactFingerprintCollector::SCHEMA_VERSION];
-        $full = ['schema_version' => 999];
+        $full = ['schema_version' => ReleaseFingerprintCollector::SCHEMA_VERSION];
 
         config(['nntmux.fingerprint_format' => 'compact']);
         $this->assertTrue(CollectReleaseFingerprintMetadata::isCurrent($compact));
         $this->assertFalse(CollectReleaseFingerprintMetadata::isCurrent($full));
         $this->assertFalse(CollectReleaseFingerprintMetadata::isCurrent(['format' => CompactFingerprintCollector::FORMAT, 'schema_version' => 0]));
         $this->assertFalse(CollectReleaseFingerprintMetadata::isCurrent(null));
+        // A newer version left behind by a rollback is collected again too.
+        $this->assertFalse(CollectReleaseFingerprintMetadata::isCurrent(['format' => CompactFingerprintCollector::FORMAT, 'schema_version' => CompactFingerprintCollector::SCHEMA_VERSION + 1]));
 
         config(['nntmux.fingerprint_format' => 'full']);
         $this->assertTrue(CollectReleaseFingerprintMetadata::isCurrent($full));
