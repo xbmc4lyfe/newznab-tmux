@@ -1407,6 +1407,12 @@ SH);
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         $this->assertStringContainsString('artisan migrate --force', $this->events());
         $this->assertStringNotContainsString('u:p@', (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
+
+        // Rotating only the URL's password is no database switch.
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_URL=mysql://u:rotated@192.0.2.30:3306/nntmux\nDB_HOST=192.0.2.20\nDB_DATABASE=nntmux\nAPP_DEBUG=true\n");
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
     }
 
     public function test_infrastructure_a_new_data_service_needs_starts_first(): void

@@ -10,6 +10,7 @@ import re
 import shlex
 import stat
 import subprocess
+from urllib.parse import urlsplit, urlunsplit
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -742,8 +743,17 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
     app_env_hash = env_hashes[1]
     # The database the app connects to: pointing app.env at another (e.g. a restored copy) migrates.
     app_env_values = read_dotenv(docker_dir / "config/app.env")
+    # DB_URL's credentials are not the database's identity (rotating a password never migrates).
+    try:
+        db_url = urlsplit(app_env_values.get("DB_URL", ""))
+        db_url_identity = urlunsplit((db_url.scheme, db_url.hostname or "", db_url.path, db_url.query, "")) + (
+            f"|{db_url.port}" if db_url.netloc and db_url.port else "")
+    except ValueError:
+        # Unparseable (e.g. a bad port): compare its digest whole rather than guess.
+        db_url_identity = sha256_text(app_env_values.get("DB_URL", ""))
     database_hash = sha256_text("\n".join(
-        f"{key}={app_env_values.get(key, '')}" for key in ("DB_URL", "DB_CONNECTION", "DB_HOST", "DB_PORT", "DB_SOCKET", "DB_DATABASE")
+        [f"DB_URL={db_url_identity}"]
+        + [f"{key}={app_env_values.get(key, '')}" for key in ("DB_CONNECTION", "DB_HOST", "DB_PORT", "DB_SOCKET", "DB_DATABASE")]
     ))
 
     effective_hash = "none"
