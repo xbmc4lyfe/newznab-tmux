@@ -1415,6 +1415,16 @@ SH);
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         $this->assertStringNotContainsString('artisan migrate', $this->events());
 
+        // Nor is one whose new password holds a literal `$`, nor a later unrelated edit.
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_URL=mysql://u:n\$ew@192.0.2.30:3306/nntmux\nDB_HOST=192.0.2.20\nDB_DATABASE=nntmux\nAPP_DEBUG=true\n");
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_URL=mysql://u:n\$ew@192.0.2.30:3306/nntmux\nDB_HOST=192.0.2.20\nDB_DATABASE=nntmux\nAPP_DEBUG=false\n");
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
+
         // A nested reference can switch databases without changing DB_HOST's text.
         file_put_contents($this->directory.'/docker/config/app.env', "DB_TARGET=192.0.2.40\nDB_HOST=\${DB_TARGET}\nDB_DATABASE=nntmux\n");
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
