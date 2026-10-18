@@ -64,6 +64,7 @@ case "$*" in
         if [ "${NNTMUX_INSPECT_FAIL_AFTER_UP:-0}" = 1 ] && [ -f "$NNTMUX_REPO/recreated" ] && ls "$NNTMUX_REPO"/docker/.deploy.stamp.tmp.* >/dev/null 2>&1; then echo "Error response from daemon: timeout" >&2; exit 1; fi
         [ "${NNTMUX_IMAGE_INSPECT_FAIL:-0}" != 1 ] || { echo "Error response from daemon: request timed out" >&2; exit 1; }
         if [ -f "$NNTMUX_REPO/replaced" ]; then echo sha256:replaced
+        elif [ "${NNTMUX_REPLACE_AT_STAMP:-0}" = 1 ] && ls "$NNTMUX_REPO"/docker/.deploy.stamp.tmp.* >/dev/null 2>&1; then echo sha256:replaced
         elif [ "$last" = nntmux/base:local ] && [ -n "${NNTMUX_BASE_IMAGE_ID:-}" ]; then echo "$NNTMUX_BASE_IMAGE_ID"
         else echo "${NNTMUX_IMAGE_ID:-sha256:fixture}"; fi ;;
     *'image inspect'*) exit 0 ;;
@@ -658,6 +659,36 @@ SH);
         $this->make(['deploy', 'FORCE=1'])->mustRun();
         $this->assertStringContainsString('build --target', $this->events());
         $this->assertStringContainsString(' stop ', $this->events());
+    }
+
+    public function test_an_owed_barrier_release_is_never_batched(): void
+    {
+        $this->deploy()->mustRun();
+        file_put_contents($this->directory.'/docker/.deploy.stamp.barrier-owed', '');
+        file_put_contents($this->directory.'/docker/.env', "DB_ROOTPASSWORD=rotated\n");
+        file_put_contents($this->directory.'/events', '');
+
+        $this->deploy()->mustRun();
+        $this->assertStringContainsString('releases:verification-barrier --timeout=900', $this->events());
+        $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp.barrier-owed');
+    }
+
+    public function test_the_final_stamp_records_the_verified_images_not_a_tag_replaced_afterwards(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_REPLACE_AT_STAMP' => '1'])->mustRun();
+        $stamp = (string) file_get_contents($this->directory.'/docker/.deploy.stamp');
+        $this->assertStringContainsString('image:web=nntmux/web:local@sha256:fixture', $stamp);
+        $this->assertStringNotContainsString('sha256:replaced', $stamp);
+    }
+
+    public function test_a_daemon_chosen_inside_dc_fails_closed(): void
+    {
+        foreach (['--context remote', '-H ssh://host'] as $flags) {
+            $plan = $this->make(['deploy-plan', 'DC=docker '.$flags.' compose --project-directory '.$this->directory.'/docker']);
+            $plan->run();
+            $this->assertNotSame(0, $plan->getExitCode(), $flags);
+            $this->assertStringContainsString('DC selects a Docker daemon itself', $plan->getErrorOutput(), $flags);
+        }
     }
 
     public function test_effective_compose_configuration_changes_trigger_a_rollout(): void

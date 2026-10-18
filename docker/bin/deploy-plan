@@ -458,6 +458,13 @@ def reject_alternate_env_file() -> None:
     if any(arg == "--env-file" or arg.startswith("--env-file=") for arg in argv):
         sys.exit("deploy-plan: DC passes --env-file; selective deployment fingerprints only the default .env files. "
                  "Put those values in docker/.env or the environment instead.")
+    # Docker's own daemon selection before `compose` would send Compose elsewhere than the direct
+    # docker calls (build, inspect, the barrier) and the recorded daemon identity.
+    globals_end = argv.index("compose") if "compose" in argv else len(argv)
+    for arg in argv[1:globals_end]:
+        if arg in ("--context", "-c", "--host", "-H") or arg.startswith(("--context=", "--host=", "-H=")):
+            sys.exit("deploy-plan: DC selects a Docker daemon itself; use DOCKER_CONTEXT or DOCKER_HOST instead, so "
+                     "every docker call and the recorded daemon identity agree.")
 
 
 def verify_planned_images(docker_dir: Path, stamp_path: Path, services: list[str], running: bool) -> None:
@@ -919,8 +926,8 @@ def with_image_ids(state: dict[str, str]) -> dict[str, str]:
     return stamped
 
 
-def format_stamp(state: dict[str, str]) -> str:
-    stamped = with_image_ids(state)
+def format_stamp(state: dict[str, str], refresh_images: bool = True) -> str:
+    stamped = with_image_ids(state) if refresh_images else dict(state)
     lines = [stamped["fingerprint"]]
     for key in sorted(k for k in stamped if k != "fingerprint"):
         lines.append(f"{key}={stamped[key]}")
@@ -1146,7 +1153,7 @@ def mounts_changed_since_start(docker_dir: Path, svc: str) -> bool:
     for volume in cfg["volumes"]:
         if isinstance(volume, dict) and volume.get("type") == "bind" and isinstance(volume.get("source"), str):
             source = volume["source"]
-            if not volume.get("read_only") and symlinked_below(source, project_directory(docker_dir)):
+            if symlinked_below(source, project_directory(docker_dir)):
                 # A symlinked data source may have been retargeted; with no record of what the
                 # container mounted, recreate it rather than reconcile it in place.
                 return True
@@ -1667,6 +1674,16 @@ def main() -> None:
     if cmd == "--stamp-data":
         include_compose = bool(os.environ.get("DEPLOY_CONFIG_COMMAND", "")) or (len(sys.argv) > 2 and sys.argv[2] == "deploy")
         state = compute_state(repo, docker_dir, include_compose=include_compose)
+        if len(sys.argv) > 2 and sys.argv[2] == "deploy":
+            # The image IDs this run planned and verified on the running containers, not the tags'
+            # current IDs: a tag replaced after the final check must not be stamped as deployed.
+            state = with_image_ids(state)
+            snapshot = parse_stamp(Path(f"{stamp_path}.plan"))
+            for key in ("image:base", *(f"image:{svc}" for svc in APP_SERVICES)):
+                if key in snapshot:
+                    state[key] = snapshot[key]
+            sys.stdout.write(format_stamp(state, refresh_images=False))
+            return
         sys.stdout.write(format_stamp(state))
         return
 

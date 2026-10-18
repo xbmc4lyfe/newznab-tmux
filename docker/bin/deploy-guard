@@ -228,6 +228,8 @@ unchanged() {
 
 cooldown() {
     [ "${FORCE:-0}" != 1 ] || return 1
+    # Never defer an owed barrier release: remote workers stay paused until it runs.
+    [ ! -e "$STAMP.barrier-owed" ] || return 1
     interval=${DEPLOY_MIN_INTERVAL:-0}
     case "$interval" in ''|*[!0-9]*) echo "deploy-guard: DEPLOY_MIN_INTERVAL must be nonnegative seconds" >&2; exit 64;; esac
     [ "$interval" -gt 0 ] && [ -f "$STAMP" ] && [ -f "$SUCCESS_TIME" ] || return 1
