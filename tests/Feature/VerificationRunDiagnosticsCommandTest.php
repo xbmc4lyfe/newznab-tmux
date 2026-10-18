@@ -379,7 +379,7 @@ final class VerificationRunDiagnosticsCommandTest extends ReleaseVerificationCan
         $this->assertCount(1, $paths);
         $contents = file_get_contents($paths[0]);
         $this->assertStringContainsString('Candidate verification run summary.', $contents);
-        $this->assertStringContainsString('"schema_version":2', $contents);
+        $this->assertStringContainsString('"schema_version":3', $contents);
         $this->assertStringContainsString('"claims_admitted":0', $contents);
         Log::forgetChannel('daily');
     }

@@ -37,6 +37,12 @@ final class PublicationOutcome
     /** Primary only: publication returned no release and the row names none, as the single endpoint reports it. */
     public const string UNRESOLVED = 'unresolved';
 
+    /**
+     * Worker only: the primary could not be reached, or did not answer in time. Nothing is known about
+     * the item; unlike an error response, which the primary gave, sending it again is safe and expected.
+     */
+    public const string TRANSPORT = 'transport';
+
     /** Worker only: nothing was sent, or the single endpoint answered without a release; read the row for why. */
     public const string NO_RELEASE = 'no_release';
 
