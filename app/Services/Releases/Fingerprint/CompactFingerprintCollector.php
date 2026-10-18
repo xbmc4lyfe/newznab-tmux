@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Releases\Fingerprint;
 
 use App\Models\Release;
+use App\Services\NNTP\NntpArticleMissingException;
 use App\Services\NNTP\NntpProviderUnavailableException;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
@@ -100,6 +101,11 @@ final class CompactFingerprintCollector
                 $providers[$account]['implementation'] = self::bounded($profile['implementation'] ?? null);
                 if ($server['alternate']) {
                     $this->breaker->recordReachable($server);
+                }
+                // A profile can fail without throwing: same acceptance rule as the full collector.
+                if (! self::profileSucceeded($profile)) {
+                    $providers[$account]['profile'] = 'ProfileResponseInvalid';
+                    $errors[$account]['ProfileResponseInvalid'] = ($errors[$account]['ProfileResponseInvalid'] ?? 0) + 1;
                 }
             } catch (Throwable $exception) {
                 $providers[$account]['profile'] = class_basename($exception);
@@ -527,7 +533,9 @@ final class CompactFingerprintCollector
      */
     private static function posting(array $files): ?array
     {
-        $dates = array_values(array_filter(array_map(static fn (array $file): mixed => $file['date'] ?? null, $files), 'is_int'));
+        // NZBs use date="0" for an unknown date; only positive timestamps are evidence.
+        $dates = array_values(array_filter(array_map(static fn (array $file): mixed => $file['date'] ?? null, $files),
+            static fn (mixed $date): bool => is_int($date) && $date > 0));
         if ($dates === []) {
             return null;
         }
@@ -738,10 +746,19 @@ final class CompactFingerprintCollector
         return is_array($response) && is_numeric($response['response_code'] ?? null) ? (int) $response['response_code'] : null;
     }
 
-    /** HEAD or BODY answered without the article (normally 430); the NNTP layer reports no code. */
+    /** @param array<string, mixed> $profile */
+    private static function profileSucceeded(array $profile): bool
+    {
+        return ! isset($profile['capabilities_error_type'])
+            && ! isset($profile['overview_format_error_type'])
+            && in_array($profile['capabilities_response_code'] ?? null, [101, 500, 501], true)
+            && (($profile['overview_format_response_code'] ?? null) === null
+                || in_array($profile['overview_format_response_code'], [215, 500, 501], true));
+    }
+
+    /** The provider said the article does not exist; protocol and transport failures are errors. */
     private static function isMissingArticle(Throwable $exception): bool
     {
-        return $exception instanceof \RuntimeException && in_array($exception->getMessage(),
-            ['Article headers are unavailable.', 'Article is unavailable; retry verification later.'], true);
+        return $exception instanceof NntpArticleMissingException;
     }
 }
