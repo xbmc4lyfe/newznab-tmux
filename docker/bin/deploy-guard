@@ -217,7 +217,8 @@ unchanged() {
         build_stamp=$STAMP
         [ "${target:-}" = "build" ] || build_stamp="$DIR/.build.stamp"
         # A failing planner is not "nothing to build".
-        build_targets=$(DEPLOY_STAMP="$build_stamp" "$DIR/bin/deploy-plan" --build-targets) || return 1
+        # Build targets ignore the rendered Compose configuration; skip re-rendering it.
+        build_targets=$(DEPLOY_CONFIG_COMMAND= DEPLOY_STAMP="$build_stamp" "$DIR/bin/deploy-plan" --build-targets) || return 1
         [ -z "$build_targets" ] || return 1
     fi
     if [ -n "${CHECK_UNCHANGED_COMMAND:-}" ]; then

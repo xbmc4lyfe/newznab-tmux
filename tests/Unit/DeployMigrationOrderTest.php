@@ -81,6 +81,7 @@ case "$*" in
         if [ -n "${NNTMUX_UNHEALTHY_AFTER:-}" ] && grep -q -- "$NNTMUX_UNHEALTHY_AFTER" "$NNTMUX_DEPLOY_EVENTS"; then late=${NNTMUX_UNHEALTHY_LATE:-none}; fi
         case "$*" in *"fixture-container-${NNTMUX_UNHEALTHY:-none}"|*"fixture-container-$late") echo "running unhealthy" ;; *) echo "running ${NNTMUX_HEALTH_STATUS:-healthy}" ;; esac ;;
     *' ps -a -q '*)
+        if [ -n "${NNTMUX_PS_A_FAIL_AFTER:-}" ] && grep -q -- "$NNTMUX_PS_A_FAIL_AFTER" "$NNTMUX_DEPLOY_EVENTS"; then echo "Cannot connect to the Docker daemon" >&2; exit 1; fi
         [ "${NNTMUX_NO_EXISTING_APP:-0}" = 1 ] && exit 0
         [ -n "${NNTMUX_NO_CONTAINER:-}" ] && [ "$last" = "$NNTMUX_NO_CONTAINER" ] && exit 0
         [ ! -f "$NNTMUX_REPO/recreated-$last" ] || printf 'r%s-' "$(wc -c < "$NNTMUX_REPO/recreated-$last" | tr -d ' ')"
@@ -2198,6 +2199,18 @@ SH);
         $this->assertStringContainsString(' start horizon', $events);
         $this->assertStringContainsString('scheduler.py restore --token=', $events);
         $this->assertStringContainsString('tmux:drain --resume', $events);
+    }
+
+    public function test_a_failed_database_lookup_before_the_barrier_aborts_instead_of_starting_it(): void
+    {
+        // First deploy: mariadb has no record and is reconciled, so its container is looked up.
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_PS_A_FAIL_AFTER' => 'tmux:drain --timeout']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('tmux:drain --timeout', $this->events());
+        $this->assertStringContainsString('ps -a -q mariadb', $this->events());
+        $this->assertStringNotContainsString('up -d --no-deps --wait --wait-timeout 240 mariadb', $this->events());
+        $this->assertStringNotContainsString(' stop web scheduler indexer', $this->events());
     }
 
     public function test_image_tag_replaced_after_the_build_aborts_before_any_change(): void
