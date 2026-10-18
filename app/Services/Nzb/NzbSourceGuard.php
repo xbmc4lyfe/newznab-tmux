@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace App\Services\Nzb;
 
-use App\Models\Release;
 use App\Support\ReleaseArchiveNamingEvidence;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -32,27 +31,16 @@ final class NzbSourceGuard
         return hash('sha256', "nntmux:nzb-archive-naming:1\0".$decoded);
     }
 
+    /** Partial upgrades stage their generation as `<canonical>.c<candidate>-<16 hex>.next` until they commit. */
+    public const string STAGED_NAME = '/^(.+)\.nzb\.gz\.c\d+-[0-9a-f]{16}\.next$/D';
+
     /** @return SourceSnapshot|null */
     public function snapshot(string $guid, bool $beginNamingInspection = false): ?array
     {
         return DB::transaction(function () use ($guid, $beginNamingInspection): ?array {
-            $partialCounts = $beginNamingInspection && Release::hasPartialArticleCounts();
-            $release = DB::table('releases')->where('guid', $guid)->lockForUpdate()->first($partialCounts ? ['id', 'guid', 'articles_expected'] : ['id', 'guid']);
+            $release = DB::table('releases')->where('guid', $guid)->lockForUpdate()->first(['id', 'guid']);
 
-            if ($release === null) {
-                return null;
-            }
-            // Only an in-place upgrade of a partial preserves a source, and it leaves the counts set unless it
-            // committed a complete inventory (after which the canonical file is the committed source). So only a
-            // release still recorded as partial can have one to settle; others skip the directory scan.
-            if ($partialCounts && ($release->articles_expected ?? null) !== null) {
-                // A replacement a crash or failed commit left behind is settled first: its evidence must name
-                // the source the committed row describes, never an uncommitted one still on disk.
-                $this->lockRelease($release);
-                $this->withGuidLock((string) $release->guid, fn () => $this->settlePreservedSiblingsLocked($release));
-            }
-
-            return $this->withLockedSource($release, static function (?array $source) use ($release, $beginNamingInspection): ?array {
+            return $release === null ? null : $this->withSettledSource($release, $beginNamingInspection, static function (?array $source) use ($release, $beginNamingInspection): ?array {
                 if ($source !== null && $beginNamingInspection) {
                     // First inspection must leave legacy admission before any
                     // producer can mistake one readable file for the whole NZB.
@@ -67,6 +55,8 @@ final class NzbSourceGuard
     /**
      * The caller owns its transaction and any canonical/candidate locks. No
      * callback may acquire a different release while holding this source lock.
+     * The source is the committed generation: one still staged beside the
+     * canonical file is put in place first (null while that cannot be done).
      *
      * @template TResult
      *
@@ -75,9 +65,7 @@ final class NzbSourceGuard
      */
     public function withLockedSource(object $release, callable $callback): mixed
     {
-        $this->lockRelease($release);
-
-        return $this->withGuidLock((string) $release->guid, fn (): mixed => $callback($this->readCurrent((string) $release->guid)));
+        return $this->withSettledSource($release, false, $callback);
     }
 
     /**
@@ -85,57 +73,104 @@ final class NzbSourceGuard
      * The optional digest is a compare-and-swap for parser repairs.
      *
      * @param  (callable(string, string): bool)|null  $move
-     * @param  int|null  $preserveFor  The candidate whose upgrade replaces this source: the replaced source is kept,
-     *                                 tagged with it, so a rollback, or later reconcilePreserved(), can restore it.
+     * @param  int|null  $stageFor  The candidate whose in-place upgrade replaces this source. The new generation is
+     *                              staged beside the canonical file, which keeps the committed one until the
+     *                              receipt's close() after commit swaps it in; rollback only removes the staged file.
      */
-    public function install(object $release, string $temporary, string $destination, ?string $expectedDigest = null, ?callable $move = null, ?int $preserveFor = null): NzbSourceInstallation
+    public function install(object $release, string $temporary, string $destination, ?string $expectedDigest = null, ?callable $move = null, ?int $stageFor = null): NzbSourceInstallation
     {
         $this->lockRelease($release);
 
-        return $this->withGuidLock((string) $release->guid, function () use ($release, $temporary, $destination, $expectedDigest, $move, $preserveFor): NzbSourceInstallation {
-            if ($expectedDigest !== null && ($this->readCurrent((string) $release->guid)['digest'] ?? null) !== $expectedDigest) {
+        return $this->withGuidLock((string) $release->guid, function () use ($release, $temporary, $destination, $expectedDigest, $move, $stageFor): NzbSourceInstallation {
+            // A repair compares against the committed generation, never one an earlier upgrade has yet to swap in.
+            if ($expectedDigest !== null && ($this->readSettledLocked($release)['digest'] ?? null) !== $expectedDigest) {
                 throw new RuntimeException('NZB source changed before replacement.');
             }
 
             return $this->installFile((string) $release->guid, $temporary, $destination,
                 static function (string $digest) use ($release): void {
                     app(ReleaseArchiveNamingEvidence::class)->sourceReplacedLocked($release, $digest);
-                }, $move, $preserveFor);
+                }, $move, $stageFor === null ? null : $destination.'.c'.$stageFor.'-'.bin2hex(random_bytes(8)).'.next');
         });
     }
 
     /**
-     * Settle a replaced source left beside its release, in installation's lock order (see settlePreservedLocked()).
+     * Settle a staged generation left beside its release (a crash or failed callback between commit and swap,
+     * or a rolled-back upgrade), in installation's lock order; see settleStagedLocked(). A dry run reports.
      *
-     * @return 'deleted'|'restored'|'kept'
+     * @return 'applied'|'deleted'|'kept'
      */
-    public function reconcilePreserved(string $path, bool $apply = true): string
+    public function reconcileStaged(string $path, bool $apply = true): string
     {
-        if (preg_match(self::PRESERVED_NAME, basename($path), $match) !== 1) {
+        if (preg_match(self::STAGED_NAME, basename($path), $match) !== 1) {
             return 'kept';
         }
         $guid = $match[1];
 
         return DB::transaction(function () use ($path, $guid, $apply): string {
             $release = DB::table('releases')->where('guid', $guid)->lockForUpdate()->first(['id', 'guid']);
+            $outcome = $this->withGuidLock($guid, fn (): string => $this->settleStagedLocked($release, $guid, $path, $apply));
 
-            return $this->withGuidLock($guid, fn (): string => $this->settlePreservedLocked($release, $guid, $path, $apply));
+            return $outcome === 'failed' ? 'kept' : $outcome;
         });
     }
 
-    private const string PRESERVED_NAME = '/^(.+)\.nzb\.gz\.c\d+-[0-9a-f]{16}\.prev$/D';
+    /**
+     * @template TResult
+     *
+     * @param  callable(SourceSnapshot|null): TResult  $callback
+     * @return TResult
+     */
+    private function withSettledSource(object $release, bool $deferUnresolved, callable $callback): mixed
+    {
+        $this->lockRelease($release);
+
+        return $this->withGuidLock((string) $release->guid, fn (): mixed => $callback($this->readSettledLocked($release, $deferUnresolved)));
+    }
 
     /**
-     * With the release row and source locks held. Every installation records its source digest in its own
-     * transaction, and a naming inspection settles preserved sources before recording one, so the evidence names
-     * the source the committed release row describes: the preserved link goes when the canonical file is that
-     * source (the replacement committed), and is put back when it is (the replacement rolled back) or when no
-     * installation ever committed. Anything else is kept for an operator; a release that no longer exists takes
-     * its link.
+     * With the release row and source locks held. Every installation records its digest in its own transaction,
+     * so a canonical file differing from the committed digest may have the committed generation staged beside it
+     * still: that is put in place before anything reads, or records evidence for, the source.
      *
-     * @return 'deleted'|'restored'|'kept'
+     * @return SourceSnapshot|null
      */
-    private function settlePreservedLocked(?object $release, string $guid, string $path, bool $apply): string
+    private function readSettledLocked(object $release, bool $deferUnresolved = false): ?array
+    {
+        $guid = (string) $release->guid;
+        $source = $this->readCurrent($guid);
+        $committed = app(ReleaseArchiveNamingEvidence::class)->committedSourceDigestLocked($release);
+        if ($committed === null || ($source !== null && hash_equals($committed, $source['digest']))) {
+            return $source;
+        }
+        $outcomes = [];
+        foreach ($this->stagedSiblings($guid) as $path) {
+            // Staged by this very transaction: its evidence is not committed yet, and its close() settles it.
+            if (! NzbSourceInstallation::isPendingStaged($path, DB::connection()->getPdo())) {
+                $outcomes[] = $this->settleStagedLocked($release, $guid, $path, true);
+            }
+        }
+        if ($deferUnresolved && array_intersect($outcomes, ['kept', 'failed']) !== []) {
+            // Recording the current file's digest now could later cost the only copy of the committed source.
+            throw new RuntimeException('A staged NZB generation is unresolved; naming inspection deferred.');
+        }
+        if (in_array('failed', $outcomes, true)) {
+            // The committed generation exists but is not in place: the canonical file is not the source.
+            return null;
+        }
+
+        return in_array('applied', $outcomes, true) ? $this->readCurrent($guid) : $source;
+    }
+
+    /**
+     * With the release row and source locks held. The staged file is put in place when it is the committed
+     * generation and the canonical file is not; it goes when the canonical file is the committed generation (the
+     * upgrade rolled back, or was already swapped in) or its release no longer exists. Anything else, including
+     * a release without a committed digest, is kept for an operator. A dry run reports without changing files.
+     *
+     * @return 'applied'|'deleted'|'kept'|'failed'
+     */
+    private function settleStagedLocked(?object $release, string $guid, string $path, bool $apply): string
     {
         if (! is_file($path)) {
             return 'kept';
@@ -145,40 +180,52 @@ final class NzbSourceGuard
         }
         $canonical = dirname($path).DIRECTORY_SEPARATOR.$guid.'.nzb.gz';
         $committed = app(ReleaseArchiveNamingEvidence::class)->committedSourceDigestLocked($release);
-        $digestOf = static function (string $file): ?string {
-            $contents = @file_get_contents($file);
-            $decoded = $contents === false ? false : @gzdecode($contents);
+        if ($committed !== null) {
+            $current = is_file($canonical) ? self::fileDigest($canonical) : null;
+            if ($current !== null && hash_equals($committed, $current)) {
+                return ! $apply || @unlink($path) ? 'deleted' : 'kept';
+            }
+            $staged = self::fileDigest($path);
+            if ($staged !== null && hash_equals($committed, $staged)) {
+                if (! $apply || @rename($path, $canonical)) {
+                    return 'applied';
+                }
+                Log::warning('Could not put a committed staged NZB generation in place; kept.', ['staged_source' => $path]);
 
-            return $decoded === false || $decoded === '' ? null : self::digest($decoded);
-        };
-        $current = is_file($canonical) ? $digestOf($canonical) : null;
-        if ($committed !== null && $current !== null && hash_equals($committed, $current)) {
-            return ! $apply || @unlink($path) ? 'deleted' : 'kept';
+                return 'failed';
+            }
         }
-        $preserved = $digestOf($path);
-        if ($preserved !== null && ($committed === null || hash_equals($committed, $preserved))) {
-            return ! $apply || @rename($path, $canonical) ? 'restored' : 'kept';
-        }
-        Log::warning('Preserved NZB source matches neither the committed release nor its current source; kept.', [
-            'preserved_source' => $path,
+        Log::warning('Staged NZB generation matches neither the committed release nor its current source; kept.', [
+            'staged_source' => $path,
         ]);
 
         return 'kept';
     }
 
-    /** @param  object{id: int, guid: string}  $release */
-    private function settlePreservedSiblingsLocked(object $release): void
+    /** @return list<string> */
+    private function stagedSiblings(string $guid): array
     {
-        $canonical = $this->nzb->nzbPath((string) $release->guid);
-        $directory = $canonical === false ? rtrim($this->nzb->buildNzbPath((string) $release->guid, 0, true), DIRECTORY_SEPARATOR) : dirname($canonical);
-        foreach (glob($directory.DIRECTORY_SEPARATOR.$release->guid.'.nzb.gz.c*-*.prev') ?: [] as $path) {
-            if (preg_match(self::PRESERVED_NAME, basename($path)) === 1
-                && $this->settlePreservedLocked($release, (string) $release->guid, $path, true) === 'kept') {
-                // Unresolved (a failed restore, or a source matching neither side): recording the current file's
-                // digest now could later cost the only copy of the committed source.
-                throw new RuntimeException('A preserved NZB source is unresolved; naming inspection deferred.');
+        // Staged beside the installation path; the canonical file can also have been found at another base path.
+        $current = $this->nzb->nzbPath($guid);
+        $directories = array_unique([dirname($this->nzb->getNzbPath($guid)), ...($current === false ? [] : [dirname($current)])]);
+        $paths = [];
+        foreach ($directories as $directory) {
+            foreach (glob($directory.DIRECTORY_SEPARATOR.$guid.'.nzb.gz.c*-*.next') ?: [] as $path) {
+                if (preg_match(self::STAGED_NAME, basename($path), $match) === 1 && $match[1] === $guid) {
+                    $paths[] = $path;
+                }
             }
         }
+
+        return $paths;
+    }
+
+    private static function fileDigest(string $file): ?string
+    {
+        $contents = @file_get_contents($file);
+        $decoded = $contents === false ? false : @gzdecode($contents);
+
+        return $decoded === false || $decoded === '' ? null : self::digest($decoded);
     }
 
     /** Final source deletion uses the same release-to-source order as installation. */
@@ -397,15 +444,15 @@ final class NzbSourceGuard
             $query->fetchAll();
             $query->closeCursor();
             $this->withGuidLock($installation->guid, static function () use ($installation): void {
-                if (! $installation->ownsCurrentPath()) {
+                if ($installation->staged !== null) {
+                    // A staged generation never reached the canonical path, which keeps its committed source.
+                    if ($installation->ownsStagedPath() && ! @unlink($installation->staged)) {
+                        throw new RuntimeException('Cannot remove a rolled-back staged NZB generation.');
+                    }
+
                     return;
                 }
-                // A rolled-back replacement restores the source it replaced; a new installation is removed.
-                if ($installation->previous !== null && is_file($installation->previous)) {
-                    if (! @rename($installation->previous, $installation->path)) {
-                        throw new RuntimeException('Cannot restore the NZB a rolled-back replacement displaced.');
-                    }
-                } elseif (! @unlink($installation->path)) {
+                if ($installation->ownsCurrentPath() && ! @unlink($installation->path)) {
                     throw new RuntimeException('Cannot remove owned rolled-back NZB installation.');
                 }
             });
@@ -486,10 +533,11 @@ final class NzbSourceGuard
     /**
      * @param  (callable(string): void)|null  $beforeRename
      * @param  (callable(string, string): bool)|null  $move
+     * @param  string|null  $staged  Where the new generation waits for its transaction to commit, instead of $destination.
      */
-    private function installFile(string $guid, string $temporary, string $destination, ?callable $beforeRename = null, ?callable $move = null, ?int $preserveFor = null): NzbSourceInstallation
+    private function installFile(string $guid, string $temporary, string $destination, ?callable $beforeRename = null, ?callable $move = null, ?string $staged = null): NzbSourceInstallation
     {
-        $previous = null;
+        $target = $staged ?? $destination;
         $handle = @fopen($temporary, 'rb');
         if ($handle === false) {
             throw new RuntimeException('Cannot open staged NZB installation.');
@@ -506,62 +554,24 @@ final class NzbSourceGuard
             if ($beforeRename !== null) {
                 $beforeRename($digest);
             }
-            if ($preserveFor !== null && is_file($destination)) {
-                // Keep the replaced source reachable so a rolled-back replacement can restore it.
-                $previous = $destination.'.c'.$preserveFor.'-'.bin2hex(random_bytes(8)).'.prev';
-                if (! @link($destination, $previous)) {
-                    throw new RuntimeException('Cannot preserve the NZB being replaced.');
-                }
-            }
-            if (! ($move === null ? @rename($temporary, $destination) : $move($temporary, $destination))) {
+            if (! ($move === null ? @rename($temporary, $target) : $move($temporary, $target))) {
                 throw new RuntimeException('Unable to move temporary NZB into place.');
             }
-            clearstatcache(true, $destination);
+            clearstatcache(true, $target);
             $owned = fstat($handle);
-            $current = @lstat($destination);
+            $current = @lstat($target);
             if ($owned === false || $current === false || $owned['dev'] !== $current['dev'] || $owned['ino'] !== $current['ino']) {
                 throw new RuntimeException('Staged NZB installation identity changed.');
             }
 
-            return new NzbSourceInstallation($this, $guid, $destination, $digest, $handle, DB::connection()->getPdo(), $previous);
+            return new NzbSourceInstallation($this, $guid, $destination, $digest, $handle, DB::connection()->getPdo(), $staged);
         } catch (Throwable $exception) {
             fclose($handle);
-            if ($previous !== null) {
-                $this->discardPreservedSource($previous, $destination);
+            // The staged name is this installation's own; the canonical file was never touched.
+            if ($staged !== null && is_file($staged)) {
+                @unlink($staged);
             }
             throw $exception;
-        }
-    }
-
-    /**
-     * A failed install must never leave the canonical path without the source it
-     * replaced. If the new file already went into place, put the preserved link
-     * back (atomic rename); drop the link only when the displaced inode is still
-     * the canonical one, i.e. the move never happened. A restore failure keeps
-     * the link for stale-leftover cleanup instead of losing the only reference.
-     */
-    private function discardPreservedSource(string $previous, string $destination): void
-    {
-        clearstatcache(true, $previous);
-        clearstatcache(true, $destination);
-        $kept = @lstat($previous);
-        if ($kept === false) {
-            return;
-        }
-        $current = @lstat($destination);
-        if ($current !== false && $current['dev'] === $kept['dev'] && $current['ino'] === $kept['ino']) {
-            @unlink($previous);
-
-            return;
-        }
-        if (! @rename($previous, $destination)) {
-            try {
-                Log::warning('Failed NZB replacement could not restore the source it displaced.', [
-                    'preserved_source' => $previous,
-                ]);
-            } catch (Throwable) {
-                // Preserve the original installation exception.
-            }
         }
     }
 }

@@ -28,11 +28,13 @@ use App\Services\Releases\Verification\VerifiedReleasePublisher;
 use App\Services\YencService;
 use App\Support\Configuration\IngestionConfigurationData;
 use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Database\Events\TransactionCommitting;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Http\Client\Request as HttpRequest;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Queue;
@@ -427,6 +429,60 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
             (int) DB::table('releases')->where('id', $first)->value('nfostatus')], 'Post-processing reruns on the upgraded NZB.');
         $this->assertSame(1, DB::table('releases')->count());
         $this->assertSame([$first, $first], DB::table('release_verification_candidates')->orderBy('id')->pluck('release_id')->map(fn ($id): int => (int) $id)->all());
+    }
+
+    public function test_an_upgrade_swaps_its_nzb_in_only_after_its_transaction_commits(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('post-commit-swap', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+        $guid = (string) DB::table('releases')->where('id', $first)->value('guid');
+        $canonical = app(NzbService::class)->getNzbPath($guid);
+        $seen = [];
+        // What a download or duplicate-coverage reader (neither takes the release lock) finds as the upgrade commits.
+        Event::listen(TransactionCommitting::class, static function () use ($canonical, &$seen): void {
+            $staged = glob($canonical.'.c*-*.next') ?: [];
+            if ($staged !== []) {
+                $seen[] = [(string) gzdecode((string) file_get_contents($canonical)), (string) gzdecode((string) file_get_contents($staged[0]))];
+            }
+        });
+
+        $this->assertSame($first, $this->publishStalledPartial(null));
+
+        $this->assertCount(1, $seen, 'The upgrade staged its NZB beside the canonical file.');
+        $this->assertStringNotContainsString('c@d', $seen[0][0], 'The canonical file held only the committed generation.');
+        $this->assertStringContainsString('c@d', $seen[0][1]);
+        $this->assertStringContainsString('c@d', (string) app(NzbService::class)->readNzbContents($guid), 'Swapped in after commit.');
+        $this->assertSame([], glob($canonical.'.c*-*.next') ?: []);
+    }
+
+    public function test_a_rolled_back_upgrade_leaves_the_published_nzb_untouched(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('rolled-back-upgrade', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+        $guid = (string) DB::table('releases')->where('id', $first)->value('guid');
+        $canonical = app(NzbService::class)->getNzbPath($guid);
+        $before = [(string) file_get_contents($canonical), fileinode($canonical)];
+        // Fail the upgrade once its NZB is staged, before it commits.
+        DB::listen(static function (QueryExecuted $query) use ($canonical): void {
+            if (str_contains($query->sql, 'update "release_verification_candidates"') && (glob($canonical.'.c*-*.next') ?: []) !== []) {
+                throw new \RuntimeException('Upgrade interrupted.');
+            }
+        });
+
+        try {
+            $this->publishStalledPartial(null);
+            $this->fail('The upgrade must fail.');
+        } catch (\RuntimeException $exception) {
+            $this->assertSame('Upgrade interrupted.', $exception->getMessage());
+        }
+
+        $this->assertSame($before, [(string) file_get_contents($canonical), fileinode($canonical)], 'The canonical file was never replaced.');
+        $this->assertSame([], glob($canonical.'.c*-*.next') ?: [], 'The staged NZB is removed.');
+        $this->assertSame(1, (int) DB::table('releases')->where('id', $first)->value('articles_found'));
     }
 
     public function test_a_replay_of_headers_the_partial_holds_changes_nothing(): void

@@ -36,7 +36,8 @@ final class VerifiedNzbWriter
      * @param  array<string, mixed>  $manifest
      * @param  string|null  $body  compress(document($manifest)) when the caller rendered it earlier, outside any lock;
      *                             it must come from this same manifest. Null renders and compresses here.
-     * @param  int|null  $replaceFor  The candidate whose in-place upgrade replaces the release's source (see NzbSourceGuard::install()).
+     * @param  int|null  $replaceFor  The candidate whose in-place upgrade replaces the release's source: the NZB is staged and
+     *                                swapped in by the receipt's close() after commit (see NzbSourceGuard::install()).
      */
     public function writeWithReceipt(array $manifest, string $guid, object $release, ?PublicationTiming $timing = null, ?string $body = null,
         ?int $replaceFor = null): NzbSourceInstallation
@@ -58,7 +59,7 @@ final class VerifiedNzbWriter
                 fclose($handle);
             }
             $sources = new NzbSourceGuard($this->nzb);
-            $receipt = $sources->install($release, $temporary, $path, preserveFor: $replaceFor);
+            $receipt = $sources->install($release, $temporary, $path, stageFor: $replaceFor);
         } finally {
             if (is_file($temporary)) {
                 unlink($temporary);

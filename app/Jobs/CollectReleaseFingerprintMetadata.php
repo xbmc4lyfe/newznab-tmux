@@ -110,9 +110,9 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
             $encodedMetadata = json_encode($result['data'], JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR);
             $safeMetadata = json_decode($encodedMetadata, true, 512, JSON_THROW_ON_ERROR);
             $saved = DB::transaction(function () use ($record, $token, $result, $safeMetadata, $release): int {
-                // Only metadata of the committed source: a replacement read before its upgrade rolled back (which
-                // also undoes that upgrade's stale marking) must not be saved. The evidence row lock waits for
-                // an upgrade still in flight.
+                // Only metadata of the committed source: the generation an upgrade replaced, read before its staged
+                // successor was swapped in after commit, must not be saved; this run then collects again. The
+                // evidence row lock waits for an upgrade still in flight.
                 $digest = $result['source_digest'] ?? null;
                 if (is_string($digest) && self::tracksSources()) {
                     $committed = app(ReleaseArchiveNamingEvidence::class)->committedSourceDigestLocked((object) ['id' => $release->id, 'guid' => $release->guid]);
@@ -134,7 +134,7 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
                 return;
             }
         }
-        // Still preempted, or it only ever read an uncommitted replacement: hand the record back as stale (only while
+        // Still preempted, or it only ever read a replaced generation: hand the record back as stale (only while
         // this run still owns it), which the scheduled stale sweep and the next upgrade's dispatch pick up.
         ReleaseFingerprintMetadata::query()->whereKey($record->getKey())->where('status', 'processing')
             ->when(self::tracksRuns(), fn ($query) => $query->where('run_token', $this->claimToken()))->update(['status' => 'stale']);

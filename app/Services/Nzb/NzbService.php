@@ -575,14 +575,14 @@ class NzbService
                 }
 
                 $path = $file->getPathname();
-                $isPreserved = self::isPreservedNzbPathName($path);
-                if (! $isPreserved && ! $this->isTemporaryNzbPath($path)) {
+                $isStaged = self::isStagedNzbPathName($path);
+                if (! $isStaged && ! $this->isTemporaryNzbPath($path)) {
                     continue;
                 }
 
                 try {
-                    // A preserved link shares the replaced NZB's mtime; its ctime is when it was linked.
-                    $age = $isPreserved ? max($file->getMTime(), $file->getCTime()) : $file->getMTime();
+                    // A staged generation's ctime is when its upgrade renamed it into place.
+                    $age = $isStaged ? max($file->getMTime(), $file->getCTime()) : $file->getMTime();
                     if ($age <= $cutoff) {
                         $paths[] = $path;
                     }
@@ -608,13 +608,13 @@ class NzbService
             if (! File::isFile($path)) {
                 continue;
             }
-            if (self::isPreservedNzbPathName($path)) {
-                // Never just deleted: it may be the only copy matching a rolled-back release row.
-                $outcome = $this->reconcileStalePreservedNzb($path, $olderThanSeconds);
+            if (self::isStagedNzbPathName($path)) {
+                // Never just deleted: it may be the committed generation its upgrade did not get to swap in.
+                $outcome = $this->reconcileStaleStagedNzb($path, $olderThanSeconds);
                 if ($outcome === 'deleted') {
                     $deleted++;
-                } elseif ($outcome === 'restored') {
-                    Log::channel('nzb_creation')->warning('Restored a preserved NZB source whose replacement rolled back', ['path' => $path]);
+                } elseif ($outcome === 'applied') {
+                    Log::channel('nzb_creation')->warning('Applied a committed staged NZB generation left beside its release', ['path' => $path]);
                 }
 
                 continue;
@@ -626,10 +626,10 @@ class NzbService
         return $deleted;
     }
 
-    /** Remove one stale temporary NZB (never a preserved source; see reconcileStalePreservedNzb()). */
+    /** Remove one stale temporary NZB (never a staged generation; see reconcileStaleStagedNzb()). */
     public function deleteStaleTemporaryNzb(string $path): bool
     {
-        if (self::isPreservedNzbPathName($path) || ! File::isFile($path)) {
+        if (self::isStagedNzbPathName($path) || ! File::isFile($path)) {
             return false;
         }
         try {
@@ -777,18 +777,19 @@ class NzbService
     }
 
     /**
-     * A hard link to the source a partial release's in-place upgrade replaced, tagged with the upgrading
-     * candidate; only a crash or a failed rollback leaves one behind.
+     * The generation a partial release's in-place upgrade staged beside its canonical NZB, tagged with the
+     * upgrading candidate; only a crash or a failed callback between commit and swap, or a rollback whose
+     * cleanup failed, leaves one behind.
      */
-    public static function isPreservedNzbPathName(string $path): bool
+    public static function isStagedNzbPathName(string $path): bool
     {
-        return preg_match('/\.nzb\.gz\.c\d+-[0-9a-f]{16}\.prev$/D', basename($path)) === 1;
+        return preg_match(NzbSourceGuard::STAGED_NAME, basename($path)) === 1;
     }
 
-    /** A stale replaced-source link is removable whether or not its release still exists. */
-    public function isStalePreservedNzb(string $path, int $olderThanSeconds = 86400): bool
+    /** A stale staged generation is settled whether or not its release still exists. */
+    public function isStaleStagedNzb(string $path, int $olderThanSeconds = 86400): bool
     {
-        if (! self::isPreservedNzbPathName($path)) {
+        if (! self::isStagedNzbPathName($path)) {
             return false;
         }
         clearstatcache(true, $path);
@@ -799,20 +800,20 @@ class NzbService
     }
 
     /**
-     * Settle a stale preserved source by its upgrade's outcome: removed when the upgrade committed, put back
-     * when it rolled back (see NzbSourceGuard::reconcilePreserved()).
+     * Settle a stale staged generation by its upgrade's outcome: swapped in when it committed, removed when it
+     * rolled back or was already swapped in (see NzbSourceGuard::reconcileStaged()). A dry run reports.
      *
-     * @return 'deleted'|'restored'|'kept'
+     * @return 'applied'|'deleted'|'kept'
      */
-    public function reconcileStalePreservedNzb(string $path, int $olderThanSeconds = 86400, bool $apply = true): string
+    public function reconcileStaleStagedNzb(string $path, int $olderThanSeconds = 86400, bool $apply = true): string
     {
-        if (! $this->isStalePreservedNzb($path, $olderThanSeconds)) {
+        if (! $this->isStaleStagedNzb($path, $olderThanSeconds)) {
             return 'kept';
         }
         try {
-            return (new NzbSourceGuard($this))->reconcilePreserved($path, $apply);
+            return (new NzbSourceGuard($this))->reconcileStaged($path, $apply);
         } catch (Throwable $e) {
-            Log::channel('nzb_creation')->warning('Failed to reconcile a preserved NZB source', ['path' => $path, 'error' => $e->getMessage()]);
+            Log::channel('nzb_creation')->warning('Failed to reconcile a staged NZB generation', ['path' => $path, 'error' => $e->getMessage()]);
 
             return 'kept';
         }

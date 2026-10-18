@@ -636,99 +636,114 @@ class NzbCreationReliabilityTest extends TestCase
         $this->assertFileExists($finalNzb);
     }
 
-    public function test_stale_temporary_cleanup_removes_only_aged_replaced_source_links(): void
+    public function test_stale_temporary_cleanup_settles_only_aged_staged_generations(): void
     {
         $directory = $this->tempNzbPath.'/b';
         mkdir($directory, 0777, true);
 
         $guid = str_repeat('h', 36);
         $canonical = $directory.'/'.$guid.'.nzb.gz';
-        $preserved = $canonical.'.c7-'.str_repeat('c', 16).'.prev';
-        $lookalike = $canonical.'.'.str_repeat('c', 15).'.prev';
+        $staged = $canonical.'.c7-'.str_repeat('c', 16).'.next';
+        $lookalike = $canonical.'.'.str_repeat('c', 15).'.next';
 
         $this->insertRelease(31, 'h');
         DB::table('releases')->where('id', 31)->update(['guid' => $guid]);
+        // The upgrade rolled back: the canonical file is the committed source.
         $this->commitEvidence(31, $guid, 'live');
         file_put_contents($canonical, gzencode('live'));
         file_put_contents($lookalike, 'other');
-        link($canonical, $preserved);
-        // The hard link shares the replaced NZB's old mtime; only its link time is recent.
-        touch($canonical, time() - 7200);
+        file_put_contents($staged, gzencode('upgraded'));
+        // Only its rename time is recent, as when an upgrade renames its fsynced temporary into place.
+        touch($staged, time() - 7200);
         touch($lookalike, time() - 7200);
 
         $nzb = new NzbService(app(CollectionCleanupService::class));
 
-        $this->assertSame([], $nzb->findStaleTemporaryNzbPaths(3600), 'A just-linked backup is live.');
+        $this->assertSame([], $nzb->findStaleTemporaryNzbPaths(3600), 'A just-staged generation may belong to an upgrade in flight.');
         $this->assertSame(0, $nzb->cleanupStaleTemporaryNzbs(3600));
-        $this->assertFileExists($preserved);
+        $this->assertFileExists($staged);
 
         sleep(2);
 
-        $this->assertSame([$preserved], $nzb->findStaleTemporaryNzbPaths(1));
+        $this->assertSame([$staged], $nzb->findStaleTemporaryNzbPaths(1));
         $this->assertSame(1, $nzb->cleanupStaleTemporaryNzbs(1));
-        $this->assertFileDoesNotExist($preserved);
+        $this->assertFileDoesNotExist($staged);
         $this->assertSame('live', gzdecode((string) file_get_contents($canonical)));
         $this->assertFileExists($lookalike);
     }
 
-    public function test_stale_preserved_link_is_reconciled_by_the_committed_source_digest(): void
+    public function test_stale_cleanup_applies_a_committed_staged_generation_instead_of_deleting_it(): void
+    {
+        $directory = $this->tempNzbPath.'/e';
+        mkdir($directory, 0777, true);
+        $fixture = $this->stagedFixture($directory, 'p', 'upgraded');
+        $nzb = new NzbService(app(CollectionCleanupService::class));
+
+        sleep(2);
+
+        $this->assertSame(0, $nzb->cleanupStaleTemporaryNzbs(1), 'Applied, not counted as deleted.');
+        $this->assertFileDoesNotExist($fixture['staged']);
+        $this->assertSame('upgraded', $this->decoded($fixture['canonical']));
+    }
+
+    public function test_stale_staged_generation_is_reconciled_by_the_committed_source_digest(): void
     {
         $directory = $this->tempNzbPath.'/c';
         mkdir($directory, 0777, true);
         $nzb = new NzbService(app(CollectionCleanupService::class));
 
-        $committed = $this->preservedFixture($directory, 'i', 'upgraded');
-        $rolledBack = $this->preservedFixture($directory, 'j', 'original');
-        $neverCommitted = $this->preservedFixture($directory, 'k', null);
-        $neither = $this->preservedFixture($directory, 'n', 'something else');
-        $orphan = $this->preservedFixture($directory, 'l', null, false);
+        $committed = $this->stagedFixture($directory, 'i', 'upgraded');
+        $rolledBack = $this->stagedFixture($directory, 'j', 'original');
+        $neverCommitted = $this->stagedFixture($directory, 'k', null);
+        $neither = $this->stagedFixture($directory, 'n', 'something else');
+        $orphan = $this->stagedFixture($directory, 'l', null, false);
 
         sleep(2);
 
-        $this->assertSame('deleted', $nzb->reconcileStalePreservedNzb($committed['preserved'], 1));
-        $this->assertFileDoesNotExist($committed['preserved']);
+        $this->assertSame('applied', $nzb->reconcileStaleStagedNzb($committed['staged'], 1));
+        $this->assertFileDoesNotExist($committed['staged']);
         $this->assertSame('upgraded', $this->decoded($committed['canonical']));
 
-        $this->assertSame('restored', $nzb->reconcileStalePreservedNzb($rolledBack['preserved'], 1));
-        $this->assertFileDoesNotExist($rolledBack['preserved']);
+        $this->assertSame('deleted', $nzb->reconcileStaleStagedNzb($rolledBack['staged'], 1));
+        $this->assertFileDoesNotExist($rolledBack['staged']);
         $this->assertSame('original', $this->decoded($rolledBack['canonical']));
 
-        $this->assertSame('restored', $nzb->reconcileStalePreservedNzb($neverCommitted['preserved'], 1));
-        $this->assertFileDoesNotExist($neverCommitted['preserved']);
+        $this->assertSame('kept', $nzb->reconcileStaleStagedNzb($neverCommitted['staged'], 1));
+        $this->assertSame('upgraded', $this->decoded($neverCommitted['staged']));
         $this->assertSame('original', $this->decoded($neverCommitted['canonical']));
 
-        $this->assertSame('kept', $nzb->reconcileStalePreservedNzb($neither['preserved'], 1));
-        $this->assertSame('original', $this->decoded($neither['preserved']));
-        $this->assertSame('upgraded', $this->decoded($neither['canonical']));
+        $this->assertSame('kept', $nzb->reconcileStaleStagedNzb($neither['staged'], 1));
+        $this->assertSame('upgraded', $this->decoded($neither['staged']));
+        $this->assertSame('original', $this->decoded($neither['canonical']));
 
-        $this->assertSame('deleted', $nzb->reconcileStalePreservedNzb($orphan['preserved'], 1));
-        $this->assertFileDoesNotExist($orphan['preserved']);
-        $this->assertSame('upgraded', $this->decoded($orphan['canonical']));
+        $this->assertSame('deleted', $nzb->reconcileStaleStagedNzb($orphan['staged'], 1));
+        $this->assertFileDoesNotExist($orphan['staged']);
+        $this->assertSame('original', $this->decoded($orphan['canonical']));
     }
 
-    public function test_fresh_preserved_link_is_kept_by_reconciliation_even_when_the_upgrade_rolled_back(): void
+    public function test_fresh_staged_generation_is_kept_by_reconciliation_even_when_its_upgrade_committed(): void
     {
         $directory = $this->tempNzbPath.'/d';
         mkdir($directory, 0777, true);
-        $fixture = $this->preservedFixture($directory, 'm', 'original');
+        $fixture = $this->stagedFixture($directory, 'm', 'upgraded');
         $nzb = new NzbService(app(CollectionCleanupService::class));
 
-        $this->assertSame('kept', $nzb->reconcileStalePreservedNzb($fixture['preserved'], 3600));
-        $this->assertFileExists($fixture['preserved']);
-        $this->assertSame('upgraded', $this->decoded($fixture['canonical']));
+        $this->assertSame('kept', $nzb->reconcileStaleStagedNzb($fixture['staged'], 3600));
+        $this->assertFileExists($fixture['staged']);
+        $this->assertSame('original', $this->decoded($fixture['canonical']));
     }
 
     /**
-     * The canonical holds 'upgraded' and the tagged backup 'original'; the committed evidence digest is for
-     * $committedSource (no evidence row when null).
+     * The canonical holds 'original' and the tagged staged generation 'upgraded'; the committed evidence digest is
+     * for $committedSource (no evidence row when null).
      *
-     * @return array{canonical: string, preserved: string}
+     * @return array{canonical: string, staged: string}
      */
-    private function preservedFixture(string $directory, string $char, ?string $committedSource, bool $releaseExists = true): array
+    private function stagedFixture(string $directory, string $char, ?string $committedSource, bool $releaseExists = true): array
     {
         $guid = str_repeat($char, 36);
         $canonical = $directory.'/'.$guid.'.nzb.gz';
-        $preserved = $canonical.'.c9-'.str_repeat('a', 16).'.prev';
+        $staged = $canonical.'.c9-'.str_repeat('a', 16).'.next';
         $id = 100 + ord($char);
         if ($releaseExists) {
             $this->insertRelease($id, $char);
@@ -737,10 +752,10 @@ class NzbCreationReliabilityTest extends TestCase
                 $this->commitEvidence($id, $guid, $committedSource);
             }
         }
-        file_put_contents($preserved, gzencode('original'));
-        file_put_contents($canonical, gzencode('upgraded'));
+        file_put_contents($staged, gzencode('upgraded'));
+        file_put_contents($canonical, gzencode('original'));
 
-        return ['canonical' => $canonical, 'preserved' => $preserved];
+        return ['canonical' => $canonical, 'staged' => $staged];
     }
 
     private function commitEvidence(int $releaseId, string $guid, string $decodedSource): void

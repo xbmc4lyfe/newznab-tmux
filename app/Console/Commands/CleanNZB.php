@@ -72,8 +72,8 @@ class CleanNZB extends Command
             if (NzbService::isTemporaryNzbPathName((string) $filePath)) {
                 continue;
             }
-            if (NzbService::isPreservedNzbPathName((string) $filePath)) {
-                $this->removeStalePreservedNzb((string) $filePath, $delete, $checked, $deleted);
+            if (NzbService::isStagedNzbPathName((string) $filePath)) {
+                $this->reconcileStaleStagedNzb((string) $filePath, $delete, $checked, $deleted);
 
                 continue;
             }
@@ -99,20 +99,27 @@ class CleanNZB extends Command
         $this->info("Checked: $checked / Deleted: $deleted");
     }
 
-    private function removeStalePreservedNzb(string $path, mixed $delete, int &$checked, int &$deleted): void
+    private function reconcileStaleStagedNzb(string $path, mixed $delete, int &$checked, int &$deleted): void
     {
         $nzb = app(NzbService::class);
         $olderThanSeconds = max(1, (int) $this->option('temp-age-hours')) * 3600;
         $checked++;
-        $outcome = $nzb->reconcileStalePreservedNzb($path, $olderThanSeconds, apply: (bool) $delete);
+        $outcome = $nzb->reconcileStaleStagedNzb($path, $olderThanSeconds, apply: (bool) $delete);
         if ($outcome === 'deleted') {
             $deleted++;
-            $this->line(($delete ? 'Deleted' : 'Would delete').' replaced NZB source: '.$path);
-        } elseif ($outcome === 'restored') {
-            $this->line(($delete ? 'Restored' : 'Would restore').' replaced NZB source: '.$path);
-        } elseif ($nzb->isStalePreservedNzb($path, $olderThanSeconds)) {
-            $this->line('Kept replaced NZB source for review: '.$path);
         }
+        if ($outcome !== 'kept' || $nzb->isStaleStagedNzb($path, $olderThanSeconds)) {
+            $this->line($this->stagedOutcomeLine($outcome, (bool) $delete, $path));
+        }
+    }
+
+    private function stagedOutcomeLine(string $outcome, bool $delete, string $path): string
+    {
+        return match ($outcome) {
+            'applied' => ($delete ? 'Applied' : 'Would apply').' staged NZB generation: '.$path,
+            'deleted' => ($delete ? 'Deleted' : 'Would delete').' staged NZB generation: '.$path,
+            default => 'Kept staged NZB generation for review: '.$path,
+        };
     }
 
     private function GetReleasesWithNoNZBOnDisk(mixed $delete = false): void
@@ -148,18 +155,14 @@ class CleanNZB extends Command
         $nzb = app(NzbService::class);
         $ageHours = max(1, (int) $this->option('temp-age-hours'));
         $olderThanSeconds = $ageHours * 3600;
-        $outcomes = ['deleted' => 0, 'restored' => 0, 'kept' => 0];
+        $outcomes = ['deleted' => 0, 'applied' => 0, 'kept' => 0];
 
         foreach ($nzb->findStaleTemporaryNzbPaths($olderThanSeconds) as $path) {
-            if (NzbService::isPreservedNzbPathName($path)) {
-                // A replaced source is settled by its upgrade's outcome, never just deleted.
-                $outcome = $nzb->reconcileStalePreservedNzb($path, $olderThanSeconds, apply: (bool) $delete);
+            if (NzbService::isStagedNzbPathName($path)) {
+                // A staged generation is settled by its upgrade's outcome, never just deleted.
+                $outcome = $nzb->reconcileStaleStagedNzb($path, $olderThanSeconds, apply: (bool) $delete);
                 $outcomes[$outcome]++;
-                $this->line(match ($outcome) {
-                    'deleted' => ($delete ? 'Deleted' : 'Would delete').' replaced NZB source: '.$path,
-                    'restored' => ($delete ? 'Restored' : 'Would restore').' replaced NZB source: '.$path,
-                    default => 'Kept replaced NZB source for review: '.$path,
-                });
+                $this->line($this->stagedOutcomeLine($outcome, (bool) $delete, $path));
 
                 continue;
             }
@@ -177,10 +180,10 @@ class CleanNZB extends Command
             }
         }
 
-        if ($delete && $outcomes['deleted'] + $outcomes['restored'] > 0) {
+        if ($delete && $outcomes['deleted'] + $outcomes['applied'] > 0) {
             Log::channel('nzb_creation')->warning('Cleaned stale temporary NZB files', $outcomes + ['older_than_hours' => $ageHours]);
         }
-        $this->info(sprintf('%s stale temporary NZBs: %d deleted, %d restored, %d kept.', $delete ? 'Cleaned' : 'Checked (dry run)',
-            $outcomes['deleted'], $outcomes['restored'], $outcomes['kept']));
+        $this->info(sprintf('%s stale temporary NZBs: %d deleted, %d applied, %d kept.', $delete ? 'Cleaned' : 'Checked (dry run)',
+            $outcomes['deleted'], $outcomes['applied'], $outcomes['kept']));
     }
 }

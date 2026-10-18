@@ -254,7 +254,8 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
             DB::transaction(fn () => $this->sources->install($this->release, $temporary, $this->path()));
             self::fail('Missing schema must reject installation.');
         } catch (QueryException) {
-            self::assertSame($old, $this->digest());
+            // Read directly: every locked read consults the (missing) committed evidence.
+            self::assertSame($old, NzbSourceGuard::digest((string) gzdecode((string) file_get_contents($this->path()))));
         }
     }
 
@@ -271,23 +272,55 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
         self::assertSame($inode, fileinode($locks[0]));
     }
 
-    public function test_rolled_back_preserving_replacement_restores_the_replaced_source(): void
+    public function test_staged_install_keeps_the_committed_source_in_place_until_its_transaction_commits(): void
     {
         $this->writeSource('original');
+        $this->commitEvidence('original');
+        $temporary = $this->directory.'/upgrade.tmp';
+        file_put_contents($temporary, gzencode('upgraded'));
+        $during = [];
+
+        $receipt = DB::transaction(function () use ($temporary, &$during): NzbSourceInstallation {
+            $receipt = $this->sources->install($this->release, $temporary, $this->path(), stageFor: 5);
+            DB::afterRollBack(static fn () => $receipt->rollback());
+            DB::afterCommit(static fn () => $receipt->close());
+            // What a reader without the release lock (a download, duplicate coverage) sees before commit.
+            $during = [gzdecode((string) file_get_contents($this->path())), $this->staged()];
+
+            return $receipt;
+        });
+
+        self::assertSame('original', $during[0], 'The never-committed generation is not at the canonical path.');
+        self::assertCount(1, $during[1]);
+        self::assertMatchesRegularExpression('/fixture-guid\.nzb\.gz\.c5-[0-9a-f]{16}\.next$/', $during[1][0]);
+        self::assertSame($this->path(), $receipt->path);
+        self::assertSame('upgraded', gzdecode((string) file_get_contents($this->path())), 'Swapped in after commit.');
+        self::assertSame([], $this->staged());
+        self::assertSame(NzbSourceGuard::digest('upgraded'), DB::table('release_archive_naming_evidence')->value('source_sha256'));
+    }
+
+    public function test_rolled_back_staged_install_removes_only_its_staged_file(): void
+    {
+        $this->writeSource('original');
+        $this->commitEvidence('original');
+        $inode = fileinode($this->path());
         $temporary = $this->directory.'/upgrade.tmp';
         file_put_contents($temporary, gzencode('upgraded'));
 
         DB::beginTransaction();
-        $receipt = $this->sources->install($this->release, $temporary, $this->path(), preserveFor: 5);
+        $receipt = $this->sources->install($this->release, $temporary, $this->path(), stageFor: 5);
         DB::afterRollBack(fn () => $receipt->rollback());
-        self::assertSame('upgraded', gzdecode((string) file_get_contents($this->path())));
+        DB::afterCommit(fn () => $receipt->close());
+        self::assertCount(1, $this->staged());
         DB::rollBack();
 
         self::assertSame('original', gzdecode((string) file_get_contents($this->path())), 'The partial keeps its NZB.');
-        self::assertSame([], glob($this->path().'.*.prev'));
+        self::assertSame($inode, fileinode($this->path()), 'The canonical file was never touched.');
+        self::assertSame([], $this->staged());
+        self::assertSame(NzbSourceGuard::digest('original'), DB::table('release_archive_naming_evidence')->value('source_sha256'));
     }
 
-    public function test_failed_preserving_install_after_the_move_restores_the_replaced_source(): void
+    public function test_failed_staged_install_after_the_move_leaves_the_canonical_source(): void
     {
         $this->writeSource('original');
         $temporary = $this->directory.'/upgrade.tmp';
@@ -302,7 +335,7 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
 
         DB::beginTransaction();
         try {
-            $this->sources->install($this->release, $temporary, $this->path(), move: $move, preserveFor: 5);
+            $this->sources->install($this->release, $temporary, $this->path(), move: $move, stageFor: 5);
             self::fail('The identity check must reject the swapped file.');
         } catch (RuntimeException $exception) {
             self::assertSame('Staged NZB installation identity changed.', $exception->getMessage());
@@ -310,11 +343,11 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
             DB::rollBack();
         }
 
-        self::assertSame('original', gzdecode((string) file_get_contents($this->path())), 'The only link to the old NZB is not lost.');
-        self::assertSame([], glob($this->path().'.*.prev'));
+        self::assertSame('original', gzdecode((string) file_get_contents($this->path())));
+        self::assertSame([], $this->staged());
     }
 
-    public function test_failed_preserving_install_before_the_move_drops_only_its_backup(): void
+    public function test_failed_staged_install_before_the_move_leaves_the_canonical_source(): void
     {
         $this->writeSource('original');
         $temporary = $this->directory.'/upgrade.tmp';
@@ -322,7 +355,7 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
 
         DB::beginTransaction();
         try {
-            $this->sources->install($this->release, $temporary, $this->path(), move: static fn (): bool => false, preserveFor: 5);
+            $this->sources->install($this->release, $temporary, $this->path(), move: static fn (): bool => false, stageFor: 5);
             self::fail('A failed move must be reported.');
         } catch (RuntimeException $exception) {
             self::assertSame('Unable to move temporary NZB into place.', $exception->getMessage());
@@ -331,22 +364,42 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
         }
 
         self::assertSame('original', gzdecode((string) file_get_contents($this->path())));
-        self::assertSame([], glob($this->path().'.*.prev'));
+        self::assertSame([], $this->staged());
     }
 
-    public function test_committed_preserving_replacement_discards_its_backup(): void
+    public function test_an_install_without_staging_still_replaces_the_canonical_file_in_its_transaction(): void
     {
         $this->writeSource('original');
+        $temporary = $this->directory.'/repair.tmp';
+        file_put_contents($temporary, gzencode('repaired'));
+
+        DB::transaction(function () use ($temporary): void {
+            $receipt = $this->sources->install($this->release, $temporary, $this->path(), NzbSourceGuard::digest('original'));
+            DB::afterCommit(static fn () => $receipt->close());
+            self::assertSame('repaired', gzdecode((string) file_get_contents($this->path())));
+            self::assertNull($receipt->staged);
+        });
+
+        self::assertSame('repaired', gzdecode((string) file_get_contents($this->path())));
+        self::assertSame([], $this->staged());
+    }
+
+    public function test_a_same_transaction_reader_never_swaps_in_its_own_uncommitted_generation(): void
+    {
+        $this->writeSource('original');
+        $this->commitEvidence('original');
         $temporary = $this->directory.'/upgrade.tmp';
         file_put_contents($temporary, gzencode('upgraded'));
 
         DB::transaction(function () use ($temporary): void {
-            $receipt = $this->sources->install($this->release, $temporary, $this->path(), preserveFor: 5);
+            $receipt = $this->sources->install($this->release, $temporary, $this->path(), stageFor: 5);
             DB::afterCommit(static fn () => $receipt->close());
+            // The evidence this transaction recorded names the staged file, but it has not committed.
+            self::assertSame(NzbSourceGuard::digest('original'), $this->sources->snapshot('fixture-guid')['digest'] ?? null);
+            self::assertCount(1, $this->staged());
         });
 
         self::assertSame('upgraded', gzdecode((string) file_get_contents($this->path())));
-        self::assertSame([], glob($this->path().'.*.prev'));
     }
 
     public function test_full_rollback_cleanup_does_not_corrupt_the_next_transaction_callbacks(): void
@@ -554,115 +607,122 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
         return $this->sources->install($this->release, $temporary, $this->path());
     }
 
-    public function test_reconcile_deletes_the_backup_when_evidence_matches_the_canonical_source(): void
+    public function test_reconcile_applies_a_committed_generation_left_staged(): void
     {
-        $this->writeSource('upgraded');
-        $backup = $this->tagBackup(5, 'original');
+        $this->writeSource('original');
+        $staged = $this->stage(5, 'upgraded');
         $this->commitEvidence('upgraded');
 
-        self::assertSame('deleted', $this->sources->reconcilePreserved($backup));
+        self::assertSame('applied', $this->sources->reconcileStaged($staged));
 
-        self::assertFileDoesNotExist($backup);
+        self::assertFileDoesNotExist($staged);
         self::assertSame('upgraded', gzdecode((string) file_get_contents($this->path())));
     }
 
-    public function test_reconcile_restores_the_backup_when_evidence_matches_it(): void
+    public function test_reconcile_deletes_a_staged_generation_whose_upgrade_rolled_back(): void
     {
-        $this->writeSource('upgraded');
-        $backup = $this->tagBackup(5, 'original');
+        $this->writeSource('original');
+        $staged = $this->stage(5, 'upgraded');
         $this->commitEvidence('original');
 
-        self::assertSame('restored', $this->sources->reconcilePreserved($backup));
+        self::assertSame('deleted', $this->sources->reconcileStaged($staged));
 
-        self::assertFileDoesNotExist($backup);
+        self::assertFileDoesNotExist($staged);
         self::assertSame('original', gzdecode((string) file_get_contents($this->path())));
     }
 
-    public function test_reconcile_restores_the_backup_when_no_installation_ever_committed(): void
+    public function test_reconcile_deletes_a_staged_generation_already_in_place(): void
     {
         $this->writeSource('upgraded');
-        $backup = $this->tagBackup(5, 'original');
-        self::assertSame(0, DB::table('release_archive_naming_evidence')->count());
+        $staged = $this->stage(5, 'upgraded');
+        $this->commitEvidence('upgraded');
+        $inode = fileinode($this->path());
 
-        self::assertSame('restored', $this->sources->reconcilePreserved($backup));
+        self::assertSame('deleted', $this->sources->reconcileStaged($staged));
 
-        self::assertFileDoesNotExist($backup);
-        self::assertSame('original', gzdecode((string) file_get_contents($this->path())));
+        self::assertFileDoesNotExist($staged);
+        self::assertSame($inode, fileinode($this->path()));
     }
 
-    public function test_reconcile_keeps_both_files_when_evidence_matches_neither(): void
+    public function test_reconcile_keeps_a_staged_generation_matching_neither_source(): void
     {
         $this->writeSource('newer source');
-        $backup = $this->tagBackup(5, 'original');
+        $staged = $this->stage(5, 'upgraded');
         $this->commitEvidence('something else');
 
-        self::assertSame('kept', $this->sources->reconcilePreserved($backup));
+        self::assertSame('kept', $this->sources->reconcileStaged($staged));
 
-        self::assertSame('original', gzdecode((string) file_get_contents($backup)));
+        self::assertSame('upgraded', gzdecode((string) file_get_contents($staged)));
         self::assertSame('newer source', gzdecode((string) file_get_contents($this->path())));
     }
 
-    public function test_reconcile_deletes_the_backup_of_a_release_that_no_longer_exists(): void
-    {
-        $this->writeSource('upgraded');
-        $backup = $this->tagBackup(5, 'original');
-        DB::table('release_archive_naming_evidence')->delete();
-        DB::table('releases')->where('id', 1)->delete();
-
-        self::assertSame('deleted', $this->sources->reconcilePreserved($backup));
-
-        self::assertFileDoesNotExist($backup);
-        self::assertSame('upgraded', gzdecode((string) file_get_contents($this->path())));
-    }
-
-    public function test_reconcile_dry_run_changes_nothing(): void
-    {
-        $this->writeSource('upgraded');
-        $backup = $this->tagBackup(5, 'original');
-        $this->commitEvidence('original');
-
-        self::assertSame('restored', $this->sources->reconcilePreserved($backup, false));
-
-        self::assertFileExists($backup);
-        self::assertSame('upgraded', gzdecode((string) file_get_contents($this->path())));
-    }
-
-    public function test_close_after_an_uncommitted_install_restores_the_replaced_source(): void
-    {
-        foreach ([null, 'original'] as $priorEvidence) {
-            $this->writeSource('original');
-            DB::table('release_archive_naming_evidence')->delete();
-            if ($priorEvidence !== null) {
-                $this->commitEvidence($priorEvidence);
-            }
-            $temporary = $this->directory.'/upgrade.tmp';
-            file_put_contents($temporary, gzencode('upgraded'));
-
-            // The transaction ends without committing (no rollback hook runs), yet close() is still called.
-            DB::beginTransaction();
-            $receipt = $this->sources->install($this->release, $temporary, $this->path(), preserveFor: 5);
-            DB::rollBack();
-            self::assertCount(1, glob($this->path().'.*.prev'));
-            $receipt->close();
-
-            self::assertSame([], glob($this->path().'.*.prev'), 'The backup is put back, not left behind.');
-            self::assertSame('original', gzdecode((string) file_get_contents($this->path())));
-        }
-    }
-
-    public function test_close_after_a_committed_install_deletes_the_backup_only_when_evidence_matches(): void
+    public function test_reconcile_keeps_a_staged_generation_of_a_release_without_committed_evidence(): void
     {
         $this->writeSource('original');
+        $staged = $this->stage(5, 'upgraded');
+        self::assertSame(0, DB::table('release_archive_naming_evidence')->count());
+
+        self::assertSame('kept', $this->sources->reconcileStaged($staged));
+
+        self::assertFileExists($staged);
+        self::assertSame('original', gzdecode((string) file_get_contents($this->path())));
+    }
+
+    public function test_reconcile_deletes_the_staged_generation_of_a_release_that_no_longer_exists(): void
+    {
+        $this->writeSource('original');
+        $staged = $this->stage(5, 'upgraded');
+        DB::table('releases')->where('id', 1)->delete();
+
+        self::assertSame('deleted', $this->sources->reconcileStaged($staged));
+
+        self::assertFileDoesNotExist($staged);
+        self::assertSame('original', gzdecode((string) file_get_contents($this->path())));
+    }
+
+    public function test_reconcile_dry_run_reports_without_changing_files(): void
+    {
+        $this->writeSource('original');
+        $staged = $this->stage(5, 'upgraded');
+        $this->commitEvidence('upgraded');
+
+        self::assertSame('applied', $this->sources->reconcileStaged($staged, false));
+        DB::table('release_archive_naming_evidence')->update(['source_sha256' => NzbSourceGuard::digest('original')]);
+        self::assertSame('deleted', $this->sources->reconcileStaged($staged, false));
+
+        self::assertSame('upgraded', gzdecode((string) file_get_contents($staged)));
+        self::assertSame('original', gzdecode((string) file_get_contents($this->path())));
+    }
+
+    public function test_reconcile_keeps_an_untagged_staged_file(): void
+    {
+        $this->writeSource('original');
+        $staged = $this->path().'.'.str_repeat('a', 16).'.next';
+        file_put_contents($staged, gzencode('upgraded'));
+        $this->commitEvidence('upgraded');
+
+        self::assertSame('kept', $this->sources->reconcileStaged($staged));
+
+        self::assertFileExists($staged);
+        self::assertSame('original', gzdecode((string) file_get_contents($this->path())));
+    }
+
+    public function test_close_after_an_uncommitted_install_deletes_its_staged_file(): void
+    {
+        $this->writeSource('original');
+        $this->commitEvidence('original');
         $temporary = $this->directory.'/upgrade.tmp';
         file_put_contents($temporary, gzencode('upgraded'));
 
-        $receipt = DB::transaction(fn () => $this->sources->install($this->release, $temporary, $this->path(), preserveFor: 5));
-        self::assertSame(NzbSourceGuard::digest('upgraded'), DB::table('release_archive_naming_evidence')->value('source_sha256'));
-        self::assertCount(1, glob($this->path().'.*.prev'));
+        // The transaction ends without committing (no rollback hook runs), yet close() is still called.
+        DB::beginTransaction();
+        $receipt = $this->sources->install($this->release, $temporary, $this->path(), stageFor: 5);
+        DB::rollBack();
+        self::assertCount(1, $this->staged());
         $receipt->close();
 
-        self::assertSame([], glob($this->path().'.*.prev'));
-        self::assertSame('upgraded', gzdecode((string) file_get_contents($this->path())));
+        self::assertSame([], $this->staged());
+        self::assertSame('original', gzdecode((string) file_get_contents($this->path())), 'Never swapped in.');
     }
 
     public function test_close_keeps_both_sources_when_evidence_matches_neither(): void
@@ -670,99 +730,141 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
         $this->writeSource('original');
         $temporary = $this->directory.'/upgrade.tmp';
         file_put_contents($temporary, gzencode('upgraded'));
-        $receipt = DB::transaction(fn () => $this->sources->install($this->release, $temporary, $this->path(), preserveFor: 5));
+        $receipt = DB::transaction(fn () => $this->sources->install($this->release, $temporary, $this->path(), stageFor: 5));
         DB::table('release_archive_naming_evidence')->update(['source_sha256' => NzbSourceGuard::digest('unrelated')]);
 
         $receipt->close();
 
-        self::assertCount(1, glob($this->path().'.*.prev'));
-        self::assertSame('upgraded', gzdecode((string) file_get_contents($this->path())));
+        self::assertCount(1, $this->staged());
+        self::assertSame('original', gzdecode((string) file_get_contents($this->path())));
     }
 
-    public function test_destroying_an_installation_without_close_leaves_the_backup(): void
+    public function test_a_crash_after_commit_leaves_the_committed_generation_staged_for_reconciliation(): void
     {
         $this->writeSource('original');
         $temporary = $this->directory.'/upgrade.tmp';
         file_put_contents($temporary, gzencode('upgraded'));
 
-        $receipt = DB::transaction(fn () => $this->sources->install($this->release, $temporary, $this->path(), preserveFor: 5));
+        // Committed, but the process ends before the after-commit swap.
+        $receipt = DB::transaction(fn () => $this->sources->install($this->release, $temporary, $this->path(), stageFor: 5));
         unset($receipt);
         gc_collect_cycles();
 
-        self::assertCount(1, glob($this->path().'.*.prev'));
+        $staged = $this->staged();
+        self::assertCount(1, $staged);
+        self::assertSame('original', gzdecode((string) file_get_contents($this->path())));
+        self::assertSame('applied', $this->sources->reconcileStaged($staged[0]));
         self::assertSame('upgraded', gzdecode((string) file_get_contents($this->path())));
     }
 
-    public function test_naming_inspection_settles_a_rolled_back_replacement_before_recording_evidence(): void
+    public function test_naming_inspection_applies_a_committed_staged_generation_before_recording_evidence(): void
     {
-        // A partial: only those can be mid-upgrade.
-        DB::table('releases')->update(['articles_expected' => 3]);
-        $this->writeSource('upgraded');
-        $backup = $this->tagBackup(5, 'original');
-        $this->commitEvidence('original');
-
-        $snapshot = $this->sources->snapshot('fixture-guid', beginNamingInspection: true);
-
-        self::assertNotNull($snapshot);
-        self::assertSame(NzbSourceGuard::digest('original'), $snapshot['digest']);
-        self::assertFileDoesNotExist($backup);
-        self::assertSame('original', gzdecode((string) file_get_contents($this->path())));
-        self::assertSame(NzbSourceGuard::digest('original'), DB::table('release_archive_naming_evidence')->value('source_sha256'));
-    }
-
-    public function test_naming_inspection_records_nothing_while_a_backup_is_unresolved(): void
-    {
-        // A partial: only those can be mid-upgrade.
-        DB::table('releases')->update(['articles_expected' => 3]);
-        $this->writeSource('upgraded');
-        $backup = $this->tagBackup(5, 'original');
-        // The committed source is neither file: the backup cannot be settled.
-        $this->commitEvidence('another');
-
-        try {
-            $this->sources->snapshot('fixture-guid', beginNamingInspection: true);
-            self::fail('Inspection must wait for the backup to be resolved.');
-        } catch (RuntimeException $error) {
-            self::assertStringContainsString('unresolved', $error->getMessage());
-        }
-
-        self::assertFileExists($backup);
-        self::assertSame(NzbSourceGuard::digest('another'), DB::table('release_archive_naming_evidence')->value('source_sha256'), 'No evidence was recorded.');
-    }
-
-    public function test_naming_inspection_of_a_complete_release_skips_the_backup_scan(): void
-    {
-        $this->writeSource('upgraded');
-        $backup = $this->tagBackup(5, 'original');
+        // Complete once upgraded: the counts no longer mark it partial.
+        $this->writeSource('original');
+        $staged = $this->stage(5, 'upgraded');
         $this->commitEvidence('upgraded');
 
         $snapshot = $this->sources->snapshot('fixture-guid', beginNamingInspection: true);
 
+        self::assertNotNull($snapshot);
         self::assertSame(NzbSourceGuard::digest('upgraded'), $snapshot['digest']);
-        self::assertFileExists($backup, 'Left to nzbclean: a complete release has no upgrade in flight.');
+        self::assertFileDoesNotExist($staged);
+        self::assertSame('upgraded', gzdecode((string) file_get_contents($this->path())));
+        self::assertSame(NzbSourceGuard::digest('upgraded'), DB::table('release_archive_naming_evidence')->value('source_sha256'));
     }
 
-    public function test_plain_snapshot_does_not_settle_backups(): void
+    public function test_naming_inspection_records_nothing_while_a_staged_generation_is_unresolved(): void
     {
-        $this->writeSource('upgraded');
-        $backup = $this->tagBackup(5, 'original');
+        $this->writeSource('original');
+        $staged = $this->stage(5, 'upgraded');
+        // The committed source is neither file: the staged generation cannot be settled.
+        $this->commitEvidence('another');
+
+        try {
+            $this->sources->snapshot('fixture-guid', beginNamingInspection: true);
+            self::fail('Inspection must wait for the staged generation to be resolved.');
+        } catch (RuntimeException $error) {
+            self::assertStringContainsString('unresolved', $error->getMessage());
+        }
+
+        self::assertFileExists($staged);
+        self::assertSame('original', gzdecode((string) file_get_contents($this->path())));
+        self::assertSame(NzbSourceGuard::digest('another'), DB::table('release_archive_naming_evidence')->value('source_sha256'), 'No evidence was recorded.');
+    }
+
+    public function test_naming_inspection_of_a_committed_canonical_source_leaves_a_rolled_back_leftover_to_nzbclean(): void
+    {
+        $this->writeSource('original');
+        $staged = $this->stage(5, 'upgraded');
         $this->commitEvidence('original');
 
-        $snapshot = $this->sources->snapshot('fixture-guid');
+        $snapshot = $this->sources->snapshot('fixture-guid', beginNamingInspection: true);
 
-        self::assertSame(NzbSourceGuard::digest('upgraded'), $snapshot['digest']);
-        self::assertFileExists($backup);
+        self::assertSame(NzbSourceGuard::digest('original'), $snapshot['digest']);
+        self::assertFileExists($staged, 'No scan: the canonical file is the committed source.');
     }
 
-    public function test_reconcile_keeps_an_untagged_backup(): void
+    public function test_a_committed_generation_that_cannot_be_put_in_place_is_no_source(): void
     {
-        $this->writeSource('upgraded');
-        $backup = $this->path().'.'.str_repeat('a', 16).'.prev';
-        file_put_contents($backup, gzencode('original'));
+        // The older generation is found at another base path; the staged one cannot replace the installation path.
+        mkdir($this->directory.'/alternate');
+        $alternate = $this->directory.'/alternate/fixture-guid.nzb.gz';
+        file_put_contents($alternate, gzencode('original'));
+        File::delete($this->path());
+        mkdir($this->path());
+        $nzb = Mockery::mock(NzbService::class);
+        $nzb->shouldReceive('buildNzbPath')->with('fixture-guid', 0, true)->andReturn($this->directory.'/');
+        $nzb->shouldReceive('getNzbPath')->with('fixture-guid')->andReturn($this->path());
+        $nzb->shouldReceive('nzbPath')->andReturn($alternate);
+        $sources = new NzbSourceGuard($nzb);
+        $staged = $this->stage(5, 'upgraded');
+        $this->commitEvidence('upgraded');
 
-        self::assertSame('kept', $this->sources->reconcilePreserved($backup));
+        self::assertNull(DB::transaction(fn () => $sources->withLockedSource($this->release, static fn (?array $source): ?array => $source)),
+            'The replaced generation is not the source.');
+        try {
+            $sources->snapshot('fixture-guid', beginNamingInspection: true);
+            self::fail('Inspection must wait for the committed generation to be put in place.');
+        } catch (RuntimeException $error) {
+            self::assertStringContainsString('unresolved', $error->getMessage());
+        }
+        self::assertFileExists($staged);
+        self::assertSame(NzbSourceGuard::digest('upgraded'), DB::table('release_archive_naming_evidence')->value('source_sha256'));
+        rmdir($this->path());
+    }
 
-        self::assertFileExists($backup);
+    public function test_evidence_from_a_replaced_generation_cannot_overwrite_a_committed_staged_one(): void
+    {
+        // An inspection read the original; then an upgrade committed without getting to swap its NZB in.
+        $this->writeSource('original');
+        $old = NzbSourceGuard::digest('original');
+        $staged = $this->stage(5, 'upgraded');
+        $this->commitEvidence('upgraded');
+
+        self::assertFalse($this->record($old, 'complete_single', ['Show.S01E01.mkv'], true));
+
+        self::assertFileDoesNotExist($staged);
+        self::assertSame('upgraded', gzdecode((string) file_get_contents($this->path())));
+        self::assertSame(NzbSourceGuard::digest('upgraded'), DB::table('release_archive_naming_evidence')->value('source_sha256'));
+    }
+
+    public function test_a_repair_of_a_replaced_generation_is_refused_once_the_committed_one_is_applied(): void
+    {
+        $this->writeSource('original');
+        $this->stage(5, 'upgraded');
+        $this->commitEvidence('upgraded');
+        $temporary = $this->directory.'/repair.tmp';
+        file_put_contents($temporary, gzencode('repaired original'));
+
+        try {
+            DB::transaction(fn () => $this->sources->install($this->release, $temporary, $this->path(), NzbSourceGuard::digest('original')));
+            self::fail('The repair compared against a replaced generation.');
+        } catch (RuntimeException $exception) {
+            self::assertSame('NZB source changed before replacement.', $exception->getMessage());
+        }
+
+        self::assertSame('upgraded', gzdecode((string) file_get_contents($this->path())));
+        self::assertSame([], $this->staged());
     }
 
     private function commitEvidence(string $decodedSource): void
@@ -778,12 +880,18 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
         ]);
     }
 
-    private function tagBackup(int $candidateId, string $contents): string
+    private function stage(int $candidateId, string $contents): string
     {
-        $backup = $this->path().'.c'.$candidateId.'-'.str_repeat('a', 16).'.prev';
-        file_put_contents($backup, gzencode($contents));
+        $staged = $this->path().'.c'.$candidateId.'-'.str_repeat('a', 16).'.next';
+        file_put_contents($staged, gzencode($contents));
 
-        return $backup;
+        return $staged;
+    }
+
+    /** @return list<string> */
+    private function staged(): array
+    {
+        return glob($this->path().'.c*-*.next') ?: [];
     }
 
     private function path(): string

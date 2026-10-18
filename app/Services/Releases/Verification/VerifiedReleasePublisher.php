@@ -569,7 +569,8 @@ final class VerifiedReleasePublisher
 
     /**
      * Rewrite a published partial in place with the merged inventory: the same row and GUID, a replaced NZB
-     * (restored if this transaction rolls back), and counts cleared once nothing is missing.
+     * (staged until this transaction commits, then swapped in first among its after-commit callbacks, so the
+     * canonical file only ever holds a committed generation), and counts cleared once nothing is missing.
      *
      * @param  array<string, mixed>  $manifest
      * @param  array<string, mixed>  $metadata
@@ -601,6 +602,7 @@ final class VerifiedReleasePublisher
         $timing?->nextPhase('final_xml_gzip');
         $receipt = $this->writer->writeWithReceipt($manifest, (string) $release->guid, $release, $timing, $body, replaceFor: $candidateId);
         DB::afterRollBack(static fn () => $receipt->rollback());
+        // The first after-commit callback: the swap precedes the fingerprint dispatch and search sync below.
         DB::afterCommit(static fn () => $receipt->close());
         // After the replacement, and even if no collection has started yet: a run that read the smaller NZB
         // can then only save while its record still says processing, which this (row-locked until commit) ends.
