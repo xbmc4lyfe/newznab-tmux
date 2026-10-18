@@ -5,6 +5,7 @@ use App\Jobs\RemoveInactiveAccounts;
 use App\Models\UserActivityStat;
 use App\Models\UserDownload;
 use App\Models\UserRequest;
+use App\Services\Releases\Verification\PublicationOutbox;
 use App\Services\Releases\Verification\VerificationWorkerLocks;
 use Illuminate\Foundation\Inspiring;
 use Illuminate\Support\Facades\Schedule;
@@ -35,9 +36,26 @@ $scheduleVerificationWorkers = static function (): void {
     }
 };
 
+// With asynchronous publication a remote worker hands verified results to a per-host outbox, and
+// these forwarders (numbered from 1) send them to the primary in batches. Forwarder N runs N-1
+// extra minutes so their restarts stagger and workers nearly always find one alive.
+$scheduleVerificationForwarders = static function (): void {
+    if (! PublicationOutbox::enabled()) {
+        return;
+    }
+    for ($forwarder = 1; $forwarder <= PublicationOutbox::forwarders(); $forwarder++) {
+        $forwarderCommand = escapeshellarg(PHP_BINARY).' -d memory_limit=256M '.escapeshellarg(base_path('artisan'))
+            .' releases:forward-verified-publications --slot='.$forwarder
+            .' --max-seconds='.(max(1, (int) config('release_verification.publish_forwarder_seconds', 300)) + ($forwarder - 1) * 60).' --diagnostics';
+        Schedule::exec($forwarderCommand)->everyMinute()->runInBackground()
+            ->when(static fn (): bool => (bool) config('release_verification.scheduled'));
+    }
+};
+
 // A remote worker host only verifies candidates; the primary host runs everything else.
 if ((bool) config('release_verification.worker_only')) {
     $scheduleVerificationWorkers();
+    $scheduleVerificationForwarders();
 
     return;
 }
