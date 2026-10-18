@@ -12,6 +12,7 @@ use App\Services\Releases\Verification\VerifiedReleasePublisher;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\Support\PublicationBatchFixtures;
 
@@ -445,5 +446,22 @@ class ReleaseVerificationPublicationBatchTest extends ReleaseVerificationCandida
 
         $this->assertSame('deferred', $results[0]['status']);
         $this->assertSame(0, DB::table('releases')->count(), 'Never filtered terminally: later articles may still satisfy the policy.');
+    }
+
+    public function test_a_complete_upload_sent_as_partial_publishes_complete(): void
+    {
+        $this->batchSchema(releases: 1);
+        Schema::table('releases', function ($table): void {
+            $table->unsignedInteger('articles_expected')->nullable();
+        });
+        $claim = $this->claimedCandidate('complete@article');
+        $item = $this->item($claim);
+        $item['evidence']['partial'] = true;
+
+        $releaseId = $this->withServerVariables(self::PEER)->postJson('/internal/release-verification/publish', $item)->assertOk()->json('release_id');
+
+        $this->assertIsInt($releaseId);
+        $this->assertNull(DB::table('releases')->where('id', $releaseId)->value('articles_expected'), 'The stored inventory, not the sender, decides.');
+        $this->assertSame('', $this->candidateRow($claim)->manifest_path, 'A complete release retains no inventory.');
     }
 }

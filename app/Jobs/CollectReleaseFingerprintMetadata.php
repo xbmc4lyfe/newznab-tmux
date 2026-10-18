@@ -181,7 +181,8 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
             // Never end a run that took the record over meanwhile.
             ->when(self::tracksRuns(), fn ($query) => $query->where('run_token', $this->claimToken()))
             ->update([
-                'status' => 'failed',
+                // An in-place upgrade's refresh must still happen: stale, which the scheduled sweep requeues.
+                'status' => $this->generation !== '' ? 'stale' : 'failed',
                 'last_error' => $exception === null ? 'QueueJobFailed' : class_basename($exception),
                 'collected_at' => now(),
             ]);

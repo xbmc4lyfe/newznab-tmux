@@ -189,6 +189,7 @@ final class RemotePublicationService
             }
             $timing?->requestPhase('candidate_read');
             $archived = $this->store->read($candidate->manifest_path);
+            $evidence['partial'] = (new CandidateHeaderInventory)->assessment($archived)['status'] === 'waiting_upload';
             $manifest = SpotCheckVerifier::withEvidence($archived, $evidence);
             $timing?->requestPhase('manifest_read');
             if (! $gate->enter()) {

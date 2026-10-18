@@ -270,4 +270,28 @@ final class ReleaseFingerprintStaleUpgradeTest extends TestCase
         sort($queued);
         $this->assertSame([1, 2], $queued, 'Stale, and processing long past the job timeout; not a live run or a complete one.');
     }
+
+    #[Test]
+    public function an_upgrade_refresh_that_exhausts_its_tries_stays_queued_for_the_stale_sweep(): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:',
+            'database.connections.sqlite.url' => null]);
+        DB::purge();
+        DB::reconnect();
+        Schema::create('releases', static function (Blueprint $table): void {
+            $table->increments('id');
+            $table->string('guid');
+        });
+        DB::table('releases')->insert(['id' => 1, 'guid' => 'upgraded']);
+        (require database_path('migrations/2026_10_12_120000_create_release_fingerprint_metadata_table.php'))->up();
+        (require database_path('migrations/2026_10_18_000000_add_run_token_to_release_fingerprint_metadata.php'))->up();
+        $upgrade = new CollectReleaseFingerprintMetadata(1, 'upgrade-abc');
+        $token = (fn (): string => $this->claimToken())->call($upgrade);
+        DB::table('release_fingerprint_metadata')->insert(['releases_id' => 1, 'status' => 'processing', 'run_token' => $token,
+            'created_at' => now(), 'updated_at' => now()]);
+
+        $upgrade->failed(new \RuntimeException('exhausted'));
+
+        $this->assertSame('stale', DB::table('release_fingerprint_metadata')->value('status'));
+    }
 }

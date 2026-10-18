@@ -135,7 +135,9 @@ final class VerifiedReleasePublisher
                         $inventory = new CandidateHeaderInventory;
                         if (isset($manifest['partial'])) {
                             // Recompute rather than trust the counts, and require the locked candidate to still qualify.
-                            if ($manifest['partial'] !== $inventory->completeness($manifest)
+                            // The stored inventory, not the sender, decides that the upload is incomplete.
+                            if ($inventory->assessment($manifest)['status'] !== 'waiting_upload'
+                                || $manifest['partial'] !== $inventory->completeness($manifest)
                                 || ! app(CandidateRepository::class)->partialAllowed($candidate)) {
                                 throw new RuntimeException('Partial publication is no longer eligible.');
                             }
