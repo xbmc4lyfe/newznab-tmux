@@ -645,12 +645,24 @@ final class CandidateRepository
                 // Too large to compare (or for archive() to merge), so fence any verification already under way:
                 // it must not publish a result read before these headers. Each post stays claimable and is
                 // verified again on what it has, as when ingestion failed on such a collection; this chunk is
-                // not aborted.
+                // not aborted. A partial under the hash can never take these late headers, and its retained
+                // inventory would otherwise wait on this collection forever: it is settled as it stands.
+                $heldIds = array_map(static fn (object $held): int => (int) $held->id, $this->lockPartialHolders($identity, true));
+                $released = 0;
                 foreach ($candidates as $candidate) {
-                    if ($candidate->release_id === null && $candidate->manifest_path !== '') {
+                    if ($candidate->manifest_path === '') {
+                        continue;
+                    }
+                    if (in_array((int) $candidate->id, $heldIds, true)) {
+                        $this->settleOverBudgetHolder($candidate);
+                        $released += (int) $candidate->manifest_bytes;
+                    } elseif ($candidate->release_id === null) {
                         DB::table('release_verification_candidates')->where('id', $candidate->id)->update([
                             'lease_token' => null, 'lease_until' => null, 'version' => $candidate->version + 1]);
                     }
+                }
+                if ($released > 0) {
+                    $this->ledger->adjust(-$released);
                 }
                 DB::table('collections')->where('id', $collection->id)->where('filecheck', '!=', 4)->update(['filecheck' => 3]);
 
@@ -699,6 +711,29 @@ final class CandidateRepository
                 break;
             }
         }
+    }
+
+    /**
+     * Release a partial's retained inventory, held by its published candidate or a pending generation, when late
+     * headers under its hash exceed the metadata budget: they can never be merged, so the partial stays as
+     * published and workers may process it. The caller adjusts the ledger.
+     */
+    private function settleOverBudgetHolder(object $holder): void
+    {
+        $retention = self::tracksRetention() ? ['retained_for_release_id' => null, 'retained_last_unique_at' => null] : [];
+        $release = $holder->release_id ?? ($holder->upgrades_release_id ?? null);
+        if ($holder->release_id !== null) {
+            DB::table('release_verification_candidates')->where('id', $holder->id)->update(['manifest_path' => '', 'manifest_bytes' => 0] + $retention);
+        } else {
+            DB::table('release_verification_candidates')->where('id', $holder->id)->update(['status' => 'expired',
+                'reason' => 'Late headers under this upload exceed the metadata budget; the partial stays as published.',
+                'manifest_path' => '', 'manifest_bytes' => 0, 'lease_token' => null, 'lease_until' => null, 'version' => $holder->version + 1]
+                + (self::tracksUpgrades() ? ['upgrades_release_id' => null] : []) + $retention);
+        }
+        if ($release !== null && Release::hasLateArticleFlag()) {
+            DB::table('releases')->where('id', $release)->where('late_article_candidate_id', $holder->id)->update(['late_article_candidate_id' => null]);
+        }
+        DB::afterCommit(fn () => $this->store->deleteIfUnreferenced($holder->manifest_path));
     }
 
     /**

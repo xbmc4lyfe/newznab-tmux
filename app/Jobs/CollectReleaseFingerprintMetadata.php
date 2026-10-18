@@ -78,7 +78,7 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
         for ($round = 0; $round < 3; $round++) {
             // A query update: the model still believes it is processing, so a model update would write nothing.
             // The run token makes this run the record's only writer until another run takes it over.
-            $token = $this->runToken !== '' ? $this->runToken : bin2hex(random_bytes(8));
+            $token = $this->claimToken();
             ReleaseFingerprintMetadata::query()->whereKey($record->getKey())->update(['status' => 'processing', 'last_error' => null]
                 + (self::tracksRuns() ? ['run_token' => $token] : []));
             $result = $collector->collect($release->refresh());
@@ -112,6 +112,16 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
         // Still preempted: leave it stale, which the backfill command and the next upgrade's dispatch pick up.
     }
 
+    /**
+     * The token this job claims the record with. A job queued before tokens existed derives a stable one from its
+     * identity, so failed() (which runs on a freshly unserialized copy) still ends only its own run; jobs sharing
+     * that identity are one unique job.
+     */
+    private function claimToken(): string
+    {
+        return $this->runToken !== '' ? $this->runToken : substr(hash('sha256', 'legacy:'.$this->releaseId.':'.$this->generation), 0, 16);
+    }
+
     /** @var \WeakMap<\PDO, bool>|null */
     private static ?\WeakMap $sourceEvidenceSupport = null;
 
@@ -141,7 +151,7 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
             ->where('releases_id', $this->releaseId)
             ->where('status', 'processing')
             // Never end a run that took the record over meanwhile.
-            ->when(self::tracksRuns() && $this->runToken !== '', fn ($query) => $query->where('run_token', $this->runToken))
+            ->when(self::tracksRuns(), fn ($query) => $query->where('run_token', $this->claimToken()))
             ->update([
                 'status' => 'failed',
                 'last_error' => $exception === null ? 'QueueJobFailed' : class_basename($exception),

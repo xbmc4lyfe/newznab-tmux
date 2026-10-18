@@ -1097,6 +1097,28 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame($pending->status, DB::table('release_verification_candidates')->where('id', $pending->id)->value('status'), 'Never stranded.');
     }
 
+    public function test_over_budget_late_headers_settle_a_retained_partial_instead_of_holding_it_forever(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('over-budget-partial', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $retained = DB::table('release_verification_candidates')->sole();
+        $this->assertSame((int) $retained->id, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
+        $late = $this->collectionForPolicy('movie.mkv', 20000, $hash, part: 3, messageId: 'e@f');
+        $binary = (int) DB::table('binaries')->where('collections_id', $late)->value('id');
+        foreach (array_chunk(range(4, 15003), 500) as $numbers) {
+            DB::table('parts')->insert(array_map(static fn (int $number): array => ['binaries_id' => $binary, 'partnumber' => $number,
+                'messageid' => str_pad((string) $number, 1000, 'm').'@late', 'size' => 5], $numbers));
+        }
+
+        DB::transaction(fn () => app(CandidateRepository::class)->invalidateHotCollections([$late]));
+
+        $this->assertNull(DB::table('releases')->where('id', $first)->value('late_article_candidate_id'), 'Workers may process it.');
+        $after = DB::table('release_verification_candidates')->where('id', $retained->id)->first();
+        $this->assertSame(['', 0, null], [$after->manifest_path, (int) $after->manifest_bytes, $after->retained_for_release_id]);
+        $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'), 'Its capacity is released.');
+    }
+
     public function test_a_covering_release_with_conflicting_metadata_sends_the_generation_to_review_not_an_upgrade(): void
     {
         $this->publicationSchema(partialColumns: true);

@@ -170,4 +170,37 @@ final class ReleaseFingerprintStaleUpgradeTest extends TestCase
         $this->assertSame(['replacement', 'committed'], $reads, 'The rolled-back replacement was not saved; it collected again.');
         $this->assertNotSame('processing', DB::table('release_fingerprint_metadata')->value('status'));
     }
+
+    #[Test]
+    public function a_failing_job_queued_before_run_tokens_only_ends_its_own_run(): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:',
+            'database.connections.sqlite.url' => null]);
+        DB::purge();
+        DB::reconnect();
+        Schema::create('releases', static function (Blueprint $table): void {
+            $table->increments('id');
+            $table->string('guid');
+        });
+        DB::table('releases')->insert(['id' => 1, 'guid' => 'legacy']);
+        (require database_path('migrations/2026_10_12_120000_create_release_fingerprint_metadata_table.php'))->up();
+        (require database_path('migrations/2026_10_18_000000_add_run_token_to_release_fingerprint_metadata.php'))->up();
+        // The payload such a job was queued with: the release id alone.
+        $legacy = static function (): CollectReleaseFingerprintMetadata {
+            $job = (new \ReflectionClass(CollectReleaseFingerprintMetadata::class))->newInstanceWithoutConstructor();
+            $job->__unserialize(["\0".CollectReleaseFingerprintMetadata::class."\0releaseId" => 1, 'connection' => 'release-fingerprint', 'queue' => 'release-fingerprint']);
+
+            return $job;
+        };
+        $ownToken = (fn (): string => $this->claimToken())->call($legacy());
+        DB::table('release_fingerprint_metadata')->insert(['releases_id' => 1, 'status' => 'processing', 'run_token' => 'upgraderun000000',
+            'created_at' => now(), 'updated_at' => now()]);
+
+        $legacy()->failed(new \RuntimeException('exhausted'));
+        $this->assertSame('processing', DB::table('release_fingerprint_metadata')->value('status'), 'The upgrade run still owns it.');
+
+        DB::table('release_fingerprint_metadata')->update(['run_token' => $ownToken]);
+        $legacy()->failed(new \RuntimeException('exhausted'));
+        $this->assertSame('failed', DB::table('release_fingerprint_metadata')->value('status'), 'Its own run, claimed in an earlier attempt, is ended.');
+    }
 }
