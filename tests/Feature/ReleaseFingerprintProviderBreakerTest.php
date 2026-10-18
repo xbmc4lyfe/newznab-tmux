@@ -191,70 +191,55 @@ final class ReleaseFingerprintProviderBreakerTest extends TestCase
     public function a_success_racing_a_newer_failure_keeps_the_reprobe_serialised(): void
     {
         $nntp = $this->mock(NNTPService::class);
-        $nntp->shouldReceive('getFingerprintServerProfile')->twice()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintServerProfile')->times(3)->with(false)->andReturn(['capabilities_raw' => []]);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(true)
             ->andThrow(new NntpProviderUnavailableException('Unable to connect to the requested NNTP provider.'));
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(true)
             ->andReturnUsing(function (): array {
                 // Another worker records a new failure while this re-probe is still finishing.
-                Cache::put($this->breakerKey('open'), true, 900);
-                Cache::put($this->breakerKey('suspect'), true, 3600);
-                Cache::forget($this->breakerKey('probe'));
+                $this->recordCompetingFailure();
 
                 return ['capabilities_raw' => []];
             });
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(9)->andThrow(new \RuntimeException('Article unavailable.'));
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(12)->andThrow(new \RuntimeException('Article unavailable.'));
 
         $this->collect();
         $this->travel(901)->seconds();
         $this->collect();
+        $this->assertFalse(Cache::has($this->breakerKey('recovered')));
+        $this->travel(901)->seconds();
+        // The newer failure still admits a single re-probe after its window.
+        $this->assertTrue(Cache::add($this->breakerKey('probe'), true, 240));
 
-        $this->assertTrue(Cache::has($this->breakerKey('suspect')));
-        $this->assertTrue(Cache::has($this->breakerKey('open')));
+        $this->assertSame('provider_probe_in_progress', $this->alternateProfile($this->collect()['data'])['profile_skipped_reason']);
     }
 
     #[Test]
     public function a_failure_recorded_while_another_job_was_admitted_keeps_the_reprobe_serialised(): void
     {
         $nntp = $this->mock(NNTPService::class);
-        $nntp->shouldReceive('getFingerprintServerProfile')->twice()->with(false)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintServerProfile')->times(3)->with(false)->andReturn(['capabilities_raw' => []]);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(true)
             ->andThrow(new NntpProviderUnavailableException('Unable to connect to the requested NNTP provider.'));
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)
-            ->withArgs(fn (string $id, int $body, int $header, bool $alternate): bool => $alternate === false)
-            ->andThrow(new \RuntimeException('Article unavailable.'));
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(true)->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(12)->andThrow(new \RuntimeException('Article unavailable.'));
 
         $this->collect();
         $this->travel(901)->seconds();
+        $stale = (string) Cache::get($this->breakerKey('generation'));
         $injected = false;
-        Event::listen(CacheMissed::class, function (CacheMissed $event) use (&$injected): void {
-            // Another worker records a new failure right after this job saw the breaker closed.
-            if (! $injected && $event->key === $this->breakerKey('open')) {
+        Event::listen(CacheMissed::class, function (CacheMissed $event) use (&$injected, $stale): void {
+            // Another worker records a new failure right after this job saw the old window closed.
+            if (! $injected && $event->key === $this->breakerKey('open', $stale)) {
                 $injected = true;
-                Cache::put($this->breakerKey('open'), true, 900);
+                $this->recordCompetingFailure();
             }
         });
 
+        // The stale admission probes once and succeeds, but only for the old generation.
+        $this->assertArrayHasKey('profile', $this->alternateProfile($this->collect()['data']));
+
         $this->assertSame('recent_provider_failure', $this->alternateProfile($this->collect()['data'])['profile_skipped_reason']);
-        $this->assertFalse(Cache::has($this->breakerKey('probe')));
-    }
-
-    #[Test]
-    public function a_failure_is_recorded_even_while_the_state_lock_is_stuck(): void
-    {
-        $nntp = $this->mock(NNTPService::class);
-        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(['capabilities_raw' => []]);
-        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(true)
-            ->andThrow(new NntpProviderUnavailableException('Unable to connect to the requested NNTP provider.'));
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)
-            ->withArgs(fn (string $id, int $body, int $header, bool $alternate): bool => $alternate === false)
-            ->andThrow(new \RuntimeException('Article unavailable.'));
-        $this->assertTrue(Cache::lock($this->breakerKey('state-lock'), 60)->get());
-
-        $this->collect();
-
-        $this->assertTrue(Cache::has($this->breakerKey('open')));
-        $this->assertTrue(Cache::has($this->breakerKey('suspect')));
     }
 
     #[Test]
@@ -302,9 +287,25 @@ final class ReleaseFingerprintProviderBreakerTest extends TestCase
         $this->collect();
     }
 
-    private function breakerKey(string $state): string
+    /** Key for the current failure generation's $state ('generation' is the pointer itself). */
+    private function breakerKey(string $state, ?string $generation = null): string
     {
-        return 'release-fingerprint:provider-unavailable:'.$state.':'.sha1('news.alternate.invalid||plain');
+        $base = 'release-fingerprint:provider-breaker:'.sha1('news.alternate.invalid||plain');
+        if ($state === 'generation') {
+            return $base.':generation';
+        }
+
+        return $base.':'.$state.':'.($generation ?? (string) Cache::get($base.':generation'));
+    }
+
+    /** Record a failure the way another worker would, starting a new generation. */
+    private function recordCompetingFailure(): string
+    {
+        $generation = bin2hex(random_bytes(16));
+        Cache::put($this->breakerKey('open', $generation), true, 900);
+        Cache::put($this->breakerKey('generation'), $generation, 3600);
+
+        return $generation;
     }
 
     /**
