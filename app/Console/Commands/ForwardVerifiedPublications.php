@@ -66,6 +66,9 @@ class ForwardVerifiedPublications extends Command
     /** Whether this process currently holds the shared worker group. */
     private bool $joined = false;
 
+    /** Whether this run, ending at its scheduled deadline, leaves its alive marker for its replacement. */
+    private bool $keepMarker = false;
+
     /** Whether the worker group last refused this forwarder: workers should then publish for themselves. */
     private bool $blocked = false;
 
@@ -93,6 +96,7 @@ class ForwardVerifiedPublications extends Command
         $this->diagnostics = $this->option('diagnostics') ? new PublicationForwarderDiagnostics(hrtime(true), now()->utc()->toIso8601String(),
             $this->slot, $maxSeconds) : null;
         $this->terminate = false;
+        $this->keepMarker = false;
         // A container stop must not wait for a run's deadline: finish the request in hand, then leave.
         if (defined('SIGTERM')) {
             $this->trap([SIGTERM, SIGINT], function (): void {
@@ -149,7 +153,9 @@ class ForwardVerifiedPublications extends Command
             // Workers must not hand off to a forwarder that is gone. Only a marker this process wrote, and only
             // while it still provably holds the slot lock, is removed: after a lost session a replacement
             // forwarder may already have taken the slot and its marker.
-            if ($this->locks->forwarderHeld()) {
+            // A run that ends at its scheduled deadline leaves its marker, touched just before, for the scheduler's
+            // replacement to take over: the alive window bridges the few seconds until the next tick.
+            if ($this->locks->forwarderHeld() && ! $this->keepMarker) {
                 $this->outbox->clearAlive($this->slot);
             }
             $this->locks->close();
@@ -181,6 +187,11 @@ class ForwardVerifiedPublications extends Command
             }
             if ((hrtime(true) - $started) / 1e9 >= $maxSeconds) {
                 $this->diagnostics?->stop('deadline');
+                // Still enabled, not terminated and in possession of its locks: stay advertised until the replacement starts.
+                if (! $this->blocked) {
+                    $this->advertise();
+                    $this->keepMarker = ! $this->blocked;
+                }
 
                 return;
             }

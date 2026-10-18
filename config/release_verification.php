@@ -54,6 +54,7 @@ return [
     // A forwarder counts as alive to workers for this many seconds after it last touched its marker. It touches
     // it every few seconds, idle or while a request waits for the primary (up to publish_timeout, through cURL's
     // progress callback), so this only has to cover a stall; a hung or crashed forwarder is noticed after this long.
+    // Values under 20 count as 20: it must bridge the seconds between a forwarder's scheduled exit and its replacement.
     'publish_forwarder_alive_seconds' => (int) env('RELEASE_VERIFICATION_PUBLISH_FORWARDER_ALIVE_SECONDS', 30),
     // The primary host serves that endpoint, without authentication, to these networks only.
     'publish_endpoint' => (bool) env('RELEASE_VERIFICATION_PUBLISH_ENDPOINT', false),

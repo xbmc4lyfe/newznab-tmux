@@ -24,9 +24,15 @@ use RuntimeException;
 final class PublicationOutbox
 {
     /**
-     * Seconds within which a forwarder's alive file proves it is running, when not configured: longer
-     * than a batch round trip (the primary's 15 s budget plus the item in flight), since a forwarder
-     * touches its file before and after a request, not during it.
+     * The least the configured alive window can be: it must outlast the seconds between a forwarder's
+     * scheduled exit (10 s before a tick) and its replacement's first touch, with a margin.
+     */
+    public const int MINIMUM_ALIVE_SECONDS = 20;
+
+    /**
+     * Seconds within which a forwarder's alive file proves it is running, when not configured. A
+     * forwarder touches it every few seconds, also while a request waits, so this covers a stall and
+     * the gap between a scheduled exit and the replacement's start.
      */
     public const int ALIVE_SECONDS = 30;
 
@@ -173,10 +179,11 @@ final class PublicationOutbox
             return false;
         }
         $now ??= time();
-        $window ??= max(1, (int) config('release_verification.publish_forwarder_alive_seconds', self::ALIVE_SECONDS));
+        $window ??= max(self::MINIMUM_ALIVE_SECONDS, (int) config('release_verification.publish_forwarder_alive_seconds', self::ALIVE_SECONDS));
         clearstatcache();
         foreach (@scandir($this->root) ?: [] as $file) {
-            if (preg_match('/\Aforwarder-\d+\.alive\z/D', $file) === 1) {
+            // A linked marker is never followed, as touching and removing refuse it too.
+            if (preg_match('/\Aforwarder-\d+\.alive\z/D', $file) === 1 && ! is_link($this->root.'/'.$file)) {
                 $modified = @filemtime($this->root.'/'.$file);
                 if ($modified !== false && $now - $modified <= $window) {
                     return true;
