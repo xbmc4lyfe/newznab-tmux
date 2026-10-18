@@ -194,6 +194,10 @@ class HeaderFilenameIdentityTest extends TestCase
             'readable extensionless body under a parity subject' => ['[1/1] - "Xk29dPq8LmZ0Yt5R.par2" yEnc', 'README', false],
             'combining mark extends an unquoted executable name' => ["Release setup.exe\u{301}.mkv yEnc", 'setup.exe', false],
             'long lowercase random token with inner digits' => ['"cxjzxhjlgr3djfprozg6.rar" yEnc', 'Readable.Name.rar', true],
+            'identical PAR2 stream names' => ['"set.par2:stream" yEnc', 'set.par2:stream', true],
+            'long all-caps title with a number' => ['"TERMINATOR2JUDGMENTDAY.mkv" yEnc', 'Totally.Different.mkv', false],
+            'native library under an opaque subject' => ['"0123456789abcdef0123456789abcdef.mkv" yEnc', 'payload.dylib', false],
+            'yEnc inside a quoted filename' => ['"Movie yEnc Documentary.mkv" yEnc', 'Movie yEnc Documentary.mkv', true],
             'opaque subject with an extensionless body' => ['[3/8] - "o9aeI3YpDwgHGoJ2ZsCm.vol00+01.par2" yEnc', '148f76878d7732b981734a9e0c51a348', true],
         ];
     }

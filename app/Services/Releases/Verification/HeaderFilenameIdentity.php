@@ -16,7 +16,7 @@ final class HeaderFilenameIdentity
 
     private const string SUFFIX = '/\A(?:part\d+|vol\d+[+-]\d+|par2|rar|r\d{2,3}|\d{3}|7z|zip|tar|gz|tgz|xz|bz2|zst|mkv|avi|mp4|m4v|ts|nfo|sfv|nzb|epub|pdf|flac|mp3|iso|srt|txt|jpg|png)\z/i';
 
-    private const string EXECUTABLE = '/\.(?:exe|scr|bat|cmd|com|msi|msix|msp|lnk|pif|cpl|hta|reg|scf|js|jse|vbs|vbe|wsf|wsh|ps1|psm1|jar|apk|dll|sh|command|app|dmg|pkg|chm|msc|ps1xml|psd1|cab|appx|appxbundle|msixbundle|application|gadget|inf|url|xll|ws|wsc|sct|vb|ocx|sys|iso|img|vhd|vhdx|desktop|appimage|deb|rpm|snap|run|msu|py|pyw|pl|rb|php)\z/i';
+    private const string EXECUTABLE = '/\.(?:exe|scr|bat|cmd|com|msi|msix|msp|lnk|pif|cpl|hta|reg|scf|js|jse|vbs|vbe|wsf|wsh|ps1|psm1|jar|apk|dll|sh|command|app|dmg|pkg|chm|msc|ps1xml|psd1|cab|appx|appxbundle|msixbundle|application|gadget|inf|url|xll|ws|wsc|sct|vb|ocx|sys|iso|img|vhd|vhdx|desktop|appimage|deb|rpm|snap|run|msu|py|pyw|pl|rb|php|so|dylib|bundle|ko)\z/i';
 
     public static function matches(string $subject, string $actual): bool
     {
@@ -31,7 +31,12 @@ final class HeaderFilenameIdentity
             return false;
         }
         // One yEnc marker ends the declaration: a second marker is ambiguous, and quotes after it are metadata.
-        if (preg_match_all('/(?<![\p{L}\p{M}\p{N}_])yEnc(?![\p{L}\p{M}\p{N}_])/iu', $subject, $markers, PREG_OFFSET_CAPTURE) > 1) {
+        // Markers count only outside quoted names, so a filename may contain the word yEnc.
+        $unquoted = $subject;
+        foreach ($matches as $match) {
+            $unquoted = substr_replace($unquoted, str_repeat(' ', strlen($match[0][0])), $match[0][1], strlen($match[0][0]));
+        }
+        if (preg_match_all('/(?<![\p{L}\p{M}\p{N}_])yEnc(?![\p{L}\p{M}\p{N}_])/iu', $unquoted, $markers, PREG_OFFSET_CAPTURE) > 1) {
             return false;
         }
         $marker = $markers[0][0][1] ?? strlen($subject);
@@ -72,7 +77,9 @@ final class HeaderFilenameIdentity
         }
         // Parity and payload are not interchangeable: a declared PAR2 file is not payload evidence, and a
         // declared payload file is not satisfied by a PAR2 body, even when another quoted value names it.
-        if (! self::sameParity([self::extension(self::trimmed($declared)), self::extension(self::bare($declared))], $actual)) {
+        $declaredClass = self::parityClass($declared, false);
+        $bodyClass = self::parityClass($actual, true);
+        if ($declaredClass !== null && $bodyClass !== null && $declaredClass !== $bodyClass) {
             return false;
         }
         if (in_array($actual, $quoted, true)) {
@@ -114,27 +121,19 @@ final class HeaderFilenameIdentity
      * a readable extensionless name such as README, but never an obfuscated extensionless token.
      */
     /**
-     * Whether a body agrees with every declared extension on being parity or payload, in every filesystem form.
-     *
-     * @param  list<string>  $declaredExtensions
+     * Parity when either filesystem form is a PAR2 name, payload when the name has another extension (or, for
+     * a body, is a readable extensionless payload such as README), and null when it declares neither.
      */
-    private static function sameParity(array $declaredExtensions, string $actual): bool
+    private static function parityClass(string $name, bool $body): ?string
     {
-        foreach ($declaredExtensions as $declaredExtension) {
-            $declaredExtension = strtolower($declaredExtension);
-            foreach ([self::trimmed($actual), self::bare($actual)] as $form) {
-                $bodyExtension = strtolower(self::extension($form));
-                // A readable extensionless body such as README is payload evidence, so it is not parity.
-                if ($bodyExtension === '' && self::provesPayload($form)) {
-                    $bodyExtension = 'payload';
-                }
-                if ($declaredExtension !== '' && $bodyExtension !== '' && ($declaredExtension === 'par2') !== ($bodyExtension === 'par2')) {
-                    return false;
-                }
-            }
+        if (preg_match('/\.par2\z/i', self::trimmed($name)) === 1 || preg_match('/\.par2\z/i', self::bare($name)) === 1) {
+            return 'parity';
+        }
+        if (self::extension(self::trimmed($name)) !== '' || self::extension(self::bare($name)) !== '' || ($body && self::provesPayload($name))) {
+            return 'payload';
         }
 
-        return true;
+        return null;
     }
 
     public static function provesPayload(string $name): bool
@@ -143,7 +142,7 @@ final class HeaderFilenameIdentity
             return false;
         }
 
-        return preg_match('/\.[A-Za-z0-9]{1,8}\z/', self::trimmed($name)) === 1 || preg_match('/\.[A-Za-z0-9]{1,8}\z/', self::bare($name)) === 1
+        return preg_match('/\.[\p{L}\p{N}]{1,8}\z/u', self::trimmed($name)) === 1 || preg_match('/\.[\p{L}\p{N}]{1,8}\z/u', self::bare($name)) === 1
             || (($bare = self::bare($name)) !== '' && ! str_contains($bare, '.') && ! self::opaque($bare) && preg_match('/\p{L}/u', $bare) === 1);
     }
 
@@ -155,9 +154,9 @@ final class HeaderFilenameIdentity
         // Random tokens switch between lowercase, uppercase and digits at nearly every other character.
         $switches = preg_match_all('/[a-z](?=[A-Z0-9])|[A-Z](?=[a-z0-9])|[0-9](?=[A-Za-z])/', $token);
 
-        // A long token counts only with digits inside it; a long title keeps its number at the end.
+        // A long token counts only with separate digit runs; a long title has at most one number in it.
         return self::opaque($name) && (preg_match('/\A[0-9a-f]{16,}\z/i', $token) === 1 || $switches >= 0.4 * strlen($token)
-            || (strlen($token) >= 20 && preg_match('/[0-9][A-Za-z]/', $token) === 1));
+            || (strlen($token) >= 20 && preg_match_all('/[0-9]+/', $token) >= 2));
     }
 
     /** A single random-looking token, such as an obfuscated posting name, makes no filename claim. */
