@@ -127,6 +127,38 @@ final class CleanNzbPreservedSourceTest extends TestCase
         self::assertSame('upgraded', gzdecode((string) file_get_contents($this->canonical)));
     }
 
+    public function test_notindb_dry_run_reports_the_restore_and_leaves_the_temporary_to_temps(): void
+    {
+        $output = $this->clean('nntmux:nzbclean', ['--notindb' => true, '--temp-age-hours' => 1]);
+
+        self::assertStringContainsString('Would restore replaced NZB source: '.$this->preserved, $output);
+        self::assertStringNotContainsString('orphan', strtolower($output), 'Side files are never GUID orphans.');
+        self::assertFileExists($this->preserved);
+        self::assertFileExists($this->temporary);
+        self::assertSame('upgraded', gzdecode((string) file_get_contents($this->canonical)));
+    }
+
+    public function test_notindb_delete_restores_the_backup(): void
+    {
+        $output = $this->clean('nntmux:nzbclean', ['--notindb' => true, '--temp-age-hours' => 1, '--delete' => true]);
+
+        self::assertStringContainsString('Restored replaced NZB source: '.$this->preserved, $output);
+        self::assertFileDoesNotExist($this->preserved);
+        self::assertFileExists($this->temporary);
+        self::assertSame('original', gzdecode((string) file_get_contents($this->canonical)));
+    }
+
+    public function test_notindb_reports_a_backup_kept_for_review(): void
+    {
+        DB::table('release_archive_naming_evidence')->update(['source_sha256' => NzbSourceGuard::digest('newer')]);
+
+        $output = $this->clean('nntmux:nzbclean', ['--notindb' => true, '--temp-age-hours' => 1, '--delete' => true]);
+
+        self::assertStringContainsString('Kept replaced NZB source for review: '.$this->preserved, $output);
+        self::assertFileExists($this->preserved);
+        self::assertSame('upgraded', gzdecode((string) file_get_contents($this->canonical)));
+    }
+
     /**
      * @param  array<string, mixed>  $arguments
      */

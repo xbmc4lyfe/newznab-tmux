@@ -171,7 +171,7 @@ final class VerifiedReleasePublisher
                     }
                     if ($upgrade !== null) {
                         $retain = isset($manifest['partial']) && $this->awaitsLateArticles($manifest);
-                        $id = $this->upgradePartial($upgrade, $manifest, $metadata, $size, $totalParts, (int) $candidate->id, $retain, $timing);
+                        $id = $this->upgradePartial($upgrade, $manifest, $metadata, $size, $totalParts, (int) $candidate->id, $retain, $timing, $incoming);
                         $this->recordGroups($id, $manifest['groups']);
                         app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
                         $this->markPublished($candidate->id, $id, $result, retainManifest: $retain);
@@ -461,8 +461,10 @@ final class VerifiedReleasePublisher
      *
      * @param  array<string, mixed>  $manifest
      * @param  array<string, mixed>  $metadata
+     * @param  array{xml: ?\SimpleXMLElement, fingerprint: ?string}|null  $incoming  The pre-lock parse, when it ran.
      */
-    private function upgradePartial(object $release, array $manifest, array $metadata, int $size, int $totalParts, int $candidateId, bool $retain, ?PublicationTiming $timing): int
+    private function upgradePartial(object $release, array $manifest, array $metadata, int $size, int $totalParts, int $candidateId, bool $retain, ?PublicationTiming $timing,
+        ?array $incoming = null): int
     {
         $id = (int) $release->id;
         $timing?->nextPhase('release_identity_sql');
@@ -482,7 +484,7 @@ final class VerifiedReleasePublisher
             'articles_found' => $partial['articles_found'] ?? null, 'articles_expected' => $partial['articles_expected'] ?? null,
             'files_found' => $partial['files_found'] ?? null, 'files_expected' => $partial['files_expected'] ?? null,
             'late_article_candidate_id' => $retain ? $candidateId : null] + $naming + $this->freshPostProcessingState());
-        ReleaseArticleFingerprintStore::store($id, $this->incomingDocument($manifest)['fingerprint']);
+        ReleaseArticleFingerprintStore::store($id, ($incoming ?? $this->incomingDocument($manifest))['fingerprint']);
         $timing?->nextPhase('final_xml_gzip');
         $receipt = $this->writer->writeWithReceipt($manifest, (string) $release->guid, $release, $timing, replaceFor: $candidateId);
         DB::afterRollBack(static fn () => $receipt->rollback());
