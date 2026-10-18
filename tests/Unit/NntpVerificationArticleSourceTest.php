@@ -185,6 +185,40 @@ final class NntpVerificationArticleSourceTest extends TestCase
         }
     }
 
+    public function test_a_line_past_a_remaining_budget_of_exactly_the_line_limit_is_oversized(): void
+    {
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        stream_set_blocking($pair[1], false);
+        $source = null;
+        $primary = new PipelineSocketNntpHarness($pair[0]);
+        try {
+            fwrite($pair[1], "222 0 <wide@example> body\r\n");
+            $source = new NntpArticleSource($primary, maximumBytes: 65534, allowAlternateFallback: false);
+            $writer = str_repeat('a', 70000)."\r\n.\r\n";
+            // Feed the long line while the reader consumes it.
+            $reader = static fn () => $source->fetchBounded('wide@example', 65534);
+            $pending = $writer;
+            $error = null;
+            $pid = pcntl_fork();
+            if ($pid === 0) {
+                stream_set_blocking($pair[1], true);
+                fwrite($pair[1], $pending);
+                posix_kill(getmypid(), SIGKILL);
+            }
+            try {
+                $reader();
+            } catch (\Throwable $caught) {
+                $error = $caught;
+            }
+            pcntl_waitpid($pid, $status);
+            $this->assertInstanceOf(ArticleBudgetExceeded::class, $error, $error?->getMessage() ?? 'returned');
+        } finally {
+            unset($source);
+            $primary->closeFixture();
+            fclose($pair[1]);
+        }
+    }
+
     public function test_article_unavailable_response_keeps_the_session_aligned_for_the_next_request(): void
     {
         $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
