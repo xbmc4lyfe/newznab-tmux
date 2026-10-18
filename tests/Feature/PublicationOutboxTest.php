@@ -1890,6 +1890,158 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(3, $summaries[0]['outcomes']['transport']);
     }
 
+    public function test_the_alive_marker_is_never_written_or_removed_through_a_linked_outbox_root(): void
+    {
+        $this->configureAsync();
+        $outbox = $this->outbox();
+        $outbox->prepare(1);
+        $outbox->touchAlive(1);
+        $directory = $outbox->directory();
+        $moved = $directory.'-elsewhere';
+        // The root becomes a link to the folder that holds this process's own marker.
+        rename($directory, $moved);
+        symlink($moved, $directory);
+
+        $outbox->clearAlive(1);
+        $this->assertFileExists($moved.'/forwarder-1.alive');
+        $this->assertFalse($outbox->forwarderAlive());
+        try {
+            $outbox->touchAlive(1);
+            $this->fail('A marker must not be written through a link.');
+        } catch (\RuntimeException $error) {
+            $this->assertStringContainsString('symlink', $error->getMessage());
+        }
+        unlink($directory);
+        rename($moved, $directory);
+        $outbox->clearAlive(1);
+        $this->assertFileDoesNotExist($directory.'/forwarder-1.alive');
+    }
+
+    public function test_cancellation_during_the_retry_delay_makes_no_further_attempt(): void
+    {
+        $cancelled = false;
+        Sleep::fake();
+        // The retry helper asks its predicate first, then sleeps; the cancellation arrives during the sleep.
+        Sleep::whenFakingSleep(function () use (&$cancelled): void {
+            $cancelled = true;
+        });
+        $this->batchSchema();
+        $claim = $this->claimedCandidate('one@article');
+        $items = [new RemotePublishItem($claim, $this->sampled($claim))];
+        $publisher = app(RemoteReleasePublisher::class);
+
+        foreach ([false, true] as $batch) {
+            $this->configureAsync(batch: $batch);
+            $cancelled = false;
+            Http::fake(function (HttpRequest $request) {
+                $this->requested[] = $request->url();
+                throw new ConnectionException('cURL error 28: Operation timed out.');
+            });
+
+            try {
+                $outcomes = $publisher->publishMany($items, null, function () use (&$cancelled): bool {
+                    return $cancelled;
+                });
+                $this->assertSame(['transport'], array_map(static fn (PublicationOutcome $outcome): string => $outcome->status, $outcomes));
+            } catch (ConnectionException) {
+                $this->assertTrue($batch);
+            }
+
+            // One request went out; the attempt after the delay was stopped before it was sent.
+            $this->assertCount(1, $this->requested);
+        }
+    }
+
+    public function test_a_marker_written_by_a_replacement_forwarder_survives_the_old_ones_exit(): void
+    {
+        $first = new PublicationOutbox;
+        $second = new PublicationOutbox;
+        $first->prepare(1);
+        $first->touchAlive(1);
+        $second->touchAlive(1);
+
+        $first->clearAlive(1);
+        $this->assertFileExists($this->outbox()->directory().'/forwarder-1.alive');
+        $this->assertTrue($second->forwarderAlive());
+        $second->clearAlive(1);
+        $this->assertFileDoesNotExist($this->outbox()->directory().'/forwarder-1.alive');
+    }
+
+    public function test_after_lost_locks_the_unwinding_forwarder_leaves_the_replacements_marker(): void
+    {
+        $this->batchSchema(releases: 1);
+        $this->configureAsync(batch: false);
+        $claim = $this->claimedCandidate('one@article');
+        $this->handOff($claim);
+        $marker = $this->outbox()->directory().'/forwarder-1.alive';
+        Http::fake(function (HttpRequest $request) use ($marker) {
+            $this->requested[] = $request->url();
+            $this->loseForwarderLocks();
+            // A replacement forwarder took the slot and wrote its own marker meanwhile.
+            file_put_contents($marker, 'replacement-token');
+
+            return Http::response($this->withServerVariables(self::PEER)->postJson('/internal/release-verification/publish', $request->data())->json());
+        });
+
+        try {
+            $this->forward();
+            $this->fail('The forwarder must stop when it loses its locks.');
+        } catch (\RuntimeException $error) {
+            $this->assertSame('Publication forwarder locks were lost.', $error->getMessage());
+        }
+
+        $this->assertSame('replacement-token', file_get_contents($marker));
+    }
+
+    public function test_orphans_are_adopted_without_the_diagnostics_option(): void
+    {
+        Sleep::fake();
+        $this->batchSchema(releases: 1);
+        $this->configureAsync();
+        config(['release_verification.publish_forwarders' => 4]);
+        $claim = $this->claimedCandidate('orphan@article');
+        $this->handOff($claim);
+        $this->outbox()->prepare(9);
+        rename($this->pendingPath($claim), $this->inflightPath($claim, 9));
+        $this->servePrimary();
+
+        // No --diagnostics: nothing records the adoption, yet it must still happen.
+        $this->forward(['--passes' => 2]);
+
+        $this->assertSame('sampled', $this->candidateStatus($claim));
+        $this->assertDirectoryDoesNotExist($this->outbox()->inflightDirectory(9));
+        $this->assertSame(0, $this->outbox()->depth());
+    }
+
+    /** @return array<string, array{int}> */
+    public static function periods(): array
+    {
+        return ['131 s' => [131], '150 s' => [150], '300 s' => [300], '119 s' => [119], '611 s' => [611]];
+    }
+
+    #[DataProvider('periods')]
+    public function test_forwarder_lifetimes_end_just_before_a_scheduler_tick_and_leave_no_gap(int $period): void
+    {
+        config(['release_verification.publish_forwarder_seconds' => $period]);
+        $minutes = intdiv(max(120, $period), 60);
+        $lifetimes = array_map(PublicationOutbox::forwarderLifetime(...), range(1, 12));
+
+        foreach ($lifetimes as $lifetime) {
+            // 10 s short of a whole number of minutes, so the next tick restarts the forwarder at once.
+            $this->assertSame(50, $lifetime % 60);
+            $this->assertLessThanOrEqual($minutes * 60, $lifetime);
+            $this->assertGreaterThanOrEqual(110, $lifetime);
+            // Started at a tick, it ends 10 s before another: the gap is far below the alive window.
+            $this->assertLessThan((int) config('release_verification.publish_forwarder_alive_seconds'), 60 - ($lifetime % 60));
+        }
+        if ($minutes === 2) {
+            $this->assertSame([110], array_values(array_unique($lifetimes)));
+        }
+        if ($period === 300) {
+            $this->assertSame([290, 230, 170, 110, 290, 230], array_slice($lifetimes, 0, 6));
+        }
+    }
+
     public function test_a_forwarder_run_stops_at_its_deadline(): void
     {
         $this->batchSchema();
