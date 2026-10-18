@@ -641,10 +641,11 @@ final class CompactFingerprintCollector
         if (self::declaredCrcsContradict($yenc)) {
             $errors[] = 'YencCrcMismatch';
         }
-        $verified = ($yenc['declared_crc32_matches'] ?? null) === true
+        $partWithoutTrailerPart = self::partWithoutTrailerPart($yenc);
+        $verified = (($yenc['declared_crc32_matches'] ?? null) === true || $partWithoutTrailerPart)
             && ($yenc['all_declared_crc32_fields_are_hex'] ?? null) !== false
             && (self::sizesAgree($yenc) === true || self::emptySinglePart($yenc))
-            && in_array($yenc['multipart_structure_status'] ?? null, ['single-part', 'complete'], true)
+            && (in_array($yenc['multipart_structure_status'] ?? null, ['single-part', 'complete'], true) || $partWithoutTrailerPart)
             && ($yenc['payload_escape_state_valid'] ?? null) === true
             && ($yenc['integrity_checks_ambiguous'] ?? null) !== true
             && ($yenc['decoded_size_matches_yend_size'] ?? null) === true
@@ -659,6 +660,34 @@ final class CompactFingerprintCollector
         }
 
         return array_values(array_unique($errors));
+    }
+
+    /**
+     * Posting tools commonly end a part with "=yend size=N pcrc32=X" and no part= field. The analyzer
+     * then calls the structure incomplete and skips the CRC comparison, so this accepts exactly that
+     * form when everything else is proven: a numbered header part, a valid =ypart range, a hex pcrc32
+     * equal to the decoded bytes' CRC, no trailer total, and no other missing or conflicting field.
+     *
+     * @param  array<string, mixed>  $yenc
+     */
+    private static function partWithoutTrailerPart(array $yenc): bool
+    {
+        $trailer = is_array($yenc['trailer_fields'] ?? null) ? $yenc['trailer_fields'] : [];
+        $header = is_array($yenc['header_fields'] ?? null) ? $yenc['header_fields'] : [];
+        $declared = $trailer['pcrc32'] ?? null;
+        $observed = $yenc['observed_decoded_crc32'] ?? null;
+
+        return ($yenc['multipart'] ?? null) === true
+            && ($yenc['multipart_structure_status'] ?? null) === 'incomplete'
+            && ($yenc['multipart_pcrc32_status'] ?? null) === 'present-hex'
+            && ! array_key_exists('part', $trailer) && ! array_key_exists('total', $trailer)
+            && isset($header['part'], $header['size'], $trailer['size'])
+            && is_int($yenc['part'] ?? null) && $yenc['part'] >= 1
+            && ($yenc['ypart_range_valid'] ?? null) === true
+            && ($yenc['header_numeric_fields_valid'] ?? null) === true
+            && ($yenc['trailer_numeric_fields_valid'] ?? null) === true
+            && is_string($declared) && preg_match('/\A[0-9a-f]{1,8}\z/i', trim($declared)) === 1
+            && is_string($observed) && hexdec(trim($declared)) === hexdec($observed);
     }
 
     /**

@@ -701,6 +701,59 @@ final class CompactFingerprintCollectorTest extends TestCase
     }
 
     #[Test]
+    public function a_part_whose_trailer_omits_the_part_number_is_verified(): void
+    {
+        // Real posting tools end parts with "=yend size=16 pcrc32=..." and no part= field.
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)->andReturnUsing(function (string $id): array {
+            $article = self::segmentArticle($id, 2);
+            $article['body'] = (string) preg_replace('/(=yend size=16) part=\d+/', '$1', $article['body']);
+
+            return $article;
+        });
+
+        $result = $this->collector()->collectFromNzb(self::nzb(3, 2, false), 7);
+
+        $this->assertSame([], $result['data']['errors']);
+        $this->assertSame('complete', $result['status']);
+    }
+
+    /** @return array<string, array{callable(string): string}> */
+    public static function unprovenTrailerlessParts(): array
+    {
+        return [
+            'wrong pcrc32' => [static fn (string $body): string => (string) preg_replace('/pcrc32=[0-9a-f]{8}/', 'pcrc32=00000001', $body)],
+            'no pcrc32' => [static fn (string $body): string => (string) preg_replace('/ pcrc32=[0-9a-f]{8}/', '', $body)],
+            'bad range' => [static fn (string $body): string => str_replace('=ypart begin=1 end=16', '=ypart begin=5 end=16', $body)],
+            'no trailer size' => [static fn (string $body): string => str_replace('=yend size=16 ', '=yend ', $body)],
+        ];
+    }
+
+    /** @param callable(string): string $corrupt */
+    #[Test]
+    #[DataProvider('unprovenTrailerlessParts')]
+    public function a_trailerless_part_without_full_proof_stays_partial(callable $corrupt): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)->andReturnUsing(function (string $id) use ($corrupt): array {
+            $article = self::segmentArticle($id, 2);
+            $article['body'] = (string) preg_replace('/(=yend size=16) part=\d+/', '$1', $article['body']);
+            if ($id === 'f1-s1@fixture') {
+                $article['body'] = $corrupt($article['body']);
+            }
+
+            return $article;
+        });
+
+        $result = $this->collector()->collectFromNzb(self::nzb(3, 2, false), 7);
+
+        $this->assertSame('partial', $result['status']);
+        $this->assertNotSame([], $result['data']['errors']);
+    }
+
+    #[Test]
     public function a_part_from_another_segment_is_rejected(): void
     {
         $nntp = $this->mock(NNTPService::class);
