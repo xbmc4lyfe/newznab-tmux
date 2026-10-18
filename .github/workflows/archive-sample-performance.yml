@@ -285,7 +285,7 @@ jobs:
           path: ${{ runner.temp }}/nntmux-composer-archives/files
           key: composer-archives-v1-${{ hashFiles('composer.lock') }}
       - name: Install locked dependencies without application boot
-        run: bash scripts/composer-install-ci.sh utility-evidence/install
+        run: bash scripts/composer-install-ci.sh filename-identity-evidence/install
         env:
           COMPOSER_CACHE_DIR: ${{ runner.temp }}/nntmux-composer-archives
       - name: Verify the PHP rule, the golden corpus and the benchmark harness
@@ -320,6 +320,16 @@ jobs:
         env:
           NNTMUX_TEST_NATIVE_LIBRARY: ${{ github.workspace }}/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so
         run: php -d ffi.enable=true -d memory_limit=1G vendor/bin/phpunit --fail-on-skipped tests/Unit/HeaderFilenameIdentityNativeTest.php 2>&1 | tee filename-identity-evidence/parity.log
+      - name: Capture all visible resource limits before measurement
+        shell: bash
+        run: |
+          ulimit -Sa > filename-identity-evidence/process-soft-limits.txt
+          ulimit -Ha > filename-identity-evidence/process-hard-limits.txt
+          python3 scripts/benchmark-resource-limits.py capture \
+            --soft-limits=filename-identity-evidence/process-soft-limits.txt \
+            --hard-limits=filename-identity-evidence/process-hard-limits.txt \
+            --output=filename-identity-evidence/resource-limits-before.json
+          cp filename-identity-evidence/resource-limits-before.json filename-identity-evidence/resource-limits.json
       - name: Measure PHP versus Rust including FFI and report the result
         shell: bash
         run: |
@@ -343,6 +353,24 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           # A missed threshold exits 0; 2 is an invalid run (parity or setup failure).
           exit "$status"
+      - name: Capture all visible resource limits after measurement
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p filename-identity-evidence
+          ulimit -Sa > filename-identity-evidence/process-soft-limits-after.txt
+          ulimit -Ha > filename-identity-evidence/process-hard-limits-after.txt
+          python3 scripts/benchmark-resource-limits.py capture \
+            --soft-limits=filename-identity-evidence/process-soft-limits-after.txt \
+            --hard-limits=filename-identity-evidence/process-hard-limits-after.txt \
+            --output=filename-identity-evidence/resource-limits-after.json
+      - name: Require unchanged visible static limits and retain raw usage endpoints
+        if: always()
+        run: |
+          python3 scripts/benchmark-resource-limits.py compare \
+            --before=filename-identity-evidence/resource-limits-before.json \
+            --after=filename-identity-evidence/resource-limits-after.json \
+            --output=filename-identity-evidence/resource-limits-comparison.json
       - name: Retain observations and frozen evidence
         if: always()
         uses: actions/upload-artifact@v4
