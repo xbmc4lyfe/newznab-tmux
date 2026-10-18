@@ -1414,6 +1414,14 @@ SH);
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         $this->assertStringNotContainsString('artisan migrate', $this->events());
+
+        // A nested reference can switch databases without changing DB_HOST's text.
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_TARGET=192.0.2.40\nDB_HOST=\${DB_TARGET}\nDB_DATABASE=nntmux\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_TARGET=192.0.2.41\nDB_HOST=\${DB_TARGET}\nDB_DATABASE=nntmux\n");
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->assertStringContainsString('artisan migrate --force', $this->events());
     }
 
     public function test_infrastructure_a_new_data_service_needs_starts_first(): void

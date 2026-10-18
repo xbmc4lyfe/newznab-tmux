@@ -267,6 +267,16 @@ SH);
         $this->assertStringContainsString('COMPOSE_FILE=[/stack/base.yml]', $plain->getOutput());
     }
 
+    public function test_root_env_values_are_interpolated_like_compose(): void
+    {
+        file_put_contents($this->directory.'/.env', "SEARCH_BACKEND=manticore\nSEARCH_DRIVER=\${SEARCH_BACKEND}\nMODE=\"\${UNSET_X:-fallback}\"\nLITERAL='\${SEARCH_BACKEND}'\n");
+        foreach (['SEARCH_DRIVER' => 'manticore', 'MODE' => 'fallback', 'LITERAL' => '${SEARCH_BACKEND}'] as $key => $expected) {
+            $process = new Process([dirname(__DIR__, 2).'/scripts/dotenv-get', $key], $this->directory, $this->environment([]));
+            $process->mustRun();
+            $this->assertSame($expected, $process->getOutput(), $key);
+        }
+    }
+
     public function test_check_env_honours_the_trailing_monitoring_override(): void
     {
         unlink($this->directory.'/storage/app/monitoring/public/grafana-jwt.pub');
