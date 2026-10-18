@@ -5,11 +5,14 @@ declare(strict_types=1);
 namespace Tests\Feature;
 
 use App\Jobs\CollectReleaseFingerprintMetadata;
+use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
+use App\Services\Nzb\NzbSourceGuard;
 use App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer;
 use App\Services\Releases\Fingerprint\Par2MetadataParser;
 use App\Services\Releases\Fingerprint\ReleaseFingerprintCollector;
 use App\Services\YencService;
+use App\Support\ReleaseArchiveNamingEvidence;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -124,5 +127,47 @@ final class ReleaseFingerprintStaleUpgradeTest extends TestCase
         DB::table('release_fingerprint_metadata')->update(['run_token' => $token]);
         $older->failed(new \RuntimeException('exhausted'));
         $this->assertSame('failed', DB::table('release_fingerprint_metadata')->value('status'), 'Its own run is ended.');
+    }
+
+    #[Test]
+    public function metadata_of_a_replacement_whose_upgrade_rolled_back_is_never_saved(): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:',
+            'database.connections.sqlite.url' => null]);
+        DB::purge();
+        DB::reconnect();
+        Schema::create('releases', static function (Blueprint $table): void {
+            $table->increments('id');
+            $table->string('guid');
+        });
+        (require database_path('migrations/2026_10_12_120000_create_release_fingerprint_metadata_table.php'))->up();
+        (require database_path('migrations/2026_10_18_000000_add_run_token_to_release_fingerprint_metadata.php'))->up();
+        (require database_path('migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
+        DB::table('releases')->insert(['id' => 1, 'guid' => 'rolled-back']);
+        $committed = '<nzb><file subject="one.rar"><segments><segment bytes="5" number="1">one@example.net</segment></segments></file></nzb>';
+        $replacement = '<nzb><file subject="one.rar"><segments><segment bytes="5" number="1">one@example.net</segment></segments></file>'
+            .'<file subject="two.rar"><segments><segment bytes="5" number="1">two@example.net</segment></segments></file></nzb>';
+        config(['nntmux_nntp.server' => 'news.primary.invalid', 'nntmux_nntp.alternate_server' => '']);
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->andReturn(['capabilities_raw' => []]);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->andThrow(new \RuntimeException('Article unavailable.'));
+        DB::table('release_archive_naming_evidence')->insert(['releases_id' => 1, 'release_guid' => 'rolled-back',
+            'source_sha256' => NzbSourceGuard::digest($committed), 'proof_version' => ReleaseArchiveNamingEvidence::PROOF_VERSION,
+            'scope' => 'unknown', 'episode_files' => '[]', 'updated_at' => now()]);
+        $nzb = \Mockery::mock(NzbService::class);
+        $reads = [];
+        // The first read sees a replacement whose upgrade then rolled back; the next reads the restored source.
+        $nzb->shouldReceive('readNzbContents')->with('rolled-back')->andReturnUsing(static function () use (&$reads, $committed, $replacement): string {
+            $reads[] = $reads === [] ? 'replacement' : 'committed';
+
+            return count($reads) === 1 ? $replacement : $committed;
+        });
+        $yenc = new YencService;
+
+        (new CollectReleaseFingerprintMetadata(1))->withFakeQueueInteractions()
+            ->handle(new ReleaseFingerprintCollector($nzb, new NzbFingerprintAnalyzer($yenc), new Par2MetadataParser, $yenc));
+
+        $this->assertSame(['replacement', 'committed'], $reads, 'The rolled-back replacement was not saved; it collected again.');
+        $this->assertNotSame('processing', DB::table('release_fingerprint_metadata')->value('status'));
     }
 }

@@ -7,6 +7,7 @@ namespace App\Jobs;
 use App\Models\Release;
 use App\Models\ReleaseFingerprintMetadata;
 use App\Services\Releases\Fingerprint\ReleaseFingerprintCollector;
+use App\Support\ReleaseArchiveNamingEvidence;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -83,19 +84,44 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
             $result = $collector->collect($release->refresh());
             $encodedMetadata = json_encode($result['data'], JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR);
             $safeMetadata = json_decode($encodedMetadata, true, 512, JSON_THROW_ON_ERROR);
-            $saved = ReleaseFingerprintMetadata::query()->whereKey($record->getKey())->where('status', 'processing')
-                ->when(self::tracksRuns(), fn ($query) => $query->where('run_token', $token))->update([
-                    'status' => $result['status'],
-                    // A builder update skips the model's array cast.
-                    'metadata' => json_encode($safeMetadata, JSON_THROW_ON_ERROR),
-                    'last_error' => $result['status'] === 'unavailable' ? ($result['data']['reason'] ?? 'NZB unavailable.') : null,
-                    'collected_at' => now(),
-                ]);
+            $saved = DB::transaction(function () use ($record, $token, $result, $safeMetadata, $release): int {
+                // Only metadata of the committed source: a replacement read before its upgrade rolled back (which
+                // also undoes that upgrade's stale marking) must not be saved. The evidence row lock waits for
+                // an upgrade still in flight.
+                $digest = $result['source_digest'] ?? null;
+                if (is_string($digest) && self::tracksSources()) {
+                    $committed = app(ReleaseArchiveNamingEvidence::class)->committedSourceDigestLocked((object) ['id' => $release->id, 'guid' => $release->guid]);
+                    if ($committed !== null && ! hash_equals($committed, $digest)) {
+                        return 0;
+                    }
+                }
+
+                return ReleaseFingerprintMetadata::query()->whereKey($record->getKey())->where('status', 'processing')
+                    ->when(self::tracksRuns(), fn ($query) => $query->where('run_token', $token))->update([
+                        'status' => $result['status'],
+                        // A builder update skips the model's array cast.
+                        'metadata' => json_encode($safeMetadata, JSON_THROW_ON_ERROR),
+                        'last_error' => $result['status'] === 'unavailable' ? ($result['data']['reason'] ?? 'NZB unavailable.') : null,
+                        'collected_at' => now(),
+                    ]);
+            });
             if ($saved === 1) {
                 return;
             }
         }
         // Still preempted: leave it stale, which the backfill command and the next upgrade's dispatch pick up.
+    }
+
+    /** @var \WeakMap<\PDO, bool>|null */
+    private static ?\WeakMap $sourceEvidenceSupport = null;
+
+    /** Whether installations record their committed source digest. */
+    private static function tracksSources(): bool
+    {
+        $pdo = DB::connection()->getPdo();
+        self::$sourceEvidenceSupport ??= new \WeakMap;
+
+        return self::$sourceEvidenceSupport[$pdo] ??= Schema::hasTable('release_archive_naming_evidence');
     }
 
     /** @var \WeakMap<\PDO, bool>|null */
