@@ -10,6 +10,7 @@ use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\LeaseHeartbeat;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\NntpArticleSource;
+use App\Services\Releases\Verification\PublicationOutbox;
 use App\Services\Releases\Verification\RemoteReleasePublisher;
 use App\Services\Releases\Verification\ScratchBudget;
 use App\Services\Releases\Verification\ScratchInventory;
@@ -145,6 +146,8 @@ class VerifyReleaseCandidates extends Command
                 $directory = $root.'/scratch/'.$claim->id.'-'.$claim->version;
                 // The phase charged if an operation throws.
                 $active = 'bookkeeping';
+                // Once true, the forwarder owns the live lease: nothing after that may finish the candidate.
+                $handedOff = false;
                 try {
                     $phase = $diagnostics === null ? null : hrtime(true);
                     $heartbeat = static fn () => $repository->heartbeat((int) $claim->id, $claim->lease_token);
@@ -180,16 +183,22 @@ class VerifyReleaseCandidates extends Command
                     $active = $result->passed() ? 'publish' : 'finish';
                     $diagnostics?->verified($result->verdict);
                     if ($result->passed()) {
-                        $published = config('release_verification.publish_url')
-                            ? app(RemoteReleasePublisher::class)->publish($claim, $result) : $publisher->publish($claim, $result);
-                        if ($published === null) {
-                            $result = $this->filteredResult($claim) ?? throw new RuntimeException('Publication did not produce a verified current release.');
-                            $diagnostics?->filtered();
+                        if ($this->handOff($claim, $result, $directory, $scratchEntryId, $scratchInventory, $heartbeat, $progressHeartbeat, $diagnostics)) {
+                            // The forwarder publishes it; this worker has already freed its scratch and moves on.
+                            $handedOff = true;
+                            $diagnostics?->handedOff();
                         } else {
-                            $diagnostics?->published();
-                        }
-                        if (File::deleteDirectory($directory) || (! file_exists($directory) && ! is_link($directory))) {
-                            $scratchInventory->forget($scratchEntryId);
+                            $published = config('release_verification.publish_url')
+                                ? app(RemoteReleasePublisher::class)->publish($claim, $result) : $publisher->publish($claim, $result);
+                            if ($published === null) {
+                                $result = $this->filteredResult($claim) ?? throw new RuntimeException('Publication did not produce a verified current release.');
+                                $diagnostics?->filtered();
+                            } else {
+                                $diagnostics?->published();
+                            }
+                            if (File::deleteDirectory($directory) || (! file_exists($directory) && ! is_link($directory))) {
+                                $scratchInventory->forget($scratchEntryId);
+                            }
                         }
                         // Publication includes its filtered-result recovery and scratch removal.
                         $phase = $diagnostics?->phase('publish', $phase);
@@ -223,8 +232,12 @@ class VerifyReleaseCandidates extends Command
                         $diagnostics?->phase($active, $phase);
                     }
                     $diagnostics?->candidateFailed();
-                    $filtered = $this->filteredResult($claim);
-                    if ($filtered !== null) {
+                    $filtered = $handedOff ? null : $this->filteredResult($claim);
+                    if ($handedOff) {
+                        // A later step failed (such as the status file); the verified result is still queued, and
+                        // finishing the candidate would clear the lease that its forwarder is keeping alive.
+                        $this->warn($claim->id.': handed off for publication; a later step failed — '.$error->getMessage());
+                    } elseif ($filtered !== null) {
                         $diagnostics?->filtered();
                         $this->line($claim->id.': '.$filtered->verdict.' — '.$filtered->reason);
                     } else {
@@ -388,6 +401,56 @@ class VerifyReleaseCandidates extends Command
         if (! rmdir($directory)) {
             throw new RuntimeException('Cannot remove stale verification scratch.');
         }
+    }
+
+    /**
+     * With asynchronous publication, a remote worker leaves a spot-checked result in the host's
+     * outbox for a forwarder to send in a batch, after freeing its scratch: publication needs only
+     * the stored manifest and the sampled evidence. The lease heartbeat that follows hands the lease
+     * to the forwarder, which renews it until the primary answers. Returns false when the result
+     * must be published synchronously instead: the flag is off, this is not a remote worker, no
+     * forwarder is alive, the outbox stayed full for the wait, or the entry could not be written.
+     *
+     * @param  callable(): void  $heartbeat  Renews the lease at once.
+     * @param  callable(): void  $progressHeartbeat  Renews the lease at most once per interval.
+     */
+    private function handOff(object $claim, VerificationResult $result, string $directory, int $scratchEntryId,
+        ScratchInventory $scratchInventory, callable $heartbeat, callable $progressHeartbeat, ?VerificationRunDiagnostics $diagnostics): bool
+    {
+        if ($result->verdict !== 'sampled' || ! PublicationOutbox::enabled()) {
+            return false;
+        }
+        $outbox = new PublicationOutbox;
+        if (! $outbox->forwarderAlive()) {
+            $diagnostics?->outboxFallback();
+
+            return false;
+        }
+        $waitStarted = hrtime(true);
+        $room = $outbox->awaitRoom($progressHeartbeat, max(0.0, (float) config('release_verification.publish_outbox_wait_seconds', 30)));
+        $diagnostics?->outboxWaited($waitStarted, hrtime(true));
+        if (! $room) {
+            $diagnostics?->outboxFallback();
+
+            return false;
+        }
+        // Built before anything is removed: a malformed result fails as the synchronous path fails.
+        $evidence = SpotCheckVerifier::evidence($result->manifest);
+        if (File::deleteDirectory($directory) || (! file_exists($directory) && ! is_link($directory))) {
+            $scratchInventory->forget($scratchEntryId);
+        }
+        $heartbeat();
+        try {
+            $outbox->enqueue($claim, $result->reason, $evidence);
+        } catch (Throwable $error) {
+            // Publication needs no scratch, so the synchronous path still works.
+            Log::warning('Publication outbox hand-off failed; publishing synchronously.', ['error' => $error->getMessage()]);
+            $diagnostics?->outboxFallback();
+
+            return false;
+        }
+
+        return true;
     }
 
     private function filteredResult(object $claim): ?VerificationResult

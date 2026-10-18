@@ -118,9 +118,16 @@ final class VerificationResetService
             if (in_array($entry->getFilename(), ['worker.lock', 'reset.lock', 'locks', '.gitignore'], true)) {
                 continue;
             }
-            $deleted = $entry->isDir() && ! $entry->isLink()
-                ? File::deleteDirectory($entry->getPathname())
-                : File::delete($entry->getPathname());
+            $path = $entry->getPathname();
+            $directory = $entry->isDir() && ! $entry->isLink();
+            $deleted = $directory ? File::deleteDirectory($path) : File::delete($path);
+            // A folder that something refilled meanwhile gets one more pass; one that is already gone is gone.
+            if (! $deleted && $directory && is_dir($path)) {
+                $deleted = File::deleteDirectory($path);
+            }
+            if (! $deleted && ! file_exists($path) && ! is_link($path)) {
+                $deleted = true;
+            }
             if (! $deleted) {
                 throw new RuntimeException('Cannot remove verification reset artifacts.');
             }
