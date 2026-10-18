@@ -9,6 +9,7 @@ use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\PublicationOutbox;
 use App\Services\Releases\Verification\PublicationOutboxEntry;
 use App\Services\Releases\Verification\PublicationOutcome;
+use App\Services\Releases\Verification\RemotePublicationService;
 use App\Services\Releases\Verification\RemotePublishItem;
 use App\Services\Releases\Verification\RemoteReleasePublisher;
 use App\Services\Releases\Verification\SpotCheckVerifier;
@@ -490,7 +491,7 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
     /** @return array<string, array{string}> */
     public static function failedStatuses(): array
     {
-        return ['stale' => ['stale'], 'invalid' => ['invalid'], 'error' => ['error'], 'paused' => ['paused']];
+        return ['stale' => ['stale'], 'invalid' => ['invalid'], 'error' => ['error']];
     }
 
     #[DataProvider('failedStatuses')]
@@ -2040,6 +2041,134 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         if ($period === 300) {
             $this->assertSame([290, 230, 170, 110, 290, 230], array_slice($lifetimes, 0, 6));
         }
+    }
+
+    public function test_a_paused_outcome_requeues_the_entry_with_its_lease_instead_of_finishing_it(): void
+    {
+        $this->batchSchema(releases: 1);
+        $this->configureAsync();
+        $claim = $this->claimedCandidate('one@article');
+        $this->handOff($claim);
+        $paused = true;
+        $this->servePrimary(function (HttpRequest $request) use (&$paused) {
+            if ($paused) {
+                return $this->answerAll($request, 'paused', RemotePublicationService::PAUSED_MESSAGE);
+            }
+
+            return Http::response($this->withServerVariables(self::PEER)->postJson('/internal/release-verification/publish-batch', $request->data())->json());
+        });
+
+        $this->forward();
+
+        // Transient maintenance on the primary: the candidate is untouched and the attempt budget unspent.
+        $row = $this->candidateRow($claim);
+        $this->assertSame('verifying', $row->status);
+        $this->assertSame($claim->lease_token, $row->lease_token);
+        $document = $this->entryDocument($this->pendingPath($claim));
+        $this->assertSame([0, 1], [$document['attempts'], $document['deferrals']]);
+        $this->assertGreaterThan(microtime(true), $document['not_before']);
+
+        $paused = false;
+        $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['not_before' => 0] + $document);
+        $this->forward();
+
+        $this->assertSame('sampled', $this->candidateStatus($claim));
+        $this->assertSame([], $this->pendingNames());
+    }
+
+    public function test_the_single_endpoints_paused_answer_is_also_a_requeue_while_a_worker_still_fails_it(): void
+    {
+        $this->batchSchema();
+        $this->configureAsync(batch: false);
+        $claim = $this->claimedCandidate('one@article');
+        $this->handOff($claim);
+        Http::fake(['primary.test/*' => Http::response(['error' => RemotePublicationService::PAUSED_MESSAGE], 409)]);
+
+        $this->forward();
+
+        $this->assertSame('verifying', $this->candidateStatus($claim));
+        $this->assertSame(1, $this->entryDocument($this->pendingPath($claim))['deferrals']);
+        // A synchronous worker publishing the same answer gets an exception, and finishes the candidate as before.
+        try {
+            app(RemoteReleasePublisher::class)->publish($claim, $this->sampled($claim));
+            $this->fail('A paused primary must fail a synchronous publication.');
+        } catch (\RuntimeException $error) {
+            $this->assertStringContainsString(RemotePublicationService::PAUSED_MESSAGE, $error->getMessage());
+        }
+    }
+
+    public function test_batches_are_split_by_the_byte_limit_the_primary_advertised(): void
+    {
+        $this->batchSchema(releases: 12);
+        $this->configureAsync();
+        $claims = array_map(fn (int $number): object => $this->claimedCandidate($number.'@article'), range(1, 12));
+        $items = array_map(fn (object $claim): RemotePublishItem => new RemotePublishItem($claim, $this->sampled($claim)), $claims);
+        $single = max(array_map(fn (object $claim): int => strlen(json_encode(['protocol' => 1, 'items' => [$this->item($claim)]])), $claims));
+        $this->servePrimary();
+
+        // One request fits, two do not. The first batch of three is refused (and goes out one by one)...
+        config(['release_verification.publish_batch_max_bytes' => $single + 20]);
+        $publisher = app(RemoteReleasePublisher::class);
+        $publisher->publishMany(array_slice($items, 0, 3));
+        $this->assertSame($single + 20, $publisher->advertisedMaxBytes());
+        $this->assertSame([self::BATCH, self::SINGLE, self::SINGLE, self::SINGLE], $this->requested);
+        // ...and the next three are split by size up front, each in a request of its own.
+        $this->requested = [];
+        $this->batchSizes = [];
+        $outcomes = $publisher->publishMany(array_slice($items, 3, 3));
+        $this->assertSame([self::BATCH, self::BATCH, self::BATCH], $this->requested);
+        $this->assertSame([1, 1, 1], $this->batchSizes);
+        $this->assertSame(['published', 'published', 'published'], array_map(static fn (PublicationOutcome $outcome): string => $outcome->status, $outcomes));
+
+        // A limit under one item's size: every item goes through the single endpoint, with no batch request.
+        config(['release_verification.publish_batch_max_bytes' => $single - 30]);
+        $small = app(RemoteReleasePublisher::class);
+        $small->publishMany(array_slice($items, 6, 3));
+        $this->assertSame($single - 30, $small->advertisedMaxBytes());
+        $this->requested = [];
+        $outcomes = $small->publishMany(array_slice($items, 9, 3));
+        $this->assertSame([self::SINGLE, self::SINGLE, self::SINGLE], $this->requested);
+        $this->assertSame(['published', 'published', 'published'], array_map(static fn (PublicationOutcome $outcome): string => $outcome->status, $outcomes));
+        $this->assertSame(12, DB::table('releases')->count());
+    }
+
+    public function test_idle_writes_are_refused_once_a_database_session_has_dropped_the_locks(): void
+    {
+        $this->batchSchema(releases: 0);
+        $this->configureAsync();
+        config(['release_verification.publish_forward_items' => 1]);
+        $stale = $this->claimedCandidate('stale@article');
+        $second = $this->claimedCandidate('second@article');
+        foreach ([$stale, $second] as $index => $claim) {
+            $this->handOff($claim);
+            $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['enqueued_at' => time() - 100 + $index] + $document);
+        }
+        // A newer attempt owns the first candidate, so the primary answers stale and the forwarder finishes (fences) it.
+        DB::table('release_verification_candidates')->where('id', $stale->id)->update(['lease_token' => 'newer-owner']);
+        $junk = $this->outbox()->directory().'/pending/99-1-aaaaaaaaaaaa.json';
+        $lost = false;
+        DB::listen(function ($query) use (&$lost, $junk): void {
+            // After the post-request ownership check, while settling: the session drops, and a stray document appears.
+            if (! $lost && str_contains($query->sql, 'update "release_verification_candidates"') && in_array('unknown', $query->bindings, true)) {
+                $lost = true;
+                $this->loseForwarderLocks();
+                file_put_contents($junk, 'not json');
+            }
+        });
+        $this->servePrimary();
+
+        try {
+            $this->forward(['--passes' => 3]);
+            $this->fail('A forwarder whose locks are gone must not go on writing.');
+        } catch (\RuntimeException $error) {
+            $this->assertSame('Publication forwarder locks were lost.', $error->getMessage());
+        }
+
+        $this->assertTrue($lost);
+        // The cached join would have let the cleanup delete this; ownership is proved first.
+        $this->assertFileExists($junk);
+        $this->assertFileExists($this->pendingPath($second));
+        $this->assertSame('verifying', $this->candidateStatus($second));
     }
 
     public function test_a_forwarder_run_stops_at_its_deadline(): void
