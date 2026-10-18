@@ -31,9 +31,11 @@ default_config='{"services":{"web":{},"horizon":{},"scheduler":{},"indexer":{},"
 case "$*" in
     *'releases:verification-barrier --release'*) echo forced-release >> "$NNTMUX_DEPLOY_EVENTS"; [ "${NNTMUX_FORCED_RELEASE_FAIL:-0}" != 1 ] || exit 52 ;;
     *'releases:verification-barrier'*)
-        if [ "${NNTMUX_BARRIER_FAIL:-0}" = 1 ]; then echo 'still running' > "$NNTMUX_REPO/barrier.log"; else echo 'barrier held' > "$NNTMUX_REPO/barrier.log"; : > "$NNTMUX_REPO/barrier.running"; fi
+        if [ "${NNTMUX_BARRIER_FAIL:-0}" = 1 ] || { [ -n "${NNTMUX_BARRIER_FAIL_AFTER:-}" ] && grep -q -- "$NNTMUX_BARRIER_FAIL_AFTER" "$NNTMUX_DEPLOY_EVENTS"; }; then echo 'still running' > "$NNTMUX_REPO/barrier.log"; else echo 'barrier held' > "$NNTMUX_REPO/barrier.log"; : > "$NNTMUX_REPO/barrier.running"; fi
         echo barrier-container ;;
-    'inspect --format {{.State.Running}} '*'-verification-barrier') [ -f "$NNTMUX_REPO/barrier.running" ] && echo 'true nntmux' || echo 'false nntmux' ;;
+    'inspect --format {{.State.Running}} '*'-verification-barrier')
+        if [ -n "${NNTMUX_BARRIER_EXIT_ON:-}" ] && grep -q -- "$NNTMUX_BARRIER_EXIT_ON" "$NNTMUX_DEPLOY_EVENTS"; then rm -f "$NNTMUX_REPO/barrier.running"; echo 'barrier lost' >> "$NNTMUX_REPO/barrier.log"; fi
+        [ -f "$NNTMUX_REPO/barrier.running" ] && echo 'true nntmux' || echo 'false nntmux' ;;
     'logs '*'-verification-barrier')
         cat "$NNTMUX_REPO/barrier.log" 2>/dev/null
         if [ "${NNTMUX_BARRIER_LOST:-}" != '' ] && grep -q "${NNTMUX_BARRIER_LOST}" "$NNTMUX_DEPLOY_EVENTS"; then echo 'barrier lost'; fi ;;
@@ -280,6 +282,39 @@ SH);
         $this->assertGreaterThan($recreate, strrpos($events, 'releases:verification-barrier --timeout=900'));
         $this->assertGreaterThan(strrpos($events, 'releases:verification-barrier --timeout=900'), strpos($events, 'horizon scheduler indexer'));
         $this->assertStringContainsString('released', $events);
+    }
+
+    public function test_a_failed_migration_never_releases_the_pause_of_a_barrier_that_exited(): void
+    {
+        $process = $this->deploy(['NNTMUX_MIGRATION_FAIL' => '1', 'NNTMUX_BARRIER_EXIT_ON' => 'artisan migrate', 'NNTMUX_BARRIER_UNCLEAN' => '1']);
+        $process->run();
+
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('stay held', $process->getErrorOutput());
+        $this->assertStringNotContainsString('forced-release', $this->events());
+        $this->assertStringNotContainsString('released', $this->events());
+        $this->assertFileExists($this->directory.'/docker/.deploy.stamp.barrier-owed');
+    }
+
+    public function test_a_failed_barrier_retake_after_a_data_service_restart_still_owes_a_release(): void
+    {
+        mkdir($this->directory.'/docker/config/redis', 0777, true);
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 1gb\n");
+        $config = ['NNTMUX_CONFIG_ID' => $this->composeJson()];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 2gb\n");
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_BARRIER_FAIL_AFTER' => '--wait-timeout 240 redis']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertFileExists($this->directory.'/docker/.deploy.stamp.barrier-owed');
+
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('releases:verification-barrier --timeout=900', $events);
+        $this->assertStringContainsString('released', $events);
+        $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp.barrier-owed');
     }
 
     public function test_native_indexer_abort_uses_the_same_unique_operation_token_as_its_drain(): void

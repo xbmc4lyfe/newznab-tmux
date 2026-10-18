@@ -41,6 +41,9 @@ barrier_running() {
     [ "$(docker inspect --format '{{.State.Running}} {{index .Config.Labels "com.docker.compose.project"}}' "$barrier_name" 2>/dev/null)" = "true $project" ]
 }
 hold_barrier() {
+    # Owed from before the first pause until a release succeeds: any failure from here on, even
+    # one that leaves no barrier container, makes the next run take a barrier and release it.
+    owe_barrier
     # A barrier still running from a failed attempt is retained until this rollout is healthy.
     if barrier_running && ! docker logs "$barrier_name" 2>&1 | grep -q '^barrier lost'; then
         barrier_keep=1
@@ -205,8 +208,10 @@ resume() {
     if [ "$barrier_held" = 1 ] && [ "$rc" != 0 ]; then
         owe_barrier
     fi
-    if [ "$barrier_held" = 1 ] && [ "$barrier_keep" = 1 ] && barrier_running; then
-        echo "Remote verification workers stay held by container $barrier_name until a repaired deployment completes or it is stopped." >&2
+    if [ "$barrier_held" = 1 ] && [ "$barrier_keep" = 1 ]; then
+        # Never release after the migration began: a barrier that lost its session left its
+        # durable pause, which must keep remote workers off a half-migrated schema.
+        echo "Remote verification workers stay held by container $barrier_name (or its durable pause) until a repaired deployment completes or it is stopped." >&2
     else
         release_barrier || true
     fi
