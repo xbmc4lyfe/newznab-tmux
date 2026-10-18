@@ -9,12 +9,12 @@ use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\PublicationOutbox;
 use App\Services\Releases\Verification\PublicationOutboxEntry;
 use App\Services\Releases\Verification\PublicationOutcome;
-use App\Services\Releases\Verification\RemotePublicationService;
 use App\Services\Releases\Verification\RemotePublishItem;
 use App\Services\Releases\Verification\RemoteReleasePublisher;
 use App\Services\Releases\Verification\SpotCheckVerifier;
 use App\Services\Releases\Verification\VerificationWorkerLocks;
 use Illuminate\Console\Scheduling\Schedule;
+use Illuminate\Console\Signals;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Request as HttpRequest;
 use Illuminate\Support\Carbon;
@@ -100,12 +100,12 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
 
     private function pendingPath(object $claim): string
     {
-        return $this->outbox()->directory().'/pending/'.PublicationOutboxEntry::nameFor((int) $claim->id, (int) $claim->version);
+        return $this->outbox()->directory().'/pending/'.PublicationOutboxEntry::nameFor((int) $claim->id, (int) $claim->version, (string) $claim->lease_token);
     }
 
     private function inflightPath(object $claim, int $slot = 1): string
     {
-        return $this->outbox()->inflightDirectory($slot).'/'.PublicationOutboxEntry::nameFor((int) $claim->id, (int) $claim->version);
+        return $this->outbox()->inflightDirectory($slot).'/'.PublicationOutboxEntry::nameFor((int) $claim->id, (int) $claim->version, (string) $claim->lease_token);
     }
 
     /** @return array<string, mixed> */
@@ -211,7 +211,7 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->assertSame('verifying', $row->status);
         $this->assertNull($row->release_id);
         $entries = $this->pendingNames();
-        $this->assertSame([PublicationOutboxEntry::nameFor((int) $row->id, (int) $row->version)], $entries);
+        $this->assertSame([PublicationOutboxEntry::nameFor((int) $row->id, (int) $row->version, (string) $row->lease_token)], $entries);
         $document = $this->entryDocument($this->outbox()->directory().'/pending/'.$entries[0]);
         $this->assertSame(['id' => (int) $row->id, 'version' => (int) $row->version, 'manifest_hash' => $row->manifest_hash, 'lease_token' => $row->lease_token], $document['claim']);
         $this->assertSame(1, $document['evidence']['articles']);
@@ -482,7 +482,7 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
 
         $this->assertSame([2], $this->batchSizes);
         $this->assertSame(['sampled', 'sampled', 'verifying'], array_map($this->candidateStatus(...), $claims));
-        $this->assertSame([PublicationOutboxEntry::nameFor((int) $claims[2]->id, (int) $claims[2]->version)], $this->pendingNames());
+        $this->assertSame([PublicationOutboxEntry::nameFor((int) $claims[2]->id, (int) $claims[2]->version, (string) $claims[2]->lease_token)], $this->pendingNames());
     }
 
     /** @return array<string, array{string}> */
@@ -548,7 +548,9 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->forward();
 
         $document = $this->entryDocument($this->pendingPath($claim));
-        $this->assertSame(1, $document['attempts']);
+        // The primary never started the item, so no attempt was used up; the backoff still counts it.
+        $this->assertSame(0, $document['attempts']);
+        $this->assertSame(1, $document['deferrals']);
         $this->assertGreaterThan(microtime(true), $document['not_before']);
         $this->assertSame('verifying', $this->candidateStatus($claim));
         $this->assertFileDoesNotExist($this->inflightPath($claim));
@@ -608,7 +610,8 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
 
         $this->forward();
 
-        $this->assertSame(1, $this->entryDocument($this->pendingPath($claim))['attempts']);
+        $document = $this->entryDocument($this->pendingPath($claim));
+        $this->assertSame([0, 1], [$document['attempts'], $document['deferrals']]);
         $this->assertSame('verifying', $this->candidateStatus($claim));
     }
 
@@ -796,9 +799,10 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->assertFalse($this->outbox()->forwarderAlive());
     }
 
-    public function test_a_pause_that_appears_while_working_finishes_the_waiting_entries_unknown_and_stops(): void
+    public function test_a_pause_that_appears_while_working_leaves_the_waiting_entries_alone_until_it_lifts(): void
     {
-        $this->batchSchema(releases: 1);
+        Sleep::fake();
+        $this->batchSchema(releases: 2);
         $this->configureAsync();
         config(['release_verification.publish_forward_items' => 1]);
         $first = $this->claimedCandidate('one@article');
@@ -816,29 +820,27 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $summaries = [];
         $this->captureSummaries($summaries, 'Publication forwarder run summary.');
 
-        $this->assertSame(0, Artisan::call('releases:forward-verified-publications', ['--slot' => 1, '--max-seconds' => 60, '--diagnostics' => true]));
+        $this->assertSame(0, $this->forward(['--passes' => 3, '--diagnostics' => true]));
 
+        // The first batch went; the pause kept the forwarder out of the worker group for the second.
         $this->assertSame('sampled', $this->candidateStatus($first));
-        $row = $this->candidateRow($second);
-        $this->assertSame('unknown', $row->status);
-        $this->assertSame(RemotePublicationService::PAUSED_MESSAGE, $row->reason);
-        $this->assertSame([], $this->pendingNames());
+        $this->assertSame('verifying', $this->candidateStatus($second));
+        $this->assertNotNull($this->candidateRow($second)->lease_token);
         $this->assertSame(1, count($this->requested));
-        $this->assertSame('draining', $summaries[0]['stop_reason']);
-        $this->assertSame(1, $summaries[0]['finished_for_drain']);
+        $this->assertFileExists($this->inflightPath($second));
+        $this->assertGreaterThanOrEqual(1, $summaries[0]['lock_blocked']);
+        // A refused forwarder does not advertise itself, so workers publish for themselves.
         $this->assertFileDoesNotExist($this->outbox()->directory().'/forwarder-1.alive');
-        // It let go of the worker group, so the barrier can proceed once the pause is lifted.
+        // Once the pause lifts the same entry is sent, still fenced by its lease.
         VerificationWorkerLocks::unpause('test-barrier');
-        $probe = new VerificationWorkerLocks;
-        try {
-            $this->assertTrue($probe->tryExclusive());
-        } finally {
-            $probe->close();
-        }
+        $this->forward();
+        $this->assertSame('sampled', $this->candidateStatus($second));
+        $this->assertSame(2, count($this->requested));
     }
 
-    public function test_a_forwarder_does_not_start_under_a_pause_and_leaves_its_entries_alone(): void
+    public function test_a_forwarder_started_under_a_pause_touches_nothing_and_does_not_advertise_itself(): void
     {
+        Sleep::fake();
         $this->batchSchema();
         $this->configureAsync();
         $claim = $this->claimedCandidate('one@article');
@@ -846,12 +848,261 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         VerificationWorkerLocks::pause('test-barrier', 'maintenance');
         $this->servePrimary();
 
-        $this->assertSame(0, $this->forward());
+        $this->assertSame(0, $this->forward(['--passes' => 2]));
 
         $this->assertSame([], $this->requested);
         $this->assertSame('verifying', $this->candidateStatus($claim));
-        $this->assertCount(1, $this->pendingNames());
+        $this->assertNotNull($this->candidateRow($claim)->lease_token);
+        $this->assertFileExists($this->inflightPath($claim));
         $this->assertFileDoesNotExist($this->outbox()->directory().'/forwarder-1.alive');
+    }
+
+    public function test_an_idle_forwarder_neither_holds_the_worker_group_nor_queries_the_database(): void
+    {
+        $this->batchSchema();
+        $this->configureAsync();
+        $queries = 0;
+        $probing = false;
+        $probes = [];
+        Sleep::fake();
+        Sleep::whenFakingSleep(function () use (&$probes, &$probing): void {
+            $probing = true;
+            $barrier = new VerificationWorkerLocks;
+            try {
+                $probes[] = ['exclusive' => $barrier->tryExclusive()];
+            } finally {
+                $barrier->close();
+            }
+            $probes[] = ['alive' => $this->outbox()->forwarderAlive()];
+            $probing = false;
+        });
+        DB::listen(function () use (&$queries, &$probing): void {
+            $queries += $probing ? 0 : 1;
+        });
+
+        $this->forward(['--passes' => 4]);
+
+        $this->assertSame(0, $queries);
+        $this->assertCount(8, $probes);
+        foreach ($probes as $probe) {
+            $this->assertTrue(current($probe), key($probe));
+        }
+    }
+
+    public function test_a_forwarder_leaves_the_worker_group_as_soon_as_the_outbox_is_quiet(): void
+    {
+        $this->batchSchema(releases: 1);
+        $this->configureAsync();
+        $claim = $this->claimedCandidate('one@article');
+        $this->handOff($claim);
+        $this->servePrimary();
+        $exclusive = [];
+        Sleep::fake();
+        Sleep::whenFakingSleep(function () use (&$exclusive): void {
+            $barrier = new VerificationWorkerLocks;
+            try {
+                $exclusive[] = $barrier->tryExclusive();
+            } finally {
+                $barrier->close();
+            }
+        });
+
+        $this->forward(['--passes' => 3]);
+
+        $this->assertSame('sampled', $this->candidateStatus($claim));
+        // Pass 1 sent the batch; passes 2 and 3 found nothing and slept outside the group.
+        $this->assertSame([true, true], $exclusive);
+    }
+
+    public function test_waiting_entries_are_renewed_inside_the_group_and_the_group_is_left_again(): void
+    {
+        $this->batchSchema();
+        $this->configureAsync();
+        $claim = $this->claimedCandidate('one@article');
+        $this->handOff($claim);
+        $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['not_before' => time() + 3600] + $document);
+        touch($this->pendingPath($claim), time() - 200);
+        $before = $this->candidateRow($claim)->lease_until;
+        $this->travel(150)->seconds();
+        $this->servePrimary();
+        Sleep::fake();
+        $free = [];
+        Sleep::whenFakingSleep(function () use (&$free): void {
+            $barrier = new VerificationWorkerLocks;
+            try {
+                $free[] = $barrier->tryExclusive();
+            } finally {
+                $barrier->close();
+            }
+        });
+
+        $this->forward(['--passes' => 2]);
+
+        $this->assertGreaterThan($before, $this->candidateRow($claim)->lease_until);
+        $this->assertSame([true, true], $free);
+        $this->assertSame([], $this->requested);
+    }
+
+    public function test_the_forwarder_stops_promptly_on_sigterm(): void
+    {
+        if (! function_exists('posix_kill') || ! defined('SIGTERM')) {
+            $this->markTestSkipped('Requires pcntl and posix.');
+        }
+        $this->batchSchema();
+        $this->configureAsync();
+        $sleeps = 0;
+        // Command signal traps are off under unit tests; this one verifies the trap itself.
+        Signals::resolveAvailabilityUsing(static fn (): bool => true);
+        Sleep::fake();
+        Sleep::whenFakingSleep(function () use (&$sleeps): void {
+            if (++$sleeps === 2) {
+                posix_kill(getmypid(), SIGTERM);
+            }
+        });
+        $summaries = [];
+        $this->captureSummaries($summaries, 'Publication forwarder run summary.');
+
+        try {
+            $this->assertSame(0, Artisan::call('releases:forward-verified-publications', ['--slot' => 1, '--max-seconds' => 3600, '--diagnostics' => true]));
+        } finally {
+            Signals::resolveAvailabilityUsing(static fn (): bool => false);
+        }
+
+        $this->assertSame('terminated', $summaries[0]['stop_reason']);
+        $this->assertLessThan(10, $sleeps);
+        $this->assertFileDoesNotExist($this->outbox()->directory().'/forwarder-1.alive');
+    }
+
+    public function test_entries_of_a_forwarder_number_nobody_runs_are_adopted_and_sent(): void
+    {
+        Sleep::fake();
+        $this->batchSchema(releases: 2);
+        $this->configureAsync();
+        config(['release_verification.publish_forwarders' => 4]);
+        $beyond = $this->claimedCandidate('beyond@article');
+        $idle = $this->claimedCandidate('idle@article');
+        $running = $this->claimedCandidate('running@article');
+        foreach ([[$beyond, 9], [$idle, 3], [$running, 2]] as [$claim, $slot]) {
+            $this->handOff($claim);
+            $this->outbox()->prepare($slot);
+            rename($this->pendingPath($claim), $this->inflightPath($claim, $slot));
+        }
+        // Forwarder 2 is alive and keeps its entries; 3 never restarted; 9 is above the configured count.
+        $other = new VerificationWorkerLocks;
+        $this->assertTrue($other->startForwarder(2));
+        $this->servePrimary();
+        $summaries = [];
+        $this->captureSummaries($summaries, 'Publication forwarder run summary.');
+        $this->assertSame(3, $this->outbox()->depth());
+
+        try {
+            $this->forward(['--passes' => 2, '--diagnostics' => true]);
+        } finally {
+            $other->close();
+        }
+
+        $this->assertSame(['sampled', 'sampled', 'verifying'], array_map($this->candidateStatus(...), [$beyond, $idle, $running]));
+        $this->assertSame(2, $summaries[0]['orphans_adopted']);
+        $this->assertDirectoryDoesNotExist($this->outbox()->inflightDirectory(9));
+        $this->assertFileExists($this->inflightPath($running, 2));
+        $this->assertSame(1, $this->outbox()->depth());
+    }
+
+    public function test_a_second_hand_off_of_the_same_candidate_generation_never_collides_with_the_first(): void
+    {
+        $this->batchSchema(releases: 1);
+        $this->configureAsync();
+        $old = $this->claimedCandidate('one@article');
+        $this->handOff($old);
+        // The lease lapsed and the same generation was claimed again.
+        $new = (object) ['id' => $old->id, 'version' => $old->version, 'manifest_hash' => $old->manifest_hash, 'lease_token' => 'second-lease'];
+        DB::table('release_verification_candidates')->where('id', $old->id)->update(['lease_token' => 'second-lease', 'lease_until' => now()->addSeconds(300)]);
+        $this->handOff($new);
+        $this->assertNotSame($this->pendingPath($old), $this->pendingPath($new));
+        $this->assertCount(2, $this->pendingNames());
+        $newDocument = file_get_contents($this->pendingPath($new));
+        // Sending the old entry back (after a failure) replaces only its own document.
+        $this->outbox()->prepare(1);
+        rename($this->pendingPath($old), $this->inflightPath($old));
+        $this->outbox()->requeue(current($this->outbox()->inflight(1))->withFailure(microtime(true) + 60, true));
+        $this->assertSame($newDocument, file_get_contents($this->pendingPath($new)));
+        $this->assertSame(1, $this->entryDocument($this->pendingPath($old))['attempts']);
+        $this->assertFileDoesNotExist($this->inflightPath($old));
+        touch($this->pendingPath($old), time() - 200);
+        $this->servePrimary();
+
+        $this->forward();
+
+        // The old lease token no longer owns the candidate: its entry is dropped by lease loss, the new one publishes.
+        $this->assertFileDoesNotExist($this->pendingPath($old));
+        $this->assertSame('sampled', $this->candidateStatus($old));
+        $this->assertSame([], $this->pendingNames());
+        $this->assertSame(1, DB::table('releases')->count());
+    }
+
+    public function test_work_the_primary_never_processed_does_not_use_up_attempts_but_an_error_does(): void
+    {
+        Sleep::fake();
+        $this->batchSchema();
+        $this->configureAsync();
+        config(['release_verification.publish_forward_max_attempts' => 5]);
+        $claim = $this->claimedCandidate('one@article');
+        $this->handOff($claim);
+        $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['attempts' => 4] + $document);
+        $answer = 'retry';
+        Http::fake(function (HttpRequest $request) use (&$answer) {
+            return match ($answer) {
+                'retry' => $this->answerAll($request, 'retry', 'Batch time budget exhausted; resend this item.'),
+                'transport' => $this->answerAll($request, 'transport', 'unreachable'),
+                'unreachable' => throw new ConnectionException('Connection refused.'),
+                default => Http::response(['error' => 'Database unavailable.'], 500),
+            };
+        });
+        $due = fn () => $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['not_before' => 0] + $document);
+
+        foreach (['retry', 'unreachable', 'retry'] as $round => $kind) {
+            $answer = $kind;
+            $due();
+            $this->forward();
+            $document = $this->entryDocument($this->pendingPath($claim));
+            $this->assertSame(4, $document['attempts']);
+            $this->assertSame($round + 1, $document['deferrals']);
+            $this->assertSame('verifying', $this->candidateStatus($claim));
+        }
+        // An error the primary produced is the fifth counted failure.
+        $answer = 'error';
+        $due();
+        $this->forward();
+
+        $this->assertSame('unknown', $this->candidateStatus($claim));
+        $this->assertSame([], $this->pendingNames());
+    }
+
+    public function test_a_failure_after_the_hand_off_does_not_finish_the_candidate(): void
+    {
+        $this->batchSchema(releases: 1);
+        $this->configureAsync();
+        $this->workerCandidate();
+        $this->markForwarderAlive();
+        // A status file that cannot be replaced, as on a full or damaged disk.
+        mkdir(config('release_verification.storage_path').'/status.json');
+        Http::fake();
+
+        $report = $this->runWorker();
+
+        Http::assertNothingSent();
+        $row = DB::table('release_verification_candidates')->first();
+        $this->assertSame('verifying', $row->status);
+        $this->assertNotNull($row->lease_token);
+        $this->assertSame(1, $report['handed_off']);
+        $this->assertSame(0, $report['finish_returned']);
+        $this->assertSame(1, $report['candidate_errors']);
+        $this->assertCount(1, $this->pendingNames());
+        // The queued result still publishes: its lease was never cleared.
+        $this->servePrimary();
+        $this->forward();
+        $this->assertSame('sampled', $this->candidateStatus($row));
+        $this->assertSame(1, DB::table('releases')->count());
     }
 
     public function test_a_forwarder_does_nothing_when_asynchronous_publication_is_off_or_its_number_is_too_high(): void
@@ -919,7 +1170,7 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(array_fill(0, 3, self::SINGLE), $this->requested);
         foreach ($claims as $claim) {
             $document = $this->entryDocument($this->pendingPath($claim));
-            $this->assertSame(1, $document['attempts']);
+            $this->assertSame([0, 1], [$document['attempts'], $document['deferrals']]);
             $this->assertGreaterThan(microtime(true), $document['not_before']);
             $this->assertSame('verifying', $this->candidateStatus($claim));
             $this->assertNotNull($this->candidateRow($claim)->lease_token);
@@ -1005,12 +1256,28 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $name = $this->outbox()->enqueue($claim, 'Reason.', $evidence);
         $entry = $this->outbox()->pending()[0];
 
-        $this->assertSame('7-3.json', $name);
+        $this->assertSame('7-3-'.substr(sha1('token'), 0, 12).'.json', $name);
         $this->assertSame($evidence, SpotCheckVerifier::evidence($entry->item()->result->manifest));
         $this->assertSame('Reason.', $entry->item()->result->reason);
         $this->assertSame('sampled', $entry->item()->result->verdict);
         $this->assertSame(7, $entry->item()->claim->id);
         $this->assertSame('token', $entry->item()->claim->lease_token);
+    }
+
+    public function test_no_forwarder_outlives_the_configured_period_and_the_staggers_stay_inside_it(): void
+    {
+        foreach ([300, 600, 120, 60, 30, 3600] as $period) {
+            config(['release_verification.publish_forwarder_seconds' => $period]);
+            $lifetimes = array_map(PublicationOutbox::forwarderLifetime(...), range(1, 64));
+            $this->assertLessThanOrEqual($period, max($lifetimes));
+            $this->assertGreaterThanOrEqual(20, min($lifetimes));
+        }
+        config(['release_verification.publish_forwarder_seconds' => 300]);
+        $this->assertSame([290, 230, 170, 110, 290, 230], array_map(PublicationOutbox::forwarderLifetime(...), range(1, 6)));
+        $this->assertSame(110, PublicationOutbox::forwarderLifetime(64));
+        // With 64 forwarders a container stop still waits for no run longer than the period.
+        config(['release_verification.publish_forwarder_seconds' => 3600]);
+        $this->assertLessThanOrEqual(3600, PublicationOutbox::forwarderLifetime(64));
     }
 
     // ---- scheduling ------------------------------------------------------------------------------------------
@@ -1043,7 +1310,7 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->assertCount(3, $forwarders);
         foreach ([1, 2, 3] as $index => $number) {
             $this->assertStringContainsString('--slot='.$number.' ', $forwarders[$index]);
-            $this->assertStringContainsString('--max-seconds='.(300 + $index * 60).' ', $forwarders[$index]);
+            $this->assertStringContainsString('--max-seconds='.[290, 230, 170][$index].' ', $forwarders[$index]);
             $this->assertStringContainsString('--diagnostics', $forwarders[$index]);
         }
         // The verification slots are untouched.

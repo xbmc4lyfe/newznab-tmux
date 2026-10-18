@@ -330,7 +330,7 @@ class VerificationDatabaseLocksMariaDbTest extends TestCase
         $late->close();
     }
 
-    public function test_publication_forwarders_are_fenced_by_number_and_hold_the_worker_group_across_hosts(): void
+    public function test_publication_forwarders_are_fenced_by_number_and_join_the_worker_group_only_while_working(): void
     {
         config(['database.connections.verification_lock_child' => config('database.connections.mysql')]);
         $here = new VerificationWorkerLocks(new DatabaseVerificationLockStore);
@@ -339,8 +339,7 @@ class VerificationDatabaseLocksMariaDbTest extends TestCase
         $other = new VerificationWorkerLocks(new DatabaseVerificationLockStore('verification_lock_child'));
         try {
             $this->assertTrue($here->startForwarder(1));
-            $this->assertTrue($here->held());
-            $this->assertTrue($here->admitting());
+            $this->assertTrue($here->forwarderHeld());
             // The same number on the same host is one process; another number joins.
             $this->assertFalse($same->startForwarder(1));
             $this->assertTrue($same->startForwarder(2));
@@ -349,15 +348,35 @@ class VerificationDatabaseLocksMariaDbTest extends TestCase
             $this->assertTrue($other->startForwarder(1));
             config(['release_verification.host' => '']);
             $other->close();
-            // A barrier or reset waits for forwarders as for workers, and does not abandon them.
+            // Idle forwarders hold no worker group: a barrier, reset or audit proceeds at once.
+            $this->assertTrue($barrier->tryExclusive());
+            $this->assertFalse($here->joinWorkers());
+            $barrier->close();
+            // Working, a forwarder is a worker: it excludes them and is waited for, not abandoned.
+            $this->assertTrue($here->joinWorkers());
+            $this->assertTrue($here->held());
+            $this->assertTrue($here->admitting());
             $this->assertFalse($barrier->tryExclusive());
             $this->assertFalse($barrier->drain(0.5));
-            $this->assertTrue($here->admitting());
             $this->assertTrue($here->held());
-            $here->close();
-            $same->close();
-            $this->assertTrue($barrier->tryExclusive());
-            $this->assertFalse($here->startForwarder(1));
+            $here->leaveWorkers();
+            $this->assertFalse($here->held());
+            $this->assertTrue($here->forwarderHeld());
+            // A drain keeps it out of the group until the barrier is done.
+            $this->assertTrue($barrier->drain(5));
+            $this->assertFalse($here->joinWorkers());
+            $barrier->close();
+            $this->assertTrue($here->joinWorkers());
+            $here->leaveWorkers();
+            // A number nobody runs can be adopted; a running one cannot.
+            $adopted = [];
+            $this->assertFalse($barrier->withForwarderNumber(1, function () use (&$adopted): void {
+                $adopted[] = 1;
+            }));
+            $this->assertTrue($barrier->withForwarderNumber(7, function () use (&$adopted): void {
+                $adopted[] = 7;
+            }));
+            $this->assertSame([7], $adopted);
         } finally {
             $here->close();
             $same->close();
