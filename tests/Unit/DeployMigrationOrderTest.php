@@ -2365,6 +2365,11 @@ SH);
         $plan->run();
         $this->assertNotSame(0, $plan->getExitCode());
         $this->assertStringContainsString('DC passes --env-file', $plan->getErrorOutput());
+
+        $plan = $this->make(['deploy-plan'], ['COMPOSE_ENV_FILES' => '/tmp/other.env']);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('COMPOSE_ENV_FILES is set', $plan->getErrorOutput());
     }
 
     public function test_image_tag_replaced_after_the_build_aborts_before_any_change(): void

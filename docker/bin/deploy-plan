@@ -448,6 +448,9 @@ def service_top_level_compose_deps(parsed: dict[str, object], svc_cfg: object) -
 def reject_alternate_env_file() -> None:
     """Configs and secrets resolve variables from the default .env files; an alternate one would be
     read by Compose but not by the fingerprint."""
+    if os.environ.get("COMPOSE_ENV_FILES"):
+        sys.exit("deploy-plan: COMPOSE_ENV_FILES is set; selective deployment fingerprints only the default .env files. "
+                 "Unset it and put those values in docker/.env or the environment instead.")
     try:
         argv = shlex.split(os.environ.get("DC", ""))
     except ValueError:
