@@ -30,9 +30,14 @@ final class HeaderFilenameIdentity
             return false;
         }
         if ($count === 0) {
-            return ! self::executable($actual)
+            // The last extension before the yEnc marker is the unquoted subject's declared file type.
+            $head = (string) preg_replace('/(?<![\p{L}\p{N}_])yEnc(?![\p{L}\p{N}_]).*\z/isu', '', $subject);
+            $unquoted = preg_match_all('/\.([A-Za-z0-9+]{1,8})(?![\p{L}\p{N}_])/u', $head, $extensions) > 0
+                ? (string) end($extensions[1]) : '';
+
+            return self::sameParity($unquoted, $actual) && (! self::executable($actual)
                 // The subject must name the body itself, not a longer file such as body.exe.mkv.
-                || preg_match('/(?<![\p{L}\p{N}_])'.preg_quote($actual, '/').'(?![\p{L}\p{N}_]|[.\-]+[\p{L}\p{N}])/iu', $subject) === 1;
+                || preg_match('/(?<![\p{L}\p{N}_])'.preg_quote($actual, '/').'(?![\p{L}\p{N}_]|[.\-]+[\p{L}\p{N}])/iu', $subject) === 1);
         }
         $quoted = [];
         $declared = null;
@@ -60,12 +65,8 @@ final class HeaderFilenameIdentity
         }
         // Parity and payload are not interchangeable: a declared PAR2 file is not payload evidence, and a
         // declared payload file is not satisfied by a PAR2 body, even when another quoted value names it.
-        $declaredExtension = strtolower(self::extension(self::trimmed($declared)));
-        foreach ([self::trimmed($actual), self::bare($actual)] as $form) {
-            $bodyExtension = strtolower(self::extension($form));
-            if ($declaredExtension !== '' && $bodyExtension !== '' && ($declaredExtension === 'par2') !== ($bodyExtension === 'par2')) {
-                return false;
-            }
+        if (! self::sameParity(self::extension(self::trimmed($declared)), $actual)) {
+            return false;
         }
         if (in_array($actual, $quoted, true)) {
             return true;
@@ -105,13 +106,27 @@ final class HeaderFilenameIdentity
      * Whether a sampled article name is evidence of a source payload: a non-PAR2 name with an extension, or
      * a readable extensionless name such as README, but never an obfuscated extensionless token.
      */
+    /** Whether a body agrees with a declared extension on being parity or payload, in every filesystem form. */
+    private static function sameParity(string $declaredExtension, string $actual): bool
+    {
+        $declaredExtension = strtolower($declaredExtension);
+        foreach ([self::trimmed($actual), self::bare($actual)] as $form) {
+            $bodyExtension = strtolower(self::extension($form));
+            if ($declaredExtension !== '' && $bodyExtension !== '' && ($declaredExtension === 'par2') !== ($bodyExtension === 'par2')) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     public static function provesPayload(string $name): bool
     {
         if (preg_match('/\.par2\z/i', self::trimmed($name)) === 1 || preg_match('/\.par2\z/i', self::bare($name)) === 1) {
             return false;
         }
 
-        return preg_match('/\.[A-Za-z0-9]{1,8}\z/', $name) === 1
+        return preg_match('/\.[A-Za-z0-9]{1,8}\z/', self::trimmed($name)) === 1
             || ($name !== '' && ! str_contains($name, '.') && ! self::opaque($name) && preg_match('/[\p{L}]/u', $name) === 1);
     }
 

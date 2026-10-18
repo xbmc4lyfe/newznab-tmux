@@ -171,6 +171,10 @@ class HeaderFilenameIdentityTest extends TestCase
             'acronym titles with numbers do not vouch for each other' => ['"BBC2Documentary.mkv" yEnc', 'Channel4Documentary.mkv', false],
             'compound archive suffix on an opaque subject' => ['[1/9] - "Xk29dPq8LmZ0Yt5R.tar.gz" yEnc', 'b7Qe1ZrT9wXy4KpL.tar.gz', true],
             'NTFS base name hides a parity body' => ['"0123456789abcdef0123456789abcdef.mkv" yEnc', 'set.vol00+01.par2:payload.mkv', false],
+            'unquoted parity subject with a payload body' => ['set.par2 yEnc', 'payload.mkv', false],
+            'unquoted payload subject with a parity body' => ['[1/5] - payload.part1.rar yEnc (1/50)', 'set.vol00+01.par2', false],
+            'unquoted parity subject with a parity body' => ['[2/5] - set.vol00+01.par2 yEnc (1/2)', 'set.vol00+01.par2', true],
+            'unquoted payload subject with a payload body' => ['Movie 2026 [1/5] - payload.part1.rar yEnc (1/50)', 'payload.part1.rar', true],
             'opaque subject with an extensionless body' => ['[3/8] - "o9aeI3YpDwgHGoJ2ZsCm.vol00+01.par2" yEnc', '148f76878d7732b981734a9e0c51a348', true],
         ];
     }
