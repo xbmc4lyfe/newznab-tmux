@@ -18,6 +18,8 @@ final readonly class PublicationPrelock
      * @param  bool  $policyKnown  Whether $policyRejection holds an evaluated collection-policy verdict.
      * @param  string|null  $body  The gzipped verified NZB for this exact manifest.
      * @param  array<string, true>|null  $coverageIds  Article IDs the incoming NZB requires an earlier release to cover.
+     * @param  bool  $coverageKnown  Whether coverageIds() ran; null with this set means the document has no usable
+     *                               inventory (oversized or malformed), which no earlier release can cover.
      */
     public function __construct(
         public ?int $size = null,
@@ -27,5 +29,6 @@ final readonly class PublicationPrelock
         public ?string $policyRejection = null,
         public ?string $body = null,
         public ?array $coverageIds = null,
+        public bool $coverageKnown = false,
     ) {}
 }

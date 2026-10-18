@@ -825,6 +825,51 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         $this->assertNull(DB::table('release_verification_candidates')->value('release_id'));
     }
 
+    public function test_known_null_coverage_is_not_recomputed_by_the_duplicate_search_but_unknown_coverage_is(): void
+    {
+        ['claim' => $claim, 'manifest' => $manifest] = $this->publishableCandidate();
+        $counting = (new class('<nzb/>') extends \SimpleXMLElement
+        {
+            public static int $serializations = 0;
+
+            public function asXML(?string $filename = null): string|bool
+            {
+                self::$serializations++;
+
+                return parent::asXML($filename);
+            }
+        })::class;
+        // An inventory with no files has no usable article IDs, as an oversized or malformed one has none.
+        $xml = simplexml_load_string('<nzb><head/></nzb>', $counting);
+        $this->assertNotFalse($xml);
+        $search = fn (bool $known): array => (new \ReflectionMethod(VerifiedReleasePublisher::class, 'findCoveredDuplicate'))->invoke(
+            app(VerifiedReleasePublisher::class), $claim, $manifest, ['name' => 'Movie', 'searchname' => 'Movie', 'predb_id' => 0],
+            12345, null, ['xml' => $xml, 'fingerprint' => null], null, $known);
+        $none = ['release_id' => null, 'metadata_conflict' => false];
+
+        $counting::$serializations = 0;
+        $this->assertSame($none, $search(true));
+        $this->assertSame(0, $counting::$serializations, 'A pre-lock null result must not serialize the document under the lock.');
+        $this->assertSame($none, $search(false));
+        $this->assertGreaterThan(0, $counting::$serializations, 'Without a pre-lock result the document is inspected under the lock.');
+    }
+
+    public function test_a_candidate_whose_nzb_has_no_usable_inventory_still_publishes_after_the_prelock_step(): void
+    {
+        config(['release_verification.publication_timing_sample_every' => 1]);
+        ['claim' => $claim, 'manifest' => $manifest] = $this->publishableCandidate();
+        $manifest['files'][0]['segments'] = [];
+        $reports = $this->captureTimingReports();
+
+        $id = app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('complete', 'Downloaded and verified', $manifest));
+
+        $this->assertIsInt($id);
+        $this->assertSame(gzencode(app(VerifiedNzbWriter::class)->document($manifest)),
+            file_get_contents(app(NzbService::class)->getNzbPath(DB::table('releases')->where('id', $id)->value('guid'))));
+        $this->assertSame('published', $reports[0]['outcome']);
+        $this->assertContains('coverage_ids', array_keys($reports[0]['pre_lock_phases_ns']));
+    }
+
     public function test_the_writer_installs_a_supplied_body_verbatim_and_otherwise_renders_the_same_bytes(): void
     {
         ['manifest' => $manifest] = $this->publishableCandidate();

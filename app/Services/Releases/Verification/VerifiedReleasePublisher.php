@@ -85,6 +85,8 @@ final class VerifiedReleasePublisher
         // Everything below depends only on the manifest and unlocked reads, so it runs before the
         // locks; the locked section applies each result exactly where it used to compute it.
         $prelock = $current ? $this->prelock($result, (string) $claimedPath, $archived, $incoming, $size, $timing) : new PublicationPrelock;
+        // Only the compressed body is needed from here; the rendered document would stay alive through every lock wait.
+        unset($incoming['document']);
         if ($timing !== null) {
             $segments = 0;
             foreach ((array) ($result->manifest['files'] ?? []) as $file) {
@@ -158,7 +160,7 @@ final class VerifiedReleasePublisher
                             throw new RuntimeException('Legacy release identity changed before publication.');
                         }
                     }
-                    $duplicate = $legacy === null ? $this->findCoveredDuplicate($claim, $manifest, $metadata, $size, $timing, $incoming, $prelock->coverageIds) : ['release_id' => null, 'metadata_conflict' => false];
+                    $duplicate = $legacy === null ? $this->findCoveredDuplicate($claim, $manifest, $metadata, $size, $timing, $incoming, $prelock->coverageIds, $prelock->coverageKnown) : ['release_id' => null, 'metadata_conflict' => false];
                     $duplicateId = $duplicate['release_id'];
                     if ($duplicateId !== null || $duplicate['metadata_conflict']) {
                         $timing?->nextPhase('sql_accounting');
@@ -249,12 +251,13 @@ final class VerifiedReleasePublisher
     /**
      * @param  array<string, mixed>  $manifest
      * @param  array<string, mixed>  $metadata
-     * @param  array{document: string, xml: ?\SimpleXMLElement, fingerprint: ?string}|null  $incoming  The pre-lock parse, when it ran.
+     * @param  array{xml: ?\SimpleXMLElement, fingerprint: ?string}|null  $incoming  The pre-lock parse, when it ran.
      * @param  array<string, true>|null  $coverageIds  coverageIds() of that parse, when computed before the lock.
+     * @param  bool  $coverageKnown  Whether $coverageIds was computed, so null means "no usable inventory" rather than "not computed".
      * @return array{release_id: ?int, metadata_conflict: bool}
      */
     private function findCoveredDuplicate(object $claim, array $manifest, array $metadata, int $size, ?PublicationTiming $timing,
-        ?array $incoming = null, ?array $coverageIds = null): array
+        ?array $incoming = null, ?array $coverageIds = null, bool $coverageKnown = false): array
     {
         $lastHeartbeat = 0.0;
         $repository = app(CandidateRepository::class);
@@ -286,7 +289,8 @@ final class VerifiedReleasePublisher
 
             return true;
         };
-        $duplicate = $xml === null ? null : $coverage->findCoveredUpload($size, $fingerprint, $xml,
+        // Known-null coverage (an oversized or malformed inventory) is what findCoveredUpload would conclude too.
+        $duplicate = $xml === null || ($coverageKnown && $coverageIds === null) ? null : $coverage->findCoveredUpload($size, $fingerprint, $xml,
             $metadata['name'], $metadata['searchname'], $metadata['predb_id'], publishedOnly: true,
             onCandidate: $heartbeat, acceptCovered: $acceptCovered, requiredIds: $coverageIds);
         $repository->heartbeat((int) $claim->id, $claim->lease_token);
@@ -359,6 +363,7 @@ final class VerifiedReleasePublisher
         $timing?->preLockPhase('policy_check');
         $body = null;
         $coverageIds = null;
+        $coverageKnown = false;
         // A filtered candidate never writes or compares an NZB, and a legacy row is never searched for covering releases.
         if ($incoming !== null && $rejection === null) {
             try {
@@ -369,13 +374,15 @@ final class VerifiedReleasePublisher
             try {
                 if ($incoming['xml'] !== null && ($manifest['legacy_release_id'] ?? null) === null) {
                     $coverageIds = (new NzbArticleCoverage(app(NzbService::class), $this->duplicates))->coverageIds($incoming['xml']);
+                    // Null is itself a result here: the inventory is oversized or malformed.
+                    $coverageKnown = true;
                 }
             } catch (Throwable) {
             }
             $timing?->preLockPhase('coverage_ids');
         }
 
-        return new PublicationPrelock($size, $claimedPath, $archived, $policyKnown, $rejection, $body, $coverageIds);
+        return new PublicationPrelock($size, $claimedPath, $archived, $policyKnown, $rejection, $body, $coverageIds, $coverageKnown);
     }
 
     /**
