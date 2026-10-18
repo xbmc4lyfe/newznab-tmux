@@ -18,7 +18,7 @@ except OSError:
 for raw in lines:
     m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", raw)
     if m and m.group(1) == key:
-        quoted = re.match(r"""^(["'])(.*)\1\s*(?:#.*)?$""", m.group(2))
+        quoted = re.match(r"""^(["'])((?:(?!\1).)*)\1\s*(?:#.*)?$""", m.group(2))
         value = quoted.group(2) if quoted else re.sub(r"\s#.*$", "", m.group(2)).strip()
 if raw_mode:
     sys.stdout.write(default if value is None else value)

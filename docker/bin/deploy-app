@@ -32,11 +32,12 @@ fi
 
 # Remote worker hosts share the database but not this Compose project. The new image's barrier,
 # a one-off container, stops their verification workers, waits for them and keeps them out while
-# writers are stopped, data services change or migrations run. A healthy rollout releases it. A
-# failed run keeps it (and its durable pause) only once a migration began, or when it was adopted
-# from or inherited from an earlier failed attempt; remote workers then stay held until the
-# repaired deployment (which reuses a running barrier, whatever it then has to do) finishes, or an
-# operator stops it. Any other failure releases it, and a release that fails is owed to the next run.
+# writers are stopped, data services change or migrations run. A healthy rollout releases it, only
+# after the final whole-stack check. A failed run keeps it (and its durable pause) once a migration
+# began, once the final check started, or when it was adopted or inherited from an earlier failed
+# attempt; remote workers then stay held until the repaired deployment (which reuses a running
+# barrier, whatever it then has to do) finishes, or an operator stops it. Any earlier failure
+# releases it. Every failed run that held one leaves the release owed to the next run.
 # Named after Compose's effective project, so installations never share or adopt each other's barrier.
 project=$(compose config --format json | python3 -c 'import json, sys; print(json.load(sys.stdin)["name"])')
 case "$project" in
@@ -103,15 +104,21 @@ barrier_owed="${DEPLOY_STAMP:-$DIR/.deploy.stamp}.barrier-owed"
 owed_at_start=0
 [ ! -e "$barrier_owed" ] || owed_at_start=1
 # Without the marker a crash could leave a durable pause nothing ever clears: never pause unrecorded.
+# `printf` rather than `:`, whose failed redirection would exit dash outright. Once a barrier is held
+# (recovery, failed release) a write failure only warns, so the EXIT trap still restores the writers.
 owe_barrier() {
-    if ! : >"$barrier_owed"; then
+    if ! printf '' 2>/dev/null >"$barrier_owed"; then
+        if [ "${1:-}" = held ]; then
+            echo "Could not record the owed barrier release in $barrier_owed; clear the verification pause by hand after repairing it." >&2
+            return 0
+        fi
         echo "Cannot record the owed barrier release in $barrier_owed; not pausing remote verification workers." >&2
         exit 1
     fi
 }
 settle_barrier() {
     if ! release_barrier; then
-        owe_barrier
+        owe_barrier held
         return 1
     fi
     rm -f "$barrier_owed"
@@ -225,7 +232,7 @@ scheduler_command() { compose exec -T scheduler python3 /app/docker/app/bin/sche
 resume() {
     rc=$?
     if [ "$barrier_held" = 1 ] && [ "$rc" != 0 ]; then
-        owe_barrier
+        owe_barrier held
     fi
     if [ "$barrier_held" = 1 ] && [ "$barrier_keep" = 1 ]; then
         # Never release after the migration began: a barrier that lost its session left its
@@ -343,6 +350,17 @@ elif [ "$scheduler_drained" = 1 ]; then
     verify
 fi
 
+# The barrier runs against the database. A database service this run must apply that has no
+# container yet (e.g. FORCE=1 after it was removed) is started first, since nothing can use it; other
+# data services still change only after the writers stop, and every record is written by the apply.
+for svc in $DIRTY_DATA $RECONCILE_DATA; do
+    [ "$svc" = mariadb ] || continue
+    if [ -z "$(compose ps -a -q "$svc")" ]; then
+        compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" "$svc"
+        verify
+    fi
+done
+
 # Remote workers are held out whenever the database's writers stop for a schema or data-service
 # change; a barrier left running by an earlier failed attempt is adopted and released on success.
 if [ "$need_barrier" = 1 ] || barrier_running || [ -e "$barrier_owed" ]; then
@@ -419,7 +437,7 @@ fi
 # Success is recorded only when the whole stack is current, not just the services this run touched:
 # all four app services healthy on their expected images, and no data/infra container stale. This
 # runs before the barrier is released, so remote workers resume only on a verified stack; a failure
-# leaves the release owed (and kept when a migration began), and the retry clears it once healthy.
+# keeps the barrier and leaves its release owed, and the retry clears it once the stack is healthy.
 [ "$barrier_held" != 1 ] || barrier_keep=1
 if ! "$DIR/bin/deploy-current"; then
     echo "deploy-app: the rollout finished, but not every app service is running healthy on its expected image (or a data/infrastructure container runs a stale image); not recording a successful deployment." >&2

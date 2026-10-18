@@ -254,6 +254,19 @@ SH);
         $this->assertStringContainsString('COMPOSE_PROFILES=[]', $cleared->getOutput());
     }
 
+    public function test_a_quoted_value_ends_at_its_own_closing_quote(): void
+    {
+        file_put_contents($this->directory.'/.env', "MONITORING_ENABLED=\"true\" # turn off with \"false\"\n");
+        $process = new Process([dirname(__DIR__, 2).'/scripts/dotenv-get', 'MONITORING_ENABLED'], $this->directory);
+        $process->mustRun();
+        $this->assertSame('true', $process->getOutput());
+
+        file_put_contents($this->directory.'/docker/.env', "COMPOSE_FILE=\"/stack/base.yml\" # not \"/other.yml\"\n");
+        $plain = $this->just('docker/Justfile', ['ps'], ['DC' => $this->directory.'/bin/fake']);
+        $plain->mustRun();
+        $this->assertStringContainsString('COMPOSE_FILE=[/stack/base.yml]', $plain->getOutput());
+    }
+
     public function test_check_env_honours_the_trailing_monitoring_override(): void
     {
         unlink($this->directory.'/storage/app/monitoring/public/grafana-jwt.pub');

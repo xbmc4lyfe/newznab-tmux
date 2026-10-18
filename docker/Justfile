@@ -44,9 +44,9 @@ LOAD_ENV := '''preset=" "
             [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?(COMPOSE_FILE|DC|DEPLOY_BY|APP_PORT|DB_DATABASE|DB_ROOTPASSWORD|HELPER_IMAGE|BASE_IMAGE|APP_IMAGE|WEB_IMAGE|HORIZON_IMAGE|SCHEDULER_IMAGE|INDEXER_IMAGE|DEPLOY_MIN_INTERVAL|DEPLOY_DRAIN_TIMEOUT|DEPLOY_SCHEDULER_DRAIN_TIMEOUT|DEPLOY_HEALTH_TIMEOUT|DEPLOY_LEGACY_DRAIN_TIMEOUT)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
             key=${BASH_REMATCH[2]} value=${BASH_REMATCH[3]}
             quote=
-            if [[ "$value" =~ ^\"(.*)\"[[:space:]]*(#.*)?$ ]]; then
+            if [[ "$value" =~ ^\"([^\"]*)\"[[:space:]]*(#.*)?$ ]]; then
                 quote='"' value=${BASH_REMATCH[1]}
-            elif [[ "$value" =~ ^\'(.*)\'[[:space:]]*(#.*)?$ ]]; then
+            elif [[ "$value" =~ ^\'([^\']*)\'[[:space:]]*(#.*)?$ ]]; then
                 quote="'" value=${BASH_REMATCH[1]}
             else
                 value=${value%%[[:space:]]#*}

@@ -37,6 +37,7 @@ case "$*" in
     *'releases:verification-barrier --release'*) echo forced-release >> "$NNTMUX_DEPLOY_EVENTS"; [ "${NNTMUX_FORCED_RELEASE_FAIL:-0}" != 1 ] || exit 52 ;;
     *'releases:verification-barrier'*)
         if [ "${NNTMUX_BARRIER_FAIL:-0}" = 1 ] || { [ -n "${NNTMUX_BARRIER_FAIL_AFTER:-}" ] && grep -q -- "$NNTMUX_BARRIER_FAIL_AFTER" "$NNTMUX_DEPLOY_EVENTS"; }; then echo 'still running' > "$NNTMUX_REPO/barrier.log"; else echo 'barrier held' > "$NNTMUX_REPO/barrier.log"; : > "$NNTMUX_REPO/barrier.running"; fi
+        if [ "${NNTMUX_BARRIER_LOCK_MARKER:-0}" = 1 ]; then chmod 444 "$NNTMUX_REPO/docker/.deploy.stamp.barrier-owed"; echo two > "$NNTMUX_REPO/app.txt"; fi
         echo barrier-container ;;
     'inspect --format {{.State.Running}} '*'-verification-barrier')
         if [ -n "${NNTMUX_BARRIER_EXIT_ON:-}" ] && grep -q -- "$NNTMUX_BARRIER_EXIT_ON" "$NNTMUX_DEPLOY_EVENTS"; then rm -f "$NNTMUX_REPO/barrier.running"; echo 'barrier lost' >> "$NNTMUX_REPO/barrier.log"; fi
@@ -2163,6 +2164,42 @@ SH);
         $this->assertLessThan($proxy, $redis);
     }
 
+    public function test_a_forced_rollout_starts_a_missing_data_service_before_taking_the_barrier(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0', 'FORCE=1'], ['NNTMUX_NO_CONTAINER' => 'mariadb'])->mustRun();
+        $events = $this->events();
+        $start = strpos($events, 'up -d --no-deps --wait --wait-timeout 240 mariadb');
+        $this->assertNotFalse($start);
+        $this->assertLessThan(strpos($events, 'releases:verification-barrier --timeout'), $start);
+    }
+
+    public function test_a_pending_base_rebuild_is_not_skipped_as_unchanged(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        // The base image was refreshed in place: same source and tags, a new local base image ID.
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_BASE_IMAGE_ID' => 'sha256:refreshed'])->mustRun();
+        $this->assertStringContainsString('build --target selfhosted-web', $this->events());
+    }
+
+    public function test_an_unwritable_marker_during_recovery_still_restores_the_writers(): void
+    {
+        $process = $this->deploy(['NNTMUX_BARRIER_LOCK_MARKER' => '1']);
+        $process->run();
+        @chmod($this->directory.'/docker/.deploy.stamp.barrier-owed', 0644);
+
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('Could not record the owed barrier release', $process->getErrorOutput());
+        $events = $this->events();
+        $this->assertStringContainsString(' start horizon', $events);
+        $this->assertStringContainsString('scheduler.py restore --token=', $events);
+        $this->assertStringContainsString('tmux:drain --resume', $events);
+    }
+
     public function test_image_tag_replaced_after_the_build_aborts_before_any_change(): void
     {
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
@@ -2441,6 +2478,15 @@ SH);
         $plan->run();
         $this->assertNotSame(0, $plan->getExitCode());
         $this->assertStringContainsString('cannot resolve environment variable NNTMUX_SITE_CONFIG behind config site', $plan->getErrorOutput());
+
+        // A .env value Compose would interpolate cannot be hashed literally; a single-quoted one can.
+        file_put_contents($this->directory.'/docker/.env', "NNTMUX_SITE_CONFIG=\"\${ROTATED}\"\n");
+        $plan = $this->make(['deploy-plan'], $config);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('NNTMUX_SITE_CONFIG behind config site uses interpolation', $plan->getErrorOutput());
+        file_put_contents($this->directory.'/docker/.env', "NNTMUX_SITE_CONFIG='\${literal}'\n");
+        $this->make(['deploy-plan'], $config)->mustRun();
     }
 
     public function test_service_definitions_no_fingerprint_can_represent_fail_closed(): void
@@ -2465,6 +2511,14 @@ SH);
         $process->run();
         $this->assertNotSame(0, $process->getExitCode());
         $this->assertStringNotContainsString(' up -d', $this->events());
+
+        // Health and recreation checks inspect one container per app service.
+        foreach ([['deploy' => ['replicas' => 2]], ['scale' => 3]] as $scaled) {
+            $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['web' => $scaled] + $services], JSON_UNESCAPED_SLASHES)]);
+            $plan->run();
+            $this->assertNotSame(0, $plan->getExitCode());
+            $this->assertStringContainsString('app service web runs more than one replica', $plan->getErrorOutput());
+        }
 
         // node-exporter's `pid: host` names no other container.
         $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => $services + ['node-exporter' => ['pid' => 'host']]])])->mustRun();

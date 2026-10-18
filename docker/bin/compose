@@ -24,7 +24,7 @@ if env_file.is_file():
         m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", raw)
         if m:
             key, value = m.group(1), m.group(2)
-            quoted = re.match(r"""^(["'])(.*)\1\s*(?:#.*)?$""", value)
+            quoted = re.match(r"""^(["'])((?:(?!\1).)*)\1\s*(?:#.*)?$""", value)
             file_env[key] = quoted.group(2) if quoted else re.sub(r"\s#.*$", "", value).strip()
             # The last assignment wins, so only it can be interpolated.
             interpolated.discard(key)

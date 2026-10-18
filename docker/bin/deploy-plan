@@ -531,8 +531,10 @@ def service_bind_records(svc_cfg: object, project_dir: Path) -> list[str]:
     return records
 
 
-def read_dotenv(path: Path) -> dict[str, str]:
-    """The keys of a Compose .env file (same rules as bin/compose); last assignment wins."""
+def read_dotenv(path: Path, interpolated: set[str] | None = None) -> dict[str, str]:
+    """The keys of a Compose .env file (same rules as bin/compose); last assignment wins. Keys whose
+    last value Compose would interpolate (unquoted or double-quoted, containing `$`) are added to
+    `interpolated`."""
     try:
         text = path.read_text(encoding="utf-8", errors="surrogateescape")
     except FileNotFoundError:
@@ -544,8 +546,12 @@ def read_dotenv(path: Path) -> dict[str, str]:
         m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", raw)
         if m:
             value = m.group(2)
-            quoted = re.match(r"""^(["'])(.*)\1\s*(?:#.*)?$""", value)
+            quoted = re.match(r"""^(["'])((?:(?!\1).)*)\1\s*(?:#.*)?$""", value)
             values[m.group(1)] = quoted.group(2) if quoted else re.sub(r"\s#.*$", "", value).strip()
+            if interpolated is not None:
+                interpolated.discard(m.group(1))
+                if "$" in values[m.group(1)] and not (quoted and quoted.group(1) == "'"):
+                    interpolated.add(m.group(1))
     return values
 
 
@@ -572,8 +578,14 @@ def service_resource_sources(parsed: dict[str, object], svc_cfg: object, docker_
                 value = os.environ.get(source_env)
                 if value is None:
                     if dotenv is None:
-                        dotenv = {**read_dotenv(docker_dir / ".env"), **read_dotenv(project_dir / ".env")}
+                        dotenv_interpolated: set[str] = set()
+                        dotenv = {**read_dotenv(docker_dir / ".env", dotenv_interpolated), **read_dotenv(project_dir / ".env", dotenv_interpolated)}
                     value = dotenv.get(source_env)
+                    if value is not None and source_env in dotenv_interpolated:
+                        # Compose installs the interpolated value; hashing the literal reference
+                        # would miss a rotation of what it points at.
+                        sys.exit(f"deploy-plan: {source_env} behind {section[:-1]} {name} uses interpolation in a .env "
+                                 "file; export it in the environment or give it a literal (single-quoted) value.")
                 if value is None:
                     sys.exit(f"deploy-plan: cannot resolve environment variable {source_env} behind {section[:-1]} {name}; "
                              "set it in the environment or docker/.env.")
@@ -595,6 +607,12 @@ def reject_unsupported_service(svc: str, cfg: object) -> None:
         if isinstance(value, str) and value.startswith(("service:", "container:")):
             sys.exit(f"deploy-plan: service {svc} uses {key}: {value}; selective deployment cannot recreate "
                      "consumers of another container's namespace. Remove it from the effective Compose files.")
+    deploy = cfg.get("deploy")
+    replicas = deploy.get("replicas") if isinstance(deploy, dict) else None
+    if svc in APP_SERVICES and ((isinstance(replicas, int) and replicas > 1) or (isinstance(cfg.get("scale"), int) and cfg["scale"] > 1)):
+        # Health, image and recreation checks inspect one container per service.
+        sys.exit(f"deploy-plan: app service {svc} runs more than one replica; selective deployment checks one "
+                 "container per app service. Remove the scale/replicas override.")
     if cfg.get("volumes_from"):
         sys.exit(f"deploy-plan: service {svc} uses volumes_from; selective deployment cannot recreate "
                  "consumers of another container's volumes. Remove it from the effective Compose files.")

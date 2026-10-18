@@ -212,11 +212,13 @@ unchanged() {
         for req_img in $REQUIRE_IMAGE; do
             docker image inspect "$req_img" >/dev/null 2>&1 || return 1
         done
-        if [ "${target:-}" = "build" ]; then
-            # A failing planner is not "nothing to build".
-            build_targets=$(DEPLOY_STAMP="$STAMP" "$DIR/bin/deploy-plan" --build-targets) || return 1
-            [ -z "$build_targets" ] || return 1
-        fi
+        # A pending build (e.g. a base image refreshed in place) is not "unchanged", for the deploy
+        # target too. Its targets live in the build stamp, not the deployment stamp.
+        build_stamp=$STAMP
+        [ "${target:-}" = "build" ] || build_stamp="$DIR/.build.stamp"
+        # A failing planner is not "nothing to build".
+        build_targets=$(DEPLOY_STAMP="$build_stamp" "$DIR/bin/deploy-plan" --build-targets) || return 1
+        [ -z "$build_targets" ] || return 1
     fi
     if [ -n "${CHECK_UNCHANGED_COMMAND:-}" ]; then
         "$CHECK_UNCHANGED_COMMAND" || return 1
