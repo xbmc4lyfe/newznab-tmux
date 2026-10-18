@@ -827,11 +827,12 @@ pub unsafe extern "C" fn nntmux_spot_check_sample_v1_json(
 }
 
 /// Rust candidate for `HeaderFilenameIdentity::matches`. Returns 1 when the article filename is
-/// accepted, 0 when the declared subject filename contradicts it, and -1 for unusable input
-/// (null with a nonzero length, or an argument over 4 KiB, or a shape the port
-/// declines such as a valid non-ASCII executable name checked against an unquoted subject) so the
-/// caller keeps the PHP verdict.
-/// An invalid UTF-8 subject is a valid input: PHP's `/u` pattern fails there and rejects (0).
+/// accepted, 0 when the declared subject filename contradicts it, and -1 when the port declines
+/// so the caller keeps the PHP verdict: null with a nonzero length, an argument over 4 KiB, or a
+/// shape needing Unicode case mapping, NFC or caseless Unicode matching (a valid non-ASCII name
+/// searched in an unquoted subject, or a non-ASCII stem or extension that differs byte for byte).
+/// A name or subject that is not valid UTF-8 is decided (0), as PHP rejects it before any
+/// pattern runs.
 ///
 /// # Safety
 /// Each pointer must be readable for its length when that length is nonzero.
@@ -865,6 +866,15 @@ pub unsafe extern "C" fn nntmux_header_filename_identity_v1(
         .ok()
         .flatten()
         .map_or(-1, c_int::from)
+}
+
+/// The PCRE version (NUL-terminated, static) whose Unicode classes this library's header filename
+/// port was generated from. The PHP wrapper refuses a library whose version differs from the
+/// runtime's `PCRE_VERSION`, because the port's letter, mark, number, digit and whitespace tables
+/// must be those of the PCRE that runs the PHP rule.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_header_filename_identity_tables_v1() -> *const c_char {
+    header_filename_unicode::PCRE_VERSION.as_ptr()
 }
 
 /// Decode `src_length` bytes from `src` into `dest` and return the decoded length.
@@ -1942,6 +1952,13 @@ mod tests {
             assert_eq!(std::ffi::CStr::from_ptr(result).to_bytes(), br#"[{"file_key":"f","totalparts":0,"totalparts_inferred":false,"number":1,"messageid":"m","bytes":2}]"#);
             nntmux_metadata_string_free(result);
         }
+    }
+
+    #[test]
+    fn header_filename_identity_reports_the_pcre_version_of_its_tables() {
+        let version =
+            unsafe { std::ffi::CStr::from_ptr(nntmux_header_filename_identity_tables_v1()) };
+        assert!(version.to_bytes().starts_with(b"10."), "{version:?}");
     }
 
     #[test]

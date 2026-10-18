@@ -48,18 +48,12 @@ final class HeaderFilenameIdentityCorpus
     }
 
     /**
-     * The PHP verdict with preg warnings swallowed: an unquoted subject checked against an
-     * executable name that is not valid UTF-8 makes the /u pattern fail to compile, which PHP
-     * reports as a warning and treats as "not named" (false).
+     * The PHP verdict. A body name that is not valid UTF-8 is rejected before any pattern runs, so no
+     * preg warning is possible and none is suppressed here.
      */
     public static function php(string $subject, string $actual): bool
     {
-        set_error_handler(static fn (): bool => true);
-        try {
-            return HeaderFilenameIdentity::matches($subject, $actual);
-        } finally {
-            restore_error_handler();
-        }
+        return HeaderFilenameIdentity::matches($subject, $actual);
     }
 
     /**

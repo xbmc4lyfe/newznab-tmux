@@ -80,6 +80,9 @@ DECLARATIONS = {
         'Guarded candidate for HeaderFilenameIdentity::matches, not wired into production. The paired '
         'PHP-versus-Rust+FFI benchmark (scripts/benchmark-filename-identity.php) runs in CI on x86 and ARM; '
         'PHP stays authoritative until common-median and uncommon-p99 reach 1.5x.'),
+    'nntmux_header_filename_identity_tables_v1': ('lifecycle-included', ('filename-identity',),
+        ('app/Services/Releases/Verification/NativeHeaderFilenameIdentity.php',),
+        'PCRE-version query run once when the wrapper loads the library; no individual timing.'),
     'rapidyenc_decode_ex': ('caller-comparison', ('php',), (DECODER,),
         'PHP decoder caller comparison; optional native ABI diagnostics are separate.'),
     'nntmux_yenc_decode_span_v1': ('caller-comparison', ('php',), (DECODER,),

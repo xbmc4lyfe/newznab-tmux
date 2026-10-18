@@ -11,8 +11,13 @@ use Throwable;
  * Guarded Rust candidate for {@see HeaderFilenameIdentity::matches()}. It is not wired into
  * production: the PHP rule stays authoritative until benchmarks qualify a replacement, and
  * scripts/benchmark-filename-identity.php keeps measuring the pair in CI. Null means "use PHP":
- * not Linux CLI with FFI, library missing or failing its known-answer probe, or input the
- * native side declines.
+ * not Linux CLI with FFI, library missing, built from the Unicode tables of a different PCRE than the
+ * one running this PHP, failing its known-answer probe, or input the native side declines.
+ *
+ * The port's letter, mark, number, digit and whitespace classes are generated from a PCRE
+ * (scripts/generate-header-filename-unicode.php). Another PCRE version can classify a code point
+ * differently, so the library reports its table version and the wrapper requires it to equal
+ * PCRE_VERSION exactly; a deployment must regenerate the tables from the PHP it runs before building.
  */
 final class NativeHeaderFilenameIdentity
 {
@@ -23,7 +28,7 @@ final class NativeHeaderFilenameIdentity
 
     private bool $resolved = false;
 
-    public function __construct(private readonly ?string $libraryPath = null) {}
+    public function __construct(private readonly ?string $libraryPath = null, private readonly ?string $pcreVersion = null) {}
 
     /** Whether a verified native library backs this instance. */
     public function available(): bool
@@ -65,16 +70,23 @@ final class NativeHeaderFilenameIdentity
         if ($resolved === false || ! is_file($resolved) || ! is_readable($resolved)) {
             return null;
         }
-        $key = getmypid().':'.$resolved;
+        $key = getmypid().':'.$resolved.':'.($this->pcreVersion ?? PCRE_VERSION);
         if (array_key_exists($key, self::$libraries)) {
             return self::$libraries[$key];
         }
         self::$libraries[$key] = null;
         try {
             $library = FFI::cdef(
-                'int nntmux_header_filename_identity_v1(const char *subject, size_t subject_len, const char *actual, size_t actual_len);',
+                'int nntmux_header_filename_identity_v1(const char *subject, size_t subject_len, const char *actual, size_t actual_len);'
+                .' const char *nntmux_header_filename_identity_tables_v1(void);',
                 $resolved,
             );
+            // PHP FFI returns a `const char *` as a string already.
+            // @phpstan-ignore method.notFound
+            $tables = $library->nntmux_header_filename_identity_tables_v1();
+            if ((is_string($tables) ? $tables : FFI::string($tables)) !== ($this->pcreVersion ?? PCRE_VERSION)) {
+                return null;
+            }
             foreach (self::probe() as [$subject, $actual, $expected]) {
                 if (self::call($library, $subject, $actual) !== $expected) {
                     return null;

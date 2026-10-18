@@ -282,11 +282,13 @@ fn number_runs(stem: &[u8]) -> impl Iterator<Item = &str> {
         .filter(|run| !run.is_empty())
 }
 
-/// `preg_match('/(?<![\p{L}\p{N}_])'.preg_quote($actual).'(?![\p{L}\p{N}_])/iu', $subject) === 1`.
+/// `preg_match('/(?<![\p{L}\p{M}\p{N}_])'.preg_quote($actual).'(?![\p{L}\p{M}\p{N}_]|[.\-]+[\p{L}\p{N}])/iu',
+/// $subject) === 1`. A character glued to the name on either side (a letter, mark, number or
+/// underscore, or dashes and dots leading into a letter or number) means a longer name.
 ///
-/// An invalid UTF-8 `actual` is a pattern compilation failure in PHP (false). `/iu` folds
-/// Unicode case through PCRE's tables, which this port does not carry, so a valid non-ASCII
-/// `actual` is declined (None) and PHP decides. For ASCII `actual` the only non-ASCII folds are
+/// `matches` has already rejected an `actual` that is not valid UTF-8. `/iu` folds Unicode case
+/// through PCRE's tables, which this port does not carry, so a valid non-ASCII `actual` is
+/// declined (None) and PHP decides. For ASCII `actual` the only non-ASCII folds are
 /// U+212A (K) for k and U+017F (long s) for s.
 fn named_in_subject(subject: &str, actual: &[u8]) -> Option<bool> {
     if !actual.is_ascii() {

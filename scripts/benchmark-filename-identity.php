@@ -63,8 +63,6 @@ function filenameIdentityBenchmarkMain(): int
 
         return 2;
     }
-    // The rule warns when an invalid UTF-8 executable name reaches its /u pattern; keep it quiet.
-    set_error_handler(static fn (): bool => true);
     $php = static fn (string $subject, string $actual): bool => HeaderFilenameIdentity::matches($subject, $actual);
     $rust = static fn (string $subject, string $actual): bool => $native->matches($subject, $actual) ?? HeaderFilenameIdentity::matches($subject, $actual);
     $declines = static fn (string $subject, string $actual): bool => $native->matches($subject, $actual) === null;

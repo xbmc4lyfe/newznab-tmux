@@ -139,13 +139,14 @@ final class HeaderFilenameIdentityNativeTest extends TestCase
 
     /**
      * Every Unicode scalar next to a single-quoted name or a yEnc marker must classify exactly like PCRE's
-     * \p{L}\p{M}\p{N}_ lookarounds and \s class. Code points the running PCRE has not assigned yet (it is older
-     * than the generated table) are the only tolerated, counted differences.
+     * \p{L}\p{M}\p{N}_ lookarounds and \s class. The wrapper only loads a library whose tables were generated
+     * from this runtime's PCRE, so there is no tolerated difference: a mismatch of any kind fails, and a
+     * Rust decline (null) where PHP decides is not an accept.
      */
     public function test_single_quote_lookarounds_agree_for_every_unicode_scalar(): void
     {
         $native = $this->native();
-        $unassignedDrift = 0;
+        $declined = 0;
         $mismatches = [];
         for ($code = 0; $code <= 0x10FFFF; $code++) {
             if ($code >= 0xD800 && $code <= 0xDFFF) {
@@ -164,19 +165,29 @@ final class HeaderFilenameIdentityNativeTest extends TestCase
             foreach ($subjects as [$subject, $actual]) {
                 $php = HeaderFilenameIdentityCorpus::php($subject, $actual);
                 $rust = $native->matches($subject, $actual);
-                if ($php === $rust) {
+                if ($rust === null) {
+                    $declined++;
+
                     continue;
                 }
-                if ($rust === true && preg_match('/\A\p{Cn}\z/u', $character) === 1) {
-                    $unassignedDrift++;
-
+                if ($php === $rust) {
                     continue;
                 }
                 $mismatches[] = sprintf('U+%04X php=%s rust=%s', $code, var_export($php, true), var_export($rust, true));
             }
         }
-        fwrite(STDERR, sprintf("\nlookaround scalars compared; unassigned-in-PCRE drift=%d (PCRE %s)\n", $unassignedDrift, PCRE_VERSION));
+        fwrite(STDERR, sprintf("\nlookaround scalars compared; declined=%d (PCRE %s)\n", $declined, PCRE_VERSION));
         self::assertSame([], array_slice($mismatches, 0, 10));
+        self::assertSame(0, $declined, 'These subjects are ASCII-named and must never be declined.');
+    }
+
+    public function test_a_library_built_from_another_pcre_version_is_refused(): void
+    {
+        $library = (string) getenv('NNTMUX_TEST_NATIVE_LIBRARY');
+        $this->native();
+        $other = new NativeHeaderFilenameIdentity($library, '0.0 not this PCRE');
+        self::assertFalse($other->available());
+        self::assertNull($other->matches('"a.mkv"', 'b.mkv'));
     }
 
     public function test_oversized_input_is_declined_so_php_decides(): void
@@ -203,7 +214,7 @@ final class HeaderFilenameIdentityNativeTest extends TestCase
             self::markTestSkipped('Requires a Linux CLI with FFI and NNTMUX_TEST_NATIVE_LIBRARY.');
         }
         $native = new NativeHeaderFilenameIdentity($library);
-        self::assertTrue($native->available(), 'Library failed its known-answer probe.');
+        self::assertTrue($native->available(), 'Library failed its known-answer probe or was built from another PCRE\'s Unicode tables.');
 
         return $native;
     }

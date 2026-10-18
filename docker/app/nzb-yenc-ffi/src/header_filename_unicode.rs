@@ -2,6 +2,8 @@
 //! PCRE2 10.49 2026-09-28 general categories L, M and N, and the UCP-aware /u \s and \d classes, as used by
 //! App\Services\Releases\Verification\HeaderFilenameIdentity (UTF mode).
 
+pub(crate) const PCRE_VERSION: &std::ffi::CStr = c"10.49 2026-09-28";
+
 #[rustfmt::skip]
 pub(crate) const LETTERS: &[(u32, u32)] = &[
     (0x0041, 0x005A), (0x0061, 0x007A), (0x00AA, 0x00AA), (0x00B5, 0x00B5), (0x00BA, 0x00BA), (0x00C0, 0x00D6),
