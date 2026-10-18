@@ -52,8 +52,8 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
         return self::compactFormat() ? CompactFingerprintCollector::SCHEMA_VERSION : ReleaseFingerprintCollector::SCHEMA_VERSION;
     }
 
-    /** @param array<string, mixed>|null $metadata */
-    public static function isCurrent(?array $metadata): bool
+    /** A JSON column can decode to a scalar; anything but the exact current markers is stale. */
+    public static function isCurrent(mixed $metadata): bool
     {
         return is_array($metadata) && ($metadata['format'] ?? null) === self::currentFormat()
             && ($metadata['schema_version'] ?? null) === self::currentSchemaVersion();

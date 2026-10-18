@@ -14,6 +14,7 @@ use App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer;
 use App\Services\Releases\Fingerprint\Par2MetadataParser;
 use App\Services\Releases\Fingerprint\ReleaseFingerprintCollector;
 use App\Services\YencService;
+use Illuminate\Support\Facades\Cache;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\Fixtures\ArchiveParsingBenchmarkFixtures;
@@ -65,7 +66,8 @@ final class CompactFingerprintCollectorTest extends TestCase
         $nntp->shouldNotReceive('getFingerprintServerProfile')->with(true);
         $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(CompactFingerprintCollector::SAMPLE_LIMIT)
             ->withArgs(fn (string $id, int $body, int $header, bool $alternate): bool => $alternate === false)
-            ->andReturnUsing(fn (string $id): array => self::article($id));
+            // f0/f1 are the single-segment PAR2 files; RAR volumes have five segments.
+            ->andReturnUsing(fn (string $id): array => self::segmentArticle($id, preg_match('/\Af[01]-/', $id) === 1 ? 1 : 5));
 
         $result = $this->collector()->collectFromNzb(self::nzb(120, 5), 7);
         $data = $result['data'];
@@ -76,8 +78,9 @@ final class CompactFingerprintCollectorTest extends TestCase
         $this->assertSame(['requested' => 12, 'found' => 12, 'missing' => 0, 'errors' => 0], $data['providers'][0]['articles']);
         $this->assertSame('IMPLEMENTATION Fixture', $data['providers'][0]['implementation']);
         $this->assertCount(12, $data['articles']);
-        // Single-part yEnc carries no part, total or range fields.
-        $this->assertSame(['name' => 'fixture file.bin', 'size' => 16, 'part' => null, 'total' => null, 'begin' => null, 'end' => null, 'crc_ok' => true, 'size_ok' => true], $data['articles'][1]['yenc']);
+        $this->assertSame(['name' => 'segment.bin', 'size' => 80, 'part' => 1, 'total' => 5, 'begin' => 1, 'end' => 16, 'crc_ok' => true, 'size_ok' => true], $data['articles'][1]['yenc']);
+        // Single-part yEnc (the PAR2 index) carries no part, total or range fields.
+        $this->assertSame([null, null], [$data['articles'][0]['yenc']['part'], $data['articles'][0]['yenc']['total']]);
         $this->assertArrayNotHasKey('date_utc', $data['articles'][1]);
         $this->assertSame(['ngPost'], $data['uploader_software_candidates']);
         // Two single-segment PAR2 files plus 120 five-segment RAR volumes.
@@ -363,13 +366,13 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(function (string $id) use ($corrupt): array {
-            $body = YencArticles::part('0123456789abcdef', 'multi.bin', 32, 1, 1, 2);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)->andReturnUsing(function (string $id) use ($corrupt): array {
+            $article = self::segmentArticle($id, 2);
 
-            return ['body' => str_starts_with($id, 'f1-') ? $corrupt($body) : $body] + self::article($id);
+            return $id === 'f1-s1@fixture' ? ['body' => $corrupt($article['body'])] + $article : $article;
         });
 
-        $result = $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7);
+        $result = $this->collector()->collectFromNzb(self::nzb(3, 2, false), 7);
 
         $this->assertSame('partial', $result['status']);
         $this->assertNotSame([], $result['data']['errors']);
@@ -380,11 +383,9 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(fn (string $id): array => [
-            'body' => YencArticles::part('0123456789abcdef', 'multi.bin', 32, 1, 1, 2),
-        ] + self::article($id));
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)->andReturnUsing(fn (string $id): array => self::segmentArticle($id, 2));
 
-        $result = $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7);
+        $result = $this->collector()->collectFromNzb(self::nzb(3, 2, false), 7);
 
         $this->assertSame([], $result['data']['errors']);
         $this->assertSame('complete', $result['status']);
@@ -680,6 +681,126 @@ final class CompactFingerprintCollectorTest extends TestCase
 
         $this->assertNull($data['nzb']['total_bytes']);
         $this->assertContains('NzbManifestInvalid', array_column($data['errors'], 'error_type'));
+    }
+
+    /**
+     * A fixture article whose yEnc framing matches its NZB segment: single-part for one-segment files,
+     * otherwise part N of $total for Message-ID f<file>-s<N>@fixture, 16 bytes per part.
+     *
+     * @return array<string, mixed>
+     */
+    private static function segmentArticle(string $messageId, int $total): array
+    {
+        if ($total === 1) {
+            return self::article($messageId);
+        }
+        $part = preg_match('/-s(\d+)@/', $messageId, $match) === 1 ? (int) $match[1] : 1;
+
+        return ['body' => YencArticles::part('0123456789abcdef', 'segment.bin', 16 * $total, $part, 16 * ($part - 1) + 1, $total)]
+            + self::article($messageId);
+    }
+
+    #[Test]
+    public function a_part_from_another_segment_is_rejected(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)->andReturnUsing(fn (string $id): array => $id === 'f1-s2@fixture'
+            ? ['headers' => self::article($id)['headers']] + self::segmentArticle('f1-s1@fixture', 2)
+            : self::segmentArticle($id, 2));
+
+        $result = $this->collector()->collectFromNzb(self::nzb(3, 2, false), 7);
+
+        $this->assertSame('partial', $result['status']);
+        $this->assertSame([['account' => 'primary', 'error_type' => 'YencPartMismatch', 'count' => 1]], $result['data']['errors']);
+    }
+
+    #[Test]
+    public function article_identity_must_be_exact_and_present(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(function (string $id): array {
+            $article = self::article($id);
+            if ($id === 'f1-s1@fixture') {
+                $article['headers'][0] = 'Message-ID: <F1-S1@fixture>';
+            } elseif ($id === 'f2-s1@fixture') {
+                unset($article['headers'][0]);
+                $article['headers'] = array_values($article['headers']);
+            }
+
+            return $article;
+        });
+
+        $errors = $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7)['data']['errors'];
+
+        $this->assertSame([
+            ['account' => 'primary', 'error_type' => 'ArticleIdentityMismatch', 'count' => 1],
+            ['account' => 'primary', 'error_type' => 'ArticleIdentityUnconfirmed', 'count' => 1],
+        ], $errors);
+    }
+
+    #[Test]
+    public function a_later_par2_volume_is_sampled_before_remaining_data_files(): void
+    {
+        $manifest = (new NzbFingerprintAnalyzer(new YencService))->analyzeManifest(self::nzb(8, 5));
+
+        $samples = CompactFingerprintCollector::selectSamples($manifest['files']);
+
+        $this->assertSame('movie.vol00+01.par2', self::subjectName($manifest['files'], $samples[10]['file_index']));
+    }
+
+    #[Test]
+    public function prefix_hashes_come_only_from_verified_copies(): void
+    {
+        $data = str_repeat('x', 20_000);
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(function (string $id) use ($data): array {
+            $body = YencArticles::article($data);
+            if ($id === 'f1-s1@fixture') {
+                $body = (string) preg_replace('/crc32=[0-9a-f]{8}/', 'crc32=00000000', $body);
+            }
+
+            return ['body' => $body] + self::article($id);
+        });
+
+        $files = array_column($this->collector()->collectFromNzb(self::nzb(3, 1, false), 7)['data']['files'], 'first16k_md5', 'file_index');
+
+        $this->assertSame(md5(substr($data, 0, 16_384)), $files[0]);
+        $this->assertNull($files[1]);
+    }
+
+    #[Test]
+    public function an_invalid_alternate_profile_does_not_close_the_breaker(): void
+    {
+        config(['nntmux.fingerprint_alternate_percent' => 100]);
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->with(false)->andReturn(self::profile());
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(true)
+            ->andThrow(new NntpProviderUnavailableException('Unable to connect to the requested NNTP provider.'));
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(true)
+            ->andReturn(['capabilities_response_code' => null, 'capabilities_error_type' => 'Error']);
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->andReturnUsing(fn (string $id): array => self::article($id));
+
+        $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7);
+        $this->travel(901)->seconds();
+        $this->collector()->collectFromNzb(self::nzb(3, 1, false), 8);
+        // Another worker now holds the re-probe claim. Had the rejected profile marked the provider
+        // recovered, this job would probe freely; instead it must wait for the claimant.
+        $base = 'release-fingerprint:provider-breaker:'.sha1('news.alternate.invalid||plain');
+        Cache::put($base.':probe:'.Cache::get($base.':generation'), true, 240);
+        $third = $this->collector()->collectFromNzb(self::nzb(3, 1, false), 9)['data']['providers'][1];
+
+        $this->assertSame('provider_probe_in_progress', $third['skipped_reason']);
+    }
+
+    #[Test]
+    public function scalar_metadata_is_never_current(): void
+    {
+        foreach ([1, true, 'bad', null] as $metadata) {
+            $this->assertFalse(CollectReleaseFingerprintMetadata::isCurrent($metadata));
+        }
     }
 
     /** @return array<string, mixed> */

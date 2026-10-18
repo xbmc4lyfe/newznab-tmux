@@ -99,13 +99,18 @@ final class CompactFingerprintCollector
             try {
                 $profile = $nntp->getFingerprintServerProfile($server['alternate']);
                 $providers[$account]['implementation'] = self::bounded($profile['implementation'] ?? null);
-                if ($server['alternate']) {
-                    $this->breaker->recordReachable($server);
-                }
-                // A profile can fail without throwing: same acceptance rule as the full collector.
-                if (! self::profileSucceeded($profile)) {
+                // A profile can fail without throwing: same acceptance rule as the full collector. Only an
+                // accepted profile proves the alternate reachable; otherwise its re-probe claim is released.
+                if (self::profileSucceeded($profile)) {
+                    if ($server['alternate']) {
+                        $this->breaker->recordReachable($server);
+                    }
+                } else {
                     $providers[$account]['profile'] = 'ProfileResponseInvalid';
                     $errors[$account]['ProfileResponseInvalid'] = ($errors[$account]['ProfileResponseInvalid'] ?? 0) + 1;
+                    if ($server['alternate']) {
+                        $this->breaker->releaseProbe($server);
+                    }
                 }
             } catch (Throwable $exception) {
                 $providers[$account]['profile'] = class_basename($exception);
@@ -119,6 +124,10 @@ final class CompactFingerprintCollector
             }
         }
 
+        $segmentCounts = [];
+        foreach ($files as $file) {
+            $segmentCounts[(int) $file['index']] = is_array($file['segments'] ?? null) ? count($file['segments']) : 0;
+        }
         $manifestInvalidFiles = self::manifestInvalidFileCount($manifest);
         if ($manifestInvalidFiles > 0) {
             $errors['nzb']['NzbManifestInvalid'] = $manifestInvalidFiles;
@@ -161,18 +170,31 @@ final class CompactFingerprintCollector
                     // Each provider's copy is decoded so corruption on any of them is reported.
                     $analysis = $this->analyzer->analyzeArticleAndDecodedBytes($fetched['headers'], $fetched['body']);
                     $metadata = $analysis['metadata'];
-                    // A copy that identifies as another article must not supply evidence for this one.
-                    if (! self::identityMatches($sample['messageid'], $metadata['headers']['message-id'] ?? null, $fetched)) {
-                        $errors[$account]['ArticleIdentityMismatch'] = ($errors[$account]['ArticleIdentityMismatch'] ?? 0) + 1;
+                    // Only a copy that positively identifies as this article, and whose yEnc part is this NZB
+                    // segment, may supply evidence for it.
+                    $identity = self::identityStatus($sample['messageid'], $metadata['headers']['message-id'] ?? null, $fetched);
+                    if ($identity !== null) {
+                        $errors[$account][$identity] = ($errors[$account][$identity] ?? 0) + 1;
+
+                        continue;
+                    }
+                    if (! self::partMatchesSegment($metadata['yenc'] ?? null, $sample['segment_number'], $segmentCounts[$sample['file_index']] ?? 0)) {
+                        $errors[$account]['YencPartMismatch'] = ($errors[$account]['YencPartMismatch'] ?? 0) + 1;
 
                         continue;
                     }
                     $yenc = self::yencSummary($metadata['yenc'] ?? null);
-                    foreach (self::yencIntegrityErrors($metadata['yenc'] ?? null) as $integrityError) {
+                    $integrityErrors = self::yencIntegrityErrors($metadata['yenc'] ?? null);
+                    foreach ($integrityErrors as $integrityError) {
                         $errors[$account][$integrityError] = ($errors[$account][$integrityError] ?? 0) + 1;
                     }
+                    $prefixMd5 = $metadata['yenc']['par2_first_16k_md5_candidate'] ?? null;
+                    if ($integrityErrors === [] && $sample['segment_number'] === 1 && is_string($prefixMd5)) {
+                        // Prefix hashes come only from integrity-verified copies, from whichever provider first has one.
+                        $firstPrefixMd5[$sample['file_index']] ??= strtolower($prefixMd5);
+                    }
                     // Every verified provider copy may supply PAR2 metadata until a usable summary is found.
-                    if ($par2 === null && $sample['kind'] === 'par2' && self::yencIntegrityErrors($metadata['yenc'] ?? null) === []
+                    if ($par2 === null && $sample['kind'] === 'par2' && $integrityErrors === []
                         && is_string($analysis['decoded_bytes'] ?? null)) {
                         $summary = $this->par2Summary($analysis['decoded_bytes'], $files);
                         // Only a summary with file descriptions ends the search; a set ID alone (e.g. a
@@ -190,10 +212,6 @@ final class CompactFingerprintCollector
                     $article['yenc'] = $yenc;
                     foreach (array_keys($metadata['uploader_software_candidates'] ?? []) as $candidate) {
                         $softwareCandidates[$candidate] = true;
-                    }
-                    $prefixMd5 = $metadata['yenc']['par2_first_16k_md5_candidate'] ?? null;
-                    if ($sample['segment_number'] === 1 && is_string($prefixMd5)) {
-                        $firstPrefixMd5[$sample['file_index']] ??= strtolower($prefixMd5);
                     }
                 } catch (Throwable $exception) {
                     $providers[$account]['retrieval_ms'][] = (int) round((hrtime(true) - $started) / 1_000_000);
@@ -322,7 +340,7 @@ final class CompactFingerprintCollector
 
     /**
      * Segment 1 of the smallest PAR2 file, then first/middle/last segments of the largest non-PAR2
-     * files, then first segments of the remaining files, up to SAMPLE_LIMIT.
+     * files, then one further PAR2 volume, then first segments of the remaining files, up to SAMPLE_LIMIT.
      *
      * @param  list<array<string, mixed>>  $files
      *
@@ -352,10 +370,15 @@ final class CompactFingerprintCollector
                 $candidates[] = [$file, $last, 'last'];
             }
         }
+        // One further PAR2 volume comes before the remaining data files, so a missing or unusable index
+        // can still be replaced by another volume's metadata.
+        foreach (array_slice($par2Files, 1, 1) as $file) {
+            $candidates[] = [$file, 0, 'first'];
+        }
         foreach (array_slice($dataFiles, self::LARGEST_FILES_SAMPLED) as $file) {
             $candidates[] = [$file, 0, 'first'];
         }
-        foreach (array_slice($par2Files, 1) as $file) {
+        foreach (array_slice($par2Files, 2) as $file) {
             $candidates[] = [$file, 0, 'first'];
         }
 
@@ -456,7 +479,9 @@ final class CompactFingerprintCollector
             && ($parsed['source_descriptions_valid'] ?? false) === true
             && ($parsed['main_definition_conflict'] ?? false) !== true
             && ($parsed['conflicting_file_description_ids'] ?? []) === []
-            && ($parsed['source_definition_conflicts'] ?? []) === [];
+            && ($parsed['source_definition_conflicts'] ?? []) === []
+            && ($parsed['source_inventory_complete'] ?? false) === true
+            && ($parsed['missing_file_description_ids'] ?? []) === [];
         if (! $coherent) {
             // Multiple sets or contradictory descriptions: keep only a set ID fallback (no files).
             return count($setIds) === 1 ? ['set_id' => $setIds[0], 'block_size' => null, 'recovery_blocks' => null,
@@ -466,7 +491,9 @@ final class CompactFingerprintCollector
         return [
             'set_id' => $setIds[0],
             'block_size' => $parsed['source_block_size'] ?? null,
-            'recovery_blocks' => $parsed['unique_recovery_slice_count'] ?? null,
+            // Conflicting recovery slices make the count ambiguous, so it is left unknown.
+            'recovery_blocks' => (int) ($parsed['recovery_slice_conflict_count'] ?? 0) === 0 && ($parsed['conflicting_recovery_exponents'] ?? []) === []
+                ? ($parsed['unique_recovery_slice_count'] ?? null) : null,
             'file_count' => count($sources),
             'files' => array_slice($sources, 0, self::MAX_LISTED_FILES),
             'nzb_matches' => $matches,
@@ -756,26 +783,46 @@ final class CompactFingerprintCollector
     }
 
     /**
-     * The copy must identify as the requested article: the HEAD Message-ID header and any Message-ID
-     * in the HEAD/BODY status lines must equal it.
+     * Null when the copy positively identifies as the requested article: its HEAD Message-ID header is
+     * present and exactly equal (Message-IDs are case-sensitive), and any Message-ID in the HEAD/BODY
+     * status lines is exactly equal too. Otherwise the error type to record.
      *
      * @param  array<string, mixed>  $fetched
      */
-    private static function identityMatches(string $requested, mixed $headerMessageId, array $fetched): bool
+    private static function identityStatus(string $requested, mixed $headerMessageId, array $fetched): ?string
     {
-        $normalize = static fn (string $id): string => strtolower(trim(trim($id), '<>'));
-        $want = $normalize($requested);
-        if (is_string($headerMessageId) && $normalize($headerMessageId) !== $want) {
-            return false;
+        $want = '<'.trim($requested, '<>').'>';
+        if (! is_string($headerMessageId) || trim($headerMessageId) === '') {
+            return 'ArticleIdentityUnconfirmed';
+        }
+        if (trim($headerMessageId) !== $want) {
+            return 'ArticleIdentityMismatch';
         }
         foreach (['head_response', 'body_response'] as $response) {
             $text = $fetched[$response]['response_text'] ?? null;
-            if (is_string($text) && preg_match('/<([^>]+)>/', $text, $match) === 1 && $normalize($match[1]) !== $want) {
-                return false;
+            if (is_string($text) && preg_match('/<[^>]+>/', $text, $match) === 1 && $match[0] !== $want) {
+                return 'ArticleIdentityMismatch';
             }
         }
 
-        return true;
+        return null;
+    }
+
+    /**
+     * A part's number and total must be this NZB segment and the file's segment count; a single-part
+     * body is only consistent with a single-segment file. Non-yEnc bodies are judged by integrity checks.
+     */
+    private static function partMatchesSegment(mixed $yenc, int $segment, int $segmentCount): bool
+    {
+        if (! is_array($yenc)) {
+            return true;
+        }
+        if (($yenc['multipart'] ?? null) !== true) {
+            return $segmentCount === 1;
+        }
+
+        return ($yenc['part'] ?? null) === $segment
+            && (($yenc['total_parts'] ?? null) === null || $yenc['total_parts'] === $segmentCount);
     }
 
     /** @param array<string, mixed> $profile */
