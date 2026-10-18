@@ -226,6 +226,9 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         }
         $this->assertNull($policy->verifiedRejection(['verified_file_names' => ['9d3276d357227b78.mkv']] + $manifest));
         $this->assertNull($policy->verifiedRejection(['verified_file_names' => ['metadata.torrent']] + $manifest));
+        $this->assertNull($policy->verifiedRejection(['verified_file_names' => ['README']] + $manifest));
+        $this->assertSame('Header inventory contains only PAR2 files without a declared source payload.',
+            $policy->verifiedRejection(['verified_file_names' => ['set.vol00+01.par2:payload.mkv']] + $manifest));
     }
 
     public function test_manual_import_preserves_legacy_bypass_of_collection_size_and_count_filters(): void

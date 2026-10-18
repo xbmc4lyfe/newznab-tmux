@@ -13,7 +13,7 @@ final class HeaderFilenameIdentity
 {
     private const string QUOTED = '/"([^"\r\n]+)"|(?<![\p{L}\p{N}_])\'([^\'\r\n]+)\'(?![\p{L}\p{N}_])/u';
 
-    private const string SUFFIX = '/\A(?:part\d+|vol\d+[+-]\d+|par2|rar|r\d{2,3}|\d{3}|7z|zip|mkv|avi|mp4|m4v|ts|nfo|sfv|nzb|epub|pdf|flac|mp3|iso|srt|txt|jpg|png)\z/i';
+    private const string SUFFIX = '/\A(?:part\d+|vol\d+[+-]\d+|par2|rar|r\d{2,3}|\d{3}|7z|zip|tar|gz|tgz|xz|bz2|zst|mkv|avi|mp4|m4v|ts|nfo|sfv|nzb|epub|pdf|flac|mp3|iso|srt|txt|jpg|png)\z/i';
 
     private const string EXECUTABLE = '/\.(?:exe|scr|bat|cmd|com|msi|msix|msp|lnk|pif|cpl|hta|reg|scf|js|jse|vbs|vbe|wsf|wsh|ps1|psm1|jar|apk|dll|sh|command|app|dmg|pkg|chm|msc|ps1xml|psd1|cab|appx|appxbundle|msixbundle|application|gadget|inf|url|xll|ws|wsc|sct|vb|ocx|sys|iso|img|vhd|vhdx|desktop|appimage|deb|rpm|snap|run|msu|py|pyw|pl|rb|php)\z/i';
 
@@ -60,20 +60,22 @@ final class HeaderFilenameIdentity
         }
         // Parity and payload are not interchangeable: a declared PAR2 file is not payload evidence, and a
         // declared payload file is not satisfied by a PAR2 body, even when another quoted value names it.
-        $bodyExtension = strtolower(self::extension(self::trimmed($actual)));
         $declaredExtension = strtolower(self::extension(self::trimmed($declared)));
-        if (($declaredExtension === 'par2') !== ($bodyExtension === 'par2') && $bodyExtension !== '' && $declaredExtension !== '') {
-            return false;
+        foreach ([self::trimmed($actual), self::bare($actual)] as $form) {
+            $bodyExtension = strtolower(self::extension($form));
+            if ($declaredExtension !== '' && $bodyExtension !== '' && ($declaredExtension === 'par2') !== ($bodyExtension === 'par2')) {
+                return false;
+            }
         }
         if (in_array($actual, $quoted, true)) {
             return true;
         }
-        // A long or hexadecimal random token is plainly obfuscated. A shorter one could be a misread title, so it admits
-        // only a body that is random too or extends the declared token, never a different readable name.
+        // A long or hexadecimal random token is plainly obfuscated. A shorter one could be a misread title
+        // (12AngryMen), so it admits only a plainly random body or one that extends the declared token.
         if (self::opaque($declared)) {
             $token = self::token($declared);
 
-            return strlen($token) >= 20 || preg_match('/\A[0-9a-f]{16,}\z/i', $token) === 1 || self::opaque($actual)
+            return self::random($declared) || self::opaque($actual)
                 || str_starts_with(strtolower(self::bare($actual)), strtolower($token));
         }
         // A readable declared name must agree on its volume and extension chain, and on its final
@@ -99,6 +101,28 @@ final class HeaderFilenameIdentity
         return (string) preg_replace('/\.[A-Za-z0-9]{1,8}\z/', '', self::stem($name));
     }
 
+    /**
+     * Whether a sampled article name is evidence of a source payload: a non-PAR2 name with an extension, or
+     * a readable extensionless name such as README, but never an obfuscated extensionless token.
+     */
+    public static function provesPayload(string $name): bool
+    {
+        if (preg_match('/\.par2\z/i', self::trimmed($name)) === 1 || preg_match('/\.par2\z/i', self::bare($name)) === 1) {
+            return false;
+        }
+
+        return preg_match('/\.[A-Za-z0-9]{1,8}\z/', $name) === 1
+            || ($name !== '' && ! str_contains($name, '.') && ! self::opaque($name) && preg_match('/[\p{L}]/u', $name) === 1);
+    }
+
+    /** An opaque token that is long or hexadecimal, too random to be a misread title. */
+    private static function random(string $name): bool
+    {
+        $token = self::token($name);
+
+        return self::opaque($name) && (strlen($token) >= 20 || preg_match('/\A[0-9a-f]{16,}\z/i', $token) === 1);
+    }
+
     /** A single random-looking token, such as an obfuscated posting name, makes no filename claim. */
     private static function opaque(string $name): bool
     {
@@ -109,14 +133,40 @@ final class HeaderFilenameIdentity
         if (preg_match('/\A[0-9a-f]{16,}\z/i', $stem) === 1) {
             return true;
         }
-        // Capitalized words, optionally after a leading acronym or lowercase word, or one single-case run,
-        // with only trailing digits, read as a run-together title (BBCDocumentary, iPhoneMovie2026).
-        if (preg_match('/\A(?:[A-Z]+|(?:[A-Z]{2,}(?=[A-Z][a-z])|[a-z]+)?(?:[A-Z][a-z]+)*)[0-9]*\z/', $stem) === 1) {
+        if (self::titled($stem)) {
             return false;
         }
         $classes = preg_match('/[a-z]/', $stem) + preg_match('/[A-Z]/', $stem) + preg_match('/[0-9]/', $stem);
 
         return strlen($stem) >= 10 && $classes >= 2;
+    }
+
+    /**
+     * Whether a token reads as a run-together title (BBC2Documentary, 13GoingOn30, iPhoneMovie): it splits
+     * into an optional leading lowercase word, capitalized words, numbers and at most one short acronym, and
+     * every word has a vowel. Random tokens break one of these almost immediately.
+     */
+    private static function titled(string $stem): bool
+    {
+        preg_match_all('/[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+/', $stem, $matches);
+        $acronyms = 0;
+        foreach ($matches[0] as $index => $part) {
+            if (ctype_digit($part)) {
+                continue;
+            }
+            if (ctype_upper($part) && strlen($part) > 1) {
+                if (++$acronyms > 1 || strlen($part) > 4) {
+                    return false;
+                }
+
+                continue;
+            }
+            if ((ctype_lower($part) && $index > 0) || preg_match('/[aeiouy]/i', $part) !== 1) {
+                return false;
+            }
+        }
+
+        return $matches[0] !== [];
     }
 
     private static function executable(string $name): bool

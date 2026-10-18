@@ -167,6 +167,10 @@ class HeaderFilenameIdentityTest extends TestCase
             'opaque subject with an unlisted media extension' => ['[1/9] - "Xk29dPq8LmZ0Yt5R.wmv" yEnc', 'b7Qe1ZrT9wXy4K.wmv', true],
             'composed and decomposed accents agree' => ['"Résumé Ultimate.mkv" yEnc', "Re\u{301}sume\u{301} Ultimate.mkv", true],
             'random letters without digits stay opaque' => ['"camjQoMXQvVmpZMR" yEnc', '0SDtjNqVpAyF7Orb', true],
+            'number-bearing titles do not vouch for each other' => ['"12AngryMen.mkv" yEnc', '13GoingOn30.mkv', false],
+            'acronym titles with numbers do not vouch for each other' => ['"BBC2Documentary.mkv" yEnc', 'Channel4Documentary.mkv', false],
+            'compound archive suffix on an opaque subject' => ['[1/9] - "Xk29dPq8LmZ0Yt5R.tar.gz" yEnc', 'b7Qe1ZrT9wXy4KpL.tar.gz', true],
+            'NTFS base name hides a parity body' => ['"0123456789abcdef0123456789abcdef.mkv" yEnc', 'set.vol00+01.par2:payload.mkv', false],
             'opaque subject with an extensionless body' => ['[3/8] - "o9aeI3YpDwgHGoJ2ZsCm.vol00+01.par2" yEnc', '148f76878d7732b981734a9e0c51a348', true],
         ];
     }
