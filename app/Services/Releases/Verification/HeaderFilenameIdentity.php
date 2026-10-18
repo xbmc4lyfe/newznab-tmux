@@ -40,7 +40,7 @@ final class HeaderFilenameIdentity
             if ($declared === null && preg_match('/\A\s*(?:\(\d+\/\d+\)\s*)?yEnc/i', substr($subject, $end)) === 1) {
                 $declared = $value;
             }
-            if ($afterCounter === null && preg_match('/\[\d+\/\d+\]\s*-?\s*\z/', substr($subject, 0, $match[0][1])) === 1) {
+            if ($afterCounter === null && preg_match('/\[\d+\/\d+\]\s*+(?:-\s*+)?\z/', substr($subject, 0, $match[0][1])) === 1) {
                 $afterCounter = $value;
             }
         }
@@ -50,7 +50,8 @@ final class HeaderFilenameIdentity
         }
         // An executable body must be exactly the executable type its subject declares.
         if (self::executable($actual) && (! self::executable($declared)
-            || strtolower(self::extension(self::bare($actual))) !== strtolower(self::extension(self::bare($declared))))) {
+            || strtolower(self::extension(self::bare($actual))) !== strtolower(self::extension(self::bare($declared)))
+            || strtolower(self::extension(self::trimmed($actual))) !== strtolower(self::extension(self::trimmed($declared))))) {
             return false;
         }
         if (self::opaque($declared)) {
@@ -66,7 +67,8 @@ final class HeaderFilenameIdentity
         }
         $expected = self::normalized($declared);
         $body = self::normalized($actual);
-        if ($expected === '' || $body === '') {
+        // Removing separators must not merge different numbers: Show 1 10 is not Show 11 0.
+        if ($expected === '' || $body === '' || self::numbers($declared) !== self::numbers($actual)) {
             return false;
         }
         if ($expected === $body) {
@@ -101,13 +103,19 @@ final class HeaderFilenameIdentity
 
     private static function executable(string $name): bool
     {
-        return preg_match(self::EXECUTABLE, self::bare($name)) === 1;
+        return preg_match(self::EXECUTABLE, self::trimmed($name)) === 1 || preg_match(self::EXECUTABLE, self::bare($name)) === 1;
     }
 
-    /** The name a filesystem writes: without an NTFS stream suffix or trailing dots and spaces. */
+    /** The name a filesystem writes, without trailing dots and spaces. */
+    private static function trimmed(string $name): string
+    {
+        return rtrim($name, ". \t");
+    }
+
+    /** The name an NTFS write keeps, without a stream suffix after the first colon. */
     private static function bare(string $name): string
     {
-        return rtrim((string) preg_replace('/:.*\z/s', '', $name), ". \t");
+        return self::trimmed((string) preg_replace('/:.*\z/s', '', $name));
     }
 
     private static function extension(string $name): string
@@ -123,6 +131,14 @@ final class HeaderFilenameIdentity
     private static function suffix(string $name): string
     {
         return substr($name, strlen(self::stem($name)));
+    }
+
+    /** @return list<string> */
+    private static function numbers(string $name): array
+    {
+        preg_match_all('/\p{N}+/u', self::stem($name), $matches);
+
+        return $matches[0];
     }
 
     private static function normalized(string $name): string

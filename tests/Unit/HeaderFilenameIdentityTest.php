@@ -25,7 +25,8 @@ class HeaderFilenameIdentityTest extends TestCase
         ini_set('pcre.jit', '0');
         try {
             foreach (['[1/1]'.str_repeat(' ', 990).'"a"', str_repeat('"a" ', 250), '"a'.str_repeat('.rar', 248).'"',
-                str_repeat("'", 1000), '"'.str_repeat('Ab1', 330).'" yEnc'] as $subject) {
+                str_repeat("'", 1000), '"'.str_repeat('Ab1', 330).'" yEnc',
+                '[1/1]'.str_repeat(' ', 667).'x'.str_repeat('"a"', 111)] as $subject) {
                 HeaderFilenameIdentity::matches($subject, 'Readable.Name.mkv');
                 self::assertSame(PREG_NO_ERROR, preg_last_error(), substr($subject, 0, 20));
             }
@@ -110,6 +111,12 @@ class HeaderFilenameIdentityTest extends TestCase
             'single-class digit token below the hex length' => ['"1234567890.rar" yEnc', 'other.rar', false],
             'ASCII digit ends the shorter stem' => ['"Readable.Name.2.mkv" yEnc', 'Readable.Name.2.Extra.mkv', false],
             'stem comparison ignores case' => ['"Readable.Name.mkv" yEnc', 'readable.name.mkv', true],
+            'colon before an executable under an opaque subject' => ['[1/9] - "Xk29dPq8LmZ0Yt5R.mkv" yEnc', 'Xk29: setup.exe', false],
+            'colon before an executable under an unquoted subject' => ['Readable Release yEnc (1/2)', 'Title: setup.exe', false],
+            'stream suffix changes a declared executable type' => ['[1/1] - "Xk29dPq8LmZ0Yt5R.exe" yEnc', 'setup.exe:x.scr', false],
+            'colon inside a readable payload name' => ['[1/2] - "Movie: The Title.mkv" yEnc', 'Movie- The Title.mkv', true],
+            'separators merge different numbers' => ['"Show 1 10.mkv" yEnc', 'Show 11 0.mkv', false],
+            'dotted numbers merge differently' => ['"Readable.Name.1.10.mkv" yEnc', 'Readable.Name.11.0.mkv', false],
             'opaque subject with an extensionless body' => ['[3/8] - "o9aeI3YpDwgHGoJ2ZsCm.vol00+01.par2" yEnc', '148f76878d7732b981734a9e0c51a348', true],
         ];
     }
