@@ -1749,6 +1749,35 @@ SH);
         $this->assertFileExists($this->directory.'/barrier.running');
     }
 
+    public function test_a_foreign_barrier_is_refused_before_a_missing_database_is_started(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/barrier.log', "barrier held\n");
+        touch($this->directory.'/barrier.running');
+        file_put_contents($this->directory.'/barrier.database', "another-database\n");
+        file_put_contents($this->directory.'/events', '');
+
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0', 'FORCE=1'], ['NNTMUX_NO_CONTAINER' => 'mariadb']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('fences another database than this rollout', $process->getErrorOutput());
+        $this->assertStringNotContainsString('--pull never mariadb', $this->events());
+        $this->assertStringNotContainsString(' stop web scheduler indexer', $this->events());
+    }
+
+    public function test_a_database_whose_start_times_out_is_stopped_again(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        // `up --wait` fails, yet the container may come up later: it must not stay running unfenced.
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0', 'FORCE=1'], ['NNTMUX_NO_CONTAINER' => 'mariadb', 'NNTMUX_UP_FAIL_SERVICE' => 'mariadb']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertMatchesRegularExpression('/--pull never mariadb\n(.*\n)*.* stop mariadb\n/', $this->events());
+        $this->assertStringNotContainsString('releases:verification-barrier --timeout', $this->events());
+    }
+
     public function test_an_interpolated_app_env_database_host_fails_closed(): void
     {
         mkdir($this->directory.'/docker/config', 0777, true);
@@ -2943,7 +2972,7 @@ SH);
         $this->assertStringContainsString('service:mariadb=pending', (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
         // Unfenced, the started database is stopped again: remote workers never reach it unmigrated.
         $this->assertMatchesRegularExpression('/--pull never mariadb\n(.*\n)*.* stop mariadb\n/', $this->events());
-        $this->assertStringContainsString('stopped the new mariadb again', $process->getErrorOutput());
+        $this->assertStringContainsString('never fenced by a verification barrier; stopped it again', $process->getErrorOutput());
     }
 
     public function test_a_recreated_database_whose_fresh_barrier_fails_is_stopped_again(): void

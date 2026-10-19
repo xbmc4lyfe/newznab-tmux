@@ -49,6 +49,16 @@ barrier_name="$project-verification-barrier"
 barrier_held=0
 barrier_keep=0
 database_fresh=0
+# A barrier is adopted only while it fences this rollout's database: its lock session and durable
+# pause live on the database it was started against.
+refuse_foreign_barrier() {
+    barrier_running || return 0
+    ! docker logs "$barrier_name" 2>&1 | grep -q '^barrier lost' || return 0
+    if [ "$(docker inspect --format '{{index .Config.Labels "nntmux.deploy.database"}}' "$barrier_name" 2>/dev/null)" != "$DATABASE_TARGET" ]; then
+        echo "deploy-app: the verification barrier $barrier_name left by an earlier attempt fences another database than this rollout's. Release its pause on that database (releases:verification-barrier --release there), stop it, then retry." >&2
+        exit 1
+    fi
+}
 barrier_running() {
     [ "$(docker inspect --format '{{.State.Running}} {{index .Config.Labels "com.docker.compose.project"}}' "$barrier_name" 2>/dev/null)" = "true $project" ]
 }
@@ -61,12 +71,7 @@ hold_barrier() {
     # mid-migration, and this barrier's release would clear the durable pause it left behind.
     [ "$owed_at_start" != 1 ] || barrier_keep=1
     if barrier_running && ! docker logs "$barrier_name" 2>&1 | grep -q '^barrier lost'; then
-        # Adopted only while it fences this rollout's database: its lock session and durable pause
-        # live on the database it was started against.
-        if [ "$(docker inspect --format '{{index .Config.Labels "nntmux.deploy.database"}}' "$barrier_name" 2>/dev/null)" != "$DATABASE_TARGET" ]; then
-            echo "deploy-app: the verification barrier $barrier_name left by an earlier attempt fences another database than this rollout's. Release its pause on that database (releases:verification-barrier --release there), stop it, then retry." >&2
-            exit 1
-        fi
+        refuse_foreign_barrier
         barrier_keep=1
     else
         docker rm -f "$barrier_name" >/dev/null 2>&1 || true
@@ -80,18 +85,13 @@ hold_barrier() {
             docker logs "$barrier_name" >&2 || true
             docker rm -f "$barrier_name" >/dev/null 2>&1 || true
             barrier_held=0
-            if [ "$database_fresh" = 1 ]; then
-                # Started or recreated just now and unfenced (replacement storage has no pause): stop
-                # it again; the retry recreates it (it is pending or unrecorded).
-                compose stop "$DATABASE_SERVICE" || true
-                echo "Remote verification workers did not drain; stopped the new $DATABASE_SERVICE again, not migrating." >&2
-                exit 1
-            fi
             echo "Remote verification workers did not drain; not stopping writers or migrating." >&2
             exit 1
         fi
         sleep 1
     done
+    # The database started or recreated before this barrier is fenced now.
+    database_fresh=0
 }
 assert_barrier() {
     [ "$barrier_held" = 1 ] || return 0
@@ -251,6 +251,13 @@ resume() {
     rc=$?
     # Recovery must finish even if a second signal arrives (e.g. a terminal's INT plus the guard's).
     trap '' INT TERM HUP
+    if [ "$database_fresh" = 1 ]; then
+        # Started or recreated by this run but never fenced (replacement storage has no pause): stop
+        # it again before anything else, so no remote worker reaches it unmigrated; the retry
+        # recreates it (it is pending or unrecorded).
+        compose stop "$DATABASE_SERVICE" || true
+        echo "The new $DATABASE_SERVICE was never fenced by a verification barrier; stopped it again, not migrating." >&2
+    fi
     if [ "$barrier_held" = 1 ] && [ "$rc" != 0 ]; then
         owe_barrier held
     fi
@@ -397,6 +404,7 @@ if [ "$database_missing" = 1 ]; then
     # The first change to it: a retry after any failure from here must recreate it, even if its
     # configuration is reverted meanwhile.
     plan --pending "$DATABASE_SERVICE"
+    refuse_foreign_barrier
     # Web's tag too: the barrier that fences the database is started from it right after, and a
     # replaced tag must abort before the database is touched, not between starting and fencing it.
     plan --verify-images "$DATABASE_SERVICE" web
@@ -411,9 +419,10 @@ if [ "$database_missing" = 1 ]; then
     stop_removed_data
     # The images this run planned, as for every other applied service (web's for the barrier).
     plan --verify-images "$DATABASE_SERVICE" web
+    # From its start until a barrier holds it, any exit stops it again (the EXIT trap).
+    database_fresh=1
     compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" --pull never "$DATABASE_SERVICE"
     # No check between starting it and fencing it: the barrier below is taken next (and verifies).
-    database_fresh=1
 fi
 
 # Remote workers are held out whenever the database's writers stop for a schema or data-service
@@ -447,8 +456,8 @@ for item in $POST_DRAIN; do
         [ "$MIGRATE" != 1 ] || barrier_keep=1
         # The fresh barrier below starts from web's tag: a replaced one aborts before the recreate.
         plan --verify-images web
-        apply_up "--${item%%:*}" "${item#*:}"
         database_fresh=1
+        apply_up "--${item%%:*}" "${item#*:}"
         # A recreated database ends the barrier's lock session, and replacement storage lacks its
         # durable pause: fence the new database at once, before anything else that could fail
         # (recording it included).
