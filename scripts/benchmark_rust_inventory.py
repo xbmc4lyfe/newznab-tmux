@@ -83,6 +83,11 @@ DECLARATIONS = {
     'nntmux_header_filename_identity_tables_v1': ('lifecycle-included', ('filename-identity',),
         ('app/Services/Releases/Verification/NativeHeaderFilenameIdentity.php',),
         'PCRE-version query run once when the wrapper loads the library; no individual timing.'),
+    'nntmux_per_article_obfuscation_v1': ('caller-comparison', ('filename-identity',),
+        ('app/Services/Binaries/NativePerArticleObfuscation.php',),
+        'Adopted for HeaderParser::markPerArticleObfuscated with the PHP rule as fallback. The paired '
+        'PHP-versus-Rust+FFI benchmark (scripts/benchmark-per-article-obfuscation.php) and native parity '
+        'test run in CI on x86 and ARM in the archive-sample-performance filename-identity job.'),
     'rapidyenc_decode_ex': ('caller-comparison', ('php',), (DECODER,),
         'PHP decoder caller comparison; optional native ABI diagnostics are separate.'),
     'nntmux_yenc_decode_span_v1': ('caller-comparison', ('php',), (DECODER,),
