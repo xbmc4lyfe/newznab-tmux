@@ -119,6 +119,9 @@ class ExportMonitoringMetricsCommandTest extends TestCase
     {
         Http::fake([self::PUSH_URL => Http::response('', 200)]);
         $event = $this->exportEvent();
+        // Lock expiry is compared with the clock; freeze it so wall-clock drift between
+        // creating the lock and travelling cannot move the boundary.
+        $this->freezeTime();
 
         $this->assertTrue($event->mutex->create($event));
         $this->travel(4)->minutes();
