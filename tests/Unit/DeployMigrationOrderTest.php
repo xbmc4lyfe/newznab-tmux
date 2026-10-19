@@ -1742,8 +1742,28 @@ SH);
         $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0']);
         $process->run();
         $this->assertFalse($process->isSuccessful());
-        $this->assertStringContainsString("app.env's DB_HOST uses `\$` interpolation", $process->getErrorOutput());
+        $this->assertStringContainsString("app.env's DB_HOST uses `\${...}` interpolation", $process->getErrorOutput());
         $this->assertStringNotContainsString(' up -d', $this->events());
+    }
+
+    public function test_a_data_service_scaled_to_zero_never_blocks_rollouts(): void
+    {
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['mariadb'] = ['deploy' => ['replicas' => 0]];
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES), 'NNTMUX_NO_CONTAINER' => 'mariadb'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        // Compose never creates its container: no `up`, no "missing" report, and the next poll is a no-op.
+        $this->assertStringNotContainsString('--pull never mariadb', $this->events());
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $this->assertStringContainsString('result=skipped (nothing changed', (string) file_get_contents($this->directory.'/docker/.deploy.log'));
+    }
+
+    public function test_a_bare_dollar_in_the_database_url_is_literal(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        // phpdotenv expands only `${NAME}`: a `$` in the password is part of it.
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_URL=mysql://u:pa\$w0rd@db.example:3306/nntmux\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
     }
 
     public function test_a_deleted_data_container_is_not_an_unchanged_stack(): void

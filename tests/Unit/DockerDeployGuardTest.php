@@ -78,6 +78,37 @@ final class DockerDeployGuardTest extends TestCase
     }
 
     #[Test]
+    public function a_signal_before_the_payload_is_forked_never_hangs_the_guard(): void
+    {
+        // A copy of the guard that signals itself after its FIFO reader starts, before the fork.
+        mkdir($this->dir.'/docker/bin', 0777, true);
+        symlink(dirname(__DIR__, 2).'/docker/bin/deploy-plan', $this->dir.'/docker/bin/deploy-plan');
+        $source = (string) file_get_contents(dirname(__DIR__, 2).'/docker/bin/deploy-guard');
+        $fork = '    if ( exec 3<&0 ) 2>/dev/null; then';
+        $this->assertSame(1, substr_count($source, $fork));
+        file_put_contents($this->dir.'/docker/bin/deploy-guard', str_replace($fork, "    kill -TERM \$\$\n".$fork, $source));
+        foreach (['sh', 'dash', 'bash'] as $shell) {
+            if ((new Process(['sh', '-c', 'command -v '.$shell]))->run() !== 0) {
+                continue;
+            }
+            $guard = $this->guardProcess(['run', 'deploy', '--', 'true'], [], $shell);
+            $process = new Process([$shell, $this->dir.'/docker/bin/deploy-guard', 'run', 'deploy', '--', 'true'], null, $guard->getEnv());
+            $process->start();
+            $deadline = microtime(true) + 5;
+            while ($process->isRunning() && microtime(true) < $deadline) {
+                usleep(50_000);
+            }
+            $hung = $process->isRunning();
+            $process->stop(0);
+            // A hung guard's FIFO reader would otherwise outlive the test.
+            (new Process(['pkill', '-f', $this->dir.'/deploy-guard-alive']))->run();
+            $this->assertFalse($hung, $shell.': the guard waited forever for a reader no payload would close');
+            $this->assertSame(130, $process->getExitCode(), $shell.': '.$process->getErrorOutput());
+            $this->assertFalse(is_link($this->dir.'/lock'), $shell);
+        }
+    }
+
+    #[Test]
     public function a_signal_during_the_descendant_wait_keeps_the_lock_until_they_exit(): void
     {
         $ready = $this->dir.'/grandchild-ready';

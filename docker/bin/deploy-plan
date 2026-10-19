@@ -1300,6 +1300,16 @@ def compute_build_targets(repo: Path, docker_dir: Path, stamp_path: Path, force:
 STATELESS_LABEL = "nntmux.deploy.stateless"
 
 
+def scaled_to_zero(svc: str) -> bool:
+    """`scale: 0` or `deploy.replicas: 0`: rendered, but Compose never creates a container for it."""
+    cfg = RENDERED_SERVICES.get(svc)
+    if not isinstance(cfg, dict):
+        return False
+    deploy = cfg.get("deploy")
+    replicas = deploy.get("replicas") if isinstance(deploy, dict) else None
+    return cfg.get("scale") == 0 or replicas == 0
+
+
 def declared_stateless(svc: str) -> bool:
     """An added service is stateless only when it carries the label `nntmux.deploy.stateless: "true"`."""
     cfg = RENDERED_SERVICES.get(svc)
@@ -1385,10 +1395,13 @@ def database_service(docker_dir: Path) -> str:
         # Keys Compose sets for this app shadow app.env's (Laravel reads the process environment first).
         merged = {**app_env, **{k: v for k, v in rendered.items() if k in ("DB_URL", "DB_HOST")}}
         for key in ("DB_URL", "DB_HOST"):
-            if key in interpolated and key not in rendered:
-                # phpdotenv expands it, so the literal is not the host Laravel connects to.
-                sys.exit(f"deploy-plan: config/app.env's {key} uses `$` interpolation, so the database service it "
-                         "selects cannot be determined; write the host literally (or single-quote a literal `$`).")
+            value = app_env.get(key, "")
+            # phpdotenv expands only `${NAME}` (a bare `$`, e.g. in a password, is literal); a
+            # multi-line value is flagged without a `$` and cannot be read whole here either.
+            if key in interpolated and key not in rendered and ("${" in value or "$" not in value):
+                # Expanded, the literal is not the host Laravel connects to.
+                sys.exit(f"deploy-plan: config/app.env's {key} uses `${{...}}` interpolation (or a multi-line value), so the database service it "
+                         "selects cannot be determined; write the host literally (single-quoted to keep a literal `${`).")
         for host in selected(merged):
             if host:
                 if host in RENDERED_SERVICES:
@@ -1564,6 +1577,8 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
     for svc in data_services(state):
         if not compose_present(state, svc):
             data_reasons[svc] = "not rendered"
+        elif scaled_to_zero(svc) and not container_exists(docker_dir, svc):
+            data_reasons[svc] = "scaled to zero"
         elif not container_exists(docker_dir, svc):
             stamped_hash = stamped.get(f"service:{svc}")
             if force:
@@ -1885,7 +1900,8 @@ def main() -> None:
         stale = stale_service_images(docker_dir, RENDERED_SERVICES)
         # A rendered data or infrastructure service with no container at all also needs a rollout
         # (healthy apps do not prove that, e.g., a deleted Manticore came back).
-        missing = [svc for svc in RENDERED_SERVICES if svc not in APP_SERVICES and svc not in stale and not container_exists(docker_dir, svc)]
+        missing = [svc for svc in RENDERED_SERVICES if svc not in APP_SERVICES and svc not in stale
+                   and not scaled_to_zero(svc) and not container_exists(docker_dir, svc)]
         print(" ".join([*stale, *missing]))
         return
 
