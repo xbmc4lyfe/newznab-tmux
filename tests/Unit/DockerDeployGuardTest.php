@@ -111,6 +111,7 @@ final class DockerDeployGuardTest extends TestCase
                 $this->assertFalse($hung, $label.': the guard waited forever for its FIFO reader');
                 $this->assertSame(130, $process->getExitCode(), $label.': '.$process->getErrorOutput());
                 $this->assertFalse(is_link($this->dir.'/lock'), $label);
+                $this->assertSame([], glob($this->dir.'/deploy-guard.*'), $label.': the FIFO directory was left behind');
             }
         }
     }
@@ -137,6 +138,7 @@ final class DockerDeployGuardTest extends TestCase
             $this->waitFor(fn (): bool => ! $process->isRunning());
             $this->assertFileExists($done, $shell.': the lock was released before the grandchild finished');
             $this->assertFalse(is_link($this->dir.'/lock'), $shell);
+            $this->assertSame([], glob($this->dir.'/deploy-guard.*'), $shell);
         }
     }
 

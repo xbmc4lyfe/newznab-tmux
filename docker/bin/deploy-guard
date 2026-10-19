@@ -110,7 +110,7 @@ guard_exit() {
         exec 8>&-
         kill -KILL "$alive_reader" 2>/dev/null || true
     fi
-    [ -z "${alive_fifo:-}" ] || remove_fifo "$alive_fifo"
+    [ -z "${alive_dir:-}" ] || remove_fifo "$alive_dir"
     if [ "${attempt_open:-0}" = 1 ]; then
         attempt_open=0
         log "$target" "result=finished rc=$exit_code (interrupted)"
@@ -257,12 +257,13 @@ cooldown() {
 payload=
 alive_reader=
 alive_fifo=
+alive_dir=
 # Every descendant of the payload inherits the write end of a FIFO (fd 9); its reader sees EOF only
 # once all of them (nested guards, a docker build) have exited, so the lock is held until then.
 # It lives in a private directory (its name cannot be raced); both are removed through Python, not
-# rm: the guard's lock handling owns every rm call it makes.
+# rm: the guard's lock handling owns every rm call it makes. rmdir only ever removes an empty one.
 remove_fifo() { python3 -c 'import os, sys
-for remove, path in ((os.unlink, sys.argv[1]), (os.rmdir, os.path.dirname(sys.argv[1]))):
+for remove, path in ((os.unlink, os.path.join(sys.argv[1], "alive")), (os.rmdir, sys.argv[1])):
     try:
         remove(path)
     except FileNotFoundError:
@@ -270,7 +271,8 @@ for remove, path in ((os.unlink, sys.argv[1]), (os.rmdir, os.path.dirname(sys.ar
 wait_for_descendants() {
     [ -z "$alive_reader" ] || wait "$alive_reader" 2>/dev/null || true
     alive_reader=
-    [ -z "$alive_fifo" ] || remove_fifo "$alive_fifo"
+    [ -z "${alive_dir:-}" ] || remove_fifo "$alive_dir"
+    alive_dir=
     alive_fifo=
 }
 forward_signal() {
@@ -281,12 +283,15 @@ forward_signal() {
     # the payload (never the reader), and it is signalled like any other.
     if [ -z "$payload" ] && [ "${payload_forking:-0}" = 1 ] && [ -n "$!" ] && [ "$!" != "$alive_reader" ]; then
         payload=$!
+        payload_forking=0
     fi
     if [ -n "$payload" ]; then
         # Only the direct child: its own traps let a running step finish and then recover (restart
         # Horizon, resume the drains) before it exits.
         kill -"$1" "$payload" 2>/dev/null || true
         wait "$payload" 2>/dev/null || true
+        # Reaped: its PID may be reused, and a later signal must never reach it.
+        payload=
     fi
     # Its descendants are waited for in every case, including a signal that arrives while the
     # guard already waits for them after the payload exited.
@@ -353,7 +358,11 @@ cmd_run() {
     # A closed stdin (`<&-`) cannot be duplicated: the payload then reads /dev/null, as a foreground
     # command with nothing to read would.
     # Without the FIFO, descendants could outlive the lock: the run fails closed instead.
-    if ! alive_dir=$(mktemp -d "${TMPDIR:-/tmp}/deploy-guard.XXXXXX" 2>/dev/null); then
+    # The name is chosen (and recorded for cleanup) before the directory exists, so no signal can
+    # leave it behind; an existing path makes mkdir fail, closed.
+    alive_dir="${TMPDIR:-/tmp}/deploy-guard.$$.$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+    if ! mkdir -m 0700 "$alive_dir" 2>/dev/null; then
+        alive_dir=
         echo "deploy-guard: cannot create a private directory for the descendant FIFO under ${TMPDIR:-/tmp}; nothing was changed." >&2
         exit 1
     fi
@@ -379,6 +388,7 @@ cmd_run() {
         "$@" </dev/null 9>&8 8>&- &
     fi
     payload=$!
+    payload_forking=0
     payload_started=1
     exec 8>&-
     if wait "$payload"; then rc=0; else rc=$?; fi
