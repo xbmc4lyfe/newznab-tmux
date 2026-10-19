@@ -453,6 +453,8 @@ class ReleaseVerificationCandidateLifecycleTest extends ReleaseVerificationCandi
 
     public function test_archiving_uses_last_unique_arrival_age_instead_of_archival_time(): void
     {
+        // Without partial publication: a stalled upload owed its partial attempt is published, not expired.
+        config(['release_verification.partial_after_hours' => 0]);
         $this->arrivalColumns();
         $id = $this->arrival();
         $arrival = now()->subHours(47)->format('Y-m-d H:i:s');

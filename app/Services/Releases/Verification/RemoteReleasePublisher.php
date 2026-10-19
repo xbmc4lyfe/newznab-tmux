@@ -68,6 +68,11 @@ final class RemoteReleasePublisher
         }
         $timing?->reportRoundTrip($response->successful() ? 'returned' : 'failed', $response->status());
         if (! $response->successful()) {
+            $deferred = $response->json('deferred');
+            if (is_string($deferred)) {
+                // Handled as a local publication's deferral: back to waiting for late articles.
+                throw new PartialPublicationDeferredException($deferred);
+            }
             $error = $response->json('error');
             throw new RuntimeException('Remote publication failed: '
                 .mb_strcut(is_string($error) ? $error : 'HTTP '.$response->status(), 0, 500, 'UTF-8'));
@@ -379,6 +384,9 @@ final class RemoteReleasePublisher
                 $releaseId = $this->publish($items[$position]->claim, $items[$position]->result);
                 $outcomes[$position] = $releaseId === null ? new PublicationOutcome(PublicationOutcome::NO_RELEASE)
                     : new PublicationOutcome(PublicationOutcome::PUBLISHED, $releaseId);
+            } catch (PartialPublicationDeferredException $deferred) {
+                // The primary answered: a partial below a recoverable policy goes back to waiting for late articles.
+                $outcomes[$position] = new PublicationOutcome(PublicationOutcome::DEFERRED, null, $deferred->getMessage());
             } catch (ConnectionException $error) {
                 $failed = true;
                 // A refused or dropped connection or a timeout is no answer from the primary; an error

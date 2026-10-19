@@ -36,10 +36,13 @@ final class VerifiedNzbWriter
      * @param  array<string, mixed>  $manifest
      * @param  string|null  $body  compress(document($manifest)) when the caller rendered it earlier, outside any lock;
      *                             it must come from this same manifest. Null renders and compresses here.
+     * @param  int|null  $replaceFor  The candidate whose in-place upgrade replaces the release's source: the NZB is staged and
+     *                                swapped in by the receipt's close() after commit (see NzbSourceGuard::install()).
      */
-    public function writeWithReceipt(array $manifest, string $guid, object $release, ?PublicationTiming $timing = null, ?string $body = null): NzbSourceInstallation
+    public function writeWithReceipt(array $manifest, string $guid, object $release, ?PublicationTiming $timing = null, ?string $body = null,
+        ?int $replaceFor = null): NzbSourceInstallation
     {
-        $path = $this->nzb->getNzbPath($guid, createIfNotExist: true);
+        $path = $replaceFor !== null ? $this->upgradePath($guid) : $this->nzb->getNzbPath($guid, createIfNotExist: true);
         $body ??= $this->compress($this->document($manifest));
         $timing?->nextPhase('durable_install');
         $temporary = $path.'.'.bin2hex(random_bytes(8)).'.tmp';
@@ -56,7 +59,7 @@ final class VerifiedNzbWriter
                 fclose($handle);
             }
             $sources = new NzbSourceGuard($this->nzb);
-            $receipt = $sources->install($release, $temporary, $path);
+            $receipt = $sources->install($release, $temporary, $path, stageFor: $replaceFor);
         } finally {
             if (is_file($temporary)) {
                 unlink($temporary);
@@ -154,5 +157,24 @@ final class VerifiedNzbWriter
         $xml->endDocument();
 
         return $xml->outputMemory();
+    }
+
+    /**
+     * An upgrade installs at the configured path unless readers would still find the release's existing NZB first
+     * (as after a split-level change): that file is replaced instead, so the upgrade is never shadowed.
+     */
+    private function upgradePath(string $guid): string
+    {
+        $configured = $this->nzb->getNzbPath($guid, createIfNotExist: true);
+        foreach ($this->nzb->nzbPathCandidates($guid) as $candidate) {
+            if ($candidate === $configured) {
+                break;
+            }
+            if (is_file($candidate)) {
+                return $candidate;
+            }
+        }
+
+        return $configured;
     }
 }

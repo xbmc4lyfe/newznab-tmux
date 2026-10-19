@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Feature;
 
+use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\RemotePublicationService;
 use App\Services\Releases\Verification\VerificationWorkerLocks;
@@ -11,6 +12,7 @@ use App\Services\Releases\Verification\VerifiedReleasePublisher;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\Support\PublicationBatchFixtures;
 
@@ -419,5 +421,47 @@ class ReleaseVerificationPublicationBatchTest extends ReleaseVerificationCandida
 
         $this->assertSame(0, $statusReads);
         $this->assertSame('filtered', $this->candidateRow($claim)->status);
+    }
+
+    public function test_a_partial_below_a_recoverable_policy_is_deferred_on_both_endpoints(): void
+    {
+        $this->batchSchema();
+        config(['release_verification.partial_after_hours' => 4]);
+        // A stalled upload in the strict group: one of three articles, far below its minimum size.
+        $collection = DB::table('collections')->insertGetId(['collectionhash' => sha1(random_bytes(8), true), 'subject' => 'Movie partial',
+            'fromname' => 'poster', 'totalfiles' => 1, 'groups_id' => 2, 'date' => '2026-10-11 12:00:00', 'filecheck' => 3, 'filesize' => 100000]);
+        $binary = DB::table('binaries')->insertGetId(['collections_id' => $collection, 'binaryhash' => md5('partial', true), 'name' => 'movie.mkv', 'totalparts' => 3]);
+        DB::table('parts')->insert(['binaries_id' => $binary, 'partnumber' => 1, 'messageid' => 'partial@article', 'size' => 100000]);
+        $repository = app(CandidateRepository::class);
+        $repository->archive($collection);
+        $this->travel(5)->hours();
+        $this->assertSame(1, $repository->promotePartial(10));
+        $claim = $repository->claim();
+        $item = $this->item($claim);
+        $item['evidence']['partial'] = true;
+
+        $this->withServerVariables(self::PEER)->postJson('/internal/release-verification/publish', $item)
+            ->assertStatus(409)->assertJsonStructure(['deferred']);
+        $results = $this->postBatch([$item])->assertOk()->json('results');
+
+        $this->assertSame('deferred', $results[0]['status']);
+        $this->assertSame(0, DB::table('releases')->count(), 'Never filtered terminally: later articles may still satisfy the policy.');
+    }
+
+    public function test_a_complete_upload_sent_as_partial_publishes_complete(): void
+    {
+        $this->batchSchema(releases: 1);
+        Schema::table('releases', function ($table): void {
+            $table->unsignedInteger('articles_expected')->nullable();
+        });
+        $claim = $this->claimedCandidate('complete@article');
+        $item = $this->item($claim);
+        $item['evidence']['partial'] = true;
+
+        $releaseId = $this->withServerVariables(self::PEER)->postJson('/internal/release-verification/publish', $item)->assertOk()->json('release_id');
+
+        $this->assertIsInt($releaseId);
+        $this->assertNull(DB::table('releases')->where('id', $releaseId)->value('articles_expected'), 'The stored inventory, not the sender, decides.');
+        $this->assertSame('', $this->candidateRow($claim)->manifest_path, 'A complete release retains no inventory.');
     }
 }

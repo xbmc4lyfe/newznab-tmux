@@ -835,6 +835,8 @@ class NfoService
     {
         $query = Release::query()
             ->whereBetween('nfostatus', [$this->getMaxRetries(), self::NFO_UNPROC]);
+        // NFOs are read from the NZB; a partial awaiting late articles may still have it replaced.
+        Release::whereNzbSettled($query);
 
         if ($guidChar !== '') {
             $query->where('leftguid', $guidChar);
@@ -912,6 +914,8 @@ class NfoService
                             ->orWhere('name', 'like', '%info.txt');
                     });
             });
+        // NFOs are read from the NZB; a partial awaiting late articles may still have it replaced.
+        Release::whereNzbSettled($query);
 
         if ($guidChar !== '') {
             $query->where('leftguid', $guidChar);
@@ -997,11 +1001,12 @@ class NfoService
         $maxRetries = ($dummy >= 0 ? -($dummy + 1) : self::NFO_UNPROC);
 
         return sprintf(
-            'AND r.nfostatus BETWEEN %d AND %d %s %s',
+            'AND r.nfostatus BETWEEN %d AND %d %s %s AND %s',
             ($maxRetries < -8 ? -8 : $maxRetries),
             self::NFO_UNPROC,
             ($maxSize > 0 ? ('AND r.size < '.$maxSize) : ''),
-            ($minSize > 0 ? ('AND r.size > '.$minSize) : '')
+            ($minSize > 0 ? ('AND r.size > '.$minSize) : ''),
+            Release::nzbSettledSql('r')
         );
     }
 

@@ -569,8 +569,14 @@ class ForwardVerifiedPublications extends Command
                 $this->retry($entry, $outcome->error ?? RemotePublicationService::PAUSED_MESSAGE, counted: false);
 
                 return;
+            case PublicationOutcome::DEFERRED:
+                // A partial upload below a policy more articles may still satisfy: back to waiting, exactly as a
+                // worker's own deferred publication, fenced by the lease token. It is not a failure to retry.
+                $this->deferPartial($entry, $outcome->error ?? 'Partial publication deferred.');
+
+                return;
             default:
-                // stale, invalid, error, paused: as a worker's own failed publication finishes it, fenced by the lease token.
+                // stale, invalid, error: as a worker's own failed publication finishes it, fenced by the lease token.
                 $this->finishUnknown($entry, $outcome->error ?? 'Remote publication ended as '.$outcome->status.'.');
         }
     }
@@ -607,6 +613,22 @@ class ForwardVerifiedPublications extends Command
         } catch (Throwable $error) {
             $this->diagnostics?->finishFailed();
             Log::warning('Publication outbox entry could not be finished; its lease will expire.', ['error' => $error->getMessage()]);
+        }
+        $this->drop($entry);
+    }
+
+    /**
+     * Return a deferred partial to waiting_upload for its hold window (fenced by its lease token) and drop
+     * the entry. If the update fails the entry is dropped anyway, as {@see finishUnknown()} does: the lease
+     * expires and the candidate is verified, and deferred, again.
+     */
+    private function deferPartial(PublicationOutboxEntry $entry, string $reason): void
+    {
+        try {
+            $this->repository()->deferPartial($entry->claim(), $reason);
+        } catch (Throwable $error) {
+            $this->diagnostics?->finishFailed();
+            Log::warning('Publication outbox entry could not be deferred; its lease will expire.', ['error' => $error->getMessage()]);
         }
         $this->drop($entry);
     }

@@ -18,6 +18,9 @@ final class PublicationOutcome
     /** A covered release lacks the supplied metadata; the candidate is retained for review. */
     public const string METADATA_REVIEW = 'metadata_review';
 
+    /** A partial upload failed a policy more articles may still satisfy: the worker returns it to waiting. */
+    public const string DEFERRED = 'deferred';
+
     /** The claim no longer owns the candidate generation. */
     public const string STALE = 'stale';
 

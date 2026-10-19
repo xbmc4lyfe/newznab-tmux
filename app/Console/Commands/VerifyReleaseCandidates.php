@@ -10,6 +10,7 @@ use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\LeaseHeartbeat;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\NntpArticleSource;
+use App\Services\Releases\Verification\PartialPublicationDeferredException;
 use App\Services\Releases\Verification\PublicationOutbox;
 use App\Services\Releases\Verification\RemoteReleasePublisher;
 use App\Services\Releases\Verification\ScratchBudget;
@@ -178,7 +179,7 @@ class VerifyReleaseCandidates extends Command
                     $phase = $diagnostics?->phase('manifest_read', $phase);
                     $active = 'verify_other';
                     $started = microtime(true);
-                    $result = $verifier->verify($manifest, $progressHeartbeat);
+                    $result = $verifier->verify($manifest, $progressHeartbeat, $repository->partialAllowed($claim));
                     $phase = $diagnostics?->phase($result->passed() ? 'verify_passed' : 'verify_other', $phase);
                     $active = $result->passed() ? 'publish' : 'finish';
                     $diagnostics?->verified($result->verdict);
@@ -226,6 +227,17 @@ class VerifyReleaseCandidates extends Command
                     $phase = $diagnostics?->phase('status_write', $phase);
                     $active = null;
                     $this->line($claim->id.': '.$result->verdict.' — '.$result->reason);
+                } catch (PartialPublicationDeferredException $deferred) {
+                    // Charged like the generic recovery: the throwing operation, then the deferral update.
+                    $diagnostics?->phase($active, $phase);
+                    $recovery = $diagnostics === null ? null : hrtime(true);
+                    try {
+                        $repository->deferPartial($claim, $deferred->getMessage());
+                    } finally {
+                        $diagnostics?->phase('finish', $recovery);
+                    }
+                    $diagnostics?->finished();
+                    $this->line($claim->id.': waiting_upload — partial publication deferred: '.$deferred->getMessage());
                 } catch (Throwable $error) {
                     // Time spent in the operation that threw, under its own phase.
                     if ($active !== null) {
@@ -456,7 +468,7 @@ class VerifyReleaseCandidates extends Command
     private function filteredResult(object $claim): ?VerificationResult
     {
         $candidate = DB::table('release_verification_candidates')->where('id', $claim->id)->where('version', $claim->version)
-            ->where('manifest_hash', $claim->manifest_hash)->whereIn('status', ['filtered', 'metadata_review'])->whereNull('release_id')->first();
+            ->where('manifest_hash', $claim->manifest_hash)->whereIn('status', ['filtered', 'metadata_review', 'expired'])->whereNull('release_id')->first();
 
         return $candidate === null ? null : new VerificationResult((string) $candidate->status, (string) $candidate->reason);
     }

@@ -159,6 +159,163 @@ final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
         $this->assertSame(1, DB::table('release_verification_candidates')->count());
     }
 
+    public function test_re_archiving_leaves_neighbouring_uploads_admissible(): void
+    {
+        $this->partialSchema();
+        app(CandidateRepository::class)->archive($this->arrival('gap-owner', totalParts: 3));
+        $id = $this->arrival('gap-owner', part: 2, totalParts: 3);
+        // Uploads whose source identities sort right beside this one in the source index.
+        $owner = sha1('gap-owner');
+        $neighbours = [substr($owner, 0, 39).'0', substr($owner, 0, 38).'ff'];
+        $other = $this->connection();
+        $inserted = [];
+        DB::listen(function (QueryExecuted $query) use ($other, $neighbours, &$inserted): void {
+            if ($inserted !== [] || preg_match('/^insert into [`"]?release_verification_manifests[`"]?/i', $query->sql) !== 1) {
+                return;
+            }
+            $other->beginTransaction();
+            try {
+                foreach ($neighbours as $neighbour) {
+                    $this->insertCandidate($other, $neighbour);
+                }
+                $inserted[] = 'both';
+            } catch (\PDOException $error) {
+                $inserted[] = (int) $error->errorInfo[1];
+            } finally {
+                $other->rollBack();
+            }
+        });
+
+        app(CandidateRepository::class)->archive($id);
+
+        $this->assertSame(['both'], $inserted, 'Re-archiving one upload must not gap-lock the uploads beside it.');
+        $this->assertSame(1, DB::table('release_verification_candidates')->count());
+    }
+
+    public function test_re_archiving_locks_the_uploads_candidates_in_primary_key_order_first(): void
+    {
+        $this->partialSchema();
+        app(CandidateRepository::class)->archive($this->arrival('lock-order', totalParts: 3));
+        // A second, older-looking row of the same upload, as a conflicting post archived apart leaves.
+        $first = DB::table('release_verification_candidates')->sole();
+        DB::table('release_verification_candidates')->insert(['identity' => sha1('lock-order-apart'), 'source_identity' => $first->source_identity,
+            'groups_id' => 1, 'manifest_path' => '', 'manifest_bytes' => 0, 'manifest_hash' => str_repeat('0', 64), 'status' => 'pending',
+            'last_unique_at' => now(), 'next_attempt_at' => now()]);
+        $locks = [];
+        DB::listen(function (QueryExecuted $query) use (&$locks): void {
+            if (preg_match('/release_verification_candidates.* for update/i', $query->sql) === 1 && ! str_contains($query->sql, 'skip locked')) {
+                $locks[] = $query->sql;
+            }
+        });
+
+        app(CandidateRepository::class)->archive($this->arrival('lock-order', part: 2, totalParts: 3));
+
+        // Batched candidate updates lock in primary-key order: so must archive(), before it locks the newest row
+        // alone, or the two wait on each other.
+        $this->assertNotEmpty($locks);
+        $this->assertMatchesRegularExpression('/force index \(`?primary`?\).* in \(.*order by `?id`? asc .*for update/i', $locks[0]);
+    }
+
+    public function test_promotion_skips_rows_another_session_holds_without_waiting(): void
+    {
+        $this->partialSchema();
+        config(['release_verification.partial_after_hours' => 4]);
+        $stalled = now()->subHours(5)->format('Y-m-d H:i:s');
+        $inWindow = now()->subHour()->format('Y-m-d H:i:s');
+        foreach (['held-stalled' => $stalled, 'held-waiting' => $inWindow, 'free-stalled' => $stalled] as $name => $last) {
+            DB::table('release_verification_candidates')->insert(['identity' => sha1($name), 'source_identity' => sha1($name), 'groups_id' => 1,
+                'manifest_path' => '', 'manifest_bytes' => 0, 'manifest_hash' => str_repeat('0', 64), 'status' => 'waiting_upload',
+                'last_unique_at' => $last, 'next_attempt_at' => now()->subMinute()->format('Y-m-d H:i:s')]);
+        }
+        $before = DB::table('release_verification_candidates')->orderBy('id')->get()->keyBy('identity');
+        $other = $this->connection();
+        $other->beginTransaction();
+        $other->prepare('SELECT id FROM release_verification_candidates WHERE identity IN (?, ?) FOR UPDATE')->execute([sha1('held-stalled'), sha1('held-waiting')]);
+        try {
+            $started = microtime(true);
+            $promoted = app(CandidateRepository::class)->promotePartial(10);
+            $elapsed = microtime(true) - $started;
+        } finally {
+            $other->rollBack();
+        }
+
+        $this->assertSame(1, $promoted);
+        $this->assertLessThan(0.9, $elapsed, 'Promotion never waits on rows ingestion holds.');
+        $after = DB::table('release_verification_candidates')->orderBy('id')->get()->keyBy('identity');
+        $this->assertSame('ready', $after[sha1('free-stalled')]->status);
+        foreach (['held-stalled', 'held-waiting'] as $name) {
+            $this->assertSame([$before[sha1($name)]->status, $before[sha1($name)]->next_attempt_at],
+                [$after[sha1($name)]->status, $after[sha1($name)]->next_attempt_at], $name.' is left to the session holding it.');
+        }
+    }
+
+    public function test_promotion_takes_later_stalled_uploads_past_a_prefix_another_session_holds(): void
+    {
+        $this->partialSchema();
+        config(['release_verification.partial_after_hours' => 4]);
+        $stalled = now()->subHours(5)->format('Y-m-d H:i:s');
+        foreach (['held-first' => 2, 'free-later' => 1] as $name => $minutesDue) {
+            DB::table('release_verification_candidates')->insert(['identity' => sha1($name), 'source_identity' => sha1($name), 'groups_id' => 1,
+                'manifest_path' => '', 'manifest_bytes' => 0, 'manifest_hash' => str_repeat('0', 64), 'status' => 'waiting_upload',
+                'last_unique_at' => $stalled, 'next_attempt_at' => now()->subMinutes($minutesDue)->format('Y-m-d H:i:s')]);
+        }
+        $other = $this->connection();
+        $other->beginTransaction();
+        $other->prepare('SELECT id FROM release_verification_candidates WHERE identity = ? FOR UPDATE')->execute([sha1('held-first')]);
+        try {
+            // A one-row window: the oldest due row is busy, so the next one is taken instead.
+            $promoted = app(CandidateRepository::class)->promotePartial(1);
+        } finally {
+            $other->rollBack();
+        }
+
+        $this->assertSame(1, $promoted);
+        $this->assertSame(['held-first' => 'waiting_upload', 'free-later' => 'ready'],
+            ['held-first' => DB::table('release_verification_candidates')->where('identity', sha1('held-first'))->value('status'),
+                'free-later' => DB::table('release_verification_candidates')->where('identity', sha1('free-later'))->value('status')]);
+    }
+
+    public function test_admissions_into_the_due_queue_never_wait_behind_promotion(): void
+    {
+        $this->partialSchema();
+        config(['release_verification.partial_after_hours' => 4]);
+        $row = static fn (string $name, string $status, string $due, string $last): array => ['identity' => sha1($name), 'source_identity' => sha1($name),
+            'groups_id' => 1, 'manifest_path' => '', 'manifest_bytes' => 0, 'manifest_hash' => str_repeat('0', 64), 'status' => $status,
+            'last_unique_at' => $last, 'next_attempt_at' => $due];
+        $stalled = now()->subHours(5)->format('Y-m-d H:i:s');
+        DB::table('release_verification_candidates')->insert([
+            $row('due', 'waiting_upload', now()->subMinute()->format('Y-m-d H:i:s'), $stalled),
+            $row('later', 'waiting_upload', now()->addHour()->format('Y-m-d H:i:s'), now()->format('Y-m-d H:i:s')),
+            $row('arriving', 'pending', now()->format('Y-m-d H:i:s'), now()->format('Y-m-d H:i:s')),
+        ]);
+        $other = $this->connection();
+        $result = [];
+        DB::listen(function (QueryExecuted $query) use ($other, &$result): void {
+            if ($result !== [] || ! str_contains(strtolower($query->sql), 'skip locked')) {
+                return;
+            }
+            // Mid-promotion: an incomplete upload is admitted into the due range.
+            try {
+                $other->prepare("UPDATE release_verification_candidates SET status = 'waiting_upload', next_attempt_at = NOW() WHERE identity = ?")
+                    ->execute([sha1('arriving')]);
+                $result[] = 'admitted';
+            } catch (\PDOException $error) {
+                $result[] = (int) $error->errorInfo[1];
+            }
+        });
+
+        $this->assertSame(1, app(CandidateRepository::class)->promotePartial(10));
+        $this->assertSame(['admitted'], $result, 'Promotion takes no gap locks on the due queue.');
+    }
+
+    /** The late-article columns partial publication adds, as deployed. */
+    private function partialSchema(): void
+    {
+        (require database_path('migrations/2026_10_17_230000_add_upgrades_release_id_to_release_verification_candidates.php'))->up();
+        DB::statement('CREATE TABLE releases (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            late_article_candidate_id BIGINT UNSIGNED NULL, KEY releases_late_article_candidate_id_index (late_article_candidate_id)) ENGINE=InnoDB');
+    }
+
     public function test_first_time_imports_leave_the_identity_gap_open_for_concurrent_imports(): void
     {
         $other = $this->connection();
@@ -487,14 +644,14 @@ final class VerificationLedgerConcurrencyMariaDbTest extends TestCase
         return $pdo;
     }
 
-    private function arrival(string $identity): int
+    private function arrival(string $identity, int $part = 1, int $totalParts = 1): int
     {
         $id = DB::table('collections')->insertGetId(['collectionhash' => sha1($identity, true),
             'subject' => 'Movie', 'fromname' => 'poster', 'totalfiles' => 1, 'groups_id' => 1,
             'date' => now()->format('Y-m-d H:i:s')]);
         $binary = DB::table('binaries')->insertGetId(['collections_id' => $id, 'binaryhash' => md5($identity, true),
-            'name' => 'movie.mkv', 'totalparts' => 1]);
-        DB::table('parts')->insert(['binaries_id' => $binary, 'partnumber' => 1, 'messageid' => $identity.'@article', 'size' => 5]);
+            'name' => 'movie.mkv', 'totalparts' => $totalParts]);
+        DB::table('parts')->insert(['binaries_id' => $binary, 'partnumber' => $part, 'messageid' => $identity.'-'.$part.'@article', 'size' => 5]);
 
         return $id;
     }

@@ -46,6 +46,9 @@ class MovieService
 
     protected string $currentRelID = '';
 
+    /** Searchname the release currently being processed was selected with. */
+    protected ?string $currentSearchname = null;
+
     protected string $showPasswords;
 
     protected ReleaseImageService $releaseImage;
@@ -963,8 +966,9 @@ class MovieService
      *
      * @throws \Exception
      */
-    public function doMovieUpdate(string $buffer, string $service, int $id, int $processImdb = 1): string|false
+    public function doMovieUpdate(string $buffer, string $service, int $id, int $processImdb = 1, ?string $searchname = null): string|false
     {
+        $searchname ??= $this->currentRelID === (string) $id ? $this->currentSearchname : null;
         $this->candidateMismatch = false;
 
         $existingImdbId = Release::query()->where('id', $id)->value('imdbid');
@@ -1016,12 +1020,17 @@ class MovieService
 
                 $movieInfoId = MovieInfo::query()->where('imdbid', $imdbId)->first(['id']);
 
-                Release::query()->where('id', $id)->update([
-                    'imdbid' => $imdbId,
-                    'movieinfo_id' => $movieInfoId !== null ? $movieInfoId['id'] : null,
-                ]);
+                // Only for the title it was matched on: an upgrade may have renamed it meanwhile.
+                $updated = Release::query()->where('id', $id)
+                    ->when($searchname !== null, static fn ($q) => $q->where('searchname', $searchname))
+                    ->update([
+                        'imdbid' => $imdbId,
+                        'movieinfo_id' => $movieInfoId !== null ? $movieInfoId['id'] : null,
+                    ]);
 
-                Search::updateRelease($id);
+                if ($updated > 0) {
+                    Search::updateRelease($id);
+                }
 
                 return $imdbId;
             } catch (\Exception $e) {
@@ -1053,6 +1062,7 @@ class MovieService
                 $query->whereNull('imdbid')
                     ->orWhereIn('imdbid', imdb_id_pending_values());
             });
+        Release::whereNzbSettled($query);
 
         if ($groupID !== '') {
             $query->where('groups_id', $groupID);
@@ -1070,6 +1080,7 @@ class MovieService
 
         $movieCount = count($res);
         $failedIDs = [];
+        $failedNames = [];
 
         if ($movieCount > 0) {
             if ($this->echooutput && $movieCount > 1) {
@@ -1079,11 +1090,13 @@ class MovieService
             foreach ($res as $arr) {
                 if (! $this->parseMovieSearchName($arr['searchname'])) {
                     $failedIDs[] = $arr['id'];
+                    $failedNames[$arr['id']] = $arr['searchname'];
 
                     continue;
                 }
 
                 $this->currentRelID = (string) $arr['id'];
+                $this->currentSearchname = $arr['searchname'];
                 $movieName = $this->formatMovieName();
 
                 if ($this->echooutput) {
@@ -1121,6 +1134,7 @@ class MovieService
                 }
 
                 $failedIDs[] = $arr['id'];
+                $failedNames[$arr['id']] = $arr['searchname'];
             }
 
             if (! empty($failedIDs)) {
@@ -1137,11 +1151,22 @@ class MovieService
                 }
 
                 foreach (array_chunk($failedIDs, 100) as $chunk) {
-                    Release::query()->whereIn('id', $chunk)->update(['imdbid' => '']);
+                    foreach ($chunk as $failedId) {
+                        $this->markImdbNotFound((int) $failedId, $failedNames[$failedId] ?? null);
+                    }
                     ReleaseSearchIndexSync::forIds($chunk);
                 }
             }
         }
+    }
+
+    /** Record that no IMDb id was found, only while the release still carries the title that was looked up. */
+    protected function markImdbNotFound(int $id, ?string $searchname = null): int
+    {
+        // Only for the title it was matched on: an upgrade may have renamed it meanwhile.
+        return Release::query()->where('id', $id)
+            ->when($searchname !== null, static fn ($q) => $q->where('searchname', $searchname))
+            ->update(['imdbid' => '']);
     }
 
     private function formatMovieName(): string

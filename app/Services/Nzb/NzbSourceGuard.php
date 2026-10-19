@@ -31,13 +31,16 @@ final class NzbSourceGuard
         return hash('sha256', "nntmux:nzb-archive-naming:1\0".$decoded);
     }
 
+    /** Partial upgrades stage their generation as `<canonical>.c<candidate>-<16 hex>.next` until they commit. */
+    public const string STAGED_NAME = '/^(.+)\.nzb\.gz\.c\d+-[0-9a-f]{16}\.next$/D';
+
     /** @return SourceSnapshot|null */
     public function snapshot(string $guid, bool $beginNamingInspection = false): ?array
     {
         return DB::transaction(function () use ($guid, $beginNamingInspection): ?array {
             $release = DB::table('releases')->where('guid', $guid)->lockForUpdate()->first(['id', 'guid']);
 
-            return $release === null ? null : $this->withLockedSource($release, static function (?array $source) use ($release, $beginNamingInspection): ?array {
+            return $release === null ? null : $this->withSettledSource($release, $beginNamingInspection, static function (?array $source) use ($release, $beginNamingInspection): ?array {
                 if ($source !== null && $beginNamingInspection) {
                     // First inspection must leave legacy admission before any
                     // producer can mistake one readable file for the whole NZB.
@@ -52,6 +55,8 @@ final class NzbSourceGuard
     /**
      * The caller owns its transaction and any canonical/candidate locks. No
      * callback may acquire a different release while holding this source lock.
+     * The source is the committed generation: one still staged beside the
+     * canonical file is put in place first (null while that cannot be done).
      *
      * @template TResult
      *
@@ -60,9 +65,30 @@ final class NzbSourceGuard
      */
     public function withLockedSource(object $release, callable $callback): mixed
     {
-        $this->lockRelease($release);
+        return $this->withSettledSource($release, false, $callback);
+    }
 
-        return $this->withGuidLock((string) $release->guid, fn (): mixed => $callback($this->readCurrent((string) $release->guid)));
+    /**
+     * With the caller's transaction, install the committed generation if it is still staged, and report the result:
+     * 'settled' when the canonical file is the committed source (or none is recorded), 'failed' when the committed
+     * generation is staged but could not be put in place (worth retrying), 'unresolved' when neither file is it.
+     */
+    public function settleLocked(object $release): string
+    {
+        return $this->withSettledSource($release, false, function (?array $source) use ($release): string {
+            $committed = app(ReleaseArchiveNamingEvidence::class)->committedSourceDigestLocked($release);
+            if ($committed === null || ($source !== null && hash_equals($committed, $source['digest']))) {
+                return 'settled';
+            }
+            foreach ($this->stagedSiblings((string) $release->guid) as $path) {
+                $digest = NzbSourceInstallation::isPendingStaged($path, DB::connection()->getPdo()) ? null : self::fileDigest($path);
+                if ($digest !== null && hash_equals($committed, $digest)) {
+                    return 'failed';
+                }
+            }
+
+            return 'unresolved';
+        });
     }
 
     /**
@@ -70,21 +96,240 @@ final class NzbSourceGuard
      * The optional digest is a compare-and-swap for parser repairs.
      *
      * @param  (callable(string, string): bool)|null  $move
+     * @param  int|null  $stageFor  The candidate whose in-place upgrade replaces this source. The new generation is
+     *                              staged beside the canonical file, which keeps the committed one until the
+     *                              receipt's close() after commit swaps it in; rollback only removes the staged file.
      */
-    public function install(object $release, string $temporary, string $destination, ?string $expectedDigest = null, ?callable $move = null): NzbSourceInstallation
+    public function install(object $release, string $temporary, string $destination, ?string $expectedDigest = null, ?callable $move = null, ?int $stageFor = null): NzbSourceInstallation
     {
         $this->lockRelease($release);
 
-        return $this->withGuidLock((string) $release->guid, function () use ($release, $temporary, $destination, $expectedDigest, $move): NzbSourceInstallation {
-            if ($expectedDigest !== null && ($this->readCurrent((string) $release->guid)['digest'] ?? null) !== $expectedDigest) {
+        return $this->withGuidLock((string) $release->guid, function () use ($release, $temporary, $destination, $expectedDigest, $move, $stageFor): NzbSourceInstallation {
+            // A repair compares against the committed generation, never one an earlier upgrade has yet to swap in.
+            if ($expectedDigest !== null && ($this->readSettledLocked($release)['digest'] ?? null) !== $expectedDigest) {
                 throw new RuntimeException('NZB source changed before replacement.');
             }
 
             return $this->installFile((string) $release->guid, $temporary, $destination,
                 static function (string $digest) use ($release): void {
                     app(ReleaseArchiveNamingEvidence::class)->sourceReplacedLocked($release, $digest);
-                }, $move);
+                }, $move, $stageFor === null ? null : $destination.'.c'.$stageFor.'-'.bin2hex(random_bytes(8)).'.next');
         });
+    }
+
+    /**
+     * Settle a staged generation left beside its release (a crash or failed callback between commit and swap,
+     * or a rolled-back upgrade), in installation's lock order; see settleStagedLocked(). A dry run reports.
+     *
+     * @return 'applied'|'deleted'|'kept'
+     */
+    public function reconcileStaged(string $path, bool $apply = true): string
+    {
+        if (preg_match(self::STAGED_NAME, basename($path), $match) !== 1) {
+            return 'kept';
+        }
+        $guid = $match[1];
+
+        return DB::transaction(function () use ($path, $guid, $apply): string {
+            $release = DB::table('releases')->where('guid', $guid)->lockForUpdate()->first(['id', 'guid']);
+            $outcome = $this->withGuidLock($guid, fn (): string => $this->settleStagedLocked($release, $guid, $path, $apply));
+
+            return $outcome === 'failed' ? 'kept' : $outcome;
+        });
+    }
+
+    /**
+     * @template TResult
+     *
+     * @param  callable(SourceSnapshot|null): TResult  $callback
+     * @return TResult
+     */
+    private function withSettledSource(object $release, bool $deferUnresolved, callable $callback): mixed
+    {
+        $this->lockRelease($release);
+
+        return $this->withGuidLock((string) $release->guid, fn (): mixed => $callback($this->readSettledLocked($release, $deferUnresolved)));
+    }
+
+    /**
+     * With the release row and source locks held. Every installation records its digest in its own transaction,
+     * so a canonical file differing from the committed digest may have the committed generation staged beside it
+     * still: that is put in place before anything reads, or records evidence for, the source.
+     *
+     * @return SourceSnapshot|null
+     */
+    private function readSettledLocked(object $release, bool $deferUnresolved = false): ?array
+    {
+        $guid = (string) $release->guid;
+        $source = $this->readCurrent($guid);
+        $committed = app(ReleaseArchiveNamingEvidence::class)->committedSourceDigestLocked($release);
+        if ($committed === null || ($source !== null && hash_equals($committed, $source['digest']))) {
+            return $source;
+        }
+        $outcomes = [];
+        foreach ($this->stagedSiblings($guid) as $path) {
+            // Staged by this very transaction: its evidence is not committed yet, and its close() settles it.
+            if (! NzbSourceInstallation::isPendingStaged($path, DB::connection()->getPdo())) {
+                $outcomes[] = $this->settleStagedLocked($release, $guid, $path, true);
+            }
+        }
+        $current = in_array('applied', $outcomes, true) ? $this->readCurrent($guid) : $source;
+        // Judged on the result, not the order siblings were visited: a stray one kept before the committed one was
+        // applied leaves the canonical file correct.
+        $inPlace = $current !== null && hash_equals($committed, $current['digest']);
+        if ($deferUnresolved && ! $inPlace && array_intersect($outcomes, ['kept', 'failed']) !== []) {
+            // Recording the current file's digest now could later cost the only copy of the committed source.
+            throw new RuntimeException('A staged NZB generation is unresolved; naming inspection deferred.');
+        }
+        if (! $inPlace && in_array('failed', $outcomes, true)) {
+            // The committed generation exists but is not in place: the canonical file is not the source.
+            return null;
+        }
+
+        return $current;
+    }
+
+    /**
+     * With the release row and source locks held. The staged file is put in place when it is the committed
+     * generation and the canonical file is not; it goes when the canonical file is the committed generation (the
+     * upgrade rolled back, or was already swapped in) or its release no longer exists. Anything else, including
+     * a release without a committed digest, is kept for an operator. A dry run reports without changing files.
+     *
+     * @return 'applied'|'deleted'|'kept'|'failed'
+     */
+    private function settleStagedLocked(?object $release, string $guid, string $path, bool $apply): string
+    {
+        if (! is_file($path)) {
+            return 'kept';
+        }
+        if ($release === null) {
+            return ! $apply || @unlink($path) ? 'deleted' : 'kept';
+        }
+        $canonical = dirname($path).DIRECTORY_SEPARATOR.$guid.'.nzb.gz';
+        $committed = app(ReleaseArchiveNamingEvidence::class)->committedSourceDigestLocked($release);
+        if ($committed !== null) {
+            $current = is_file($canonical) ? self::fileDigest($canonical) : null;
+            // The committed source is already what readers resolve, beside this file or on another search path:
+            // whatever is staged here is obsolete.
+            $resolved = $this->nzb->nzbPath($guid);
+            if (($current !== null && hash_equals($committed, $current))
+                || (is_string($resolved) && $resolved !== $canonical && ($digest = self::fileDigest($resolved)) !== null && hash_equals($committed, $digest))) {
+                return ! $apply || @unlink($path) ? 'deleted' : 'kept';
+            }
+            $staged = self::fileDigest($path);
+            if ($staged !== null && hash_equals($committed, $staged)) {
+                if (! $apply || @rename($path, $canonical)) {
+                    if ($apply && ! self::syncDirectory($canonical)) {
+                        Log::warning('Could not sync the directory of a swapped-in NZB generation.', ['source' => $canonical]);
+                    }
+                    if ($apply) {
+                        $this->removeShadowedCopies($guid, $canonical);
+                    }
+
+                    return 'applied';
+                }
+                Log::warning('Could not put a committed staged NZB generation in place; kept.', ['staged_source' => $path]);
+
+                return 'failed';
+            }
+        }
+        Log::warning('Staged NZB generation matches neither the committed release nor its current source; kept.', [
+            'staged_source' => $path,
+        ]);
+
+        return 'kept';
+    }
+
+    /**
+     * Settle every staged generation left beside this release's NZB (see reconcileStaged()); true when none remains,
+     * so the canonical file is the committed source.
+     */
+    public function settleStagedGenerations(string $guid): bool
+    {
+        foreach ($this->stagedSiblings($guid) as $path) {
+            // Staged by this very transaction: its evidence is not committed yet, and its close() settles it.
+            if (! NzbSourceInstallation::isPendingStaged($path, DB::connection()->getPdo())) {
+                $this->reconcileStaged($path);
+            }
+        }
+
+        return $this->stagedSiblings($guid) === [];
+    }
+
+    /** Whether a staged generation is left beside this release's NZB (reading the directory only, no locks). */
+    public function hasStagedGenerations(string $guid): bool
+    {
+        return $this->stagedSiblings($guid) !== [];
+    }
+
+    /**
+     * The staged generations left beside this release's NZB (reading the directory only, no locks).
+     *
+     * @return list<string>
+     */
+    public function stagedGenerations(string $guid): array
+    {
+        return $this->stagedSiblings($guid);
+    }
+
+    /** @return list<string> */
+    private function stagedSiblings(string $guid): array
+    {
+        // Staged beside the installation path, or beside an existing copy readers found first at another base path
+        // or split level, which may have gone missing since: every directory readers search.
+        $directories = array_unique(array_map(dirname(...), [$this->nzb->getNzbPath($guid), ...$this->nzb->nzbPathCandidates($guid)]));
+        $paths = [];
+        foreach ($directories as $directory) {
+            foreach (glob($directory.DIRECTORY_SEPARATOR.$guid.'.nzb.gz.c*-*.next') ?: [] as $path) {
+                if (preg_match(self::STAGED_NAME, basename($path), $match) === 1 && $match[1] === $guid) {
+                    $paths[] = $path;
+                }
+            }
+        }
+
+        return $paths;
+    }
+
+    /**
+     * Once a committed generation is in place, an older copy elsewhere on the search path (left by a changed split
+     * level or base path) is removed where it can be, so it can never be read again for this release. A read-only
+     * copy stays; readers find the installed generation first.
+     */
+    private function removeShadowedCopies(string $guid, string $installed): void
+    {
+        $candidates = $this->nzb->nzbPathCandidates($guid);
+        if (! in_array($installed, $candidates, true)) {
+            // Installed where readers never look (a staged file a tree scan found): the copies they can reach stay.
+            return;
+        }
+        $inode = @fileinode($installed);
+        foreach ($candidates as $candidate) {
+            if ($candidate !== $installed && is_file($candidate) && @fileinode($candidate) !== $inode && ! @unlink($candidate)) {
+                Log::info('Could not remove an older copy of an upgraded NZB.', ['source' => $candidate]);
+            }
+        }
+    }
+
+    /** Make a rename in $path's directory durable: on Linux and macOS a file's fsync does not cover its name. */
+    private static function syncDirectory(string $path): bool
+    {
+        $directory = @fopen(dirname($path), 'r');
+        if ($directory === false) {
+            return false;
+        }
+        try {
+            return @fsync($directory);
+        } finally {
+            fclose($directory);
+        }
+    }
+
+    private static function fileDigest(string $file): ?string
+    {
+        $contents = @file_get_contents($file);
+        $decoded = $contents === false ? false : @gzdecode($contents);
+
+        return $decoded === false || $decoded === '' ? null : self::digest($decoded);
     }
 
     /** Final source deletion uses the same release-to-source order as installation. */
@@ -303,6 +548,14 @@ final class NzbSourceGuard
             $query->fetchAll();
             $query->closeCursor();
             $this->withGuidLock($installation->guid, static function () use ($installation): void {
+                if ($installation->staged !== null) {
+                    // A staged generation never reached the canonical path, which keeps its committed source.
+                    if ($installation->ownsStagedPath() && ! @unlink($installation->staged)) {
+                        throw new RuntimeException('Cannot remove a rolled-back staged NZB generation.');
+                    }
+
+                    return;
+                }
                 if ($installation->ownsCurrentPath() && ! @unlink($installation->path)) {
                     throw new RuntimeException('Cannot remove owned rolled-back NZB installation.');
                 }
@@ -384,9 +637,11 @@ final class NzbSourceGuard
     /**
      * @param  (callable(string): void)|null  $beforeRename
      * @param  (callable(string, string): bool)|null  $move
+     * @param  string|null  $staged  Where the new generation waits for its transaction to commit, instead of $destination.
      */
-    private function installFile(string $guid, string $temporary, string $destination, ?callable $beforeRename = null, ?callable $move = null): NzbSourceInstallation
+    private function installFile(string $guid, string $temporary, string $destination, ?callable $beforeRename = null, ?callable $move = null, ?string $staged = null): NzbSourceInstallation
     {
+        $target = $staged ?? $destination;
         $handle = @fopen($temporary, 'rb');
         if ($handle === false) {
             throw new RuntimeException('Cannot open staged NZB installation.');
@@ -403,19 +658,27 @@ final class NzbSourceGuard
             if ($beforeRename !== null) {
                 $beforeRename($digest);
             }
-            if (! ($move === null ? @rename($temporary, $destination) : $move($temporary, $destination))) {
+            if (! ($move === null ? @rename($temporary, $target) : $move($temporary, $target))) {
                 throw new RuntimeException('Unable to move temporary NZB into place.');
             }
-            clearstatcache(true, $destination);
+            if ($staged !== null && ! self::syncDirectory($target)) {
+                // The evidence committed with it names this file; it must survive a power loss once committed.
+                throw new RuntimeException('Cannot make the staged NZB generation durable.');
+            }
+            clearstatcache(true, $target);
             $owned = fstat($handle);
-            $current = @lstat($destination);
+            $current = @lstat($target);
             if ($owned === false || $current === false || $owned['dev'] !== $current['dev'] || $owned['ino'] !== $current['ino']) {
                 throw new RuntimeException('Staged NZB installation identity changed.');
             }
 
-            return new NzbSourceInstallation($this, $guid, $destination, $digest, $handle, DB::connection()->getPdo());
+            return new NzbSourceInstallation($this, $guid, $destination, $digest, $handle, DB::connection()->getPdo(), $staged);
         } catch (Throwable $exception) {
             fclose($handle);
+            // The staged name is this installation's own; the canonical file was never touched.
+            if ($staged !== null && is_file($staged)) {
+                @unlink($staged);
+            }
             throw $exception;
         }
     }

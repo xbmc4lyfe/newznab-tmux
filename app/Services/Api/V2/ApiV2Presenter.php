@@ -8,6 +8,7 @@ use App\Data\Api\DetailsData;
 use App\Data\Api\ReleaseData;
 use App\Models\Release;
 use App\Models\User;
+use App\Services\Api\V1\ReleaseRows;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Carbon;
 
@@ -29,7 +30,8 @@ final class ApiV2Presenter
      */
     public function search(iterable $rows, User $user, array $usage, ?array $pagination = null): JsonResponse
     {
-        $rows = is_array($rows) ? $rows : iterator_to_array($rows, false);
+        // Search projections omit the partial-publication counts; attach them as API v1 does.
+        $rows = (new ReleaseRows(is_array($rows) ? $rows : iterator_to_array($rows, false)))->rows();
         $results = [];
         foreach ($rows as $row) {
             $results[] = ReleaseData::toArrayFromRelease($row, $user, url('/details').'/', url('/getnzb'));

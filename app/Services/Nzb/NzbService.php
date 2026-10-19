@@ -455,21 +455,35 @@ class NzbService
      * @param  string  $releaseGuid  The guid of the release.
      * @return false|string On success: (string) Path+file name of the nzb.
      *                      On failure: false.
+     *
+     * @phpstan-impure It reads the filesystem.
      */
     public function nzbPath(string $releaseGuid): bool|string
     {
-        $levelsToSplit = $this->nzbSplitLevel === 0 ? 1 : $this->nzbSplitLevel;
-
-        foreach ($this->siteNzbPaths as $basePath) {
-            $nzbFile = $this->buildNzbPathAtBasePath($basePath, $releaseGuid, $levelsToSplit).$releaseGuid.'.nzb.gz';
+        foreach ($this->nzbPathCandidates($releaseGuid) as $nzbFile) {
             if (is_file($nzbFile)) {
                 return $nzbFile;
             }
         }
 
-        $nzbFile = $this->getNzbPath($releaseGuid);
+        return false;
+    }
 
-        return is_file($nzbFile) ? $nzbFile : false;
+    /**
+     * Where nzbPath() looks for a release's NZB, in the order it looks.
+     *
+     * @return list<string>
+     */
+    public function nzbPathCandidates(string $releaseGuid): array
+    {
+        $levelsToSplit = $this->nzbSplitLevel === 0 ? 1 : $this->nzbSplitLevel;
+        $candidates = [];
+        foreach ($this->siteNzbPaths as $basePath) {
+            $candidates[] = $this->buildNzbPathAtBasePath($basePath, $releaseGuid, $levelsToSplit).$releaseGuid.'.nzb.gz';
+        }
+        $candidates[] = $this->getNzbPath($releaseGuid);
+
+        return array_values(array_unique($candidates));
     }
 
     /**
@@ -575,12 +589,15 @@ class NzbService
                 }
 
                 $path = $file->getPathname();
-                if (! $this->isTemporaryNzbPath($path)) {
+                $isStaged = self::isStagedNzbPathName($path);
+                if (! $isStaged && ! $this->isTemporaryNzbPath($path)) {
                     continue;
                 }
 
                 try {
-                    if ($file->getMTime() <= $cutoff) {
+                    // A staged generation's ctime is when its upgrade renamed it into place.
+                    $age = $isStaged ? max($file->getMTime(), $file->getCTime()) : $file->getMTime();
+                    if ($age <= $cutoff) {
                         $paths[] = $path;
                     }
                 } catch (Throwable $e) {
@@ -605,26 +622,46 @@ class NzbService
             if (! File::isFile($path)) {
                 continue;
             }
-
-            try {
-                if (File::delete($path)) {
+            if (self::isStagedNzbPathName($path)) {
+                // Never just deleted: it may be the committed generation its upgrade did not get to swap in.
+                $outcome = $this->reconcileStaleStagedNzb($path, $olderThanSeconds);
+                if ($outcome === 'deleted') {
                     $deleted++;
-
-                    continue;
+                } elseif ($outcome === 'applied') {
+                    Log::channel('nzb_creation')->warning('Applied a committed staged NZB generation left beside its release', ['path' => $path]);
                 }
 
-                Log::channel('nzb_creation')->warning('Failed to delete stale temporary NZB file', [
-                    'path' => $path,
-                ]);
-            } catch (Throwable $e) {
-                Log::channel('nzb_creation')->warning('Failed to delete stale temporary NZB file', [
-                    'path' => $path,
-                    'error' => $e->getMessage(),
-                ]);
+                continue;
             }
+
+            $deleted += $this->deleteStaleTemporaryNzb($path) ? 1 : 0;
         }
 
         return $deleted;
+    }
+
+    /** Remove one stale temporary NZB (never a staged generation; see reconcileStaleStagedNzb()). */
+    public function deleteStaleTemporaryNzb(string $path): bool
+    {
+        if (self::isStagedNzbPathName($path) || ! File::isFile($path)) {
+            return false;
+        }
+        try {
+            if (File::delete($path)) {
+                return true;
+            }
+
+            Log::channel('nzb_creation')->warning('Failed to delete stale temporary NZB file', [
+                'path' => $path,
+            ]);
+        } catch (Throwable $e) {
+            Log::channel('nzb_creation')->warning('Failed to delete stale temporary NZB file', [
+                'path' => $path,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        return false;
     }
 
     /**
@@ -751,6 +788,49 @@ class NzbService
     public static function isTemporaryNzbPathName(string $path): bool
     {
         return preg_match('/\.nzb\.gz\.tmp\.\d+\.[0-9a-f]{12}$/', basename($path)) === 1;
+    }
+
+    /**
+     * The generation a partial release's in-place upgrade staged beside its canonical NZB, tagged with the
+     * upgrading candidate; only a crash or a failed callback between commit and swap, or a rollback whose
+     * cleanup failed, leaves one behind.
+     */
+    public static function isStagedNzbPathName(string $path): bool
+    {
+        return preg_match(NzbSourceGuard::STAGED_NAME, basename($path)) === 1;
+    }
+
+    /** A stale staged generation is settled whether or not its release still exists. */
+    public function isStaleStagedNzb(string $path, int $olderThanSeconds = 86400): bool
+    {
+        if (! self::isStagedNzbPathName($path)) {
+            return false;
+        }
+        clearstatcache(true, $path);
+        $stat = @lstat($path);
+
+        return $stat !== false && ($stat['mode'] & 0170000) === 0100000
+            && max($stat['mtime'], $stat['ctime']) <= time() - max(1, $olderThanSeconds);
+    }
+
+    /**
+     * Settle a stale staged generation by its upgrade's outcome: swapped in when it committed, removed when it
+     * rolled back or was already swapped in (see NzbSourceGuard::reconcileStaged()). A dry run reports.
+     *
+     * @return 'applied'|'deleted'|'kept'
+     */
+    public function reconcileStaleStagedNzb(string $path, int $olderThanSeconds = 86400, bool $apply = true): string
+    {
+        if (! $this->isStaleStagedNzb($path, $olderThanSeconds)) {
+            return 'kept';
+        }
+        try {
+            return (new NzbSourceGuard($this))->reconcileStaged($path, $apply);
+        } catch (Throwable $e) {
+            Log::channel('nzb_creation')->warning('Failed to reconcile a staged NZB generation', ['path' => $path, 'error' => $e->getMessage()]);
+
+            return 'kept';
+        }
     }
 
     private function temporaryNzbPath(string $path): string
