@@ -318,88 +318,65 @@ final class PublicationOutbox
     }
 
     /**
-     * Whether work is waiting that must not linger: this forwarder already owns an entry, or a pending
-     * one has outlived its age limit. Reads only.
+     * One read-only pass over what a forwarder needs to decide whether, and how long, to wait for a
+     * fuller batch. Returns early once the answer cannot change: the batch is full ($cap fresh entries)
+     * or something is urgent or already tried.
+     *
+     * - fresh: pending entries that are due and not expired, counted up to $cap.
+     * - urgent: this slot already owns an entry, or a pending one has outlived its age limit.
+     * - retried: a due, unexpired pending entry was tried before (attempts or deferrals).
+     * - oldest: the earliest hand-off time among the fresh entries.
+     * - wake: the earliest moment any unexpired pending entry needs attention: when a backed-off one
+     *   becomes due, or $margin seconds before any of them reaches its age limit.
+     *
+     * @return array{fresh: int, urgent: bool, retried: bool, oldest: ?float, wake: ?float}
      */
-    public function hasUrgent(int $slot, float $now): bool
+    public function survey(float $now, int $slot, int $cap, float $margin = 0.0): array
     {
-        if ($this->inflight($slot) !== []) {
-            return true;
-        }
-        $maxAge = self::maxAgeSeconds();
-        foreach ($this->pending() as $entry) {
-            if ($entry->olderThan($maxAge, $now)) {
-                return true;
+        $result = ['fresh' => 0, 'urgent' => false, 'retried' => false, 'oldest' => null, 'wake' => null];
+        clearstatcache();
+        $owned = $this->inflightDirectory($slot);
+        foreach ($this->names($owned) as $name) {
+            if (! isset($this->stuck[$owned.'/'.$name]) && $this->read($owned.'/'.$name) !== null) {
+                $result['urgent'] = true;
+
+                return $result;
             }
         }
-
-        return false;
-    }
-
-    /**
-     * What a forwarder needs to decide whether, and how long, to wait for a fuller batch, from the
-     * pending entries that have not expired: whether a due one was already tried (attempts or
-     * deferrals), the earliest hand-off time among the due ones, and the earliest moment ($margin
-     * seconds short of its age limit, or when a backed-off entry becomes due) at which any waiting
-     * entry needs attention. Reads only.
-     *
-     * @return array{retried: bool, oldest: ?float, wake: ?float}
-     */
-    public function dueSurvey(float $now, int $slot, float $margin = 0.0): array
-    {
-        $retried = false;
-        $oldest = null;
-        $wake = null;
         $maxAge = self::maxAgeSeconds();
-        foreach ($this->pending() as $entry) {
-            if ($entry->olderThan($maxAge, $now)) {
+        $directory = $this->root.'/pending';
+        foreach ($this->names($directory) as $name) {
+            if (isset($this->stuck[$directory.'/'.$name])) {
                 continue;
+            }
+            $entry = $this->read($directory.'/'.$name);
+            if ($entry === null) {
+                continue;
+            }
+            if ($entry->olderThan($maxAge, $now)) {
+                $result['urgent'] = true;
+
+                return $result;
             }
             $needs = $entry->enqueuedAt + $maxAge - $margin;
             if ($entry->notBefore > $now) {
                 $needs = min($needs, $entry->notBefore);
             } else {
-                $retried = $retried || $entry->attempts > 0 || $entry->deferrals > 0;
-                $oldest = $oldest === null ? $entry->enqueuedAt : min($oldest, $entry->enqueuedAt);
-            }
-            $wake = $wake === null ? $needs : min($wake, $needs);
-        }
+                if ($entry->attempts > 0 || $entry->deferrals > 0) {
+                    $result['retried'] = true;
 
-        return ['retried' => $retried, 'oldest' => $oldest, 'wake' => $wake];
-    }
-
-    /**
-     * How many entries {@see claim()} could take now, counting at most $cap: this forwarder's own
-     * entries plus the pending ones that are due (past their backoff) or past their age limit; with
-     * $fresh, expired ones and the forwarder's own are left out. Stops reading at the cap. Reads only;
-     * unreadable documents and links count for nothing.
-     */
-    public function dueCount(int $cap, float $now, int $slot = 1, bool $fresh = false): int
-    {
-        $count = 0;
-        $maxAge = self::maxAgeSeconds();
-        clearstatcache();
-        $sources = $fresh ? [$this->root.'/pending' => false] : [$this->inflightDirectory($slot) => true, $this->root.'/pending' => false];
-        foreach ($sources as $directory => $owned) {
-            foreach ($this->names($directory) as $name) {
-                if ($count >= $cap) {
-                    return $count;
+                    return $result;
                 }
-                if (isset($this->stuck[$directory.'/'.$name])) {
-                    continue;
-                }
-                $entry = $this->read($directory.'/'.$name);
-                if ($entry === null) {
-                    continue;
-                }
-                $expired = $entry->olderThan($maxAge, $now);
-                if ($fresh ? ($entry->notBefore <= $now && ! $expired) : ($owned || $entry->notBefore <= $now || $expired)) {
-                    $count++;
+                $result['fresh']++;
+                $result['oldest'] = $result['oldest'] === null ? $entry->enqueuedAt : min($result['oldest'], $entry->enqueuedAt);
+                if ($result['fresh'] >= $cap) {
+                    return $result;
                 }
             }
+            $result['wake'] = $result['wake'] === null ? $needs : min($result['wake'], $needs);
         }
 
-        return $count;
+        return $result;
     }
 
     /**

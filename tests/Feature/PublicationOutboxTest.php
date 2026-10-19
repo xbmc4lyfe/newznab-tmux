@@ -2646,41 +2646,46 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         }
     }
 
-    public function test_the_due_count_follows_the_claim_eligibility_rules(): void
+    public function test_the_survey_follows_the_claim_eligibility_rules(): void
     {
         $this->configureAsync();
         $now = microtime(true);
         $outbox = $this->outbox();
-        $claims = $this->handOffMany(6);
+        $claims = $this->handOffMany(4);
         $this->outbox()->prepare(1);
         $this->outbox()->prepare(2);
-        // Backed off: not due. Backed off but past its age limit: due. Owned by this slot: due. Another slot's: not counted.
+        // Backed off: not fresh, but it sets the wake time.
         $this->changeEntry($this->pendingPath($claims[0]), static fn (array $document): array => ['not_before' => $now + 60] + $document);
-        $this->changeEntry($this->pendingPath($claims[1]), static fn (array $document): array => ['not_before' => $now + 60, 'enqueued_at' => $now - 100_000] + $document);
-        rename($this->pendingPath($claims[2]), $this->inflightPath($claims[2], 1));
-        rename($this->pendingPath($claims[3]), $this->inflightPath($claims[3], 2));
-        file_put_contents($this->outbox()->directory().'/pending/9-9-broken.json', 'not json');
 
-        // Due: claims 1 (expired), 2 (own in-flight), 4 and 5 (plain pending).
-        $this->assertSame(4, $outbox->dueCount(100, $now, 1));
-        $this->assertSame(2, $outbox->dueCount(2, $now, 1));
-        $this->assertSame(0, $outbox->dueCount(0, $now, 1));
-        // Read-only: nothing moved, and the broken document is only reported for purging.
-        $this->assertFileExists($this->pendingPath($claims[4]));
-        $this->assertFileExists($this->pendingPath($claims[0]));
-        $this->assertTrue($outbox->hasInvalid());
-        // Fresh counting leaves out expired and own entries; the survey reports retries and the earliest hand-off.
-        $this->assertSame(2, $outbox->dueCount(100, $now, 1, fresh: true));
-        $survey = $outbox->dueSurvey($now, 1);
-        $this->assertFalse($survey['retried']);
+        $survey = $outbox->survey($now, 1, 100, 10.0);
+        $this->assertSame(['fresh' => 3, 'urgent' => false, 'retried' => false], array_intersect_key($survey, array_flip(['fresh', 'urgent', 'retried'])));
         $this->assertGreaterThan($now, $survey['oldest']);
-        $this->changeEntry($this->pendingPath($claims[4]), static fn (array $document): array => ['attempts' => 1] + $document);
-        $this->assertTrue($outbox->dueSurvey($now, 1)['retried']);
-        // Slot 2 sees its own entry and the same pending ones.
-        $this->assertSame(4, $outbox->dueCount(100, $now, 2));
+        $this->assertEqualsWithDelta($now + 60, $survey['wake'], 0.001);
+        // Stops counting at the cap.
+        $this->assertSame(2, $outbox->survey($now, 1, 2)['fresh']);
+        // An entry tried before is reported and ends the pass.
+        $this->changeEntry($this->pendingPath($claims[3]), static fn (array $document): array => ['attempts' => 1] + $document);
+        $this->assertTrue($outbox->survey($now, 1, 100)['retried']);
+        $this->changeEntry($this->pendingPath($claims[3]), static fn (array $document): array => ['attempts' => 0] + $document);
+        // Another slot's in-flight entry does not matter; this slot's own is urgent.
+        rename($this->pendingPath($claims[2]), $this->inflightPath($claims[2], 2));
+        $this->assertFalse($outbox->survey($now, 1, 100)['urgent']);
+        $this->assertTrue($outbox->survey($now, 2, 100)['urgent']);
+        rename($this->inflightPath($claims[2], 2), $this->inflightPath($claims[2], 1));
+        $this->assertTrue($outbox->survey($now, 1, 100)['urgent']);
+        rename($this->inflightPath($claims[2], 1), $this->pendingPath($claims[2]));
+        // An expired entry is urgent even when it is backed off.
+        $this->changeEntry($this->pendingPath($claims[0]), static fn (array $document): array => ['enqueued_at' => $now - 100_000] + $document);
+        $this->assertTrue($outbox->survey($now, 1, 100)['urgent']);
+        $this->changeEntry($this->pendingPath($claims[0]), static fn (array $document): array => ['enqueued_at' => $now + 1000] + $document);
+        // Read-only: nothing moved, and a broken document is only reported for purging.
+        file_put_contents($this->outbox()->directory().'/pending/9-9-broken.json', 'not json');
+        $this->assertSame(3, $outbox->survey($now, 1, 100)['fresh']);
+        $this->assertTrue($outbox->hasInvalid());
+        $this->assertFileExists($this->pendingPath($claims[1]));
     }
 
-    public function test_the_due_count_never_follows_a_symlinked_directory(): void
+    public function test_the_survey_never_follows_a_symlinked_directory(): void
     {
         $this->configureAsync();
         $this->handOffMany(2);
@@ -2695,12 +2700,12 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         symlink($outside, $directory.'/pending');
 
         try {
-            $this->assertSame(0, $this->outbox()->dueCount(10, microtime(true), 1));
+            $this->assertSame(0, $this->outbox()->survey(microtime(true), 1, 10)['fresh']);
         } finally {
             unlink($directory.'/pending');
             rename($directory.'/pending.real', $directory.'/pending');
         }
-        $this->assertSame(2, $this->outbox()->dueCount(10, microtime(true), 1));
+        $this->assertSame(2, $this->outbox()->survey(microtime(true), 1, 10)['fresh']);
     }
 
     public function test_the_group_is_free_while_lingering_right_after_a_send(): void
@@ -2923,6 +2928,60 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->forward();
 
         Sleep::assertNeverSlept();
+        $this->assertSame([1], $this->batchSizes);
+    }
+
+    public function test_a_retried_entry_requeued_by_another_forwarder_ends_the_wait(): void
+    {
+        $this->batchSchema(releases: 2);
+        $this->configureAsync();
+        config(['release_verification.publish_forward_linger_ms' => 30000]);
+        $this->handOffMany(1);
+        $requeued = $this->claimedCandidate('requeued@article');
+        $sleeps = 0;
+        $this->servePrimary();
+        Sleep::fake(syncWithCarbon: true);
+        Sleep::whenFakingSleep(function () use (&$sleeps, $requeued): void {
+            if (++$sleeps === 2) {
+                // Another forwarder hit its deadline after a RETRY and put the entry back, due again.
+                $this->handOff($requeued);
+                $this->changeEntry($this->pendingPath($requeued), static fn (array $document): array => ['deferrals' => 1] + $document);
+            }
+        });
+        $summaries = [];
+        $this->captureSummaries($summaries, 'Publication forwarder run summary.');
+
+        $this->forward(['--diagnostics' => true]);
+
+        $this->assertSame(5, $sleeps);
+        $this->assertLinger($summaries[0], 1, 0, 0, 1);
+        $this->assertSame([2], $this->batchSizes);
+    }
+
+    public function test_a_backed_off_entry_that_appears_during_the_wait_caps_it(): void
+    {
+        $this->batchSchema(releases: 1);
+        $this->configureAsync();
+        config(['release_verification.publish_forward_linger_ms' => 30000]);
+        $this->handOffMany(1);
+        $backed = $this->claimedCandidate('backed@article');
+        $sleeps = 0;
+        $this->servePrimary();
+        Sleep::fake(syncWithCarbon: true);
+        Sleep::whenFakingSleep(function () use (&$sleeps, $backed): void {
+            if (++$sleeps === 1) {
+                $this->handOff($backed);
+                $this->changeEntry($this->pendingPath($backed), static fn (array $document): array => ['deferrals' => 1, 'not_before' => microtime(true) + 0.4] + $document);
+            }
+        });
+        $summaries = [];
+        $this->captureSummaries($summaries, 'Publication forwarder run summary.');
+
+        $this->forward(['--diagnostics' => true]);
+
+        // Seen at the next look (step 5); its backoff ends by step 10, which ends the wait instead of 30 s.
+        $this->assertLessThanOrEqual(10, $sleeps);
+        $this->assertLinger($summaries[0], 1, 0, 0, 1);
         $this->assertSame([1], $this->batchSizes);
     }
 }

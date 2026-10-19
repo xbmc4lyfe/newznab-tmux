@@ -304,13 +304,11 @@ class ForwardVerifiedPublications extends Command
     private function linger(float &$nextMaintenance, float &$nextMark): bool
     {
         $wall = microtime(true);
-        if ($this->outbox->hasUrgent($this->slot, $wall)) {
-            return true;
-        }
         $maxAge = PublicationOutbox::maxAgeSeconds();
         $margin = min(self::LINGER_AGE_MARGIN_SECONDS, $maxAge / 2);
-        $survey = $this->outbox->dueSurvey($wall, $this->slot, $margin);
-        if ($survey['retried'] || $survey['oldest'] === null || $this->outbox->dueCount($this->limit, $wall, $this->slot, fresh: true) >= $this->limit) {
+        // One pass over the outbox: a full batch, urgent or already tried work is sent at once.
+        $survey = $this->outbox->survey($wall, $this->slot, $this->limit, $margin);
+        if ($survey['urgent'] || $survey['retried'] || $survey['oldest'] === null || $survey['fresh'] >= $this->limit) {
             return true;
         }
         $age = max(0.0, $wall - $survey['oldest']);
@@ -363,11 +361,20 @@ class ForwardVerifiedPublications extends Command
                 return true;
             }
             $expired = $waited >= $budget;
-            // Reading the outbox is the costly part: look every few steps, and once more at the end.
-            if (($expired || $steps % self::LINGER_FILL_STEPS === 0) && $this->outbox->dueCount($this->limit, $now, $this->slot, fresh: true) >= $this->limit) {
-                $this->diagnostics?->lingerEnded('fill', $waited);
+            // Reading the outbox is the costly part: look every few steps, and once more at the end. Work
+            // other forwarders requeue into pending meanwhile is seen here too.
+            if ($expired || $steps % self::LINGER_FILL_STEPS === 0) {
+                $poll = $this->outbox->survey($now, $this->slot, $this->limit, $margin);
+                if ($poll['fresh'] >= $this->limit) {
+                    $this->diagnostics?->lingerEnded('fill', $waited);
 
-                return true;
+                    return true;
+                }
+                if (! $expired && ($poll['urgent'] || $poll['retried'] || ($poll['wake'] !== null && $now >= $poll['wake']))) {
+                    $this->diagnostics?->lingerEnded('interrupted', $waited);
+
+                    return true;
+                }
             }
             if ($expired) {
                 $this->diagnostics?->lingerEnded('timeout', $waited);
