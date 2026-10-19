@@ -32,7 +32,7 @@ class ParallelVerificationWorkersTest extends ReleaseVerificationCandidatesTest
             static fn ($event): bool => str_contains($event->command ?? '', 'releases:verify-candidates')));
         $this->assertCount(2, $events);
         $this->assertStringContainsString('--limit=1000 --max-seconds=300', $events[0]->command);
-        $this->assertStringContainsString('-d ffi.enable=true -d memory_limit=256M', $events[0]->command);
+        $this->assertStringContainsString("-d ffi.enable=true -d 'memory_limit=512M'", $events[0]->command);
         $this->assertStringContainsString('--slot=1', $events[0]->command);
         $this->assertStringContainsString('--slot=2', $events[1]->command);
         foreach ($events as $event) {

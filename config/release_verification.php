@@ -81,6 +81,9 @@ return [
     // 32 MiB audit reader limit. Larger uploads keep their headers and are retried after a backoff, or at
     // once when this is raised.
     'metadata_bytes' => (int) env('RELEASE_VERIFICATION_METADATA_BYTES', 50331648),
+    // PHP memory limit for verification workers and the candidate preparer. A candidate at the metadata
+    // budget's limit peaks near 250 MiB above PHP's baseline (more with short message-IDs).
+    'worker_memory' => (string) env('RELEASE_VERIFICATION_WORKER_MEMORY', '512M'),
     'download_connections' => (int) env('RELEASE_VERIFICATION_DOWNLOAD_CONNECTIONS', 2),
     'pipeline_window' => (int) env('RELEASE_VERIFICATION_PIPELINE_WINDOW', 4),
     'download_buffer_bytes' => (int) env('RELEASE_VERIFICATION_DOWNLOAD_BUFFER_BYTES', 67108864),
