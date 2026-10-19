@@ -42,9 +42,7 @@ final class VerifiedNzbWriter
     public function writeWithReceipt(array $manifest, string $guid, object $release, ?PublicationTiming $timing = null, ?string $body = null,
         ?int $replaceFor = null): NzbSourceInstallation
     {
-        // An upgrade replaces the file readers resolve, which a changed split level can leave outside the configured path.
-        $current = $replaceFor !== null ? $this->nzb->nzbPath($guid) : false;
-        $path = is_string($current) ? $current : $this->nzb->getNzbPath($guid, createIfNotExist: true);
+        $path = $replaceFor !== null ? $this->upgradePath($guid) : $this->nzb->getNzbPath($guid, createIfNotExist: true);
         $body ??= $this->compress($this->document($manifest));
         $timing?->nextPhase('durable_install');
         $temporary = $path.'.'.bin2hex(random_bytes(8)).'.tmp';
@@ -159,5 +157,24 @@ final class VerifiedNzbWriter
         $xml->endDocument();
 
         return $xml->outputMemory();
+    }
+
+    /**
+     * An upgrade installs at the configured path unless readers would still find the release's existing NZB first
+     * (as after a split-level change): that file is replaced instead, so the upgrade is never shadowed.
+     */
+    private function upgradePath(string $guid): string
+    {
+        $configured = $this->nzb->getNzbPath($guid, createIfNotExist: true);
+        foreach ($this->nzb->nzbPathCandidates($guid) as $candidate) {
+            if ($candidate === $configured) {
+                break;
+            }
+            if (is_file($candidate)) {
+                return $candidate;
+            }
+        }
+
+        return $configured;
     }
 }

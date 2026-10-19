@@ -460,18 +460,30 @@ class NzbService
      */
     public function nzbPath(string $releaseGuid): bool|string
     {
-        $levelsToSplit = $this->nzbSplitLevel === 0 ? 1 : $this->nzbSplitLevel;
-
-        foreach ($this->siteNzbPaths as $basePath) {
-            $nzbFile = $this->buildNzbPathAtBasePath($basePath, $releaseGuid, $levelsToSplit).$releaseGuid.'.nzb.gz';
+        foreach ($this->nzbPathCandidates($releaseGuid) as $nzbFile) {
             if (is_file($nzbFile)) {
                 return $nzbFile;
             }
         }
 
-        $nzbFile = $this->getNzbPath($releaseGuid);
+        return false;
+    }
 
-        return is_file($nzbFile) ? $nzbFile : false;
+    /**
+     * Where nzbPath() looks for a release's NZB, in the order it looks.
+     *
+     * @return list<string>
+     */
+    public function nzbPathCandidates(string $releaseGuid): array
+    {
+        $levelsToSplit = $this->nzbSplitLevel === 0 ? 1 : $this->nzbSplitLevel;
+        $candidates = [];
+        foreach ($this->siteNzbPaths as $basePath) {
+            $candidates[] = $this->buildNzbPathAtBasePath($basePath, $releaseGuid, $levelsToSplit).$releaseGuid.'.nzb.gz';
+        }
+        $candidates[] = $this->getNzbPath($releaseGuid);
+
+        return array_values(array_unique($candidates));
     }
 
     /**
