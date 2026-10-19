@@ -157,4 +157,145 @@ class XxxCategorizationTest extends TestCase
 
         $this->assertFalse($result->isSuccessful());
     }
+
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function onlyFansReleasesProvider(): array
+    {
+        return [
+            'screenshot Sadie' => ['OF.Sadie.Summers.NEW.TRADWIFE.BG.1080p'],
+            'screenshot Dolly' => ['OF.Dolly.Orchid.Beautiful.Asian.Girl.With.Small.Tits.Shakes.Her.Ass.Nonstop.Until.I.Cum.1080p'],
+            'screenshot Veronica' => ['OF.Theapolloshow.Veronica.Grace.1080p'],
+            'screenshot Maya' => ['OF.Theapolloshow.Maya.Faye.1080p'],
+            'canonical HD prefix' => ['OF.Creator.Title.1080p'],
+            'canonical UHD prefix' => ['OF.Creator.Title.2160p'],
+            'lowercase full site' => ['onlyfans.Creator.Title.1080p'],
+            'mixed case full site UHD' => ['oNlY-FaNs.Creator.Title.2160p'],
+            'no video hints' => ['OF.Creator.Title'],
+            'HD studio match' => ['OF.Brazzers.Performer.Title.1080p'],
+            'VR match' => ['OF.SexBabesVR.Creator.VR180.2160p'],
+            'video pack' => ['OF.Creator.Pack.mp4'],
+            'underscored video pack' => ['OF.Creator_Pack_mp4'],
+            'plural photos with video hint' => ['OF.Creator_Photos_Packs_mp4'],
+            'full site name' => ['OnlyFans.Creator.Title.1080p'],
+            'hyphenated site name' => ['Only-Fans.Creator.Title.1080p'],
+            'underscored site name' => ['Only_Fans.Creator.Title.1080p'],
+            'spaced site name' => ['Only Fans Creator Title 1080p'],
+        ];
+    }
+
+    #[DataProvider('onlyFansReleasesProvider')]
+    public function test_onlyfans_releases_match_directly_and_through_the_pipeline(string $releaseName): void
+    {
+        $context = new ReleaseContext(releaseName: $releaseName, groupId: 0);
+        $result = (new XxxCategorizer)->categorize($context);
+
+        $this->assertTrue($context->hasAdultMarkers());
+        $this->assertSame(Category::XXX_ONLYFANS, $result->categoryId);
+        $this->assertSame(0.95, $result->confidence);
+        $this->assertSame('onlyfans', $result->matchedBy);
+
+        foreach (['', 'alt.binaries.erotica.erotica'] as $groupName) {
+            $passable = $this->runPipeline($releaseName, $groupName);
+            $this->assertSame(Category::XXX_ONLYFANS, $passable->bestResult->categoryId);
+            $this->assertSame('onlyfans', $passable->bestResult->matchedBy);
+        }
+    }
+
+    /** @return array<string, array{string}> */
+    public static function ordinaryMovieReleasesProvider(): array
+    {
+        return [
+            'title case Of movie' => ['Of.Mice.and.Men.1939.1080p.BluRay.x264'],
+            'lowercase of movie' => ['of.Mice.and.Men.1939.1080p.BluRay.x264'],
+            'mixed case oF movie' => ['oF.Mice.and.Men.1939.1080p.BluRay.x264'],
+        ];
+    }
+
+    #[DataProvider('ordinaryMovieReleasesProvider')]
+    public function test_ambiguous_of_prefix_does_not_force_adult_categorization(string $releaseName): void
+    {
+        $context = new ReleaseContext(releaseName: $releaseName, groupId: 0);
+
+        $this->assertFalse($context->hasOnlyFansMarker());
+        $this->assertFalse($context->hasAdultMarkers());
+        $this->assertFalse((new XxxCategorizer)->categorize($context)->isSuccessful());
+        $this->assertSame(Category::MOVIE_HD, $this->runPipeline($releaseName)->bestResult->categoryId);
+    }
+
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function nonOnlyFansReleasesProvider(): array
+    {
+        return [
+            'internal prefix' => ['Story.OF.Creator.1080p'],
+            'different separator' => ['OF-Creator.1080p'],
+            'longer word' => ['OFFER.Creator.1080p'],
+            'leading whitespace' => [' OF.Creator.1080p'],
+            'bracketed prefix' => ['[OF.Creator.1080p]'],
+            'regular movie' => ['Some.Movie.2024.1080p.BluRay.x264-GROUP'],
+            'photos' => ['OF.Creator.Photoset.1080p'],
+            'underscored photos' => ['OF.Creator_Photoset.1080p'],
+            'plural photos' => ['OF.Creator_Photos.1080p'],
+            'plural images' => ['OF.Creator.Images.2160p'],
+            'plural photosets' => ['OF.Creator_Photosets.1080p'],
+            'plural imagesets' => ['OF.Creator.Imagesets.2160p'],
+            'plural collections' => ['OF.Creator_Collections.1080p'],
+            'plural packs' => ['OF.Creator.Packs.2160p'],
+            'underscored pack without video hint' => ['OF.Creator_Pack.2160p'],
+            'pack without video hint' => ['OF.Creator.Pack.2160p'],
+            'full name photos' => ['OnlyFans.Creator.Imageset'],
+        ];
+    }
+
+    #[DataProvider('nonOnlyFansReleasesProvider')]
+    public function test_unrelated_names_and_photo_packs_do_not_match_onlyfans(string $releaseName): void
+    {
+        $context = new ReleaseContext(releaseName: $releaseName, groupId: 0);
+        $result = (new XxxCategorizer)->categorize($context);
+
+        $this->assertNotSame(Category::XXX_ONLYFANS, $result->categoryId);
+        foreach (['', 'alt.binaries.erotica.erotica'] as $groupName) {
+            $this->assertNotSame(Category::XXX_ONLYFANS, $this->runPipeline($releaseName, $groupName)->bestResult->categoryId);
+        }
+    }
+
+    /**
+     * @return array<string, array{0: string, 1: int}>
+     */
+    public static function jacquieEtMichelReleasesProvider(): array
+    {
+        return [
+            'VFF 2160p' => ['JacquieEtMichelTV.Angel.26.10.10.VFF.2160p.WEB.AAC.2.0.x264.NOTAG', Category::XXX_UHD],
+            'VFF 720p' => ['JacquieEtMichelTV.Helena.26.09.29.VFF.720p.WEB.AAC.2.0.x264.NOTAG', Category::XXX_CLIPHD],
+            'VFF 720p space separated' => ['JacquieEtMichelTV Helena 26 09 29 VFF 720p WEB AAC 2 0 x264 NOTAG', Category::XXX_CLIPHD],
+            'VFF 576p' => ['JacquieEtMichelTV.Helena.26.09.29.VFF.576p.WEB.AAC.2.0.x264.NOTAG', Category::XXX_X264],
+            'VFF 360p' => ['JacquieEtMichelTV.Helena.26.09.29.VFF.360p.WEB.AAC.2.0.x264.NOTAG', Category::XXX_X264],
+        ];
+    }
+
+    #[DataProvider('jacquieEtMichelReleasesProvider')]
+    public function test_jacquie_et_michel_releases_are_categorized_as_xxx(string $releaseName, int $expectedCategoryId): void
+    {
+        $passable = $this->runPipeline($releaseName, 'alt.binaries.erotica.erotica');
+
+        $this->assertSame($expectedCategoryId, $passable->bestResult->categoryId, "Wrong category for: {$releaseName}");
+    }
+
+    public function test_french_movie_release_stays_in_movies_foreign(): void
+    {
+        $passable = $this->runPipeline('Some.Movie.2024.FRENCH.1080p.WEB-DL.x264-GROUP');
+
+        $this->assertSame(Category::MOVIE_FOREIGN, $passable->bestResult->categoryId);
+    }
+
+    public function test_normalized_movie_titles_sharing_a_studio_word_stay_in_movies_foreign(): void
+    {
+        foreach (['Private School 1983', 'Private Life 2018'] as $title) {
+            $name = $title.' FRENCH 1080p BluRay x264-GROUP';
+            $this->assertSame(Category::MOVIE_FOREIGN, $this->runPipeline($name)->bestResult->categoryId, $name);
+        }
+    }
 }
