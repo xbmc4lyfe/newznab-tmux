@@ -138,6 +138,7 @@ case "$*" in
         case "$*" in *'--force-recreate'*' redis'*) [ "${NNTMUX_REDIS_FAIL:-0}" != 1 ] || exit 53 ;; esac
         [ -z "${NNTMUX_UP_FAIL_SERVICE:-}" ] || [ "$last" != "$NNTMUX_UP_FAIL_SERVICE" ] || exit 54
         if [ "${NNTMUX_STALE_UP:-0}" = 1 ]; then echo changed > "$NNTMUX_REPO/app.txt"; fi
+        if [ -n "${NNTMUX_STALE_AFTER_UP_OF:-}" ] && [ "$last" = "$NNTMUX_STALE_AFTER_UP_OF" ]; then echo changed > "$NNTMUX_REPO/app.txt"; fi
         case "$*" in *' --force-recreate '*)
             : > "$NNTMUX_REPO/recreated"
             # Every service named after the options gets a new container, not only the last one.
@@ -377,6 +378,23 @@ SH);
         $events = $this->events();
         $this->assertStringContainsString('--wait-timeout 240 mariadb', $events);
         $this->assertGreaterThan(strpos($events, '--wait-timeout 240 mariadb'), strpos($events, 'artisan migrate --force'));
+    }
+
+    public function test_a_check_failing_right_after_the_database_is_replaced_keeps_remote_workers_out(): void
+    {
+        $services = json_decode($this->composeJson(), true);
+        $services['services']['mariadb'] = ['image' => 'mariadb:one'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($services, JSON_UNESCAPED_SLASHES)])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        $services['services']['mariadb'] = ['image' => 'mariadb:two'];
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($services, JSON_UNESCAPED_SLASHES), 'NNTMUX_STALE_AFTER_UP_OF' => 'mariadb']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $events = $this->events();
+        $this->assertStringNotContainsString('artisan migrate', $events);
+        $this->assertStringNotContainsString('released', $events);
+        $this->assertStringNotContainsString('forced-release', $events);
     }
 
     public function test_another_data_service_keeps_the_existing_barrier(): void
@@ -1624,6 +1642,15 @@ SH);
         $plan->run();
         $this->assertNotSame(0, $plan->getExitCode());
         $this->assertStringContainsString('data service cache2 depends on app service web', $plan->getErrorOutput());
+    }
+
+    public function test_docker_context_overrides_docker_host_in_the_daemon_identity(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['DOCKER_HOST' => 'unix:///same.sock', 'DOCKER_CONTEXT' => 'one'])->mustRun();
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['DOCKER_HOST' => 'unix:///same.sock', 'DOCKER_CONTEXT' => 'two']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('Docker daemon changed from context:one to context:two', $process->getErrorOutput());
     }
 
     public function test_a_docker_daemon_change_aborts_before_any_change(): void

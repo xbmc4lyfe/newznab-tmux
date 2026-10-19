@@ -392,21 +392,23 @@ horizon_stopped=0
 # Changed data services are recreated, unrecorded ones reconciled (only Compose drift changes),
 # together in depends_on order (POST_DRAIN, mark:service) so a provider is up before its consumer.
 for item in $POST_DRAIN; do
-    apply_each "--${item%%:*}" "${item#*:}"
-    verify
     if [ "${item#*:}" = mariadb ] && [ "$barrier_held" = 1 ]; then
+        # From the moment the database is replaced it awaits the migration: any failure from here
+        # keeps remote workers out (the release stays owed), never readmits them to its schema.
+        [ "$MIGRATE" != 1 ] || barrier_keep=1
+        apply_each "--${item%%:*}" "${item#*:}"
         # A recreated database ends the barrier's lock session, and replacement storage lacks its
-        # durable pause: fence the new database at once, before any other step can fail and leave
-        # remote workers admitted to it ahead of the migration.
+        # durable pause: fence the new database at once, before any check that could fail.
         docker rm -f "$barrier_name" >/dev/null 2>&1 || true
         keep=$barrier_keep
         barrier_held=0
         hold_barrier
-        # The replacement database still awaits the migration: from here a failure must keep
-        # remote workers out (its release stays owed), not readmit them to an unmigrated schema.
-        if [ "$MIGRATE" = 1 ]; then barrier_keep=1; else barrier_keep=$keep; fi
+        barrier_keep=$keep
         verify
+        continue
     fi
+    apply_each "--${item%%:*}" "${item#*:}"
+    verify
 done
 
 if [ "$MIGRATE" = 1 ]; then
