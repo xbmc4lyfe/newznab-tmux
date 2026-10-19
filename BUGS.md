@@ -456,7 +456,13 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom:** on 2026-10-19, `releases:process 1`, `9`, `14` and `42` were still running 3 h 21 min after the 09:51Z restart. Their parent `multiprocessing:releases` had run as long, so the other groups had no new release pass in that time. This most likely explains why archival warnings came in a burst after each deploy and then stopped.
 - **Fix:** not yet investigated.
 
-### 63. Verification-mode retention archives about 25 stale collections per release round while hundreds of thousands go stale each hour (Fixed)
+### 63. Dirty verification candidates wait weeks for release creation to merge their late headers (Fixed)
+
+- **Where:** `CandidateRepository::invalidateHotCollections()` marks a pending candidate `dirty` when more of its articles arrive. Only `archive()` of that late collection makes the candidate claimable again, and only release creation's per-group id cursor reached it.
+- **Symptom:** on 2026-10-19, 29,258 candidates sat in `dirty` while verification workers stopped with `no_claim`. Every late collection was Sized and ready to archive, and none had failed archival. 85% were in group 9, which has 1.28 million Sized collections; its release window cursor was at id 184M of a 189M snapshot, while the late collections had ids 209M–429M.
+- **Fix:** branch `codex/settle-dirty-candidates`. `releases:prepare-candidates` now runs `DirtyCandidateSettler` every minute (`--dirty-limit=200`, `--dirty-seconds=20`). It archives the late collections of dirty candidates, oldest first, with a resume cursor, and honors over-budget deferrals.
+
+### 64. Verification-mode retention archives about 25 stale collections per release round while hundreds of thousands go stale each hour (Fixed)
 
 - **Where:** `CollectionCleanupService::deleteOldVerificationWindow()` (`app/Services/CollectionCleanupService.php`), called once per release round from `deleteFinishedAndOrphans()`.
 - **Bug:** with release verification required, this sweep is the only retention path for stale collections. Each call took one window of at most 25 stale ids under a global cache lock and sent every verification-eligible one through `CandidateRepository::archive()`. That call reads every header and writes a manifest. Then, for a collection with no existing candidate whose newest article is older than `release_verification.expiry_hours` (48), it inserts an already `expired` candidate with no manifest. It also deletes the manifest and the collection. With 72 h part retention, almost every stale collection takes this path, so the archive work produced nothing.
