@@ -122,7 +122,7 @@ class HeaderParserPerArticleObfuscationTest extends TestCase
     {
         $headers = [];
         for ($i = 0; $i < 20000; $i++) {
-            $headers[] = $this->header(10000 + $i, '[40/62] "'.md5((string) $i).'" yEnc ('.($i % 685 + 2).'/687)');
+            $headers[] = $this->header(10000 + $i, '[40/62] "'.md5((string) $i).'" yEnc ('.($i + 2).'/100079)');
         }
 
         $this->assertSame(20000, $this->parser()->markPerArticleObfuscated($headers, 16));
@@ -173,6 +173,21 @@ class HeaderParserPerArticleObfuscationTest extends TestCase
         $this->assertSame(0, BinariesConfig::obfuscationMinArticles(-3));
         $this->assertSame(8, BinariesConfig::obfuscationMinArticles(1));
         $this->assertSame(16, BinariesConfig::obfuscationMinArticles(16));
+    }
+
+    public function test_round_robin_files_with_random_names_per_file_are_kept(): void
+    {
+        $headers = [];
+        $number = 8000;
+        // Twenty files with their own random names, posted one segment of each in turn.
+        for ($segment = 2; $segment <= 4; $segment++) {
+            for ($file = 0; $file < 20; $file++) {
+                $headers[] = $this->header($number++, '"'.$this->token(900 + $file).'" yEnc ('.$segment.'/100)');
+            }
+        }
+
+        $this->assertSame(0, $this->parser()->markPerArticleObfuscated(array_slice($headers, 0, 20), 16));
+        $this->assertSame(0, $this->parser()->markPerArticleObfuscated($headers, 16));
     }
 
     public function test_single_part_files_are_never_marked(): void
