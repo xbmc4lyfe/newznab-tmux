@@ -1105,6 +1105,7 @@ final class CandidateRepository
         sort($groups);
         $files = [];
         $metadataBytes = 0;
+        $budget = OversizedCollectionDeferrals::budget();
         $binaries = $this->snapshotQuery('binaries', $currentReads)->where('collections_id', $collection->id)->orderBy('binaryhash')
             ->select(['id', 'binaryhash', 'name', 'totalparts'])->cursor();
         foreach ($binaries->chunk(100) as $batch) {
@@ -1113,7 +1114,7 @@ final class CandidateRepository
                 ->orderBy('binaries_id')->orderBy('partnumber')
                 ->select(['binaries_id', 'partnumber', 'messageid', 'size'])->cursor() as $part) {
                 $metadataBytes += 128 + strlen($part->messageid);
-                if ($metadataBytes > 16777216) {
+                if ($metadataBytes > $budget) {
                     throw new CandidateMetadataBudgetExceeded('Candidate exceeds metadata budget; headers retained.');
                 }
                 $segmentsByBinary[$part->binaries_id][] = ['number' => (int) $part->partnumber,

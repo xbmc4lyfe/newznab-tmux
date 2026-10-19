@@ -102,7 +102,7 @@ final class VerificationResetService
                     ->filter(static fn ($guid): bool => is_string($guid) && $guard->hasStagedGenerations($guid))->keys()->all();
                 DB::table('releases')->whereNotNull('late_article_candidate_id')->whereNotIn('id', $kept)->update(['late_article_candidate_id' => null]);
             }
-            foreach (['release_verification_scratch', 'release_verification_candidates', 'release_verification_audit_retries', 'release_verification_manifests'] as $table) {
+            foreach (['release_verification_scratch', 'release_verification_candidates', 'release_verification_audit_retries', 'release_verification_manifests', 'release_verification_oversized_collections'] as $table) {
                 if (Schema::hasTable($table)) {
                     $query = DB::table($table);
                     if ($table === 'release_verification_scratch' && $hosts) {
