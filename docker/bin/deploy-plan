@@ -594,10 +594,10 @@ def service_bind_records(svc_cfg: object, project_dir: Path) -> list[str]:
     return records
 
 
-def read_dotenv(path: Path, interpolated: set[str] | None = None) -> dict[str, str]:
+def read_dotenv(path: Path, interpolated: set[str] | None = None, multiline: set[str] | None = None) -> dict[str, str]:
     """The keys of a Compose .env file (same rules as bin/compose); last assignment wins. Keys whose
     last value Compose would interpolate (unquoted or double-quoted, containing `$`) are added to
-    `interpolated`."""
+    `interpolated`; keys whose last value spans lines (only its first line is read) to `multiline`."""
     try:
         text = path.read_text(encoding="utf-8", errors="surrogateescape")
     except FileNotFoundError:
@@ -615,12 +615,16 @@ def read_dotenv(path: Path, interpolated: set[str] | None = None) -> dict[str, s
                 # Compose and phpdotenv decode escapes inside double quotes only: `"a\nb"` installs a
                 # newline while `'a\nb'` stays literal, so the two must not hash alike.
                 values[m.group(1)] = re.sub(r"\\([nrt\\\"$])", lambda e: {"n": "\n", "r": "\r", "t": "\t"}.get(e.group(1), e.group(1)), values[m.group(1)])
+            # An opening quote with no closing one starts a multi-line value, which this line-based
+            # parser cannot read whole.
+            spans_lines = not quoted and value[:1] in ("'", '"')
+            if multiline is not None:
+                multiline.discard(m.group(1))
+                if spans_lines:
+                    multiline.add(m.group(1))
             if interpolated is not None:
                 interpolated.discard(m.group(1))
-                # An opening quote with no closing one starts a multi-line value, which this
-                # line-based parser cannot read whole.
-                multiline = not quoted and value[:1] in ("'", '"')
-                if multiline or ("$" in values[m.group(1)] and not (quoted and quoted.group(1) == "'")):
+                if spans_lines or ("$" in values[m.group(1)] and not (quoted and quoted.group(1) == "'")):
                     interpolated.add(m.group(1))
     return values
 
@@ -1376,7 +1380,8 @@ def database_service(docker_dir: Path) -> str:
     environment wins over app.env, and DB_URL's host over DB_HOST (Laravel's order). All apps must
     agree; a host that is no rendered service (an external database) leaves `mariadb`."""
     interpolated: set[str] = set()
-    app_env = read_dotenv(docker_dir / "config/app.env", interpolated)
+    multiline: set[str] = set()
+    app_env = read_dotenv(docker_dir / "config/app.env", interpolated, multiline)
 
     def selected(values: dict) -> list[str]:
         hosts = []
@@ -1397,8 +1402,8 @@ def database_service(docker_dir: Path) -> str:
         for key in ("DB_URL", "DB_HOST"):
             value = app_env.get(key, "")
             # phpdotenv expands only `${NAME}` (a bare `$`, e.g. in a password, is literal); a
-            # multi-line value is flagged without a `$` and cannot be read whole here either.
-            if key in interpolated and key not in rendered and ("${" in value or "$" not in value):
+            # multi-line value cannot be read whole here either.
+            if key not in rendered and (key in multiline or (key in interpolated and "${" in value)):
                 # Expanded, the literal is not the host Laravel connects to.
                 sys.exit(f"deploy-plan: config/app.env's {key} uses `${{...}}` interpolation (or a multi-line value), so the database service it "
                          "selects cannot be determined; write the host literally (single-quoted to keep a literal `${`).")
@@ -1631,6 +1636,8 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
         elif svc in stale_images:
             dirty_infra.append(svc)
             infra_reasons[svc] = "running image differs from its tag"
+        elif scaled_to_zero(svc) and not container_exists(docker_dir, svc):
+            infra_reasons[svc] = "scaled to zero"
         elif not container_exists(docker_dir, svc):
             # Removed (not merely stopped, which may be an operator's choice): recreate it.
             reconcile_infra.append(svc)

@@ -1758,12 +1758,32 @@ SH);
         $this->assertStringContainsString('result=skipped (nothing changed', (string) file_get_contents($this->directory.'/docker/.deploy.log'));
     }
 
+    public function test_infrastructure_scaled_to_zero_needs_no_local_image(): void
+    {
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['grafana'] = ['image' => 'grafana/grafana:off', 'scale' => 0];
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES), 'NNTMUX_NO_CONTAINER' => 'grafana', 'NNTMUX_MISSING_IMAGE' => 'grafana/grafana:off'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $this->assertStringNotContainsString('--pull never grafana', $this->events());
+    }
+
+    public function test_a_multi_line_database_url_fails_closed_even_with_a_bare_dollar(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_URL=\"mysql://u:p\$w@db2:3306/x\n\"\n");
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString("app.env's DB_URL uses", $process->getErrorOutput());
+    }
+
     public function test_a_bare_dollar_in_the_database_url_is_literal(): void
     {
         mkdir($this->directory.'/docker/config', 0777, true);
         // phpdotenv expands only `${NAME}`: a `$` in the password is part of it.
         file_put_contents($this->directory.'/docker/config/app.env', "DB_URL=mysql://u:pa\$w0rd@db.example:3306/nntmux\n");
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate', $this->events());
     }
 
     public function test_a_deleted_data_container_is_not_an_unchanged_stack(): void

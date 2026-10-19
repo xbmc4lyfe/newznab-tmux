@@ -80,31 +80,38 @@ final class DockerDeployGuardTest extends TestCase
     #[Test]
     public function a_signal_before_the_payload_is_forked_never_hangs_the_guard(): void
     {
-        // A copy of the guard that signals itself after its FIFO reader starts, before the fork.
+        // Copies of the guard that signal themselves at each point between creating the FIFO and
+        // forking the payload: before the FIFO is opened, after its reader is forked, before the fork.
         mkdir($this->dir.'/docker/bin', 0777, true);
         symlink(dirname(__DIR__, 2).'/docker/bin/deploy-plan', $this->dir.'/docker/bin/deploy-plan');
         $source = (string) file_get_contents(dirname(__DIR__, 2).'/docker/bin/deploy-guard');
-        $fork = '    if ( exec 3<&0 ) 2>/dev/null; then';
-        $this->assertSame(1, substr_count($source, $fork));
-        file_put_contents($this->dir.'/docker/bin/deploy-guard', str_replace($fork, "    kill -TERM \$\$\n".$fork, $source));
-        foreach (['sh', 'dash', 'bash'] as $shell) {
-            if ((new Process(['sh', '-c', 'command -v '.$shell]))->run() !== 0) {
-                continue;
+        $points = [
+            "    if mkfifo \"\$alive_fifo\" 2>/dev/null; then\n",
+            "        alive_reader=\$!\n",
+            "    if ( exec 3<&0 ) 2>/dev/null; then\n",
+        ];
+        foreach ($points as $point) {
+            $this->assertSame(1, substr_count($source, $point), $point);
+            $indent = substr($point, 0, strspn($point, ' '));
+            file_put_contents($this->dir.'/docker/bin/deploy-guard', str_replace($point, $indent."kill -TERM \$\$\n".$point, $source));
+            foreach (['sh', 'dash', 'bash'] as $shell) {
+                if ((new Process(['sh', '-c', 'command -v '.$shell]))->run() !== 0) {
+                    continue;
+                }
+                $label = $shell.' at '.trim($point);
+                $guard = $this->guardProcess(['run', 'deploy', '--', 'true'], [], $shell);
+                $process = new Process([$shell, $this->dir.'/docker/bin/deploy-guard', 'run', 'deploy', '--', 'true'], null, $guard->getEnv());
+                $process->start();
+                $deadline = microtime(true) + 5;
+                while ($process->isRunning() && microtime(true) < $deadline) {
+                    usleep(50_000);
+                }
+                $hung = $process->isRunning();
+                $process->stop(0);
+                $this->assertFalse($hung, $label.': the guard waited forever for its FIFO reader');
+                $this->assertSame(130, $process->getExitCode(), $label.': '.$process->getErrorOutput());
+                $this->assertFalse(is_link($this->dir.'/lock'), $label);
             }
-            $guard = $this->guardProcess(['run', 'deploy', '--', 'true'], [], $shell);
-            $process = new Process([$shell, $this->dir.'/docker/bin/deploy-guard', 'run', 'deploy', '--', 'true'], null, $guard->getEnv());
-            $process->start();
-            $deadline = microtime(true) + 5;
-            while ($process->isRunning() && microtime(true) < $deadline) {
-                usleep(50_000);
-            }
-            $hung = $process->isRunning();
-            $process->stop(0);
-            // A hung guard's FIFO reader would otherwise outlive the test.
-            (new Process(['pkill', '-f', $this->dir.'/deploy-guard-alive']))->run();
-            $this->assertFalse($hung, $shell.': the guard waited forever for a reader no payload would close');
-            $this->assertSame(130, $process->getExitCode(), $shell.': '.$process->getErrorOutput());
-            $this->assertFalse(is_link($this->dir.'/lock'), $shell);
         }
     }
 

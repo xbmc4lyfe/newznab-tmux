@@ -344,15 +344,19 @@ cmd_run() {
     # command with nothing to read would.
     alive_fifo="${TMPDIR:-/tmp}/deploy-guard-alive.$$"
     remove_fifo "$alive_fifo"
+    # Every FIFO end is opened by the guard itself before anything is forked (a read-write open never
+    # blocks, and each later open finds its other end), then the read end is handed to the reader.
+    # The guard holds a write end (fd 8) until the payload is forked, so a signal at any point
+    # before then never waits on a reader blocked in open() or one that no writer would close.
     if mkfifo "$alive_fifo" 2>/dev/null; then
-        cat "$alive_fifo" >/dev/null 2>&1 &
+        exec 7<>"$alive_fifo" 6<"$alive_fifo" 8>"$alive_fifo" 7>&-
+        cat <&6 >/dev/null 2>&1 6<&- 8>&- &
         alive_reader=$!
+        exec 6<&-
     else
         alive_fifo=/dev/null
+        exec 8>/dev/null
     fi
-    # The guard holds a write end itself until the payload is forked, so a signal in between never
-    # waits on a reader that no writer would ever open.
-    exec 8>"$alive_fifo"
     if ( exec 3<&0 ) 2>/dev/null; then
         { "$@" <&3 3<&- 9>&8 8>&- & } 3<&0
     else
