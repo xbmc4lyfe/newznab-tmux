@@ -69,7 +69,9 @@ hold_barrier() {
         barrier_keep=1
     else
         docker rm -f "$barrier_name" >/dev/null 2>&1 || true
-        compose run -d --no-deps --label "nntmux.deploy.database=$DATABASE_TARGET" --name "$barrier_name" web php artisan releases:verification-barrier --timeout="${DEPLOY_REMOTE_DRAIN_TIMEOUT:-900}" --no-interaction >/dev/null
+        # Started from web's tag: it must still name the image this run planned.
+        "$DIR/bin/deploy-plan" --verify-images web
+        compose run -d --no-deps --pull never --label "nntmux.deploy.database=$DATABASE_TARGET" --name "$barrier_name" web php artisan releases:verification-barrier --timeout="${DEPLOY_REMOTE_DRAIN_TIMEOUT:-900}" --no-interaction >/dev/null
     fi
     barrier_held=1
     until docker logs "$barrier_name" 2>&1 | grep -q '^barrier held'; do
@@ -98,7 +100,7 @@ release_barrier() {
         docker rm -f "$barrier_name" >/dev/null 2>&1 || true
         barrier_held=0
         # Its durable pause would otherwise keep every host's workers out after a healthy rollout.
-        if [ "$released" != 1 ] && ! compose run --rm --no-deps -T web php artisan releases:verification-barrier --release --no-interaction; then
+        if [ "$released" != 1 ] && ! { "$DIR/bin/deploy-plan" --verify-images web && compose run --rm --no-deps --pull never -T web php artisan releases:verification-barrier --release --no-interaction; }; then
             echo "The verification deployment pause could not be cleared; every host's workers stay paused." >&2
             return 1
         fi
@@ -453,7 +455,7 @@ if [ "$MIGRATE" = 1 ]; then
     [ "$barrier_held" != 1 ] || barrier_keep=1
     # The migration runs from web's tag: it must still be the image this run planned.
     plan --verify-images web
-    compose run --rm --no-deps web php artisan migrate --force --no-interaction
+    compose run --rm --no-deps --pull never web php artisan migrate --force --no-interaction
     assert_barrier
     plan --record migration effective
     verify

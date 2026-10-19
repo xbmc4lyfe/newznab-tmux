@@ -287,7 +287,8 @@ forward_signal() {
     fi
     if [ -n "$payload" ]; then
         # Only the direct child: its own traps let a running step finish and then recover (restart
-        # Horizon, resume the drains) before it exits.
+        # Horizon, resume the drains) before it exits. (bash may reap a child that exited on the same
+        # group signal before this trap runs; its PID is then only milliseconds old, as in any shell.)
         kill -"$1" "$payload" 2>/dev/null || true
         wait "$payload" 2>/dev/null || true
         # Reaped: its PID may be reused, and a later signal must never reach it.

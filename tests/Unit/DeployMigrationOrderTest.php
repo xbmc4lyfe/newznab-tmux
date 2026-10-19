@@ -102,6 +102,7 @@ case "$*" in
         [ "$missing" = 1 ] || { [ ! -f "$NNTMUX_REPO/recreated-horizon" ] || printf 'r%s-' "$(wc -c < "$NNTMUX_REPO/recreated-horizon" | tr -d ' ')"; echo "fixture-container-horizon"; } ;;
     *' ps -q '*)
         [ "${NNTMUX_PS_FAIL:-0}" != 1 ] || { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
+        if [ -n "${NNTMUX_PS_FAIL_AFTER:-}" ] && grep -q -- "$NNTMUX_PS_FAIL_AFTER" "$NNTMUX_DEPLOY_EVENTS"; then echo "Cannot connect to the Docker daemon" >&2; exit 1; fi
         # A recreated container gets a new ID, as Docker gives it.
         # NNTMUX_NO_CONTAINER: missing until this run (re)creates it.
         if [ -n "${NNTMUX_NO_CONTAINER:-}" ] && [ "$last" = "$NNTMUX_NO_CONTAINER" ] && ! grep -q -- " up -d .* $last\( \|\$\)" "$NNTMUX_DEPLOY_EVENTS"; then exit 0; fi
@@ -2932,13 +2933,29 @@ SH);
     public function test_a_failed_database_lookup_before_the_barrier_aborts_instead_of_starting_it(): void
     {
         // First deploy: mariadb has no record and is reconciled, so its container is looked up.
-        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_PS_A_FAIL_AFTER' => 'tmux:drain --timeout']);
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_PS_FAIL_AFTER' => 'tmux:drain --timeout']);
         $process->run();
         $this->assertFalse($process->isSuccessful());
         $this->assertStringContainsString('tmux:drain --timeout', $this->events());
-        $this->assertStringContainsString('ps -a -q mariadb', $this->events());
+        $this->assertStringContainsString('ps -q mariadb', $this->events());
         $this->assertStringNotContainsString('up -d --no-deps --wait --wait-timeout 240 --pull never mariadb', $this->events());
         $this->assertStringNotContainsString(' stop web scheduler indexer', $this->events());
+    }
+
+    public function test_the_barrier_never_starts_from_a_tag_replaced_during_the_drain(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        mkdir($this->directory.'/database/migrations', 0777, true);
+        file_put_contents($this->directory.'/database/migrations/2026_10_17_000001_x.php', "<?php\n");
+        file_put_contents($this->directory.'/events', '');
+
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_REPLACE_DURING_DRAIN' => '1']);
+        $process->run();
+        @unlink($this->directory.'/replaced');
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('not rolling out a replaced image', $process->getErrorOutput());
+        $this->assertStringNotContainsString('releases:verification-barrier --timeout', $this->events());
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
     }
 
     public function test_an_image_tag_replaced_during_the_drain_is_never_rolled_out(): void
