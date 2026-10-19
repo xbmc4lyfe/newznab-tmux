@@ -12,6 +12,10 @@ on:
       - 'app/Services/Releases/Fingerprint/**'
       - 'app/Services/Releases/Verification/*SpotCheckPlanner.php'
       - 'app/Services/Releases/Verification/*HeaderFilenameIdentity.php'
+      - 'app/Services/Binaries/HeaderParser.php'
+      - 'app/Services/Binaries/NativePerArticleObfuscation.php'
+      - 'tests/Support/PerArticleObfuscationCorpus.php'
+      - 'tests/Unit/PerArticleObfuscation*'
       - 'docker/app/nzb-yenc-ffi/**'
       - 'scripts/generate-header-filename-*'
       - 'tests/Support/HeaderFilenameIdentityCorpus.php'
@@ -353,6 +357,20 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           # A missed threshold exits 0; 2 is an invalid run (parity or setup failure).
           exit "$status"
+      # HeaderParser::markPerArticleObfuscated() uses this library's port; a parity failure fails
+      # the job, a missed 1.5x threshold is reported.
+      - name: Verify per-article obfuscation parity and measure PHP versus Rust including FFI
+        shell: bash
+        env:
+          NNTMUX_TEST_NATIVE_LIBRARY: ${{ github.workspace }}/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so
+        run: |
+          source scripts/benchmark-rust-toolchain.sh
+          cargo +"$RUST_TOOLCHAIN" test --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml --lib per_article_obfuscation
+          php -d ffi.enable=true -d memory_limit=2G vendor/bin/phpunit --fail-on-skipped tests/Unit/PerArticleObfuscationNativeTest.php
+          php -d ffi.enable=true -d memory_limit=3G scripts/benchmark-per-article-obfuscation.php \
+            --native="$NNTMUX_TEST_NATIVE_LIBRARY" \
+            --output-dir="$GITHUB_WORKSPACE/filename-identity-evidence/per-article-obfuscation" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Capture all visible resource limits after measurement
         if: always()
         shell: bash

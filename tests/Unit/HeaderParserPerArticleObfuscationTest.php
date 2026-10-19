@@ -21,7 +21,7 @@ class HeaderParserPerArticleObfuscationTest extends TestCase
             {
                 return false;
             }
-        });
+        }, false);
     }
 
     /** @return array<string, mixed> */

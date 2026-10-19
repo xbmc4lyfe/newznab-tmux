@@ -32,9 +32,13 @@ final class HeaderParser
     /** @var array<int, true> Article numbers whose subject is randomised per article. */
     private array $perArticleObfuscated = [];
 
-    public function __construct(?BlacklistService $blacklistService = null)
+    /** Rust port of markPerArticleObfuscated(); false keeps the PHP rule only. */
+    private NativePerArticleObfuscation|false $native;
+
+    public function __construct(?BlacklistService $blacklistService = null, NativePerArticleObfuscation|false|null $native = null)
     {
         $this->blacklistService = $blacklistService ?? new BlacklistService;
+        $this->native = $native ?? new NativePerArticleObfuscation;
     }
 
     /**
@@ -70,6 +74,14 @@ final class HeaderParser
         $this->perArticleObfuscated = [];
         if ($minArticles < 1) {
             return 0;
+        }
+        // The Rust port marks the same articles about 2-3x faster (scripts/benchmark-per-article-obfuscation.php);
+        // null means it is unavailable or declined, and the PHP rule below decides.
+        $marked = $this->native === false ? null : $this->native->mark($headers, $minArticles);
+        if ($marked !== null) {
+            $this->perArticleObfuscated = array_fill_keys($marked, true);
+
+            return \count($this->perArticleObfuscated);
         }
 
         /** @var array<string, array{names: array<string, list<array{int, int}>>, articles: int, total: int}> $signatures */
@@ -127,6 +139,16 @@ final class HeaderParser
         }
 
         return \count($this->perArticleObfuscated);
+    }
+
+    /**
+     * Article numbers marked by the last markPerArticleObfuscated() call.
+     *
+     * @return list<int>
+     */
+    public function perArticleObfuscatedNumbers(): array
+    {
+        return array_keys($this->perArticleObfuscated);
     }
 
     /**
