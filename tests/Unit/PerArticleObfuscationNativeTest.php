@@ -75,11 +75,20 @@ final class PerArticleObfuscationNativeTest extends TestCase
             self::markTestSkipped('Needs a Linux CLI with FFI and NNTMUX_TEST_NATIVE_LIBRARY.');
         }
         // Token-poor ranges stay on PHP; the unsampled path still answers for them.
-        foreach (['non-yenc', 'readable-yenc'] as $name) {
+        foreach (['non-yenc', 'readable-yenc', 'bare-random', 'single-part-hashed'] as $name) {
             $routed = PerArticleObfuscationCorpus::stratum($name, 5, 200);
             self::assertNull($native->mark($routed, 16));
             self::assertSame([], $native->markWithoutSampling($routed, 16));
         }
+        // Alternating real and obfuscated articles at an even period are still sampled.
+        $alternating = [];
+        $obfuscated = PerArticleObfuscationCorpus::stratum('kenpsx', 6, 10000);
+        $real = PerArticleObfuscationCorpus::stratum('readable-yenc', 6, 10000);
+        for ($i = 0; $i < 10000; $i++) {
+            $alternating[] = $real[$i];
+            $alternating[] = $obfuscated[$i];
+        }
+        self::assertNotNull($native->mark($alternating, 16));
         $headers = PerArticleObfuscationCorpus::stratum('kenpsx', 5, 200);
         self::assertNotSame([], $native->mark($headers, 16));
         $headers[] = ['Number' => 1, 'Subject' => str_repeat(' ', NativePerArticleObfuscation::MAX_SUBJECT_LENGTH).')'];

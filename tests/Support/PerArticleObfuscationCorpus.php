@@ -26,6 +26,8 @@ final class PerArticleObfuscationCorpus
             'boneless' => ['category' => 'common', 'description' => 'per-article random bracketed names, files posted in turn', 'size' => 20000],
             'mixed' => ['category' => 'common', 'description' => 'half real uploads, half obfuscated, interleaved', 'size' => 20000],
             'readable-yenc' => ['category' => 'routed', 'description' => 'readable yEnc uploads without 16+ alphanumeric tokens (stays on PHP)', 'size' => 20000],
+            'bare-random' => ['category' => 'routed', 'description' => 'random 32-character subjects without part counts (stays on PHP)', 'size' => 20000],
+            'single-part-hashed' => ['category' => 'routed', 'description' => 'hash-named single-part posts, 15% in a readable range (stays on PHP)', 'size' => 20000],
             'non-yenc' => ['category' => 'routed', 'description' => 'text posts without yEnc part counts (stays on PHP)', 'size' => 20000],
             'large-range' => ['category' => 'uncommon', 'description' => 'mixed range of 200k headers', 'size' => 200000],
             'small-range' => ['category' => 'uncommon', 'description' => 'mixed range of 200 headers', 'size' => 200],
@@ -44,6 +46,8 @@ final class PerArticleObfuscationCorpus
             'real-uploads' => self::real($random, $size),
             'readable-yenc' => self::real($random, $size, false),
             'non-yenc' => self::text($random, $size),
+            'bare-random' => array_map(static fn (): string => self::token($random, 32), range(1, $size)),
+            'single-part-hashed' => self::singlePartHashed($random, $size),
             'kenpsx' => self::kenpsx($random, $size),
             'boneless' => self::boneless($random, $size),
             'mixed', 'large-range', 'small-range' => self::mixed($random, $size, ''),
@@ -78,6 +82,19 @@ final class PerArticleObfuscationCorpus
                 for ($part = 1; $part <= $parts && count($subjects) < $size; $part++) {
                     $subjects[] = sprintf('[%02d/%02d] - "%s" yEnc (%d/%d)', $file, $files, $name, $part, $parts);
                 }
+            }
+        }
+
+        return $subjects;
+    }
+
+    /** @return list<string> */
+    private static function singlePartHashed(Randomizer $random, int $size): array
+    {
+        $subjects = self::real($random, $size, false);
+        foreach ($subjects as $index => $subject) {
+            if ($random->getInt(0, 99) < 15) {
+                $subjects[$index] = sprintf('"%s.jpg" yEnc (1/1)', md5($random->getBytes(8)));
             }
         }
 

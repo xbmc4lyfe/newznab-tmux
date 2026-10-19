@@ -20,7 +20,7 @@ final class NativePerArticleObfuscation
     public const int MAX_SUBJECT_LENGTH = 512;
 
     /** Headers sampled to decide whether a range is worth marshalling to Rust. */
-    private const int SAMPLE_SIZE = 64;
+    private const int SAMPLE_SIZE = 128;
 
     /** @var array<string, FFI|null> */
     private static array $libraries = [];
@@ -39,8 +39,8 @@ final class NativePerArticleObfuscation
 
     /**
      * Article numbers the PHP rule would mark, or null to keep the PHP result. Ranges where under
-     * an eighth of a spread sample carries a 16+ alphanumeric token stay on PHP: the PHP rule
-     * rejects those subjects faster than they can be packed for FFI.
+     * a sixteenth of a spread sample is a multi-part subject with a 16+ alphanumeric token in its
+     * name stay on PHP: the PHP rule rejects other subjects faster than they can be packed for FFI.
      *
      * @param  array<int, array<string, mixed>>  $headers
      * @return list<int>|null
@@ -72,17 +72,30 @@ final class NativePerArticleObfuscation
         if ($count === 0) {
             return false;
         }
-        $step = max(1, intdiv($count, self::SAMPLE_SIZE));
-        $sampled = $tokens = 0;
-        for ($i = 0; $i < $count; $i += $step) {
+        // An odd step started mid-stride, so a range alternating at an even period is not seen
+        // in one phase only.
+        $step = intdiv($count, self::SAMPLE_SIZE) | 1;
+        $sampled = $candidates = 0;
+        for ($i = intdiv($step, 2); $i < $count; $i += $step) {
             $sampled++;
-            $subject = $values[$i]['Subject'] ?? null;
-            if (is_string($subject) && preg_match('/[A-Za-z0-9]{16}/', $subject) === 1) {
-                $tokens++;
+            if (self::candidate($values[$i]['Subject'] ?? null)) {
+                $candidates++;
             }
         }
 
-        return $tokens * 8 >= $sampled;
+        return $candidates * 16 >= $sampled;
+    }
+
+    /**
+     * Approximates the PHP rule's prefilter, a multi-part `(n/total)` count and a 16+ alphanumeric
+     * token, with patterns that cannot backtrack on crafted whitespace.
+     */
+    private static function candidate(mixed $subject): bool
+    {
+        return is_string($subject)
+            && preg_match('/\(\d+\/0*([1-9]\d*)\)/', $subject, $match) === 1
+            && $match[1] !== '1'
+            && preg_match('/[A-Za-z0-9]{16}/', $subject) === 1;
     }
 
     private function library(): ?FFI
