@@ -192,7 +192,7 @@ class XxxCategorizer extends AbstractCategorizer
         $name = str_replace('_', ' ', $context->releaseName);
 
         // Skip photo packs unless there's a video hint
-        if (preg_match('/\b(photo(set)?|image(set)?|pics?|wallpapers?|collection|pack)\b/i', $name) &&
+        if (preg_match('/\b(photo(?:set)?s?|image(?:set)?s?|pics?|wallpapers?|collections?|packs?)\b/i', $name) &&
             ! preg_match('/\b(mp4|mkv|mov|wmv|avi|webm|h\.?264|x264|h\.?265|x265)\b/i', $name)) {
             return null;
         }

@@ -113,6 +113,7 @@ class RecategorizeOnlyFansTest extends TestCase
             $this->insertRelease('OF.Theapolloshow.Veronica.Grace.1080p'),
             $this->insertRelease('of.Creator.Title.2160p', Category::XXX_UHD),
             $this->insertRelease('oF.Creator_Pack_mp4', Category::XXX_OTHER),
+            $this->insertRelease('OF.Creator_Photos_Packs_mp4', Category::XXX_OTHER),
             $this->insertRelease('OF.Creator.Title', Category::XXX_OTHER),
         ];
         $before = DB::table('releases')->get()->keyBy('id');
@@ -120,7 +121,7 @@ class RecategorizeOnlyFansTest extends TestCase
         $this->useConfirmedSearchDriver($ids);
 
         $this->artisan('releases:recategorize-onlyfans', ['--apply' => true])
-            ->expectsOutput('Database categories updated: 4; Search refreshes confirmed: 4; Unconfirmed: 0.')
+            ->expectsOutput('Database categories updated: 5; Search refreshes confirmed: 5; Unconfirmed: 0.')
             ->assertSuccessful();
 
         $this->assertSame($cacheVersion + 1, Cache::get('releases:cache_version', 1));
@@ -141,7 +142,7 @@ class RecategorizeOnlyFansTest extends TestCase
         $this->insertRelease('OF.Creator.Title.1080p', Category::MOVIE_HD);
         $this->insertRelease('OF.Creator.Title.1080p', Category::XXX_ONLYFANS);
         $this->insertRelease('OF.Creator.Title.1080p', 6998);
-        foreach (['Movie.OF.Creator.1080p', 'OF-Creator.1080p', 'OFFER.Creator.1080p', ' OF.Creator.1080p', '[OF.Creator.1080p]', 'OnlyFans.Creator.1080p', 'OF.Creator.Photoset', 'OF.Creator.Pack.1080p', 'OF.Creator_Photoset.1080p', 'OF.Creator_Pack.2160p'] as $name) {
+        foreach (['Movie.OF.Creator.1080p', 'OF-Creator.1080p', 'OFFER.Creator.1080p', ' OF.Creator.1080p', '[OF.Creator.1080p]', 'OnlyFans.Creator.1080p', 'OF.Creator.Photoset', 'OF.Creator.Pack.1080p', 'OF.Creator_Photoset.1080p', 'OF.Creator_Pack.2160p', 'OF.Creator_Photos.1080p', 'OF.Creator.Images.2160p', 'OF.Creator_Photosets.1080p', 'OF.Creator.Imagesets.2160p', 'OF.Creator_Collections.1080p', 'OF.Creator.Packs.2160p'] as $name) {
             $this->insertRelease($name);
         }
         $before = DB::table('releases')->get();
@@ -149,7 +150,7 @@ class RecategorizeOnlyFansTest extends TestCase
         Search::shouldReceive('updateRelease')->never();
 
         $this->artisan('releases:recategorize-onlyfans', ['--apply' => true])
-            ->expectsOutput('Inspected: 4; Eligible: 0; Skipped: 4; Failed: 0.')
+            ->expectsOutput('Inspected: 10; Eligible: 0; Skipped: 10; Failed: 0.')
             ->expectsOutput('Database categories updated: 0; Search refreshes confirmed: 0; Unconfirmed: 0.')
             ->assertSuccessful();
 
