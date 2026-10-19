@@ -7,6 +7,7 @@ namespace Tests\Feature;
 use App\Exceptions\CandidateMetadataBudgetExceeded;
 use App\Facades\Search;
 use App\Jobs\CollectReleaseFingerprintMetadata;
+use App\Services\CollectionCleanupService;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
 use App\Services\Nzb\NzbSourceGuard;
@@ -561,6 +562,31 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         DB::table('release_archive_naming_evidence')->where('releases_id', $release)->update(['source_sha256' => NzbSourceGuard::digest('another')]);
 
         return [$canonical, $staged];
+    }
+
+    public function test_an_upgrade_replaces_the_nzb_readers_resolve_when_the_configured_path_moved(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('moved-split-level', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $guid = (string) DB::table('releases')->where('id', $first)->value('guid');
+        $resolved = (string) app(NzbService::class)->nzbPath($guid);
+        // The split level changed since publication: new files go elsewhere, while readers still find the old one.
+        $this->app->instance(NzbService::class, new class(app(CollectionCleanupService::class)) extends NzbService
+        {
+            public function getNzbPath(string $releaseGuid, int $levelsToSplit = 0, bool $createIfNotExist = false): string
+            {
+                return $levelsToSplit === 0 ? rtrim((string) config('nntmux_settings.path_to_nzbs'), '/').'/'.$releaseGuid.'.nzb.gz'
+                    : parent::getNzbPath($releaseGuid, $levelsToSplit, $createIfNotExist);
+            }
+        });
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+
+        $this->assertSame($first, $this->publishStalledPartial(null));
+
+        $this->assertSame($resolved, app(NzbService::class)->nzbPath($guid));
+        $this->assertStringContainsString('c@d', (string) gzdecode((string) file_get_contents($resolved)), 'Readers see the upgrade.');
+        $this->assertFileDoesNotExist(app(NzbService::class)->getNzbPath($guid), 'No second, shadowed copy.');
     }
 
     public function test_a_rolled_back_upgrade_leaves_the_published_nzb_untouched(): void

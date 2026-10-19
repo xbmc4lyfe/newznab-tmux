@@ -13,15 +13,16 @@ return new class extends Migration
      * complete ("236 of 934 articles found"); all stay null for complete releases. A partial whose
      * inventory is still retained may be upgraded in place by late articles; late_article_candidate_id
      * names the candidate holding that inventory, and no worker reads its NZB until it clears for good.
+     * Article counts sum every file's 32-bit part total, so they are 64-bit.
      */
     public function up(): void
     {
         Schema::table('releases', static function (Blueprint $table): void {
             if (! Schema::hasColumn('releases', 'articles_found')) {
-                $table->unsignedInteger('articles_found')->nullable();
+                $table->unsignedBigInteger('articles_found')->nullable();
             }
             if (! Schema::hasColumn('releases', 'articles_expected')) {
-                $table->unsignedInteger('articles_expected')->nullable();
+                $table->unsignedBigInteger('articles_expected')->nullable();
             }
             if (! Schema::hasColumn('releases', 'files_found')) {
                 $table->unsignedInteger('files_found')->nullable();

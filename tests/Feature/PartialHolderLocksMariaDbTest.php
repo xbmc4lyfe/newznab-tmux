@@ -81,6 +81,20 @@ class PartialHolderLocksMariaDbTest extends TestCase
         }
     }
 
+    public function test_article_counts_hold_the_sum_of_many_files_32_bit_part_totals(): void
+    {
+        Schema::drop('releases');
+        Schema::create('releases', function ($table): void {
+            $table->id();
+        });
+        (require database_path('migrations/2026_10_17_210000_add_partial_article_counts_to_releases_table.php'))->up();
+        $articles = 2 * 4294967295;
+
+        DB::table('releases')->insert(['id' => 1, 'articles_found' => $articles - 1, 'articles_expected' => $articles]);
+
+        $this->assertSame([$articles - 1, $articles], [(int) DB::table('releases')->value('articles_found'), (int) DB::table('releases')->value('articles_expected')]);
+    }
+
     public function test_reading_holders_neither_blocks_pointer_moves_nor_new_partials_elsewhere(): void
     {
         $other = DB::connection('partial_holder_other');

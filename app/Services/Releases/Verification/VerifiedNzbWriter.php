@@ -42,7 +42,9 @@ final class VerifiedNzbWriter
     public function writeWithReceipt(array $manifest, string $guid, object $release, ?PublicationTiming $timing = null, ?string $body = null,
         ?int $replaceFor = null): NzbSourceInstallation
     {
-        $path = $this->nzb->getNzbPath($guid, createIfNotExist: true);
+        // An upgrade replaces the file readers resolve, which a changed split level can leave outside the configured path.
+        $current = $replaceFor !== null ? $this->nzb->nzbPath($guid) : false;
+        $path = is_string($current) ? $current : $this->nzb->getNzbPath($guid, createIfNotExist: true);
         $body ??= $this->compress($this->document($manifest));
         $timing?->nextPhase('durable_install');
         $temporary = $path.'.'.bin2hex(random_bytes(8)).'.tmp';
