@@ -1393,25 +1393,39 @@ def database_service(docker_dir: Path) -> str:
         hosts.append(str(values.get("DB_HOST") or ""))
         return hosts
 
+    aliases: dict[str, set[str]] = {}
+    for name, svc_cfg in RENDERED_SERVICES.items():
+        networks = svc_cfg.get("networks") if isinstance(svc_cfg, dict) else None
+        if isinstance(networks, dict):
+            for net in networks.values():
+                for alias in (net.get("aliases") or []) if isinstance(net, dict) else []:
+                    if alias != name:
+                        aliases.setdefault(str(alias), set()).add(name)
     targets = set()
     for app in APP_SERVICES:
         cfg = RENDERED_SERVICES.get(app)
         env = cfg.get("environment") if isinstance(cfg, dict) else None
         rendered = env if isinstance(env, dict) else {}
         # Keys Compose sets for this app shadow app.env's (Laravel reads the process environment first).
-        merged = {**app_env, **{k: v for k, v in rendered.items() if k in ("DB_URL", "DB_HOST")}}
-        for key in ("DB_URL", "DB_HOST"):
+        merged = {**app_env, **{k: v for k, v in rendered.items() if k in ("DB_URL", "DB_HOST", "DB_CONNECTION", "DB_PORT", "DB_SOCKET", "DB_DATABASE")}}
+        for key in ("DB_URL", "DB_HOST", "DB_CONNECTION", "DB_PORT", "DB_SOCKET", "DB_DATABASE"):
             value = app_env.get(key, "")
             # phpdotenv expands only `${NAME}` (a bare `$`, e.g. in a password, is literal); a
             # multi-line value cannot be read whole here either.
             if key not in rendered and (key in multiline or (key in interpolated and "${" in value)):
                 # Expanded, the literal is not the host Laravel connects to.
-                sys.exit(f"deploy-plan: config/app.env's {key} uses `${{...}}` interpolation (or a multi-line value), so the database service it "
-                         "selects cannot be determined; write the host literally (single-quoted to keep a literal `${`).")
+                sys.exit(f"deploy-plan: config/app.env's {key} uses `${{...}}` interpolation (or a multi-line value), so the database it "
+                         "selects cannot be determined; write it literally (single-quoted to keep a literal `${`).")
         for host in selected(merged):
             if host:
                 if host in RENDERED_SERVICES:
                     targets.add(host)
+                elif host in aliases:
+                    # A Compose network alias names its service as well as the service name does.
+                    if len(aliases[host]) > 1:
+                        sys.exit(f"deploy-plan: the database host {host} is a network alias of several services "
+                                 f"({', '.join(sorted(aliases[host]))}); selective deployment must know which one it migrates and fences.")
+                    targets.update(aliases[host])
                 break
     if len(targets) > 1:
         sys.exit(f"deploy-plan: the app services select different database services ({', '.join(sorted(targets))}); "

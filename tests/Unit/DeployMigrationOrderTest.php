@@ -1836,6 +1836,17 @@ SH);
         $this->assertStringNotContainsString('releases:verification-barrier --timeout', $this->events());
     }
 
+    public function test_an_interpolated_app_env_database_name_fails_closed(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        // phpdotenv connects to `blue`; the barrier's recorded target would keep the literal.
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_SCHEMA=blue\nDB_DATABASE=\${DB_SCHEMA}\n");
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString("app.env's DB_DATABASE uses `\${...}` interpolation", $process->getErrorOutput());
+    }
+
     public function test_an_interpolated_app_env_database_host_fails_closed(): void
     {
         mkdir($this->directory.'/docker/config', 0777, true);
@@ -3513,6 +3524,18 @@ SH);
         $plan->run();
         $this->assertNotSame(0, $plan->getExitCode());
         $this->assertStringContainsString('select different database services (db2, db3)', $plan->getErrorOutput());
+
+        // A network alias names its service: an alias of db2 and db3 itself still disagree.
+        $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['horizon' => ['environment' => ['DB_HOST' => 'restored-db']], 'web' => ['environment' => ['DB_HOST' => 'db3']], 'db2' => ['networks' => ['default' => ['aliases' => ['restored-db']]]], 'db3' => []] + $services], JSON_UNESCAPED_SLASHES)]);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('select different database services (db2, db3)', $plan->getErrorOutput());
+
+        // An alias shared by two services cannot name the one database to fence.
+        $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['db2' => ['networks' => ['default' => ['aliases' => ['shared-db']]]], 'db3' => ['networks' => ['default' => ['aliases' => ['shared-db']]]]] + array_map(fn ($svc) => ['environment' => ['DB_HOST' => 'shared-db']], $services)], JSON_UNESCAPED_SLASHES)]);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('network alias of several services (db2, db3)', $plan->getErrorOutput());
 
         // The database cannot wait for another data service.
         $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['mariadb' => ['depends_on' => ['redis' => ['condition' => 'service_healthy']]], 'redis' => []] + $services], JSON_UNESCAPED_SLASHES)]);
