@@ -175,6 +175,19 @@ class AdditionalCandidateQueryTest extends TestCase
         $this->assertSame([1], $third->pluck('id')->all());
     }
 
+    public function test_a_partial_awaiting_late_articles_is_not_claimed_until_settled(): void
+    {
+        DB::table('categories')->insert(['id' => 1, 'disablepreview' => 0]);
+        DB::table('releases')->insert([$this->releaseRow(1, 'a', postdate: '2026-07-12 10:00:00')]);
+        DB::table('releases')->where('id', 1)->update(['late_article_candidate_id' => 77]);
+
+        $this->assertSame([], AdditionalCandidateQuery::claimBatch('a', 10, 'token-one', columns: ['id'])->pluck('id')->all(),
+            'Late articles may still replace its NZB.');
+
+        DB::table('releases')->where('id', 1)->update(['late_article_candidate_id' => null]);
+        $this->assertSame([1], AdditionalCandidateQuery::claimBatch('a', 10, 'token-two', columns: ['id'])->pluck('id')->all());
+    }
+
     public function test_a_queued_archive_retry_is_not_a_candidate_until_it_is_due(): void
     {
         DB::table('categories')->insert(['id' => 1, 'disablepreview' => 0]);
@@ -346,6 +359,7 @@ class AdditionalCandidateQueryTest extends TestCase
             $table->timestamp('additional_pp_claimed_at')->nullable();
             $table->string('additional_pp_claim_token', 64)->nullable();
             $table->timestamp('archive_retry_at')->nullable();
+            $table->unsignedBigInteger('late_article_candidate_id')->nullable();
         });
     }
 }

@@ -316,8 +316,10 @@ final class HeaderStorageService
             if (Schema::hasTable('release_verification_candidates')) {
                 $hashes = DB::table('collections')->whereIn('id', $ids)->pluck('collectionhash', 'id');
                 $identities = $hashes->map(static fn ($hash): string => bin2hex($hash))->all();
+                // A published partial keeps its inventory; its late articles must merge promptly too.
                 $active = DB::table('release_verification_candidates')->whereIn('source_identity', $identities)
-                    ->whereNull('release_id')->whereNotIn('status', ['expired'])->pluck('source_identity')->all();
+                    ->where(fn ($query) => $query->whereNull('release_id')->orWhere('manifest_path', '<>', ''))
+                    ->whereNotIn('status', ['expired'])->pluck('source_identity')->all();
                 $tracked = $hashes->filter(static fn ($hash): bool => in_array(bin2hex($hash), $active, true))->keys()->all();
                 foreach ($tracked as $id) {
                     $this->verificationCollectionIds[(int) $id] = true;

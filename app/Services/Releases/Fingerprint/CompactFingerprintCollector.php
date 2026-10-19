@@ -9,6 +9,7 @@ use App\Services\NNTP\NntpArticleMissingException;
 use App\Services\NNTP\NntpProviderUnavailableException;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
+use App\Services\Nzb\NzbSourceGuard;
 use Throwable;
 
 /**
@@ -50,7 +51,12 @@ final class CompactFingerprintCollector
         $this->breaker = $breaker ?? new FingerprintProviderBreaker;
     }
 
-    /** @return array{status: string, data: array<string, mixed>} */
+    /**
+     * source_digest identifies the NZB generation read (NzbSourceGuard::digest()), so a caller can tell
+     * whether it is still the committed source when it saves.
+     *
+     * @return array{status: string, data: array<string, mixed>, source_digest?: string}
+     */
     public function collect(Release $release): array
     {
         $xml = $this->nzb->readNzbContents((string) $release->guid);
@@ -58,7 +64,7 @@ final class CompactFingerprintCollector
             return ['status' => 'unavailable', 'data' => ['reason' => 'The release NZB is not available locally.']];
         }
 
-        return $this->collectFromNzb($xml, (int) $release->id);
+        return $this->collectFromNzb($xml, (int) $release->id) + ['source_digest' => NzbSourceGuard::digest($xml)];
     }
 
     /** @return array{status: string, data: array<string, mixed>} */

@@ -87,6 +87,12 @@ class AdditionalProcessingOrchestrator
 
                 return new ReleaseProcessingResult(0, $guid, ProcessingOutcome::NotFound, reason: 'Release not found.');
             }
+            if (Release::hasLateArticleFlag() && $release->getAttribute('late_article_candidate_id') !== null) {
+                $this->output->warning('Release is a partial still awaiting late articles: '.$guid);
+
+                return new ReleaseProcessingResult((int) $release->id, $guid, ProcessingOutcome::AwaitingLateArticles,
+                    reason: 'Release is a partial still awaiting late articles.');
+            }
 
             $releaseId = (int) $release->id;
 

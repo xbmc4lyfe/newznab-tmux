@@ -17,6 +17,7 @@ use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
+use Tests\Fixtures\YencArticles;
 use Tests\TestCase;
 
 class ReleaseVerificationAuditRetriesTest extends TestCase
@@ -94,6 +95,55 @@ class ReleaseVerificationAuditRetriesTest extends TestCase
 
         $this->assertSame(['unknown', 'sampled'], array_column($this->records(), 'verdict'));
         $this->assertSame(0, DB::table('release_verification_audit_retries')->count());
+    }
+
+    public function test_audit_samples_a_partial_publication_instead_of_retrying_it_forever(): void
+    {
+        Schema::table('releases', function (Blueprint $table): void {
+            foreach (['articles_found', 'articles_expected', 'files_found', 'files_expected'] as $column) {
+                $table->unsignedInteger($column)->nullable();
+            }
+        });
+        $this->release(1);
+        $this->release(2);
+        $this->release(3);
+        $this->release(4);
+        $counts = ['articles_expected' => 3, 'files_found' => 1, 'files_expected' => 1];
+        DB::table('releases')->where('id', 1)->update($counts + ['articles_found' => 1]);
+        // Release 3 was published with two articles; its NZB has since lost one.
+        DB::table('releases')->where('id', 3)->update($counts + ['articles_found' => 2]);
+        // Release 4's upgrade installed a fuller NZB but never committed its counts (an interrupted worker).
+        DB::table('releases')->where('id', 4)->update(['articles_found' => 0, 'articles_expected' => 3, 'files_found' => 0, 'files_expected' => 1]);
+        // Every NZB declares three articles and contains one; releases 1 and 3 were published as partial.
+        $xml = '<nzb><file subject="Release [1/1] &quot;movie.mkv&quot; (1/3)"><groups><group>alt.test</group></groups>'
+            .'<segments><segment bytes="5" number="1">a@b</segment></segments></file></nzb>';
+        $this->mock(NzbService::class, function ($mock) use ($xml): void {
+            $mock->shouldReceive('readNzbContents')->andReturn($xml);
+        });
+        $this->mock(NNTPService::class, function ($mock): void {
+            $mock->shouldReceive('doConnect')->with(false)->andReturn(true);
+            $mock->shouldReceive('verificationArticle')->with('a@b', 1048576)->andReturn(YencArticles::part('11111', 'movie.mkv', 15, 1, 1, 3));
+            $mock->shouldReceive('doQuit')->andReturn(null);
+        });
+
+        $this->audit(4);
+
+        $this->assertSame([1 => 'sampled', 2 => 'unknown', 3 => 'unrepairable', 4 => 'sampled'], array_column($this->records(), 'verdict', 'id'));
+    }
+
+    public function test_a_partial_awaiting_late_articles_is_retried_without_reading_its_nzb(): void
+    {
+        Schema::table('releases', function (Blueprint $table): void {
+            $table->unsignedBigInteger('late_article_candidate_id')->nullable();
+        });
+        $this->release(1);
+        DB::table('releases')->where('id', 1)->update(['late_article_candidate_id' => 9]);
+        $this->mock(NzbService::class)->shouldNotReceive('readNzbContents');
+
+        $this->audit();
+
+        $this->assertSame([['id' => 1, 'verdict' => 'unknown']], array_map(fn (array $record): array => ['id' => $record['id'], 'verdict' => $record['verdict']], $this->records()));
+        $this->assertTrue(DB::table('release_verification_audit_retries')->where('release_id', 1)->exists(), 'It is audited once settled.');
     }
 
     public function test_sample_budget_exhaustion_can_recover_on_a_later_resume(): void
@@ -304,6 +354,19 @@ class ReleaseVerificationAuditRetriesTest extends TestCase
         app(VerificationResetService::class)->run(static function (): void {});
         $this->assertSame(0, DB::table('release_verification_scratch')->count());
         $this->assertDirectoryDoesNotExist($new);
+    }
+
+    public function test_verification_reset_releases_partials_fenced_by_deleted_candidates(): void
+    {
+        Schema::table('releases', function (Blueprint $table): void {
+            $table->unsignedBigInteger('late_article_candidate_id')->nullable();
+        });
+        $this->release(1);
+        DB::table('releases')->where('id', 1)->update(['late_article_candidate_id' => 7]);
+
+        app(VerificationResetService::class)->run(static function (): void {});
+
+        $this->assertNull(DB::table('releases')->where('id', 1)->value('late_article_candidate_id'), 'Its candidate is gone; workers may process it.');
     }
 
     public function test_terminal_audit_symlink_target_and_index_are_preserved(): void

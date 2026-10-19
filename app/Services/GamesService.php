@@ -754,6 +754,7 @@ class GamesService
         $query = Release::query()
             ->where('gamesinfo_id', '=', 0)
             ->where('categories_id', '=', Category::PC_GAMES);
+        Release::whereNzbSettled($query);
 
         if ($guidChar !== '') {
             $query->where('leftguid', 'like', $guidChar.'%');
@@ -781,11 +782,13 @@ class GamesService
             Log::info('GamesService: Starting processing', ['count' => $res->count()]);
 
             $releaseUpdates = [];
+            $releaseNames = [];
 
             foreach ($res as $arr) {
                 $this->processedCount++;
                 $this->maxHitRequest = false;
 
+                $releaseNames[$arr['id']] = $arr['searchname'];
                 $gameInfo = $this->parseTitle($arr['searchname']);
 
                 if ($gameInfo !== false) {
@@ -819,7 +822,7 @@ class GamesService
             }
 
             // Batch update releases
-            $this->batchUpdateReleases($releaseUpdates);
+            $this->batchUpdateReleases($releaseUpdates, $releaseNames);
 
             $elapsed = round(microtime(true) - $startTime, 2);
 
@@ -860,8 +863,9 @@ class GamesService
      * Batch update release records with game IDs.
      *
      * @param  array<string, mixed>  $updates
+     * @param  array<int|string, string>  $searchnames  Release id => searchname the lookup used; omitted ids are not guarded.
      */
-    protected function batchUpdateReleases(array $updates): void
+    protected function batchUpdateReleases(array $updates, array $searchnames = []): void
     {
         if (empty($updates)) {
             return;
@@ -871,9 +875,11 @@ class GamesService
             DB::beginTransaction();
 
             foreach ($updates as $releaseId => $gameId) {
+                // Only for the title it was matched on: an upgrade may have renamed it meanwhile.
                 Release::query()
                     ->where('id', '=', $releaseId)
                     ->where('categories_id', '=', Category::PC_GAMES)
+                    ->when(isset($searchnames[$releaseId]), static fn ($q) => $q->where('searchname', $searchnames[$releaseId]))
                     ->update(['gamesinfo_id' => $gameId]);
             }
 
@@ -890,6 +896,7 @@ class GamesService
                     Release::query()
                         ->where('id', '=', $releaseId)
                         ->where('categories_id', '=', Category::PC_GAMES)
+                        ->when(isset($searchnames[$releaseId]), static fn ($q) => $q->where('searchname', $searchnames[$releaseId]))
                         ->update(['gamesinfo_id' => $gameId]);
                 } catch (\Exception $e) {
                     Log::error('GamesService: Failed to update release', [

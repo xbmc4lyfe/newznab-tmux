@@ -68,6 +68,15 @@ class CleanNZB extends Command
 
         // Checking filename GUIDs against the releases table
         foreach ($itr as $filePath) {
+            // Side files belong to --temps, which ages them out whether or not a release exists.
+            if (NzbService::isTemporaryNzbPathName((string) $filePath)) {
+                continue;
+            }
+            if (NzbService::isStagedNzbPathName((string) $filePath)) {
+                $this->reconcileStaleStagedNzb((string) $filePath, $delete, $checked, $deleted);
+
+                continue;
+            }
             $guid = stristr($filePath->getFilename(), '.nzb.gz', true);
             if (File::isFile($filePath) && $guid) {
                 // If NZB file guid is not present in DB delete the file from disk
@@ -90,6 +99,58 @@ class CleanNZB extends Command
         $this->info("Checked: $checked / Deleted: $deleted");
     }
 
+    private function reconcileStaleStagedNzb(string $path, mixed $delete, int &$checked, int &$deleted): void
+    {
+        $nzb = app(NzbService::class);
+        $olderThanSeconds = max(1, (int) $this->option('temp-age-hours')) * 3600;
+        $checked++;
+        $outcome = $nzb->reconcileStaleStagedNzb($path, $olderThanSeconds, apply: (bool) $delete);
+        if ($outcome === 'deleted') {
+            $deleted++;
+        }
+        if ($outcome !== 'kept' || $nzb->isStaleStagedNzb($path, $olderThanSeconds)) {
+            $this->line($this->stagedOutcomeLine($outcome, (bool) $delete, $path));
+        }
+    }
+
+    private function stagedOutcomeLine(string $outcome, bool $delete, string $path): string
+    {
+        return match ($outcome) {
+            'applied' => ($delete ? 'Applied' : 'Would apply').' staged NZB generation: '.$path,
+            'deleted' => ($delete ? 'Deleted' : 'Would delete').' staged NZB generation: '.$path,
+            default => 'Kept staged NZB generation for review: '.$path,
+        };
+    }
+
+    private function hasNzbOnDisk(NzbService $nzb, string $guid, bool $delete): bool
+    {
+        if ($nzb->nzbPath($guid) !== false) {
+            return true;
+        }
+        // A committed upgrade's NZB may still be staged beside the missing canonical file.
+        $guard = app(NzbSourceGuard::class);
+        if ($delete) {
+            if ($guard->settleStagedGenerations($guid) && $nzb->nzbPath($guid) !== false) {
+                return true;
+            }
+            // A staged generation that could not be put in place may be the only copy of the committed source.
+            $kept = $guard->stagedGenerations($guid);
+            foreach ($kept as $path) {
+                $this->line($this->stagedOutcomeLine('kept', true, $path));
+            }
+
+            return $kept !== [];
+        }
+        // A dry run changes no file: it reports what --delete would do, which keeps any release with a staged generation.
+        $staged = $guard->stagedGenerations($guid);
+        foreach ($staged as $path) {
+            $outcome = $guard->reconcileStaged($path, apply: false);
+            $this->line($this->stagedOutcomeLine($outcome === 'applied' ? 'applied' : 'kept', false, $path));
+        }
+
+        return $staged !== [];
+    }
+
     private function GetReleasesWithNoNZBOnDisk(mixed $delete = false): void
     {
         // Setup
@@ -105,7 +166,7 @@ class CleanNZB extends Command
             echo 'Total done: '.$checked."\r";
             foreach ($releases as $r) {
 
-                if (! $nzb->nzbPath($r->guid)) {
+                if (! $this->hasNzbOnDisk($nzb, (string) $r->guid, (bool) $delete)) {
                     if ($delete) {
                         $releaseManagement->deleteSingleWithService(['g' => $r->guid, 'i' => $r->id], $nzb, new ReleaseImageService);
                     }
@@ -123,26 +184,35 @@ class CleanNZB extends Command
         $nzb = app(NzbService::class);
         $ageHours = max(1, (int) $this->option('temp-age-hours'));
         $olderThanSeconds = $ageHours * 3600;
+        $outcomes = ['deleted' => 0, 'applied' => 0, 'kept' => 0];
 
-        if (! $delete) {
-            $paths = $nzb->findStaleTemporaryNzbPaths($olderThanSeconds);
-            foreach ($paths as $path) {
-                $this->line("Would delete stale temporary NZB: {$path}");
+        foreach ($nzb->findStaleTemporaryNzbPaths($olderThanSeconds) as $path) {
+            if (NzbService::isStagedNzbPathName($path)) {
+                // A staged generation is settled by its upgrade's outcome, never just deleted.
+                $outcome = $nzb->reconcileStaleStagedNzb($path, $olderThanSeconds, apply: (bool) $delete);
+                $outcomes[$outcome]++;
+                $this->line($this->stagedOutcomeLine($outcome, (bool) $delete, $path));
+
+                continue;
             }
+            if (! $delete) {
+                $outcomes['deleted']++;
+                $this->line("Would delete stale temporary NZB: {$path}");
 
-            $this->info('Checked stale temporary NZBs: '.count($paths).' would be deleted.');
-
-            return;
+                continue;
+            }
+            if ($nzb->deleteStaleTemporaryNzb($path)) {
+                $outcomes['deleted']++;
+            } else {
+                $outcomes['kept']++;
+                $this->warn("Could not delete stale temporary NZB: {$path}");
+            }
         }
 
-        $deleted = $nzb->cleanupStaleTemporaryNzbs($olderThanSeconds);
-        if ($deleted > 0) {
-            Log::channel('nzb_creation')->warning('Deleted stale temporary NZB files', [
-                'count' => $deleted,
-                'older_than_hours' => $ageHours,
-            ]);
+        if ($delete && $outcomes['deleted'] + $outcomes['applied'] > 0) {
+            Log::channel('nzb_creation')->warning('Cleaned stale temporary NZB files', $outcomes + ['older_than_hours' => $ageHours]);
         }
-
-        $this->info("Deleted stale temporary NZBs: {$deleted}");
+        $this->info(sprintf('%s stale temporary NZBs: %d deleted, %d applied, %d kept.', $delete ? 'Cleaned' : 'Checked (dry run)',
+            $outcomes['deleted'], $outcomes['applied'], $outcomes['kept']));
     }
 }

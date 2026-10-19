@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Tmux;
 
 use App\Models\Category;
+use App\Models\Release;
 use App\Services\AdditionalProcessing\AdditionalCandidateQuery;
 use App\Services\BookProcessingCandidateQuery;
 use App\Services\Configuration\ConfigurationProvider;
@@ -379,7 +380,7 @@ class Tmux
             return '0 = 1';
         }
 
-        return $condition.($renamedOnly && $lookupMode === 2 ? ' AND isrenamed = 1' : '');
+        return $condition.($renamedOnly && $lookupMode === 2 ? ' AND isrenamed = 1' : '').' AND '.Release::nzbSettledSql('r');
     }
 
     /**

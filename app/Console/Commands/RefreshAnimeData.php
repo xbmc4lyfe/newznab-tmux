@@ -71,6 +71,8 @@ class RefreshAnimeData extends Command
         $query = Release::query()
             ->select(['releases.id', 'releases.anidbid', 'releases.searchname'])
             ->where('categories_id', Category::TV_ANIME);
+        // A partial awaiting late articles is renamed when they arrive; look it up once it settles.
+        Release::whereNzbSettled($query);
 
         // If retry-failed, only get releases with anidbid <= 0 (failed processing)
         if ($retryFailed) {
@@ -242,6 +244,8 @@ class RefreshAnimeData extends Command
                     // Update release with the anidbid
                     Release::query()
                         ->where('id', $release->id)
+                        // Only for the title it was matched on: an upgrade may have renamed it meanwhile.
+                        ->where('searchname', $release->searchname)
                         ->update(['anidbid' => $anidbid]);
 
                     $successful++;
