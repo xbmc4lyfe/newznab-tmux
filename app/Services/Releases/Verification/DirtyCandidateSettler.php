@@ -38,19 +38,13 @@ final class DirtyCandidateSettler
         $cursor = Cache::get(self::CURSOR);
         $valid = static fn (mixed $at, mixed $id): bool => is_string($at) && is_numeric($id);
         $after = is_array($cursor) && $valid($cursor['at'] ?? null, $cursor['id'] ?? null) ? ['at' => $cursor['at'], 'id' => (int) $cursor['id']] : null;
-        // Each sweep ends at the newest candidate dirty when it began, so it always comes round again to those
-        // it passed over (not ready, kept, failed) however many become dirty while it runs.
+        // Each sweep ends at the time it began, so it always comes round again to those it passed over (not
+        // ready, kept, failed) however many become dirty while it runs: archive() moves a settled candidate's
+        // next attempt to now, and a dirty one keeps its own, which may lie days ahead until it falls due.
         $upper = is_array($cursor) && $valid($cursor['upper_at'] ?? null, $cursor['upper_id'] ?? null)
             ? ['at' => $cursor['upper_at'], 'id' => (int) $cursor['upper_id']] : null;
         if ($upper === null) {
-            $newest = DB::table('release_verification_candidates')->where('status', 'dirty')->orderByDesc('next_attempt_at')->orderByDesc('id')
-                ->first(['id', 'next_attempt_at']);
-            if ($newest === null) {
-                Cache::forget(self::CURSOR);
-
-                return $totals;
-            }
-            $upper = ['at' => (string) $newest->next_attempt_at, 'id' => (int) $newest->id];
+            $upper = ['at' => now()->format('Y-m-d H:i:s'), 'id' => PHP_INT_MAX];
             $after = null;
         }
         $rows = DB::table('release_verification_candidates')->where('status', 'dirty')

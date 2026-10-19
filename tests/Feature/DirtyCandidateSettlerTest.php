@@ -8,6 +8,7 @@ use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\DirtyCandidateSettler;
 use App\Services\Releases\Verification\ManifestStore;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -152,6 +153,33 @@ class DirtyCandidateSettlerTest extends ReleaseVerificationCandidatesTest
         }
 
         $this->assertTrue($settled, 'The candidate it passed over is reached again.');
+    }
+
+    public function test_a_sweep_ends_at_its_start_though_a_hot_upload_and_a_future_attempt_would_keep_it_going(): void
+    {
+        $this->releasesTable();
+        Carbon::setTestNow('2026-10-19 15:00:00');
+        $waiting = $this->dirtyCandidate('waiting');
+        DB::table('collections')->where('id', $waiting)->update(['filecheck' => 1]);
+        $this->dirtyCandidate('hot');
+        $future = $this->dirtyCandidate('future');
+        DB::table('release_verification_candidates')->where('source_identity', bin2hex(sha1('future', true)))->update(['next_attempt_at' => '2026-10-20 15:00:00']);
+        app(DirtyCandidateSettler::class)->settle(1, 20);
+        DB::table('collections')->where('id', $waiting)->update(['filecheck' => 3]);
+
+        $settled = false;
+        for ($minute = 1; $minute <= 6 && ! $settled; $minute++) {
+            Carbon::setTestNow(Carbon::parse('2026-10-19 15:00:00')->addMinutes($minute));
+            // The hot upload gets another late article every minute.
+            $late = $this->upload('hot', 2 + $minute);
+            DB::transaction(fn () => app(CandidateRepository::class)->invalidateHotCollections([$late]));
+            app(DirtyCandidateSettler::class)->settle(1, 20);
+            $settled = DB::table('release_verification_candidates')->where('source_identity', bin2hex(sha1('waiting', true)))->value('status') !== 'dirty';
+        }
+        Carbon::setTestNow();
+
+        $this->assertTrue($settled, 'The candidate it passed over is reached again within a few runs.');
+        $this->assertTrue(DB::table('collections')->where('id', $future)->exists(), 'One not yet due waits for a sweep that starts after it falls due.');
     }
 
     public function test_the_preparer_settles_dirty_candidates(): void
