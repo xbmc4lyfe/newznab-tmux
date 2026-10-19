@@ -308,7 +308,7 @@ class ForwardVerifiedPublications extends Command
         $margin = min(self::LINGER_AGE_MARGIN_SECONDS, $maxAge / 2);
         // One pass over the outbox: a full batch, urgent or already tried work is sent at once.
         $survey = $this->outbox->survey($wall, $this->slot, $this->limit, $margin);
-        if ($survey['urgent'] || $survey['retried'] || $survey['oldest'] === null || $survey['fresh'] >= $this->limit) {
+        if ($survey['urgent'] || $survey['retried'] || $survey['oldest'] === null || $survey['fresh'] >= $this->limit || $this->outboxFull()) {
             return true;
         }
         $age = max(0.0, $wall - $survey['oldest']);
@@ -365,7 +365,7 @@ class ForwardVerifiedPublications extends Command
             // other forwarders requeue into pending meanwhile is seen here too.
             if ($expired || $steps % self::LINGER_FILL_STEPS === 0) {
                 $poll = $this->outbox->survey($now, $this->slot, $this->limit, $margin);
-                if ($poll['fresh'] >= $this->limit) {
+                if ($poll['fresh'] >= $this->limit || $this->outboxFull()) {
                     $this->diagnostics?->lingerEnded('fill', $waited);
 
                     return true;
@@ -382,6 +382,15 @@ class ForwardVerifiedPublications extends Command
                 return true;
             }
         }
+    }
+
+    /**
+     * Whether the outbox holds as many entries (waiting or in flight, every forwarder's) as workers may
+     * hand off: they then block for room, so no batch can fill further and waiting only throttles them.
+     */
+    private function outboxFull(): bool
+    {
+        return $this->outbox->depth() >= PublicationOutbox::capacity();
     }
 
     /** Join the shared worker group, which a drain, an exclusive holder or a pause refuses. */

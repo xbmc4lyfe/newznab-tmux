@@ -2984,4 +2984,49 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->assertLinger($summaries[0], 1, 0, 0, 1);
         $this->assertSame([1], $this->batchSizes);
     }
+
+    public function test_a_full_outbox_counts_as_a_filled_batch_before_the_wait(): void
+    {
+        $this->batchSchema(releases: 2);
+        $this->configureAsync();
+        // Workers block at two entries, so a batch of sixteen can never fill.
+        config(['release_verification.publish_forward_linger_ms' => 30000, 'release_verification.publish_forward_items' => 16, 'release_verification.publish_outbox_max' => 2]);
+        $this->handOffMany(2);
+        $this->servePrimary();
+        Sleep::fake(syncWithCarbon: true);
+        $summaries = [];
+        $this->captureSummaries($summaries, 'Publication forwarder run summary.');
+
+        $this->forward(['--diagnostics' => true]);
+
+        Sleep::assertNeverSlept();
+        $this->assertSame([2], $this->batchSizes);
+        $this->assertLinger($summaries[0], 0, 0, 0, 0);
+    }
+
+    public function test_the_wait_ends_as_filled_when_the_outbox_reaches_its_capacity(): void
+    {
+        $this->batchSchema(releases: 3);
+        $this->configureAsync();
+        config(['release_verification.publish_forward_linger_ms' => 30000, 'release_verification.publish_forward_items' => 16, 'release_verification.publish_outbox_max' => 3]);
+        $this->handOffMany(2);
+        $late = $this->claimedCandidate('3@article');
+        $sleeps = 0;
+        $this->servePrimary();
+        Sleep::fake(syncWithCarbon: true);
+        Sleep::whenFakingSleep(function () use (&$sleeps, $late): void {
+            if (++$sleeps === 2) {
+                $this->handOff($late);
+            }
+        });
+        $summaries = [];
+        $this->captureSummaries($summaries, 'Publication forwarder run summary.');
+
+        $this->forward(['--diagnostics' => true]);
+
+        // The third hand-off fills the outbox; the next look ends the wait at once rather than after 30 s.
+        $this->assertSame(5, $sleeps);
+        $this->assertLinger($summaries[0], 1, 1, 0, 0);
+        $this->assertSame([3], $this->batchSizes);
+    }
 }

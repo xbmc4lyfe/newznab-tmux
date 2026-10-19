@@ -82,6 +82,12 @@ final class PublicationOutbox
         return max(0, min(self::MAX_LINGER_MILLISECONDS, (int) config('release_verification.publish_forward_linger_ms', 0)));
     }
 
+    /** Entries (waiting or being sent) at which workers stop handing off and wait for room. */
+    public static function capacity(): int
+    {
+        return max(1, (int) config('release_verification.publish_outbox_max', 256));
+    }
+
     /** Seconds an entry may wait before it is finished unknown and left to be re-verified. */
     public static function maxAgeSeconds(): float
     {
@@ -244,7 +250,7 @@ final class PublicationOutbox
      */
     public function awaitRoom(callable $heartbeat, float $seconds, ?int $limit = null): bool
     {
-        $limit ??= max(1, (int) config('release_verification.publish_outbox_max', 256));
+        $limit ??= self::capacity();
         $deadline = microtime(true) + $seconds;
         while (true) {
             if (! $this->forwarderAlive()) {
