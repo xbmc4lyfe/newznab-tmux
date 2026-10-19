@@ -169,6 +169,28 @@ class OversizedCollectionDeferralTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(0, DB::table('release_verification_oversized_collections')->count(), 'Its deferral goes with it.');
     }
 
+    public function test_a_deferral_survives_when_a_new_article_holds_back_the_expired_deletion(): void
+    {
+        $oversized = $this->upload('oversized', 600);
+        $this->createReleases();
+        DB::table('collections')->where('id', $oversized)->update(['dateadded' => '2026-10-01 00:00:00']);
+        $injected = false;
+        DB::listen(static function (QueryExecuted $event) use (&$injected, $oversized): void {
+            if (! $injected && str_contains($event->sql, 'from "release_verification_candidates"')
+                && str_contains($event->sql, '"source_identity" in')) {
+                $injected = true;
+                DB::table('collections')->where('id', $oversized)->update(['dateadded' => now()]);
+            }
+        });
+
+        $this->sweep();
+
+        $this->assertTrue($injected);
+        $this->assertTrue(DB::table('collections')->where('id', $oversized)->exists());
+        $this->assertSame($oversized, (int) DB::table('release_verification_oversized_collections')->value('collection_id'),
+            'A collection the locked recheck keeps keeps its deferral.');
+    }
+
     public function test_late_headers_that_would_push_a_pending_candidate_over_budget_are_kept_apart_for_a_later_pass(): void
     {
         // Each fits the budget on its own (45,600 bytes); merged they do not.
