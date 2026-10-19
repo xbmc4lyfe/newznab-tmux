@@ -219,6 +219,18 @@ final class CleanNzbStagedGenerationTest extends TestCase
         self::assertFileExists($this->staged);
     }
 
+    public function test_a_notondisk_dry_run_keeps_a_release_whose_staged_generation_would_be_kept(): void
+    {
+        $this->missingCanonicalWithStagedGeneration();
+        DB::table('release_archive_naming_evidence')->update(['source_sha256' => NzbSourceGuard::digest('newer')]);
+
+        $output = $this->clean(['--notondisk' => true]);
+
+        self::assertStringContainsString('Kept staged NZB generation for review: '.$this->staged, $output);
+        self::assertStringNotContainsString('Deleted: Movie', $output, 'The dry run reports what --delete would do.');
+        self::assertFileExists($this->staged);
+    }
+
     private function missingCanonicalWithStagedGeneration(): void
     {
         Schema::table('releases', static function (Blueprint $table): void {

@@ -141,16 +141,14 @@ class CleanNZB extends Command
 
             return $kept !== [];
         }
-        // A dry run changes no file: it reports the generation it would install instead.
-        $found = false;
-        foreach ($guard->stagedGenerations($guid) as $path) {
-            if ($guard->reconcileStaged($path, apply: false) === 'applied') {
-                $this->line($this->stagedOutcomeLine('applied', false, $path));
-                $found = true;
-            }
+        // A dry run changes no file: it reports what --delete would do, which keeps any release with a staged generation.
+        $staged = $guard->stagedGenerations($guid);
+        foreach ($staged as $path) {
+            $outcome = $guard->reconcileStaged($path, apply: false);
+            $this->line($this->stagedOutcomeLine($outcome === 'applied' ? 'applied' : 'kept', false, $path));
         }
 
-        return $found;
+        return $staged !== [];
     }
 
     private function GetReleasesWithNoNZBOnDisk(mixed $delete = false): void

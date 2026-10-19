@@ -348,13 +348,11 @@ final class VerifiedReleasePublisher
             // Hold the nominated published row stable while reading its retained generation.
             $row = DB::table('releases')->where('id', $candidate->id)->where('nzbstatus', NzbService::NZB_ADDED)
                 ->lockForUpdate()->first(['id', 'guid']);
-            // A committed upgrade's NZB may still be staged: coverage reads the generation the row describes.
+            // A committed upgrade's NZB may still be staged: coverage reads the generation the row describes. Settled
+            // through the row lock already held (by id, then the source lock, as every settle path takes them); a
+            // database error ends this publication rather than continue outside its rolled-back transaction.
             if ($row !== null && is_string($row->guid) && $guard->hasStagedGenerations($row->guid)) {
-                try {
-                    $guard->settleStagedGenerations($row->guid);
-                } catch (Throwable $e) {
-                    Log::warning('Could not settle a staged NZB generation before a coverage check.', ['release_id' => $row->id, 'error' => $e->getMessage()]);
-                }
+                $guard->withLockedSource($row, static fn (): null => null);
             }
         };
         $coverage = new NzbArticleCoverage(app(NzbService::class), $this->duplicates);
