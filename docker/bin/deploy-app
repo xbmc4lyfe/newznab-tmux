@@ -50,6 +50,7 @@ barrier_held=0
 barrier_keep=0
 database_fresh=0
 fresh_on_up=0
+fresh_old_id=
 # A barrier is adopted only while it fences this rollout's database: its lock session and durable
 # pause live on the database it was started against.
 refuse_foreign_barrier() {
@@ -177,7 +178,8 @@ apply_up() {
     plan --verify-images "$svc"
     plan "$mark" "$svc"
     # Set only once the container is about to change: an earlier failure leaves the old one running.
-    [ "$fresh_on_up" != 1 ] || database_fresh=1
+    # A reconcile that leaves the container untouched keeps it fenced: the trap compares its ID.
+    if [ "$fresh_on_up" = 1 ]; then fresh_old_id=$(compose ps -a -q "$svc"); database_fresh=1; fi
     if [ "$mark" = --pending ]; then
         compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" --pull never "$svc"
     else
@@ -254,6 +256,9 @@ resume() {
     rc=$?
     # Recovery must finish even if a second signal arrives (e.g. a terminal's INT plus the guard's).
     trap '' INT TERM HUP
+    if [ "$database_fresh" = 1 ] && [ -n "$fresh_old_id" ] && [ "$(compose ps -a -q "$DATABASE_SERVICE" 2>/dev/null)" = "$fresh_old_id" ]; then
+        database_fresh=0  # The same container as before (a no-op reconcile): still fenced.
+    fi
     if [ "$database_fresh" = 1 ]; then
         # Started or recreated by this run but never fenced (replacement storage has no pause): stop
         # it again before anything else, so no remote worker reaches it unmigrated; the retry

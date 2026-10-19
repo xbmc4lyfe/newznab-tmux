@@ -1767,6 +1767,21 @@ SH);
         $this->assertStringNotContainsString(' stop mariadb', $this->events());
     }
 
+    public function test_an_untouched_reconciled_database_is_not_stopped_when_its_fresh_barrier_fails(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        // No record for it (e.g. a legacy stamp): it is reconciled, and the no-op `up` keeps its container.
+        $stamp = $this->directory.'/docker/.deploy.stamp';
+        file_put_contents($stamp, (string) preg_replace(['/^[^\n]*\n/', '/^service:mariadb=.*\n/m'], ["stale\n", ''], (string) file_get_contents($stamp), 1));
+        file_put_contents($this->directory.'/events', '');
+
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_BARRIER_FAIL_AFTER' => '--wait --wait-timeout 240 --pull never mariadb']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('up -d --no-deps --wait --wait-timeout 240 --pull never mariadb', $this->events());
+        $this->assertStringNotContainsString(' stop mariadb', $this->events());
+    }
+
     public function test_a_foreign_barrier_is_refused_before_a_missing_database_is_started(): void
     {
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
