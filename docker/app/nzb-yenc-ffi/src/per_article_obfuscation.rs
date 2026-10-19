@@ -27,7 +27,7 @@ struct Signature {
 }
 
 /// Marked article numbers, distinct and ascending; `None` declines (a subject longer than
-/// `MAX_SUBJECT_LENGTH` or an integer field PHP would saturate), so the caller keeps the PHP result.
+/// `MAX_SUBJECT_LENGTH`), so the caller keeps the PHP result.
 pub fn mark(articles: &[Article<'_>], min_articles: usize) -> Option<Vec<i64>> {
     if min_articles == 0 {
         return Some(Vec::new());
@@ -47,11 +47,11 @@ pub fn mark(articles: &[Article<'_>], min_articles: usize) -> Option<Vec<i64>> {
         if !has_token(name) {
             continue;
         }
-        let total_value = php_int(total)?;
+        let total_value = php_int(total);
         if total_value < 2 {
             continue;
         }
-        let part_value = php_int(part)?;
+        let part_value = php_int(part);
         key.clear();
         normalized.clear();
         shape_and_normalized(name, &mut key, &mut normalized);
@@ -219,17 +219,14 @@ fn parenthesized(subject: &[u8], at: usize) -> Option<(&[u8], &[u8])> {
     Some((part, &subject[cursor..cursor + total_length]))
 }
 
-/// PHP's `(int)` of an ASCII digit string; `None` where PHP would saturate.
-fn php_int(digits: &[u8]) -> Option<i64> {
-    let significant = &digits[digits.iter().take_while(|byte| **byte == b'0').count()..];
-    if significant.len() > 18 {
-        return None;
-    }
-    Some(
-        significant
-            .iter()
-            .fold(0_i64, |value, byte| value * 10 + i64::from(byte - b'0')),
-    )
+/// PHP's `(int)` of an ASCII digit string, which saturates at `i64::MAX`.
+fn php_int(digits: &[u8]) -> i64 {
+    digits
+        .iter()
+        .try_fold(0_i64, |value, byte| {
+            value.checked_mul(10)?.checked_add(i64::from(byte - b'0'))
+        })
+        .unwrap_or(i64::MAX)
 }
 
 fn alnum_runs(name: &[u8]) -> impl Iterator<Item = (usize, usize)> + '_ {
@@ -450,8 +447,10 @@ mod tests {
             normalized_name(b"short7.part07.rar"),
             b"short.part.rar".to_vec()
         );
-        assert_eq!(php_int(b"0000000000000000000000002"), Some(2));
-        assert_eq!(php_int(b"9999999999999999999"), None);
+        assert_eq!(php_int(b"0000000000000000000000002"), 2);
+        assert_eq!(php_int(b"9223372036854775807"), i64::MAX);
+        assert_eq!(php_int(b"9223372036854775808"), i64::MAX);
+        assert_eq!(php_int(b"000009999999999999999999"), i64::MAX);
     }
 
     /// The previous direct translation of the PCRE search (cubic on whitespace), kept as the

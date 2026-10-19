@@ -869,34 +869,54 @@ pub unsafe extern "C" fn nntmux_header_filename_identity_v1(
         .map_or(-1, c_int::from)
 }
 
-/// Rust port of `HeaderParser::markPerArticleObfuscated()`. `records` holds one record per
-/// article: its number as a little-endian i64, the subject length as a little-endian u32, then the
-/// subject bytes. Marked article numbers are written to `output` as little-endian i64s and their
-/// count is returned. `usize::MAX` declines (malformed records, too little output space, a subject
-/// longer than 512 bytes, or an integer field PHP would saturate) so the caller keeps the PHP
-/// result.
+/// Rust port of `HeaderParser::markPerArticleObfuscated()` over `count` articles: `numbers` holds
+/// their numbers as little-endian i64s, `lengths` their subject lengths as little-endian u32s, and
+/// `subjects` the subjects back to back. Marked article numbers are written to `output` as
+/// little-endian i64s and their count is returned. `usize::MAX` declines (inconsistent lengths, too
+/// little output space, or a subject longer than 512 bytes) so the caller keeps the PHP result.
 ///
 /// # Safety
-/// `records` is readable for `records_len` bytes and `output` writable for `output_capacity`
-/// bytes whenever the respective length is nonzero.
+/// `numbers` is readable for `count * 8` bytes, `lengths` for `count * 4`, `subjects` for
+/// `subjects_len` and `output` writable for `output_capacity` bytes whenever that size is nonzero.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn nntmux_per_article_obfuscation_v1(
-    records: *const u8,
-    records_len: usize,
+pub unsafe extern "C" fn nntmux_per_article_obfuscation_v2(
+    numbers: *const u8,
+    lengths: *const u8,
+    count: usize,
+    subjects: *const u8,
+    subjects_len: usize,
     min_articles: usize,
     output: *mut u8,
     output_capacity: usize,
 ) -> usize {
-    if (records_len > 0 && records.is_null()) || (output_capacity > 0 && output.is_null()) {
+    let (Some(number_bytes), Some(length_bytes)) = (count.checked_mul(8), count.checked_mul(4))
+    else {
+        return DECODE_FAILED;
+    };
+    if (count > 0 && (numbers.is_null() || lengths.is_null()))
+        || (subjects_len > 0 && subjects.is_null())
+        || (output_capacity > 0 && output.is_null())
+    {
         return DECODE_FAILED;
     }
-    let records: &[u8] = if records_len == 0 {
+    let (numbers, lengths): (&[u8], &[u8]) = if count == 0 {
+        (&[], &[])
+    } else {
+        // SAFETY: the caller supplies readable arrays of the checked sizes.
+        unsafe {
+            (
+                slice::from_raw_parts(numbers, number_bytes),
+                slice::from_raw_parts(lengths, length_bytes),
+            )
+        }
+    };
+    let subjects: &[u8] = if subjects_len == 0 {
         &[]
     } else {
         // SAFETY: the caller supplies readable input of the checked length.
-        unsafe { slice::from_raw_parts(records, records_len) }
+        unsafe { slice::from_raw_parts(subjects, subjects_len) }
     };
-    let Some(articles) = per_article_obfuscation_records(records) else {
+    let Some(articles) = per_article_obfuscation_articles(numbers, lengths, subjects) else {
         return DECODE_FAILED;
     };
     let Ok(Some(marked)) = catch_unwind(|| per_article_obfuscation::mark(&articles, min_articles))
@@ -917,25 +937,30 @@ pub unsafe extern "C" fn nntmux_per_article_obfuscation_v1(
     marked.len()
 }
 
-fn per_article_obfuscation_records(
-    mut records: &[u8],
-) -> Option<Vec<per_article_obfuscation::Article<'_>>> {
-    let mut articles = Vec::new();
-    while !records.is_empty() {
-        let (number, rest) = records.split_first_chunk::<8>()?;
-        let (length, rest) = rest.split_first_chunk::<4>()?;
+fn per_article_obfuscation_articles<'a>(
+    numbers: &[u8],
+    lengths: &[u8],
+    mut subjects: &'a [u8],
+) -> Option<Vec<per_article_obfuscation::Article<'a>>> {
+    let mut articles = Vec::with_capacity(lengths.len() / 4);
+    for (number, length) in numbers
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .zip(lengths.as_chunks::<4>().0)
+    {
         let length = usize::try_from(u32::from_le_bytes(*length)).ok()?;
-        if rest.len() < length {
+        if subjects.len() < length {
             return None;
         }
-        let (subject, rest) = rest.split_at(length);
+        let (subject, rest) = subjects.split_at(length);
         articles.push(per_article_obfuscation::Article {
             number: i64::from_le_bytes(*number),
             subject,
         });
-        records = rest;
+        subjects = rest;
     }
-    Some(articles)
+    subjects.is_empty().then_some(articles)
 }
 
 /// The PCRE version (NUL-terminated, static) whose Unicode classes this library's header filename

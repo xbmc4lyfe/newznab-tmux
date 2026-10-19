@@ -9,10 +9,10 @@ use Throwable;
 
 /**
  * Rust port of {@see HeaderParser::markPerArticleObfuscated()}, adopted after
- * scripts/benchmark-per-article-obfuscation.php measured it at 1.9-3.2x the PHP rule with identical
+ * scripts/benchmark-per-article-obfuscation.php measured it at 1.8-2.9x the PHP rule on the ranges it is routed to with identical
  * marks. Null means "use PHP": not a Linux CLI with FFI, library missing, failing its known-answer
  * probe, or input the native side declines (a subject longer than MAX_SUBJECT_LENGTH, where PHP's
- * backtrack limit could stop the subject pattern, or an integer field PHP would saturate).
+ * backtrack limit could stop the subject pattern).
  */
 final class NativePerArticleObfuscation
 {
@@ -26,6 +26,19 @@ final class NativePerArticleObfuscation
 
     /** Smaller ranges stay on PHP: Rust's margin there is under a millisecond and not reliably 1.5x. */
     public const int MIN_HEADERS = 1000;
+
+    /**
+     * Per-header cost in nanoseconds, [PHP rule, Rust with marshalling], by sampled class: no part
+     * count, a part count only, a candidate. Measured with scripts/benchmark-per-article-obfuscation.php
+     * on Linux arm64 (non-yEnc text, readable yEnc, and kenpsx/boneless strata).
+     */
+    private const array COSTS = [[100, 141], [270, 164], [1300, 500]];
+
+    /**
+     * A range goes to Rust when its predicted speedup reaches 2x. The prices run about a sixth
+     * optimistic on mixed ranges, so this keeps the measured speedup above the 1.5x rule.
+     */
+    private const int PREDICTED_SPEEDUP_PERCENT = 200;
 
     /** @var array<string, FFI|null> */
     private static array $libraries = [];
@@ -46,9 +59,8 @@ final class NativePerArticleObfuscation
      * Article numbers the PHP rule would mark, or null to keep the PHP result. These ranges stay
      * on PHP:
      * - under MIN_HEADERS, where Rust's margin is too small to establish;
-     * - where over a quarter of a spread sample has no part count, or under a third is a
-     *   multi-part subject with a 16+ alphanumeric token in its name, because the PHP rule
-     *   rejects other subjects faster than they can be packed for FFI;
+     * - where a spread sample, priced with COSTS, predicts under 2x: the PHP rule rejects
+     *   subjects without a part count faster than they can be handed to Rust;
      * - with any subject over MAX_SUBJECT_LENGTH, which Rust would decline.
      *
      * @param  array<int, array<string, mixed>>  $headers
@@ -85,18 +97,13 @@ final class NativePerArticleObfuscation
         // in one phase only.
         $samples = min(self::SAMPLE_MAX, max(self::SAMPLE_MIN, intdiv($count, 64)));
         $step = intdiv($count, $samples) | 1;
-        $sampled = $counted = $candidates = 0;
+        $php = $rust = 0;
         for ($i = intdiv($step, 2); $i < $count; $i += $step) {
-            $sampled++;
-            $kind = self::classify($values[$i]['Subject'] ?? null);
-            $counted += $kind > 0 ? 1 : 0;
-            $candidates += $kind === 2 ? 1 : 0;
+            [$phpCost, $rustCost] = self::COSTS[self::classify($values[$i]['Subject'] ?? null)];
+            $php += $phpCost;
+            $rust += $rustCost;
         }
-
-        // PHP rejects subjects without a part count, or without a token, in a regex or two, so Rust
-        // reaches 1.5x only when three quarters of the sample has a part count and a third
-        // are candidates.
-        if ($counted * 4 < $sampled * 3 || $candidates * 3 < $sampled) {
+        if ($php * 100 < $rust * self::PREDICTED_SPEEDUP_PERCENT) {
             return false;
         }
         // A subject Rust would decline sends the range to PHP before any packing.
@@ -150,8 +157,8 @@ final class NativePerArticleObfuscation
         self::$libraries[$key] = null;
         try {
             $library = FFI::cdef(
-                'size_t nntmux_per_article_obfuscation_v1(const char *records, size_t records_len, size_t min_articles,'
-                .' char *output, size_t output_capacity);',
+                'size_t nntmux_per_article_obfuscation_v2(const char *numbers, const char *lengths, size_t count,'
+                .' const char *subjects, size_t subjects_len, size_t min_articles, char *output, size_t output_capacity);',
                 $resolved,
             );
             $probe = [];
@@ -179,25 +186,22 @@ final class NativePerArticleObfuscation
         if ($minArticles < 1) {
             return [];
         }
-        $records = '';
-        $count = 0;
-        foreach ($headers as $header) {
-            if (! isset($header['Number'], $header['Subject']) || ! is_numeric($header['Number']) || ! is_string($header['Subject'])) {
-                continue;
-            }
-            if (strlen($header['Subject']) > self::MAX_SUBJECT_LENGTH) {
-                return null;
-            }
-            $records .= pack('PV', (int) $header['Number'], strlen($header['Subject'])).$header['Subject'];
-            $count++;
-        }
+        [$numbers, $subjects] = self::columns($headers);
+        $count = count($subjects);
         if ($count === 0) {
             return [];
         }
+        $lengths = array_map(strlen(...), $subjects);
+        if (max($lengths) > self::MAX_SUBJECT_LENGTH) {
+            return null;
+        }
+        $subjectBytes = implode('', $subjects);
         try {
             $output = $library->new('char['.($count * 8).']');
             // @phpstan-ignore method.notFound
-            $marked = $library->nntmux_per_article_obfuscation_v1($records, strlen($records), $minArticles, $output, $count * 8);
+            $marked = $library->nntmux_per_article_obfuscation_v2(
+                pack('P*', ...$numbers), pack('V*', ...$lengths), $count, $subjectBytes, strlen($subjectBytes), $minArticles, $output, $count * 8,
+            );
             if (! is_int($marked) || $marked < 0 || $marked > $count) {
                 return null;
             }
@@ -210,5 +214,33 @@ final class NativePerArticleObfuscation
         }
 
         return $numbers === false ? null : array_values(array_map('intval', $numbers));
+    }
+
+    /**
+     * Article numbers and subjects of the headers the PHP rule reads (a numeric Number and a string
+     * Subject), in order. Whole columns are taken in bulk when every header qualifies.
+     *
+     * @param  array<int, array<string, mixed>>  $headers
+     * @return array{list<int>, list<string>}
+     */
+    private static function columns(array $headers): array
+    {
+        $count = count($headers);
+        $numbers = array_column($headers, 'Number');
+        $subjects = array_column($headers, 'Subject');
+        if (count($numbers) === $count && count($subjects) === $count
+            && count(array_filter($numbers, is_int(...))) === $count
+            && count(array_filter($subjects, is_string(...))) === $count) {
+            return [$numbers, $subjects];
+        }
+        $numbers = $subjects = [];
+        foreach ($headers as $header) {
+            if (isset($header['Number'], $header['Subject']) && is_numeric($header['Number']) && is_string($header['Subject'])) {
+                $numbers[] = (int) $header['Number'];
+                $subjects[] = $header['Subject'];
+            }
+        }
+
+        return [$numbers, $subjects];
     }
 }

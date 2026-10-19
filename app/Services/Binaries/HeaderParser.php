@@ -75,7 +75,7 @@ final class HeaderParser
         if ($minArticles < 1) {
             return 0;
         }
-        // The Rust port marks the same articles about 2-3x faster (scripts/benchmark-per-article-obfuscation.php);
+        // The Rust port marks the same articles about 1.8-2.9x faster on ranges it is routed to (scripts/benchmark-per-article-obfuscation.php);
         // null means it is unavailable or declined, and the PHP rule below decides.
         $marked = $this->native === false ? null : $this->native->mark($headers, $minArticles);
         if ($marked !== null) {
