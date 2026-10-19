@@ -4,3 +4,7 @@
 .deploy.lock.recovery-hold
 .deploy.log
 .deploy.stamp
+.deploy.stamp.*
+.build.stamp.*
+.build.stamp
+.deploy.time

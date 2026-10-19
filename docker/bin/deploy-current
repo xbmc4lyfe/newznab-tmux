@@ -1,5 +1,7 @@
 #!/bin/sh
-# A matching source stamp only skips a deploy while every app service is healthy.
+# A matching source stamp only skips a deploy while every app service is healthy and on its expected
+# image, and no running data/infrastructure container runs an image other than its tag's local one.
+# --healthy checks app health only. deploy-app also runs this after a rollout before success.
 set -eu
 DIR=$(cd "$(dirname "$0")/.." && pwd)
 COMPOSE_FILE="${COMPOSE_FILE:-$DIR/docker-compose.yml}"
@@ -14,14 +16,38 @@ if [ "${1:-}" = --fingerprint ]; then
     fi
     exit 0
 fi
-expected=$(docker image inspect --format '{{.Id}}' "${APP_IMAGE:-nntmux/app:local}") || exit 1
+
+APP_IMAGE="${APP_IMAGE:-nntmux/app:local}"
+# Same resolution as bin/compose and bin/deploy-plan: a custom APP_IMAGE replaces blank or
+# default role tags, while an explicit custom role tag wins.
+service_image() {
+    default_role_img="nntmux/$1:local"
+    case "$1" in
+        web) role_img="${WEB_IMAGE:-}" ;;
+        horizon) role_img="${HORIZON_IMAGE:-}" ;;
+        scheduler) role_img="${SCHEDULER_IMAGE:-}" ;;
+        indexer) role_img="${INDEXER_IMAGE:-}" ;;
+    esac
+    if [ "$APP_IMAGE" != "nntmux/app:local" ] && { [ -z "$role_img" ] || [ "$role_img" = "$default_role_img" ]; }; then
+        printf '%s\n' "$APP_IMAGE"
+    else
+        printf '%s\n' "${role_img:-$default_role_img}"
+    fi
+}
+
 for service in web horizon scheduler indexer; do
     container=$(compose ps -q "$service") || exit 1
     [ -n "$container" ] || exit 1
     status=$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container") || exit 1
     [ "$status" = 'running healthy' ] || exit 1
     if [ "${1:-}" != --healthy ]; then
+        expected=$(docker image inspect --format '{{.Id}}' "$(service_image "$service")") || exit 1
         image=$(docker inspect --format '{{.Image}}' "$container") || exit 1
         [ "$image" = "$expected" ] || exit 1
     fi
 done
+if [ "${1:-}" != --healthy ]; then
+    # A pulled or rebuilt data/infra tag never changes the fingerprint; its container is stale.
+    stale=$("$DIR/bin/deploy-plan" --stale-images) || exit 1
+    [ -z "$stale" ] || exit 1
+fi

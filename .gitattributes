@@ -53,9 +53,11 @@ Dockerfile		-binary text
 /tests/Fixtures/rapidyenc-abi.c -binary text eol=lf
 
 # Reviewable, mergeable text despite the repository-wide `* binary` default
+Justfile		-binary text eol=lf
 docker/bin/deploy-guard	-binary text eol=lf
-docker/Makefile		-binary text eol=lf
+docker/Justfile		-binary text eol=lf
 /scripts/nzb_fingerprint.py	-binary text eol=lf
+/scripts/dotenv-get -binary text eol=lf
 /tests/Unit/test_nzb_fingerprint.py	-binary text eol=lf
 /scripts/benchmark-yenc-abi.py -binary text eol=lf
 /tests/Unit/test_yenc_abi_benchmark.py -binary text eol=lf
@@ -79,9 +81,11 @@ docker/Makefile		-binary text eol=lf
 /tests/Fixtures/ReleasePresentation.Dockerfile.dockerignore -binary text eol=lf
 
 # Guarded application rollout helpers are source, not binary artifacts.
+/docker/bin/build-images -binary text eol=lf
 /docker/bin/compose -binary text eol=lf
 /docker/bin/deploy-app -binary text eol=lf
 /docker/bin/deploy-current -binary text eol=lf
+/docker/bin/deploy-plan -binary text eol=lf
 /docker/bin/up-app -binary text eol=lf
 
 /scripts/benchmark-pages.py -binary text eol=lf

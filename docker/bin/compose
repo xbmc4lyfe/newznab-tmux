@@ -1,12 +1,54 @@
 #!/usr/bin/env python3
-"""Use the Makefile's Compose argv consistently, without evaluating shell code."""
+"""Use the Justfile's Compose argv consistently, without evaluating shell code."""
 import os
+import re
 import shlex
 import sys
 from pathlib import Path
 
 stack = Path(__file__).resolve().parent.parent
 os.environ.setdefault("COMPOSE_FILE", str(stack / "docker-compose.yml"))
+
+env_file = stack / ".env"
+file_env: dict[str, str] = {}
+# Keys this wrapper and the Justfile's LOAD_ENV read literally. Compose interpolates unquoted and
+# double-quoted dotenv values (`${REGISTRY}/app:${TAG}`) but neither parser can, so a `$` there would be
+# exported unexpanded and shadow Compose's own resolution. Single-quoted values are literal in Compose.
+LITERAL_KEYS = ("DC", "COMPOSE_FILE", "HELPER_IMAGE", "BASE_IMAGE", "APP_IMAGE",
+                "WEB_IMAGE", "HORIZON_IMAGE", "SCHEDULER_IMAGE", "INDEXER_IMAGE")
+interpolated: set[str] = set()
+if env_file.is_file():
+    for raw in env_file.read_text(encoding="utf-8", errors="surrogateescape").splitlines():
+        # Same rules as the Justfile's LOAD_ENV: optional `export`, spaces around `=`, quoted values with
+        # an optional trailing comment, unquoted values ending at an inline ` #` comment; last one wins.
+        m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", raw)
+        if m:
+            key, value = m.group(1), m.group(2)
+            quoted = re.match(r"""^(["'])((?:(?!\1).)*)\1\s*(?:#.*)?$""", value)
+            file_env[key] = quoted.group(2) if quoted else re.sub(r"\s#.*$", "", value).strip()
+            # The last assignment wins, so only it can be interpolated.
+            interpolated.discard(key)
+            if "$" in file_env[key] and not (quoted and quoted.group(1) == "'"):
+                interpolated.add(key)
+
+for key in LITERAL_KEYS:
+    if key in interpolated:
+        sys.exit(
+            f"docker/.env: {key} must be literal but uses $ interpolation, which docker/bin/compose and the "
+            f"Justfile do not evaluate. Write the final value or single-quote it."
+        )
+
+# An explicitly empty variable (`WEB_IMAGE=` as a just argument) overrides docker/.env: it means
+# "use the default", exactly as Compose reads `${WEB_IMAGE:-default}`.
+app_img = (os.environ["APP_IMAGE"] if "APP_IMAGE" in os.environ else file_env.get("APP_IMAGE", "")) or "nntmux/app:local"
+if app_img != "nntmux/app:local":
+    for role in ("web", "horizon", "scheduler", "indexer"):
+        key = f"{role.upper()}_IMAGE"
+        default_img = f"nntmux/{role}:local"
+        val = os.environ[key] if key in os.environ else file_env.get(key, "")
+        if not val or val == default_img:
+            os.environ[key] = app_img
+
 try:
     command = shlex.split(os.environ.get("DC", ""))
 except ValueError:
