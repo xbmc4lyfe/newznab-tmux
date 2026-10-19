@@ -57,7 +57,8 @@ final class HeaderParser
      * token (16+ alphanumerics) are grouped by the subject's shape (alphanumeric runs
      * collapsed), part total and file counter; a group of at least $minArticles in
      * which at least 90% of base names are distinct (digit runs outside the token
-     * ignored) has its once-seen names skipped by parse(). A
+     * ignored) has its once-seen names, other than first and last parts, skipped by
+     * parse(). A
      * legitimate upload repeats its base name for every part, which keeps its group
      * out. Pass 0 to disable, as part repair does for its sparse ranges.
      *
@@ -71,7 +72,7 @@ final class HeaderParser
             return 0;
         }
 
-        /** @var array<string, array{names: array<string, list<int>>, articles: int}> $signatures */
+        /** @var array<string, array{names: array<string, list<array{int, bool}>>, articles: int}> $signatures */
         $signatures = [];
         foreach ($headers as $header) {
             if (! isset($header['Number'], $header['Subject']) || ! is_numeric($header['Number'])
@@ -94,7 +95,8 @@ final class HeaderParser
             $key = (preg_replace('/[A-Za-z0-9]+/', 'x', $matches[1]) ?? $matches[1])."\0".$matches[3]."\0".$fileCounter;
             // Write in place: copying the growing arrays per article would be quadratic.
             $signatures[$key] ??= ['names' => [], 'articles' => 0];
-            $signatures[$key]['names'][$name][] = (int) $header['Number'];
+            $edge = (int) $matches[2] === 1 || $matches[2] === $matches[3];
+            $signatures[$key]['names'][$name][] = [(int) $header['Number'], $edge];
             $signatures[$key]['articles']++;
         }
 
@@ -104,10 +106,12 @@ final class HeaderParser
             if ($articles < $minArticles || \count($signature['names']) * 10 < $articles * 9) {
                 continue;
             }
-            // Only once-seen names are skipped, so a real upload sharing the group keeps its parts.
-            foreach ($signature['names'] as $numbers) {
-                if (\count($numbers) === 1) {
-                    $this->perArticleObfuscated[$numbers[0]] = true;
+            // Only once-seen names are skipped, so a real upload sharing the group keeps its
+            // repeated parts. A first or last part is kept too: a real upload cut by the range
+            // boundary can show just that one article, and part repair would never restore it.
+            foreach ($signature['names'] as $articlesForName) {
+                if (\count($articlesForName) === 1 && ! $articlesForName[0][1]) {
+                    $this->perArticleObfuscated[$articlesForName[0][0]] = true;
                 }
             }
         }

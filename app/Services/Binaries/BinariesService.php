@@ -354,10 +354,19 @@ class BinariesService
             : array_fill_keys(array_map('intval', $missingParts), true);
         $totalHeaders = \count($headers);
         // Detect across the whole range: one chunk can hold too few of an upload's articles.
-        $this->headerParser->markPerArticleObfuscated(
+        $obfuscated = $this->headerParser->markPerArticleObfuscated(
             $headers,
             $partRepair ? 0 : $this->config->perArticleObfuscationMinArticles
         );
+        if ($obfuscated > 0) {
+            Log::info('Skipping articles obfuscated per article', [
+                'groups_id' => $groupMySQL['id'],
+                'first' => $first,
+                'last' => $last,
+                'skipped' => $obfuscated,
+                'received' => $totalHeaders,
+            ]);
+        }
         for ($offset = 0; $offset < $totalHeaders; $offset += $this->config->headerChunkSize) {
             $rawChunk = array_slice($headers, $offset, $this->config->headerChunkSize);
             $this->headerParser->reset();

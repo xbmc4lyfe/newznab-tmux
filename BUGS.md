@@ -463,14 +463,16 @@ These bugs turned up while building and running the self-hosted stack in `docker
   - In alt.binaries.kenpsx, `[40/62] "<32 random chars>" yEnc (n/687)`: the file counter is constant, and the quoted name changes on every article.
   - In alt.binaries.boneless, `[<2 random chars>] - <40 random chars> yEnc (n/1250)`.
   The cleaner strips the file and part counters correctly, but the random token stays in the base name. So every article gets its own binary (1 of N parts) and its own collection, and none can ever complete.
-- **Symptom:** about 81M stale `filecheck=0` collections in group 109 and about 40M in group 1 (2026-10-19), each holding 1 binary and 1 part (about 740 KB). These made up most of the roughly 690,000 collections an hour behind the stale backlog in #62/#63. A read-only simulation over the newest 200,000 collections found the same pattern in alt.binaries.test (99) and alt.binaries.multimedia (14). No other group had a matching signature.
+- **Symptom:** about 81M stale `filecheck=0` collections in group 109 and about 40M in group 1 (2026-10-19), each holding 1 binary and 1 part (about 740 KB). These made up most of the roughly 690,000 new collections an hour that grow the stale-collection backlog. A read-only simulation over the newest 200,000 collections found the same pattern in alt.binaries.test (99) and alt.binaries.multimedia (14). No other group had a matching signature.
 - **Fix:** branch `codex/skip-per-article-obfuscated-headers`. Before chunked storage, `BinariesService::scan()` passes the whole downloaded range to `HeaderParser::markPerArticleObfuscated()`, which considers only multi-part articles whose base name holds a random-looking token (16 or more alphanumeric characters).
   - It groups those articles by subject shape (alphanumeric runs collapsed), part total and file counter.
-  - When a group has at least `CBP_PER_ARTICLE_OBFUSCATION_MIN_ARTICLES` articles (default 16; non-zero values are floored at 8) and at least 90% of its base names are distinct, the articles whose name appears only once are skipped; repeated names (a real upload sharing the group) are kept. Digit runs outside the token are ignored when comparing names.
+  - When a group has at least `CBP_PER_ARTICLE_OBFUSCATION_MIN_ARTICLES` articles (default 16; non-zero values are floored at 8) and at least 90% of its base names are distinct, the articles whose name appears only once are skipped. Repeated names (a real upload sharing the group) and first or last parts (a real upload cut by the range boundary) are kept. Digit runs outside the token are ignored when comparing names.
   - Skipped articles still count as received, so they are not queued for part repair. The CLI reports them as "obfuscated per article".
   - A legitimate upload repeats its base name on nearly every part, and numbered volumes (`<hash>.part07.rar`) share one name, so legitimate groups stay out.
   - Part repair (sparse ranges) and a value of `0` disable the check.
   - Header-only indexing can't reconstruct these uploads; they're only usable from an NZB.
+  - Each skipping range logs `Skipping articles obfuscated per article` with the group and count.
+  - Remaining risk: 16 or more unrelated real files in one range that share a subject shape with a long random token, have the same part total and no file counter, and show only one middle article each would be skipped.
 
 ## Issues in the docker/ stack itself (all fixed)
 

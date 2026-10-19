@@ -622,7 +622,7 @@ class BinariesStorageInternalsTest extends TestCase
         $this->createMissedPartsTable();
         $headers = [];
         for ($i = 0; $i < 16; $i++) {
-            $headers[] = $this->rawHeader(1400 + $i, '[40/62] "'.md5((string) $i).'" yEnc ('.($i + 1).'/687)');
+            $headers[] = $this->rawHeader(1400 + $i, '[40/62] "'.md5((string) $i).'" yEnc ('.($i + 2).'/687)');
         }
         $headers[] = $this->rawHeader(1416, 'Kept.Release (1/2)');
         $headers[] = $this->rawHeader(1417, 'Kept.Release (2/2)');
@@ -652,7 +652,7 @@ class BinariesStorageInternalsTest extends TestCase
         $this->createMissedPartsTable();
         $headers = [];
         for ($i = 0; $i < 16; $i++) {
-            $headers[] = $this->rawHeader(1500 + $i, '[40/62] "'.md5((string) $i).'" yEnc ('.($i + 1).'/687)');
+            $headers[] = $this->rawHeader(1500 + $i, '[40/62] "'.md5((string) $i).'" yEnc ('.($i + 2).'/687)');
         }
         DB::table('missed_parts')->insert(array_map(static fn (array $header): array => ['numberid' => $header['Number'], 'groups_id' => 1], $headers));
 

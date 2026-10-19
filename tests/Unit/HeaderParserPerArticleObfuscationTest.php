@@ -37,6 +37,7 @@ class HeaderParserPerArticleObfuscationTest extends TestCase
 
     /**
      * Random quoted name per article with a constant file counter, as seen in alt.binaries.kenpsx.
+     * Parts start at 2: a lone first or last part is deliberately kept.
      *
      * @return list<array<string, mixed>>
      */
@@ -44,7 +45,7 @@ class HeaderParserPerArticleObfuscationTest extends TestCase
     {
         $headers = [];
         for ($i = 0; $i < $count; $i++) {
-            $headers[] = $this->header($first + $i, '[40/62] "'.$this->token($first + $i).'" yEnc ('.($i + 1).'/'.$totalParts.')');
+            $headers[] = $this->header($first + $i, '[40/62] "'.$this->token($first + $i).'" yEnc ('.($i + 2).'/'.$totalParts.')');
         }
 
         return $headers;
@@ -61,6 +62,20 @@ class HeaderParserPerArticleObfuscationTest extends TestCase
         $this->assertSame([], $result['headers']);
         $this->assertSame(16, $result['obfuscated']);
         $this->assertCount(16, $result['received']);
+    }
+
+    public function test_a_real_uploads_lone_first_or_last_part_at_a_range_boundary_is_kept(): void
+    {
+        $parser = $this->parser();
+        $headers = $this->quotedObfuscated(1000, 400);
+        $headers[] = $this->header(3001, '[40/62] "'.$this->token(77777).'" yEnc (1/687)');
+        $headers[] = $this->header(3002, '[40/62] "'.$this->token(88888).'" yEnc (687/687)');
+
+        $parser->markPerArticleObfuscated($headers, 16);
+        $kept = array_column($parser->parse($headers, 'alt.binaries.kenpsx')['headers'], 'Number');
+
+        $this->assertContains(3001, $kept);
+        $this->assertContains(3002, $kept);
     }
 
     public function test_bracketed_prefix_obfuscation_without_file_counter_is_marked(): void
@@ -107,7 +122,7 @@ class HeaderParserPerArticleObfuscationTest extends TestCase
     {
         $headers = [];
         for ($i = 0; $i < 20000; $i++) {
-            $headers[] = $this->header(10000 + $i, '[40/62] "'.md5((string) $i).'" yEnc ('.($i % 687 + 1).'/687)');
+            $headers[] = $this->header(10000 + $i, '[40/62] "'.md5((string) $i).'" yEnc ('.($i % 685 + 2).'/687)');
         }
 
         $this->assertSame(20000, $this->parser()->markPerArticleObfuscated($headers, 16));

@@ -63,8 +63,8 @@ final readonly class BinariesConfig
     }
 
     /**
-     * 0 disables the check; any other value is held to at least 8 so a range boundary
-     * cannot drop a legitimate upload's lone article.
+     * 0 or less disables the check; any other value is held to at least 8 so a handful of
+     * unrelated single articles cannot form a group.
      */
     public static function obfuscationMinArticles(int $configured): int
     {
