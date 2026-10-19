@@ -679,8 +679,9 @@ final class CandidateRepository
                 $old = $this->store->read($owner->manifest_path);
                 $merged = $this->merge($old, $snapshot);
                 if (self::metadataBytes($merged) > OversizedCollectionDeferrals::budget()) {
-                    // archive() cannot merge them into the holder either: the partial stays as published.
-                    $released += $this->fenceOverBudget($collection, [$owner], [(int) $owner->id]);
+                    // archive() keeps these headers for a later pass (or a raised budget) instead of merging them,
+                    // so the holder keeps its inventory and its partial: only a pending upgrade under way is fenced.
+                    $this->fenceOverBudget($collection, [$owner], []);
 
                     continue;
                 }

@@ -151,10 +151,10 @@ class OversizedCollectionDeferralTest extends ReleaseVerificationCandidatesTest
     public function test_late_headers_that_would_push_a_pending_candidate_over_budget_are_kept_apart_for_a_later_pass(): void
     {
         // Each fits the budget on its own (45,600 bytes); merged they do not.
-        $this->upload('first', 200, hash: 'upload');
+        $this->upload('first', 200, hash: 'upload', totalParts: 400);
         $this->createReleases();
         $candidate = DB::table('release_verification_candidates')->sole();
-        $late = $this->upload('late', 200, hash: 'upload', first: 201);
+        $late = $this->upload('late', 200, hash: 'upload', first: 201, totalParts: 400);
 
         DB::transaction(fn () => app(CandidateRepository::class)->invalidateHotCollections([$late]));
         $fenced = DB::table('release_verification_candidates')->sole();
@@ -237,12 +237,12 @@ class OversizedCollectionDeferralTest extends ReleaseVerificationCandidatesTest
         return DB::table('parts')->join('binaries', 'binaries.id', '=', 'parts.binaries_id')->where('binaries.collections_id', $collectionId)->count();
     }
 
-    private function upload(string $label, int $parts, int $messageIdBytes = 100, ?string $hash = null, int $first = 1): int
+    private function upload(string $label, int $parts, int $messageIdBytes = 100, ?string $hash = null, int $first = 1, ?int $totalParts = null): int
     {
         $id = DB::table('collections')->insertGetId(['collectionhash' => sha1($hash ?? $label, true), 'subject' => 'movie.mkv', 'fromname' => 'poster',
             'totalfiles' => 1, 'groups_id' => 1, 'date' => '2026-10-19 11:00:00', 'dateadded' => '2026-10-19 11:00:00']);
         $binary = DB::table('binaries')->insertGetId(['collections_id' => $id, 'binaryhash' => md5($hash ?? $label, true), 'name' => 'movie.mkv',
-            'totalparts' => $first + $parts - 1]);
+            'totalparts' => $totalParts ?? $parts]);
         foreach (array_chunk(range($first, $first + $parts - 1), 500) as $numbers) {
             DB::table('parts')->insert(array_map(static fn (int $number): array => ['binaries_id' => $binary, 'partnumber' => $number,
                 'messageid' => str_pad($label.$number, $messageIdBytes - 6, 'x').'@fixed', 'size' => 5], $numbers));
