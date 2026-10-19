@@ -49,6 +49,7 @@ barrier_name="$project-verification-barrier"
 barrier_held=0
 barrier_keep=0
 database_fresh=0
+fresh_on_up=0
 # A barrier is adopted only while it fences this rollout's database: its lock session and durable
 # pause live on the database it was started against.
 refuse_foreign_barrier() {
@@ -175,6 +176,8 @@ apply_up() {
     # Its tag must still name the image this run planned (a long drain gives time to replace it).
     plan --verify-images "$svc"
     plan "$mark" "$svc"
+    # Set only once the container is about to change: an earlier failure leaves the old one running.
+    [ "$fresh_on_up" != 1 ] || database_fresh=1
     if [ "$mark" = --pending ]; then
         compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" --pull never "$svc"
     else
@@ -455,9 +458,11 @@ for item in $POST_DRAIN; do
         # keeps remote workers out (the release stays owed), never readmits them to its schema.
         [ "$MIGRATE" != 1 ] || barrier_keep=1
         # The fresh barrier below starts from web's tag: a replaced one aborts before the recreate.
-        plan --verify-images web
-        database_fresh=1
+        plan --verify-images "${item#*:}" web
+        # From its recreate until the fresh barrier holds it, any exit stops it again (the EXIT trap).
+        fresh_on_up=1
         apply_up "--${item%%:*}" "${item#*:}"
+        fresh_on_up=0
         # A recreated database ends the barrier's lock session, and replacement storage lacks its
         # durable pause: fence the new database at once, before anything else that could fail
         # (recording it included).

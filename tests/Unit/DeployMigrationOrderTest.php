@@ -1749,6 +1749,24 @@ SH);
         $this->assertFileExists($this->directory.'/barrier.running');
     }
 
+    public function test_a_database_whose_tag_check_fails_before_its_recreate_keeps_running(): void
+    {
+        $services = json_decode($this->composeJson(), true);
+        $services['services']['mariadb'] = ['image' => 'mariadb:one'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($services, JSON_UNESCAPED_SLASHES)])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        // mariadb's own tag is replaced at the writers' stop: the recreate aborts on the old container.
+        $services['services']['mariadb'] = ['image' => 'mariadb:two'];
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($services, JSON_UNESCAPED_SLASHES), 'NNTMUX_REPLACE_AT_STOP' => '1', 'NNTMUX_REPLACED_ONLY' => 'mariadb:two']);
+        $process->run();
+        @unlink($this->directory.'/replaced');
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('mariadb:two now names sha256:replaced', $process->getErrorOutput());
+        $this->assertStringNotContainsString('--pull never mariadb', $this->events());
+        $this->assertStringNotContainsString(' stop mariadb', $this->events());
+    }
+
     public function test_a_foreign_barrier_is_refused_before_a_missing_database_is_started(): void
     {
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
