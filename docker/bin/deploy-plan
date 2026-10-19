@@ -10,7 +10,7 @@ import re
 import shlex
 import stat
 import subprocess
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -462,8 +462,10 @@ def reject_alternate_env_file() -> None:
     # docker calls (build, inspect, the barrier) and the recorded daemon identity.
     # Only plain `docker` (or `docker-compose`) with logging options may precede the subcommand:
     # --context/-c/--host/-H (attached or not), --config, or an `env VAR=...` prefix all move it.
-    # A standalone docker-compose has no docker global options to scan.
-    globals_end = argv.index("compose") if "compose" in argv else (1 if argv and os.path.basename(argv[0]) == "docker-compose" else len(argv))
+    # A standalone docker-compose has no docker global options before a subcommand to scan, but takes
+    # the daemon selectors itself (-H/--host, -c/--context) anywhere among its own options.
+    standalone = bool(argv) and os.path.basename(argv[0]) == "docker-compose"
+    globals_end = argv.index("compose") if "compose" in argv else (1 if standalone else len(argv))
     allowed = ("-D", "--debug", "-l", "--log-level")
     # A wrapper executable could select any daemon itself; only docker or docker-compose is known.
     selects_daemon = bool(argv) and os.path.basename(argv[0]) not in ("docker", "docker-compose")
@@ -474,6 +476,12 @@ def reject_alternate_env_file() -> None:
         elif not arg.startswith("-") and previous not in ("-l", "--log-level"):
             selects_daemon = True
         previous = arg
+    for arg in argv[1:] if standalone else []:
+        # `-H tcp://...`, `-Htcp://...`, `--host=...`, `-c remote`, `--context=remote`.
+        if arg in ("--host", "--context") or arg.startswith(("--host=", "--context=")) or (
+            not arg.startswith("--") and arg.startswith(("-H", "-c"))
+        ):
+            selects_daemon = True
     if selects_daemon:
         sys.exit("deploy-plan: DC passes Docker options before compose (or an env prefix) that can select another "
                  "daemon; use DOCKER_CONTEXT or DOCKER_HOST instead, so every docker call and the recorded daemon "
@@ -729,10 +737,13 @@ DEFINITIONS: dict[str, str] = {}
 # Effective Compose project name from the last get_compose_service_hashes() call.
 RENDERED_PROJECT: str | None = None
 
+# Top-level `networks:` of the last get_compose_service_hashes() call (names services join).
+RENDERED_NETWORKS: dict[str, object] = {}
+
 
 def get_compose_service_hashes(docker_dir: Path) -> tuple[str, dict[str, str]]:
     """Return (global_config_hash, per_service_config_hashes)."""
-    global RENDERED_PROJECT
+    global RENDERED_PROJECT, RENDERED_NETWORKS
     reject_alternate_env_file()
     env = dict(os.environ)
     env.setdefault("COMPOSE_FILE", str(docker_dir / "docker-compose.yml"))
@@ -756,6 +767,7 @@ def get_compose_service_hashes(docker_dir: Path) -> tuple[str, dict[str, str]]:
             services_map = parsed["services"]
             name = parsed.get("name")
             RENDERED_PROJECT = name if isinstance(name, str) and name else None
+            RENDERED_NETWORKS = parsed["networks"] if isinstance(parsed.get("networks"), dict) else {}
             for svc in sorted(services_map):
                 reject_unsupported_service(svc, services_map[svc])
             # Every rendered service gets a record, so an added Compose service is started rather
@@ -846,28 +858,6 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
     image_tags = [base_img, *(service_image_name(svc) for svc in APP_SERVICES)]
     configuration_hash = sha256_text("\n".join([*env_hashes, *image_tags]))
     app_env_hash = env_hashes[1]
-    # The database the app connects to: pointing app.env at another (e.g. a restored copy) migrates.
-    app_env_values = read_dotenv(docker_dir / "config/app.env")
-    # DB_URL's credentials are not the database's identity (rotating a password never migrates).
-    try:
-        db_url = urlsplit(app_env_values.get("DB_URL", ""))
-        db_url_identity = urlunsplit((db_url.scheme, db_url.hostname or "", db_url.path, db_url.query, "")) + (
-            f"|{db_url.port}" if db_url.netloc and db_url.port else "")
-    except ValueError:
-        # Unparseable (e.g. a bad or `${PORT}` port): compare everything after the credentials.
-        db_url_identity = "unparsed " + app_env_values.get("DB_URL", "").rsplit("@", 1)[-1]
-    identity_keys = ("DB_URL", "DB_CONNECTION", "DB_HOST", "DB_PORT", "DB_SOCKET", "DB_DATABASE")
-    # phpdotenv (which reads app.env as /app/.env) only expands `${NAME}`; a bare `$`, e.g. in a
-    # password, is literal. DB_URL is checked after its credentials are stripped.
-    if "${" in db_url_identity or any("${" in app_env_values.get(key, "") for key in identity_keys[1:]):
-        # A nested reference (DB_HOST=${DB_TARGET}) can point elsewhere without changing these
-        # values; any app.env change then counts as a possible database switch.
-        db_url_identity = f"nested {app_env_hash}"
-    database_hash = sha256_text("\n".join(
-        [f"DB_URL={db_url_identity}"]
-        + [f"{key}={app_env_values.get(key, '')}" for key in identity_keys[1:]]
-    ))
-
     effective_hash = "none"
     fingerprint_effective = ""
     per_service_compose: dict[str, str] = {svc: "none" for svc in ALL_SERVICES}
@@ -892,6 +882,33 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
     elif include_compose:
         effective_hash, per_service_compose = get_compose_service_hashes(docker_dir)
         compose_rendered = True
+
+    # The database the app connects to: pointing app.env at another (e.g. a restored copy) migrates.
+    # Read from the file the app services actually mount as /app/.env once Compose is rendered.
+    db_env_file = app_env_path(docker_dir) if compose_rendered else docker_dir / "config/app.env"
+    app_env_values = read_dotenv(db_env_file)
+    # DB_URL's credentials are not the database's identity (rotating a password never migrates).
+    try:
+        db_url = urlsplit(app_env_values.get("DB_URL", ""))
+        db_url_identity = urlunsplit((db_url.scheme, db_url.hostname or "", db_url.path, db_url.query, "")) + (
+            f"|{db_url.port}" if db_url.netloc and db_url.port else "")
+    except ValueError:
+        # Unparseable (e.g. a bad or `${PORT}` port): compare everything after the credentials.
+        db_url_identity = "unparsed " + app_env_values.get("DB_URL", "").rsplit("@", 1)[-1]
+    identity_keys = ("DB_URL", "DB_CONNECTION", "DB_HOST", "DB_PORT", "DB_SOCKET", "DB_DATABASE")
+    # phpdotenv (which reads app.env as /app/.env) only expands `${NAME}`; a bare `$`, e.g. in a
+    # password, is literal. DB_URL is checked after its credentials are stripped.
+    if "${" in db_url_identity or any("${" in app_env_values.get(key, "") for key in identity_keys[1:]):
+        # A nested reference (DB_HOST=${DB_TARGET}) can point elsewhere without changing these
+        # values; any app.env change then counts as a possible database switch.
+        try:
+            db_url_identity = f"nested {sha256_bytes(db_env_file.read_bytes())}"
+        except OSError as error:
+            sys.exit(f"deploy-plan: cannot read {db_env_file}: {error.strerror or error}")
+    database_hash = sha256_text("\n".join(
+        [f"DB_URL={db_url_identity}"]
+        + [f"{key}={app_env_values.get(key, '')}" for key in identity_keys[1:]]
+    ))
 
     runtime_tree_hash = sha256_text("\n".join(runtime_records))
     shared_app_hash = sha256_text("\n".join(buckets["shared-app"]))
@@ -1250,7 +1267,10 @@ def mounts_changed_since_start(docker_dir: Path, svc: str) -> bool:
     for volume in cfg["volumes"]:
         if isinstance(volume, dict) and volume.get("type") == "bind" and isinstance(volume.get("source"), str):
             source = compose_path(volume["source"])
-            if symlinked_below(source, project_directory(docker_dir)):
+            # The source itself counts wherever it lives (an external `/srv/database/current`), but
+            # not the host-system trees observed through links such as macOS `/var/run/docker.sock`.
+            own_link = os.path.islink(source.rstrip("/")) and not is_host_system(os.path.abspath(source))
+            if own_link or symlinked_below(source, project_directory(docker_dir)):
                 # A symlinked data source may have been retargeted; with no record of what the
                 # container mounted, recreate it rather than reconcile it in place.
                 return True
@@ -1336,6 +1356,20 @@ def compute_build_targets(repo: Path, docker_dir: Path, stamp_path: Path, force:
 STATELESS_LABEL = "nntmux.deploy.stateless"
 
 
+def orphan_running(svc: str) -> bool:
+    """True while a container of this project's (unrendered) service still runs. A failed query exits."""
+    if not RENDERED_PROJECT:
+        sys.exit("deploy-plan: the rendered Compose configuration names no project; cannot look for orphans.")
+    proc = subprocess.run(
+        ["docker", "ps", "-q", "--filter", f"label=com.docker.compose.project={RENDERED_PROJECT}",
+         "--filter", f"label=com.docker.compose.service={svc}"],
+        capture_output=True, text=True, check=False,
+    )
+    if proc.returncode != 0:
+        sys.exit(f"deploy-plan: cannot list the {svc} containers: {proc.stderr.strip()}")
+    return bool(proc.stdout.strip())
+
+
 def scaled_to_zero(svc: str) -> bool:
     """`scale: 0` or `deploy.replicas: 0`: rendered, but Compose never creates a container for it."""
     cfg = RENDERED_SERVICES.get(svc)
@@ -1407,18 +1441,77 @@ def compose_path(path: str) -> str:
     return path.replace("$$", "$")
 
 
-def database_service(docker_dir: Path) -> str:
-    """The rendered service the app's database runs in. Per app service: its rendered Compose
-    environment wins over app.env, and DB_URL's host over DB_HOST (Laravel's order). All apps must
-    agree; a host that is no rendered service (an external database) leaves `mariadb`."""
+def app_env_path(docker_dir: Path) -> Path:
+    """The dotenv file the app services read as /app/.env: the source of their rendered bind mount
+    (an override may remap it, e.g. to a persistent runtime copy), else config/app.env. Every rendered
+    app service must mount the same file: otherwise no one file says which database they use."""
+    sources: dict[str | None, str | None] = {}
+    for app in APP_SERVICES:
+        cfg = RENDERED_SERVICES.get(app)
+        if not isinstance(cfg, dict):
+            continue
+        source: str | None = None
+        for volume in cfg.get("volumes") or []:
+            if not (isinstance(volume, dict) and str(volume.get("target", "")).rstrip("/") == "/app/.env"):
+                continue
+            if volume.get("type") != "bind" or not isinstance(volume.get("source"), str):
+                sys.exit(f"deploy-plan: app service {app} mounts /app/.env from a {volume.get('type')} mount; selective "
+                         "deployment reads the database settings from a bind-mounted file. Bind-mount the app.env file.")
+            source = compose_path(volume["source"])
+        # Symlinks to one file (the split production layout) are the same file.
+        sources.setdefault(os.path.realpath(source) if source else None, source)
+    if len(sources) > 1:
+        sys.exit("deploy-plan: the app services mount different files (or none) as /app/.env; selective deployment "
+                 "reads one app.env to know which database they migrate and fence. Mount the same file in all four.")
+    source = next(iter(sources.values()), None)
+    return Path(source) if source else docker_dir / "config/app.env"
+
+
+def normalize_host(host: str) -> str:
+    """DNS names are case-insensitive and may be written fully qualified (`mariadb.`)."""
+    return host.strip().lower().rstrip(".")
+
+
+def normalize_db_url(url: str) -> str:
+    """DB_URL with only its host normalized; credentials, database name and query keep their case."""
+    try:
+        parts = urlsplit(url)
+        if not parts.hostname:
+            return url
+    except ValueError:
+        return url
+    userinfo, at, hostport = parts.netloc.rpartition("@")
+    if hostport.startswith("["):
+        end = hostport.find("]") + 1
+        hostport = hostport[:end].lower() + hostport[end:]
+    else:
+        name, colon, port = hostport.rpartition(":") if ":" in hostport else (hostport, "", "")
+        hostport = normalize_host(name) + colon + port
+    return urlunsplit((parts.scheme, userinfo + at + hostport, parts.path, parts.query, parts.fragment))
+
+
+def matched_database_service(docker_dir: Path) -> str | None:
+    """The rendered service the app's database runs in, or None when its host names no rendered
+    service (an external database). Per app service: its rendered Compose environment wins over
+    app.env, DB_URL's host over DB_HOST, and a `host=` query option over the URL's host (Laravel's
+    order). All apps must agree."""
     interpolated: set[str] = set()
     multiline: set[str] = set()
-    app_env = read_dotenv(docker_dir / "config/app.env", interpolated, multiline)
+    env_path = app_env_path(docker_dir)
+    app_env = read_dotenv(env_path, interpolated, multiline)
 
     def selected(values: dict) -> list[str]:
         hosts = []
         try:
-            hosts.append(urlsplit(str(values.get("DB_URL") or "")).hostname or "")
+            url = urlsplit(str(values.get("DB_URL") or ""))
+            # Laravel merges the URL's query options last: `?host=db2` is the host it connects to.
+            query_host = parse_qs(url.query, keep_blank_values=True).get("host")
+            if query_host is not None:
+                if not query_host[-1].strip():
+                    sys.exit("deploy-plan: DB_URL sets an empty host= query option, so the database it selects cannot "
+                             "be determined; remove it or name the host.")
+                hosts.append(query_host[-1])
+            hosts.append(url.hostname or "")
         except ValueError:
             pass
         hosts.append(str(values.get("DB_HOST") or ""))
@@ -1426,8 +1519,9 @@ def database_service(docker_dir: Path) -> str:
 
     # Every name Docker DNS resolves to a service, case-insensitively: its service name, network
     # aliases, `hostname:`, container name (explicit, or Compose's `<project>-<svc>-1`) and `links:`
-    # aliases; any of them may also be qualified with `.<network>`.
+    # aliases; any of them may also be qualified with `.<network>` for a network the service joins.
     dns_names: dict[str, set[str]] = {}
+    joined: dict[str, set[str]] = {}
     for name, svc_cfg in RENDERED_SERVICES.items():
         cfg_map = svc_cfg if isinstance(svc_cfg, dict) else {}
         names = [name]
@@ -1435,6 +1529,16 @@ def database_service(docker_dir: Path) -> str:
         if isinstance(networks, dict):
             for net in networks.values():
                 names.extend(str(a) for a in ((net.get("aliases") or []) if isinstance(net, dict) else []))
+        # The networks' real names (Docker DNS knows `<project>_default`, not the Compose key); a
+        # service with `network_mode` joins none.
+        keys = [] if cfg_map.get("network_mode") else (list(networks) if isinstance(networks, (dict, list)) else ["default"])
+        for key in keys:
+            top = RENDERED_NETWORKS.get(key)
+            real = top.get("name") if isinstance(top, dict) else None
+            if isinstance(real, str) and real:
+                joined.setdefault(name, set()).add(real.lower())
+            elif RENDERED_PROJECT:
+                joined.setdefault(name, set()).add(f"{RENDERED_PROJECT}_{key}".lower())
         for key in ("container_name", "hostname"):
             if cfg_map.get(key):
                 names.append(str(cfg_map[key]))
@@ -1448,8 +1552,16 @@ def database_service(docker_dir: Path) -> str:
             dns_names.setdefault(alias.lower(), set()).add(name)
 
     def resolve(host: str) -> set[str]:
-        host = host.lower().rstrip(".")
-        return dns_names.get(host) or (dns_names.get(host.split(".", 1)[0], set()) if "." in host else set())
+        host = normalize_host(host)
+        if host in dns_names:
+            return dns_names[host]
+        # Any other dotted name (db2.prod.example) goes to the upstream resolver, whatever its first
+        # label: only a suffix naming a network the service is on stays local.
+        found: set[str] = set()
+        for index, char in enumerate(host):
+            if char == ".":
+                found.update(svc for svc in dns_names.get(host[:index], set()) if host[index + 1:] in joined.get(svc, set()))
+        return found
 
     targets = set()
     for app in APP_SERVICES:
@@ -1480,27 +1592,54 @@ def database_service(docker_dir: Path) -> str:
         sys.exit(f"deploy-plan: the app services select different database services ({', '.join(sorted(targets))}); "
                  "selective deployment migrates and fences one database. Give every app the same DB_HOST/DB_URL.")
     database_target(docker_dir)  # Same host, another schema: rejected there too.
-    return targets.pop() if targets else "mariadb"
+    if not targets:
+        return None
+    matched = targets.pop()
+    cfg = RENDERED_SERVICES.get(matched)
+    deploy = cfg.get("deploy") if isinstance(cfg, dict) else None
+    replicas = deploy.get("replicas") if isinstance(deploy, dict) else None
+    if (isinstance(replicas, int) and replicas != 1) or (isinstance(cfg, dict) and isinstance(cfg.get("scale"), int) and cfg["scale"] != 1):
+        # A rollout would drain the writers and converge the database to that many containers: none
+        # left for the barrier and the migration, or several answering one host.
+        sys.exit(f"deploy-plan: the database service {matched} sets a replica count other than one; selective deployment "
+                 "migrates and fences exactly one database container. Remove the scale/replicas override.")
+    return matched
 
-def app_connection(app: str, app_env: dict) -> dict:
-    """The connection settings an app service uses: its rendered environment over app.env's."""
+
+def database_service(docker_dir: Path) -> str:
+    """The rendered database service, or `mariadb` when the app's host names no rendered service (an
+    external database; the default then need not be rendered, and may be scaled to zero)."""
+    return matched_database_service(docker_dir) or "mariadb"
+
+
+def app_connection(app: str, app_env: dict, normalized: bool = True) -> dict:
+    """The connection settings an app service uses: its rendered environment over app.env's. The DNS
+    host (DB_HOST, DB_URL's host) is compared case-insensitively unless `normalized` is False."""
     cfg = RENDERED_SERVICES.get(app)
     env = cfg.get("environment") if isinstance(cfg, dict) else None
     rendered = {k: v for k, v in env.items() if v is not None} if isinstance(env, dict) else {}
     keys = ("DB_CONNECTION", "DB_URL", "DB_HOST", "DB_PORT", "DB_SOCKET", "DB_DATABASE")
-    return {key: str(rendered[key] if key in rendered else app_env.get(key, "")) for key in keys}
+    values = {key: str(rendered[key] if key in rendered else app_env.get(key, "")) for key in keys}
+    if normalized:
+        values["DB_HOST"] = normalize_host(values["DB_HOST"])
+        values["DB_URL"] = normalize_db_url(values["DB_URL"])
+    return values
 
 
-def database_target(docker_dir: Path) -> str:
+def database_target(docker_dir: Path, normalized: bool = True) -> str:
     """A digest of the connection web (and so the verification barrier) uses: a barrier adopted from
     an earlier attempt fences only this database if its recorded target matches. Every app must use
-    the same connection, or web would migrate a schema another app does not read."""
-    app_env = read_dotenv(docker_dir / "config/app.env")
+    the same connection, or web would migrate a schema another app does not read. With `normalized`
+    False: the digest of the literal settings, as barriers were labelled before host normalization
+    (the same connection, so deploy-app accepts either)."""
+    app_env = read_dotenv(app_env_path(docker_dir))
     web = app_connection("web", app_env)
     for app in APP_SERVICES:
         if app in RENDERED_SERVICES and app_connection(app, app_env) != web:
             sys.exit(f"deploy-plan: app service {app} connects to another database than web (its DB_* settings differ); "
                      "selective deployment migrates through web and fences one database. Give every app the same DB_* settings.")
+    if not normalized:
+        web = app_connection("web", app_env, normalized=False)
     return hashlib.sha256(json.dumps(web, sort_keys=True).encode()).hexdigest()[:32]
 
 
@@ -1647,13 +1786,23 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
     # A recorded data service that is no longer rendered may have been renamed onto the same storage
     # as a new one; then no new data service may start before the writers are quiesced.
     # deploy-app stops each such predecessor (an orphan Compose leaves running) once writers stop.
-    removed_data = sorted(
+    removed_data = {
         key.split(":", 1)[1] for key in stamped
         if key.startswith("compose:") and stamped[key] != "absent"
         and key.split(":", 1)[1] not in RENDERED_SERVICES
         and key.split(":", 1)[1] not in APP_SERVICES and key.split(":", 1)[1] not in INFRA_SERVICES
-    )
+    }
+    # Its record outlives the stamp that first saw it unrendered (a no-op poll replaces the stamp):
+    # an `orphan:` record stays while its container still runs, so a successor added by a later poll
+    # still waits for the writers' drain and the orphan's stop.
+    recorded_orphans = {key.split(":", 1)[1] for key in stamped if key.startswith("orphan:")} - set(RENDERED_SERVICES)
+    running_orphans = {svc for svc in removed_data | recorded_orphans if orphan_running(svc)}
+    removed_data = sorted(removed_data | running_orphans)
+    for svc in running_orphans:
+        state[f"orphan:{svc}"] = "running"
     data_removed = bool(removed_data)
+    # The apps' database when it names a rendered service (None for an external one).
+    matched_database = matched_database_service(docker_dir)
     for svc in data_services(state):
         if not compose_present(state, svc):
             data_reasons[svc] = "not rendered"
@@ -1665,6 +1814,12 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
                 # FORCE=1 stops every writer anyway, so it is reconciled after they stop.
                 reconcile_data.append(svc)
                 data_reasons[svc] = "start (no container)"
+            elif svc == matched_database:
+                # E.g. a database added beside its predecessor for a cutover: started before the drain,
+                # remote workers could reach it before the barrier and the migration. deploy-app starts
+                # a missing database only after the writers stop, and fences it at once.
+                dirty_data.append(svc)
+                data_reasons[svc] = "database (no container)"
             elif not data_removed and (
                 first_deploy or legacy_stamp or stamped_hash is None
                 or stamped.get(f"compose:{svc}") == "absent"
@@ -1959,6 +2114,8 @@ def main() -> None:
             for key in ("image:base", *(f"image:{svc}" for svc in APP_SERVICES)):
                 if key in snapshot:
                     state[key] = snapshot[key]
+            # The orphans this run planned around; the next plan drops each one whose container is gone.
+            state.update({key: value for key, value in snapshot.items() if key.startswith("orphan:")})
             sys.stdout.write(format_stamp(state, refresh_images=False))
             return
         if len(sys.argv) > 2 and sys.argv[2] == "build":
@@ -2015,6 +2172,8 @@ def main() -> None:
         print(f"START_DATA={shlex.quote(' '.join(plan['start_data']))}")
         print(f"DATABASE_SERVICE={shlex.quote(database_service(docker_dir))}")
         print(f"DATABASE_TARGET={shlex.quote(database_target(docker_dir))}")
+        # The same connection's digest before host normalization, which earlier barriers carry.
+        print(f"DATABASE_TARGET_LEGACY={shlex.quote(database_target(docker_dir, normalized=False))}")
         print(f"REMOVED_DATA={shlex.quote(' '.join(plan['removed_data']))}")  # type: ignore[arg-type]
         # Everything applied before the drain, in one depends_on order across the three lists:
         # `up --no-deps` never starts a provider, whichever list it is in.
