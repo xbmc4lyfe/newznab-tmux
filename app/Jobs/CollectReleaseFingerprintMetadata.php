@@ -6,6 +6,7 @@ namespace App\Jobs;
 
 use App\Models\Release;
 use App\Models\ReleaseFingerprintMetadata;
+use App\Services\Nzb\NzbSourceGuard;
 use App\Services\Releases\Fingerprint\CompactFingerprintCollector;
 use App\Services\Releases\Fingerprint\ReleaseFingerprintCollector;
 use App\Support\ReleaseArchiveNamingEvidence;
@@ -114,9 +115,11 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
                 // successor was swapped in after commit, must not be saved; this run then collects again. The
                 // evidence row lock waits for an upgrade still in flight.
                 $digest = $result['source_digest'] ?? null;
-                if (is_string($digest) && self::tracksSources()) {
+                if (self::tracksSources()) {
                     $committed = app(ReleaseArchiveNamingEvidence::class)->committedSourceDigestLocked((object) ['id' => $release->id, 'guid' => $release->guid]);
-                    if ($committed !== null && ! hash_equals($committed, $digest)) {
+                    if ($committed !== null && (is_string($digest) ? ! hash_equals($committed, $digest)
+                        // Unreadable while the committed generation is still staged beside it: not its final verdict.
+                        : app(NzbSourceGuard::class)->hasStagedGenerations((string) $release->guid))) {
                         return 0;
                     }
                 }

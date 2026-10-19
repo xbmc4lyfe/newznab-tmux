@@ -415,7 +415,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
 
         $guid = DB::table('releases')->where('id', $first)->value('guid');
         // Post-processing already ran on the smaller NZB; a title lookup ran on a later-normalized name.
-        DB::table('releases')->where('id', $first)->update(['haspreview' => 0, 'nfostatus' => 0, 'searchname' => 'Normalized', 'imdbid' => '0000000']);
+        DB::table('releases')->where('id', $first)->update(['haspreview' => 0, 'nfostatus' => 0, 'searchname' => 'Normalized', 'imdbid' => '0000000', 'gamesinfo_id' => 5]);
         $upgraded = $this->publishStalledPartial(null);
 
         $this->assertSame($first, $upgraded, 'The partial is upgraded in place, keeping its id and GUID.');
@@ -427,6 +427,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertStringContainsString('c@d', $nzb, 'Its NZB now carries the late article.');
         $this->assertSame(['Movie', null], [DB::table('releases')->where('id', $first)->value('searchname'),
             DB::table('releases')->where('id', $first)->value('imdbid')], 'The fuller name is applied and title lookups rerun.');
+        $this->assertSame(0, (int) DB::table('releases')->where('id', $first)->value('gamesinfo_id'), 'Its PC-game lookup reruns too.');
         $this->assertSame([-1, -1], [(int) DB::table('releases')->where('id', $first)->value('haspreview'),
             (int) DB::table('releases')->where('id', $first)->value('nfostatus')], 'Post-processing reruns on the upgraded NZB.');
         $this->assertSame(1, DB::table('releases')->count());
@@ -1476,7 +1477,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         self::assertLessThan(min($candidates), min($state), 'As archive() does with file manifests.');
     }
 
-    public function test_a_covering_copy_keeps_the_partial_fenced_while_an_earlier_upgrades_nzb_is_staged(): void
+    public function test_a_covering_copy_settles_the_partials_staged_nzb_before_releasing_its_fence(): void
     {
         $this->publicationSchema(partialColumns: true);
         $hash = sha1('covered-staged', true);
@@ -1484,6 +1485,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $holder = (int) DB::table('release_verification_candidates')->sole()->id;
         // An earlier partial-to-partial upgrade committed, but its post-commit swap did not happen.
         [$canonical, $staged] = $this->stageGeneration($first, $holder, 'upgraded');
+        DB::table('release_archive_naming_evidence')->where('releases_id', $first)->update(['source_sha256' => NzbSourceGuard::digest('<nzb>upgraded</nzb>')]);
         app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
         $generation = DB::table('release_verification_candidates')->orderByDesc('id')->first();
         $merged = app(ManifestStore::class)->read($generation->manifest_path);
@@ -1497,12 +1499,6 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->publishStalledPartial(null);
 
         $this->assertSame($first + 100, (int) DB::table('release_verification_candidates')->where('id', $generation->id)->value('release_id'), 'The copy is reused.');
-        $this->assertNotNull(DB::table('releases')->where('id', $first)->value('late_article_candidate_id'),
-            'Workers that read the NZB wait while the staged generation is unresolved.');
-
-        DB::table('release_archive_naming_evidence')->where('releases_id', $first)->update(['source_sha256' => NzbSourceGuard::digest('<nzb>upgraded</nzb>')]);
-        Cache::forget('release_verification:settle_cursor');
-        app(CandidateRepository::class)->expire();
         $this->assertSame('<nzb>upgraded</nzb>', gzdecode((string) file_get_contents($canonical)), 'The committed generation is installed first.');
         $this->assertFileDoesNotExist($staged);
         $this->assertNull(DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
@@ -1538,6 +1534,62 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
             'Coverage read the generation the copy row describes.');
         $this->assertFileDoesNotExist($staged);
         $this->assertSame(1, (int) DB::table('releases')->where('id', $first)->value('articles_found'), 'The partial is not upgraded into a second copy.');
+    }
+
+    public function test_coverage_defers_publication_while_a_candidates_staged_nzb_cannot_be_put_in_place(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('covering-unresolved-copy', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+        $generation = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        $merged = app(ManifestStore::class)->read($generation->manifest_path);
+        $copy = (array) DB::table('releases')->where('id', $first)->first();
+        $copy = ['id' => $first + 100, 'guid' => 'covering-copy', 'articles_found' => null, 'articles_expected' => null,
+            'files_found' => null, 'files_expected' => null, 'late_article_candidate_id' => null] + $copy;
+        DB::table('releases')->insert($copy);
+        app(VerifiedNzbWriter::class)->write($merged, 'covering-copy');
+        $staged = app(NzbService::class)->getNzbPath('covering-copy').'.c999-'.str_repeat('a', 16).'.next';
+        file_put_contents($staged, gzencode('<nzb>unresolvable</nzb>'));
+        // The copy's committed source is neither file: its staged generation cannot be settled.
+        DB::table('release_archive_naming_evidence')->where('releases_id', $first + 100)->update(['source_sha256' => NzbSourceGuard::digest('another')]);
+
+        try {
+            $this->publishStalledPartial(null);
+        } catch (\RuntimeException) {
+            // Deferred: the claim is retried once the copy's NZB is resolved.
+        }
+
+        $this->assertNull(DB::table('release_verification_candidates')->where('id', $generation->id)->value('release_id'), 'Nothing is published on stale coverage.');
+        $this->assertSame(1, (int) DB::table('releases')->where('id', $first)->value('articles_found'));
+        $this->assertSame(2, DB::table('releases')->count());
+        $this->assertFileExists($staged);
+    }
+
+    public function test_the_settle_sweep_stops_at_the_maintenance_deadline_and_resumes_after_the_last_row_it_settled(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, sha1('sweep-deadline', true)));
+        $row = (array) DB::table('releases')->where('id', $first)->first();
+        // Two partials whose holders are gone: each is settled when the sweep reaches it.
+        foreach ([900, 901] as $pointer) {
+            DB::table('releases')->insert(['id' => $pointer, 'guid' => 'held-'.$pointer, 'late_article_candidate_id' => $pointer] + $row);
+        }
+        Cache::forget('release_verification:settle_cursor');
+        $starts = 0;
+        $mayStart = static function () use (&$starts): bool {
+            return ++$starts <= 2;
+        };
+
+        (new \ReflectionMethod(CandidateRepository::class, 'settleLateArticleHolders'))->invoke(app(CandidateRepository::class), $mayStart);
+
+        $this->assertNull(DB::table('releases')->where('id', 900)->value('late_article_candidate_id'));
+        $this->assertSame(901, (int) DB::table('releases')->where('id', 901)->value('late_article_candidate_id'), 'Left for the next pass.');
+        $this->assertSame(900, (int) Cache::get('release_verification:settle_cursor'));
+
+        (new \ReflectionMethod(CandidateRepository::class, 'settleLateArticleHolders'))->invoke(app(CandidateRepository::class), null);
+        $this->assertNull(DB::table('releases')->where('id', 901)->value('late_article_candidate_id'), 'The next pass resumes there.');
+        $this->assertSame(0, (int) Cache::get('release_verification:settle_cursor'));
     }
 
     public function test_the_settle_sweep_installs_a_live_holders_staged_nzb_and_keeps_it_fenced(): void
@@ -2039,6 +2091,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
                 }
                 $table->unsignedBigInteger('late_article_candidate_id')->nullable();
                 $table->string('imdbid')->nullable();
+                $table->unsignedInteger('gamesinfo_id')->default(0);
             }
         });
         (require base_path('database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();

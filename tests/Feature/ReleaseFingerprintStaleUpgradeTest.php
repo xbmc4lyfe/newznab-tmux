@@ -240,6 +240,47 @@ final class ReleaseFingerprintStaleUpgradeTest extends TestCase
     }
 
     #[Test]
+    public function an_unreadable_nzb_whose_committed_generation_is_still_staged_is_never_saved_unavailable(): void
+    {
+        config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:',
+            'database.connections.sqlite.url' => null]);
+        DB::purge();
+        DB::reconnect();
+        Schema::create('releases', static function (Blueprint $table): void {
+            $table->increments('id');
+            $table->string('guid');
+        });
+        (require database_path('migrations/2026_10_12_120000_create_release_fingerprint_metadata_table.php'))->up();
+        (require database_path('migrations/2026_10_18_000000_add_run_token_to_release_fingerprint_metadata.php'))->up();
+        (require database_path('migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php'))->up();
+        $guid = 'aaaaaaaa-0000-0000-0000-000000000001';
+        DB::table('releases')->insert(['id' => 1, 'guid' => $guid]);
+        DB::table('release_archive_naming_evidence')->insert(['releases_id' => 1, 'release_guid' => $guid,
+            'source_sha256' => NzbSourceGuard::digest('<nzb>upgraded</nzb>'), 'proof_version' => ReleaseArchiveNamingEvidence::PROOF_VERSION,
+            'scope' => 'unknown', 'episode_files' => '[]', 'updated_at' => now()]);
+        $directory = sys_get_temp_dir().'/fingerprint-staged-'.bin2hex(random_bytes(6));
+        config(['nntmux_settings.path_to_nzbs' => $directory]);
+        $this->app->forgetInstance(NzbService::class);
+        $staged = app(NzbService::class)->getNzbPath($guid, createIfNotExist: true).'.c7-'.str_repeat('a', 16).'.next';
+        file_put_contents($staged, gzencode('<nzb>upgraded</nzb>'));
+        $nzb = \Mockery::mock(NzbService::class);
+        $nzb->shouldReceive('readNzbContents')->with($guid)->andReturn(false);
+        $yenc = new YencService;
+        $collector = new ReleaseFingerprintCollector($nzb, new NzbFingerprintAnalyzer($yenc), new Par2MetadataParser, $yenc);
+
+        try {
+            (new CollectReleaseFingerprintMetadata(1))->withFakeQueueInteractions()->handle($collector);
+            $this->assertSame('stale', DB::table('release_fingerprint_metadata')->value('status'), 'Collected again once the staged generation is in place.');
+
+            unlink($staged);
+            (new CollectReleaseFingerprintMetadata(1, 'retry'))->withFakeQueueInteractions()->handle($collector);
+            $this->assertSame('unavailable', DB::table('release_fingerprint_metadata')->value('status'), 'With nothing staged, the NZB really is unavailable.');
+        } finally {
+            app('files')->deleteDirectory($directory);
+        }
+    }
+
+    #[Test]
     public function the_stale_sweep_queues_stale_and_stuck_records_only(): void
     {
         config(['database.default' => 'sqlite', 'database.connections.sqlite.database' => ':memory:',

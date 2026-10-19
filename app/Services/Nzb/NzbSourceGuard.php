@@ -69,6 +69,16 @@ final class NzbSourceGuard
     }
 
     /**
+     * With the caller's transaction, install the committed generation if it is still staged, or throw when one is
+     * staged but cannot be put in place: a reader of the canonical file would otherwise see an older generation
+     * than the row describes.
+     */
+    public function settleLockedOrDefer(object $release): void
+    {
+        $this->withSettledSource($release, true, static fn (): null => null);
+    }
+
+    /**
      * Caller registers receipt rollback/close with its outer transaction.
      * The optional digest is a compare-and-swap for parser repairs.
      *

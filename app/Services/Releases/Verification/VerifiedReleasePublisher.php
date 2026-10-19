@@ -349,10 +349,11 @@ final class VerifiedReleasePublisher
             $row = DB::table('releases')->where('id', $candidate->id)->where('nzbstatus', NzbService::NZB_ADDED)
                 ->lockForUpdate()->first(['id', 'guid']);
             // A committed upgrade's NZB may still be staged: coverage reads the generation the row describes. Settled
-            // through the row lock already held (by id, then the source lock, as every settle path takes them); a
-            // database error ends this publication rather than continue outside its rolled-back transaction.
+            // through the row lock already held (by id, then the source lock, as every settle path takes them). One
+            // that cannot be put in place defers this publication, which would otherwise judge coverage on the older
+            // file; a database error likewise ends it rather than continue outside its rolled-back transaction.
             if ($row !== null && is_string($row->guid) && $guard->hasStagedGenerations($row->guid)) {
-                $guard->withLockedSource($row, static fn (): null => null);
+                $guard->settleLockedOrDefer($row);
             }
         };
         $coverage = new NzbArticleCoverage(app(NzbService::class), $this->duplicates);
@@ -597,10 +598,10 @@ final class VerifiedReleasePublisher
         $naming = (int) $release->predb_id > 0 ? [] : array_intersect_key($metadata,
             array_flip(['name', 'searchname', 'fromname', 'categories_id', 'isrenamed', 'predb_id']));
         if ($naming !== [] && ($naming['searchname'] ?? null) !== $release->searchname) {
-            // Title-derived lookups (TV, movie, book, music, console, anime) ran on the old name; redo them,
+            // Title-derived lookups (TV, movie, book, music, console, PC game, anime) ran on the old name; redo them,
             // as any rename does.
             $naming += array_intersect_key([...TvProcessingCandidateQuery::resetColumns(), 'imdbid' => null, 'movieinfo_id' => null, 'musicinfo_id' => null,
-                'consoleinfo_id' => null, 'bookinfo_id' => null, 'book_lookup_attempts' => 0, 'book_lookup_retry_at' => null,
+                'consoleinfo_id' => null, 'gamesinfo_id' => 0, 'bookinfo_id' => null, 'book_lookup_attempts' => 0, 'book_lookup_retry_at' => null,
                 'book_name_normalized_at' => null, 'anidbid' => null, 'iscategorized' => 1], array_flip(Schema::getColumnListing('releases')));
         }
         DB::table('releases')->where('id', $id)->update(['size' => $size, 'totalpart' => $totalParts,

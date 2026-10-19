@@ -1262,7 +1262,7 @@ final class CandidateRepository
             }, 5);
         }
         $this->expireRetainedPartials($mayStart);
-        $this->settleLateArticleHolders();
+        $this->settleLateArticleHolders($mayStart);
     }
 
     /**
@@ -1292,7 +1292,8 @@ final class CandidateRepository
      * Clear a release's late-article candidate once that candidate can no longer upgrade it: it ended
      * unpublished (expired, filtered) or published elsewhere. The pointer only ever clears.
      */
-    private function settleLateArticleHolders(): void
+    /** @param  (callable(): bool)|null  $mayStart */
+    private function settleLateArticleHolders(?callable $mayStart = null): void
     {
         if (! Release::hasLateArticleFlag()) {
             return;
@@ -1309,19 +1310,23 @@ final class CandidateRepository
             ->when(in_array(DB::getDriverName(), ['mysql', 'mariadb'], true), fn ($query) => $query->forceIndex('releases_late_article_candidate_id_index'))
             ->where('late_article_candidate_id', '>', $after)->orderBy('late_article_candidate_id')->limit(1000)
             ->get(['id', 'late_article_candidate_id']);
-        try {
-            Cache::put($cursorKey, $held->count() < 1000 ? 0 : (int) $held->last()->late_article_candidate_id, now()->addDay());
-        } catch (Throwable) {
-            // The next pass starts over.
-        }
         if ($held->isEmpty()) {
+            $this->putSettleCursor($cursorKey, 0);
+
             return;
         }
         $candidates = DB::table('release_verification_candidates')->whereIn('id', $held->pluck('late_article_candidate_id')->unique()->all())
             ->get(['id', 'release_id', 'manifest_path', 'status'])->keyBy('id');
         $guids = DB::table('releases')->whereIn('id', $held->pluck('id')->all())->pluck('guid', 'id');
         $guard = app(NzbSourceGuard::class);
+        $checkpoint = $after;
         foreach ($held as $release) {
+            if ($mayStart !== null && ! $mayStart()) {
+                // Past the maintenance deadline: the next pass resumes after the last row settled here.
+                $this->putSettleCursor($cursorKey, $checkpoint);
+
+                return;
+            }
             $candidate = $candidates->get((int) $release->late_article_candidate_id);
             // Settled once its holder ended unpublished, was published elsewhere, or released its inventory.
             $settled = $candidate === null
@@ -1341,6 +1346,17 @@ final class CandidateRepository
                 DB::table('releases')->where('id', $release->id)->where('late_article_candidate_id', $release->late_article_candidate_id)
                     ->update(['late_article_candidate_id' => null]);
             }
+            $checkpoint = (int) $release->late_article_candidate_id;
+        }
+        $this->putSettleCursor($cursorKey, $held->count() < 1000 ? 0 : $checkpoint);
+    }
+
+    private function putSettleCursor(string $cursorKey, int $cursor): void
+    {
+        try {
+            Cache::put($cursorKey, $cursor, now()->addDay());
+        } catch (Throwable) {
+            // The next pass starts over.
         }
     }
 
