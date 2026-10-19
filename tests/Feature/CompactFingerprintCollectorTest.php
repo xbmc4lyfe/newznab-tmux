@@ -717,6 +717,28 @@ final class CompactFingerprintCollectorTest extends TestCase
 
         $this->assertSame([], $result['data']['errors']);
         $this->assertSame('complete', $result['status']);
+        $this->assertSame([true], array_values(array_unique(array_map(static fn (array $article): mixed => $article['yenc']['crc_ok'], $result['data']['articles']))));
+        // A 16-byte first part cannot cover the file's prefix, so no prefix hash is claimed.
+        $this->assertNull($result['data']['files'][0]['first16k_md5']);
+    }
+
+    #[Test]
+    public function a_proven_trailerless_first_part_supplies_the_prefix_hash(): void
+    {
+        $data = str_repeat('y', 20_000);
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)->andReturnUsing(function (string $id) use ($data): array {
+            $part = preg_match('/-s(\d+)@/', $id, $match) === 1 ? (int) $match[1] : 1;
+            $body = YencArticles::part($data, 'big.bin', 40_000, $part, 20_000 * ($part - 1) + 1, 2);
+
+            return ['body' => (string) preg_replace('/(=yend size=20000) part=\d+/', '$1', $body)] + self::article($id);
+        });
+
+        $result = $this->collector()->collectFromNzb(self::nzb(3, 2, false), 7);
+
+        $this->assertSame('complete', $result['status']);
+        $this->assertSame(md5(substr($data, 0, 16_384)), $result['data']['files'][0]['first16k_md5']);
     }
 
     /** @return array<string, array{callable(string): string}> */

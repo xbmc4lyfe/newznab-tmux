@@ -189,6 +189,11 @@ final class CompactFingerprintCollector
                         $errors[$account][$integrityError] = ($errors[$account][$integrityError] ?? 0) + 1;
                     }
                     $prefixMd5 = $metadata['yenc']['par2_first_16k_md5_candidate'] ?? null;
+                    if (! is_string($prefixMd5) && $integrityErrors === [] && is_array($metadata['yenc'] ?? null)
+                        && self::partWithoutTrailerPart($metadata['yenc'])) {
+                        // The analyzer withholds the prefix for a part it calls incomplete; this part is proven.
+                        $prefixMd5 = self::verifiedPartPrefixMd5($metadata['yenc'], $analysis['decoded_bytes'] ?? null);
+                    }
                     if ($integrityErrors === [] && $sample['segment_number'] === 1 && is_string($prefixMd5)) {
                         // Prefix hashes come only from integrity-verified copies, from whichever provider first has one.
                         $firstPrefixMd5[$sample['file_index']] ??= strtolower($prefixMd5);
@@ -607,7 +612,8 @@ final class CompactFingerprintCollector
             'total' => is_int($yenc['total_parts'] ?? null) ? $yenc['total_parts'] : null,
             'begin' => is_int($yenc['begin'] ?? null) ? $yenc['begin'] : null,
             'end' => is_int($yenc['end'] ?? null) ? $yenc['end'] : null,
-            'crc_ok' => is_bool($yenc['declared_crc32_matches'] ?? null) ? $yenc['declared_crc32_matches'] : null,
+            'crc_ok' => is_bool($yenc['declared_crc32_matches'] ?? null) ? $yenc['declared_crc32_matches']
+                : (self::partWithoutTrailerPart($yenc) ? true : null),
             'size_ok' => self::sizesAgree($yenc),
         ];
     }
@@ -688,6 +694,23 @@ final class CompactFingerprintCollector
             && ($yenc['trailer_numeric_fields_valid'] ?? null) === true
             && is_string($declared) && preg_match('/\A[0-9a-f]{1,8}\z/i', trim($declared)) === 1
             && is_string($observed) && hexdec(trim($declared)) === hexdec($observed);
+    }
+
+    /**
+     * MD5 of a proven part's first min(file size, 16 KiB) bytes, when the part starts the file and
+     * covers that whole prefix (the same basis the analyzer uses for its PAR2 prefix candidate).
+     *
+     * @param  array<string, mixed>  $yenc
+     */
+    private static function verifiedPartPrefixMd5(array $yenc, mixed $decoded): ?string
+    {
+        $fileSize = $yenc['file_size'] ?? null;
+        if (! is_string($decoded) || ! is_int($fileSize) || $fileSize < 1 || ($yenc['begin'] ?? null) !== 1) {
+            return null;
+        }
+        $length = min($fileSize, 16_384);
+
+        return strlen($decoded) >= $length ? md5(substr($decoded, 0, $length)) : null;
     }
 
     /**
