@@ -1394,13 +1394,14 @@ def database_service(docker_dir: Path) -> str:
     return targets.pop() if targets else "mariadb"
 
 def docker_daemon_identity() -> str:
-    """The daemon selection Docker resolves: DOCKER_CONTEXT overrides DOCKER_HOST, which overrides
-    the current context."""
+    """The daemon the Docker CLI actually connects to: DOCKER_HOST wins over DOCKER_CONTEXT (with both
+    set, `docker context show` reports `default` and the CLI dials DOCKER_HOST), which wins over the
+    current context."""
+    host = os.environ.get("DOCKER_HOST", "")
+    if host:
+        return f"host:{host}"
     context = os.environ.get("DOCKER_CONTEXT", "")
     if not context:
-        host = os.environ.get("DOCKER_HOST", "")
-        if host:
-            return f"host:{host}"
         # The current context, so an exported DOCKER_CONTEXT naming it compares equal.
         proc = subprocess.run(["docker", "context", "show"], capture_output=True, text=True, check=False)
         context = proc.stdout.strip() if proc.returncode == 0 else ""

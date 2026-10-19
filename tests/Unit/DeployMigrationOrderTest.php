@@ -1875,13 +1875,15 @@ SH);
         $this->assertStringContainsString('data service cache2 depends on app service web', $plan->getErrorOutput());
     }
 
-    public function test_docker_context_overrides_docker_host_in_the_daemon_identity(): void
+    public function test_docker_host_overrides_docker_context_in_the_daemon_identity(): void
     {
-        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['DOCKER_HOST' => 'unix:///same.sock', 'DOCKER_CONTEXT' => 'one'])->mustRun();
-        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['DOCKER_HOST' => 'unix:///same.sock', 'DOCKER_CONTEXT' => 'two']);
+        // The CLI dials DOCKER_HOST when both are set: switching it is a daemon change even with the
+        // same context name.
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['DOCKER_HOST' => 'unix:///one.sock', 'DOCKER_CONTEXT' => 'same'])->mustRun();
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['DOCKER_HOST' => 'unix:///two.sock', 'DOCKER_CONTEXT' => 'same']);
         $process->run();
         $this->assertFalse($process->isSuccessful());
-        $this->assertStringContainsString('Docker daemon changed from context:one to context:two', $process->getErrorOutput());
+        $this->assertStringContainsString('Docker daemon changed from host:unix:///one.sock to host:unix:///two.sock', $process->getErrorOutput());
     }
 
     public function test_a_docker_daemon_change_aborts_before_any_change(): void

@@ -60,14 +60,21 @@ final class DockerDeployGuardTest extends TestCase
         $done = $this->dir.'/grandchild-done';
         // The payload dies on TERM, but its grandchild (like a nested docker build) keeps running.
         $payload = 'sh -c "trap \"\" TERM; touch '.$ready.'; sleep 2; touch '.$done.'" & wait';
-        $process = $this->guardProcess(['run', 'deploy', '--', 'sh', '-c', $payload]);
-        $process->start();
-        $this->waitFor(fn (): bool => file_exists($ready));
-        $process->signal(15);
-        $this->waitFor(fn (): bool => ! $process->isRunning());
-
-        $this->assertFileExists($done, 'the guard returned before the grandchild finished');
-        $this->assertFalse(is_link($this->dir.'/lock'));
+        foreach (['sh', 'dash', 'bash'] as $shell) {
+            if ((new Process(['sh', '-c', 'command -v '.$shell]))->run() !== 0) {
+                continue;
+            }
+            @unlink($ready);
+            @unlink($done);
+            $process = $this->guardProcess(['run', 'deploy', '--', 'sh', '-c', $payload], [], $shell);
+            $process->start();
+            $this->waitFor(fn (): bool => file_exists($ready));
+            $process->signal(15);
+            // The guard itself (not just its output pipes) must outlive the grandchild.
+            $this->waitFor(fn (): bool => ! $process->isRunning());
+            $this->assertFileExists($done, $shell.': the guard returned before the grandchild finished');
+            $this->assertFalse(is_link($this->dir.'/lock'), $shell);
+        }
     }
 
     #[Test]

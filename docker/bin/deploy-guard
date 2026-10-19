@@ -104,6 +104,9 @@ release() {
 # `finished` line, then release a lock this process owns.
 guard_exit() {
     exit_code=$?
+    # A reader still waiting (the guard stopped before its payload ran) must not linger.
+    if [ -n "${alive_reader:-}" ]; then kill "$alive_reader" 2>/dev/null || true; fi
+    case "${alive_fifo:-}" in ''|/dev/null) ;; *) remove_fifo "$alive_fifo" ;; esac
     if [ "${attempt_open:-0}" = 1 ]; then
         attempt_open=0
         log "$target" "result=finished rc=$exit_code (interrupted)"
@@ -248,14 +251,29 @@ cooldown() {
 # A signal to the guard alone (e.g. a supervisor stopping it) reaches the payload too, and the guard
 # waits for the payload's own recovery (drain restore, barrier hold) before releasing ownership.
 payload=
-NEW_GROUP='import os, sys; os.setpgid(0, 0); os.execvp(sys.argv[1], sys.argv[1:])'
+alive_reader=
+alive_fifo=
+# Every descendant of the payload inherits the write end of a FIFO (fd 9); its reader sees EOF only
+# once all of them (nested guards, a docker build) have exited, so the lock is held until then.
+# Unlinked through Python, not rm: the guard's lock handling owns every rm call it makes.
+remove_fifo() { python3 -c 'import os, sys
+try:
+    os.unlink(sys.argv[1])
+except FileNotFoundError:
+    pass' "$1" 2>/dev/null || true; }
+wait_for_descendants() {
+    [ -z "$alive_reader" ] || wait "$alive_reader" 2>/dev/null || true
+    alive_reader=
+    case "$alive_fifo" in ''|/dev/null) ;; *) remove_fifo "$alive_fifo" ;; esac
+    alive_fifo=
+}
 forward_signal() {
     if [ -n "$payload" ]; then
-        # The payload leads its own process group: signal all of it (nested guards, docker build)
-        # and hold the lock until every member has exited, not just the direct child.
-        kill -"$1" -- "-$payload" 2>/dev/null || kill -"$1" "$payload" 2>/dev/null || true
+        # Only the direct child: its own traps let a running step finish and then recover (restart
+        # Horizon, resume the drains) before it exits; descendants are then waited for.
+        kill -"$1" "$payload" 2>/dev/null || true
         wait "$payload" 2>/dev/null || true
-        while kill -0 -- "-$payload" 2>/dev/null; do sleep 1; done
+        wait_for_descendants
     fi
     exit "$2"
 }
@@ -318,15 +336,23 @@ cmd_run() {
     # guard's stdin travels on descriptor 3, e.g. for `... run resume-scheduler -- python3 - < script`.
     # A closed stdin (`<&-`) cannot be duplicated: the payload then reads /dev/null, as a foreground
     # command with nothing to read would.
-    # Its own process group (setpgid), so a forwarded signal reaches every descendant.
-    if ( exec 3<&0 ) 2>/dev/null; then
-        { python3 -c "$NEW_GROUP" "$@" <&3 3<&- & } 3<&0
+    alive_fifo="${TMPDIR:-/tmp}/deploy-guard-alive.$$"
+    remove_fifo "$alive_fifo"
+    if mkfifo "$alive_fifo" 2>/dev/null; then
+        cat "$alive_fifo" >/dev/null 2>&1 &
+        alive_reader=$!
     else
-        python3 -c "$NEW_GROUP" "$@" </dev/null &
+        alive_fifo=/dev/null
+    fi
+    if ( exec 3<&0 ) 2>/dev/null; then
+        { "$@" <&3 3<&- 9>"$alive_fifo" & } 3<&0
+    else
+        "$@" </dev/null 9>"$alive_fifo" &
     fi
     payload=$!
     if wait "$payload"; then rc=0; else rc=$?; fi
     payload=
+    wait_for_descendants
     if [ "$rc" -eq 0 ] && [ "${STAMP_ON_SUCCESS:-0}" = 1 ]; then
         # One snapshot supplies both the comparison and the stamp, so a checkout change between
         # them cannot stamp per-service data that was never built or verified.
