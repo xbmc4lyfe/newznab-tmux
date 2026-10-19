@@ -3543,6 +3543,15 @@ SH);
         $this->assertNotSame(0, $plan->getExitCode());
         $this->assertStringContainsString('select different database services (db2, db3)', $plan->getErrorOutput());
 
+        // A pass-through key Compose leaves unset renders null; app.env's value still selects.
+        mkdir($this->directory.'/docker/config', 0777, true);
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=db2\n");
+        $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['web' => ['environment' => ['DB_HOST' => null]], 'horizon' => ['environment' => ['DB_HOST' => 'db3']], 'db2' => [], 'db3' => []] + $services], JSON_UNESCAPED_SLASHES)]);
+        $plan->run();
+        @unlink($this->directory.'/docker/config/app.env');
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('select different database services (db2, db3)', $plan->getErrorOutput());
+
         // A service name another service also answers to is ambiguous.
         $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['mariadb' => [], 'db2' => ['networks' => ['default' => ['aliases' => ['mariadb']]]]] + array_map(fn ($svc) => ['environment' => ['DB_HOST' => 'mariadb']], $services)], JSON_UNESCAPED_SLASHES)]);
         $plan->run();

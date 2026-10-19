@@ -933,8 +933,8 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
             env = RENDERED_SERVICES.get(svc, {}).get("environment") if isinstance(RENDERED_SERVICES.get(svc), dict) else None
             if isinstance(env, dict):
                 for key in ("DB_URL", "DB_CONNECTION", "DB_HOST", "DB_PORT", "DB_SOCKET", "DB_DATABASE"):
-                    if key in env:
-                        value = str(env[key] or "")
+                    if env.get(key) is not None:  # A null pass-through is unset in the container.
+                        value = str(env[key])
                         if key == "DB_URL":
                             value = value.rsplit("@", 1)[-1]
                         rendered_db.append(f"{svc}:{key}={value}")
@@ -1424,7 +1424,8 @@ def database_service(docker_dir: Path) -> str:
     for app in APP_SERVICES:
         cfg = RENDERED_SERVICES.get(app)
         env = cfg.get("environment") if isinstance(cfg, dict) else None
-        rendered = env if isinstance(env, dict) else {}
+        # A pass-through key Compose leaves unset (`environment: [DB_HOST]`) renders null: app.env decides.
+        rendered = {k: v for k, v in env.items() if v is not None} if isinstance(env, dict) else {}
         # Keys Compose sets for this app shadow app.env's (Laravel reads the process environment first).
         merged = {**app_env, **{k: v for k, v in rendered.items() if k in ("DB_URL", "DB_HOST", "DB_CONNECTION", "DB_PORT", "DB_SOCKET", "DB_DATABASE")}}
         for key in ("DB_URL", "DB_HOST", "DB_CONNECTION", "DB_PORT", "DB_SOCKET", "DB_DATABASE"):
@@ -1454,7 +1455,7 @@ def app_connection(app: str, app_env: dict) -> dict:
     """The connection settings an app service uses: its rendered environment over app.env's."""
     cfg = RENDERED_SERVICES.get(app)
     env = cfg.get("environment") if isinstance(cfg, dict) else None
-    rendered = env if isinstance(env, dict) else {}
+    rendered = {k: v for k, v in env.items() if v is not None} if isinstance(env, dict) else {}
     keys = ("DB_CONNECTION", "DB_URL", "DB_HOST", "DB_PORT", "DB_SOCKET", "DB_DATABASE")
     return {key: str(rendered[key] if key in rendered else app_env.get(key, "")) for key in keys}
 
