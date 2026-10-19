@@ -1355,24 +1355,36 @@ def compose_path(path: str) -> str:
 
 
 def database_service(docker_dir: Path) -> str:
-    """The rendered service the app's database runs in: the host in DB_URL (which Laravel prefers),
-    else DB_HOST from app.env, when it names one (e.g. an override's `db2`); otherwise `mariadb`."""
-    candidates = []
-    # The environment Compose renders for the apps wins over app.env (Laravel reads it first).
-    sources = [RENDERED_SERVICES.get(app, {}).get("environment") if isinstance(RENDERED_SERVICES.get(app), dict) else None
-               for app in APP_SERVICES]
-    sources = [env for env in sources if isinstance(env, dict)] + [read_dotenv(docker_dir / "config/app.env")]
-    for values in sources:
+    """The rendered service the app's database runs in. Per app service: its rendered Compose
+    environment wins over app.env, and DB_URL's host over DB_HOST (Laravel's order). All apps must
+    agree; a host that is no rendered service (an external database) leaves `mariadb`."""
+    app_env = read_dotenv(docker_dir / "config/app.env")
+
+    def selected(values: dict) -> list[str]:
+        hosts = []
         try:
-            candidates.append(urlsplit(str(values.get("DB_URL") or "")).hostname or "")
+            hosts.append(urlsplit(str(values.get("DB_URL") or "")).hostname or "")
         except ValueError:
             pass
-        candidates.append(str(values.get("DB_HOST") or ""))
-    for host in candidates:
-        if host in RENDERED_SERVICES:
-            return host
-    return "mariadb"
+        hosts.append(str(values.get("DB_HOST") or ""))
+        return hosts
 
+    targets = set()
+    for app in APP_SERVICES:
+        cfg = RENDERED_SERVICES.get(app)
+        env = cfg.get("environment") if isinstance(cfg, dict) else None
+        rendered = env if isinstance(env, dict) else {}
+        # Keys Compose sets for this app shadow app.env's (Laravel reads the process environment first).
+        merged = {**app_env, **{k: v for k, v in rendered.items() if k in ("DB_URL", "DB_HOST")}}
+        for host in selected(merged):
+            if host:
+                if host in RENDERED_SERVICES:
+                    targets.add(host)
+                break
+    if len(targets) > 1:
+        sys.exit(f"deploy-plan: the app services select different database services ({', '.join(sorted(targets))}); "
+                 "selective deployment migrates and fences one database. Give every app the same DB_HOST/DB_URL.")
+    return targets.pop() if targets else "mariadb"
 
 def docker_daemon_identity() -> str:
     """The daemon selection Docker resolves: DOCKER_CONTEXT overrides DOCKER_HOST, which overrides
@@ -1394,15 +1406,27 @@ def docker_daemon_identity() -> str:
     return f"context:{context}@{endpoint}" if endpoint else f"context:{context}"
 
 
+def service_providers(svc: str) -> set[str]:
+    """The services `svc` starts after: `depends_on` and `links` (`name` or `name:alias`)."""
+    cfg = RENDERED_SERVICES.get(svc)
+    if not isinstance(cfg, dict):
+        return set()
+    providers: set[str] = set()
+    deps = cfg.get("depends_on")
+    if isinstance(deps, (dict, list)):
+        providers.update(d for d in deps if isinstance(d, str))
+    links = cfg.get("links")
+    if isinstance(links, list):
+        providers.update(link.split(":", 1)[0] for link in links if isinstance(link, str))
+    return providers
+
+
 def transitive_dependencies(svc: str) -> set[str]:
     """Every rendered service `svc` depends on, directly or through others."""
     found: set[str] = set()
     pending = [svc]
     while pending:
-        cfg = RENDERED_SERVICES.get(pending.pop())
-        deps = cfg.get("depends_on") if isinstance(cfg, dict) else None
-        names = list(deps) if isinstance(deps, (dict, list)) else []
-        for dep in names:
+        for dep in service_providers(pending.pop()):
             if isinstance(dep, str) and dep not in found:
                 found.add(dep)
                 pending.append(dep)
@@ -1413,13 +1437,7 @@ def dependency_order(services: list[str]) -> list[str]:
     """Order services so each comes after the rendered services it `depends_on` (transitively),
     keeping the given order otherwise; a dependency cycle keeps the given order unchanged."""
     def deps_of(svc: str) -> list[str]:
-        cfg = RENDERED_SERVICES.get(svc)
-        deps = cfg.get("depends_on") if isinstance(cfg, dict) else None
-        if isinstance(deps, dict):
-            return sorted(d for d in deps if isinstance(d, str))
-        if isinstance(deps, list):
-            return sorted(d for d in deps if isinstance(d, str))
-        return []
+        return sorted(service_providers(svc))
 
     order: dict[str, int] = {}
     visiting: set[str] = set()
@@ -1667,6 +1685,13 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
             if consumers:
                 sys.exit(f"deploy-plan: infrastructure service {svc} depends on an app service and app service "
                          f"{consumers[0]} depends on it; selective deployment cannot order that. Break the cycle.")
+    # A missing database is started (and fenced) ahead of the other data services; it cannot wait
+    # for one of them.
+    database = database_service(docker_dir)
+    data_providers = sorted(dep for dep in transitive_dependencies(database) if dep in data_services(state))
+    if data_providers:
+        sys.exit(f"deploy-plan: the database service {database} depends on data service {data_providers[0]}; "
+                 "selective deployment starts the database first. Remove that dependency.")
     # A stateful service changes only with every writer stopped, so it cannot wait for an app provider.
     for svc in [*dirty_data, *reconcile_data, *start_data]:
         app_providers = sorted(dep for dep in transitive_dependencies(svc) if dep in APP_SERVICES)
@@ -1881,6 +1906,12 @@ def main() -> None:
                 stopping = set(APP_SERVICES) if plan["mode"] == "full" else {app for app in plan["dirty_app"] if app != "web"}
                 (after_app if any(dep in stopping for dep in app_providers) else after_data).append(svc)
         pre_drain = [svc for svc in pre_drain if svc not in after_app and svc not in after_data]
+        # Compose would pull an absent image during the apply, which no check here has inspected.
+        for svc in [*pre_drain, *after_app, *plan["dirty_data"], *plan["reconcile_data"], *after_data]:
+            cfg = RENDERED_SERVICES.get(svc)
+            if isinstance(cfg, dict) and isinstance(cfg.get("image"), str) and not image_id(cfg["image"]):
+                sys.exit(f"deploy-plan: image {cfg['image']} for {svc} is not present locally; pull it deliberately "
+                         "(docker compose pull) before deploying, so the plan inspects what it applies.")
         print(f"PRE_DRAIN={shlex.quote(' '.join(f'{marks[svc]}:{svc}' for svc in pre_drain))}")
         print(f"AFTER_APP={shlex.quote(' '.join(f'{marks[svc]}:{svc}' for svc in after_app))}")
         # The data services applied after the writers stop, likewise in one depends_on order.

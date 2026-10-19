@@ -63,6 +63,7 @@ case "$*" in
         # After the rollout, while the guard writes the stamp.
         if [ "${NNTMUX_INSPECT_FAIL_AFTER_UP:-0}" = 1 ] && [ -f "$NNTMUX_REPO/recreated" ] && ls "$NNTMUX_REPO"/docker/.deploy.stamp.tmp.* >/dev/null 2>&1; then echo "Error response from daemon: timeout" >&2; exit 1; fi
         [ "${NNTMUX_IMAGE_INSPECT_FAIL:-0}" != 1 ] || { echo "Error response from daemon: request timed out" >&2; exit 1; }
+        if [ -n "${NNTMUX_MISSING_IMAGE:-}" ] && [ "$last" = "$NNTMUX_MISSING_IMAGE" ]; then echo "Error response from daemon: No such image: $last" >&2; exit 1; fi
         if [ -f "$NNTMUX_REPO/replaced" ]; then echo sha256:replaced
         elif [ "${NNTMUX_REPLACE_AT_STAMP:-0}" = 1 ] && ls "$NNTMUX_REPO"/docker/.deploy.stamp.tmp.* >/dev/null 2>&1; then echo sha256:replaced
         elif [ "$last" = nntmux/base:local ] && [ -n "${NNTMUX_BASE_IMAGE_ID:-}" ]; then echo "$NNTMUX_BASE_IMAGE_ID"
@@ -1727,6 +1728,50 @@ SH);
         $this->assertStringNotContainsString('--wait-timeout 240 redis', $this->events());
     }
 
+    public function test_a_check_failing_after_starting_a_missing_database_keeps_remote_workers_out(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0', 'FORCE=1'], ['NNTMUX_NO_CONTAINER' => 'mariadb', 'NNTMUX_STALE_AFTER_UP_OF' => 'mariadb']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('releases:verification-barrier --timeout=900', $this->events());
+        $this->assertStringNotContainsString('released', $this->events());
+    }
+
+    public function test_an_absent_data_image_fails_closed_before_any_change(): void
+    {
+        mkdir($this->directory.'/docker/config/redis', 0777, true);
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 1gb\n");
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['redis']['image'] = 'redis:7';
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 2gb\n");
+        file_put_contents($this->directory.'/events', '');
+
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_MISSING_IMAGE' => 'redis:7']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('image redis:7 for redis is not present locally', $process->getErrorOutput());
+        $this->assertStringNotContainsString(' stop ', $this->events());
+    }
+
+    public function test_links_order_providers_like_depends_on(): void
+    {
+        $base = json_decode($this->composeJson(), true);
+        unset($base['services']['redis']);
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($base, JSON_UNESCAPED_SLASHES)])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        $with = $base;
+        $with['services']['redis'] = ['links' => ['tunnel:t']];
+        $with['services']['tunnel'] = ['labels' => ['nntmux.deploy.stateless' => 'true']];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($with, JSON_UNESCAPED_SLASHES), 'NNTMUX_NO_CONTAINER' => 'redis'])->mustRun();
+        $events = $this->events();
+        $this->assertLessThan(strpos($events, '--wait-timeout 240 redis'), strpos($events, '--wait-timeout 240 tunnel'));
+    }
+
     public function test_infrastructure_a_new_data_service_needs_starts_first(): void
     {
         $base = json_decode($this->composeJson(), true);
@@ -3181,6 +3226,18 @@ SH);
         $plan->run();
         $this->assertNotSame(0, $plan->getExitCode());
         $this->assertStringContainsString('pull_policy: always', $plan->getErrorOutput());
+
+        // Apps that disagree on their database cannot be migrated and fenced as one.
+        $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['horizon' => ['environment' => ['DB_HOST' => 'db2']], 'web' => ['environment' => ['DB_HOST' => 'db3']], 'db2' => [], 'db3' => []] + $services], JSON_UNESCAPED_SLASHES)]);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('select different database services (db2, db3)', $plan->getErrorOutput());
+
+        // The database cannot wait for another data service.
+        $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['mariadb' => ['depends_on' => ['redis' => ['condition' => 'service_healthy']]], 'redis' => []] + $services], JSON_UNESCAPED_SLASHES)]);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('database service mariadb depends on data service redis', $plan->getErrorOutput());
 
         // App services must run their role image.
         $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['web' => ['image' => 'nntmux/app:local']] + $services], JSON_UNESCAPED_SLASHES)]);

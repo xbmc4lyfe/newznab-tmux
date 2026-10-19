@@ -372,13 +372,16 @@ if [ "$database_missing" = 1 ]; then
         verify
     fi
     compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" "$DATABASE_SERVICE"
-    verify
+    # No check between starting it and fencing it: the barrier below is taken next (and verifies).
 fi
 
 # Remote workers are held out whenever the database's writers stop for a schema or data-service
 # change; a barrier left running by an earlier failed attempt is adopted and released on success.
 if [ "$need_barrier" = 1 ] || barrier_running || [ -e "$barrier_owed" ]; then
     hold_barrier
+    # A database started just now (missing before) awaits the migration like a replaced one: keep
+    # remote workers out on any failure from here.
+    if [ "$database_missing" = 1 ] && [ "$MIGRATE" = 1 ]; then barrier_keep=1; fi
     verify
 fi
 
