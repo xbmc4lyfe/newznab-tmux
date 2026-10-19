@@ -13,6 +13,7 @@ use App\Services\Releases\Verification\OversizedCollectionDeferrals;
 use DateTimeInterface;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\QueryException;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -252,10 +253,17 @@ class CollectionCleanupService
         }
     }
 
-    /** Archive one small stale window, retaining failed inputs until the snapshot wraps. */
+    /**
+     * Archive stale windows, retaining failed inputs until the snapshot wraps.
+     *
+     * Each pass hands at most a small number of collections to verification archival, which reads
+     * every header. Stale collections whose archival would only record an already expired candidate
+     * are deleted directly instead, so a pass keeps paging through such windows until its time
+     * budget runs out.
+     */
     private function deleteOldVerificationWindow(DateTimeInterface $cutoff, bool $echoCLI): int
     {
-        $lock = Cache::lock(self::VERIFICATION_OLD_SWEEP_LOCK, 600);
+        $lock = Cache::lock(self::VERIFICATION_OLD_SWEEP_LOCK, self::ORPHAN_SWEEP_LOCK_SECONDS);
         if (! $lock->get()) {
             return 0;
         }
@@ -270,40 +278,150 @@ class CollectionCleanupService
                 $lastId = 0;
                 $maxId = (int) DB::table('collections')->max('id');
             }
-            $limit = min(self::VERIFICATION_OLD_SWEEP_MAX_CANDIDATES, $this->sqlChunkSize());
-            $ids = DB::table('collections')->where('dateadded', '<', $cutoff)
-                ->where('id', '>', $lastId)->where('id', '<=', $maxId)
-                ->orderBy('id')->limit($limit)->pluck('id')->map(static fn ($id): int => (int) $id)->all();
-            if ($ids === []) {
-                Cache::forget(self::VERIFICATION_OLD_SWEEP_CURSOR);
+            $archiveBudget = min(self::VERIFICATION_OLD_SWEEP_MAX_CANDIDATES, $this->sqlChunkSize());
+            $deadline = microtime(true) + $this->verificationSweepSeconds();
+            $deleted = 0;
+            do {
+                $page = $this->sweepOldVerificationPage($cutoff, $lastId, $maxId, $archiveBudget, $echoCLI);
+                if ($page === null) {
+                    Cache::forget(self::VERIFICATION_OLD_SWEEP_CURSOR);
 
-                return 0;
-            }
-            $eligible = array_fill_keys($this->verificationEligibleCollections()->whereIn('id', $ids)
-                ->pluck('id')->map(static fn ($id): int => (int) $id)->all(), true);
-            // Deferred over-budget uploads keep their headers, like failed ones, without being read again.
-            $kept = app(OversizedCollectionDeferrals::class)->archiveEach(array_values(array_filter($ids, static fn (int $id): bool => isset($eligible[$id]))),
-                static function (int $id): void {
-                    app(CandidateRepository::class)->archive($id);
-                });
-            $failed = array_keys($kept);
-            foreach ($kept as $id => $outcome) {
-                if ($outcome['error'] !== null) {
-                    Log::warning('Verification archival failed during stale cleanup.', ['collection_id' => $id,
-                        'error_type' => $outcome['error']::class] + ($outcome['retry_after'] === null ? [] : ['retry_after' => $outcome['retry_after']]));
+                    return $deleted;
                 }
-            }
-            $lastId = $ids[array_key_last($ids)];
-            if ($lastId >= $maxId || count($ids) < $limit) {
-                Cache::forget(self::VERIFICATION_OLD_SWEEP_CURSOR);
-            } else {
-                Cache::forever(self::VERIFICATION_OLD_SWEEP_CURSOR, ['last_id' => $lastId, 'max_id' => $maxId]);
-            }
+                [$lastId, $archived, $pageDeleted, $exhausted] = $page;
+                $deleted += $pageDeleted;
+                $archiveBudget -= $archived;
+                if ($exhausted || $lastId >= $maxId) {
+                    Cache::forget(self::VERIFICATION_OLD_SWEEP_CURSOR);
 
-            return $this->deleteCollectionsAndDescendants(array_values(array_diff($ids, $failed)), 'Cleanup', $echoCLI);
+                    return $deleted;
+                }
+                Cache::forever(self::VERIFICATION_OLD_SWEEP_CURSOR, ['last_id' => $lastId, 'max_id' => $maxId]);
+            } while ($archiveBudget > 0 && microtime(true) < $deadline);
+
+            return $deleted;
         } finally {
             $lock->release();
         }
+    }
+
+    /**
+     * Process one page after $lastId: archive at most $archiveBudget collections that still need verification,
+     * delete those whose archival could only expire, and plain-delete the rest. The page ends at the last
+     * collection archival was attempted for, so none still owed archival is skipped.
+     *
+     * @return array{0: int, 1: int, 2: int, 3: bool}|null [last id, archival attempts, deleted rows, snapshot exhausted]
+     */
+    private function sweepOldVerificationPage(DateTimeInterface $cutoff, int $lastId, int $maxId, int $archiveBudget, bool $echoCLI): ?array
+    {
+        $limit = $this->sqlChunkSize();
+        $ids = DB::table('collections')->where('dateadded', '<', $cutoff)
+            ->where('id', '>', $lastId)->where('id', '<=', $maxId)
+            ->orderBy('id')->limit($limit)->pluck('id')->map(static fn ($id): int => (int) $id)->all();
+        if ($ids === []) {
+            return null;
+        }
+        $exhausted = count($ids) < $limit;
+        $eligible = array_fill_keys($this->verificationEligibleCollections()->whereIn('id', $ids)
+            ->pluck('id')->map(static fn ($id): int => (int) $id)->all(), true);
+        $expired = array_fill_keys($this->expiredOnArchival(array_keys($eligible)), true);
+        $archive = [];
+        foreach ($ids as $index => $id) {
+            if (! isset($eligible[$id]) || isset($expired[$id])) {
+                continue;
+            }
+            if (count($archive) === $archiveBudget) {
+                $ids = array_slice($ids, 0, $index);
+                $exhausted = false;
+                break;
+            }
+            $archive[] = $id;
+        }
+        // Deferred over-budget uploads keep their headers, like failed ones, without being read again.
+        $kept = app(OversizedCollectionDeferrals::class)->archiveEach($archive, static function (int $id): void {
+            app(CandidateRepository::class)->archive($id);
+        });
+        foreach ($kept as $id => $outcome) {
+            if ($outcome['error'] !== null) {
+                Log::warning('Verification archival failed during stale cleanup.', ['collection_id' => $id,
+                    'error_type' => $outcome['error']::class] + ($outcome['retry_after'] === null ? [] : ['retry_after' => $outcome['retry_after']]));
+            }
+        }
+        $expiredIds = array_values(array_filter($ids, static fn (int $id): bool => isset($expired[$id])));
+        $plain = array_values(array_filter($ids, static fn (int $id): bool => ! isset($expired[$id]) && ! isset($kept[$id])));
+        $deleted = $this->deleteExpiredOnArchival($expiredIds, $echoCLI)
+            + $this->deleteCollectionsAndDescendants($plain, 'Cleanup', $echoCLI);
+        // The deferral table has no foreign key, and these deletions bypass archiveEach's own cleanup.
+        app(OversizedCollectionDeferrals::class)->forget([...$expiredIds, ...$plain]);
+
+        return [$ids[array_key_last($ids)], count($archive), $deleted, $exhausted];
+    }
+
+    /**
+     * Archival records a collection whose newest article is older than the candidate expiry, and that
+     * has no candidate to join, as an expired candidate holding no headers and then deletes it.
+     * Collection hashes are unique, so only this collection's own archival could create that candidate.
+     * Legacy inserted rows keep the full archival path for their release handoff.
+     *
+     * @param  list<int>  $ids
+     * @return list<int>
+     */
+    private function expiredOnArchival(array $ids, bool $lock = false): array
+    {
+        if ($ids === []) {
+            return [];
+        }
+        sort($ids);
+        $expiresBefore = now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
+        $rows = DB::table('collections')
+            ->when($lock && in_array(DB::getDriverName(), ['mysql', 'mariadb'], true), fn ($query) => $query->forceIndex('PRIMARY'))
+            ->whereIn('id', $ids)->orderBy('id')->when($lock, fn ($query) => $query->lockForUpdate())->get();
+        $sources = [];
+        foreach ($rows as $row) {
+            $arrival = $row->last_seen_at ?? $row->dateadded ?? $row->added ?? null;
+            if ((int) $row->filecheck === CollectionFileCheckStatus::Inserted->value || ! is_string($row->collectionhash)
+                || $arrival === null || Carbon::parse($arrival)->format('Y-m-d H:i:s') >= $expiresBefore) {
+                continue;
+            }
+            $sources[bin2hex($row->collectionhash)] = (int) $row->id;
+        }
+        if ($sources === []) {
+            return [];
+        }
+        foreach (DB::table('release_verification_candidates')->whereIn('source_identity', array_map('strval', array_keys($sources)))
+            ->distinct()->pluck('source_identity') as $known) {
+            unset($sources[$known]);
+        }
+        $expired = array_values($sources);
+        sort($expired);
+
+        return $expired;
+    }
+
+    /**
+     * Delete collections whose archival would only expire, rechecking each under its row lock: header
+     * storage locks the parent first, so a new article either landed before the recheck or waits for it.
+     *
+     * @param  list<int>  $ids
+     */
+    private function deleteExpiredOnArchival(array $ids, bool $echoCLI): int
+    {
+        $deleted = 0;
+        foreach (array_chunk($ids, $this->sqlChunkSize()) as $chunk) {
+            $deleted += $this->retryOnLockError(
+                fn (): int => DB::transaction(fn (): int => $this->deleteRows($this->expiredOnArchival($chunk, lock: true))),
+                'Expired stale cleanup',
+                $echoCLI,
+            );
+        }
+
+        return $deleted;
+    }
+
+    private function verificationSweepSeconds(): int
+    {
+        // Archival after the last page starts is not timed, so stay well inside the sweep lock's lifetime.
+        return max(0, min(120, (int) config('nntmux.cbp.verification_sweep_seconds', 60)));
     }
 
     /**
@@ -512,30 +630,8 @@ class CollectionCleanupService
                         if (config('release_verification.required', true) && ! $manifestArchived) {
                             $chunk = $this->deletableVerificationIds($chunk);
                         }
-                        if ($chunk === []) {
-                            return 0;
-                        }
-                        $placeholders = implode(',', array_fill(0, count($chunk), '?'));
-                        if ($this->cascadeDeleteReady()) {
-                            return (int) DB::affectingStatement(
-                                "DELETE FROM collections WHERE id IN ({$placeholders})",
-                                $chunk
-                            );
-                        }
 
-                        DB::statement(
-                            "DELETE FROM parts WHERE binaries_id IN (SELECT id FROM binaries WHERE collections_id IN ({$placeholders}))",
-                            $chunk
-                        );
-                        DB::statement(
-                            "DELETE FROM binaries WHERE collections_id IN ({$placeholders})",
-                            $chunk
-                        );
-
-                        return (int) DB::affectingStatement(
-                            "DELETE FROM collections WHERE id IN ({$placeholders})",
-                            $chunk
-                        );
+                        return $this->deleteRows($chunk);
                     }
                 ),
                 $label,
@@ -544,6 +640,30 @@ class CollectionCleanupService
         }
 
         return $deletedCollections;
+    }
+
+    /**
+     * Delete the given collections with their binaries and parts; the caller holds the transaction.
+     *
+     * @param  list<int>  $ids
+     */
+    private function deleteRows(array $ids): int
+    {
+        if ($ids === []) {
+            return 0;
+        }
+        $placeholders = implode(',', array_fill(0, count($ids), '?'));
+        if ($this->cascadeDeleteReady()) {
+            return (int) DB::affectingStatement("DELETE FROM collections WHERE id IN ({$placeholders})", $ids);
+        }
+
+        DB::statement(
+            "DELETE FROM parts WHERE binaries_id IN (SELECT id FROM binaries WHERE collections_id IN ({$placeholders}))",
+            $ids
+        );
+        DB::statement("DELETE FROM binaries WHERE collections_id IN ({$placeholders})", $ids);
+
+        return (int) DB::affectingStatement("DELETE FROM collections WHERE id IN ({$placeholders})", $ids);
     }
 
     /** @return list<int> */

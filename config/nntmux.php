@@ -78,6 +78,8 @@ return [
         'nzb_stream_rows' => (int) env('CBP_NZB_STREAM_ROWS', 5000),
         // Collection id span checked for orphans by one cleanup pass; passes resume from a stored cursor.
         'orphan_scan_window' => (int) env('CBP_ORPHAN_SCAN_WINDOW', 250000),
+        // Seconds one verification-mode retention pass may keep paging through stale collections that need no archival.
+        'verification_sweep_seconds' => (int) env('CBP_VERIFICATION_SWEEP_SECONDS', 60),
         // Explicit maintenance-window approval for the destructive hash/key migration.
         'storage_migration_execute' => (bool) env('CBP_STORAGE_MIGRATION_EXECUTE', false),
     ],
