@@ -131,13 +131,20 @@ jobs:
           ADDITIONAL_ADMISSION_TEST_PASSWORD: donor-fixture-only
         run: php -d memory_limit=2G vendor/bin/phpunit --fail-on-skipped tests/Integration/AdditionalPasswordDisabledMariaDbTest.php
 
+      - name: Qualify verification ledger and admission locks against MariaDB
+        env:
+          VERIFICATION_LOCK_TEST_HOST: 127.0.0.1
+          VERIFICATION_LOCK_TEST_USERNAME: root
+          VERIFICATION_LOCK_TEST_PASSWORD: donor-fixture-only
+        run: php -d memory_limit=2G vendor/bin/phpunit --fail-on-skipped tests/Integration/VerificationLedgerConcurrencyMariaDbTest.php
+
       - name: Qualify verification candidates and cross-host locks against MariaDB
         env:
           VERIFICATION_MARIADB_TEST: 1
           VERIFICATION_MARIADB_HOST: 127.0.0.1
           VERIFICATION_MARIADB_USERNAME: root
           VERIFICATION_MARIADB_PASSWORD: donor-fixture-only
-        run: php -d memory_limit=2G vendor/bin/phpunit --fail-on-skipped tests/Feature/ReleaseVerificationMariaDbTest.php tests/Feature/ReleaseVerificationDatabaseManifestMariaDbTest.php tests/Feature/VerificationDatabaseLocksMariaDbTest.php
+        run: php -d memory_limit=2G vendor/bin/phpunit --fail-on-skipped tests/Feature/ReleaseVerificationMariaDbTest.php tests/Feature/ReleaseVerificationDatabaseManifestMariaDbTest.php tests/Feature/VerificationDatabaseLocksMariaDbTest.php tests/Feature/PartialHolderLocksMariaDbTest.php
 
       - name: Qualify reopened filename lifecycle against MariaDB
         env:

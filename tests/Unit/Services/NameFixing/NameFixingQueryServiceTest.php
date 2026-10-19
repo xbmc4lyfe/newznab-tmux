@@ -6,7 +6,7 @@ namespace Tests\Unit\Services\NameFixing;
 
 use App\Services\NameFixing\NameFixingQueryService;
 use Illuminate\Database\ConnectionInterface;
-use PHPUnit\Framework\TestCase;
+use Tests\TestCase;
 
 class NameFixingQueryServiceTest extends TestCase
 {

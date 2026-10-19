@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Models\Release;
+use App\Services\Nzb\NzbSourceGuard;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
@@ -72,7 +74,18 @@ final class VerificationResetService
 
     private function clearVerification(): void
     {
-        DB::transaction(function (): void {
+        $guard = app(NzbSourceGuard::class);
+        if (Release::hasLateArticleFlag()) {
+            // A committed upgrade whose post-commit swap did not run is installed first (each in its own transaction).
+            DB::table('releases')->whereNotNull('late_article_candidate_id')->select(['id', 'guid'])->chunkById(1000, static function ($fenced) use ($guard): void {
+                foreach ($fenced as $release) {
+                    if (is_string($release->guid) && $guard->hasStagedGenerations($release->guid)) {
+                        $guard->settleStagedGenerations($release->guid);
+                    }
+                }
+            });
+        }
+        DB::transaction(function () use ($guard): void {
             if (Schema::hasTable('release_verification_state')) {
                 DB::table('release_verification_state')->where('id', 1)->lockForUpdate()->first();
             }
@@ -81,6 +94,13 @@ final class VerificationResetService
             $hosts = Schema::hasTable('release_verification_scratch') && Schema::hasColumn('release_verification_scratch', 'host');
             if ($hosts) {
                 DB::table('release_verification_scratch')->where('host', '<>', ScratchInventory::host())->update(['terminal' => true]);
+            }
+            if (Release::hasLateArticleFlag()) {
+                // Partials keep no inventory once candidates are gone; let NZB-reading workers process them. One whose
+                // staged NZB is still unresolved stays fenced: the settle sweep installs it before releasing the fence.
+                $kept = DB::table('releases')->whereNotNull('late_article_candidate_id')->pluck('guid', 'id')
+                    ->filter(static fn ($guid): bool => is_string($guid) && $guard->hasStagedGenerations($guid))->keys()->all();
+                DB::table('releases')->whereNotNull('late_article_candidate_id')->whereNotIn('id', $kept)->update(['late_article_candidate_id' => null]);
             }
             foreach (['release_verification_scratch', 'release_verification_candidates', 'release_verification_audit_retries', 'release_verification_manifests'] as $table) {
                 if (Schema::hasTable($table)) {

@@ -246,6 +246,31 @@ class ReleaseVerificationAuditDeletionTest extends TestCase
         $this->assertFileExists($this->imagePath);
     }
 
+    public function test_a_partial_upgraded_after_its_audit_is_never_deleted_on_the_stale_verdict(): void
+    {
+        Schema::table('releases', static function (Blueprint $table): void {
+            $table->unsignedInteger('articles_found')->nullable();
+            $table->unsignedInteger('late_article_candidate_id')->nullable();
+        });
+        DB::table('releases')->where('id', 1)->update(['articles_found' => 1]);
+        $audited = Release::query()->findOrFail(1);
+        $inventory = app(ScratchInventory::class);
+        $entry = $inventory->registerAudit(1);
+        $inventory->recordAudit((int) $entry->id, 'unrepairable', 'Partial release NZB is truncated.');
+        // Late articles upgrade it while the audit does its NNTP work.
+        DB::table('releases')->where('id', 1)->update(['articles_found' => 3]);
+
+        try {
+            DB::transaction(fn () => app(AuditReleaseDeletion::class)->commit($audited, (int) $entry->id));
+            $this->fail('A changed generation must not be deleted.');
+        } catch (\RuntimeException $error) {
+            $this->assertSame('Audited release changed before deletion.', $error->getMessage());
+        }
+
+        $this->assertSame(1, DB::table('releases')->count());
+        $this->assertFileExists($this->nzbPath);
+    }
+
     private function audit(): void
     {
         // Exercise cleanup of a previously committed full-audit verdict without a new full download.

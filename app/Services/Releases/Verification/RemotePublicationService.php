@@ -53,6 +53,7 @@ final class RemotePublicationService
             'evidence.verified_file_names.*' => ['string', 'max:1024'],
             'evidence.identity_hints' => ['present', 'array', 'max:16'],
             'evidence.identity_hints.*' => ['string', 'max:1024'],
+            'evidence.partial' => ['sometimes', 'boolean'],
         ];
     }
 
@@ -172,7 +173,8 @@ final class RemotePublicationService
         $evidence = ['articles' => (int) $data['evidence']['articles'], 'bytes' => (int) $data['evidence']['bytes'],
             'sampled_files' => (int) $data['evidence']['sampled_files'],
             'verified_file_names' => array_values(array_map('strval', $data['evidence']['verified_file_names'])),
-            'identity_hints' => array_values(array_map('strval', $data['evidence']['identity_hints']))];
+            'identity_hints' => array_values(array_map('strval', $data['evidence']['identity_hints'])),
+            'partial' => (bool) ($data['evidence']['partial'] ?? false)];
         try {
             $settled = $this->settled($claim, $replayResolved);
             $timing?->requestPhase('published_check');
@@ -187,6 +189,7 @@ final class RemotePublicationService
             }
             $timing?->requestPhase('candidate_read');
             $archived = $this->store->read($candidate->manifest_path);
+            $evidence['partial'] = (new CandidateHeaderInventory)->assessment($archived)['status'] === 'waiting_upload';
             $manifest = SpotCheckVerifier::withEvidence($archived, $evidence);
             $timing?->requestPhase('manifest_read');
             if (! $gate->enter()) {
@@ -196,6 +199,9 @@ final class RemotePublicationService
             try {
                 $releaseId = $this->publisher->publish($claim, new VerificationResult('sampled', (string) $data['reason'], $manifest),
                     'remote', $timing ?? false, ['path' => (string) $candidate->manifest_path, 'manifest' => $archived]);
+            } catch (PartialPublicationDeferredException $deferred) {
+                // The sending worker returns the partial to waiting for one more hold window.
+                return new PublicationOutcome(PublicationOutcome::DEFERRED, null, $deferred->getMessage());
             } finally {
                 $gate->leave();
             }

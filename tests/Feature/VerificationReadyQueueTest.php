@@ -308,6 +308,8 @@ class VerificationReadyQueueTest extends ReleaseVerificationCandidatesTest
 
     public function test_waiting_upload_expiry_releases_reserved_storage_and_complete_work_falls_back(): void
     {
+        // Without partial publication: a stalled upload owed its partial attempt is published, not expired.
+        config(['release_verification.partial_after_hours' => 0]);
         $repository = app(CandidateRepository::class);
         $repository->enqueue($this->manifest('partial', 2));
         $this->travel(49)->hours();

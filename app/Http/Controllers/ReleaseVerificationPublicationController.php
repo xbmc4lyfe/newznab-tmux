@@ -29,6 +29,8 @@ class ReleaseVerificationPublicationController extends Controller
 
         return match ($outcome->status) {
             PublicationOutcome::PUBLISHED => response()->json(['release_id' => $outcome->releaseId]),
+            // The sending worker returns the partial to waiting for one more hold window.
+            PublicationOutcome::DEFERRED => response()->json(['deferred' => $outcome->error], 409),
             // The worker reads the candidate row to learn why no release exists.
             PublicationOutcome::FILTERED, PublicationOutcome::METADATA_REVIEW, PublicationOutcome::UNRESOLVED => response()->json(['release_id' => null]),
             default => response()->json(['error' => $outcome->error], 409),

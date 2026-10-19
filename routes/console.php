@@ -103,6 +103,8 @@ Schedule::call(function () {
 Schedule::command('tmux:health-check --auto-restart')->everyThirtyMinutes()->withoutOverlapping()->when(static fn (): bool => (bool) config('tmux.scheduled_health_check'));
 Schedule::command('nntmux:check-service-health')->everyMinute()->withoutOverlapping();
 Schedule::command('nntmux:search-repair --limit=100')->everyMinute()->withoutOverlapping();
+// Fingerprint metadata a partial's in-place upgrade marked stale, whose collection could not be queued or saved.
+Schedule::command('releases:fingerprint-backfill --stale --limit=200')->everyFifteenMinutes()->withoutOverlapping();
 // TV: retry episode lookups for shows whose episode wasn't available yet, and normalize
 // any release still carrying a legacy TV processor status.
 

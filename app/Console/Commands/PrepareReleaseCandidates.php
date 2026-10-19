@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Services\Releases\Verification\CandidatePreparationService;
+use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\VerificationWorkerLocks;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
@@ -16,7 +17,7 @@ class PrepareReleaseCandidates extends Command
 
     protected $description = 'Separate complete header inventories from uploads waiting for articles';
 
-    public function handle(CandidatePreparationService $service): int
+    public function handle(CandidatePreparationService $service, CandidateRepository $repository): int
     {
         $locks = new VerificationWorkerLocks;
         if (! $locks->startPreparation()) {
@@ -32,6 +33,8 @@ class PrepareReleaseCandidates extends Command
             $changed = $service->prepare(max(1, (int) $this->option('limit')), max(1, (int) $this->option('max-seconds')),
                 fn (bool $advance): bool => $locks->preferPending($advance), $observer);
             $this->info('Classified '.$changed.' candidate header inventories.');
+            $promoted = $repository->promotePartial(max(1, (int) $this->option('limit')));
+            $this->info('Queued '.$promoted.' stalled incomplete uploads for partial publication.');
 
             return self::SUCCESS;
         } finally {

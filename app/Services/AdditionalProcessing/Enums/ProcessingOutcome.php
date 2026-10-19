@@ -16,6 +16,8 @@ enum ProcessingOutcome: string
     case DeletedBrokenNzb = 'deleted-broken-nzb';
     case DeletedPar2Only = 'deleted-par2-only';
     case NotFound = 'not-found';
+    // A partial publication whose NZB late articles may still replace; processed once settled.
+    case AwaitingLateArticles = 'awaiting-late-articles';
     case Failed = 'failed';
 
     public function isSuccessful(): bool
