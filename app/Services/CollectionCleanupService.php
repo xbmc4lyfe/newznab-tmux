@@ -97,15 +97,21 @@ class CollectionCleanupService
         // Batch-delete old collections using select-then-delete so we can
         // explicitly remove parts/binaries/collections even when FK cascades
         // are not present in the runtime schema.
-        $cutoff = now()->subHours(app(ConfigurationProvider::class)->ingestion()->partRetentionHours);
+        $retentionHours = app(ConfigurationProvider::class)->ingestion()->partRetentionHours;
+        $cutoff = now()->subHours($retentionHours);
         $batchDeleted = 0;
         $verificationRequired = (bool) config('release_verification.required', true);
         if ($verificationRequired) {
             $batchDeleted = $this->deleteOldVerificationWindow($cutoff, $echoCLI);
         } else {
+            // Collections already found ready are owed a release attempt that a capped release
+            // pass may not have reached yet, so they get one more retention period.
+            $readyCutoff = now()->subHours(2 * $retentionHours);
+            $ready = [CollectionFileCheckStatus::CompleteParts->value, CollectionFileCheckStatus::Sized->value];
             do {
                 $ids = DB::table('collections')
                     ->where('dateadded', '<', $cutoff)
+                    ->where(static fn ($query) => $query->whereNotIn('filecheck', $ready)->orWhere('dateadded', '<', $readyCutoff))
                     ->orderBy('id')
                     ->limit($this->sqlChunkSize())
                     ->pluck('id')

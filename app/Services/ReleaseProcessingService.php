@@ -778,28 +778,36 @@ final class ReleaseProcessingService
         $lastId = 0;
         $normalizedGroupId = $this->normalizeGroupId($groupID);
         // Sized rows leave CompleteParts, so a capped sweep simply continues next pass.
+        // The capped reconciliation walk may not have reached a page yet, so each page is
+        // reconciled from its stored parts before it is promoted.
         $pages = 0;
         $deadline = now()->addSeconds($this->binariesConfig->reconcilePassSeconds);
+        $statuses = $this->reconcileStatuses();
         do {
             if (app(ProcessingRuntimeStateRepository::class)->stopRequested()
                 || $pages >= $this->binariesConfig->reconcilePagesPerPass || now()->gte($deadline)) {
                 break;
             }
             $pages++;
-            $query = Collection::query()
+            $ids = Collection::query()
                 ->where('id', '>', $lastId)
                 ->where('filecheck', CollectionFileCheckStatus::CompleteParts->value)
                 ->when($normalizedGroupId !== null, static fn ($q) => $q->where('groups_id', $normalizedGroupId))
                 ->orderBy('id')
-                ->limit($this->binariesConfig->reconcileBatchSize);
-            $ids = $query->pluck('id')->map(static fn ($id): int => (int) $id)->all();
+                ->limit($this->binariesConfig->reconcileBatchSize)
+                ->pluck('id')->map(static fn ($id): int => (int) $id)->all();
             if ($ids === []) {
                 break;
             }
+            $sized = $this->withCollectionReconciliationBarrier(function () use ($ids, $statuses): int {
+                $this->reconcileCollectionIds($ids, $statuses);
+
+                return Collection::query()->whereIn('id', $ids)
+                    ->where('filecheck', CollectionFileCheckStatus::CompleteParts->value)
+                    ->update(['filecheck' => CollectionFileCheckStatus::Sized->value]);
+            });
             $lastId = (int) end($ids);
-            $updated += Collection::query()->whereIn('id', $ids)->update([
-                'filecheck' => CollectionFileCheckStatus::Sized->value,
-            ]);
+            $updated += $sized;
         } while (\count($ids) === $this->binariesConfig->reconcileBatchSize);
 
         $this->outputStat('Collections sized', $updated);
@@ -814,34 +822,29 @@ final class ReleaseProcessingService
      * Stale incomplete collections stay in scope until retention removes them,
      * and a busy group can hold tens of millions, so one pass walks at most a
      * page and time budget and stores its position; the next pass resumes there
-     * and starts again from the lowest id once the walk reaches the end.
+     * and starts again from the lowest id once the walk reaches the end. Each
+     * cycle stops at the highest id present when it began, so collections added
+     * meanwhile cannot keep it from wrapping round to rows that became stale
+     * after the cursor passed them.
      *
      * @param  callable(list<int>): void|null  $afterReconciliation
      */
     private function reconcileIncompleteCollections(?int $groupId, ?callable $afterReconciliation): void
     {
         $cursorKey = self::RECONCILE_CURSOR_PREFIX.($groupId === null ? 'all' : 'group:'.$groupId);
-        // Redis returns a stored integer as a numeric string.
-        $saved = Cache::get($cursorKey);
-        $lastId = is_numeric($saved) ? max(0, (int) $saved) : 0;
+        [$lastId, $maxId] = $this->reconcileCursor($cursorKey);
         $pages = 0;
         $deadline = now()->addSeconds($this->binariesConfig->reconcilePassSeconds);
-        $statuses = [
-            CollectionFileCheckStatus::Default->value,
-            CollectionFileCheckStatus::CompleteCollection->value,
-            CollectionFileCheckStatus::CompleteParts->value,
-            CollectionFileCheckStatus::TempComplete->value,
-            CollectionFileCheckStatus::ZeroPart->value,
-            10,
-        ];
+        $statuses = $this->reconcileStatuses();
 
         do {
             if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
                 break;
             }
-            $ids = $this->withCollectionReconciliationBarrier(function () use ($lastId, $groupId, $statuses): array {
+            $ids = $this->withCollectionReconciliationBarrier(function () use ($lastId, $maxId, $groupId, $statuses): array {
                 $query = Collection::query()
                     ->where('id', '>', $lastId)
+                    ->where('id', '<=', $maxId)
                     ->where(function ($query) use ($statuses): void {
                         $query->where('filecheck', CollectionFileCheckStatus::CompleteParts->value)
                             ->orWhere(function ($stale) use ($statuses): void {
@@ -869,18 +872,51 @@ final class ReleaseProcessingService
                 break;
             }
             $lastId = (int) end($ids);
-            $finished = \count($ids) < $this->binariesConfig->reconcileBatchSize;
+            $finished = \count($ids) < $this->binariesConfig->reconcileBatchSize || $lastId >= $maxId;
             // Store the position before creating releases, so a failed page is not walked again first.
             if ($finished) {
                 Cache::forget($cursorKey);
             } else {
-                Cache::forever($cursorKey, $lastId);
+                Cache::forever($cursorKey, ['last_id' => $lastId, 'max_id' => $maxId]);
             }
             if ($afterReconciliation !== null) {
                 $afterReconciliation($ids);
             }
             $pages++;
         } while (! $finished && $pages < $this->binariesConfig->reconcilePagesPerPass && now()->lt($deadline));
+    }
+
+    /**
+     * The stored walk position and the snapshot ceiling of its cycle; a missing or
+     * finished cursor starts a new cycle at the current highest id.
+     *
+     * @return array{int, int}
+     */
+    private function reconcileCursor(string $cursorKey): array
+    {
+        $saved = Cache::get($cursorKey);
+        // Redis returns a stored integer as a numeric string; a bare number is the
+        // position stored before cycles had a ceiling.
+        if (is_array($saved) && is_numeric($saved['last_id'] ?? null) && is_numeric($saved['max_id'] ?? null)
+            && (int) $saved['last_id'] >= 0 && (int) $saved['max_id'] > (int) $saved['last_id']) {
+            return [(int) $saved['last_id'], (int) $saved['max_id']];
+        }
+        $lastId = is_numeric($saved) ? max(0, (int) $saved) : 0;
+
+        return [$lastId, (int) Collection::query()->max('id')];
+    }
+
+    /** @return list<int> */
+    private function reconcileStatuses(): array
+    {
+        return [
+            CollectionFileCheckStatus::Default->value,
+            CollectionFileCheckStatus::CompleteCollection->value,
+            CollectionFileCheckStatus::CompleteParts->value,
+            CollectionFileCheckStatus::TempComplete->value,
+            CollectionFileCheckStatus::ZeroPart->value,
+            10,
+        ];
     }
 
     /**

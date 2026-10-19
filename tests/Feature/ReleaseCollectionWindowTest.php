@@ -585,7 +585,7 @@ class ReleaseCollectionWindowTest extends TestCase
         };
 
         $this->assertSame([[1, 2]], $walk());
-        $this->assertSame(2, Cache::get('cbp:release-reconcile:cursor:group:1'));
+        $this->assertSame(['last_id' => 2, 'max_id' => 5], Cache::get('cbp:release-reconcile:cursor:group:1'));
         $this->assertSame([[3, 4]], $walk());
         $this->assertSame([[5]], $walk());
         $this->assertNull(Cache::get('cbp:release-reconcile:cursor:group:1'));
@@ -621,7 +621,44 @@ class ReleaseCollectionWindowTest extends TestCase
         });
 
         $this->assertSame([[1, 2]], $pages);
-        $this->assertSame(2, Cache::get('cbp:release-reconcile:cursor:group:1'));
+        $this->assertSame(['last_id' => 2, 'max_id' => 5], Cache::get('cbp:release-reconcile:cursor:group:1'));
+    }
+
+    public function test_stale_walk_cycle_ends_at_its_starting_ceiling_despite_new_arrivals(): void
+    {
+        config(['release_verification.required' => true]);
+        $this->insertStaleIncompleteCollections([1, 2, 3]);
+        $service = $this->service(new WindowTestReleaseCreationService,
+            binariesConfig: new BinariesConfig(reconcileBatchSize: 2, reconcilePagesPerPass: 1));
+        $walk = function () use ($service): array {
+            $pages = [];
+            $service->processIncompleteCollections(1, function (array $ids) use (&$pages): void {
+                $pages[] = $ids;
+            });
+
+            return $pages;
+        };
+
+        $this->assertSame([[1, 2]], $walk());
+        // Full pages keep arriving above the ceiling; the cycle still ends at id 3 and wraps.
+        $this->insertStaleIncompleteCollections([4, 5, 6, 7]);
+        $this->assertSame([[3]], $walk());
+        $this->assertNull(Cache::get('cbp:release-reconcile:cursor:group:1'));
+        $this->assertSame([[1, 2]], $walk());
+        $this->assertSame(['last_id' => 2, 'max_id' => 7], Cache::get('cbp:release-reconcile:cursor:group:1'));
+    }
+
+    public function test_sizing_reconciles_a_page_the_capped_walk_has_not_reached(): void
+    {
+        $this->insertCollection(1, size: 10);
+        DB::table('collections')->where('id', 1)->update(['filecheck' => 2]);
+        DB::table('binaries')->where('id', 1)->update(['partsize' => 10]);
+        DB::table('parts')->insert(['binaries_id' => 1, 'size' => 5000]);
+
+        $this->service(new WindowTestReleaseCreationService)->processCollectionSizes(1);
+
+        $this->assertSame(['filecheck' => 3, 'filesize' => 5000],
+            (array) DB::table('collections')->where('id', 1)->first(['filecheck', 'filesize']));
     }
 
     public function test_group_and_global_walk_cursors_are_independent(): void
@@ -632,7 +669,7 @@ class ReleaseCollectionWindowTest extends TestCase
         $this->service(new WindowTestReleaseCreationService,
             binariesConfig: new BinariesConfig(reconcileBatchSize: 2, reconcilePagesPerPass: 1))->processIncompleteCollections(1);
 
-        $this->assertSame(2, Cache::get('cbp:release-reconcile:cursor:group:1'));
+        $this->assertSame(['last_id' => 2, 'max_id' => 3], Cache::get('cbp:release-reconcile:cursor:group:1'));
         $this->assertSame(99, Cache::get('cbp:release-reconcile:cursor:all'));
     }
 
@@ -667,7 +704,7 @@ class ReleaseCollectionWindowTest extends TestCase
         $this->assertSame(2, DB::table('collections')->whereIn('id', [1, 2])->where('filecheck', 3)->count());
         $this->assertSame(0, DB::table('collections')->whereIn('id', [3, 4, 5, 6])->where('filecheck', '<>', 0)->count());
         $this->assertSame(1, $totals['releases']);
-        $this->assertSame(2, Cache::get('cbp:release-reconcile:cursor:group:1'));
+        $this->assertSame(['last_id' => 2, 'max_id' => 7], Cache::get('cbp:release-reconcile:cursor:group:1'));
     }
 
     public function test_fresh_pages_validate_all_rules_even_when_priority_cursors_are_ahead(): void
@@ -771,6 +808,21 @@ class ReleaseCollectionWindowTest extends TestCase
         $this->assertSame([1, 2, 3], DB::table('releases')->orderBy('id')->pluck('id')->all());
         $this->assertSame(3, $totals['releases']);
         $this->assertSame(0, DB::table('collections')->count());
+    }
+
+    public function test_retention_keeps_ready_collections_for_one_more_period(): void
+    {
+        ConfigurationTestBuilder::update(ConfigurationDomain::Ingestion, ['part_retention_hours' => 24]);
+        foreach ([1 => [2, 30], 2 => [3, 30], 3 => [0, 30], 4 => [2, 49], 5 => [3, 49]] as $id => [$filecheck, $hours]) {
+            $this->insertCollection($id);
+            DB::table('collections')->where('id', $id)->update([
+                'filecheck' => $filecheck, 'dateadded' => now()->subHours($hours), 'added' => now()->subHours($hours),
+            ]);
+        }
+
+        $this->service(new WindowTestReleaseCreationService)->deleteCollections(1);
+
+        $this->assertSame([1, 2], DB::table('collections')->orderBy('id')->pluck('id')->all());
     }
 
     public function test_idle_pipeline_runs_legacy_callbacks_once(): void
