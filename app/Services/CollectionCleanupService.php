@@ -95,7 +95,9 @@ class CollectionCleanupService
         if ($echoCLI) {
             echo cli()->header('Process Releases -> Delete finished collections.'.PHP_EOL).
                 cli()->primary(sprintf(
-                    'Deleting collections/binaries/parts older than %d hours.',
+                    config('release_verification.required', true)
+                        ? 'Deleting collections/binaries/parts older than %d hours.'
+                        : 'Deleting collections/binaries/parts older than %d hours (up to twice that while still owed processing).',
                     app(ConfigurationProvider::class)->ingestion()->partRetentionHours
                 ), true);
         }
