@@ -110,8 +110,8 @@ class CollectionCleanupService
         if ($verificationRequired) {
             $batchDeleted = $this->deleteOldVerificationWindow($cutoff, $echoCLI);
         } else {
-            // Collections already found ready are owed a release attempt that a capped release
-            // pass may not have reached yet, so they get one more retention period.
+            // Collections still waiting for reconciliation or release creation are owed an attempt
+            // that a capped release pass may not have reached yet, so they get one more retention period.
             $readyCutoff = now()->subHours(2 * $retentionHours);
             do {
                 $ids = DB::table('collections')
@@ -193,8 +193,8 @@ class CollectionCleanupService
     }
 
     /**
-     * Delete collections between the two retention cutoffs unless they are ready for release.
-     * The kept ready rows stay in this band, so it is walked in dateadded order from a stored
+     * Delete collections between the two retention cutoffs unless reconciliation or release
+     * creation still owes them an attempt. The kept rows stay in this band, so it is walked in dateadded order from a stored
      * position, a bounded number of pages per call, and each kept row is read once per walk.
      */
     private function deleteRetentionBandExceptReady(DateTimeInterface $readyCutoff, DateTimeInterface $cutoff, bool $echoCLI): int
@@ -205,7 +205,9 @@ class CollectionCleanupService
             return 0;
         }
         try {
-            $ready = [CollectionFileCheckStatus::CompleteParts->value, CollectionFileCheckStatus::Sized->value];
+            // The statuses the reconciliation walk revisits, and sized rows waiting for creation.
+            $ready = [...array_map(static fn (CollectionFileCheckStatus $status): int => $status->value,
+                [...CollectionFileCheckStatus::inProgress(), CollectionFileCheckStatus::Sized]), 10];
             $saved = Cache::get(self::RETENTION_BAND_CURSOR);
             [$lastDate, $lastId] = is_array($saved) && is_string($saved['dateadded'] ?? null) && is_numeric($saved['id'] ?? null)
                 ? [$saved['dateadded'], (int) $saved['id']] : [null, 0];

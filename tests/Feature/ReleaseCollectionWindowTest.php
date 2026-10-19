@@ -813,7 +813,9 @@ class ReleaseCollectionWindowTest extends TestCase
     public function test_retention_keeps_ready_collections_for_one_more_period(): void
     {
         ConfigurationTestBuilder::update(ConfigurationDomain::Ingestion, ['part_retention_hours' => 24]);
-        $rows = [1 => [2, 30], 2 => [0, 31], 3 => [3, 32], 4 => [0, 33], 5 => [1, 34], 6 => [2, 49], 7 => [3, 50], 8 => [0, 1]];
+        // Rows the walk or creation still owes an attempt (0, 1, 2, 3, 10, 15, 16) are kept up to twice retention.
+        $rows = [1 => [2, 30], 2 => [5, 31], 3 => [3, 32], 4 => [5, 33], 5 => [0, 34], 6 => [2, 49], 7 => [0, 50], 8 => [0, 1],
+            9 => [1, 35], 10 => [10, 36], 11 => [15, 37], 12 => [16, 38], 13 => [5, 39]];
         foreach ($rows as $id => [$filecheck, $hours]) {
             $this->insertCollection($id);
             DB::table('collections')->where('id', $id)->update([
@@ -824,18 +826,18 @@ class ReleaseCollectionWindowTest extends TestCase
         $cleanup = new CollectionCleanupService(new BinariesConfig(sqlChunkSize: 2));
         $this->service(new WindowTestReleaseCreationService, $cleanup)->deleteCollections(1);
 
-        $this->assertSame([1, 3, 8], DB::table('collections')->orderBy('id')->pluck('id')->all());
+        $this->assertSame([1, 3, 5, 8, 9, 10, 11, 12], DB::table('collections')->orderBy('id')->pluck('id')->all());
         $this->assertNull(Cache::get('cbp:retention-band:cursor'));
     }
 
     public function test_retention_band_walk_stops_at_its_page_cap_and_resumes_from_its_cursor(): void
     {
         ConfigurationTestBuilder::update(ConfigurationDomain::Ingestion, ['part_retention_hours' => 24]);
-        // 42 rows share one dateadded, so pages also split ties; even ids are ready.
+        // 42 rows share one dateadded, so pages also split ties; even ids are still owed an attempt.
         foreach (range(1, 42) as $id) {
             $this->insertCollection($id);
             DB::table('collections')->where('id', $id)->update([
-                'filecheck' => $id % 2 === 0 ? 3 : 0, 'dateadded' => now()->subHours(30), 'added' => now()->subHours(30),
+                'filecheck' => $id % 2 === 0 ? 0 : 5, 'dateadded' => now()->subHours(30), 'added' => now()->subHours(30),
             ]);
         }
         $cleanup = new CollectionCleanupService(new BinariesConfig(sqlChunkSize: 2));
