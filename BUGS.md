@@ -472,7 +472,7 @@ These bugs turned up while building and running the self-hosted stack in `docker
   - Part repair (sparse ranges) and a value of `0` disable the check.
   - Header-only indexing can't reconstruct these uploads; they're only usable from an NZB.
   - Each skipping range logs `Skipping articles obfuscated per article` with the group and count.
-  - The detection runs in Rust (`nntmux_per_article_obfuscation_v1` in `libnzbyenc`, through `NativePerArticleObfuscation`) and falls back to the PHP rule when FFI or the library is unavailable. `scripts/benchmark-per-article-obfuscation.php` found identical marks and a 1.9–3.2× speedup, including FFI and marshalling, in every stratum (200 paired samples, Linux arm64).
+  - The detection runs in Rust (`nntmux_per_article_obfuscation_v1` in `libnzbyenc`, through `NativePerArticleObfuscation`) and falls back to the PHP rule when FFI or the library is unavailable. Its subject scan is linear, and a range with a subject over 512 bytes stays on PHP, below where PHP's `pcre.backtrack_limit` can stop the subject pattern, so both sides mark alike. `scripts/benchmark-per-article-obfuscation.php` found identical marks and a 2.0–3.4× speedup, including FFI and marshalling, in every stratum, and 190× on crafted-whitespace subjects (200 paired samples, Linux arm64).
   - Remaining risk (all rare) — these real articles would still be skipped:
     - 16 or more unrelated real files in one range that share a subject shape with a long random token, have the same part total and no file counter, and each show a single middle article, at 16 or more different part positions.
     - A real upload in an obfuscated group whose only article in the range is a middle part (uploads posted over several connections arrive out of order).

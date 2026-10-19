@@ -6,7 +6,7 @@ declare(strict_types=1);
  * Paired PHP versus Rust comparison for HeaderParser::markPerArticleObfuscated() over seeded ranges.
  *
  *   php -d ffi.enable=true -d memory_limit=2G scripts/benchmark-per-article-obfuscation.php
- *     --native=/absolute/libnzbyenc.so --output-dir=/new/directory [--repeats=40] [--seed=20261019]
+ *     --native=/absolute/libnzbyenc.so --output-dir=/new/directory [--repeats=200] [--seed=20261019]
  *
  * Protocol: per stratum (Tests\Support\PerArticleObfuscationCorpus), the marked sets are first
  * checked for equality; then each side is timed `repeats` times on the whole range, one call per
@@ -14,8 +14,9 @@ declare(strict_types=1);
  * disabled. The Rust side is the caller's full path: record packing, the FFI call, unpacking and
  * building the article-number set HeaderParser consults, falling back to PHP on a decline. The
  * thresholds follow .ai/rules/rust-performance.md: common strata compare medians, uncommon strata
- * p99, and each must reach 1.5x. A missed threshold is a valid result and exits 0; invalid runs
- * (parity failure, missing library) exit 2.
+ * p99, and each must reach 1.5x on the point estimate. Uncertainty is a 95% percentile bootstrap
+ * interval of that speedup (2000 seeded resamples of the paired observations). A missed threshold
+ * is a valid result and exits 0; invalid runs (parity failure, missing library) exit 2.
  */
 
 use App\Services\Binaries\HeaderParser;
@@ -27,6 +28,7 @@ use Tests\Support\PerArticleObfuscationCorpus;
 
 const PER_ARTICLE_THRESHOLD = 1.5;
 const PER_ARTICLE_MIN_ARTICLES = 16;
+const PER_ARTICLE_BOOTSTRAP = 2000;
 
 try {
     exit(perArticleBenchmarkMain());
@@ -39,7 +41,7 @@ function perArticleBenchmarkMain(): int
 {
     $options = getopt('', ['native:', 'output-dir:', 'repeats:', 'seed:']);
     require_once dirname(__DIR__).'/vendor/autoload.php';
-    $repeats = filter_var($options['repeats'] ?? 40, FILTER_VALIDATE_INT);
+    $repeats = filter_var($options['repeats'] ?? 200, FILTER_VALIDATE_INT);
     $seed = filter_var($options['seed'] ?? 20261019, FILTER_VALIDATE_INT);
     if ($repeats === false || $repeats < 10 || $repeats > 1000 || $seed === false || $seed < 1) {
         throw new InvalidArgumentException('Invalid protocol parameters.');
@@ -74,7 +76,7 @@ function perArticleBenchmarkMain(): int
 
     $report = ['protocol' => [
         'name' => 'per-article-obfuscation-v1', 'seed' => $seed, 'repeats' => $repeats, 'min_articles' => PER_ARTICLE_MIN_ARTICLES,
-        'threshold' => PER_ARTICLE_THRESHOLD, 'timing' => 'hrtime around each whole-range call; random side order per observation; 3 warm-ups; GC disabled',
+        'threshold' => PER_ARTICLE_THRESHOLD, 'bootstrap_resamples' => PER_ARTICLE_BOOTSTRAP, 'timing' => 'hrtime around each whole-range call; random side order per observation; 3 warm-ups; GC disabled',
         'rust_path' => 'pack records + FFI call + unpack + array_fill_keys, PHP fallback on decline',
     ], 'environment' => ['php' => PHP_VERSION, 'machine' => php_uname('m'), 'os' => php_uname('s').' '.php_uname('r'),
         'library_sha256' => hash_file('sha256', (string) $options['native'])], 'strata' => [], 'status' => 'qualified'];
@@ -111,10 +113,12 @@ function perArticleBenchmarkMain(): int
         $phpValue = perArticleQuantile($samples['php'], $quantile);
         $rustValue = perArticleQuantile($samples['rust'], $quantile);
         $speedup = $phpValue / max(1, $rustValue);
+        [$low, $high] = perArticleBootstrap($samples, $quantile, $random);
         $row = ['category' => $stratum['category'], 'description' => $stratum['description'], 'headers' => count($headers),
             'marked' => count($expected), 'declined' => $native->mark($headers, PER_ARTICLE_MIN_ARTICLES) === null,
             'statistic' => $quantile === 0.5 ? 'median' : 'p99',
             'php_ms' => round($phpValue / 1e6, 3), 'rust_ms' => round($rustValue / 1e6, 3), 'speedup' => round($speedup, 2),
+            'speedup_ci95' => [round($low, 2), round($high, 2)],
             'php_median_ms' => round(perArticleQuantile($samples['php'], 0.5) / 1e6, 3),
             'rust_median_ms' => round(perArticleQuantile($samples['rust'], 0.5) / 1e6, 3),
             'php_p99_ms' => round(perArticleQuantile($samples['php'], 0.99) / 1e6, 3),
@@ -127,11 +131,11 @@ function perArticleBenchmarkMain(): int
         $report['raw'][$name] = $samples;
     }
 
-    $markdown = "| Stratum | Category | Headers | Marked | Statistic | PHP ms | Rust+FFI ms | Speedup |\n|---|---|---:|---:|---|---:|---:|---:|\n";
+    $markdown = "| Stratum | Category | Headers | Marked | Statistic | PHP ms | Rust+FFI ms | Speedup | 95% CI |\n|---|---|---:|---:|---|---:|---:|---:|---|\n";
     foreach ($report['strata'] as $name => $row) {
-        $markdown .= isset($row['parity']) ? "| {$name} | parity mismatch |||||||\n"
-            : sprintf("| %s | %s | %d | %d | %s | %.3f | %.3f | %.2fx |\n", $name, $row['category'], $row['headers'], $row['marked'],
-                $row['statistic'], $row['php_ms'], $row['rust_ms'], $row['speedup']);
+        $markdown .= isset($row['parity']) ? "| {$name} | parity mismatch ||||||||\n"
+            : sprintf("| %s | %s | %d | %d | %s | %.3f | %.3f | %.2fx | %.2f-%.2fx |\n", $name, $row['category'], $row['headers'], $row['marked'],
+                $row['statistic'], $row['php_ms'], $row['rust_ms'], $row['speedup'], $row['speedup_ci95'][0], $row['speedup_ci95'][1]);
     }
     $markdown .= "\nStatus: **{$report['status']}** (threshold ".PER_ARTICLE_THRESHOLD."x; {$repeats} paired samples per stratum).\n";
     file_put_contents($directory.'/report.json', json_encode($report, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR));
@@ -139,6 +143,29 @@ function perArticleBenchmarkMain(): int
     echo $markdown;
 
     return $report['status'] === 'invalid' ? 2 : 0;
+}
+
+/**
+ * 95% percentile bootstrap interval of the quantile speedup, resampling paired observations.
+ *
+ * @param  array{php: list<int>, rust: list<int>}  $samples
+ * @return array{float, float}
+ */
+function perArticleBootstrap(array $samples, float $quantile, Randomizer $random): array
+{
+    $count = count($samples['php']);
+    $ratios = [];
+    for ($resample = 0; $resample < PER_ARTICLE_BOOTSTRAP; $resample++) {
+        $php = $rust = [];
+        for ($i = 0; $i < $count; $i++) {
+            $pick = $random->getInt(0, $count - 1);
+            $php[] = $samples['php'][$pick];
+            $rust[] = $samples['rust'][$pick];
+        }
+        $ratios[] = perArticleQuantile($php, $quantile) / max(1, perArticleQuantile($rust, $quantile));
+    }
+
+    return [perArticleQuantile($ratios, 0.025), perArticleQuantile($ratios, 0.975)];
 }
 
 /** @param list<int|float> $values */

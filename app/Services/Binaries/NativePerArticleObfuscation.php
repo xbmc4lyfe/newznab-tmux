@@ -11,10 +11,14 @@ use Throwable;
  * Rust port of {@see HeaderParser::markPerArticleObfuscated()}, adopted after
  * scripts/benchmark-per-article-obfuscation.php measured it at 2-3x the PHP rule with identical
  * marks. Null means "use PHP": not a Linux CLI with FFI, library missing, failing its known-answer
- * probe, or input the native side declines (an integer field PHP would saturate).
+ * probe, or input the native side declines (a subject longer than MAX_SUBJECT_LENGTH, where PHP's
+ * backtrack limit could stop the subject pattern, or an integer field PHP would saturate).
  */
 final class NativePerArticleObfuscation
 {
+    /** Mirrors MAX_SUBJECT_LENGTH in the Rust port; longer subjects are declined before packing. */
+    public const int MAX_SUBJECT_LENGTH = 512;
+
     /** @var array<string, FFI|null> */
     private static array $libraries = [];
 
@@ -108,6 +112,9 @@ final class NativePerArticleObfuscation
         foreach ($headers as $header) {
             if (! isset($header['Number'], $header['Subject']) || ! is_numeric($header['Number']) || ! is_string($header['Subject'])) {
                 continue;
+            }
+            if (strlen($header['Subject']) > self::MAX_SUBJECT_LENGTH) {
+                return null;
             }
             $records .= pack('PV', (int) $header['Number'], strlen($header['Subject'])).$header['Subject'];
             $count++;

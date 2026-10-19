@@ -872,8 +872,9 @@ pub unsafe extern "C" fn nntmux_header_filename_identity_v1(
 /// Rust port of `HeaderParser::markPerArticleObfuscated()`. `records` holds one record per
 /// article: its number as a little-endian i64, the subject length as a little-endian u32, then the
 /// subject bytes. Marked article numbers are written to `output` as little-endian i64s and their
-/// count is returned. `usize::MAX` declines (malformed records, too little output space, or an
-/// integer field PHP would saturate) so the caller keeps the PHP result.
+/// count is returned. `usize::MAX` declines (malformed records, too little output space, a subject
+/// longer than 512 bytes, or an integer field PHP would saturate) so the caller keeps the PHP
+/// result.
 ///
 /// # Safety
 /// `records` is readable for `records_len` bytes and `output` writable for `output_capacity`
@@ -905,10 +906,13 @@ pub unsafe extern "C" fn nntmux_per_article_obfuscation_v1(
     if marked.len().saturating_mul(8) > output_capacity {
         return DECODE_FAILED;
     }
+    if marked.is_empty() {
+        return 0;
+    }
     // SAFETY: the caller supplies writable output of the checked capacity.
     let output = unsafe { slice::from_raw_parts_mut(output, output_capacity) };
-    for (slot, number) in output.chunks_exact_mut(8).zip(&marked) {
-        slot.copy_from_slice(&number.to_le_bytes());
+    for (slot, number) in output.as_chunks_mut::<8>().0.iter_mut().zip(&marked) {
+        *slot = number.to_le_bytes();
     }
     marked.len()
 }

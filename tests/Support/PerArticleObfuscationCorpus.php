@@ -29,6 +29,7 @@ final class PerArticleObfuscationCorpus
             'small-range' => ['category' => 'uncommon', 'description' => 'mixed range of 200 headers', 'size' => 200],
             'long-subjects' => ['category' => 'uncommon', 'description' => 'mixed range with 300-byte subject prefixes', 'size' => 20000],
             'adversarial' => ['category' => 'uncommon', 'description' => 'random bytes, newlines, odd counters and invalid UTF-8', 'size' => 20000],
+            'crafted-whitespace' => ['category' => 'uncommon', 'description' => 'mixed range with 10% whitespace-padded subjects of 256-512 bytes built to make the subject pattern backtrack', 'size' => 2000],
         ];
     }
 
@@ -44,6 +45,7 @@ final class PerArticleObfuscationCorpus
             'mixed', 'large-range', 'small-range' => self::mixed($random, $size, ''),
             'long-subjects' => self::mixed($random, $size, str_repeat('Long.Prefix.Words ', 17)),
             'adversarial' => self::adversarial($random, $size),
+            'crafted-whitespace' => self::craftedWhitespace($random, $size),
             default => throw new \InvalidArgumentException('Unknown stratum '.$name),
         };
         $headers = [];
@@ -120,6 +122,31 @@ final class PerArticleObfuscationCorpus
         while ($real !== [] || $obfuscated !== []) {
             $from = $obfuscated === [] || ($real !== [] && $random->getInt(0, 1) === 0) ? 'real' : 'obfuscated';
             $subjects[] = $prefix.array_shift(${$from});
+        }
+
+        return $subjects;
+    }
+
+    /** @return list<string> */
+    private static function craftedWhitespace(Randomizer $random, int $size): array
+    {
+        $subjects = self::mixed($random, $size, '');
+        $spaces = [' ', "\t", "\x0b", "\x0c", "\r"];
+        for ($i = 0; $i < intdiv($size, 10); $i++) {
+            $length = $random->getInt(256, 512);
+            $padding = '';
+            while (strlen($padding) < $length) {
+                $padding .= $spaces[$random->getInt(0, 4)];
+            }
+            $half = intdiv($length, 2);
+            $subject = match ($random->getInt(0, 4)) {
+                0 => substr($padding, 0, $length - 1).')',
+                1 => substr($padding, 0, $half).'x'.substr($padding, $half, $length - $half - 2).')',
+                2 => substr($padding, 0, $half).str_repeat('x (1/', intdiv($length - $half, 5)),
+                3 => substr($padding, 0, $length - 40).self::token($random, 32).' (2/687)',
+                default => substr($padding, 0, $half)."\n".substr($padding, $half, $length - $half - 7).' (2/9)',
+            };
+            $subjects[$random->getInt(0, $size - 1)] = substr($subject, 0, 512);
         }
 
         return $subjects;

@@ -17,7 +17,10 @@ use Tests\Support\PerArticleObfuscationCorpus;
  */
 final class PerArticleObfuscationNativeTest extends TestCase
 {
-    /** @return list<int> */
+    /**
+     * @param  array<int, array<string, mixed>>  $headers
+     * @return list<int>
+     */
     private static function php(array $headers, int $minArticles): array
     {
         $parser = new HeaderParser(new class extends BlacklistService
@@ -63,6 +66,18 @@ final class PerArticleObfuscationNativeTest extends TestCase
 
         self::assertSame(self::php($headers, 16), $numbers);
         self::assertSame($marked, $parser->parse($headers, 'alt.test')['obfuscated']);
+    }
+
+    public function test_native_declines_subjects_longer_than_the_backtrack_safe_length(): void
+    {
+        $native = new NativePerArticleObfuscation((string) getenv('NNTMUX_TEST_NATIVE_LIBRARY'));
+        if (getenv('NNTMUX_TEST_NATIVE_LIBRARY') === false || ! $native->available()) {
+            self::markTestSkipped('Needs a Linux CLI with FFI and NNTMUX_TEST_NATIVE_LIBRARY.');
+        }
+        $headers = PerArticleObfuscationCorpus::stratum('kenpsx', 5, 200);
+        self::assertNotSame([], $native->mark($headers, 16));
+        $headers[] = ['Number' => 1, 'Subject' => str_repeat(' ', NativePerArticleObfuscation::MAX_SUBJECT_LENGTH).')'];
+        self::assertNull($native->mark($headers, 16));
     }
 
     /** @return iterable<string, array{string, int}> */

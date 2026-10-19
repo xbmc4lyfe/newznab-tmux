@@ -7,6 +7,9 @@
 use std::collections::HashMap;
 
 const TOKEN_LENGTH: usize = 16;
+/// Longer subjects decline. PHP's `pcre.backtrack_limit` (1,000,000) can stop the subject pattern
+/// on crafted whitespace from about 1,000 bytes, so up to this length both sides match alike.
+const MAX_SUBJECT_LENGTH: usize = 512;
 const USENET_INDEX_POST: &[u8] = b"Usenet Index Post";
 
 /// One article: its number and raw subject.
@@ -23,8 +26,8 @@ struct Signature {
     total: i64,
 }
 
-/// Marked article numbers, distinct and ascending; `None` declines (an integer field
-/// PHP would saturate), so the caller keeps the PHP result.
+/// Marked article numbers, distinct and ascending; `None` declines (a subject longer than
+/// `MAX_SUBJECT_LENGTH` or an integer field PHP would saturate), so the caller keeps the PHP result.
 pub fn mark(articles: &[Article<'_>], min_articles: usize) -> Option<Vec<i64>> {
     if min_articles == 0 {
         return Some(Vec::new());
@@ -35,11 +38,17 @@ pub fn mark(articles: &[Article<'_>], min_articles: usize) -> Option<Vec<i64>> {
     let mut key = Vec::new();
     let mut normalized = Vec::new();
     for article in articles {
+        if article.subject.len() > MAX_SUBJECT_LENGTH {
+            return None;
+        }
         let Some((name, part, total)) = subject_parts(article.subject) else {
             continue;
         };
+        if !has_token(name) {
+            continue;
+        }
         let total_value = php_int(total)?;
-        if total_value < 2 || !has_token(name) {
+        if total_value < 2 {
             continue;
         }
         let part_value = php_int(part)?;
@@ -131,36 +140,72 @@ fn digits(bytes: &[u8], from: usize) -> usize {
         .count()
 }
 
-/// `^\s*(?!Usenet Index Post)(.+?)\s+\((\d+)\/(\d+)\)`: base name, part and total.
+/// `^\s*(?!Usenet Index Post)(.+?)\s+\((\d+)\/(\d+)\)`: base name, part and total, in time
+/// linear in the subject length. PCRE tries starts from the end of the leading whitespace back to
+/// 0 and, for each, the shortest name not crossing a `\n`.
 fn subject_parts(subject: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
     let lead = subject.iter().take_while(|byte| is_space(**byte)).count();
-    for start in (0..=lead).rev() {
-        if subject[start..].starts_with(USENET_INDEX_POST) {
+    let newline = subject[lead..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(subject.len(), |offset| lead + offset);
+    // The first name end after the leading whitespace; the same for every start, as long as no
+    // `\n` lies between that start and `lead`.
+    let after_lead = first_tail(subject, lead + 1, newline);
+    if !subject[lead..].starts_with(USENET_INDEX_POST)
+        && let Some((end, part, total)) = after_lead
+    {
+        return Some((&subject[lead..end], part, total));
+    }
+    // A start inside the leading whitespace (never `Usenet Index Post`): every end before `lead`
+    // sits in that whitespace run, so its tail is the parenthesized count at `lead`; an end at
+    // `lead` itself has no whitespace before it.
+    let inside = parenthesized(subject, lead);
+    let mut newline_seen = false;
+    for start in (0..lead).rev() {
+        if subject[start] == b'\n' {
+            // `.` cannot match here, and lower starts cannot reach past it.
+            newline_seen = true;
             continue;
         }
-        for end in start + 1..=subject.len() {
-            if subject[end - 1] == b'\n' {
-                break;
-            }
-            if let Some((part, total)) = part_tail(subject, end) {
-                return Some((&subject[start..end], part, total));
-            }
+        if let (true, Some((part, total))) = (start + 1 < lead, inside) {
+            return Some((&subject[start..start + 1], part, total));
+        }
+        if let (false, Some((end, part, total))) = (newline_seen, after_lead) {
+            return Some((&subject[start..end], part, total));
         }
     }
     None
 }
 
-/// `\s+\((\d+)\/(\d+)\)` at `at`.
-fn part_tail(subject: &[u8], at: usize) -> Option<(&[u8], &[u8])> {
-    let spaces = subject[at..]
-        .iter()
-        .take_while(|byte| is_space(**byte))
-        .count();
-    let mut cursor = at + spaces;
-    if spaces == 0 || subject.get(cursor) != Some(&b'(') {
+/// The first `end` in `from..=last` where `\s+\((\d+)\/(\d+)\)` matches. Every end inside one
+/// whitespace run shares the tail after that run, so each run is examined once.
+fn first_tail(subject: &[u8], from: usize, last: usize) -> Option<(usize, &[u8], &[u8])> {
+    let mut end = from;
+    while end <= last && end < subject.len() {
+        if !is_space(subject[end]) {
+            end += 1;
+            continue;
+        }
+        let run_end = end
+            + subject[end..]
+                .iter()
+                .take_while(|byte| is_space(**byte))
+                .count();
+        if let Some((part, total)) = parenthesized(subject, run_end) {
+            return Some((end, part, total));
+        }
+        end = run_end + 1;
+    }
+    None
+}
+
+/// `\((\d+)\/(\d+)\)` at `at`.
+fn parenthesized(subject: &[u8], at: usize) -> Option<(&[u8], &[u8])> {
+    if subject.get(at) != Some(&b'(') {
         return None;
     }
-    cursor += 1;
+    let mut cursor = at + 1;
     let part_length = digits(subject, cursor);
     if part_length == 0 || subject.get(cursor + part_length) != Some(&b'/') {
         return None;
@@ -363,6 +408,33 @@ mod tests {
             Some((&b" Usenet Index Post"[..], &b"1"[..], &b"2"[..]))
         );
         assert_eq!(subject_parts(b"a\nb (1/2)"), None);
+        assert_eq!(
+            subject_parts(b" \n  (1/2)"),
+            Some((&b" "[..], &b"1"[..], &b"2"[..]))
+        );
+        assert_eq!(subject_parts(b"\n (1/2)"), None);
+        assert_eq!(
+            subject_parts(b"   (1/2)"),
+            Some((&b" "[..], &b"1"[..], &b"2"[..]))
+        );
+        assert_eq!(
+            subject_parts(b" \nx (1/2)"),
+            Some((&b"x"[..], &b"1"[..], &b"2"[..]))
+        );
+        for subject in [&b"\n\n  (1/2)"[..], b" \n (1/2)"] {
+            assert_eq!(
+                subject_parts(subject),
+                Some((&b" "[..], &b"1"[..], &b"2"[..]))
+            );
+        }
+        assert_eq!(
+            subject_parts(b"  x  (1/2)"),
+            Some((&b"x"[..], &b"1"[..], &b"2"[..]))
+        );
+        assert_eq!(
+            subject_parts(b"  Usenet Index Post (1/2)"),
+            Some((&b" Usenet Index Post"[..], &b"1"[..], &b"2"[..]))
+        );
         assert_eq!(file_counter(b"x [03/62] y"), Some((&b"03"[..], &b"62"[..])));
         assert_eq!(
             file_counter(b"x (3 OF 62) y"),
@@ -380,5 +452,81 @@ mod tests {
         );
         assert_eq!(php_int(b"0000000000000000000000002"), Some(2));
         assert_eq!(php_int(b"9999999999999999999"), None);
+    }
+
+    /// The previous direct translation of the PCRE search (cubic on whitespace), kept as the
+    /// reference for the linear scan.
+    fn subject_parts_reference(subject: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
+        let lead = subject.iter().take_while(|byte| is_space(**byte)).count();
+        for start in (0..=lead).rev() {
+            if subject[start..].starts_with(USENET_INDEX_POST) {
+                continue;
+            }
+            for end in start + 1..=subject.len() {
+                if subject[end - 1] == b'\n' {
+                    break;
+                }
+                let spaces = subject[end..]
+                    .iter()
+                    .take_while(|byte| is_space(**byte))
+                    .count();
+                if spaces > 0
+                    && let Some((part, total)) = parenthesized(subject, end + spaces)
+                {
+                    return Some((&subject[start..end], part, total));
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn per_article_obfuscation_linear_scan_matches_the_reference_exhaustively() {
+        let alphabet = b" \n\tx(1/)";
+        let mut subject = Vec::new();
+        for length in 0..=7_u32 {
+            for mut code in 0..alphabet.len().pow(length) {
+                subject.clear();
+                for _ in 0..length {
+                    subject.push(alphabet[code % alphabet.len()]);
+                    code /= alphabet.len();
+                }
+                assert_eq!(
+                    subject_parts(&subject),
+                    subject_parts_reference(&subject),
+                    "{subject:?}"
+                );
+                let mut prefixed = b" Usenet Index Post".to_vec();
+                prefixed.extend_from_slice(&subject);
+                assert_eq!(
+                    subject_parts(&prefixed[1..]),
+                    subject_parts_reference(&prefixed[1..])
+                );
+                assert_eq!(subject_parts(&prefixed), subject_parts_reference(&prefixed));
+            }
+        }
+    }
+
+    #[test]
+    fn per_article_obfuscation_is_linear_on_crafted_whitespace() {
+        let started = std::time::Instant::now();
+        for length in [MAX_SUBJECT_LENGTH, 100_000] {
+            let half = " ".repeat(length / 2);
+            for subject in [
+                " ".repeat(length),
+                format!("{})", " ".repeat(length)),
+                format!("{half}x{half}("),
+                format!("{half}{}", "x (1/".repeat(length / 10)),
+            ] {
+                assert_eq!(subject_parts(subject.as_bytes()), None);
+            }
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let long = " ".repeat(MAX_SUBJECT_LENGTH + 1);
+        let headers = [Article {
+            number: 1,
+            subject: long.as_bytes(),
+        }];
+        assert_eq!(mark(&headers, 16), None);
     }
 }
