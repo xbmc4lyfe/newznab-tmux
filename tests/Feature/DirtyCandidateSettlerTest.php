@@ -25,7 +25,7 @@ class DirtyCandidateSettlerTest extends ReleaseVerificationCandidatesTest
 
         $totals = app(DirtyCandidateSettler::class)->settle(200, 20);
 
-        $this->assertSame(['inspected' => 1, 'archived' => 1, 'kept' => 0], $totals);
+        $this->assertSame(['inspected' => 1, 'settled' => 1, 'kept' => 0], $totals);
         $candidate = DB::table('release_verification_candidates')->sole();
         $this->assertNotSame('dirty', $candidate->status);
         $this->assertSame([1, 2], array_column(app(ManifestStore::class)->read($candidate->manifest_path)['files'][0]['segments'], 'number'));
@@ -40,11 +40,11 @@ class DirtyCandidateSettlerTest extends ReleaseVerificationCandidatesTest
         }
 
         $first = app(DirtyCandidateSettler::class)->settle(2, 20);
-        $this->assertSame(2, $first['archived']);
+        $this->assertSame(2, $first['settled']);
         $this->assertNotNull(Cache::get('release-verification:dirty-settle:cursor'));
         $second = app(DirtyCandidateSettler::class)->settle(2, 20);
 
-        $this->assertSame(['inspected' => 1, 'archived' => 1, 'kept' => 0], $second);
+        $this->assertSame(['inspected' => 1, 'settled' => 1, 'kept' => 0], $second);
         $this->assertSame(0, DB::table('release_verification_candidates')->where('status', 'dirty')->count());
         $this->assertNull(Cache::get('release-verification:dirty-settle:cursor'), 'Reaching the newest starts over from the oldest.');
     }
@@ -58,7 +58,7 @@ class DirtyCandidateSettlerTest extends ReleaseVerificationCandidatesTest
 
         $totals = app(DirtyCandidateSettler::class)->settle(200, 20);
 
-        $this->assertSame(['inspected' => 2, 'archived' => 1, 'kept' => 0], $totals);
+        $this->assertSame(['inspected' => 2, 'settled' => 1, 'kept' => 0], $totals);
         $this->assertTrue(DB::table('collections')->where('id', $waiting)->exists(), 'Headers still being reconciled stay in place.');
         $this->assertFalse(DB::table('collections')->where('id', $ready)->exists());
     }
@@ -73,10 +73,60 @@ class DirtyCandidateSettlerTest extends ReleaseVerificationCandidatesTest
 
         $totals = app(DirtyCandidateSettler::class)->settle(200, 20);
 
-        $this->assertSame(['inspected' => 1, 'archived' => 0, 'kept' => 1], $totals);
+        $this->assertSame(['inspected' => 1, 'settled' => 0, 'kept' => 1], $totals);
         $this->assertTrue(DB::table('collections')->where('id', $late)->exists());
         $this->assertSame($late, (int) DB::table('release_verification_oversized_collections')->value('collection_id'));
         $this->assertSame('dirty', DB::table('release_verification_candidates')->value('status'), 'Never published on what it lacks.');
+    }
+
+    public function test_a_candidate_whose_archive_kills_the_process_does_not_block_the_walk(): void
+    {
+        $this->releasesTable();
+        $this->dirtyCandidate('first');
+        $this->dirtyCandidate('second');
+        $cursors = [];
+        // Records where the cursor stands each time archive() starts, then dies like a fatal error would.
+        $this->app->instance(CandidateRepository::class, new class($cursors)
+        {
+            /** @param list<mixed> $cursors */
+            public function __construct(public array &$cursors) {}
+
+            public function archive(int $collectionId): void
+            {
+                $this->cursors[] = Cache::get('release-verification:dirty-settle:cursor');
+
+                throw new \Error('Allowed memory size exhausted');
+            }
+        });
+
+        app(DirtyCandidateSettler::class)->settle(200, 20);
+
+        // A fatal error cannot be caught, so the cursor saved before each archive is what a killed process leaves.
+        $this->assertSame(DB::table('release_verification_candidates')->orderBy('id')->pluck('id')->map(static fn ($id): int => (int) $id)->all(),
+            array_map(static fn (array $cursor): int => (int) $cursor['id'], $cursors), 'The cursor is past each candidate before its archive starts.');
+        $this->assertSame(2, DB::table('release_verification_candidates')->where('status', 'dirty')->count(), 'Failed archives leave them dirty.');
+    }
+
+    public function test_the_time_budget_is_checked_before_every_archive(): void
+    {
+        $this->releasesTable();
+        foreach (['a', 'b', 'c'] as $label) {
+            $this->dirtyCandidate($label);
+        }
+
+        $this->assertSame(['inspected' => 1, 'settled' => 1, 'kept' => 0], app(DirtyCandidateSettler::class)->settle(200, 0),
+            'One archive always runs; none starts past the deadline.');
+        $this->assertSame(2, DB::table('release_verification_candidates')->where('status', 'dirty')->count());
+    }
+
+    public function test_nothing_is_archived_when_verification_is_not_required(): void
+    {
+        $this->releasesTable();
+        $late = $this->dirtyCandidate('off');
+        config(['release_verification.required' => false]);
+
+        $this->assertSame(['inspected' => 0, 'settled' => 0, 'kept' => 0], app(DirtyCandidateSettler::class)->settle(200, 20));
+        $this->assertTrue(DB::table('collections')->where('id', $late)->exists());
     }
 
     public function test_the_preparer_settles_dirty_candidates(): void

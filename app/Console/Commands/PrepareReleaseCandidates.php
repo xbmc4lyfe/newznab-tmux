@@ -39,7 +39,7 @@ class PrepareReleaseCandidates extends Command
             // Late headers make a candidate dirty until archive() merges them; release creation may not reach
             // their collection for a long time on a large group.
             $dirty = $settler->settle(max(1, (int) $this->option('dirty-limit')), max(1, (int) $this->option('dirty-seconds')));
-            $this->info('Settled '.$dirty['archived'].' of '.$dirty['inspected'].' dirty candidates ('.$dirty['kept'].' kept for a later pass).');
+            $this->info('Settled '.$dirty['settled'].' of '.$dirty['inspected'].' dirty candidates ('.$dirty['kept'].' late collections kept for a later pass).');
             if ($report !== null) {
                 $report['dirty_settle'] = $dirty;
             }
