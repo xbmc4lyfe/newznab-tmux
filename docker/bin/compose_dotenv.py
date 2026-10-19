@@ -17,7 +17,8 @@ import sys
 from pathlib import Path
 
 ASSIGNMENT = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
-# compose-go's control escapes; any other escaped character stands for itself.
+# compose-go's control escapes; with `\$`, `\"`, `\\` and octal `\0NNN` the only decoded ones:
+# any other backslash sequence is kept as written.
 ESCAPES = {"a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v"}
 
 
@@ -30,8 +31,17 @@ def decode_double_quoted(body: str) -> tuple[str, bool]:
         char = body[index]
         if char == "\\" and index + 1 < len(body):
             escaped = body[index + 1]
-            out.append(ESCAPES.get(escaped, escaped))
-            index += 2
+            if escaped == "0" and len(body) >= index + 5 and all(c in "01234567" for c in body[index + 2:index + 5]):
+                out.append(chr(int(body[index + 2:index + 5], 8)))  # `\0NNN`: octal
+                index += 5
+                continue
+            if escaped in ESCAPES or escaped in '$"\\':
+                out.append(ESCAPES.get(escaped, escaped))
+                index += 2
+                continue
+            # Any other sequence is kept as written, backslash included.
+            out.append(char)
+            index += 1
             continue
         interpolates = interpolates or char == "$"
         out.append(char)

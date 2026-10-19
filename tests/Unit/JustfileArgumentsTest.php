@@ -154,6 +154,12 @@ SH);
         $wrapper->mustRun();
         $this->assertStringContainsString("\nWEB_IMAGE=registry/app:\"1\"\n", "\n".$wrapper->getOutput());
 
+        // Other backslash sequences stay as written; `\0NNN` is octal (Compose gives `a\cbA`).
+        file_put_contents($this->directory.'/docker/.env', "DB_ROOTPASSWORD=\"a\\cb\\0101\"\nDB_DATABASE=nntmux\n");
+        $kept = $this->just('docker/Justfile', ['mysql'], ['DC' => $this->directory.'/bin/fake', 'DB_DATABASE' => false]);
+        $kept->mustRun();
+        $this->assertContains('-pa\\cbA', $this->arguments($kept));
+
         // An escaped `$` is literal in Compose, so it is no interpolation either.
         file_put_contents($this->directory.'/docker/.env', "APP_IMAGE=\"registry/\\\$app:1\"\n");
         $literal = $this->just('docker/Justfile', ['ps'], ['DC' => $this->directory.'/bin/fake']);
