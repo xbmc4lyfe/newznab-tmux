@@ -13,6 +13,7 @@ use Mockery;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
+use Symfony\Component\Process\Process;
 
 class ArchiveExtractionServiceTest extends TestCase
 {
@@ -585,8 +586,42 @@ class ArchiveExtractionServiceTest extends TestCase
 
         $this->assertIsArray($result);
         $this->assertGreaterThan(0, count($result['files']));
-        $this->assertLessThan(intdiv(ArchiveExtractionService::SEVENZIP_LISTING_MAX_BYTES, 20000) + 5, count($result['files']));
+        $this->assertLessThanOrEqual(intdiv(ArchiveExtractionService::SEVENZIP_LISTING_MAX_BYTES, strlen("Path = {$result['files'][0]['name']}\nSize = 1\n\n")), count($result['files']));
         $this->assertSame(str_repeat('a', 20000), $result['files'][0]['name']);
+    }
+
+    #[Test]
+    #[DataProvider('cappedSevenZipChunks')]
+    public function it_keeps_only_records_within_the_output_cap(array $chunks, bool $complete): void
+    {
+        $process = Mockery::mock(Process::class);
+        $process->shouldReceive('getIterator')->with(Process::ITER_SKIP_ERR)
+            ->andReturnUsing(static function () use ($chunks): \Generator {
+                yield from $chunks;
+            });
+        $process->shouldReceive('stop')->andReturn(0);
+        $process->shouldReceive('wait')->andReturn(0);
+        $service = new ArchiveExtractionService($this->makeConfig());
+
+        [$files, $reliable] = (new \ReflectionMethod($service, 'readSevenZipListing'))->invoke($service, $process);
+
+        $this->assertSame(['first.mkv'], array_column($files, 'name'));
+        $this->assertSame($complete, $reliable);
+    }
+
+    /** @return array<string, array{list<string>, bool}> */
+    public static function cappedSevenZipChunks(): array
+    {
+        $prefix = "Path = first.mkv\nSize = 1\nComment = ";
+        $record = $prefix.str_repeat('x', ArchiveExtractionService::SEVENZIP_LISTING_MAX_BYTES - strlen($prefix) - 2)."\n\n";
+        $extra = "Path = beyond.mkv\nSize = 2\nEncrypted = +\n\n";
+
+        return [
+            'complete exactly at the cap' => [[$record], true],
+            'one chunk crossing the cap' => [[$record.$extra], false],
+            'extra chunk after the cap' => [[$record, $extra], false],
+            'chunk crossing after a split record' => [[substr($record, 0, -10), substr($record, -10).$extra], false],
+        ];
     }
 
     /**
