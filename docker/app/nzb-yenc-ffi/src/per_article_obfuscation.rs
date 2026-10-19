@@ -4,6 +4,7 @@
 //! the PCRE semantics PHP uses for these non-UTF patterns: `\s` is ASCII 0x09-0x0D and space,
 //! `\d` is ASCII digits and `.` is any byte but `\n`.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 const TOKEN_LENGTH: usize = 16;
@@ -18,21 +19,22 @@ pub struct Article<'a> {
     pub subject: &'a [u8],
 }
 
-struct Signature {
+struct Signature<'a> {
     /// Per distinct name: its first article number and part, and how many articles carry it.
     names: Vec<(i64, i64, u32)>,
-    index: HashMap<Vec<u8>, usize>,
+    /// Names borrow the subject unless normalization changed them.
+    index: HashMap<Cow<'a, [u8]>, usize>,
     articles: usize,
     total: i64,
 }
 
 /// Marked article numbers, distinct and ascending; `None` declines (a subject longer than
 /// `MAX_SUBJECT_LENGTH`), so the caller keeps the PHP result.
-pub fn mark(articles: &[Article<'_>], min_articles: usize) -> Option<Vec<i64>> {
+pub fn mark<'a>(articles: &[Article<'a>], min_articles: usize) -> Option<Vec<i64>> {
     if min_articles == 0 {
         return Some(Vec::new());
     }
-    let mut signatures: Vec<Signature> = Vec::new();
+    let mut signatures: Vec<Signature<'a>> = Vec::new();
     let mut by_key: HashMap<Vec<u8>, usize> = HashMap::new();
     // Reused buffers: lookups borrow them, and only a new key or name is copied.
     let mut key = Vec::new();
@@ -54,7 +56,8 @@ pub fn mark(articles: &[Article<'_>], min_articles: usize) -> Option<Vec<i64>> {
         let part_value = php_int(part);
         key.clear();
         normalized.clear();
-        shape_and_normalized(name, &mut key, &mut normalized);
+        let changed = shape_and_normalized(name, &mut key, &mut normalized);
+        let normalized_name: &[u8] = if changed { &normalized } else { name };
         key.push(0);
         key.extend_from_slice(total);
         key.push(0);
@@ -77,13 +80,16 @@ pub fn mark(articles: &[Article<'_>], min_articles: usize) -> Option<Vec<i64>> {
             }
         };
         let signature = &mut signatures[slot];
-        let position = match signature.index.get(normalized.as_slice()) {
+        let position = match signature.index.get(normalized_name) {
             Some(&position) => position,
             None => {
                 signature.names.push((article.number, part_value, 0));
-                signature
-                    .index
-                    .insert(normalized.clone(), signature.names.len() - 1);
+                let owned = if changed {
+                    Cow::Owned(normalized.clone())
+                } else {
+                    Cow::Borrowed(name)
+                };
+                signature.index.insert(owned, signature.names.len() - 1);
                 signature.names.len() - 1
             }
         };
@@ -125,12 +131,37 @@ pub fn mark(articles: &[Article<'_>], min_articles: usize) -> Option<Vec<i64>> {
     Some(marked)
 }
 
+const SPACE: u8 = 1;
+const ALNUM: u8 = 2;
+/// `[`, `(` or whitespace: where a file counter can open.
+const OPENER: u8 = 4;
+
+/// Byte classes, so each scan tests one table entry instead of a chain of comparisons.
+static CLASSES: [u8; 256] = {
+    let mut classes = [0_u8; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        let b = byte as u8;
+        if matches!(b, b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b' ') {
+            classes[byte] |= SPACE | OPENER;
+        }
+        if b.is_ascii_alphanumeric() {
+            classes[byte] |= ALNUM;
+        }
+        if b == b'[' || b == b'(' {
+            classes[byte] |= OPENER;
+        }
+        byte += 1;
+    }
+    classes
+};
+
 fn is_space(byte: u8) -> bool {
-    matches!(byte, b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b' ')
+    CLASSES[usize::from(byte)] & SPACE != 0
 }
 
 fn is_alnum(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric()
+    CLASSES[usize::from(byte)] & ALNUM != 0
 }
 
 fn digits(bytes: &[u8], from: usize) -> usize {
@@ -178,24 +209,27 @@ fn subject_parts(subject: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
     None
 }
 
-/// The first `end` in `from..=last` where `\s+\((\d+)\/(\d+)\)` matches. Every end inside one
-/// whitespace run shares the tail after that run, so each run is examined once.
+/// The first `end` in `from..=last` where `\s+\((\d+)\/(\d+)\)` matches. A match needs a `(`
+/// preceded by whitespace, and every end inside that whitespace run shares the same tail, so only
+/// `(` positions are examined; the end is the run's first byte at or after `from`.
 fn first_tail(subject: &[u8], from: usize, last: usize) -> Option<(usize, &[u8], &[u8])> {
-    let mut end = from;
-    while end <= last && end < subject.len() {
-        if !is_space(subject[end]) {
-            end += 1;
-            continue;
+    let mut search = from;
+    while let Some(offset) = subject.get(search..)?.iter().position(|byte| *byte == b'(') {
+        let open = search + offset;
+        let run_start = subject[..open]
+            .iter()
+            .rposition(|byte| !is_space(*byte))
+            .map_or(0, |index| index + 1);
+        let end = run_start.max(from);
+        if end > last {
+            return None;
         }
-        let run_end = end
-            + subject[end..]
-                .iter()
-                .take_while(|byte| is_space(**byte))
-                .count();
-        if let Some((part, total)) = parenthesized(subject, run_end) {
+        if end < open
+            && let Some((part, total)) = parenthesized(subject, open)
+        {
             return Some((end, part, total));
         }
-        end = run_end + 1;
+        search = open + 1;
     }
     None
 }
@@ -247,7 +281,18 @@ fn alnum_runs(name: &[u8]) -> impl Iterator<Item = (usize, usize)> + '_ {
 }
 
 fn has_token(name: &[u8]) -> bool {
-    alnum_runs(name).any(|(start, end)| end - start >= TOKEN_LENGTH)
+    let mut run = 0;
+    for &byte in name {
+        if is_alnum(byte) {
+            run += 1;
+            if run >= TOKEN_LENGTH {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -260,35 +305,47 @@ fn shape(name: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 fn normalized_name(name: &[u8]) -> Vec<u8> {
     let (mut shape, mut normalized) = (Vec::new(), Vec::new());
-    shape_and_normalized(name, &mut shape, &mut normalized);
-    normalized
+    if shape_and_normalized(name, &mut shape, &mut normalized) {
+        normalized
+    } else {
+        name.to_vec()
+    }
 }
 
 /// One pass over the name: the shape (alphanumeric runs collapsed to `x`) and the normalized
-/// name (digits dropped except inside alphanumeric runs of token length).
-fn shape_and_normalized(name: &[u8], shape: &mut Vec<u8>, normalized: &mut Vec<u8>) {
+/// name (digits dropped except inside alphanumeric runs of token length). Returns whether the
+/// normalized name differs from the name; when it does not, `normalized` is left empty.
+fn shape_and_normalized(name: &[u8], shape: &mut Vec<u8>, normalized: &mut Vec<u8>) -> bool {
     let mut cursor = 0;
+    let mut changed = false;
     for (start, end) in alnum_runs(name) {
         shape.extend_from_slice(&name[cursor..start]);
-        normalized.extend_from_slice(&name[cursor..start]);
         shape.push(b'x');
         let run = &name[start..end];
-        if run.len() >= TOKEN_LENGTH {
-            normalized.extend_from_slice(run);
-        } else {
+        if run.len() < TOKEN_LENGTH && run.iter().any(u8::is_ascii_digit) {
+            if !changed {
+                normalized.extend_from_slice(&name[..start]);
+                changed = true;
+            } else {
+                normalized.extend_from_slice(&name[cursor..start]);
+            }
             normalized.extend(run.iter().filter(|byte| !byte.is_ascii_digit()));
+        } else if changed {
+            normalized.extend_from_slice(&name[cursor..end]);
         }
         cursor = end;
     }
     shape.extend_from_slice(&name[cursor..]);
-    normalized.extend_from_slice(&name[cursor..]);
+    if changed {
+        normalized.extend_from_slice(&name[cursor..]);
+    }
+    changed
 }
 
 /// `[[(\s](\d{1,5})(\/|[\s_]of[\s_]|-)(\d{1,5})[])[\s$:]` (case-insensitive): first match.
 fn file_counter(name: &[u8]) -> Option<(&[u8], &[u8])> {
     for open in 0..name.len() {
-        let byte = name[open];
-        if byte != b'[' && byte != b'(' && !is_space(byte) {
+        if CLASSES[usize::from(name[open])] & OPENER == 0 {
             continue;
         }
         let first = open + 1;

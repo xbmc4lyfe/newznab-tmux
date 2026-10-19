@@ -5,11 +5,13 @@ declare(strict_types=1);
 namespace App\Services\Binaries;
 
 use FFI;
+use Random\Engine\Xoshiro256StarStar;
+use Random\Randomizer;
 use Throwable;
 
 /**
  * Rust port of {@see HeaderParser::markPerArticleObfuscated()}, adopted after
- * scripts/benchmark-per-article-obfuscation.php measured it at 1.8-2.9x the PHP rule on the ranges it is routed to with identical
+ * scripts/benchmark-per-article-obfuscation.php measured it at 1.9-3.1x the PHP rule on the ranges it is routed to with identical
  * marks. Null means "use PHP": not a Linux CLI with FFI, library missing, failing its known-answer
  * probe, or input the native side declines (a subject longer than MAX_SUBJECT_LENGTH, where PHP's
  * backtrack limit could stop the subject pattern).
@@ -24,15 +26,19 @@ final class NativePerArticleObfuscation
 
     private const int SAMPLE_MAX = 128;
 
-    /** Smaller ranges stay on PHP: Rust's margin there is under a millisecond and not reliably 1.5x. */
-    public const int MIN_HEADERS = 1000;
+    /**
+     * Smaller ranges stay on PHP: there the PHP rule takes well under a millisecond, and even the
+     * sample would cost several percent of it.
+     */
+    public const int MIN_HEADERS = 4000;
 
     /**
-     * Per-header cost in nanoseconds, [PHP rule, Rust with marshalling], by sampled class: no part
-     * count, a part count only, a candidate. Measured with scripts/benchmark-per-article-obfuscation.php
-     * on Linux arm64 (non-yEnc text, readable yEnc, and kenpsx/boneless strata).
+     * Per-header cost by sampled class (no part count, a part count only, a candidate) as
+     * [PHP base ns, PHP tenths of a ns per subject byte, Rust base ns, Rust tenths of a ns per byte].
+     * Fitted to XOVER-shaped ranges of 60-480 byte subjects with
+     * scripts/benchmark-per-article-obfuscation.php on Linux arm64.
      */
-    private const array COSTS = [[100, 141], [270, 164], [1300, 500]];
+    private const array COSTS = [[210, 5, 265, 10], [80, 80, 110, 39], [1350, 60, 330, 37]];
 
     /**
      * A range goes to Rust when its predicted speedup reaches 2x. The prices run about a sixth
@@ -40,8 +46,17 @@ final class NativePerArticleObfuscation
      */
     private const int PREDICTED_SPEEDUP_PERCENT = 200;
 
+    /**
+     * Loading the library and running its probe took 0.6-1.8 ms per process; a range that would
+     * load it must be predicted to save at least 4 ms.
+     */
+    private const int FIRST_LOAD_SAVING_NS = 4_000_000;
+
     /** @var array<string, FFI|null> */
     private static array $libraries = [];
+
+    /** Sample positions only need to be unpredictable per range, not secure: one seeded engine per process. */
+    private static ?Randomizer $sampler = null;
 
     private ?FFI $library = null;
 
@@ -59,6 +74,7 @@ final class NativePerArticleObfuscation
      * Article numbers the PHP rule would mark, or null to keep the PHP result. These ranges stay
      * on PHP:
      * - under MIN_HEADERS, where Rust's margin is too small to establish;
+     * - before the library is loaded, where the predicted saving is under FIRST_LOAD_SAVING_NS;
      * - where a spread sample, priced with COSTS, predicts under 2x: the PHP rule rejects
      *   subjects without a part count faster than they can be handed to Rust;
      * - with any subject over MAX_SUBJECT_LENGTH, which Rust would decline.
@@ -68,7 +84,7 @@ final class NativePerArticleObfuscation
      */
     public function mark(array $headers, int $minArticles): ?array
     {
-        return self::worthMarshalling($headers) ? $this->markWithoutSampling($headers, $minArticles) : null;
+        return $this->worthMarshalling($headers) ? $this->markWithoutSampling($headers, $minArticles) : null;
     }
 
     /**
@@ -86,24 +102,33 @@ final class NativePerArticleObfuscation
     }
 
     /** @param  array<int, array<string, mixed>>  $headers */
-    private static function worthMarshalling(array $headers): bool
+    private function worthMarshalling(array $headers): bool
     {
-        $values = array_values($headers);
+        $values = array_is_list($headers) ? $headers : array_values($headers);
         $count = count($values);
         if ($count < self::MIN_HEADERS) {
             return false;
         }
-        // An odd step started mid-stride, so a range alternating at an even period is not seen
-        // in one phase only.
+        // One random header from each of $samples equal slices, so no periodic ordering of the
+        // range decides the prediction.
         $samples = min(self::SAMPLE_MAX, max(self::SAMPLE_MIN, intdiv($count, 64)));
-        $step = intdiv($count, $samples) | 1;
+        $random = self::$sampler ??= new Randomizer(new Xoshiro256StarStar);
         $php = $rust = 0;
-        for ($i = intdiv($step, 2); $i < $count; $i += $step) {
-            [$phpCost, $rustCost] = self::COSTS[self::classify($values[$i]['Subject'] ?? null)];
-            $php += $phpCost;
-            $rust += $rustCost;
+        for ($slice = 0; $slice < $samples; $slice++) {
+            $start = intdiv($slice * $count, $samples);
+            $index = $random->getInt($start, max($start, intdiv(($slice + 1) * $count, $samples) - 1));
+            $subject = $values[$index]['Subject'] ?? null;
+            $bytes = is_string($subject) ? strlen($subject) : 0;
+            [$phpBase, $phpPerByte, $rustBase, $rustPerByte] = self::COSTS[self::classify($subject)];
+            $php += $phpBase + intdiv($phpPerByte * $bytes, 10);
+            $rust += $rustBase + intdiv($rustPerByte * $bytes, 10);
         }
         if ($php * 100 < $rust * self::PREDICTED_SPEEDUP_PERCENT) {
+            return false;
+        }
+        // Before this process has loaded the library, the predicted saving must also pay for
+        // loading it and running its probe.
+        if (! $this->resolved && intdiv(($php - $rust) * $count, $samples) < self::FIRST_LOAD_SAVING_NS) {
             return false;
         }
         // A subject Rust would decline sends the range to PHP before any packing.
@@ -157,8 +182,9 @@ final class NativePerArticleObfuscation
         self::$libraries[$key] = null;
         try {
             $library = FFI::cdef(
-                'size_t nntmux_per_article_obfuscation_v2(const char *numbers, const char *lengths, size_t count,'
-                .' const char *subjects, size_t subjects_len, size_t min_articles, char *output, size_t output_capacity);',
+                'size_t nntmux_per_article_obfuscation_v2(const char *numbers, size_t numbers_len, const char *lengths,'
+                .' size_t count, const char *subjects, size_t subjects_len, size_t min_articles, char *output,'
+                .' size_t output_capacity);',
                 $resolved,
             );
             $probe = [];
@@ -186,7 +212,21 @@ final class NativePerArticleObfuscation
         if ($minArticles < 1) {
             return [];
         }
-        [$numbers, $subjects] = self::columns($headers);
+        // XOVER rows carry numbers as strings: hand the column over as text and let Rust parse
+        // `-?[0-9]+`. Any other form makes Rust decline, and the filtered loop retries with ints.
+        $columns = self::columns($headers, true);
+        $marked = $columns === null ? null : self::invoke($library, $columns, $minArticles);
+
+        return $marked ?? self::invoke($library, self::columns($headers, false), $minArticles);
+    }
+
+    /**
+     * @param  array{list<int|string>, list<string>}  $columns
+     * @return list<int>|null
+     */
+    private static function invoke(FFI $library, array $columns, int $minArticles): ?array
+    {
+        [$numbers, $subjects] = $columns;
         $count = count($subjects);
         if ($count === 0) {
             return [];
@@ -195,12 +235,14 @@ final class NativePerArticleObfuscation
         if (max($lengths) > self::MAX_SUBJECT_LENGTH) {
             return null;
         }
+        $numberText = implode("\n", $numbers);
         $subjectBytes = implode('', $subjects);
         try {
             $output = $library->new('char['.($count * 8).']');
             // @phpstan-ignore method.notFound
             $marked = $library->nntmux_per_article_obfuscation_v2(
-                pack('P*', ...$numbers), pack('V*', ...$lengths), $count, $subjectBytes, strlen($subjectBytes), $minArticles, $output, $count * 8,
+                $numberText, strlen($numberText), pack('V*', ...$lengths), $count, $subjectBytes, strlen($subjectBytes),
+                $minArticles, $output, $count * 8,
             );
             if (! is_int($marked) || $marked < 0 || $marked > $count) {
                 return null;
@@ -218,20 +260,25 @@ final class NativePerArticleObfuscation
 
     /**
      * Article numbers and subjects of the headers the PHP rule reads (a numeric Number and a string
-     * Subject), in order. Whole columns are taken in bulk when every header qualifies.
+     * Subject), in order. In bulk, whole columns are taken as they are when every header has both
+     * keys, a string Subject and a string or int Number (null otherwise); the filtered form casts each Number with (int).
      *
      * @param  array<int, array<string, mixed>>  $headers
-     * @return array{list<int>, list<string>}
+     * @return ($bulk is true ? array{list<int|string>, list<string>}|null : array{list<int>, list<string>})
      */
-    private static function columns(array $headers): array
+    private static function columns(array $headers, bool $bulk): ?array
     {
-        $count = count($headers);
-        $numbers = array_column($headers, 'Number');
-        $subjects = array_column($headers, 'Subject');
-        if (count($numbers) === $count && count($subjects) === $count
-            && count(array_filter($numbers, is_int(...))) === $count
-            && count(array_filter($subjects, is_string(...))) === $count) {
-            return [$numbers, $subjects];
+        if ($bulk) {
+            $count = count($headers);
+            $numbers = array_column($headers, 'Number');
+            $subjects = array_column($headers, 'Subject');
+
+            // Numbers must all be strings or all ints: implode would turn true into "1", which the
+            // PHP rule skips as non-numeric.
+            return count($numbers) === $count && count($subjects) === $count
+                && count(array_filter($subjects, is_string(...))) === $count
+                && (count(array_filter($numbers, is_string(...))) === $count || count(array_filter($numbers, is_int(...))) === $count)
+                ? [$numbers, $subjects] : null;
         }
         $numbers = $subjects = [];
         foreach ($headers as $header) {

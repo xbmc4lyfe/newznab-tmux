@@ -88,7 +88,7 @@ final class PerArticleObfuscationNativeTest extends TestCase
         // Token-poor ranges stay on PHP; the unsampled path still answers for them.
         foreach (['non-yenc', 'readable-yenc', 'bare-random', 'single-part-hashed', 'text-with-uploads'] as $name) {
             // Above MIN_HEADERS, so the sample (not the size floor) keeps these on PHP.
-            $routed = PerArticleObfuscationCorpus::stratum($name, 5, 2000);
+            $routed = PerArticleObfuscationCorpus::stratum($name, 5, 2 * NativePerArticleObfuscation::MIN_HEADERS);
             self::assertNull($native->mark($routed, 16));
             $marked = $native->markWithoutSampling($routed, 16);
             self::assertNotNull($marked);
@@ -105,7 +105,7 @@ final class PerArticleObfuscationNativeTest extends TestCase
         self::assertNotNull($native->mark($alternating, 16));
         self::assertNull($native->mark(PerArticleObfuscationCorpus::stratum('kenpsx', 5, NativePerArticleObfuscation::MIN_HEADERS - 1), 16));
         // The sampler stays linear on long zero runs inside a part count.
-        $zeros = PerArticleObfuscationCorpus::stratum('non-yenc', 5, 2000);
+        $zeros = PerArticleObfuscationCorpus::stratum('non-yenc', 5, NativePerArticleObfuscation::MIN_HEADERS);
         foreach (array_keys($zeros) as $index) {
             $zeros[$index]['Subject'] = 'x (1/'.str_repeat('0', 32000).'x)';
         }
@@ -140,12 +140,8 @@ final class PerArticleObfuscationNativeTest extends TestCase
         $headers = PerArticleObfuscationCorpus::stratum($name, $seed, $size);
         foreach ([16, 8, 40] as $minArticles) {
             $marked = $native->markWithoutSampling($headers, $minArticles);
-            if ($marked === null) {
-                // A decline keeps the PHP result; only the saturating-integer case may decline.
-                self::assertSame('adversarial', $name);
-
-                continue;
-            }
+            // Counts saturate as in PHP and no corpus subject exceeds 512 bytes, so nothing declines.
+            self::assertNotNull($marked, $name.' at '.$minArticles);
             sort($marked);
             self::assertSame(self::php($headers, $minArticles), $marked, $name.' at '.$minArticles);
         }

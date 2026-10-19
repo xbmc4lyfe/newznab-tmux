@@ -870,17 +870,20 @@ pub unsafe extern "C" fn nntmux_header_filename_identity_v1(
 }
 
 /// Rust port of `HeaderParser::markPerArticleObfuscated()` over `count` articles: `numbers` holds
-/// their numbers as little-endian i64s, `lengths` their subject lengths as little-endian u32s, and
-/// `subjects` the subjects back to back. Marked article numbers are written to `output` as
-/// little-endian i64s and their count is returned. `usize::MAX` declines (inconsistent lengths, too
-/// little output space, or a subject longer than 512 bytes) so the caller keeps the PHP result.
+/// their numbers as decimal text separated by `\n` (each `-?[0-9]+`, saturating as PHP's `(int)`
+/// does), `lengths` their subject lengths as little-endian u32s, and `subjects` the subjects back to
+/// back. Marked article numbers are written to `output` as little-endian i64s and their count is
+/// returned. `usize::MAX` declines (a number in any other form, inconsistent lengths, too little
+/// output space, or a subject longer than 512 bytes) so the caller falls back.
 ///
 /// # Safety
-/// `numbers` is readable for `count * 8` bytes, `lengths` for `count * 4`, `subjects` for
+/// `numbers` is readable for `numbers_len` bytes, `lengths` for `count * 4`, `subjects` for
 /// `subjects_len` and `output` writable for `output_capacity` bytes whenever that size is nonzero.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn nntmux_per_article_obfuscation_v2(
     numbers: *const u8,
+    numbers_len: usize,
     lengths: *const u8,
     count: usize,
     subjects: *const u8,
@@ -889,34 +892,37 @@ pub unsafe extern "C" fn nntmux_per_article_obfuscation_v2(
     output: *mut u8,
     output_capacity: usize,
 ) -> usize {
-    let (Some(number_bytes), Some(length_bytes)) = (count.checked_mul(8), count.checked_mul(4))
-    else {
+    let Some(length_bytes) = count.checked_mul(4) else {
         return DECODE_FAILED;
     };
-    if (count > 0 && (numbers.is_null() || lengths.is_null()))
+    if (numbers_len > 0 && numbers.is_null())
+        || (count > 0 && lengths.is_null())
         || (subjects_len > 0 && subjects.is_null())
         || (output_capacity > 0 && output.is_null())
     {
         return DECODE_FAILED;
     }
-    let (numbers, lengths): (&[u8], &[u8]) = if count == 0 {
-        (&[], &[])
-    } else {
-        // SAFETY: the caller supplies readable arrays of the checked sizes.
-        unsafe {
-            (
-                slice::from_raw_parts(numbers, number_bytes),
-                slice::from_raw_parts(lengths, length_bytes),
-            )
-        }
+    // SAFETY: each slice is built only for a nonzero size the caller guarantees readable.
+    let (numbers, lengths, subjects): (&[u8], &[u8], &[u8]) = unsafe {
+        (
+            if numbers_len == 0 {
+                &[]
+            } else {
+                slice::from_raw_parts(numbers, numbers_len)
+            },
+            if count == 0 {
+                &[]
+            } else {
+                slice::from_raw_parts(lengths, length_bytes)
+            },
+            if subjects_len == 0 {
+                &[]
+            } else {
+                slice::from_raw_parts(subjects, subjects_len)
+            },
+        )
     };
-    let subjects: &[u8] = if subjects_len == 0 {
-        &[]
-    } else {
-        // SAFETY: the caller supplies readable input of the checked length.
-        unsafe { slice::from_raw_parts(subjects, subjects_len) }
-    };
-    let Some(articles) = per_article_obfuscation_articles(numbers, lengths, subjects) else {
+    let Some(articles) = per_article_obfuscation_articles(numbers, lengths, count, subjects) else {
         return DECODE_FAILED;
     };
     let Ok(Some(marked)) = catch_unwind(|| per_article_obfuscation::mark(&articles, min_articles))
@@ -940,27 +946,92 @@ pub unsafe extern "C" fn nntmux_per_article_obfuscation_v2(
 fn per_article_obfuscation_articles<'a>(
     numbers: &[u8],
     lengths: &[u8],
+    count: usize,
     mut subjects: &'a [u8],
 ) -> Option<Vec<per_article_obfuscation::Article<'a>>> {
-    let mut articles = Vec::with_capacity(lengths.len() / 4);
-    for (number, length) in numbers
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .zip(lengths.as_chunks::<4>().0)
-    {
+    if count == 0 {
+        return (numbers.is_empty() && subjects.is_empty()).then(Vec::new);
+    }
+    let mut articles = Vec::with_capacity(count);
+    let mut numbers = numbers.split(|byte| *byte == b'\n');
+    for length in lengths.as_chunks::<4>().0 {
+        let number = php_decimal(numbers.next()?)?;
         let length = usize::try_from(u32::from_le_bytes(*length)).ok()?;
         if subjects.len() < length {
             return None;
         }
         let (subject, rest) = subjects.split_at(length);
-        articles.push(per_article_obfuscation::Article {
-            number: i64::from_le_bytes(*number),
-            subject,
-        });
+        articles.push(per_article_obfuscation::Article { number, subject });
         subjects = rest;
     }
-    subjects.is_empty().then_some(articles)
+    (subjects.is_empty() && numbers.next().is_none()).then_some(articles)
+}
+
+/// `-?[0-9]+` as PHP's `(int)` reads it, saturating at the i64 bounds; anything else is `None`.
+fn php_decimal(text: &[u8]) -> Option<i64> {
+    let (negative, digits) = match text.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        _ => (false, text),
+    };
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let saturated = if negative { i64::MIN } else { i64::MAX };
+    Some(
+        digits
+            .iter()
+            .try_fold(0_i64, |value, byte| {
+                let digit = i64::from(byte - b'0');
+                value
+                    .checked_mul(10)?
+                    .checked_add(if negative { -digit } else { digit })
+            })
+            .unwrap_or(saturated),
+    )
+}
+
+#[cfg(test)]
+mod per_article_obfuscation_abi_tests {
+    use super::*;
+
+    fn call(numbers: &[u8], subjects: &[&[u8]]) -> usize {
+        let lengths: Vec<u8> = subjects
+            .iter()
+            .flat_map(|subject| (subject.len() as u32).to_le_bytes())
+            .collect();
+        let joined: Vec<u8> = subjects.concat();
+        let mut output = vec![0_u8; subjects.len() * 8];
+        // SAFETY: every buffer is a live Vec of the stated length.
+        unsafe {
+            nntmux_per_article_obfuscation_v2(
+                numbers.as_ptr(),
+                numbers.len(),
+                lengths.as_ptr(),
+                subjects.len(),
+                joined.as_ptr(),
+                joined.len(),
+                16,
+                output.as_mut_ptr(),
+                output.len(),
+            )
+        }
+    }
+
+    #[test]
+    fn per_article_obfuscation_abi_parses_numbers_like_php() {
+        assert_eq!(php_decimal(b"0042"), Some(42));
+        assert_eq!(php_decimal(b"-7"), Some(-7));
+        assert_eq!(php_decimal(b"99999999999999999999"), Some(i64::MAX));
+        assert_eq!(php_decimal(b"-99999999999999999999"), Some(i64::MIN));
+        for invalid in [&b""[..], b"-", b" 42", b"1e3", b"4.2", b"+4"] {
+            assert_eq!(php_decimal(invalid), None);
+        }
+        assert_eq!(call(b"1\n2", &[b"a (1/2)", b"b (1/2)"]), 0);
+        assert_eq!(call(b"1\n 2", &[b"a (1/2)", b"b (1/2)"]), DECODE_FAILED);
+        assert_eq!(call(b"1", &[b"a (1/2)", b"b (1/2)"]), DECODE_FAILED);
+        assert_eq!(call(b"1\n2\n3", &[b"a (1/2)", b"b (1/2)"]), DECODE_FAILED);
+        assert_eq!(call(b"", &[]), 0);
+    }
 }
 
 /// The PCRE version (NUL-terminated, static) whose Unicode classes this library's header filename

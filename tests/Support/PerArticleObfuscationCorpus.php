@@ -33,20 +33,22 @@ final class PerArticleObfuscationCorpus
             'readable-25-obfuscated' => ['category' => 'common', 'description' => 'readable yEnc with 25% obfuscated articles (goes to Rust)', 'size' => 20000],
             'readable-tenth-obfuscated' => ['category' => 'routed', 'description' => 'readable yEnc with 10% obfuscated articles (predicted 1.88x, stays on PHP)', 'size' => 20000],
             'text-half-obfuscated' => ['category' => 'common', 'description' => 'text posts with 50% obfuscated articles (goes to Rust)', 'size' => 20000],
-            'small-text' => ['category' => 'routed', 'description' => 'text posts, 1000 headers (smallest sampled range, stays on PHP)', 'size' => 1000],
-            'small-readable' => ['category' => 'routed', 'description' => 'readable yEnc, 1000 headers (smallest sampled range, stays on PHP)', 'size' => 1000],
+            'small-text' => ['category' => 'routed', 'description' => 'text posts, 4000 headers (smallest sampled range, stays on PHP)', 'size' => 4000],
+            'small-readable' => ['category' => 'routed', 'description' => 'readable yEnc, 4000 headers (smallest sampled range, stays on PHP)', 'size' => 4000],
             'text-third-obfuscated' => ['category' => 'routed', 'description' => 'text posts with 20% obfuscated articles (predicted 1.6x, stays on PHP)', 'size' => 20000],
+            'long-text-obfuscated' => ['category' => 'routed', 'description' => 'text posts of about 450 bytes with 40% obfuscated articles (stays on PHP)', 'size' => 20000],
+            'long-token-obfuscated' => ['category' => 'common', 'description' => 'per-article random names of about 400 characters (goes to Rust)', 'size' => 20000],
             'text-with-uploads' => ['category' => 'routed', 'description' => 'text posts with 8% obfuscated articles and 10% counter-prefixed single-part images (stays on PHP)', 'size' => 20000],
             'non-yenc' => ['category' => 'routed', 'description' => 'text posts without yEnc part counts (stays on PHP)', 'size' => 20000],
             'large-range' => ['category' => 'uncommon', 'description' => 'mixed range of 100k headers', 'size' => 100000],
             'small-range' => ['category' => 'routed', 'description' => 'mixed range of 200 headers (under MIN_HEADERS, stays on PHP)', 'size' => 200],
             'long-subjects' => ['category' => 'uncommon', 'description' => 'mixed range with 300-byte subject prefixes', 'size' => 20000],
             'adversarial' => ['category' => 'uncommon', 'description' => 'random bytes, newlines, odd counters and invalid UTF-8', 'size' => 20000],
-            'crafted-whitespace' => ['category' => 'uncommon', 'description' => 'mixed range with 10% whitespace-padded subjects of 256-512 bytes built to make the subject pattern backtrack', 'size' => 2000],
+            'crafted-whitespace' => ['category' => 'routed', 'description' => 'mixed range with 10% whitespace-padded subjects of 256-512 bytes built to make the subject pattern backtrack (under MIN_HEADERS, stays on PHP)', 'size' => 2000],
         ];
     }
 
-    /** @return list<array{Number: int, Subject: string}> */
+    /** @return list<array<string, string>> */
     public static function stratum(string $name, int $seed, ?int $size = null): array
     {
         $random = new Randomizer(new Mt19937($seed ^ crc32($name)));
@@ -61,6 +63,8 @@ final class PerArticleObfuscationCorpus
             'text-heavy-obfuscated' => self::textObfuscated($random, $size, 85),
             'text-half-obfuscated' => self::textObfuscated($random, $size, 50),
             'text-third-obfuscated' => self::textObfuscated($random, $size, 20),
+            'long-text-obfuscated' => self::longTextObfuscated($random, $size),
+            'long-token-obfuscated' => self::longTokens($random, $size),
             'readable-40-obfuscated' => self::readableObfuscated($random, $size, 40),
             'readable-25-obfuscated' => self::readableObfuscated($random, $size, 25),
             'readable-tenth-obfuscated' => self::readableObfuscated($random, $size, 10),
@@ -74,9 +78,13 @@ final class PerArticleObfuscationCorpus
             'crafted-whitespace' => self::craftedWhitespace($random, $size),
             default => throw new \InvalidArgumentException('Unknown stratum '.$name),
         };
+        // Shaped like NNTPService::getXOVER() rows: every field is a string.
         $headers = [];
         foreach ($subjects as $index => $subject) {
-            $headers[] = ['Number' => 5_000_000_000 + $index, 'Subject' => $subject];
+            $number = (string) (5_000_000_000 + $index);
+            $headers[] = ['Number' => $number, 'Subject' => $subject, 'From' => 'poster@example.invalid',
+                'Date' => 'Mon, 19 Oct 2026 12:00:00 +0000', 'Message-ID' => '<'.$number.'@example.invalid>', 'References' => '',
+                'Bytes' => '768000', 'Lines' => '5900', 'Xref' => 'news.example.invalid alt.binaries.test:'.$number];
         }
 
         return $headers;
@@ -158,6 +166,33 @@ final class PerArticleObfuscationCorpus
         foreach (array_keys($subjects) as $index) {
             if ($random->getInt(0, 99) < $percent) {
                 $subjects[$index] = $obfuscated[$index];
+            }
+        }
+
+        return $subjects;
+    }
+
+    /** @return list<string> */
+    private static function longTextObfuscated(Randomizer $random, int $size): array
+    {
+        $subjects = self::textObfuscated($random, $size, 40);
+        foreach ($subjects as $index => $subject) {
+            if (! str_contains($subject, 'yEnc')) {
+                $subjects[$index] = substr(str_repeat($subject.' ', intdiv(450, strlen($subject) + 1) + 1), 0, 450);
+            }
+        }
+
+        return $subjects;
+    }
+
+    /** @return list<string> */
+    private static function longTokens(Randomizer $random, int $size): array
+    {
+        $subjects = [];
+        while (count($subjects) < $size) {
+            $total = $random->getInt(900, 1300);
+            for ($part = 1; $part <= $total && count($subjects) < $size; $part++) {
+                $subjects[] = sprintf('[%s] - %s yEnc (%d/%d)', self::token($random, 2), self::token($random, 400), $part, $total);
             }
         }
 
