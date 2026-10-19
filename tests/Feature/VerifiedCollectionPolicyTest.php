@@ -1560,7 +1560,7 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         return [$first, $generation, $canonical, $canonical.'.c999-'.str_repeat('a', 16).'.next'];
     }
 
-    public function test_a_covering_copy_whose_staged_nzb_is_neither_generation_covers_nothing(): void
+    public function test_a_covering_copy_whose_staged_nzb_is_neither_generation_is_judged_on_its_canonical_file(): void
     {
         [$first, $generation, , $staged] = $this->coveringCopyWithStagedGeneration('covering-unresolved-copy');
         file_put_contents($staged, gzencode('<nzb>unresolvable</nzb>'));
@@ -1569,10 +1569,10 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
 
         $this->publishStalledPartial(null);
 
-        $this->assertSame($first, (int) DB::table('release_verification_candidates')->where('id', $generation->id)->value('release_id'),
-            'The partial is upgraded rather than the generation reused as the unresolved copy.');
-        $this->assertSame(2, (int) DB::table('releases')->where('id', $first)->value('articles_found'));
-        $this->assertFileExists($staged);
+        $this->assertSame($first + 100, (int) DB::table('release_verification_candidates')->where('id', $generation->id)->value('release_id'),
+            'Its canonical file covers the generation, as it would with nothing staged.');
+        $this->assertSame(1, (int) DB::table('releases')->where('id', $first)->value('articles_found'), 'No second copy.');
+        $this->assertFileExists($staged, 'Kept for review.');
     }
 
     public function test_coverage_defers_publication_while_a_copys_committed_nzb_cannot_be_put_in_place(): void
