@@ -96,11 +96,11 @@ final class NativePerArticleObfuscation
     /**
      * 0: no part count; 1: a part count only; 2: a candidate as the PHP rule sees it, a first
      * whitespace-led `(n/total)` with total of at least 2 and a 16+ alphanumeric token before it.
-     * The patterns cannot backtrack on crafted whitespace.
+     * Both patterns run in linear time (the int cast drops leading zeros, so no `0*` overlaps `\d+`).
      */
     private static function classify(mixed $subject): int
     {
-        if (! is_string($subject) || preg_match('/\s\(\d+\/0*(\d+)\)/', $subject, $match, PREG_OFFSET_CAPTURE) !== 1) {
+        if (! is_string($subject) || preg_match('/\s\(\d+\/(\d+)\)/', $subject, $match, PREG_OFFSET_CAPTURE) !== 1) {
             return 0;
         }
 

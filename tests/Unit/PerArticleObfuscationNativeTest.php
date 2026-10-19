@@ -87,7 +87,8 @@ final class PerArticleObfuscationNativeTest extends TestCase
         }
         // Token-poor ranges stay on PHP; the unsampled path still answers for them.
         foreach (['non-yenc', 'readable-yenc', 'bare-random', 'single-part-hashed', 'text-with-uploads'] as $name) {
-            $routed = PerArticleObfuscationCorpus::stratum($name, 5, 200);
+            // Above MIN_HEADERS, so the sample (not the size floor) keeps these on PHP.
+            $routed = PerArticleObfuscationCorpus::stratum($name, 5, 2000);
             self::assertNull($native->mark($routed, 16));
             $marked = $native->markWithoutSampling($routed, 16);
             self::assertNotNull($marked);
@@ -103,6 +104,14 @@ final class PerArticleObfuscationNativeTest extends TestCase
         }
         self::assertNotNull($native->mark($alternating, 16));
         self::assertNull($native->mark(PerArticleObfuscationCorpus::stratum('kenpsx', 5, NativePerArticleObfuscation::MIN_HEADERS - 1), 16));
+        // The sampler stays linear on long zero runs inside a part count.
+        $zeros = PerArticleObfuscationCorpus::stratum('non-yenc', 5, 2000);
+        foreach (array_keys($zeros) as $index) {
+            $zeros[$index]['Subject'] = 'x (1/'.str_repeat('0', 32000).'x)';
+        }
+        $started = hrtime(true);
+        self::assertNull($native->mark($zeros, 16));
+        self::assertLessThan(1e9, hrtime(true) - $started);
         $headers = PerArticleObfuscationCorpus::stratum('kenpsx', 5, NativePerArticleObfuscation::MIN_HEADERS);
         self::assertNotSame([], $native->mark($headers, 16));
         $headers[] = ['Number' => 1, 'Subject' => str_repeat(' ', NativePerArticleObfuscation::MAX_SUBJECT_LENGTH).')'];
