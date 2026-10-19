@@ -337,15 +337,41 @@ final class PublicationOutbox
     }
 
     /**
-     * How many entries {@see claim()} could take now, counting at most $cap: this forwarder's own
-     * entries plus the pending ones that are due (past their backoff) or past their age limit. Stops
-     * reading at the cap. Reads only; unreadable documents and links count for nothing.
+     * What a forwarder needs to decide whether to wait for a fuller batch, from the pending entries that
+     * are due and not expired: whether any was already tried (attempts or deferrals), and the earliest
+     * hand-off time. Reads only.
+     *
+     * @return array{retried: bool, oldest: ?float}
      */
-    public function dueCount(int $cap, float $now, int $slot = 1): int
+    public function dueSurvey(float $now, int $slot): array
+    {
+        $retried = false;
+        $oldest = null;
+        $maxAge = self::maxAgeSeconds();
+        foreach ($this->pending() as $entry) {
+            if ($entry->notBefore > $now || $entry->olderThan($maxAge, $now)) {
+                continue;
+            }
+            $retried = $retried || $entry->attempts > 0 || $entry->deferrals > 0;
+            $oldest = $oldest === null ? $entry->enqueuedAt : min($oldest, $entry->enqueuedAt);
+        }
+
+        return ['retried' => $retried, 'oldest' => $oldest];
+    }
+
+    /**
+     * How many entries {@see claim()} could take now, counting at most $cap: this forwarder's own
+     * entries plus the pending ones that are due (past their backoff) or past their age limit; with
+     * $fresh, expired ones and the forwarder's own are left out. Stops reading at the cap. Reads only;
+     * unreadable documents and links count for nothing.
+     */
+    public function dueCount(int $cap, float $now, int $slot = 1, bool $fresh = false): int
     {
         $count = 0;
         $maxAge = self::maxAgeSeconds();
-        foreach ([$this->inflightDirectory($slot) => true, $this->root.'/pending' => false] as $directory => $owned) {
+        clearstatcache();
+        $sources = $fresh ? [$this->root.'/pending' => false] : [$this->inflightDirectory($slot) => true, $this->root.'/pending' => false];
+        foreach ($sources as $directory => $owned) {
             foreach ($this->names($directory) as $name) {
                 if ($count >= $cap) {
                     return $count;
@@ -354,7 +380,11 @@ final class PublicationOutbox
                     continue;
                 }
                 $entry = $this->read($directory.'/'.$name);
-                if ($entry !== null && ($owned || $entry->notBefore <= $now || $entry->olderThan($maxAge, $now))) {
+                if ($entry === null) {
+                    continue;
+                }
+                $expired = $entry->olderThan($maxAge, $now);
+                if ($fresh ? ($entry->notBefore <= $now && ! $expired) : ($owned || $entry->notBefore <= $now || $expired)) {
                     $count++;
                 }
             }

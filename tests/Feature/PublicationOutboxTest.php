@@ -2404,7 +2404,8 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         foreach (range($first, $first + $count - 1) as $number) {
             $claims[] = $claim = $this->claimedCandidate($number.'@article');
             $this->handOff($claim);
-            $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['enqueued_at' => microtime(true) - 10 + $number / 100] + $document);
+            // Handed off in the future, so the wait is not shortened by the time the test itself takes.
+            $this->changeEntry($this->pendingPath($claim), static fn (array $document): array => ['enqueued_at' => microtime(true) + 1000 + $number / 100] + $document);
         }
 
         return $claims;
@@ -2668,6 +2669,13 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->assertFileExists($this->pendingPath($claims[4]));
         $this->assertFileExists($this->pendingPath($claims[0]));
         $this->assertTrue($outbox->hasInvalid());
+        // Fresh counting leaves out expired and own entries; the survey reports retries and the earliest hand-off.
+        $this->assertSame(2, $outbox->dueCount(100, $now, 1, fresh: true));
+        $survey = $outbox->dueSurvey($now, 1);
+        $this->assertFalse($survey['retried']);
+        $this->assertGreaterThan($now, $survey['oldest']);
+        $this->changeEntry($this->pendingPath($claims[4]), static fn (array $document): array => ['attempts' => 1] + $document);
+        $this->assertTrue($outbox->dueSurvey($now, 1)['retried']);
         // Slot 2 sees its own entry and the same pending ones.
         $this->assertSame(4, $outbox->dueCount(100, $now, 2));
     }
@@ -2693,5 +2701,188 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
             rename($directory.'/pending.real', $directory.'/pending');
         }
         $this->assertSame(2, $this->outbox()->dueCount(10, microtime(true), 1));
+    }
+
+    public function test_the_group_is_free_while_lingering_right_after_a_send(): void
+    {
+        $this->batchSchema(releases: 2);
+        $this->configureAsync();
+        config(['release_verification.publish_forward_linger_ms' => 100]);
+        $this->handOffMany(1);
+        $second = $this->claimedCandidate('2@article');
+        $sent = false;
+        $this->servePrimary(function (HttpRequest $request) use (&$sent, $second) {
+            $response = $this->withServerVariables(self::PEER)->postJson('/internal/release-verification/publish-batch', $request->data());
+            // Work arrives while the first batch is in flight; the forwarder still holds the group afterwards.
+            $this->handOff($second);
+            $sent = true;
+
+            return Http::response($response->json(), $response->status());
+        });
+        $exclusive = [];
+        Sleep::fake(syncWithCarbon: true);
+        Sleep::whenFakingSleep(function () use (&$sent, &$exclusive): void {
+            if (! $sent) {
+                return;
+            }
+            $probe = new VerificationWorkerLocks;
+            try {
+                $exclusive[] = $probe->tryExclusive();
+            } finally {
+                $probe->close();
+            }
+        });
+
+        $this->forward(['--passes' => 2]);
+
+        $this->assertSame([1, 1], $this->batchSizes);
+        $this->assertNotSame([], $exclusive);
+        $this->assertSame(array_fill(0, count($exclusive), true), $exclusive);
+        $this->assertSame('sampled', $this->candidateStatus($second));
+    }
+
+    public function test_a_pause_during_the_wait_ends_it_and_the_forwarder_writes_nothing(): void
+    {
+        $this->configureAsync();
+        config(['release_verification.publish_forward_linger_ms' => 30000]);
+        $claims = $this->handOffMany(1);
+        $this->servePrimary();
+        $sleeps = 0;
+        Sleep::fake(syncWithCarbon: true);
+        Sleep::whenFakingSleep(function () use (&$sleeps): void {
+            if (++$sleeps === 3) {
+                VerificationWorkerLocks::pause('test-barrier', 'maintenance');
+            }
+        });
+        $summaries = [];
+        $this->captureSummaries($summaries, 'Publication forwarder run summary.');
+
+        $this->forward(['--diagnostics' => true]);
+
+        $this->assertSame(20, $sleeps);
+        $this->assertSame([], $this->batchSizes);
+        $this->assertLinger($summaries[0], 1, 0, 0, 1);
+        $this->assertGreaterThanOrEqual(1, $summaries[0]['lock_blocked']);
+        $this->assertFileExists($this->pendingPath($claims[0]));
+        $this->assertFileDoesNotExist($this->outbox()->directory().'/forwarder-1.alive');
+    }
+
+    public function test_the_marker_and_leases_keep_their_cadence_during_a_long_wait(): void
+    {
+        $this->batchSchema(releases: 1);
+        $this->configureAsync();
+        config(['release_verification.publish_forward_linger_ms' => 30000]);
+        $claims = $this->handOffMany(1);
+        // Not yet a third of the lease old when the wait starts, but past it ten seconds later.
+        $this->changeEntry($this->pendingPath($claims[0]), static fn (array $document): array => ['heartbeat_at' => microtime(true) - 95] + $document);
+        $before = $this->candidateRow($claims[0])->lease_until;
+        $this->servePrimary();
+        $sleeps = 0;
+        $marker = $this->outbox()->directory().'/forwarder-1.alive';
+        $observed = [];
+        Sleep::fake(syncWithCarbon: true);
+        Sleep::whenFakingSleep(function () use (&$sleeps, &$observed, $marker, $claims, $before): void {
+            $sleeps++;
+            if ($sleeps === 5) {
+                touch($marker, time() - 100);
+            }
+            if ($sleeps === 230) {
+                clearstatcache();
+                $observed = ['marker' => filemtime($marker), 'lease' => $this->candidateRow($claims[0])->lease_until > $before];
+            }
+        });
+
+        $this->forward();
+
+        $this->assertGreaterThanOrEqual(time() - 20, $observed['marker']);
+        $this->assertTrue($observed['lease']);
+        $this->assertSame([1], $this->batchSizes);
+    }
+
+    public function test_a_retried_entry_is_not_made_to_wait(): void
+    {
+        $this->batchSchema(releases: 1);
+        $this->configureAsync();
+        config(['release_verification.publish_forward_linger_ms' => 5000]);
+        $claims = $this->handOffMany(1);
+        $this->changeEntry($this->pendingPath($claims[0]), static fn (array $document): array => ['deferrals' => 1] + $document);
+        $this->servePrimary();
+        Sleep::fake(syncWithCarbon: true);
+
+        $this->forward();
+
+        Sleep::assertNeverSlept();
+        $this->assertSame([1], $this->batchSizes);
+    }
+
+    public function test_an_entry_too_close_to_its_age_limit_is_not_made_to_wait(): void
+    {
+        $this->batchSchema(releases: 1);
+        $this->configureAsync();
+        config(['release_verification.publish_forward_linger_ms' => 30000]);
+        $claims = $this->handOffMany(1);
+        // The age limit is 240 s here; with the safety margin left, 200 s old leaves no room to wait.
+        $this->changeEntry($this->pendingPath($claims[0]), static fn (array $document): array => ['enqueued_at' => microtime(true) - 200] + $document);
+        $this->servePrimary();
+        Sleep::fake(syncWithCarbon: true);
+
+        $this->forward();
+
+        Sleep::assertNeverSlept();
+        $this->assertSame([1], $this->batchSizes);
+        $this->assertSame('sampled', $this->candidateStatus($claims[0]));
+    }
+
+    public function test_the_wait_is_anchored_to_the_oldest_entrys_age_not_restarted(): void
+    {
+        $this->batchSchema(releases: 1);
+        $this->configureAsync();
+        config(['release_verification.publish_forward_linger_ms' => 1000]);
+        $claims = $this->handOffMany(1);
+        $this->changeEntry($this->pendingPath($claims[0]), static fn (array $document): array => ['enqueued_at' => microtime(true) - 0.7] + $document);
+        $this->servePrimary();
+        Sleep::fake(syncWithCarbon: true);
+        $summaries = [];
+        $this->captureSummaries($summaries, 'Publication forwarder run summary.');
+
+        $this->forward(['--diagnostics' => true]);
+
+        // Only the remainder of the linger (about 300 ms of the 1000) is waited.
+        $this->assertLinger($summaries[0], 1, 0, 1, 0);
+        $this->assertLessThanOrEqual(350.0, $summaries[0]['linger']['total_ms']);
+        $this->assertGreaterThan(0.0, $summaries[0]['linger']['total_ms']);
+    }
+
+    public function test_urgency_does_not_outlive_the_adopted_work_that_caused_it(): void
+    {
+        $this->batchSchema(releases: 1);
+        $this->configureAsync();
+        config(['release_verification.publish_forwarders' => 4, 'release_verification.publish_forward_linger_ms' => 100]);
+        $orphan = $this->claimedCandidate('orphan@article');
+        $this->handOff($orphan);
+        $this->changeEntry($this->pendingPath($orphan), static fn (array $document): array => ['not_before' => microtime(true) + 3600] + $document);
+        $this->outbox()->prepare(3);
+        rename($this->pendingPath($orphan), $this->inflightPath($orphan, 3));
+        $fresh = $this->claimedCandidate('fresh@article');
+        $steps = 0;
+        $handedOff = false;
+        $this->servePrimary();
+        Sleep::fake(syncWithCarbon: true);
+        Sleep::whenFakingSleep(function ($duration) use (&$steps, &$handedOff, $fresh): void {
+            if ((int) $duration->totalMicroseconds === 50_000) {
+                $steps++;
+            } elseif (! $handedOff) {
+                // The idle pass after the adoption: new work arrives.
+                $handedOff = true;
+                $this->handOff($fresh);
+            }
+        });
+
+        $this->forward(['--passes' => 3]);
+
+        // The adopted entry was not due, so nothing was urgent: the fresh one waited for its batch.
+        $this->assertGreaterThanOrEqual(1, $steps);
+        $this->assertSame([1], $this->batchSizes);
+        $this->assertSame('sampled', $this->candidateStatus($fresh));
     }
 }
