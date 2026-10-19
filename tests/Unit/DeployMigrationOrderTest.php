@@ -2941,6 +2941,24 @@ SH);
         $this->assertFalse($process->isSuccessful());
         $this->assertStringContainsString('up -d --no-deps --wait --wait-timeout 240 --pull never mariadb', $this->events());
         $this->assertStringContainsString('service:mariadb=pending', (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
+        // Unfenced, the started database is stopped again: remote workers never reach it unmigrated.
+        $this->assertMatchesRegularExpression('/--pull never mariadb\n(.*\n)*.* stop mariadb\n/', $this->events());
+        $this->assertStringContainsString('stopped the new mariadb again', $process->getErrorOutput());
+    }
+
+    public function test_a_recreated_database_whose_fresh_barrier_fails_is_stopped_again(): void
+    {
+        $services = json_decode($this->composeJson(), true);
+        $services['services']['mariadb'] = ['image' => 'mariadb:one'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($services, JSON_UNESCAPED_SLASHES)])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        $services['services']['mariadb'] = ['image' => 'mariadb:two'];
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($services, JSON_UNESCAPED_SLASHES), 'NNTMUX_BARRIER_FAIL_AFTER' => '--force-recreate --wait --wait-timeout 240 --pull never mariadb']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertMatchesRegularExpression('/--force-recreate --wait --wait-timeout 240 --pull never mariadb\n(.*\n)*.* stop mariadb\n/', $this->events());
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
     }
 
     public function test_a_failed_database_lookup_before_the_barrier_aborts_instead_of_starting_it(): void

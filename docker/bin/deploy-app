@@ -48,6 +48,7 @@ esac
 barrier_name="$project-verification-barrier"
 barrier_held=0
 barrier_keep=0
+database_fresh=0
 barrier_running() {
     [ "$(docker inspect --format '{{.State.Running}} {{index .Config.Labels "com.docker.compose.project"}}' "$barrier_name" 2>/dev/null)" = "true $project" ]
 }
@@ -79,6 +80,13 @@ hold_barrier() {
             docker logs "$barrier_name" >&2 || true
             docker rm -f "$barrier_name" >/dev/null 2>&1 || true
             barrier_held=0
+            if [ "$database_fresh" = 1 ]; then
+                # Started or recreated just now and unfenced (replacement storage has no pause): stop
+                # it again; the retry recreates it (it is pending or unrecorded).
+                compose stop "$DATABASE_SERVICE" || true
+                echo "Remote verification workers did not drain; stopped the new $DATABASE_SERVICE again, not migrating." >&2
+                exit 1
+            fi
             echo "Remote verification workers did not drain; not stopping writers or migrating." >&2
             exit 1
         fi
@@ -405,6 +413,7 @@ if [ "$database_missing" = 1 ]; then
     plan --verify-images "$DATABASE_SERVICE" web
     compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" --pull never "$DATABASE_SERVICE"
     # No check between starting it and fencing it: the barrier below is taken next (and verifies).
+    database_fresh=1
 fi
 
 # Remote workers are held out whenever the database's writers stop for a schema or data-service
@@ -439,6 +448,7 @@ for item in $POST_DRAIN; do
         # The fresh barrier below starts from web's tag: a replaced one aborts before the recreate.
         plan --verify-images web
         apply_up "--${item%%:*}" "${item#*:}"
+        database_fresh=1
         # A recreated database ends the barrier's lock session, and replacement storage lacks its
         # durable pause: fence the new database at once, before anything else that could fail
         # (recording it included).
