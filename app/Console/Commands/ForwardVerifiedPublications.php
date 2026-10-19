@@ -56,6 +56,9 @@ class ForwardVerifiedPublications extends Command
     /** Seconds of its age limit a lingering entry must keep left, at most (half the limit for short limits). */
     private const float LINGER_AGE_MARGIN_SECONDS = 60.0;
 
+    /** Wait steps between looks at the outbox for a filled batch (about a quarter second). */
+    private const int LINGER_FILL_STEPS = 5;
+
     protected $signature = 'releases:forward-verified-publications {--slot=1 : Forwarder number, 1 to RELEASE_VERIFICATION_PUBLISH_FORWARDERS} {--max-seconds=0 : Stop taking work after this duration; zero uses RELEASE_VERIFICATION_PUBLISH_FORWARDER_SECONDS} {--passes=0 : Stop after this many loop passes (zero runs until the deadline)} {--diagnostics : Log a bounded run summary}';
 
     protected $description = 'Publish verified candidates handed off by this host\'s workers to the primary in batches';
@@ -304,13 +307,18 @@ class ForwardVerifiedPublications extends Command
         if ($this->outbox->hasUrgent($this->slot, $wall)) {
             return true;
         }
-        $survey = $this->outbox->dueSurvey($wall, $this->slot);
+        $maxAge = PublicationOutbox::maxAgeSeconds();
+        $margin = min(self::LINGER_AGE_MARGIN_SECONDS, $maxAge / 2);
+        $survey = $this->outbox->dueSurvey($wall, $this->slot, $margin);
         if ($survey['retried'] || $survey['oldest'] === null || $this->outbox->dueCount($this->limit, $wall, $this->slot, fresh: true) >= $this->limit) {
             return true;
         }
-        $maxAge = PublicationOutbox::maxAgeSeconds();
         $age = max(0.0, $wall - $survey['oldest']);
-        $budget = (min($this->lingerMs / 1000.0, $maxAge - min(self::LINGER_AGE_MARGIN_SECONDS, $maxAge / 2)) - $age) * 1000.0;
+        // Never past the moment a backed-off entry becomes due or any waiting entry nears its age limit.
+        $budget = (min($this->lingerMs / 1000.0, $maxAge - $margin) - $age) * 1000.0;
+        if ($survey['wake'] !== null) {
+            $budget = min($budget, ($survey['wake'] - $wall) * 1000.0);
+        }
         if ($budget <= 0.0) {
             return true;
         }
@@ -354,12 +362,14 @@ class ForwardVerifiedPublications extends Command
 
                 return true;
             }
-            if ($this->outbox->dueCount($this->limit, $now, $this->slot, fresh: true) >= $this->limit) {
+            $expired = $waited >= $budget;
+            // Reading the outbox is the costly part: look every few steps, and once more at the end.
+            if (($expired || $steps % self::LINGER_FILL_STEPS === 0) && $this->outbox->dueCount($this->limit, $now, $this->slot, fresh: true) >= $this->limit) {
                 $this->diagnostics?->lingerEnded('fill', $waited);
 
                 return true;
             }
-            if ($waited >= $budget) {
+            if ($expired) {
                 $this->diagnostics?->lingerEnded('timeout', $waited);
 
                 return true;

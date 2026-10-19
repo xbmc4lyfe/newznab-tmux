@@ -2471,12 +2471,12 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
 
         $this->forward(['--diagnostics' => true]);
 
-        $this->assertSame(2, $sleeps);
-        $this->assertSame([true, true], $exclusive);
+        $this->assertSame(5, $sleeps);
+        $this->assertSame([true, true, true, true, true], $exclusive);
         $this->assertSame([3], $this->batchSizes);
         $this->assertSame(['sampled', 'sampled', 'sampled'], array_map($this->candidateStatus(...), [...$first, ...$late]));
         $this->assertLinger($summaries[0], 1, 1, 0, 0);
-        $this->assertEqualsWithDelta(100.0, $summaries[0]['linger']['total_ms'], 5.0);
+        $this->assertEqualsWithDelta(250.0, $summaries[0]['linger']['total_ms'], 5.0);
     }
 
     public function test_the_wait_ends_at_the_timeout_with_a_partial_batch(): void
@@ -2884,5 +2884,45 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->assertGreaterThanOrEqual(1, $steps);
         $this->assertSame([1], $this->batchSizes);
         $this->assertSame('sampled', $this->candidateStatus($fresh));
+    }
+
+    public function test_the_wait_ends_when_a_backed_off_entry_becomes_due(): void
+    {
+        $this->batchSchema(releases: 1);
+        $this->configureAsync();
+        config(['release_verification.publish_forward_linger_ms' => 30000]);
+        $this->handOffMany(1);
+        $retried = $this->claimedCandidate('retry@article');
+        $this->handOff($retried);
+        $this->changeEntry($this->pendingPath($retried), static fn (array $document): array => ['deferrals' => 1, 'not_before' => microtime(true) + 0.3] + $document);
+        $this->servePrimary();
+        Sleep::fake(syncWithCarbon: true);
+        $summaries = [];
+        $this->captureSummaries($summaries, 'Publication forwarder run summary.');
+
+        $this->forward(['--diagnostics' => true]);
+
+        // Not the whole 30 s: the wait stops when the retried entry's backoff ends, so it is not held back.
+        $this->assertLinger($summaries[0], 1, 0, 1, 0);
+        $this->assertLessThanOrEqual(350.0, $summaries[0]['linger']['total_ms']);
+        $this->assertSame([1], $this->batchSizes);
+    }
+
+    public function test_a_backed_off_entry_near_its_age_limit_keeps_the_forwarder_from_waiting(): void
+    {
+        $this->batchSchema(releases: 1);
+        $this->configureAsync();
+        config(['release_verification.publish_forward_linger_ms' => 30000]);
+        $this->handOffMany(1);
+        $old = $this->claimedCandidate('old@article');
+        $this->handOff($old);
+        $this->changeEntry($this->pendingPath($old), static fn (array $document): array => ['deferrals' => 1, 'not_before' => microtime(true) + 3600, 'enqueued_at' => microtime(true) - 200] + $document);
+        $this->servePrimary();
+        Sleep::fake(syncWithCarbon: true);
+
+        $this->forward();
+
+        Sleep::assertNeverSlept();
+        $this->assertSame([1], $this->batchSizes);
     }
 }

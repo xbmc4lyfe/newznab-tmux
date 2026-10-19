@@ -337,26 +337,35 @@ final class PublicationOutbox
     }
 
     /**
-     * What a forwarder needs to decide whether to wait for a fuller batch, from the pending entries that
-     * are due and not expired: whether any was already tried (attempts or deferrals), and the earliest
-     * hand-off time. Reads only.
+     * What a forwarder needs to decide whether, and how long, to wait for a fuller batch, from the
+     * pending entries that have not expired: whether a due one was already tried (attempts or
+     * deferrals), the earliest hand-off time among the due ones, and the earliest moment ($margin
+     * seconds short of its age limit, or when a backed-off entry becomes due) at which any waiting
+     * entry needs attention. Reads only.
      *
-     * @return array{retried: bool, oldest: ?float}
+     * @return array{retried: bool, oldest: ?float, wake: ?float}
      */
-    public function dueSurvey(float $now, int $slot): array
+    public function dueSurvey(float $now, int $slot, float $margin = 0.0): array
     {
         $retried = false;
         $oldest = null;
+        $wake = null;
         $maxAge = self::maxAgeSeconds();
         foreach ($this->pending() as $entry) {
-            if ($entry->notBefore > $now || $entry->olderThan($maxAge, $now)) {
+            if ($entry->olderThan($maxAge, $now)) {
                 continue;
             }
-            $retried = $retried || $entry->attempts > 0 || $entry->deferrals > 0;
-            $oldest = $oldest === null ? $entry->enqueuedAt : min($oldest, $entry->enqueuedAt);
+            $needs = $entry->enqueuedAt + $maxAge - $margin;
+            if ($entry->notBefore > $now) {
+                $needs = min($needs, $entry->notBefore);
+            } else {
+                $retried = $retried || $entry->attempts > 0 || $entry->deferrals > 0;
+                $oldest = $oldest === null ? $entry->enqueuedAt : min($oldest, $entry->enqueuedAt);
+            }
+            $wake = $wake === null ? $needs : min($wake, $needs);
         }
 
-        return ['retried' => $retried, 'oldest' => $oldest];
+        return ['retried' => $retried, 'oldest' => $oldest, 'wake' => $wake];
     }
 
     /**
