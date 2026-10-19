@@ -780,11 +780,16 @@ SH);
     public function test_a_database_setting_in_an_app_services_rendered_environment_migrates(): void
     {
         $json = json_decode($this->composeJson(), true);
-        $json['services']['web'] = ['environment' => ['DB_HOST' => '192.0.2.10']];
+        // Every app gets it: apps on different databases are refused.
+        foreach (['web', 'horizon', 'scheduler', 'indexer'] as $app) {
+            $json['services'][$app] = ['environment' => ['DB_HOST' => '192.0.2.10']];
+        }
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
         file_put_contents($this->directory.'/events', '');
 
-        $json['services']['web'] = ['environment' => ['DB_HOST' => '192.0.2.20']];
+        foreach (['web', 'horizon', 'scheduler', 'indexer'] as $app) {
+            $json['services'][$app] = ['environment' => ['DB_HOST' => '192.0.2.20']];
+        }
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
         $this->assertStringContainsString('artisan migrate --force', $this->events());
     }
@@ -1635,21 +1640,21 @@ SH);
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         $this->assertStringNotContainsString('artisan migrate', $this->events());
 
-        // So can a reference in DB_URL's port.
+        // A reference in DB_URL's port cannot be resolved here: the plan refuses it.
         file_put_contents($this->directory.'/docker/config/app.env', "CUTOVER_PORT=3306\nDB_URL=mysql://u:p@192.0.2.50:\${CUTOVER_PORT}/nntmux\n");
-        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
-        file_put_contents($this->directory.'/docker/config/app.env', "CUTOVER_PORT=3307\nDB_URL=mysql://u:p@192.0.2.50:\${CUTOVER_PORT}/nntmux\n");
         file_put_contents($this->directory.'/events', '');
-        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
-        $this->assertStringContainsString('artisan migrate --force', $this->events());
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString("app.env's DB_URL uses `\${...}` interpolation", $process->getErrorOutput());
+        $this->assertStringNotContainsString(' stop ', $this->events());
 
-        // A nested reference can switch databases without changing DB_HOST's text.
+        // Nor can a nested reference that switches databases without changing DB_HOST's text.
         file_put_contents($this->directory.'/docker/config/app.env', "DB_TARGET=192.0.2.40\nDB_HOST=\${DB_TARGET}\nDB_DATABASE=nntmux\n");
-        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
-        file_put_contents($this->directory.'/docker/config/app.env', "DB_TARGET=192.0.2.41\nDB_HOST=\${DB_TARGET}\nDB_DATABASE=nntmux\n");
-        file_put_contents($this->directory.'/events', '');
-        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
-        $this->assertStringContainsString('artisan migrate --force', $this->events());
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString("app.env's DB_HOST uses `\${...}` interpolation", $process->getErrorOutput());
     }
 
     public function test_a_shared_app_env_edit_restarts_the_apps_without_migrating(): void
