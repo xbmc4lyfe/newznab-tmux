@@ -2116,6 +2116,19 @@ SH);
         $this->assertMatchesRegularExpression('/indexer\s+app\s+skip\s+unchanged/', $plan->getOutput());
     }
 
+    public function test_roles_sharing_an_equivalent_image_reference_are_recreated_together(): void
+    {
+        $shared = ['WEB_IMAGE' => 'nntmux/shared:local', 'HORIZON_IMAGE' => 'docker.io/nntmux/shared:local', 'SCHEDULER_IMAGE' => 'custom/scheduler:1', 'INDEXER_IMAGE' => 'custom/indexer:1'];
+        mkdir($this->directory.'/resources/js', 0777, true);
+        file_put_contents($this->directory.'/resources/js/app.js', "1\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $shared)->mustRun();
+        file_put_contents($this->directory.'/resources/js/app.js', "2\n");
+
+        $plan = $this->make(['deploy-plan'], $shared);
+        $plan->mustRun();
+        $this->assertMatchesRegularExpression('/horizon\s+app\s+drain\+recreate\s+shares a rebuilt image/', $plan->getOutput());
+    }
+
     public function test_failed_image_inspection_aborts_instead_of_reading_as_a_missing_image(): void
     {
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
@@ -3182,11 +3195,11 @@ SH);
         $this->assertStringContainsString('depends_on.proxy.restart', $plan->getErrorOutput());
 
         // Health and recreation checks inspect one container per app service.
-        foreach ([['deploy' => ['replicas' => 2]], ['scale' => 3]] as $scaled) {
+        foreach ([['deploy' => ['replicas' => 2]], ['scale' => 3], ['scale' => 0], ['deploy' => ['replicas' => 0]]] as $scaled) {
             $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['web' => $scaled] + $services], JSON_UNESCAPED_SLASHES)]);
             $plan->run();
             $this->assertNotSame(0, $plan->getExitCode());
-            $this->assertStringContainsString('app service web runs more than one replica', $plan->getErrorOutput());
+            $this->assertStringContainsString('app service web sets a replica count other than one', $plan->getErrorOutput());
         }
 
         // node-exporter's `pid: host` names no other container.
