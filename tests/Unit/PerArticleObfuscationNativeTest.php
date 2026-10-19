@@ -119,6 +119,30 @@ final class PerArticleObfuscationNativeTest extends TestCase
         self::assertNull($native->markWithoutSampling($headers, 16));
     }
 
+    public function test_counts_php_reads_as_an_infinite_double_keep_the_php_result(): void
+    {
+        $native = new NativePerArticleObfuscation((string) getenv('NNTMUX_TEST_NATIVE_LIBRARY'));
+        if (getenv('NNTMUX_TEST_NATIVE_LIBRARY') === false || ! $native->available()) {
+            self::markTestSkipped('Needs a Linux CLI with FFI and NNTMUX_TEST_NATIVE_LIBRARY.');
+        }
+        // PHP's (int) caps a 308-digit total at PHP_INT_MAX but turns 309 digits into 0.
+        foreach ([308 => false, 309 => true] as $digits => $declines) {
+            $headers = PerArticleObfuscationCorpus::stratum('kenpsx', 9, 2 * NativePerArticleObfuscation::MIN_HEADERS);
+            for ($i = 0; $i < 40; $i++) {
+                $headers[] = ['Number' => (string) (9_000_000_000 + $i),
+                    'Subject' => '[40/62] "'.md5((string) $i).'" yEnc ('.($i + 2).'/'.str_repeat('9', $digits).')'];
+            }
+            $headers[] = ['Number' => str_repeat('9', $digits), 'Subject' => '[40/62] "'.md5('n').'" yEnc (3/687)'];
+            $marked = $native->mark($headers, 16);
+            if ($declines) {
+                self::assertNull($marked);
+            } else {
+                self::assertNotNull($marked);
+                self::assertSame(self::php($headers, 16), self::sorted($marked));
+            }
+        }
+    }
+
     /** @return iterable<string, array{string, int}> */
     public static function strata(): iterable
     {
@@ -140,7 +164,7 @@ final class PerArticleObfuscationNativeTest extends TestCase
         $headers = PerArticleObfuscationCorpus::stratum($name, $seed, $size);
         foreach ([16, 8, 40] as $minArticles) {
             $marked = $native->markWithoutSampling($headers, $minArticles);
-            // Counts saturate as in PHP and no corpus subject exceeds 512 bytes, so nothing declines.
+            // No corpus count reaches 309 digits and no subject exceeds 512 bytes, so nothing declines.
             self::assertNotNull($marked, $name.' at '.$minArticles);
             sort($marked);
             self::assertSame(self::php($headers, $minArticles), $marked, $name.' at '.$minArticles);

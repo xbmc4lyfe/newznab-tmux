@@ -29,7 +29,8 @@ struct Signature<'a> {
 }
 
 /// Marked article numbers, distinct and ascending; `None` declines (a subject longer than
-/// `MAX_SUBJECT_LENGTH`), so the caller keeps the PHP result.
+/// `MAX_SUBJECT_LENGTH`, or a part or total of `PHP_INT_DOUBLE_DIGITS` or more digits), so the
+/// caller keeps the PHP result.
 pub fn mark<'a>(articles: &[Article<'a>], min_articles: usize) -> Option<Vec<i64>> {
     if min_articles == 0 {
         return Some(Vec::new());
@@ -49,11 +50,11 @@ pub fn mark<'a>(articles: &[Article<'a>], min_articles: usize) -> Option<Vec<i64
         if !has_token(name) {
             continue;
         }
-        let total_value = php_int(total);
+        let total_value = php_int(total)?;
         if total_value < 2 {
             continue;
         }
-        let part_value = php_int(part);
+        let part_value = php_int(part)?;
         key.clear();
         normalized.clear();
         let changed = shape_and_normalized(name, &mut key, &mut normalized);
@@ -253,14 +254,25 @@ fn parenthesized(subject: &[u8], at: usize) -> Option<(&[u8], &[u8])> {
     Some((part, &subject[cursor..cursor + total_length]))
 }
 
-/// PHP's `(int)` of an ASCII digit string, which saturates at `i64::MAX`.
-fn php_int(digits: &[u8]) -> i64 {
-    digits
-        .iter()
-        .try_fold(0_i64, |value, byte| {
-            value.checked_mul(10)?.checked_add(i64::from(byte - b'0'))
-        })
-        .unwrap_or(i64::MAX)
+/// Digit runs at least this long (after leading zeros) decline: PHP reads them as a double, and
+/// once that exceeds `f64::MAX` (from 309 digits) its `(int)` gives 0 instead of saturating.
+pub const PHP_INT_DOUBLE_DIGITS: usize = 309;
+
+/// PHP's `(int)` of an ASCII digit string, which saturates at `i64::MAX`; `None` for runs of
+/// `PHP_INT_DOUBLE_DIGITS` or more significant digits.
+fn php_int(digits: &[u8]) -> Option<i64> {
+    let significant = &digits[digits.iter().take_while(|byte| **byte == b'0').count()..];
+    if significant.len() >= PHP_INT_DOUBLE_DIGITS {
+        return None;
+    }
+    Some(
+        significant
+            .iter()
+            .try_fold(0_i64, |value, byte| {
+                value.checked_mul(10)?.checked_add(i64::from(byte - b'0'))
+            })
+            .unwrap_or(i64::MAX),
+    )
 }
 
 fn alnum_runs(name: &[u8]) -> impl Iterator<Item = (usize, usize)> + '_ {
@@ -504,10 +516,16 @@ mod tests {
             normalized_name(b"short7.part07.rar"),
             b"short.part.rar".to_vec()
         );
-        assert_eq!(php_int(b"0000000000000000000000002"), 2);
-        assert_eq!(php_int(b"9223372036854775807"), i64::MAX);
-        assert_eq!(php_int(b"9223372036854775808"), i64::MAX);
-        assert_eq!(php_int(b"000009999999999999999999"), i64::MAX);
+        assert_eq!(php_int(b"0000000000000000000000002"), Some(2));
+        assert_eq!(php_int(b"9223372036854775807"), Some(i64::MAX));
+        assert_eq!(php_int(b"9223372036854775808"), Some(i64::MAX));
+        assert_eq!(php_int(b"000009999999999999999999"), Some(i64::MAX));
+        assert_eq!(php_int("9".repeat(308).as_bytes()), Some(i64::MAX));
+        assert_eq!(
+            php_int(format!("000{}", "9".repeat(308)).as_bytes()),
+            Some(i64::MAX)
+        );
+        assert_eq!(php_int("9".repeat(309).as_bytes()), None);
     }
 
     /// The previous direct translation of the PCRE search (cubic on whitespace), kept as the

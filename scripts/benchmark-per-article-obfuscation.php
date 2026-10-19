@@ -173,10 +173,11 @@ function perArticleBenchmarkMain(): int
         $report['cold'][$name] = ['php_ms' => round(perArticleQuantile($cold['php'], 0.5) / 1e6, 3),
             'rust_ms' => round(perArticleQuantile($cold['rust'], 0.5) / 1e6, 3), 'speedup' => round($coldSpeedup, 2),
             'speedup_ci95' => [round($coldLow, 2), round($coldHigh, 2)], 'samples' => PER_ARTICLE_COLD_RUNS, 'raw' => $cold];
-        // A cold first call that took Rust must clear the threshold; one the routing kept on PHP
-        // (before the library pays for itself) must only not regress.
+        // A cold first call that took Rust must clear the threshold at its lower bound. One the
+        // routing kept on PHP must not regress; with 21 sub-millisecond runs a median is noisy, so it
+        // fails only when its whole interval sits below the floor.
         $required = $usedRust ? PER_ARTICLE_THRESHOLD : PER_ARTICLE_ROUTED_FLOOR;
-        if ($coldSpeedup < $required) {
+        if ($usedRust ? $coldSpeedup < $required : $coldHigh < $required) {
             $report['status'] = $report['status'] === 'invalid' ? 'invalid' : 'not-qualified';
         } elseif ($usedRust && $coldLow < $required && $report['status'] === 'qualified') {
             $report['status'] = 'inconclusive';
