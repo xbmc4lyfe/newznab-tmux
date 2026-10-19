@@ -1430,7 +1430,7 @@ SH);
         $this->assertStringNotContainsString('drain', $events);
         $this->assertStringNotContainsString('artisan migrate', $events);
         $this->assertStringNotContainsString('--wait-timeout 240 web', $events);
-        $this->assertStringNotContainsString(' proxy', $events);
+        $this->assertDoesNotMatchRegularExpression('/ up -d[^\n]* proxy\b/', $events);
     }
 
     public function test_compose_change_requiring_migration_still_migrates_when_retried_after_a_failed_drain(): void
@@ -1566,6 +1566,45 @@ SH);
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         $this->assertStringContainsString('artisan migrate --force', $this->events());
+    }
+
+    public function test_a_shared_app_env_edit_restarts_the_apps_without_migrating(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=192.0.2.10\nAPP_DEBUG=false\n");
+        $json = json_decode($this->composeJson(), true);
+        foreach (['web', 'horizon', 'scheduler', 'indexer'] as $app) {
+            $json['services'][$app] = ['volumes' => [['type' => 'bind', 'source' => $this->directory.'/docker/config/app.env', 'target' => '/app/.env', 'read_only' => true]]];
+        }
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        // Record the definition records once (stamps from before them fall back to compose records).
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0', 'FORCE=1'], $config)->mustRun();
+
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=192.0.2.10\nAPP_DEBUG=true\n");
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('web horizon scheduler indexer', $events);
+        $this->assertStringNotContainsString('artisan migrate', $events);
+    }
+
+    public function test_a_renamed_database_service_is_handled_as_the_database(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=db2\n");
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['db2'] = ['image' => 'mariadb:one'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        $json['services']['db2'] = ['image' => 'mariadb:two'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
+        $events = $this->events();
+        $recreate = strpos($events, '--force-recreate --wait --wait-timeout 240 db2');
+        $this->assertNotFalse($recreate);
+        $this->assertGreaterThan($recreate, strrpos($events, 'releases:verification-barrier --timeout=900'));
+        $this->assertGreaterThan($recreate, strpos($events, 'artisan migrate --force'));
     }
 
     public function test_infrastructure_a_new_data_service_needs_starts_first(): void
@@ -2991,6 +3030,12 @@ SH);
         $process->run();
         $this->assertNotSame(0, $process->getExitCode());
         $this->assertStringNotContainsString(' up -d', $this->events());
+
+        // App services must run their role image.
+        $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['web' => ['image' => 'nntmux/app:local']] + $services], JSON_UNESCAPED_SLASHES)]);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('not its role image nntmux/web:local', $plan->getErrorOutput());
 
         // Compose would restart a dependent after its provider's update; deploy-app cannot.
         $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['web' => ['depends_on' => ['proxy' => ['condition' => 'service_started', 'restart' => true]]]] + $services], JSON_UNESCAPED_SLASHES)]);

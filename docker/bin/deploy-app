@@ -20,7 +20,7 @@ verify
 
 # Capture first: a failing plan inside eval "$(...)" would be ignored, and a stale MODE in the
 # caller's environment must never stand in for the plan's output.
-unset MODE MIGRATE DIRTY_APP DIRTY_DATA DIRTY_INFRA RECONCILE_DATA RECONCILE_INFRA START_DATA PRE_DRAIN POST_DRAIN AFTER_APP BUILD_TARGETS GLOBAL_FALLBACK
+unset MODE MIGRATE DIRTY_APP DIRTY_DATA DIRTY_INFRA RECONCILE_DATA RECONCILE_INFRA START_DATA PRE_DRAIN POST_DRAIN AFTER_APP DATABASE_SERVICE BUILD_TARGETS GLOBAL_FALLBACK
 actions=$("$DIR/bin/deploy-plan" --deploy-actions)
 eval "$actions"
 # The plan's build targets ignore FORCE (the build above already honoured it): any target still
@@ -351,14 +351,14 @@ fi
 # lookup must abort, never read as a missing container.
 database_missing=0
 for svc in $DIRTY_DATA $RECONCILE_DATA; do
-    [ "$svc" = mariadb ] || continue
+    [ "$svc" = "$DATABASE_SERVICE" ] || continue
     existing=$(compose ps -a -q "$svc")
     [ -n "$existing" ] || database_missing=1
 done
 if [ "$database_missing" = 1 ]; then
     # The first change to it: a retry after any failure from here must recreate it, even if its
     # configuration is reverted meanwhile.
-    plan --pending mariadb
+    plan --pending "$DATABASE_SERVICE"
     if [ -n "$stop_services" ]; then
         # shellcheck disable=SC2086
         compose stop $stop_services
@@ -367,7 +367,7 @@ if [ "$database_missing" = 1 ]; then
         horizon_stopped=0
         verify
     fi
-    compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" mariadb
+    compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" "$DATABASE_SERVICE"
     verify
 fi
 
@@ -392,7 +392,7 @@ horizon_stopped=0
 # Changed data services are recreated, unrecorded ones reconciled (only Compose drift changes),
 # together in depends_on order (POST_DRAIN, mark:service) so a provider is up before its consumer.
 for item in $POST_DRAIN; do
-    if [ "${item#*:}" = mariadb ] && [ "$barrier_held" = 1 ]; then
+    if [ "${item#*:}" = "$DATABASE_SERVICE" ] && [ "$barrier_held" = 1 ]; then
         # From the moment the database is replaced it awaits the migration: any failure from here
         # keeps remote workers out (the release stays owed), never readmits them to its schema.
         [ "$MIGRATE" != 1 ] || barrier_keep=1

@@ -683,6 +683,11 @@ def reject_unsupported_service(svc: str, cfg: object) -> None:
                 # recreates the provider alone with --no-deps.
                 sys.exit(f"deploy-plan: service {svc} sets depends_on.{provider}.restart; selective deployment "
                          "recreates a provider without restarting its dependents. Remove `restart: true`.")
+    if svc in APP_SERVICES and isinstance(cfg.get("image"), str) and cfg["image"] != service_image_name(svc):
+        # Health, image and stamp checks compare against the role image; another tag would never match.
+        sys.exit(f"deploy-plan: app service {svc} runs image {cfg['image']}, not its role image "
+                 f"{service_image_name(svc)}; set the role image variables (e.g. {svc.upper()}_IMAGE) instead of "
+                 "overriding image: for app services.")
     deploy = cfg.get("deploy")
     replicas = deploy.get("replicas") if isinstance(deploy, dict) else None
     if svc in APP_SERVICES and ((isinstance(replicas, int) and replicas > 1) or (isinstance(cfg.get("scale"), int) and cfg["scale"] > 1)):
@@ -693,6 +698,9 @@ def reject_unsupported_service(svc: str, cfg: object) -> None:
         sys.exit(f"deploy-plan: service {svc} uses volumes_from; selective deployment cannot recreate "
                  "consumers of another container's volumes. Remove it from the effective Compose files.")
 
+
+# Per-service rendered definition hashes (no mounted contents) from get_compose_service_hashes().
+DEFINITIONS: dict[str, str] = {}
 
 # Effective Compose project name from the last get_compose_service_hashes() call.
 RENDERED_PROJECT: str | None = None
@@ -744,6 +752,9 @@ def get_compose_service_hashes(docker_dir: Path) -> tuple[str, dict[str, str]]:
                         svc_payload["sources"] = sources
                     svc_json = json.dumps(svc_payload, sort_keys=True)
                     per_service[svc] = sha256_text(svc_json)
+                    # The rendered definition alone, without mounted contents: a shared app.env edit
+                    # changes every app's compose record but is no cutover (the database record is).
+                    DEFINITIONS[svc] = sha256_text(json.dumps({k: svc_payload[k] for k in ("service", "top_level")}, sort_keys=True))
                 else:
                     per_service[svc] = "absent"
             # The residual: everything no per-service record explains (top-level sections, the
@@ -883,6 +894,8 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
         state[f"build:{svc}"] = build_hash
         state[f"service:{svc}"] = deploy_hash
         state[f"compose:{svc}"] = per_service_compose[svc]
+        if svc in APP_SERVICES and svc in DEFINITIONS:
+            state[f"definition:{svc}"] = DEFINITIONS[svc]
 
     if compose_rendered and RENDERED_PROJECT:
         # The project identity every `compose ps` and `up` resolves containers in (see the planner).
@@ -895,6 +908,8 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
         deploy_hash = sha256_text(f"{svc_files_hash}\n{per_service_compose[svc]}")
         state[f"service:{svc}"] = deploy_hash
         state[f"compose:{svc}"] = per_service_compose[svc]
+        if svc in APP_SERVICES and svc in DEFINITIONS:
+            state[f"definition:{svc}"] = DEFINITIONS[svc]
 
     return state
 
@@ -1296,6 +1311,13 @@ def symlinked_below(source: str, root: Path) -> bool:
     return False
 
 
+def database_service(docker_dir: Path) -> str:
+    """The rendered service the app's database runs in: DB_HOST from app.env when it names one
+    (e.g. an override's `db2`), else `mariadb`."""
+    host = read_dotenv(docker_dir / "config/app.env").get("DB_HOST", "")
+    return host if host in RENDERED_SERVICES else "mariadb"
+
+
 def docker_daemon_identity() -> str:
     """The daemon selection Docker resolves: DOCKER_CONTEXT overrides DOCKER_HOST, which overrides
     the current context."""
@@ -1533,9 +1555,12 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
             app_reasons[svc] = "shares a rebuilt image"
     # A Compose change to all four app services (e.g. a database cutover) migrates too. Only recorded
     # app definitions count: a forgotten record means the migration record decides.
-    all_app_compose_changed = global_fallback or all(
-        f"compose:{svc}" in stamped and stamped[f"compose:{svc}"] != state[f"compose:{svc}"] for svc in APP_SERVICES
-    )
+    # The rendered definitions decide (a shared mounted-file edit is not a cutover); stamps from
+    # before definition records fall back to the compose records.
+    def app_definition_changed(svc: str) -> bool:
+        key = f"definition:{svc}" if f"definition:{svc}" in stamped and f"definition:{svc}" in state else f"compose:{svc}"
+        return key in stamped and stamped[key] != state.get(key)
+    all_app_compose_changed = global_fallback or all(app_definition_changed(svc) for svc in APP_SERVICES)
 
     migrate = (
         force
@@ -1546,9 +1571,9 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
         # A changed database service (e.g. storage swapped for a restored copy) may hold an older
         # schema; the idempotent migration always follows it, and its forgotten record makes a retry
         # repeat it until it completes.
-        or "mariadb" in dirty_data
+        or database_service(docker_dir) in dirty_data
         # Reconciling it may recreate it on a changed definition too (e.g. restored storage).
-        or "mariadb" in reconcile_data
+        or database_service(docker_dir) in reconcile_data
         # The app now connects to another database. Stamps from before this record never migrate for it.
         or ("database" in stamped and stamped["database"] != state["database"])
     )
@@ -1623,12 +1648,12 @@ def main() -> None:
         record = {} if "__legacy__" in stamped else {k: v for k, v in stamped.items() if k != "fingerprint"}
         items = sys.argv[2:]
         keys = [key for item in items for key in (
-            (item,) if item in ("migration", "effective") else (f"service:{item}", f"compose:{item}", f"image:{item}", f"build:{item}"))]
+            (item,) if item in ("migration", "effective") else (f"service:{item}", f"compose:{item}", f"definition:{item}", f"image:{item}", f"build:{item}"))]
         if cmd == "--forget":
             for key in keys:
                 # An app service's compose record is the definition the migration state matches; it
                 # survives the recreate and moves only when the migration (or rollout) completes.
-                if key.startswith("compose:") and key.split(":", 1)[1] in APP_SERVICES:
+                if key.startswith(("compose:", "definition:")) and key.split(":", 1)[1] in APP_SERVICES:
                     continue
                 record.pop(key, None)
         elif cmd == "--pending":
@@ -1664,7 +1689,7 @@ def main() -> None:
                 label = container_config_hash(docker_dir, item)
                 if not label or label != compose_config_hash(docker_dir, item):
                     continue
-                for key in (f"service:{item}", f"compose:{item}", f"image:{item}", f"build:{item}"):
+                for key in (f"service:{item}", f"compose:{item}", f"definition:{item}", f"image:{item}", f"build:{item}"):
                     if key in snapshot:
                         record[key] = snapshot[key]
         elif cmd == "--record":
@@ -1673,7 +1698,7 @@ def main() -> None:
                 sys.exit("deploy-plan: no plan snapshot to record from.")
             if "migration" in items:
                 # The completed migration covers the app definitions and the database this run deploys.
-                keys += [f"compose:{svc}" for svc in APP_SERVICES] + ["database"]
+                keys += [f"{kind}:{svc}" for svc in APP_SERVICES for kind in ("compose", "definition")] + ["database"]
             for key in keys:
                 if key in snapshot:
                     record[key] = snapshot[key]
@@ -1752,6 +1777,7 @@ def main() -> None:
         print(f"RECONCILE_DATA={shlex.quote(' '.join(plan['reconcile_data']))}")
         print(f"RECONCILE_INFRA={shlex.quote(' '.join(plan['reconcile_infra']))}")
         print(f"START_DATA={shlex.quote(' '.join(plan['start_data']))}")
+        print(f"DATABASE_SERVICE={shlex.quote(database_service(docker_dir))}")
         # Everything applied before the drain, in one depends_on order across the three lists:
         # `up --no-deps` never starts a provider, whichever list it is in.
         marks = {**{svc: "forget" for svc in plan["start_data"]}, **{svc: "forget" for svc in plan["reconcile_infra"]},
