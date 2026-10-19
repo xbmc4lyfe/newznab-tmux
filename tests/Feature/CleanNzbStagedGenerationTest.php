@@ -246,6 +246,36 @@ final class CleanNzbStagedGenerationTest extends TestCase
         self::assertFileExists($stray, 'Kept for review.');
     }
 
+    public function test_notondisk_finds_a_staged_generation_beside_a_vanished_copy_on_another_search_path(): void
+    {
+        Schema::table('releases', static function (Blueprint $table): void {
+            $table->integer('nzbstatus')->default(1);
+            $table->string('searchname')->default('Movie');
+        });
+        // Staged beside a copy found at an older split level, which then vanished before its swap ran.
+        unlink($this->canonical);
+        $older = $this->canonical;
+        $this->app->instance(NzbService::class, new class(app(CollectionCleanupService::class), $older) extends NzbService
+        {
+            public function __construct(CollectionCleanupService $cleanup, private readonly string $older)
+            {
+                parent::__construct($cleanup);
+            }
+
+            public function nzbPathCandidates(string $releaseGuid): array
+            {
+                return [$this->older, ...parent::nzbPathCandidates($releaseGuid)];
+            }
+        });
+
+        $output = $this->clean(['--notondisk' => true, '--delete' => true]);
+
+        self::assertStringNotContainsString('Deleted: Movie', $output);
+        self::assertSame(1, DB::table('releases')->count());
+        self::assertSame('upgraded', gzdecode((string) file_get_contents($older)));
+        self::assertFileDoesNotExist($this->staged);
+    }
+
     private function missingCanonicalWithStagedGeneration(): void
     {
         Schema::table('releases', static function (Blueprint $table): void {

@@ -589,14 +589,15 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertFileDoesNotExist(app(NzbService::class)->getNzbPath($guid), 'No second, shadowed copy.');
     }
 
-    public function test_an_upgrade_installs_at_the_configured_path_when_readers_find_it_before_an_older_copy(): void
+    #[DataProvider('olderCopyWritability')]
+    public function test_an_upgrade_installs_at_the_configured_path_when_readers_find_it_before_an_older_copy(bool $writable): void
     {
         $this->publicationSchema(partialColumns: true);
         $hash = sha1('alternate-base', true);
         $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
         $guid = (string) DB::table('releases')->where('id', $first)->value('guid');
         $configured = app(NzbService::class)->getNzbPath($guid);
-        // The partial's NZB lives only on an alternate, read-only base path that readers consult after the configured one.
+        // The partial's NZB lives only on an alternate base path that readers consult after the configured one.
         $alternate = dirname(config('release_verification.storage_path')).'/alternate-'.bin2hex(random_bytes(4)).'/'.$guid.'.nzb.gz';
         mkdir(dirname($alternate), 0777, true);
         rename($configured, $alternate);
@@ -612,19 +613,29 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
                 return [...parent::nzbPathCandidates($releaseGuid), $this->alternate];
             }
         });
-        chmod(dirname($alternate), 0555);
+        if (! $writable) {
+            chmod(dirname($alternate), 0555);
+        }
         app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
 
         try {
-            $this->assertSame($first, $this->publishStalledPartial(null));
+            $this->assertSame($first, $this->publishStalledPartial(null), 'A read-only older copy never blocks the upgrade.');
 
             $this->assertSame($configured, app(NzbService::class)->nzbPath($guid), 'Readers find the configured path first.');
             $this->assertStringContainsString('c@d', (string) gzdecode((string) file_get_contents($configured)));
-            $this->assertFileExists($alternate, 'The read-only copy is left alone.');
+            if ($writable) {
+                $this->assertFileDoesNotExist($alternate, 'The older partial copy can never be read again.');
+            }
         } finally {
             chmod(dirname($alternate), 0777);
             app('files')->deleteDirectory(dirname($alternate));
         }
+    }
+
+    /** @return array<string, array{bool}> */
+    public static function olderCopyWritability(): array
+    {
+        return ['writable' => [true], 'read-only' => [false]];
     }
 
     public function test_a_rolled_back_upgrade_leaves_the_published_nzb_untouched(): void

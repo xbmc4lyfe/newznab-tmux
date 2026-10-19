@@ -218,6 +218,9 @@ final class NzbSourceGuard
                     if ($apply && ! self::syncDirectory($canonical)) {
                         Log::warning('Could not sync the directory of a swapped-in NZB generation.', ['source' => $canonical]);
                     }
+                    if ($apply) {
+                        $this->removeShadowedCopies($guid, $canonical);
+                    }
 
                     return 'applied';
                 }
@@ -268,9 +271,9 @@ final class NzbSourceGuard
     /** @return list<string> */
     private function stagedSiblings(string $guid): array
     {
-        // Staged beside the installation path; the canonical file can also have been found at another base path.
-        $current = $this->nzb->nzbPath($guid);
-        $directories = array_unique([dirname($this->nzb->getNzbPath($guid)), ...($current === false ? [] : [dirname($current)])]);
+        // Staged beside the installation path, or beside an existing copy readers found first at another base path
+        // or split level, which may have gone missing since: every directory readers search.
+        $directories = array_unique(array_map(dirname(...), [$this->nzb->getNzbPath($guid), ...$this->nzb->nzbPathCandidates($guid)]));
         $paths = [];
         foreach ($directories as $directory) {
             foreach (glob($directory.DIRECTORY_SEPARATOR.$guid.'.nzb.gz.c*-*.next') ?: [] as $path) {
@@ -281,6 +284,21 @@ final class NzbSourceGuard
         }
 
         return $paths;
+    }
+
+    /**
+     * Once a committed generation is in place, an older copy elsewhere on the search path (left by a changed split
+     * level or base path) is removed where it can be, so it can never be read again for this release. A read-only
+     * copy stays; readers find the installed generation first.
+     */
+    private function removeShadowedCopies(string $guid, string $installed): void
+    {
+        $inode = @fileinode($installed);
+        foreach ($this->nzb->nzbPathCandidates($guid) as $candidate) {
+            if ($candidate !== $installed && is_file($candidate) && @fileinode($candidate) !== $inode && ! @unlink($candidate)) {
+                Log::info('Could not remove an older copy of an upgraded NZB.', ['source' => $candidate]);
+            }
+        }
     }
 
     /** Make a rename in $path's directory durable: on Linux and macOS a file's fsync does not cover its name. */

@@ -49,6 +49,7 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
         $nzb->shouldReceive('buildNzbPath')->with('fixture-guid', 0, true)->andReturn($this->directory.'/');
         $nzb->shouldReceive('getNzbPath')->with('fixture-guid')->andReturn($this->path());
         $nzb->shouldReceive('nzbPath')->andReturnUsing(fn (string $guid): string|false => is_file($this->path()) ? $this->path() : false);
+        $nzb->shouldReceive('nzbPathCandidates')->andReturnUsing(fn (string $guid): array => [$this->path()]);
         $this->sources = new NzbSourceGuard($nzb);
         $this->app->instance(NzbSourceGuard::class, $this->sources);
         $this->evidence = new ReleaseArchiveNamingEvidence($this->sources);
@@ -816,6 +817,7 @@ final class ReleaseArchiveNamingEvidenceTest extends TestCase
         $nzb->shouldReceive('buildNzbPath')->with('fixture-guid', 0, true)->andReturn($this->directory.'/');
         $nzb->shouldReceive('getNzbPath')->with('fixture-guid')->andReturn($this->path());
         $nzb->shouldReceive('nzbPath')->andReturn($alternate);
+        $nzb->shouldReceive('nzbPathCandidates')->andReturn([$alternate, $this->path()]);
         $sources = new NzbSourceGuard($nzb);
         $staged = $this->stage(5, 'upgraded');
         $this->commitEvidence('upgraded');
