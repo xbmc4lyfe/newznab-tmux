@@ -76,6 +76,8 @@ final class ReleaseProcessingService
 
     private const int PRIORITY_GROUP_PROBES_PER_PASS = 20;
 
+    private const string RECONCILE_CURSOR_PREFIX = 'cbp:release-reconcile:cursor:';
+
     private bool $echoCLI;
 
     private readonly ProcessReleasesSettings $settings;
@@ -775,10 +777,15 @@ final class ReleaseProcessingService
         $updated = 0;
         $lastId = 0;
         $normalizedGroupId = $this->normalizeGroupId($groupID);
+        // Sized rows leave CompleteParts, so a capped sweep simply continues next pass.
+        $pages = 0;
+        $deadline = now()->addSeconds($this->binariesConfig->reconcilePassSeconds);
         do {
-            if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+            if (app(ProcessingRuntimeStateRepository::class)->stopRequested()
+                || $pages >= $this->binariesConfig->reconcilePagesPerPass || now()->gte($deadline)) {
                 break;
             }
+            $pages++;
             $query = Collection::query()
                 ->where('id', '>', $lastId)
                 ->where('filecheck', CollectionFileCheckStatus::CompleteParts->value)
@@ -804,11 +811,20 @@ final class ReleaseProcessingService
      * authority for binary counts/sizes; binary aggregates are then the
      * authority for collection readiness and filesize.
      *
+     * Stale incomplete collections stay in scope until retention removes them,
+     * and a busy group can hold tens of millions, so one pass walks at most a
+     * page and time budget and stores its position; the next pass resumes there
+     * and starts again from the lowest id once the walk reaches the end.
+     *
      * @param  callable(list<int>): void|null  $afterReconciliation
      */
     private function reconcileIncompleteCollections(?int $groupId, ?callable $afterReconciliation): void
     {
-        $lastId = 0;
+        $cursorKey = self::RECONCILE_CURSOR_PREFIX.($groupId === null ? 'all' : 'group:'.$groupId);
+        $saved = Cache::get($cursorKey);
+        $lastId = is_int($saved) && $saved > 0 ? $saved : 0;
+        $pages = 0;
+        $deadline = now()->addSeconds($this->binariesConfig->reconcilePassSeconds);
         $statuses = [
             CollectionFileCheckStatus::Default->value,
             CollectionFileCheckStatus::CompleteCollection->value,
@@ -848,13 +864,22 @@ final class ReleaseProcessingService
                 return $ids;
             });
             if ($ids === []) {
+                Cache::forget($cursorKey);
                 break;
             }
             $lastId = (int) end($ids);
+            $finished = \count($ids) < $this->binariesConfig->reconcileBatchSize;
+            // Store the position before creating releases, so a failed page is not walked again first.
+            if ($finished) {
+                Cache::forget($cursorKey);
+            } else {
+                Cache::forever($cursorKey, $lastId);
+            }
             if ($afterReconciliation !== null) {
                 $afterReconciliation($ids);
             }
-        } while (\count($ids) === $this->binariesConfig->reconcileBatchSize);
+            $pages++;
+        } while (! $finished && $pages < $this->binariesConfig->reconcilePagesPerPass && now()->lt($deadline));
     }
 
     /**

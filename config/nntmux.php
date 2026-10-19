@@ -70,6 +70,10 @@ return [
         'sql_chunk_size' => (int) env('CBP_SQL_CHUNK_SIZE', 500),
         // Number of stale collections reconciled by one release-processing batch.
         'reconcile_batch_size' => (int) env('CBP_RECONCILE_BATCH_SIZE', 500),
+        // Pages and seconds one per-group release pass spends reconciling stale collections
+        // (and, separately, sizing complete ones); the next pass resumes from a stored cursor.
+        'reconcile_pages_per_pass' => (int) env('CBP_RECONCILE_PAGES_PER_PASS', 1000),
+        'reconcile_pass_seconds' => (int) env('CBP_RECONCILE_PASS_SECONDS', 300),
         // Maximum flattened binary/part rows loaded while streaming an NZB.
         'nzb_stream_rows' => (int) env('CBP_NZB_STREAM_ROWS', 5000),
         // Collection id span checked for orphans by one cleanup pass; passes resume from a stored cursor.
