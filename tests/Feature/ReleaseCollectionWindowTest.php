@@ -813,16 +813,19 @@ class ReleaseCollectionWindowTest extends TestCase
     public function test_retention_keeps_ready_collections_for_one_more_period(): void
     {
         ConfigurationTestBuilder::update(ConfigurationDomain::Ingestion, ['part_retention_hours' => 24]);
-        foreach ([1 => [2, 30], 2 => [3, 30], 3 => [0, 30], 4 => [2, 49], 5 => [3, 49]] as $id => [$filecheck, $hours]) {
+        $rows = [1 => [2, 30], 2 => [0, 31], 3 => [3, 32], 4 => [0, 33], 5 => [1, 34], 6 => [2, 49], 7 => [3, 50], 8 => [0, 1]];
+        foreach ($rows as $id => [$filecheck, $hours]) {
             $this->insertCollection($id);
             DB::table('collections')->where('id', $id)->update([
                 'filecheck' => $filecheck, 'dateadded' => now()->subHours($hours), 'added' => now()->subHours($hours),
             ]);
         }
+        // Pages of two walk the retention band across several pages and finish the walk.
+        $cleanup = new CollectionCleanupService(new BinariesConfig(sqlChunkSize: 2));
+        $this->service(new WindowTestReleaseCreationService, $cleanup)->deleteCollections(1);
 
-        $this->service(new WindowTestReleaseCreationService)->deleteCollections(1);
-
-        $this->assertSame([1, 2], DB::table('collections')->orderBy('id')->pluck('id')->all());
+        $this->assertSame([1, 3, 8], DB::table('collections')->orderBy('id')->pluck('id')->all());
+        $this->assertNull(Cache::get('cbp:retention-band:cursor'));
     }
 
     public function test_idle_pipeline_runs_legacy_callbacks_once(): void

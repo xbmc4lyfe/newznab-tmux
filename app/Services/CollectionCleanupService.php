@@ -66,6 +66,10 @@ class CollectionCleanupService
      */
     private const ORPHAN_SWEEP_MAX_BATCHES = 20;
 
+    private const RETENTION_BAND_CURSOR = 'cbp:retention-band:cursor';
+
+    private const RETENTION_BAND_MAX_PAGES = 20;
+
     private ?bool $cascadeDeleteReady = null;
 
     private readonly BinariesConfig $binariesConfig;
@@ -107,11 +111,9 @@ class CollectionCleanupService
             // Collections already found ready are owed a release attempt that a capped release
             // pass may not have reached yet, so they get one more retention period.
             $readyCutoff = now()->subHours(2 * $retentionHours);
-            $ready = [CollectionFileCheckStatus::CompleteParts->value, CollectionFileCheckStatus::Sized->value];
             do {
                 $ids = DB::table('collections')
-                    ->where('dateadded', '<', $cutoff)
-                    ->where(static fn ($query) => $query->whereNotIn('filecheck', $ready)->orWhere('dateadded', '<', $readyCutoff))
+                    ->where('dateadded', '<', $readyCutoff)
                     ->orderBy('id')
                     ->limit($this->sqlChunkSize())
                     ->pluck('id')
@@ -130,6 +132,7 @@ class CollectionCleanupService
                 // Brief pause to reduce pressure on the lock manager in busy systems.
                 usleep(10000);
             } while (true);
+            $batchDeleted += $this->deleteRetentionBandExceptReady($readyCutoff, $cutoff, $echoCLI);
         }
 
         $deletedCount += $batchDeleted;
@@ -185,6 +188,48 @@ class CollectionCleanupService
         }
 
         return $deletedCount;
+    }
+
+    /**
+     * Delete collections between the two retention cutoffs unless they are ready for release.
+     * The kept ready rows stay in this band, so it is walked in dateadded order from a stored
+     * position, a bounded number of pages per call, and each kept row is read once per walk.
+     */
+    private function deleteRetentionBandExceptReady(DateTimeInterface $readyCutoff, DateTimeInterface $cutoff, bool $echoCLI): int
+    {
+        $ready = [CollectionFileCheckStatus::CompleteParts->value, CollectionFileCheckStatus::Sized->value];
+        $saved = Cache::get(self::RETENTION_BAND_CURSOR);
+        [$lastDate, $lastId] = is_array($saved) && is_string($saved['dateadded'] ?? null) && is_numeric($saved['id'] ?? null)
+            ? [$saved['dateadded'], (int) $saved['id']] : [null, 0];
+        $limit = $this->sqlChunkSize();
+        $deleted = 0;
+        for ($page = 0; $page < self::RETENTION_BAND_MAX_PAGES; $page++) {
+            $rows = DB::table('collections')
+                ->where('dateadded', '>=', $readyCutoff)
+                ->where('dateadded', '<', $cutoff)
+                ->when($lastDate !== null, static fn ($query) => $query->where(static fn ($after) => $after
+                    ->where('dateadded', '>', $lastDate)
+                    ->orWhere(static fn ($same) => $same->where('dateadded', $lastDate)->where('id', '>', $lastId))))
+                ->orderBy('dateadded')->orderBy('id')
+                ->limit($limit)
+                ->get(['id', 'dateadded', 'filecheck']);
+            $ids = $rows->reject(static fn ($row): bool => \in_array((int) $row->filecheck, $ready, true))
+                ->pluck('id')->map(static fn ($id): int => (int) $id)->values()->all();
+            if ($ids !== []) {
+                $deleted += $this->deleteCollectionsAndDescendants($ids, 'Cleanup', $echoCLI);
+            }
+            if ($rows->count() < $limit) {
+                Cache::forget(self::RETENTION_BAND_CURSOR);
+
+                break;
+            }
+            $last = $rows->last();
+            $lastDate = (string) $last->dateadded;
+            $lastId = (int) $last->id;
+            Cache::forever(self::RETENTION_BAND_CURSOR, ['dateadded' => $lastDate, 'id' => $lastId]);
+        }
+
+        return $deleted;
     }
 
     /** Archive one small stale window, retaining failed inputs until the snapshot wraps. */
