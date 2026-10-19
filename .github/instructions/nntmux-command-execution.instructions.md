@@ -23,7 +23,7 @@ Do **not** prefix routine commands with `vendor/bin/sail` or `./sail`.
 
 ## Sail / Docker only when needed
 
-Use Sail or `make …` for stack lifecycle (`make up` / `make down`) or when the user explicitly asks for containerized commands.
+Use Sail or `just …` for stack lifecycle (`just up` / `just down`) or when the user explicitly asks for containerized commands.
 
 ## Docker diagnostics
 

@@ -1,21 +1,21 @@
 #!/bin/sh
 # Deploy guard for the docker/ stack: one deploy at a time, a log of who deployed what, and no
-# rebuild when nothing changed.
+# rebuild when nothing runtime-relevant changed.
 #
 #   deploy-guard run <target> -- <command...>
 #   deploy-guard verify    exit 76 if the tree changed since the last stamped build (nothing stamped is fine)
 #   deploy-guard verify-owner    verify the inherited live guard and any recovery hold without changing them
 #
-# A guarded command may run another guarded command (make deploy runs build and up): the inner run
+# A guarded command may run another guarded command (just deploy runs build and up): the inner run
 # verifies its ancestor's exact lock generation and neither takes nor releases it.
 # A durable <lock>.recovery-hold blocks new runs even after that owner dies. Only the same live
 # guard and DEPLOY_RECOVERY_OPERATION may continue; the recovery owner creates and clears the hold.
 #
 # Environment:
 #   DEPLOY_BY            who is deploying (a session or person name); logged. Default: the login user.
-#   SKIP_IF_UNCHANGED=1  skip the command when the tree matches the last stamped deploy.
-#   STAMP_ON_SUCCESS=1   record the tree fingerprint after the command succeeds.
-#   REQUIRE_IMAGE=<ref>  with SKIP_IF_UNCHANGED, only skip while this docker image still exists.
+#   SKIP_IF_UNCHANGED=1  skip the command when the runtime tree matches the last stamped deploy.
+#   STAMP_ON_SUCCESS=1   record the per-service tree fingerprint after the command succeeds.
+#   REQUIRE_IMAGE=<refs> with SKIP_IF_UNCHANGED, only skip while these docker images still exist.
 #   FORCE=1              never skip or defer.
 #   CHECK_UNCHANGED_COMMAND executable verifying the running image and service health.
 #   CHECK_HEALTH_COMMAND executable checking health (--healthy), before batching.
@@ -31,6 +31,7 @@ umask 0002
 
 DIR=$(cd "$(dirname "$0")/.." && pwd)
 REPO="${DEPLOY_REPO:-$(cd "$DIR/.." && pwd)}"
+export DEPLOY_REPO="$REPO"
 LOCK="${DEPLOY_LOCK_DIR:-$DIR/.deploy.lock}"
 lock_parent=$(cd "$(dirname "$LOCK")" && pwd -P) || {
     echo "deploy-guard: cannot resolve the lock parent; leaving the stack alone." >&2
@@ -49,42 +50,9 @@ hash_stdin() {
     if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1
 }
 
-# One "hash  path" line per untracked file, plus its mode, so file boundaries, names, contents and
-# permissions (an execute bit survives COPY into the image) are all part of the fingerprint.
-untracked_hashes() {
-    (
-        cd "$REPO"
-        if command -v sha256sum >/dev/null 2>&1; then
-            git ls-files -o --exclude-standard -z | xargs -0 sha256sum -- 2>/dev/null || true
-        else
-            git ls-files -o --exclude-standard -z | xargs -0 shasum -a 256 -- 2>/dev/null || true
-        fi
-        # Symlinks are hashed and statted through to their target above; also record where each points.
-        git ls-files -o --exclude-standard -z | xargs -0 -n1 sh -c 'if [ -L "$1" ]; then printf "link %s -> %s\n" "$1" "$(readlink "$1")"; fi' _ 2>/dev/null || true
-        if stat -c '%a %n' . >/dev/null 2>&1; then
-            git ls-files -o --exclude-standard -z | xargs -0 stat -c '%a %n' -- 2>/dev/null || true
-        else
-            git ls-files -o --exclude-standard -z | xargs -0 stat -f '%Lp %N' 2>/dev/null || true
-        fi
-    )
-}
-
-# HEAD plus uncommitted changes plus every untracked file with its own content hash: the image bakes
-# the working tree.
+# Content-addressed runtime fingerprint (excludes documentation, tests, and non-runtime files).
 fingerprint() {
-    head=$(git -C "$REPO" rev-parse HEAD)
-    diff=$(git -C "$REPO" diff HEAD | hash_stdin)
-    untracked=$(untracked_hashes | hash_stdin)
-    # Bind-mounted configuration is excluded from Git and the image; still trigger a rollout
-    # when it changes. Hash only, never copy secrets to the deploy log or stamp.
-    configuration=$(for file in "$DIR/.env" "$DIR/config/app.env"; do
-        if [ -f "$file" ]; then hash_stdin <"$file"; else echo missing; fi
-    done | hash_stdin)
-    effective=none
-    if [ -n "${DEPLOY_CONFIG_COMMAND:-}" ]; then
-        effective=$("$DEPLOY_CONFIG_COMMAND" --fingerprint) || return 1
-    fi
-    echo "$head $diff $untracked $configuration $effective"
+    "$DIR/bin/deploy-plan" --fingerprint
 }
 
 log() {
@@ -130,6 +98,26 @@ release() {
         rm -f "$LOCK" || return 1
     fi
     rmdir "$CLAIM"
+}
+
+# EXIT trap of a guarded run: close an attempt that ends early (error, signal) with its own
+# `finished` line, then release a lock this process owns.
+guard_exit() {
+    exit_code=$?
+    # A reader still waiting because no payload ever ran (the guard stopped first) must not linger;
+    # once a payload ran, the reader is only ever waited for.
+    if [ -n "${alive_reader:-}" ] && [ "${payload_started:-0}" != 1 ]; then
+        exec 8>&-
+        kill -KILL "$alive_reader" 2>/dev/null || true
+    fi
+    [ -z "${alive_dir:-}" ] || remove_fifo "$alive_dir"
+    if [ "${attempt_open:-0}" = 1 ]; then
+        attempt_open=0
+        log "$target" "result=finished rc=$exit_code (interrupted)"
+    fi
+    if [ -n "${owned_info:-}" ]; then
+        release
+    fi
 }
 
 busy() {
@@ -224,11 +212,23 @@ acquire() {
 
 unchanged() {
     [ "${FORCE:-0}" != 1 ] || return 1
+    # An owed barrier release must run even when everything else matches again (e.g. reverted).
+    [ ! -e "$STAMP.barrier-owed" ] || return 1
     [ "${SKIP_IF_UNCHANGED:-0}" = 1 ] || return 1
     [ -f "$STAMP" ] || return 1
-    [ "$(cat "$STAMP")" = "$(fingerprint)" ] || return 1
+    [ "$(head -n 1 "$STAMP")" = "$(fingerprint)" ] || return 1
     if [ -n "${REQUIRE_IMAGE:-}" ]; then
-        docker image inspect "$REQUIRE_IMAGE" >/dev/null 2>&1 || return 1
+        for req_img in $REQUIRE_IMAGE; do
+            docker image inspect "$req_img" >/dev/null 2>&1 || return 1
+        done
+        # A pending build (e.g. a base image refreshed in place) is not "unchanged", for the deploy
+        # target too. Its targets live in the build stamp, not the deployment stamp.
+        build_stamp=$STAMP
+        [ "${target:-}" = "build" ] || build_stamp="$DIR/.build.stamp"
+        # A failing planner is not "nothing to build".
+        # Build targets ignore the rendered Compose configuration; skip re-rendering it.
+        build_targets=$(DEPLOY_CONFIG_COMMAND= DEPLOY_STAMP="$build_stamp" "$DIR/bin/deploy-plan" --build-targets) || return 1
+        [ -z "$build_targets" ] || return 1
     fi
     if [ -n "${CHECK_UNCHANGED_COMMAND:-}" ]; then
         "$CHECK_UNCHANGED_COMMAND" || return 1
@@ -237,6 +237,8 @@ unchanged() {
 
 cooldown() {
     [ "${FORCE:-0}" != 1 ] || return 1
+    # Never defer an owed barrier release: remote workers stay paused until it runs.
+    [ ! -e "$STAMP.barrier-owed" ] || return 1
     interval=${DEPLOY_MIN_INTERVAL:-0}
     case "$interval" in ''|*[!0-9]*) echo "deploy-guard: DEPLOY_MIN_INTERVAL must be nonnegative seconds" >&2; exit 64;; esac
     [ "$interval" -gt 0 ] && [ -f "$STAMP" ] && [ -f "$SUCCESS_TIME" ] || return 1
@@ -250,6 +252,54 @@ cooldown() {
     echo "deploy-guard: batching changes for $((interval - elapsed)) more seconds (FORCE=1 to deploy now)."
 }
 
+# A signal to the guard alone (e.g. a supervisor stopping it) reaches the payload too, and the guard
+# waits for the payload's own recovery (drain restore, barrier hold) before releasing ownership.
+payload=
+alive_reader=
+alive_fifo=
+alive_dir=
+# Every descendant of the payload inherits the write end of a FIFO (fd 9); its reader sees EOF only
+# once all of them (nested guards, a docker build) have exited, so the lock is held until then.
+# It lives in a private directory (its name cannot be raced); both are removed through Python, not
+# rm: the guard's lock handling owns every rm call it makes. rmdir only ever removes an empty one.
+remove_fifo() { python3 -c 'import os, sys
+for remove, path in ((os.unlink, os.path.join(sys.argv[1], "alive")), (os.rmdir, sys.argv[1])):
+    try:
+        remove(path)
+    except FileNotFoundError:
+        pass' "$1" 2>/dev/null || true; }
+wait_for_descendants() {
+    [ -z "$alive_reader" ] || wait "$alive_reader" 2>/dev/null || true
+    alive_reader=
+    [ -z "${alive_dir:-}" ] || remove_fifo "$alive_dir"
+    alive_dir=
+    alive_fifo=
+}
+forward_signal() {
+    # The guard's own write end: closed, the reader sees EOF once no descendant holds one (at once
+    # if the signal came before the payload was forked).
+    exec 8>&-
+    # Signalled while the payload line ran, before `payload=$!`: the last background job is then
+    # the payload (never the reader), and it is signalled like any other.
+    if [ -z "$payload" ] && [ "${payload_forking:-0}" = 1 ] && [ -n "$!" ] && [ "$!" != "$alive_reader" ]; then
+        payload=$!
+        payload_forking=0
+    fi
+    if [ -n "$payload" ]; then
+        # Only the direct child: its own traps let a running step finish and then recover (restart
+        # Horizon, resume the drains) before it exits. (bash may reap a child that exited on the same
+        # group signal before this trap runs; its PID is then only milliseconds old, as in any shell.)
+        kill -"$1" "$payload" 2>/dev/null || true
+        wait "$payload" 2>/dev/null || true
+        # Reaped: its PID may be reused, and a later signal must never reach it.
+        payload=
+    fi
+    # Its descendants are waited for in every case, including a signal that arrives while the
+    # guard already waits for them after the payload exited.
+    wait_for_descendants
+    exit "$2"
+}
+
 cmd_run() {
     [ "$#" -ge 3 ] || { echo "usage: deploy-guard run <target> -- <command...>" >&2; exit 64; }
     target=$1
@@ -259,11 +309,19 @@ cmd_run() {
     check_recovery_hold
     if [ -n "${DEPLOY_GUARD_HELD:-}${DEPLOY_GUARD_OWNER_SHA256:-}${DEPLOY_GUARD_LOCK:-}" ]; then
         nested_owner || busy "invalid inherited guard ownership"
+        trap 'guard_exit' EXIT
+        # A background payload starts with SIGINT ignored (POSIX); TERM is what reaches it.
+        trap 'forward_signal TERM 130' INT
+        trap 'forward_signal TERM 130' TERM
+        trap 'forward_signal HUP 129' HUP
     else
         acquire "$target"
         owned_info=$info
-        trap release EXIT
-        trap 'exit 130' INT TERM
+        trap 'guard_exit' EXIT
+        # A background payload starts with SIGINT ignored (POSIX); TERM is what reaches it.
+        trap 'forward_signal TERM 130' INT
+        trap 'forward_signal TERM 130' TERM
+        trap 'forward_signal HUP 129' HUP
         DEPLOY_GUARD_HELD=$$
         DEPLOY_GUARD_OWNER_SHA256=$(printf '%s\n' "$owned_info" | hash_stdin)
         DEPLOY_GUARD_LOCK=$LOCK
@@ -281,33 +339,111 @@ cmd_run() {
 
     if cooldown; then exit 0; fi
 
-    log "$target" "result=started"
     # The tree that goes into the build is the one fingerprinted now. Stamp it afterwards only if the
     # shared checkout did not change in the meantime; otherwise the image holds older bytes than the stamp.
-    before=$(fingerprint)
+    # Fingerprint before logging `started` so a fail-closed fingerprint never leaves an open attempt.
+    if ! before=$(fingerprint); then
+        log "$target" "result=failed (cannot fingerprint the checkout; nothing was changed)"
+        exit 1
+    fi
+    log "$target" "result=started"
+    attempt_open=1
     DEPLOY_EXPECTED_FINGERPRINT="$before"
-    export DEPLOY_EXPECTED_FINGERPRINT
+    DEPLOY_NOOP_MARKER="$STAMP.noop.$$"
+    [ ! -e "$DEPLOY_NOOP_MARKER" ] || rm -f "$DEPLOY_NOOP_MARKER"
+    export DEPLOY_EXPECTED_FINGERPRINT DEPLOY_NOOP_MARKER
     check_recovery_hold
-    if "$@"; then rc=0; else rc=$?; fi
+    # In the background so a trapped signal interrupts `wait` and can be forwarded. A non-interactive
+    # shell gives a background job /dev/null as stdin (dash applies that before any `0<&0`), so the
+    # guard's stdin travels on descriptor 3, e.g. for `... run resume-scheduler -- python3 - < script`.
+    # A closed stdin (`<&-`) cannot be duplicated: the payload then reads /dev/null, as a foreground
+    # command with nothing to read would.
+    # Without the FIFO, descendants could outlive the lock: the run fails closed instead.
+    # The name is chosen (and recorded for cleanup) before the directory exists, so no signal can
+    # leave it behind; an existing path makes mkdir fail, closed.
+    alive_dir="${TMPDIR:-/tmp}/deploy-guard.$$.$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+    if ! mkdir -m 0700 "$alive_dir" 2>/dev/null; then
+        alive_dir=
+        echo "deploy-guard: cannot create a private directory for the descendant FIFO under ${TMPDIR:-/tmp}; nothing was changed." >&2
+        exit 1
+    fi
+    alive_fifo="$alive_dir/alive"
+    if ! mkfifo "$alive_fifo" 2>/dev/null; then
+        echo "deploy-guard: cannot create the descendant FIFO $alive_fifo; nothing was changed." >&2
+        exit 1
+    fi
+    # Every FIFO end is opened by the guard itself before anything is forked (a read-write open never
+    # blocks, and each later open finds its other end), then the read end is handed to the reader.
+    # The guard holds a write end (fd 8) until the payload is forked, so a signal at any point
+    # before then never waits on a reader blocked in open() or one that no writer would close.
+    # The reader ignores signals (a whole process group may be signalled at once): it exits only on
+    # EOF, once no descendant holds a write end.
+    exec 7<>"$alive_fifo" 6<"$alive_fifo" 8>"$alive_fifo" 7>&-
+    ( trap '' HUP INT TERM QUIT; exec cat >/dev/null 2>&1 ) <&6 6<&- 8>&- &
+    alive_reader=$!
+    exec 6<&-
+    payload_forking=1
+    if ( exec 3<&0 ) 2>/dev/null; then
+        { "$@" <&3 3<&- 9>&8 8>&- & } 3<&0
+    else
+        "$@" </dev/null 9>&8 8>&- &
+    fi
+    payload=$!
+    payload_forking=0
+    payload_started=1
+    exec 8>&-
+    if wait "$payload"; then rc=0; else rc=$?; fi
+    payload=
+    wait_for_descendants
     if [ "$rc" -eq 0 ] && [ "${STAMP_ON_SUCCESS:-0}" = 1 ]; then
-        if [ "$(fingerprint)" = "$before" ]; then
-            printf '%s\n' "$before" >"$STAMP"
-            if [ "${RECORD_DEPLOY_TIME:-0}" = 1 ]; then date +%s >"$SUCCESS_TIME"; fi
+        # One snapshot supplies both the comparison and the stamp, so a checkout change between
+        # them cannot stamp per-service data that was never built or verified.
+        stamp_tmp="$STAMP.tmp.$$"
+        if ! "$DIR/bin/deploy-plan" --stamp-data "$target" >"$stamp_tmp"; then
+            # The rollout succeeded; only recording it failed (e.g. a transient Docker query). Keep
+            # the records but invalidate the fingerprint so the next run re-plans and stamps.
+            if [ -f "$STAMP" ]; then
+                { echo stale; tail -n +2 "$STAMP"; } >"$stamp_tmp" && mv -f "$stamp_tmp" "$STAMP"
+            fi
+            rm -f "$stamp_tmp"
+            if [ ! -f "$DEPLOY_NOOP_MARKER" ] && [ "${RECORD_DEPLOY_TIME:-0}" = 1 ]; then date +%s >"$SUCCESS_TIME"; fi
+            log "$target" "result=stamp-failed (the $target completed; its stamp could not be written)"
+            echo "deploy-guard: $target completed but its stamp could not be written; the next run re-plans." >&2
+            rc=1
+        elif [ "$(head -n 1 "$stamp_tmp")" = "$before" ]; then
+            mv -f "$stamp_tmp" "$STAMP"
+            if [ -f "$DEPLOY_NOOP_MARKER" ]; then
+                noop=1
+            elif [ "${RECORD_DEPLOY_TIME:-0}" = 1 ]; then
+                date +%s >"$SUCCESS_TIME"
+            fi
         else
-            rm -f "$STAMP"
+            # Keep the previous per-service record so the next run redeploys only what changed instead
+            # of treating the stack as a first installation, but invalidate its fingerprint so it can
+            # never satisfy an unchanged check for images this run may already have rolled out.
+            if [ -f "$STAMP" ]; then
+                { echo stale; tail -n +2 "$STAMP"; } >"$stamp_tmp" && mv -f "$stamp_tmp" "$STAMP"
+            fi
+            rm -f "$stamp_tmp"
             log "$target" "result=tree-changed-during-run (not stamped; the next build will run)"
             echo "deploy-guard: the checkout changed while $target ran, so what was built is already out of date; not deploying it. Run again." >&2
             rc=76
         fi
     fi
-    log "$target" "result=finished rc=$rc"
+    [ ! -e "$DEPLOY_NOOP_MARKER" ] || rm -f "$DEPLOY_NOOP_MARKER"
+    attempt_open=0
+    if [ "${noop:-0}" = 1 ]; then
+        log "$target" "result=finished rc=$rc (no service affected; stamped without a rollout)"
+    else
+        log "$target" "result=finished rc=$rc"
+    fi
     exit "$rc"
 }
 
 # Before rolling out an image, check the checkout still matches the tree that image was built from.
 cmd_verify() {
     [ -f "$STAMP" ] || exit 0
-    if [ "$(cat "$STAMP")" != "$(fingerprint)" ]; then
+    if [ "$(head -n 1 "$STAMP")" != "$(fingerprint)" ]; then
         echo "deploy-guard: the checkout changed since the last build, so the image is out of date; not deploying it. Run again." >&2
         exit 76
     fi

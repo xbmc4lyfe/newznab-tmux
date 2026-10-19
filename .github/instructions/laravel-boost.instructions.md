@@ -123,11 +123,11 @@ Do **not** prefix every command with Sail. Ignore any conflicting Boost text tha
 
 ## When Sail / Docker is appropriate
 
-Use Sail or `Makefile` targets only when:
+Use Sail or `Justfile` recipes only when:
 
-- Starting/stopping the stack (`make up` / `vendor/bin/sail up -d`, `make down` / `vendor/bin/sail stop`)
+- Starting/stopping the stack (`just up` / `vendor/bin/sail up -d`, `just down` / `vendor/bin/sail stop`)
 - The user explicitly asks for containerized commands
-- A task needs services only available inside Compose (e.g. aligning container UIDs via `make fix-permissions`)
+- A task needs services only available inside Compose (e.g. aligning container UIDs via `just fix-permissions`)
 
 ## Docker diagnostics
 

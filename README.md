@@ -27,7 +27,7 @@ Read the [personal fork documentation](https://xbmc4lyfe.github.io/newznab-tmux/
 
 The stack in [`docker/docker-compose.yml`](docker/docker-compose.yml) includes the web app, tmux indexer, Horizon workers, scheduler, MariaDB, Redis, Manticore, Caddy, Mailpit, and Prometheus/Grafana monitoring. Images build the PHP dependencies, frontend assets, and native decoder for you.
 
-You need Git, Make, Python 3, a running Docker installation with Compose v2, and Usenet provider credentials. On macOS, use Docker Desktop or OrbStack; on Linux, use Docker Engine with the Compose plugin.
+You need Git, [just](https://github.com/casey/just) 1.43 or newer (distribution packages such as Ubuntu 24.04's 1.21 are too old), Python 3, a running Docker installation with Compose v2, and Usenet provider credentials. On macOS, use Docker Desktop or OrbStack; on Linux, use Docker Engine with the Compose plugin.
 
 The supplied settings target a substantial indexing workload: MariaDB has an 8 GiB buffer pool, and service memory limits total roughly 30 GiB. Allow enough Docker memory, or lower both the limits in `docker/.env` and the buffer pool in `docker/config/mariadb/conf.d/99-nntmux.cnf`. Verification allows up to 200 GiB of scratch space while keeping 10 GiB free; plan additional disk space for the database and NZBs, or adjust the verification limits in `docker/config/app.env`.
 
@@ -63,10 +63,10 @@ Generate the Compose and application configuration using that host for both prim
 chmod 600 docker/config/usenet_servers.json
 export NNTP_PRIMARY_HOST=news.example.com
 export NNTP_ALT_HOST="$NNTP_PRIMARY_HOST"
-make -C docker env
+just --justfile docker/Justfile --working-directory docker env
 ```
 
-For a separate fallback provider, add a second server entry and set `NNTP_ALT_HOST` to its host before running `make -C docker env`.
+For a separate fallback provider, add a second server entry and set `NNTP_ALT_HOST` to its host before running `just --justfile docker/Justfile --working-directory docker env`.
 
 This creates `docker/.env` and `docker/config/app.env`, including a generated application key, database passwords, and administrator password. Keep these files private. Edit `docker/.env` for ports and memory limits, and `docker/config/app.env` for application settings and metadata API keys.
 
@@ -77,8 +77,8 @@ This creates `docker/.env` and `docker/config/app.env`, including a generated ap
 Run this for a fresh installation:
 
 ```bash
-make -C docker init DEPLOY_BY=local-setup
-make -C docker ps
+just --justfile docker/Justfile --working-directory docker init DEPLOY_BY=local-setup
+just --justfile docker/Justfile --working-directory docker ps
 ```
 
 Initialization builds the images, installs the database and search tables, configures monitoring, seeds groups and processing settings, attempts a PreDB import, and starts the stack. A failed public PreDB import is retried by the scheduler.
@@ -96,18 +96,18 @@ If `rg` is unavailable, open `docker/config/app.env` in your editor. Grafana is 
 Run these from the repository root:
 
 ```bash
-make -C docker ps                         # Service status
-make -C docker logs s=indexer             # Follow indexing logs
-make -C docker tmux                       # Attach to tmux; detach with Ctrl-a, then d
-make -C docker down                       # Stop containers; retain bind-mounted data
-make -C docker up DEPLOY_BY=local-start    # Start an initialized stack
-make -C docker backup                     # Database dump in docker/backups/
-make -C docker help                       # All available commands
+just --justfile docker/Justfile --working-directory docker ps                         # Service status
+just --justfile docker/Justfile --working-directory docker logs s=indexer             # Follow indexing logs
+just --justfile docker/Justfile --working-directory docker tmux                       # Attach to tmux; detach with Ctrl-a, then d
+just --justfile docker/Justfile --working-directory docker down                       # Stop containers; retain bind-mounted data
+just --justfile docker/Justfile --working-directory docker up DEPLOY_BY=local-start   # Start an initialized stack
+just --justfile docker/Justfile --working-directory docker backup                     # Database dump in docker/backups/
+just --justfile docker/Justfile --working-directory docker help                       # All available commands
 ```
 
-After updating the checkout, back up the database and use `make -C docker deploy DEPLOY_BY=local-update` to rebuild, pause application writers, run migrations, and recreate the services. Use `deploy` for updates; `init` reapplies the starter groups and tuning.
+After updating the checkout, back up the database and use `just --justfile docker/Justfile --working-directory docker deploy DEPLOY_BY=local-update` to rebuild, pause affected application writers, run migrations when needed, and recreate only the affected services. Use `deploy` for updates; `init` reapplies the starter groups and tuning.
 
-Persistent data lives in `docker/data/`, logs in `docker/logs/`, and database dumps in `docker/backups/`. The backup command covers MariaDB; preserve application configuration and NZB/storage files separately. If initialization fails, inspect `make -C docker logs` before retrying; a partially initialized database needs recovery rather than a reset.
+Persistent data lives in `docker/data/`, logs in `docker/logs/`, and database dumps in `docker/backups/`. The backup command covers MariaDB; preserve application configuration and NZB/storage files separately. If initialization fails, inspect `just --justfile docker/Justfile --working-directory docker logs` before retrying; a partially initialized database needs recovery rather than a reset.
 
 ## Cloud deployments
 
