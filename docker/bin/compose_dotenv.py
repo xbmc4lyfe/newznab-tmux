@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """docker/.env as Compose (compose-go) reads it, for docker/bin/compose and the Justfile's LOAD_ENV.
 
-Optional `export`, spaces around `=`, the last assignment wins. A quoted value ends at the first
-matching quote not escaped by a backslash and may carry a trailing comment; double-quoted values
+Optional `export`, `=` or YAML-style `: `, spaces around it, a leading BOM, the last assignment wins;
+the lines of a multi-line quoted value are never assignments of their own. A quoted value ends at the first
+matching quote not escaped by a backslash; anything after it is dropped; double-quoted values
 decode compose-go's escapes (`\\n`, `\\t`, `\\\\`, `\\"`, octal `\\0NNN`, ...; `\\$` is a literal `$`) and
 keep any other backslash sequence; single-quoted ones are literal except for `\\'`. An
 unquoted value ends at an inline ` #` comment and is trimmed.
@@ -17,7 +18,8 @@ import shlex
 import sys
 from pathlib import Path
 
-ASSIGNMENT = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+# `KEY=value`, or the YAML-style `KEY: value` Compose also accepts.
+ASSIGNMENT = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:=|:(?=\s|$))\s*(.*)$")
 # compose-go's control escapes; with `\$`, `\"`, `\\` and octal `\0NNN` the only decoded ones:
 # any other backslash sequence is kept as written.
 ESCAPES = {"a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v"}
@@ -67,13 +69,13 @@ def parse_value(value: str) -> tuple[str, str]:
         if end >= len(value):
             # An opening quote with no closing one starts a value spanning lines.
             return value, "multiline"
-        if re.match(r"^\s*(?:#.*)?$", value[end + 1:]):
-            body = value[1:end]
-            if quote == "'":
-                # Literal, except that an escaped single quote loses its backslash.
-                return body.replace("\\'", "'"), ""
-            decoded, interpolates = decode_double_quoted(body)
-            return decoded, "interpolated" if interpolates else ""
+        # Text after the closing quote (`"abc" def`) is dropped by Compose, as a comment is.
+        body = value[1:end]
+        if quote == "'":
+            # Literal, except that an escaped single quote loses its backslash.
+            return body.replace("\\'", "'"), ""
+        decoded, interpolates = decode_double_quoted(body)
+        return decoded, "interpolated" if interpolates else ""
     value = re.sub(r"\s#.*$", "", value).strip()
     return value, "interpolated" if "$" in value else ""
 
@@ -81,15 +83,40 @@ def parse_value(value: str) -> tuple[str, str]:
 def parse(path: Path) -> dict[str, tuple[str, str]]:
     """Every key of the file with its last (value, flag); {} when the file is missing."""
     try:
-        text = path.read_text(encoding="utf-8", errors="surrogateescape")
+        text = path.read_text(encoding="utf-8", errors="surrogateescape").removeprefix("\ufeff")
     except FileNotFoundError:
         return {}
     values: dict[str, tuple[str, str]] = {}
-    for raw in text.splitlines():
-        match = ASSIGNMENT.match(raw)
-        if match:
-            values[match.group(1)] = parse_value(match.group(2))
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        match = ASSIGNMENT.match(lines[index])
+        index += 1
+        if not match:
+            continue
+        value, flag = parse_value(match.group(2))
+        if flag == "multiline":
+            # The value runs on to its closing quote: the lines up to it are part of it, never
+            # assignments of their own (a continuation reading `DC=...` must not set DC).
+            quote = value[0]
+            while index < len(lines) and not closes(lines[index], quote):
+                index += 1
+            index += 1
+        values[match.group(1)] = (value, flag)
     return values
+
+
+def closes(line: str, quote: str) -> bool:
+    """Whether a continuation line holds the unescaped quote that ends a multi-line value."""
+    position = 0
+    while position < len(line):
+        if line[position] == "\\":
+            position += 2
+            continue
+        if line[position] == quote:
+            return True
+        position += 1
+    return False
 
 
 if __name__ == "__main__":

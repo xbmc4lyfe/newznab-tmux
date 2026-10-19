@@ -3795,6 +3795,17 @@ SH);
         file_put_contents($this->directory.'/runtime/app.env', "DB_HOST=192.0.2.20\n");
         $this->assertStringContainsString('Run Migrations  : yes', $this->make(['deploy-plan'], $config)->mustRun()->getOutput());
 
+        // Another spelling of the same host (case, a root dot) is the same database.
+        file_put_contents($this->directory.'/runtime/app.env', "DB_HOST=External-DB.example\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        file_put_contents($this->directory.'/runtime/app.env', "DB_HOST=external-db.example.\n");
+        $this->assertStringContainsString('Run Migrations  : no', $this->make(['deploy-plan'], $config)->mustRun()->getOutput());
+
+        // The default app.env no app mounts any more never rolls the apps out.
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=mariadb\nAPP_DEBUG=true\n");
+        $this->assertStringNotContainsString('code/config changed', $this->make(['deploy-plan'], $config)->mustRun()->getOutput());
+
         // Apps mounting different files select no single database.
         $json['services']['indexer'] = ['volumes' => [['type' => 'bind', 'source' => $this->directory.'/docker/config/app.env', 'target' => '/app/.env', 'read_only' => true]]];
         $plan = $this->planProcess(['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)]);

@@ -167,6 +167,21 @@ SH);
         $this->assertContains('-psecret\\', $this->arguments($closed));
         $this->assertContains("it's", $this->arguments($closed));
 
+        // A multi-line value's continuation lines are no assignments of their own.
+        file_put_contents($this->directory.'/docker/.env', "APP_IMAGE=registry/app:1\nNOTE='first\nAPP_IMAGE=evil/app:1\nlast'\n");
+        $multiline = new Process([$this->directory.'/docker/bin/compose'], env: $this->environment(['DC' => 'env']));
+        $multiline->mustRun();
+        $this->assertStringContainsString("\nWEB_IMAGE=registry/app:1\n", "\n".$multiline->getOutput());
+
+        // Compose keeps only the quoted part before trailing text, and reads `KEY: value` and a BOM.
+        file_put_contents($this->directory.'/docker/.env', "\u{FEFF}APP_IMAGE: registry/yaml:1\nDB_ROOTPASSWORD=\"s3cret\" rotated\nDB_DATABASE=nntmux\n");
+        $forms = new Process([$this->directory.'/docker/bin/compose'], env: $this->environment(['DC' => 'env']));
+        $forms->mustRun();
+        $this->assertStringContainsString("\nWEB_IMAGE=registry/yaml:1\n", "\n".$forms->getOutput());
+        $trailing = $this->just('docker/Justfile', ['mysql'], ['DC' => $this->directory.'/bin/fake', 'DB_DATABASE' => false]);
+        $trailing->mustRun();
+        $this->assertContains('-ps3cret', $this->arguments($trailing));
+
         // An escaped `$` is literal in Compose, so it is no interpolation either.
         file_put_contents($this->directory.'/docker/.env', "APP_IMAGE=\"registry/\\\$app:1\"\n");
         $literal = $this->just('docker/Justfile', ['ps'], ['DC' => $this->directory.'/bin/fake']);
