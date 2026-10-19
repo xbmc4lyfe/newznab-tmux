@@ -14,7 +14,7 @@ use Illuminate\Support\Facades\Log;
  * articles arrive, and only archive() of that collection makes it claimable again. Release creation reaches
  * a collection only when its group's id cursor does, which on a group with a million ready collections can
  * take weeks, so this walks the dirty candidates themselves, oldest first, resuming after the last one it
- * looked at and starting over once it reaches the newest. archive() keeps every guarantee it gives release
+ * looked at and starting over once it reaches the newest that was dirty when the sweep began. archive() keeps every guarantee it gives release
  * creation, and over-budget uploads keep their deferral.
  */
 final class DirtyCandidateSettler
@@ -36,14 +36,31 @@ final class DirtyCandidateSettler
         $limit = max(1, $limit);
         $deadline = microtime(true) + max(0.0, $seconds);
         $cursor = Cache::get(self::CURSOR);
-        $after = is_array($cursor) && is_string($cursor['at'] ?? null) && is_numeric($cursor['id'] ?? null)
-            ? ['at' => $cursor['at'], 'id' => (int) $cursor['id']] : null;
+        $valid = static fn (mixed $at, mixed $id): bool => is_string($at) && is_numeric($id);
+        $after = is_array($cursor) && $valid($cursor['at'] ?? null, $cursor['id'] ?? null) ? ['at' => $cursor['at'], 'id' => (int) $cursor['id']] : null;
+        // Each sweep ends at the newest candidate dirty when it began, so it always comes round again to those
+        // it passed over (not ready, kept, failed) however many become dirty while it runs.
+        $upper = is_array($cursor) && $valid($cursor['upper_at'] ?? null, $cursor['upper_id'] ?? null)
+            ? ['at' => $cursor['upper_at'], 'id' => (int) $cursor['upper_id']] : null;
+        if ($upper === null) {
+            $newest = DB::table('release_verification_candidates')->where('status', 'dirty')->orderByDesc('next_attempt_at')->orderByDesc('id')
+                ->first(['id', 'next_attempt_at']);
+            if ($newest === null) {
+                Cache::forget(self::CURSOR);
+
+                return $totals;
+            }
+            $upper = ['at' => (string) $newest->next_attempt_at, 'id' => (int) $newest->id];
+            $after = null;
+        }
         $rows = DB::table('release_verification_candidates')->where('status', 'dirty')
             ->when($after !== null, static fn ($query) => $query->where(static fn ($q) => $q->where('next_attempt_at', '>', $after['at'])
                 ->orWhere(static fn ($same) => $same->where('next_attempt_at', $after['at'])->where('id', '>', $after['id']))))
+            ->where(static fn ($q) => $q->where('next_attempt_at', '<', $upper['at'])
+                ->orWhere(static fn ($same) => $same->where('next_attempt_at', $upper['at'])->where('id', '<=', $upper['id'])))
             ->orderBy('next_attempt_at')->orderBy('id')->limit($limit)->get(['id', 'source_identity', 'next_attempt_at']);
         if ($rows->isEmpty()) {
-            // Nothing dirty past the cursor: start again from the oldest.
+            // This sweep is done: the next run starts a new one from the oldest.
             Cache::forget(self::CURSOR);
 
             return $totals;
@@ -54,7 +71,7 @@ final class DirtyCandidateSettler
             }
             // Moved past first: a process that dies inside archive() (out of memory, killed) skips this candidate
             // until the walk comes round again instead of retrying it on every run ahead of the rest.
-            Cache::forever(self::CURSOR, ['at' => (string) $row->next_attempt_at, 'id' => (int) $row->id]);
+            Cache::forever(self::CURSOR, ['at' => (string) $row->next_attempt_at, 'id' => (int) $row->id, 'upper_at' => $upper['at'], 'upper_id' => $upper['id']]);
             $totals['inspected']++;
             $hash = is_string($row->source_identity) && strlen($row->source_identity) === 40 && ctype_xdigit($row->source_identity)
                 ? (string) hex2bin($row->source_identity) : null;
@@ -75,7 +92,7 @@ final class DirtyCandidateSettler
             }
         }
         if ($rows->count() < $limit) {
-            // The walk reached the newest dirty candidate: start again from the oldest.
+            // The sweep reached its end: the next run starts a new one from the oldest.
             Cache::forget(self::CURSOR);
         }
 

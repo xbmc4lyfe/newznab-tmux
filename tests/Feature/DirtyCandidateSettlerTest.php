@@ -129,6 +129,31 @@ class DirtyCandidateSettlerTest extends ReleaseVerificationCandidatesTest
         $this->assertTrue(DB::table('collections')->where('id', $late)->exists());
     }
 
+    public function test_a_passed_over_candidate_is_revisited_though_new_ones_keep_arriving_ahead_of_the_cursor(): void
+    {
+        $this->releasesTable();
+        $waiting = $this->dirtyCandidate('waiting');
+        DB::table('collections')->where('id', $waiting)->update(['filecheck' => 1]);
+        $this->dirtyCandidate('ready');
+        app(DirtyCandidateSettler::class)->settle(1, 20);
+        $this->assertSame('dirty', DB::table('release_verification_candidates')->where('source_identity', bin2hex(sha1('waiting', true)))->value('status'));
+        DB::table('collections')->where('id', $waiting)->update(['filecheck' => 3]);
+
+        // Every run another candidate becomes dirty ahead of the cursor; the sweep still ends and starts over.
+        $settled = false;
+        foreach (['n1', 'n2', 'n3', 'n4'] as $label) {
+            $this->dirtyCandidate($label);
+            DB::table('release_verification_candidates')->where('source_identity', bin2hex(sha1($label, true)))->update(['next_attempt_at' => now()->addDay()]);
+            app(DirtyCandidateSettler::class)->settle(1, 20);
+            if (DB::table('release_verification_candidates')->where('source_identity', bin2hex(sha1('waiting', true)))->value('status') !== 'dirty') {
+                $settled = true;
+                break;
+            }
+        }
+
+        $this->assertTrue($settled, 'The candidate it passed over is reached again.');
+    }
+
     public function test_the_preparer_settles_dirty_candidates(): void
     {
         $this->releasesTable();
