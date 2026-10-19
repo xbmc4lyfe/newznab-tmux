@@ -28,6 +28,7 @@ final class PerArticleObfuscationCorpus
             'readable-yenc' => ['category' => 'routed', 'description' => 'readable yEnc uploads without 16+ alphanumeric tokens (stays on PHP)', 'size' => 20000],
             'bare-random' => ['category' => 'routed', 'description' => 'random 32-character subjects without part counts (stays on PHP)', 'size' => 20000],
             'single-part-hashed' => ['category' => 'routed', 'description' => 'hash-named single-part posts, 15% in a readable range (stays on PHP)', 'size' => 20000],
+            'text-with-uploads' => ['category' => 'routed', 'description' => 'text posts with 8% obfuscated articles and 10% counter-prefixed single-part images (stays on PHP)', 'size' => 20000],
             'non-yenc' => ['category' => 'routed', 'description' => 'text posts without yEnc part counts (stays on PHP)', 'size' => 20000],
             'large-range' => ['category' => 'uncommon', 'description' => 'mixed range of 200k headers', 'size' => 200000],
             'small-range' => ['category' => 'uncommon', 'description' => 'mixed range of 200 headers', 'size' => 200],
@@ -48,6 +49,7 @@ final class PerArticleObfuscationCorpus
             'non-yenc' => self::text($random, $size),
             'bare-random' => array_map(static fn (): string => self::token($random, 32), range(1, $size)),
             'single-part-hashed' => self::singlePartHashed($random, $size),
+            'text-with-uploads' => self::textWithUploads($random, $size),
             'kenpsx' => self::kenpsx($random, $size),
             'boneless' => self::boneless($random, $size),
             'mixed', 'large-range', 'small-range' => self::mixed($random, $size, ''),
@@ -95,6 +97,23 @@ final class PerArticleObfuscationCorpus
         foreach ($subjects as $index => $subject) {
             if ($random->getInt(0, 99) < 15) {
                 $subjects[$index] = sprintf('"%s.jpg" yEnc (1/1)', md5($random->getBytes(8)));
+            }
+        }
+
+        return $subjects;
+    }
+
+    /** @return list<string> */
+    private static function textWithUploads(Randomizer $random, int $size): array
+    {
+        $subjects = self::text($random, $size);
+        $obfuscated = self::boneless($random, $size);
+        foreach ($subjects as $index => $subject) {
+            $roll = $random->getInt(0, 99);
+            if ($roll < 8) {
+                $subjects[$index] = $obfuscated[$index];
+            } elseif ($roll < 18) {
+                $subjects[$index] = sprintf('(%02d/10) "%s.jpg" yEnc (1/1)', $random->getInt(1, 10), md5($random->getBytes(8)));
             }
         }
 

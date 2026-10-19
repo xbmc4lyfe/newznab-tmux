@@ -34,6 +34,17 @@ final class PerArticleObfuscationNativeTest extends TestCase
         return $numbers;
     }
 
+    /**
+     * @param  list<int>  $numbers
+     * @return list<int>
+     */
+    private static function sorted(array $numbers): array
+    {
+        sort($numbers);
+
+        return $numbers;
+    }
+
     public function test_corpus_is_deterministic_and_exercises_marking(): void
     {
         self::assertSame(PerArticleObfuscationCorpus::stratum('mixed', 7, 2000), PerArticleObfuscationCorpus::stratum('mixed', 7, 2000));
@@ -75,10 +86,12 @@ final class PerArticleObfuscationNativeTest extends TestCase
             self::markTestSkipped('Needs a Linux CLI with FFI and NNTMUX_TEST_NATIVE_LIBRARY.');
         }
         // Token-poor ranges stay on PHP; the unsampled path still answers for them.
-        foreach (['non-yenc', 'readable-yenc', 'bare-random', 'single-part-hashed'] as $name) {
+        foreach (['non-yenc', 'readable-yenc', 'bare-random', 'single-part-hashed', 'text-with-uploads'] as $name) {
             $routed = PerArticleObfuscationCorpus::stratum($name, 5, 200);
             self::assertNull($native->mark($routed, 16));
-            self::assertSame([], $native->markWithoutSampling($routed, 16));
+            $marked = $native->markWithoutSampling($routed, 16);
+            self::assertNotNull($marked);
+            self::assertSame(self::php($routed, 16), self::sorted($marked));
         }
         // Alternating real and obfuscated articles at an even period are still sampled.
         $alternating = [];

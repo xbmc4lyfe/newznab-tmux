@@ -39,8 +39,8 @@ final class NativePerArticleObfuscation
 
     /**
      * Article numbers the PHP rule would mark, or null to keep the PHP result. Ranges where under
-     * a sixteenth of a spread sample is a multi-part subject with a 16+ alphanumeric token in its
-     * name stay on PHP: the PHP rule rejects other subjects faster than they can be packed for FFI.
+     * a sixteenth of a spread sample (an eighth when most samples have no part count) is a
+     * multi-part subject with a 16+ alphanumeric token in its name stay on PHP: the PHP rule rejects other subjects faster than they can be packed for FFI.
      *
      * @param  array<int, array<string, mixed>>  $headers
      * @return list<int>|null
@@ -75,27 +75,31 @@ final class NativePerArticleObfuscation
         // An odd step started mid-stride, so a range alternating at an even period is not seen
         // in one phase only.
         $step = intdiv($count, self::SAMPLE_SIZE) | 1;
-        $sampled = $candidates = 0;
+        $sampled = $counted = $candidates = 0;
         for ($i = intdiv($step, 2); $i < $count; $i += $step) {
             $sampled++;
-            if (self::candidate($values[$i]['Subject'] ?? null)) {
-                $candidates++;
-            }
+            $kind = self::classify($values[$i]['Subject'] ?? null);
+            $counted += $kind > 0 ? 1 : 0;
+            $candidates += $kind === 2 ? 1 : 0;
         }
 
-        return $candidates * 16 >= $sampled;
+        // PHP rejects subjects without a part count in about one regex, so a range made mostly of
+        // them needs twice the candidate share before packing pays off.
+        return $candidates * ($counted * 2 >= $sampled ? 16 : 8) >= $sampled;
     }
 
     /**
-     * Approximates the PHP rule's prefilter, a multi-part `(n/total)` count and a 16+ alphanumeric
-     * token, with patterns that cannot backtrack on crafted whitespace.
+     * 0: no part count; 1: a part count only; 2: a candidate as the PHP rule sees it, a first
+     * whitespace-led `(n/total)` with total of at least 2 and a 16+ alphanumeric token before it.
+     * The patterns cannot backtrack on crafted whitespace.
      */
-    private static function candidate(mixed $subject): bool
+    private static function classify(mixed $subject): int
     {
-        return is_string($subject)
-            && preg_match('/\(\d+\/0*([1-9]\d*)\)/', $subject, $match) === 1
-            && $match[1] !== '1'
-            && preg_match('/[A-Za-z0-9]{16}/', $subject) === 1;
+        if (! is_string($subject) || preg_match('/\s\(\d+\/0*(\d+)\)/', $subject, $match, PREG_OFFSET_CAPTURE) !== 1) {
+            return 0;
+        }
+
+        return (int) $match[1][0] >= 2 && preg_match('/[A-Za-z0-9]{16}/', substr($subject, 0, $match[0][1])) === 1 ? 2 : 1;
     }
 
     private function library(): ?FFI
