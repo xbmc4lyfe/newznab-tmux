@@ -25,7 +25,10 @@ final class AuditReleaseDeletion
             throw new RuntimeException('Audit deletion requires a database transaction.');
         }
         $current = Release::query()->whereKey($release->id)->where('guid', $release->guid)->lockForUpdate()->first();
-        if ($current === null) {
+        // The verdict holds only for the generation audited: a partial upgraded (or fenced for late articles)
+        // meanwhile has another NZB.
+        $generation = ['late_article_candidate_id', 'articles_found', 'articles_expected', 'files_found', 'files_expected', 'size'];
+        if ($current === null || array_any($generation, static fn (string $column): bool => $current->getAttribute($column) != $release->getAttribute($column))) {
             throw new RuntimeException('Audited release changed before deletion.');
         }
         $receipt = (new NzbSourceGuard($this->nzb))->captureDeletionAnchor($current);

@@ -122,6 +122,16 @@ class CleanNZB extends Command
         };
     }
 
+    private function hasNzbOnDisk(NzbService $nzb, string $guid): bool
+    {
+        if ($nzb->nzbPath($guid) !== false) {
+            return true;
+        }
+
+        // A committed upgrade's NZB may still be staged beside the missing canonical file.
+        return app(NzbSourceGuard::class)->settleStagedGenerations($guid) && $nzb->nzbPath($guid) !== false;
+    }
+
     private function GetReleasesWithNoNZBOnDisk(mixed $delete = false): void
     {
         // Setup
@@ -137,7 +147,7 @@ class CleanNZB extends Command
             echo 'Total done: '.$checked."\r";
             foreach ($releases as $r) {
 
-                if (! $nzb->nzbPath($r->guid)) {
+                if (! $this->hasNzbOnDisk($nzb, (string) $r->guid)) {
                     if ($delete) {
                         $releaseManagement->deleteSingleWithService(['g' => $r->guid, 'i' => $r->id], $nzb, new ReleaseImageService);
                     }

@@ -1266,6 +1266,29 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(0, DB::table('release_verification_candidates')->whereNotNull('upgrades_release_id')->count());
     }
 
+    public function test_headers_a_repost_published_into_an_older_legacy_release_could_own_never_upgrade_the_partial(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('legacy-repost', true);
+        // A legacy release that predates the partial, which a repost publishes into later.
+        $legacy = ['id' => 50, 'guid' => 'legacy', 'name' => 'Movie', 'searchname' => 'Movie', 'leftguid' => 'l', 'fromname' => 'poster',
+            'postdate' => '2026-10-11 12:00:00', 'adddate' => now()->subDay()->format('Y-m-d H:i:s'), 'totalpart' => 1, 'groups_id' => 1, 'size' => 5,
+            'passwordstatus' => 0, 'haspreview' => 0, 'categories_id' => 2000, 'nfostatus' => 0, 'nzbstatus' => NzbService::NZB_NONE,
+            'isrenamed' => 0, 'iscategorized' => 1, 'predb_id' => 0];
+        DB::table('releases')->insert($legacy);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $this->assertGreaterThan(50, $first);
+        $retained = DB::table('release_verification_candidates')->sole();
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 1, messageId: 'b1@b'));
+        DB::table('release_verification_candidates')->orderByDesc('id')->limit(1)->update(['release_id' => 50, 'status' => 'sampled',
+            'manifest_path' => '', 'manifest_bytes' => 0, 'verified_at' => now()->addMinute()->format('Y-m-d H:i:s')]);
+
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 3, messageId: 'b3@b'));
+
+        $this->assertSame((int) $retained->id, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
+        $this->assertSame(0, DB::table('release_verification_candidates')->whereNotNull('upgrades_release_id')->count(), 'No generation upgrades it.');
+    }
+
     public function test_headers_an_older_pending_repost_also_takes_never_upgrade_the_partial(): void
     {
         $this->publicationSchema(partialColumns: true);

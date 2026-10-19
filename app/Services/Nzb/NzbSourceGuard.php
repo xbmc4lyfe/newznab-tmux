@@ -188,6 +188,10 @@ final class NzbSourceGuard
             $staged = self::fileDigest($path);
             if ($staged !== null && hash_equals($committed, $staged)) {
                 if (! $apply || @rename($path, $canonical)) {
+                    if ($apply && ! self::syncDirectory($canonical)) {
+                        Log::warning('Could not sync the directory of a swapped-in NZB generation.', ['source' => $canonical]);
+                    }
+
                     return 'applied';
                 }
                 Log::warning('Could not put a committed staged NZB generation in place; kept.', ['staged_source' => $path]);
@@ -231,6 +235,20 @@ final class NzbSourceGuard
         }
 
         return $paths;
+    }
+
+    /** Make a rename in $path's directory durable: on Linux and macOS a file's fsync does not cover its name. */
+    private static function syncDirectory(string $path): bool
+    {
+        $directory = @fopen(dirname($path), 'r');
+        if ($directory === false) {
+            return false;
+        }
+        try {
+            return @fsync($directory);
+        } finally {
+            fclose($directory);
+        }
     }
 
     private static function fileDigest(string $file): ?string
@@ -569,6 +587,10 @@ final class NzbSourceGuard
             }
             if (! ($move === null ? @rename($temporary, $target) : $move($temporary, $target))) {
                 throw new RuntimeException('Unable to move temporary NZB into place.');
+            }
+            if ($staged !== null && ! self::syncDirectory($target)) {
+                // The evidence committed with it names this file; it must survive a power loss once committed.
+                throw new RuntimeException('Cannot make the staged NZB generation durable.');
             }
             clearstatcache(true, $target);
             $owned = fstat($handle);

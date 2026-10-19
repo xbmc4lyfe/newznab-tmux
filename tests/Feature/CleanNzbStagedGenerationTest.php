@@ -182,6 +182,27 @@ final class CleanNzbStagedGenerationTest extends TestCase
         self::assertSame('original', $this->decoded($this->canonical));
     }
 
+    public function test_notondisk_installs_a_committed_staged_generation_instead_of_deleting_the_release(): void
+    {
+        Schema::table('releases', static function (Blueprint $table): void {
+            $table->integer('nzbstatus')->default(1);
+            $table->string('searchname')->default('Movie');
+        });
+        // The canonical file was gone when the upgrade committed, and its swap never ran; both live at the installation path.
+        unlink($this->canonical);
+        $this->canonical = app(NzbService::class)->getNzbPath($this->guid, createIfNotExist: true);
+        $staged = $this->canonical.'.c3-'.str_repeat('b', 16).'.next';
+        rename($this->staged, $staged);
+        $this->staged = $staged;
+
+        $output = $this->clean(['--notondisk' => true, '--delete' => true]);
+
+        self::assertStringNotContainsString('Deleted: Movie', $output);
+        self::assertSame(1, DB::table('releases')->count(), 'Its committed NZB was only staged.');
+        self::assertSame('upgraded', gzdecode((string) file_get_contents($this->canonical)));
+        self::assertFileDoesNotExist($this->staged);
+    }
+
     /**
      * @param  array<string, mixed>  $arguments
      */

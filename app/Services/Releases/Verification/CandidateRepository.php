@@ -777,11 +777,14 @@ final class CandidateRepository
                 return null;
             }
         }
-        // A newer post under the hash published since (a release created after the partial's): its inventory is
-        // gone, so these headers' compatibility with it can no longer be checked. Keep them apart.
+        // Another post under the hash published since the partial (a newer release, or one published into an
+        // older legacy release after the partial's publication): its inventory is gone, so these headers'
+        // compatibility with it can no longer be checked. Keep them apart.
         $partial = (int) ($holder->release_id ?? ($holder->upgrades_release_id ?? 0));
+        $publishedAt = DB::table('releases')->where('id', $partial)->value('adddate');
         $published = $this->lockSourceCandidates($sourceIdentity, $currentReads, static fn (object $row): bool => $row->release_id !== null
-            && (int) $row->release_id > $partial && ! in_array((int) $row->id, $heldIds, true));
+            && (int) $row->release_id !== $partial && ! in_array((int) $row->id, $heldIds, true)
+            && ((int) $row->release_id > $partial || ($publishedAt !== null && $row->verified_at !== null && $row->verified_at >= $publishedAt)));
         if ($published->isNotEmpty()) {
             return null;
         }

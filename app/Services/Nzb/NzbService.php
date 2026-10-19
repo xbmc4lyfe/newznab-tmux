@@ -455,6 +455,8 @@ class NzbService
      * @param  string  $releaseGuid  The guid of the release.
      * @return false|string On success: (string) Path+file name of the nzb.
      *                      On failure: false.
+     *
+     * @phpstan-impure It reads the filesystem.
      */
     public function nzbPath(string $releaseGuid): bool|string
     {
