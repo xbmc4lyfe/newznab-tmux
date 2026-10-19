@@ -701,6 +701,100 @@ final class CompactFingerprintCollectorTest extends TestCase
     }
 
     #[Test]
+    public function a_part_whose_trailer_omits_the_part_number_is_verified(): void
+    {
+        // Real posting tools end parts with "=yend size=16 pcrc32=..." and no part= field.
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)->andReturnUsing(function (string $id): array {
+            $article = self::segmentArticle($id, 2);
+            $article['body'] = (string) preg_replace('/(=yend size=16) part=\d+/', '$1', $article['body']);
+
+            return $article;
+        });
+
+        $result = $this->collector()->collectFromNzb(self::nzb(3, 2, false), 7);
+
+        $this->assertSame([], $result['data']['errors']);
+        $this->assertSame('complete', $result['status']);
+        $this->assertSame([true], array_values(array_unique(array_map(static fn (array $article): mixed => $article['yenc']['crc_ok'], $result['data']['articles']))));
+        // A 16-byte first part cannot cover the file's prefix, so no prefix hash is claimed.
+        $this->assertNull($result['data']['files'][0]['first16k_md5']);
+    }
+
+    #[Test]
+    public function a_proven_trailerless_first_part_supplies_the_prefix_hash(): void
+    {
+        $data = str_repeat('y', 20_000);
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)->andReturnUsing(function (string $id) use ($data): array {
+            $part = preg_match('/-s(\d+)@/', $id, $match) === 1 ? (int) $match[1] : 1;
+            $body = YencArticles::part($data, 'big.bin', 40_000, $part, 20_000 * ($part - 1) + 1, 2);
+
+            return ['body' => (string) preg_replace('/(=yend size=20000) part=\d+/', '$1', $body)] + self::article($id);
+        });
+
+        $result = $this->collector()->collectFromNzb(self::nzb(3, 2, false), 7);
+
+        $this->assertSame('complete', $result['status']);
+        $this->assertSame(md5(substr($data, 0, 16_384)), $result['data']['files'][0]['first16k_md5']);
+    }
+
+    #[Test]
+    public function a_trailerless_part_with_a_matching_crc_but_a_size_mismatch_does_not_report_crc_ok(): void
+    {
+        // The pcrc32 still matches the decoded bytes, but the trailer size disagrees with them.
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)->andReturnUsing(function (string $id): array {
+            $article = self::segmentArticle($id, 2);
+            $article['body'] = (string) preg_replace('/=yend size=16 part=\d+/', '=yend size=17', $article['body']);
+
+            return $article;
+        });
+
+        $result = $this->collector()->collectFromNzb(self::nzb(3, 2, false), 7);
+
+        $this->assertSame('partial', $result['status']);
+        $this->assertSame([null], array_values(array_unique(array_map(static fn (array $article): mixed => $article['yenc']['crc_ok'], $result['data']['articles']))));
+    }
+
+    /** @return array<string, array{callable(string): string}> */
+    public static function unprovenTrailerlessParts(): array
+    {
+        return [
+            'wrong pcrc32' => [static fn (string $body): string => (string) preg_replace('/pcrc32=[0-9a-f]{8}/', 'pcrc32=00000001', $body)],
+            'no pcrc32' => [static fn (string $body): string => (string) preg_replace('/ pcrc32=[0-9a-f]{8}/', '', $body)],
+            'bad range' => [static fn (string $body): string => str_replace('=ypart begin=1 end=16', '=ypart begin=5 end=16', $body)],
+            'no trailer size' => [static fn (string $body): string => str_replace('=yend size=16 ', '=yend ', $body)],
+        ];
+    }
+
+    /** @param callable(string): string $corrupt */
+    #[Test]
+    #[DataProvider('unprovenTrailerlessParts')]
+    public function a_trailerless_part_without_full_proof_stays_partial(callable $corrupt): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)->andReturnUsing(function (string $id) use ($corrupt): array {
+            $article = self::segmentArticle($id, 2);
+            $article['body'] = (string) preg_replace('/(=yend size=16) part=\d+/', '$1', $article['body']);
+            if ($id === 'f1-s1@fixture') {
+                $article['body'] = $corrupt($article['body']);
+            }
+
+            return $article;
+        });
+
+        $result = $this->collector()->collectFromNzb(self::nzb(3, 2, false), 7);
+
+        $this->assertSame('partial', $result['status']);
+        $this->assertNotSame([], $result['data']['errors']);
+    }
+
+    #[Test]
     public function a_part_from_another_segment_is_rejected(): void
     {
         $nntp = $this->mock(NNTPService::class);
