@@ -347,7 +347,8 @@ class CollectionCleanupService
 
     private function verificationSweepSeconds(): int
     {
-        return max(0, min(300, (int) config('nntmux.cbp.verification_sweep_seconds', 60)));
+        // Archival after the last page starts is not timed, so stay well inside the sweep lock's lifetime.
+        return max(0, min(120, (int) config('nntmux.cbp.verification_sweep_seconds', 60)));
     }
 
     /**
