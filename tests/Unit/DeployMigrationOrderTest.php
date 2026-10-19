@@ -697,11 +697,11 @@ SH);
 
     public function test_a_daemon_chosen_inside_dc_fails_closed(): void
     {
-        foreach (['--context remote', '-H ssh://host'] as $flags) {
+        foreach (['--context remote', '-H ssh://host', '-Hssh://host', '-cremote', '--config /tmp/other'] as $flags) {
             $plan = $this->make(['deploy-plan', 'DC=docker '.$flags.' compose --project-directory '.$this->directory.'/docker']);
             $plan->run();
             $this->assertNotSame(0, $plan->getExitCode(), $flags);
-            $this->assertStringContainsString('DC selects a Docker daemon itself', $plan->getErrorOutput(), $flags);
+            $this->assertStringContainsString('can select another', $plan->getErrorOutput(), $flags);
         }
     }
 

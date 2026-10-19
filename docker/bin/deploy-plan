@@ -460,11 +460,23 @@ def reject_alternate_env_file() -> None:
                  "Put those values in docker/.env or the environment instead.")
     # Docker's own daemon selection before `compose` would send Compose elsewhere than the direct
     # docker calls (build, inspect, the barrier) and the recorded daemon identity.
-    globals_end = argv.index("compose") if "compose" in argv else len(argv)
+    # Only plain `docker` (or `docker-compose`) with logging options may precede the subcommand:
+    # --context/-c/--host/-H (attached or not), --config, or an `env VAR=...` prefix all move it.
+    # A standalone docker-compose has no docker global options to scan.
+    globals_end = argv.index("compose") if "compose" in argv else (1 if argv and os.path.basename(argv[0]) == "docker-compose" else len(argv))
+    allowed = ("-D", "--debug", "-l", "--log-level")
+    selects_daemon = bool(argv) and os.path.basename(argv[0]) == "env"
+    previous = ""
     for arg in argv[1:globals_end]:
-        if arg in ("--context", "-c", "--host", "-H") or arg.startswith(("--context=", "--host=", "-H=")):
-            sys.exit("deploy-plan: DC selects a Docker daemon itself; use DOCKER_CONTEXT or DOCKER_HOST instead, so "
-                     "every docker call and the recorded daemon identity agree.")
+        if arg.startswith("-") and arg not in allowed and not arg.startswith("--log-level="):
+            selects_daemon = True
+        elif not arg.startswith("-") and previous not in ("-l", "--log-level"):
+            selects_daemon = True
+        previous = arg
+    if selects_daemon:
+        sys.exit("deploy-plan: DC passes Docker options before compose (or an env prefix) that can select another "
+                 "daemon; use DOCKER_CONTEXT or DOCKER_HOST instead, so every docker call and the recorded daemon "
+                 "identity agree.")
 
 
 def verify_planned_images(docker_dir: Path, stamp_path: Path, services: list[str], running: bool) -> None:
