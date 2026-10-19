@@ -47,6 +47,9 @@ class ForwardVerifiedPublications extends Command
     /** Seconds between touches of the alive marker, idle or in the middle of a request. */
     private const int MARKER_SECONDS = 5;
 
+    /** Microseconds between checks while waiting for a batch to fill. */
+    private const int LINGER_STEP_MICROSECONDS = 50_000;
+
     protected $signature = 'releases:forward-verified-publications {--slot=1 : Forwarder number, 1 to RELEASE_VERIFICATION_PUBLISH_FORWARDERS} {--max-seconds=0 : Stop taking work after this duration; zero uses RELEASE_VERIFICATION_PUBLISH_FORWARDER_SECONDS} {--passes=0 : Stop after this many loop passes (zero runs until the deadline)} {--diagnostics : Log a bounded run summary}';
 
     protected $description = 'Publish verified candidates handed off by this host\'s workers to the primary in batches';
@@ -81,6 +84,12 @@ class ForwardVerifiedPublications extends Command
 
     /** Items per request; lowered when the primary advertises a smaller limit. */
     private int $limit = 16;
+
+    /** Milliseconds to wait for a batch to fill once work is due (0 sends at once). */
+    private int $lingerMs = 0;
+
+    /** Whether work that must not wait (adopted orphans) was found since the last claim. */
+    private bool $urgent = false;
 
     /** @var array<string, int> Unix seconds of each entry's last lease renewal, by file name. */
     private array $beats = [];
@@ -145,6 +154,8 @@ class ForwardVerifiedPublications extends Command
         $this->blocked = false;
         $this->nextJoin = 0.0;
         $this->beats = [];
+        $this->urgent = false;
+        $this->lingerMs = PublicationOutbox::lingerMilliseconds();
         $this->limit = max(1, min(RemotePublicationService::BATCH_HARD_MAX_ITEMS, (int) config('release_verification.publish_forward_items', 16)));
         try {
             $this->diagnostics?->adopted(count($this->outbox->inflight($this->slot)));
@@ -237,6 +248,13 @@ class ForwardVerifiedPublications extends Command
 
                 continue;
             }
+            if ($this->lingerMs > 0 && ! $this->urgent) {
+                // Wait for the batch to fill before joining the group, so it is not held while idle.
+                if (! $this->linger($nextMaintenance, $nextMark)) {
+                    continue;
+                }
+                $now = microtime(true);
+            }
             if (! $this->enter()) {
                 $this->refuse();
                 Sleep::usleep(self::IDLE_MICROSECONDS);
@@ -250,6 +268,7 @@ class ForwardVerifiedPublications extends Command
                 continue;
             }
             $batch = $this->outbox->claim($this->slot, $this->limit, $now);
+            $this->urgent = false;
             if ($batch === []) {
                 $this->leave();
                 Sleep::usleep(self::IDLE_MICROSECONDS);
@@ -258,6 +277,70 @@ class ForwardVerifiedPublications extends Command
             }
             $this->forwardBatch($publisher, $batch, $now);
         }
+    }
+
+    /**
+     * Wait, outside the worker group, until the due entries fill a batch or the linger has passed.
+     * Work that must not wait (entries in flight, expired ones, adopted orphans) and a backlog that
+     * already fills a batch skip the wait. The marker and housekeeping keep their cadence meanwhile.
+     *
+     * @return bool True to go on and claim; false when the loop should start over (stop requested or refused).
+     */
+    private function linger(float &$nextMaintenance, float &$nextMark): bool
+    {
+        $now = microtime(true);
+        if ($this->outbox->hasUrgent($this->slot, $now) || $this->outbox->dueCount($this->limit, $now, $this->slot) >= $this->limit) {
+            return true;
+        }
+        $this->diagnostics?->lingerStarted();
+        $started = $this->clock();
+        while (true) {
+            Sleep::usleep(self::LINGER_STEP_MICROSECONDS);
+            if (function_exists('pcntl_signal_dispatch')) {
+                pcntl_signal_dispatch();
+            }
+            $waited = ($this->clock() - $started) * 1000.0;
+            if ($this->terminate || (hrtime(true) - $this->runStarted) / 1e9 >= $this->runSeconds) {
+                $this->diagnostics?->lingerEnded('interrupted', $waited);
+
+                return false;
+            }
+            $now = microtime(true);
+            if ($now >= $nextMaintenance) {
+                $nextMaintenance = $now + self::MAINTENANCE_SECONDS;
+                $this->maintain();
+            }
+            if (! $this->blocked && $now >= $nextMark) {
+                $nextMark = $now + self::MARKER_SECONDS;
+                $this->advertise();
+            }
+            if ($this->blocked) {
+                $this->diagnostics?->lingerEnded('interrupted', $waited);
+
+                return false;
+            }
+            if ($this->urgent) {
+                $this->diagnostics?->lingerEnded('interrupted', $waited);
+
+                return true;
+            }
+            if ($this->outbox->dueCount($this->limit, $now, $this->slot) >= $this->limit) {
+                $this->diagnostics?->lingerEnded('fill', $waited);
+
+                return true;
+            }
+            if ($waited >= $this->lingerMs) {
+                $this->diagnostics?->lingerEnded('timeout', $waited);
+
+                return true;
+            }
+        }
+    }
+
+    /** Wall-clock seconds, following Carbon so tests can drive it with faked sleeps. */
+    private function clock(): float
+    {
+        return (float) now()->format('U.u');
     }
 
     /** Join the shared worker group, which a drain, an exclusive holder or a pause refuses. */
@@ -360,6 +443,8 @@ class ForwardVerifiedPublications extends Command
                     // Adoption is the work; only recording its count depends on the diagnostics.
                     $adopted = $this->outbox->adopt($other);
                     $this->diagnostics?->orphansAdopted($adopted);
+                    // Adopted entries are overdue work from a dead forwarder: send them without waiting.
+                    $this->urgent = $this->urgent || $adopted > 0;
                 });
             }
             $this->renewLeases($due);

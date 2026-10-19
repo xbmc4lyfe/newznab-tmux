@@ -73,6 +73,15 @@ final class PublicationOutbox
         return max(1, min(VerificationWorkerLocks::MAX_SLOTS, (int) config('release_verification.publish_forwarders', 4)));
     }
 
+    /** Longest linger a forwarder may wait for a fuller batch, in milliseconds. */
+    public const int MAX_LINGER_MILLISECONDS = 30_000;
+
+    /** Milliseconds a forwarder waits for a batch to fill once work is due; zero sends at once. */
+    public static function lingerMilliseconds(): int
+    {
+        return max(0, min(self::MAX_LINGER_MILLISECONDS, (int) config('release_verification.publish_forward_linger_ms', 0)));
+    }
+
     /** Seconds an entry may wait before it is finished unknown and left to be re-verified. */
     public static function maxAgeSeconds(): float
     {
@@ -306,6 +315,52 @@ final class PublicationOutbox
         }
 
         return false;
+    }
+
+    /**
+     * Whether work is waiting that must not linger: this forwarder already owns an entry, or a pending
+     * one has outlived its age limit. Reads only.
+     */
+    public function hasUrgent(int $slot, float $now): bool
+    {
+        if ($this->inflight($slot) !== []) {
+            return true;
+        }
+        $maxAge = self::maxAgeSeconds();
+        foreach ($this->pending() as $entry) {
+            if ($entry->olderThan($maxAge, $now)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * How many entries {@see claim()} could take now, counting at most $cap: this forwarder's own
+     * entries plus the pending ones that are due (past their backoff) or past their age limit. Stops
+     * reading at the cap. Reads only; unreadable documents and links count for nothing.
+     */
+    public function dueCount(int $cap, float $now, int $slot = 1): int
+    {
+        $count = 0;
+        $maxAge = self::maxAgeSeconds();
+        foreach ([$this->inflightDirectory($slot) => true, $this->root.'/pending' => false] as $directory => $owned) {
+            foreach ($this->names($directory) as $name) {
+                if ($count >= $cap) {
+                    return $count;
+                }
+                if (isset($this->stuck[$directory.'/'.$name])) {
+                    continue;
+                }
+                $entry = $this->read($directory.'/'.$name);
+                if ($entry !== null && ($owned || $entry->notBefore <= $now || $entry->olderThan($maxAge, $now))) {
+                    $count++;
+                }
+            }
+        }
+
+        return $count;
     }
 
     /**
