@@ -205,6 +205,99 @@ class CbpCleanupServiceTest extends TestCase
         $this->assertSame([26], $this->collectionIds());
     }
 
+    public function test_stale_input_that_archival_would_only_expire_is_deleted_without_using_the_archive_budget(): void
+    {
+        $this->enableVerification();
+        foreach (range(1, 30) as $id) {
+            $this->insertStalePayload($id, CollectionFileCheckStatus::Default->value, hoursAgo: 60);
+        }
+        $this->insertStalePayload(31, CollectionFileCheckStatus::Default->value);
+
+        app(CollectionCleanupService::class)->deleteFinishedAndOrphans(false);
+
+        $this->assertSame([], $this->collectionIds());
+        $this->assertSame(0, DB::table('binaries')->count());
+        $this->assertSame(0, DB::table('parts')->count());
+        $candidate = DB::table('release_verification_candidates')->sole();
+        $this->assertSame(bin2hex('orphan-hash-31'), $candidate->source_identity);
+        $this->assertNotSame('expired', $candidate->status);
+        $this->assertNotSame('', $candidate->manifest_path);
+    }
+
+    public function test_expired_stale_input_still_joins_an_existing_candidate_through_archival(): void
+    {
+        $this->enableVerification();
+        $this->insertStalePayload(1, CollectionFileCheckStatus::Default->value, hoursAgo: 60);
+        $this->insertStalePayload(2, CollectionFileCheckStatus::Default->value, hoursAgo: 60);
+        $this->breakCandidateManifest(1);
+
+        app(CollectionCleanupService::class)->deleteFinishedAndOrphans(false);
+
+        // Archival was attempted (and failed on the broken manifest), so the headers are kept.
+        $this->assertSame([1], $this->collectionIds());
+        $this->assertSame(1, DB::table('parts')->count());
+        $this->assertSame(1, DB::table('release_verification_candidates')->count());
+    }
+
+    public function test_recently_seen_stale_input_keeps_the_archival_path(): void
+    {
+        $this->enableVerification();
+        DB::statement('ALTER TABLE collections ADD COLUMN last_seen_at DATETIME NULL');
+        $this->insertStalePayload(1, CollectionFileCheckStatus::Default->value, hoursAgo: 60);
+        $this->insertStalePayload(2, CollectionFileCheckStatus::Default->value, hoursAgo: 60);
+        DB::table('collections')->where('id', 1)->update(['last_seen_at' => now()->subHour()]);
+        DB::table('collections')->where('id', 2)->update(['last_seen_at' => now()->subHours(50)]);
+
+        app(CollectionCleanupService::class)->deleteFinishedAndOrphans(false);
+
+        $this->assertSame([], $this->collectionIds());
+        $candidate = DB::table('release_verification_candidates')->sole();
+        $this->assertSame(bin2hex('orphan-hash-1'), $candidate->source_identity);
+        $this->assertNotSame('expired', $candidate->status);
+        $this->assertNotSame('', $candidate->manifest_path);
+    }
+
+    public function test_new_article_after_expired_selection_is_preserved(): void
+    {
+        $this->enableVerification();
+        $this->insertStalePayload(1, CollectionFileCheckStatus::Default->value, hoursAgo: 60);
+        $injected = false;
+        DB::listen(static function (QueryExecuted $event) use (&$injected): void {
+            if (! $injected && str_contains($event->sql, 'from "release_verification_candidates"')
+                && str_contains($event->sql, '"source_identity" in')) {
+                $injected = true;
+                DB::table('collections')->where('id', 1)->update(['dateadded' => now(), 'added' => now()]);
+            }
+        });
+
+        app(CollectionCleanupService::class)->deleteFinishedAndOrphans(false);
+
+        $this->assertTrue($injected);
+        $this->assertSame([1], $this->collectionIds());
+        $this->assertSame(1, DB::table('parts')->count());
+        $this->assertSame(0, DB::table('release_verification_candidates')->count());
+    }
+
+    public function test_expired_stale_pages_continue_within_the_time_budget(): void
+    {
+        $this->enableVerification();
+        foreach (range(1, 5) as $id) {
+            $this->insertStalePayload($id, CollectionFileCheckStatus::Default->value, hoursAgo: 60);
+        }
+        $cleanup = new CollectionCleanupService(new BinariesConfig(sqlChunkSize: 2));
+
+        config(['nntmux.cbp.verification_sweep_seconds' => 0]);
+        $cleanup->deleteFinishedAndOrphans(false);
+        $this->assertSame([3, 4, 5], $this->collectionIds());
+        $this->assertSame(['last_id' => 2, 'max_id' => 5], Cache::get('cbp:verification-old-sweep:cursor'));
+
+        config(['nntmux.cbp.verification_sweep_seconds' => 60]);
+        $cleanup->deleteFinishedAndOrphans(false);
+        $this->assertSame([], $this->collectionIds());
+        $this->assertNull(Cache::get('cbp:verification-old-sweep:cursor'));
+        $this->assertSame(0, DB::table('release_verification_candidates')->count());
+    }
+
     public function test_failed_retrievable_input_is_not_deleted_by_legacy_nzb_missed_cleanup(): void
     {
         $this->enableVerification();
@@ -313,10 +406,10 @@ class CbpCleanupServiceTest extends TestCase
         DB::statement('ALTER TABLE binaries ADD COLUMN binaryhash VARCHAR(255)');
     }
 
-    private function insertStalePayload(int $id, int $status, int $bytes = 100, string $messageId = 'payload@example.com', string $subject = 'Payload.part01.rar'): void
+    private function insertStalePayload(int $id, int $status, int $bytes = 100, string $messageId = 'payload@example.com', string $subject = 'Payload.part01.rar', int $hoursAgo = 2): void
     {
         $this->insertRecentCollection($id);
-        DB::table('collections')->where('id', $id)->update(['dateadded' => now()->subHours(2), 'added' => now()->subHours(2), 'filecheck' => $status]);
+        DB::table('collections')->where('id', $id)->update(['dateadded' => now()->subHours($hoursAgo), 'added' => now()->subHours($hoursAgo), 'filecheck' => $status]);
         DB::table('binaries')->insert(['id' => $id, 'collections_id' => $id, 'binaryhash' => 'binary-'.$id, 'name' => $subject, 'totalparts' => 1]);
         DB::table('parts')->insert(['binaries_id' => $id, 'number' => $id, 'messageid' => $messageId, 'partnumber' => 1, 'size' => $bytes]);
     }
