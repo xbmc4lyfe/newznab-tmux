@@ -465,7 +465,8 @@ def reject_alternate_env_file() -> None:
     # A standalone docker-compose has no docker global options to scan.
     globals_end = argv.index("compose") if "compose" in argv else (1 if argv and os.path.basename(argv[0]) == "docker-compose" else len(argv))
     allowed = ("-D", "--debug", "-l", "--log-level")
-    selects_daemon = bool(argv) and os.path.basename(argv[0]) == "env"
+    # A wrapper executable could select any daemon itself; only docker or docker-compose is known.
+    selects_daemon = bool(argv) and os.path.basename(argv[0]) not in ("docker", "docker-compose")
     previous = ""
     for arg in argv[1:globals_end]:
         if arg.startswith("-") and arg not in allowed and not arg.startswith("--log-level="):
@@ -1299,16 +1300,20 @@ def docker_daemon_identity() -> str:
     """The daemon selection Docker resolves: DOCKER_CONTEXT overrides DOCKER_HOST, which overrides
     the current context."""
     context = os.environ.get("DOCKER_CONTEXT", "")
-    if context:
-        return f"context:{context}"
-    host = os.environ.get("DOCKER_HOST", "")
-    if host:
-        return f"host:{host}"
     if not context:
+        host = os.environ.get("DOCKER_HOST", "")
+        if host:
+            return f"host:{host}"
         # The current context, so an exported DOCKER_CONTEXT naming it compares equal.
         proc = subprocess.run(["docker", "context", "show"], capture_output=True, text=True, check=False)
         context = proc.stdout.strip() if proc.returncode == 0 else ""
-    return f"context:{context}" if context else "default"
+    if not context:
+        return "default"
+    # A context updated in place to another endpoint is another daemon under the same name.
+    proc = subprocess.run(["docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}", context],
+                          capture_output=True, text=True, check=False)
+    endpoint = proc.stdout.strip() if proc.returncode == 0 else ""
+    return f"context:{context}@{endpoint}" if endpoint else f"context:{context}"
 
 
 def transitive_dependencies(svc: str) -> set[str]:
@@ -1478,6 +1483,10 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
         elif svc in stale_images:
             dirty_infra.append(svc)
             infra_reasons[svc] = "running image differs from its tag"
+        elif not container_exists(docker_dir, svc):
+            # Removed (not merely stopped, which may be an operator's choice): recreate it.
+            reconcile_infra.append(svc)
+            infra_reasons[svc] = "no container"
         elif (first_deploy or legacy_stamp or f"service:{svc}" not in stamped) and mounts_changed_since_start(docker_dir, svc):
             dirty_infra.append(svc)
             infra_reasons[svc] = "mounted config newer than container"
@@ -1596,6 +1605,9 @@ def main() -> None:
     repo = Path(os.environ.get("DEPLOY_REPO", docker_dir.parent)).resolve()
     BUILD_CONTEXT = BuildContext(repo)
     stamp_path = Path(os.environ.get("DEPLOY_STAMP", docker_dir / ".deploy.stamp"))
+    if len(sys.argv) > 1 and sys.argv[1] != "--classify":
+        # Before any Compose call: DC must not reach another daemon or env file than the checks see.
+        reject_alternate_env_file()
 
     cmd = sys.argv[1] if len(sys.argv) > 1 else "--explain"
 
@@ -1718,7 +1730,11 @@ def main() -> None:
         # deploy-current: running data/infra services whose image tag now names another image.
         # Only services the effective Compose configuration renders (`ps` also lists orphans).
         get_compose_service_hashes(docker_dir)
-        print(" ".join(stale_service_images(docker_dir, RENDERED_SERVICES)))
+        stale = stale_service_images(docker_dir, RENDERED_SERVICES)
+        # Rendered infrastructure with no container at all also needs a rollout.
+        infra = [*INFRA_SERVICES, *(svc for svc in RENDERED_SERVICES if svc not in ALL_SERVICES and declared_stateless(svc))]
+        missing = [svc for svc in infra if svc in RENDERED_SERVICES and svc not in stale and not container_exists(docker_dir, svc)]
+        print(" ".join([*stale, *missing]))
         return
 
     if cmd == "--deploy-actions":
@@ -1754,8 +1770,11 @@ def main() -> None:
             if any(not check_app_container(docker_dir, dep, verify_image=False)[0] for dep in app_providers):
                 after_app.append(svc)
             elif deps & post_services:
-                # Its data provider changes only after the drain; apply it right after that provider.
-                after_data.append(svc)
+                # Its data provider changes only after the drain. If an app provider is stopped by
+                # then (every writer in full mode), it waits for the app rollout; otherwise it
+                # follows its data provider.
+                stopping = set(APP_SERVICES) if plan["mode"] == "full" else {app for app in plan["dirty_app"] if app != "web"}
+                (after_app if any(dep in stopping for dep in app_providers) else after_data).append(svc)
         pre_drain = [svc for svc in pre_drain if svc not in after_app and svc not in after_data]
         print(f"PRE_DRAIN={shlex.quote(' '.join(f'{marks[svc]}:{svc}' for svc in pre_drain))}")
         print(f"AFTER_APP={shlex.quote(' '.join(f'{marks[svc]}:{svc}' for svc in after_app))}")

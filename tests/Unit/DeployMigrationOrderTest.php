@@ -84,7 +84,7 @@ case "$*" in
     *' ps -a -q '*)
         if [ -n "${NNTMUX_PS_A_FAIL_AFTER:-}" ] && grep -q -- "$NNTMUX_PS_A_FAIL_AFTER" "$NNTMUX_DEPLOY_EVENTS"; then echo "Cannot connect to the Docker daemon" >&2; exit 1; fi
         [ "${NNTMUX_NO_EXISTING_APP:-0}" = 1 ] && exit 0
-        [ -n "${NNTMUX_NO_CONTAINER:-}" ] && [ "$last" = "$NNTMUX_NO_CONTAINER" ] && exit 0
+        if [ -n "${NNTMUX_NO_CONTAINER:-}" ] && [ "$last" = "$NNTMUX_NO_CONTAINER" ] && ! grep -q -- " up -d .* $last\( \|\$\)" "$NNTMUX_DEPLOY_EVENTS"; then exit 0; fi
         [ ! -f "$NNTMUX_REPO/recreated-$last" ] || printf 'r%s-' "$(wc -c < "$NNTMUX_REPO/recreated-$last" | tr -d ' ')"
         echo "fixture-container-$last" ;;
     *' ps -q')
@@ -693,6 +693,33 @@ SH);
         $this->assertStringContainsString(' stop ', $this->events());
     }
 
+    public function test_a_removed_infrastructure_container_is_recreated_but_a_stopped_one_is_left(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        // The proxy container was removed: the guard must not skip, and the plan recreates it.
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_NO_CONTAINER' => 'proxy'])->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 proxy', $this->events());
+    }
+
+    public function test_infrastructure_needing_a_changed_data_service_and_a_stopped_app_follows_the_apps(): void
+    {
+        mkdir($this->directory.'/docker/config/redis', 0777, true);
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 1gb\n");
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['sidecar'] = ['labels' => ['nntmux.deploy.stateless' => 'true'], 'depends_on' => ['web' => ['condition' => 'service_healthy'], 'redis' => ['condition' => 'service_healthy']], 'environment' => ['V' => '1']];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        // Changed redis stops every writer (full mode); the sidecar needs web, so it waits for it.
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 2gb\n");
+        $json['services']['sidecar']['environment'] = ['V' => '2'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
+        $events = $this->events();
+        $this->assertGreaterThan(strpos($events, 'web horizon scheduler indexer'), strpos($events, '--wait-timeout 240 sidecar'));
+    }
+
     public function test_an_owed_barrier_release_is_never_batched(): void
     {
         $this->deploy()->mustRun();
@@ -715,8 +742,8 @@ SH);
 
     public function test_a_daemon_chosen_inside_dc_fails_closed(): void
     {
-        foreach (['--context remote', '-H ssh://host', '-Hssh://host', '-cremote', '--config /tmp/other'] as $flags) {
-            $plan = $this->make(['deploy-plan', 'DC=docker '.$flags.' compose --project-directory '.$this->directory.'/docker']);
+        foreach (['docker --context remote', 'docker -H ssh://host', 'docker -Hssh://host', 'docker -cremote', 'docker --config /tmp/other', '/usr/local/bin/remote-compose'] as $flags) {
+            $plan = $this->make(['deploy-plan', 'DC='.$flags.' compose --project-directory '.$this->directory.'/docker']);
             $plan->run();
             $this->assertNotSame(0, $plan->getExitCode(), $flags);
             $this->assertStringContainsString('can select another', $plan->getErrorOutput(), $flags);
@@ -1285,7 +1312,7 @@ SH);
         // A retry does not recreate proxy again; it is already on B.
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_SCHEDULER_DRAIN_FAIL' => '1'])->run();
-        $this->assertStringNotContainsString(' proxy', $this->events());
+        $this->assertDoesNotMatchRegularExpression('/ up -d[^\n]* proxy\b/', $this->events());
 
         // Reverting both changes must put proxy back on A rather than skip.
         file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', "A\n");
@@ -2563,6 +2590,7 @@ SH);
     public function test_a_failed_run_after_starting_a_missing_database_forces_its_recreate_on_retry(): void
     {
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
         $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0', 'FORCE=1'], ['NNTMUX_NO_CONTAINER' => 'mariadb', 'NNTMUX_BARRIER_FAIL' => '1']);
         $process->run();
 
