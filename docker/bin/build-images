@@ -1,0 +1,73 @@
+#!/bin/sh
+# Build only the Docker targets whose inputs changed since the last .build.stamp.
+set -eu
+DIR=$(cd "$(dirname "$0")/.." && pwd)
+REPO="${DEPLOY_REPO:-$(cd "$DIR/.." && pwd)}"
+
+BASE_IMAGE="${BASE_IMAGE:-nntmux/base:local}"
+APP_IMAGE="${APP_IMAGE:-nntmux/app:local}"
+if [ "$APP_IMAGE" != "nntmux/app:local" ]; then
+    [ -n "${WEB_IMAGE:-}" ] && [ "$WEB_IMAGE" != "nntmux/web:local" ] || WEB_IMAGE="$APP_IMAGE"
+    [ -n "${HORIZON_IMAGE:-}" ] && [ "$HORIZON_IMAGE" != "nntmux/horizon:local" ] || HORIZON_IMAGE="$APP_IMAGE"
+    [ -n "${SCHEDULER_IMAGE:-}" ] && [ "$SCHEDULER_IMAGE" != "nntmux/scheduler:local" ] || SCHEDULER_IMAGE="$APP_IMAGE"
+    [ -n "${INDEXER_IMAGE:-}" ] && [ "$INDEXER_IMAGE" != "nntmux/indexer:local" ] || INDEXER_IMAGE="$APP_IMAGE"
+else
+    WEB_IMAGE="${WEB_IMAGE:-nntmux/web:local}"
+    HORIZON_IMAGE="${HORIZON_IMAGE:-nntmux/horizon:local}"
+    SCHEDULER_IMAGE="${SCHEDULER_IMAGE:-nntmux/scheduler:local}"
+    INDEXER_IMAGE="${INDEXER_IMAGE:-nntmux/indexer:local}"
+fi
+export BASE_IMAGE APP_IMAGE WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE
+
+targets=$(DEPLOY_STAMP="${DEPLOY_STAMP:-$DIR/.build.stamp}" "$DIR/bin/deploy-plan" --build-targets)
+[ -n "$targets" ] || exit 0
+
+tag_for_role() {
+    case "$1" in
+        web) printf '%s\n' "$WEB_IMAGE" ;;
+        horizon) printf '%s\n' "$HORIZON_IMAGE" ;;
+        scheduler) printf '%s\n' "$SCHEDULER_IMAGE" ;;
+        indexer) printf '%s\n' "$INDEXER_IMAGE" ;;
+    esac
+}
+
+# Docker's canonical form: no docker.io/ or library/ prefix, :latest when untagged.
+normalize_ref() {
+    ref=$1
+    case "$ref" in docker.io/*) ref=${ref#docker.io/} ;; index.docker.io/*) ref=${ref#index.docker.io/} ;; esac
+    case "$ref" in library/*) ref=${ref#library/} ;; esac
+    case "${ref##*/}" in *:*|*@*) ;; *) ref="$ref:latest" ;; esac
+    printf '%s\n' "$ref"
+}
+
+tag_role_count() {
+    count=0
+    wanted=$(normalize_ref "$1")
+    for candidate in "$WEB_IMAGE" "$HORIZON_IMAGE" "$SCHEDULER_IMAGE" "$INDEXER_IMAGE"; do
+        if [ "$(normalize_ref "$candidate")" = "$wanted" ]; then
+            count=$((count + 1))
+        fi
+    done
+    printf '%s\n' "$count"
+}
+
+built_tags=" "
+for target in $targets; do
+    case "$target" in
+        base)
+            docker build --target base -t "$BASE_IMAGE" -f "$REPO/Dockerfile" "$REPO"
+            ;;
+        web|horizon|scheduler|indexer)
+            role_tag=$(tag_for_role "$target")
+            case "$built_tags" in
+                *" $(normalize_ref "$role_tag") "*) continue ;;
+            esac
+            if [ "$(tag_role_count "$role_tag")" -gt 1 ]; then
+                docker build --target selfhosted -t "$role_tag" -f "$REPO/Dockerfile" "$REPO"
+            else
+                docker build --target "selfhosted-$target" -t "$role_tag" -f "$REPO/Dockerfile" "$REPO"
+            fi
+            built_tags="$built_tags$(normalize_ref "$role_tag") "
+            ;;
+    esac
+done
