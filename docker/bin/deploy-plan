@@ -587,7 +587,7 @@ def service_bind_records(svc_cfg: object, project_dir: Path) -> list[str]:
     records: list[str] = []
     for volume in svc_cfg["volumes"]:
         if isinstance(volume, dict) and volume.get("type") == "bind" and isinstance(volume.get("source"), str):
-            records.append(bind_source_record(volume["source"], bool(volume.get("read_only")), project_dir))
+            records.append(bind_source_record(compose_path(volume["source"]), bool(volume.get("read_only")), project_dir))
     return records
 
 
@@ -640,7 +640,7 @@ def service_resource_sources(parsed: dict[str, object], svc_cfg: object, docker_
             source_file = definition.get("file")
             source_env = definition.get("environment")
             if isinstance(source_file, str):
-                records.append(f"{section}:{name} {bind_source_record(source_file, True, project_dir)}")
+                records.append(f"{section}:{name} {bind_source_record(compose_path(source_file), True, project_dir)}")
             elif isinstance(source_env, str):
                 value = os.environ.get(source_env)
                 if value is None:
@@ -1198,7 +1198,7 @@ def mounts_changed_since_start(docker_dir: Path, svc: str) -> bool:
         return False
     for volume in cfg["volumes"]:
         if isinstance(volume, dict) and volume.get("type") == "bind" and isinstance(volume.get("source"), str):
-            source = volume["source"]
+            source = compose_path(volume["source"])
             if symlinked_below(source, project_directory(docker_dir)):
                 # A symlinked data source may have been retargeted; with no record of what the
                 # container mounted, recreate it rather than reconcile it in place.
@@ -1213,7 +1213,7 @@ def mounts_changed_since_start(docker_dir: Path, svc: str) -> bool:
     for volume in cfg["volumes"]:
         if not (isinstance(volume, dict) and volume.get("type") == "bind" and isinstance(volume.get("source"), str)):
             continue
-        path = Path(volume["source"])
+        path = Path(compose_path(volume["source"]))
         try:
             try:
                 info = os.stat(path)
@@ -1329,11 +1329,23 @@ def symlinked_below(source: str, root: Path) -> bool:
     return False
 
 
+def compose_path(path: str) -> str:
+    """A path from `compose config` output: Compose escapes a literal `$` as `$$` there."""
+    return path.replace("$$", "$")
+
+
 def database_service(docker_dir: Path) -> str:
-    """The rendered service the app's database runs in: DB_HOST from app.env when it names one
-    (e.g. an override's `db2`), else `mariadb`."""
-    host = read_dotenv(docker_dir / "config/app.env").get("DB_HOST", "")
-    return host if host in RENDERED_SERVICES else "mariadb"
+    """The rendered service the app's database runs in: the host in DB_URL (which Laravel prefers),
+    else DB_HOST from app.env, when it names one (e.g. an override's `db2`); otherwise `mariadb`."""
+    values = read_dotenv(docker_dir / "config/app.env")
+    try:
+        url_host = urlsplit(values.get("DB_URL", "")).hostname or ""
+    except ValueError:
+        url_host = ""
+    for host in (url_host, values.get("DB_HOST", "")):
+        if host in RENDERED_SERVICES:
+            return host
+    return "mariadb"
 
 
 def docker_daemon_identity() -> str:
@@ -1613,6 +1625,14 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
     # deploy-app applies each list one service at a time with `--no-deps`: providers first.
     dirty_data, reconcile_data, start_data = (dependency_order(lst) for lst in (dirty_data, reconcile_data, start_data))
     dirty_infra, reconcile_infra = (dependency_order(lst) for lst in (dirty_infra, reconcile_infra))
+    # Infrastructure between apps (gateway depends on web, indexer on gateway) has no phase order
+    # that starts each provider before its consumer; reject it.
+    for svc in infra_services(state):
+        if svc in RENDERED_SERVICES and any(dep in APP_SERVICES for dep in transitive_dependencies(svc)):
+            consumers = sorted(app for app in APP_SERVICES if svc in transitive_dependencies(app))
+            if consumers:
+                sys.exit(f"deploy-plan: infrastructure service {svc} depends on an app service and app service "
+                         f"{consumers[0]} depends on it; selective deployment cannot order that. Break the cycle.")
     # A stateful service changes only with every writer stopped, so it cannot wait for an app provider.
     for svc in [*dirty_data, *reconcile_data, *start_data]:
         app_providers = sorted(dep for dep in transitive_dependencies(svc) if dep in APP_SERVICES)

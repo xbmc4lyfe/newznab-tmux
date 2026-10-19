@@ -1645,6 +1645,36 @@ SH);
         $this->assertGreaterThan($recreate, strpos($events, 'artisan migrate --force'));
     }
 
+    public function test_db_url_names_the_database_service_before_db_host(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_URL=mysql://u:p@db2:3306/nntmux\nDB_HOST=mariadb\n");
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['db2'] = ['image' => 'mariadb:one'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        $json['services']['db2'] = ['image' => 'mariadb:two'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
+        $this->assertStringContainsString('artisan migrate --force', $this->events());
+    }
+
+    public function test_a_mounted_path_with_a_dollar_sign_is_content_hashed(): void
+    {
+        mkdir($this->directory.'/docker/config/site$one', 0777, true);
+        file_put_contents($this->directory.'/docker/config/site$one/x.conf', "one\n");
+        $json = json_decode($this->composeJson(), true);
+        // Compose's rendered config escapes the literal `$` as `$$`.
+        $json['services']['proxy'] = ['volumes' => [['type' => 'bind', 'source' => $this->directory.'/docker/config/site$$one/x.conf', 'target' => '/etc/x.conf', 'read_only' => true]]];
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        file_put_contents($this->directory.'/docker/config/site$one/x.conf', "two\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+    }
+
     public function test_infrastructure_a_new_data_service_needs_starts_first(): void
     {
         $base = json_decode($this->composeJson(), true);
@@ -3068,6 +3098,12 @@ SH);
         $process->run();
         $this->assertNotSame(0, $process->getExitCode());
         $this->assertStringNotContainsString(' up -d', $this->events());
+
+        // Infrastructure between apps cannot be ordered across the phases.
+        $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['gateway' => ['labels' => ['nntmux.deploy.stateless' => 'true'], 'depends_on' => ['web' => ['condition' => 'service_started']]], 'indexer' => ['depends_on' => ['gateway' => ['condition' => 'service_started']]]] + $services], JSON_UNESCAPED_SLASHES)]);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('infrastructure service gateway depends on an app service', $plan->getErrorOutput());
 
         // A one-shot provider's successful exit cannot be waited for one service at a time.
         $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['proxy' => ['depends_on' => ['init' => ['condition' => 'service_completed_successfully']]], 'init' => ['labels' => ['nntmux.deploy.stateless' => 'true']]] + $services], JSON_UNESCAPED_SLASHES)]);
