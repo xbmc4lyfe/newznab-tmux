@@ -28,7 +28,13 @@ final class PerArticleObfuscationCorpus
             'readable-yenc' => ['category' => 'routed', 'description' => 'readable yEnc uploads without 16+ alphanumeric tokens (stays on PHP)', 'size' => 20000],
             'bare-random' => ['category' => 'routed', 'description' => 'random 32-character subjects without part counts (stays on PHP)', 'size' => 20000],
             'single-part-hashed' => ['category' => 'routed', 'description' => 'hash-named single-part posts, 15% in a readable range (stays on PHP)', 'size' => 20000],
-            'text-heavy-obfuscated' => ['category' => 'common', 'description' => 'text posts with 60% obfuscated articles (just past the part-count majority, goes to Rust)', 'size' => 20000],
+            'text-heavy-obfuscated' => ['category' => 'common', 'description' => 'text posts with 85% obfuscated articles (past the part-count cutoff, goes to Rust)', 'size' => 20000],
+            'readable-40-obfuscated' => ['category' => 'common', 'description' => 'readable yEnc with 40% obfuscated articles (past the candidate cutoff, goes to Rust)', 'size' => 20000],
+            'readable-25-obfuscated' => ['category' => 'routed', 'description' => 'readable yEnc with 25% obfuscated articles (stays on PHP)', 'size' => 20000],
+            'readable-tenth-obfuscated' => ['category' => 'routed', 'description' => 'readable yEnc with 10% obfuscated articles (stays on PHP)', 'size' => 20000],
+            'text-half-obfuscated' => ['category' => 'routed', 'description' => 'text posts with 50% obfuscated articles (stays on PHP)', 'size' => 20000],
+            'small-text' => ['category' => 'routed', 'description' => 'text posts, 1000 headers (smallest sampled range, stays on PHP)', 'size' => 1000],
+            'small-readable' => ['category' => 'routed', 'description' => 'readable yEnc, 1000 headers (smallest sampled range, stays on PHP)', 'size' => 1000],
             'text-with-uploads' => ['category' => 'routed', 'description' => 'text posts with 8% obfuscated articles and 10% counter-prefixed single-part images (stays on PHP)', 'size' => 20000],
             'non-yenc' => ['category' => 'routed', 'description' => 'text posts without yEnc part counts (stays on PHP)', 'size' => 20000],
             'large-range' => ['category' => 'uncommon', 'description' => 'mixed range of 100k headers', 'size' => 100000],
@@ -51,7 +57,13 @@ final class PerArticleObfuscationCorpus
             'bare-random' => array_map(static fn (): string => self::token($random, 32), range(1, $size)),
             'single-part-hashed' => self::singlePartHashed($random, $size),
             'text-with-uploads' => self::textWithUploads($random, $size),
-            'text-heavy-obfuscated' => self::textObfuscated($random, $size, 60),
+            'text-heavy-obfuscated' => self::textObfuscated($random, $size, 85),
+            'text-half-obfuscated' => self::textObfuscated($random, $size, 50),
+            'readable-40-obfuscated' => self::readableObfuscated($random, $size, 40),
+            'readable-25-obfuscated' => self::readableObfuscated($random, $size, 25),
+            'readable-tenth-obfuscated' => self::readableObfuscated($random, $size, 10),
+            'small-text' => self::text($random, $size),
+            'small-readable' => self::real($random, $size, false),
             'kenpsx' => self::kenpsx($random, $size),
             'boneless' => self::boneless($random, $size),
             'mixed', 'large-range', 'small-range' => self::mixed($random, $size, ''),
@@ -126,6 +138,20 @@ final class PerArticleObfuscationCorpus
     private static function textObfuscated(Randomizer $random, int $size, int $percent): array
     {
         $subjects = self::text($random, $size);
+        $obfuscated = self::boneless($random, $size);
+        foreach (array_keys($subjects) as $index) {
+            if ($random->getInt(0, 99) < $percent) {
+                $subjects[$index] = $obfuscated[$index];
+            }
+        }
+
+        return $subjects;
+    }
+
+    /** @return list<string> */
+    private static function readableObfuscated(Randomizer $random, int $size, int $percent): array
+    {
+        $subjects = self::real($random, $size, false);
         $obfuscated = self::boneless($random, $size);
         foreach (array_keys($subjects) as $index) {
             if ($random->getInt(0, 99) < $percent) {

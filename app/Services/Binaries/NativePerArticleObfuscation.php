@@ -19,8 +19,10 @@ final class NativePerArticleObfuscation
     /** Mirrors MAX_SUBJECT_LENGTH in the Rust port; longer subjects are declined before packing. */
     public const int MAX_SUBJECT_LENGTH = 512;
 
-    /** Headers sampled to decide whether a range is worth marshalling to Rust. */
-    private const int SAMPLE_SIZE = 128;
+    /** Headers sampled to decide whether a range is worth marshalling to Rust: one in 64, 32 to 128. */
+    private const int SAMPLE_MIN = 32;
+
+    private const int SAMPLE_MAX = 128;
 
     /** Smaller ranges stay on PHP: Rust's margin there is under a millisecond and not reliably 1.5x. */
     public const int MIN_HEADERS = 1000;
@@ -44,9 +46,9 @@ final class NativePerArticleObfuscation
      * Article numbers the PHP rule would mark, or null to keep the PHP result. These ranges stay
      * on PHP:
      * - under MIN_HEADERS, where Rust's margin is too small to establish;
-     * - where most of a spread sample has no part count, or under a sixteenth is a multi-part
-     *   subject with a 16+ alphanumeric token in its name, because the PHP rule rejects other
-     *   subjects faster than they can be packed for FFI;
+     * - where over a quarter of a spread sample has no part count, or under a third is a
+     *   multi-part subject with a 16+ alphanumeric token in its name, because the PHP rule
+     *   rejects other subjects faster than they can be packed for FFI;
      * - with any subject over MAX_SUBJECT_LENGTH, which Rust would decline.
      *
      * @param  array<int, array<string, mixed>>  $headers
@@ -81,7 +83,8 @@ final class NativePerArticleObfuscation
         }
         // An odd step started mid-stride, so a range alternating at an even period is not seen
         // in one phase only.
-        $step = intdiv($count, self::SAMPLE_SIZE) | 1;
+        $samples = min(self::SAMPLE_MAX, max(self::SAMPLE_MIN, intdiv($count, 64)));
+        $step = intdiv($count, $samples) | 1;
         $sampled = $counted = $candidates = 0;
         for ($i = intdiv($step, 2); $i < $count; $i += $step) {
             $sampled++;
@@ -90,9 +93,10 @@ final class NativePerArticleObfuscation
             $candidates += $kind === 2 ? 1 : 0;
         }
 
-        // PHP rejects subjects without a part count in about one regex, so a range made mostly of
-        // them stays on PHP whatever its candidate share.
-        if ($counted * 2 < $sampled || $candidates * 16 < $sampled) {
+        // PHP rejects subjects without a part count, or without a token, in a regex or two, so Rust
+        // reaches 1.5x only when three quarters of the sample has a part count and a third
+        // are candidates.
+        if ($counted * 4 < $sampled * 3 || $candidates * 3 < $sampled) {
             return false;
         }
         // A subject Rust would decline sends the range to PHP before any packing.
