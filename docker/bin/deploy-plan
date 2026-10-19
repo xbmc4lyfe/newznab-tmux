@@ -898,7 +898,7 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
     try:
         db_url = urlsplit(app_env_values.get("DB_URL", ""))
         # An equivalent DNS spelling (case, a root dot) is the same database.
-        db_url_identity = urlunsplit((db_url.scheme, normalize_host(db_url.hostname or ""), db_url.path, db_url.query, "")) + (
+        db_url_identity = urlunsplit((db_url.scheme, normalize_host(db_url.hostname or ""), db_url.path, normalize_query_host(db_url.query), "")) + (
             f"|{db_url.port}" if db_url.netloc and db_url.port else "")
     except ValueError:
         # Unparseable (e.g. a bad or `${PORT}` port): compare everything after the credentials.
@@ -1499,7 +1499,12 @@ def normalize_db_url(url: str) -> str:
     else:
         name, colon, port = hostport.rpartition(":") if ":" in hostport else (hostport, "", "")
         hostport = normalize_host(name) + colon + port
-    return urlunsplit((parts.scheme, userinfo + at + hostport, parts.path, parts.query, parts.fragment))
+    return urlunsplit((parts.scheme, userinfo + at + hostport, parts.path, normalize_query_host(parts.query), parts.fragment))
+
+
+def normalize_query_host(query: str) -> str:
+    """A `host=` query option (it overrides the URL's host in Laravel) normalized like the host."""
+    return re.sub(r"(^|&)(host=)([^&]*)", lambda m: m.group(1) + m.group(2) + normalize_host(m.group(3)), query)
 
 
 def matched_database_service(docker_dir: Path) -> str | None:

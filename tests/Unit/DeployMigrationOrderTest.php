@@ -44,6 +44,7 @@ case "$*" in
         echo "fixture-container-$last" ;;
     # The barrier container exists while it runs or after it exited (barrier.stopped), until `rm -f`.
     'inspect --format {{index .Config.Labels "nntmux.deploy.database"}} '*)
+        [ "${NNTMUX_BARRIER_INSPECT_FAIL:-0}" != 1 ] || { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
         [ -f "$NNTMUX_REPO/barrier.running" ] || [ -f "$NNTMUX_REPO/barrier.stopped" ] || { echo "Error: No such object" >&2; exit 1; }
         cat "$NNTMUX_REPO/barrier.database" 2>/dev/null; exit 0 ;;
     'ps -q --filter label=com.docker.compose.project='*) [ -z "${NNTMUX_ORPHAN:-}" ] || case "$*" in *"service=$NNTMUX_ORPHAN") echo "fixture-container-$NNTMUX_ORPHAN" ;; esac ;;
@@ -3739,6 +3740,32 @@ SH);
         $this->assertStringContainsString('without naming its database', $process->getErrorOutput());
         $this->assertStringNotContainsString('releases:verification-barrier', $this->events());
         $this->assertSame('', file_get_contents($this->directory.'/docker/.deploy.stamp.barrier-owed'));
+    }
+
+    public function test_a_db_url_host_query_spelled_differently_is_the_same_database(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_URL=mysql://u:p@192.0.2.9/nntmux?host=External-DB.example.\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_URL=mysql://u:p@192.0.2.9/nntmux?host=external-db.example\n");
+        $this->assertStringContainsString('Run Migrations  : no', $this->make(['deploy-plan'])->mustRun()->getOutput());
+    }
+
+    public function test_a_failed_barrier_inspection_never_counts_as_no_barrier(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/barrier.log', "barrier held\n");
+        touch($this->directory.'/barrier.running');
+        file_put_contents($this->directory.'/barrier.database', "another-database\n");
+        file_put_contents($this->directory.'/docker/.deploy.stamp.barrier-owed', '');
+        file_put_contents($this->directory.'/events', '');
+
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_BARRIER_INSPECT_FAIL' => '1']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('cannot inspect the verification barrier', $process->getErrorOutput());
+        $this->assertStringNotContainsString('rm -f nntmux-verification-barrier', $this->events());
+        $this->assertFileExists($this->directory.'/barrier.running');
     }
 
     public function test_standalone_docker_compose_daemon_flags_fail_closed(): void

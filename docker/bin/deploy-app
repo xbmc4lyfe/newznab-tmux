@@ -67,7 +67,15 @@ same_database() {
 }
 refuse_foreign_barrier() {
     labelled=
-    if labelled=$(docker inspect --format '{{index .Config.Labels "nntmux.deploy.database"}}' "$barrier_name" 2>/dev/null); then
+    if ! inspected=$(docker inspect --format '{{index .Config.Labels "nntmux.deploy.database"}}' "$barrier_name" 2>&1); then
+        # Only a confirmed missing container has no database to compare; any other error (an
+        # unreachable daemon) could hide a foreign barrier that a later check would adopt or remove.
+        case "$inspected" in
+            *"No such object"*|*"No such container"*) ;;
+            *) echo "deploy-app: cannot inspect the verification barrier $barrier_name ($inspected); not adopting or replacing it unchecked." >&2
+               exit 1 ;;
+        esac
+    elif labelled=$inspected; then
         if ! same_database "$labelled"; then
             echo "deploy-app: the verification barrier $barrier_name left by an earlier attempt fences another database than this rollout's. Release its pause on that database (releases:verification-barrier --release there), remove it, then retry." >&2
             exit 1

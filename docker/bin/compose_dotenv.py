@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 # `KEY=value`, or the YAML-style `KEY: value` Compose also accepts.
-ASSIGNMENT = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:=|:(?=\s|$))\s*(.*)$")
+ASSIGNMENT = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:=|:)\s*(.*)$")
 # compose-go's control escapes; with `\$`, `\"`, `\\` and octal `\0NNN` the only decoded ones:
 # any other backslash sequence is kept as written.
 ESCAPES = {"a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v"}
@@ -38,6 +38,8 @@ def decode_double_quoted(body: str) -> tuple[str, bool]:
                 digits = body[index + 2:index + 5]
                 if len(digits) == 3 and all(c in "01234567" for c in digits) and int(digits, 8) <= 0o377:
                     out.append(chr(int(digits, 8)))  # `\0NNN`: one octal byte
+                    # Compose expands escapes before variables: an encoded `$` interpolates too.
+                    interpolates = interpolates or out[-1] == "$"
                     index += 5
                     continue
                 # Any other `\0` loses its `0` and keeps the backslash (`\0b` is `\b`, `\0777` is `\777`).

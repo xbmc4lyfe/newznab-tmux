@@ -182,6 +182,18 @@ SH);
         $trailing->mustRun();
         $this->assertContains('-ps3cret', $this->arguments($trailing));
 
+        // `KEY:value` needs no space after the colon.
+        file_put_contents($this->directory.'/docker/.env', "APP_IMAGE:registry/tight:1\n");
+        $tight = new Process([$this->directory.'/docker/bin/compose'], env: $this->environment(['DC' => 'env']));
+        $tight->mustRun();
+        $this->assertStringContainsString("\nWEB_IMAGE=registry/tight:1\n", "\n".$tight->getOutput());
+
+        // An octal-encoded `$` interpolates in Compose too, so a literal key refuses it.
+        file_put_contents($this->directory.'/docker/.env', "DB_ROOTPASSWORD=\"\\0044HOME\"\nDB_DATABASE=nntmux\n");
+        $octal = $this->just('docker/Justfile', ['mysql'], ['DC' => $this->directory.'/bin/fake', 'DB_DATABASE' => false]);
+        $octal->run();
+        $this->assertFalse($octal->isSuccessful());
+
         // `$$` is Compose's literal `$`: no interpolation, one dollar.
         file_put_contents($this->directory.'/docker/.env', "DB_ROOTPASSWORD=\"pa\$\$word\"\nDB_DATABASE=nntmux\n");
         $dollars = $this->just('docker/Justfile', ['mysql'], ['DC' => $this->directory.'/bin/fake', 'DB_DATABASE' => false]);
