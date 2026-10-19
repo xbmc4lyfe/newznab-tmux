@@ -47,6 +47,18 @@ class ForwardVerifiedPublications extends Command
     /** Seconds between touches of the alive marker, idle or in the middle of a request. */
     private const int MARKER_SECONDS = 5;
 
+    /** Microseconds between checks while waiting for a batch to fill. */
+    private const int LINGER_STEP_MICROSECONDS = 50_000;
+
+    /** Wait steps between checks that the worker group still admits writers (about a second). */
+    private const int LINGER_ADMIT_STEPS = 20;
+
+    /** Seconds of its age limit a lingering entry must keep left, at most (half the limit for short limits). */
+    private const float LINGER_AGE_MARGIN_SECONDS = 60.0;
+
+    /** Wait steps between looks at the outbox for a filled batch (about a quarter second). */
+    private const int LINGER_FILL_STEPS = 5;
+
     protected $signature = 'releases:forward-verified-publications {--slot=1 : Forwarder number, 1 to RELEASE_VERIFICATION_PUBLISH_FORWARDERS} {--max-seconds=0 : Stop taking work after this duration; zero uses RELEASE_VERIFICATION_PUBLISH_FORWARDER_SECONDS} {--passes=0 : Stop after this many loop passes (zero runs until the deadline)} {--diagnostics : Log a bounded run summary}';
 
     protected $description = 'Publish verified candidates handed off by this host\'s workers to the primary in batches';
@@ -81,6 +93,12 @@ class ForwardVerifiedPublications extends Command
 
     /** Items per request; lowered when the primary advertises a smaller limit. */
     private int $limit = 16;
+
+    /** Milliseconds to wait for a batch to fill once work is due (0 sends at once). */
+    private int $lingerMs = 0;
+
+    /** Whether work that must not wait (adopted orphans) was found since the last claim. */
+    private bool $urgent = false;
 
     /** @var array<string, int> Unix seconds of each entry's last lease renewal, by file name. */
     private array $beats = [];
@@ -145,6 +163,8 @@ class ForwardVerifiedPublications extends Command
         $this->blocked = false;
         $this->nextJoin = 0.0;
         $this->beats = [];
+        $this->urgent = false;
+        $this->lingerMs = PublicationOutbox::lingerMilliseconds();
         $this->limit = max(1, min(RemotePublicationService::BATCH_HARD_MAX_ITEMS, (int) config('release_verification.publish_forward_items', 16)));
         try {
             $this->diagnostics?->adopted(count($this->outbox->inflight($this->slot)));
@@ -232,10 +252,21 @@ class ForwardVerifiedPublications extends Command
                 $this->purgeInvalid();
             }
             if ($this->blocked || ! $due) {
+                // Nothing is waiting: an urgency found earlier must not outlive its reason.
+                if (! $due) {
+                    $this->urgent = false;
+                }
                 $this->leave();
                 Sleep::usleep(self::IDLE_MICROSECONDS);
 
                 continue;
+            }
+            if ($this->lingerMs > 0 && ! $this->urgent) {
+                // Wait for the batch to fill before joining the group, so it is not held while idle.
+                if (! $this->linger($nextMaintenance, $nextMark)) {
+                    continue;
+                }
+                $now = microtime(true);
             }
             if (! $this->enter()) {
                 $this->refuse();
@@ -250,6 +281,7 @@ class ForwardVerifiedPublications extends Command
                 continue;
             }
             $batch = $this->outbox->claim($this->slot, $this->limit, $now);
+            $this->urgent = false;
             if ($batch === []) {
                 $this->leave();
                 Sleep::usleep(self::IDLE_MICROSECONDS);
@@ -258,6 +290,107 @@ class ForwardVerifiedPublications extends Command
             }
             $this->forwardBatch($publisher, $batch, $now);
         }
+    }
+
+    /**
+     * Wait, outside the worker group, until the due entries fill a batch or the linger has passed.
+     * Work that must not wait (entries in flight, expired ones, retried ones, adopted orphans) and a
+     * backlog that already fills a batch skip the wait. The wait is anchored to the oldest due entry's
+     * age, so an interruption never restarts it, and it ends with the entry still a safe margin short of
+     * its age limit. The marker and housekeeping keep their cadence meanwhile.
+     *
+     * @return bool True to go on and claim; false when the loop should start over (stop requested or refused).
+     */
+    private function linger(float &$nextMaintenance, float &$nextMark): bool
+    {
+        $wall = microtime(true);
+        $maxAge = PublicationOutbox::maxAgeSeconds();
+        $margin = min(self::LINGER_AGE_MARGIN_SECONDS, $maxAge / 2);
+        // One pass over the outbox: a full batch, urgent or already tried work is sent at once.
+        $survey = $this->outbox->survey($wall, $this->slot, $this->limit, $margin);
+        if ($survey['urgent'] || $survey['retried'] || $survey['oldest'] === null || $survey['fresh'] >= $this->limit || $this->outboxFull()) {
+            return true;
+        }
+        $age = max(0.0, $wall - $survey['oldest']);
+        // Never past the moment a backed-off entry becomes due or any waiting entry nears its age limit.
+        $budget = (min($this->lingerMs / 1000.0, $maxAge - $margin) - $age) * 1000.0;
+        if ($survey['wake'] !== null) {
+            $budget = min($budget, ($survey['wake'] - $wall) * 1000.0);
+        }
+        if ($budget <= 0.0) {
+            return true;
+        }
+        // The group is not held while waiting, even right after a send.
+        $this->leave();
+        $this->diagnostics?->lingerStarted();
+        $started = hrtime(true);
+        $steps = 0;
+        while (true) {
+            Sleep::usleep(self::LINGER_STEP_MICROSECONDS);
+            $steps++;
+            if (function_exists('pcntl_signal_dispatch')) {
+                pcntl_signal_dispatch();
+            }
+            // Monotonic; never less than the nominal steps slept, so the wait is the same with faked sleeps.
+            $waited = max($steps * self::LINGER_STEP_MICROSECONDS / 1000.0, (hrtime(true) - $started) / 1e6);
+            if ($this->terminate || (hrtime(true) - $this->runStarted) / 1e9 >= $this->runSeconds) {
+                $this->diagnostics?->lingerEnded('interrupted', $waited);
+
+                return false;
+            }
+            $now = max(microtime(true), $wall + $waited / 1000.0);
+            if ($now >= $nextMaintenance) {
+                $nextMaintenance = $now + self::MAINTENANCE_SECONDS;
+                $this->maintain();
+            }
+            if (! $this->blocked && $now >= $nextMark) {
+                $nextMark = $now + self::MARKER_SECONDS;
+                $this->advertise();
+            }
+            if (! $this->blocked && $steps % self::LINGER_ADMIT_STEPS === 0 && ! $this->locks->admitting()) {
+                $this->refuse();
+            }
+            if ($this->blocked) {
+                $this->diagnostics?->lingerEnded('interrupted', $waited);
+
+                return false;
+            }
+            if ($this->urgent) {
+                $this->diagnostics?->lingerEnded('interrupted', $waited);
+
+                return true;
+            }
+            $expired = $waited >= $budget;
+            // Reading the outbox is the costly part: look every few steps, and once more at the end. Work
+            // other forwarders requeue into pending meanwhile is seen here too.
+            if ($expired || $steps % self::LINGER_FILL_STEPS === 0) {
+                $poll = $this->outbox->survey($now, $this->slot, $this->limit, $margin);
+                if ($poll['fresh'] >= $this->limit || $this->outboxFull()) {
+                    $this->diagnostics?->lingerEnded('fill', $waited);
+
+                    return true;
+                }
+                if (! $expired && ($poll['urgent'] || $poll['retried'] || ($poll['wake'] !== null && $now >= $poll['wake']))) {
+                    $this->diagnostics?->lingerEnded('interrupted', $waited);
+
+                    return true;
+                }
+            }
+            if ($expired) {
+                $this->diagnostics?->lingerEnded('timeout', $waited);
+
+                return true;
+            }
+        }
+    }
+
+    /**
+     * Whether the outbox holds as many entries (waiting or in flight, every forwarder's) as workers may
+     * hand off: they then block for room, so no batch can fill further and waiting only throttles them.
+     */
+    private function outboxFull(): bool
+    {
+        return $this->outbox->depth() >= PublicationOutbox::capacity();
     }
 
     /** Join the shared worker group, which a drain, an exclusive holder or a pause refuses. */
@@ -360,6 +493,8 @@ class ForwardVerifiedPublications extends Command
                     // Adoption is the work; only recording its count depends on the diagnostics.
                     $adopted = $this->outbox->adopt($other);
                     $this->diagnostics?->orphansAdopted($adopted);
+                    // Adopted entries are overdue work from a dead forwarder: send them without waiting.
+                    $this->urgent = $this->urgent || $adopted > 0;
                 });
             }
             $this->renewLeases($due);
