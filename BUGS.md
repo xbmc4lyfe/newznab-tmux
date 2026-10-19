@@ -443,6 +443,19 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom:** workers fell back to the PHP yEnc decoder, which made each passing verification about 10x slower.
 - **Fix:** fixed by branch `codex/worker-template-fixups`. The template sets `YENC_DECODER=auto` and `YENC_NATIVE_LIBRARY=/usr/local/lib/nntmux/libnzbyenc.so`.
 
+### 61. Complete uploads over about 88,000 articles were never verified, and their headers were read again on every pass (Fixed)
+
+- **Where:** `CandidateRepository::snapshotHeaders()` (`app/Services/Releases/Verification/CandidateRepository.php`), called from `ReleaseCreationService::createReleases()`.
+- **Bug:** the fixed 16 MiB metadata budget (128 bytes plus the message-ID per article) threw `CandidateMetadataBudgetExceeded` for every upload over about 88,000 articles. The collection stayed Sized with no candidate, so release creation read all its parts again and failed on each visit.
+- **Symptom:** 5,000–20,000 `Verification archival failed … CandidateMetadataBudgetExceeded` warnings a day from 2026-10-13. Each deploy produced a burst of 2,000–3,500 within two hours. By 2026-10-19, 1,174 distinct complete uploads were stuck: median about 125,000 articles, p99 about 360,000, largest about 1.4 million (estimated from file size).
+- **Fix:** branch `codex/verification-metadata-budget`. The budget is now `RELEASE_VERIFICATION_METADATA_BYTES` (default 48 MiB, about 250,000 articles with typical message-IDs, which keeps the NZB under the 32 MiB audit reader limit). Merged inventories are held to the same budget. Larger uploads are recorded in `release_verification_oversized_collections`, and both release creation and the stale-collection sweep skip them for a backoff of 6 hours, doubling up to 7 days. Raising the budget lets them retry at once. Uploads above the budget still need a streamed or segmented manifest before they can be published.
+
+### 62. A release-processing round can last hours, so most groups get no release pass between deploys (Open)
+
+- **Where:** `multiprocessing:releases` (`ForkingService::releases()`) runs one `releases:process <group>` child per group and returns only when the round ends.
+- **Symptom:** on 2026-10-19, `releases:process 1`, `9`, `14` and `42` were still running 3 h 21 min after the 09:51Z restart. Their parent `multiprocessing:releases` had run as long, so the other groups had no new release pass in that time. This most likely explains why archival warnings came in a burst after each deploy and then stopped.
+- **Fix:** not yet investigated.
+
 ## Issues in the docker/ stack itself (all fixed)
 
 | Issue | Fix |

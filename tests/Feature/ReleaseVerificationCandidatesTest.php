@@ -21,7 +21,8 @@ class ReleaseVerificationCandidatesTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
-        config(['release_verification.required' => true, 'nntmux.echocli' => false, 'release_verification.storage_path' => storage_path('framework/testing/verify-'.bin2hex(random_bytes(6)))]);
+        // Keep oversized fixtures small: 15,000 parts with 1,000-byte message-IDs exceed this budget.
+        config(['release_verification.required' => true, 'nntmux.echocli' => false, 'release_verification.metadata_bytes' => 16777216, 'release_verification.storage_path' => storage_path('framework/testing/verify-'.bin2hex(random_bytes(6)))]);
         $this->configureVerificationDatabase();
         $migration = require database_path('migrations/2026_10_11_154028_create_release_verification_candidates_table.php');
         $migration->up();
