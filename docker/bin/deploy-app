@@ -371,6 +371,8 @@ if [ "$database_missing" = 1 ]; then
         horizon_stopped=0
         verify
     fi
+    # The image this run planned, as for every other applied service.
+    plan --verify-images "$DATABASE_SERVICE"
     compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" "$DATABASE_SERVICE"
     # No check between starting it and fencing it: the barrier below is taken next (and verifies).
 fi

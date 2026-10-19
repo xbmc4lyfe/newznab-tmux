@@ -104,8 +104,9 @@ release() {
 # `finished` line, then release a lock this process owns.
 guard_exit() {
     exit_code=$?
-    # A reader still waiting (the guard stopped before its payload ran) must not linger.
-    if [ -n "${alive_reader:-}" ]; then kill "$alive_reader" 2>/dev/null || true; fi
+    # A reader still waiting because no payload ever ran (the guard stopped first) must not linger;
+    # once a payload ran, the reader is only ever waited for.
+    if [ -n "${alive_reader:-}" ] && [ "${payload_started:-0}" != 1 ]; then kill "$alive_reader" 2>/dev/null || true; fi
     case "${alive_fifo:-}" in ''|/dev/null) ;; *) remove_fifo "$alive_fifo" ;; esac
     if [ "${attempt_open:-0}" = 1 ]; then
         attempt_open=0
@@ -270,11 +271,13 @@ wait_for_descendants() {
 forward_signal() {
     if [ -n "$payload" ]; then
         # Only the direct child: its own traps let a running step finish and then recover (restart
-        # Horizon, resume the drains) before it exits; descendants are then waited for.
+        # Horizon, resume the drains) before it exits.
         kill -"$1" "$payload" 2>/dev/null || true
         wait "$payload" 2>/dev/null || true
-        wait_for_descendants
     fi
+    # Its descendants are waited for in every case, including a signal that arrives while the
+    # guard already waits for them after the payload exited.
+    wait_for_descendants
     exit "$2"
 }
 
@@ -350,6 +353,7 @@ cmd_run() {
         "$@" </dev/null 9>"$alive_fifo" &
     fi
     payload=$!
+    payload_started=1
     if wait "$payload"; then rc=0; else rc=$?; fi
     payload=
     wait_for_descendants

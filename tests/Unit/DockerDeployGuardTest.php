@@ -78,6 +78,32 @@ final class DockerDeployGuardTest extends TestCase
     }
 
     #[Test]
+    public function a_signal_during_the_descendant_wait_keeps_the_lock_until_they_exit(): void
+    {
+        $ready = $this->dir.'/grandchild-ready';
+        $done = $this->dir.'/grandchild-done';
+        // The payload exits at once, leaving a TERM-ignoring grandchild; the signal arrives while
+        // the guard already waits for its descendants.
+        // Its output goes to /dev/null, so only the guard (not inherited pipes) keeps the process open.
+        $payload = '(trap "" TERM; touch '.$ready.'; sleep 2; touch '.$done.') >/dev/null 2>&1 & exit 0';
+        foreach (['sh', 'dash', 'bash'] as $shell) {
+            if ((new Process(['sh', '-c', 'command -v '.$shell]))->run() !== 0) {
+                continue;
+            }
+            @unlink($ready);
+            @unlink($done);
+            $process = $this->guardProcess(['run', 'deploy', '--', 'sh', '-c', $payload], [], $shell);
+            $process->start();
+            $this->waitFor(fn (): bool => file_exists($ready));
+            usleep(200_000);
+            $process->signal(15);
+            $this->waitFor(fn (): bool => ! $process->isRunning());
+            $this->assertFileExists($done, $shell.': the lock was released while a descendant still ran');
+            $this->assertFalse(is_link($this->dir.'/lock'), $shell);
+        }
+    }
+
+    #[Test]
     public function a_closed_stdin_still_runs_the_payload(): void
     {
         foreach (['sh', 'dash', 'bash'] as $shell) {
@@ -829,6 +855,8 @@ PHP);
             [$shell, dirname(__DIR__, 2).'/docker/bin/deploy-guard', ...$arguments],
             null,
             $env + [
+                // The guard's descendant FIFO stays in the test directory even when a test kills it.
+                'TMPDIR' => $this->dir,
                 'DEPLOY_LOCK_DIR' => $this->dir.'/lock',
                 'DEPLOY_LOG' => $this->dir.'/deploy.log',
                 'DEPLOY_STAMP' => $this->dir.'/stamp',
