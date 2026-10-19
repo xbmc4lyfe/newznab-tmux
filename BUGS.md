@@ -456,6 +456,12 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom:** on 2026-10-19, `releases:process 1`, `9`, `14` and `42` were still running 3 h 21 min after the 09:51Z restart. Their parent `multiprocessing:releases` had run as long, so the other groups had no new release pass in that time. This most likely explains why archival warnings came in a burst after each deploy and then stopped.
 - **Fix:** not yet investigated.
 
+### 63. Dirty verification candidates wait weeks for release creation to merge their late headers (Fixed)
+
+- **Where:** `CandidateRepository::invalidateHotCollections()` marks a pending candidate `dirty` when more of its articles arrive. Only `archive()` of that late collection makes the candidate claimable again, and only release creation's per-group id cursor reached it.
+- **Symptom:** on 2026-10-19, 29,258 candidates sat in `dirty` while verification workers stopped with `no_claim`. Every late collection was Sized and ready to archive, and none had failed archival. 85% were in group 9, which has 1.28 million Sized collections; its release window cursor was at id 184M of a 189M snapshot, while the late collections had ids 209M–429M.
+- **Fix:** branch `codex/settle-dirty-candidates`. `releases:prepare-candidates` now runs `DirtyCandidateSettler` every minute (`--dirty-limit=200`, `--dirty-seconds=20`). It archives the late collections of dirty candidates, oldest first, with a resume cursor, and honors over-budget deferrals.
+
 ## Issues in the docker/ stack itself (all fixed)
 
 | Issue | Fix |
