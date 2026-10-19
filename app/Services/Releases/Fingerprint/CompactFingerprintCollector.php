@@ -163,13 +163,15 @@ final class CompactFingerprintCollector
                 }
                 $started = hrtime(true);
                 try {
-                    $fetched = $nntp->getFingerprintArticleByMessageID($sample['messageid'], self::MAX_ARTICLE_BODY_BYTES,
-                        self::MAX_ARTICLE_HEADER_BYTES, $server['alternate'], false);
+                    // One ARTICLE request per sample instead of HEAD + BODY: the fetch is network-bound.
+                    $fetched = $nntp->getFingerprintFullArticleByMessageID($sample['messageid'], self::MAX_ARTICLE_BODY_BYTES,
+                        self::MAX_ARTICLE_HEADER_BYTES, $server['alternate']);
                     $ms = (int) round((hrtime(true) - $started) / 1_000_000);
                     $providers[$account]['retrieval_ms'][] = $ms;
                     $providers[$account]['articles']['found']++;
                     $article['provider_results'][$account] = [
-                        'code' => self::responseCode($fetched['body_response'] ?? null) ?? 222,
+                        // compact-v1 records the BODY success code; ARTICLE's 220 carries the identical body.
+                        'code' => 222,
                         'bytes' => strlen($fetched['body']),
                         'ms' => $ms,
                     ];
@@ -809,11 +811,6 @@ final class CompactFingerprintCollector
         return is_int($file['advertised_bytes'] ?? null) ? $file['advertised_bytes'] : 0;
     }
 
-    private static function responseCode(mixed $response): ?int
-    {
-        return is_array($response) && is_numeric($response['response_code'] ?? null) ? (int) $response['response_code'] : null;
-    }
-
     /**
      * Files whose NZB records the analyzer found corrupt (or 1 when the release byte total is invalid
      * or not representable).
@@ -845,9 +842,9 @@ final class CompactFingerprintCollector
     }
 
     /**
-     * Null when the copy positively identifies as the requested article: its HEAD Message-ID header is
-     * present and exactly equal (Message-IDs are case-sensitive), and any Message-ID in the HEAD/BODY
-     * status lines is exactly equal too. Otherwise the error type to record.
+     * Null when the copy positively identifies as the requested article: its Message-ID header is
+     * present and exactly equal (Message-IDs are case-sensitive), and any Message-ID in the ARTICLE
+     * status line is exactly equal too. Otherwise the error type to record.
      *
      * @param  array<string, mixed>  $fetched
      */
@@ -860,11 +857,9 @@ final class CompactFingerprintCollector
         if (trim($headerMessageId) !== $want) {
             return 'ArticleIdentityMismatch';
         }
-        foreach (['head_response', 'body_response'] as $response) {
-            $text = $fetched[$response]['response_text'] ?? null;
-            if (is_string($text) && preg_match('/<[^>]+>/', $text, $match) === 1 && $match[0] !== $want) {
-                return 'ArticleIdentityMismatch';
-            }
+        $text = $fetched['article_response']['response_text'] ?? null;
+        if (is_string($text) && preg_match('/<[^>]+>/', $text, $match) === 1 && $match[0] !== $want) {
+            return 'ArticleIdentityMismatch';
         }
 
         return null;

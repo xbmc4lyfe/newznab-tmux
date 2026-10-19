@@ -59,6 +59,17 @@ class NNTPService extends NntpClient
                 ? new NntpArticleMissingException('Article is unavailable; retry verification later.')
                 : new \RuntimeException('Article is unavailable; retry verification later.');
         }
+
+        return $this->readVerificationBody($maximumBytes);
+    }
+
+    /**
+     * Read a bounded, dot-unstuffed article body up to its terminator once a BODY or ARTICLE status was accepted.
+     *
+     * @throws \RuntimeException
+     */
+    private function readVerificationBody(int $maximumBytes): string
+    {
         $raw = '';
         while (($line = fgets($this->_socket, $limit = max(4, min($maximumBytes - strlen($raw), 65534) + 2))) !== false) {
             if ($line === ".\r\n" || $line === ".\n") {
@@ -1461,6 +1472,57 @@ class NNTPService extends NntpClient
     }
 
     /**
+     * Read raw header lines and a bounded raw body for a known article ID with one ARTICLE request,
+     * instead of the HEAD + BODY pair, saving a server round trip per article. The headers and body
+     * are the same bytes HEAD and BODY return. The alternate provider is queried directly.
+     *
+     * @return array{headers: list<string>, body: string, article_response: array{response_code: int|null, response_text: string|null, response_text_basis: string, error_type: string|null}}
+     */
+    public function getFingerprintFullArticleByMessageID(string $identifier, int $maximumBodyBytes = 2_000_000,
+        int $maximumHeaderBytes = 65_536, bool $alternate = false): array
+    {
+        $identifier = self::verificationMessageId($identifier, $maximumBodyBytes);
+        $connection = $this;
+        if ($alternate) {
+            $connection = $this->previewAlternateConnection();
+            $connected = $this->_currentServer === $this->_configServer
+                ? $connection->doConnect($this->_configCompressedHeaders, true) : $connection->doConnect();
+        } else {
+            $connected = $connection->_checkConnection(false);
+        }
+        if ($connected !== true) {
+            throw new NntpProviderUnavailableException('Unable to connect to the requested NNTP provider.');
+        }
+
+        try {
+            $response = $connection->_sendCommand('ARTICLE <'.$identifier.'>');
+            $articleResponse = $connection->fingerprintResponseMetadata($response);
+            if ($response !== ResponseCode::ArticleFollows->value) {
+                // As after BODY: only a plain "no such article" leaves the connection in a known state.
+                if ($response !== ResponseCode::NoSuchArticleId->value) {
+                    $connection->doQuit();
+                }
+                throw in_array($response, [ResponseCode::NoSuchArticleId->value, ResponseCode::NoSuchArticleNumber->value], true)
+                    ? new NntpArticleMissingException('Article is unavailable.')
+                    : new \RuntimeException('Article is unavailable.');
+            }
+            $terminated = false;
+            $headers = $connection->readFingerprintHeaderLines($maximumHeaderBytes, true, $terminated);
+            $body = $terminated ? '' : $connection->readVerificationBody($maximumBodyBytes);
+
+            return ['headers' => $headers, 'body' => $body, 'article_response' => $articleResponse];
+        } finally {
+            if ($alternate) {
+                try {
+                    $connection->doQuit();
+                } catch (\Throwable) {
+                    // Preserve the article result when alternate cleanup fails.
+                }
+            }
+        }
+    }
+
+    /**
      * Capture the responding NNTP server's advertised capabilities and overview schema.
      *
      * @return array<string, mixed>
@@ -1554,10 +1616,29 @@ class NNTPService extends NntpClient
                 : new \RuntimeException('Article headers are unavailable.');
         }
 
+        return $this->readFingerprintHeaderLines($maximumBytes);
+    }
+
+    /**
+     * Read bounded raw header lines. HEAD ends at its terminator; an ARTICLE header section ends at the
+     * blank separator line, and $terminated reports whether the terminator came first (no body follows).
+     *
+     * @param-out bool $terminated
+     *
+     * @return list<string>
+     */
+    private function readFingerprintHeaderLines(int $maximumBytes, bool $untilSeparator = false, ?bool &$terminated = null): array
+    {
+        $terminated = false;
         $headers = [];
         $bytes = 0;
         while (($line = fgets($this->_socket, 16_385)) !== false) {
             if ($line === ".\r\n" || $line === ".\n") {
+                $terminated = true;
+
+                return $headers;
+            }
+            if ($untilSeparator && ($line === "\r\n" || $line === "\n")) {
                 return $headers;
             }
             if (! str_ends_with($line, "\n") || strlen($line) > 16_384) {
