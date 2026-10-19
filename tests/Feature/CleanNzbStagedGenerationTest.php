@@ -160,6 +160,19 @@ final class CleanNzbStagedGenerationTest extends TestCase
         self::assertSame('upgraded', $this->decoded($this->canonical));
     }
 
+    public function test_applying_a_generation_staged_where_readers_never_look_keeps_the_copy_they_reach(): void
+    {
+        // The fixture's NZB directory is not on the search path; readers find the release at the configured path.
+        $reachable = app(NzbService::class)->getNzbPath($this->guid, createIfNotExist: true);
+        file_put_contents($reachable, gzencode('original'));
+
+        $this->clean(['--notindb' => true, '--temp-age-hours' => 1, '--delete' => true]);
+
+        self::assertSame('upgraded', $this->decoded($this->canonical));
+        self::assertFileExists($reachable, 'The only copy readers can reach is never removed.');
+        self::assertSame($reachable, app(NzbService::class)->nzbPath($this->guid));
+    }
+
     public function test_notindb_deletes_the_generation_of_a_deleted_release(): void
     {
         DB::table('release_archive_naming_evidence')->delete();

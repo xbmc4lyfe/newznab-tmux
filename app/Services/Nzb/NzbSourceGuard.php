@@ -293,8 +293,13 @@ final class NzbSourceGuard
      */
     private function removeShadowedCopies(string $guid, string $installed): void
     {
+        $candidates = $this->nzb->nzbPathCandidates($guid);
+        if (! in_array($installed, $candidates, true)) {
+            // Installed where readers never look (a staged file a tree scan found): the copies they can reach stay.
+            return;
+        }
         $inode = @fileinode($installed);
-        foreach ($this->nzb->nzbPathCandidates($guid) as $candidate) {
+        foreach ($candidates as $candidate) {
             if ($candidate !== $installed && is_file($candidate) && @fileinode($candidate) !== $inode && ! @unlink($candidate)) {
                 Log::info('Could not remove an older copy of an upgraded NZB.', ['source' => $candidate]);
             }
