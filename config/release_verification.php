@@ -50,6 +50,9 @@ return [
     'publish_outbox_wait_seconds' => (int) env('RELEASE_VERIFICATION_PUBLISH_OUTBOX_WAIT_SECONDS', 30),
     // Items a forwarder sends per request; the primary refuses more than its publish_batch_max_items.
     'publish_forward_items' => (int) env('RELEASE_VERIFICATION_PUBLISH_FORWARD_ITEMS', 16),
+    // Milliseconds (0-30000) a forwarder waits, once work is due, for a batch to fill to its item limit before
+    // sending a partial one. 0 sends as soon as anything is due. Backlogs and in-flight work never wait.
+    'publish_forward_linger_ms' => (int) env('RELEASE_VERIFICATION_PUBLISH_FORWARD_LINGER_MS', 0),
     // Failed sends after which a forwarder finishes an entry unknown, to be verified again.
     'publish_forward_max_attempts' => (int) env('RELEASE_VERIFICATION_PUBLISH_FORWARD_MAX_ATTEMPTS', 5),
     // Period in seconds after which the scheduler restarts a forwarder. No run lasts longer (forwarder N runs
@@ -73,6 +76,14 @@ return [
     'scratch_bytes' => (int) env('RELEASE_VERIFICATION_SCRATCH_BYTES', 214748364800),
     'free_bytes' => (int) env('RELEASE_VERIFICATION_FREE_BYTES', 10737418240),
     'article_bytes' => (int) env('RELEASE_VERIFICATION_ARTICLE_BYTES', 16777216),
+    // Most header metadata one candidate may hold, merged or not, counted as 128 bytes plus the message-ID
+    // per article. 48 MiB is about 250,000 articles with typical message-IDs, whose NZB stays under the
+    // 32 MiB audit reader limit. Larger uploads keep their headers and are retried after a backoff, or at
+    // once when this is raised.
+    'metadata_bytes' => (int) env('RELEASE_VERIFICATION_METADATA_BYTES', 50331648),
+    // PHP memory limit for verification workers and the candidate preparer. A candidate at the metadata
+    // budget's limit peaks near 250 MiB above PHP's baseline (more with short message-IDs).
+    'worker_memory' => (string) env('RELEASE_VERIFICATION_WORKER_MEMORY', '512M'),
     'download_connections' => (int) env('RELEASE_VERIFICATION_DOWNLOAD_CONNECTIONS', 2),
     'pipeline_window' => (int) env('RELEASE_VERIFICATION_PIPELINE_WINDOW', 4),
     'download_buffer_bytes' => (int) env('RELEASE_VERIFICATION_DOWNLOAD_BUFFER_BYTES', 67108864),

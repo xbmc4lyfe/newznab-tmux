@@ -48,6 +48,16 @@ final class PublicationForwarderDiagnostics
 
     private int $finishFailures = 0;
 
+    private int $lingersStarted = 0;
+
+    private int $lingersFilled = 0;
+
+    private int $lingersTimedOut = 0;
+
+    private int $lingersInterrupted = 0;
+
+    private float $lingerMilliseconds = 0.0;
+
     private float $roundTripMilliseconds = 0.0;
 
     private float $slowestRoundTripMilliseconds = 0.0;
@@ -142,6 +152,26 @@ final class PublicationForwarderDiagnostics
         $this->orphansAdopted += $count;
     }
 
+    /** The forwarder began waiting for a fuller batch. */
+    public function lingerStarted(): void
+    {
+        $this->lingersStarted++;
+    }
+
+    /**
+     * A wait ended after $milliseconds: by 'fill' (the batch limit was reached), 'timeout' (the linger
+     * passed with a partial batch) or anything else, an interruption (stop, refusal or urgent work).
+     */
+    public function lingerEnded(string $how, float $milliseconds): void
+    {
+        match ($how) {
+            'fill' => $this->lingersFilled++,
+            'timeout' => $this->lingersTimedOut++,
+            default => $this->lingersInterrupted++,
+        };
+        $this->lingerMilliseconds += max(0.0, $milliseconds);
+    }
+
     public function finishFailed(): void
     {
         $this->finishFailures++;
@@ -178,6 +208,9 @@ final class PublicationForwarderDiagnostics
             'advertised_item_limit' => $this->itemLimit,
             'orphans_adopted' => $this->orphansAdopted,
             'finish_failures' => $this->finishFailures,
+            'linger' => ['waits_started' => $this->lingersStarted, 'ended_by_fill' => $this->lingersFilled,
+                'ended_by_timeout' => $this->lingersTimedOut, 'interrupted' => $this->lingersInterrupted,
+                'total_ms' => round($this->lingerMilliseconds, 3)],
             'round_trip_ms' => ['total' => round($this->roundTripMilliseconds, 3), 'max' => round($this->slowestRoundTripMilliseconds, 3),
                 'mean' => $this->batches === 0 ? 0.0 : round($this->roundTripMilliseconds / $this->batches, 3)],
             'duration_ms' => round(($finished - $this->started) / 1_000_000.0, 3),

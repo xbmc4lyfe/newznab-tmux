@@ -189,12 +189,17 @@ final class CompactFingerprintCollector
 
                         continue;
                     }
-                    $yenc = self::yencSummary($metadata['yenc'] ?? null);
                     $integrityErrors = self::yencIntegrityErrors($metadata['yenc'] ?? null);
+                    $yenc = self::yencSummary($metadata['yenc'] ?? null, $integrityErrors === []);
                     foreach ($integrityErrors as $integrityError) {
                         $errors[$account][$integrityError] = ($errors[$account][$integrityError] ?? 0) + 1;
                     }
                     $prefixMd5 = $metadata['yenc']['par2_first_16k_md5_candidate'] ?? null;
+                    if (! is_string($prefixMd5) && $integrityErrors === [] && is_array($metadata['yenc'] ?? null)
+                        && self::partWithoutTrailerPart($metadata['yenc'])) {
+                        // The analyzer withholds the prefix for a part it calls incomplete; this part is proven.
+                        $prefixMd5 = self::verifiedPartPrefixMd5($metadata['yenc'], $analysis['decoded_bytes'] ?? null);
+                    }
                     if ($integrityErrors === [] && $sample['segment_number'] === 1 && is_string($prefixMd5)) {
                         // Prefix hashes come only from integrity-verified copies, from whichever provider first has one.
                         $firstPrefixMd5[$sample['file_index']] ??= strtolower($prefixMd5);
@@ -599,8 +604,12 @@ final class CompactFingerprintCollector
         return ['first_utc' => gmdate('Y-m-d\TH:i:s\Z', $first), 'last_utc' => gmdate('Y-m-d\TH:i:s\Z', $last), 'span_s' => $last - $first];
     }
 
-    /** @return array<string, mixed>|null */
-    private static function yencSummary(mixed $yenc): ?array
+    /**
+     * @param  bool  $verified  whether the copy passed every integrity check; only then may a proven
+     *                          trailerless part report its CRC as matching
+     * @return array<string, mixed>|null
+     */
+    private static function yencSummary(mixed $yenc, bool $verified): ?array
     {
         if (! is_array($yenc)) {
             return null;
@@ -613,7 +622,8 @@ final class CompactFingerprintCollector
             'total' => is_int($yenc['total_parts'] ?? null) ? $yenc['total_parts'] : null,
             'begin' => is_int($yenc['begin'] ?? null) ? $yenc['begin'] : null,
             'end' => is_int($yenc['end'] ?? null) ? $yenc['end'] : null,
-            'crc_ok' => is_bool($yenc['declared_crc32_matches'] ?? null) ? $yenc['declared_crc32_matches'] : null,
+            'crc_ok' => is_bool($yenc['declared_crc32_matches'] ?? null) ? $yenc['declared_crc32_matches']
+                : ($verified && self::partWithoutTrailerPart($yenc) ? true : null),
             'size_ok' => self::sizesAgree($yenc),
         ];
     }
@@ -647,10 +657,11 @@ final class CompactFingerprintCollector
         if (self::declaredCrcsContradict($yenc)) {
             $errors[] = 'YencCrcMismatch';
         }
-        $verified = ($yenc['declared_crc32_matches'] ?? null) === true
+        $partWithoutTrailerPart = self::partWithoutTrailerPart($yenc);
+        $verified = (($yenc['declared_crc32_matches'] ?? null) === true || $partWithoutTrailerPart)
             && ($yenc['all_declared_crc32_fields_are_hex'] ?? null) !== false
             && (self::sizesAgree($yenc) === true || self::emptySinglePart($yenc))
-            && in_array($yenc['multipart_structure_status'] ?? null, ['single-part', 'complete'], true)
+            && (in_array($yenc['multipart_structure_status'] ?? null, ['single-part', 'complete'], true) || $partWithoutTrailerPart)
             && ($yenc['payload_escape_state_valid'] ?? null) === true
             && ($yenc['integrity_checks_ambiguous'] ?? null) !== true
             && ($yenc['decoded_size_matches_yend_size'] ?? null) === true
@@ -665,6 +676,51 @@ final class CompactFingerprintCollector
         }
 
         return array_values(array_unique($errors));
+    }
+
+    /**
+     * Posting tools commonly end a part with "=yend size=N pcrc32=X" and no part= field. The analyzer
+     * then calls the structure incomplete and skips the CRC comparison, so this accepts exactly that
+     * form when everything else is proven: a numbered header part, a valid =ypart range, a hex pcrc32
+     * equal to the decoded bytes' CRC, no trailer total, and no other missing or conflicting field.
+     *
+     * @param  array<string, mixed>  $yenc
+     */
+    private static function partWithoutTrailerPart(array $yenc): bool
+    {
+        $trailer = is_array($yenc['trailer_fields'] ?? null) ? $yenc['trailer_fields'] : [];
+        $header = is_array($yenc['header_fields'] ?? null) ? $yenc['header_fields'] : [];
+        $declared = $trailer['pcrc32'] ?? null;
+        $observed = $yenc['observed_decoded_crc32'] ?? null;
+
+        return ($yenc['multipart'] ?? null) === true
+            && ($yenc['multipart_structure_status'] ?? null) === 'incomplete'
+            && ($yenc['multipart_pcrc32_status'] ?? null) === 'present-hex'
+            && ! array_key_exists('part', $trailer) && ! array_key_exists('total', $trailer)
+            && isset($header['part'], $header['size'], $trailer['size'])
+            && is_int($yenc['part'] ?? null) && $yenc['part'] >= 1
+            && ($yenc['ypart_range_valid'] ?? null) === true
+            && ($yenc['header_numeric_fields_valid'] ?? null) === true
+            && ($yenc['trailer_numeric_fields_valid'] ?? null) === true
+            && is_string($declared) && preg_match('/\A[0-9a-f]{1,8}\z/i', trim($declared)) === 1
+            && is_string($observed) && hexdec(trim($declared)) === hexdec($observed);
+    }
+
+    /**
+     * MD5 of a proven part's first min(file size, 16 KiB) bytes, when the part starts the file and
+     * covers that whole prefix (the same basis the analyzer uses for its PAR2 prefix candidate).
+     *
+     * @param  array<string, mixed>  $yenc
+     */
+    private static function verifiedPartPrefixMd5(array $yenc, mixed $decoded): ?string
+    {
+        $fileSize = $yenc['file_size'] ?? null;
+        if (! is_string($decoded) || ! is_int($fileSize) || $fileSize < 1 || ($yenc['begin'] ?? null) !== 1) {
+            return null;
+        }
+        $length = min($fileSize, 16_384);
+
+        return strlen($decoded) >= $length ? md5(substr($decoded, 0, $length)) : null;
     }
 
     /**

@@ -15,6 +15,7 @@ use App\Services\Nzb\NzbService;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\ReleaseGroupResolver;
 use App\Services\Releases\Verification\CandidateRepository;
+use App\Services\Releases\Verification\OversizedCollectionDeferrals;
 use App\Support\Utf8;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -46,18 +47,19 @@ class ReleaseCreationService
             $ids = $this->collectionCleanupService->verificationReadyCollections()
                 ->when(! empty($groupID), static fn ($q) => $q->where('groups_id', $groupID))
                 ->when($allowedIds !== null, static fn ($q) => $q->whereIn('id', $allowedIds))
-                ->orderBy('id')->limit(max(1, $limit))->pluck('id');
-            foreach ($ids as $id) {
-                try {
-                    app(CandidateRepository::class)->archive((int) $id);
-                } catch (\Throwable $error) {
-                    // Keep this collection for retry without starving later
-                    // candidates or preventing the bounded window cursor saving.
-                    Log::warning('Verification archival failed; original headers retained.', [
-                        'collection_id' => (int) $id,
-                        'error_type' => $error::class,
-                    ]);
+                ->orderBy('id')->limit(max(1, $limit))->pluck('id')->map(static fn ($id): int => (int) $id)->all();
+            // Uploads already over the metadata budget would only read every part again and fail.
+            $kept = app(OversizedCollectionDeferrals::class)->archiveEach($ids, static function (int $id): void {
+                app(CandidateRepository::class)->archive($id);
+            });
+            foreach ($kept as $id => $outcome) {
+                if ($outcome['error'] === null) {
+                    continue;
                 }
+                // Keep this collection for retry without starving later
+                // candidates or preventing the bounded window cursor saving.
+                Log::warning('Verification archival failed; original headers retained.', ['collection_id' => $id,
+                    'error_type' => $outcome['error']::class] + ($outcome['retry_after'] === null ? [] : ['retry_after' => $outcome['retry_after']]));
             }
 
             return ['added' => 0, 'dupes' => 0];

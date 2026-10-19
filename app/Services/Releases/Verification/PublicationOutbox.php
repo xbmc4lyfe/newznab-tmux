@@ -73,6 +73,21 @@ final class PublicationOutbox
         return max(1, min(VerificationWorkerLocks::MAX_SLOTS, (int) config('release_verification.publish_forwarders', 4)));
     }
 
+    /** Longest linger a forwarder may wait for a fuller batch, in milliseconds. */
+    public const int MAX_LINGER_MILLISECONDS = 30_000;
+
+    /** Milliseconds a forwarder waits for a batch to fill once work is due; zero sends at once. */
+    public static function lingerMilliseconds(): int
+    {
+        return max(0, min(self::MAX_LINGER_MILLISECONDS, (int) config('release_verification.publish_forward_linger_ms', 0)));
+    }
+
+    /** Entries (waiting or being sent) at which workers stop handing off and wait for room. */
+    public static function capacity(): int
+    {
+        return max(1, (int) config('release_verification.publish_outbox_max', 256));
+    }
+
     /** Seconds an entry may wait before it is finished unknown and left to be re-verified. */
     public static function maxAgeSeconds(): float
     {
@@ -235,7 +250,7 @@ final class PublicationOutbox
      */
     public function awaitRoom(callable $heartbeat, float $seconds, ?int $limit = null): bool
     {
-        $limit ??= max(1, (int) config('release_verification.publish_outbox_max', 256));
+        $limit ??= self::capacity();
         $deadline = microtime(true) + $seconds;
         while (true) {
             if (! $this->forwarderAlive()) {
@@ -306,6 +321,68 @@ final class PublicationOutbox
         }
 
         return false;
+    }
+
+    /**
+     * One read-only pass over what a forwarder needs to decide whether, and how long, to wait for a
+     * fuller batch. Returns early once the answer cannot change: the batch is full ($cap fresh entries)
+     * or something is urgent or already tried.
+     *
+     * - fresh: pending entries that are due and not expired, counted up to $cap.
+     * - urgent: this slot already owns an entry, or a pending one has outlived its age limit.
+     * - retried: a due, unexpired pending entry was tried before (attempts or deferrals).
+     * - oldest: the earliest hand-off time among the fresh entries.
+     * - wake: the earliest moment any unexpired pending entry needs attention: when a backed-off one
+     *   becomes due, or $margin seconds before any of them reaches its age limit.
+     *
+     * @return array{fresh: int, urgent: bool, retried: bool, oldest: ?float, wake: ?float}
+     */
+    public function survey(float $now, int $slot, int $cap, float $margin = 0.0): array
+    {
+        $result = ['fresh' => 0, 'urgent' => false, 'retried' => false, 'oldest' => null, 'wake' => null];
+        clearstatcache();
+        $owned = $this->inflightDirectory($slot);
+        foreach ($this->names($owned) as $name) {
+            if (! isset($this->stuck[$owned.'/'.$name]) && $this->read($owned.'/'.$name) !== null) {
+                $result['urgent'] = true;
+
+                return $result;
+            }
+        }
+        $maxAge = self::maxAgeSeconds();
+        $directory = $this->root.'/pending';
+        foreach ($this->names($directory) as $name) {
+            if (isset($this->stuck[$directory.'/'.$name])) {
+                continue;
+            }
+            $entry = $this->read($directory.'/'.$name);
+            if ($entry === null) {
+                continue;
+            }
+            if ($entry->olderThan($maxAge, $now)) {
+                $result['urgent'] = true;
+
+                return $result;
+            }
+            $needs = $entry->enqueuedAt + $maxAge - $margin;
+            if ($entry->notBefore > $now) {
+                $needs = min($needs, $entry->notBefore);
+            } else {
+                if ($entry->attempts > 0 || $entry->deferrals > 0) {
+                    $result['retried'] = true;
+
+                    return $result;
+                }
+                $result['fresh']++;
+                $result['oldest'] = $result['oldest'] === null ? $entry->enqueuedAt : min($result['oldest'], $entry->enqueuedAt);
+                if ($result['fresh'] >= $cap) {
+                    return $result;
+                }
+            }
+            $result['wake'] = $result['wake'] === null ? $needs : min($result['wake'], $needs);
+        }
+
+        return $result;
     }
 
     /**

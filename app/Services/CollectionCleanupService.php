@@ -9,6 +9,7 @@ use App\Services\Binaries\BinariesConfig;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Nzb\NzbService;
 use App\Services\Releases\Verification\CandidateRepository;
+use App\Services\Releases\Verification\OversizedCollectionDeferrals;
 use DateTimeInterface;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\QueryException;
@@ -209,17 +210,16 @@ class CollectionCleanupService
             }
             $eligible = array_fill_keys($this->verificationEligibleCollections()->whereIn('id', $ids)
                 ->pluck('id')->map(static fn ($id): int => (int) $id)->all(), true);
-            $failed = [];
-            foreach ($ids as $id) {
-                if (! isset($eligible[$id])) {
-                    continue;
-                }
-                try {
+            // Deferred over-budget uploads keep their headers, like failed ones, without being read again.
+            $kept = app(OversizedCollectionDeferrals::class)->archiveEach(array_values(array_filter($ids, static fn (int $id): bool => isset($eligible[$id]))),
+                static function (int $id): void {
                     app(CandidateRepository::class)->archive($id);
-                } catch (Throwable $error) {
-                    $failed[] = $id;
-                    Log::warning('Verification archival failed during stale cleanup.', [
-                        'collection_id' => $id, 'error_type' => $error::class]);
+                });
+            $failed = array_keys($kept);
+            foreach ($kept as $id => $outcome) {
+                if ($outcome['error'] !== null) {
+                    Log::warning('Verification archival failed during stale cleanup.', ['collection_id' => $id,
+                        'error_type' => $outcome['error']::class] + ($outcome['retry_after'] === null ? [] : ['retry_after' => $outcome['retry_after']]));
                 }
             }
             $lastId = $ids[array_key_last($ids)];

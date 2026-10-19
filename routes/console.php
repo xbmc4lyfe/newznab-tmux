@@ -25,10 +25,18 @@ Artisan::command('inspire', function () {
     $this->comment(Inspiring::quote());
 })->purpose('Display an inspiring quote');
 
+// Verification workers and the preparer hold one candidate's whole manifest in memory (about 1 KiB per
+// article at the metadata budget's limit), so their limit follows the budget rather than PHP's default.
+$verificationMemory = static function (): string {
+    $limit = (string) config('release_verification.worker_memory', '512M');
+
+    return escapeshellarg('memory_limit='.(preg_match('/^[1-9][0-9]*[KMG]?$/i', $limit) === 1 ? $limit : '512M'));
+};
+
 // Each host sharing the database runs its own disjoint range of verification slots.
-$scheduleVerificationWorkers = static function (): void {
+$scheduleVerificationWorkers = static function () use ($verificationMemory): void {
     for ($slot = VerificationWorkerLocks::firstSlot(); $slot <= VerificationWorkerLocks::lastSlot(); $slot++) {
-        $verificationCommand = escapeshellarg(PHP_BINARY).' -d ffi.enable=true -d memory_limit=256M '
+        $verificationCommand = escapeshellarg(PHP_BINARY).' -d ffi.enable=true -d '.$verificationMemory().' '
             .escapeshellarg(base_path('artisan')).' releases:verify-candidates --limit='.max(1, (int) config('release_verification.worker_limit', 1000))
             .' --max-seconds='.max(1, (int) config('release_verification.worker_seconds', 300)).' --slot='.$slot.' --no-summary --diagnostics';
         Schedule::exec($verificationCommand)->everyMinute()->runInBackground()
@@ -140,7 +148,7 @@ Schedule::command("releases:fix-names 8 --update --category={$par2Category} --se
     ->when(static fn (): bool => (bool) config('tmux.fix_names.par2_scheduled'));
 
 // One metadata preparer parks uploads without consuming a spot-verification slot.
-$preparationCommand = escapeshellarg(PHP_BINARY).' -d memory_limit=256M '
+$preparationCommand = escapeshellarg(PHP_BINARY).' -d '.$verificationMemory().' '
     .escapeshellarg(base_path('artisan')).' releases:prepare-candidates --limit=5000 --max-seconds=30 --diagnostics';
 Schedule::exec($preparationCommand)->everyMinute()->runInBackground()
     ->when(static fn (): bool => (bool) config('release_verification.scheduled'));
