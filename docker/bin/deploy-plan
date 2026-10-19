@@ -704,11 +704,12 @@ def reject_unsupported_service(svc: str, cfg: object) -> None:
                  f"{service_image_name(svc)}; set the role image variables (e.g. {svc.upper()}_IMAGE) instead of "
                  "overriding image: for app services.")
     health = cfg.get("healthcheck")
-    if svc in APP_SERVICES and isinstance(health, dict) and (
-        health.get("disable") or (isinstance(health.get("test"), list) and health["test"][:1] == ["NONE"])
-    ):
-        # Success requires each app container to report healthy; without a health check it never does.
-        sys.exit(f"deploy-plan: app service {svc} disables its health check; selective deployment verifies app "
+    if svc in APP_SERVICES and (not isinstance(health, dict) or not health or health.get("disable") or (
+        isinstance(health.get("test"), list) and health["test"][:1] == ["NONE"]
+    )):
+        # Success requires each app container to report healthy; without a health check it never does
+        # (the role images define none, so a removed one, e.g. `!reset null`, is none at all).
+        sys.exit(f"deploy-plan: app service {svc} disables or removes its health check; selective deployment verifies app "
                  "services by their health. Keep the shipped health check.")
     deploy = cfg.get("deploy")
     replicas = deploy.get("replicas") if isinstance(deploy, dict) else None
@@ -1415,18 +1416,29 @@ def database_service(docker_dir: Path) -> str:
     if len(targets) > 1:
         sys.exit(f"deploy-plan: the app services select different database services ({', '.join(sorted(targets))}); "
                  "selective deployment migrates and fences one database. Give every app the same DB_HOST/DB_URL.")
+    database_target(docker_dir)  # Same host, another schema: rejected there too.
     return targets.pop() if targets else "mariadb"
 
-def database_target(docker_dir: Path) -> str:
-    """A digest of the connection web (and so the verification barrier) uses: a barrier adopted from
-    an earlier attempt fences only this database if its recorded target matches."""
-    app_env = read_dotenv(docker_dir / "config/app.env")
-    cfg = RENDERED_SERVICES.get("web")
+def app_connection(app: str, app_env: dict) -> dict:
+    """The connection settings an app service uses: its rendered environment over app.env's."""
+    cfg = RENDERED_SERVICES.get(app)
     env = cfg.get("environment") if isinstance(cfg, dict) else None
     rendered = env if isinstance(env, dict) else {}
     keys = ("DB_CONNECTION", "DB_URL", "DB_HOST", "DB_PORT", "DB_SOCKET", "DB_DATABASE")
-    merged = {key: str(rendered[key] if key in rendered else app_env.get(key, "")) for key in keys}
-    return hashlib.sha256(json.dumps(merged, sort_keys=True).encode()).hexdigest()[:32]
+    return {key: str(rendered[key] if key in rendered else app_env.get(key, "")) for key in keys}
+
+
+def database_target(docker_dir: Path) -> str:
+    """A digest of the connection web (and so the verification barrier) uses: a barrier adopted from
+    an earlier attempt fences only this database if its recorded target matches. Every app must use
+    the same connection, or web would migrate a schema another app does not read."""
+    app_env = read_dotenv(docker_dir / "config/app.env")
+    web = app_connection("web", app_env)
+    for app in APP_SERVICES:
+        if app in RENDERED_SERVICES and app_connection(app, app_env) != web:
+            sys.exit(f"deploy-plan: app service {app} connects to another database than web (its DB_* settings differ); "
+                     "selective deployment migrates through web and fences one database. Give every app the same DB_* settings.")
+    return hashlib.sha256(json.dumps(web, sort_keys=True).encode()).hexdigest()[:32]
 
 
 def docker_daemon_identity() -> str:

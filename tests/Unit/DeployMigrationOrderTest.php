@@ -62,7 +62,18 @@ case "$*" in
             if [ "$svc" = "${NNTMUX_STALE_SERVICE_IMAGE:-}" ] && [ ! -f "$NNTMUX_REPO/recreated-$svc" ]; then id=sha256:stale; else id=${NNTMUX_IMAGE_ID:-sha256:fixture}; fi
             echo "$svc $id fixture/$svc:tag"
         done ;;
-    *' config --format json'*) printf '%s\n' "${NNTMUX_CONFIG_ID:-$default_config}" | sed 's/^{/{"name":"nntmux",/' ;;
+    # App services get the shipped health check unless NNTMUX_NO_HEALTHCHECK names one (`!reset null`).
+    *' config --format json'*) printf '%s\n' "${NNTMUX_CONFIG_ID:-$default_config}" | sed 's/^{/{"name":"nntmux",/' | python3 -c '
+import json, os, sys
+raw = sys.stdin.read()
+try:
+    config = json.loads(raw)
+except ValueError:
+    sys.stdout.write(raw); sys.exit(0)
+for name, svc in (config.get("services") or {}).items():
+    if name in ("web", "horizon", "scheduler", "indexer") and isinstance(svc, dict) and "healthcheck" not in svc and name != os.environ.get("NNTMUX_NO_HEALTHCHECK"):
+        svc["healthcheck"] = {"test": ["CMD", "true"]}
+print(json.dumps(config))' ;;
     *'image inspect --format'*)
         # After the rollout, while the guard writes the stamp.
         if [ "${NNTMUX_INSPECT_FAIL_AFTER_UP:-0}" = 1 ] && [ -f "$NNTMUX_REPO/recreated" ] && ls "$NNTMUX_REPO"/docker/.deploy.stamp.tmp.* >/dev/null 2>&1; then echo "Error response from daemon: timeout" >&2; exit 1; fi
@@ -3374,8 +3385,19 @@ SH);
             $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['web' => ['healthcheck' => $health]] + $services], JSON_UNESCAPED_SLASHES)]);
             $plan->run();
             $this->assertNotSame(0, $plan->getExitCode());
-            $this->assertStringContainsString('app service web disables its health check', $plan->getErrorOutput());
+            $this->assertStringContainsString('app service web disables or removes its health check', $plan->getErrorOutput());
         }
+        // An override that removes it (`healthcheck: !reset null`) leaves the role image with none.
+        $plan = $this->make(['deploy-plan'], ['NNTMUX_NO_HEALTHCHECK' => 'web']);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('app service web disables or removes its health check', $plan->getErrorOutput());
+
+        // Apps on one database host but another schema would read a schema web never migrated.
+        $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['horizon' => ['environment' => ['DB_DATABASE' => 'restored']]] + $services], JSON_UNESCAPED_SLASHES)]);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('app service horizon connects to another database than web', $plan->getErrorOutput());
 
         // App services must run their role image.
         $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['web' => ['image' => 'nntmux/app:local']] + $services], JSON_UNESCAPED_SLASHES)]);
