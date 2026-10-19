@@ -1376,6 +1376,60 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame($pending->status, DB::table('release_verification_candidates')->where('id', $pending->id)->value('status'), 'Never stranded.');
     }
 
+    public function test_late_headers_that_fit_alone_but_not_merged_leave_a_published_partial_and_its_inventory_intact(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        // 131 bytes for the partial's article; the late one (278) fits alone, but not merged with it.
+        config(['release_verification.metadata_bytes' => 300]);
+        $hash = sha1('merged-over-budget-partial', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $retained = DB::table('release_verification_candidates')->sole();
+        $late = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: str_repeat('l', 148).'@b');
+
+        DB::transaction(fn () => app(CandidateRepository::class)->invalidateHotCollections([$late]));
+        try {
+            app(CandidateRepository::class)->archive($late);
+            $this->fail('The merged inventory exceeds the budget.');
+        } catch (CandidateMetadataBudgetExceeded) {
+            // Kept for a later pass.
+        }
+
+        $after = DB::table('release_verification_candidates')->sole();
+        $this->assertSame([$retained->manifest_path, (int) $retained->id], [$after->manifest_path, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id')],
+            'The partial keeps its inventory, so the late article can still upgrade it.');
+        $this->assertTrue(DB::table('collections')->where('id', $late)->exists(), 'The late headers are retained.');
+    }
+
+    public function test_late_headers_that_fit_alone_but_not_merged_leave_a_pending_upgrade_intact(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        config(['release_verification.metadata_bytes' => 300]);
+        $hash = sha1('merged-over-budget-upgrade', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+        $generation = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        $this->assertSame((int) $generation->id, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
+        DB::table('release_verification_candidates')->where('id', $generation->id)->update(['lease_token' => 'worker', 'lease_until' => now()->addMinutes(5)]);
+        $late = $this->collectionForPolicy('movie.mkv', 3, $hash, part: 3, messageId: str_repeat('l', 118).'@b');
+
+        DB::transaction(fn () => app(CandidateRepository::class)->invalidateHotCollections([$late]));
+        try {
+            app(CandidateRepository::class)->archive($late);
+            $this->fail('The merged inventory exceeds the budget.');
+        } catch (CandidateMetadataBudgetExceeded) {
+            // Kept for a later pass.
+        }
+
+        $after = DB::table('release_verification_candidates')->where('id', $generation->id)->first();
+        $this->assertSame([$generation->status, $generation->manifest_path, null, (int) $generation->version + 1, (int) $generation->upgrades_release_id],
+            [$after->status, $after->manifest_path, $after->lease_token, (int) $after->version, (int) $after->upgrades_release_id],
+            'The upgrade keeps its articles and its partial; a verification under way cannot publish.');
+        $this->assertSame((int) $generation->id, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
+        $this->assertSame([1, 2], array_column(app(ManifestStore::class)->read($after->manifest_path)['files'][0]['segments'], 'number'));
+        $this->assertSame(2, DB::table('release_verification_candidates')->count(), 'No standalone fragment is admitted.');
+        $this->assertTrue(DB::table('collections')->where('id', $late)->exists());
+    }
+
     public function test_over_budget_late_headers_settle_a_retained_partial_instead_of_holding_it_forever(): void
     {
         $this->publicationSchema(partialColumns: true);
