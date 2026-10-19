@@ -231,6 +231,21 @@ final class CleanNzbStagedGenerationTest extends TestCase
         self::assertFileExists($this->staged);
     }
 
+    public function test_a_stray_sibling_visited_first_never_defers_a_snapshot_once_the_committed_one_is_in_place(): void
+    {
+        $this->missingCanonicalWithStagedGeneration();
+        // Sorted before the committed generation, and matching neither the committed source nor the canonical file.
+        $stray = dirname($this->staged).'/'.$this->guid.'.nzb.gz.c1-'.str_repeat('e', 16).'.next';
+        file_put_contents($stray, gzencode('stray'));
+
+        $source = app(NzbSourceGuard::class)->snapshot($this->guid, beginNamingInspection: true);
+
+        self::assertNotNull($source);
+        self::assertSame(NzbSourceGuard::digest('upgraded'), $source['digest']);
+        self::assertSame('upgraded', gzdecode((string) file_get_contents($this->canonical)));
+        self::assertFileExists($stray, 'Kept for review.');
+    }
+
     private function missingCanonicalWithStagedGeneration(): void
     {
         Schema::table('releases', static function (Blueprint $table): void {

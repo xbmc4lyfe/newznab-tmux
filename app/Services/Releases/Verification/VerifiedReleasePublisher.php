@@ -340,7 +340,10 @@ final class VerifiedReleasePublisher
         $lastHeartbeat = 0.0;
         $repository = app(CandidateRepository::class);
         $guard = app(NzbSourceGuard::class);
-        $heartbeat = function (Release $candidate) use ($repository, $claim, &$lastHeartbeat, $guard): void {
+        $target = (int) ($manifest['upgrades_release_id'] ?? 0);
+        /** @var array<int, true> $unresolved */
+        $unresolved = [];
+        $heartbeat = function (Release $candidate) use ($repository, $claim, &$lastHeartbeat, $guard, $target, &$unresolved): void {
             if (microtime(true) - $lastHeartbeat >= 1) {
                 $repository->heartbeat((int) $claim->id, $claim->lease_token);
                 $lastHeartbeat = microtime(true);
@@ -349,11 +352,22 @@ final class VerifiedReleasePublisher
             $row = DB::table('releases')->where('id', $candidate->id)->where('nzbstatus', NzbService::NZB_ADDED)
                 ->lockForUpdate()->first(['id', 'guid']);
             // A committed upgrade's NZB may still be staged: coverage reads the generation the row describes. Settled
-            // through the row lock already held (by id, then the source lock, as every settle path takes them). One
-            // that cannot be put in place defers this publication, which would otherwise judge coverage on the older
-            // file; a database error likewise ends it rather than continue outside its rolled-back transaction.
+            // through the row lock already held (by id, then the source lock, as every settle path takes them); a
+            // database error ends this publication rather than continue outside its rolled-back transaction.
             if ($row !== null && is_string($row->guid) && $guard->hasStagedGenerations($row->guid)) {
-                $guard->settleLockedOrDefer($row);
+                $outcome = $guard->settleLocked($row);
+                if ((int) $row->id === $target) {
+                    // The partial this publication upgrades: its new generation replaces whatever is staged.
+                    return;
+                }
+                if ($outcome === 'failed') {
+                    // Its committed generation is there but not yet in place: retried rather than judged on the older file.
+                    throw new RuntimeException('A covering release\'s committed NZB is still staged; publication deferred.');
+                }
+                if ($outcome === 'unresolved') {
+                    // Neither file is its committed source, and waiting cannot change that: it covers nothing.
+                    $unresolved[(int) $row->id] = true;
+                }
             }
         };
         $coverage = new NzbArticleCoverage(app(NzbService::class), $this->duplicates);
@@ -361,7 +375,10 @@ final class VerifiedReleasePublisher
         ['xml' => $xml, 'fingerprint' => $fingerprint] = $incoming ?? $this->incomingDocument($manifest);
         $timing?->nextPhase('duplicate_search_revalidation');
         $metadataConflict = false;
-        $acceptCovered = function (Release $duplicate, \SimpleXMLElement $snapshot) use ($manifest, &$metadataConflict): bool {
+        $acceptCovered = function (Release $duplicate, \SimpleXMLElement $snapshot) use ($manifest, &$metadataConflict, &$unresolved): bool {
+            if (isset($unresolved[(int) $duplicate->id])) {
+                return false;
+            }
             $current = DB::table('releases')->where('id', $duplicate->id)->where('nzbstatus', NzbService::NZB_ADDED)
                 ->lockForUpdate()->first(['id', 'guid']);
             if ($current === null || $current->guid !== (string) $duplicate->guid) {

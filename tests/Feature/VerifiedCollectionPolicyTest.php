@@ -1536,10 +1536,16 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(1, (int) DB::table('releases')->where('id', $first)->value('articles_found'), 'The partial is not upgraded into a second copy.');
     }
 
-    public function test_coverage_defers_publication_while_a_candidates_staged_nzb_cannot_be_put_in_place(): void
+    /**
+     * A complete copy of the merged late-article generation, published meanwhile, with a staged generation beside
+     * its canonical NZB.
+     *
+     * @return array{int, object, string, string}
+     */
+    private function coveringCopyWithStagedGeneration(string $seed): array
     {
         $this->publicationSchema(partialColumns: true);
-        $hash = sha1('covering-unresolved-copy', true);
+        $hash = sha1($seed, true);
         $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
         app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
         $generation = DB::table('release_verification_candidates')->orderByDesc('id')->first();
@@ -1549,21 +1555,66 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
             'files_found' => null, 'files_expected' => null, 'late_article_candidate_id' => null] + $copy;
         DB::table('releases')->insert($copy);
         app(VerifiedNzbWriter::class)->write($merged, 'covering-copy');
-        $staged = app(NzbService::class)->getNzbPath('covering-copy').'.c999-'.str_repeat('a', 16).'.next';
+        $canonical = app(NzbService::class)->getNzbPath('covering-copy');
+
+        return [$first, $generation, $canonical, $canonical.'.c999-'.str_repeat('a', 16).'.next'];
+    }
+
+    public function test_a_covering_copy_whose_staged_nzb_is_neither_generation_covers_nothing(): void
+    {
+        [$first, $generation, , $staged] = $this->coveringCopyWithStagedGeneration('covering-unresolved-copy');
         file_put_contents($staged, gzencode('<nzb>unresolvable</nzb>'));
-        // The copy's committed source is neither file: its staged generation cannot be settled.
+        // The copy's committed source is neither file, and waiting cannot change that.
         DB::table('release_archive_naming_evidence')->where('releases_id', $first + 100)->update(['source_sha256' => NzbSourceGuard::digest('another')]);
+
+        $this->publishStalledPartial(null);
+
+        $this->assertSame($first, (int) DB::table('release_verification_candidates')->where('id', $generation->id)->value('release_id'),
+            'The partial is upgraded rather than the generation reused as the unresolved copy.');
+        $this->assertSame(2, (int) DB::table('releases')->where('id', $first)->value('articles_found'));
+        $this->assertFileExists($staged);
+    }
+
+    public function test_coverage_defers_publication_while_a_copys_committed_nzb_cannot_be_put_in_place(): void
+    {
+        [$first, $generation, $canonical, $staged] = $this->coveringCopyWithStagedGeneration('covering-failed-copy');
+        rename($canonical, $staged);
+        // The committed generation is staged, but its canonical path cannot be replaced (a non-empty directory).
+        mkdir($canonical);
+        touch($canonical.'/occupied');
+        DB::table('release_archive_naming_evidence')->where('releases_id', $first + 100)
+            ->update(['source_sha256' => NzbSourceGuard::digest((string) gzdecode((string) file_get_contents($staged)))]);
 
         try {
             $this->publishStalledPartial(null);
-        } catch (\RuntimeException) {
-            // Deferred: the claim is retried once the copy's NZB is resolved.
+            $this->fail('Publication waits for the committed generation.');
+        } catch (\RuntimeException $exception) {
+            $this->assertStringContainsString('publication deferred', $exception->getMessage());
+        } finally {
+            unlink($canonical.'/occupied');
+            rmdir($canonical);
         }
 
         $this->assertNull(DB::table('release_verification_candidates')->where('id', $generation->id)->value('release_id'), 'Nothing is published on stale coverage.');
         $this->assertSame(1, (int) DB::table('releases')->where('id', $first)->value('articles_found'));
         $this->assertSame(2, DB::table('releases')->count());
         $this->assertFileExists($staged);
+    }
+
+    public function test_a_stray_staged_nzb_beside_the_partial_never_blocks_its_upgrade(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('stray-staged-target', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $holder = (int) DB::table('release_verification_candidates')->sole()->id;
+        $this->stageGeneration($first, $holder, 'stray');
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+        $generation = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+
+        $this->assertSame($first, $this->publishStalledPartial(null));
+
+        $this->assertSame($first, (int) DB::table('release_verification_candidates')->where('id', $generation->id)->value('release_id'));
+        $this->assertSame(2, (int) DB::table('releases')->where('id', $first)->value('articles_found'), 'Its new generation replaces whatever is staged.');
     }
 
     public function test_the_settle_sweep_stops_at_the_maintenance_deadline_and_resumes_after_the_last_row_it_settled(): void

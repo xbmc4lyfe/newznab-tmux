@@ -69,13 +69,26 @@ final class NzbSourceGuard
     }
 
     /**
-     * With the caller's transaction, install the committed generation if it is still staged, or throw when one is
-     * staged but cannot be put in place: a reader of the canonical file would otherwise see an older generation
-     * than the row describes.
+     * With the caller's transaction, install the committed generation if it is still staged, and report the result:
+     * 'settled' when the canonical file is the committed source (or none is recorded), 'failed' when the committed
+     * generation is staged but could not be put in place (worth retrying), 'unresolved' when neither file is it.
      */
-    public function settleLockedOrDefer(object $release): void
+    public function settleLocked(object $release): string
     {
-        $this->withSettledSource($release, true, static fn (): null => null);
+        return $this->withSettledSource($release, false, function (?array $source) use ($release): string {
+            $committed = app(ReleaseArchiveNamingEvidence::class)->committedSourceDigestLocked($release);
+            if ($committed === null || ($source !== null && hash_equals($committed, $source['digest']))) {
+                return 'settled';
+            }
+            foreach ($this->stagedSiblings((string) $release->guid) as $path) {
+                $digest = NzbSourceInstallation::isPendingStaged($path, DB::connection()->getPdo()) ? null : self::fileDigest($path);
+                if ($digest !== null && hash_equals($committed, $digest)) {
+                    return 'failed';
+                }
+            }
+
+            return 'unresolved';
+        });
     }
 
     /**
@@ -160,16 +173,20 @@ final class NzbSourceGuard
                 $outcomes[] = $this->settleStagedLocked($release, $guid, $path, true);
             }
         }
-        if ($deferUnresolved && array_intersect($outcomes, ['kept', 'failed']) !== []) {
+        $current = in_array('applied', $outcomes, true) ? $this->readCurrent($guid) : $source;
+        // Judged on the result, not the order siblings were visited: a stray one kept before the committed one was
+        // applied leaves the canonical file correct.
+        $inPlace = $current !== null && hash_equals($committed, $current['digest']);
+        if ($deferUnresolved && ! $inPlace && array_intersect($outcomes, ['kept', 'failed']) !== []) {
             // Recording the current file's digest now could later cost the only copy of the committed source.
             throw new RuntimeException('A staged NZB generation is unresolved; naming inspection deferred.');
         }
-        if (in_array('failed', $outcomes, true)) {
+        if (! $inPlace && in_array('failed', $outcomes, true)) {
             // The committed generation exists but is not in place: the canonical file is not the source.
             return null;
         }
 
-        return in_array('applied', $outcomes, true) ? $this->readCurrent($guid) : $source;
+        return $current;
     }
 
     /**
