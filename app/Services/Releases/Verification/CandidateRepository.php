@@ -290,8 +290,7 @@ final class CandidateRepository
                         // By primary key: an update through the pointer index would gap-lock it like a locking read.
                         $pointed = self::tracksUpgrades() ? array_values(array_filter([(int) ($existing->release_id ?? 0), (int) ($existing->upgrades_release_id ?? 0)])) : null;
                         if ($pointed === null || $pointed !== []) {
-                            DB::table('releases')->when($pointed !== null, static fn ($query) => $query->whereIn('id', $pointed))
-                                ->where('late_article_candidate_id', $existing->id)->update(['late_article_candidate_id' => null]);
+                            $this->releaseLateArticleFence($pointed ?? DB::table('releases')->where('late_article_candidate_id', $existing->id)->pluck('id')->all(), (int) $existing->id);
                         }
                     }
                 }
@@ -312,8 +311,12 @@ final class CandidateRepository
                     DB::table('release_verification_candidates')->where('id', $previous->id)->update(['manifest_path' => '', 'manifest_bytes' => 0]
                         + (self::tracksRetention() ? ['retained_for_release_id' => null, 'retained_last_unique_at' => null] : []));
                     if ($merges && Release::hasLateArticleFlag()) {
-                        DB::table('releases')->where('id', $previous->release_id)->where('late_article_candidate_id', $previous->id)
-                            ->update(['late_article_candidate_id' => $expired ? null : $holderId]);
+                        if ($expired) {
+                            $this->releaseLateArticleFence([(int) $previous->release_id], (int) $previous->id);
+                        } else {
+                            DB::table('releases')->where('id', $previous->release_id)->where('late_article_candidate_id', $previous->id)
+                                ->update(['late_article_candidate_id' => $holderId]);
+                        }
                     }
                     if ($previous->manifest_path !== $path) {
                         DB::afterCommit(fn () => $this->store->deleteIfUnreferenced($previous->manifest_path));
@@ -743,7 +746,7 @@ final class CandidateRepository
                 + (self::tracksUpgrades() ? ['upgrades_release_id' => null] : []) + $retention);
         }
         if ($release !== null && Release::hasLateArticleFlag()) {
-            DB::table('releases')->where('id', $release)->where('late_article_candidate_id', $holder->id)->update(['late_article_candidate_id' => null]);
+            $this->releaseLateArticleFence([(int) $release], (int) $holder->id);
         }
         DB::afterCommit(fn () => $this->store->deleteIfUnreferenced($holder->manifest_path));
     }
@@ -1250,7 +1253,7 @@ final class CandidateRepository
                     + (self::tracksUpgrades() ? ['upgrades_release_id' => null] : []));
                 if (($row->upgrades_release_id ?? null) !== null && Release::hasLateArticleFlag()) {
                     // An expired generation can no longer upgrade its partial; workers may now process it.
-                    DB::table('releases')->where('id', $row->upgrades_release_id)->where('late_article_candidate_id', $id)->update(['late_article_candidate_id' => null]);
+                    $this->releaseLateArticleFence([(int) $row->upgrades_release_id], (int) $id);
                 }
                 $this->ledger->adjust(-(int) $row->manifest_bytes);
                 DB::afterCommit(function () use ($row): void {
@@ -1260,6 +1263,27 @@ final class CandidateRepository
         }
         $this->expireRetainedPartials($mayStart);
         $this->settleLateArticleHolders();
+    }
+
+    /**
+     * Release these partials' fence held by $candidateId, except where an upgrade's staged NZB still waits beside
+     * the canonical file: those stay fenced until settleLateArticleHolders() installs it, so NZB-reading workers
+     * never take the older generation for the upgraded release.
+     *
+     * @param  list<int>  $releaseIds
+     */
+    private function releaseLateArticleFence(array $releaseIds, int $candidateId): void
+    {
+        if ($releaseIds === []) {
+            return;
+        }
+        $guard = app(NzbSourceGuard::class);
+        $free = DB::table('releases')->whereIn('id', $releaseIds)->pluck('guid', 'id')
+            ->filter(static fn ($guid): bool => ! is_string($guid) || ! $guard->hasStagedGenerations($guid))->keys()->all();
+        if ($free !== []) {
+            // By primary key: an update through the pointer index would gap-lock it like a locking read.
+            DB::table('releases')->whereIn('id', $free)->where('late_article_candidate_id', $candidateId)->update(['late_article_candidate_id' => null]);
+        }
     }
 
     /**
@@ -1299,8 +1323,8 @@ final class CandidateRepository
             $settled = $candidate === null
                 || ($candidate->release_id !== null && ((int) $candidate->release_id !== (int) $release->id || $candidate->manifest_path === ''))
                 || ($candidate->release_id === null && in_array($candidate->status, ['expired', 'filtered', 'metadata_expired'], true));
-            if ($settled && $candidate !== null && (int) $candidate->release_id === (int) $release->id && $candidate->manifest_path === '') {
-                // Its own completing upgrade: only once that upgrade's staged NZB is in place.
+            if ($settled) {
+                // Only once any committed upgrade's staged NZB is in place.
                 $guid = DB::table('releases')->where('id', $release->id)->value('guid');
                 try {
                     $settled = is_string($guid) && app(NzbSourceGuard::class)->settleStagedGenerations($guid);
@@ -1407,7 +1431,7 @@ final class CandidateRepository
                 + (self::tracksRetention() ? ['retained_for_release_id' => null, 'retained_last_unique_at' => null] : []));
             if (Release::hasLateArticleFlag()) {
                 // No late articles can merge any more: workers that read NZBs may now process it.
-                DB::table('releases')->where('id', $row->release_id)->where('late_article_candidate_id', $id)->update(['late_article_candidate_id' => null]);
+                $this->releaseLateArticleFence([(int) $row->release_id], (int) $id);
             }
             $this->ledger->adjust(-(int) $row->manifest_bytes);
             DB::afterCommit(function () use ($row): void {
@@ -1573,8 +1597,7 @@ final class CandidateRepository
                 'manifest_path' => '', 'manifest_bytes' => 0] + (self::tracksUpgrades() ? ['upgrades_release_id' => null] : []));
             if (($candidate->upgrades_release_id ?? null) !== null && Release::hasLateArticleFlag()) {
                 // A retired generation can no longer upgrade its partial: workers may process it now.
-                DB::table('releases')->where('id', $candidate->upgrades_release_id)->where('late_article_candidate_id', $candidate->id)
-                    ->update(['late_article_candidate_id' => null]);
+                $this->releaseLateArticleFence([(int) $candidate->upgrades_release_id], (int) $candidate->id);
             }
             $previous = $timing?->enterNestedPhase('ledger_adjust');
             $this->ledger->adjust(-(int) $candidate->manifest_bytes);

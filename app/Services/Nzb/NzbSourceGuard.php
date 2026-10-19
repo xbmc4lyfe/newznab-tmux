@@ -219,6 +219,12 @@ final class NzbSourceGuard
         return $this->stagedSiblings($guid) === [];
     }
 
+    /** Whether a staged generation is left beside this release's NZB (reading the directory only, no locks). */
+    public function hasStagedGenerations(string $guid): bool
+    {
+        return $this->stagedSiblings($guid) !== [];
+    }
+
     /** @return list<string> */
     private function stagedSiblings(string $guid): array
     {

@@ -22,6 +22,7 @@ use App\Services\Releases\Verification\ReleaseMetadataResolver;
 use App\Services\Releases\Verification\RemoteReleasePublisher;
 use App\Services\Releases\Verification\ScratchInventory;
 use App\Services\Releases\Verification\SpotCheckVerifier;
+use App\Services\Releases\Verification\VerificationResetService;
 use App\Services\Releases\Verification\VerificationResult;
 use App\Services\Releases\Verification\VerificationWorkerLocks;
 use App\Services\Releases\Verification\VerifiedNzbWriter;
@@ -481,6 +482,84 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         Cache::forget('release_verification:settle_cursor');
         app(CandidateRepository::class)->expire();
         $this->assertNull(DB::table('releases')->where('id', $first)->value('late_article_candidate_id'), 'Released once it is settled.');
+    }
+
+    public function test_retained_expiry_installs_a_committed_staged_nzb_before_releasing_the_fence(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, sha1('retained-staged', true)));
+        $holder = DB::table('release_verification_candidates')->sole();
+        // As a partial-to-partial upgrade leaves it when its post-commit swap did not happen.
+        [$canonical, $staged] = $this->stageGeneration($first, (int) $holder->id, 'unresolvable');
+
+        $this->travel((int) config('release_verification.expiry_hours') + 1)->hours();
+        $this->limits();
+        app(CandidateRepository::class)->expire();
+        $this->assertSame('', DB::table('release_verification_candidates')->where('id', $holder->id)->value('manifest_path'), 'Its inventory is released.');
+        $this->assertSame((int) $holder->id, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'),
+            'Workers that read the NZB wait while the staged generation is unresolved.');
+
+        DB::table('release_archive_naming_evidence')->where('releases_id', $first)->update(['source_sha256' => NzbSourceGuard::digest('<nzb>upgraded</nzb>')]);
+        file_put_contents($staged, gzencode('<nzb>upgraded</nzb>'));
+        Cache::forget('release_verification:settle_cursor');
+        app(CandidateRepository::class)->expire();
+        $this->assertSame('<nzb>upgraded</nzb>', gzdecode((string) file_get_contents($canonical)), 'The committed generation is installed first.');
+        $this->assertFileDoesNotExist($staged);
+        $this->assertNull(DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
+    }
+
+    #[DataProvider('resetStagedGenerations')]
+    public function test_a_verification_reset_installs_a_committed_staged_nzb_and_keeps_an_unresolved_one_fenced(bool $committed): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $release = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, sha1('reset-staged', true)));
+        $holder = (int) DB::table('release_verification_candidates')->sole()->id;
+        [$canonical, $staged] = $this->stageGeneration($release, $holder, 'upgraded');
+        if ($committed) {
+            DB::table('release_archive_naming_evidence')->where('releases_id', $release)->update(['source_sha256' => NzbSourceGuard::digest('<nzb>upgraded</nzb>')]);
+        }
+
+        // The fixture keeps NZBs under the verification storage root, which a reset empties.
+        $storage = config('release_verification.storage_path');
+        config(['release_verification.storage_path' => $storage.'-reset']);
+        try {
+            app(VerificationResetService::class)->run(static fn () => null);
+        } finally {
+            app('files')->deleteDirectory($storage.'-reset');
+            config(['release_verification.storage_path' => $storage]);
+        }
+
+        $this->assertSame(0, DB::table('release_verification_candidates')->count());
+        if ($committed) {
+            $this->assertSame('<nzb>upgraded</nzb>', gzdecode((string) file_get_contents($canonical)), 'The committed generation is installed first.');
+            $this->assertFileDoesNotExist($staged);
+            $this->assertNull(DB::table('releases')->where('id', $release)->value('late_article_candidate_id'));
+        } else {
+            $this->assertFileExists($staged);
+            $this->assertSame($holder, (int) DB::table('releases')->where('id', $release)->value('late_article_candidate_id'),
+                'Workers that read the NZB wait until the settle sweep can install it.');
+        }
+    }
+
+    /** @return array<string, array{bool}> */
+    public static function resetStagedGenerations(): array
+    {
+        return ['committed' => [true], 'unresolved' => [false]];
+    }
+
+    /**
+     * A committed upgrade's staged NZB beside the canonical one; the evidence names neither file until a test says so.
+     *
+     * @return array{string, string}
+     */
+    private function stageGeneration(int $release, int $candidate, string $content): array
+    {
+        $canonical = app(NzbService::class)->getNzbPath((string) DB::table('releases')->where('id', $release)->value('guid'));
+        $staged = $canonical.'.c'.$candidate.'-'.str_repeat('a', 16).'.next';
+        file_put_contents($staged, gzencode('<nzb>'.$content.'</nzb>'));
+        DB::table('release_archive_naming_evidence')->where('releases_id', $release)->update(['source_sha256' => NzbSourceGuard::digest('another')]);
+
+        return [$canonical, $staged];
     }
 
     public function test_a_rolled_back_upgrade_leaves_the_published_nzb_untouched(): void
