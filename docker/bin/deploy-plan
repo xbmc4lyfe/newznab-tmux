@@ -1024,9 +1024,9 @@ def with_built_image_ids(state: dict[str, str], stamp_path: Path) -> dict[str, s
     build must still name its recorded image: one replaced meanwhile is never stamped as built."""
     previous = parse_stamp(stamp_path)
     try:
-        built = {line.strip() for line in Path(f"{stamp_path}.built").read_text(encoding="utf-8").splitlines() if line.strip()}
+        built = dict((line.split() + [""])[:2] for line in Path(f"{stamp_path}.built").read_text(encoding="utf-8").splitlines() if line.strip())
     except FileNotFoundError:
-        built = set()
+        built = {}
     except OSError as error:
         sys.exit(f"deploy-plan: cannot read {stamp_path}.built: {error.strerror or error}")
     stamped = dict(state)
@@ -1035,8 +1035,11 @@ def with_built_image_ids(state: dict[str, str], stamp_path: Path) -> dict[str, s
     for key, tag in roles:
         current = image_id(tag)
         if normalize_ref(tag) in built:
-            if current:
-                stamped[key] = f"{tag}@{current}"
+            # The image the build produced (recorded right after it), not whatever the tag names now.
+            if current != built[normalize_ref(tag)]:
+                sys.exit(f"deploy-plan: {tag} now names {current or 'nothing'}, not the {built[normalize_ref(tag)] or 'unrecorded'} "
+                         "this build produced; not stamping a replaced image as built.")
+            stamped[key] = f"{tag}@{current}"
             continue
         record = previous.get(key)
         if not record:

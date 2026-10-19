@@ -66,14 +66,20 @@ same_database() {
     [ "$1" = "$DATABASE_TARGET" ] || { [ -n "${DATABASE_TARGET_LEGACY:-}" ] && [ "$1" = "$DATABASE_TARGET_LEGACY" ]; }
 }
 refuse_foreign_barrier() {
+    labelled=
     if labelled=$(docker inspect --format '{{index .Config.Labels "nntmux.deploy.database"}}' "$barrier_name" 2>/dev/null); then
         if ! same_database "$labelled"; then
             echo "deploy-app: the verification barrier $barrier_name left by an earlier attempt fences another database than this rollout's. Release its pause on that database (releases:verification-barrier --release there), remove it, then retry." >&2
             exit 1
         fi
     fi
-    # An empty marker (written before it recorded the database) names none.
     owed_database=$(head -n 1 "$barrier_owed" 2>/dev/null || true)
+    # An empty marker (written before it recorded the database) names none: without a labelled
+    # container it is this database's only while the database is unchanged (a switch migrates).
+    if [ -e "$barrier_owed" ] && [ -z "$owed_database" ] && [ -z "$labelled" ] && [ "$MIGRATE" = 1 ]; then
+        echo "deploy-app: an earlier attempt left a verification pause owed ($barrier_owed) without naming its database, and this rollout may switch databases. Release the pause on the database it was taken on (releases:verification-barrier --release there), remove the marker, then retry." >&2
+        exit 1
+    fi
     if [ -n "$owed_database" ] && ! same_database "$owed_database"; then
         echo "deploy-app: an earlier attempt left a verification pause owed on another database than this rollout's ($barrier_owed). Release it on that database (releases:verification-barrier --release there), remove the marker, then retry." >&2
         exit 1

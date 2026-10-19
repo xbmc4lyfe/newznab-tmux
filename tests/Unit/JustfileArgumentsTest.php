@@ -182,6 +182,12 @@ SH);
         $trailing->mustRun();
         $this->assertContains('-ps3cret', $this->arguments($trailing));
 
+        // `$$` is Compose's literal `$`: no interpolation, one dollar.
+        file_put_contents($this->directory.'/docker/.env', "DB_ROOTPASSWORD=\"pa\$\$word\"\nDB_DATABASE=nntmux\n");
+        $dollars = $this->just('docker/Justfile', ['mysql'], ['DC' => $this->directory.'/bin/fake', 'DB_DATABASE' => false]);
+        $dollars->mustRun();
+        $this->assertContains('-ppa$word', $this->arguments($dollars));
+
         // An escaped `$` is literal in Compose, so it is no interpolation either.
         file_put_contents($this->directory.'/docker/.env', "APP_IMAGE=\"registry/\\\$app:1\"\n");
         $literal = $this->just('docker/Justfile', ['ps'], ['DC' => $this->directory.'/bin/fake']);

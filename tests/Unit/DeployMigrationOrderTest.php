@@ -89,6 +89,8 @@ for name, svc in (config.get("services") or {}).items():
         svc["healthcheck"] = {"test": ["CMD", "true"]}
 print(json.dumps(config))' ;;
     *'image inspect --format'*)
+        # NNTMUX_REPLACE_AFTER_BUILD: that tag is replaced once its build was recorded, before the stamp.
+        if [ -n "${NNTMUX_REPLACE_AFTER_BUILD:-}" ] && [ "$last" = "$NNTMUX_REPLACE_AFTER_BUILD" ] && grep -q -- "$last " "$NNTMUX_REPO/docker/.build.stamp.built" 2>/dev/null; then echo sha256:replaced; exit 0; fi
         # After the rollout, while the guard writes the stamp.
         if [ "${NNTMUX_INSPECT_FAIL_AFTER_UP:-0}" = 1 ] && [ -f "$NNTMUX_REPO/recreated" ] && ls "$NNTMUX_REPO"/docker/.deploy.stamp.tmp.* >/dev/null 2>&1; then echo "Error response from daemon: timeout" >&2; exit 1; fi
         [ "${NNTMUX_IMAGE_INSPECT_FAIL:-0}" != 1 ] || { echo "Error response from daemon: request timed out" >&2; exit 1; }
@@ -3721,6 +3723,24 @@ SH);
         $this->assertSame("another-database\n", file_get_contents($this->directory.'/docker/.deploy.stamp.barrier-owed'));
     }
 
+    public function test_an_empty_legacy_owed_marker_is_refused_when_the_database_may_switch(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=192.0.2.10\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        // Older tooling's marker names no database, its barrier is gone, and app.env now points elsewhere.
+        file_put_contents($this->directory.'/docker/.deploy.stamp.barrier-owed', '');
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=192.0.2.20\n");
+        file_put_contents($this->directory.'/events', '');
+
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('without naming its database', $process->getErrorOutput());
+        $this->assertStringNotContainsString('releases:verification-barrier', $this->events());
+        $this->assertSame('', file_get_contents($this->directory.'/docker/.deploy.stamp.barrier-owed'));
+    }
+
     public function test_standalone_docker_compose_daemon_flags_fail_closed(): void
     {
         foreach (['docker-compose -H ssh://remote', 'docker-compose -Htcp://remote:2375', 'docker-compose --host=tcp://remote:2375', 'docker-compose -f x.yml --context remote', 'docker-compose -cremote', 'docker-compose --context=remote'] as $command) {
@@ -3850,6 +3870,14 @@ SH);
         $this->assertStringContainsString('build --target selfhosted-web', $this->events());
         $this->assertStringNotContainsString('build --target selfhosted-horizon', $this->events());
         $this->assertFalse($process->isSuccessful());
+        $this->assertStringNotContainsString('sha256:replaced', (string) file_get_contents($this->directory.'/docker/.build.stamp'));
+
+        // Nor is a built tag replaced between its build and the stamp.
+        file_put_contents($this->directory.'/resources/js/app.js', "console.log(3);\n");
+        $process = $this->make(['build'], ['NNTMUX_REPLACE_AFTER_BUILD' => 'nntmux/web:local']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('not the sha256:fixture this build produced', $process->getErrorOutput());
         $this->assertStringNotContainsString('sha256:replaced', (string) file_get_contents($this->directory.'/docker/.build.stamp'));
 
         // Rebuilt and stamped normally once the tag is back.

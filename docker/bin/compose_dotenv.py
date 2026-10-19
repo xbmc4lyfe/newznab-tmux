@@ -52,6 +52,10 @@ def decode_double_quoted(body: str) -> tuple[str, bool]:
             out.append(char)
             index += 1
             continue
+        if char == "$" and body[index + 1:index + 2] == "$":
+            out.append("$")  # `$$` is a literal `$`
+            index += 2
+            continue
         interpolates = interpolates or char == "$"
         out.append(char)
         index += 1
@@ -77,7 +81,7 @@ def parse_value(value: str) -> tuple[str, str]:
         decoded, interpolates = decode_double_quoted(body)
         return decoded, "interpolated" if interpolates else ""
     value = re.sub(r"\s#.*$", "", value).strip()
-    return value, "interpolated" if "$" in value else ""
+    return value.replace("$$", "$"), "interpolated" if "$" in value.replace("$$", "") else ""
 
 
 def parse(path: Path) -> dict[str, tuple[str, str]]:
