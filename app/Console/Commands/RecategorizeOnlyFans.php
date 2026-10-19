@@ -123,6 +123,7 @@ class RecategorizeOnlyFans extends Command
 
         if ($updated > 0) {
             ReleaseBrowseService::bumpCacheVersion();
+            Release::clearAdminReleasesRangeCache();
         }
 
         $this->info(sprintf('Inspected: %d; Eligible: %d; Skipped: %d; Failed: %d.', $inspected, $eligible, $skipped, $failed));

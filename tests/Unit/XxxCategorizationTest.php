@@ -168,8 +168,10 @@ class XxxCategorizationTest extends TestCase
             'screenshot Dolly' => ['OF.Dolly.Orchid.Beautiful.Asian.Girl.With.Small.Tits.Shakes.Her.Ass.Nonstop.Until.I.Cum.1080p'],
             'screenshot Veronica' => ['OF.Theapolloshow.Veronica.Grace.1080p'],
             'screenshot Maya' => ['OF.Theapolloshow.Maya.Faye.1080p'],
-            'lowercase' => ['of.Creator.Title.1080p'],
-            'mixed case UHD' => ['oF.Creator.Title.2160p'],
+            'canonical HD prefix' => ['OF.Creator.Title.1080p'],
+            'canonical UHD prefix' => ['OF.Creator.Title.2160p'],
+            'lowercase full site' => ['onlyfans.Creator.Title.1080p'],
+            'mixed case full site UHD' => ['oNlY-FaNs.Creator.Title.2160p'],
             'no video hints' => ['OF.Creator.Title'],
             'HD studio match' => ['OF.Brazzers.Performer.Title.1080p'],
             'VR match' => ['OF.SexBabesVR.Creator.VR180.2160p'],
@@ -199,6 +201,27 @@ class XxxCategorizationTest extends TestCase
             $this->assertSame(Category::XXX_ONLYFANS, $passable->bestResult->categoryId);
             $this->assertSame('onlyfans', $passable->bestResult->matchedBy);
         }
+    }
+
+    /** @return array<string, array{string}> */
+    public static function ordinaryMovieReleasesProvider(): array
+    {
+        return [
+            'title case Of movie' => ['Of.Mice.and.Men.1939.1080p.BluRay.x264'],
+            'lowercase of movie' => ['of.Mice.and.Men.1939.1080p.BluRay.x264'],
+            'mixed case oF movie' => ['oF.Mice.and.Men.1939.1080p.BluRay.x264'],
+        ];
+    }
+
+    #[DataProvider('ordinaryMovieReleasesProvider')]
+    public function test_ambiguous_of_prefix_does_not_force_adult_categorization(string $releaseName): void
+    {
+        $context = new ReleaseContext(releaseName: $releaseName, groupId: 0);
+
+        $this->assertFalse($context->hasOnlyFansMarker());
+        $this->assertFalse($context->hasAdultMarkers());
+        $this->assertFalse((new XxxCategorizer)->categorize($context)->isSuccessful());
+        $this->assertSame(Category::MOVIE_HD, $this->runPipeline($releaseName)->bestResult->categoryId);
     }
 
     /**

@@ -6,6 +6,7 @@ namespace Tests\Feature;
 
 use App\Facades\Search;
 use App\Models\Category;
+use App\Models\Release;
 use App\Services\Categorization\CategorizationService;
 use App\Services\Search\Contracts\BulkReleaseIndexUpdater;
 use App\Services\Search\Contracts\SearchDriverInterface;
@@ -43,6 +44,11 @@ class RecategorizeOnlyFansTest extends TestCase
             ['id' => Category::XXX_ONLYFANS, 'root_categories_id' => Category::XXX_ROOT, 'title' => 'OnlyFans'],
             ['id' => Category::MOVIE_HD, 'root_categories_id' => Category::MOVIE_ROOT, 'title' => 'HD'],
         ]);
+        Schema::create('root_categories', function (Blueprint $table): void {
+            $table->integer('id')->primary();
+            $table->string('title');
+        });
+        DB::table('root_categories')->insert(['id' => Category::XXX_ROOT, 'title' => 'XXX']);
         Schema::create('usenet_groups', function (Blueprint $table): void {
             $table->increments('id');
             $table->string('name');
@@ -65,6 +71,12 @@ class RecategorizeOnlyFansTest extends TestCase
             $table->integer('book_lookup_attempts')->default(4);
             $table->dateTime('book_lookup_retry_at')->default('2026-10-19 12:00:00');
             $table->integer('proc_nfo')->default(1);
+            $table->string('guid')->default('');
+            $table->bigInteger('size')->default(1);
+            $table->integer('totalpart')->default(1);
+            $table->integer('grabs')->default(0);
+            $table->dateTime('postdate')->default('2026-10-19 12:00:00');
+            $table->dateTime('adddate')->default('2026-10-19 12:00:00');
         });
     }
 
@@ -73,6 +85,7 @@ class RecategorizeOnlyFansTest extends TestCase
         $id = $this->insertRelease('OF.Sadie.Summers.NEW.TRADWIFE.BG.1080p');
         $before = DB::table('releases')->find($id);
         $cacheVersion = Cache::get('releases:cache_version', 1);
+        $adminCacheVersion = Cache::get('adminReleasesRangeVersion', 1);
         Search::shouldReceive('driver')->never();
         Search::shouldReceive('updateRelease')->never();
 
@@ -84,6 +97,7 @@ class RecategorizeOnlyFansTest extends TestCase
 
         $this->assertEquals($before, DB::table('releases')->find($id));
         $this->assertSame($cacheVersion, Cache::get('releases:cache_version', 1));
+        $this->assertSame($adminCacheVersion, Cache::get('adminReleasesRangeVersion', 1));
     }
 
     #[DataProviderExternal(XxxCategorizationTest::class, 'onlyFansReleasesProvider')]
@@ -111,13 +125,14 @@ class RecategorizeOnlyFansTest extends TestCase
     {
         $ids = [
             $this->insertRelease('OF.Theapolloshow.Veronica.Grace.1080p'),
-            $this->insertRelease('of.Creator.Title.2160p', Category::XXX_UHD),
-            $this->insertRelease('oF.Creator_Pack_mp4', Category::XXX_OTHER),
+            $this->insertRelease('OF.Creator.Title.2160p', Category::XXX_UHD),
+            $this->insertRelease('OF.Creator_Pack_mp4', Category::XXX_OTHER),
             $this->insertRelease('OF.Creator_Photos_Packs_mp4', Category::XXX_OTHER),
             $this->insertRelease('OF.Creator.Title', Category::XXX_OTHER),
         ];
         $before = DB::table('releases')->get()->keyBy('id');
         $cacheVersion = Cache::get('releases:cache_version', 1);
+        $adminCacheVersion = Cache::get('adminReleasesRangeVersion', 1);
         $this->useConfirmedSearchDriver($ids);
 
         $this->artisan('releases:recategorize-onlyfans', ['--apply' => true])
@@ -125,6 +140,7 @@ class RecategorizeOnlyFansTest extends TestCase
             ->assertSuccessful();
 
         $this->assertSame($cacheVersion + 1, Cache::get('releases:cache_version', 1));
+        $this->assertSame($adminCacheVersion + 1, Cache::get('adminReleasesRangeVersion', 1));
 
         foreach ($ids as $id) {
             $expected = (array) $before->get($id);
@@ -135,6 +151,8 @@ class RecategorizeOnlyFansTest extends TestCase
         $this->artisan('releases:recategorize-onlyfans', ['--apply' => true])
             ->expectsOutput('Database categories updated: 0; Search refreshes confirmed: 0; Unconfirmed: 0.')
             ->assertSuccessful();
+
+        $this->assertSame($adminCacheVersion + 1, Cache::get('adminReleasesRangeVersion', 1));
     }
 
     public function test_repair_excludes_unrelated_categories_names_and_photo_packs(): void
@@ -259,6 +277,7 @@ class RecategorizeOnlyFansTest extends TestCase
     {
         $id = $this->insertRelease('OF.Creator.1080p');
         $cacheVersion = Cache::get('releases:cache_version', 1);
+        $adminCacheVersion = Cache::get('adminReleasesRangeVersion', 1);
         $before = (array) DB::table('releases')->find($id);
         Schema::create('search_index_failures', function (Blueprint $table): void {
             $table->id();
@@ -281,6 +300,7 @@ class RecategorizeOnlyFansTest extends TestCase
         $this->assertSame(Category::XXX_ONLYFANS, DB::table('releases')->where('id', $id)->value('categories_id'));
         $this->assertSame(array_replace($before, ['categories_id' => Category::XXX_ONLYFANS]), (array) DB::table('releases')->find($id));
         $this->assertSame($cacheVersion + 1, Cache::get('releases:cache_version', 1));
+        $this->assertSame($adminCacheVersion + 1, Cache::get('adminReleasesRangeVersion', 1));
         $this->assertSame('updateRelease_query', DB::table('search_index_failures')->where('release_id', $id)->value('last_error'));
     }
 
@@ -288,6 +308,7 @@ class RecategorizeOnlyFansTest extends TestCase
     {
         $id = $this->insertRelease('OF.Creator.1080p');
         $cacheVersion = Cache::get('releases:cache_version', 1);
+        $adminCacheVersion = Cache::get('adminReleasesRangeVersion', 1);
         $before = (array) DB::table('releases')->find($id);
         $requested = [];
         $driver = $this->createStub(SearchDriverInterface::class);
@@ -306,6 +327,67 @@ class RecategorizeOnlyFansTest extends TestCase
         $this->assertSame(array_replace($before, ['categories_id' => Category::XXX_ONLYFANS]), (array) DB::table('releases')->find($id));
         $this->assertSame(Category::XXX_ONLYFANS, DB::table('releases')->where('id', $id)->value('categories_id'));
         $this->assertSame($cacheVersion + 1, Cache::get('releases:cache_version', 1));
+        $this->assertSame($adminCacheVersion + 1, Cache::get('adminReleasesRangeVersion', 1));
+    }
+
+    #[DataProviderExternal(XxxCategorizationTest::class, 'ordinaryMovieReleasesProvider')]
+    public function test_service_preserves_ordinary_movies_with_ambiguous_prefixes(string $releaseName): void
+    {
+        $result = app(CategorizationService::class)->determineCategory(0, $releaseName);
+        $this->assertSame(Category::MOVIE_HD, $result['categories_id']);
+    }
+
+    #[DataProviderExternal(XxxCategorizationTest::class, 'ordinaryMovieReleasesProvider')]
+    public function test_repair_preserves_ordinary_movies_with_ambiguous_prefixes(string $releaseName): void
+    {
+        $id = $this->insertRelease($releaseName);
+        $before = DB::table('releases')->find($id);
+        $adminCacheVersion = Cache::get('adminReleasesRangeVersion', 1);
+        Search::shouldReceive('driver')->never();
+        Search::shouldReceive('updateRelease')->never();
+
+        $this->artisan('releases:recategorize-onlyfans', ['--apply' => true])
+            ->expectsOutput('Inspected: 1; Eligible: 0; Skipped: 1; Failed: 0.')
+            ->assertSuccessful();
+
+        $this->assertEquals($before, DB::table('releases')->find($id));
+        $this->assertSame($adminCacheVersion, Cache::get('adminReleasesRangeVersion', 1));
+    }
+
+    /** @return array<string, array{string}> */
+    public static function searchRefreshOutcomesProvider(): array
+    {
+        return [
+            'confirmed refresh' => ['confirmed'],
+            'failed refresh' => ['failed'],
+            'unconfirmed refresh' => ['unconfirmed'],
+        ];
+    }
+
+    #[DataProvider('searchRefreshOutcomesProvider')]
+    public function test_apply_refreshes_cached_admin_rows_and_category_filters(string $refreshOutcome): void
+    {
+        $id = $this->insertRelease('OF.Creator.1080p');
+        $this->assertSame('XXX > HD Clips', Release::getReleasesRange()->items()[0]->category_name);
+        $this->assertSame([$id], Release::getReleasesRange(categoryId: Category::XXX_CLIPHD)->pluck('id')->all());
+        $this->assertSame([], Release::getReleasesRange(categoryId: Category::XXX_ONLYFANS)->pluck('id')->all());
+
+        if ($refreshOutcome === 'confirmed') {
+            $this->useConfirmedSearchDriver([$id]);
+        } elseif ($refreshOutcome === 'failed') {
+            $driver = $this->createStubForIntersectionOfInterfaces([SearchDriverInterface::class, BulkReleaseIndexUpdater::class]);
+            $driver->method('updateReleases')->willReturn([$id]);
+            $this->useSearchDriver($driver);
+        } else {
+            $this->useSearchDriver($this->createStub(SearchDriverInterface::class));
+        }
+
+        $this->artisan('releases:recategorize-onlyfans', ['--apply' => true])
+            ->assertExitCode($refreshOutcome === 'confirmed' ? 0 : 1);
+
+        $this->assertSame('XXX > OnlyFans', Release::getReleasesRange()->items()[0]->category_name);
+        $this->assertSame([], Release::getReleasesRange(categoryId: Category::XXX_CLIPHD)->pluck('id')->all());
+        $this->assertSame([$id], Release::getReleasesRange(categoryId: Category::XXX_ONLYFANS)->pluck('id')->all());
     }
 
     /** @param list<int> $ids */

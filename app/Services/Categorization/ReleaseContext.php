@@ -62,7 +62,8 @@ class ReleaseContext
 
     public function hasOnlyFansMarker(): bool
     {
-        return preg_match('/\bOnly[-_ ]?Fans\b|^OF\./i', $this->releaseName) === 1;
+        return str_starts_with($this->releaseName, 'OF.') ||
+            preg_match('/\bOnly[-_ ]?Fans\b/i', $this->releaseName) === 1;
     }
 
     /**
