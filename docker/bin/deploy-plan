@@ -699,6 +699,13 @@ def reject_unsupported_service(svc: str, cfg: object) -> None:
         sys.exit(f"deploy-plan: app service {svc} runs image {cfg['image']}, not its role image "
                  f"{service_image_name(svc)}; set the role image variables (e.g. {svc.upper()}_IMAGE) instead of "
                  "overriding image: for app services.")
+    health = cfg.get("healthcheck")
+    if svc in APP_SERVICES and isinstance(health, dict) and (
+        health.get("disable") or (isinstance(health.get("test"), list) and health["test"][:1] == ["NONE"])
+    ):
+        # Success requires each app container to report healthy; without a health check it never does.
+        sys.exit(f"deploy-plan: app service {svc} disables its health check; selective deployment verifies app "
+                 "services by their health. Keep the shipped health check.")
     deploy = cfg.get("deploy")
     replicas = deploy.get("replicas") if isinstance(deploy, dict) else None
     if svc in APP_SERVICES and ((isinstance(replicas, int) and replicas != 1) or (isinstance(cfg.get("scale"), int) and cfg["scale"] != 1)):

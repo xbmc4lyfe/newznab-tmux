@@ -3239,6 +3239,14 @@ SH);
         $this->assertNotSame(0, $plan->getExitCode());
         $this->assertStringContainsString('database service mariadb depends on data service redis', $plan->getErrorOutput());
 
+        // App services must keep a health check: success is judged by it.
+        foreach ([['disable' => true], ['test' => ['NONE']]] as $health) {
+            $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['web' => ['healthcheck' => $health]] + $services], JSON_UNESCAPED_SLASHES)]);
+            $plan->run();
+            $this->assertNotSame(0, $plan->getExitCode());
+            $this->assertStringContainsString('app service web disables its health check', $plan->getErrorOutput());
+        }
+
         // App services must run their role image.
         $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['web' => ['image' => 'nntmux/app:local']] + $services], JSON_UNESCAPED_SLASHES)]);
         $plan->run();
