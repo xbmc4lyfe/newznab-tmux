@@ -34,6 +34,8 @@ missing=0
 if [ "${NNTMUX_SERVICE_MISSING:-0}" = 1 ] && ! grep -q -- ' up -d --no-deps --force-recreate' "$NNTMUX_DEPLOY_EVENTS"; then missing=1; fi
 default_config='{"services":{"web":{},"horizon":{},"scheduler":{},"indexer":{},"mariadb":{},"redis":{},"manticore":{},"proxy":{},"mailpit":{},"prometheus":{},"pushgateway":{},"grafana":{},"node-exporter":{},"mysqld-exporter":{},"redis-exporter":{}}}'
 case "$*" in
+    # NNTMUX_REPLACE_ON_BUILD: another tag is replaced while this build runs.
+    'build --target '*) [ "${NNTMUX_REPLACE_ON_BUILD:-0}" != 1 ] || : > "$NNTMUX_REPO/replaced" ;;
     'ps -a -q --no-trunc --filter label=com.docker.compose.project='*)
         # Service containers only (no one-offs): as `compose ps -a -q`, minus the barrier.
         last=${last#label=com.docker.compose.service=}
@@ -3616,6 +3618,31 @@ SH);
 
         // node-exporter's `pid: host` names no other container.
         $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => $services + ['node-exporter' => ['pid' => 'host']]])])->mustRun();
+    }
+
+    public function test_a_selective_build_never_stamps_a_role_tag_it_did_not_build(): void
+    {
+        mkdir($this->directory.'/resources/js', 0777, true);
+        file_put_contents($this->directory.'/resources/js/app.js', "console.log(1);\n");
+        $this->make(['build'])->mustRun();
+        $this->assertStringContainsString('image:horizon=nntmux/horizon:local@sha256:fixture', (string) file_get_contents($this->directory.'/docker/.build.stamp'));
+
+        // A web-only build while horizon's tag is replaced in place: horizon was not built.
+        file_put_contents($this->directory.'/resources/js/app.js', "console.log(2);\n");
+        file_put_contents($this->directory.'/events', '');
+        $process = $this->make(['build'], ['NNTMUX_REPLACE_ON_BUILD' => '1', 'NNTMUX_REPLACED_ONLY' => 'nntmux/horizon:local']);
+        $process->run();
+        @unlink($this->directory.'/replaced');
+        $this->assertStringContainsString('build --target selfhosted-web', $this->events());
+        $this->assertStringNotContainsString('build --target selfhosted-horizon', $this->events());
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringNotContainsString('sha256:replaced', (string) file_get_contents($this->directory.'/docker/.build.stamp'));
+
+        // Rebuilt and stamped normally once the tag is back.
+        $this->make(['build'])->mustRun();
+        $stamp = (string) file_get_contents($this->directory.'/docker/.build.stamp');
+        $this->assertNotSame('stale', strtok($stamp, "\n"));
+        $this->assertStringContainsString('image:web=nntmux/web:local@sha256:fixture', $stamp);
     }
 
     /** Create the files composeJson() bind-mounts, older than every fixture container. */
