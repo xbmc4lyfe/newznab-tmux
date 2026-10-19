@@ -10,6 +10,16 @@ use RuntimeException;
 
 final class CollectionReleasePolicy
 {
+    private const VERIFIED_OVERSIZE = 'Verified payload exceeds the configured maximum size.';
+
+    private const DECLARED_OVERSIZE = 'Declared collection size exceeds the configured maximum.';
+
+    /** A rejection more articles cannot cure: a collection's size only grows as they arrive. */
+    public static function irrecoverable(string $reason): bool
+    {
+        return $reason === self::VERIFIED_OVERSIZE || $reason === self::DECLARED_OVERSIZE;
+    }
+
     /** @param array<string, mixed> $manifest */
     public function verifiedRejection(array $manifest): ?string
     {
@@ -17,7 +27,9 @@ final class CollectionReleasePolicy
             return null;
         }
         if (($manifest['verification_mode'] ?? null) === 'spot_check') {
-            if (($rejection = (new CandidateHeaderInventory)->rejection($manifest)) !== null) {
+            // The publisher has already validated a partial block against the locked candidate.
+            $inventory = new CandidateHeaderInventory;
+            if (($rejection = isset($manifest['partial']) ? $inventory->partialRejection($manifest) : $inventory->rejection($manifest)) !== null) {
                 throw new RuntimeException($rejection);
             }
 
@@ -39,7 +51,7 @@ final class CollectionReleasePolicy
             return 'Verified payload is below the configured minimum size.';
         }
         if ($limits['max_size'] > 0 && $bytes > $limits['max_size']) {
-            return 'Verified payload exceeds the configured maximum size.';
+            return self::VERIFIED_OVERSIZE;
         }
         if (count($names) < $limits['min_files']) {
             return 'Verified inventory is below the configured minimum file count.';
@@ -60,19 +72,22 @@ final class CollectionReleasePolicy
             return 'A bounded article spot check did not complete.';
         }
         $bytes = (new CandidateHeaderInventory)->bytes($manifest);
-        $fileCount = count($manifest['files'] ?? []);
+        // Only files with articles are written to the NZB; a partial upload can declare files it never posted.
+        $emitted = array_values(array_filter($manifest['files'] ?? [], static fn (mixed $file): bool => is_array($file)
+            && is_array($file['segments'] ?? null) && $file['segments'] !== []));
+        $fileCount = count($emitted);
         $limits = $this->limits((int) $manifest['groups_id']);
         if ($bytes < $limits['min_size']) {
             return 'Declared collection size is below the configured minimum.';
         }
         if ($limits['max_size'] > 0 && $bytes > $limits['max_size']) {
-            return 'Declared collection size exceeds the configured maximum.';
+            return self::DECLARED_OVERSIZE;
         }
         if ($fileCount < $limits['min_files']) {
             return 'Declared file count is below the configured minimum.';
         }
 
-        $subjects = array_map(static fn (array $file): string => (string) ($file['subject'] ?? ''), $manifest['files'] ?? []);
+        $subjects = array_map(static fn (array $file): string => (string) ($file['subject'] ?? ''), $emitted);
         $hasPayload = array_filter($subjects,
             static fn (string $subject): bool => preg_match('/\.par2(?:["\'\s]|$)/i', $subject) !== 1) !== [];
         // An obfuscated, extensionless body name is not evidence of a source payload.

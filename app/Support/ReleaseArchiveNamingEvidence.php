@@ -174,6 +174,15 @@ final class ReleaseArchiveNamingEvidence
         });
     }
 
+    /**
+     * The digest of the source last installed for this release in a committed transaction: every
+     * installation records it in its own transaction. Null when none ever was.
+     */
+    public function committedSourceDigestLocked(object $release): ?string
+    {
+        return $this->loadLocked($release)?->source_sha256;
+    }
+
     private function loadLocked(object $release): ?object
     {
         $this->requireTransaction();

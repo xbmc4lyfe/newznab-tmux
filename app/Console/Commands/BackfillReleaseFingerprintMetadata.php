@@ -14,7 +14,8 @@ final class BackfillReleaseFingerprintMetadata extends Command
                             {--limit=100 : Maximum number of releases to queue}
                             {--after-id=0 : Resume after this release ID}
                             {--delay-ms=0 : Delay between queue submissions in milliseconds}
-                            {--dry-run : Show matching releases without queueing jobs}';
+                            {--dry-run : Show matching releases without queueing jobs}
+                            {--stale : Only re-queue records left stale (an upgrade replaced their NZB) or stuck processing}';
 
     protected $description = 'Queue resumable collection of public release format and NNTP metadata';
 
@@ -23,7 +24,7 @@ final class BackfillReleaseFingerprintMetadata extends Command
         $limit = max(1, min(10_000, (int) $this->option('limit')));
         $afterId = max(0, (int) $this->option('after-id'));
         $delayMs = max(0, min(60_000, (int) $this->option('delay-ms')));
-        $releaseIds = collect($this->staleReleaseIds($afterId, $limit));
+        $releaseIds = collect($this->option('stale') ? $this->interruptedReleaseIds($afterId, $limit) : $this->staleReleaseIds($afterId, $limit));
 
         if ($this->option('dry-run')) {
             $this->table(['release_id'], $releaseIds->map(static fn (int|string $id): array => [(string) $id])->all());
@@ -33,7 +34,8 @@ final class BackfillReleaseFingerprintMetadata extends Command
         }
 
         foreach ($releaseIds as $releaseId) {
-            CollectReleaseFingerprintMetadata::dispatch((int) $releaseId);
+            // A recovered refresh keeps its intent: one that exhausts its tries returns to stale, not failed.
+            CollectReleaseFingerprintMetadata::dispatch((int) $releaseId, $this->option('stale') ? 'stale-sweep' : '');
             if ($delayMs > 0) {
                 usleep($delayMs * 1000);
             }
@@ -85,6 +87,24 @@ final class BackfillReleaseFingerprintMetadata extends Command
         }
 
         return $ids;
+    }
+
+    /**
+     * Records an in-place upgrade marked stale, and runs still processing long past the job timeout (the
+     * worker died), after $afterId. The status index serves both ranges.
+     *
+     * @return list<int>
+     */
+    private function interruptedReleaseIds(int $afterId, int $limit): array
+    {
+        return DB::table('release_fingerprint_metadata')
+            // Stale for an hour: an upgrade queues its own refresh first, and a refresh that keeps failing (which
+            // returns to stale) is retried hourly rather than every pass.
+            ->where(fn ($query) => $query->where(fn ($stale) => $stale->where('status', 'stale')->where('updated_at', '<', now()->subHour()))
+                ->orWhere(fn ($stuck) => $stuck->where('status', 'processing')
+                    ->where('updated_at', '<', now()->subSeconds(2 * CollectReleaseFingerprintMetadata::TIMEOUT_SECONDS))))
+            ->where('releases_id', '>', $afterId)->orderBy('releases_id')->limit($limit)
+            ->pluck('releases_id')->map(static fn (mixed $id): int => (int) $id)->all();
     }
 
     private static function markersAreCurrent(object $row): bool

@@ -14,6 +14,15 @@ final class NzbSourceInstallation
     /** @var resource|null */
     private mixed $handle;
 
+    private bool $finished = false;
+
+    /**
+     * Staged generations of this process's installations whose transactions have not finished, with their connection.
+     *
+     * @var array<string, PDO>
+     */
+    private static array $pendingStaged = [];
+
     /** @param resource $handle */
     public function __construct(
         private readonly NzbSourceGuard $sources,
@@ -22,25 +31,38 @@ final class NzbSourceInstallation
         public readonly string $digest,
         mixed $handle,
         public readonly PDO $pdo,
+        // An in-place upgrade's generation, beside $path until its transaction commits: close() swaps it in.
+        public readonly ?string $staged = null,
     ) {
         $this->handle = $handle;
+        if ($staged !== null) {
+            self::$pendingStaged[$staged] = $pdo;
+        }
+    }
+
+    /**
+     * Whether $path is a generation staged by a transaction still open on $pdo: only its own close() settles it. A
+     * reconnected connection's transaction cannot be the one that staged it.
+     */
+    public static function isPendingStaged(string $path, PDO $pdo): bool
+    {
+        return (self::$pendingStaged[$path] ?? null) === $pdo && $pdo->inTransaction();
     }
 
     public function ownsCurrentPath(): bool
     {
-        if (! is_resource($this->handle)) {
-            return false;
-        }
-        clearstatcache(true, $this->path);
-        $owned = fstat($this->handle);
-        $current = @lstat($this->path);
+        return $this->owns($this->path);
+    }
 
-        return $owned !== false && $current !== false
-            && $owned['dev'] === $current['dev'] && $owned['ino'] === $current['ino'];
+    public function ownsStagedPath(): bool
+    {
+        return $this->staged !== null && $this->owns($this->staged);
     }
 
     public function rollback(): void
     {
+        // Rolled back: a staged generation is only ever removed, never swapped in.
+        $this->finished = true;
         try {
             $this->sources->rollbackInstallation($this);
         } catch (Throwable $exception) {
@@ -50,6 +72,7 @@ final class NzbSourceInstallation
             try {
                 Log::warning('NZB rollback cleanup retained its source.', [
                     'release_guid' => $this->guid,
+                    'staged_source' => $this->staged,
                     'exception' => $exception::class,
                 ]);
             } catch (Throwable) {
@@ -60,16 +83,61 @@ final class NzbSourceInstallation
         }
     }
 
+    /**
+     * After commit: a staged generation is swapped in only when it is the committed one (see
+     * NzbSourceGuard::reconcileStaged()); a failed COMMIT can still run after-commit callbacks.
+     */
     public function close(): void
+    {
+        $this->release();
+        if ($this->staged === null || $this->finished) {
+            return;
+        }
+        $this->finished = true;
+        if (! is_file($this->staged)) {
+            // Already settled by a reader or the next installation.
+            return;
+        }
+        try {
+            $this->sources->reconcileStaged($this->staged);
+        } catch (Throwable $exception) {
+            try {
+                Log::warning('Could not swap in a staged NZB generation after commit.', [
+                    'staged_source' => $this->staged, 'exception' => $exception::class,
+                ]);
+            } catch (Throwable) {
+                // Settled later by naming inspection or nzbclean.
+            }
+        }
+    }
+
+    public function __destruct()
+    {
+        // Only the descriptor: a staged generation left unsettled is reconciled later.
+        $this->release();
+    }
+
+    private function owns(string $path): bool
+    {
+        if (! is_resource($this->handle)) {
+            return false;
+        }
+        clearstatcache(true, $path);
+        $owned = fstat($this->handle);
+        $current = @lstat($path);
+
+        return $owned !== false && $current !== false
+            && $owned['dev'] === $current['dev'] && $owned['ino'] === $current['ino'];
+    }
+
+    private function release(): void
     {
         if (is_resource($this->handle)) {
             fclose($this->handle);
         }
         $this->handle = null;
-    }
-
-    public function __destruct()
-    {
-        $this->close();
+        if ($this->staged !== null) {
+            unset(self::$pendingStaged[$this->staged]);
+        }
     }
 }

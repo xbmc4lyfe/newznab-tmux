@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tests\Feature;
 
 use App\Services\NNTP\NNTPService;
+use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\PublicationOutbox;
 use App\Services\Releases\Verification\PublicationOutboxEntry;
@@ -2097,6 +2098,70 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         }
     }
 
+    /** A stalled upload in the strict group, promoted as a partial and claimed: one of three articles, far below its minimum size. */
+    private function claimedPartial(): object
+    {
+        config(['release_verification.partial_after_hours' => 4]);
+        $collection = DB::table('collections')->insertGetId(['collectionhash' => sha1(random_bytes(8), true), 'subject' => 'Movie partial',
+            'fromname' => 'poster', 'totalfiles' => 1, 'groups_id' => 2, 'date' => '2026-10-11 12:00:00', 'filecheck' => 3, 'filesize' => 100000]);
+        $binary = DB::table('binaries')->insertGetId(['collections_id' => $collection, 'binaryhash' => md5('partial', true), 'name' => 'movie.mkv', 'totalparts' => 3]);
+        DB::table('parts')->insert(['binaries_id' => $binary, 'partnumber' => 1, 'messageid' => 'partial@article', 'size' => 100000]);
+        $repository = app(CandidateRepository::class);
+        $repository->archive($collection);
+        $this->travel(5)->hours();
+        $this->assertSame(1, $repository->promotePartial(10));
+
+        return $repository->claim();
+    }
+
+    /** As a worker's own deferred publication: back to waiting_upload for the hold window, lease cleared, nothing published. */
+    private function assertDeferredToWaiting(object $claim): void
+    {
+        $row = $this->candidateRow($claim);
+        $this->assertSame('waiting_upload', $row->status);
+        $this->assertStringStartsWith('Partial publication deferred: ', (string) $row->reason);
+        $this->assertNull($row->lease_token);
+        $this->assertNull($row->lease_until);
+        $this->assertNull($row->release_id);
+        $this->assertTrue(Carbon::parse($row->next_attempt_at)->greaterThan(now()->addMinutes(30)), 'Not retried every retry interval.');
+        $this->assertSame(0, DB::table('releases')->count());
+        $this->assertSame([], $this->pendingNames());
+        $this->assertSame([], glob($this->outbox()->inflightDirectory(1).'/*') ?: []);
+    }
+
+    public function test_a_deferred_batch_outcome_returns_the_partial_to_waiting_instead_of_finishing_it(): void
+    {
+        $this->batchSchema();
+        $this->configureAsync();
+        $claim = $this->claimedPartial();
+        $this->handOff($claim);
+        $this->servePrimary();
+        $summaries = [];
+        $this->captureSummaries($summaries, 'Publication forwarder run summary.');
+
+        $this->assertSame(0, $this->forward(['--diagnostics' => true]));
+
+        $this->assertSame([self::BATCH], $this->requested);
+        $this->assertDeferredToWaiting($claim);
+        $this->assertSame(1, $summaries[0]['outcomes']['deferred']);
+        $this->assertSame(0, $summaries[0]['outcomes']['other']);
+        $this->assertSame([0, 0, 0], [$summaries[0]['requeued'], $summaries[0]['expired'], $summaries[0]['finish_failures']]);
+    }
+
+    public function test_the_single_endpoints_deferred_answer_also_returns_the_partial_to_waiting(): void
+    {
+        $this->batchSchema();
+        $this->configureAsync(batch: false);
+        $claim = $this->claimedPartial();
+        $this->handOff($claim);
+        $this->servePrimary();
+
+        $this->assertSame(0, $this->forward());
+
+        $this->assertSame([self::SINGLE], $this->requested);
+        $this->assertDeferredToWaiting($claim);
+    }
+
     public function test_batches_are_split_by_the_byte_limit_the_primary_advertised(): void
     {
         $this->batchSchema(releases: 12);
@@ -2244,7 +2309,8 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $entry = $this->outbox()->pending()[0];
 
         $this->assertSame('7-3-'.substr(sha1('token'), 0, 12).'.json', $name);
-        $this->assertSame($evidence, SpotCheckVerifier::evidence($entry->item()->result->manifest));
+        // An entry carries no partial flag: the primary decides partial status from its stored manifest.
+        $this->assertSame($evidence + ['partial' => false], SpotCheckVerifier::evidence($entry->item()->result->manifest));
         $this->assertSame('Reason.', $entry->item()->result->reason);
         $this->assertSame('sampled', $entry->item()->result->verdict);
         $this->assertSame(7, $entry->item()->claim->id);

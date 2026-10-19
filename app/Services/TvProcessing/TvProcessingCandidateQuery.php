@@ -6,6 +6,7 @@ namespace App\Services\TvProcessing;
 
 use App\Enums\TvLookupStatus;
 use App\Models\Category;
+use App\Models\Release;
 
 /**
  * SQL shared by the TV bucket dispatcher, the pipeline workers, the tmux ready-work
@@ -37,6 +38,7 @@ final class TvProcessingCandidateQuery
 
         return self::categoryCondition()
             .' AND videos_id = 0 AND tv_episodes_id = '.TvLookupStatus::Pending->value
+            .' AND '.self::settledCondition()
             .' AND '.self::dueCondition()
             .($lookupMode === 2 ? ' AND isrenamed = 1' : '');
     }
@@ -45,7 +47,8 @@ final class TvProcessingCandidateQuery
     public static function episodeRetryCondition(bool $ignoreSchedule = false): string
     {
         $condition = self::categoryCondition()
-            .' AND videos_id > 0 AND tv_episodes_id = '.TvLookupStatus::EpisodeMissing->value;
+            .' AND videos_id > 0 AND tv_episodes_id = '.TvLookupStatus::EpisodeMissing->value
+            .' AND '.self::settledCondition();
 
         if ($ignoreSchedule) {
             return $condition;
@@ -88,6 +91,12 @@ final class TvProcessingCandidateQuery
             'tv_lookup_attempts' => 0,
             'tv_lookup_retry_at' => null,
         ];
+    }
+
+    /** A partial awaiting a late-article upgrade may be renamed and reset, so a lookup on its title would go stale. */
+    public static function settledCondition(): string
+    {
+        return Release::hasLateArticleFlag() ? 'late_article_candidate_id IS NULL' : '1 = 1';
     }
 
     private static function dueCondition(): string

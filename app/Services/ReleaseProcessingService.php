@@ -1785,15 +1785,27 @@ final class ReleaseProcessingService
         return $stats;
     }
 
+    /**
+     * Releases below the completion threshold. Partial publications are knowingly incomplete, carry
+     * their found and declared article counts, and are kept.
+     *
+     * @return \Illuminate\Database\Eloquent\Builder<Release>
+     */
+    private function incompleteReleases(): \Illuminate\Database\Eloquent\Builder
+    {
+        return Release::query()
+            ->where('completion', '<', $this->settings->completion)
+            ->where('completion', '>', 0)
+            ->when(Release::hasPartialArticleCounts(), static fn ($query) => $query->whereNull('articles_expected'));
+    }
+
     private function deleteIncompleteReleases(ReleaseDeleteStats $stats): ReleaseDeleteStats
     {
         if (! $this->settings->hasCompletionCleanup()) {
             return $stats;
         }
 
-        Release::query()
-            ->where('completion', '<', $this->settings->completion)
-            ->where('completion', '>', 0)
+        $this->incompleteReleases()
             ->select(['id', 'guid'])
             ->chunkById(self::BATCH_SIZE, function ($releases) use (&$stats): bool {
                 foreach ($releases as $release) {
@@ -1843,6 +1855,8 @@ final class ReleaseProcessingService
             Release::query()
                 ->where('categories_id', (int) $category->id)
                 ->where('size', '<', (int) $category->minsize) // @phpstan-ignore property.notFound
+                // A partial publication is knowingly short; late articles may still complete it.
+                ->when(Release::hasPartialArticleCounts(), static fn ($query) => $query->whereNull('articles_expected'))
                 ->select(['id', 'guid'])
                 ->limit(1000)
                 ->chunkById(self::BATCH_SIZE, function ($releases) use (&$stats): bool {

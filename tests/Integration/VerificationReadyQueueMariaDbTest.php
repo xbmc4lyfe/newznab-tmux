@@ -392,7 +392,8 @@ PHP);
             $evidence = json_encode(['parent_error' => $parentError, 'parent_changed' => $changed, 'child' => $child], JSON_THROW_ON_ERROR);
             $this->assertNull($parentError, $evidence);
             $this->assertSame('committed', $child['status'], $evidence);
-            $this->assertCount(2, $child['lock_queries'], $evidence);
+            // Per collection: its candidates, then the partial holders' pointer read (both locking, same rows first).
+            $this->assertCount(4, $child['lock_queries'], $evidence);
             $this->assertSame([], $child['wait_graph'], $evidence);
             $this->assertSame(1, $changed, $evidence);
             $this->assertSame(1, $report['updated']['waiting_upload']);
