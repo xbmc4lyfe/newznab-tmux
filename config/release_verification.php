@@ -73,6 +73,11 @@ return [
     'scratch_bytes' => (int) env('RELEASE_VERIFICATION_SCRATCH_BYTES', 214748364800),
     'free_bytes' => (int) env('RELEASE_VERIFICATION_FREE_BYTES', 10737418240),
     'article_bytes' => (int) env('RELEASE_VERIFICATION_ARTICLE_BYTES', 16777216),
+    // Most header metadata one candidate may hold, merged or not, counted as 128 bytes plus the message-ID
+    // per article. 48 MiB is about 250,000 articles with typical message-IDs, whose NZB stays under the
+    // 32 MiB audit reader limit. Larger uploads keep their headers and are retried after a backoff, or at
+    // once when this is raised.
+    'metadata_bytes' => (int) env('RELEASE_VERIFICATION_METADATA_BYTES', 50331648),
     'download_connections' => (int) env('RELEASE_VERIFICATION_DOWNLOAD_CONNECTIONS', 2),
     'pipeline_window' => (int) env('RELEASE_VERIFICATION_PIPELINE_WINDOW', 4),
     'download_buffer_bytes' => (int) env('RELEASE_VERIFICATION_DOWNLOAD_BUFFER_BYTES', 67108864),

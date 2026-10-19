@@ -253,6 +253,11 @@ final class CandidateRepository
                     $prepared = null;
                     $headerAssessment = null;
                 }
+                if (($merges || $existing !== null) && self::metadataBytes($manifest) > OversizedCollectionDeferrals::budget()) {
+                    // Each snapshot fits, but the merged inventory would not: keep these headers for a later pass
+                    // (or a raised budget) before anything is written or charged to the ledger.
+                    throw new CandidateMetadataBudgetExceeded('Merged candidate exceeds metadata budget; headers retained.');
+                }
                 $path = $prepared === null ? $this->store->write($manifest) : $this->store->writePrepared($prepared);
                 $size = $this->store->size($path);
                 $arrivalAt = Carbon::parse($collection->last_seen_at ?? $collection->dateadded ?? $collection->added ?? now())->format('Y-m-d H:i:s');
@@ -658,25 +663,10 @@ final class CandidateRepository
             try {
                 $snapshot = $this->snapshot($collection);
             } catch (CandidateMetadataBudgetExceeded) {
-                // Too large to compare (or for archive() to merge), so fence any verification already under way:
-                // it must not publish a result read before these headers. Each post stays claimable and is
-                // verified again on what it has, as when ingestion failed on such a collection; this chunk is
-                // not aborted. A partial under the hash can never take these late headers, and its retained
-                // inventory would otherwise wait on this collection forever: it is settled as it stands.
-                $heldIds = array_map(static fn (object $held): int => (int) $held->id, $this->lockPartialHolders($identity, true));
-                foreach ($candidates as $candidate) {
-                    if ($candidate->manifest_path === '') {
-                        continue;
-                    }
-                    if (in_array((int) $candidate->id, $heldIds, true)) {
-                        $this->settleOverBudgetHolder($candidate);
-                        $released += (int) $candidate->manifest_bytes;
-                    } elseif ($candidate->release_id === null) {
-                        DB::table('release_verification_candidates')->where('id', $candidate->id)->update([
-                            'lease_token' => null, 'lease_until' => null, 'version' => $candidate->version + 1]);
-                    }
-                }
-                DB::table('collections')->where('id', $collection->id)->where('filecheck', '!=', 4)->update(['filecheck' => 3]);
+                // Too large to compare (or for archive() to merge). A partial under the hash can never take these
+                // late headers, and its retained inventory would otherwise wait on this collection forever.
+                $released += $this->fenceOverBudget($collection, $candidates,
+                    array_map(static fn (object $held): int => (int) $held->id, $this->lockPartialHolders($identity, true)));
 
                 continue;
             }
@@ -688,6 +678,13 @@ final class CandidateRepository
                 // generation that upgrades it. Other posts under the hash are left alone.
                 $old = $this->store->read($owner->manifest_path);
                 $merged = $this->merge($old, $snapshot);
+                if (self::metadataBytes($merged) > OversizedCollectionDeferrals::budget()) {
+                    // archive() keeps these headers for a later pass (or a raised budget) instead of merging them,
+                    // so the holder keeps its inventory and its partial: only a pending upgrade under way is fenced.
+                    $this->fenceOverBudget($collection, [$owner], []);
+
+                    continue;
+                }
                 if ($this->articleIdentity($old) !== $this->articleIdentity($merged)) {
                     DB::table('release_verification_candidates')->where('id', $owner->id)->update($owner->release_id === null
                         ? ['status' => 'dirty', 'lease_token' => null, 'lease_until' => null, 'version' => $owner->version + 1, 'last_unique_at' => now()]
@@ -712,6 +709,12 @@ final class CandidateRepository
                     ->where('source_identity', $identity)->orderByDesc('id')->lockForUpdate()->value('id') !== (int) $candidate->id)) {
                     break;
                 }
+                if (self::metadataBytes($merged) > OversizedCollectionDeferrals::budget()) {
+                    // archive() cannot merge these headers into it; it is verified again on what it has.
+                    $released += $this->fenceOverBudget($collection, [$candidate], []);
+
+                    continue 2;
+                }
                 if ($this->articleIdentity($old) !== $this->articleIdentity($merged) || ($merged['conflict'] ?? false)) {
                     DB::table('release_verification_candidates')->where('id', $candidate->id)->update([
                         'status' => 'dirty', 'lease_token' => null, 'lease_until' => null, 'version' => $candidate->version + 1,
@@ -726,6 +729,35 @@ final class CandidateRepository
         if ($released > 0) {
             $this->ledger->adjust(-$released);
         }
+    }
+
+    /**
+     * Fence verification already under way for these candidates when late headers exceed the metadata budget:
+     * it must not publish a result read before these headers. Each post stays claimable and is verified again
+     * on what it has, as when ingestion failed on such a collection; the ingestion chunk is not aborted. A held
+     * partial inventory is settled as it stands. Returns the capacity released, for the caller to adjust.
+     *
+     * @param  iterable<object>  $candidates
+     * @param  list<int>  $heldIds
+     */
+    private function fenceOverBudget(object $collection, iterable $candidates, array $heldIds): int
+    {
+        $released = 0;
+        foreach ($candidates as $candidate) {
+            if ($candidate->manifest_path === '') {
+                continue;
+            }
+            if (in_array((int) $candidate->id, $heldIds, true)) {
+                $this->settleOverBudgetHolder($candidate);
+                $released += (int) $candidate->manifest_bytes;
+            } elseif ($candidate->release_id === null) {
+                DB::table('release_verification_candidates')->where('id', $candidate->id)->update([
+                    'lease_token' => null, 'lease_until' => null, 'version' => $candidate->version + 1]);
+            }
+        }
+        DB::table('collections')->where('id', $collection->id)->where('filecheck', '!=', 4)->update(['filecheck' => 3]);
+
+        return $released;
     }
 
     /**
@@ -1094,6 +1126,23 @@ final class CandidateRepository
         return $manifest;
     }
 
+    /**
+     * Header metadata a manifest holds, counted as snapshotHeaders() counts it against the budget.
+     *
+     * @param  array<string, mixed>  $manifest
+     */
+    private static function metadataBytes(array $manifest): int
+    {
+        $bytes = 0;
+        foreach ($manifest['files'] as $file) {
+            foreach ($file['segments'] as $segment) {
+                $bytes += 128 + strlen($segment['messageid']);
+            }
+        }
+
+        return $bytes;
+    }
+
     /** @return array<string, mixed> */
     private function snapshotHeaders(object $collection, bool $currentReads): array
     {
@@ -1105,6 +1154,7 @@ final class CandidateRepository
         sort($groups);
         $files = [];
         $metadataBytes = 0;
+        $budget = OversizedCollectionDeferrals::budget();
         $binaries = $this->snapshotQuery('binaries', $currentReads)->where('collections_id', $collection->id)->orderBy('binaryhash')
             ->select(['id', 'binaryhash', 'name', 'totalparts'])->cursor();
         foreach ($binaries->chunk(100) as $batch) {
@@ -1113,7 +1163,7 @@ final class CandidateRepository
                 ->orderBy('binaries_id')->orderBy('partnumber')
                 ->select(['binaries_id', 'partnumber', 'messageid', 'size'])->cursor() as $part) {
                 $metadataBytes += 128 + strlen($part->messageid);
-                if ($metadataBytes > 16777216) {
+                if ($metadataBytes > $budget) {
                     throw new CandidateMetadataBudgetExceeded('Candidate exceeds metadata budget; headers retained.');
                 }
                 $segmentsByBinary[$part->binaries_id][] = ['number' => (int) $part->partnumber,
