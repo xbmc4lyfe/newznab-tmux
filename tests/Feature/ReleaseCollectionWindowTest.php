@@ -828,6 +828,26 @@ class ReleaseCollectionWindowTest extends TestCase
         $this->assertNull(Cache::get('cbp:retention-band:cursor'));
     }
 
+    public function test_retention_band_walk_stops_at_its_page_cap_and_resumes_from_its_cursor(): void
+    {
+        ConfigurationTestBuilder::update(ConfigurationDomain::Ingestion, ['part_retention_hours' => 24]);
+        // 42 rows share one dateadded, so pages also split ties; even ids are ready.
+        foreach (range(1, 42) as $id) {
+            $this->insertCollection($id);
+            DB::table('collections')->where('id', $id)->update([
+                'filecheck' => $id % 2 === 0 ? 3 : 0, 'dateadded' => now()->subHours(30), 'added' => now()->subHours(30),
+            ]);
+        }
+        $cleanup = new CollectionCleanupService(new BinariesConfig(sqlChunkSize: 2));
+
+        $cleanup->deleteFinishedAndOrphans(false);
+        $this->assertSame(40, Cache::get('cbp:retention-band:cursor')['id']);
+        $this->assertSame([41, 42], DB::table('collections')->where('id', '>', 40)->orderBy('id')->pluck('id')->all());
+        $cleanup->deleteFinishedAndOrphans(false);
+        $this->assertNull(Cache::get('cbp:retention-band:cursor'));
+        $this->assertSame(range(2, 42, 2), DB::table('collections')->orderBy('id')->pluck('id')->all());
+    }
+
     public function test_idle_pipeline_runs_legacy_callbacks_once(): void
     {
         $categorized = 0;
