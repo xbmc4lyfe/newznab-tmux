@@ -1675,6 +1675,58 @@ SH);
         $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
     }
 
+    public function test_a_renamed_data_service_starts_only_after_the_writers_stop(): void
+    {
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['mariadb'] = ['image' => 'mariadb:one'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        // mariadb is renamed to db2 (same storage): db2 has no container and no record.
+        unset($json['services']['mariadb']);
+        $json['services']['db2'] = ['image' => 'mariadb:one'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES), 'NNTMUX_NO_CONTAINER' => 'db2'])->mustRun();
+        $events = $this->events();
+        $this->assertGreaterThan(strpos($events, ' stop web scheduler indexer'), strpos($events, '--wait-timeout 240 db2'));
+    }
+
+    public function test_the_rendered_app_environment_names_the_database_service(): void
+    {
+        $json = json_decode($this->composeJson(), true);
+        foreach (['web', 'horizon', 'scheduler', 'indexer'] as $app) {
+            $json['services'][$app] = ['environment' => ['DB_HOST' => 'db2']];
+        }
+        $json['services']['db2'] = ['image' => 'mariadb:one'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        $json['services']['db2'] = ['image' => 'mariadb:two'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
+        $events = $this->events();
+        $recreate = strpos($events, '--force-recreate --wait --wait-timeout 240 db2');
+        $this->assertNotFalse($recreate);
+        $this->assertGreaterThan($recreate, strrpos($events, 'releases:verification-barrier --timeout=900'));
+    }
+
+    public function test_a_data_service_image_replaced_during_the_drain_is_never_applied(): void
+    {
+        mkdir($this->directory.'/docker/config/redis', 0777, true);
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 1gb\n");
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['redis']['image'] = 'redis:7';
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 2gb\n");
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_REPLACE_DURING_DRAIN' => '1']);
+        $process->run();
+        @unlink($this->directory.'/replaced');
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('not rolling out a replaced image', $process->getErrorOutput());
+        $this->assertStringNotContainsString('--wait-timeout 240 redis', $this->events());
+    }
+
     public function test_infrastructure_a_new_data_service_needs_starts_first(): void
     {
         $base = json_decode($this->composeJson(), true);
@@ -3110,6 +3162,12 @@ SH);
         $plan->run();
         $this->assertNotSame(0, $plan->getExitCode());
         $this->assertStringContainsString('waits for init to complete successfully', $plan->getErrorOutput());
+
+        // Compose would pull or build another image during the apply than the plan inspected.
+        $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['proxy' => ['image' => 'caddy:2', 'pull_policy' => 'always']] + $services], JSON_UNESCAPED_SLASHES)]);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('pull_policy: always', $plan->getErrorOutput());
 
         // App services must run their role image.
         $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['web' => ['image' => 'nntmux/app:local']] + $services], JSON_UNESCAPED_SLASHES)]);

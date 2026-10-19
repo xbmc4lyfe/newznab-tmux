@@ -487,6 +487,9 @@ def verify_planned_images(docker_dir: Path, stamp_path: Path, services: list[str
     for svc in services:
         planned = snapshot.get(f"image:{svc}", "")
         if "@" not in planned:
+            if svc not in APP_SERVICES:
+                # No local image when planned (Compose will pull it): nothing pinned to compare.
+                continue
             sys.exit(f"deploy-plan: no planned image for {svc}")
         tag, planned_id = planned.rsplit("@", 1)
         current = running_image(docker_dir, svc) if running else image_id(tag)
@@ -687,6 +690,10 @@ def reject_unsupported_service(svc: str, cfg: object) -> None:
                 # recreates the provider alone with --no-deps.
                 sys.exit(f"deploy-plan: service {svc} sets depends_on.{provider}.restart; selective deployment "
                          "recreates a provider without restarting its dependents. Remove `restart: true`.")
+    if str(cfg.get("pull_policy", "")).lower() in ("always", "build", "daily", "weekly") or str(cfg.get("pull_policy", "")).lower().startswith("every_"):
+        # Compose would fetch or build another image during the apply than the one the plan pinned.
+        sys.exit(f"deploy-plan: service {svc} sets pull_policy: {cfg['pull_policy']}; selective deployment applies "
+                 "only images it has inspected. Pull deliberately before deploying and use the default policy.")
     if svc in APP_SERVICES and isinstance(cfg.get("image"), str) and cfg["image"] != service_image_name(svc):
         # Health, image and stamp checks compare against the role image; another tag would never match.
         sys.exit(f"deploy-plan: app service {svc} runs image {cfg['image']}, not its role image "
@@ -1337,12 +1344,18 @@ def compose_path(path: str) -> str:
 def database_service(docker_dir: Path) -> str:
     """The rendered service the app's database runs in: the host in DB_URL (which Laravel prefers),
     else DB_HOST from app.env, when it names one (e.g. an override's `db2`); otherwise `mariadb`."""
-    values = read_dotenv(docker_dir / "config/app.env")
-    try:
-        url_host = urlsplit(values.get("DB_URL", "")).hostname or ""
-    except ValueError:
-        url_host = ""
-    for host in (url_host, values.get("DB_HOST", "")):
+    candidates = []
+    # The environment Compose renders for the apps wins over app.env (Laravel reads it first).
+    sources = [RENDERED_SERVICES.get(app, {}).get("environment") if isinstance(RENDERED_SERVICES.get(app), dict) else None
+               for app in APP_SERVICES]
+    sources = [env for env in sources if isinstance(env, dict)] + [read_dotenv(docker_dir / "config/app.env")]
+    for values in sources:
+        try:
+            candidates.append(urlsplit(str(values.get("DB_URL") or "")).hostname or "")
+        except ValueError:
+            pass
+        candidates.append(str(values.get("DB_HOST") or ""))
+    for host in candidates:
         if host in RENDERED_SERVICES:
             return host
     return "mariadb"
@@ -1480,6 +1493,14 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
     reconcile_data: list[str] = []
     start_data: list[str] = []
     data_reasons: dict[str, str] = {}
+    # A recorded data service that is no longer rendered may have been renamed onto the same storage
+    # as a new one; then no new data service may start before the writers are quiesced.
+    data_removed = any(
+        key.startswith("compose:") and stamped[key] != "absent"
+        and key.split(":", 1)[1] not in RENDERED_SERVICES
+        and key.split(":", 1)[1] not in APP_SERVICES and key.split(":", 1)[1] not in INFRA_SERVICES
+        for key in stamped
+    )
     for svc in data_services(state):
         if not compose_present(state, svc):
             data_reasons[svc] = "not rendered"
@@ -1489,7 +1510,7 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
                 # FORCE=1 stops every writer anyway, so it is reconciled after they stop.
                 reconcile_data.append(svc)
                 data_reasons[svc] = "start (no container)"
-            elif (
+            elif not data_removed and (
                 first_deploy or legacy_stamp or stamped_hash is None
                 or stamped.get(f"compose:{svc}") == "absent"
                 or stamped_hash == state[f"service:{svc}"]
@@ -1805,7 +1826,14 @@ def main() -> None:
         plan = compute_deploy_plan(repo, docker_dir, stamp_path, build_force=False)
         snapshot = Path(f"{stamp_path}.plan")
         tmp = snapshot.with_name(f"{snapshot.name}.tmp.{os.getpid()}")
-        tmp.write_text(format_stamp(plan["state"]))  # type: ignore[arg-type]
+        planned_state = dict(plan["state"])  # type: ignore[arg-type]
+        # The data/infrastructure images this plan inspected, for apply_each to verify each against.
+        for svc, cfg in RENDERED_SERVICES.items():
+            if svc not in APP_SERVICES and isinstance(cfg, dict) and isinstance(cfg.get("image"), str):
+                local = image_id(cfg["image"])
+                if local:
+                    planned_state[f"image:{svc}"] = f"{cfg['image']}@{local}"
+        tmp.write_text(format_stamp(planned_state))
         os.replace(tmp, snapshot)
         print(f"MODE={shlex.quote(str(plan['mode']))}")
         print(f"MIGRATE={'1' if plan['migrate'] else '0'}")

@@ -156,6 +156,8 @@ apply_each() {
     mark=$1
     shift
     for svc in "$@"; do
+        # Its tag must still name the image this run planned (a long drain gives time to replace it).
+        plan --verify-images "$svc"
         plan "$mark" "$svc"
         if [ "$mark" = --pending ]; then
             compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" "$svc"
