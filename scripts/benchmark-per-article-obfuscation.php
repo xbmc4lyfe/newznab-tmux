@@ -14,7 +14,8 @@ declare(strict_types=1);
  * disabled. The Rust side is the caller's full path: record packing, the FFI call, unpacking and
  * building the article-number set HeaderParser consults, falling back to PHP on a decline. The
  * thresholds follow .ai/rules/rust-performance.md: common strata compare medians, uncommon strata
- * p99, and each must reach 1.5x on the point estimate. Uncertainty is a 95% percentile bootstrap
+ * p99, and each must reach 1.5x on the point estimate; routed strata (token-poor ranges the
+ * wrapper leaves on PHP) compare medians and must stay at 0.9x or better. Uncertainty is a 95% percentile bootstrap
  * interval of that speedup (2000 seeded resamples of the paired observations). A missed threshold
  * is a valid result and exits 0; invalid runs (parity failure, missing library) exit 2.
  */
@@ -29,6 +30,7 @@ use Tests\Support\PerArticleObfuscationCorpus;
 const PER_ARTICLE_THRESHOLD = 1.5;
 const PER_ARTICLE_MIN_ARTICLES = 16;
 const PER_ARTICLE_BOOTSTRAP = 2000;
+const PER_ARTICLE_ROUTED_FLOOR = 0.9;
 
 try {
     exit(perArticleBenchmarkMain());
@@ -109,7 +111,7 @@ function perArticleBenchmarkMain(): int
             }
         }
         gc_enable();
-        $quantile = $stratum['category'] === 'common' ? 0.5 : 0.99;
+        $quantile = $stratum['category'] === 'uncommon' ? 0.99 : 0.5;
         $phpValue = perArticleQuantile($samples['php'], $quantile);
         $rustValue = perArticleQuantile($samples['rust'], $quantile);
         $speedup = $phpValue / max(1, $rustValue);
@@ -124,7 +126,9 @@ function perArticleBenchmarkMain(): int
             'php_p99_ms' => round(perArticleQuantile($samples['php'], 0.99) / 1e6, 3),
             'rust_p99_ms' => round(perArticleQuantile($samples['rust'], 0.99) / 1e6, 3),
             'samples' => $repeats];
-        if ($speedup < PER_ARTICLE_THRESHOLD && $report['status'] === 'qualified') {
+        // Routed strata stay on PHP by design; they only must not regress (sampling overhead).
+        $required = $stratum['category'] === 'routed' ? PER_ARTICLE_ROUTED_FLOOR : PER_ARTICLE_THRESHOLD;
+        if ($speedup < $required && $report['status'] === 'qualified') {
             $report['status'] = 'not-qualified';
         }
         $report['strata'][$name] = $row;

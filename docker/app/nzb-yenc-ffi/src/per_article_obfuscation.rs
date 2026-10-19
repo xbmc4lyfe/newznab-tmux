@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 const TOKEN_LENGTH: usize = 16;
 /// Longer subjects decline. PHP's `pcre.backtrack_limit` (1,000,000) can stop the subject pattern
-/// on crafted whitespace from about 1,000 bytes, so up to this length both sides match alike.
+/// on crafted whitespace from about 800 bytes, so up to this length both sides match alike.
 const MAX_SUBJECT_LENGTH: usize = 512;
 const USENET_INDEX_POST: &[u8] = b"Usenet Index Post";
 

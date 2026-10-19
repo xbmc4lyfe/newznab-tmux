@@ -25,6 +25,8 @@ final class PerArticleObfuscationCorpus
             'kenpsx' => ['category' => 'common', 'description' => 'per-article random quoted names, 4 interleaved files per signature', 'size' => 20000],
             'boneless' => ['category' => 'common', 'description' => 'per-article random bracketed names, files posted in turn', 'size' => 20000],
             'mixed' => ['category' => 'common', 'description' => 'half real uploads, half obfuscated, interleaved', 'size' => 20000],
+            'readable-yenc' => ['category' => 'routed', 'description' => 'readable yEnc uploads without 16+ alphanumeric tokens (stays on PHP)', 'size' => 20000],
+            'non-yenc' => ['category' => 'routed', 'description' => 'text posts without yEnc part counts (stays on PHP)', 'size' => 20000],
             'large-range' => ['category' => 'uncommon', 'description' => 'mixed range of 200k headers', 'size' => 200000],
             'small-range' => ['category' => 'uncommon', 'description' => 'mixed range of 200 headers', 'size' => 200],
             'long-subjects' => ['category' => 'uncommon', 'description' => 'mixed range with 300-byte subject prefixes', 'size' => 20000],
@@ -40,6 +42,8 @@ final class PerArticleObfuscationCorpus
         $size ??= self::strata()[$name]['size'];
         $subjects = match ($name) {
             'real-uploads' => self::real($random, $size),
+            'readable-yenc' => self::real($random, $size, false),
+            'non-yenc' => self::text($random, $size),
             'kenpsx' => self::kenpsx($random, $size),
             'boneless' => self::boneless($random, $size),
             'mixed', 'large-range', 'small-range' => self::mixed($random, $size, ''),
@@ -62,19 +66,35 @@ final class PerArticleObfuscationCorpus
     }
 
     /** @return list<string> */
-    private static function real(Randomizer $random, int $size): array
+    private static function real(Randomizer $random, int $size, bool $allowHashed = true): array
     {
         $subjects = [];
         while (count($subjects) < $size) {
             $files = $random->getInt(1, 40);
             $parts = $random->getInt(2, 300);
-            $hashed = $random->getInt(0, 2) === 0 ? md5($random->getBytes(8)) : null;
+            $hashed = $allowHashed && $random->getInt(0, 2) === 0 ? md5($random->getBytes(8)) : null;
             for ($file = 1; $file <= $files && count($subjects) < $size; $file++) {
                 $name = $hashed !== null ? $hashed.sprintf('.part%02d.rar', $file) : sprintf('Some.Show.S01E%02d.1080p.part%02d.rar', $files, $file);
                 for ($part = 1; $part <= $parts && count($subjects) < $size; $part++) {
                     $subjects[] = sprintf('[%02d/%02d] - "%s" yEnc (%d/%d)', $file, $files, $name, $part, $parts);
                 }
             }
+        }
+
+        return $subjects;
+    }
+
+    /** @return list<string> */
+    private static function text(Randomizer $random, int $size): array
+    {
+        $words = ['Re:', 'question', 'about', 'the', 'new', 'release', 'help', 'needed', 'with', 'setup', 'thanks', 'update', 'Fwd:', 'weekly', 'discussion'];
+        $subjects = [];
+        for ($i = 0; $i < $size; $i++) {
+            $subject = [];
+            for ($word = $random->getInt(2, 9); $word > 0; $word--) {
+                $subject[] = $words[$random->getInt(0, count($words) - 1)];
+            }
+            $subjects[] = implode(' ', $subject).($random->getInt(0, 3) === 0 ? ' #'.$random->getInt(1, 999) : '');
         }
 
         return $subjects;

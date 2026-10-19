@@ -19,6 +19,9 @@ final class NativePerArticleObfuscation
     /** Mirrors MAX_SUBJECT_LENGTH in the Rust port; longer subjects are declined before packing. */
     public const int MAX_SUBJECT_LENGTH = 512;
 
+    /** Headers sampled to decide whether a range is worth marshalling to Rust. */
+    private const int SAMPLE_SIZE = 64;
+
     /** @var array<string, FFI|null> */
     private static array $libraries = [];
 
@@ -35,16 +38,51 @@ final class NativePerArticleObfuscation
     }
 
     /**
-     * Article numbers the PHP rule would mark, or null to keep the PHP result.
+     * Article numbers the PHP rule would mark, or null to keep the PHP result. Ranges where under
+     * an eighth of a spread sample carries a 16+ alphanumeric token stay on PHP: the PHP rule
+     * rejects those subjects faster than they can be packed for FFI.
      *
      * @param  array<int, array<string, mixed>>  $headers
      * @return list<int>|null
      */
     public function mark(array $headers, int $minArticles): ?array
     {
+        return self::worthMarshalling($headers) ? $this->markWithoutSampling($headers, $minArticles) : null;
+    }
+
+    /**
+     * The Rust result for every range, without the sampling that routes token-poor ranges to PHP
+     * (parity tests).
+     *
+     * @param  array<int, array<string, mixed>>  $headers
+     * @return list<int>|null
+     */
+    public function markWithoutSampling(array $headers, int $minArticles): ?array
+    {
         $library = $this->library();
 
         return $library === null ? null : self::call($library, $headers, $minArticles);
+    }
+
+    /** @param  array<int, array<string, mixed>>  $headers */
+    private static function worthMarshalling(array $headers): bool
+    {
+        $values = array_values($headers);
+        $count = count($values);
+        if ($count === 0) {
+            return false;
+        }
+        $step = max(1, intdiv($count, self::SAMPLE_SIZE));
+        $sampled = $tokens = 0;
+        for ($i = 0; $i < $count; $i += $step) {
+            $sampled++;
+            $subject = $values[$i]['Subject'] ?? null;
+            if (is_string($subject) && preg_match('/[A-Za-z0-9]{16}/', $subject) === 1) {
+                $tokens++;
+            }
+        }
+
+        return $tokens * 8 >= $sampled;
     }
 
     private function library(): ?FFI

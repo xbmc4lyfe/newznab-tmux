@@ -74,6 +74,12 @@ final class PerArticleObfuscationNativeTest extends TestCase
         if (getenv('NNTMUX_TEST_NATIVE_LIBRARY') === false || ! $native->available()) {
             self::markTestSkipped('Needs a Linux CLI with FFI and NNTMUX_TEST_NATIVE_LIBRARY.');
         }
+        // Token-poor ranges stay on PHP; the unsampled path still answers for them.
+        foreach (['non-yenc', 'readable-yenc'] as $name) {
+            $routed = PerArticleObfuscationCorpus::stratum($name, 5, 200);
+            self::assertNull($native->mark($routed, 16));
+            self::assertSame([], $native->markWithoutSampling($routed, 16));
+        }
         $headers = PerArticleObfuscationCorpus::stratum('kenpsx', 5, 200);
         self::assertNotSame([], $native->mark($headers, 16));
         $headers[] = ['Number' => 1, 'Subject' => str_repeat(' ', NativePerArticleObfuscation::MAX_SUBJECT_LENGTH).')'];
@@ -100,7 +106,7 @@ final class PerArticleObfuscationNativeTest extends TestCase
         $size = $name === 'large-range' ? 50000 : null;
         $headers = PerArticleObfuscationCorpus::stratum($name, $seed, $size);
         foreach ([16, 8, 40] as $minArticles) {
-            $marked = $native->mark($headers, $minArticles);
+            $marked = $native->markWithoutSampling($headers, $minArticles);
             if ($marked === null) {
                 // A decline keeps the PHP result; only the saturating-integer case may decline.
                 self::assertSame('adversarial', $name);
