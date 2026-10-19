@@ -9,9 +9,11 @@ use App\Models\Category;
 use App\Models\Release;
 use App\Services\Categorization\CategorizationService;
 use App\Services\Releases\ReleaseBrowseService;
+use App\Services\Search\Contracts\BulkReleaseIndexUpdater;
 use Illuminate\Console\Command;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Facades\DB;
+use RuntimeException;
 use Throwable;
 
 class RecategorizeOnlyFans extends Command
@@ -34,7 +36,7 @@ class RecategorizeOnlyFans extends Command
         }
 
         $apply = (bool) $this->option('apply');
-        $inspected = $eligible = $updated = $refreshRequested = $skipped = $failed = 0;
+        $inspected = $eligible = $updated = $refreshConfirmed = $unconfirmed = $skipped = $failed = 0;
 
         if (! $apply) {
             $this->info('Preview only. Run with --apply to save these category corrections.');
@@ -47,7 +49,7 @@ class RecategorizeOnlyFans extends Command
             ->whereRaw('LOWER(searchname) LIKE ?', ['of.%'])
             ->chunkById(250, function (Collection $releases) use (
                 $categorizationService, $categories, $apply,
-                &$inspected, &$eligible, &$updated, &$refreshRequested, &$skipped, &$failed
+                &$inspected, &$eligible, &$updated, &$refreshConfirmed, &$unconfirmed, &$skipped, &$failed
             ): void {
                 foreach ($releases as $release) {
                     $inspected++;
@@ -94,8 +96,21 @@ class RecategorizeOnlyFans extends Command
                     }
 
                     try {
-                        Search::updateRelease((int) $release->id);
-                        $refreshRequested++;
+                        $driver = Search::driver();
+                        if ($driver instanceof BulkReleaseIndexUpdater) {
+                            if ($driver->updateReleases([(int) $release->id]) !== []) {
+                                throw new RuntimeException('The driver could not refresh this release');
+                            }
+                            $refreshConfirmed++;
+                        } else {
+                            Search::updateRelease((int) $release->id);
+                            $unconfirmed++;
+                            $failed++;
+                            $this->warn(sprintf(
+                                '#%d category saved; search refresh requested but unconfirmed: the driver cannot acknowledge completion. Reindex this release before considering its repair complete.',
+                                $release->id,
+                            ));
+                        }
                     } catch (Throwable $exception) {
                         $failed++;
                         $this->error(sprintf(
@@ -112,7 +127,7 @@ class RecategorizeOnlyFans extends Command
 
         $this->info(sprintf('Inspected: %d; Eligible: %d; Skipped: %d; Failed: %d.', $inspected, $eligible, $skipped, $failed));
         if ($apply) {
-            $this->info(sprintf('Database categories updated: %d; Search refreshes requested: %d.', $updated, $refreshRequested));
+            $this->info(sprintf('Database categories updated: %d; Search refreshes confirmed: %d; Unconfirmed: %d.', $updated, $refreshConfirmed, $unconfirmed));
         } else {
             $this->info(sprintf('Would update: %d. No releases were changed.', $eligible));
         }

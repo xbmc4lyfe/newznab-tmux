@@ -174,6 +174,7 @@ class XxxCategorizationTest extends TestCase
             'HD studio match' => ['OF.Brazzers.Performer.Title.1080p'],
             'VR match' => ['OF.SexBabesVR.Creator.VR180.2160p'],
             'video pack' => ['OF.Creator.Pack.mp4'],
+            'underscored video pack' => ['OF.Creator_Pack_mp4'],
             'full site name' => ['OnlyFans.Creator.Title.1080p'],
             'hyphenated site name' => ['Only-Fans.Creator.Title.1080p'],
             'underscored site name' => ['Only_Fans.Creator.Title.1080p'],
@@ -212,6 +213,8 @@ class XxxCategorizationTest extends TestCase
             'bracketed prefix' => ['[OF.Creator.1080p]'],
             'regular movie' => ['Some.Movie.2024.1080p.BluRay.x264-GROUP'],
             'photos' => ['OF.Creator.Photoset.1080p'],
+            'underscored photos' => ['OF.Creator_Photoset.1080p'],
+            'underscored pack without video hint' => ['OF.Creator_Pack.2160p'],
             'pack without video hint' => ['OF.Creator.Pack.2160p'],
             'full name photos' => ['OnlyFans.Creator.Imageset'],
         ];

@@ -189,7 +189,7 @@ class XxxCategorizer extends AbstractCategorizer
 
     protected function checkOnlyFans(ReleaseContext $context): ?CategorizationResult
     {
-        $name = $context->releaseName;
+        $name = str_replace('_', ' ', $context->releaseName);
 
         // Skip photo packs unless there's a video hint
         if (preg_match('/\b(photo(set)?|image(set)?|pics?|wallpapers?|collection|pack)\b/i', $name) &&

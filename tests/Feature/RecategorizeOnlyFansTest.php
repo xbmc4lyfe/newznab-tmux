@@ -7,6 +7,10 @@ namespace Tests\Feature;
 use App\Facades\Search;
 use App\Models\Category;
 use App\Services\Categorization\CategorizationService;
+use App\Services\Search\Contracts\BulkReleaseIndexUpdater;
+use App\Services\Search\Contracts\SearchDriverInterface;
+use App\Services\Search\Drivers\ManticoreSearchDriver;
+use App\Services\Search\SearchService;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -69,6 +73,7 @@ class RecategorizeOnlyFansTest extends TestCase
         $id = $this->insertRelease('OF.Sadie.Summers.NEW.TRADWIFE.BG.1080p');
         $before = DB::table('releases')->find($id);
         $cacheVersion = Cache::get('releases:cache_version', 1);
+        Search::shouldReceive('driver')->never();
         Search::shouldReceive('updateRelease')->never();
 
         $this->artisan('releases:recategorize-onlyfans')
@@ -107,17 +112,15 @@ class RecategorizeOnlyFansTest extends TestCase
         $ids = [
             $this->insertRelease('OF.Theapolloshow.Veronica.Grace.1080p'),
             $this->insertRelease('of.Creator.Title.2160p', Category::XXX_UHD),
-            $this->insertRelease('oF.Creator.Pack.mp4', Category::XXX_OTHER),
+            $this->insertRelease('oF.Creator_Pack_mp4', Category::XXX_OTHER),
             $this->insertRelease('OF.Creator.Title', Category::XXX_OTHER),
         ];
         $before = DB::table('releases')->get()->keyBy('id');
         $cacheVersion = Cache::get('releases:cache_version', 1);
-        foreach ($ids as $id) {
-            Search::shouldReceive('updateRelease')->once()->with($id);
-        }
+        $this->useConfirmedSearchDriver($ids);
 
         $this->artisan('releases:recategorize-onlyfans', ['--apply' => true])
-            ->expectsOutput('Database categories updated: 4; Search refreshes requested: 4.')
+            ->expectsOutput('Database categories updated: 4; Search refreshes confirmed: 4; Unconfirmed: 0.')
             ->assertSuccessful();
 
         $this->assertSame($cacheVersion + 1, Cache::get('releases:cache_version', 1));
@@ -129,7 +132,7 @@ class RecategorizeOnlyFansTest extends TestCase
         }
 
         $this->artisan('releases:recategorize-onlyfans', ['--apply' => true])
-            ->expectsOutput('Database categories updated: 0; Search refreshes requested: 0.')
+            ->expectsOutput('Database categories updated: 0; Search refreshes confirmed: 0; Unconfirmed: 0.')
             ->assertSuccessful();
     }
 
@@ -138,15 +141,16 @@ class RecategorizeOnlyFansTest extends TestCase
         $this->insertRelease('OF.Creator.Title.1080p', Category::MOVIE_HD);
         $this->insertRelease('OF.Creator.Title.1080p', Category::XXX_ONLYFANS);
         $this->insertRelease('OF.Creator.Title.1080p', 6998);
-        foreach (['Movie.OF.Creator.1080p', 'OF-Creator.1080p', 'OFFER.Creator.1080p', ' OF.Creator.1080p', '[OF.Creator.1080p]', 'OnlyFans.Creator.1080p', 'OF.Creator.Photoset', 'OF.Creator.Pack.1080p'] as $name) {
+        foreach (['Movie.OF.Creator.1080p', 'OF-Creator.1080p', 'OFFER.Creator.1080p', ' OF.Creator.1080p', '[OF.Creator.1080p]', 'OnlyFans.Creator.1080p', 'OF.Creator.Photoset', 'OF.Creator.Pack.1080p', 'OF.Creator_Photoset.1080p', 'OF.Creator_Pack.2160p'] as $name) {
             $this->insertRelease($name);
         }
         $before = DB::table('releases')->get();
+        Search::shouldReceive('driver')->never();
         Search::shouldReceive('updateRelease')->never();
 
         $this->artisan('releases:recategorize-onlyfans', ['--apply' => true])
-            ->expectsOutput('Inspected: 2; Eligible: 0; Skipped: 2; Failed: 0.')
-            ->expectsOutput('Database categories updated: 0; Search refreshes requested: 0.')
+            ->expectsOutput('Inspected: 4; Eligible: 0; Skipped: 4; Failed: 0.')
+            ->expectsOutput('Database categories updated: 0; Search refreshes confirmed: 0; Unconfirmed: 0.')
             ->assertSuccessful();
 
         $this->assertEquals($before, DB::table('releases')->get());
@@ -170,6 +174,7 @@ class RecategorizeOnlyFansTest extends TestCase
     {
         $id = $this->insertRelease('OF.Creator.1080p');
         $before = (array) DB::table('releases')->find($id);
+        Search::shouldReceive('driver')->never();
         Search::shouldReceive('updateRelease')->never();
         $this->mock(CategorizationService::class)->shouldReceive('determineCategory')->once()
             ->andReturnUsing(function () use ($id, $changes): array {
@@ -180,7 +185,7 @@ class RecategorizeOnlyFansTest extends TestCase
 
         $this->artisan('releases:recategorize-onlyfans', ['--apply' => true])
             ->expectsOutputToContain("#{$id} changed during repair; skipped.")
-            ->expectsOutput('Database categories updated: 0; Search refreshes requested: 0.')
+            ->expectsOutput('Database categories updated: 0; Search refreshes confirmed: 0; Unconfirmed: 0.')
             ->assertSuccessful();
 
         $this->assertSame(array_replace($before, $changes), (array) DB::table('releases')->find($id));
@@ -190,6 +195,7 @@ class RecategorizeOnlyFansTest extends TestCase
     {
         $id = $this->insertRelease('OF.Creator.1080p');
         DB::table('categories')->where('id', Category::XXX_ONLYFANS)->delete();
+        Search::shouldReceive('driver')->never();
         Search::shouldReceive('updateRelease')->never();
 
         $this->artisan('releases:recategorize-onlyfans', ['--apply' => true])
@@ -204,12 +210,12 @@ class RecategorizeOnlyFansTest extends TestCase
         $failedId = $this->insertRelease('OF.Failed.1080p');
         $validId = $this->insertRelease('OF.Valid.1080p');
         DB::unprepared("CREATE TRIGGER fail_category_update BEFORE UPDATE ON releases WHEN OLD.id = {$failedId} BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END");
-        Search::shouldReceive('updateRelease')->once()->with($validId);
+        $this->useConfirmedSearchDriver([$validId]);
 
         $this->artisan('releases:recategorize-onlyfans', ['--apply' => true])
             ->expectsOutputToContain("#{$failedId} category correction failed:")
             ->expectsOutput('Inspected: 2; Eligible: 2; Skipped: 0; Failed: 1.')
-            ->expectsOutput('Database categories updated: 1; Search refreshes requested: 1.')
+            ->expectsOutput('Database categories updated: 1; Search refreshes confirmed: 1; Unconfirmed: 0.')
             ->assertFailed();
 
         $this->assertSame(Category::XXX_CLIPHD, DB::table('releases')->where('id', $failedId)->value('categories_id'));
@@ -219,12 +225,14 @@ class RecategorizeOnlyFansTest extends TestCase
     public function test_search_exception_reports_the_affected_id_and_a_failed_exit_status(): void
     {
         $id = $this->insertRelease('OF.Creator.1080p');
-        Search::shouldReceive('updateRelease')->once()->with($id)->andThrow(new RuntimeException('Index unavailable'));
+        $driver = $this->createStubForIntersectionOfInterfaces([SearchDriverInterface::class, BulkReleaseIndexUpdater::class]);
+        $driver->method('updateReleases')->willThrowException(new RuntimeException('Index unavailable'));
+        $this->useSearchDriver($driver);
 
         $this->artisan('releases:recategorize-onlyfans', ['--apply' => true])
             ->expectsOutputToContain("#{$id} category saved, but search refresh failed: Index unavailable")
             ->expectsOutput('Inspected: 1; Eligible: 1; Skipped: 0; Failed: 1.')
-            ->expectsOutput('Database categories updated: 1; Search refreshes requested: 0.')
+            ->expectsOutput('Database categories updated: 1; Search refreshes confirmed: 0; Unconfirmed: 0.')
             ->assertFailed();
 
         $this->assertSame(Category::XXX_ONLYFANS, DB::table('releases')->where('id', $id)->value('categories_id'));
@@ -237,15 +245,85 @@ class RecategorizeOnlyFansTest extends TestCase
             $rows[] = ['name' => "OF.Creator.Title.{$index}.1080p", 'searchname' => "OF.Creator.Title.{$index}.1080p", 'categories_id' => Category::XXX_CLIPHD];
         }
         DB::table('releases')->insert($rows);
-        foreach (DB::table('releases')->pluck('id') as $id) {
-            Search::shouldReceive('updateRelease')->once()->with($id);
-        }
+        $this->useConfirmedSearchDriver(DB::table('releases')->pluck('id')->all());
 
         $this->artisan('releases:recategorize-onlyfans', ['--apply' => true])
-            ->expectsOutput('Database categories updated: 251; Search refreshes requested: 251.')
+            ->expectsOutput('Database categories updated: 251; Search refreshes confirmed: 251; Unconfirmed: 0.')
             ->assertSuccessful();
 
         $this->assertSame(251, DB::table('releases')->where('categories_id', Category::XXX_ONLYFANS)->count());
+    }
+
+    public function test_suppressed_manticore_failure_is_reported_without_reverting_the_category(): void
+    {
+        $id = $this->insertRelease('OF.Creator.1080p');
+        $cacheVersion = Cache::get('releases:cache_version', 1);
+        $before = (array) DB::table('releases')->find($id);
+        Schema::create('search_index_failures', function (Blueprint $table): void {
+            $table->id();
+            $table->unsignedBigInteger('release_id')->unique();
+            $table->string('operation');
+            $table->unsignedInteger('attempts');
+            $table->text('last_error')->nullable();
+            $table->timestamp('next_attempt_at')->nullable();
+            $table->timestamp('resolved_at')->nullable();
+            $table->timestamps();
+        });
+        // The incomplete projection schema makes the real driver suppress a query error.
+        $this->useSearchDriver(new ManticoreSearchDriver);
+
+        $this->artisan('releases:recategorize-onlyfans', ['--apply' => true])
+            ->expectsOutputToContain("#{$id} category saved, but search refresh failed:")
+            ->expectsOutput('Inspected: 1; Eligible: 1; Skipped: 0; Failed: 1.')
+            ->assertFailed();
+
+        $this->assertSame(Category::XXX_ONLYFANS, DB::table('releases')->where('id', $id)->value('categories_id'));
+        $this->assertSame(array_replace($before, ['categories_id' => Category::XXX_ONLYFANS]), (array) DB::table('releases')->find($id));
+        $this->assertSame($cacheVersion + 1, Cache::get('releases:cache_version', 1));
+        $this->assertSame('updateRelease_query', DB::table('search_index_failures')->where('release_id', $id)->value('last_error'));
+    }
+
+    public function test_refresh_without_driver_acknowledgment_is_reported_as_unconfirmed(): void
+    {
+        $id = $this->insertRelease('OF.Creator.1080p');
+        $cacheVersion = Cache::get('releases:cache_version', 1);
+        $before = (array) DB::table('releases')->find($id);
+        $requested = [];
+        $driver = $this->createStub(SearchDriverInterface::class);
+        $driver->method('updateRelease')->willReturnCallback(static function (int|string $id) use (&$requested): void {
+            $requested[] = (int) $id;
+        });
+        $this->useSearchDriver($driver);
+
+        $this->artisan('releases:recategorize-onlyfans', ['--apply' => true])
+            ->expectsOutputToContain("#{$id} category saved; search refresh requested but unconfirmed:")
+            ->expectsOutput('Inspected: 1; Eligible: 1; Skipped: 0; Failed: 1.')
+            ->expectsOutput('Database categories updated: 1; Search refreshes confirmed: 0; Unconfirmed: 1.')
+            ->assertFailed();
+
+        $this->assertSame([$id], $requested);
+        $this->assertSame(array_replace($before, ['categories_id' => Category::XXX_ONLYFANS]), (array) DB::table('releases')->find($id));
+        $this->assertSame(Category::XXX_ONLYFANS, DB::table('releases')->where('id', $id)->value('categories_id'));
+        $this->assertSame($cacheVersion + 1, Cache::get('releases:cache_version', 1));
+    }
+
+    /** @param list<int> $ids */
+    private function useConfirmedSearchDriver(array $ids): void
+    {
+        $driver = $this->createMockForIntersectionOfInterfaces([SearchDriverInterface::class, BulkReleaseIndexUpdater::class]);
+        $driver->expects($this->exactly(count($ids)))->method('updateReleases')
+            ->with($this->callback(static fn (array $releaseIds): bool => count($releaseIds) === 1 && in_array($releaseIds[0], $ids, true)))
+            ->willReturn([]);
+        $driver->expects($this->never())->method('updateRelease');
+        $this->useSearchDriver($driver);
+    }
+
+    private function useSearchDriver(SearchDriverInterface $driver): void
+    {
+        config(['search.default' => 'test']);
+        $search = new SearchService($this->app);
+        $search->extend('test', static fn (): SearchDriverInterface => $driver);
+        Search::swap($search);
     }
 
     private function insertRelease(string $name, int $categoryId = Category::XXX_CLIPHD): int
