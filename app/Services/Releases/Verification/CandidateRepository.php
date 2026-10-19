@@ -1319,17 +1319,20 @@ final class CandidateRepository
         }
         $candidates = DB::table('release_verification_candidates')->whereIn('id', $held->pluck('late_article_candidate_id')->unique()->all())
             ->get(['id', 'release_id', 'manifest_path', 'status'])->keyBy('id');
+        $guids = DB::table('releases')->whereIn('id', $held->pluck('id')->all())->pluck('guid', 'id');
+        $guard = app(NzbSourceGuard::class);
         foreach ($held as $release) {
             $candidate = $candidates->get((int) $release->late_article_candidate_id);
             // Settled once its holder ended unpublished, was published elsewhere, or released its inventory.
             $settled = $candidate === null
                 || ($candidate->release_id !== null && ((int) $candidate->release_id !== (int) $release->id || $candidate->manifest_path === ''))
                 || ($candidate->release_id === null && in_array($candidate->status, ['expired', 'filtered', 'metadata_expired'], true));
-            if ($settled) {
-                // Only once any committed upgrade's staged NZB is in place.
-                $guid = DB::table('releases')->where('id', $release->id)->value('guid');
+            // A committed upgrade's staged NZB is installed whether or not its holder still waits for late articles,
+            // so readers of the canonical file see the generation the row describes; the fence clears only after.
+            $guid = $guids->get($release->id);
+            if (is_string($guid) && $guard->hasStagedGenerations($guid)) {
                 try {
-                    $settled = is_string($guid) && app(NzbSourceGuard::class)->settleStagedGenerations($guid);
+                    $settled = $guard->settleStagedGenerations($guid) && $settled;
                 } catch (Throwable) {
                     $settled = false;
                 }

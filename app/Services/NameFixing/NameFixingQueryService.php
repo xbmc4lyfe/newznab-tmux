@@ -18,7 +18,7 @@ use RuntimeException;
 
 final class NameFixingQueryService
 {
-    public const PREDB_IDENTITY_POLICY = '3981b572b825b8d407229066fb972ae8288e86252c7363e687855f0f622c80bb';
+    public const PREDB_IDENTITY_POLICY = 'ff9ba61a9f1d2e1adaf9d556da5a2d804b05f98b958845152a966abe69ee9fc9';
 
     public const SOURCE_NFO = 'nfo';
 
@@ -102,7 +102,9 @@ final class NameFixingQueryService
             .Category::OTHER_MISC.', '.Category::OTHER_HASHED.'))'
             .$categoryFilter
             .' AND (CASE WHEN r.proc_par2 = 0 AND ('.self::SOURCE_EXISTS[self::SOURCE_PAR2].') AND '.Release::nzbSettledSql('r').' THEN 1'
-            .' WHEN '.implode(' OR ', $sources).' THEN 1 ELSE 0 END = 1)';
+            .' WHEN '.implode(' OR ', $sources).' THEN 1 ELSE 0 END = 1)'
+            // An in-place upgrade resets each source's status while its rows still describe the smaller NZB.
+            .' AND '.Release::nzbSettledSql('r');
 
         if (! (bool) config('tmux.fix_names.full_backlog', true)) {
             $cutoff = DB::getDriverName() === 'sqlite'
@@ -738,10 +740,9 @@ final class NameFixingQueryService
             $where[] = 'r.categories_id IN ('.implode(',', Category::OTHERS_GROUP).')';
         }
 
-        if ($source === self::SOURCE_PAR2) {
-            // PAR2 names come from the NZB; a partial awaiting late articles may still have it replaced.
-            $where[] = Release::nzbSettledSql('r');
-        }
+        // PAR2 names come from the NZB, and an in-place upgrade resets every other source's status while that
+        // source's rows still describe the smaller NZB: a partial awaiting late articles is renamed once settled.
+        $where[] = Release::nzbSettledSql('r');
 
         if ($source === self::SOURCE_HASH) {
             $where[] = 'NOT EXISTS (SELECT 1 FROM par2_hash_retry hr WHERE hr.releases_id = r.id

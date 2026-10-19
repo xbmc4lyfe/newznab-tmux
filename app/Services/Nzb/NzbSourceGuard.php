@@ -213,7 +213,10 @@ final class NzbSourceGuard
     public function settleStagedGenerations(string $guid): bool
     {
         foreach ($this->stagedSiblings($guid) as $path) {
-            $this->reconcileStaged($path);
+            // Staged by this very transaction: its evidence is not committed yet, and its close() settles it.
+            if (! NzbSourceInstallation::isPendingStaged($path, DB::connection()->getPdo())) {
+                $this->reconcileStaged($path);
+            }
         }
 
         return $this->stagedSiblings($guid) === [];

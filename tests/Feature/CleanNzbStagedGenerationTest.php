@@ -194,6 +194,19 @@ final class CleanNzbStagedGenerationTest extends TestCase
         self::assertFileDoesNotExist($this->staged);
     }
 
+    public function test_notondisk_keeps_a_release_whose_staged_generation_cannot_be_put_in_place(): void
+    {
+        $this->missingCanonicalWithStagedGeneration();
+        DB::table('release_archive_naming_evidence')->update(['source_sha256' => NzbSourceGuard::digest('newer')]);
+
+        $output = $this->clean(['--notondisk' => true, '--delete' => true]);
+
+        self::assertStringContainsString('Kept staged NZB generation for review: '.$this->staged, $output);
+        self::assertStringNotContainsString('Deleted: Movie', $output);
+        self::assertSame(1, DB::table('releases')->count(), 'The staged file may be its only committed source.');
+        self::assertFileExists($this->staged);
+    }
+
     public function test_a_notondisk_dry_run_reports_the_staged_generation_without_installing_it(): void
     {
         $this->missingCanonicalWithStagedGeneration();

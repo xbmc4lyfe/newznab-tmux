@@ -11,6 +11,7 @@ use App\Models\ReleaseRegex;
 use App\Services\Nzb\NzbArticleCoverage;
 use App\Services\Nzb\NzbArticleFingerprint;
 use App\Services\Nzb\NzbService;
+use App\Services\Nzb\NzbSourceGuard;
 use App\Services\Nzb\ReleaseArticleFingerprintStore;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseDuplicateFinder;
@@ -338,14 +339,23 @@ final class VerifiedReleasePublisher
     {
         $lastHeartbeat = 0.0;
         $repository = app(CandidateRepository::class);
-        $heartbeat = function (Release $candidate) use ($repository, $claim, &$lastHeartbeat): void {
+        $guard = app(NzbSourceGuard::class);
+        $heartbeat = function (Release $candidate) use ($repository, $claim, &$lastHeartbeat, $guard): void {
             if (microtime(true) - $lastHeartbeat >= 1) {
                 $repository->heartbeat((int) $claim->id, $claim->lease_token);
                 $lastHeartbeat = microtime(true);
             }
             // Hold the nominated published row stable while reading its retained generation.
-            DB::table('releases')->where('id', $candidate->id)->where('nzbstatus', NzbService::NZB_ADDED)
+            $row = DB::table('releases')->where('id', $candidate->id)->where('nzbstatus', NzbService::NZB_ADDED)
                 ->lockForUpdate()->first(['id', 'guid']);
+            // A committed upgrade's NZB may still be staged: coverage reads the generation the row describes.
+            if ($row !== null && is_string($row->guid) && $guard->hasStagedGenerations($row->guid)) {
+                try {
+                    $guard->settleStagedGenerations($row->guid);
+                } catch (Throwable $e) {
+                    Log::warning('Could not settle a staged NZB generation before a coverage check.', ['release_id' => $row->id, 'error' => $e->getMessage()]);
+                }
+            }
         };
         $coverage = new NzbArticleCoverage(app(NzbService::class), $this->duplicates);
         $timing?->nextPhase('incoming_xml_fingerprint');

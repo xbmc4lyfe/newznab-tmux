@@ -130,7 +130,16 @@ class CleanNZB extends Command
         // A committed upgrade's NZB may still be staged beside the missing canonical file.
         $guard = app(NzbSourceGuard::class);
         if ($delete) {
-            return $guard->settleStagedGenerations($guid) && $nzb->nzbPath($guid) !== false;
+            if ($guard->settleStagedGenerations($guid) && $nzb->nzbPath($guid) !== false) {
+                return true;
+            }
+            // A staged generation that could not be put in place may be the only copy of the committed source.
+            $kept = $guard->stagedGenerations($guid);
+            foreach ($kept as $path) {
+                $this->line($this->stagedOutcomeLine('kept', true, $path));
+            }
+
+            return $kept !== [];
         }
         // A dry run changes no file: it reports the generation it would install instead.
         $found = false;

@@ -1508,6 +1508,53 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertNull(DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
     }
 
+    public function test_a_covering_copy_whose_upgrade_is_still_staged_is_reused_not_duplicated(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('covering-staged-copy', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $partialNzb = (string) app(NzbService::class)->readNzbContents(DB::table('releases')->where('id', $first)->value('guid'));
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+        $generation = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        $merged = app(ManifestStore::class)->read($generation->manifest_path);
+        // A copy whose own upgrade to the merged articles committed, but whose swap did not happen: its canonical
+        // file is still the smaller generation.
+        $copy = (array) DB::table('releases')->where('id', $first)->first();
+        $copy = ['id' => $first + 100, 'guid' => 'covering-copy', 'articles_found' => null, 'articles_expected' => null,
+            'files_found' => null, 'files_expected' => null, 'late_article_candidate_id' => null] + $copy;
+        DB::table('releases')->insert($copy);
+        app(VerifiedNzbWriter::class)->write($merged, 'covering-copy');
+        $canonical = app(NzbService::class)->getNzbPath('covering-copy');
+        $staged = $canonical.'.c999-'.str_repeat('a', 16).'.next';
+        rename($canonical, $staged);
+        file_put_contents($canonical, gzencode($partialNzb));
+        $evidence = array_diff_key((array) DB::table('release_archive_naming_evidence')->where('releases_id', $first)->first(), ['id' => 0, 'releases_id' => 0]);
+        DB::table('release_archive_naming_evidence')->updateOrInsert(['releases_id' => $first + 100], ['release_guid' => 'covering-copy',
+            'source_sha256' => NzbSourceGuard::digest((string) gzdecode((string) file_get_contents($staged)))] + $evidence);
+
+        $this->publishStalledPartial(null);
+
+        $this->assertSame($first + 100, (int) DB::table('release_verification_candidates')->where('id', $generation->id)->value('release_id'),
+            'Coverage read the generation the copy row describes.');
+        $this->assertFileDoesNotExist($staged);
+        $this->assertSame(1, (int) DB::table('releases')->where('id', $first)->value('articles_found'), 'The partial is not upgraded into a second copy.');
+    }
+
+    public function test_the_settle_sweep_installs_a_live_holders_staged_nzb_and_keeps_it_fenced(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, sha1('live-staged', true)));
+        $holder = (int) DB::table('release_verification_candidates')->sole()->id;
+        [$canonical, $staged] = $this->stageGeneration($first, $holder, 'upgraded');
+        DB::table('release_archive_naming_evidence')->where('releases_id', $first)->update(['source_sha256' => NzbSourceGuard::digest('<nzb>upgraded</nzb>')]);
+
+        app(CandidateRepository::class)->expire();
+
+        $this->assertSame('<nzb>upgraded</nzb>', gzdecode((string) file_get_contents($canonical)), 'Readers see the committed generation.');
+        $this->assertFileDoesNotExist($staged);
+        $this->assertSame($holder, (int) DB::table('releases')->where('id', $first)->value('late_article_candidate_id'), 'Its holder still awaits late articles.');
+    }
+
     public function test_a_covering_release_with_conflicting_metadata_sends_the_generation_to_review_not_an_upgrade(): void
     {
         $this->publicationSchema(partialColumns: true);

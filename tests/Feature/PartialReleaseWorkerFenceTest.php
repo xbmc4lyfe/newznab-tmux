@@ -50,7 +50,14 @@ final class PartialReleaseWorkerFenceTest extends TestCase
 
         $this->assertStringContainsString('r.late_article_candidate_id IS NULL', $sql[0]);
         $this->assertStringContainsString('r.late_article_candidate_id IS NULL', $sql[1]);
-        $this->assertStringNotContainsString('late_article_candidate_id', $sql[2], 'File names come from release_files, not the NZB.');
+        $this->assertStringContainsString('r.late_article_candidate_id IS NULL', $sql[2], 'An upgrade resets proc_files while release_files still describe the smaller NZB.');
+        foreach ([NameFixingQueryService::SOURCE_NFO, NameFixingQueryService::SOURCE_SRR, NameFixingQueryService::SOURCE_CRC, NameFixingQueryService::SOURCE_UID, NameFixingQueryService::SOURCE_HASH] as $source) {
+            $sql = [];
+            $service->candidateBatch($source, 2, 3, 0, 100);
+            $this->assertStringContainsString('r.late_article_candidate_id IS NULL', $sql[0], "The {$source} pass waits for a settled release.");
+        }
+        $this->assertStringEndsWith(' END = 1) AND r.late_article_candidate_id IS NULL', NameFixingQueryService::pendingWorkCondition(),
+            'No held partial counts as pending naming work.');
         $this->assertMatchesRegularExpression('/proc_par2 = 0 AND \(r\.nzbstatus = 1\) AND r\.late_article_candidate_id IS NULL THEN 1/',
             NameFixingQueryService::pendingWorkCondition(), 'Held partials are not counted as pending PAR2 work.');
     }
