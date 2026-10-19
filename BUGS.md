@@ -472,7 +472,10 @@ These bugs turned up while building and running the self-hosted stack in `docker
   - Part repair (sparse ranges) and a value of `0` disable the check.
   - Header-only indexing can't reconstruct these uploads; they're only usable from an NZB.
   - Each skipping range logs `Skipping articles obfuscated per article` with the group and count.
-  - Remaining risk: 16 or more unrelated real files in one range that share a subject shape with a long random token, have the same part total and no file counter, and each show a single middle article, at 16 or more different part positions, would be skipped.
+  - Remaining risk (all rare) — these real articles would still be skipped:
+    - 16 or more unrelated real files in one range that share a subject shape with a long random token, have the same part total and no file counter, and each show a single middle article, at 16 or more different part positions.
+    - A real upload in an obfuscated group whose only article in the range is a middle part (uploads posted over several connections arrive out of order).
+    - One uploader posting 16 or more files with their own random names at staggered offsets when the range holds exactly one article from each file.
 
 ## Issues in the docker/ stack itself (all fixed)
 
