@@ -17,7 +17,7 @@ class DeployMigrationOrderTest extends TestCase
         mkdir($this->directory.'/docker/bin', 0700, true);
         mkdir($this->directory.'/bin', 0700);
         copy(__DIR__.'/../../docker/Justfile', $this->directory.'/docker/Justfile');
-        foreach (['deploy-guard', 'deploy-app', 'deploy-current', 'deploy-plan', 'build-images', 'up-app', 'compose', 'legacy-drain.php', 'legacy-scheduler-drain.py'] as $script) {
+        foreach (['deploy-guard', 'deploy-app', 'deploy-current', 'deploy-plan', 'build-images', 'up-app', 'compose', 'compose_dotenv.py', 'legacy-drain.php', 'legacy-scheduler-drain.py'] as $script) {
             copy(__DIR__.'/../../docker/bin/'.$script, $this->directory.'/docker/bin/'.$script);
             chmod($this->directory.'/docker/bin/'.$script, 0755);
         }

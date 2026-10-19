@@ -26,6 +26,7 @@ class JustfileArgumentsTest extends TestCase
         copy(__DIR__.'/../../Justfile', $this->directory.'/Justfile');
         copy(__DIR__.'/../../docker/Justfile', $this->directory.'/docker/Justfile');
         copy(__DIR__.'/../../docker/bin/compose', $this->directory.'/docker/bin/compose');
+        copy(__DIR__.'/../../docker/bin/compose_dotenv.py', $this->directory.'/docker/bin/compose_dotenv.py');
         copy(__DIR__.'/../../scripts/dotenv-get', $this->directory.'/scripts/dotenv-get');
         chmod($this->directory.'/docker/bin/compose', 0755);
         chmod($this->directory.'/scripts/dotenv-get', 0755);
@@ -135,6 +136,29 @@ SH);
         $process = $this->just('docker/Justfile', ['ps'], ['DC' => $this->directory.'/bin/fake']);
         $process->mustRun();
         $this->assertStringContainsString('WEB_IMAGE=[registry/$literal:1]', $process->getOutput());
+    }
+
+    public function test_double_quoted_docker_env_escapes_are_decoded_like_compose(): void
+    {
+        // Compose initializes MariaDB with `pa\ss"q`; the recipes must pass the same password.
+        file_put_contents($this->directory.'/docker/.env', "DB_ROOTPASSWORD=\"pa\\\\ss\\\"q\" # root\nDB_DATABASE='nn\\\\tmux'\nAPP_IMAGE=\"registry/app:\\\"1\\\"\"\n");
+        // phpunit.xml's DB_DATABASE would win over docker/.env.
+        $process = $this->just('docker/Justfile', ['mysql'], ['DC' => $this->directory.'/bin/fake', 'DB_DATABASE' => false]);
+        $process->mustRun();
+        $this->assertContains('-ppa\\ss"q', $this->arguments($process));
+        // Single-quoted values stay literal.
+        $this->assertContains('nn\\\\tmux', $this->arguments($process));
+
+        // The Compose wrapper reads docker/.env with the same parser.
+        $wrapper = new Process([$this->directory.'/docker/bin/compose'], env: $this->environment(['DC' => 'env']));
+        $wrapper->mustRun();
+        $this->assertStringContainsString("\nWEB_IMAGE=registry/app:\"1\"\n", "\n".$wrapper->getOutput());
+
+        // An escaped `$` is literal in Compose, so it is no interpolation either.
+        file_put_contents($this->directory.'/docker/.env', "APP_IMAGE=\"registry/\\\$app:1\"\n");
+        $literal = $this->just('docker/Justfile', ['ps'], ['DC' => $this->directory.'/bin/fake']);
+        $literal->mustRun();
+        $this->assertStringContainsString('WEB_IMAGE=[registry/$app:1]', $literal->getOutput());
     }
 
     // T43 ----------------------------------------------------------------------------------------
@@ -328,7 +352,7 @@ SH);
 
     /**
      * @param  list<string>  $arguments
-     * @param  array<string, string>  $environment
+     * @param  array<string, string|false>  $environment
      */
     private function just(string $justfile, array $arguments, array $environment = []): Process
     {
@@ -340,7 +364,7 @@ SH);
     }
 
     /**
-     * @param  array<string, string>  $environment
+     * @param  array<string, string|false>  $environment
      * @return array<string, string|false>
      */
     private function environment(array $environment): array
