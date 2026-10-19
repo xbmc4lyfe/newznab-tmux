@@ -11,11 +11,26 @@ use App\Services\BlacklistService;
  */
 final class HeaderParser
 {
+    /**
+     * Base name, part number and part total of a yEnc subject such as `name (12/45)`.
+     */
+    private const string SUBJECT_PATTERN = '/^\s*(?!Usenet Index Post)(.+?)\s+\((\d+)\/(\d+)\)/';
+
+    /**
+     * File counter inside a subject base name, such as `[03/62]` or `(3 of 62)`.
+     */
+    public const string FILE_COUNTER_PATTERN = '/[[(\s](\d{1,5})(\/|[\s_]of[\s_]|-)(\d{1,5})[])[\s$:]/i';
+
     private BlacklistService $blacklistService;
 
     private int $notYEnc = 0;
 
     private int $blacklisted = 0;
+
+    private int $obfuscated = 0;
+
+    /** @var array<int, true> Article numbers whose subject is randomised per article. */
+    private array $perArticleObfuscated = [];
 
     public function __construct(?BlacklistService $blacklistService = null)
     {
@@ -29,6 +44,75 @@ final class HeaderParser
     {
         $this->notYEnc = 0;
         $this->blacklisted = 0;
+        $this->obfuscated = 0;
+    }
+
+    /**
+     * Find articles whose subject is randomised per article across a downloaded range.
+     *
+     * Some uploaders (nyuu's article obfuscation) give every article its own random
+     * subject token, and often its own random poster, so no two parts of a file share
+     * a binary or a collection. Each such article becomes a one-part collection that
+     * can never complete. Multi-part articles whose base name holds a random-looking
+     * token (16+ alphanumerics) are grouped by the subject's shape (alphanumeric runs
+     * collapsed), part total and file counter; a group of at least $minArticles in
+     * which at least 90% of base names are distinct (digit runs outside the token
+     * ignored) has its once-seen names skipped by parse(). A
+     * legitimate upload repeats its base name for every part, which keeps its group
+     * out. Pass 0 to disable, as part repair does for its sparse ranges.
+     *
+     * @param  array<int, array<string, mixed>>  $headers  Raw headers from NNTP
+     * @return int Number of articles marked
+     */
+    public function markPerArticleObfuscated(array $headers, int $minArticles): int
+    {
+        $this->perArticleObfuscated = [];
+        if ($minArticles < 1) {
+            return 0;
+        }
+
+        /** @var array<string, array{names: array<string, list<int>>, articles: int}> $signatures */
+        $signatures = [];
+        foreach ($headers as $header) {
+            if (! isset($header['Number'], $header['Subject']) || ! is_numeric($header['Number'])
+                || ! is_string($header['Subject'])
+                || ! preg_match(self::SUBJECT_PATTERN, $header['Subject'], $matches)
+                || (int) $matches[3] < 2
+                || ! preg_match('/[A-Za-z0-9]{16,}/', $matches[1])) {
+                continue;
+            }
+
+            // Digit runs outside the long tokens are ignored, so numbered volumes
+            // (`<hash>.part07.rar`) of one upload share a name while random tokens stay whole.
+            $name = implode('', array_map(
+                static fn (string $piece): string => preg_match('/^[A-Za-z0-9]{16,}$/', $piece) === 1
+                    ? $piece
+                    : (preg_replace('/\d+/', '', $piece) ?? $piece),
+                preg_split('/([A-Za-z0-9]{16,})/', $matches[1], -1, PREG_SPLIT_DELIM_CAPTURE) ?: [$matches[1]]
+            ));
+            $fileCounter = preg_match(self::FILE_COUNTER_PATTERN, $matches[1], $counter) ? $counter[1].'/'.$counter[3] : '';
+            $key = (preg_replace('/[A-Za-z0-9]+/', 'x', $matches[1]) ?? $matches[1])."\0".$matches[3]."\0".$fileCounter;
+            // Write in place: copying the growing arrays per article would be quadratic.
+            $signatures[$key] ??= ['names' => [], 'articles' => 0];
+            $signatures[$key]['names'][$name][] = (int) $header['Number'];
+            $signatures[$key]['articles']++;
+        }
+
+        foreach ($signatures as $signature) {
+            $articles = $signature['articles'];
+            // A stray duplicate line must not shield the group; a real upload repeats on nearly every part.
+            if ($articles < $minArticles || \count($signature['names']) * 10 < $articles * 9) {
+                continue;
+            }
+            // Only once-seen names are skipped, so a real upload sharing the group keeps its parts.
+            foreach ($signature['names'] as $numbers) {
+                if (\count($numbers) === 1) {
+                    $this->perArticleObfuscated[$numbers[0]] = true;
+                }
+            }
+        }
+
+        return \count($this->perArticleObfuscated);
     }
 
     /**
@@ -71,8 +155,14 @@ final class HeaderParser
                 $headersRepaired[] = $header['Number'];
             }
 
+            if (isset($this->perArticleObfuscated[(int) $header['Number']])) {
+                $this->obfuscated++;
+
+                continue;
+            }
+
             // Parse subject to get base name and part/total like "(12/45)"
-            if (! preg_match('/^\s*(?!Usenet Index Post)(.+?)\s+\((\d+)\/(\d+)\)/', $header['Subject'], $matches)) {
+            if (! preg_match(self::SUBJECT_PATTERN, $header['Subject'], $matches)) {
                 $this->notYEnc++;
 
                 continue;
@@ -106,6 +196,7 @@ final class HeaderParser
             'received' => $receivedNumbers,
             'notYEnc' => $this->notYEnc,
             'blacklisted' => $this->blacklisted,
+            'obfuscated' => $this->obfuscated,
         ];
     }
 

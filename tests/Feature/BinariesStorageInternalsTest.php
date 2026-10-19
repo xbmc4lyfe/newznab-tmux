@@ -616,6 +616,52 @@ class BinariesStorageInternalsTest extends TestCase
         $this->assertSame([1301, 1302], DB::table('missed_parts')->orderBy('numberid')->pluck('numberid')->all());
     }
 
+    public function test_scan_skips_articles_obfuscated_per_article_across_chunks_without_queueing_repair(): void
+    {
+        $this->createHeaderStorageTables();
+        $this->createMissedPartsTable();
+        $headers = [];
+        for ($i = 0; $i < 16; $i++) {
+            $headers[] = $this->rawHeader(1400 + $i, '[40/62] "'.md5((string) $i).'" yEnc ('.($i + 1).'/687)');
+        }
+        $headers[] = $this->rawHeader(1416, 'Kept.Release (1/2)');
+        $headers[] = $this->rawHeader(1417, 'Kept.Release (2/2)');
+        $nntp = Mockery::mock(NNTPService::class);
+        $nntp->shouldReceive('getXOVER')->once()->andReturn($headers);
+        // Chunks of four hold too few obfuscated articles to detect them chunk by chunk.
+        $config = new BinariesConfig(headerChunkSize: 4, sqlChunkSize: 4);
+        $service = new BinariesService($config, new HeaderParser(new class extends BlacklistService
+        {
+            public function isBlackListed(array $msg, string $groupName): bool
+            {
+                return false;
+            }
+        }), new HeaderStorageService($this->deterministicCollectionHandler(), config: $config), nntp: $nntp);
+
+        $service->scan(['id' => 1, 'name' => 'alt.test'], 1400, 1417);
+
+        $this->assertSame(1417, $service->completedRangeEnd());
+        $this->assertSame(1, DB::table('collections')->count());
+        $this->assertSame([1416, 1417], DB::table('parts')->orderBy('number')->pluck('number')->all());
+        $this->assertSame(0, DB::table('missed_parts')->count());
+    }
+
+    public function test_part_repair_stores_articles_that_look_obfuscated_per_article(): void
+    {
+        $this->createHeaderStorageTables();
+        $this->createMissedPartsTable();
+        $headers = [];
+        for ($i = 0; $i < 16; $i++) {
+            $headers[] = $this->rawHeader(1500 + $i, '[40/62] "'.md5((string) $i).'" yEnc ('.($i + 1).'/687)');
+        }
+        DB::table('missed_parts')->insert(array_map(static fn (array $header): array => ['numberid' => $header['Number'], 'groups_id' => 1], $headers));
+
+        $this->scanService($headers)->scan(['id' => 1, 'name' => 'alt.test'], 1500, 1515, 'partrepair', range(1500, 1515));
+
+        $this->assertSame(16, DB::table('parts')->count());
+        $this->assertSame(0, DB::table('missed_parts')->count());
+    }
+
     public function test_storage_rollback_without_repair_cannot_complete_a_range_and_retry_preserves_all_parts(): void
     {
         $this->createHeaderStorageTables();

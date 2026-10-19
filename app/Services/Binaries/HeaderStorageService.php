@@ -404,7 +404,7 @@ final class HeaderStorageService
      */
     private function getFileCount(string $subject): array
     {
-        if (! preg_match('/[[(\s](\d{1,5})(\/|[\s_]of[\s_]|-)(\d{1,5})[])[\s$:]/i', $subject, $fileCount)) {
+        if (! preg_match(HeaderParser::FILE_COUNTER_PATTERN, $subject, $fileCount)) {
             $fileCount[1] = $fileCount[3] = 0;
         }
 

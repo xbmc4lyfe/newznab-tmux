@@ -32,6 +32,9 @@ final readonly class BinariesConfig
         public int $sqlChunkSize = 500,
         public int $reconcileBatchSize = 500,
         public int $nzbStreamRows = 5000,
+        // Skip a range's articles whose subject is randomised per article once this many
+        // share a subject shape without repeating a name; 0 keeps them.
+        public int $perArticleObfuscationMinArticles = 16,
     ) {}
 
     /**
@@ -55,6 +58,16 @@ final readonly class BinariesConfig
             sqlChunkSize: max(50, min(1000, (int) config('nntmux.cbp.sql_chunk_size', 500))),
             reconcileBatchSize: max(50, min(2000, (int) config('nntmux.cbp.reconcile_batch_size', 500))),
             nzbStreamRows: max(500, min(20000, (int) config('nntmux.cbp.nzb_stream_rows', 5000))),
+            perArticleObfuscationMinArticles: self::obfuscationMinArticles((int) config('nntmux.cbp.per_article_obfuscation_min_articles', 16)),
         );
+    }
+
+    /**
+     * 0 disables the check; any other value is held to at least 8 so a range boundary
+     * cannot drop a legitimate upload's lone article.
+     */
+    public static function obfuscationMinArticles(int $configured): int
+    {
+        return $configured <= 0 ? 0 : max(8, $configured);
     }
 }

@@ -72,6 +72,9 @@ return [
         'reconcile_batch_size' => (int) env('CBP_RECONCILE_BATCH_SIZE', 500),
         // Maximum flattened binary/part rows loaded while streaming an NZB.
         'nzb_stream_rows' => (int) env('CBP_NZB_STREAM_ROWS', 5000),
+        // Articles sharing a subject shape with no repeated name before a range skips them as
+        // obfuscated per article (they would each become a one-part collection); 0 disables, minimum 8.
+        'per_article_obfuscation_min_articles' => (int) env('CBP_PER_ARTICLE_OBFUSCATION_MIN_ARTICLES', 16),
         // Collection id span checked for orphans by one cleanup pass; passes resume from a stored cursor.
         'orphan_scan_window' => (int) env('CBP_ORPHAN_SCAN_WINDOW', 250000),
         // Explicit maintenance-window approval for the destructive hash/key migration.
