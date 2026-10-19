@@ -86,8 +86,8 @@ final class DockerDeployGuardTest extends TestCase
         symlink(dirname(__DIR__, 2).'/docker/bin/deploy-plan', $this->dir.'/docker/bin/deploy-plan');
         $source = (string) file_get_contents(dirname(__DIR__, 2).'/docker/bin/deploy-guard');
         $points = [
-            "    if mkfifo \"\$alive_fifo\" 2>/dev/null; then\n",
-            "        alive_reader=\$!\n",
+            "    exec 7<>\"\$alive_fifo\" 6<\"\$alive_fifo\" 8>\"\$alive_fifo\" 7>&-\n",
+            "    alive_reader=\$!\n",
             "    if ( exec 3<&0 ) 2>/dev/null; then\n",
         ];
         foreach ($points as $point) {
@@ -113,6 +113,68 @@ final class DockerDeployGuardTest extends TestCase
                 $this->assertFalse(is_link($this->dir.'/lock'), $label);
             }
         }
+    }
+
+    #[Test]
+    public function a_signal_to_the_whole_process_group_keeps_the_lock_until_descendants_exit(): void
+    {
+        $ready = $this->dir.'/payload-ready';
+        $done = $this->dir.'/grandchild-done';
+        // A hangup or `tmux kill-pane` signals every process in the group, the FIFO reader included.
+        $payload = 'sh -c "trap \"\" TERM; touch '.$ready.'; sleep 2; touch '.$done.'" & wait';
+        foreach (['sh', 'dash', 'bash'] as $shell) {
+            if ((new Process(['sh', '-c', 'command -v '.$shell]))->run() !== 0) {
+                continue;
+            }
+            @unlink($ready);
+            @unlink($done);
+            $guard = $this->guardProcess(['run', 'deploy', '--', 'sh', '-c', $payload], [], $shell);
+            // Its own process group, so the group signal never reaches the test runner.
+            $process = new Process(['python3', '-c', 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])', $shell, dirname(__DIR__, 2).'/docker/bin/deploy-guard', 'run', 'deploy', '--', 'sh', '-c', $payload], null, $guard->getEnv());
+            $process->start();
+            $this->waitFor(fn (): bool => file_exists($ready));
+            (new Process(['kill', '-TERM', '--', '-'.$process->getPid()]))->run();
+            $this->waitFor(fn (): bool => ! $process->isRunning());
+            $this->assertFileExists($done, $shell.': the lock was released before the grandchild finished');
+            $this->assertFalse(is_link($this->dir.'/lock'), $shell);
+        }
+    }
+
+    #[Test]
+    public function a_signal_before_the_payload_pid_is_recorded_still_reaches_the_payload(): void
+    {
+        mkdir($this->dir.'/docker/bin', 0777, true);
+        symlink(dirname(__DIR__, 2).'/docker/bin/deploy-plan', $this->dir.'/docker/bin/deploy-plan');
+        $source = (string) file_get_contents(dirname(__DIR__, 2).'/docker/bin/deploy-guard');
+        // After the fork (the payload has exec'd by then: a child still in the shell's trap would
+        // swallow the signal), before its PID is recorded.
+        $point = "\n    payload=\$!\n";
+        $this->assertSame(1, substr_count($source, $point));
+        file_put_contents($this->dir.'/docker/bin/deploy-guard', str_replace($point, "\n    sleep 0.5; kill -TERM \$\$".$point, $source));
+        foreach (['sh', 'dash', 'bash'] as $shell) {
+            if ((new Process(['sh', '-c', 'command -v '.$shell]))->run() !== 0) {
+                continue;
+            }
+            $guard = $this->guardProcess(['run', 'deploy', '--', 'sleep', '4'], [], $shell);
+            $process = new Process([$shell, $this->dir.'/docker/bin/deploy-guard', 'run', 'deploy', '--', 'sleep', '4'], null, $guard->getEnv());
+            $started = microtime(true);
+            $process->run();
+            // Forwarded, the TERM ends the payload at once instead of after its full run.
+            $this->assertLessThan(3, microtime(true) - $started, $shell.': the signal never reached the payload');
+            $this->assertSame(130, $process->getExitCode(), $shell);
+        }
+    }
+
+    #[Test]
+    public function a_guard_that_cannot_create_its_descendant_fifo_fails_closed(): void
+    {
+        $ran = $this->dir.'/payload-ran';
+        $process = $this->guardProcess(['run', 'deploy', '--', 'touch', $ran], ['TMPDIR' => $this->dir.'/missing']);
+        $process->run();
+        $this->assertSame(1, $process->getExitCode());
+        $this->assertStringContainsString('descendant FIFO', $process->getErrorOutput());
+        $this->assertFileDoesNotExist($ran);
+        $this->assertFalse(is_link($this->dir.'/lock'));
     }
 
     #[Test]

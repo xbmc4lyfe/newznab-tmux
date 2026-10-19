@@ -106,8 +106,11 @@ guard_exit() {
     exit_code=$?
     # A reader still waiting because no payload ever ran (the guard stopped first) must not linger;
     # once a payload ran, the reader is only ever waited for.
-    if [ -n "${alive_reader:-}" ] && [ "${payload_started:-0}" != 1 ]; then kill "$alive_reader" 2>/dev/null || true; fi
-    case "${alive_fifo:-}" in ''|/dev/null) ;; *) remove_fifo "$alive_fifo" ;; esac
+    if [ -n "${alive_reader:-}" ] && [ "${payload_started:-0}" != 1 ]; then
+        exec 8>&-
+        kill -KILL "$alive_reader" 2>/dev/null || true
+    fi
+    [ -z "${alive_fifo:-}" ] || remove_fifo "$alive_fifo"
     if [ "${attempt_open:-0}" = 1 ]; then
         attempt_open=0
         log "$target" "result=finished rc=$exit_code (interrupted)"
@@ -256,22 +259,29 @@ alive_reader=
 alive_fifo=
 # Every descendant of the payload inherits the write end of a FIFO (fd 9); its reader sees EOF only
 # once all of them (nested guards, a docker build) have exited, so the lock is held until then.
-# Unlinked through Python, not rm: the guard's lock handling owns every rm call it makes.
+# It lives in a private directory (its name cannot be raced); both are removed through Python, not
+# rm: the guard's lock handling owns every rm call it makes.
 remove_fifo() { python3 -c 'import os, sys
-try:
-    os.unlink(sys.argv[1])
-except FileNotFoundError:
-    pass' "$1" 2>/dev/null || true; }
+for remove, path in ((os.unlink, sys.argv[1]), (os.rmdir, os.path.dirname(sys.argv[1]))):
+    try:
+        remove(path)
+    except FileNotFoundError:
+        pass' "$1" 2>/dev/null || true; }
 wait_for_descendants() {
     [ -z "$alive_reader" ] || wait "$alive_reader" 2>/dev/null || true
     alive_reader=
-    case "$alive_fifo" in ''|/dev/null) ;; *) remove_fifo "$alive_fifo" ;; esac
+    [ -z "$alive_fifo" ] || remove_fifo "$alive_fifo"
     alive_fifo=
 }
 forward_signal() {
     # The guard's own write end: closed, the reader sees EOF once no descendant holds one (at once
     # if the signal came before the payload was forked).
     exec 8>&-
+    # Signalled while the payload line ran, before `payload=$!`: the last background job is then
+    # the payload (never the reader), and it is signalled like any other.
+    if [ -z "$payload" ] && [ "${payload_forking:-0}" = 1 ] && [ -n "$!" ] && [ "$!" != "$alive_reader" ]; then
+        payload=$!
+    fi
     if [ -n "$payload" ]; then
         # Only the direct child: its own traps let a running step finish and then recover (restart
         # Horizon, resume the drains) before it exits.
@@ -342,21 +352,27 @@ cmd_run() {
     # guard's stdin travels on descriptor 3, e.g. for `... run resume-scheduler -- python3 - < script`.
     # A closed stdin (`<&-`) cannot be duplicated: the payload then reads /dev/null, as a foreground
     # command with nothing to read would.
-    alive_fifo="${TMPDIR:-/tmp}/deploy-guard-alive.$$"
-    remove_fifo "$alive_fifo"
+    # Without the FIFO, descendants could outlive the lock: the run fails closed instead.
+    if ! alive_dir=$(mktemp -d "${TMPDIR:-/tmp}/deploy-guard.XXXXXX" 2>/dev/null); then
+        echo "deploy-guard: cannot create a private directory for the descendant FIFO under ${TMPDIR:-/tmp}; nothing was changed." >&2
+        exit 1
+    fi
+    alive_fifo="$alive_dir/alive"
+    if ! mkfifo "$alive_fifo" 2>/dev/null; then
+        echo "deploy-guard: cannot create the descendant FIFO $alive_fifo; nothing was changed." >&2
+        exit 1
+    fi
     # Every FIFO end is opened by the guard itself before anything is forked (a read-write open never
     # blocks, and each later open finds its other end), then the read end is handed to the reader.
     # The guard holds a write end (fd 8) until the payload is forked, so a signal at any point
     # before then never waits on a reader blocked in open() or one that no writer would close.
-    if mkfifo "$alive_fifo" 2>/dev/null; then
-        exec 7<>"$alive_fifo" 6<"$alive_fifo" 8>"$alive_fifo" 7>&-
-        cat <&6 >/dev/null 2>&1 6<&- 8>&- &
-        alive_reader=$!
-        exec 6<&-
-    else
-        alive_fifo=/dev/null
-        exec 8>/dev/null
-    fi
+    # The reader ignores signals (a whole process group may be signalled at once): it exits only on
+    # EOF, once no descendant holds a write end.
+    exec 7<>"$alive_fifo" 6<"$alive_fifo" 8>"$alive_fifo" 7>&-
+    ( trap '' HUP INT TERM QUIT; exec cat >/dev/null 2>&1 ) <&6 6<&- 8>&- &
+    alive_reader=$!
+    exec 6<&-
+    payload_forking=1
     if ( exec 3<&0 ) 2>/dev/null; then
         { "$@" <&3 3<&- 9>&8 8>&- & } 3<&0
     else
