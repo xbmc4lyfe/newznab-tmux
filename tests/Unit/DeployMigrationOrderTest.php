@@ -34,6 +34,12 @@ missing=0
 if [ "${NNTMUX_SERVICE_MISSING:-0}" = 1 ] && ! grep -q -- ' up -d --no-deps --force-recreate' "$NNTMUX_DEPLOY_EVENTS"; then missing=1; fi
 default_config='{"services":{"web":{},"horizon":{},"scheduler":{},"indexer":{},"mariadb":{},"redis":{},"manticore":{},"proxy":{},"mailpit":{},"prometheus":{},"pushgateway":{},"grafana":{},"node-exporter":{},"mysqld-exporter":{},"redis-exporter":{}}}'
 case "$*" in
+    'ps -a -q --no-trunc --filter label=com.docker.compose.project='*)
+        # Service containers only (no one-offs): as `compose ps -a -q`, minus the barrier.
+        last=${last#label=com.docker.compose.service=}
+        [ "${NNTMUX_NO_EXISTING_APP:-0}" = 1 ] && exit 0
+        [ ! -f "$NNTMUX_REPO/recreated-$last" ] || printf 'r%s-' "$(wc -c < "$NNTMUX_REPO/recreated-$last" | tr -d ' ')"
+        echo "fixture-container-$last" ;;
     'inspect --format {{index .Config.Labels "nntmux.deploy.database"}} '*) cat "$NNTMUX_REPO/barrier.database" 2>/dev/null ;;
     'ps -q --filter label=com.docker.compose.project='*) [ -z "${NNTMUX_ORPHAN:-}" ] || case "$*" in *"service=$NNTMUX_ORPHAN") echo "fixture-container-$NNTMUX_ORPHAN" ;; esac ;;
     'stop fixture-container-'*) ;;
@@ -99,6 +105,8 @@ print(json.dumps(config))' ;;
         if [ -n "${NNTMUX_UNHEALTHY_AFTER:-}" ] && grep -q -- "$NNTMUX_UNHEALTHY_AFTER" "$NNTMUX_DEPLOY_EVENTS"; then late=${NNTMUX_UNHEALTHY_LATE:-none}; fi
         case "$*" in *"fixture-container-${NNTMUX_UNHEALTHY:-none}"|*"fixture-container-$late") echo "running unhealthy" ;; *) echo "running ${NNTMUX_HEALTH_STATUS:-healthy}" ;; esac ;;
     *' ps -a -q '*)
+        # Compose lists one-off containers too: a running barrier (from web's definition) sorts first.
+        [ "$last" != web ] || [ ! -f "$NNTMUX_REPO/barrier.running" ] || echo barrier-container
         if [ -n "${NNTMUX_PS_A_FAIL_AFTER:-}" ] && grep -q -- "$NNTMUX_PS_A_FAIL_AFTER" "$NNTMUX_DEPLOY_EVENTS"; then echo "Cannot connect to the Docker daemon" >&2; exit 1; fi
         [ "${NNTMUX_NO_EXISTING_APP:-0}" = 1 ] && exit 0
         if [ -n "${NNTMUX_NO_CONTAINER:-}" ] && [ "$last" = "$NNTMUX_NO_CONTAINER" ] && ! grep -q -- " up -d .* $last\( \|\$\)" "$NNTMUX_DEPLOY_EVENTS"; then exit 0; fi
@@ -562,6 +570,23 @@ SH);
 
         // The old containers stayed healthy on the same image and Compose hash; none was replaced, so
         // the retry must recreate all of them instead of stamping a no-op.
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web horizon scheduler indexer', $this->events());
+    }
+
+    public function test_an_unreplaced_app_container_is_never_recorded_while_a_barrier_runs(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        // An owed release makes this selective run hold a barrier, a one-off container from web's
+        // definition that `compose ps -a web` lists first.
+        file_put_contents($this->directory.'/docker/.deploy.stamp.barrier-owed', "held\n");
+        file_put_contents($this->directory.'/app.txt', "two\n");
+        $failed = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_APP_UP_FAIL' => '1', 'NNTMUX_APP_UP_NO_REPLACE' => '1']);
+        $failed->run();
+        $this->assertSame(52, $failed->getExitCode());
+        $this->assertStringContainsString('releases:verification-barrier --timeout', $this->events());
+
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web horizon scheduler indexer', $this->events());

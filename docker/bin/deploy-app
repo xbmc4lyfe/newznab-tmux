@@ -500,7 +500,9 @@ if [ -n "$up_app_services" ]; then
     # health, image and Compose hash say (bind-mounted inputs are outside that hash).
     previous_containers=""
     for svc in $up_app_services; do
-        id=$(compose ps -a -q "$svc")
+        # Not `compose ps -a`: it also lists one-off `compose run` containers such as the barrier
+        # (from web's definition), which can sort first. Full IDs, as `compose ps -q` reports them.
+        id=$(docker ps -a -q --no-trunc --filter "label=com.docker.compose.project=$project" --filter "label=com.docker.compose.oneoff=False" --filter "label=com.docker.compose.service=$svc")
         previous_containers="$previous_containers $svc=$(printf '%s' "$id" | head -n 1)"
     done
     export DEPLOY_PREVIOUS_CONTAINERS="$previous_containers"
