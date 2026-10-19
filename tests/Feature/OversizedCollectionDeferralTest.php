@@ -158,6 +158,7 @@ class OversizedCollectionDeferralTest extends ReleaseVerificationCandidatesTest
         $this->createReleases();
         // Archival could only record it as an expired candidate holding no headers.
         DB::table('collections')->where('id', $oversized)->update(['dateadded' => '2026-10-01 00:00:00']);
+        $this->assertSame($oversized, (int) DB::table('release_verification_oversized_collections')->value('collection_id'));
 
         $reads = $this->partReadsDuring(fn () => $this->sweep());
 
@@ -165,6 +166,7 @@ class OversizedCollectionDeferralTest extends ReleaseVerificationCandidatesTest
         $this->assertFalse(DB::table('collections')->where('id', $oversized)->exists());
         $this->assertSame(0, $this->partsOf($oversized));
         $this->assertSame(0, DB::table('release_verification_candidates')->count());
+        $this->assertSame(0, DB::table('release_verification_oversized_collections')->count(), 'Its deferral goes with it.');
     }
 
     public function test_late_headers_that_would_push_a_pending_candidate_over_budget_are_kept_apart_for_a_later_pass(): void

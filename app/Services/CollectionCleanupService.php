@@ -280,6 +280,8 @@ class CollectionCleanupService
         $plain = array_values(array_filter($ids, static fn (int $id): bool => ! isset($expired[$id]) && ! isset($kept[$id])));
         $deleted = $this->deleteExpiredOnArchival($expiredIds, $echoCLI)
             + $this->deleteCollectionsAndDescendants($plain, 'Cleanup', $echoCLI);
+        // The deferral table has no foreign key, and these deletions bypass archiveEach's own cleanup.
+        app(OversizedCollectionDeferrals::class)->forget([...$expiredIds, ...$plain]);
 
         return [$ids[array_key_last($ids)], count($archive), $deleted, $exhausted];
     }
