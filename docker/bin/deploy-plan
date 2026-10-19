@@ -1365,7 +1365,8 @@ def database_service(docker_dir: Path) -> str:
     """The rendered service the app's database runs in. Per app service: its rendered Compose
     environment wins over app.env, and DB_URL's host over DB_HOST (Laravel's order). All apps must
     agree; a host that is no rendered service (an external database) leaves `mariadb`."""
-    app_env = read_dotenv(docker_dir / "config/app.env")
+    interpolated: set[str] = set()
+    app_env = read_dotenv(docker_dir / "config/app.env", interpolated)
 
     def selected(values: dict) -> list[str]:
         hosts = []
@@ -1383,6 +1384,11 @@ def database_service(docker_dir: Path) -> str:
         rendered = env if isinstance(env, dict) else {}
         # Keys Compose sets for this app shadow app.env's (Laravel reads the process environment first).
         merged = {**app_env, **{k: v for k, v in rendered.items() if k in ("DB_URL", "DB_HOST")}}
+        for key in ("DB_URL", "DB_HOST"):
+            if key in interpolated and key not in rendered:
+                # phpdotenv expands it, so the literal is not the host Laravel connects to.
+                sys.exit(f"deploy-plan: config/app.env's {key} uses `$` interpolation, so the database service it "
+                         "selects cannot be determined; write the host literally (or single-quote a literal `$`).")
         for host in selected(merged):
             if host:
                 if host in RENDERED_SERVICES:
@@ -1393,14 +1399,27 @@ def database_service(docker_dir: Path) -> str:
                  "selective deployment migrates and fences one database. Give every app the same DB_HOST/DB_URL.")
     return targets.pop() if targets else "mariadb"
 
+def database_target(docker_dir: Path) -> str:
+    """A digest of the connection web (and so the verification barrier) uses: a barrier adopted from
+    an earlier attempt fences only this database if its recorded target matches."""
+    app_env = read_dotenv(docker_dir / "config/app.env")
+    cfg = RENDERED_SERVICES.get("web")
+    env = cfg.get("environment") if isinstance(cfg, dict) else None
+    rendered = env if isinstance(env, dict) else {}
+    keys = ("DB_CONNECTION", "DB_URL", "DB_HOST", "DB_PORT", "DB_SOCKET", "DB_DATABASE")
+    merged = {key: str(rendered[key] if key in rendered else app_env.get(key, "")) for key in keys}
+    return hashlib.sha256(json.dumps(merged, sort_keys=True).encode()).hexdigest()[:32]
+
+
 def docker_daemon_identity() -> str:
     """The daemon the Docker CLI actually connects to: DOCKER_HOST wins over DOCKER_CONTEXT (with both
     set, `docker context show` reports `default` and the CLI dials DOCKER_HOST), which wins over the
     current context."""
     host = os.environ.get("DOCKER_HOST", "")
-    if host:
-        return f"host:{host}"
     context = os.environ.get("DOCKER_CONTEXT", "")
+    if host:
+        # With both set, either one changing is another daemon under some CLI's precedence.
+        return f"host:{host}+context:{context}" if context else f"host:{host}"
     if not context:
         # The current context, so an exported DOCKER_CONTEXT naming it compares equal.
         proc = subprocess.run(["docker", "context", "show"], capture_output=True, text=True, check=False)
@@ -1534,12 +1553,14 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
     data_reasons: dict[str, str] = {}
     # A recorded data service that is no longer rendered may have been renamed onto the same storage
     # as a new one; then no new data service may start before the writers are quiesced.
-    data_removed = any(
-        key.startswith("compose:") and stamped[key] != "absent"
+    # deploy-app stops each such predecessor (an orphan Compose leaves running) once writers stop.
+    removed_data = sorted(
+        key.split(":", 1)[1] for key in stamped
+        if key.startswith("compose:") and stamped[key] != "absent"
         and key.split(":", 1)[1] not in RENDERED_SERVICES
         and key.split(":", 1)[1] not in APP_SERVICES and key.split(":", 1)[1] not in INFRA_SERVICES
-        for key in stamped
     )
+    data_removed = bool(removed_data)
     for svc in data_services(state):
         if not compose_present(state, svc):
             data_reasons[svc] = "not rendered"
@@ -1719,6 +1740,7 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
         "dirty_infra": dirty_infra,
         "reconcile_data": reconcile_data,
         "start_data": start_data,
+        "removed_data": removed_data,
         "global_fallback": global_fallback,
         "reconcile_infra": reconcile_infra,
         "build_targets": build_targets,
@@ -1861,9 +1883,9 @@ def main() -> None:
         # Only services the effective Compose configuration renders (`ps` also lists orphans).
         get_compose_service_hashes(docker_dir)
         stale = stale_service_images(docker_dir, RENDERED_SERVICES)
-        # Rendered infrastructure with no container at all also needs a rollout.
-        infra = [*INFRA_SERVICES, *(svc for svc in RENDERED_SERVICES if svc not in ALL_SERVICES and declared_stateless(svc))]
-        missing = [svc for svc in infra if svc in RENDERED_SERVICES and svc not in stale and not container_exists(docker_dir, svc)]
+        # A rendered data or infrastructure service with no container at all also needs a rollout
+        # (healthy apps do not prove that, e.g., a deleted Manticore came back).
+        missing = [svc for svc in RENDERED_SERVICES if svc not in APP_SERVICES and svc not in stale and not container_exists(docker_dir, svc)]
         print(" ".join([*stale, *missing]))
         return
 
@@ -1890,6 +1912,8 @@ def main() -> None:
         print(f"RECONCILE_INFRA={shlex.quote(' '.join(plan['reconcile_infra']))}")
         print(f"START_DATA={shlex.quote(' '.join(plan['start_data']))}")
         print(f"DATABASE_SERVICE={shlex.quote(database_service(docker_dir))}")
+        print(f"DATABASE_TARGET={shlex.quote(database_target(docker_dir))}")
+        print(f"REMOVED_DATA={shlex.quote(' '.join(plan['removed_data']))}")  # type: ignore[arg-type]
         # Everything applied before the drain, in one depends_on order across the three lists:
         # `up --no-deps` never starts a provider, whichever list it is in.
         marks = {**{svc: "forget" for svc in plan["start_data"]}, **{svc: "forget" for svc in plan["reconcile_infra"]},

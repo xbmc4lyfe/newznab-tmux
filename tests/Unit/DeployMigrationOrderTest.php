@@ -21,9 +21,9 @@ class DeployMigrationOrderTest extends TestCase
             copy(__DIR__.'/../../docker/bin/'.$script, $this->directory.'/docker/bin/'.$script);
             chmod($this->directory.'/docker/bin/'.$script, 0755);
         }
-        file_put_contents($this->directory.'/.gitignore', "/docker/.build.stamp\n/docker/.deploy.stamp\n/docker/.deploy.time\n/docker/.deploy.log\n/docker/.deploy.lock*\n/events\n/recreated*\n/replaced\n/barrier.log\n/barrier.running\n");
+        file_put_contents($this->directory.'/.gitignore', "/docker/.build.stamp\n/docker/.deploy.stamp\n/docker/.deploy.time\n/docker/.deploy.log\n/docker/.deploy.lock*\n/events\n/recreated*\n/replaced\n/barrier.log\n/barrier.running\n/barrier.database\n");
         // Docker ignores .gitignore: the fixture's own state must also stay out of the build context.
-        file_put_contents($this->directory.'/.dockerignore', "events\nrecreated*\nreplaced\nbarrier.log\nbarrier.running\n");
+        file_put_contents($this->directory.'/.dockerignore', "events\nrecreated*\nreplaced\nbarrier.log\nbarrier.running\nbarrier.database\n");
         file_put_contents($this->directory.'/app.txt', "one\n");
         file_put_contents($this->directory.'/bin/docker', <<<'SH'
 #!/bin/sh
@@ -34,10 +34,14 @@ missing=0
 if [ "${NNTMUX_SERVICE_MISSING:-0}" = 1 ] && ! grep -q -- ' up -d --no-deps --force-recreate' "$NNTMUX_DEPLOY_EVENTS"; then missing=1; fi
 default_config='{"services":{"web":{},"horizon":{},"scheduler":{},"indexer":{},"mariadb":{},"redis":{},"manticore":{},"proxy":{},"mailpit":{},"prometheus":{},"pushgateway":{},"grafana":{},"node-exporter":{},"mysqld-exporter":{},"redis-exporter":{}}}'
 case "$*" in
+    'inspect --format {{index .Config.Labels "nntmux.deploy.database"}} '*) cat "$NNTMUX_REPO/barrier.database" 2>/dev/null ;;
+    'ps -q --filter label=com.docker.compose.project='*) [ -z "${NNTMUX_ORPHAN:-}" ] || case "$*" in *"service=$NNTMUX_ORPHAN") echo "fixture-container-$NNTMUX_ORPHAN" ;; esac ;;
+    'stop fixture-container-'*) ;;
     *'releases:verification-barrier --release'*) echo forced-release >> "$NNTMUX_DEPLOY_EVENTS"; [ "${NNTMUX_FORCED_RELEASE_FAIL:-0}" != 1 ] || exit 52 ;;
     *'releases:verification-barrier'*)
         if [ "${NNTMUX_BARRIER_FAIL:-0}" = 1 ] || { [ -n "${NNTMUX_BARRIER_FAIL_AFTER:-}" ] && grep -q -- "$NNTMUX_BARRIER_FAIL_AFTER" "$NNTMUX_DEPLOY_EVENTS"; }; then echo 'still running' > "$NNTMUX_REPO/barrier.log"; else echo 'barrier held' > "$NNTMUX_REPO/barrier.log"; : > "$NNTMUX_REPO/barrier.running"; fi
         if [ "${NNTMUX_BARRIER_LOCK_MARKER:-0}" = 1 ]; then chmod 444 "$NNTMUX_REPO/docker/.deploy.stamp.barrier-owed"; echo two > "$NNTMUX_REPO/app.txt"; fi
+        for arg in "$@"; do case "$arg" in nntmux.deploy.database=*) printf '%s\n' "${arg#*=}" > "$NNTMUX_REPO/barrier.database" ;; esac; done
         echo barrier-container ;;
     'inspect --format {{.State.Running}} '*'-verification-barrier')
         if [ -n "${NNTMUX_BARRIER_EXIT_ON:-}" ] && grep -q -- "$NNTMUX_BARRIER_EXIT_ON" "$NNTMUX_DEPLOY_EVENTS"; then rm -f "$NNTMUX_REPO/barrier.running"; echo 'barrier lost' >> "$NNTMUX_REPO/barrier.log"; fi
@@ -101,6 +105,8 @@ case "$*" in
         # A recreated container gets a new ID, as Docker gives it.
         # NNTMUX_NO_CONTAINER: missing until this run (re)creates it.
         if [ -n "${NNTMUX_NO_CONTAINER:-}" ] && [ "$last" = "$NNTMUX_NO_CONTAINER" ] && ! grep -q -- " up -d .* $last\( \|\$\)" "$NNTMUX_DEPLOY_EVENTS"; then exit 0; fi
+        # NNTMUX_STOPPED: an exited container (listed by `ps -a` only) until this run starts it.
+        if [ -n "${NNTMUX_STOPPED:-}" ] && [ "$last" = "$NNTMUX_STOPPED" ] && ! grep -q -- " up -d .* $last\( \|\$\)" "$NNTMUX_DEPLOY_EVENTS"; then exit 0; fi
         [ "$missing" = 1 ] || { [ ! -f "$NNTMUX_REPO/recreated-$last" ] || printf 'r%s-' "$(wc -c < "$NNTMUX_REPO/recreated-$last" | tr -d ' ')"; echo "fixture-container-$last"; } ;;
     *'scheduler python3 -c '*) [ "${NNTMUX_SCHEDULER_CAPABILITY_FAIL:-0}" != 1 ] || exit 48; echo "${NNTMUX_SCHEDULER_CAPABILITY:-native}" ;;
     *'scheduler.py drain --timeout='*)
@@ -128,7 +134,7 @@ case "$*" in
         case "$*" in *' proxy'*)
             if [ -n "${NNTMUX_PROXY_EDIT:-}" ]; then echo C > "$NNTMUX_PROXY_EDIT"; fi
             [ "${NNTMUX_PROXY_FAIL:-0}" != 1 ] || exit 51 ;; esac
-        case "$*" in *'--wait-timeout 240 web'*)
+        case "$*" in *'--wait-timeout 240 --pull never web'*)
             if [ "${NNTMUX_APP_UP_FAIL:-0}" = 1 ]; then
                 # Compose replaced the containers before the health wait failed, unless it failed first.
                 if [ "${NNTMUX_APP_UP_NO_REPLACE:-0}" != 1 ]; then
@@ -143,7 +149,7 @@ case "$*" in
         case "$*" in *' --force-recreate '*)
             : > "$NNTMUX_REPO/recreated"
             # Every service named after the options gets a new container, not only the last one.
-            for svc in "$@"; do case "$svc" in -*|*/*|compose|up|[0-9]*) ;; *) printf x >> "$NNTMUX_REPO/recreated-$svc" ;; esac; done ;; esac ;;
+            for svc in "$@"; do case "$svc" in -*|*/*|compose|up|never|[0-9]*) ;; *) printf x >> "$NNTMUX_REPO/recreated-$svc" ;; esac; done ;; esac ;;
 esac
 exit 0
 SH);
@@ -166,7 +172,7 @@ SH);
     {
         $this->deploy()->mustRun();
         $events = $this->events();
-        $steps = ['build --target selfhosted', 'artisan list --raw', ' stop --timeout 1920 horizon', 'scheduler.py drain --timeout=1800', 'artisan tmux:drain --timeout=900', 'releases:verification-barrier --timeout=900', ' stop web scheduler indexer', 'artisan migrate --force --no-interaction', ' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', 'released'];
+        $steps = ['build --target selfhosted', 'artisan list --raw', ' stop --timeout 1920 horizon', 'scheduler.py drain --timeout=1800', 'artisan tmux:drain --timeout=900', 'releases:verification-barrier --timeout=900', ' stop web scheduler indexer', 'artisan migrate --force --no-interaction', ' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web horizon scheduler indexer', 'released'];
         $previous = -1;
         foreach ($steps as $step) {
             $position = strpos($events, $step);
@@ -337,7 +343,7 @@ SH);
         $services['services']['mariadb'] = ['image' => 'mariadb:two'];
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($services, JSON_UNESCAPED_SLASHES)])->mustRun();
         $events = $this->events();
-        $recreate = strpos($events, ' up -d --no-deps --force-recreate --wait --wait-timeout 240 mariadb');
+        $recreate = strpos($events, ' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never mariadb');
         $this->assertNotFalse($recreate);
         $this->assertSame(2, substr_count($events, 'releases:verification-barrier --timeout=900'));
         $this->assertGreaterThan($recreate, strrpos($events, 'releases:verification-barrier --timeout=900'));
@@ -377,8 +383,8 @@ SH);
 
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         $events = $this->events();
-        $this->assertStringContainsString('--wait-timeout 240 mariadb', $events);
-        $this->assertGreaterThan(strpos($events, '--wait-timeout 240 mariadb'), strpos($events, 'artisan migrate --force'));
+        $this->assertStringContainsString('--wait-timeout 240 --pull never mariadb', $events);
+        $this->assertGreaterThan(strpos($events, '--wait-timeout 240 --pull never mariadb'), strpos($events, 'artisan migrate --force'));
     }
 
     public function test_a_check_failing_right_after_the_database_is_replaced_keeps_remote_workers_out(): void
@@ -431,7 +437,7 @@ SH);
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
 
         file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 2gb\n");
-        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_BARRIER_FAIL_AFTER' => '--wait-timeout 240 redis']);
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_BARRIER_FAIL_AFTER' => '--wait-timeout 240 --pull never redis']);
         $process->run();
         $this->assertFalse($process->isSuccessful());
         $this->assertFileExists($this->directory.'/docker/.deploy.stamp.barrier-owed');
@@ -509,7 +515,7 @@ SH);
         $this->deploy(['NNTMUX_SERVICE_MISSING' => '1'])->mustRun();
         // Missing services are recreated; the recorded migration state alone decides migrating.
         $this->assertStringNotContainsString('artisan migrate', $this->events());
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web horizon scheduler indexer', $this->events());
     }
 
     public function test_retry_after_an_unhealthy_web_only_rollout_recreates_only_web(): void
@@ -528,7 +534,7 @@ SH);
         $this->assertStringNotContainsString('drain', $events);
         $this->assertStringNotContainsString('artisan migrate', $events);
         $this->assertStringNotContainsString(' stop ', $events);
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web', $events);
         $this->assertStringNotContainsString('web horizon', $events);
     }
 
@@ -544,7 +550,7 @@ SH);
         // the retry must recreate all of them instead of stamping a no-op.
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web horizon scheduler indexer', $this->events());
     }
 
     public function test_retry_after_a_failed_app_start_does_not_repeat_a_completed_migration(): void
@@ -562,7 +568,7 @@ SH);
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_UNHEALTHY' => 'web'])->run();
         $this->assertStringNotContainsString('artisan migrate', $this->events());
         // Only the service that never came up healthy is redeployed.
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web', $this->events());
         $this->assertStringNotContainsString('web horizon', $this->events());
     }
 
@@ -651,7 +657,7 @@ SH);
         $process->run();
         $this->assertFalse($process->isSuccessful());
         // Infra (before any drain) and data reconciliation may run; new app containers never start.
-        $this->assertStringNotContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
+        $this->assertStringNotContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web horizon scheduler indexer', $this->events());
         $this->assertNotStamped();
         $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.time');
     }
@@ -701,7 +707,7 @@ SH);
 
         // The proxy container was removed: the guard must not skip, and the plan recreates it.
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_NO_CONTAINER' => 'proxy'])->mustRun();
-        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 proxy', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 --pull never proxy', $this->events());
     }
 
     public function test_infrastructure_needing_a_changed_data_service_and_a_stopped_app_follows_the_apps(): void
@@ -718,7 +724,7 @@ SH);
         $json['services']['sidecar']['environment'] = ['V' => '2'];
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
         $events = $this->events();
-        $this->assertGreaterThan(strpos($events, 'web horizon scheduler indexer'), strpos($events, '--wait-timeout 240 sidecar'));
+        $this->assertGreaterThan(strpos($events, 'web horizon scheduler indexer'), strpos($events, '--wait-timeout 240 --pull never sidecar'));
     }
 
     public function test_an_owed_barrier_release_runs_even_when_nothing_else_changed(): void
@@ -797,7 +803,7 @@ SH);
         $process->run();
         $this->assertFalse($process->isSuccessful());
         $this->assertStringContainsString('artisan migrate', $this->events());
-        $this->assertStringNotContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
+        $this->assertStringNotContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web horizon scheduler indexer', $this->events());
     }
 
     public function test_up_preserves_first_bringup_when_no_app_containers_exist(): void
@@ -841,7 +847,7 @@ SH);
         $this->assertFalse($process->isSuccessful());
         $this->assertStringContainsString(' stop web scheduler indexer', $this->events());
         $this->assertStringNotContainsString('artisan migrate', $this->events());
-        $this->assertStringNotContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
+        $this->assertStringNotContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web horizon scheduler indexer', $this->events());
         $this->assertLessThan(strpos($this->events(), 'scheduler.py drain'), strrpos($this->events(), ' up -d') ?: -1, 'nothing may start after the writers stop');
         $this->assertStringNotContainsString('tmux:drain --resume', $this->events());
         $this->assertNotStamped();
@@ -1052,7 +1058,7 @@ SH);
         $this->assertStringNotContainsString('tmux:drain', $events);
         $this->assertStringNotContainsString(' stop ', $events);
         $this->assertStringNotContainsString('artisan migrate', $events);
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web', $events);
         $this->assertStringNotContainsString('horizon scheduler indexer', $events);
         $this->assertStringNotContainsString('releases:verification-barrier', $events);
     }
@@ -1071,7 +1077,7 @@ SH);
 
         $events = $this->events();
         $this->assertStringNotContainsString('releases:verification-barrier --timeout', $events);
-        $this->assertGreaterThan(strpos($events, ' up -d --no-deps --force-recreate --wait --wait-timeout 240 web'), strpos($events, 'released'));
+        $this->assertGreaterThan(strpos($events, ' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web'), strpos($events, 'released'));
         $this->assertFileDoesNotExist($this->directory.'/barrier.running');
     }
 
@@ -1096,7 +1102,7 @@ SH);
         $this->assertStringNotContainsString('tmux:drain', $events);
         $this->assertStringNotContainsString(' stop --timeout 1920 horizon', $events);
         $this->assertStringNotContainsString('artisan migrate', $events);
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 scheduler', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never scheduler', $events);
     }
 
     public function test_indexer_only_changes_rebuild_drain_and_recreate_only_indexer(): void
@@ -1119,7 +1125,7 @@ SH);
         $this->assertStringNotContainsString('scheduler.py drain', $events);
         $this->assertStringNotContainsString(' stop --timeout 1920 horizon', $events);
         $this->assertStringNotContainsString('artisan migrate', $events);
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 indexer', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never indexer', $events);
     }
 
     public function test_application_code_reachable_from_several_roles_rebuilds_and_drains_every_app_service(): void
@@ -1145,7 +1151,7 @@ SH);
             $this->assertStringContainsString('scheduler.py drain --timeout=1800', $events, $path);
             $this->assertStringContainsString('artisan tmux:drain --timeout=900', $events, $path);
             $this->assertStringContainsString(' stop --timeout 1920 horizon', $events, $path);
-            $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $events, $path);
+            $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web horizon scheduler indexer', $events, $path);
         }
     }
 
@@ -1164,7 +1170,7 @@ SH);
         $this->assertStringContainsString(' stop --timeout 1920 horizon', $events);
         $this->assertStringContainsString(' stop web scheduler indexer', $events);
         $this->assertStringContainsString('artisan migrate --force --no-interaction', $events);
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web horizon scheduler indexer', $events);
     }
 
     public function test_stateless_infra_config_changes_recreate_only_the_affected_infra_service_without_draining_writers(): void
@@ -1185,7 +1191,7 @@ SH);
         $this->assertStringNotContainsString('tmux:drain', $events);
         $this->assertStringNotContainsString(' stop ', $events);
         $this->assertStringNotContainsString('artisan migrate', $events);
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never proxy', $events);
         $this->assertDoesNotMatchRegularExpression('/ up -d[^\\n]* redis\\b/', $events);
     }
 
@@ -1197,8 +1203,8 @@ SH);
 
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0', 'DC=docker compose --project-directory '.$this->directory.'/docker --ansi never'], $config)->mustRun();
         $events = $this->events();
-        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 redis', $events);
-        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 proxy', $events);
+        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 --pull never redis', $events);
+        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 --pull never proxy', $events);
     }
 
     public function test_dockerignore_and_file_permission_changes_invalidate_build_fingerprints(): void
@@ -1265,7 +1271,7 @@ SH);
 
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
         $events = $this->events();
-        $recreate = ' up -d --no-deps --force-recreate --wait --wait-timeout 240 redis';
+        $recreate = ' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never redis';
         $this->assertStringContainsString('scheduler.py drain --timeout=1800', $events);
         $this->assertStringContainsString('artisan tmux:drain --timeout=900', $events);
         $this->assertStringContainsString(' stop web scheduler indexer', $events);
@@ -1294,17 +1300,17 @@ SH);
     {
         $this->deploy()->mustRun();
         $events = $this->events();
-        $reconcile = ' up -d --no-deps --wait --wait-timeout 240 mariadb';
-        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 redis', $events);
-        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 manticore', $events);
+        $reconcile = ' up -d --no-deps --wait --wait-timeout 240 --pull never mariadb';
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 --pull never redis', $events);
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 --pull never manticore', $events);
         $this->assertStringContainsString($reconcile, $events);
         $this->assertStringNotContainsString('--force-recreate --wait mariadb', $events);
         $this->assertLessThan(strpos($events, 'artisan migrate'), strpos($events, $reconcile));
         $this->assertGreaterThan(strpos($events, ' stop web scheduler indexer'), strpos($events, $reconcile));
-        $infra = ' up -d --no-deps --wait --wait-timeout 240 proxy';
-        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 mailpit', $events);
+        $infra = ' up -d --no-deps --wait --wait-timeout 240 --pull never proxy';
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 --pull never mailpit', $events);
         $this->assertStringContainsString($infra, $events);
-        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 proxy', $events);
+        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 --pull never proxy', $events);
         $this->assertLessThan(strpos($events, 'scheduler.py drain'), strpos($events, $infra), 'infra is applied before any drain');
     }
 
@@ -1313,7 +1319,7 @@ SH);
         mkdir($this->directory.'/docker/config/caddy', 0777, true);
         file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', ":8080\n");
         $this->deploy(['NNTMUX_CONFIG_ID' => $this->composeJson(), 'NNTMUX_STARTED_AT' => '2000-01-01T00:00:00Z'])->mustRun();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never proxy', $this->events());
     }
 
     public function test_deleting_a_nested_file_from_a_read_only_mount_counts_as_newer_than_the_container(): void
@@ -1330,7 +1336,7 @@ SH);
         unlink($tree.'/datasources/legacy.yml');
         touch($tree, 946684800);
         $this->deploy($config + ['NNTMUX_STARTED_AT' => '2001-01-01T00:00:00Z'])->mustRun();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 grafana', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never grafana', $this->events());
     }
 
     public function test_infra_recreated_before_a_failed_drain_is_recorded_so_a_revert_or_retry_is_correct(): void
@@ -1345,7 +1351,7 @@ SH);
         file_put_contents($this->directory.'/app.txt', "two\n");
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_SCHEDULER_DRAIN_FAIL' => '1'])->run();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never proxy', $this->events());
         $this->assertSame('stale', strtok((string) file_get_contents($this->directory.'/docker/.deploy.stamp'), "\n"));
 
         // A retry does not recreate proxy again; it is already on B.
@@ -1358,7 +1364,7 @@ SH);
         file_put_contents($this->directory.'/app.txt', "one\n");
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never proxy', $this->events());
 
         // And afterwards the stack is fully stamped again: the next poll skips.
         file_put_contents($this->directory.'/events', '');
@@ -1393,7 +1399,7 @@ SH);
         file_put_contents($this->directory.'/app.txt', "one\n");
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web horizon scheduler indexer', $this->events());
     }
 
     public function test_infra_recreate_failing_never_lets_a_revert_be_skipped(): void
@@ -1411,7 +1417,7 @@ SH);
         file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', "A\n");
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_STARTED_AT' => '2000-01-01T00:00:00Z'])->mustRun();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never proxy', $this->events());
     }
 
     public function test_mounted_file_changed_during_its_recreate_is_redeployed_on_the_next_poll(): void
@@ -1428,7 +1434,7 @@ SH);
 
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never proxy', $this->events());
     }
 
     public function test_recorded_mount_change_with_a_reverted_app_change_needs_no_app_rollout(): void
@@ -1468,7 +1474,7 @@ SH);
         $events = $this->events();
         $this->assertStringNotContainsString('drain', $events);
         $this->assertStringNotContainsString('artisan migrate', $events);
-        $this->assertStringNotContainsString('--wait-timeout 240 web', $events);
+        $this->assertStringNotContainsString('--wait-timeout 240 --pull never web', $events);
         $this->assertDoesNotMatchRegularExpression('/ up -d[^\n]* proxy\b/', $events);
     }
 
@@ -1511,7 +1517,7 @@ SH);
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0', $dc])->mustRun();
         $this->assertStringNotContainsString('artisan migrate', $this->events());
         // Every service came up healthy despite the failed wait: nothing is repeated.
-        $this->assertStringNotContainsString('--wait-timeout 240 web', $this->events());
+        $this->assertStringNotContainsString('--wait-timeout 240 --pull never web', $this->events());
     }
 
     public function test_removing_a_service_from_compose_needs_no_app_rollout(): void
@@ -1640,7 +1646,7 @@ SH);
         $json['services']['db2'] = ['image' => 'mariadb:two'];
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
         $events = $this->events();
-        $recreate = strpos($events, '--force-recreate --wait --wait-timeout 240 db2');
+        $recreate = strpos($events, '--force-recreate --wait --wait-timeout 240 --pull never db2');
         $this->assertNotFalse($recreate);
         $this->assertGreaterThan($recreate, strrpos($events, 'releases:verification-barrier --timeout=900'));
         $this->assertGreaterThan($recreate, strpos($events, 'artisan migrate --force'));
@@ -1673,7 +1679,7 @@ SH);
 
         file_put_contents($this->directory.'/docker/config/site$one/x.conf', "two\n");
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never proxy', $this->events());
     }
 
     public function test_a_renamed_data_service_starts_only_after_the_writers_stop(): void
@@ -1686,9 +1692,68 @@ SH);
         // mariadb is renamed to db2 (same storage): db2 has no container and no record.
         unset($json['services']['mariadb']);
         $json['services']['db2'] = ['image' => 'mariadb:one'];
-        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES), 'NNTMUX_NO_CONTAINER' => 'db2'])->mustRun();
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES), 'NNTMUX_NO_CONTAINER' => 'db2', 'NNTMUX_ORPHAN' => 'mariadb'])->mustRun();
         $events = $this->events();
-        $this->assertGreaterThan(strpos($events, ' stop web scheduler indexer'), strpos($events, '--wait-timeout 240 db2'));
+        $this->assertGreaterThan(strpos($events, ' stop web scheduler indexer'), strpos($events, '--wait-timeout 240 --pull never db2'));
+        // The orphaned predecessor (Compose leaves it running) is stopped before its successor starts.
+        $stop = strpos($events, 'stop fixture-container-mariadb');
+        $this->assertNotFalse($stop);
+        $this->assertGreaterThan(strpos($events, ' stop web scheduler indexer'), $stop);
+        $this->assertGreaterThan($stop, strpos($events, '--wait-timeout 240 --pull never db2'));
+    }
+
+    public function test_a_stopped_database_scheduled_for_rollout_starts_before_its_barrier(): void
+    {
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['mariadb'] = ['image' => 'mariadb:one'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        $json['services']['mariadb'] = ['image' => 'mariadb:two'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES), 'NNTMUX_STOPPED' => 'mariadb'])->mustRun();
+        $events = $this->events();
+        $start = strpos($events, ' up -d --no-deps --wait --wait-timeout 240 --pull never mariadb');
+        $this->assertNotFalse($start);
+        $this->assertGreaterThan($start, strpos($events, 'releases:verification-barrier --timeout=900'));
+    }
+
+    public function test_an_adopted_barrier_must_fence_this_rollouts_database(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        // A failed attempt left a barrier running against another database target.
+        file_put_contents($this->directory.'/barrier.log', "barrier held\n");
+        touch($this->directory.'/barrier.running');
+        file_put_contents($this->directory.'/barrier.database', "another-database\n");
+        file_put_contents($this->directory.'/docker/.env', "DB_ROOTPASSWORD=rotated\n");
+        file_put_contents($this->directory.'/events', '');
+
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('fences another database than this rollout', $process->getErrorOutput());
+        $this->assertStringNotContainsString('artisan migrate', $this->events());
+        $this->assertFileExists($this->directory.'/barrier.running');
+    }
+
+    public function test_an_interpolated_app_env_database_host_fails_closed(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_TARGET=db2\nDB_HOST=\${DB_TARGET}\n");
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString("app.env's DB_HOST uses `\$` interpolation", $process->getErrorOutput());
+        $this->assertStringNotContainsString(' up -d', $this->events());
+    }
+
+    public function test_a_deleted_data_container_is_not_an_unchanged_stack(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        // Manticore was deleted after the healthy rollout; the apps stay healthy without it.
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_NO_CONTAINER' => 'manticore'])->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 --pull never manticore', $this->events());
     }
 
     public function test_the_rendered_app_environment_names_the_database_service(): void
@@ -1704,7 +1769,7 @@ SH);
         $json['services']['db2'] = ['image' => 'mariadb:two'];
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
         $events = $this->events();
-        $recreate = strpos($events, '--force-recreate --wait --wait-timeout 240 db2');
+        $recreate = strpos($events, '--force-recreate --wait --wait-timeout 240 --pull never db2');
         $this->assertNotFalse($recreate);
         $this->assertGreaterThan($recreate, strrpos($events, 'releases:verification-barrier --timeout=900'));
     }
@@ -1725,7 +1790,7 @@ SH);
         @unlink($this->directory.'/replaced');
         $this->assertFalse($process->isSuccessful());
         $this->assertStringContainsString('not rolling out a replaced image', $process->getErrorOutput());
-        $this->assertStringNotContainsString('--wait-timeout 240 redis', $this->events());
+        $this->assertStringNotContainsString('--wait-timeout 240 --pull never redis', $this->events());
     }
 
     public function test_a_check_failing_after_starting_a_missing_database_keeps_remote_workers_out(): void
@@ -1769,7 +1834,7 @@ SH);
         $with['services']['tunnel'] = ['labels' => ['nntmux.deploy.stateless' => 'true']];
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($with, JSON_UNESCAPED_SLASHES), 'NNTMUX_NO_CONTAINER' => 'redis'])->mustRun();
         $events = $this->events();
-        $this->assertLessThan(strpos($events, '--wait-timeout 240 redis'), strpos($events, '--wait-timeout 240 tunnel'));
+        $this->assertLessThan(strpos($events, '--wait-timeout 240 --pull never redis'), strpos($events, '--wait-timeout 240 --pull never tunnel'));
     }
 
     public function test_infrastructure_a_new_data_service_needs_starts_first(): void
@@ -1785,8 +1850,8 @@ SH);
         $with['services']['tunnel'] = ['labels' => ['nntmux.deploy.stateless' => 'true']];
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($with, JSON_UNESCAPED_SLASHES), 'NNTMUX_NO_CONTAINER' => 'redis'])->mustRun();
         $events = $this->events();
-        $tunnel = strpos($events, '--wait-timeout 240 tunnel');
-        $redis = strpos($events, '--wait-timeout 240 redis');
+        $tunnel = strpos($events, '--wait-timeout 240 --pull never tunnel');
+        $redis = strpos($events, '--wait-timeout 240 --pull never redis');
         $this->assertNotFalse($tunnel);
         $this->assertNotFalse($redis);
         $this->assertLessThan($redis, $tunnel);
@@ -1809,7 +1874,7 @@ SH);
         symlink($this->directory.'/storage-b', $this->directory.'/current');
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 redis', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never redis', $this->events());
     }
 
     public function test_data_services_after_the_drain_follow_depends_on_across_both_lists(): void
@@ -1827,8 +1892,8 @@ SH);
 
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
         $events = $this->events();
-        $redis = strpos($events, '--wait-timeout 240 redis');
-        $cache = strpos($events, '--wait-timeout 240 cache2');
+        $redis = strpos($events, '--wait-timeout 240 --pull never redis');
+        $cache = strpos($events, '--wait-timeout 240 --pull never cache2');
         $this->assertNotFalse($redis);
         $this->assertNotFalse($cache);
         $this->assertLessThan($cache, $redis);
@@ -1852,7 +1917,7 @@ SH);
         symlink($this->directory.'/conf-b', $this->directory.'/conf');
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never proxy', $this->events());
     }
 
     public function test_infrastructure_whose_app_provider_has_no_container_starts_after_the_apps(): void
@@ -1865,7 +1930,7 @@ SH);
         $json['services']['sidecar']['environment'] = ['CHANGED' => '1'];
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0', 'FORCE=1'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES), 'NNTMUX_NO_CONTAINER' => 'web'])->mustRun();
         $events = $this->events();
-        $this->assertGreaterThan(strpos($events, 'web horizon scheduler indexer'), strpos($events, '--wait-timeout 240 sidecar'));
+        $this->assertGreaterThan(strpos($events, 'web horizon scheduler indexer'), strpos($events, '--wait-timeout 240 --pull never sidecar'));
 
         // A data service cannot wait for an app provider.
         $json['services']['cache2'] = ['depends_on' => ['web' => ['condition' => 'service_healthy']]];
@@ -1883,7 +1948,13 @@ SH);
         $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['DOCKER_HOST' => 'unix:///two.sock', 'DOCKER_CONTEXT' => 'same']);
         $process->run();
         $this->assertFalse($process->isSuccessful());
-        $this->assertStringContainsString('Docker daemon changed from host:unix:///one.sock to host:unix:///two.sock', $process->getErrorOutput());
+        $this->assertStringContainsString('Docker daemon changed from host:unix:///one.sock+context:same to host:unix:///two.sock+context:same', $process->getErrorOutput());
+
+        // With both set, a context change alone is also treated as another daemon.
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['DOCKER_HOST' => 'unix:///one.sock', 'DOCKER_CONTEXT' => 'other']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('Docker daemon changed', $process->getErrorOutput());
     }
 
     public function test_a_docker_daemon_change_aborts_before_any_change(): void
@@ -1912,7 +1983,7 @@ SH);
         $json['services']['redis-exporter']['environment'] = ['V' => '2'];
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
         $events = $this->events();
-        $this->assertLessThan(strpos($events, '--wait-timeout 240 redis-exporter'), strpos($events, '--wait-timeout 240 redis'."\n"));
+        $this->assertLessThan(strpos($events, '--wait-timeout 240 --pull never redis-exporter'), strpos($events, '--wait-timeout 240 --pull never redis'."\n"));
     }
 
     public function test_infrastructure_whose_app_provider_is_stopped_or_unhealthy_follows_the_apps(): void
@@ -1925,7 +1996,7 @@ SH);
         $json['services']['sidecar']['environment'] = ['CHANGED' => '1'];
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0', 'FORCE=1'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES), 'NNTMUX_UNHEALTHY' => 'web'])->run();
         $events = $this->events();
-        $this->assertGreaterThan(strpos($events, 'web horizon scheduler indexer'), strpos($events, '--wait-timeout 240 sidecar'));
+        $this->assertGreaterThan(strpos($events, 'web horizon scheduler indexer'), strpos($events, '--wait-timeout 240 --pull never sidecar'));
     }
 
     public function test_retargeting_a_symlinked_read_only_directory_recreates_the_service(): void
@@ -1947,7 +2018,7 @@ SH);
         symlink($this->directory.'/tree-b', $this->directory.'/tree');
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never proxy', $this->events());
     }
 
     public function test_unreadable_env_file_fails_closed(): void
@@ -2014,10 +2085,10 @@ SH);
 
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => $with, 'NNTMUX_NO_CONTAINER' => 'mariadb'])->mustRun();
         $events = $this->events();
-        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 mariadb', $events);
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 --pull never mariadb', $events);
         $this->assertStringNotContainsString('drain', $events);
         $this->assertStringNotContainsString(' stop ', $events);
-        $this->assertStringNotContainsString('--wait-timeout 240 web', $events);
+        $this->assertStringNotContainsString('--wait-timeout 240 --pull never web', $events);
         $this->assertAttemptsClosed();
     }
 
@@ -2036,10 +2107,10 @@ SH);
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($with, JSON_UNESCAPED_SLASHES), 'NNTMUX_STARTED_AT' => '2000-01-01T00:00:00Z'])->mustRun();
         $events = $this->events();
-        $recreate = ' up -d --no-deps --force-recreate --wait --wait-timeout 240 redis';
+        $recreate = ' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never redis';
         $this->assertStringContainsString($recreate, $events);
         $this->assertLessThan(strpos($events, $recreate), strpos($events, ' stop web scheduler indexer'));
-        $this->assertStringNotContainsString(' up -d --no-deps --wait --wait-timeout 240 redis', $events);
+        $this->assertStringNotContainsString(' up -d --no-deps --wait --wait-timeout 240 --pull never redis', $events);
     }
 
     public function test_interrupted_recreate_of_a_changed_data_service_is_still_forced_on_retry(): void
@@ -2059,7 +2130,7 @@ SH);
 
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 redis', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never redis', $this->events());
     }
 
     public function test_partially_failed_app_start_keeps_the_services_that_came_up(): void
@@ -2073,7 +2144,7 @@ SH);
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         $events = $this->events();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 indexer', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never indexer', $events);
         $this->assertStringNotContainsString('web horizon', $events);
         $this->assertStringNotContainsString('scheduler.py drain', $events);
         $this->assertStringNotContainsString(' stop --timeout 1920 horizon', $events);
@@ -2104,7 +2175,7 @@ SH);
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'FORCE=1'], ['NNTMUX_NO_CONTAINER' => 'redis'])->mustRun();
         $events = $this->events();
-        $this->assertMatchesRegularExpression('/ up -d --no-deps --wait --wait-timeout 240 [^\n]*redis/', $events);
+        $this->assertMatchesRegularExpression('/ up -d --no-deps --wait --wait-timeout 240 --pull never [^\n]*redis/', $events);
         $this->assertLessThan(strpos($events, 'artisan migrate'), strpos($events, ' stop web scheduler indexer'));
     }
 
@@ -2252,7 +2323,7 @@ SH);
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
         $events = $this->events();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 prometheus', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never prometheus', $events);
         $this->assertDoesNotMatchRegularExpression('/ up -d[^\n]* proxy\b/', $events);
     }
 
@@ -2305,7 +2376,7 @@ SH);
         ]);
         $process->mustRun();
         $this->assertStringContainsString('build --target selfhosted-web', $this->events());
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web horizon scheduler indexer', $this->events());
     }
 
     public function test_service_added_to_effective_compose_is_started_and_unrendered_data_is_left_alone(): void
@@ -2318,10 +2389,10 @@ SH);
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => '{"services":{'.$services.',"sidecar":{}}}', 'NNTMUX_NO_CONTAINER' => 'sidecar'])->mustRun();
         $events = $this->events();
         // A service added to Compose (with no container yet) is created by a non-forced up, without a drain.
-        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 sidecar', $events);
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 --pull never sidecar', $events);
         $this->assertStringNotContainsString('drain', $events);
         $this->assertStringNotContainsString(' stop ', $events);
-        $this->assertStringNotContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $events);
+        $this->assertStringNotContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never proxy', $events);
         $this->assertStringNotContainsString('artisan migrate', $events);
         $this->assertFileExists($this->directory.'/docker/.deploy.stamp');
         $this->assertStringContainsString('service:sidecar=', (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
@@ -2351,7 +2422,7 @@ SH);
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         // Read-only image queries may name it; nothing recreates or reconciles it.
         $this->assertDoesNotMatchRegularExpression('/ up -d[^\n]* proxy\b/', $this->events());
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web horizon scheduler indexer', $this->events());
     }
 
     public function test_running_image_that_differs_from_the_stamp_is_redeployed(): void
@@ -2395,12 +2466,12 @@ SH);
 
             $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => $this->composeJson()])->mustRun();
             $events = $this->events();
-            $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 redis', $events, $revision);
-            $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 manticore', $events, $revision);
-            $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 proxy', $events, $revision);
-            $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 redis', $events, $revision);
-            $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 proxy', $events, $revision);
-            $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $events, $revision);
+            $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 --pull never redis', $events, $revision);
+            $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 --pull never manticore', $events, $revision);
+            $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 --pull never proxy', $events, $revision);
+            $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 --pull never redis', $events, $revision);
+            $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 --pull never proxy', $events, $revision);
+            $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web horizon scheduler indexer', $events, $revision);
             $this->assertStringContainsString('service:web=', (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
         }
     }
@@ -2491,11 +2562,11 @@ SH);
 
         $deploy();
         $events = $this->events();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $events);
-        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 redis', $events);
-        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 manticore', $events);
-        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 redis', $events);
-        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 proxy', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web horizon scheduler indexer', $events);
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 --pull never redis', $events);
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 --pull never manticore', $events);
+        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 --pull never redis', $events);
+        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 --pull never proxy', $events);
         $this->assertStringContainsString('compose --project-directory '.$runtime, $events);
         $this->assertStringContainsString('service:redis=', (string) file_get_contents($runtime.'/.deploy.stamp'));
         $this->assertFileExists($runtime.'/.deploy.time');
@@ -2519,7 +2590,7 @@ SH);
         file_put_contents($runtime.'/config/redis/redis.conf', "maxmemory 2gb\n");
         $deploy();
         $events = $this->events();
-        $recreate = ' up -d --no-deps --force-recreate --wait --wait-timeout 240 redis';
+        $recreate = ' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never redis';
         $this->assertStringContainsString($recreate, $events);
         $this->assertLessThan(strpos($events, $recreate), strpos($events, ' stop web scheduler indexer'));
         $this->assertDoesNotMatchRegularExpression('/ up -d[^\\n]* manticore\\b/', $events);
@@ -2599,7 +2670,7 @@ SH);
 
         file_put_contents($this->directory.'/outside/certs/ca.pem', "two\n");
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never proxy', $this->events());
     }
 
     public function test_compose_wrapper_parses_docker_env_like_compose(): void
@@ -2635,8 +2706,8 @@ SH);
         // Containers started after the edit already run it: reconcile only.
         file_put_contents($this->directory.'/docker/.deploy.stamp', $head." e3b0 e3b0 c16c bb93\n");
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
-        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 proxy', $this->events());
-        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 proxy', $this->events());
+        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 --pull never proxy', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 --pull never proxy', $this->events());
 
         // A container that started before the edit never loaded it, so the stamp must not claim it.
         file_put_contents($this->directory.'/events', '');
@@ -2644,8 +2715,8 @@ SH);
         file_put_contents($this->directory.'/docker/.deploy.stamp', $head." e3b0 e3b0 c16c bb93\n");
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_STARTED_AT' => '2000-01-01T00:00:00Z'])->mustRun();
         $events = $this->events();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $events);
-        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 redis', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never proxy', $events);
+        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 --pull never redis', $events);
     }
 
     public function test_failing_infra_service_aborts_before_any_writer_is_drained(): void
@@ -2657,11 +2728,11 @@ SH);
         $process->run();
         $this->assertSame(51, $process->getExitCode());
         $events = $this->events();
-        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 proxy', $events);
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 --pull never proxy', $events);
         $this->assertStringNotContainsString('drain', $events);
         $this->assertStringNotContainsString(' stop ', $events);
         $this->assertStringNotContainsString('artisan migrate', $events);
-        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 web', $events);
+        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 --pull never web', $events);
     }
 
     public function test_real_repository_paths_reach_only_the_roles_whose_images_copy_them(): void
@@ -2693,7 +2764,7 @@ SH);
 
         // Horizon, untouched by this web-only rollout, becomes unhealthy while web is recreated.
         $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], [
-            'NNTMUX_UNHEALTHY_AFTER' => ' up -d --no-deps --force-recreate --wait --wait-timeout 240 web', 'NNTMUX_UNHEALTHY_LATE' => 'horizon',
+            'NNTMUX_UNHEALTHY_AFTER' => ' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web', 'NNTMUX_UNHEALTHY_LATE' => 'horizon',
         ]);
         $process->run();
         $this->assertNotSame(0, $process->getExitCode());
@@ -2706,7 +2777,7 @@ SH);
 
     public function test_a_failed_final_check_keeps_remote_workers_paused(): void
     {
-        $process = $this->deploy(['NNTMUX_UNHEALTHY_AFTER' => ' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', 'NNTMUX_UNHEALTHY_LATE' => 'horizon']);
+        $process = $this->deploy(['NNTMUX_UNHEALTHY_AFTER' => ' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web horizon scheduler indexer', 'NNTMUX_UNHEALTHY_LATE' => 'horizon']);
         $process->run();
 
         $this->assertNotSame(0, $process->getExitCode());
@@ -2754,8 +2825,8 @@ SH);
         file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', "two\n");
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($with, JSON_UNESCAPED_SLASHES), 'NNTMUX_NO_CONTAINER' => 'redis'])->mustRun();
         $events = $this->events();
-        $redis = strpos($events, '--wait-timeout 240 redis');
-        $proxy = strpos($events, '--wait-timeout 240 proxy');
+        $redis = strpos($events, '--wait-timeout 240 --pull never redis');
+        $proxy = strpos($events, '--wait-timeout 240 --pull never proxy');
         $this->assertNotFalse($redis);
         $this->assertNotFalse($proxy);
         $this->assertLessThan($proxy, $redis);
@@ -2775,7 +2846,7 @@ SH);
             file_put_contents($this->directory.'/events', '');
             $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0', ...$arguments], ['NNTMUX_NO_CONTAINER' => 'mariadb', 'NNTMUX_CONFIG_ID' => $arguments === [] ? '{"services":{"web":{},"horizon":{},"scheduler":{},"indexer":{},"mariadb":{"image":"mariadb:restored"},"redis":{},"manticore":{},"proxy":{}}}' : ''])->mustRun();
             $events = $this->events();
-            $start = strpos($events, 'up -d --no-deps --wait --wait-timeout 240 mariadb');
+            $start = strpos($events, 'up -d --no-deps --wait --wait-timeout 240 --pull never mariadb');
             $this->assertNotFalse($start, implode(' ', $arguments));
             $this->assertLessThan($start, strpos($events, ' stop web scheduler indexer'));
             $this->assertLessThan(strpos($events, 'releases:verification-barrier --timeout'), $start);
@@ -2814,7 +2885,7 @@ SH);
         $process->run();
 
         $this->assertFalse($process->isSuccessful());
-        $this->assertStringContainsString('up -d --no-deps --wait --wait-timeout 240 mariadb', $this->events());
+        $this->assertStringContainsString('up -d --no-deps --wait --wait-timeout 240 --pull never mariadb', $this->events());
         $this->assertStringContainsString('service:mariadb=pending', (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
     }
 
@@ -2826,7 +2897,7 @@ SH);
         $this->assertFalse($process->isSuccessful());
         $this->assertStringContainsString('tmux:drain --timeout', $this->events());
         $this->assertStringContainsString('ps -a -q mariadb', $this->events());
-        $this->assertStringNotContainsString('up -d --no-deps --wait --wait-timeout 240 mariadb', $this->events());
+        $this->assertStringNotContainsString('up -d --no-deps --wait --wait-timeout 240 --pull never mariadb', $this->events());
         $this->assertStringNotContainsString(' stop web scheduler indexer', $this->events());
     }
 
@@ -2842,7 +2913,7 @@ SH);
         @unlink($this->directory.'/replaced');
         $this->assertFalse($process->isSuccessful());
         $this->assertStringContainsString('not rolling out a replaced image', $process->getErrorOutput());
-        $this->assertStringNotContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web', $this->events());
+        $this->assertStringNotContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web', $this->events());
         $this->assertNotStamped();
     }
 
@@ -2894,7 +2965,7 @@ SH);
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'FORCE=1'])->mustRun();
         $this->assertStringContainsString('build --target', $this->events());
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web horizon scheduler indexer', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web horizon scheduler indexer', $this->events());
     }
 
     public function test_unknown_service_with_a_container_but_no_record_changes_only_with_writers_quiesced(): void
@@ -2910,7 +2981,7 @@ SH);
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
         $events = $this->events();
-        $up = ' up -d --no-deps --wait --wait-timeout 240 replacement-db';
+        $up = ' up -d --no-deps --wait --wait-timeout 240 --pull never replacement-db';
         $this->assertStringContainsString($up, $events);
         $this->assertLessThan(strpos($events, $up), strpos($events, ' stop web scheduler indexer'));
     }
@@ -2923,7 +2994,7 @@ SH);
 
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => '{"services":{'.$services.',"sidecar":{"labels":{"nntmux.deploy.stateless":"true"}}}}'])->mustRun();
         $events = $this->events();
-        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 sidecar', $events);
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 --pull never sidecar', $events);
         $this->assertStringNotContainsString('drain', $events);
         $this->assertStringNotContainsString(' stop ', $events);
     }
@@ -2941,9 +3012,9 @@ SH);
         ];
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => $services])])->mustRun();
         $events = $this->events();
-        $provider = strpos($events, ' up -d --no-deps --wait --wait-timeout 240 zzz-provider');
+        $provider = strpos($events, ' up -d --no-deps --wait --wait-timeout 240 --pull never zzz-provider');
         $this->assertNotFalse($provider);
-        $this->assertGreaterThan($provider, strpos($events, ' up -d --no-deps --wait --wait-timeout 240 aaa-consumer'));
+        $this->assertGreaterThan($provider, strpos($events, ' up -d --no-deps --wait --wait-timeout 240 --pull never aaa-consumer'));
     }
 
     public function test_legacy_stamp_recreates_a_service_whose_mounted_file_was_deleted(): void
@@ -2956,9 +3027,9 @@ SH);
 
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => $this->composeJson()])->mustRun();
         $events = $this->events();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $events);
-        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 redis', $events);
-        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 redis', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never proxy', $events);
+        $this->assertStringContainsString(' up -d --no-deps --wait --wait-timeout 240 --pull never redis', $events);
+        $this->assertStringNotContainsString('--force-recreate --wait --wait-timeout 240 --pull never redis', $events);
     }
 
     public function test_retargeted_directory_symlink_in_a_read_only_mount_recreates_the_service(): void
@@ -2977,7 +3048,7 @@ SH);
         unlink($tree.'/current');
         symlink('v2', $tree.'/current');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never proxy', $this->events());
     }
 
     public function test_replacing_the_database_storage_runs_the_migration(): void
@@ -2991,7 +3062,7 @@ SH);
         // A cutover points MariaDB at a restored copy; no migration file or app definition changed.
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config('data/restored'))->mustRun();
         $events = $this->events();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 mariadb', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never mariadb', $events);
         $this->assertGreaterThan(strpos($events, '240 mariadb'), strpos($events, 'artisan migrate --force'));
     }
 
@@ -3005,10 +3076,10 @@ SH);
 
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_NO_CONTAINER' => 'redis'])->mustRun();
         $events = $this->events();
-        $recreate = ' up -d --no-deps --force-recreate --wait --wait-timeout 240 redis';
+        $recreate = ' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never redis';
         $this->assertStringContainsString($recreate, $events);
         $this->assertLessThan(strpos($events, $recreate), strpos($events, ' stop web scheduler indexer'));
-        $this->assertStringNotContainsString(' up -d --no-deps --wait --wait-timeout 240 redis', $events);
+        $this->assertStringNotContainsString(' up -d --no-deps --wait --wait-timeout 240 --pull never redis', $events);
     }
 
     public function test_compose_project_name_change_aborts_before_any_change(): void
@@ -3049,7 +3120,7 @@ SH);
 
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 web', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web', $this->events());
     }
 
     public function test_data_and_infra_containers_running_a_replaced_image_tag_are_recreated(): void
@@ -3069,7 +3140,7 @@ SH);
         $this->assertMatchesRegularExpression('/redis\s+data\s+drain\+recreate\s+running image differs from its tag/', $plan->getOutput());
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_STALE_SERVICE_IMAGE' => 'redis'])->mustRun();
         $events = $this->events();
-        $recreate = ' up -d --no-deps --force-recreate --wait --wait-timeout 240 redis';
+        $recreate = ' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never redis';
         $this->assertStringContainsString($recreate, $events);
         $this->assertLessThan(strpos($events, $recreate), strpos($events, ' stop web scheduler indexer'));
         // Image IDs never enter the fingerprint.
@@ -3083,7 +3154,7 @@ SH);
         // A stale stateless service is recreated without draining any writer.
         file_put_contents($this->directory.'/events', '');
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_STALE_SERVICE_IMAGE' => 'proxy'])->mustRun();
-        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy', $this->events());
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never proxy', $this->events());
         $this->assertStringNotContainsString('drain', $this->events());
     }
 
@@ -3134,7 +3205,7 @@ SH);
             'secrets' => ['tls' => ['file' => $this->directory.'/docker/config/tls.pem']],
             'configs' => ['site' => ['environment' => 'NNTMUX_SITE_CONFIG']]];
         $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
-        $recreate = ' up -d --no-deps --force-recreate --wait --wait-timeout 240 proxy';
+        $recreate = ' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never proxy';
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config + ['NNTMUX_SITE_CONFIG' => 'site-value-one'])->mustRun();
 
         // The secret's file content changes; its rendered definition does not.

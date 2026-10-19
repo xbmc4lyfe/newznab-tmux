@@ -22,7 +22,7 @@ verify
 
 # Capture first: a failing plan inside eval "$(...)" would be ignored, and a stale MODE in the
 # caller's environment must never stand in for the plan's output.
-unset MODE MIGRATE DIRTY_APP DIRTY_DATA DIRTY_INFRA RECONCILE_DATA RECONCILE_INFRA START_DATA PRE_DRAIN POST_DRAIN AFTER_APP DATABASE_SERVICE BUILD_TARGETS GLOBAL_FALLBACK
+unset MODE MIGRATE DIRTY_APP DIRTY_DATA DIRTY_INFRA RECONCILE_DATA RECONCILE_INFRA START_DATA PRE_DRAIN POST_DRAIN AFTER_APP DATABASE_SERVICE DATABASE_TARGET REMOVED_DATA BUILD_TARGETS GLOBAL_FALLBACK
 actions=$("$DIR/bin/deploy-plan" --deploy-actions)
 eval "$actions"
 # The plan's build targets ignore FORCE (the build above already honoured it): any target still
@@ -60,10 +60,16 @@ hold_barrier() {
     # mid-migration, and this barrier's release would clear the durable pause it left behind.
     [ "$owed_at_start" != 1 ] || barrier_keep=1
     if barrier_running && ! docker logs "$barrier_name" 2>&1 | grep -q '^barrier lost'; then
+        # Adopted only while it fences this rollout's database: its lock session and durable pause
+        # live on the database it was started against.
+        if [ "$(docker inspect --format '{{index .Config.Labels "nntmux.deploy.database"}}' "$barrier_name" 2>/dev/null)" != "$DATABASE_TARGET" ]; then
+            echo "deploy-app: the verification barrier $barrier_name left by an earlier attempt fences another database than this rollout's. Release its pause on that database (releases:verification-barrier --release there), stop it, then retry." >&2
+            exit 1
+        fi
         barrier_keep=1
     else
         docker rm -f "$barrier_name" >/dev/null 2>&1 || true
-        compose run -d --no-deps --name "$barrier_name" web php artisan releases:verification-barrier --timeout="${DEPLOY_REMOTE_DRAIN_TIMEOUT:-900}" --no-interaction >/dev/null
+        compose run -d --no-deps --label "nntmux.deploy.database=$DATABASE_TARGET" --name "$barrier_name" web php artisan releases:verification-barrier --timeout="${DEPLOY_REMOTE_DRAIN_TIMEOUT:-900}" --no-interaction >/dev/null
     fi
     barrier_held=1
     until docker logs "$barrier_name" 2>&1 | grep -q '^barrier held'; do
@@ -151,19 +157,25 @@ plan() { "$DIR/bin/deploy-plan" "$@"; }
 plan --invalidate
 # Data and infra services are applied one at a time (mark, up, record): a failing service never
 # makes the next run repeat the ones that already came up. $1 is --pending (forced recreate) or
-# --forget (non-forced up).
+# --forget (non-forced up). `--pull never`: Compose pulls a `latest` tag even under the `missing`
+# policy, which would run registry contents this plan never inspected.
+apply_up() {
+    mark=$1
+    svc=$2
+    # Its tag must still name the image this run planned (a long drain gives time to replace it).
+    plan --verify-images "$svc"
+    plan "$mark" "$svc"
+    if [ "$mark" = --pending ]; then
+        compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" --pull never "$svc"
+    else
+        compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" --pull never "$svc"
+    fi
+}
 apply_each() {
     mark=$1
     shift
     for svc in "$@"; do
-        # Its tag must still name the image this run planned (a long drain gives time to replace it).
-        plan --verify-images "$svc"
-        plan "$mark" "$svc"
-        if [ "$mark" = --pending ]; then
-            compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" "$svc"
-        else
-            compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" "$svc"
-        fi
+        apply_up "$mark" "$svc"
         plan --record "$svc"
     done
 }
@@ -348,15 +360,27 @@ elif [ "$scheduler_drained" = 1 ]; then
     verify
 fi
 
+# A data service renamed onto the same storage leaves its predecessor running as an orphan
+# (COMPOSE_REMOVE_ORPHANS=false): stop it once the writers are quiesced, before its successor starts.
+stop_removed_data() {
+    [ -n "$DIRTY_DATA$RECONCILE_DATA" ] || return 0
+    for svc in $REMOVED_DATA; do
+        ids=$(docker ps -q --filter "label=com.docker.compose.project=$project" --filter "label=com.docker.compose.service=$svc")
+        # shellcheck disable=SC2086
+        [ -z "$ids" ] || docker stop $ids >/dev/null
+    done
+}
+
 # The barrier runs against the database. When the database service this run applies has no
 # container (removed, or a cutover to a restored copy), nothing local or remote can be writing:
 # stop the writers first so none reaches the new database early, then start it, then take the
 # barrier on it; the apply below still recreates and records it. A checked assignment: a failed
 # lookup must abort, never read as a missing container.
+# A stopped database container (`ps -q` lists running ones only) is as unavailable to the barrier.
 database_missing=0
 for svc in $DIRTY_DATA $RECONCILE_DATA; do
     [ "$svc" = "$DATABASE_SERVICE" ] || continue
-    existing=$(compose ps -a -q "$svc")
+    existing=$(compose ps -q "$svc")
     [ -n "$existing" ] || database_missing=1
 done
 if [ "$database_missing" = 1 ]; then
@@ -371,9 +395,10 @@ if [ "$database_missing" = 1 ]; then
         horizon_stopped=0
         verify
     fi
+    stop_removed_data
     # The image this run planned, as for every other applied service.
     plan --verify-images "$DATABASE_SERVICE"
-    compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" "$DATABASE_SERVICE"
+    compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" --pull never "$DATABASE_SERVICE"
     # No check between starting it and fencing it: the barrier below is taken next (and verifies).
 fi
 
@@ -395,6 +420,7 @@ if [ -n "$stop_services" ]; then
     verify
 fi
 assert_barrier
+stop_removed_data
 # Past this point Horizon is replaced, never restarted on its old container.
 horizon_stopped=0
 
@@ -405,14 +431,16 @@ for item in $POST_DRAIN; do
         # From the moment the database is replaced it awaits the migration: any failure from here
         # keeps remote workers out (the release stays owed), never readmits them to its schema.
         [ "$MIGRATE" != 1 ] || barrier_keep=1
-        apply_each "--${item%%:*}" "${item#*:}"
+        apply_up "--${item%%:*}" "${item#*:}"
         # A recreated database ends the barrier's lock session, and replacement storage lacks its
-        # durable pause: fence the new database at once, before any check that could fail.
+        # durable pause: fence the new database at once, before anything else that could fail
+        # (recording it included).
         docker rm -f "$barrier_name" >/dev/null 2>&1 || true
         keep=$barrier_keep
         barrier_held=0
         hold_barrier
         barrier_keep=$keep
+        plan --record "${item#*:}"
         verify
         continue
     fi
@@ -445,7 +473,7 @@ if [ -n "$up_app_services" ]; then
     # shellcheck disable=SC2086
     plan --verify-images $up_app_services
     # shellcheck disable=SC2086
-    if compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" $up_app_services; then
+    if compose up -d --no-deps --force-recreate --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" --pull never $up_app_services; then
         :
     else
         up_rc=$?
