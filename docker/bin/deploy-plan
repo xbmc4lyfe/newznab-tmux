@@ -1393,14 +1393,28 @@ def database_service(docker_dir: Path) -> str:
         hosts.append(str(values.get("DB_HOST") or ""))
         return hosts
 
+    # Every other name Docker DNS resolves to a service: network aliases, its container name
+    # (explicit, or Compose's `<project>-<svc>-1`) and `links:` aliases.
     aliases: dict[str, set[str]] = {}
     for name, svc_cfg in RENDERED_SERVICES.items():
-        networks = svc_cfg.get("networks") if isinstance(svc_cfg, dict) else None
+        cfg_map = svc_cfg if isinstance(svc_cfg, dict) else {}
+        names = []
+        networks = cfg_map.get("networks")
         if isinstance(networks, dict):
             for net in networks.values():
-                for alias in (net.get("aliases") or []) if isinstance(net, dict) else []:
-                    if alias != name:
-                        aliases.setdefault(str(alias), set()).add(name)
+                names.extend(str(a) for a in ((net.get("aliases") or []) if isinstance(net, dict) else []))
+        if cfg_map.get("container_name"):
+            names.append(str(cfg_map["container_name"]))
+        if RENDERED_PROJECT:
+            names.extend(f"{RENDERED_PROJECT}{sep}{name}{sep}1" for sep in ("-", "_"))
+        for alias in names:
+            if alias != name:
+                aliases.setdefault(alias, set()).add(name)
+    for svc_cfg in RENDERED_SERVICES.values():
+        for link in (svc_cfg.get("links") or []) if isinstance(svc_cfg, dict) else []:
+            target, _, alias = str(link).partition(":")
+            if alias and alias != target and target in RENDERED_SERVICES:
+                aliases.setdefault(alias, set()).add(target)
     targets = set()
     for app in APP_SERVICES:
         cfg = RENDERED_SERVICES.get(app)
@@ -1418,6 +1432,10 @@ def database_service(docker_dir: Path) -> str:
                          "selects cannot be determined; write it literally (single-quoted to keep a literal `${`).")
         for host in selected(merged):
             if host:
+                if host in RENDERED_SERVICES and host in aliases:
+                    # A service name another service also answers to: DNS may resolve either.
+                    sys.exit(f"deploy-plan: the database host {host} is a service and also an alias of "
+                             f"{', '.join(sorted(aliases[host]))}; selective deployment must know which one it migrates and fences.")
                 if host in RENDERED_SERVICES:
                     targets.add(host)
                 elif host in aliases:

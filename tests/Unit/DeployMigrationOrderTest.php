@@ -3531,6 +3531,18 @@ SH);
         $this->assertNotSame(0, $plan->getExitCode());
         $this->assertStringContainsString('select different database services (db2, db3)', $plan->getErrorOutput());
 
+        // So do a container name and a `links:` alias.
+        $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['horizon' => ['environment' => ['DB_HOST' => 'restored-db']], 'web' => ['environment' => ['DB_HOST' => 'linkdb'], 'links' => ['db3:linkdb']], 'db2' => ['container_name' => 'restored-db'], 'db3' => []] + $services], JSON_UNESCAPED_SLASHES)]);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('select different database services (db2, db3)', $plan->getErrorOutput());
+
+        // A service name another service also answers to is ambiguous.
+        $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['mariadb' => [], 'db2' => ['networks' => ['default' => ['aliases' => ['mariadb']]]]] + array_map(fn ($svc) => ['environment' => ['DB_HOST' => 'mariadb']], $services)], JSON_UNESCAPED_SLASHES)]);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('the database host mariadb is a service and also an alias of db2', $plan->getErrorOutput());
+
         // An alias shared by two services cannot name the one database to fence.
         $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['db2' => ['networks' => ['default' => ['aliases' => ['shared-db']]]], 'db3' => ['networks' => ['default' => ['aliases' => ['shared-db']]]]] + array_map(fn ($svc) => ['environment' => ['DB_HOST' => 'shared-db']], $services)], JSON_UNESCAPED_SLASHES)]);
         $plan->run();
