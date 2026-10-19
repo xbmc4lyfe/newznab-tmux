@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace App\Services;
 
 use App\Enums\CollectionFileCheckStatus;
-use App\Exceptions\CandidateMetadataBudgetExceeded;
 use App\Models\Category;
 use App\Models\Collection;
 use App\Models\Predb;
@@ -49,34 +48,19 @@ class ReleaseCreationService
                 ->when(! empty($groupID), static fn ($q) => $q->where('groups_id', $groupID))
                 ->when($allowedIds !== null, static fn ($q) => $q->whereIn('id', $allowedIds))
                 ->orderBy('id')->limit(max(1, $limit))->pluck('id')->map(static fn ($id): int => (int) $id)->all();
-            $oversized = app(OversizedCollectionDeferrals::class);
             // Uploads already over the metadata budget would only read every part again and fail.
-            $recorded = $oversized->lookup($ids);
-            $cleared = [];
-            foreach ($ids as $id) {
-                if ($recorded[$id] ?? false) {
+            $kept = app(OversizedCollectionDeferrals::class)->archiveEach($ids, static function (int $id): void {
+                app(CandidateRepository::class)->archive($id);
+            });
+            foreach ($kept as $id => $outcome) {
+                if ($outcome['error'] === null) {
                     continue;
                 }
-                try {
-                    app(CandidateRepository::class)->archive($id);
-                    if (isset($recorded[$id])) {
-                        $cleared[] = $id;
-                    }
-                } catch (\Throwable $error) {
-                    // Keep this collection for retry without starving later
-                    // candidates or preventing the bounded window cursor saving.
-                    $context = ['collection_id' => $id, 'error_type' => $error::class];
-                    if ($error instanceof CandidateMetadataBudgetExceeded) {
-                        try {
-                            $context['retry_after'] = $oversized->record($id)?->toIso8601String();
-                        } catch (\Throwable) {
-                            // Unrecorded, it is simply tried again on the next pass.
-                        }
-                    }
-                    Log::warning('Verification archival failed; original headers retained.', $context);
-                }
+                // Keep this collection for retry without starving later
+                // candidates or preventing the bounded window cursor saving.
+                Log::warning('Verification archival failed; original headers retained.', ['collection_id' => $id,
+                    'error_type' => $outcome['error']::class] + ($outcome['retry_after'] === null ? [] : ['retry_after' => $outcome['retry_after']]));
             }
-            $oversized->clear($cleared);
 
             return ['added' => 0, 'dupes' => 0];
         }

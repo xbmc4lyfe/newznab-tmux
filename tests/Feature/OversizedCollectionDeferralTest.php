@@ -5,12 +5,15 @@ declare(strict_types=1);
 namespace Tests\Feature;
 
 use App\Exceptions\CandidateMetadataBudgetExceeded;
+use App\Services\CollectionCleanupService;
 use App\Services\ReleaseCreationService;
+use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\VerificationResetService;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
@@ -23,6 +26,10 @@ class OversizedCollectionDeferralTest extends ReleaseVerificationCandidatesTest
     {
         parent::setUp();
         (require database_path('migrations/2026_10_19_120000_create_release_verification_oversized_collections_table.php'))->up();
+        Schema::table('collections', static function (Blueprint $table): void {
+            $table->dateTime('dateadded')->nullable();
+            $table->unsignedBigInteger('releases_id')->nullable();
+        });
         config(['release_verification.metadata_bytes' => self::BUDGET]);
         Carbon::setTestNow('2026-10-19 12:00:00');
     }
@@ -117,7 +124,92 @@ class OversizedCollectionDeferralTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(0, DB::table('release_verification_oversized_collections')->count());
     }
 
+    public function test_the_stale_sweep_keeps_a_deferred_upload_without_reading_it_again(): void
+    {
+        $oversized = $this->upload('oversized', 600);
+        $this->createReleases();
+        DB::table('collections')->where('id', $oversized)->update(['dateadded' => '2026-10-01 00:00:00']);
+
+        $reads = $this->partReadsDuring(fn () => $this->sweep());
+
+        $this->assertSame(0, $reads, 'The sweep honours the deferral.');
+        $this->assertSame(600, $this->partsOf($oversized), 'Its headers are retained.');
+        $this->assertSame(1, (int) DB::table('release_verification_oversized_collections')->value('attempts'));
+    }
+
+    public function test_the_stale_sweep_records_an_over_budget_upload_and_keeps_its_headers(): void
+    {
+        $oversized = $this->upload('oversized', 600);
+        DB::table('collections')->where('id', $oversized)->update(['dateadded' => '2026-10-01 00:00:00']);
+
+        $this->sweep();
+
+        $this->assertSame(600, $this->partsOf($oversized));
+        $this->assertSame($oversized, (int) DB::table('release_verification_oversized_collections')->value('collection_id'));
+    }
+
+    public function test_late_headers_that_would_push_a_pending_candidate_over_budget_are_kept_apart_for_a_later_pass(): void
+    {
+        // Each fits the budget on its own (45,600 bytes); merged they do not.
+        $this->upload('first', 200, hash: 'upload');
+        $this->createReleases();
+        $candidate = DB::table('release_verification_candidates')->sole();
+        $late = $this->upload('late', 200, hash: 'upload', first: 201);
+
+        DB::transaction(fn () => app(CandidateRepository::class)->invalidateHotCollections([$late]));
+        $fenced = DB::table('release_verification_candidates')->sole();
+        $this->assertSame([$candidate->status, null, (int) $candidate->version + 1], [$fenced->status, $fenced->lease_token, (int) $fenced->version],
+            'Still claimable, and a verification already under way cannot publish.');
+        $this->createReleases();
+
+        $this->assertSame(200, $this->partsOf($late), 'The late headers are retained.');
+        $this->assertSame($fenced->manifest_path, DB::table('release_verification_candidates')->sole()->manifest_path, 'The candidate keeps what it had.');
+        $this->assertSame(200, count(app(ManifestStore::class)->read($fenced->manifest_path)['files'][0]['segments']));
+        $this->assertSame($late, (int) DB::table('release_verification_oversized_collections')->value('collection_id'));
+        $this->assertSame((int) $fenced->manifest_bytes, (int) DB::table('release_verification_state')->value('pending_bytes'), 'Nothing more is charged.');
+    }
+
+    public function test_a_record_survives_when_archive_returns_without_archiving(): void
+    {
+        $oversized = $this->upload('oversized', 600);
+        $this->createReleases();
+        Carbon::setTestNow('2026-10-19 18:00:01');
+        // Another archiver holds the collection: archive() returns without touching it.
+        $this->app->instance(CandidateRepository::class, new class
+        {
+            public function archive(int $collectionId): void {}
+        });
+
+        $this->createReleases();
+
+        $this->assertSame([$oversized, 1], [(int) DB::table('release_verification_oversized_collections')->value('collection_id'),
+            (int) DB::table('release_verification_oversized_collections')->value('attempts')]);
+    }
+
+    public function test_bookkeeping_failures_never_stop_archival(): void
+    {
+        $id = $this->upload('small', 1);
+        Cache::partialMock()->shouldReceive('add')->andThrow(new \RuntimeException('cache down'));
+
+        $this->createReleases();
+
+        $this->assertFalse(DB::table('collections')->where('id', $id)->exists());
+    }
+
     private function createReleases(): void
+    {
+        $this->releasesTable();
+        app(ReleaseCreationService::class)->createReleases(null, 100, false);
+    }
+
+    private function sweep(): void
+    {
+        $this->releasesTable();
+        app(CollectionCleanupService::class)->deleteFinishedAndOrphans(false);
+    }
+
+    /** The parent suite creates it in some tests, so it cannot be made in setUp. */
+    private function releasesTable(): void
     {
         if (! Schema::hasTable('releases')) {
             Schema::create('releases', static function (Blueprint $table): void {
@@ -125,7 +217,6 @@ class OversizedCollectionDeferralTest extends ReleaseVerificationCandidatesTest
                 $table->integer('nzbstatus')->default(0);
             });
         }
-        app(ReleaseCreationService::class)->createReleases(null, 100, false);
     }
 
     private function partReadsDuring(callable $work): int
@@ -146,12 +237,13 @@ class OversizedCollectionDeferralTest extends ReleaseVerificationCandidatesTest
         return DB::table('parts')->join('binaries', 'binaries.id', '=', 'parts.binaries_id')->where('binaries.collections_id', $collectionId)->count();
     }
 
-    private function upload(string $label, int $parts, int $messageIdBytes = 100): int
+    private function upload(string $label, int $parts, int $messageIdBytes = 100, ?string $hash = null, int $first = 1): int
     {
-        $id = DB::table('collections')->insertGetId(['collectionhash' => sha1($label, true), 'subject' => $label.'.mkv', 'fromname' => 'poster',
-            'totalfiles' => 1, 'groups_id' => 1, 'date' => '2026-10-19 11:00:00']);
-        $binary = DB::table('binaries')->insertGetId(['collections_id' => $id, 'binaryhash' => md5($label, true), 'name' => $label.'.mkv', 'totalparts' => $parts]);
-        foreach (array_chunk(range(1, $parts), 500) as $numbers) {
+        $id = DB::table('collections')->insertGetId(['collectionhash' => sha1($hash ?? $label, true), 'subject' => 'movie.mkv', 'fromname' => 'poster',
+            'totalfiles' => 1, 'groups_id' => 1, 'date' => '2026-10-19 11:00:00', 'dateadded' => '2026-10-19 11:00:00']);
+        $binary = DB::table('binaries')->insertGetId(['collections_id' => $id, 'binaryhash' => md5($hash ?? $label, true), 'name' => 'movie.mkv',
+            'totalparts' => $first + $parts - 1]);
+        foreach (array_chunk(range($first, $first + $parts - 1), 500) as $numbers) {
             DB::table('parts')->insert(array_map(static fn (int $number): array => ['binaries_id' => $binary, 'partnumber' => $number,
                 'messageid' => str_pad($label.$number, $messageIdBytes - 6, 'x').'@fixed', 'size' => 5], $numbers));
         }
