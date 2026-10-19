@@ -209,7 +209,11 @@ final class NzbSourceGuard
         $committed = app(ReleaseArchiveNamingEvidence::class)->committedSourceDigestLocked($release);
         if ($committed !== null) {
             $current = is_file($canonical) ? self::fileDigest($canonical) : null;
-            if ($current !== null && hash_equals($committed, $current)) {
+            // The committed source is already what readers resolve, beside this file or on another search path:
+            // whatever is staged here is obsolete.
+            $resolved = $this->nzb->nzbPath($guid);
+            if (($current !== null && hash_equals($committed, $current))
+                || (is_string($resolved) && $resolved !== $canonical && ($digest = self::fileDigest($resolved)) !== null && hash_equals($committed, $digest))) {
                 return ! $apply || @unlink($path) ? 'deleted' : 'kept';
             }
             $staged = self::fileDigest($path);

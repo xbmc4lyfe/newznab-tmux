@@ -173,6 +173,32 @@ final class CleanNzbStagedGenerationTest extends TestCase
         self::assertSame($reachable, app(NzbService::class)->nzbPath($this->guid));
     }
 
+    public function test_a_stale_staged_sibling_beside_an_older_copy_is_obsolete_once_readers_resolve_the_committed_source(): void
+    {
+        // Readers resolve the committed source at the configured path; an older directory still holds a staged file.
+        $reachable = app(NzbService::class)->getNzbPath($this->guid, createIfNotExist: true);
+        file_put_contents($reachable, gzencode('upgraded'));
+        unlink($this->canonical);
+        $older = $this->canonical;
+        $this->app->instance(NzbService::class, new class(app(CollectionCleanupService::class), $older) extends NzbService
+        {
+            public function __construct(CollectionCleanupService $cleanup, private readonly string $older)
+            {
+                parent::__construct($cleanup);
+            }
+
+            public function nzbPathCandidates(string $releaseGuid): array
+            {
+                return [...parent::nzbPathCandidates($releaseGuid), $this->older];
+            }
+        });
+        file_put_contents($this->staged, gzencode('original'));
+
+        self::assertTrue(app(NzbSourceGuard::class)->settleStagedGenerations($this->guid), 'Settled: its fence may clear.');
+        self::assertFileDoesNotExist($this->staged);
+        self::assertSame('upgraded', $this->decoded($reachable));
+    }
+
     public function test_notindb_deletes_the_generation_of_a_deleted_release(): void
     {
         DB::table('release_archive_naming_evidence')->delete();
