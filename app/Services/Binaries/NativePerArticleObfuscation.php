@@ -9,7 +9,7 @@ use Throwable;
 
 /**
  * Rust port of {@see HeaderParser::markPerArticleObfuscated()}, adopted after
- * scripts/benchmark-per-article-obfuscation.php measured it at 2-3x the PHP rule with identical
+ * scripts/benchmark-per-article-obfuscation.php measured it at 1.9-3.2x the PHP rule with identical
  * marks. Null means "use PHP": not a Linux CLI with FFI, library missing, failing its known-answer
  * probe, or input the native side declines (a subject longer than MAX_SUBJECT_LENGTH, where PHP's
  * backtrack limit could stop the subject pattern, or an integer field PHP would saturate).
@@ -41,11 +41,13 @@ final class NativePerArticleObfuscation
     }
 
     /**
-     * Article numbers the PHP rule would mark, or null to keep the PHP result. Two kinds of range
-     * stay on PHP. Ranges under MIN_HEADERS stay because Rust's margin there is too small to
-     * establish. Ranges where under a sixteenth of a spread sample is a multi-part subject with a
-     * 16+ alphanumeric token in its name stay too (an eighth when most samples have no part
-     * count), because the PHP rule rejects other subjects faster than they can be packed for FFI.
+     * Article numbers the PHP rule would mark, or null to keep the PHP result. These ranges stay
+     * on PHP:
+     * - under MIN_HEADERS, where Rust's margin is too small to establish;
+     * - where most of a spread sample has no part count, or under a sixteenth is a multi-part
+     *   subject with a 16+ alphanumeric token in its name, because the PHP rule rejects other
+     *   subjects faster than they can be packed for FFI;
+     * - with any subject over MAX_SUBJECT_LENGTH, which Rust would decline.
      *
      * @param  array<int, array<string, mixed>>  $headers
      * @return list<int>|null
@@ -89,8 +91,14 @@ final class NativePerArticleObfuscation
         }
 
         // PHP rejects subjects without a part count in about one regex, so a range made mostly of
-        // them needs twice the candidate share before packing pays off.
-        return $candidates * ($counted * 2 >= $sampled ? 16 : 8) >= $sampled;
+        // them stays on PHP whatever its candidate share.
+        if ($counted * 2 < $sampled || $candidates * 16 < $sampled) {
+            return false;
+        }
+        // A subject Rust would decline sends the range to PHP before any packing.
+        $subjects = array_filter(array_column($values, 'Subject'), is_string(...));
+
+        return $subjects === [] || max(array_map(strlen(...), $subjects)) <= self::MAX_SUBJECT_LENGTH;
     }
 
     /**

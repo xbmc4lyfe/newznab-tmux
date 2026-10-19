@@ -15,7 +15,7 @@ declare(strict_types=1);
  * building the article-number set HeaderParser consults, falling back to PHP on a decline. The
  * thresholds follow .ai/rules/rust-performance.md: common strata compare medians, uncommon strata
  * p99, and each must reach 1.5x with the 95% interval's lower bound (otherwise the run is
- * inconclusive); uncommon strata up to 20k headers take at least 1000 samples; routed strata (token-poor ranges the
+ * inconclusive); uncommon strata take at least 1000 samples; routed strata (token-poor ranges the
  * wrapper leaves on PHP) compare medians and must stay at 0.9x or better. Uncertainty is a 95% percentile bootstrap
  * interval of that speedup (2000 seeded resamples of the paired observations). A missed threshold
  * is a valid result and exits 0; invalid runs (parity failure, missing library) exit 2.
@@ -104,8 +104,8 @@ function perArticleBenchmarkMain(): int
             $php($headers);
             $rust($headers);
         }
-        // A p99 needs a deep tail: uncommon strata up to 20k headers take at least 1000 samples.
-        $observations = $stratum['category'] === 'uncommon' && count($headers) <= 20000 ? max($repeats, PER_ARTICLE_TAIL_SAMPLES) : $repeats;
+        // A p99 needs a deep tail: every uncommon stratum takes at least 1000 samples.
+        $observations = $stratum['category'] === 'uncommon' ? max($repeats, PER_ARTICLE_TAIL_SAMPLES) : $repeats;
         for ($i = 0; $i < $observations; $i++) {
             $order = $random->getInt(0, 1) === 0 ? ['php', 'rust'] : ['rust', 'php'];
             foreach ($order as $side) {
@@ -149,7 +149,7 @@ function perArticleBenchmarkMain(): int
             : sprintf("| %s | %s | %d | %d | %s | %.3f | %.3f | %.2fx | %.2f-%.2fx |\n", $name, $row['category'], $row['headers'], $row['marked'],
                 $row['statistic'], $row['php_ms'], $row['rust_ms'], $row['speedup'], $row['speedup_ci95'][0], $row['speedup_ci95'][1]);
     }
-    $markdown .= "\nStatus: **{$report['status']}** (threshold ".PER_ARTICLE_THRESHOLD."x; {$repeats} paired samples per stratum, ".PER_ARTICLE_TAIL_SAMPLES." for uncommon strata up to 20k headers; Rust strata need the 95% lower bound at the threshold).\n";
+    $markdown .= "\nStatus: **{$report['status']}** (threshold ".PER_ARTICLE_THRESHOLD."x; {$repeats} paired samples per stratum, ".PER_ARTICLE_TAIL_SAMPLES." for uncommon strata; Rust strata need the 95% lower bound at the threshold).\n";
     file_put_contents($directory.'/report.json', json_encode($report, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR));
     file_put_contents($directory.'/summary.md', $markdown);
     echo $markdown;

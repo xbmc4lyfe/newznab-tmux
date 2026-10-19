@@ -28,9 +28,10 @@ final class PerArticleObfuscationCorpus
             'readable-yenc' => ['category' => 'routed', 'description' => 'readable yEnc uploads without 16+ alphanumeric tokens (stays on PHP)', 'size' => 20000],
             'bare-random' => ['category' => 'routed', 'description' => 'random 32-character subjects without part counts (stays on PHP)', 'size' => 20000],
             'single-part-hashed' => ['category' => 'routed', 'description' => 'hash-named single-part posts, 15% in a readable range (stays on PHP)', 'size' => 20000],
+            'text-heavy-obfuscated' => ['category' => 'common', 'description' => 'text posts with 60% obfuscated articles (just past the part-count majority, goes to Rust)', 'size' => 20000],
             'text-with-uploads' => ['category' => 'routed', 'description' => 'text posts with 8% obfuscated articles and 10% counter-prefixed single-part images (stays on PHP)', 'size' => 20000],
             'non-yenc' => ['category' => 'routed', 'description' => 'text posts without yEnc part counts (stays on PHP)', 'size' => 20000],
-            'large-range' => ['category' => 'uncommon', 'description' => 'mixed range of 200k headers', 'size' => 200000],
+            'large-range' => ['category' => 'uncommon', 'description' => 'mixed range of 100k headers', 'size' => 100000],
             'small-range' => ['category' => 'routed', 'description' => 'mixed range of 200 headers (under MIN_HEADERS, stays on PHP)', 'size' => 200],
             'long-subjects' => ['category' => 'uncommon', 'description' => 'mixed range with 300-byte subject prefixes', 'size' => 20000],
             'adversarial' => ['category' => 'uncommon', 'description' => 'random bytes, newlines, odd counters and invalid UTF-8', 'size' => 20000],
@@ -50,6 +51,7 @@ final class PerArticleObfuscationCorpus
             'bare-random' => array_map(static fn (): string => self::token($random, 32), range(1, $size)),
             'single-part-hashed' => self::singlePartHashed($random, $size),
             'text-with-uploads' => self::textWithUploads($random, $size),
+            'text-heavy-obfuscated' => self::textObfuscated($random, $size, 60),
             'kenpsx' => self::kenpsx($random, $size),
             'boneless' => self::boneless($random, $size),
             'mixed', 'large-range', 'small-range' => self::mixed($random, $size, ''),
@@ -114,6 +116,20 @@ final class PerArticleObfuscationCorpus
                 $subjects[$index] = $obfuscated[$index];
             } elseif ($roll < 18) {
                 $subjects[$index] = sprintf('(%02d/10) "%s.jpg" yEnc (1/1)', $random->getInt(1, 10), md5($random->getBytes(8)));
+            }
+        }
+
+        return $subjects;
+    }
+
+    /** @return list<string> */
+    private static function textObfuscated(Randomizer $random, int $size, int $percent): array
+    {
+        $subjects = self::text($random, $size);
+        $obfuscated = self::boneless($random, $size);
+        foreach (array_keys($subjects) as $index) {
+            if ($random->getInt(0, 99) < $percent) {
+                $subjects[$index] = $obfuscated[$index];
             }
         }
 

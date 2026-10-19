@@ -116,6 +116,7 @@ final class PerArticleObfuscationNativeTest extends TestCase
         self::assertNotSame([], $native->mark($headers, 16));
         $headers[] = ['Number' => 1, 'Subject' => str_repeat(' ', NativePerArticleObfuscation::MAX_SUBJECT_LENGTH).')'];
         self::assertNull($native->mark($headers, 16));
+        self::assertNull($native->markWithoutSampling($headers, 16));
     }
 
     /** @return iterable<string, array{string, int}> */
