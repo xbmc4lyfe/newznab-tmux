@@ -189,8 +189,8 @@ final class CompactFingerprintCollector
 
                         continue;
                     }
-                    $yenc = self::yencSummary($metadata['yenc'] ?? null);
                     $integrityErrors = self::yencIntegrityErrors($metadata['yenc'] ?? null);
+                    $yenc = self::yencSummary($metadata['yenc'] ?? null, $integrityErrors === []);
                     foreach ($integrityErrors as $integrityError) {
                         $errors[$account][$integrityError] = ($errors[$account][$integrityError] ?? 0) + 1;
                     }
@@ -604,8 +604,12 @@ final class CompactFingerprintCollector
         return ['first_utc' => gmdate('Y-m-d\TH:i:s\Z', $first), 'last_utc' => gmdate('Y-m-d\TH:i:s\Z', $last), 'span_s' => $last - $first];
     }
 
-    /** @return array<string, mixed>|null */
-    private static function yencSummary(mixed $yenc): ?array
+    /**
+     * @param  bool  $verified  whether the copy passed every integrity check; only then may a proven
+     *                          trailerless part report its CRC as matching
+     * @return array<string, mixed>|null
+     */
+    private static function yencSummary(mixed $yenc, bool $verified): ?array
     {
         if (! is_array($yenc)) {
             return null;
@@ -619,7 +623,7 @@ final class CompactFingerprintCollector
             'begin' => is_int($yenc['begin'] ?? null) ? $yenc['begin'] : null,
             'end' => is_int($yenc['end'] ?? null) ? $yenc['end'] : null,
             'crc_ok' => is_bool($yenc['declared_crc32_matches'] ?? null) ? $yenc['declared_crc32_matches']
-                : (self::partWithoutTrailerPart($yenc) ? true : null),
+                : ($verified && self::partWithoutTrailerPart($yenc) ? true : null),
             'size_ok' => self::sizesAgree($yenc),
         ];
     }

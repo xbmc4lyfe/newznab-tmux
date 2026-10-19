@@ -741,6 +741,25 @@ final class CompactFingerprintCollectorTest extends TestCase
         $this->assertSame(md5(substr($data, 0, 16_384)), $result['data']['files'][0]['first16k_md5']);
     }
 
+    #[Test]
+    public function a_trailerless_part_with_a_matching_crc_but_a_size_mismatch_does_not_report_crc_ok(): void
+    {
+        // The pcrc32 still matches the decoded bytes, but the trailer size disagrees with them.
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)->andReturnUsing(function (string $id): array {
+            $article = self::segmentArticle($id, 2);
+            $article['body'] = (string) preg_replace('/=yend size=16 part=\d+/', '=yend size=17', $article['body']);
+
+            return $article;
+        });
+
+        $result = $this->collector()->collectFromNzb(self::nzb(3, 2, false), 7);
+
+        $this->assertSame('partial', $result['status']);
+        $this->assertSame([null], array_values(array_unique(array_map(static fn (array $article): mixed => $article['yenc']['crc_ok'], $result['data']['articles']))));
+    }
+
     /** @return array<string, array{callable(string): string}> */
     public static function unprovenTrailerlessParts(): array
     {
