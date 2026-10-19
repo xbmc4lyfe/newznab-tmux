@@ -86,6 +86,18 @@ class LegacyVerificationBacklogTest extends ReleaseVerificationCandidatesTest
         $this->assertSame([10, 11], DB::table('releases')->orderBy('id')->pluck('id')->all());
     }
 
+    public function test_legacy_inserted_headers_past_the_candidate_expiry_keep_the_archival_handoff(): void
+    {
+        $this->legacyCollection(1);
+        DB::table('collections')->where('id', 1)->update(['added' => now()->subHours(73), 'last_seen_at' => now()->subHours(60)]);
+
+        app(CollectionCleanupService::class)->deleteFinishedAndOrphans(false);
+
+        // Archival ran (it records the candidate), unlike the direct deletion of non-legacy expired headers.
+        $this->assertSame(bin2hex(sha1('legacy-1', true)), DB::table('release_verification_candidates')->sole()->source_identity);
+        $this->assertSame(0, DB::table('collections')->count());
+    }
+
     public function test_required_background_windows_resume_past_a_failed_legacy_handoff_without_legacy_publication(): void
     {
         Schema::create('ingestion_configurations', function (Blueprint $table): void {

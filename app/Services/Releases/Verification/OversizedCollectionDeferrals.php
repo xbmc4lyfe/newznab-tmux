@@ -75,6 +75,18 @@ final class OversizedCollectionDeferrals
     }
 
     /**
+     * Drop the records of collections deleted without archival.
+     *
+     * @param  list<int>  $ids
+     */
+    public function forget(array $ids): void
+    {
+        $this->guarded(function () use ($ids): void {
+            $this->dropStale($ids);
+        }, null);
+    }
+
+    /**
      * @param  list<int>  $ids
      * @return array<int, bool> Whether each recorded collection is still deferred; ids without a record are absent.
      */
