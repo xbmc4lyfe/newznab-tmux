@@ -22,6 +22,9 @@ final class NativePerArticleObfuscation
     /** Headers sampled to decide whether a range is worth marshalling to Rust. */
     private const int SAMPLE_SIZE = 128;
 
+    /** Smaller ranges stay on PHP: Rust's margin there is under a millisecond and not reliably 1.5x. */
+    public const int MIN_HEADERS = 1000;
+
     /** @var array<string, FFI|null> */
     private static array $libraries = [];
 
@@ -38,9 +41,11 @@ final class NativePerArticleObfuscation
     }
 
     /**
-     * Article numbers the PHP rule would mark, or null to keep the PHP result. Ranges where under
-     * a sixteenth of a spread sample (an eighth when most samples have no part count) is a
-     * multi-part subject with a 16+ alphanumeric token in its name stay on PHP: the PHP rule rejects other subjects faster than they can be packed for FFI.
+     * Article numbers the PHP rule would mark, or null to keep the PHP result. Two kinds of range
+     * stay on PHP. Ranges under MIN_HEADERS stay because Rust's margin there is too small to
+     * establish. Ranges where under a sixteenth of a spread sample is a multi-part subject with a
+     * 16+ alphanumeric token in its name stay too (an eighth when most samples have no part
+     * count), because the PHP rule rejects other subjects faster than they can be packed for FFI.
      *
      * @param  array<int, array<string, mixed>>  $headers
      * @return list<int>|null
@@ -69,7 +74,7 @@ final class NativePerArticleObfuscation
     {
         $values = array_values($headers);
         $count = count($values);
-        if ($count === 0) {
+        if ($count < self::MIN_HEADERS) {
             return false;
         }
         // An odd step started mid-stride, so a range alternating at an even period is not seen

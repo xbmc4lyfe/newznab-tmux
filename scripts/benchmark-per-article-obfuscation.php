@@ -14,7 +14,8 @@ declare(strict_types=1);
  * disabled. The Rust side is the caller's full path: record packing, the FFI call, unpacking and
  * building the article-number set HeaderParser consults, falling back to PHP on a decline. The
  * thresholds follow .ai/rules/rust-performance.md: common strata compare medians, uncommon strata
- * p99, and each must reach 1.5x on the point estimate; routed strata (token-poor ranges the
+ * p99, and each must reach 1.5x with the 95% interval's lower bound (otherwise the run is
+ * inconclusive); uncommon strata up to 20k headers take at least 1000 samples; routed strata (token-poor ranges the
  * wrapper leaves on PHP) compare medians and must stay at 0.9x or better. Uncertainty is a 95% percentile bootstrap
  * interval of that speedup (2000 seeded resamples of the paired observations). A missed threshold
  * is a valid result and exits 0; invalid runs (parity failure, missing library) exit 2.
@@ -31,6 +32,7 @@ const PER_ARTICLE_THRESHOLD = 1.5;
 const PER_ARTICLE_MIN_ARTICLES = 16;
 const PER_ARTICLE_BOOTSTRAP = 2000;
 const PER_ARTICLE_ROUTED_FLOOR = 0.9;
+const PER_ARTICLE_TAIL_SAMPLES = 1000;
 
 try {
     exit(perArticleBenchmarkMain());
@@ -102,7 +104,9 @@ function perArticleBenchmarkMain(): int
             $php($headers);
             $rust($headers);
         }
-        for ($i = 0; $i < $repeats; $i++) {
+        // A p99 needs a deep tail: uncommon strata up to 20k headers take at least 1000 samples.
+        $observations = $stratum['category'] === 'uncommon' && count($headers) <= 20000 ? max($repeats, PER_ARTICLE_TAIL_SAMPLES) : $repeats;
+        for ($i = 0; $i < $observations; $i++) {
             $order = $random->getInt(0, 1) === 0 ? ['php', 'rust'] : ['rust', 'php'];
             foreach ($order as $side) {
                 $start = hrtime(true);
@@ -125,11 +129,15 @@ function perArticleBenchmarkMain(): int
             'rust_median_ms' => round(perArticleQuantile($samples['rust'], 0.5) / 1e6, 3),
             'php_p99_ms' => round(perArticleQuantile($samples['php'], 0.99) / 1e6, 3),
             'rust_p99_ms' => round(perArticleQuantile($samples['rust'], 0.99) / 1e6, 3),
-            'samples' => $repeats];
+            'samples' => $observations];
         // Routed strata stay on PHP by design; they only must not regress (sampling overhead).
         $required = $stratum['category'] === 'routed' ? PER_ARTICLE_ROUTED_FLOOR : PER_ARTICLE_THRESHOLD;
-        if ($speedup < $required && $report['status'] === 'qualified') {
-            $report['status'] = 'not-qualified';
+        // Rust strata qualify only when the interval's lower bound clears the threshold; a point
+        // estimate above it with a lower bound below is inconclusive.
+        if ($speedup < $required) {
+            $report['status'] = $report['status'] === 'invalid' ? 'invalid' : 'not-qualified';
+        } elseif ($stratum['category'] !== 'routed' && $low < $required && $report['status'] === 'qualified') {
+            $report['status'] = 'inconclusive';
         }
         $report['strata'][$name] = $row;
         $report['raw'][$name] = $samples;
@@ -141,7 +149,7 @@ function perArticleBenchmarkMain(): int
             : sprintf("| %s | %s | %d | %d | %s | %.3f | %.3f | %.2fx | %.2f-%.2fx |\n", $name, $row['category'], $row['headers'], $row['marked'],
                 $row['statistic'], $row['php_ms'], $row['rust_ms'], $row['speedup'], $row['speedup_ci95'][0], $row['speedup_ci95'][1]);
     }
-    $markdown .= "\nStatus: **{$report['status']}** (threshold ".PER_ARTICLE_THRESHOLD."x; {$repeats} paired samples per stratum).\n";
+    $markdown .= "\nStatus: **{$report['status']}** (threshold ".PER_ARTICLE_THRESHOLD."x; {$repeats} paired samples per stratum, ".PER_ARTICLE_TAIL_SAMPLES." for uncommon strata up to 20k headers; Rust strata need the 95% lower bound at the threshold).\n";
     file_put_contents($directory.'/report.json', json_encode($report, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR));
     file_put_contents($directory.'/summary.md', $markdown);
     echo $markdown;

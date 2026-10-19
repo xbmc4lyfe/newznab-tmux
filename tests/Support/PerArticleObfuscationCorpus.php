@@ -31,7 +31,7 @@ final class PerArticleObfuscationCorpus
             'text-with-uploads' => ['category' => 'routed', 'description' => 'text posts with 8% obfuscated articles and 10% counter-prefixed single-part images (stays on PHP)', 'size' => 20000],
             'non-yenc' => ['category' => 'routed', 'description' => 'text posts without yEnc part counts (stays on PHP)', 'size' => 20000],
             'large-range' => ['category' => 'uncommon', 'description' => 'mixed range of 200k headers', 'size' => 200000],
-            'small-range' => ['category' => 'uncommon', 'description' => 'mixed range of 200 headers', 'size' => 200],
+            'small-range' => ['category' => 'routed', 'description' => 'mixed range of 200 headers (under MIN_HEADERS, stays on PHP)', 'size' => 200],
             'long-subjects' => ['category' => 'uncommon', 'description' => 'mixed range with 300-byte subject prefixes', 'size' => 20000],
             'adversarial' => ['category' => 'uncommon', 'description' => 'random bytes, newlines, odd counters and invalid UTF-8', 'size' => 20000],
             'crafted-whitespace' => ['category' => 'uncommon', 'description' => 'mixed range with 10% whitespace-padded subjects of 256-512 bytes built to make the subject pattern backtrack', 'size' => 2000],

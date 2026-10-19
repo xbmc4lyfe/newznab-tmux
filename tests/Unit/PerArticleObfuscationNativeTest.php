@@ -102,7 +102,8 @@ final class PerArticleObfuscationNativeTest extends TestCase
             $alternating[] = $obfuscated[$i];
         }
         self::assertNotNull($native->mark($alternating, 16));
-        $headers = PerArticleObfuscationCorpus::stratum('kenpsx', 5, 200);
+        self::assertNull($native->mark(PerArticleObfuscationCorpus::stratum('kenpsx', 5, NativePerArticleObfuscation::MIN_HEADERS - 1), 16));
+        $headers = PerArticleObfuscationCorpus::stratum('kenpsx', 5, NativePerArticleObfuscation::MIN_HEADERS);
         self::assertNotSame([], $native->mark($headers, 16));
         $headers[] = ['Number' => 1, 'Subject' => str_repeat(' ', NativePerArticleObfuscation::MAX_SUBJECT_LENGTH).')'];
         self::assertNull($native->mark($headers, 16));
