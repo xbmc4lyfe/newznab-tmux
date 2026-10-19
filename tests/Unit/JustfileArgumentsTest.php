@@ -160,6 +160,13 @@ SH);
         $kept->mustRun();
         $this->assertContains('-pa\\cbA', $this->arguments($kept));
 
+        // An escaped backslash before the closing quote still closes it; `\'` unescapes in single quotes.
+        file_put_contents($this->directory.'/docker/.env', "DB_ROOTPASSWORD=\"secret\\\\\" # trailing\nDB_DATABASE='it\\'s'\n");
+        $closed = $this->just('docker/Justfile', ['mysql'], ['DC' => $this->directory.'/bin/fake', 'DB_DATABASE' => false]);
+        $closed->mustRun();
+        $this->assertContains('-psecret\\', $this->arguments($closed));
+        $this->assertContains("it's", $this->arguments($closed));
+
         // An escaped `$` is literal in Compose, so it is no interpolation either.
         file_put_contents($this->directory.'/docker/.env', "APP_IMAGE=\"registry/\\\$app:1\"\n");
         $literal = $this->just('docker/Justfile', ['ps'], ['DC' => $this->directory.'/bin/fake']);

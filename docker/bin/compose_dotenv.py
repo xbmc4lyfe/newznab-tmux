@@ -2,9 +2,10 @@
 """docker/.env as Compose (compose-go) reads it, for docker/bin/compose and the Justfile's LOAD_ENV.
 
 Optional `export`, spaces around `=`, the last assignment wins. A quoted value ends at the first
-matching quote not preceded by a backslash and may carry a trailing comment; double-quoted values
-decode escapes (`\\n`, `\\t`, `\\\\`, `\\"`, ...; `\\$` is a literal `$`), single-quoted ones are
-literal. An unquoted value ends at an inline ` #` comment and is trimmed.
+matching quote not escaped by a backslash and may carry a trailing comment; double-quoted values
+decode compose-go's escapes (`\\n`, `\\t`, `\\\\`, `\\"`, octal `\\0NNN`, ...; `\\$` is a literal `$`) and
+keep any other backslash sequence; single-quoted ones are literal except for `\\'`. An
+unquoted value ends at an inline ` #` comment and is trimmed.
 
 Neither caller evaluates `$` interpolation or reads a value across lines, so each value is flagged:
 "interpolated" (unquoted or double-quoted with an unescaped `$`) or "multiline" (an opening quote
@@ -31,9 +32,15 @@ def decode_double_quoted(body: str) -> tuple[str, bool]:
         char = body[index]
         if char == "\\" and index + 1 < len(body):
             escaped = body[index + 1]
-            if escaped == "0" and len(body) >= index + 5 and all(c in "01234567" for c in body[index + 2:index + 5]):
-                out.append(chr(int(body[index + 2:index + 5], 8)))  # `\0NNN`: octal
-                index += 5
+            if escaped == "0":
+                digits = body[index + 2:index + 5]
+                if len(digits) == 3 and all(c in "01234567" for c in digits) and int(digits, 8) <= 0o377:
+                    out.append(chr(int(digits, 8)))  # `\0NNN`: one octal byte
+                    index += 5
+                    continue
+                # Any other `\0` loses its `0` and keeps the backslash (`\0b` is `\b`, `\0777` is `\777`).
+                out.append(char)
+                index += 2
                 continue
             if escaped in ESCAPES or escaped in '$"\\':
                 out.append(ESCAPES.get(escaped, escaped))
@@ -53,18 +60,20 @@ def parse_value(value: str) -> tuple[str, str]:
     """(value, flag) for the text after `=`; flag is "", "interpolated" or "multiline"."""
     if value[:1] in ("'", '"'):
         quote = value[0]
-        for end in range(1, len(value)):
-            if value[end] == quote and value[end - 1] != "\\":
-                if re.match(r"^\s*(?:#.*)?$", value[end + 1:]):
-                    body = value[1:end]
-                    if quote == "'":
-                        return body, ""
-                    decoded, interpolates = decode_double_quoted(body)
-                    return decoded, "interpolated" if interpolates else ""
-                break
-        else:
+        # A backslash escapes the next character, so `"a\\"` closes after the escaped backslash.
+        end = 1
+        while end < len(value) and value[end] != quote:
+            end += 2 if value[end] == "\\" else 1
+        if end >= len(value):
             # An opening quote with no closing one starts a value spanning lines.
             return value, "multiline"
+        if re.match(r"^\s*(?:#.*)?$", value[end + 1:]):
+            body = value[1:end]
+            if quote == "'":
+                # Literal, except that an escaped single quote loses its backslash.
+                return body.replace("\\'", "'"), ""
+            decoded, interpolates = decode_double_quoted(body)
+            return decoded, "interpolated" if interpolates else ""
     value = re.sub(r"\s#.*$", "", value).strip()
     return value, "interpolated" if "$" in value else ""
 
