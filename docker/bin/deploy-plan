@@ -1393,28 +1393,33 @@ def database_service(docker_dir: Path) -> str:
         hosts.append(str(values.get("DB_HOST") or ""))
         return hosts
 
-    # Every other name Docker DNS resolves to a service: network aliases, its container name
-    # (explicit, or Compose's `<project>-<svc>-1`) and `links:` aliases.
-    aliases: dict[str, set[str]] = {}
+    # Every name Docker DNS resolves to a service, case-insensitively: its service name, network
+    # aliases, `hostname:`, container name (explicit, or Compose's `<project>-<svc>-1`) and `links:`
+    # aliases; any of them may also be qualified with `.<network>`.
+    dns_names: dict[str, set[str]] = {}
     for name, svc_cfg in RENDERED_SERVICES.items():
         cfg_map = svc_cfg if isinstance(svc_cfg, dict) else {}
-        names = []
+        names = [name]
         networks = cfg_map.get("networks")
         if isinstance(networks, dict):
             for net in networks.values():
                 names.extend(str(a) for a in ((net.get("aliases") or []) if isinstance(net, dict) else []))
-        if cfg_map.get("container_name"):
-            names.append(str(cfg_map["container_name"]))
+        for key in ("container_name", "hostname"):
+            if cfg_map.get(key):
+                names.append(str(cfg_map[key]))
         if RENDERED_PROJECT:
             names.extend(f"{RENDERED_PROJECT}{sep}{name}{sep}1" for sep in ("-", "_"))
-        for alias in names:
-            if alias != name:
-                aliases.setdefault(alias, set()).add(name)
-    for svc_cfg in RENDERED_SERVICES.values():
-        for link in (svc_cfg.get("links") or []) if isinstance(svc_cfg, dict) else []:
+        for link in cfg_map.get("links") or []:
             target, _, alias = str(link).partition(":")
-            if alias and alias != target and target in RENDERED_SERVICES:
-                aliases.setdefault(alias, set()).add(target)
+            if alias and target in RENDERED_SERVICES:
+                dns_names.setdefault(alias.lower(), set()).add(target)
+        for alias in names:
+            dns_names.setdefault(alias.lower(), set()).add(name)
+
+    def resolve(host: str) -> set[str]:
+        host = host.lower().rstrip(".")
+        return dns_names.get(host) or (dns_names.get(host.split(".", 1)[0], set()) if "." in host else set())
+
     targets = set()
     for app in APP_SERVICES:
         cfg = RENDERED_SERVICES.get(app)
@@ -1432,18 +1437,12 @@ def database_service(docker_dir: Path) -> str:
                          "selects cannot be determined; write it literally (single-quoted to keep a literal `${`).")
         for host in selected(merged):
             if host:
-                if host in RENDERED_SERVICES and host in aliases:
-                    # A service name another service also answers to: DNS may resolve either.
-                    sys.exit(f"deploy-plan: the database host {host} is a service and also an alias of "
-                             f"{', '.join(sorted(aliases[host]))}; selective deployment must know which one it migrates and fences.")
-                if host in RENDERED_SERVICES:
-                    targets.add(host)
-                elif host in aliases:
-                    # A Compose network alias names its service as well as the service name does.
-                    if len(aliases[host]) > 1:
-                        sys.exit(f"deploy-plan: the database host {host} is a network alias of several services "
-                                 f"({', '.join(sorted(aliases[host]))}); selective deployment must know which one it migrates and fences.")
-                    targets.update(aliases[host])
+                services = resolve(host)
+                if len(services) > 1:
+                    # DNS may answer with any of them.
+                    sys.exit(f"deploy-plan: the database host {host} names several services ({', '.join(sorted(services))}); "
+                             "selective deployment must know which one it migrates and fences.")
+                targets.update(services)
                 break
     if len(targets) > 1:
         sys.exit(f"deploy-plan: the app services select different database services ({', '.join(sorted(targets))}); "

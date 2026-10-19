@@ -3537,17 +3537,23 @@ SH);
         $this->assertNotSame(0, $plan->getExitCode());
         $this->assertStringContainsString('select different database services (db2, db3)', $plan->getErrorOutput());
 
+        // Names resolve case-insensitively, by `hostname:` and qualified with a network.
+        $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['horizon' => ['environment' => ['DB_HOST' => 'SQLBOX']], 'web' => ['environment' => ['DB_HOST' => 'db3.nntmux_default']], 'db2' => ['hostname' => 'sqlbox'], 'db3' => []] + $services], JSON_UNESCAPED_SLASHES)]);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('select different database services (db2, db3)', $plan->getErrorOutput());
+
         // A service name another service also answers to is ambiguous.
         $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['mariadb' => [], 'db2' => ['networks' => ['default' => ['aliases' => ['mariadb']]]]] + array_map(fn ($svc) => ['environment' => ['DB_HOST' => 'mariadb']], $services)], JSON_UNESCAPED_SLASHES)]);
         $plan->run();
         $this->assertNotSame(0, $plan->getExitCode());
-        $this->assertStringContainsString('the database host mariadb is a service and also an alias of db2', $plan->getErrorOutput());
+        $this->assertStringContainsString('the database host mariadb names several services (db2, mariadb)', $plan->getErrorOutput());
 
         // An alias shared by two services cannot name the one database to fence.
         $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['db2' => ['networks' => ['default' => ['aliases' => ['shared-db']]]], 'db3' => ['networks' => ['default' => ['aliases' => ['shared-db']]]]] + array_map(fn ($svc) => ['environment' => ['DB_HOST' => 'shared-db']], $services)], JSON_UNESCAPED_SLASHES)]);
         $plan->run();
         $this->assertNotSame(0, $plan->getExitCode());
-        $this->assertStringContainsString('network alias of several services (db2, db3)', $plan->getErrorOutput());
+        $this->assertStringContainsString('the database host shared-db names several services (db2, db3)', $plan->getErrorOutput());
 
         // The database cannot wait for another data service.
         $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['mariadb' => ['depends_on' => ['redis' => ['condition' => 'service_healthy']]], 'redis' => []] + $services], JSON_UNESCAPED_SLASHES)]);
