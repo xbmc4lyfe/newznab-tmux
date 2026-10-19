@@ -205,6 +205,8 @@ acquire() {
 
 unchanged() {
     [ "${FORCE:-0}" != 1 ] || return 1
+    # An owed barrier release must run even when everything else matches again (e.g. reverted).
+    [ ! -e "$STAMP.barrier-owed" ] || return 1
     [ "${SKIP_IF_UNCHANGED:-0}" = 1 ] || return 1
     [ -f "$STAMP" ] || return 1
     [ "$(head -n 1 "$STAMP")" = "$(fingerprint)" ] || return 1
@@ -246,10 +248,14 @@ cooldown() {
 # A signal to the guard alone (e.g. a supervisor stopping it) reaches the payload too, and the guard
 # waits for the payload's own recovery (drain restore, barrier hold) before releasing ownership.
 payload=
+NEW_GROUP='import os, sys; os.setpgid(0, 0); os.execvp(sys.argv[1], sys.argv[1:])'
 forward_signal() {
     if [ -n "$payload" ]; then
-        kill -"$1" "$payload" 2>/dev/null || true
+        # The payload leads its own process group: signal all of it (nested guards, docker build)
+        # and hold the lock until every member has exited, not just the direct child.
+        kill -"$1" -- "-$payload" 2>/dev/null || kill -"$1" "$payload" 2>/dev/null || true
         wait "$payload" 2>/dev/null || true
+        while kill -0 -- "-$payload" 2>/dev/null; do sleep 1; done
     fi
     exit "$2"
 }
@@ -312,10 +318,11 @@ cmd_run() {
     # guard's stdin travels on descriptor 3, e.g. for `... run resume-scheduler -- python3 - < script`.
     # A closed stdin (`<&-`) cannot be duplicated: the payload then reads /dev/null, as a foreground
     # command with nothing to read would.
+    # Its own process group (setpgid), so a forwarded signal reaches every descendant.
     if ( exec 3<&0 ) 2>/dev/null; then
-        { "$@" <&3 3<&- & } 3<&0
+        { python3 -c "$NEW_GROUP" "$@" <&3 3<&- & } 3<&0
     else
-        "$@" </dev/null &
+        python3 -c "$NEW_GROUP" "$@" </dev/null &
     fi
     payload=$!
     if wait "$payload"; then rc=0; else rc=$?; fi

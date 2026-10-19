@@ -31,10 +31,20 @@ tag_for_role() {
     esac
 }
 
+# Docker's canonical form: no docker.io/ or library/ prefix, :latest when untagged.
+normalize_ref() {
+    ref=$1
+    case "$ref" in docker.io/*) ref=${ref#docker.io/} ;; index.docker.io/*) ref=${ref#index.docker.io/} ;; esac
+    case "$ref" in library/*) ref=${ref#library/} ;; esac
+    case "${ref##*/}" in *:*|*@*) ;; *) ref="$ref:latest" ;; esac
+    printf '%s\n' "$ref"
+}
+
 tag_role_count() {
     count=0
+    wanted=$(normalize_ref "$1")
     for candidate in "$WEB_IMAGE" "$HORIZON_IMAGE" "$SCHEDULER_IMAGE" "$INDEXER_IMAGE"; do
-        if [ "$candidate" = "$1" ]; then
+        if [ "$(normalize_ref "$candidate")" = "$wanted" ]; then
             count=$((count + 1))
         fi
     done
@@ -50,14 +60,14 @@ for target in $targets; do
         web|horizon|scheduler|indexer)
             role_tag=$(tag_for_role "$target")
             case "$built_tags" in
-                *" $role_tag "*) continue ;;
+                *" $(normalize_ref "$role_tag") "*) continue ;;
             esac
             if [ "$(tag_role_count "$role_tag")" -gt 1 ]; then
                 docker build --target selfhosted -t "$role_tag" -f "$REPO/Dockerfile" "$REPO"
             else
                 docker build --target "selfhosted-$target" -t "$role_tag" -f "$REPO/Dockerfile" "$REPO"
             fi
-            built_tags="$built_tags$role_tag "
+            built_tags="$built_tags$(normalize_ref "$role_tag") "
             ;;
     esac
 done

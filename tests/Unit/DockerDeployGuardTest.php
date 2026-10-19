@@ -54,6 +54,23 @@ final class DockerDeployGuardTest extends TestCase
     }
 
     #[Test]
+    public function the_lock_is_held_until_every_payload_descendant_exits(): void
+    {
+        $ready = $this->dir.'/payload-ready';
+        $done = $this->dir.'/grandchild-done';
+        // The payload dies on TERM, but its grandchild (like a nested docker build) keeps running.
+        $payload = 'sh -c "trap \"\" TERM; touch '.$ready.'; sleep 2; touch '.$done.'" & wait';
+        $process = $this->guardProcess(['run', 'deploy', '--', 'sh', '-c', $payload]);
+        $process->start();
+        $this->waitFor(fn (): bool => file_exists($ready));
+        $process->signal(15);
+        $this->waitFor(fn (): bool => ! $process->isRunning());
+
+        $this->assertFileExists($done, 'the guard returned before the grandchild finished');
+        $this->assertFalse(is_link($this->dir.'/lock'));
+    }
+
+    #[Test]
     public function a_closed_stdin_still_runs_the_payload(): void
     {
         foreach (['sh', 'dash', 'bash'] as $shell) {

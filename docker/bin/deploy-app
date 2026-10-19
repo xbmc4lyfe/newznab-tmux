@@ -2,6 +2,8 @@
 # Run only through deploy-guard. Build dirty targets first, then drain/update only affected services.
 set -eu
 DIR=$(cd "$(dirname "$0")/.." && pwd)
+# Compose must never remove an orphan (e.g. a renamed data service) while writers still run.
+export COMPOSE_REMOVE_ORPHANS=false
 COMPOSE_FILE="${COMPOSE_FILE:-$DIR/docker-compose.yml}"
 export COMPOSE_FILE
 compose() { "$DIR/bin/compose" "$@"; }

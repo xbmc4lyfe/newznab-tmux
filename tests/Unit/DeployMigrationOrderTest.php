@@ -720,6 +720,29 @@ SH);
         $this->assertGreaterThan(strpos($events, 'web horizon scheduler indexer'), strpos($events, '--wait-timeout 240 sidecar'));
     }
 
+    public function test_an_owed_barrier_release_runs_even_when_nothing_else_changed(): void
+    {
+        $this->deploy()->mustRun();
+        file_put_contents($this->directory.'/docker/.deploy.stamp.barrier-owed', '');
+        file_put_contents($this->directory.'/events', '');
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $this->assertStringContainsString('releases:verification-barrier --timeout=900', $this->events());
+        $this->assertFileDoesNotExist($this->directory.'/docker/.deploy.stamp.barrier-owed');
+    }
+
+    public function test_a_database_setting_in_an_app_services_rendered_environment_migrates(): void
+    {
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['web'] = ['environment' => ['DB_HOST' => '192.0.2.10']];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        $json['services']['web'] = ['environment' => ['DB_HOST' => '192.0.2.20']];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
+        $this->assertStringContainsString('artisan migrate --force', $this->events());
+    }
+
     public function test_an_owed_barrier_release_is_never_batched(): void
     {
         $this->deploy()->mustRun();
@@ -1212,6 +1235,21 @@ SH);
         $this->assertStringContainsString('build --target selfhosted -t custom/worker:local', $events);
         $this->assertStringContainsString('build --target selfhosted-indexer -t custom/indexer:local', $events);
         $this->assertSame(1, substr_count($events, '-t custom/worker:local'));
+    }
+
+    public function test_equivalent_image_references_count_as_one_shared_tag(): void
+    {
+        $this->make(['build'], [
+            'WEB_IMAGE' => 'nntmux/shared:local',
+            'HORIZON_IMAGE' => 'docker.io/nntmux/shared:local',
+            'SCHEDULER_IMAGE' => 'custom/scheduler:local',
+            'INDEXER_IMAGE' => 'custom/indexer:local',
+        ])->mustRun();
+        $events = $this->events();
+        // One all-in-one build for the shared tag, never a web build overwritten by a horizon one.
+        $this->assertStringContainsString('build --target selfhosted -t nntmux/shared:local', $events);
+        $this->assertStringNotContainsString('build --target selfhosted-web', $events);
+        $this->assertStringNotContainsString('build --target selfhosted-horizon', $events);
     }
 
     public function test_stateful_data_service_config_changes_drain_writers_before_recreating_the_data_service(): void
@@ -3030,6 +3068,12 @@ SH);
         $process->run();
         $this->assertNotSame(0, $process->getExitCode());
         $this->assertStringNotContainsString(' up -d', $this->events());
+
+        // A one-shot provider's successful exit cannot be waited for one service at a time.
+        $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['proxy' => ['depends_on' => ['init' => ['condition' => 'service_completed_successfully']]], 'init' => ['labels' => ['nntmux.deploy.stateless' => 'true']]] + $services], JSON_UNESCAPED_SLASHES)]);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('waits for init to complete successfully', $plan->getErrorOutput());
 
         // App services must run their role image.
         $plan = $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => ['web' => ['image' => 'nntmux/app:local']] + $services], JSON_UNESCAPED_SLASHES)]);
