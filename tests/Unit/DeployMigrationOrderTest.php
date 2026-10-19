@@ -79,7 +79,8 @@ print(json.dumps(config))' ;;
         if [ "${NNTMUX_INSPECT_FAIL_AFTER_UP:-0}" = 1 ] && [ -f "$NNTMUX_REPO/recreated" ] && ls "$NNTMUX_REPO"/docker/.deploy.stamp.tmp.* >/dev/null 2>&1; then echo "Error response from daemon: timeout" >&2; exit 1; fi
         [ "${NNTMUX_IMAGE_INSPECT_FAIL:-0}" != 1 ] || { echo "Error response from daemon: request timed out" >&2; exit 1; }
         if [ -n "${NNTMUX_MISSING_IMAGE:-}" ] && [ "$last" = "$NNTMUX_MISSING_IMAGE" ]; then echo "Error response from daemon: No such image: $last" >&2; exit 1; fi
-        if [ -f "$NNTMUX_REPO/replaced" ]; then echo sha256:replaced
+        # NNTMUX_REPLACED_ONLY: only that tag is replaced (default: every tag).
+        if [ -f "$NNTMUX_REPO/replaced" ] && { [ -z "${NNTMUX_REPLACED_ONLY:-}" ] || [ "$last" = "$NNTMUX_REPLACED_ONLY" ]; }; then echo sha256:replaced
         elif [ "${NNTMUX_REPLACE_AT_STAMP:-0}" = 1 ] && ls "$NNTMUX_REPO"/docker/.deploy.stamp.tmp.* >/dev/null 2>&1; then echo sha256:replaced
         elif [ "$last" = nntmux/base:local ] && [ -n "${NNTMUX_BASE_IMAGE_ID:-}" ]; then echo "$NNTMUX_BASE_IMAGE_ID"
         else echo "${NNTMUX_IMAGE_ID:-sha256:fixture}"; fi ;;
@@ -139,7 +140,8 @@ print(json.dumps(config))' ;;
         if [ "${NNTMUX_STALE_DRAIN:-0}" = 1 ]; then echo two > "$NNTMUX_REPO/app.txt"; fi ;;
     *' stop --timeout 1920 horizon'*) [ "${NNTMUX_HORIZON_STOP_FAIL:-0}" != 1 ] || exit 45 ;;
     *' stop web scheduler indexer'*)
-        if [ "${NNTMUX_STALE_STOP:-0}" = 1 ]; then echo two > "$NNTMUX_REPO/app.txt"; fi ;;
+        if [ "${NNTMUX_STALE_STOP:-0}" = 1 ]; then echo two > "$NNTMUX_REPO/app.txt"; fi
+        if [ "${NNTMUX_REPLACE_AT_STOP:-0}" = 1 ]; then : > "$NNTMUX_REPO/replaced"; fi ;;
     *'artisan migrate'*) [ "${NNTMUX_MIGRATION_FAIL:-0}" != 1 ] || exit 42 ;;
     *' up -d'*)
         [ "${NNTMUX_HEALTH_FAIL:-0}" != 1 ] || exit 44
@@ -2967,6 +2969,39 @@ SH);
         $this->assertStringContainsString('not rolling out a replaced image', $process->getErrorOutput());
         $this->assertStringNotContainsString('releases:verification-barrier --timeout', $this->events());
         $this->assertStringNotContainsString('artisan migrate', $this->events());
+    }
+
+    public function test_a_missing_database_is_never_started_when_webs_tag_was_replaced_during_the_drain(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        // Only web's tag changes: the database's own image check passes, the barrier's would not.
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0', 'FORCE=1'], ['NNTMUX_NO_CONTAINER' => 'mariadb', 'NNTMUX_REPLACE_DURING_DRAIN' => '1', 'NNTMUX_REPLACED_ONLY' => 'nntmux/web:local']);
+        $process->run();
+        @unlink($this->directory.'/replaced');
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('nntmux/web:local now names sha256:replaced', $process->getErrorOutput());
+        $this->assertStringNotContainsString('--pull never mariadb', $this->events());
+        $this->assertStringNotContainsString(' stop web scheduler indexer', $this->events());
+    }
+
+    public function test_the_database_is_never_recreated_when_webs_tag_was_replaced_before_its_fresh_barrier(): void
+    {
+        $services = json_decode($this->composeJson(), true);
+        $services['services']['mariadb'] = ['image' => 'mariadb:one'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($services, JSON_UNESCAPED_SLASHES)])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        // mariadb changes (so the writers stop behind a barrier); web's tag is replaced at that stop.
+        $services['services']['mariadb'] = ['image' => 'mariadb:two'];
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($services, JSON_UNESCAPED_SLASHES), 'NNTMUX_REPLACE_AT_STOP' => '1', 'NNTMUX_REPLACED_ONLY' => 'nntmux/web:local']);
+        $process->run();
+        @unlink($this->directory.'/replaced');
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('releases:verification-barrier --timeout', $this->events());
+        $this->assertStringContainsString('nntmux/web:local now names sha256:replaced', $process->getErrorOutput());
+        $this->assertStringNotContainsString('--pull never mariadb', $this->events());
     }
 
     public function test_an_image_tag_replaced_during_the_drain_is_never_rolled_out(): void

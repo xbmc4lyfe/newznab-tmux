@@ -389,6 +389,9 @@ if [ "$database_missing" = 1 ]; then
     # The first change to it: a retry after any failure from here must recreate it, even if its
     # configuration is reverted meanwhile.
     plan --pending "$DATABASE_SERVICE"
+    # Web's tag too: the barrier that fences the database is started from it right after, and a
+    # replaced tag must abort before the database is touched, not between starting and fencing it.
+    plan --verify-images "$DATABASE_SERVICE" web
     if [ -n "$stop_services" ]; then
         # shellcheck disable=SC2086
         compose stop $stop_services
@@ -398,8 +401,8 @@ if [ "$database_missing" = 1 ]; then
         verify
     fi
     stop_removed_data
-    # The image this run planned, as for every other applied service.
-    plan --verify-images "$DATABASE_SERVICE"
+    # The images this run planned, as for every other applied service (web's for the barrier).
+    plan --verify-images "$DATABASE_SERVICE" web
     compose up -d --no-deps --wait --wait-timeout "${DEPLOY_HEALTH_TIMEOUT:-240}" --pull never "$DATABASE_SERVICE"
     # No check between starting it and fencing it: the barrier below is taken next (and verifies).
 fi
@@ -433,6 +436,8 @@ for item in $POST_DRAIN; do
         # From the moment the database is replaced it awaits the migration: any failure from here
         # keeps remote workers out (the release stays owed), never readmits them to its schema.
         [ "$MIGRATE" != 1 ] || barrier_keep=1
+        # The fresh barrier below starts from web's tag: a replaced one aborts before the recreate.
+        plan --verify-images web
         apply_up "--${item%%:*}" "${item#*:}"
         # A recreated database ends the barrier's lock session, and replacement storage lacks its
         # durable pause: fence the new database at once, before anything else that could fail

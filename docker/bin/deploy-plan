@@ -708,7 +708,8 @@ def reject_unsupported_service(svc: str, cfg: object) -> None:
         isinstance(health.get("test"), list) and health["test"][:1] == ["NONE"]
     )):
         # Success requires each app container to report healthy; without a health check it never does
-        # (the role images define none, so a removed one, e.g. `!reset null`, is none at all).
+        # (a removed one, e.g. `!reset null`, falls back to the base image's probe, which deploy-current
+        # does not rely on: keep the shipped check).
         sys.exit(f"deploy-plan: app service {svc} disables or removes its health check; selective deployment verifies app "
                  "services by their health. Keep the shipped health check.")
     deploy = cfg.get("deploy")
