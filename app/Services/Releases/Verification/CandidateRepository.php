@@ -1271,8 +1271,9 @@ final class CandidateRepository
      * never take the older generation for the upgraded release.
      *
      * @param  list<int>  $releaseIds
+     * @param  int|null  $candidateId  null releases whichever candidate holds the fence
      */
-    private function releaseLateArticleFence(array $releaseIds, int $candidateId): void
+    public function releaseLateArticleFence(array $releaseIds, ?int $candidateId): void
     {
         if ($releaseIds === []) {
             return;
@@ -1282,7 +1283,8 @@ final class CandidateRepository
             ->filter(static fn ($guid): bool => ! is_string($guid) || ! $guard->hasStagedGenerations($guid))->keys()->all();
         if ($free !== []) {
             // By primary key: an update through the pointer index would gap-lock it like a locking read.
-            DB::table('releases')->whereIn('id', $free)->where('late_article_candidate_id', $candidateId)->update(['late_article_candidate_id' => null]);
+            DB::table('releases')->whereIn('id', $free)->when($candidateId !== null, static fn ($query) => $query->where('late_article_candidate_id', $candidateId))
+                ->update(['late_article_candidate_id' => null]);
         }
     }
 

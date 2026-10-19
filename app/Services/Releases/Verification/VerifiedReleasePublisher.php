@@ -209,7 +209,8 @@ final class VerifiedReleasePublisher
                         // then settled rather than upgraded into a second release of the same articles.
                         $duplicate = $this->findCoveredDuplicate($claim, $manifest, $metadata, $size, $timing, $incoming, $prelock->coverageIds, $prelock->coverageKnown);
                         if ($duplicate['release_id'] !== null && $duplicate['release_id'] !== (int) $upgrade->id) {
-                            DB::table('releases')->where('id', $upgrade->id)->update(['late_article_candidate_id' => null]);
+                            // Unless an earlier generation's committed NZB is still staged: the settle sweep installs it first.
+                            app(CandidateRepository::class)->releaseLateArticleFence([(int) $upgrade->id], null);
                             $upgrade = null;
                         } elseif ($duplicate['release_id'] === null && $duplicate['metadata_conflict']) {
                             // A covering release with conflicting metadata: review it as a fresh candidate would be,

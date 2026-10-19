@@ -184,6 +184,30 @@ final class CleanNzbStagedGenerationTest extends TestCase
 
     public function test_notondisk_installs_a_committed_staged_generation_instead_of_deleting_the_release(): void
     {
+        $this->missingCanonicalWithStagedGeneration();
+
+        $output = $this->clean(['--notondisk' => true, '--delete' => true]);
+
+        self::assertStringNotContainsString('Deleted: Movie', $output);
+        self::assertSame(1, DB::table('releases')->count(), 'Its committed NZB was only staged.');
+        self::assertSame('upgraded', gzdecode((string) file_get_contents($this->canonical)));
+        self::assertFileDoesNotExist($this->staged);
+    }
+
+    public function test_a_notondisk_dry_run_reports_the_staged_generation_without_installing_it(): void
+    {
+        $this->missingCanonicalWithStagedGeneration();
+
+        $output = $this->clean(['--notondisk' => true]);
+
+        self::assertStringContainsString('Would apply staged NZB generation: '.$this->staged, $output);
+        self::assertStringNotContainsString('Deleted: Movie', $output);
+        self::assertFileDoesNotExist($this->canonical);
+        self::assertFileExists($this->staged);
+    }
+
+    private function missingCanonicalWithStagedGeneration(): void
+    {
         Schema::table('releases', static function (Blueprint $table): void {
             $table->integer('nzbstatus')->default(1);
             $table->string('searchname')->default('Movie');
@@ -194,13 +218,6 @@ final class CleanNzbStagedGenerationTest extends TestCase
         $staged = $this->canonical.'.c3-'.str_repeat('b', 16).'.next';
         rename($this->staged, $staged);
         $this->staged = $staged;
-
-        $output = $this->clean(['--notondisk' => true, '--delete' => true]);
-
-        self::assertStringNotContainsString('Deleted: Movie', $output);
-        self::assertSame(1, DB::table('releases')->count(), 'Its committed NZB was only staged.');
-        self::assertSame('upgraded', gzdecode((string) file_get_contents($this->canonical)));
-        self::assertFileDoesNotExist($this->staged);
     }
 
     /**

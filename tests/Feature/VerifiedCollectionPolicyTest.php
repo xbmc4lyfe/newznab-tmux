@@ -1476,6 +1476,38 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         self::assertLessThan(min($candidates), min($state), 'As archive() does with file manifests.');
     }
 
+    public function test_a_covering_copy_keeps_the_partial_fenced_while_an_earlier_upgrades_nzb_is_staged(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $hash = sha1('covered-staged', true);
+        $first = $this->publishStalledPartial($this->collectionForPolicy('movie.mkv', 3, $hash));
+        $holder = (int) DB::table('release_verification_candidates')->sole()->id;
+        // An earlier partial-to-partial upgrade committed, but its post-commit swap did not happen.
+        [$canonical, $staged] = $this->stageGeneration($first, $holder, 'upgraded');
+        app(CandidateRepository::class)->archive($this->collectionForPolicy('movie.mkv', 3, $hash, part: 2, messageId: 'c@d'));
+        $generation = DB::table('release_verification_candidates')->orderByDesc('id')->first();
+        $merged = app(ManifestStore::class)->read($generation->manifest_path);
+        // A complete copy of the merged articles, published meanwhile.
+        $copy = (array) DB::table('releases')->where('id', $first)->first();
+        $copy = ['id' => $first + 100, 'guid' => 'covering-copy', 'articles_found' => null, 'articles_expected' => null,
+            'files_found' => null, 'files_expected' => null, 'late_article_candidate_id' => null] + $copy;
+        DB::table('releases')->insert($copy);
+        app(VerifiedNzbWriter::class)->write($merged, 'covering-copy');
+
+        $this->publishStalledPartial(null);
+
+        $this->assertSame($first + 100, (int) DB::table('release_verification_candidates')->where('id', $generation->id)->value('release_id'), 'The copy is reused.');
+        $this->assertNotNull(DB::table('releases')->where('id', $first)->value('late_article_candidate_id'),
+            'Workers that read the NZB wait while the staged generation is unresolved.');
+
+        DB::table('release_archive_naming_evidence')->where('releases_id', $first)->update(['source_sha256' => NzbSourceGuard::digest('<nzb>upgraded</nzb>')]);
+        Cache::forget('release_verification:settle_cursor');
+        app(CandidateRepository::class)->expire();
+        $this->assertSame('<nzb>upgraded</nzb>', gzdecode((string) file_get_contents($canonical)), 'The committed generation is installed first.');
+        $this->assertFileDoesNotExist($staged);
+        $this->assertNull(DB::table('releases')->where('id', $first)->value('late_article_candidate_id'));
+    }
+
     public function test_a_covering_release_with_conflicting_metadata_sends_the_generation_to_review_not_an_upgrade(): void
     {
         $this->publicationSchema(partialColumns: true);

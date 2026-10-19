@@ -122,14 +122,26 @@ class CleanNZB extends Command
         };
     }
 
-    private function hasNzbOnDisk(NzbService $nzb, string $guid): bool
+    private function hasNzbOnDisk(NzbService $nzb, string $guid, bool $delete): bool
     {
         if ($nzb->nzbPath($guid) !== false) {
             return true;
         }
-
         // A committed upgrade's NZB may still be staged beside the missing canonical file.
-        return app(NzbSourceGuard::class)->settleStagedGenerations($guid) && $nzb->nzbPath($guid) !== false;
+        $guard = app(NzbSourceGuard::class);
+        if ($delete) {
+            return $guard->settleStagedGenerations($guid) && $nzb->nzbPath($guid) !== false;
+        }
+        // A dry run changes no file: it reports the generation it would install instead.
+        $found = false;
+        foreach ($guard->stagedGenerations($guid) as $path) {
+            if ($guard->reconcileStaged($path, apply: false) === 'applied') {
+                $this->line($this->stagedOutcomeLine('applied', false, $path));
+                $found = true;
+            }
+        }
+
+        return $found;
     }
 
     private function GetReleasesWithNoNZBOnDisk(mixed $delete = false): void
@@ -147,7 +159,7 @@ class CleanNZB extends Command
             echo 'Total done: '.$checked."\r";
             foreach ($releases as $r) {
 
-                if (! $this->hasNzbOnDisk($nzb, (string) $r->guid)) {
+                if (! $this->hasNzbOnDisk($nzb, (string) $r->guid, (bool) $delete)) {
                     if ($delete) {
                         $releaseManagement->deleteSingleWithService(['g' => $r->guid, 'i' => $r->id], $nzb, new ReleaseImageService);
                     }
