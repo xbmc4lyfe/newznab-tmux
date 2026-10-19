@@ -593,6 +593,21 @@ class ReleaseCollectionWindowTest extends TestCase
         $this->assertSame([[1, 2]], $walk(), 'A finished walk starts again from the lowest id.');
     }
 
+    public function test_stale_walk_resumes_from_a_cursor_returned_as_a_numeric_string(): void
+    {
+        config(['release_verification.required' => true]);
+        $this->insertStaleIncompleteCollections([1, 2, 3, 4, 5]);
+        Cache::forever('cbp:release-reconcile:cursor:group:1', '2');
+        $pages = [];
+        $this->service(new WindowTestReleaseCreationService,
+            binariesConfig: new BinariesConfig(reconcileBatchSize: 2, reconcilePagesPerPass: 1))
+            ->processIncompleteCollections(1, function (array $ids) use (&$pages): void {
+                $pages[] = $ids;
+            });
+
+        $this->assertSame([[3, 4]], $pages);
+    }
+
     public function test_stale_walk_stops_starting_pages_once_its_time_budget_is_spent(): void
     {
         config(['release_verification.required' => true]);

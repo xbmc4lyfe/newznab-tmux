@@ -821,8 +821,9 @@ final class ReleaseProcessingService
     private function reconcileIncompleteCollections(?int $groupId, ?callable $afterReconciliation): void
     {
         $cursorKey = self::RECONCILE_CURSOR_PREFIX.($groupId === null ? 'all' : 'group:'.$groupId);
+        // Redis returns a stored integer as a numeric string.
         $saved = Cache::get($cursorKey);
-        $lastId = is_int($saved) && $saved > 0 ? $saved : 0;
+        $lastId = is_numeric($saved) ? max(0, (int) $saved) : 0;
         $pages = 0;
         $deadline = now()->addSeconds($this->binariesConfig->reconcilePassSeconds);
         $statuses = [
