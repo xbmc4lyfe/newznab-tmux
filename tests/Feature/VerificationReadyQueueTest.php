@@ -451,12 +451,32 @@ class VerificationReadyQueueTest extends ReleaseVerificationCandidatesTest
         $this->assertSame('pending', DB::table('release_verification_candidates')->value('status'));
     }
 
+    public function test_verification_memory_limit_is_configurable_and_falls_back_on_an_invalid_value(): void
+    {
+        $commands = function (string $limit): array {
+            config(['release_verification.worker_memory' => $limit]);
+            $schedule = new Schedule;
+            $this->app->instance(Schedule::class, $schedule);
+            require base_path('routes/console.php');
+
+            return array_values(array_filter(array_map(static fn ($event): string => (string) $event->command, $schedule->events()),
+                static fn (string $command): bool => str_contains($command, 'releases:prepare-candidates') || str_contains($command, 'releases:verify-candidates')));
+        };
+
+        foreach ($commands('768M') as $command) {
+            $this->assertStringContainsString("-d 'memory_limit=768M'", $command);
+        }
+        foreach ($commands('1G; rm -rf /') as $command) {
+            $this->assertStringContainsString("-d 'memory_limit=512M'", $command, 'Anything but a size falls back to the default.');
+        }
+    }
+
     public function test_preparation_schedule_has_a_single_slot_and_respects_verification_switch(): void
     {
         $events = array_values(array_filter(app(Schedule::class)->events(), static fn ($event): bool => is_string($event->command)
             && str_contains($event->command, 'releases:prepare-candidates')));
         $this->assertCount(1, $events);
-        $this->assertStringContainsString('memory_limit=256M', $events[0]->command);
+        $this->assertStringContainsString("'memory_limit=512M'", $events[0]->command);
         $this->assertStringContainsString('--limit=5000 --max-seconds=30 --diagnostics', $events[0]->command);
         $this->assertSame('* * * * *', $events[0]->expression);
         config(['release_verification.scheduled' => false]);
