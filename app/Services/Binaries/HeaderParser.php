@@ -58,7 +58,7 @@ final class HeaderParser
      * collapsed), part total and file counter; a group of at least $minArticles in
      * which at least 90% of base names are distinct (digit runs outside the token
      * ignored) has its once-seen names, other than first and last parts, skipped by
-     * parse() when their part numbers are also at least 90% distinct. A
+     * parse() when they span at least $minArticles part positions. A
      * legitimate upload repeats its base name for every part, which keeps its group
      * out. Pass 0 to disable, as part repair does for its sparse ranges.
      *
@@ -115,9 +115,10 @@ final class HeaderParser
                     $candidates[$number] = $part;
                 }
             }
-            // An obfuscated stream posts each part of a file once; files posted round-robin
-            // instead repeat the same part positions across their distinct names.
-            if (\count(array_unique($candidates)) * 10 < \count($candidates) * 9) {
+            // Obfuscated articles spread over many part positions. A slice of files posted
+            // round-robin, each with its own random name, shows one article per file at only
+            // one or two positions (more positions would repeat each name).
+            if (\count(array_unique($candidates)) < $minArticles) {
                 continue;
             }
             foreach ($candidates as $number => $part) {

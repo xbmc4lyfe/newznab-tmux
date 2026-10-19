@@ -118,13 +118,14 @@ class HeaderParserPerArticleObfuscationTest extends TestCase
         $this->assertCount(20, $parser->parse($headers, 'alt.binaries.kenpsx')['headers']);
     }
 
-    public function test_hex_tokens_stay_distinct_across_a_large_range(): void
+    public function test_hex_tokens_of_interleaved_files_are_skipped_across_a_large_range(): void
     {
         $headers = [];
         for ($i = 0; $i < 20000; $i++) {
-            $headers[] = $this->header(10000 + $i, '[40/62] "'.md5((string) $i).'" yEnc ('.($i + 2).'/100079)');
+            $headers[] = $this->header(10000 + $i, '[40/62] "'.md5((string) $i).'" yEnc ('.($i % 685 + 2).'/687)');
         }
 
+        // About 29 files of 687 parts share the signature, so part positions repeat.
         $this->assertSame(20000, $this->parser()->markPerArticleObfuscated($headers, 16));
     }
 
@@ -188,6 +189,17 @@ class HeaderParserPerArticleObfuscationTest extends TestCase
 
         $this->assertSame(0, $this->parser()->markPerArticleObfuscated(array_slice($headers, 0, 20), 16));
         $this->assertSame(0, $this->parser()->markPerArticleObfuscated($headers, 16));
+    }
+
+    public function test_boneless_form_is_skipped_across_a_large_range(): void
+    {
+        $headers = [];
+        for ($i = 0; $i < 20000; $i++) {
+            $prefix = substr($this->token($i + 700000), 0, 2);
+            $headers[] = $this->header(30000 + $i, '['.$prefix.'] - '.$this->token($i).'abcdefgh yEnc ('.($i % 1248 + 2).'/1250)');
+        }
+
+        $this->assertSame(20000, $this->parser()->markPerArticleObfuscated($headers, 16));
     }
 
     public function test_single_part_files_are_never_marked(): void
