@@ -290,4 +290,12 @@ class XxxCategorizationTest extends TestCase
 
         $this->assertSame(Category::MOVIE_FOREIGN, $passable->bestResult->categoryId);
     }
+
+    public function test_normalized_movie_titles_sharing_a_studio_word_stay_in_movies_foreign(): void
+    {
+        foreach (['Private School 1983', 'Private Life 2018'] as $title) {
+            $name = $title.' FRENCH 1080p BluRay x264-GROUP';
+            $this->assertSame(Category::MOVIE_FOREIGN, $this->runPipeline($name)->bestResult->categoryId, $name);
+        }
+    }
 }
