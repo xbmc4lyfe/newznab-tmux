@@ -107,7 +107,11 @@ def receipts(root, result, report):
 
 
 def numeric(value, zero=False):
-    if type(value) not in (int, float) or not math.isfinite(value) or (value < 0 if zero else value <= 0):
+    try:
+        valid = type(value) in (int, float) and math.isfinite(value) and (value >= 0 if zero else value > 0)
+    except OverflowError as error:
+        raise ValueError('Number exceeds finite range') from error
+    if not valid:
         raise ValueError('Invalid number')
     return value
 
@@ -170,6 +174,8 @@ def measurements(kind, report):
                 [block['speedup_lower'], block['speedup_upper']], block['php']['estimate'] / 1e6, block['rust']['estimate'] / 1e6))
     else:
         cold = report['cold']
+        startup_samples = count(report['startup']['runs'])
+        startup_p99 = numeric(report['startup']['p99_ms'], zero=True)
         bounded = report['startup_bounded_p99']
         if set(cold) != set(definitions) - {'large-range'} or set(bounded) != {k for k, v in definitions.items() if v == 'uncommon'}:
             raise ValueError('Incomplete cold/startup matrix')
@@ -198,7 +204,13 @@ def measurements(kind, report):
                     used_rust=value['used_rust'], rust_runs=value['rust_runs'])
             if fixture in bounded:
                 value = bounded[fixture]
-                rows.append(row(fixture, category, 'startup-bound', 'p99_latency', strata[fixture]['samples'], value['speedup'], value['speedup_ci95']))
+                rows.append(row(fixture, category, 'startup-composition', 'composed_quantile_ratio', strata[fixture]['samples'], value['speedup'], value['speedup_ci95']))
+                rows[-1].pop('samples')
+                rows[-1].update(warm_samples=count(strata[fixture]['samples']), startup_samples=startup_samples,
+                    startup_p99_ms=startup_p99)
+                for source, public in (('php_p99_ms', 'warm_php_p99_ms'), ('rust_p99_ms', 'warm_rust_p99_ms')):
+                    if source in strata[fixture]:
+                        rows[-1][public] = numeric(strata[fixture][source], zero=True)
     return rows
 
 
@@ -245,7 +257,7 @@ def export(kind, runner, root=Path('.'), environ=None):
                 receipts(root, result, report)
                 result['status'] = 'recorded'
                 for item in result['rows']:
-                    item['eligible'] = True
+                    item['eligible'] = item['phase'] != 'startup-composition'
             except FileNotFoundError:
                 pass
             validate_public(result)
@@ -323,20 +335,32 @@ def validate_public(summary):
         expected |= {('release-batch-16', 'release-batch', metric) for metric in ('median_latency', 'p99_latency')}
     else:
         expected |= {(name, 'cold', 'median_latency') for name in definitions if name != 'large-range'}
-        expected |= {(name, 'startup-bound', 'p99_latency') for name, category in definitions.items() if category == 'uncommon'}
+        expected |= {(name, 'startup-composition', 'composed_quantile_ratio') for name, category in definitions.items() if category == 'uncommon'}
     keys = []
     for value in summary['rows']:
-        required = {'fixture', 'phase', 'metric', 'category', 'samples', 'baseline_over_candidate', 'diagnostic_speedup_interval', 'eligible'}
-        latency = {'baseline_latency_ms', 'candidate_latency_ms'} if value.get('phase') != 'startup-bound' else set()
+        composition = value.get('phase') == 'startup-composition'
+        required = {'fixture', 'phase', 'metric', 'category', 'baseline_over_candidate', 'diagnostic_speedup_interval', 'eligible'}
+        required |= {'warm_samples', 'startup_samples', 'startup_p99_ms'} if composition else {'samples'}
+        optional = {'warm_php_p99_ms', 'warm_rust_p99_ms'} if composition else set()
+        latency = set() if composition else {'baseline_latency_ms', 'candidate_latency_ms'}
         routing = ({'candidate_backend', 'comparison', 'native_declined'} if value.get('phase') == 'warm' else
             {'candidate_backend', 'comparison', 'used_rust', 'rust_runs'} if value.get('phase') == 'cold' else set()) if kind == 'per-article-obfuscation' else set()
-        if set(value) != required | latency | routing:
+        required_fields = required | latency | routing
+        if not required_fields <= set(value) or set(value) - required_fields - optional:
             raise ValueError('Unexpected identity row fields')
         key = (value['fixture'], value['phase'], value['metric'])
         keys.append(key)
-        if key not in expected or value['category'] != definitions.get(value['fixture'], 'common') or type(value['eligible']) is not bool or value['eligible'] != (status == 'recorded'):
+        if key not in expected or value['category'] != definitions.get(value['fixture'], 'common') or type(value['eligible']) is not bool or value['eligible'] != (status == 'recorded' and not composition):
             raise ValueError('Invalid identity row')
-        count(value['samples'])
+        if composition:
+            if count(value['warm_samples']) < 1000:
+                raise ValueError('Insufficient warm component observations')
+            count(value['startup_samples'])
+            numeric(value['startup_p99_ms'], zero=True)
+            for field in optional & set(value):
+                numeric(value[field], zero=True)
+        else:
+            count(value['samples'])
         numeric(value['baseline_over_candidate'])
         interval(value['diagnostic_speedup_interval'])
         for field in latency:
@@ -356,6 +380,19 @@ def validate_public(summary):
             raise ValueError('Insufficient identity tail observations')
     if set(keys) != expected or len(keys) != len(expected):
         raise ValueError('Incomplete identity matrix')
+    if kind == 'per-article-obfuscation':
+        warm = {value['fixture']: value for value in summary['rows'] if value['phase'] == 'warm'}
+        compositions = [value for value in summary['rows'] if value['phase'] == 'startup-composition']
+        if len({(value['startup_samples'], value['startup_p99_ms']) for value in compositions}) != 1:
+            raise ValueError('Inconsistent shared startup component')
+        for value in compositions:
+            observed = warm[value['fixture']]
+            if value['warm_samples'] != observed['samples']:
+                raise ValueError('Inconsistent warm component samples')
+            for component, latency in (('warm_php_p99_ms', 'baseline_latency_ms'), ('warm_rust_p99_ms', 'candidate_latency_ms')):
+                if component in value and value[component] != observed[latency]:
+                    raise ValueError('Inconsistent warm quantile component')
+
 
 
 def main():

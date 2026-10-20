@@ -337,7 +337,7 @@ def validate_summary(summary, run, kind, runner, historical=False):
                 'gate_passed', 'samples', 'iterations', 'php_median_ns', 'rust_median_ns', 'improvement_percent',
                 'body_ffi_median_ms', 'fixture', 'p99_sample_sufficient', 'baseline_median_ns', 'candidate_median_ns', 'median_ratio', 'paired_median_ratio', 'baseline_p99_ns', 'candidate_p99_ns', 'p99_ratio', 'median_ratio_ci95', 'p99_ratio_ci95', 'median_baseline_over_candidate_ratio', 'median_cold_baseline_over_candidate_ratio',
                 'module', 'correctness_observations', 'native_proof_observations', 'category', 'comparison', 'metric', 'baseline_over_candidate', 'speedup_interval', 'baseline_latency_ms', 'candidate_latency_ms', 'native_median_ms', 'qualification_gate_passed', 'p99_threshold_met',
-                'baseline_latency_interval_ms', 'candidate_latency_interval_ms', 'marginal_alpha', 'gate_statistic', 'gate_speedup_simultaneous_ci95', 'host_median_speedup_simultaneous_ci95', 'live_median_speedup_simultaneous_ci95', 'live_p99_speedup_simultaneous_ci95', 'diagnostic_speedup_interval', 'native_declined', 'used_rust', 'rust_runs'}
+                'baseline_latency_interval_ms', 'candidate_latency_interval_ms', 'marginal_alpha', 'gate_statistic', 'gate_speedup_simultaneous_ci95', 'host_median_speedup_simultaneous_ci95', 'live_median_speedup_simultaneous_ci95', 'live_p99_speedup_simultaneous_ci95', 'diagnostic_speedup_interval', 'native_declined', 'used_rust', 'rust_runs', 'warm_samples', 'startup_samples', 'startup_p99_ms', 'warm_php_p99_ms', 'warm_rust_p99_ms'}
     if any(not isinstance(row, dict) or set(row) - row_keys for row in summary['rows']):
         raise ValueError('Unexpected public measurement fields')
     identity_fields = {'benchmark_status', 'identity_provenance_status', 'identity_uncertainty', 'identity_runtime_sha256', 'identity_manifest_sha256'}
@@ -658,7 +658,7 @@ def coverage(root):
         elif name in ('header_filename_identity', 'header_filename_unicode'):
             label, detail = 'Comparative public caller benchmark', 'Guarded candidate for HeaderFilenameIdentity, not wired into production. Per-call and 16-call release-batch PHP versus Rust+FFI on a synthetic corpus runs in the archive-sample-performance filename-identity job (x86 and ARM, step summary); collected here as descriptive synthetic measurements; producer gates do not establish adoption qualification.'
         elif name == 'per_article_obfuscation':
-            label, detail = 'Comparative public caller benchmark', 'Adopted for HeaderParser::markPerArticleObfuscated with the PHP rule as fallback. Paired PHP versus Rust+FFI over seeded common and uncommon header ranges, with native parity, runs in the archive-sample-performance filename-identity job (x86 and ARM, step summary); collected here with warm, cold and startup-bound results. Pointwise producer gates do not establish adoption qualification.'
+            label, detail = 'Comparative public caller benchmark', 'Adopted for HeaderParser::markPerArticleObfuscated with the PHP rule as fallback. Paired PHP versus Rust+FFI over seeded common and uncommon header ranges, with native parity, runs in the archive-sample-performance filename-identity job (x86 and ARM, step summary); collected here with warm/cold measurements and composed-quantile startup diagnostics. Pointwise producer gates do not establish adoption qualification.'
         elif name in ('article_identity', 'article_xref', 'article_dates', 'iso_primary_copies', 'rar5_copy_checksums', 'rar5_quick_open'):
             label, detail = 'Shared independent PHP reference comparison', 'New bounded PHP references compare declared shared projections only; actual native wrapper includes FFI, allocation, JSON decoding and the full richer native result before projection. Cold/warm common median and uncommon p99 gates do not qualify adoption or historical PHP speedups.'
         elif name in ('iso_path_tables', 'zstd_frame', 'xz', 'xz_frame', 'xz_first_block'):
@@ -930,6 +930,8 @@ def measurement_table(rows):
         'baseline_median_ns': ('Baseline median', 1000000), 'candidate_median_ns': ('Candidate median', 1000000),
         'baseline_p99_ns': ('Baseline p99', 1000000), 'candidate_p99_ns': ('Candidate p99', 1000000),
         'baseline_latency_ms': ('Baseline latency', 1), 'candidate_latency_ms': ('Candidate latency', 1),
+        'startup_p99_ms': ('Startup q99 component', 1), 'warm_php_p99_ms': ('PHP warm q99 component', 1),
+        'warm_rust_p99_ms': ('Rust warm q99 component', 1),
         'native_median_ms': ('Native median', 1), 'median_ms': ('Median', 1), 'min_ms': ('Minimum', 1), 'max_ms': ('Maximum', 1),
     }
     ratios = {
@@ -965,6 +967,7 @@ def measurement_table(rows):
         'exact_host_cli': 'Exact host CLI', 'synthetic_cli': 'Synthetic CLI',
     }
     metrics = {'p99_unavailable': 'Tail unavailable (<1,000 pairs)', 'p99_latency': 'p99 latency',
+               'composed_quantile_ratio': 'Composed quantile ratio (diagnostic only)',
                'median_latency': 'Median latency', 'not_applicable': 'Comparison not applicable'}
     status_keys = {'decision', 'status', 'eligible_pairs', 'invalid_pairs', 'gate_passed', 'performance_gate',
                    'p99_sample_sufficient', 'qualification_gate_passed', 'p99_threshold_met', 'category',
@@ -993,6 +996,8 @@ def measurement_table(rows):
                 values.extend('BODY ' + str(stage) + ': ' + latency_ms(duration) for stage, duration in value.items())
             elif key == 'improvement_percent':
                 values.append('Improvement: ' + compact_number(value, 2) + '%')
+            elif key in ('warm_samples', 'startup_samples'):
+                states.append(('Warm component N=' if key == 'warm_samples' else 'Startup component N=') + str(value))
             elif key == 'samples':
                 states.append('N=' + str(value))
             elif key == 'eligible':
@@ -1042,7 +1047,7 @@ def render(report):
             body.append('<p>Synthetic corpus comparison including caller and FFI costs. Producer status: '
                         + escape(row.get('benchmark_status', 'unavailable')) + '; executed-input provenance: '
                         + escape(row.get('identity_provenance_status', 'unavailable'))
-                        + '. Intervals are descriptive order statistics for filename identity, or pointwise paired bootstrap for per-article obfuscation; they are not simultaneous adoption bounds. Cold first calls and startup-bounded p99 have distinct scopes. Missing measurement-time receipts leave recorded values ineligible.</p>')
+                        + '. Intervals are descriptive order statistics for filename identity, or pointwise paired bootstrap for per-article obfuscation; they are not simultaneous adoption bounds. Cold first calls and startup compositions have distinct scopes. The startup composition is PHP warm q99 / (Rust warm q99 + startup q99), a composed-quantile diagnostic with separate component sample counts; it is not empirical whole-caller p99 or a guaranteed 99th-percentile bound. Missing measurement-time receipts leave recorded values ineligible.</p>')
         if row.get('candidate_status') == 'experimental_withdrawn_from_production':
             body.append('<p>This archived Rust fingerprint candidate is withdrawn from the application runtime. The application uses PHP fingerprinting. These archived-candidate measurements do not select the production implementation or qualify adoption.</p>')
         if row.get('kind') == 'cpu-snapshot':

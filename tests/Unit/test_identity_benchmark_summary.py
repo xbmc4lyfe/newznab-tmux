@@ -41,7 +41,7 @@ def fixture(kind):
         report['batch'] = dict(observations=2000, median=copy.deepcopy(block), p99=copy.deepcopy(block))
     else:
         report['environment'].pop('source_sha256')
-        report.update(cold={}, startup_bounded_p99={}, startup=dict(raw=[MARKER]))
+        report.update(cold={}, startup_bounded_p99={}, startup=dict(runs=200, p99_ms=0.3, raw=[MARKER]))
         for name, category in EXPORT.ARTICLE.items():
             report['strata'][name] = dict(category=category, statistic='p99' if category == 'uncommon' else 'median',
                 samples=1000, speedup=2, speedup_ci95=[1.7, 2.3], php_ms=2, rust_ms=1, declined=category == 'routed',
@@ -113,7 +113,7 @@ class IdentitySummaryTest(unittest.TestCase):
             self.validate(result)
             self.assertEqual('recorded', result['status'])
             self.assertEqual('verified_current', result['identity_provenance_status'])
-            self.assertTrue(all(row['eligible'] for row in result['rows']))
+            self.assertTrue(all(row['eligible'] == (row['phase'] != 'startup-composition') for row in result['rows']))
             self.assertFalse(result['adoption_qualified'])
             self.assertEqual(EXPORT.SOURCE_PATHS | EXPORT.RESOURCE_KEYS, set(result['source_sha256']))
 
@@ -308,6 +308,68 @@ class IdentitySummaryTest(unittest.TestCase):
         producer = (ROOT / '.github/workflows/archive-sample-performance.yml').read_text()
         self.assertIn("- 'tests/Unit/test_identity_benchmark_summary.py'", producer)
         self.assertIn('python3 -B tests/Unit/test_identity_benchmark_summary.py', producer)
+
+    def test_actual_collector_contains_oversized_integer_metrics(self):
+        base = self.export('per-article-obfuscation', fixture('per-article-obfuscation'))
+        run = dict(id=12, run_attempt=2, head_sha=SHA, event='push', head_branch='master',
+            head_repository=dict(full_name=PAGES.REPOSITORY), status='completed', conclusion='failure')
+        expected = [('per-article-obfuscation', 'ubuntu-latest')]
+        for field in ('baseline_over_candidate', 'baseline_latency_ms', 'diagnostic_speedup_interval'):
+            with self.subTest(field=field):
+                summary = copy.deepcopy(base)
+                summary['rows'][0][field] = [1, 10**400] if field == 'diagnostic_speedup_interval' else 10**400
+                data = io.BytesIO()
+                with zipfile.ZipFile(data, 'w') as archive:
+                    archive.writestr('summary.json', json.dumps(summary))
+                raw = data.getvalue()
+                artifact = dict(id=1, expired=False, size_in_bytes=len(raw),
+                    name='public-benchmark-per-article-obfuscation-ubuntu-latest-12-2')
+                def fetch(path):
+                    return {'artifacts': [artifact]} if '/artifacts?' in path else {'workflow_runs': [run]}
+                with patch.object(PAGES, 'WORKFLOWS', {'archive-sample-performance.yml': expected}), \
+                        patch.object(PAGES, 'last_valid_comparison', return_value=None), \
+                        patch.object(PAGES, 'collect_dispatches', return_value=([], [])):
+                    report = PAGES.collect(SHA, ROOT, fetch, lambda artifact_id: raw)
+                self.assertEqual('Summary invalid or unavailable', report['results'][0]['status'])
+                self.assertEqual([], report['results'][0]['rows'])
+
+    def test_startup_composition_retains_actual_component_counts_and_scope(self):
+        report = fixture('per-article-obfuscation')
+        report['startup'].update(runs=200, p99_ms=0.3)
+        result = self.export('per-article-obfuscation', report)
+        rows = [row for row in result['rows'] if row['phase'] == 'startup-composition']
+        self.assertEqual(3, len(rows))
+        for row in rows:
+            self.assertEqual('composed_quantile_ratio', row['metric'])
+            self.assertEqual(1000, row['warm_samples'])
+            self.assertEqual(200, row['startup_samples'])
+            self.assertEqual(0.3, row['startup_p99_ms'])
+            self.assertNotIn('samples', row)
+        rendered = PAGES.render(dict(head_sha=SHA, generated_at='fixture', workflows=[], coverage=[], results=[result]))
+        for phrase in ('Warm component N=1000', 'Startup component N=200', 'PHP warm q99 / (Rust warm q99 + startup q99)',
+                'not empirical whole-caller p99', 'guaranteed 99th-percentile bound'):
+            self.assertIn(phrase, rendered)
+        self.assertFalse(any(row['eligible'] for row in rows))
+        for field, value in (('samples', 1000), ('warm_samples', 999), ('startup_samples', True),
+                ('startup_samples', 0), ('startup_samples', 201), ('warm_samples', 1001),
+                ('startup_p99_ms', 0.4), ('warm_php_p99_ms', 9), ('metric', 'p99_latency'), ('eligible', True)):
+            malformed = copy.deepcopy(result)
+            next(row for row in malformed['rows'] if row['phase'] == 'startup-composition')[field] = value
+            with self.assertRaises(ValueError, msg=field):
+                self.validate(malformed)
+        for fixture_name in EXPORT.ARTICLE:
+            report['strata'][fixture_name].update(php_p99_ms=2, rust_p99_ms=1)
+        optional = self.export('per-article-obfuscation', report)
+        self.validate(optional)
+        for row in optional['rows']:
+            if row['phase'] == 'startup-composition':
+                self.assertEqual(2, row['warm_php_p99_ms'])
+                self.assertEqual(1, row['warm_rust_p99_ms'])
+        report.pop('startup')
+        self.assertEqual('invalid', self.export('per-article-obfuscation', report)['status'])
+        for startup in ({}, dict(runs=True), dict(runs=0), dict(runs=200), dict(runs=200, p99_ms=-1)):
+            report['startup'] = startup
+            self.assertEqual('invalid', self.export('per-article-obfuscation', report)['status'])
 
     def test_shared_job_and_public_artifacts_are_independent_on_failure(self):
         workflow = (ROOT / '.github/workflows/archive-sample-performance.yml').read_text().split('  filename-identity:', 1)[1]
