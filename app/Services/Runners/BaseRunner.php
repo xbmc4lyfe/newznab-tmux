@@ -50,6 +50,18 @@ abstract class BaseRunner
     }
 
     /**
+     * Another run of a worker that just succeeded, queued behind the batch while the batch's
+     * first runs are still working. Follow-ups that have not started when the last first run
+     * finishes are dropped, so they never extend the batch beyond its slowest worker's tail.
+     *
+     * @return array{command: string|list<string>, not_before: float}|null
+     */
+    protected function workerFollowUp(string|int $key, float $startedAt): ?array
+    {
+        return null;
+    }
+
+    /**
      * Resolve the configured worker timeout in seconds.
      */
     protected function concurrencyTimeout(): int
@@ -156,6 +168,9 @@ abstract class BaseRunner
     private function runWorkerPool(array $commands, int $maxProcesses, int $timeout, bool $stream, ?callable $onComplete = null): array
     {
         $queue = $commands;
+        $firstRuns = array_fill_keys(array_keys($commands), true);
+        $followUps = [];
+        $startedAt = [];
         $running = [];
         $results = [];
         $completionFailure = null;
@@ -182,6 +197,10 @@ abstract class BaseRunner
                 if ($this->isCancellationRequested()) {
                     break;
                 }
+                if ($firstRuns === [] && $followUps !== []) {
+                    $queue = array_diff_key($queue, $followUps);
+                    $followUps = [];
+                }
                 if (($this->hasDrainRequest() || $completionFailure !== null) && $running === []) {
                     break;
                 }
@@ -194,7 +213,11 @@ abstract class BaseRunner
                             $busy[$group] = true;
                         }
                     }
+                    $now = microtime(true);
                     foreach (array_keys($queue) as $queuedKey) {
+                        if (($followUps[$queuedKey] ?? 0.0) > $now) {
+                            continue;
+                        }
                         $group = $this->workerConcurrencyKey($queuedKey);
                         if ($group === null || ! isset($busy[$group])) {
                             $key = $queuedKey;
@@ -205,7 +228,8 @@ abstract class BaseRunner
                         break;
                     }
                     $process = $this->workerProcess($queue[$key]);
-                    unset($queue[$key]);
+                    unset($queue[$key], $followUps[$key]);
+                    $startedAt[$key] = microtime(true);
                     $process->setTimeout($timeout);
                     $running[$key] = $process;
                     try {
@@ -240,12 +264,19 @@ abstract class BaseRunner
                         echo $process->getErrorOutput();
                     }
                     $this->recordWorkerOutcome($key, $status, $process->getExitCode(), $this->outputTail($process));
-                    unset($running[$key]);
+                    unset($running[$key], $firstRuns[$key]);
                     if ($status === 'success') {
                         try {
                             $this->workerCompleted($key, $output);
                             if ($onComplete !== null) {
                                 $onComplete($key, $output);
+                            }
+                            $followUp = $firstRuns !== [] && $completionFailure === null
+                                && ! $this->isCancellationRequested() && ! $this->hasDrainRequest()
+                                ? $this->workerFollowUp($key, $startedAt[$key]) : null;
+                            if ($followUp !== null) {
+                                $queue[$key] = $followUp['command'];
+                                $followUps[$key] = $followUp['not_before'];
                             }
                         } catch (\Throwable $exception) {
                             $completionFailure ??= $exception;
@@ -284,7 +315,7 @@ abstract class BaseRunner
                 $completionFailure !== null => 'failure',
                 default => 'cancellation',
             };
-            foreach ($queue as $key => $command) {
+            foreach (array_diff_key($queue, $followUps) as $key => $command) {
                 $this->recordWorkerOutcome($key, $queuedOutcome, null);
             }
             foreach ($handlers as $signal => $handler) {

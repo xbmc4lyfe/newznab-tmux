@@ -74,6 +74,9 @@ return [
         // (and, separately, sizing complete ones); the next pass resumes from a stored cursor.
         'reconcile_pages_per_pass' => (int) env('CBP_RECONCILE_PAGES_PER_PASS', 1000),
         'reconcile_pass_seconds' => (int) env('CBP_RECONCILE_PASS_SECONDS', 300),
+        // While a release round waits on its slowest groups, a group whose pass finished starts another
+        // one at most this often (seconds between the starts); 0 waits for the whole round as before.
+        'release_rolling_interval' => (int) env('CBP_RELEASE_ROLLING_INTERVAL', 60),
         // Maximum flattened binary/part rows loaded while streaming an NZB.
         'nzb_stream_rows' => (int) env('CBP_NZB_STREAM_ROWS', 5000),
         // Articles sharing a subject shape with no repeated name before a range skips them as
