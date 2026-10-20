@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace App\Services\Binaries;
 
 use App\Services\BlacklistService;
+use Random\Engine\Xoshiro256StarStar;
+use Random\Randomizer;
 
 /**
  * Parses and filters raw NNTP headers.
@@ -38,6 +40,44 @@ final class HeaderParser
      */
     public const int NATIVE_MIN_HEADERS = 8000;
 
+    /** Headers sampled to decide whether a range is worth marshalling to Rust: one in 128, 32 to 128. */
+    private const int NATIVE_SAMPLE_MIN = 32;
+
+    private const int NATIVE_SAMPLE_MAX = 128;
+
+    /**
+     * Per-header cost by sampled class (no part count, a part count only, a candidate) as
+     * [PHP base ns, PHP tenths of a ns per subject byte, Rust base ns, Rust tenths of a ns per byte].
+     * Fitted to XOVER-shaped ranges of 60-480 byte subjects with
+     * scripts/benchmark-per-article-obfuscation.php on Linux arm64.
+     */
+    private const array NATIVE_COSTS = [[210, 5, 265, 10], [80, 80, 110, 39], [1350, 60, 330, 37]];
+
+    /**
+     * A range goes to Rust when its predicted speedup reaches 2x. The prices run about a sixth
+     * optimistic on mixed ranges, so this keeps the measured speedup above the 1.5x rule.
+     */
+    private const int NATIVE_PREDICTED_SPEEDUP_PERCENT = 200;
+
+    /**
+     * Loading the library and running its probe took 0.6-1.8 ms per process; a range that would
+     * load it must be predicted to save at least 4 ms.
+     */
+    private const int NATIVE_FIRST_LOAD_SAVING_NS = 4_000_000;
+
+    private const string DIGITS = '0123456789';
+
+    private const string ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+
+    /** PCRE's non-UTF `\s`. */
+    private const string WHITESPACE = " \t\n\v\f\r";
+
+    /** Mirrors NativePerArticleObfuscation::MAX_SUBJECT_LENGTH: Rust declines longer subjects. */
+    public const int NATIVE_MAX_SUBJECT_LENGTH = 512;
+
+    /** Sample positions only need to be unpredictable per range, not secure: one engine per process. */
+    private static ?Randomizer $nativeSampler = null;
+
     /** Rust port of markPerArticleObfuscated(); false keeps the PHP rule only, null builds it on first need. */
     private NativePerArticleObfuscation|false|null $native;
 
@@ -45,6 +85,100 @@ final class HeaderParser
     {
         $this->blacklistService = $blacklistService ?? new BlacklistService;
         $this->native = $native;
+    }
+
+    /**
+     * Whether the Rust port should take this range. These stay on PHP:
+     * - ranges under NATIVE_MIN_HEADERS, where Rust's margin is too small to establish;
+     * - ranges where a spread sample, priced with NATIVE_COSTS, predicts under 2x: the PHP rule
+     *   rejects subjects without a part count faster than they can be handed to Rust;
+     * - before the library is loaded, ranges whose predicted saving is under
+     *   NATIVE_FIRST_LOAD_SAVING_NS (building the wrapper, loading the library and its probe);
+     * - ranges with a subject over NATIVE_MAX_SUBJECT_LENGTH, which Rust would decline.
+     * Kept here, not in the wrapper, so a range routed to PHP never loads the wrapper class.
+     *
+     * @param  array<int, array<string, mixed>>  $headers
+     */
+    public static function worthNativeMarking(array $headers, bool $libraryLoaded): bool
+    {
+        if (\count($headers) < self::NATIVE_MIN_HEADERS) {
+            return false;
+        }
+        $values = array_is_list($headers) ? $headers : array_values($headers);
+        $count = \count($values);
+        // One random header from each of $samples equal slices, so no periodic ordering of the
+        // range decides the prediction.
+        $samples = min(self::NATIVE_SAMPLE_MAX, max(self::NATIVE_SAMPLE_MIN, intdiv($count, 128)));
+        $random = self::$nativeSampler ??= new Randomizer(new Xoshiro256StarStar);
+        $php = $rust = 0;
+        for ($slice = 0; $slice < $samples; $slice++) {
+            $start = intdiv($slice * $count, $samples);
+            $index = $random->getInt($start, max($start, intdiv(($slice + 1) * $count, $samples) - 1));
+            $subject = $values[$index]['Subject'] ?? null;
+            $bytes = is_string($subject) ? strlen($subject) : 0;
+            [$phpBase, $phpPerByte, $rustBase, $rustPerByte] = self::NATIVE_COSTS[self::classifySample($subject)];
+            $php += $phpBase + intdiv($phpPerByte * $bytes, 10);
+            $rust += $rustBase + intdiv($rustPerByte * $bytes, 10);
+        }
+        if ($php * 100 < $rust * self::NATIVE_PREDICTED_SPEEDUP_PERCENT) {
+            return false;
+        }
+        // Before this process has loaded the library, the predicted saving must also pay for
+        // loading it and running its probe.
+        if (! $libraryLoaded && intdiv(($php - $rust) * $count, $samples) < self::NATIVE_FIRST_LOAD_SAVING_NS) {
+            return false;
+        }
+        // A subject Rust would decline sends the range to PHP before any packing.
+        $subjects = array_filter(array_column($values, 'Subject'), is_string(...));
+
+        return $subjects === [] || max(array_map(strlen(...), $subjects)) <= self::NATIVE_MAX_SUBJECT_LENGTH;
+    }
+
+    /**
+     * 0: no part count; 1: a part count only; 2: a candidate as the PHP rule sees it, a first
+     * whitespace-led `(n/total)` with total of at least 2 and a 16+ alphanumeric token before it.
+     * String scans rather than regexes, so a fresh process does not pay to compile patterns, and
+     * linear in the subject length.
+     */
+    private static function classifySample(mixed $subject): int
+    {
+        if (! is_string($subject)) {
+            return 0;
+        }
+        for ($open = strpos($subject, '('); $open !== false; $open = strpos($subject, '(', $open + 1)) {
+            if ($open === 0 || strspn($subject, self::WHITESPACE, $open - 1, 1) === 0) {
+                continue;
+            }
+            $part = strspn($subject, self::DIGITS, $open + 1);
+            $totalAt = $open + 2 + $part;
+            if ($part === 0 || ($subject[$totalAt - 1] ?? '') !== '/') {
+                continue;
+            }
+            $total = strspn($subject, self::DIGITS, $totalAt);
+            if ($total === 0 || ($subject[$totalAt + $total] ?? '') !== ')') {
+                continue;
+            }
+
+            return (int) substr($subject, $totalAt, $total) >= 2 && self::hasToken($subject, $open) ? 2 : 1;
+        }
+
+        return 0;
+    }
+
+    /** Whether `$subject` holds a run of 16+ ASCII alphanumerics before byte `$end`. */
+    private static function hasToken(string $subject, int $end): bool
+    {
+        $at = strcspn($subject, self::ALNUM, 0, $end);
+        while ($at < $end) {
+            $run = strspn($subject, self::ALNUM, $at, $end - $at);
+            if ($run >= 16) {
+                return true;
+            }
+            $at += $run;
+            $at += strcspn($subject, self::ALNUM, $at, $end - $at);
+        }
+
+        return false;
     }
 
     /**
@@ -83,10 +217,12 @@ final class HeaderParser
         }
         // The Rust port marks the same articles about 1.7-3.6x faster on ranges it is routed to (scripts/benchmark-per-article-obfuscation.php);
         // null means it is unavailable or declined, and the PHP rule below decides.
+        // Routing runs before the wrapper exists, so a range kept on PHP never loads its class.
         $marked = null;
-        if ($this->native !== false && \count($headers) >= self::NATIVE_MIN_HEADERS) {
+        if ($this->native !== false && ! ($this->native?->unavailable() ?? false)
+            && self::worthNativeMarking($headers, $this->native?->loaded() ?? false)) {
             $this->native ??= new NativePerArticleObfuscation;
-            $marked = $this->native->mark($headers, $minArticles);
+            $marked = $this->native->markWithoutSampling($headers, $minArticles);
         }
         if ($marked !== null) {
             $this->perArticleObfuscated = array_fill_keys($marked, true);

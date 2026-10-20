@@ -48,6 +48,7 @@ final class PerArticleObfuscationNativeTest extends TestCase
     public function test_header_parser_size_floor_mirrors_the_native_one(): void
     {
         self::assertSame(NativePerArticleObfuscation::MIN_HEADERS, HeaderParser::NATIVE_MIN_HEADERS);
+        self::assertSame(NativePerArticleObfuscation::MAX_SUBJECT_LENGTH, HeaderParser::NATIVE_MAX_SUBJECT_LENGTH);
     }
 
     public function test_corpus_is_deterministic_and_exercises_marking(): void

@@ -5,8 +5,6 @@ declare(strict_types=1);
 namespace App\Services\Binaries;
 
 use FFI;
-use Random\Engine\Xoshiro256StarStar;
-use Random\Randomizer;
 use Throwable;
 
 /**
@@ -21,81 +19,47 @@ final class NativePerArticleObfuscation
     /** Mirrors MAX_SUBJECT_LENGTH in the Rust port; longer subjects are declined before packing. */
     public const int MAX_SUBJECT_LENGTH = 512;
 
-    /** Headers sampled to decide whether a range is worth marshalling to Rust: one in 128, 32 to 128. */
-    private const int SAMPLE_MIN = 32;
-
-    private const int SAMPLE_MAX = 128;
-
-    /**
-     * Smaller ranges stay on PHP: there the PHP rule takes well under a millisecond, and even the
-     * sample would cost several percent of it.
-     */
-    public const int MIN_HEADERS = 8000;
-
-    /**
-     * Per-header cost by sampled class (no part count, a part count only, a candidate) as
-     * [PHP base ns, PHP tenths of a ns per subject byte, Rust base ns, Rust tenths of a ns per byte].
-     * Fitted to XOVER-shaped ranges of 60-480 byte subjects with
-     * scripts/benchmark-per-article-obfuscation.php on Linux arm64.
-     */
-    private const array COSTS = [[210, 5, 265, 10], [80, 80, 110, 39], [1350, 60, 330, 37]];
-
-    /**
-     * A range goes to Rust when its predicted speedup reaches 2x. The prices run about a sixth
-     * optimistic on mixed ranges, so this keeps the measured speedup above the 1.5x rule.
-     */
-    private const int PREDICTED_SPEEDUP_PERCENT = 200;
-
-    /**
-     * Loading the library and running its probe took 0.6-1.8 ms per process; a range that would
-     * load it must be predicted to save at least 4 ms.
-     */
-    private const int FIRST_LOAD_SAVING_NS = 4_000_000;
-
-    private const string DIGITS = '0123456789';
-
-    private const string ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-
-    /** PCRE's non-UTF `\s`. */
-    private const string WHITESPACE = " \t\n\v\f\r";
+    /** Mirrors HeaderParser::NATIVE_MIN_HEADERS: smaller ranges stay on PHP. */
+    public const int MIN_HEADERS = HeaderParser::NATIVE_MIN_HEADERS;
 
     /** @var array<string, FFI|null> */
     private static array $libraries = [];
-
-    /** Sample positions only need to be unpredictable per range, not secure: one seeded engine per process. */
-    private static ?Randomizer $sampler = null;
 
     private ?FFI $library = null;
 
     private bool $resolved = false;
 
-    public function __construct(private readonly ?string $libraryPath = null)
-    {
-        // Seeded here, with the service, so a process's first range does not pay for it.
-        self::$sampler ??= new Randomizer(new Xoshiro256StarStar);
-    }
+    public function __construct(private readonly ?string $libraryPath = null) {}
 
-    /** Whether a verified native library backs this instance. */
+    /** Whether a verified native library backs this instance (loading it on first call). */
     public function available(): bool
     {
         return $this->library() !== null;
     }
 
+    /** Whether the library is already loaded and verified, without loading it. */
+    public function loaded(): bool
+    {
+        return $this->library !== null;
+    }
+
+    /** Whether loading was tried and failed, so only PHP remains. */
+    public function unavailable(): bool
+    {
+        return $this->resolved && $this->library === null;
+    }
+
     /**
-     * Article numbers the PHP rule would mark, or null to keep the PHP result. These ranges stay
-     * on PHP:
-     * - under MIN_HEADERS, where Rust's margin is too small to establish;
-     * - before the library is loaded, where the predicted saving is under FIRST_LOAD_SAVING_NS;
-     * - where a spread sample, priced with COSTS, predicts under 2x: the PHP rule rejects
-     *   subjects without a part count faster than they can be handed to Rust;
-     * - with any subject over MAX_SUBJECT_LENGTH, which Rust would decline.
+     * Article numbers the PHP rule would mark, or null to keep the PHP result: the range is routed
+     * with HeaderParser::worthNativeMarking() first, and stays on PHP once loading has failed.
      *
      * @param  array<int, array<string, mixed>>  $headers
      * @return list<int>|null
      */
     public function mark(array $headers, int $minArticles): ?array
     {
-        return $this->worthMarshalling($headers) ? $this->markWithoutSampling($headers, $minArticles) : null;
+        return ! $this->unavailable() && HeaderParser::worthNativeMarking($headers, $this->loaded())
+            ? $this->markWithoutSampling($headers, $minArticles) : null;
     }
 
     /**
@@ -110,90 +74,6 @@ final class NativePerArticleObfuscation
         $library = $this->library();
 
         return $library === null ? null : self::call($library, $headers, $minArticles);
-    }
-
-    /** @param  array<int, array<string, mixed>>  $headers */
-    private function worthMarshalling(array $headers): bool
-    {
-        // A library that failed to load or probe leaves only PHP; sampling it would be wasted.
-        if (count($headers) < self::MIN_HEADERS || ($this->resolved && $this->library === null)) {
-            return false;
-        }
-        $values = array_is_list($headers) ? $headers : array_values($headers);
-        $count = count($values);
-        // One random header from each of $samples equal slices, so no periodic ordering of the
-        // range decides the prediction.
-        $samples = min(self::SAMPLE_MAX, max(self::SAMPLE_MIN, intdiv($count, 128)));
-        $random = self::$sampler ??= new Randomizer(new Xoshiro256StarStar);
-        $php = $rust = 0;
-        for ($slice = 0; $slice < $samples; $slice++) {
-            $start = intdiv($slice * $count, $samples);
-            $index = $random->getInt($start, max($start, intdiv(($slice + 1) * $count, $samples) - 1));
-            $subject = $values[$index]['Subject'] ?? null;
-            $bytes = is_string($subject) ? strlen($subject) : 0;
-            [$phpBase, $phpPerByte, $rustBase, $rustPerByte] = self::COSTS[self::classify($subject)];
-            $php += $phpBase + intdiv($phpPerByte * $bytes, 10);
-            $rust += $rustBase + intdiv($rustPerByte * $bytes, 10);
-        }
-        if ($php * 100 < $rust * self::PREDICTED_SPEEDUP_PERCENT) {
-            return false;
-        }
-        // Before this process has loaded the library, the predicted saving must also pay for
-        // loading it and running its probe.
-        if (! $this->resolved && intdiv(($php - $rust) * $count, $samples) < self::FIRST_LOAD_SAVING_NS) {
-            return false;
-        }
-        // A subject Rust would decline sends the range to PHP before any packing.
-        $subjects = array_filter(array_column($values, 'Subject'), is_string(...));
-
-        return $subjects === [] || max(array_map(strlen(...), $subjects)) <= self::MAX_SUBJECT_LENGTH;
-    }
-
-    /**
-     * 0: no part count; 1: a part count only; 2: a candidate as the PHP rule sees it, a first
-     * whitespace-led `(n/total)` with total of at least 2 and a 16+ alphanumeric token before it.
-     * String scans rather than regexes, so a fresh process does not pay to compile patterns, and
-     * linear in the subject length.
-     */
-    private static function classify(mixed $subject): int
-    {
-        if (! is_string($subject)) {
-            return 0;
-        }
-        for ($open = strpos($subject, '('); $open !== false; $open = strpos($subject, '(', $open + 1)) {
-            if ($open === 0 || strspn($subject, self::WHITESPACE, $open - 1, 1) === 0) {
-                continue;
-            }
-            $part = strspn($subject, self::DIGITS, $open + 1);
-            $totalAt = $open + 2 + $part;
-            if ($part === 0 || ($subject[$totalAt - 1] ?? '') !== '/') {
-                continue;
-            }
-            $total = strspn($subject, self::DIGITS, $totalAt);
-            if ($total === 0 || ($subject[$totalAt + $total] ?? '') !== ')') {
-                continue;
-            }
-
-            return (int) substr($subject, $totalAt, $total) >= 2 && self::hasToken($subject, $open) ? 2 : 1;
-        }
-
-        return 0;
-    }
-
-    /** Whether `$subject` holds a run of 16+ ASCII alphanumerics before byte `$end`. */
-    private static function hasToken(string $subject, int $end): bool
-    {
-        $at = strcspn($subject, self::ALNUM, 0, $end);
-        while ($at < $end) {
-            $run = strspn($subject, self::ALNUM, $at, $end - $at);
-            if ($run >= 16) {
-                return true;
-            }
-            $at += $run;
-            $at += strcspn($subject, self::ALNUM, $at, $end - $at);
-        }
-
-        return false;
     }
 
     private function library(): ?FFI
