@@ -36,7 +36,7 @@ final class HeaderParser
      * Mirrors NativePerArticleObfuscation::MIN_HEADERS. Smaller ranges stay on PHP without loading
      * the router or the wrapper class (each costs a compile per process without opcache).
      */
-    public const int NATIVE_MIN_HEADERS = 8000;
+    public const int NATIVE_MIN_HEADERS = 16000;
 
     /** Rust port of markPerArticleObfuscated(); false keeps the PHP rule only, null builds it on first need. */
     private NativePerArticleObfuscation|false|null $native;
