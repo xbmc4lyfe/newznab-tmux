@@ -6,6 +6,7 @@ namespace Tests\Unit;
 
 use App\Services\Binaries\HeaderParser;
 use App\Services\Binaries\NativePerArticleObfuscation;
+use App\Services\Binaries\PerArticleObfuscationGate;
 use App\Services\Binaries\PerArticleObfuscationRouter;
 use App\Services\BlacklistService;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -201,6 +202,25 @@ final class PerArticleObfuscationNativeTest extends TestCase
         $parser->markPerArticleObfuscated($headers, 16);
         self::assertSame(spl_object_id($wrapper), spl_object_id($wrapperOf($parser)));
         self::assertCount(count($numbers), $parser->perArticleObfuscatedNumbers());
+    }
+
+    public function test_the_gate_samples_strictly_alternating_ranges_in_every_phase(): void
+    {
+        // Obfuscated posts on even positions, plain text on odd ones: fixed probes on odd positions
+        // would keep this range on PHP every time.
+        $obfuscated = PerArticleObfuscationCorpus::stratum('boneless', 2, 10000);
+        $text = PerArticleObfuscationCorpus::stratum('non-yenc', 2, 10000);
+        $headers = [];
+        for ($i = 0; $i < 10000; $i++) {
+            $headers[] = $obfuscated[$i];
+            $headers[] = $text[$i];
+        }
+        $passes = 0;
+        $check = new \ReflectionMethod(PerArticleObfuscationGate::class, 'mayCarryPartCounts');
+        for ($round = 0; $round < 20; $round++) {
+            $passes += $check->invoke(null, $headers) ? 1 : 0;
+        }
+        self::assertGreaterThan(15, $passes);
     }
 
     /** @return iterable<string, array{string, int}> */
