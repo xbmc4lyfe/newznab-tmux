@@ -14,6 +14,8 @@ final class CandidateSampleBatch
     /** @var array<int, object> */
     private array $pending = [];
 
+    private int $admitted = 0;
+
     /** @param array<string, mixed> $options */
     public function __construct(private readonly CandidateRepository $repository, private readonly ManifestStore $store,
         private readonly VerificationWorkerLocks $locks, private readonly NntpArticleSource $source,
@@ -22,6 +24,11 @@ final class CandidateSampleBatch
     public function hasPending(): bool
     {
         return $this->pending !== [];
+    }
+
+    public function limitReached(int $maximumClaims): bool
+    {
+        return $this->admitted >= $maximumClaims;
     }
 
     /** Renew queued work as well as the candidate currently being verified by the caller. */
@@ -44,10 +51,14 @@ final class CandidateSampleBatch
     }
 
     /** @param callable(): bool $mayClaim */
-    public function next(int $remaining, callable $mayClaim): ?object
+    public function next(int $maximumClaims, callable $mayClaim): ?object
     {
         $this->heartbeat();
         if ($this->pending === []) {
+            $remaining = $maximumClaims - $this->admitted;
+            if ($remaining < 1) {
+                return null;
+            }
             $articles = max(1, min(16, (int) ($this->options['spot_check_articles'] ?? 1)));
             $limit = min(max(1, $remaining), max(1, min(16, (int) ($this->options['sample_batch_size'] ?? 1))),
                 max(1, intdiv($this->source->batchSize(), $articles)));
@@ -65,6 +76,7 @@ final class CandidateSampleBatch
                 if ($claim === null) {
                     break;
                 }
+                $this->admitted++;
                 $this->diagnostics?->claimed();
                 $this->pending[(int) $claim->id] = $claim;
             }

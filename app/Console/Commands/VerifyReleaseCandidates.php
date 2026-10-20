@@ -136,10 +136,10 @@ class VerifyReleaseCandidates extends Command
                     $diagnostics?->stop('draining', hrtime(true));
                     break;
                 }
-                $claim = $batch->next(max(1, (int) $this->option('limit')) - $index,
+                $claim = $batch->next(max(1, (int) $this->option('limit')),
                     static fn (): bool => $locks->admitting() && ($maxSeconds === 0 || (hrtime(true) - $runStarted) / 1e9 < $maxSeconds));
                 if ($claim === null) {
-                    $diagnostics?->stop('no_claim', hrtime(true));
+                    $diagnostics?->stop($batch->limitReached(max(1, (int) $this->option('limit'))) ? 'limit' : 'no_claim', hrtime(true));
                     break;
                 }
                 $directory = $root.'/scratch/'.$claim->id.'-'.$claim->version;

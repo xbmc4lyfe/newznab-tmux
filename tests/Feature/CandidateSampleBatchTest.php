@@ -88,7 +88,7 @@ class CandidateSampleBatchTest extends ReleaseVerificationCandidatesTest
         $batch = new CandidateSampleBatch($repository, app(ManifestStore::class), $locks,
             new NntpArticleSource($nntp, maximumBytes: 1024, allowAlternateFallback: false), (array) config('release_verification'));
         try {
-            $first = $batch->next(4, static fn (): bool => true);
+            $first = $batch->next(3, static fn (): bool => true);
             $this->assertSame('a', $first->identity);
             $this->assertSame(3, DB::table('release_verification_candidates')->where('status', 'verifying')->count());
             $lost = DB::table('release_verification_candidates')->where('identity', 'b')->first();
@@ -96,7 +96,7 @@ class CandidateSampleBatchTest extends ReleaseVerificationCandidatesTest
             $batch->heartbeat();
             $this->assertFalse($locks->protects((int) $lost->id));
             $this->assertSame('c', $batch->next(3, static fn (): bool => false)->identity);
-            $this->assertNull($batch->next(2, static fn (): bool => false));
+            $this->assertNull($batch->next(3, static fn (): bool => true));
             $this->assertSame('ready', DB::table('release_verification_candidates')->where('identity', 'd')->value('status'));
         } finally {
             $locks->close();
