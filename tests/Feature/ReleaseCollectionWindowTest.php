@@ -850,6 +850,23 @@ class ReleaseCollectionWindowTest extends TestCase
         $this->assertNull(Cache::get('cbp:retention-band:cursor'));
     }
 
+    public function test_retention_uses_added_for_legacy_collections_without_dateadded(): void
+    {
+        ConfigurationTestBuilder::update(ConfigurationDomain::Ingestion, ['part_retention_hours' => 24]);
+        foreach ([1 => 60, 2 => 30, 3 => 1] as $id => $hours) {
+            $this->insertCollection($id);
+            DB::table('collections')->where('id', $id)->update([
+                'filecheck' => 16, 'dateadded' => null, 'added' => now()->subHours($hours),
+            ]);
+            DB::table('parts')->insert(['binaries_id' => $id, 'size' => 5000]);
+        }
+        $this->service(new WindowTestReleaseCreationService)->deleteCollections(1);
+
+        $this->assertSame([2, 3], DB::table('collections')->orderBy('id')->pluck('id')->all());
+        $this->assertSame([2, 3], DB::table('binaries')->orderBy('id')->pluck('id')->all());
+        $this->assertSame([2, 3], DB::table('parts')->orderBy('binaries_id')->pluck('binaries_id')->all());
+    }
+
     public function test_retention_band_walk_stops_at_its_page_cap_and_resumes_from_its_cursor(): void
     {
         ConfigurationTestBuilder::update(ConfigurationDomain::Ingestion, ['part_retention_hours' => 24]);

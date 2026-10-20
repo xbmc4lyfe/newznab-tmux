@@ -118,7 +118,8 @@ class CollectionCleanupService
             $readyCutoff = now()->subHours(2 * $retentionHours);
             do {
                 $ids = DB::table('collections')
-                    ->where('dateadded', '<', $readyCutoff)
+                    ->where(static fn ($age) => $age->where('dateadded', '<', $readyCutoff)
+                        ->orWhere(static fn ($legacy) => $legacy->whereNull('dateadded')->where('added', '<', $readyCutoff)))
                     ->orderBy('id')
                     ->limit($this->sqlChunkSize())
                     ->pluck('id')
