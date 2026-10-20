@@ -3774,6 +3774,16 @@ SH);
         $this->assertStringContainsString('names proxy, which is not a data service', $plan->getErrorOutput());
     }
 
+    public function test_an_escaped_quote_never_hides_the_database_settings_after_it(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        // `"p\"w"` is one closed value: DB_DATABASE after it still selects the schema.
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=192.0.2.10\nDB_PASSWORD=\"p\\\"w\"\nDB_DATABASE=nntmux\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=192.0.2.10\nDB_PASSWORD=\"p\\\"w\"\nDB_DATABASE=nntmux_restore\n");
+        $this->assertStringContainsString('Run Migrations  : yes', $this->make(['deploy-plan'])->mustRun()->getOutput());
+    }
+
     public function test_a_rendered_db_url_spelled_differently_is_the_same_database(): void
     {
         $json = json_decode($this->composeJson(), true);

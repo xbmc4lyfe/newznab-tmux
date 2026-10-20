@@ -602,6 +602,21 @@ def service_bind_records(svc_cfg: object, project_dir: Path) -> list[str]:
     return records
 
 
+def closing_quote(value: str) -> int:
+    """The index of the unescaped quote closing a value that opens with one, else -1."""
+    if value[:1] not in ("'", '"'):
+        return -1
+    position = 1
+    while position < len(value):
+        if value[position] == "\\":
+            position += 2
+            continue
+        if value[position] == value[0]:
+            return position
+        position += 1
+    return -1
+
+
 def read_dotenv(path: Path, interpolated: set[str] | None = None, multiline: set[str] | None = None) -> dict[str, str]:
     """The keys of a Compose .env file (same rules as bin/compose); last assignment wins. Keys whose
     last value Compose would interpolate (unquoted or double-quoted, containing `$`) are added to
@@ -621,7 +636,10 @@ def read_dotenv(path: Path, interpolated: set[str] | None = None, multiline: set
         m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", raw)
         if m:
             value = m.group(2)
-            quoted = re.match(r"""^(["'])((?:(?!\1).)*)\1\s*(?:#.*)?$""", value)
+            # Escape-aware, as Compose and phpdotenv read it: `"p\"w"` is one closed value.
+            end = closing_quote(value)
+            closed = end > 0 and re.match(r"^\s*(?:#.*)?$", value[end + 1:])
+            quoted = re.match(r"""^(["'])(.*)\1$""", value[:end + 1], re.S) if closed else None
             values[m.group(1)] = quoted.group(2) if quoted else re.sub(r"\s#.*$", "", value).strip()
             if quoted and quoted.group(1) == '"':
                 # Compose and phpdotenv decode escapes inside double quotes only: `"a\nb"` installs a
@@ -629,11 +647,12 @@ def read_dotenv(path: Path, interpolated: set[str] | None = None, multiline: set
                 values[m.group(1)] = re.sub(r"\\([nrt\\\"$])", lambda e: {"n": "\n", "r": "\r", "t": "\t"}.get(e.group(1), e.group(1)), values[m.group(1)])
             # An opening quote with no closing one starts a multi-line value, which this line-based
             # parser cannot read whole.
-            spans_lines = not quoted and value[:1] in ("'", '"')
+            # An opening quote with no unescaped closing one on its line starts a multi-line value.
+            spans_lines = value[:1] in ("'", '"') and end < 0
             if spans_lines:
                 # Its continuation lines belong to it (phpdotenv and Compose read up to the closing
                 # quote): never assignments of their own, e.g. a `DB_HOST=` line inside a note.
-                while index < len(lines) and not re.search(rf"(?<!\\){re.escape(value[0])}", lines[index]):
+                while index < len(lines) and closing_quote(value[0] + lines[index]) < 0:
                     index += 1
                 index += 1
             if multiline is not None:
