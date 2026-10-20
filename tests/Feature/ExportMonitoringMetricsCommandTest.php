@@ -130,7 +130,19 @@ class ExportMonitoringMetricsCommandTest extends TestCase
         Http::assertNothingSent();
 
         $this->travel(1)->minutes();
-        $this->assertTrue($event->filtersPass($this->app));
+        $store = app('cache')->store()->getStore();
+        $this->assertTrue($event->filtersPass($this->app), json_encode([
+            'store' => $store::class,
+            'default' => config('cache.default'),
+            'monitoring' => config('monitoring.enabled'),
+            'now' => now()->format('Y-m-d H:i:s.u'),
+            'mutex' => $event->mutex::class,
+            'mutex_store' => (fn () => $this->store ?? null)->call($event->mutex),
+            'lock' => property_exists($store, 'locks') ? array_map(static fn ($l) => [$l['owner'] ?? null, isset($l['expiresAt']) ? $l['expiresAt']->format('Y-m-d H:i:s.u') : null], $store->locks) : null,
+            'filters' => count((fn () => $this->filters)->call($event)),
+            'rejects' => count((fn () => $this->rejects)->call($event)),
+            'events' => array_values(array_filter(array_map(static fn ($e) => is_string($e->command) && str_contains($e->command, 'export-metrics') ? $e->command : null, app(\Illuminate\Console\Scheduling\Schedule::class)->events()))),
+        ]));
         $this->assertFalse($event->mutex->exists($event));
         $this->artisan('monitoring:export-metrics')->assertSuccessful();
 
