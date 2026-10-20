@@ -290,13 +290,13 @@ function perArticleColdChild(string $name, string $side, string $library, int $s
     {
         public function __construct() {}
     }, false);
-    // As HeaderParser does: route first, then build the wrapper only for a range routed to Rust,
+    // As HeaderParser does: the size check inline, then routing, then the wrapper only for a range routed to Rust,
     // inside the timed call. Routing, construction (class load), library load and probe all count;
     // a range kept on PHP pays only the routing sample.
     $start = hrtime(true);
     $construct = 0;
     $marked = null;
-    if ($side === 'rust' && PerArticleObfuscationGate::worthNativeMarking($headers, false)) {
+    if ($side === 'rust' && count($headers) >= HeaderParser::NATIVE_MIN_HEADERS && PerArticleObfuscationGate::worthNativeMarking($headers, false)) {
         $built = hrtime(true);
         $native = new NativePerArticleObfuscation($library);
         $construct = hrtime(true) - $built;
