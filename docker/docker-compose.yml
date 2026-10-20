@@ -224,6 +224,7 @@ services:
       - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
     volumes:
       - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../docker/monitoring/prometheus/rules:/etc/prometheus/rules:ro
       - ./data/prometheus:/prometheus
     networks: [nntmux]
     mem_limit: 512m
