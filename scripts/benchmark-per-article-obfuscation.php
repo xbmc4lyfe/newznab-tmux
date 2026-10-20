@@ -221,7 +221,9 @@ function perArticleBenchmarkMain(): int
                 $result = json_decode((string) $output, true, 4, JSON_THROW_ON_ERROR);
                 $cold[$side][] = (int) $result['ns'];
                 $rustRuns += $side === 'rust' && $result['rust'] === true ? 1 : 0;
-                $constructions[] = (int) $result['construct_ns'];
+                if ((int) $result['construct_ns'] > 0) {
+                    $constructions[] = (int) $result['construct_ns'];
+                }
             }
         }
         // The side most of this stratum's cold runs took decides its gate, so one run the sampler
@@ -259,7 +261,7 @@ function perArticleBenchmarkMain(): int
     $markdown .= "\nStatus: **{$report['status']}** (threshold ".PER_ARTICLE_THRESHOLD."x; {$repeats} paired samples per stratum, ".PER_ARTICLE_TAIL_SAMPLES." for uncommon strata; Rust strata need the 95% lower bound at the threshold).\n";
     $markdown .= "\nUncommon p99 with start-up included (warm Rust p99 plus the p99 of construction, library load and probe over "
         .PER_ARTICLE_STARTUP_RUNS.' fresh processes: median '.$report['startup']['median_ms'].' ms, p99 '.$report['startup']['p99_ms']." ms):\n\n".$boundMarkdown;
-    $markdown .= "\nCold first call per fresh process (median of ".PER_ARTICLE_COLD_RUNS.' runs, '.PER_ARTICLE_COLD_RUNS_ROUTED.' for routed strata; same thresholds; the side most runs took sets the gate). The one-time wrapper construction with the service is measured separately and not added: median '.$report['cold_construct_median_ms'].' ms, p90 '.$report['cold_construct_p90_ms']." ms per process.\n\n".$coldMarkdown;
+    $markdown .= "\nCold first call per fresh process (median of ".PER_ARTICLE_COLD_RUNS.' runs, '.PER_ARTICLE_COLD_RUNS_ROUTED.' for routed strata; same thresholds; the side most runs took sets the gate). Each Rust-path row includes building the wrapper on the first eligible range (median '.$report['cold_construct_median_ms'].' ms, p90 '.$report['cold_construct_p90_ms']." ms of it), loading the library and its probe.\n\n".$coldMarkdown;
     file_put_contents($directory.'/report.json', json_encode($report, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR));
     file_put_contents($directory.'/summary.md', $markdown);
     echo $markdown;
@@ -287,14 +289,17 @@ function perArticleColdChild(string $name, string $side, string $library, int $s
     {
         public function __construct() {}
     }, false);
-    // The wrapper is built before timing, as HeaderParser builds it once with the service: that
-    // one-time class load and sampler seeding is timed separately (construct_ns) and reported, not
-    // added to the first call. Loading the library and its probe fall inside the timed first call.
-    $constructStart = hrtime(true);
-    $native = new NativePerArticleObfuscation($library);
-    $construct = hrtime(true) - $constructStart;
+    // As HeaderParser does, the wrapper is built on the first range of NATIVE_MIN_HEADERS or more,
+    // inside the timed call: construction (class load, sampler seeding), library load and probe
+    // all count. Smaller ranges never build it.
     $start = hrtime(true);
-    $marked = $side === 'rust' ? $native->mark($headers, PER_ARTICLE_MIN_ARTICLES) : null;
+    $construct = 0;
+    $marked = null;
+    if ($side === 'rust' && count($headers) >= HeaderParser::NATIVE_MIN_HEADERS) {
+        $native = new NativePerArticleObfuscation($library);
+        $construct = hrtime(true) - $start;
+        $marked = $native->mark($headers, PER_ARTICLE_MIN_ARTICLES);
+    }
     // The set HeaderParser::parse() consults, built on either side.
     $set = $marked === null
         ? ($parser->markPerArticleObfuscated($headers, PER_ARTICLE_MIN_ARTICLES) >= 0 ? array_flip($parser->perArticleObfuscatedNumbers()) : [])

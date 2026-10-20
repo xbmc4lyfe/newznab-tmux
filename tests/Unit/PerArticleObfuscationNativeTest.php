@@ -45,6 +45,11 @@ final class PerArticleObfuscationNativeTest extends TestCase
         return $numbers;
     }
 
+    public function test_header_parser_size_floor_mirrors_the_native_one(): void
+    {
+        self::assertSame(NativePerArticleObfuscation::MIN_HEADERS, HeaderParser::NATIVE_MIN_HEADERS);
+    }
+
     public function test_corpus_is_deterministic_and_exercises_marking(): void
     {
         self::assertSame(PerArticleObfuscationCorpus::stratum('mixed', 7, 2000), PerArticleObfuscationCorpus::stratum('mixed', 7, 2000));
@@ -60,7 +65,7 @@ final class PerArticleObfuscationNativeTest extends TestCase
         if (getenv('NNTMUX_TEST_NATIVE_LIBRARY') === false || ! $native->available()) {
             self::markTestSkipped('Needs a Linux CLI with FFI and NNTMUX_TEST_NATIVE_LIBRARY.');
         }
-        $headers = PerArticleObfuscationCorpus::stratum('mixed', 11, 4000);
+        $headers = PerArticleObfuscationCorpus::stratum('mixed', 11, 2 * HeaderParser::NATIVE_MIN_HEADERS);
         $parser = new HeaderParser(new class extends BlacklistService
         {
             public function __construct() {}

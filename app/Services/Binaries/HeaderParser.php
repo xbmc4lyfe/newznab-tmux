@@ -32,13 +32,19 @@ final class HeaderParser
     /** @var array<int, true> Article numbers whose subject is randomised per article. */
     private array $perArticleObfuscated = [];
 
-    /** Rust port of markPerArticleObfuscated(); false keeps the PHP rule only. */
-    private NativePerArticleObfuscation|false $native;
+    /**
+     * Mirrors NativePerArticleObfuscation::MIN_HEADERS, so smaller ranges never load that class
+     * (about 0.3 ms per process without opcache).
+     */
+    public const int NATIVE_MIN_HEADERS = 8000;
+
+    /** Rust port of markPerArticleObfuscated(); false keeps the PHP rule only, null builds it on first need. */
+    private NativePerArticleObfuscation|false|null $native;
 
     public function __construct(?BlacklistService $blacklistService = null, NativePerArticleObfuscation|false|null $native = null)
     {
         $this->blacklistService = $blacklistService ?? new BlacklistService;
-        $this->native = $native ?? new NativePerArticleObfuscation;
+        $this->native = $native;
     }
 
     /**
@@ -77,7 +83,11 @@ final class HeaderParser
         }
         // The Rust port marks the same articles about 1.7-3.6x faster on ranges it is routed to (scripts/benchmark-per-article-obfuscation.php);
         // null means it is unavailable or declined, and the PHP rule below decides.
-        $marked = $this->native === false ? null : $this->native->mark($headers, $minArticles);
+        $marked = null;
+        if ($this->native !== false && \count($headers) >= self::NATIVE_MIN_HEADERS) {
+            $this->native ??= new NativePerArticleObfuscation;
+            $marked = $this->native->mark($headers, $minArticles);
+        }
         if ($marked !== null) {
             $this->perArticleObfuscated = array_fill_keys($marked, true);
 
