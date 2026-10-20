@@ -72,7 +72,7 @@ final class VerificationRunDiagnosticsTest extends TestCase
         $report = $diagnostics->report(2_000_000_000);
 
         self::assertSame(1, $report['publish_returned']);
-        self::assertSame(3, $report['schema_version']);
+        self::assertSame(4, $report['schema_version']);
         self::assertSame(2, $report['handed_off']);
         self::assertSame(1, $report['outbox_fallbacks']);
         self::assertSame(250.0, $report['outbox_wait_ms']);
@@ -83,13 +83,34 @@ final class VerificationRunDiagnosticsTest extends TestCase
         self::assertFalse($report['deadline_reached_at_stop']);
         self::assertStringNotContainsString('private', json_encode($report, JSON_THROW_ON_ERROR));
         self::assertSame(['schema_version', 'started_at', 'requested_slot', 'limit', 'max_seconds',
-            'worker_acquired', 'loop_started', 'claim_calls', 'claims_admitted', 'stop_reason',
+            'worker_acquired', 'loop_started', 'claim_calls', 'claims_admitted', 'queued_returned', 'queued_lost', 'queued_return_failed', 'stop_reason',
             'limit_reached', 'deadline_reached_at_stop', 'verifier_verdicts', 'publish_returned',
             'handed_off', 'outbox_fallbacks', 'outbox_wait_ms', 'finish_returned', 'filtered_recoveries', 'candidate_errors', 'fatal_error',
             'command_result', 'exit_code', 'maintenance_state', 'durations_ms', 'phases'], array_keys($report));
         array_walk_recursive($report, static function (mixed $value): void {
             self::assertTrue($value === null || is_scalar($value));
         });
+    }
+
+    public function test_queued_claim_outcomes_reconcile_admission_without_changing_the_admission_limit(): void
+    {
+        $diagnostics = new VerificationRunDiagnostics(0, '2026-10-20T10:00:00Z', 4, 1, 1);
+        for ($index = 0; $index < 4; $index++) {
+            $diagnostics->claimed();
+        }
+        $diagnostics->verified('sampled');
+        $diagnostics->queuedReturned();
+        $diagnostics->queuedLost();
+        $diagnostics->queuedReturnFailed();
+        $diagnostics->stop('deadline', 2_000_000_000);
+        $report = $diagnostics->report(3_000_000_000);
+        self::assertSame(1, $report['queued_returned']);
+        self::assertSame(1, $report['queued_lost']);
+        self::assertSame(1, $report['queued_return_failed']);
+        self::assertSame($report['claims_admitted'], array_sum($report['verifier_verdicts'])
+            + $report['queued_returned'] + $report['queued_lost'] + $report['queued_return_failed']);
+        self::assertTrue($report['limit_reached'], 'The limit bounds admissions, including returned work.');
+        self::assertSame('deadline', $report['stop_reason']);
     }
 
     public function test_phase_timings_accumulate_only_known_phases(): void
@@ -102,7 +123,7 @@ final class VerificationRunDiagnosticsTest extends TestCase
 
         $phases = $diagnostics->report(hrtime(true))['phases'];
 
-        self::assertSame(['claim', 'bookkeeping', 'manifest_read', 'verify_passed', 'verify_other', 'publish', 'finish', 'status_write'], array_keys($phases));
+        self::assertSame(['claim', 'prefetch', 'bookkeeping', 'manifest_read', 'verify_passed', 'verify_other', 'publish', 'finish', 'status_write'], array_keys($phases));
         self::assertSame(2, $phases['claim']['count']);
         self::assertGreaterThanOrEqual(3.0, $phases['claim']['ms']);
         self::assertSame(['ms' => 0.0, 'count' => 0], $phases['finish']);

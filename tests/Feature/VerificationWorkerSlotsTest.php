@@ -27,6 +27,28 @@ class VerificationWorkerSlotsTest extends TestCase
         parent::tearDown();
     }
 
+    public function test_a_bounded_batch_keeps_other_candidate_locks_when_one_is_released(): void
+    {
+        $worker = new VerificationWorkerLocks;
+        $other = new VerificationWorkerLocks;
+        try {
+            $this->assertTrue($worker->start(1));
+            $this->assertTrue($other->start(2));
+            $this->assertTrue($worker->tryCandidate(101));
+            $this->assertTrue($worker->tryCandidate(102));
+            $this->assertFalse($other->tryCandidate(102));
+            $worker->releaseCandidate(101);
+            $this->assertFalse($worker->protects(101));
+            $this->assertTrue($worker->protects(102));
+            $this->assertTrue($other->tryCandidate(101));
+            $worker->close();
+            $this->assertTrue($other->tryCandidate(102));
+        } finally {
+            $worker->close();
+            $other->close();
+        }
+    }
+
     public function test_configured_slots_are_honoured_beyond_eight_up_to_the_ceiling(): void
     {
         foreach ([[0, 1], [2, 2], [24, 24], [64, 64], [500, VerificationWorkerLocks::MAX_SLOTS]] as [$configured, $expected]) {

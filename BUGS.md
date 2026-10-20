@@ -510,6 +510,22 @@ These bugs turned up while building and running the self-hosted stack in `docker
     - A real upload in an obfuscated group whose only article in the range is a middle part (uploads posted over several connections arrive out of order).
     - One uploader posting 16 or more files with their own random names at staggered offsets when the range holds exactly one article from each file.
 
+### 66. Prefetched verification bodies bypass the remaining transfer limit (Fixed)
+
+- **Where:** `NntpArticleSource::fetchFromProviders()` returned a cached body without checking the smaller limit supplied by `fetchBounded()`.
+- **Effect:** a prefetched article could exceed the caller's remaining transfer budget. The verifier's later byte check still prevented publication, but the bounded source contract differed between cached and direct reads.
+- **Fix:** cached reads enforce the same limit and throw `ArticleBudgetExceeded`. Batch framing preserves that type only for the offending oversized article; unread later responses remain retryable transport failures. A damaged prefetch reconnects before subsequent STAT requests. Socket regressions exercise native and Rust framing.
+- **Batch review fixes:** caches are scoped to one batch; returned and lost queued claims have separate diagnostics; unstarted leases return on deadline, drain or failure; rolled-back claims release their mutexes. Transport failures retain correlated outcomes, and unread responses retry once through the native identity-checked parser even when the Rust helper crashes. Ownership failures abort rather than retry. Publication progress renews queued leases; renewal errors outside a transaction return only the affected queued claim, while errors inside publication still abort the transaction.
+- **Crash/publication recovery:** a Rust framing failure fences only the response being processed; unread requests on other sockets remain retryable. Synchronous remote publication renews queued claims separately from the active row held by the primary, and a lost response recovers success only for the exact committed generation before normal status output and scratch cleanup.
+- **Connection fixture correction:** persistent-session and partial-audit mocks now report `isConnected()` explicitly. The full CI suite exposed four failures because those healthy-transport fixtures rejected the new health probe before their second article; all four reproduce locally and pass with the fixture contract restored.
+- **Rust experiment:** bounded cross-candidate sample batches, optional full-manifest STAT, and a Rust framing subprocess are available for validation. Batch size defaults to one and the Rust executable path defaults empty. A paired 20-observation caller screen found median times of 36.83/16.36/19.31 ms (sequential/PHP batch/Rust batch, 32 KiB bodies) and 189.96/156.20/185.56 ms (500 KiB bodies). This synthetic socket screen does not qualify p99 or TCP/TLS performance; Rust remains disabled because the required speedups were not established. The native implementation remains available.
+
+### 67. Docker CI jobs can land on workers without a Docker daemon (Fixed)
+
+- **Where:** the PHP and release-presentation workflows used `ubuntu-latest`, also advertised by repository self-hosted workers.
+- **Effect:** PHP service-container setup and presentation web-container qualification failed before their intended checks because `/var/run/docker.sock` did not exist.
+- **Fix:** select the explicit `ubuntu-24.04` hosted image for these two Docker-dependent jobs. The inspected self-hosted inventory does not advertise that label; validation and benchmark gates remain unchanged. The paired x86 decoder job accepts an optional administrator-configured disposable VBMI2 runner label while retaining its measured kernel and speedup requirements.
+
 ## Issues in the docker/ stack itself (all fixed)
 
 | Issue | Fix |

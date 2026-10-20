@@ -7,6 +7,7 @@ namespace App\Console\Commands;
 use App\Services\NNTP\NNTPService;
 use App\Services\Releases\Verification\AuditReleaseDeletion;
 use App\Services\Releases\Verification\CandidateRepository;
+use App\Services\Releases\Verification\CandidateSampleBatch;
 use App\Services\Releases\Verification\LeaseHeartbeat;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\NntpArticleSource;
@@ -117,6 +118,11 @@ class VerifyReleaseCandidates extends Command
             $runStarted = hrtime(true);
             $diagnostics?->loopStarted($runStarted);
             $maxSeconds = max(0, (int) $this->option('max-seconds'));
+            $verificationOptions = (array) config('release_verification');
+            $source = new NntpArticleSource(app(NNTPService::class), decoder: $decoder,
+                maximumBytes: max(0, min(1048576, (int) $verificationOptions['spot_check_bytes'], (int) $verificationOptions['spot_check_article_bytes'])),
+                allowAlternateFallback: false);
+            $batch = new CandidateSampleBatch($repository, $store, $locks, $source, $verificationOptions, $diagnostics);
             for ($index = 0; $index < max(1, (int) $this->option('limit')); $index++) {
                 if ($index > 0 && $maxSeconds > 0 && (hrtime(true) - $runStarted) / 1e9 >= $maxSeconds) {
                     $diagnostics?->stop('deadline', hrtime(true));
@@ -130,37 +136,31 @@ class VerifyReleaseCandidates extends Command
                     $diagnostics?->stop('draining', hrtime(true));
                     break;
                 }
-                $phase = $diagnostics === null ? null : hrtime(true);
-                try {
-                    $preferReady = $locks->preferReady();
-                    $diagnostics?->claimCalled();
-                    $claim = $repository->claim(fn (int $id): bool => $locks->tryCandidate($id), $preferReady);
-                } finally {
-                    // Also on a throwing claim, which the outer handler reports as fatal.
-                    $diagnostics?->phase('claim', $phase);
-                }
+                $claim = $batch->next(max(1, (int) $this->option('limit')),
+                    static fn (): bool => $locks->admitting() && ($maxSeconds === 0 || (hrtime(true) - $runStarted) / 1e9 < $maxSeconds));
                 if ($claim === null) {
-                    $diagnostics?->stop('no_claim', hrtime(true));
+                    $reason = ! $locks->admitting() ? 'draining'
+                        : ($maxSeconds > 0 && (hrtime(true) - $runStarted) / 1e9 >= $maxSeconds ? 'deadline'
+                            : ($batch->limitReached(max(1, (int) $this->option('limit'))) ? 'limit' : 'no_claim'));
+                    $diagnostics?->stop($reason, hrtime(true));
                     break;
                 }
-                $diagnostics?->claimed();
                 $directory = $root.'/scratch/'.$claim->id.'-'.$claim->version;
                 // The phase charged if an operation throws.
                 $active = 'bookkeeping';
                 // Once true, the forwarder owns the live lease: nothing after that may finish the candidate.
                 $handedOff = false;
+                $phase = $diagnostics === null ? null : hrtime(true);
                 try {
-                    $phase = $diagnostics === null ? null : hrtime(true);
-                    $heartbeat = static fn () => $repository->heartbeat((int) $claim->id, $claim->lease_token);
+                    $heartbeat = static function () use ($repository, $claim, $batch): void {
+                        $batch->pulse();
+                        $repository->heartbeat((int) $claim->id, $claim->lease_token);
+                    };
                     $heartbeat();
                     $progressHeartbeat = new LeaseHeartbeat($heartbeat, max(0.1, min(30, (int) config('release_verification.lease_seconds') / 3)));
                     $scratchInventory->register((int) $claim->id, (int) $claim->version);
                     $scratchEntryId = $scratchInventory->entryId((int) $claim->id, (int) $claim->version);
                     $scratchBudget->reconcile($scratchEntryId, $locks, $progressHeartbeat);
-                    $verificationOptions = (array) config('release_verification');
-                    $source ??= new NntpArticleSource(app(NNTPService::class), decoder: $decoder,
-                        maximumBytes: min((int) $verificationOptions['spot_check_bytes'], (int) $verificationOptions['spot_check_article_bytes']),
-                        allowAlternateFallback: false);
                     $verifier = new SpotCheckVerifier($source, $verificationOptions, $decoder);
                     foreach ($scratchInventory->olderVersions((int) $claim->id, (int) $claim->version) as $old) {
                         $oldDirectory = $root.'/scratch/'.$old->candidate_id.'-'.$old->version;
@@ -190,7 +190,8 @@ class VerifyReleaseCandidates extends Command
                             $diagnostics?->handedOff();
                         } else {
                             $published = config('release_verification.publish_url')
-                                ? app(RemoteReleasePublisher::class)->publish($claim, $result) : $publisher->publish($claim, $result);
+                                ? $this->publishRemotely($claim, $result, $heartbeat, $batch->pulse(...))
+                                : $publisher->publish($claim, $result, progress: $batch->pulse(...));
                             if ($published === null) {
                                 $result = $this->filteredResult($claim) ?? throw new RuntimeException('Publication did not produce a verified current release.');
                                 $diagnostics?->filtered();
@@ -212,7 +213,7 @@ class VerifyReleaseCandidates extends Command
                     $active = 'status_write';
                     $bytes = $result->passed()
                         ? (int) ($result->manifest['spot_check']['bytes'] ?? $result->manifest['verified_bytes'] ?? 0) : 0;
-                    $snapshot = json_encode(['verified_bytes_per_second' => $bytes / max(0.001, microtime(true) - $started),
+                    $snapshot = json_encode(['verified_bytes_per_second' => $batch->verifiedBytesPerSecond($bytes, $started),
                         'scratch_bytes' => null, 'scratch_bytes_status' => 'unknown'], JSON_THROW_ON_ERROR);
                     $statusTemporary = $root.'/status-'.bin2hex(random_bytes(8)).'.tmp';
                     try {
@@ -264,7 +265,7 @@ class VerifyReleaseCandidates extends Command
                     }
                 } finally {
                     unset($verifier, $manifest, $result, $progressHeartbeat, $heartbeat);
-                    $locks->releaseCandidate();
+                    $locks->releaseCandidate((int) $claim->id);
                 }
             }
             $diagnostics?->stop('limit', hrtime(true));
@@ -279,8 +280,20 @@ class VerifyReleaseCandidates extends Command
 
             throw $error;
         } finally {
-            unset($source);
-            $locks->close();
+            try {
+                if (isset($batch)) {
+                    $batch->releasePending();
+                }
+            } catch (Throwable $error) {
+                try {
+                    Log::warning('Queued verification leases could not all be returned; expiry will recover them.', ['error_type' => $error::class]);
+                } catch (Throwable) {
+                    // Cleanup must preserve the original failure even when logging is unavailable.
+                }
+            } finally {
+                unset($batch, $source);
+                $locks->close();
+            }
         }
 
         return self::SUCCESS;
@@ -463,6 +476,31 @@ class VerifyReleaseCandidates extends Command
         }
 
         return true;
+    }
+
+    /**
+     * @param  callable(): void  $heartbeat
+     * @param  callable(): void  $queuedProgress
+     */
+    private function publishRemotely(object $claim, VerificationResult $result, callable $heartbeat, callable $queuedProgress): ?int
+    {
+        // Renew once before sending. The primary then owns the active row under its publication
+        // lock and clears its lease on commit; updating it from HTTP progress would block behind
+        // that lock and mistake a successful publication for lost ownership. Queued work is independent.
+        $heartbeat();
+        try {
+            return app(RemoteReleasePublisher::class)->publish($claim, $result, progress: $queuedProgress);
+        } catch (Throwable $error) {
+            // A response can be lost after commit, including on every idempotent retry. Only the
+            // exact published generation permits normal success, scratch cleanup and status output.
+            $releaseId = DB::table('release_verification_candidates')->where('id', $claim->id)->where('version', $claim->version)
+                ->where('manifest_hash', $claim->manifest_hash)->whereNotNull('release_id')->value('release_id');
+            if ($releaseId === null) {
+                throw $error;
+            }
+
+            return (int) $releaseId;
+        }
     }
 
     private function filteredResult(object $claim): ?VerificationResult

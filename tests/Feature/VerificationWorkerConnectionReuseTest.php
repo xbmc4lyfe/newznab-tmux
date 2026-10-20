@@ -35,6 +35,7 @@ class VerificationWorkerConnectionReuseTest extends ReleaseVerificationCandidate
 
                 return $articles[$id];
             });
+            $mock->shouldReceive('isConnected')->andReturn(true);
             $mock->shouldReceive('doQuit')->andReturn(null);
         });
 
@@ -100,6 +101,7 @@ class VerificationWorkerConnectionReuseTest extends ReleaseVerificationCandidate
 
                 return $articles[$id];
             });
+            $mock->shouldReceive('isConnected')->andReturn(true);
             $mock->shouldReceive('doQuit')->andReturn(null);
         });
 
