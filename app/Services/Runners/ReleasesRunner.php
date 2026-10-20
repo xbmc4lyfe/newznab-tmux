@@ -13,6 +13,9 @@ use RuntimeException;
 
 class ReleasesRunner extends BaseRunner
 {
+    /** Seconds between the starts of one group's passes while a round still waits on slower groups; 0 disables. */
+    private int $rollingInterval = 0;
+
     public function releases(): void
     {
         $groups = DB::select('SELECT id, name FROM usenet_groups WHERE (active = 1 OR backfill = 1)');
@@ -68,9 +71,9 @@ class ReleasesRunner extends BaseRunner
         if ((bool) config('nntmux.stream_fork_output', false) === true) {
             $commands = [];
             foreach ($uGroups as $group) {
-                $commands[] = $this->buildDnrCommand('releases  '.$group['id']);
+                $commands[$group['id']] = $this->buildDnrCommand('releases  '.$group['id']);
             }
-            $this->runStreamingCommands($commands, $maxProcesses, 'releases');
+            $this->rolling(fn () => $this->runStreamingCommands($commands, $maxProcesses, 'releases'));
 
             return;
         }
@@ -83,10 +86,10 @@ class ReleasesRunner extends BaseRunner
         }
 
         try {
-            $this->runParallelCommandsWithCompletion($tasks, $maxProcesses, static function (int|string $groupId, string $output): void {
+            $this->rolling(fn () => $this->runParallelCommandsWithCompletion($tasks, $maxProcesses, static function (int|string $groupId, string $output): void {
                 echo $output;
                 cli()->primary('Finished performing release processing for group ID: '.$groupId);
-            });
+            }));
         } catch (\Throwable $e) {
             Log::error('Release processing batch failed: '.$e->getMessage());
             cli()->error('Release processing failed: '.$e->getMessage());
@@ -138,6 +141,32 @@ class ReleasesRunner extends BaseRunner
             cli()->error('Update per group failed: '.$e->getMessage());
             throw new RuntimeException('Worker batch failed.', 0, $e);
         }
+    }
+
+    /**
+     * Run a round's full passes so a group whose pass finishes starts another one while slower
+     * groups are still working, instead of idling until the round's slowest group ends.
+     */
+    private function rolling(callable $round): void
+    {
+        $this->rollingInterval = max(0, (int) config('nntmux.cbp.release_rolling_interval', 60));
+        try {
+            $round();
+        } finally {
+            $this->rollingInterval = 0;
+        }
+    }
+
+    protected function workerFollowUp(string|int $key, float $startedAt): ?array
+    {
+        if ($this->rollingInterval === 0) {
+            return null;
+        }
+
+        return [
+            'command' => $this->buildDnrCommand('releases  '.$key),
+            'not_before' => $startedAt + $this->rollingInterval,
+        ];
     }
 
     /** @param list<int> $groupIds */
