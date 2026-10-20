@@ -30,11 +30,9 @@ use App\Support\Data\ReleaseDeleteStats;
 use App\Support\ReleaseSearchIndexSync;
 use DateTimeInterface;
 use Illuminate\Database\Query\Builder;
-use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Schema;
 use Throwable;
 
 /**
@@ -58,10 +56,6 @@ final class ReleaseProcessingService
 
     private const int MAX_RETRIES = 5;
 
-    private const int RETRY_BASE_DELAY_US = 20000;
-
-    private const int BATCH_PAUSE_US = 10000;
-
     private const int CATEGORIZE_CHUNK_SIZE = 1000;
 
     private const int NZB_CREATION_MAX_ATTEMPTS = 3;
@@ -75,6 +69,8 @@ final class ReleaseProcessingService
     private const string PRIORITY_WINDOW_CURSOR_PREFIX = 'cbp:release-priority-window:cursor:';
 
     private const int PRIORITY_GROUP_PROBES_PER_PASS = 20;
+
+    private const string RECONCILE_CURSOR_PREFIX = 'cbp:release-reconcile:cursor:';
 
     private bool $echoCLI;
 
@@ -754,7 +750,8 @@ final class ReleaseProcessingService
         if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
             return;
         }
-        $this->processStuckCollections($normalizedGroupId ?? 0);
+        // A capped walk can leave rows waiting past collectionTimeout. Do not run the
+        // legacy stuck sweep before resuming: retention cleanup owns their age limit.
         $this->reconcileIncompleteCollections($normalizedGroupId, $afterReconciliation);
 
         $count = $this->countCompleteCollections($normalizedGroupId);
@@ -775,24 +772,37 @@ final class ReleaseProcessingService
         $updated = 0;
         $lastId = 0;
         $normalizedGroupId = $this->normalizeGroupId($groupID);
+        // Sized rows leave CompleteParts, so a capped sweep simply continues next pass.
+        // The capped reconciliation walk may not have reached a page yet, so each page is
+        // reconciled from its stored parts before it is promoted.
+        $pages = 0;
+        $deadline = now()->addSeconds($this->binariesConfig->reconcilePassSeconds);
+        $statuses = $this->reconcileStatuses();
         do {
-            if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
+            if (app(ProcessingRuntimeStateRepository::class)->stopRequested()
+                || $pages >= $this->binariesConfig->reconcilePagesPerPass || now()->gte($deadline)) {
                 break;
             }
-            $query = Collection::query()
+            $pages++;
+            $ids = Collection::query()
                 ->where('id', '>', $lastId)
                 ->where('filecheck', CollectionFileCheckStatus::CompleteParts->value)
                 ->when($normalizedGroupId !== null, static fn ($q) => $q->where('groups_id', $normalizedGroupId))
                 ->orderBy('id')
-                ->limit($this->binariesConfig->reconcileBatchSize);
-            $ids = $query->pluck('id')->map(static fn ($id): int => (int) $id)->all();
+                ->limit($this->binariesConfig->reconcileBatchSize)
+                ->pluck('id')->map(static fn ($id): int => (int) $id)->all();
             if ($ids === []) {
                 break;
             }
+            $sized = $this->withCollectionReconciliationBarrier(function () use ($ids, $statuses): int {
+                $this->reconcileCollectionIds($ids, $statuses);
+
+                return Collection::query()->whereIn('id', $ids)
+                    ->where('filecheck', CollectionFileCheckStatus::CompleteParts->value)
+                    ->update(['filecheck' => CollectionFileCheckStatus::Sized->value]);
+            });
             $lastId = (int) end($ids);
-            $updated += Collection::query()->whereIn('id', $ids)->update([
-                'filecheck' => CollectionFileCheckStatus::Sized->value,
-            ]);
+            $updated += $sized;
         } while (\count($ids) === $this->binariesConfig->reconcileBatchSize);
 
         $this->outputStat('Collections sized', $updated);
@@ -804,27 +814,32 @@ final class ReleaseProcessingService
      * authority for binary counts/sizes; binary aggregates are then the
      * authority for collection readiness and filesize.
      *
+     * Stale incomplete collections stay in scope until retention removes them,
+     * and a busy group can hold tens of millions, so one pass walks at most a
+     * page and time budget and stores its position; the next pass resumes there
+     * and starts again from the lowest id once the walk reaches the end. Each
+     * cycle stops at the highest id present when it began, so collections added
+     * meanwhile cannot keep it from wrapping round to rows that became stale
+     * after the cursor passed them.
+     *
      * @param  callable(list<int>): void|null  $afterReconciliation
      */
     private function reconcileIncompleteCollections(?int $groupId, ?callable $afterReconciliation): void
     {
-        $lastId = 0;
-        $statuses = [
-            CollectionFileCheckStatus::Default->value,
-            CollectionFileCheckStatus::CompleteCollection->value,
-            CollectionFileCheckStatus::CompleteParts->value,
-            CollectionFileCheckStatus::TempComplete->value,
-            CollectionFileCheckStatus::ZeroPart->value,
-            10,
-        ];
+        $cursorKey = self::RECONCILE_CURSOR_PREFIX.($groupId === null ? 'all' : 'group:'.$groupId);
+        [$lastId, $maxId] = $this->reconcileCursor($cursorKey);
+        $pages = 0;
+        $deadline = now()->addSeconds($this->binariesConfig->reconcilePassSeconds);
+        $statuses = $this->reconcileStatuses();
 
         do {
             if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
                 break;
             }
-            $ids = $this->withCollectionReconciliationBarrier(function () use ($lastId, $groupId, $statuses): array {
+            $ids = $this->withCollectionReconciliationBarrier(function () use ($lastId, $maxId, $groupId, $statuses): array {
                 $query = Collection::query()
                     ->where('id', '>', $lastId)
+                    ->where('id', '<=', $maxId)
                     ->where(function ($query) use ($statuses): void {
                         $query->where('filecheck', CollectionFileCheckStatus::CompleteParts->value)
                             ->orWhere(function ($stale) use ($statuses): void {
@@ -848,13 +863,55 @@ final class ReleaseProcessingService
                 return $ids;
             });
             if ($ids === []) {
+                Cache::forget($cursorKey);
                 break;
             }
             $lastId = (int) end($ids);
+            $finished = \count($ids) < $this->binariesConfig->reconcileBatchSize || $lastId >= $maxId;
+            // Store the position before creating releases, so a failed page is not walked again first.
+            if ($finished) {
+                Cache::forget($cursorKey);
+            } else {
+                Cache::forever($cursorKey, ['last_id' => $lastId, 'max_id' => $maxId]);
+            }
             if ($afterReconciliation !== null) {
                 $afterReconciliation($ids);
             }
-        } while (\count($ids) === $this->binariesConfig->reconcileBatchSize);
+            $pages++;
+        } while (! $finished && $pages < $this->binariesConfig->reconcilePagesPerPass && now()->lt($deadline));
+    }
+
+    /**
+     * The stored walk position and the snapshot ceiling of its cycle; a missing or
+     * finished cursor starts a new cycle at the current highest id.
+     *
+     * @return array{int, int}
+     */
+    private function reconcileCursor(string $cursorKey): array
+    {
+        $saved = Cache::get($cursorKey);
+        // Redis returns a stored integer as a numeric string; a bare number is the
+        // position stored before cycles had a ceiling.
+        if (is_array($saved) && is_numeric($saved['last_id'] ?? null) && is_numeric($saved['max_id'] ?? null)
+            && (int) $saved['last_id'] >= 0 && (int) $saved['max_id'] > (int) $saved['last_id']) {
+            return [(int) $saved['last_id'], (int) $saved['max_id']];
+        }
+        $lastId = is_numeric($saved) ? max(0, (int) $saved) : 0;
+
+        return [$lastId, (int) Collection::query()->max('id')];
+    }
+
+    /** @return list<int> */
+    private function reconcileStatuses(): array
+    {
+        return [
+            CollectionFileCheckStatus::Default->value,
+            CollectionFileCheckStatus::CompleteCollection->value,
+            CollectionFileCheckStatus::CompleteParts->value,
+            CollectionFileCheckStatus::TempComplete->value,
+            CollectionFileCheckStatus::ZeroPart->value,
+            10,
+        ];
     }
 
     /**
@@ -1546,114 +1603,6 @@ final class ReleaseProcessingService
         $groupInfo = UsenetGroup::getByName($groupID);
 
         return $groupInfo !== null ? (int) $groupInfo['id'] : null;
-    }
-
-    /**
-     * @throws Throwable
-     */
-    private function processStuckCollections(int $groupID): void
-    {
-        if (config('release_verification.required', true)) {
-            return;
-        }
-        $totalDeleted = 0;
-
-        do {
-            $affected = $this->withCollectionReconciliationBarrier(
-                fn (): int => $this->deleteStuckCollectionBatch($groupID, $this->calculateStuckCollectionsCutoff())
-            );
-            $totalDeleted += $affected;
-
-            if ($affected < self::BATCH_SIZE) {
-                break;
-            }
-
-            usleep(self::BATCH_PAUSE_US);
-        } while (true);
-
-        if ($this->echoCLI && $totalDeleted > 0) {
-            cli()->primary("Deleted {$totalDeleted} broken/stuck collections.", true);
-        }
-    }
-
-    private function calculateStuckCollectionsCutoff(): Carbon
-    {
-        $lastRun = $this->settings->lastRunTime;
-        $threshold = null;
-
-        if ($lastRun !== null) {
-            try {
-                $threshold = Carbon::createFromFormat('Y-m-d H:i:s', $lastRun);
-            } catch (Throwable) {
-                $threshold = null;
-            }
-        }
-
-        return ($threshold ?? now())->copy()->subHours($this->settings->collectionTimeout);
-    }
-
-    private function deleteStuckCollectionBatch(int $groupID, Carbon $cutoff): int
-    {
-        $attempt = 0;
-        $affected = 0;
-
-        do {
-            try {
-                $query = DB::table('collections')
-                    ->whereIn('filecheck', [
-                        CollectionFileCheckStatus::Default->value,
-                        CollectionFileCheckStatus::CompleteCollection->value,
-                        CollectionFileCheckStatus::TempComplete->value,
-                        CollectionFileCheckStatus::ZeroPart->value,
-                        10,
-                    ])
-                    // No ORDER BY: each batch deletes what it selected and the next query
-                    // starts over (see deleteCollectionQueryInBatches()).
-                    ->limit(self::BATCH_SIZE);
-                if (Schema::hasColumn('collections', 'last_seen_at')) {
-                    // Same as COALESCE(last_seen_at, dateadded, added) < cutoff, but written
-                    // so the (groups_id, filecheck, last_seen_at, id) index can range-scan it;
-                    // the COALESCE form made MariaDB read every collection in the group.
-                    $query->where(static function ($stale) use ($cutoff): void {
-                        $stale->where('last_seen_at', '<', $cutoff)
-                            ->orWhere(static function ($unseen) use ($cutoff): void {
-                                $unseen->whereNull('last_seen_at')
-                                    ->whereRaw('COALESCE(dateadded, added) < ?', [$cutoff]);
-                            });
-                    });
-                } else {
-                    $query->where('added', '<', $cutoff);
-                }
-                if ($groupID !== 0) {
-                    $query->where('groups_id', '=', $groupID);
-                }
-
-                $ids = $query->pluck('id')->all();
-                if ($ids === []) {
-                    break;
-                }
-
-                $affected = $this->collectionCleanupService->deleteCollectionsAndDescendants(
-                    $ids,
-                    'Stuck collections cleanup',
-                    $this->echoCLI
-                );
-                break;
-            } catch (Throwable $e) {
-                $attempt++;
-                if ($attempt >= self::MAX_RETRIES) {
-                    if ($this->echoCLI) {
-                        cli()->error(
-                            'Stuck collections delete failed after retries: '.$e->getMessage()
-                        );
-                    }
-                    break;
-                }
-                usleep(self::RETRY_BASE_DELAY_US * $attempt);
-            }
-        } while (true);
-
-        return $affected;
     }
 
     // ========================================================================
