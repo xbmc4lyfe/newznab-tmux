@@ -386,7 +386,7 @@ class PagesTest(unittest.TestCase):
 
     def test_new_caller_workflow_matrix_and_safe_nullable_tail_are_published(self):
         self.assertEqual(set(pages.WORKFLOWS['archive-sample-performance.yml']),
-                         {(kind, runner) for kind in ('sample-planning', 'archive-parsing', 'vendor-archive', 'metadata-modules', 'archive-modules')
+                         {(kind, runner) for kind in ('sample-planning', 'archive-parsing', 'vendor-archive', 'metadata-modules', 'archive-modules', 'filename-identity', 'per-article-obfuscation')
                           for runner in ('ubuntu-latest', 'ubuntu-24.04-arm')})
         for kind in ('sample-planning', 'archive-parsing', 'vendor-archive'):
             summary = self.caller_summary(kind)

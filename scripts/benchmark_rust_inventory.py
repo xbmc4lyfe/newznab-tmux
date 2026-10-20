@@ -83,7 +83,7 @@ DECLARATIONS = {
     'nntmux_header_filename_identity_tables_v1': ('lifecycle-included', ('filename-identity',),
         ('app/Services/Releases/Verification/NativeHeaderFilenameIdentity.php',),
         'PCRE-version query run once when the wrapper loads the library; no individual timing.'),
-    'nntmux_per_article_obfuscation_v2': ('caller-comparison', ('filename-identity',),
+    'nntmux_per_article_obfuscation_v2': ('caller-comparison', ('per-article-obfuscation',),
         ('app/Services/Binaries/NativePerArticleObfuscation.php',),
         'Adopted for HeaderParser::markPerArticleObfuscated on ranges a sampled cost model routes to it, with the PHP rule as fallback. The paired '
         'PHP-versus-Rust+FFI benchmark (scripts/benchmark-per-article-obfuscation.php) and native parity '

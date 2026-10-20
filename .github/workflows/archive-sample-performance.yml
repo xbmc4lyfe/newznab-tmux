@@ -304,6 +304,7 @@ jobs:
       - name: Generate the Unicode tables from this runner's PCRE
         run: php scripts/generate-header-filename-unicode.php > docker/app/nzb-yenc-ffi/src/header_filename_unicode.rs
       - name: Build and test optimized locked native library
+        id: identity-build
         shell: bash
         run: |
           mkdir -p filename-identity-evidence/build
@@ -315,6 +316,7 @@ jobs:
           def run(*args):
               return subprocess.check_output(args, text=True).strip()
           pathlib.Path('filename-identity-evidence/runtime.json').write_text(json.dumps({
+              'executed_sha': os.environ['GITHUB_SHA'],
               'rustc': run('rustup', 'run', os.environ['RUST_TOOLCHAIN'], 'rustc', '-Vv'),
               'cargo': run('rustup', 'run', os.environ['RUST_TOOLCHAIN'], 'cargo', '-V'),
               'architecture': platform.machine(),
@@ -337,6 +339,11 @@ jobs:
             --hard-limits=filename-identity-evidence/process-hard-limits.txt \
             --output=filename-identity-evidence/resource-limits-before.json
           cp filename-identity-evidence/resource-limits-before.json filename-identity-evidence/resource-limits.json
+      - name: Freeze executed source and generated Unicode bytes before measurements
+        run: >-
+          python3 scripts/export-identity-benchmark-summary.py --capture
+          --library=docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so
+          --output=filename-identity-evidence/measurement-before.json
       - name: Measure PHP versus Rust including FFI and report the result
         shell: bash
         run: |
@@ -363,6 +370,7 @@ jobs:
       # HeaderParser::markPerArticleObfuscated() uses this library's port; a parity failure or a
       # report that is not qualified (1.5x, routed floor) fails the job on each architecture.
       - name: Verify per-article obfuscation parity and measure PHP versus Rust including FFI
+        if: ${{ !cancelled() && steps.identity-build.outcome == 'success' }}
         shell: bash
         env:
           NNTMUX_TEST_NATIVE_LIBRARY: ${{ github.workspace }}/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so
@@ -378,6 +386,12 @@ jobs:
           # qualify: a not-qualified or inconclusive report fails the job.
           python3 -c 'import json, sys; status = json.load(open(sys.argv[1]))["status"]; print("per-article obfuscation:", status); sys.exit(status != "qualified")' \
             "$GITHUB_WORKSPACE/filename-identity-evidence/per-article-obfuscation/report.json"
+      - name: Freeze executed source and library after measurements
+        if: always()
+        run: >-
+          python3 scripts/export-identity-benchmark-summary.py --capture
+          --library=docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so
+          --output=filename-identity-evidence/measurement-after.json
       - name: Capture all visible resource limits after measurement
         if: always()
         shell: bash
@@ -396,6 +410,34 @@ jobs:
             --before=filename-identity-evidence/resource-limits-before.json \
             --after=filename-identity-evidence/resource-limits-after.json \
             --output=filename-identity-evidence/resource-limits-comparison.json
+      - name: Export bounded filename-identity summary
+        if: always()
+        run: >-
+          python3 scripts/export-identity-benchmark-summary.py
+          --kind=filename-identity --runner='${{ matrix.runner }}'
+          --output=public-filename-identity/summary.json
+      - name: Retain public filename-identity summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-benchmark-filename-identity-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: public-filename-identity/summary.json
+          retention-days: 14
+          if-no-files-found: error
+      - name: Export bounded per-article-obfuscation summary
+        if: always()
+        run: >-
+          python3 scripts/export-identity-benchmark-summary.py
+          --kind=per-article-obfuscation --runner='${{ matrix.runner }}'
+          --output=public-per-article-obfuscation/summary.json
+      - name: Retain public per-article-obfuscation summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-benchmark-per-article-obfuscation-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: public-per-article-obfuscation/summary.json
+          retention-days: 14
+          if-no-files-found: error
       - name: Retain observations and frozen evidence
         if: always()
         uses: actions/upload-artifact@v4

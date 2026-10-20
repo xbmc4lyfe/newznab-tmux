@@ -26,7 +26,7 @@ WORKFLOWS = {
                              ('profile', 'ubuntu-latest'), ('profile', 'ubuntu-24.04-arm')],
     'release-presentation.yml': [('presentation', 'ubuntu-latest')],
     'native-utilities-performance.yml': [(kind, runner) for kind in ('fingerprint-ffi', 'fingerprint-worker', 'cpu-snapshot') for runner in ('ubuntu-latest', 'ubuntu-24.04-arm')],
-    'archive-sample-performance.yml': [(kind, runner) for kind in ('sample-planning', 'archive-parsing', 'vendor-archive', 'metadata-modules', 'archive-modules') for runner in ('ubuntu-latest', 'ubuntu-24.04-arm')],
+    'archive-sample-performance.yml': [(kind, runner) for kind in ('sample-planning', 'archive-parsing', 'vendor-archive', 'metadata-modules', 'archive-modules', 'filename-identity', 'per-article-obfuscation') for runner in ('ubuntu-latest', 'ubuntu-24.04-arm')],
     'laravel.yml': [], 'rust-clippy.yml': [],
 }
 RESOURCE_HASHES = {'resource_limits_before', 'resource_limits_after', 'resource_limits_comparison'}
@@ -309,7 +309,7 @@ def validate_summary(summary, run, kind, runner, historical=False):
     if not isinstance(summary.get('rows'), list) or len(summary['rows']) > 100:
         raise ValueError('Invalid summary rows')
     allowed = set(expected) | {'rows', 'status', 'evidence_type', 'completeness', 'source_sha256',
-                               'library_sha256', 'source_and_library_identities_stable', 'instrumentation_identities_stable', 'baseline_revision', 'runtime_identity', 'protocol_sha256', 'report_sha256', 'rust_payload_mode', 'candidate_status', 'uncertainty_method', 'measurement_protocol_version', 'confidence_status', 'confidence_family_size', 'host_confidence_status', 'host_confidence_family_size', 'baseline_kind', 'benchmark_mode', 'provenance_status', 'runtime_manifest_sha256', 'kernel_qualification_sha256', 'rust_payload_kernel', 'required_payload_kernel', 'hardware_qualification', 'candidate_head_sha'}
+                               'library_sha256', 'source_and_library_identities_stable', 'instrumentation_identities_stable', 'baseline_revision', 'runtime_identity', 'protocol_sha256', 'report_sha256', 'rust_payload_mode', 'candidate_status', 'uncertainty_method', 'measurement_protocol_version', 'confidence_status', 'confidence_family_size', 'host_confidence_status', 'host_confidence_family_size', 'baseline_kind', 'benchmark_mode', 'provenance_status', 'runtime_manifest_sha256', 'kernel_qualification_sha256', 'rust_payload_kernel', 'required_payload_kernel', 'hardware_qualification', 'candidate_head_sha', 'benchmark_status', 'identity_provenance_status', 'identity_uncertainty', 'identity_runtime_sha256', 'identity_manifest_sha256'}
     if set(summary) - allowed:
         raise ValueError('Unexpected public summary fields')
     if kind not in ('cpp', 'php', 'profile', 'presentation') and set(summary) & {
@@ -337,9 +337,17 @@ def validate_summary(summary, run, kind, runner, historical=False):
                 'gate_passed', 'samples', 'iterations', 'php_median_ns', 'rust_median_ns', 'improvement_percent',
                 'body_ffi_median_ms', 'fixture', 'p99_sample_sufficient', 'baseline_median_ns', 'candidate_median_ns', 'median_ratio', 'paired_median_ratio', 'baseline_p99_ns', 'candidate_p99_ns', 'p99_ratio', 'median_ratio_ci95', 'p99_ratio_ci95', 'median_baseline_over_candidate_ratio', 'median_cold_baseline_over_candidate_ratio',
                 'module', 'correctness_observations', 'native_proof_observations', 'category', 'comparison', 'metric', 'baseline_over_candidate', 'speedup_interval', 'baseline_latency_ms', 'candidate_latency_ms', 'native_median_ms', 'qualification_gate_passed', 'p99_threshold_met',
-                'baseline_latency_interval_ms', 'candidate_latency_interval_ms', 'marginal_alpha', 'gate_statistic', 'gate_speedup_simultaneous_ci95', 'host_median_speedup_simultaneous_ci95', 'live_median_speedup_simultaneous_ci95', 'live_p99_speedup_simultaneous_ci95'}
+                'baseline_latency_interval_ms', 'candidate_latency_interval_ms', 'marginal_alpha', 'gate_statistic', 'gate_speedup_simultaneous_ci95', 'host_median_speedup_simultaneous_ci95', 'live_median_speedup_simultaneous_ci95', 'live_p99_speedup_simultaneous_ci95', 'diagnostic_speedup_interval', 'native_declined', 'used_rust', 'rust_runs'}
     if any(not isinstance(row, dict) or set(row) - row_keys for row in summary['rows']):
         raise ValueError('Unexpected public measurement fields')
+    identity_fields = {'benchmark_status', 'identity_provenance_status', 'identity_uncertainty', 'identity_runtime_sha256', 'identity_manifest_sha256'}
+    if kind in ('filename-identity', 'per-article-obfuscation'):
+        spec = importlib.util.spec_from_file_location('identity_summary', Path(__file__).with_name('export-identity-benchmark-summary.py'))
+        identity = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(identity)
+        identity.validate_public(summary)
+    elif set(summary) & identity_fields or any('diagnostic_speedup_interval' in row for row in summary['rows']):
+        raise ValueError('Identity fields on a different benchmark')
     if kind in ('cpp', 'php', 'profile', 'presentation'):
         validate_native_rows(summary, kind, run, historical)
     if summary.get('uncertainty_method', 'not_reported') not in ('not_reported', 'mixed_output_bootstrap', 'legacy_stratified_bootstrap_unqualified', 'paired_bootstrap_bonferroni'):
@@ -648,9 +656,9 @@ def coverage(root):
         elif name in ('sample_plan', 'spotcheck_plan'):
             label, detail = 'Comparative public caller benchmark', 'Exact serialized PHP/native output, cold/warm calls, common median and uncommon p99 qualification mode; small/unsupported inputs remain PHP controls.'
         elif name in ('header_filename_identity', 'header_filename_unicode'):
-            label, detail = 'Comparative public caller benchmark', 'Guarded candidate for HeaderFilenameIdentity, not wired into production. Per-call and 16-call release-batch PHP versus Rust+FFI on a synthetic corpus runs in the archive-sample-performance filename-identity job (x86 and ARM, step summary); not collected on this page and no adoption qualification.'
+            label, detail = 'Comparative public caller benchmark', 'Guarded candidate for HeaderFilenameIdentity, not wired into production. Per-call and 16-call release-batch PHP versus Rust+FFI on a synthetic corpus runs in the archive-sample-performance filename-identity job (x86 and ARM, step summary); collected here as descriptive synthetic measurements; producer gates do not establish adoption qualification.'
         elif name == 'per_article_obfuscation':
-            label, detail = 'Comparative public caller benchmark', 'Adopted for HeaderParser::markPerArticleObfuscated with the PHP rule as fallback. Paired PHP versus Rust+FFI over seeded common and uncommon header ranges, with native parity, runs in the archive-sample-performance filename-identity job (x86 and ARM, step summary); common median and uncommon p99 qualification, not collected on this page.'
+            label, detail = 'Comparative public caller benchmark', 'Adopted for HeaderParser::markPerArticleObfuscated with the PHP rule as fallback. Paired PHP versus Rust+FFI over seeded common and uncommon header ranges, with native parity, runs in the archive-sample-performance filename-identity job (x86 and ARM, step summary); collected here with warm, cold and startup-bound results. Pointwise producer gates do not establish adoption qualification.'
         elif name in ('article_identity', 'article_xref', 'article_dates', 'iso_primary_copies', 'rar5_copy_checksums', 'rar5_quick_open'):
             label, detail = 'Shared independent PHP reference comparison', 'New bounded PHP references compare declared shared projections only; actual native wrapper includes FFI, allocation, JSON decoding and the full richer native result before projection. Cold/warm common median and uncommon p99 gates do not qualify adoption or historical PHP speedups.'
         elif name in ('iso_path_tables', 'zstd_frame', 'xz', 'xz_frame', 'xz_first_block'):
@@ -758,6 +766,8 @@ def manual_job_name(kind, runner):
         return f'Experimental comparison {kind} ({runner})'
     if kind == 'cpu-snapshot':
         return f'CPU snapshot comparison {kind} ({runner})'
+    if kind in ('filename-identity', 'per-article-obfuscation'):
+        return f'filename-identity ({runner})'
     return f'{kind} ({runner})'
 
 
@@ -930,6 +940,7 @@ def measurement_table(rows):
         'p99_ratio': 'p99 baseline / candidate', 'baseline_over_candidate': 'Baseline / candidate',
     }
     intervals = {
+        'diagnostic_speedup_interval': ('Descriptive / pointwise speedup interval', 'ratio'),
         'bootstrap_95_percent_interval': ('Rust / baseline 95% interval', 'ratio'),
         'median_ratio_ci95': ('Median ratio 95% interval', 'ratio'), 'p99_ratio_ci95': ('p99 ratio 95% interval', 'ratio'),
         'speedup_interval': ('Speedup 95% interval', 'ratio'),
@@ -1027,6 +1038,11 @@ def render(report):
         if index == len(report['results']):
             body.extend(manual_heading)
         body.append(f'<details><summary>{escape(row["kind"])} · {escape(row["runner"])} · {escape(row.get("status", "unknown"))}</summary><p>{run_link(row)}. Evidence: {escape(row.get("evidence_type", "unavailable"))}; adoption qualification: not established.</p>')
+        if row.get('kind') in ('filename-identity', 'per-article-obfuscation'):
+            body.append('<p>Synthetic corpus comparison including caller and FFI costs. Producer status: '
+                        + escape(row.get('benchmark_status', 'unavailable')) + '; executed-input provenance: '
+                        + escape(row.get('identity_provenance_status', 'unavailable'))
+                        + '. Intervals are descriptive order statistics for filename identity, or pointwise paired bootstrap for per-article obfuscation; they are not simultaneous adoption bounds. Cold first calls and startup-bounded p99 have distinct scopes. Missing measurement-time receipts leave recorded values ineligible.</p>')
         if row.get('candidate_status') == 'experimental_withdrawn_from_production':
             body.append('<p>This archived Rust fingerprint candidate is withdrawn from the application runtime. The application uses PHP fingerprinting. These archived-candidate measurements do not select the production implementation or qualify adoption.</p>')
         if row.get('kind') == 'cpu-snapshot':

@@ -120,7 +120,7 @@ class CompletenessTest(unittest.TestCase):
                 return {'artifacts': []}
             return {'workflow_runs': [run()]}
         report = pages.collect(SHA, ROOT, fetch, lambda _: buffer.getvalue())
-        self.assertEqual(23, len(report['results']))
+        self.assertEqual(27, len(report['results']))
         dispatched = report.get('dispatch_results', [])
         self.assertEqual(1, len(dispatched))
         self.assertEqual('qualification', dispatched[0]['benchmark_mode'])
@@ -258,7 +258,7 @@ class CompletenessTest(unittest.TestCase):
         self.assertIn('Run 33, attempt 2', rendered)
         self.assertIn(runs[0]['status'], rendered)
 
-    def test_manual_selection_never_changes_the_23_entry_push_matrix(self):
+    def test_manual_selection_never_changes_the_27_entry_push_matrix(self):
         def fetch(include_manual):
             def response(path):
                 if '/workflows/' in path:
@@ -272,7 +272,7 @@ class CompletenessTest(unittest.TestCase):
 
         baseline = pages.collect(SHA, ROOT, fetch(False), lambda _: self.fail('Unexpected download'))
         manual = pages.collect(SHA, ROOT, fetch(True), lambda _: self.fail('Unexpected download'))
-        self.assertEqual(23, len(manual['results']))
+        self.assertEqual(27, len(manual['results']))
         self.assertEqual(baseline['results'], manual['results'])
         self.assertEqual(baseline['workflows'], manual['workflows'])
         self.assertEqual([40], [row['run_id'] for row in manual['dispatch_results']])
