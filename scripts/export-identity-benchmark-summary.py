@@ -140,7 +140,7 @@ def interval(value):
 def row(fixture, category, phase, metric, samples, ratio, bounds, baseline=None, candidate=None):
     result = dict(fixture=fixture, category=category, phase=phase, metric=metric,
                   samples=count(samples), baseline_over_candidate=numeric(ratio),
-                  diagnostic_speedup_interval=interval(bounds), eligible=False)
+                  diagnostic_speedup_interval=interval(bounds), eligible=False, identity_interval_method='descriptive_order_statistics')
     if baseline is not None:
         result['baseline_latency_ms'] = numeric(baseline, zero=True)
         result['candidate_latency_ms'] = numeric(candidate, zero=True)
@@ -192,7 +192,7 @@ def measurements(kind, report):
                 raise ValueError('Invalid decline flag')
             rows[-1].update(candidate_backend='php' if value['declined'] else 'rust',
                             comparison='same_php_control' if value['declined'] else 'exact_public_caller',
-                            native_declined=value['declined'])
+                            native_declined=value['declined'], identity_interval_method='pointwise_paired_bootstrap')
             if fixture in cold:
                 value = cold[fixture]
                 if type(value['used_rust']) is not bool or type(value['rust_runs']) is not int or not 0 <= value['rust_runs'] <= count(value['samples']):
@@ -201,13 +201,13 @@ def measurements(kind, report):
                     value['speedup_ci95'], value['php_ms'], value['rust_ms']))
                 rows[-1].update(candidate_backend='rust' if value['used_rust'] else 'php',
                     comparison='exact_public_caller' if value['used_rust'] else 'same_php_control',
-                    used_rust=value['used_rust'], rust_runs=value['rust_runs'])
+                    used_rust=value['used_rust'], rust_runs=value['rust_runs'], identity_interval_method='pointwise_paired_bootstrap')
             if fixture in bounded:
                 value = bounded[fixture]
                 rows.append(row(fixture, category, 'startup-composition', 'composed_quantile_ratio', strata[fixture]['samples'], value['speedup'], value['speedup_ci95']))
                 rows[-1].pop('samples')
                 rows[-1].update(warm_samples=count(strata[fixture]['samples']), startup_samples=startup_samples,
-                    startup_p99_ms=startup_p99)
+                    startup_p99_ms=startup_p99, identity_interval_method='pointwise_independent_component_bootstrap')
                 for source, public in (('php_p99_ms', 'warm_php_p99_ms'), ('rust_p99_ms', 'warm_rust_p99_ms')):
                     if source in strata[fixture]:
                         rows[-1][public] = numeric(strata[fixture][source], zero=True)
@@ -220,7 +220,7 @@ def export(kind, runner, root=Path('.'), environ=None):
         run_id=int(env.get('GITHUB_RUN_ID', '0')), run_attempt=int(env.get('GITHUB_RUN_ATTEMPT', '0')),
         kind=kind, runner=runner, adoption_qualified=False, rows=[], status='missing',
         evidence_type='synthetic_descriptive_comparison', identity_provenance_status='incomplete',
-        identity_uncertainty='descriptive_order_statistics' if kind == 'filename-identity' else 'pointwise_paired_bootstrap')
+        identity_uncertainty='descriptive_order_statistics' if kind == 'filename-identity' else 'mixed_pointwise_bootstrap')
     relative = 'benchmark/summary.json' if kind == 'filename-identity' else 'per-article-obfuscation/report.json'
     try:
         path = root / 'filename-identity-evidence' / relative
@@ -286,7 +286,7 @@ def validate_public(summary):
         raise ValueError('Invalid identity envelope')
     definitions = FILENAME if kind == 'filename-identity' else ARTICLE
     if (summary.get('evidence_type') != 'synthetic_descriptive_comparison'
-            or summary.get('identity_uncertainty') != ('descriptive_order_statistics' if kind == 'filename-identity' else 'pointwise_paired_bootstrap')
+            or summary.get('identity_uncertainty') != ('descriptive_order_statistics' if kind == 'filename-identity' else 'mixed_pointwise_bootstrap')
             or summary.get('identity_provenance_status') not in ('incomplete', 'invalid', 'verified_current')
             or summary.get('status') not in ('missing', 'invalid', 'incomplete_provenance', 'recorded')):
         raise ValueError('Invalid identity summary status')
@@ -339,7 +339,12 @@ def validate_public(summary):
     keys = []
     for value in summary['rows']:
         composition = value.get('phase') == 'startup-composition'
-        required = {'fixture', 'phase', 'metric', 'category', 'baseline_over_candidate', 'diagnostic_speedup_interval', 'eligible'}
+        expected_method = ('descriptive_order_statistics' if kind == 'filename-identity' else
+            'pointwise_independent_component_bootstrap' if composition else 'pointwise_paired_bootstrap')
+        if value.get('identity_interval_method') != expected_method:
+            raise ValueError('Invalid identity interval method for phase')
+
+        required = {'fixture', 'phase', 'metric', 'category', 'baseline_over_candidate', 'diagnostic_speedup_interval', 'eligible', 'identity_interval_method'}
         required |= {'warm_samples', 'startup_samples', 'startup_p99_ms'} if composition else {'samples'}
         optional = {'warm_php_p99_ms', 'warm_rust_p99_ms'} if composition else set()
         latency = set() if composition else {'baseline_latency_ms', 'candidate_latency_ms'}

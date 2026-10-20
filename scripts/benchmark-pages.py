@@ -30,6 +30,13 @@ WORKFLOWS = {
     'laravel.yml': [], 'rust-clippy.yml': [],
 }
 RESOURCE_HASHES = {'resource_limits_before', 'resource_limits_after', 'resource_limits_comparison'}
+# The same field sets extend the identity schema and forbid cross-kind payloads.
+IDENTITY_FIELDS = {'benchmark_status', 'identity_provenance_status', 'identity_uncertainty',
+    'identity_runtime_sha256', 'identity_manifest_sha256'}
+IDENTITY_ROW_FIELDS = {'diagnostic_speedup_interval', 'native_declined', 'used_rust', 'rust_runs',
+    'warm_samples', 'startup_samples', 'startup_p99_ms', 'warm_php_p99_ms', 'warm_rust_p99_ms',
+    'identity_interval_method'}
+
 UTILITY_SOURCES = {'baseline', 'candidate', 'composer_lock', 'benchmark', 'rust_cargo_lock', 'rust_cargo_toml',
     'rust_accumulator', 'rust_abi', 'rust_worker', 'php_worker', 'native_library', 'native_worker',
     'coordinator_binary', 'php_binary', 'vendor_installed', 'xml_elements', 'candidate_binary',
@@ -309,7 +316,7 @@ def validate_summary(summary, run, kind, runner, historical=False):
     if not isinstance(summary.get('rows'), list) or len(summary['rows']) > 100:
         raise ValueError('Invalid summary rows')
     allowed = set(expected) | {'rows', 'status', 'evidence_type', 'completeness', 'source_sha256',
-                               'library_sha256', 'source_and_library_identities_stable', 'instrumentation_identities_stable', 'baseline_revision', 'runtime_identity', 'protocol_sha256', 'report_sha256', 'rust_payload_mode', 'candidate_status', 'uncertainty_method', 'measurement_protocol_version', 'confidence_status', 'confidence_family_size', 'host_confidence_status', 'host_confidence_family_size', 'baseline_kind', 'benchmark_mode', 'provenance_status', 'runtime_manifest_sha256', 'kernel_qualification_sha256', 'rust_payload_kernel', 'required_payload_kernel', 'hardware_qualification', 'candidate_head_sha', 'benchmark_status', 'identity_provenance_status', 'identity_uncertainty', 'identity_runtime_sha256', 'identity_manifest_sha256'}
+                               'library_sha256', 'source_and_library_identities_stable', 'instrumentation_identities_stable', 'baseline_revision', 'runtime_identity', 'protocol_sha256', 'report_sha256', 'rust_payload_mode', 'candidate_status', 'uncertainty_method', 'measurement_protocol_version', 'confidence_status', 'confidence_family_size', 'host_confidence_status', 'host_confidence_family_size', 'baseline_kind', 'benchmark_mode', 'provenance_status', 'runtime_manifest_sha256', 'kernel_qualification_sha256', 'rust_payload_kernel', 'required_payload_kernel', 'hardware_qualification', 'candidate_head_sha'} | IDENTITY_FIELDS
     if set(summary) - allowed:
         raise ValueError('Unexpected public summary fields')
     if kind not in ('cpp', 'php', 'profile', 'presentation') and set(summary) & {
@@ -337,16 +344,15 @@ def validate_summary(summary, run, kind, runner, historical=False):
                 'gate_passed', 'samples', 'iterations', 'php_median_ns', 'rust_median_ns', 'improvement_percent',
                 'body_ffi_median_ms', 'fixture', 'p99_sample_sufficient', 'baseline_median_ns', 'candidate_median_ns', 'median_ratio', 'paired_median_ratio', 'baseline_p99_ns', 'candidate_p99_ns', 'p99_ratio', 'median_ratio_ci95', 'p99_ratio_ci95', 'median_baseline_over_candidate_ratio', 'median_cold_baseline_over_candidate_ratio',
                 'module', 'correctness_observations', 'native_proof_observations', 'category', 'comparison', 'metric', 'baseline_over_candidate', 'speedup_interval', 'baseline_latency_ms', 'candidate_latency_ms', 'native_median_ms', 'qualification_gate_passed', 'p99_threshold_met',
-                'baseline_latency_interval_ms', 'candidate_latency_interval_ms', 'marginal_alpha', 'gate_statistic', 'gate_speedup_simultaneous_ci95', 'host_median_speedup_simultaneous_ci95', 'live_median_speedup_simultaneous_ci95', 'live_p99_speedup_simultaneous_ci95', 'diagnostic_speedup_interval', 'native_declined', 'used_rust', 'rust_runs', 'warm_samples', 'startup_samples', 'startup_p99_ms', 'warm_php_p99_ms', 'warm_rust_p99_ms'}
+                'baseline_latency_interval_ms', 'candidate_latency_interval_ms', 'marginal_alpha', 'gate_statistic', 'gate_speedup_simultaneous_ci95', 'host_median_speedup_simultaneous_ci95', 'live_median_speedup_simultaneous_ci95', 'live_p99_speedup_simultaneous_ci95'} | IDENTITY_ROW_FIELDS
     if any(not isinstance(row, dict) or set(row) - row_keys for row in summary['rows']):
         raise ValueError('Unexpected public measurement fields')
-    identity_fields = {'benchmark_status', 'identity_provenance_status', 'identity_uncertainty', 'identity_runtime_sha256', 'identity_manifest_sha256'}
     if kind in ('filename-identity', 'per-article-obfuscation'):
         spec = importlib.util.spec_from_file_location('identity_summary', Path(__file__).with_name('export-identity-benchmark-summary.py'))
         identity = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(identity)
         identity.validate_public(summary)
-    elif set(summary) & identity_fields or any('diagnostic_speedup_interval' in row for row in summary['rows']):
+    elif set(summary) & IDENTITY_FIELDS or any(set(row) & IDENTITY_ROW_FIELDS for row in summary['rows']):
         raise ValueError('Identity fields on a different benchmark')
     if kind in ('cpp', 'php', 'profile', 'presentation'):
         validate_native_rows(summary, kind, run, historical)
@@ -998,6 +1004,8 @@ def measurement_table(rows):
                 values.append('Improvement: ' + compact_number(value, 2) + '%')
             elif key in ('warm_samples', 'startup_samples'):
                 states.append(('Warm component N=' if key == 'warm_samples' else 'Startup component N=') + str(value))
+            elif key == 'identity_interval_method':
+                states.append('Interval method: ' + str(value).replace('_', ' '))
             elif key == 'samples':
                 states.append('N=' + str(value))
             elif key == 'eligible':
@@ -1047,7 +1055,7 @@ def render(report):
             body.append('<p>Synthetic corpus comparison including caller and FFI costs. Producer status: '
                         + escape(row.get('benchmark_status', 'unavailable')) + '; executed-input provenance: '
                         + escape(row.get('identity_provenance_status', 'unavailable'))
-                        + '. Intervals are descriptive order statistics for filename identity, or pointwise paired bootstrap for per-article obfuscation; they are not simultaneous adoption bounds. Cold first calls and startup compositions have distinct scopes. The startup composition is PHP warm q99 / (Rust warm q99 + startup q99), a composed-quantile diagnostic with separate component sample counts; it is not empirical whole-caller p99 or a guaranteed 99th-percentile bound. Missing measurement-time receipts leave recorded values ineligible.</p>')
+                        + '. Filename identity uses descriptive order-statistic intervals. For per-article obfuscation, warm/cold intervals resample paired observations; composition intervals independently resample PHP, Rust and startup components. Both bootstrap methods produce pointwise intervals, not simultaneous adoption bounds. Cold first calls and startup compositions have distinct scopes. The startup composition is PHP warm q99 / (Rust warm q99 + startup q99), a composed-quantile diagnostic with separate component sample counts; it is not empirical whole-caller p99 or a guaranteed 99th-percentile bound. Missing measurement-time receipts leave recorded values ineligible.</p>')
         if row.get('candidate_status') == 'experimental_withdrawn_from_production':
             body.append('<p>This archived Rust fingerprint candidate is withdrawn from the application runtime. The application uses PHP fingerprinting. These archived-candidate measurements do not select the production implementation or qualify adoption.</p>')
         if row.get('kind') == 'cpu-snapshot':

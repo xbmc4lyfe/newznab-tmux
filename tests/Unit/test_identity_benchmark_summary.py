@@ -204,7 +204,7 @@ class IdentitySummaryTest(unittest.TestCase):
         self.assertFalse(cold['used_rust'])
         self.assertEqual(0, cold['rust_runs'])
         rendered = PAGES.render(dict(head_sha=SHA, generated_at='fixture', workflows=[], coverage=[], results=[result]))
-        for phrase in ('Producer status: qualified', 'incomplete', 'pointwise paired bootstrap', 'Descriptive / pointwise', 'PHP control'):
+        for phrase in ('Producer status: qualified', 'incomplete', 'pointwise intervals', 'Descriptive / pointwise', 'PHP control'):
             self.assertIn(phrase, rendered)
         self.assertNotIn('<th>Simultaneous decision bounds</th>', rendered)
         self.assertNotIn(MARKER, rendered)
@@ -370,6 +370,59 @@ class IdentitySummaryTest(unittest.TestCase):
         for startup in ({}, dict(runs=True), dict(runs=0), dict(runs=200), dict(runs=200, p99_ms=-1)):
             report['startup'] = startup
             self.assertEqual('invalid', self.export('per-article-obfuscation', report)['status'])
+
+    def test_cpu_collector_rejects_every_identity_only_schema_field(self):
+        fixture_module = module('identity_cpu_fixture', 'tests/Unit/test_benchmark_utility_extended.py')
+        utility = fixture_module.ExtendedUtilityExportTest()
+        base = utility.export('cpu-snapshot', fixture_module.cpu_host())
+        run = dict(id=123, run_attempt=1, head_sha='e' * 40, event='push', head_branch='master',
+            head_repository=dict(full_name=PAGES.REPOSITORY), status='completed', conclusion='success')
+        PAGES.validate_summary(base, run, 'cpu-snapshot', 'ubuntu-24.04-arm')
+        row_fields = {'diagnostic_speedup_interval', 'native_declined', 'used_rust', 'rust_runs',
+            'warm_samples', 'startup_samples', 'startup_p99_ms', 'warm_php_p99_ms', 'warm_rust_p99_ms',
+            'identity_interval_method'}
+        envelope_fields = {'benchmark_status', 'identity_provenance_status', 'identity_uncertainty',
+            'identity_runtime_sha256', 'identity_manifest_sha256'}
+        self.assertEqual(row_fields, PAGES.IDENTITY_ROW_FIELDS)
+        self.assertEqual(envelope_fields, PAGES.IDENTITY_FIELDS)
+        for target, fields in (('row', row_fields), ('envelope', envelope_fields)):
+            for field in fields:
+                with self.subTest(target=target, field=field):
+                    summary = copy.deepcopy(base)
+                    destination = summary['rows'][0] if target == 'row' else summary
+                    destination[field] = {'raw_private_payload': MARKER}
+                    data = io.BytesIO()
+                    with zipfile.ZipFile(data, 'w') as archive:
+                        archive.writestr('summary.json', json.dumps(summary))
+                    raw = data.getvalue()
+                    artifact = dict(id=1, expired=False, size_in_bytes=len(raw),
+                        name='public-benchmark-cpu-snapshot-ubuntu-24.04-arm-123-1')
+                    def fetch(path):
+                        return {'artifacts': [artifact]} if '/artifacts?' in path else {'workflow_runs': [run]}
+                    with patch.object(PAGES, 'WORKFLOWS', {'native-utilities-performance.yml': [('cpu-snapshot', 'ubuntu-24.04-arm')]}), \
+                            patch.object(PAGES, 'last_valid_comparison', return_value=None), \
+                            patch.object(PAGES, 'collect_dispatches', return_value=([], [])):
+                        result = PAGES.collect('e' * 40, ROOT, fetch, lambda artifact_id: raw)
+                    self.assertEqual('Summary invalid or unavailable', result['results'][0]['status'])
+                    self.assertNotIn(MARKER, json.dumps(result))
+
+    def test_interval_metadata_distinguishes_paired_and_independent_resampling(self):
+        result = self.export('per-article-obfuscation', fixture('per-article-obfuscation'))
+        self.assertEqual('mixed_pointwise_bootstrap', result['identity_uncertainty'])
+        for row in result['rows']:
+            expected = 'pointwise_independent_component_bootstrap' if row['phase'] == 'startup-composition' else 'pointwise_paired_bootstrap'
+            self.assertEqual(expected, row['identity_interval_method'])
+        for phase in ('warm', 'cold', 'startup-composition'):
+            malformed = copy.deepcopy(result)
+            next(row for row in malformed['rows'] if row['phase'] == phase)['identity_interval_method'] = 'descriptive_order_statistics'
+            with self.assertRaises(ValueError):
+                self.validate(malformed)
+        malformed = result | {'identity_uncertainty': 'pointwise_paired_bootstrap'}
+        with self.assertRaises(ValueError):
+            self.validate(malformed)
+        rendered = PAGES.render(dict(head_sha=SHA, generated_at='fixture', workflows=[], coverage=[], results=[result]))
+        self.assertIn('independently resample PHP, Rust and startup components', rendered)
+        self.assertIn('warm/cold intervals resample paired observations', rendered)
 
     def test_shared_job_and_public_artifacts_are_independent_on_failure(self):
         workflow = (ROOT / '.github/workflows/archive-sample-performance.yml').read_text().split('  filename-identity:', 1)[1]
