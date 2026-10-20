@@ -188,7 +188,7 @@ final class DatabaseNzbStorageTest extends TestCase
             self::assertFileExists($file);
             self::assertSame(1, DB::table('nzb_storage_imports')->value('last_release_id'));
             $this->artisan('nzbs:import-database', ['--root' => [$directory], '--limit' => 1])->assertExitCode(0);
-            self::assertSame(1, DB::table('release_fingerprint_jobs')->count());
+            self::assertSame(0, DB::table('release_fingerprint_jobs')->count());
         } finally {
             unlink($file);
             rmdir($directory.'/d');
@@ -374,6 +374,35 @@ final class DatabaseNzbStorageTest extends TestCase
             self::assertSame(now('UTC')->format('Y-m-d H:i:s'), DB::table('release_fingerprint_jobs')->value('available_at'));
         } finally {
             date_default_timezone_set($original);
+        }
+    }
+
+    public function test_legacy_reads_are_explicit_read_only_and_database_content_wins(): void
+    {
+        $root = sys_get_temp_dir().'/nzb-cutover-'.bin2hex(random_bytes(8));
+        mkdir($root.'/d', 0700, true);
+        $path = $root.'/d/db-nzb-one.nzb.gz';
+        file_put_contents($path, gzencode('<nzb>legacy</nzb>'));
+        $nzb = app(NzbService::class);
+        foreach (['siteNzbPaths' => [$root.'/'], 'siteNzbPath' => $root.'/', 'nzbSplitLevel' => 1] as $property => $value) {
+            (new \ReflectionProperty(NzbService::class, $property))->setValue($nzb, $value);
+        }
+        try {
+            self::assertFalse($nzb->readNzbContents('db-nzb-one'));
+            config(['nntmux.nzb_legacy_reads' => true]);
+            self::assertSame('<nzb>legacy</nzb>', $nzb->readNzbContents('db-nzb-one'));
+            self::assertTrue(app(DatabaseFingerprintQueue::class)->enqueue(1, importLegacy: true));
+            self::assertSame('<nzb>legacy</nzb>', app(DatabaseNzbStore::class)->read('db-nzb-one'));
+            self::assertSame('pending', DB::table('release_fingerprint_jobs')->value('status'));
+            app(DatabaseNzbStore::class)->put($this->release(), '<nzb>replacement</nzb>');
+            self::assertSame('<nzb>replacement</nzb>', $nzb->readNzbContents('db-nzb-one'));
+            self::assertSame('<nzb>legacy</nzb>', gzdecode(file_get_contents($path)));
+            config(['nntmux.nzb_legacy_reads' => false]);
+            self::assertSame('<nzb>replacement</nzb>', $nzb->readNzbContents('db-nzb-one'));
+        } finally {
+            unlink($path);
+            rmdir($root.'/d');
+            rmdir($root);
         }
     }
 }

@@ -16,6 +16,7 @@ use Throwable;
 final class TransferFingerprintQueue extends Command
 {
     protected $signature = 'releases:fingerprint-transfer {--limit=1000 : Maximum legacy jobs to transfer}
+        {--import-legacy : Atomically import missing sources while transferring the existing backlog}
         {--dry-run : Validate sources without changing either queue}';
 
     protected $description = 'Transfer the retained Redis fingerprint backlog to database jobs for Rust workers';
@@ -49,7 +50,7 @@ final class TransferFingerprintQueue extends Command
                     $id = (int) $matches[1];
                     if (! $this->option('dry-run')) {
                         // Commit SQL first. A crash before Redis removal only repeats an idempotent enqueue.
-                        if (! app(DatabaseFingerprintQueue::class)->enqueue($id)
+                        if (! app(DatabaseFingerprintQueue::class)->enqueue($id, importLegacy: (bool) $this->option('import-legacy'))
                             && DB::table('releases')->where('id', $id)->exists()) {
                             throw new RuntimeException('Release '.$id.' has no database NZB; import it before transfer.');
                         }

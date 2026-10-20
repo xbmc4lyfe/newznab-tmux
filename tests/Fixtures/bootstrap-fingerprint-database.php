@@ -15,7 +15,7 @@ if ($url === false || $url === '') {
     throw new RuntimeException('Set FINGERPRINT_TEST_DATABASE_URL to a new disposable database.');
 }
 config(['database.default' => 'fingerprint_test', 'database.connections.fingerprint_test' => [
-    'driver' => 'mysql', 'url' => $url, 'charset' => 'utf8mb4', 'collation' => 'utf8mb4_unicode_ci',
+    'driver' => 'mariadb', 'url' => preg_replace('/^mysql:/', 'mariadb:', $url), 'charset' => 'utf8mb4', 'collation' => 'utf8mb4_unicode_ci',
     'prefix' => '', 'strict' => true, 'engine' => 'InnoDB',
 ]]);
 DB::purge('fingerprint_test');

@@ -17,7 +17,7 @@ final class ImportDatabaseNzbs extends Command
         {--limit=1000 : Maximum releases per invocation} {--after-id= : Override the stored resume cursor}
         {--name=published-nzbs : Database checkpoint name} {--dry-run : Inspect without writing}';
 
-    protected $description = 'Copy retained NZBs into the shared database and enqueue Rust fingerprints; preserve originals';
+    protected $description = 'Copy retained NZBs into the shared database without adding historical fingerprint work; preserve originals';
 
     public function handle(): int
     {
@@ -60,7 +60,7 @@ final class ImportDatabaseNzbs extends Command
                             if ($committed !== null && (! is_string($xml) || ! hash_equals($committed, NzbSourceGuard::digest($xml)))) {
                                 throw new RuntimeException('Legacy source differs from the committed generation; settle its upgrade before import.');
                             }
-                            app(DatabaseNzbStore::class)->putLocked($current, $body);
+                            app(DatabaseNzbStore::class)->putLocked($current, $body, enqueueWork: false);
                         }
                         DB::table('nzb_storage_imports')->updateOrInsert(['name' => $name], ['last_release_id' => $release->id, 'updated_at' => now('UTC')]);
                     });

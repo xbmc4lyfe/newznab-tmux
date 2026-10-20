@@ -42,7 +42,7 @@ final class DatabaseNzbStore
     }
 
     /** Requires the caller's release lock; lock order is release, content, job. */
-    public function putLocked(object $release, string $compressed, ?string $expectedDigest = null): string
+    public function putLocked(object $release, string $compressed, ?string $expectedDigest = null, bool $enqueueWork = true): string
     {
         if (DB::transactionLevel() === 0) {
             throw new RuntimeException('Database NZB installation requires a transaction.');
@@ -69,7 +69,9 @@ final class DatabaseNzbStore
             DB::table('release_nzb_contents')->where('guid', $release->guid)->update($values);
         }
         app(ReleaseArchiveNamingEvidence::class)->sourceReplacedLocked($release, $digest);
-        app(DatabaseFingerprintQueue::class)->enqueueLocked($release, $digest);
+        if ($enqueueWork) {
+            app(DatabaseFingerprintQueue::class)->enqueueLocked($release, $digest);
+        }
 
         return $digest;
     }

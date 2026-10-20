@@ -27,7 +27,7 @@ return new class extends Migration
             $table->foreign('releases_id')->references('id')->on('releases')->cascadeOnDelete();
         });
         // The framework's generic binary column is BLOB on MySQL; NZBs need LONGBLOB.
-        if (DB::connection()->getDriverName() === 'mysql') {
+        if (in_array(DB::connection()->getDriverName(), ['mysql', 'mariadb'], true)) {
             DB::statement('ALTER TABLE release_nzb_contents MODIFY body LONGBLOB NOT NULL');
         }
         Schema::create('release_fingerprint_jobs', static function (Blueprint $table): void {

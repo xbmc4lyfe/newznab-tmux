@@ -8,6 +8,8 @@ return [
     'echocli' => env('ECHOCLI', true),
     // Published NZBs live in the database; files is only a legacy rollback mode.
     'nzb_storage' => env('NZB_STORAGE', 'database'),
+    // Temporary read-only fallback during archive import; all new writes still go to SQL.
+    'nzb_legacy_reads' => (bool) env('NZB_DATABASE_LEGACY_READS', false),
     // Rust workers consume database jobs. Legacy is retained only for migration rollback.
     'fingerprint_worker' => env('FINGERPRINT_WORKER', 'rust'),
     // Release fingerprint record format: 'compact' (bounded samples, compact-v1) or 'full' (legacy schema 39).

@@ -632,7 +632,7 @@ final class NzbSourceGuard
     private function readCurrent(string $guid): ?array
     {
         if (DatabaseNzbStore::enabled()) {
-            $contents = app(DatabaseNzbStore::class)->read($guid);
+            $contents = $this->nzb->readNzbContents($guid);
 
             return is_string($contents) ? ['guid' => $guid, 'path' => NzbService::databaseReference($guid),
                 'contents' => $contents, 'digest' => self::digest($contents)] : null;
