@@ -119,6 +119,30 @@ final class PerArticleObfuscationNativeTest extends TestCase
         self::assertNull($native->markWithoutSampling($headers, 16));
     }
 
+    public function test_unusual_article_numbers_take_the_filtered_retry_and_match_php(): void
+    {
+        $native = new NativePerArticleObfuscation((string) getenv('NNTMUX_TEST_NATIVE_LIBRARY'));
+        if (getenv('NNTMUX_TEST_NATIVE_LIBRARY') === false || ! $native->available()) {
+            self::markTestSkipped('Needs a Linux CLI with FFI and NNTMUX_TEST_NATIVE_LIBRARY.');
+        }
+        $base = PerArticleObfuscationCorpus::stratum('kenpsx', 4, 2000);
+        $forms = [static fn (int $n): int => $n, static fn (int $n): string => ' '.$n, static fn (int $n): string => $n.' ',
+            static fn (int $n): string => $n."\n", static fn (int $n): string => '+'.$n, static fn (int $n): float => $n + 0.5,
+            static fn (int $n): string => '1e3', static fn (int $n): string => 'abc', static fn (int $n): ?int => null,
+            static fn (int $n): bool => true, static fn (int $n): string => '0000'.$n];
+        foreach ($forms as $index => $form) {
+            $headers = $base;
+            foreach ($headers as $row => $header) {
+                if ($row % 7 === 0) {
+                    $headers[$row]['Number'] = $form(5_000_000_000 + $row);
+                }
+            }
+            $marked = $native->markWithoutSampling($headers, 16);
+            self::assertNotNull($marked, 'form '.$index);
+            self::assertSame(self::php($headers, 16), self::sorted($marked), 'form '.$index);
+        }
+    }
+
     public function test_counts_php_reads_as_an_infinite_double_keep_the_php_result(): void
     {
         $native = new NativePerArticleObfuscation((string) getenv('NNTMUX_TEST_NATIVE_LIBRARY'));

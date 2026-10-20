@@ -154,6 +154,7 @@ function perArticleBenchmarkMain(): int
 
     // Cold observations: each is the first call in a fresh process, so the Rust side pays for
     // loading the library and running its probe, as a finite indexing command does.
+    $constructions = [];
     $coldMarkdown = "| Stratum | Category | Cold side | Cold PHP ms | Cold Rust path ms | Speedup | 95% CI |\n|---|---|---|---:|---:|---:|---|\n";
     foreach (PerArticleObfuscationCorpus::strata() as $name => $stratum) {
         if ($stratum['size'] > 20000 || isset($report['strata'][$name]['parity'])) {
@@ -169,6 +170,7 @@ function perArticleBenchmarkMain(): int
                 $result = json_decode((string) $output, true, 4, JSON_THROW_ON_ERROR);
                 $cold[$side][] = (int) $result['ns'];
                 $rustRuns += $side === 'rust' && $result['rust'] === true ? 1 : 0;
+                $constructions[] = (int) $result['construct_ns'];
             }
         }
         // The side most of this stratum's cold runs took decides its gate, so one run the sampler
@@ -193,6 +195,9 @@ function perArticleBenchmarkMain(): int
             $report['cold'][$name]['php_ms'], $report['cold'][$name]['rust_ms'], $coldSpeedup, $coldLow, $coldHigh);
     }
 
+    $report['cold_construct_median_ms'] = $constructions === [] ? null : round(perArticleQuantile($constructions, 0.5) / 1e6, 3);
+    $report['cold_construct_p90_ms'] = $constructions === [] ? null : round(perArticleQuantile($constructions, 0.9) / 1e6, 3);
+
     $markdown = "| Stratum | Category | Headers | Marked | Statistic | PHP ms | Rust+FFI ms | Speedup | 95% CI |\n|---|---|---:|---:|---|---:|---:|---:|---|\n";
     foreach ($report['strata'] as $name => $row) {
         $markdown .= isset($row['parity']) ? "| {$name} | parity mismatch ||||||||\n"
@@ -201,7 +206,7 @@ function perArticleBenchmarkMain(): int
     }
     $markdown .= "\nSource commit: `".$report['environment']['source_commit'].'`; library sha256 `'.$report['environment']['library_sha256']."`.\n";
     $markdown .= "\nStatus: **{$report['status']}** (threshold ".PER_ARTICLE_THRESHOLD."x; {$repeats} paired samples per stratum, ".PER_ARTICLE_TAIL_SAMPLES." for uncommon strata; Rust strata need the 95% lower bound at the threshold).\n";
-    $markdown .= "\nCold first call per fresh process (median of ".PER_ARTICLE_COLD_RUNS.' runs, '.PER_ARTICLE_COLD_RUNS_ROUTED.' for routed strata; same thresholds; the side most runs took sets the gate; excludes the one-time wrapper construction with the service, about 0.4-0.6 ms per process):'."\n\n".$coldMarkdown;
+    $markdown .= "\nCold first call per fresh process (median of ".PER_ARTICLE_COLD_RUNS.' runs, '.PER_ARTICLE_COLD_RUNS_ROUTED.' for routed strata; same thresholds; the side most runs took sets the gate). The one-time wrapper construction with the service is measured separately and not added: median '.$report['cold_construct_median_ms'].' ms, p90 '.$report['cold_construct_p90_ms']." ms per process.\n\n".$coldMarkdown;
     file_put_contents($directory.'/report.json', json_encode($report, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR));
     file_put_contents($directory.'/summary.md', $markdown);
     echo $markdown;
@@ -230,9 +235,11 @@ function perArticleColdChild(string $name, string $side, string $library, int $s
         public function __construct() {}
     }, false);
     // The wrapper is built before timing, as HeaderParser builds it once with the service: that
-    // one-time class load and sampler seeding (about 0.4-0.6 ms per process, measured separately)
-    // is excluded. Loading the library and its probe fall inside the timed first call.
+    // one-time class load and sampler seeding is timed separately (construct_ns) and reported, not
+    // added to the first call. Loading the library and its probe fall inside the timed first call.
+    $constructStart = hrtime(true);
     $native = new NativePerArticleObfuscation($library);
+    $construct = hrtime(true) - $constructStart;
     $start = hrtime(true);
     $marked = $side === 'rust' ? $native->mark($headers, PER_ARTICLE_MIN_ARTICLES) : null;
     // The set HeaderParser::parse() consults, built on either side.
@@ -241,7 +248,7 @@ function perArticleColdChild(string $name, string $side, string $library, int $s
         : array_fill_keys($marked, true);
     $elapsed = hrtime(true) - $start;
 
-    return json_encode(['ns' => $elapsed, 'marked' => count($set), 'rust' => $marked !== null], JSON_THROW_ON_ERROR);
+    return json_encode(['ns' => $elapsed, 'construct_ns' => $construct, 'marked' => count($set), 'rust' => $marked !== null], JSON_THROW_ON_ERROR);
 }
 
 /**
