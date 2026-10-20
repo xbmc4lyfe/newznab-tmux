@@ -30,7 +30,7 @@ final class NativePerArticleObfuscation
      * Smaller ranges stay on PHP: there the PHP rule takes well under a millisecond, and even the
      * sample would cost several percent of it.
      */
-    public const int MIN_HEADERS = 4000;
+    public const int MIN_HEADERS = 8000;
 
     /**
      * Per-header cost by sampled class (no part count, a part count only, a candidate) as
