@@ -9,7 +9,7 @@ use Throwable;
 
 /**
  * Rust port of {@see HeaderParser::markPerArticleObfuscated()}, adopted after
- * scripts/benchmark-per-article-obfuscation.php measured it at 1.7-3.6x the PHP rule on the ranges it is routed to (warm and cold) with identical
+ * scripts/benchmark-per-article-obfuscation.php measured it at 1.7-3.4x the PHP rule on the ranges it is routed to (warm and cold) with identical
  * marks. Null means "use PHP": not a Linux CLI with FFI, library missing, failing its known-answer
  * probe, or input the native side declines (a subject longer than MAX_SUBJECT_LENGTH, where PHP's
  * backtrack limit could stop the subject pattern).
@@ -18,6 +18,9 @@ final class NativePerArticleObfuscation
 {
     /** Mirrors MAX_SUBJECT_LENGTH in the Rust port; longer subjects are declined before packing. */
     public const int MAX_SUBJECT_LENGTH = 512;
+
+    /** The library's `usize::MAX - 1` as PHP's signed int: Rust declined over the article numbers. */
+    private const int NUMBERS_DECLINED = -2;
 
     /** Mirrors HeaderParser::NATIVE_MIN_HEADERS: smaller ranges stay on PHP. */
     public const int MIN_HEADERS = HeaderParser::NATIVE_MIN_HEADERS;
@@ -138,18 +141,24 @@ final class NativePerArticleObfuscation
             return [];
         }
         // XOVER rows carry numbers as strings: hand the column over as text and let Rust parse
-        // `-?[0-9]+`. Any other form makes Rust decline, and the filtered loop retries with ints.
+        // `-?[0-9]+`. Only a decline over the numbers is retried, with the filtered loop's ints;
+        // any other decline would recur, so PHP decides at once.
         $columns = self::columns($headers, true);
-        $marked = $columns === null ? null : self::invoke($library, $columns, $minArticles);
+        $marked = $columns === null ? self::NUMBERS_DECLINED : self::invoke($library, $columns, $minArticles);
+        if ($marked === self::NUMBERS_DECLINED) {
+            $marked = self::invoke($library, self::columns($headers, false), $minArticles);
+        }
 
-        return $marked ?? self::invoke($library, self::columns($headers, false), $minArticles);
+        return is_array($marked) ? $marked : null;
     }
 
     /**
+     * Marked numbers, NUMBERS_DECLINED when Rust rejected a number, or null for any other decline.
+     *
      * @param  array{list<int|string>, list<string>}  $columns
-     * @return list<int>|null
+     * @return list<int>|int|null
      */
-    private static function invoke(FFI $library, array $columns, int $minArticles): ?array
+    private static function invoke(FFI $library, array $columns, int $minArticles): array|int|null
     {
         [$numbers, $subjects] = $columns;
         $count = count($subjects);
@@ -169,6 +178,9 @@ final class NativePerArticleObfuscation
                 $numberText, strlen($numberText), pack('V*', ...$lengths), $count, $subjectBytes, strlen($subjectBytes),
                 $minArticles, $output, $count * 8,
             );
+            if ($marked === self::NUMBERS_DECLINED) {
+                return self::NUMBERS_DECLINED;
+            }
             if (! is_int($marked) || $marked < 0 || $marked > $count) {
                 return null;
             }

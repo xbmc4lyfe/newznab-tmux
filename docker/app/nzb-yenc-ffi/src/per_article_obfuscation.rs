@@ -29,8 +29,8 @@ struct Signature<'a> {
 }
 
 /// Marked article numbers, distinct and ascending; `None` declines (a subject longer than
-/// `MAX_SUBJECT_LENGTH`, or a part or total of `PHP_INT_DOUBLE_DIGITS` or more digits), so the
-/// caller keeps the PHP result.
+/// `MAX_SUBJECT_LENGTH`, or a part or total at PHP's double-rounding boundary), so the caller keeps
+/// the PHP result.
 pub fn mark<'a>(articles: &[Article<'a>], min_articles: usize) -> Option<Vec<i64>> {
     if min_articles == 0 {
         return Some(Vec::new());
@@ -254,25 +254,46 @@ fn parenthesized(subject: &[u8], at: usize) -> Option<(&[u8], &[u8])> {
     Some((part, &subject[cursor..cursor + total_length]))
 }
 
-/// Digit runs at least this long (after leading zeros) decline: PHP reads them as a double, and
-/// once that exceeds `f64::MAX` (from 309 digits) its `(int)` gives 0 instead of saturating.
-pub const PHP_INT_DOUBLE_DIGITS: usize = 309;
+/// The first 17 digits of a 309-digit value where PHP's double rounds either to `f64::MAX` or to
+/// infinity; below it PHP's `(int)` saturates, above it (and from 310 digits) the value is
+/// infinite and `(int)` gives 0.
+const PHP_DOUBLE_OVERFLOW_PREFIX: &[u8] = b"17976931348623158";
 
-/// PHP's `(int)` of an ASCII digit string, which saturates at `i64::MAX`; `None` for runs of
-/// `PHP_INT_DOUBLE_DIGITS` or more significant digits.
-fn php_int(digits: &[u8]) -> Option<i64> {
+/// PHP's `(int)` of a digit string with an optional minus sign: exact values in the i64 range,
+/// saturation beyond it, and 0 once PHP's double is infinite. `None` only for 309-digit values
+/// whose first 17 digits are `PHP_DOUBLE_OVERFLOW_PREFIX`, where the rounding needs PHP itself.
+pub fn php_int_signed(negative: bool, digits: &[u8]) -> Option<i64> {
     let significant = &digits[digits.iter().take_while(|byte| **byte == b'0').count()..];
-    if significant.len() >= PHP_INT_DOUBLE_DIGITS {
-        return None;
+    let saturated = if negative { i64::MIN } else { i64::MAX };
+    match significant.len() {
+        310.. => return Some(0),
+        309 => {
+            return match significant[..PHP_DOUBLE_OVERFLOW_PREFIX.len()]
+                .cmp(PHP_DOUBLE_OVERFLOW_PREFIX)
+            {
+                std::cmp::Ordering::Less => Some(saturated),
+                std::cmp::Ordering::Equal => None,
+                std::cmp::Ordering::Greater => Some(0),
+            };
+        }
+        _ => {}
     }
     Some(
         significant
             .iter()
             .try_fold(0_i64, |value, byte| {
-                value.checked_mul(10)?.checked_add(i64::from(byte - b'0'))
+                let digit = i64::from(byte - b'0');
+                value
+                    .checked_mul(10)?
+                    .checked_add(if negative { -digit } else { digit })
             })
-            .unwrap_or(i64::MAX),
+            .unwrap_or(saturated),
     )
+}
+
+/// PHP's `(int)` of an unsigned ASCII digit string; see `php_int_signed`.
+fn php_int(digits: &[u8]) -> Option<i64> {
+    php_int_signed(false, digits)
 }
 
 fn alnum_runs(name: &[u8]) -> impl Iterator<Item = (usize, usize)> + '_ {
@@ -525,7 +546,17 @@ mod tests {
             php_int(format!("000{}", "9".repeat(308)).as_bytes()),
             Some(i64::MAX)
         );
-        assert_eq!(php_int("9".repeat(309).as_bytes()), None);
+        let at = |prefix: &str| format!("{prefix}{}", "0".repeat(292));
+        assert_eq!(php_int(at("17976931348623157").as_bytes()), Some(i64::MAX));
+        assert_eq!(php_int(at("17976931348623158").as_bytes()), None);
+        assert_eq!(php_int(at("17976931348623159").as_bytes()), Some(0));
+        assert_eq!(php_int("9".repeat(309).as_bytes()), Some(0));
+        assert_eq!(php_int("1".repeat(310).as_bytes()), Some(0));
+        assert_eq!(php_int_signed(true, "9".repeat(309).as_bytes()), Some(0));
+        assert_eq!(
+            php_int_signed(true, format!("1{}", "0".repeat(308)).as_bytes()),
+            Some(i64::MIN)
+        );
     }
 
     /// The previous direct translation of the PCRE search (cubic on whitespace), kept as the

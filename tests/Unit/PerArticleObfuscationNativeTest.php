@@ -6,6 +6,7 @@ namespace Tests\Unit;
 
 use App\Services\Binaries\HeaderParser;
 use App\Services\Binaries\NativePerArticleObfuscation;
+use App\Services\Binaries\PerArticleObfuscationRouter;
 use App\Services\BlacklistService;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -48,7 +49,7 @@ final class PerArticleObfuscationNativeTest extends TestCase
     public function test_header_parser_size_floor_mirrors_the_native_one(): void
     {
         self::assertSame(NativePerArticleObfuscation::MIN_HEADERS, HeaderParser::NATIVE_MIN_HEADERS);
-        self::assertSame(NativePerArticleObfuscation::MAX_SUBJECT_LENGTH, HeaderParser::NATIVE_MAX_SUBJECT_LENGTH);
+        self::assertSame(NativePerArticleObfuscation::MAX_SUBJECT_LENGTH, PerArticleObfuscationRouter::MAX_SUBJECT_LENGTH);
     }
 
     public function test_corpus_is_deterministic_and_exercises_marking(): void
@@ -149,28 +150,57 @@ final class PerArticleObfuscationNativeTest extends TestCase
         }
     }
 
-    public function test_counts_php_reads_as_an_infinite_double_keep_the_php_result(): void
+    public function test_counts_past_the_double_range_match_php_without_declining(): void
     {
         $native = new NativePerArticleObfuscation((string) getenv('NNTMUX_TEST_NATIVE_LIBRARY'));
         if (getenv('NNTMUX_TEST_NATIVE_LIBRARY') === false || ! $native->available()) {
             self::markTestSkipped('Needs a Linux CLI with FFI and NNTMUX_TEST_NATIVE_LIBRARY.');
         }
-        // PHP's (int) caps a 308-digit total at PHP_INT_MAX but turns 309 digits into 0.
-        foreach ([308 => false, 309 => true] as $digits => $declines) {
+        // PHP's (int) caps up to the largest double and gives 0 beyond it; only the rounding
+        // boundary itself (17976931348623158...) declines.
+        $boundary = '17976931348623158'.str_repeat('0', 292);
+        foreach ([str_repeat('9', 308) => false, str_repeat('9', 309) => false, str_repeat('1', 310) => false, $boundary => true] as $total => $declines) {
             $headers = PerArticleObfuscationCorpus::stratum('kenpsx', 9, 2 * NativePerArticleObfuscation::MIN_HEADERS);
             for ($i = 0; $i < 40; $i++) {
                 $headers[] = ['Number' => (string) (9_000_000_000 + $i),
-                    'Subject' => '[40/62] "'.md5((string) $i).'" yEnc ('.($i + 2).'/'.str_repeat('9', $digits).')'];
+                    'Subject' => '[40/62] "'.md5((string) $i).'" yEnc ('.($i + 2).'/'.$total.')'];
             }
-            $headers[] = ['Number' => str_repeat('9', $digits), 'Subject' => '[40/62] "'.md5('n').'" yEnc (3/687)'];
-            $marked = $native->mark($headers, 16);
+            $headers[] = ['Number' => (string) $total, 'Subject' => '[40/62] "'.md5('n').'" yEnc (3/687)'];
+            $marked = $native->markWithoutSampling($headers, 16);
             if ($declines) {
                 self::assertNull($marked);
             } else {
-                self::assertNotNull($marked);
-                self::assertSame(self::php($headers, 16), self::sorted($marked));
+                self::assertNotNull($marked, strlen((string) $total).' digits');
+                self::assertSame(self::php($headers, 16), self::sorted($marked), strlen((string) $total).' digits');
             }
         }
+    }
+
+    public function test_the_default_parser_builds_the_wrapper_only_for_routed_ranges_and_stops_after_a_failed_load(): void
+    {
+        // No Laravel config here, so the default wrapper's library path cannot resolve and its
+        // load fails: the PHP result must stand, and later ranges must neither route nor rebuild.
+        $parser = new HeaderParser(new class extends BlacklistService
+        {
+            public function __construct() {}
+        });
+        $wrapperOf = static fn (HeaderParser $parser): mixed => (new \ReflectionProperty(HeaderParser::class, 'native'))->getValue($parser);
+        $small = PerArticleObfuscationCorpus::stratum('kenpsx', 3, HeaderParser::NATIVE_MIN_HEADERS - 1);
+        $parser->markPerArticleObfuscated($small, 16);
+        self::assertNull($wrapperOf($parser));
+
+        $headers = PerArticleObfuscationCorpus::stratum('kenpsx', 3, 2 * HeaderParser::NATIVE_MIN_HEADERS);
+        $parser->markPerArticleObfuscated($headers, 16);
+        $numbers = $parser->perArticleObfuscatedNumbers();
+        sort($numbers);
+        self::assertSame(self::php($headers, 16), $numbers);
+        $wrapper = $wrapperOf($parser);
+        self::assertInstanceOf(NativePerArticleObfuscation::class, $wrapper);
+        self::assertTrue($wrapper->unavailable());
+
+        $parser->markPerArticleObfuscated($headers, 16);
+        self::assertSame(spl_object_id($wrapper), spl_object_id($wrapperOf($parser)));
+        self::assertCount(count($numbers), $parser->perArticleObfuscatedNumbers());
     }
 
     /** @return iterable<string, array{string, int}> */
