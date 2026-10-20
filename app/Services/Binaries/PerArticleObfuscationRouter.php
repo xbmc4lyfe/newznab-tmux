@@ -4,9 +4,6 @@ declare(strict_types=1);
 
 namespace App\Services\Binaries;
 
-use Random\Engine\Xoshiro256StarStar;
-use Random\Randomizer;
-
 /**
  * Decides, from a sample of a header range, whether {@see NativePerArticleObfuscation} should mark
  * it or the PHP rule in {@see HeaderParser::markPerArticleObfuscated()} should. Loaded only for
@@ -49,9 +46,6 @@ final class PerArticleObfuscationRouter
     /** Mirrors NativePerArticleObfuscation::MAX_SUBJECT_LENGTH: Rust declines longer subjects. */
     public const int MAX_SUBJECT_LENGTH = 512;
 
-    /** Sample positions only need to be unpredictable per range, not secure: one engine per process. */
-    private static ?Randomizer $sampler = null;
-
     /**
      * Whether the Rust port should take this range of HeaderParser::NATIVE_MIN_HEADERS or more.
      * These stay on PHP:
@@ -68,10 +62,10 @@ final class PerArticleObfuscationRouter
     {
         $values = array_is_list($headers) ? $headers : array_values($headers);
         $count = \count($values);
-        // One random header from each of $samples equal slices, so no periodic ordering of the
+        // One pseudo-random header from each of $samples equal slices, so no periodic ordering of the
         // range decides the prediction.
         $samples = min(self::SAMPLE_MAX, max(self::SAMPLE_MIN, intdiv($count, 128)));
-        $random = self::$sampler ??= new Randomizer(new Xoshiro256StarStar);
+        $random = PerArticleObfuscationGate::sampler($values);
         $php = $rust = 0;
         for ($slice = 0; $slice < $samples; $slice++) {
             $start = intdiv($slice * $count, $samples);

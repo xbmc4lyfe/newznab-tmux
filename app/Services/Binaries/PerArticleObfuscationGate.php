@@ -14,9 +14,6 @@ use Random\Randomizer;
  */
 final class PerArticleObfuscationGate
 {
-    /** Probe positions only need to be unpredictable per range, not secure: one engine per process. */
-    private static ?Randomizer $probes = null;
-
     /**
      * Whether the Rust port should take this range.
      *
@@ -29,7 +26,23 @@ final class PerArticleObfuscationGate
     }
 
     /**
-     * Whether at least a quarter of 16 subjects, one at random from each sixteenth of the range, hold ` (`, which every yEnc part
+     * Sample positions seeded from the range itself (its size and first and last article numbers):
+     * pseudo-random, so a periodic ordering cannot line up with them, yet the same range always
+     * gets the same routing.
+     *
+     * @param  list<array<string, mixed>>  $values
+     */
+    public static function sampler(array $values): Randomizer
+    {
+        $first = $values[0]['Number'] ?? '';
+        $last = $values[\count($values) - 1]['Number'] ?? '';
+        $key = \count($values).':'.(\is_scalar($first) ? $first : '').':'.(\is_scalar($last) ? $last : '');
+
+        return new Randomizer(new Xoshiro256StarStar(hash('xxh3', $key, true).hash('xxh3', $key.'#', true).hash('xxh3', $key.'##', true).hash('xxh3', $key.'###', true)));
+    }
+
+    /**
+     * Whether at least a quarter of 16 subjects, one pseudo-random pick from each sixteenth of the range, hold ` (`, which every yEnc part
      * count needs. Ranges of mostly plain text, which the PHP rule rejects fastest, stay on PHP
      * without loading the router. It can only keep a range on PHP, never send one to Rust.
      *
@@ -39,10 +52,10 @@ final class PerArticleObfuscationGate
     {
         $values = array_is_list($headers) ? $headers : array_values($headers);
         $count = \count($values);
-        $random = self::$probes ??= new Randomizer(new Xoshiro256StarStar);
+        $random = self::sampler($values);
         $hits = 0;
         for ($probe = 0; $probe < 16; $probe++) {
-            // One random subject from each of 16 equal slices, so no periodic ordering decides.
+            // One pseudo-random subject from each of 16 equal slices, so no periodic ordering decides.
             $subject = $values[$random->getInt(intdiv($probe * $count, 16), intdiv(($probe + 1) * $count, 16) - 1)]['Subject'] ?? null;
             if (\is_string($subject) && str_contains($subject, ' (')) {
                 $hits++;

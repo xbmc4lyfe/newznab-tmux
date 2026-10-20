@@ -207,18 +207,21 @@ final class PerArticleObfuscationNativeTest extends TestCase
     public function test_the_gate_samples_strictly_alternating_ranges_in_every_phase(): void
     {
         // Obfuscated posts on even positions, plain text on odd ones: fixed probes on odd positions
-        // would keep this range on PHP every time.
-        $obfuscated = PerArticleObfuscationCorpus::stratum('boneless', 2, 10000);
-        $text = PerArticleObfuscationCorpus::stratum('non-yenc', 2, 10000);
-        $headers = [];
-        for ($i = 0; $i < 10000; $i++) {
-            $headers[] = $obfuscated[$i];
-            $headers[] = $text[$i];
-        }
-        $passes = 0;
+        // would keep these ranges on PHP every time.
         $check = new \ReflectionMethod(PerArticleObfuscationGate::class, 'mayCarryPartCounts');
-        for ($round = 0; $round < 20; $round++) {
-            $passes += $check->invoke(null, $headers) ? 1 : 0;
+        $passes = 0;
+        for ($seed = 1; $seed <= 20; $seed++) {
+            $obfuscated = PerArticleObfuscationCorpus::stratum('boneless', $seed, 10000);
+            $text = PerArticleObfuscationCorpus::stratum('non-yenc', $seed, 10000);
+            $headers = [];
+            for ($i = 0; $i < 10000; $i++) {
+                $headers[] = ['Number' => (string) (7_000_000_000 + 20_000 * $seed + 2 * $i)] + $obfuscated[$i];
+                $headers[] = ['Number' => (string) (7_000_000_000 + 20_000 * $seed + 2 * $i + 1)] + $text[$i];
+            }
+            $first = $check->invoke(null, $headers);
+            // Seeded from the range, so repeating a range repeats its routing.
+            self::assertSame($first, $check->invoke(null, $headers));
+            $passes += $first ? 1 : 0;
         }
         self::assertGreaterThan(15, $passes);
     }
