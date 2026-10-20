@@ -12,6 +12,7 @@ on:
       - 'app/Services/Releases/Fingerprint/**'
       - 'app/Services/Releases/Verification/*SpotCheckPlanner.php'
       - 'app/Services/Releases/Verification/*HeaderFilenameIdentity.php'
+      - 'app/Services/Binaries/BinariesService.php'
       - 'app/Services/Binaries/HeaderParser.php'
       - 'app/Services/Binaries/NativePerArticleObfuscation.php'
       - 'app/Services/Binaries/PerArticleObfuscationGate.php'

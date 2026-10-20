@@ -646,7 +646,23 @@ class BinariesStorageInternalsTest extends TestCase
         $this->assertSame(0, DB::table('missed_parts')->count());
     }
 
-    public function test_part_repair_stores_articles_that_look_obfuscated_per_article(): void
+    public function test_sparse_part_repair_stores_articles_that_look_obfuscated_per_article(): void
+    {
+        $this->createHeaderStorageTables();
+        $this->createMissedPartsTable();
+        $headers = [];
+        for ($i = 0; $i < 16; $i++) {
+            $headers[] = $this->rawHeader(1500 + 2 * $i, '[40/62] "'.md5((string) $i).'" yEnc ('.($i + 2).'/687)');
+        }
+        DB::table('missed_parts')->insert(array_map(static fn (array $header): array => ['numberid' => $header['Number'], 'groups_id' => 1], $headers));
+
+        $this->scanService($headers)->scan(['id' => 1, 'name' => 'alt.test'], 1500, 1530, 'partrepair', range(1500, 1530, 2));
+
+        $this->assertSame(16, DB::table('parts')->count());
+        $this->assertSame(0, DB::table('missed_parts')->count());
+    }
+
+    public function test_repair_of_a_whole_deferred_range_skips_articles_obfuscated_per_article(): void
     {
         $this->createHeaderStorageTables();
         $this->createMissedPartsTable();
@@ -658,7 +674,7 @@ class BinariesStorageInternalsTest extends TestCase
 
         $this->scanService($headers)->scan(['id' => 1, 'name' => 'alt.test'], 1500, 1515, 'partrepair', range(1500, 1515));
 
-        $this->assertSame(16, DB::table('parts')->count());
+        $this->assertSame(0, DB::table('parts')->count());
         $this->assertSame(0, DB::table('missed_parts')->count());
     }
 

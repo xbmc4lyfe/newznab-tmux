@@ -353,10 +353,14 @@ class BinariesService
             ? null
             : array_fill_keys(array_map('intval', $missingParts), true);
         $totalHeaders = \count($headers);
-        // Detect across the whole range: one chunk can hold too few of an upload's articles.
+        // Detect across the whole range: one chunk can hold too few of an upload's articles. A
+        // sparse part repair lists scattered missing articles of real uploads, so it is exempt; a
+        // repair listing every number of its range is a range deferred before download (or lost
+        // whole) and is filtered like the scan it replaces.
+        $sparseRepair = $partRepair && ($missingParts === null || \count($missingParts) !== $last - $first + 1);
         $obfuscated = $this->headerParser->markPerArticleObfuscated(
             $headers,
-            $partRepair ? 0 : $this->config->perArticleObfuscationMinArticles
+            $sparseRepair ? 0 : $this->config->perArticleObfuscationMinArticles
         );
         if ($obfuscated > 0) {
             Log::info('Skipping articles obfuscated per article', [

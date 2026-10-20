@@ -91,7 +91,9 @@ final class NativePerArticleObfuscation
 
     private function load(): ?FFI
     {
-        if (PHP_OS_FAMILY !== 'Linux' || PHP_SAPI !== 'cli' || ! extension_loaded('FFI')) {
+        // Only architectures whose CI job requires the benchmark to qualify (x86_64 and arm64).
+        if (PHP_OS_FAMILY !== 'Linux' || PHP_SAPI !== 'cli' || ! extension_loaded('FFI')
+            || ! \in_array(php_uname('m'), ['x86_64', 'aarch64', 'arm64'], true)) {
             return null;
         }
         try {

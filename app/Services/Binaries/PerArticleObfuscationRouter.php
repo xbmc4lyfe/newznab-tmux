@@ -99,7 +99,9 @@ final class PerArticleObfuscationRouter
      */
     private static function classifySample(mixed $subject): int
     {
-        if (! is_string($subject)) {
+        // The subject pattern's negative lookahead rejects these at once (only with no leading
+        // whitespace, where it has no shorter start to fall back on).
+        if (! is_string($subject) || str_starts_with($subject, 'Usenet Index Post')) {
             return 0;
         }
         for ($open = strpos($subject, '('); $open !== false; $open = strpos($subject, '(', $open + 1)) {

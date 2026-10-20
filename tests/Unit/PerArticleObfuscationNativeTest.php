@@ -226,6 +226,16 @@ final class PerArticleObfuscationNativeTest extends TestCase
         self::assertGreaterThan(15, $passes);
     }
 
+    public function test_usenet_index_post_subjects_are_priced_as_immediate_rejects(): void
+    {
+        $classify = new \ReflectionMethod(PerArticleObfuscationRouter::class, 'classifySample');
+        $subject = '[40/62] "'.md5('x').'" yEnc (3/687)';
+        self::assertSame(2, $classify->invoke(null, $subject));
+        self::assertSame(0, $classify->invoke(null, 'Usenet Index Post '.$subject));
+        // With leading whitespace the subject pattern starts later and still matches.
+        self::assertSame(2, $classify->invoke(null, ' Usenet Index Post '.$subject));
+    }
+
     /** @return iterable<string, array{string, int}> */
     public static function strata(): iterable
     {
