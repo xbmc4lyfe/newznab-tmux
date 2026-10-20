@@ -24,14 +24,24 @@ use Tests\Fixtures\YencArticles;
 
 final class NntpVerificationArticleSourceTest extends TestCase
 {
-    public function test_a_damaged_prefetch_reconnects_before_the_next_stat_pass(): void
+    /** @return iterable<string, array{bool}> */
+    public static function recoveryOperations(): iterable
+    {
+        yield 'STAT then BODY' => [true];
+        yield 'BODY directly' => [false];
+    }
+
+    #[DataProvider('recoveryOperations')]
+    public function test_a_damaged_prefetch_reconnects_before_the_next_stat_pass(bool $stat): void
     {
         config(['release_verification.article_bytes' => 64, 'release_verification.download_buffer_bytes' => 128,
             'release_verification.download_connections' => 1, 'release_verification.pipeline_window' => 2]);
         $first = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
         $next = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
         fwrite($first[1], "222 0 <wrong@example> body\r\n");
-        fwrite($next[1], "223 0 <new@example> present\r\n");
+        if ($stat) {
+            fwrite($next[1], "223 0 <new@example> present\r\n");
+        }
         $nntp = new class([$first[0], $next[0]]) extends NNTPService
         {
             public int $connects = 0;
@@ -63,7 +73,9 @@ final class NntpVerificationArticleSourceTest extends TestCase
         $source = new NntpArticleSource($nntp, maximumBytes: 64, allowAlternateFallback: false);
         try {
             $source->prefetch(['old@example', 'old2@example'], static function (): void {});
-            $source->stat(['new@example'], static function (): void {});
+            if ($stat) {
+                $source->stat(['new@example'], static function (): void {});
+            }
             fwrite($next[1], "222 0 <new@example> body\r\nbody\r\n.\r\n");
             $this->assertSame("body\r\n", $source->fetchBounded('new@example', 64));
             $this->assertSame(2, $nntp->connects);

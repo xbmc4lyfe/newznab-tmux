@@ -91,8 +91,12 @@ final class NntpArticleSource implements ArticleSource
                 }
             }
         }
-        $this->prefetched += NNTPService::verificationArticleBatch($batches, $maximumBytes,
-            max($maximumBytes, (int) config('release_verification.download_buffer_bytes', 67108864)), $heartbeat);
+        try {
+            $this->prefetched += NNTPService::verificationArticleBatch($batches, $maximumBytes,
+                max($maximumBytes, (int) config('release_verification.download_buffer_bytes', 67108864)), $heartbeat);
+        } finally {
+            $this->connected = $this->nntp->isConnected();
+        }
     }
 
     /** STAT is extra availability evidence; it never replaces the sampled BODY checks.
