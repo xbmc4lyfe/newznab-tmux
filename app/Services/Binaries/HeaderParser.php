@@ -55,7 +55,31 @@ final class HeaderParser
      */
     public static function worthNativeMarking(array $headers, bool $libraryLoaded): bool
     {
-        return \count($headers) >= self::NATIVE_MIN_HEADERS && PerArticleObfuscationRouter::worthNativeMarking($headers, $libraryLoaded);
+        return \count($headers) >= self::NATIVE_MIN_HEADERS && self::mayCarryPartCounts($headers)
+            && PerArticleObfuscationRouter::worthNativeMarking($headers, $libraryLoaded);
+    }
+
+    /**
+     * A cheap check before the router loads: whether at least a quarter of 16 evenly spaced
+     * subjects hold ` (`, which every yEnc part count needs. Ranges of mostly plain text, which the
+     * PHP rule rejects fastest, stay on PHP without paying to load the router. It can only keep a
+     * range on PHP, never send one to Rust.
+     *
+     * @param  array<int, array<string, mixed>>  $headers
+     */
+    private static function mayCarryPartCounts(array $headers): bool
+    {
+        $values = array_is_list($headers) ? $headers : array_values($headers);
+        $count = \count($values);
+        $hits = 0;
+        for ($probe = 0; $probe < 16; $probe++) {
+            $subject = $values[intdiv((2 * $probe + 1) * $count, 32)]['Subject'] ?? null;
+            if (\is_string($subject) && str_contains($subject, ' (')) {
+                $hits++;
+            }
+        }
+
+        return $hits >= 4;
     }
 
     /**
