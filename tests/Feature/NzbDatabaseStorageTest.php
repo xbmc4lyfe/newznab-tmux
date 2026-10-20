@@ -253,6 +253,24 @@ final class NzbDatabaseStorageTest extends TestCase
         self::assertSame('<nzb>file</nzb>', $nzb->readNzbContents($this->guid));
     }
 
+    public function test_rolling_back_the_migration_refuses_to_drop_stored_nzbs(): void
+    {
+        app(VerifiedNzbWriter::class)->write($this->manifest('first.rar'), $this->guid);
+        $migration = require base_path('database/migrations/2026_10_20_120000_create_release_nzbs_table.php');
+
+        try {
+            $migration->down();
+            self::fail('The rollback should have been refused.');
+        } catch (RuntimeException $exception) {
+            self::assertStringContainsString('release_nzbs holds release NZBs', $exception->getMessage());
+        }
+        self::assertTrue(Schema::hasTable('release_nzbs'));
+
+        DB::table('release_nzbs')->delete();
+        $migration->down();
+        self::assertFalse(Schema::hasTable('release_nzbs'));
+    }
+
     public function test_decoded_chunks_follow_concatenated_gzip_members_and_stop_at_damage(): void
     {
         $twoMembers = gzencode('first ').gzencode('second');

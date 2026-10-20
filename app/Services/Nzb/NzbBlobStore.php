@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Nzb;
 
+use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use RuntimeException;
@@ -18,8 +19,13 @@ final class NzbBlobStore
 {
     public const string TABLE = 'release_nzbs';
 
+    /** Room left in one statement for everything but the body. */
+    private const int PACKET_OVERHEAD = 65536;
+
     /** Whether the table exists, checked once per instance in files mode. */
     private ?bool $tableExists = null;
+
+    private ?int $packetLimit = null;
 
     public static function usesDatabase(): bool
     {
@@ -41,30 +47,25 @@ final class NzbBlobStore
         if (! $this->tableAvailable()) {
             return null;
         }
-        $query = DB::table(self::TABLE)->where('releases_id', $releaseId);
-        if ($forUpdate) {
-            $query->lockForUpdate();
-        } elseif (DB::transactionLevel() > 0) {
-            $query->sharedLock();
-        }
-        $body = $query->value('body');
+        $body = $this->row($releaseId, $forUpdate)->value('body');
 
         return is_string($body) ? $body : null;
     }
 
+    /** The stored size, read as body() reads the row. */
     public function bytes(int $releaseId): ?int
     {
         if (! $this->tableAvailable()) {
             return null;
         }
-        $bytes = DB::table(self::TABLE)->where('releases_id', $releaseId)->value('bytes');
+        $bytes = $this->row($releaseId)->value('bytes');
 
         return $bytes === null ? null : (int) $bytes;
     }
 
     public function exists(int $releaseId): bool
     {
-        return $this->tableAvailable() && DB::table(self::TABLE)->where('releases_id', $releaseId)->exists();
+        return $this->tableAvailable() && $this->row($releaseId)->exists();
     }
 
     /** The release a GUID names, or null; GUIDs never move between releases. */
@@ -87,13 +88,41 @@ final class NzbBlobStore
         if (preg_match('/\A[0-9a-f]{64}\z/', $digest) !== 1 || $compressed === '') {
             throw new RuntimeException('Invalid NZB row.');
         }
-        $values = ['body' => $compressed, 'bytes' => strlen($compressed), 'source_sha256' => $digest, 'updated_at' => now()];
-        // One statement per row: a large NZB must stay under the packet limit.
-        if (DB::table(self::TABLE)->where('releases_id', $releaseId)->lockForUpdate()->exists()) {
-            DB::table(self::TABLE)->where('releases_id', $releaseId)->update($values);
-        } else {
-            DB::table(self::TABLE)->insert(['releases_id' => $releaseId] + $values);
+        $limit = $this->packetLimit();
+        if ($limit !== null && strlen($compressed) + self::PACKET_OVERHEAD > $limit) {
+            throw new RuntimeException(sprintf('Compressed NZB of %d bytes exceeds the database max_allowed_packet of %d bytes; raise it to store this NZB.',
+                strlen($compressed), $limit));
         }
+        // One statement, without a locking read first: the caller's release lock already serializes writers, and
+        // locking an absent key gap-locks the primary index that concurrent installs insert into.
+        DB::table(self::TABLE)->upsert([['releases_id' => $releaseId, 'body' => $compressed, 'bytes' => strlen($compressed),
+            'source_sha256' => $digest, 'updated_at' => now()]], ['releases_id'], ['body', 'bytes', 'source_sha256', 'updated_at']);
+    }
+
+    /**
+     * A current read inside a transaction: under REPEATABLE READ a plain read misses a row the importer committed
+     * after the snapshot, while its file may already be gone.
+     */
+    private function row(int $releaseId, bool $forUpdate = false): Builder
+    {
+        $query = DB::table(self::TABLE)->where('releases_id', $releaseId);
+        if ($forUpdate) {
+            $query->lockForUpdate();
+        } elseif (DB::transactionLevel() > 0) {
+            $query->sharedLock();
+        }
+
+        return $query;
+    }
+
+    /** The server's max_allowed_packet on MySQL/MariaDB, read once per instance; null elsewhere. */
+    private function packetLimit(): ?int
+    {
+        if ($this->packetLimit === null && in_array(DB::getDriverName(), ['mysql', 'mariadb'], true)) {
+            $this->packetLimit = (int) (DB::selectOne('SELECT @@max_allowed_packet AS packet')->packet ?? 0);
+        }
+
+        return $this->packetLimit === null || $this->packetLimit <= 0 ? null : $this->packetLimit;
     }
 
     public function delete(int $releaseId): bool

@@ -36,6 +36,10 @@ return new class extends Migration
 
     public function down(): void
     {
+        // With database storage these rows are the only copy of each NZB.
+        if (Schema::hasTable('release_nzbs') && DB::table('release_nzbs')->exists()) {
+            throw new RuntimeException('release_nzbs holds release NZBs; export or delete them before rolling back this migration.');
+        }
         Schema::dropIfExists('release_nzbs');
     }
 };

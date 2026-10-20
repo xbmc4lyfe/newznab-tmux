@@ -510,9 +510,13 @@ class NzbService
      */
     public function hasNzb(string $releaseGuid): bool
     {
+        if ($this->nzbPath($releaseGuid) !== false) {
+            return true;
+        }
         $id = $this->blobs()->releaseId($releaseGuid);
 
-        return ($id !== null && $this->blobs()->exists($id)) || $this->nzbPath($releaseGuid) !== false;
+        // After the file check: nzb:import-files commits the row before it deletes the file.
+        return $id !== null && $this->blobs()->exists($id);
     }
 
     /**
@@ -627,10 +631,15 @@ class NzbService
             $compressed = $stored > $maxCompressedBytes ? false : ($this->blobs()->body($id) ?? false);
         } else {
             $path = $this->nzbPath($releaseGuid);
-            if (! is_string($path)) {
-                return false;
+            $compressed = is_string($path) ? @file_get_contents($path, false, null, 0, $maxCompressedBytes + 1) : false;
+            if ($compressed === false) {
+                // Imported (and its file removed) between the two lookups.
+                $stored = $id === null ? null : $this->blobs()->bytes($id);
+                if ($stored === null) {
+                    return false;
+                }
+                $compressed = $stored > $maxCompressedBytes ? false : ($this->blobs()->body($id) ?? false);
             }
-            $compressed = @file_get_contents($path, false, null, 0, $maxCompressedBytes + 1);
         }
         if ($compressed === false || strlen($compressed) > $maxCompressedBytes || ! str_starts_with($compressed, "\x1f\x8b")) {
             $decodedBytes = $maxDecodedBytes;

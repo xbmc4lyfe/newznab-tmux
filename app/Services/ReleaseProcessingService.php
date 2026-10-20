@@ -1505,10 +1505,6 @@ final class ReleaseProcessingService
 
     private function validateNzbPath(): bool
     {
-        if (config('nntmux_settings.nzb_storage', 'database') === 'database') {
-            // NZBs are rows; the directory only holds legacy files.
-            return true;
-        }
         $nzbPath = config('nntmux_settings.path_to_nzbs');
 
         if (! file_exists($nzbPath)) {
