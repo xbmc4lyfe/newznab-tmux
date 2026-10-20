@@ -34,7 +34,7 @@ final class HeaderParser
 
     /**
      * Mirrors NativePerArticleObfuscation::MIN_HEADERS. Smaller ranges stay on PHP without loading
-     * the router or the wrapper class (each costs a compile per process without opcache).
+     * any routing or Rust class (each costs a compile per process without opcache).
      */
     public const int NATIVE_MIN_HEADERS = 16000;
 
@@ -45,41 +45,6 @@ final class HeaderParser
     {
         $this->blacklistService = $blacklistService ?? new BlacklistService;
         $this->native = $native;
-    }
-
-    /**
-     * Whether the Rust port should take this range ({@see PerArticleObfuscationRouter}). Ranges
-     * under NATIVE_MIN_HEADERS stay on PHP here, so they load neither the router nor the wrapper.
-     *
-     * @param  array<int, array<string, mixed>>  $headers
-     */
-    public static function worthNativeMarking(array $headers, bool $libraryLoaded): bool
-    {
-        return \count($headers) >= self::NATIVE_MIN_HEADERS && self::mayCarryPartCounts($headers)
-            && PerArticleObfuscationRouter::worthNativeMarking($headers, $libraryLoaded);
-    }
-
-    /**
-     * A cheap check before the router loads: whether at least a quarter of 16 evenly spaced
-     * subjects hold ` (`, which every yEnc part count needs. Ranges of mostly plain text, which the
-     * PHP rule rejects fastest, stay on PHP without paying to load the router. It can only keep a
-     * range on PHP, never send one to Rust.
-     *
-     * @param  array<int, array<string, mixed>>  $headers
-     */
-    private static function mayCarryPartCounts(array $headers): bool
-    {
-        $values = array_is_list($headers) ? $headers : array_values($headers);
-        $count = \count($values);
-        $hits = 0;
-        for ($probe = 0; $probe < 16; $probe++) {
-            $subject = $values[intdiv((2 * $probe + 1) * $count, 32)]['Subject'] ?? null;
-            if (\is_string($subject) && str_contains($subject, ' (')) {
-                $hits++;
-            }
-        }
-
-        return $hits >= 4;
     }
 
     /**
@@ -116,12 +81,12 @@ final class HeaderParser
         if ($minArticles < 1) {
             return 0;
         }
-        // The Rust port marks the same articles about 1.7-3.4x faster on ranges it is routed to (scripts/benchmark-per-article-obfuscation.php);
+        // The Rust port marks the same articles about 1.8-3.1x faster on ranges it is routed to (scripts/benchmark-per-article-obfuscation.php);
         // null means it is unavailable or declined, and the PHP rule below decides.
         // Routing runs before the wrapper exists, so a range kept on PHP never loads its class.
         $marked = null;
-        if ($this->native !== false && ! ($this->native?->unavailable() ?? false)
-            && self::worthNativeMarking($headers, $this->native?->loaded() ?? false)) {
+        if ($this->native !== false && \count($headers) >= self::NATIVE_MIN_HEADERS && ! ($this->native?->unavailable() ?? false)
+            && PerArticleObfuscationGate::worthNativeMarking($headers, $this->native?->loaded() ?? false)) {
             $this->native ??= new NativePerArticleObfuscation;
             $marked = $this->native->markWithoutSampling($headers, $minArticles);
         }

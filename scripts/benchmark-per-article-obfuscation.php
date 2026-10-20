@@ -24,6 +24,7 @@ declare(strict_types=1);
 
 use App\Services\Binaries\HeaderParser;
 use App\Services\Binaries\NativePerArticleObfuscation;
+use App\Services\Binaries\PerArticleObfuscationGate;
 use App\Services\BlacklistService;
 use Random\Engine\Mt19937;
 use Random\Randomizer;
@@ -295,7 +296,7 @@ function perArticleColdChild(string $name, string $side, string $library, int $s
     $start = hrtime(true);
     $construct = 0;
     $marked = null;
-    if ($side === 'rust' && HeaderParser::worthNativeMarking($headers, false)) {
+    if ($side === 'rust' && PerArticleObfuscationGate::worthNativeMarking($headers, false)) {
         $built = hrtime(true);
         $native = new NativePerArticleObfuscation($library);
         $construct = hrtime(true) - $built;

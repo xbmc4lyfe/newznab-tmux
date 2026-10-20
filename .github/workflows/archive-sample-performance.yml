@@ -14,6 +14,8 @@ on:
       - 'app/Services/Releases/Verification/*HeaderFilenameIdentity.php'
       - 'app/Services/Binaries/HeaderParser.php'
       - 'app/Services/Binaries/NativePerArticleObfuscation.php'
+      - 'app/Services/Binaries/PerArticleObfuscationGate.php'
+      - 'app/Services/Binaries/PerArticleObfuscationRouter.php'
       - 'tests/Support/PerArticleObfuscationCorpus.php'
       - 'tests/Unit/PerArticleObfuscation*'
       - 'docker/app/nzb-yenc-ffi/**'

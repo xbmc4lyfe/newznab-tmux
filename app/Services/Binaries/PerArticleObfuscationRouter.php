@@ -9,8 +9,8 @@ use Random\Randomizer;
 
 /**
  * Decides, from a sample of a header range, whether {@see NativePerArticleObfuscation} should mark
- * it or the PHP rule in {@see HeaderParser::markPerArticleObfuscated()} should. Only loaded for
- * ranges of HeaderParser::NATIVE_MIN_HEADERS or more.
+ * it or the PHP rule in {@see HeaderParser::markPerArticleObfuscated()} should. Loaded only for
+ * ranges of HeaderParser::NATIVE_MIN_HEADERS or more that pass {@see PerArticleObfuscationGate}'s check.
  */
 final class PerArticleObfuscationRouter
 {

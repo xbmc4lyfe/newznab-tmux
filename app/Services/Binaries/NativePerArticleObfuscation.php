@@ -9,7 +9,7 @@ use Throwable;
 
 /**
  * Rust port of {@see HeaderParser::markPerArticleObfuscated()}, adopted after
- * scripts/benchmark-per-article-obfuscation.php measured it at 1.7-3.4x the PHP rule on the ranges it is routed to (warm and cold) with identical
+ * scripts/benchmark-per-article-obfuscation.php measured it at 1.8-3.1x the PHP rule on the ranges it is routed to (warm and cold) with identical
  * marks. Null means "use PHP": not a Linux CLI with FFI, library missing, failing its known-answer
  * probe, or input the native side declines (a subject longer than MAX_SUBJECT_LENGTH, where PHP's
  * backtrack limit could stop the subject pattern).
@@ -54,14 +54,14 @@ final class NativePerArticleObfuscation
 
     /**
      * Article numbers the PHP rule would mark, or null to keep the PHP result: the range is routed
-     * with HeaderParser::worthNativeMarking() first, and stays on PHP once loading has failed.
+     * with PerArticleObfuscationGate::worthNativeMarking() first, and stays on PHP once loading has failed.
      *
      * @param  array<int, array<string, mixed>>  $headers
      * @return list<int>|null
      */
     public function mark(array $headers, int $minArticles): ?array
     {
-        return ! $this->unavailable() && HeaderParser::worthNativeMarking($headers, $this->loaded())
+        return ! $this->unavailable() && PerArticleObfuscationGate::worthNativeMarking($headers, $this->loaded())
             ? $this->markWithoutSampling($headers, $minArticles) : null;
     }
 
