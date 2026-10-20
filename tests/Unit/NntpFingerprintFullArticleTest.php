@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tests\Unit;
 
 use App\Services\NNTP\NntpArticleMissingException;
+use App\Services\NNTP\NntpProviderUnavailableException;
 use App\Services\NNTP\NNTPService;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
@@ -72,12 +73,11 @@ final class NntpFingerprintFullArticleTest extends TestCase
     }
 
     #[Test]
-    public function the_header_budget_applies_to_the_header_section(): void
+    public function the_status_line_is_returned_for_the_identity_check(): void
     {
-        $nntp = self::connection("220 0 <a@example>\r\n".self::HEADERS."\r\nbody\r\n.\r\n");
+        $nntp = self::connection("220 0 <other@example>\r\n".self::HEADERS."\r\nbody\r\n.\r\n");
 
-        $this->expectExceptionMessage('Article headers exceed the metadata memory budget.');
-        $nntp->getFingerprintFullArticleByMessageID('a@example', 2_000_000, 40);
+        $this->assertSame('0 <other@example>', $nntp->getFingerprintFullArticleByMessageID('a@example')['article_response']['response_text']);
     }
 
     #[Test]
@@ -85,19 +85,60 @@ final class NntpFingerprintFullArticleTest extends TestCase
     {
         $nntp = self::connection("220 0 <a@example>\r\n".self::HEADERS."\r\n12345678\r\n.\r\n");
         $this->assertSame("12345678\r\n", $nntp->getFingerprintFullArticleByMessageID('a@example', 10)['body']);
+        $this->assertFalse($nntp->quit);
+    }
 
-        $nntp = self::connection("220 0 <a@example>\r\n".self::HEADERS."\r\n123456789\r\n.\r\n");
-        $this->expectExceptionMessage('Article exceeds verification memory budget.');
-        $nntp->getFingerprintFullArticleByMessageID('a@example', 10);
+    /** @return array<string, array{string, int, int, string}> */
+    public static function abandonedResponses(): array
+    {
+        return [
+            'header budget' => ["220 0 <a@example>\r\n".self::HEADERS."\r\nbody\r\n.\r\n", 2_000_000, 40, 'Article headers exceed the metadata memory budget.'],
+            'oversized header line' => ["220 0 <a@example>\r\nX-Long: ".str_repeat('a', 16_400)."\r\n\r\nbody\r\n.\r\n", 2_000_000, 65_536, 'Article header line is truncated or oversized.'],
+            'headers cut off' => ["220 0 <a@example>\r\n".self::HEADERS, 2_000_000, 65_536, 'Article header response was truncated.'],
+            'body budget' => ["220 0 <a@example>\r\n".self::HEADERS."\r\n123456789\r\n.\r\n", 10, 65_536, 'Article exceeds verification memory budget.'],
+            'body cut off' => ["220 0 <a@example>\r\n".self::HEADERS."\r\nbody\r\n", 2_000_000, 65_536, 'Truncated article response.'],
+        ];
     }
 
     #[Test]
-    public function a_truncated_article_is_rejected(): void
+    #[DataProvider('abandonedResponses')]
+    public function an_abandoned_response_drops_the_connection(string $script, int $bodyBytes, int $headerBytes, string $message): void
     {
-        $nntp = self::connection("220 0 <a@example>\r\n".self::HEADERS."\r\nbody\r\n");
+        $nntp = self::connection($script);
 
-        $this->expectExceptionMessage('Truncated article response.');
-        $nntp->getFingerprintFullArticleByMessageID('a@example');
+        try {
+            $nntp->getFingerprintFullArticleByMessageID('a@example', $bodyBytes, $headerBytes);
+            $this->fail('Expected the request to fail.');
+        } catch (\RuntimeException $exception) {
+            $this->assertSame($message, $exception->getMessage());
+        }
+        $this->assertTrue($nntp->quit, 'A connection left mid-response must not be reused.');
+    }
+
+    #[Test]
+    public function the_alternate_provider_is_queried_directly_and_released(): void
+    {
+        $primary = self::connection('');
+        $alternate = self::connection("220 0 <a@example>\r\n".self::HEADERS."\r\nbody\r\n.\r\n");
+        $primary->alternate = $alternate;
+
+        $article = $primary->getFingerprintFullArticleByMessageID('a@example', alternate: true);
+
+        $this->assertSame("body\r\n", $article['body']);
+        $this->assertSame([], $primary->commands);
+        $this->assertSame(['ARTICLE <a@example>'], $alternate->commands);
+        $this->assertTrue($alternate->quit);
+    }
+
+    #[Test]
+    public function an_unreachable_alternate_provider_is_reported_as_unavailable(): void
+    {
+        $primary = self::connection('');
+        $primary->alternate = self::connection('');
+        $primary->alternate->connects = false;
+
+        $this->expectException(NntpProviderUnavailableException::class);
+        $primary->getFingerprintFullArticleByMessageID('a@example', alternate: true);
     }
 
     /**
@@ -120,11 +161,28 @@ final class ScriptedNntpConnection extends NNTPService
 
     public bool $quit = false;
 
+    public ?self $alternate = null;
+
+    public bool $connects = true;
+
     private string $status = '';
 
     public function __construct(mixed $stream)
     {
         $this->_socket = $stream;
+        $this->_configServer = 'primary.example';
+        $this->_currentServer = 'primary.example';
+        $this->_configCompressedHeaders = false;
+    }
+
+    protected function previewAlternateConnection(): NNTPService
+    {
+        return $this->alternate ?? throw new \LogicException('No alternate connection scripted.');
+    }
+
+    public function doConnect(bool $compression = true, bool $alternate = false): mixed
+    {
+        return $this->connects;
     }
 
     public function stream(): mixed
