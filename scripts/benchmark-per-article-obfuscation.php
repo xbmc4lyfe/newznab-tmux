@@ -34,7 +34,7 @@ const PER_ARTICLE_MIN_ARTICLES = 16;
 const PER_ARTICLE_BOOTSTRAP = 2000;
 const PER_ARTICLE_ROUTED_FLOOR = 0.9;
 const PER_ARTICLE_TAIL_SAMPLES = 1000;
-const PER_ARTICLE_COLD_RUNS = 21;
+const PER_ARTICLE_COLD_RUNS = 41;
 /** Cold rows the routing keeps on PHP compare sub-millisecond first calls, so take more of them. */
 const PER_ARTICLE_COLD_RUNS_ROUTED = 41;
 /** Fresh processes timing the one-time start-up cost (construction, library load and probe). */
