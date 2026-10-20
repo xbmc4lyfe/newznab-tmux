@@ -602,13 +602,14 @@ def service_bind_records(svc_cfg: object, project_dir: Path) -> list[str]:
     return records
 
 
-def closing_quote(value: str) -> int:
-    """The index of the unescaped quote closing a value that opens with one, else -1."""
+def closing_quote(value: str, escapes: bool = True) -> int:
+    """The index of the unescaped quote closing a value that opens with one, else -1. Without
+    `escapes` (phpdotenv's single quotes) a backslash is literal and the first quote closes it."""
     if value[:1] not in ("'", '"'):
         return -1
     position = 1
     while position < len(value):
-        if value[position] == "\\":
+        if escapes and value[position] == "\\":
             position += 2
             continue
         if value[position] == value[0]:
@@ -617,7 +618,8 @@ def closing_quote(value: str) -> int:
     return -1
 
 
-def read_dotenv(path: Path, interpolated: set[str] | None = None, multiline: set[str] | None = None) -> dict[str, str]:
+def read_dotenv(path: Path, interpolated: set[str] | None = None, multiline: set[str] | None = None,
+                phpdotenv: bool = False) -> dict[str, str]:
     """The keys of a Compose .env file (same rules as bin/compose); last assignment wins. Keys whose
     last value Compose would interpolate (unquoted or double-quoted, containing `$`) are added to
     `interpolated`; keys whose last value spans lines (only its first line is read) to `multiline`."""
@@ -637,7 +639,10 @@ def read_dotenv(path: Path, interpolated: set[str] | None = None, multiline: set
         if m:
             value = m.group(2)
             # Escape-aware, as Compose and phpdotenv read it: `"p\"w"` is one closed value.
-            end = closing_quote(value)
+            # app.env is read by phpdotenv only: its single quotes are literal (`'C:\tmp\'` closes) and
+            # never span lines; Compose (docker/.env) honours `\'` in them.
+            literal_single = phpdotenv and value[:1] == "'"
+            end = closing_quote(value, escapes=not literal_single)
             closed = end > 0 and re.match(r"^\s*(?:#.*)?$", value[end + 1:])
             quoted = re.match(r"""^(["'])(.*)\1$""", value[:end + 1], re.S) if closed else None
             values[m.group(1)] = quoted.group(2) if quoted else re.sub(r"\s#.*$", "", value).strip()
@@ -648,11 +653,11 @@ def read_dotenv(path: Path, interpolated: set[str] | None = None, multiline: set
             # An opening quote with no closing one starts a multi-line value, which this line-based
             # parser cannot read whole.
             # An opening quote with no unescaped closing one on its line starts a multi-line value.
-            spans_lines = value[:1] in ("'", '"') and end < 0
+            spans_lines = value[:1] in ("'", '"') and end < 0 and not literal_single
             if spans_lines:
                 # Its continuation lines belong to it (phpdotenv and Compose read up to the closing
                 # quote): never assignments of their own, e.g. a `DB_HOST=` line inside a note.
-                while index < len(lines) and closing_quote(value[0] + lines[index]) < 0:
+                while index < len(lines) and closing_quote(value[0] + lines[index], escapes=not literal_single) < 0:
                     index += 1
                 index += 1
             if multiline is not None:
@@ -915,7 +920,7 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
     # The database the app connects to: pointing app.env at another (e.g. a restored copy) migrates.
     # Read from the file the app services actually mount as /app/.env once Compose is rendered.
     db_env_file = app_env_path(docker_dir) if compose_rendered else docker_dir / "config/app.env"
-    app_env_values = read_dotenv(db_env_file)
+    app_env_values = read_dotenv(db_env_file, phpdotenv=True)
     default_app_env = docker_dir / "config/app.env"
     if os.path.realpath(db_env_file) != os.path.realpath(default_app_env):
         # The apps read another file as /app/.env: it, not the unused default, decides their rollout.
@@ -1545,7 +1550,7 @@ def matched_database_service(docker_dir: Path) -> str | None:
     interpolated: set[str] = set()
     multiline: set[str] = set()
     env_path = app_env_path(docker_dir)
-    app_env = read_dotenv(env_path, interpolated, multiline)
+    app_env = read_dotenv(env_path, interpolated, multiline, phpdotenv=True)
 
     def selected(values: dict) -> list[str]:
         hosts = []
@@ -1679,7 +1684,7 @@ def database_target(docker_dir: Path, normalized: bool = True) -> str:
     the same connection, or web would migrate a schema another app does not read. With `normalized`
     False: the digest of the literal settings, as barriers were labelled before host normalization
     (the same connection, so deploy-app accepts either)."""
-    app_env = read_dotenv(app_env_path(docker_dir))
+    app_env = read_dotenv(app_env_path(docker_dir), phpdotenv=True)
     web = app_connection("web", app_env)
     for app in APP_SERVICES:
         if app in RENDERED_SERVICES and app_connection(app, app_env) != web:

@@ -3762,8 +3762,8 @@ SH);
         $json['services']['db2'] = ['image' => 'mariadb:one'];
         $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
 
-        // A `DB_HOST=` line inside a multi-line value is part of that value.
-        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=mariadb\nNOTE='cutover plan\nDB_HOST=db2\nlater'\n");
+        // A `DB_HOST=` line inside a multi-line (double-quoted, as phpdotenv allows) value is part of it.
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=mariadb\nNOTE=\"cutover plan\nDB_HOST=db2\nlater\"\n");
         $this->assertSame('mariadb', $this->planActions($config)['DATABASE_SERVICE']);
 
         // An infrastructure service is never migrated and fenced as the database.
@@ -3781,6 +3781,12 @@ SH);
         file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=192.0.2.10\nDB_PASSWORD=\"p\\\"w\"\nDB_DATABASE=nntmux\n");
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=192.0.2.10\nDB_PASSWORD=\"p\\\"w\"\nDB_DATABASE=nntmux_restore\n");
+        $this->assertStringContainsString('Run Migrations  : yes', $this->make(['deploy-plan'])->mustRun()->getOutput());
+
+        // phpdotenv (app.env's only reader) keeps single quotes literal: `'C:\tmp\'` closes.
+        file_put_contents($this->directory.'/docker/config/app.env', "TEMP_PATH='C:\\tmp\\'\nDB_HOST=192.0.2.10\nDB_DATABASE=nntmux\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/docker/config/app.env', "TEMP_PATH='C:\\tmp\\'\nDB_HOST=192.0.2.10\nDB_DATABASE=nntmux_restore\n");
         $this->assertStringContainsString('Run Migrations  : yes', $this->make(['deploy-plan'])->mustRun()->getOutput());
     }
 
