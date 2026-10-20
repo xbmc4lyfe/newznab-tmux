@@ -19,6 +19,7 @@ on:
       - 'tests/Fixtures/ReleasePresentation.Dockerfile*'
       - 'resources/css/app.css'
       - 'scripts/*release*'
+      - 'scripts/benchmark-rust-toolchain.sh'
       - 'scripts/export-benchmark-summary.py'
       - 'tests/Unit/test_benchmark_summary_export.py'
       - '.github/workflows/release-presentation.yml'
@@ -30,6 +31,9 @@ permissions:
 jobs:
   native-presentation:
     runs-on: ubuntu-latest
+    env:
+      RUST_TOOLCHAIN: '1.98.0'
+      RUSTUP_TOOLCHAIN: '1.98.0'
     steps:
       - uses: actions/checkout@v5
       - uses: shivammathur/setup-php@v2
@@ -37,9 +41,11 @@ jobs:
           php-version: '8.5'
           extensions: bcmath, dom, curl, exif, ffi, gd, intl, mbstring, pdo, sqlite, pdo_sqlite, sockets, zip
           coverage: none
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: '1.98.0'
+      # The runner's shared Rustup store can be read-only; the helper installs a missing pin into
+      # job-owned storage and exports RUSTUP_HOME for later steps.
+      - name: Select the pinned Rust toolchain
+        shell: bash
+        run: source scripts/benchmark-rust-toolchain.sh
       - name: Install locked PHP dependencies
         env:
           COMPOSER_AUTH: '{"github-oauth":{"github.com":"${{ secrets.GITHUB_TOKEN }}"}}'
