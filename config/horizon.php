@@ -2,7 +2,7 @@
 
 use Illuminate\Support\Str;
 
-return [
+$horizon = [
 
     /*
     |--------------------------------------------------------------------------
@@ -266,3 +266,9 @@ return [
         '.env',
     ],
 ];
+
+if (env('FINGERPRINT_WORKER', 'rust') === 'rust') {
+    unset($horizon['defaults']['supervisor-fingerprint']);
+}
+
+return $horizon;

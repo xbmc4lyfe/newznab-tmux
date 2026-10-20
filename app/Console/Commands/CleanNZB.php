@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Models\Release;
+use App\Services\Nzb\DatabaseNzbStore;
 use App\Services\Nzb\NzbService;
 use App\Services\Nzb\NzbSourceGuard;
 use App\Services\ReleaseImageService;
@@ -39,12 +40,18 @@ class CleanNZB extends Command
     /**
      * Execute the console command.
      */
-    public function handle(): void
+    public function handle(): int
     {
+        if (DatabaseNzbStore::enabled() && $this->option('notondisk')) {
+            $this->error('Filesystem absence cannot qualify database releases for deletion; unimported sources must be retained.');
+
+            return self::FAILURE;
+        }
         // Check if any options are false
         if (! $this->option('notindb') && ! $this->option('notondisk') && ! $this->option('temps')) {
             $this->error('You must specify at least one option. See: --help');
-            exit();
+
+            return self::FAILURE;
         }
         if ($this->option('notindb')) {
             $this->GetNZBsWithNoDatabaseEntry($this->option('delete'));
@@ -55,6 +62,8 @@ class CleanNZB extends Command
         if ($this->option('temps')) {
             $this->cleanTemporaryNzbFiles($this->option('delete'));
         }
+
+        return self::SUCCESS;
     }
 
     private function GetNZBsWithNoDatabaseEntry(mixed $delete = false): void
@@ -124,7 +133,7 @@ class CleanNZB extends Command
 
     private function hasNzbOnDisk(NzbService $nzb, string $guid, bool $delete): bool
     {
-        if ($nzb->nzbPath($guid) !== false) {
+        if (DatabaseNzbStore::enabled() ? $nzb->hasNzb($guid) : $nzb->nzbPath($guid) !== false) {
             return true;
         }
         // A committed upgrade's NZB may still be staged beside the missing canonical file.
