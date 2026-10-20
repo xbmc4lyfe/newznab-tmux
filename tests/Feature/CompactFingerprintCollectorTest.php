@@ -757,6 +757,65 @@ final class CompactFingerprintCollectorTest extends TestCase
         $this->assertSame(md5(substr($data, 0, 16_384)), $result['data']['files'][0]['first16k_md5']);
     }
 
+    /**
+     * Trailerless parts of a 16-byte payload whose CRC (000da322) is written without its leading zeros,
+     * as posting tools do: "=yend size=16 pcrc32=da322".
+     *
+     * @param  callable(string): string|null  $corrupt  applied to f1-s1 only
+     * @return array{status: string, data: array<string, mixed>}
+     */
+    private function collectUnpaddedPcrc32Parts(?callable $corrupt = null): array
+    {
+        $data = 'short-crc-000119';
+        $this->assertSame('000da322', hash('crc32b', $data));
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
+        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)->andReturnUsing(function (string $id) use ($data, $corrupt): array {
+            $part = preg_match('/-s(\d+)@/', $id, $match) === 1 ? (int) $match[1] : 1;
+            $body = YencArticles::part($data, 'segment.bin', 32, $part, 16 * ($part - 1) + 1, 2);
+            $body = (string) preg_replace('/=yend size=16 part=\d+ pcrc32=000da322/', '=yend size=16 pcrc32=da322', $body);
+            if ($corrupt !== null && $id === 'f1-s1@fixture') {
+                $body = $corrupt($body);
+            }
+
+            return ['body' => $body] + self::article($id);
+        });
+
+        return $this->collector()->collectFromNzb(self::nzb(3, 2, false), 7);
+    }
+
+    #[Test]
+    public function a_trailerless_part_whose_pcrc32_omits_leading_zeros_is_verified(): void
+    {
+        $result = $this->collectUnpaddedPcrc32Parts();
+
+        $this->assertSame([], $result['data']['errors']);
+        $this->assertSame('complete', $result['status']);
+        $this->assertSame([true], array_values(array_unique(array_map(static fn (array $article): mixed => $article['yenc']['crc_ok'], $result['data']['articles']))));
+    }
+
+    /** @return array<string, array{callable(string): string}> */
+    public static function unprovenUnpaddedPcrc32Parts(): array
+    {
+        return [
+            'wrong short pcrc32' => [static fn (string $body): string => str_replace('pcrc32=da322', 'pcrc32=da323', $body)],
+            'non-hex pcrc32' => [static fn (string $body): string => str_replace('pcrc32=da322', 'pcrc32=da32g', $body)],
+            'size mismatch' => [static fn (string $body): string => str_replace('=yend size=16 ', '=yend size=17 ', $body)],
+            'trailer part present' => [static fn (string $body): string => str_replace('=yend size=16 ', '=yend size=16 part=1 ', $body)],
+        ];
+    }
+
+    /** @param callable(string): string $corrupt */
+    #[Test]
+    #[DataProvider('unprovenUnpaddedPcrc32Parts')]
+    public function a_trailerless_part_with_an_unpadded_pcrc32_but_no_full_proof_stays_partial(callable $corrupt): void
+    {
+        $result = $this->collectUnpaddedPcrc32Parts($corrupt);
+
+        $this->assertSame('partial', $result['status']);
+        $this->assertNotSame([], $result['data']['errors']);
+    }
+
     #[Test]
     public function a_trailerless_part_with_a_matching_crc_but_a_size_mismatch_does_not_report_crc_ok(): void
     {

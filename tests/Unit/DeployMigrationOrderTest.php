@@ -17,13 +17,13 @@ class DeployMigrationOrderTest extends TestCase
         mkdir($this->directory.'/docker/bin', 0700, true);
         mkdir($this->directory.'/bin', 0700);
         copy(__DIR__.'/../../docker/Justfile', $this->directory.'/docker/Justfile');
-        foreach (['deploy-guard', 'deploy-app', 'deploy-current', 'deploy-plan', 'build-images', 'up-app', 'compose', 'legacy-drain.php', 'legacy-scheduler-drain.py'] as $script) {
+        foreach (['deploy-guard', 'deploy-app', 'deploy-current', 'deploy-plan', 'build-images', 'up-app', 'compose', 'compose_dotenv.py', 'legacy-drain.php', 'legacy-scheduler-drain.py'] as $script) {
             copy(__DIR__.'/../../docker/bin/'.$script, $this->directory.'/docker/bin/'.$script);
             chmod($this->directory.'/docker/bin/'.$script, 0755);
         }
-        file_put_contents($this->directory.'/.gitignore', "/docker/.build.stamp\n/docker/.deploy.stamp\n/docker/.deploy.time\n/docker/.deploy.log\n/docker/.deploy.lock*\n/events\n/recreated*\n/replaced\n/barrier.log\n/barrier.running\n/barrier.database\n");
+        file_put_contents($this->directory.'/.gitignore', "/docker/.build.stamp\n/docker/.deploy.stamp\n/docker/.deploy.time\n/docker/.deploy.log\n/docker/.deploy.lock*\n/events\n/recreated*\n/replaced\n/barrier.log\n/barrier.running\n/barrier.stopped\n/barrier.database\n");
         // Docker ignores .gitignore: the fixture's own state must also stay out of the build context.
-        file_put_contents($this->directory.'/.dockerignore', "events\nrecreated*\nreplaced\nbarrier.log\nbarrier.running\nbarrier.database\n");
+        file_put_contents($this->directory.'/.dockerignore', "events\nrecreated*\nreplaced\nbarrier.log\nbarrier.running\nbarrier.stopped\nbarrier.database\n");
         file_put_contents($this->directory.'/app.txt', "one\n");
         file_put_contents($this->directory.'/bin/docker', <<<'SH'
 #!/bin/sh
@@ -34,31 +34,43 @@ missing=0
 if [ "${NNTMUX_SERVICE_MISSING:-0}" = 1 ] && ! grep -q -- ' up -d --no-deps --force-recreate' "$NNTMUX_DEPLOY_EVENTS"; then missing=1; fi
 default_config='{"services":{"web":{},"horizon":{},"scheduler":{},"indexer":{},"mariadb":{},"redis":{},"manticore":{},"proxy":{},"mailpit":{},"prometheus":{},"pushgateway":{},"grafana":{},"node-exporter":{},"mysqld-exporter":{},"redis-exporter":{}}}'
 case "$*" in
+    # NNTMUX_REPLACE_ON_BUILD: another tag is replaced while this build runs.
+    'build --target '*) [ "${NNTMUX_REPLACE_ON_BUILD:-0}" != 1 ] || : > "$NNTMUX_REPO/replaced" ;;
     'ps -a -q --no-trunc --filter label=com.docker.compose.project='*)
         # Service containers only (no one-offs): as `compose ps -a -q`, minus the barrier.
         last=${last#label=com.docker.compose.service=}
         [ "${NNTMUX_NO_EXISTING_APP:-0}" = 1 ] && exit 0
         [ ! -f "$NNTMUX_REPO/recreated-$last" ] || printf 'r%s-' "$(wc -c < "$NNTMUX_REPO/recreated-$last" | tr -d ' ')"
         echo "fixture-container-$last" ;;
-    'inspect --format {{index .Config.Labels "nntmux.deploy.database"}} '*) cat "$NNTMUX_REPO/barrier.database" 2>/dev/null ;;
+    # The barrier container exists while it runs or after it exited (barrier.stopped), until `rm -f`.
+    'ps -aq --filter name=^/'*'-verification-barrier$')
+        # NNTMUX_BARRIER_INSPECT_FAIL: the daemon cannot be reached.
+        [ "${NNTMUX_BARRIER_INSPECT_FAIL:-0}" != 1 ] || { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
+        if [ -f "$NNTMUX_REPO/barrier.running" ] || [ -f "$NNTMUX_REPO/barrier.stopped" ]; then echo barrier-container; fi ;;
+    'inspect --format {{index .Config.Labels "nntmux.deploy.database"}} '*)
+        [ -f "$NNTMUX_REPO/barrier.running" ] || [ -f "$NNTMUX_REPO/barrier.stopped" ] || { echo "error: no such object" >&2; exit 1; }
+        cat "$NNTMUX_REPO/barrier.database" 2>/dev/null; exit 0 ;;
     'ps -q --filter label=com.docker.compose.project='*) [ -z "${NNTMUX_ORPHAN:-}" ] || case "$*" in *"service=$NNTMUX_ORPHAN") echo "fixture-container-$NNTMUX_ORPHAN" ;; esac ;;
     'stop fixture-container-'*) ;;
     *'releases:verification-barrier --release'*) echo forced-release >> "$NNTMUX_DEPLOY_EVENTS"; [ "${NNTMUX_FORCED_RELEASE_FAIL:-0}" != 1 ] || exit 52 ;;
     *'releases:verification-barrier'*)
         if [ "${NNTMUX_BARRIER_FAIL:-0}" = 1 ] || { [ -n "${NNTMUX_BARRIER_FAIL_AFTER:-}" ] && grep -q -- "$NNTMUX_BARRIER_FAIL_AFTER" "$NNTMUX_DEPLOY_EVENTS"; }; then echo 'still running' > "$NNTMUX_REPO/barrier.log"; else echo 'barrier held' > "$NNTMUX_REPO/barrier.log"; : > "$NNTMUX_REPO/barrier.running"; fi
+        # A barrier that fails to drain exits, but its container stays until `rm -f`.
+        [ -f "$NNTMUX_REPO/barrier.running" ] || : > "$NNTMUX_REPO/barrier.stopped"
         if [ "${NNTMUX_BARRIER_LOCK_MARKER:-0}" = 1 ]; then chmod 444 "$NNTMUX_REPO/docker/.deploy.stamp.barrier-owed"; echo two > "$NNTMUX_REPO/app.txt"; fi
         for arg in "$@"; do case "$arg" in nntmux.deploy.database=*) printf '%s\n' "${arg#*=}" > "$NNTMUX_REPO/barrier.database" ;; esac; done
         echo barrier-container ;;
     'inspect --format {{.State.Running}} '*'-verification-barrier')
-        if [ -n "${NNTMUX_BARRIER_EXIT_ON:-}" ] && grep -q -- "$NNTMUX_BARRIER_EXIT_ON" "$NNTMUX_DEPLOY_EVENTS"; then rm -f "$NNTMUX_REPO/barrier.running"; echo 'barrier lost' >> "$NNTMUX_REPO/barrier.log"; fi
+        if [ -n "${NNTMUX_BARRIER_EXIT_ON:-}" ] && grep -q -- "$NNTMUX_BARRIER_EXIT_ON" "$NNTMUX_DEPLOY_EVENTS" && [ -f "$NNTMUX_REPO/barrier.running" ]; then rm -f "$NNTMUX_REPO/barrier.running"; : > "$NNTMUX_REPO/barrier.stopped"; echo 'barrier lost' >> "$NNTMUX_REPO/barrier.log"; fi
         [ -f "$NNTMUX_REPO/barrier.running" ] && echo 'true nntmux' || echo 'false nntmux' ;;
     'logs '*'-verification-barrier')
         cat "$NNTMUX_REPO/barrier.log" 2>/dev/null
         if [ "${NNTMUX_BARRIER_LOST:-}" != '' ] && grep -q "${NNTMUX_BARRIER_LOST}" "$NNTMUX_DEPLOY_EVENTS"; then echo 'barrier lost'; fi ;;
     'stop --timeout 30 '*'-verification-barrier')
+        [ ! -f "$NNTMUX_REPO/barrier.running" ] || : > "$NNTMUX_REPO/barrier.stopped"
         rm -f "$NNTMUX_REPO/barrier.running"; echo released >> "$NNTMUX_DEPLOY_EVENTS"
         [ "${NNTMUX_BARRIER_UNCLEAN:-0}" = 1 ] || echo 'barrier released' >> "$NNTMUX_REPO/barrier.log" ;;
-    'rm -f '*'-verification-barrier') rm -f "$NNTMUX_REPO/barrier.running" ;;
+    'rm -f '*'-verification-barrier') rm -f "$NNTMUX_REPO/barrier.running" "$NNTMUX_REPO/barrier.stopped" ;;
     *' config --hash '*) echo "$last ${NNTMUX_CONFIG_HASH:-fixture-hash}" ;;
     *'com.docker.compose.config-hash'*) echo "${NNTMUX_CONTAINER_CONFIG_HASH:-${NNTMUX_CONFIG_HASH:-fixture-hash}}" ;;
     *'com.docker.compose.service'*)
@@ -81,6 +93,8 @@ for name, svc in (config.get("services") or {}).items():
         svc["healthcheck"] = {"test": ["CMD", "true"]}
 print(json.dumps(config))' ;;
     *'image inspect --format'*)
+        # NNTMUX_REPLACE_AFTER_BUILD: that tag is replaced once its build was recorded, before the stamp.
+        if [ -n "${NNTMUX_REPLACE_AFTER_BUILD:-}" ] && [ "$last" = "$NNTMUX_REPLACE_AFTER_BUILD" ] && grep -q -- "$last " "$NNTMUX_REPO/docker/.build.stamp.built" 2>/dev/null; then echo sha256:replaced; exit 0; fi
         # After the rollout, while the guard writes the stamp.
         if [ "${NNTMUX_INSPECT_FAIL_AFTER_UP:-0}" = 1 ] && [ -f "$NNTMUX_REPO/recreated" ] && ls "$NNTMUX_REPO"/docker/.deploy.stamp.tmp.* >/dev/null 2>&1; then echo "Error response from daemon: timeout" >&2; exit 1; fi
         [ "${NNTMUX_IMAGE_INSPECT_FAIL:-0}" != 1 ] || { echo "Error response from daemon: request timed out" >&2; exit 1; }
@@ -580,7 +594,7 @@ SH);
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
         // An owed release makes this selective run hold a barrier, a one-off container from web's
         // definition that `compose ps -a web` lists first.
-        file_put_contents($this->directory.'/docker/.deploy.stamp.barrier-owed', "held\n");
+        file_put_contents($this->directory.'/docker/.deploy.stamp.barrier-owed', '');
         file_put_contents($this->directory.'/app.txt', "two\n");
         $failed = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_APP_UP_FAIL' => '1', 'NNTMUX_APP_UP_NO_REPLACE' => '1']);
         $failed->run();
@@ -3616,6 +3630,444 @@ SH);
 
         // node-exporter's `pid: host` names no other container.
         $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode(['services' => $services + ['node-exporter' => ['pid' => 'host']]])])->mustRun();
+    }
+
+    public function test_a_dotted_database_host_names_a_service_only_through_a_network_it_joins(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['db2'] = ['image' => 'mariadb:one'];
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+
+        // An external name whose first label happens to be a service is resolved upstream.
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=db2.prod.example\n");
+        $this->assertSame('mariadb', $this->planActions($config)['DATABASE_SERVICE']);
+
+        // Qualified with the project network db2 joins (any case, fully qualified), it is db2.
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=DB2.nntmux_default.\n");
+        $this->assertSame('db2', $this->planActions($config)['DATABASE_SERVICE']);
+    }
+
+    public function test_database_hosts_differing_only_in_case_are_one_connection(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=mariadb\n");
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['mariadb'] = ['image' => 'mariadb:one'];
+        $plain = $this->planActions(['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)]);
+
+        // horizon names the same database in another case: no conflict, and the same barrier target.
+        $json['services']['horizon'] = ['environment' => ['DB_HOST' => 'MariaDB.']];
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+        $mixed = $this->planActions($config);
+        $this->assertSame('mariadb', $mixed['DATABASE_SERVICE']);
+        $this->assertSame($plain['DATABASE_TARGET'], $mixed['DATABASE_TARGET']);
+
+        // A barrier labelled before hosts were normalized fences the same connection: it is adopted.
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=MariaDB\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $actions = $this->planActions($config);
+        $this->assertNotSame($actions['DATABASE_TARGET'], $actions['DATABASE_TARGET_LEGACY']);
+        file_put_contents($this->directory.'/barrier.log', "barrier held\n");
+        touch($this->directory.'/barrier.running');
+        file_put_contents($this->directory.'/barrier.database', $actions['DATABASE_TARGET_LEGACY']."\n");
+        file_put_contents($this->directory.'/docker/.deploy.stamp.barrier-owed', '');
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $this->assertStringNotContainsString('releases:verification-barrier --timeout', $this->events());
+        $this->assertStringContainsString('released', $this->events());
+    }
+
+    public function test_a_database_added_beside_its_predecessor_starts_only_after_the_writers_stop(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=mariadb\n");
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['mariadb'] = ['image' => 'mariadb:one'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
+        file_put_contents($this->directory.'/events', '');
+
+        // A side-by-side cutover: mariadb stays rendered, the apps switch to the new db2.
+        $json['services']['db2'] = ['image' => 'mariadb:one'];
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=db2\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES), 'NNTMUX_NO_CONTAINER' => 'db2'])->mustRun();
+        $events = $this->events();
+        $start = strpos($events, '--wait-timeout 240 --pull never db2');
+        $this->assertNotFalse($start);
+        $this->assertGreaterThan(strpos($events, ' stop web scheduler indexer'), $start);
+        $this->assertGreaterThan($start, strpos($events, 'releases:verification-barrier --timeout=900'));
+        $this->assertGreaterThan($start, strpos($events, 'artisan migrate --force'));
+    }
+
+    public function test_a_lost_or_stopped_barrier_for_another_database_is_refused_before_its_removal(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        // An earlier attempt's barrier lost its session and exited; its durable pause is on another database.
+        file_put_contents($this->directory.'/barrier.log', "barrier held\nbarrier lost\n");
+        touch($this->directory.'/barrier.stopped');
+        file_put_contents($this->directory.'/barrier.database', "another-database\n");
+        file_put_contents($this->directory.'/docker/.deploy.stamp.barrier-owed', '');
+        file_put_contents($this->directory.'/events', '');
+
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('fences another database than this rollout', $process->getErrorOutput());
+        $this->assertStringNotContainsString('releases:verification-barrier --timeout', $this->events());
+        $this->assertFileExists($this->directory.'/barrier.stopped');
+
+        // Its container removed, the owed-release marker still names that database.
+        unlink($this->directory.'/barrier.stopped');
+        file_put_contents($this->directory.'/docker/.deploy.stamp.barrier-owed', "another-database\n");
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('verification pause owed on another database', $process->getErrorOutput());
+        $this->assertStringNotContainsString('releases:verification-barrier --timeout', $this->events());
+        $this->assertSame("another-database\n", file_get_contents($this->directory.'/docker/.deploy.stamp.barrier-owed'));
+    }
+
+    public function test_an_empty_legacy_owed_marker_is_refused_when_the_database_may_switch(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=192.0.2.10\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        // Older tooling's marker names no database, its barrier is gone, and app.env now points elsewhere.
+        file_put_contents($this->directory.'/docker/.deploy.stamp.barrier-owed', '');
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=192.0.2.20\n");
+        file_put_contents($this->directory.'/events', '');
+
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('without naming its database', $process->getErrorOutput());
+        $this->assertStringNotContainsString('releases:verification-barrier', $this->events());
+        $this->assertSame('', file_get_contents($this->directory.'/docker/.deploy.stamp.barrier-owed'));
+    }
+
+    public function test_a_db_url_host_query_spelled_differently_is_the_same_database(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_URL=mysql://u:p@192.0.2.9/nntmux?host=External-DB.example.\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_URL=mysql://u:p@192.0.2.9/nntmux?host=External-DB.example%2E\n");
+        $this->assertStringContainsString('Run Migrations  : no', $this->make(['deploy-plan'])->mustRun()->getOutput());
+    }
+
+    public function test_the_database_must_be_a_data_service_and_multi_line_values_select_nothing(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['mariadb'] = ['image' => 'mariadb:one'];
+        $json['services']['db2'] = ['image' => 'mariadb:one'];
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+
+        // A `DB_HOST=` line inside a multi-line (double-quoted, as phpdotenv allows) value is part of it.
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=mariadb\nNOTE=\"cutover plan\nDB_HOST=db2\nlater\"\n");
+        $this->assertSame('mariadb', $this->planActions($config)['DATABASE_SERVICE']);
+
+        // An infrastructure service is never migrated and fenced as the database.
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=proxy\n");
+        $plan = $this->planProcess($config);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('names proxy, which is not a data service', $plan->getErrorOutput());
+    }
+
+    public function test_an_escaped_quote_never_hides_the_database_settings_after_it(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        // `"p\"w"` is one closed value: DB_DATABASE after it still selects the schema.
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=192.0.2.10\nDB_PASSWORD=\"p\\\"w\"\nDB_DATABASE=nntmux\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=192.0.2.10\nDB_PASSWORD=\"p\\\"w\"\nDB_DATABASE=nntmux_restore\n");
+        $this->assertStringContainsString('Run Migrations  : yes', $this->make(['deploy-plan'])->mustRun()->getOutput());
+
+        // phpdotenv (app.env's only reader) keeps single quotes literal: `'C:\tmp\'` closes.
+        file_put_contents($this->directory.'/docker/config/app.env', "TEMP_PATH='C:\\tmp\\'\nDB_HOST=192.0.2.10\nDB_DATABASE=nntmux\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/docker/config/app.env', "TEMP_PATH='C:\\tmp\\'\nDB_HOST=192.0.2.10\nDB_DATABASE=nntmux_restore\n");
+        $this->assertStringContainsString('Run Migrations  : yes', $this->make(['deploy-plan'])->mustRun()->getOutput());
+    }
+
+    public function test_a_rendered_db_url_spelled_differently_is_the_same_database(): void
+    {
+        $json = json_decode($this->composeJson(), true);
+        foreach (['web', 'horizon', 'scheduler', 'indexer'] as $app) {
+            $json['services'][$app] = ['environment' => ['DB_URL' => 'mysql://u:p@External-DB.example./nntmux']];
+        }
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
+        // Horizon alone respells it: the apps still share one connection, so nothing migrates.
+        $json['services']['horizon'] = ['environment' => ['DB_URL' => 'mysql://u:p@external-db.example/nntmux']];
+        $this->assertStringContainsString('Run Migrations  : no', $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun()->getOutput());
+    }
+
+    public function test_an_unreadable_owed_marker_is_never_overwritten(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $marker = $this->directory.'/docker/.deploy.stamp.barrier-owed';
+        file_put_contents($marker, "another-database\n");
+        chmod($marker, 0200);
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0']);
+        $process->run();
+        chmod($marker, 0644);
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('cannot read the owed verification-pause marker', $process->getErrorOutput());
+        $this->assertSame("another-database\n", file_get_contents($marker));
+    }
+
+    public function test_a_hostname_with_spaces_is_another_connection(): void
+    {
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['horizon'] = ['environment' => ['DB_HOST' => ' 192.0.2.10 ']];
+        foreach (['web', 'scheduler', 'indexer'] as $app) {
+            $json['services'][$app] = ['environment' => ['DB_HOST' => '192.0.2.10']];
+        }
+        $plan = $this->planProcess(['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)]);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('connects to another database than web', $plan->getErrorOutput());
+    }
+
+    public function test_a_failed_barrier_inspection_never_counts_as_no_barrier(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        file_put_contents($this->directory.'/barrier.log', "barrier held\n");
+        touch($this->directory.'/barrier.running');
+        file_put_contents($this->directory.'/barrier.database', "another-database\n");
+        file_put_contents($this->directory.'/docker/.deploy.stamp.barrier-owed', '');
+        file_put_contents($this->directory.'/events', '');
+
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_BARRIER_INSPECT_FAIL' => '1']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('not adopting or replacing it unchecked', $process->getErrorOutput());
+        $this->assertStringNotContainsString('rm -f nntmux-verification-barrier', $this->events());
+        $this->assertFileExists($this->directory.'/barrier.running');
+    }
+
+    public function test_standalone_docker_compose_daemon_flags_fail_closed(): void
+    {
+        foreach (['docker-compose -H ssh://remote', 'docker-compose -Htcp://remote:2375', 'docker-compose --host=tcp://remote:2375', 'docker-compose -f x.yml --context remote', 'docker-compose -cremote', 'docker-compose --context=remote'] as $command) {
+            $plan = $this->make(['deploy-plan', 'DC='.$command.' --project-directory '.$this->directory.'/docker']);
+            $plan->run();
+            $this->assertNotSame(0, $plan->getExitCode(), $command);
+            $this->assertStringContainsString('can select another', $plan->getErrorOutput(), $command);
+        }
+    }
+
+    public function test_a_db_url_host_query_option_names_the_database_service(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['mariadb'] = ['image' => 'mariadb:one'];
+        $json['services']['db2'] = ['image' => 'mariadb:one'];
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+
+        // Laravel merges the URL's query options last: the app connects to db2.
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_URL=mysql://u:p@mariadb:3306/nntmux?charset=utf8mb4&host=db2\n");
+        $this->assertSame('db2', $this->planActions($config)['DATABASE_SERVICE']);
+
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_URL=mysql://u:p@mariadb:3306/nntmux?host=\n");
+        $plan = $this->planProcess($config);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('empty host= query option', $plan->getErrorOutput());
+    }
+
+    public function test_a_selected_database_scaled_away_from_one_replica_fails_closed(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=db2\n");
+        $json = json_decode($this->composeJson(), true);
+        foreach ([['scale' => 0], ['deploy' => ['replicas' => 0]], ['deploy' => ['replicas' => 2]]] as $scaled) {
+            $json['services']['db2'] = ['image' => 'mariadb:one'] + $scaled;
+            $plan = $this->planProcess(['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)]);
+            $plan->run();
+            $this->assertNotSame(0, $plan->getExitCode(), (string) json_encode($scaled));
+            $this->assertStringContainsString('database service db2 sets a replica count other than one', $plan->getErrorOutput());
+        }
+
+        // An external database leaves the unused default alone, rendered and scaled to zero or not rendered at all.
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=192.0.2.10\n");
+        unset($json['services']['db2']);
+        $this->assertSame('mariadb', $this->planActions(['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])['DATABASE_SERVICE']);
+        $json['services']['mariadb'] = ['image' => 'mariadb:one', 'scale' => 0];
+        $this->assertSame('mariadb', $this->planActions(['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES), 'NNTMUX_NO_CONTAINER' => 'mariadb'])['DATABASE_SERVICE']);
+    }
+
+    public function test_the_database_is_read_from_the_app_env_the_apps_mount(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        mkdir($this->directory.'/runtime', 0777, true);
+        file_put_contents($this->directory.'/.gitignore', "/runtime\n", FILE_APPEND);
+        file_put_contents($this->directory.'/.dockerignore', "runtime\n", FILE_APPEND);
+        (new Process(['git', 'commit', '-q', '-am', 'runtime'], $this->directory))->mustRun();
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=mariadb\n");
+        file_put_contents($this->directory.'/runtime/app.env', "DB_HOST=db2\n");
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['mariadb'] = ['image' => 'mariadb:one'];
+        $json['services']['db2'] = ['image' => 'mariadb:one'];
+        foreach (['web', 'horizon', 'scheduler', 'indexer'] as $app) {
+            $json['services'][$app] = ['volumes' => [['type' => 'bind', 'source' => $this->directory.'/runtime/app.env', 'target' => '/app/.env', 'read_only' => true]]];
+        }
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+        $this->assertSame('db2', $this->planActions($config)['DATABASE_SERVICE']);
+
+        // Editing the mounted file to point at another database migrates.
+        file_put_contents($this->directory.'/runtime/app.env', "DB_HOST=192.0.2.10\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        file_put_contents($this->directory.'/runtime/app.env', "DB_HOST=192.0.2.20\n");
+        $this->assertStringContainsString('Run Migrations  : yes', $this->make(['deploy-plan'], $config)->mustRun()->getOutput());
+
+        // Another spelling of the same host (case, a root dot) is the same database.
+        file_put_contents($this->directory.'/runtime/app.env', "DB_HOST=External-DB.example\n");
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        file_put_contents($this->directory.'/runtime/app.env', "DB_HOST=external-db.example.\n");
+        $this->assertStringContainsString('Run Migrations  : no', $this->make(['deploy-plan'], $config)->mustRun()->getOutput());
+
+        // The default app.env no app mounts any more never rolls the apps out.
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=mariadb\nAPP_DEBUG=true\n");
+        $this->assertStringNotContainsString('code/config changed', $this->make(['deploy-plan'], $config)->mustRun()->getOutput());
+
+        // phpdotenv ends an unquoted value at any `#`: `db2#cutover` is db2.
+        file_put_contents($this->directory.'/runtime/app.env', "DB_HOST=db2#cutover\n");
+        $this->assertSame('db2', $this->planActions($config)['DATABASE_SERVICE']);
+
+        // Apps rendering mounts but none at /app/.env name no database file.
+        $unmounted = $json;
+        foreach (['web', 'horizon', 'scheduler', 'indexer'] as $app) {
+            $unmounted['services'][$app] = ['volumes' => [['type' => 'bind', 'source' => $this->directory.'/runtime', 'target' => '/srv/runtime']]];
+        }
+        $plan = $this->planProcess(['NNTMUX_CONFIG_ID' => (string) json_encode($unmounted, JSON_UNESCAPED_SLASHES)]);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('does not mount /app/.env', $plan->getErrorOutput());
+
+        // Apps mounting different files select no single database.
+        $json['services']['indexer'] = ['volumes' => [['type' => 'bind', 'source' => $this->directory.'/docker/config/app.env', 'target' => '/app/.env', 'read_only' => true]]];
+        $plan = $this->planProcess(['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)]);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('mount different files (or none) as /app/.env', $plan->getErrorOutput());
+    }
+
+    public function test_an_external_database_without_a_rendered_default_service_deploys_without_touching_it(): void
+    {
+        // As on the split production layout: no mariadb rendered, the apps mount app.env and use a literal IP.
+        mkdir($this->directory.'/docker/config', 0777, true);
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=192.0.2.10\nAPP_DEBUG=false\n");
+        $json = json_decode($this->composeJson(), true);
+        foreach (['web', 'horizon', 'scheduler', 'indexer'] as $app) {
+            $json['services'][$app] = ['volumes' => [['type' => 'bind', 'source' => $this->directory.'/docker/config/app.env', 'target' => '/app/.env', 'read_only' => true]]];
+        }
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=192.0.2.10\nAPP_DEBUG=true\n");
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web horizon scheduler indexer', $events);
+        $this->assertStringNotContainsString('mariadb', $events);
+        $this->assertStringNotContainsString('artisan migrate', $events);
+    }
+
+    public function test_a_selective_build_never_stamps_a_role_tag_it_did_not_build(): void
+    {
+        mkdir($this->directory.'/resources/js', 0777, true);
+        file_put_contents($this->directory.'/resources/js/app.js', "console.log(1);\n");
+        $this->make(['build'])->mustRun();
+        $this->assertStringContainsString('image:horizon=nntmux/horizon:local@sha256:fixture', (string) file_get_contents($this->directory.'/docker/.build.stamp'));
+
+        // A web-only build while horizon's tag is replaced in place: horizon was not built.
+        file_put_contents($this->directory.'/resources/js/app.js', "console.log(2);\n");
+        file_put_contents($this->directory.'/events', '');
+        $process = $this->make(['build'], ['NNTMUX_REPLACE_ON_BUILD' => '1', 'NNTMUX_REPLACED_ONLY' => 'nntmux/horizon:local']);
+        $process->run();
+        @unlink($this->directory.'/replaced');
+        $this->assertStringContainsString('build --target selfhosted-web', $this->events());
+        $this->assertStringNotContainsString('build --target selfhosted-horizon', $this->events());
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringNotContainsString('sha256:replaced', (string) file_get_contents($this->directory.'/docker/.build.stamp'));
+
+        // Nor is a built tag replaced between its build and the stamp.
+        file_put_contents($this->directory.'/resources/js/app.js', "console.log(3);\n");
+        $process = $this->make(['build'], ['NNTMUX_REPLACE_AFTER_BUILD' => 'nntmux/web:local']);
+        $process->run();
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('not the sha256:fixture this build produced', $process->getErrorOutput());
+        $this->assertStringNotContainsString('sha256:replaced', (string) file_get_contents($this->directory.'/docker/.build.stamp'));
+
+        // Rebuilt and stamped normally once the tag is back.
+        $this->make(['build'])->mustRun();
+        $stamp = (string) file_get_contents($this->directory.'/docker/.build.stamp');
+        $this->assertNotSame('stale', strtok($stamp, "\n"));
+        $this->assertStringContainsString('image:web=nntmux/web:local@sha256:fixture', $stamp);
+    }
+
+    public function test_an_orphan_survives_a_no_op_stamp_until_its_successor_waits_for_the_drain(): void
+    {
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['mariadb'] = ['image' => 'mariadb:one'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
+
+        // Removed in one poll (a no-op: Compose leaves the orphan running) ...
+        unset($json['services']['mariadb']);
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES), 'NNTMUX_ORPHAN' => 'mariadb'])->mustRun();
+        $this->assertStringContainsString("\norphan:mariadb=running\n", (string) file_get_contents($this->directory.'/docker/.deploy.stamp'));
+        file_put_contents($this->directory.'/events', '');
+
+        // ... its successor added in a later one starts only after the writers and the orphan stop.
+        $json['services']['db2'] = ['image' => 'mariadb:one'];
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES), 'NNTMUX_NO_CONTAINER' => 'db2', 'NNTMUX_ORPHAN' => 'mariadb'])->mustRun();
+        $events = $this->events();
+        $stop = strpos($events, 'stop fixture-container-mariadb');
+        $this->assertNotFalse($stop);
+        $this->assertGreaterThan(strpos($events, ' stop web scheduler indexer'), $stop);
+        $this->assertGreaterThan($stop, strpos($events, '--wait-timeout 240 --pull never db2'));
+    }
+
+    public function test_a_symlinked_data_source_outside_the_project_is_recreated_without_a_record(): void
+    {
+        mkdir($this->directory.'/outside/storage-a', 0777, true);
+        symlink($this->directory.'/outside/storage-a', $this->directory.'/outside/current');
+        file_put_contents($this->directory.'/.gitignore', "/outside\n", FILE_APPEND);
+        file_put_contents($this->directory.'/.dockerignore', "outside\n", FILE_APPEND);
+        (new Process(['git', 'commit', '-q', '-am', 'outside'], $this->directory))->mustRun();
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['redis'] = ['volumes' => [['type' => 'bind', 'source' => $this->directory.'/outside/current', 'target' => '/data']]];
+
+        // No record says which target the running container mounted: it is recreated, not reconciled.
+        $actions = $this->planActions(['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)]);
+        $this->assertContains('redis', explode(' ', $actions['DIRTY_DATA']));
+        $this->assertNotContains('redis', explode(' ', $actions['RECONCILE_DATA']));
+    }
+
+    /**
+     * The variables `deploy-plan --deploy-actions` prints, without running a deployment.
+     *
+     * @param  array<string, string>  $environment
+     * @return array<string, string>
+     */
+    private function planActions(array $environment = []): array
+    {
+        $actions = [];
+        foreach (explode("\n", trim($this->planProcess($environment)->mustRun()->getOutput())) as $line) {
+            [$key, $value] = explode('=', $line, 2) + [1 => ''];
+            $actions[$key] = preg_match("/^'(.*)'$/s", $value, $quoted) === 1 ? str_replace("'\"'\"'", "'", $quoted[1]) : $value;
+        }
+
+        return $actions;
+    }
+
+    /** @param array<string, string> $environment */
+    private function planProcess(array $environment = []): Process
+    {
+        return new Process([$this->directory.'/docker/bin/deploy-plan', '--deploy-actions'], $this->directory.'/docker', $environment + [
+            'PATH' => $this->directory.'/bin:'.getenv('PATH'), 'NNTMUX_DEPLOY_EVENTS' => $this->directory.'/events',
+            'NNTMUX_REPO' => $this->directory,
+        ]);
     }
 
     /** Create the files composeJson() bind-mounts, older than every fixture container. */

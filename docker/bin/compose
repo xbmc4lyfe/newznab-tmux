@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Use the Justfile's Compose argv consistently, without evaluating shell code."""
 import os
-import re
 import shlex
 import sys
 from pathlib import Path
@@ -9,33 +8,25 @@ from pathlib import Path
 stack = Path(__file__).resolve().parent.parent
 os.environ.setdefault("COMPOSE_FILE", str(stack / "docker-compose.yml"))
 
-env_file = stack / ".env"
-file_env: dict[str, str] = {}
+# docker/.env as Compose reads it (escapes in double quotes decoded), shared with the Justfile.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from compose_dotenv import parse  # noqa: E402
+
 # Keys this wrapper and the Justfile's LOAD_ENV read literally. Compose interpolates unquoted and
 # double-quoted dotenv values (`${REGISTRY}/app:${TAG}`) but neither parser can, so a `$` there would be
 # exported unexpanded and shadow Compose's own resolution. Single-quoted values are literal in Compose.
 LITERAL_KEYS = ("DC", "COMPOSE_FILE", "HELPER_IMAGE", "BASE_IMAGE", "APP_IMAGE",
                 "WEB_IMAGE", "HORIZON_IMAGE", "SCHEDULER_IMAGE", "INDEXER_IMAGE")
-interpolated: set[str] = set()
-if env_file.is_file():
-    for raw in env_file.read_text(encoding="utf-8", errors="surrogateescape").splitlines():
-        # Same rules as the Justfile's LOAD_ENV: optional `export`, spaces around `=`, quoted values with
-        # an optional trailing comment, unquoted values ending at an inline ` #` comment; last one wins.
-        m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", raw)
-        if m:
-            key, value = m.group(1), m.group(2)
-            quoted = re.match(r"""^(["'])((?:(?!\1).)*)\1\s*(?:#.*)?$""", value)
-            file_env[key] = quoted.group(2) if quoted else re.sub(r"\s#.*$", "", value).strip()
-            # The last assignment wins, so only it can be interpolated.
-            interpolated.discard(key)
-            if "$" in file_env[key] and not (quoted and quoted.group(1) == "'"):
-                interpolated.add(key)
+parsed = parse(stack / ".env")
+file_env = {key: value for key, (value, _) in parsed.items()}
+# The last assignment wins, so only it can be interpolated (or span lines, which is not read whole).
+interpolated = {key for key, (_, flag) in parsed.items() if flag}
 
 for key in LITERAL_KEYS:
     if key in interpolated:
         sys.exit(
-            f"docker/.env: {key} must be literal but uses $ interpolation, which docker/bin/compose and the "
-            f"Justfile do not evaluate. Write the final value or single-quote it."
+            f"docker/.env: {key} must be literal but uses $ interpolation (or a multi-line value), which "
+            f"docker/bin/compose and the Justfile do not evaluate. Write the final value or single-quote it."
         )
 
 # An explicitly empty variable (`WEB_IMAGE=` as a just argument) overrides docker/.env: it means

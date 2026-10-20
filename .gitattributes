@@ -83,6 +83,7 @@ docker/Justfile		-binary text eol=lf
 # Guarded application rollout helpers are source, not binary artifacts.
 /docker/bin/build-images -binary text eol=lf
 /docker/bin/compose -binary text eol=lf
+/docker/bin/compose_dotenv.py -binary text eol=lf
 /docker/bin/deploy-app -binary text eol=lf
 /docker/bin/deploy-current -binary text eol=lf
 /docker/bin/deploy-plan -binary text eol=lf
