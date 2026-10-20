@@ -67,6 +67,12 @@ class CollectionCleanupService
      */
     private const ORPHAN_SWEEP_MAX_BATCHES = 20;
 
+    private const RETENTION_BAND_LOCK = 'cbp:retention-band:lock';
+
+    private const RETENTION_BAND_CURSOR = 'cbp:retention-band:cursor';
+
+    private const RETENTION_BAND_MAX_PAGES = 20;
+
     private ?bool $cascadeDeleteReady = null;
 
     private readonly BinariesConfig $binariesConfig;
@@ -90,7 +96,9 @@ class CollectionCleanupService
         if ($echoCLI) {
             echo cli()->header('Process Releases -> Delete finished collections.'.PHP_EOL).
                 cli()->primary(sprintf(
-                    'Deleting collections/binaries/parts older than %d hours.',
+                    config('release_verification.required', true)
+                        ? 'Deleting collections/binaries/parts older than %d hours.'
+                        : 'Deleting collections/binaries/parts older than %d hours (up to twice that while still owed processing).',
                     app(ConfigurationProvider::class)->ingestion()->partRetentionHours
                 ), true);
         }
@@ -98,15 +106,20 @@ class CollectionCleanupService
         // Batch-delete old collections using select-then-delete so we can
         // explicitly remove parts/binaries/collections even when FK cascades
         // are not present in the runtime schema.
-        $cutoff = now()->subHours(app(ConfigurationProvider::class)->ingestion()->partRetentionHours);
+        $retentionHours = app(ConfigurationProvider::class)->ingestion()->partRetentionHours;
+        $cutoff = now()->subHours($retentionHours);
         $batchDeleted = 0;
         $verificationRequired = (bool) config('release_verification.required', true);
         if ($verificationRequired) {
             $batchDeleted = $this->deleteOldVerificationWindow($cutoff, $echoCLI);
         } else {
+            // Collections still waiting for reconciliation or release creation are owed an attempt
+            // that a capped release pass may not have reached yet, so they get one more retention period.
+            $readyCutoff = now()->subHours(2 * $retentionHours);
             do {
                 $ids = DB::table('collections')
-                    ->where('dateadded', '<', $cutoff)
+                    ->where(static fn ($age) => $age->where('dateadded', '<', $readyCutoff)
+                        ->orWhere(static fn ($legacy) => $legacy->whereNull('dateadded')->where('added', '<', $readyCutoff)))
                     ->orderBy('id')
                     ->limit($this->sqlChunkSize())
                     ->pluck('id')
@@ -125,6 +138,7 @@ class CollectionCleanupService
                 // Brief pause to reduce pressure on the lock manager in busy systems.
                 usleep(10000);
             } while (true);
+            $batchDeleted += $this->deleteRetentionBandExceptReady($readyCutoff, $cutoff, $echoCLI);
         }
 
         $deletedCount += $batchDeleted;
@@ -180,6 +194,64 @@ class CollectionCleanupService
         }
 
         return $deletedCount;
+    }
+
+    /**
+     * Delete collections between the two retention cutoffs unless reconciliation or release
+     * creation still owes them an attempt. The kept rows stay in this band, so it is walked in dateadded order from a stored
+     * position, a bounded number of pages per call, and each kept row is read once per walk.
+     */
+    private function deleteRetentionBandExceptReady(DateTimeInterface $readyCutoff, DateTimeInterface $cutoff, bool $echoCLI): int
+    {
+        // Every release child runs cleanup; one walker at a time keeps the cursor moving forward.
+        $lock = Cache::lock(self::RETENTION_BAND_LOCK, self::ORPHAN_SWEEP_LOCK_SECONDS);
+        if (! $lock->get()) {
+            return 0;
+        }
+        try {
+            // The statuses the reconciliation walk revisits, and sized rows waiting for creation.
+            $ready = [...array_map(static fn (CollectionFileCheckStatus $status): int => $status->value,
+                [...CollectionFileCheckStatus::inProgress(), CollectionFileCheckStatus::Sized]), 10];
+            $saved = Cache::get(self::RETENTION_BAND_CURSOR);
+            [$lastDate, $lastId] = is_array($saved) && is_string($saved['dateadded'] ?? null) && is_numeric($saved['id'] ?? null)
+                ? [$saved['dateadded'], (int) $saved['id']] : [null, 0];
+            $limit = $this->sqlChunkSize();
+            $deleted = 0;
+            for ($page = 0; $page < self::RETENTION_BAND_MAX_PAGES; $page++) {
+                $rows = DB::table('collections')
+                    ->where('dateadded', '>=', $readyCutoff)
+                    ->where('dateadded', '<', $cutoff)
+                    ->when($lastDate !== null, static fn ($query) => $query->where(static fn ($after) => $after
+                        ->where('dateadded', '>', $lastDate)
+                        ->orWhere(static fn ($same) => $same->where('dateadded', $lastDate)->where('id', '>', $lastId))))
+                    ->orderBy('dateadded')->orderBy('id')
+                    ->limit($limit)
+                    ->get(['id', 'dateadded', 'filecheck']);
+                $ids = $rows->reject(static fn ($row): bool => \in_array((int) $row->filecheck, $ready, true))
+                    ->pluck('id')->map(static fn ($id): int => (int) $id)->values()->all();
+                if ($ids !== []) {
+                    // A release pass may have promoted a row since the page was read.
+                    $ids = DB::table('collections')->whereIn('id', $ids)->whereNotIn('filecheck', $ready)
+                        ->pluck('id')->map(static fn ($id): int => (int) $id)->all();
+                }
+                if ($ids !== []) {
+                    $deleted += $this->deleteCollectionsAndDescendants($ids, 'Cleanup', $echoCLI);
+                }
+                if ($rows->count() < $limit) {
+                    Cache::forget(self::RETENTION_BAND_CURSOR);
+
+                    break;
+                }
+                $last = $rows->last();
+                $lastDate = (string) $last->dateadded;
+                $lastId = (int) $last->id;
+                Cache::forever(self::RETENTION_BAND_CURSOR, ['dateadded' => $lastDate, 'id' => $lastId]);
+            }
+
+            return $deleted;
+        } finally {
+            $lock->release();
+        }
     }
 
     /**

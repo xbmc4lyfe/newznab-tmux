@@ -32,6 +32,10 @@ final readonly class BinariesConfig
         public int $sqlChunkSize = 500,
         public int $reconcileBatchSize = 500,
         public int $nzbStreamRows = 5000,
+        // One release pass reconciles or sizes at most this many pages, and stops
+        // starting new pages after this many seconds; later passes resume.
+        public int $reconcilePagesPerPass = 1000,
+        public int $reconcilePassSeconds = 300,
         // Skip a range's articles whose subject is randomised per article once this many
         // share a subject shape without repeating a name; 0 keeps them.
         public int $perArticleObfuscationMinArticles = 16,
@@ -58,6 +62,8 @@ final readonly class BinariesConfig
             sqlChunkSize: max(50, min(1000, (int) config('nntmux.cbp.sql_chunk_size', 500))),
             reconcileBatchSize: max(50, min(2000, (int) config('nntmux.cbp.reconcile_batch_size', 500))),
             nzbStreamRows: max(500, min(20000, (int) config('nntmux.cbp.nzb_stream_rows', 5000))),
+            reconcilePagesPerPass: max(1, (int) config('nntmux.cbp.reconcile_pages_per_pass', 1000)),
+            reconcilePassSeconds: max(1, (int) config('nntmux.cbp.reconcile_pass_seconds', 300)),
             perArticleObfuscationMinArticles: self::obfuscationMinArticles((int) config('nntmux.cbp.per_article_obfuscation_min_articles', 16)),
         );
     }
