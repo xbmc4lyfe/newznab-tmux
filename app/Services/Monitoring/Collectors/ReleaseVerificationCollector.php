@@ -4,22 +4,31 @@ declare(strict_types=1);
 
 namespace App\Services\Monitoring\Collectors;
 
+use App\Services\Monitoring\BoundedMetricQuery;
 use App\Services\Monitoring\Prometheus\MetricFamily;
+use Illuminate\Database\Query\Builder;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
 final class ReleaseVerificationCollector implements MetricsCollector
 {
+    public function __construct(private readonly BoundedMetricQuery $queries) {}
+
     public function collect(): iterable
     {
         if (! Schema::hasTable('release_verification_candidates')) {
             return;
         }
         $family = MetricFamily::gauge('nntmux_release_verification_candidates', 'Candidates by verification outcome.');
-        foreach (DB::table('release_verification_candidates')->selectRaw('status, COUNT(*) AS total')->groupBy('status')->get() as $row) {
+        $counts = $this->measure(DB::table('release_verification_candidates')->selectRaw('status, COUNT(*) AS total')->groupBy('status'));
+        foreach ($counts ?? [] as $row) {
             $family->add((int) $row->total, ['status' => $row->status]);
         }
-        yield $family;
+        yield MetricFamily::gauge('nntmux_release_verification_candidates_measurement_available', 'Whether verification outcome counts were measured within their query deadline.')->add($counts === null ? 0 : 1);
+        if ($counts !== null) {
+            yield $family;
+        }
         yield MetricFamily::gauge('nntmux_release_verification_pending_bytes', 'Compressed pending manifest bytes.')
             ->add((int) DB::table('release_verification_state')->where('id', 1)->value('pending_bytes'));
         $snapshotPath = (string) config('release_verification.storage_path').'/status.json';
@@ -37,9 +46,33 @@ final class ReleaseVerificationCollector implements MetricsCollector
         }
         yield MetricFamily::gauge('nntmux_release_verification_verified_bytes_per_second', 'Latest bounded verifier measurement.')
             ->add(is_numeric($snapshot['verified_bytes_per_second'] ?? null) ? (float) $snapshot['verified_bytes_per_second'] : 0);
-        $oldest = DB::table('release_verification_candidates')->whereNull('release_id')->whereIn('status', ['ready', 'waiting_upload', 'pending', 'unknown', 'header_rejected', 'verifying', 'dirty', 'unrepairable'])->min('last_unique_at');
+        $rows = $this->measure(DB::table('release_verification_candidates')->whereNull('release_id')
+            ->whereIn('status', ['ready', 'waiting_upload', 'pending', 'unknown', 'header_rejected', 'verifying', 'dirty', 'unrepairable'])
+            ->selectRaw('MIN(last_unique_at) AS oldest'));
+        if ($rows === null) {
+            // Omit an unavailable age rather than publishing a fake zero or blocking every other collector.
+            yield MetricFamily::gauge('nntmux_release_verification_backlog_age_measurement_available', 'Whether the oldest unverified candidate age was measured within its query deadline.')->add(0);
+
+            return;
+        }
+        $oldest = $rows[0]->oldest ?? null;
+        yield MetricFamily::gauge('nntmux_release_verification_backlog_age_measurement_available', 'Whether the oldest unverified candidate age was measured within its query deadline.')->add(1);
         yield MetricFamily::gauge('nntmux_release_verification_backlog_age_seconds', 'Age of the oldest unverified candidate.')
             ->add($oldest === null ? 0 : max(0, now()->timestamp - strtotime($oldest)));
+    }
+
+    /** @return list<object>|null Null means the database cancelled an over-budget measurement. */
+    private function measure(Builder $query): ?array
+    {
+        try {
+            return $this->queries->get($query);
+        } catch (QueryException $exception) {
+            if (! in_array((int) ($exception->errorInfo[1] ?? 0), [1969, 3024], true)) {
+                throw $exception;
+            }
+
+            return null;
+        }
     }
 
     /** @return array{array<string, mixed>, int|null} */
