@@ -516,6 +516,12 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Batch review fixes:** caches are scoped to one batch; returned and lost queued claims have separate diagnostics; unstarted leases return on deadline, drain or failure; rolled-back claims release their mutexes. Transport failures retain correlated outcomes, and unread responses retry once through the native identity-checked parser even when the Rust helper crashes. Ownership failures abort rather than retry. Publication progress renews queued leases; renewal errors outside a transaction return only the affected queued claim, while errors inside publication still abort the transaction.
 - **Rust experiment:** bounded cross-candidate sample batches, optional full-manifest STAT, and a Rust framing subprocess are available for validation. Batch size defaults to one and the Rust executable path defaults empty. A paired 20-observation caller screen found median times of 36.83/16.36/19.31 ms (sequential/PHP batch/Rust batch, 32 KiB bodies) and 189.96/156.20/185.56 ms (500 KiB bodies). This synthetic socket screen does not qualify p99 or TCP/TLS performance; Rust remains disabled because the required speedups were not established. The native implementation remains available.
 
+### 67. Docker CI jobs can land on workers without a Docker daemon (Fixed)
+
+- **Where:** the PHP and release-presentation workflows used `ubuntu-latest`, also advertised by repository self-hosted workers.
+- **Effect:** PHP service-container setup and presentation web-container qualification failed before their intended checks because `/var/run/docker.sock` did not exist.
+- **Fix:** select the explicit `ubuntu-24.04` hosted image for these two Docker-dependent jobs. The inspected self-hosted inventory does not advertise that label; validation and benchmark gates remain unchanged. The paired x86 decoder job accepts an optional administrator-configured disposable VBMI2 runner label while retaining its measured kernel and speedup requirements.
+
 ## Issues in the docker/ stack itself (all fixed)
 
 | Issue | Fix |
