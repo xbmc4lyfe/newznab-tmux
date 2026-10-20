@@ -78,12 +78,13 @@ jobs:
   paired-decoding:
     if: github.event_name != 'workflow_dispatch' || inputs.comparison == 'all' || inputs.comparison == 'cpp'
     # PR code requires disposable workers. The optional x86 label is reserved for
-    # a one-job ephemeral VM whose actual decoder must still qualify as VBMI2.
+    # a one-job ephemeral VM pinned to an exact candidate SHA; the actual decoder
+    # must still qualify as VBMI2. Other revisions keep the standard routing.
     strategy:
       fail-fast: false
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.runner == 'ubuntu-latest' && vars.NNTMUX_VBMI2_RUNNER || matrix.runner }}
+    runs-on: ${{ matrix.runner == 'ubuntu-latest' && vars.NNTMUX_VBMI2_RUNNER && vars.NNTMUX_VBMI2_SHA == (github.event.pull_request.head.sha || github.sha) && vars.NNTMUX_VBMI2_RUNNER || matrix.runner }}
     # Keep the original comparison budget plus bounded diagnostics and upload time.
     timeout-minutes: 60
     env:
