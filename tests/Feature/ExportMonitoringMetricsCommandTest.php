@@ -119,17 +119,18 @@ class ExportMonitoringMetricsCommandTest extends TestCase
     {
         Http::fake([self::PUSH_URL => Http::response('', 200)]);
         $event = $this->exportEvent();
-        // Lock expiry is compared with the clock; freeze it so wall-clock drift cannot move the boundary.
         $this->freezeTime();
 
         $this->assertTrue($event->mutex->create($event));
-        $this->travel(4)->minutes();
+        $locks = &app('cache')->store()->getStore()->locks;
+        $lock = $locks[$event->mutexName()];
+        $this->assertSame(300, (int) round(now()->diffInSeconds($lock['expiresAt'], true)), 'The exporter lock must last five minutes.');
         $this->assertFalse($event->filtersPass($this->app));
         $this->assertTrue($event->shouldSkipDueToOverlapping());
         Http::assertNothingSent();
 
-        // Step just past the five-minute expiry; at exactly the boundary CI still sees the lock as held.
-        $this->travel(61)->seconds();
+        // Expire the abandoned lock directly; comparing it with a travelled clock is not reliable in CI.
+        $locks[$event->mutexName()]['expiresAt'] = now()->subMinute();
         $this->assertTrue($event->filtersPass($this->app));
         $this->assertFalse($event->mutex->exists($event));
         $this->artisan('monitoring:export-metrics')->assertSuccessful();
