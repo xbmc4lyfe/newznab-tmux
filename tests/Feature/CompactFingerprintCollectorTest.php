@@ -770,7 +770,7 @@ final class CompactFingerprintCollectorTest extends TestCase
         $this->assertSame('000da322', hash('crc32b', $data));
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)->andReturnUsing(function (string $id) use ($data, $corrupt): array {
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(6)->andReturnUsing(function (string $id) use ($data, $corrupt): array {
             $part = preg_match('/-s(\d+)@/', $id, $match) === 1 ? (int) $match[1] : 1;
             $body = YencArticles::part($data, 'segment.bin', 32, $part, 16 * ($part - 1) + 1, 2);
             $body = (string) preg_replace('/=yend size=16 part=\d+ pcrc32=000da322/', '=yend size=16 pcrc32=da322', $body);
