@@ -44,7 +44,7 @@ def fixture(kind):
         report.update(cold={}, startup_bounded_p99={}, startup=dict(raw=[MARKER]))
         for name, category in EXPORT.ARTICLE.items():
             report['strata'][name] = dict(category=category, statistic='p99' if category == 'uncommon' else 'median',
-                samples=1000, speedup=2, speedup_ci95=[1.7, 2.3], php_ms=2, rust_ms=1, declined=False,
+                samples=1000, speedup=2, speedup_ci95=[1.7, 2.3], php_ms=2, rust_ms=1, declined=category == 'routed',
                 raw=[MARKER], description=MARKER)
             if name != 'large-range':
                 report['cold'][name] = dict(samples=41, speedup=2, speedup_ci95=[1.7, 2.3], php_ms=2,
@@ -121,6 +121,7 @@ class IdentitySummaryTest(unittest.TestCase):
         mutations = [
             ('measurement-after.json', lambda value: value.update(library_sha256='d' * 64)),
             ('measurement-after.json', lambda value: value['source_sha256'].update({'composer.lock': 'd' * 64})),
+            ('measurement-after.json', lambda value: value['source_sha256'].update({'app/Services/Binaries/PerArticleObfuscationRouter.php': 'd' * 64})),
             ('runtime.json', lambda value: value.update(executed_sha='d' * 40)),
             ('resource-limits-after.json', lambda value: value.update(cpu_affinity=[1])),
         ]
@@ -270,6 +271,43 @@ class IdentitySummaryTest(unittest.TestCase):
         report = fixture('per-article-obfuscation')
         report['strata']['large-range']['samples'] = 999
         self.assertEqual('invalid', self.export('per-article-obfuscation', report)['status'])
+
+    def test_failure_and_incomplete_envelopes_reject_irrelevant_nested_payloads(self):
+        for kind in EXPORT.KINDS:
+            examples = [self.export(kind), self.export(kind, {}), self.export(kind, fixture(kind))]
+            self.receipts(kind, fixture(kind))
+            examples.append(self.export(kind, fixture(kind)))
+            self.assertEqual('recorded', examples[-1]['status'])
+            for base in examples:
+                for field, payload in (
+                    ('runtime_identity', {'raw_private_payload': MARKER}),
+                    ('identity_manifest_sha256', {'private': MARKER}),
+                    ('baseline_revision', MARKER), ('uncertainty_method', 'not_reported'),
+                    ('source_and_library_identities_stable', MARKER),
+                ):
+                    with self.subTest(kind=kind, status=base['status'], field=field):
+                        with self.assertRaises(ValueError):
+                            self.validate(base | {field: payload})
+
+    def test_observed_warm_decline_controls_backend_even_for_common_fixture(self):
+        report = fixture('per-article-obfuscation')
+        report['strata']['real-uploads']['declined'] = True
+        result = self.export('per-article-obfuscation', report)
+        self.validate(result)
+        observed = next(row for row in result['rows'] if row['fixture'] == 'real-uploads' and row['phase'] == 'warm')
+        self.assertEqual('php', observed['candidate_backend'])
+        self.assertEqual('same_php_control', observed['comparison'])
+
+    def test_executed_router_is_in_frozen_source_contract(self):
+        self.assertIn('app/Services/Binaries/PerArticleObfuscationRouter.php', EXPORT.SOURCE_PATHS)
+
+    def test_identity_tests_are_wired_to_pages_ci_and_pull_request_trigger(self):
+        workflow = (ROOT / '.github/workflows/benchmark-pages.yml').read_text()
+        self.assertIn("- 'tests/Unit/test_identity_benchmark_summary.py'", workflow)
+        self.assertIn('python3 -B tests/Unit/test_identity_benchmark_summary.py', workflow)
+        producer = (ROOT / '.github/workflows/archive-sample-performance.yml').read_text()
+        self.assertIn("- 'tests/Unit/test_identity_benchmark_summary.py'", producer)
+        self.assertIn('python3 -B tests/Unit/test_identity_benchmark_summary.py', producer)
 
     def test_shared_job_and_public_artifacts_are_independent_on_failure(self):
         workflow = (ROOT / '.github/workflows/archive-sample-performance.yml').read_text().split('  filename-identity:', 1)[1]

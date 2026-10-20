@@ -27,7 +27,8 @@ LIMIT = 32 * 1024 * 1024
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PATHS = SOURCES | {
     'app/Services/Binaries/HeaderParser.php', 'app/Services/Binaries/NativePerArticleObfuscation.php',
-    'app/Services/Binaries/PerArticleObfuscationGate.php', 'scripts/benchmark-filename-identity.php',
+    'app/Services/Binaries/PerArticleObfuscationGate.php', 'app/Services/Binaries/PerArticleObfuscationRouter.php',
+    'scripts/benchmark-filename-identity.php',
     'scripts/benchmark-per-article-obfuscation.php', 'tests/Support/HeaderFilenameIdentityCorpus.php',
     'tests/Support/PerArticleObfuscationCorpus.php', 'composer.json', 'composer.lock',
     'vendor/composer/installed.json', 'docker/app/nzb-yenc-ffi/Cargo.toml', 'docker/app/nzb-yenc-ffi/Cargo.lock',
@@ -91,19 +92,18 @@ def receipts(root, result, report):
     expected_arch = {'aarch64', 'arm64'} if result['runner'] == 'ubuntu-24.04-arm' else {'x86_64', 'amd64'}
     if runtime['architecture'] not in expected_arch:
         raise ValueError('Runner architecture mismatch')
-    result['runtime_identity'] = {key: runtime[key] for key in allowed}
-    result['identity_runtime_sha256'] = hashlib.sha256(runtime_raw).hexdigest()
+    runtime_identity = {key: runtime[key] for key in allowed}
+    runtime_digest = hashlib.sha256(runtime_raw).hexdigest()
     spec = importlib.util.spec_from_file_location('identity_resources', ROOT / 'scripts/benchmark-resource-limits.py')
     resources = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(resources)
     for phase in ('before', 'after', 'comparison'):
         strict_json(bounded_read(evidence / ('resource-limits-' + phase + '.json'), 1024 * 1024))
     hashes.update(resources.verified_receipt(evidence))
-    result['source_sha256'] = hashes
-    result['identity_provenance_status'] = 'verified_current'
-    result['identity_manifest_sha256'] = {phase: hashlib.sha256(snapshot_bytes[phase]).hexdigest()
+    manifest_digests = {phase: hashlib.sha256(snapshot_bytes[phase]).hexdigest()
         for phase in ('before', 'after')}
-
+    result.update(source_sha256=hashes, identity_provenance_status='verified_current',
+        identity_manifest_sha256=manifest_digests, runtime_identity=runtime_identity, identity_runtime_sha256=runtime_digest)
 
 
 def numeric(value, zero=False):
@@ -184,8 +184,8 @@ def measurements(kind, report):
                 value['speedup_ci95'], value['php_ms'], value['rust_ms']))
             if type(value['declined']) is not bool:
                 raise ValueError('Invalid decline flag')
-            rows[-1].update(candidate_backend='php' if category == 'routed' else 'rust',
-                            comparison='same_php_control' if category == 'routed' else 'exact_public_caller',
+            rows[-1].update(candidate_backend='php' if value['declined'] else 'rust',
+                            comparison='same_php_control' if value['declined'] else 'exact_public_caller',
                             native_declined=value['declined'])
             if fixture in cold:
                 value = cold[fixture]
@@ -235,7 +235,7 @@ def export(kind, runner, root=Path('.'), environ=None):
             hashes = environment.get('source_sha256', {})
             result['source_sha256'] = {key: digest(hashes[key]) for key in SOURCES}
         if status == 'invalid':
-            result['status'] = 'invalid'
+            result.update(status='invalid', identity_provenance_status='invalid')
         else:
             result['rows'] = measurements(kind, report)
             # Current legacy producers omit measurement-time source/input hashes,
@@ -253,12 +253,25 @@ def export(kind, runner, root=Path('.'), environ=None):
         pass
     except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError):
         result.update(status='invalid', rows=[], identity_provenance_status='invalid')
+        for field in ('runtime_identity', 'identity_runtime_sha256', 'identity_manifest_sha256'):
+            result.pop(field, None)
     return result
 
 
 def validate_public(summary):
     """Validate the public adapter contract independently at the Pages boundary."""
     kind = summary['kind']
+    base = {'schema_version', 'repository', 'head_sha', 'run_id', 'run_attempt', 'kind', 'runner',
+        'adoption_qualified', 'rows', 'status', 'evidence_type', 'identity_provenance_status', 'identity_uncertainty'}
+    evidence = {'benchmark_status', 'report_sha256', 'protocol_sha256', 'source_sha256', 'library_sha256'}
+    receipts = {'runtime_identity', 'identity_runtime_sha256', 'identity_manifest_sha256'}
+    status = summary.get('status')
+    permitted = base | (evidence if status != 'missing' else set()) | (receipts if status == 'recorded' else set())
+    if kind not in KINDS or not base <= set(summary) or set(summary) - permitted:
+        raise ValueError('Unexpected identity envelope fields for status')
+    if (type(summary['adoption_qualified']) is not bool or summary['adoption_qualified']
+            or not isinstance(summary['rows'], list) or len(summary['rows']) > 100):
+        raise ValueError('Invalid identity envelope')
     definitions = FILENAME if kind == 'filename-identity' else ARTICLE
     if (summary.get('evidence_type') != 'synthetic_descriptive_comparison'
             or summary.get('identity_uncertainty') != ('descriptive_order_statistics' if kind == 'filename-identity' else 'pointwise_paired_bootstrap')
@@ -266,6 +279,8 @@ def validate_public(summary):
             or summary.get('status') not in ('missing', 'invalid', 'incomplete_provenance', 'recorded')):
         raise ValueError('Invalid identity summary status')
     for mapping in ('source_sha256', 'library_sha256'):
+        if not isinstance(summary.get(mapping, {}), dict):
+            raise ValueError('Invalid identity digest mapping')
         for value in summary.get(mapping, {}).values():
             digest(value)
     status = summary['status']
@@ -279,8 +294,8 @@ def validate_public(summary):
     if set(summary.get('source_sha256', {})) - SOURCE_PATHS - RESOURCE_KEYS or set(summary.get('library_sha256', {})) - {'native'}:
         raise ValueError('Invalid identity source names')
     if status in ('invalid', 'missing'):
-        if summary['rows']:
-            raise ValueError('Failed identity summary contains measurements')
+        if summary['rows'] or summary['identity_provenance_status'] != ('incomplete' if status == 'missing' else 'invalid'):
+            raise ValueError('Invalid failed identity summary')
         return
     if benchmark not in set(allowed) - {'invalid'} or not all(key in summary for key in ('protocol_sha256', 'report_sha256')) or set(summary.get('library_sha256', {})) != {'native'}:
         raise ValueError('Incomplete measured report identity')
@@ -288,7 +303,8 @@ def validate_public(summary):
         runtime = summary.get('runtime_identity', {})
         fields = {'executed_sha', 'rustc', 'cargo', 'architecture', 'runner_image_version', 'build_profile'}
         manifests = summary.get('identity_manifest_sha256', {})
-        if (summary['identity_provenance_status'] != 'verified_current' or set(runtime) != fields
+        if (not isinstance(runtime, dict) or not isinstance(manifests, dict)
+                or summary['identity_provenance_status'] != 'verified_current' or set(runtime) != fields
                 or runtime.get('executed_sha') != summary['head_sha']
                 or any(not isinstance(v, str) or not v or len(v) > 4096 for v in runtime.values())
                 or set(summary.get('source_sha256', {})) != SOURCE_PATHS | RESOURCE_KEYS
@@ -329,7 +345,7 @@ def validate_public(summary):
             if value['candidate_backend'] not in ('php', 'rust') or value['comparison'] != ('same_php_control' if value['candidate_backend'] == 'php' else 'exact_public_caller'):
                 raise ValueError('Invalid routing comparison')
             if value['phase'] == 'warm':
-                if type(value['native_declined']) is not bool or (value['category'] == 'routed') != (value['candidate_backend'] == 'php'):
+                if type(value['native_declined']) is not bool or value['native_declined'] != (value['candidate_backend'] == 'php'):
                     raise ValueError('Invalid warm routing')
             elif (type(value['used_rust']) is not bool or type(value['rust_runs']) is not int
                     or not 0 <= value['rust_runs'] <= value['samples']

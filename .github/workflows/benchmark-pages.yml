@@ -12,6 +12,7 @@ on:
       - 'docker/app/nzb-yenc-ffi/**'
       - 'tests/Unit/test_benchmark*'
       - 'tests/Unit/test_verify_benchmark_pages.py'
+      - 'tests/Unit/test_identity_benchmark_summary.py'
       - 'github-pages/docs/**'
       - 'scripts/build-docs.py'
       - 'tests/Unit/test_docs_site.py'
@@ -81,6 +82,7 @@ jobs:
           python3 -B tests/Unit/test_benchmark_remaining_modules_export.py
           python3 -B tests/Unit/test_benchmark_utility_extended.py
           python3 -B tests/Unit/test_benchmark_resource_limits.py
+          python3 -B tests/Unit/test_identity_benchmark_summary.py
           python3 -B tests/Unit/test_docs_site.py
           python3 -B tests/Unit/test_docs_links.py
       - name: Check Google style with pinned Vale
