@@ -1,10 +1,13 @@
 """Identity report publication preserves provenance, routing and uncertainty scope."""
 import copy
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -225,6 +228,48 @@ class IdentitySummaryTest(unittest.TestCase):
                 result['rows'].append(copy.deepcopy(result['rows'][0]))
             with self.assertRaises(ValueError, msg=change):
                 self.validate(result)
+
+    def test_both_architectures_collect_only_exact_current_attempt_public_artifacts(self):
+        summaries = {}
+        for kind in EXPORT.KINDS:
+            summary = self.export(kind, fixture(kind))
+            for runner in ('ubuntu-latest', 'ubuntu-24.04-arm'):
+                summaries[(kind, runner)] = summary | {'runner': runner}
+        artifacts, archives = [], {}
+        for number, ((kind, runner), summary) in enumerate(summaries.items(), 1):
+            data = io.BytesIO()
+            with zipfile.ZipFile(data, 'w') as archive:
+                archive.writestr('summary.json', json.dumps(summary))
+            archives[number] = data.getvalue()
+            artifacts.append(dict(id=number, name=f'public-benchmark-{kind}-{runner}-12-2',
+                expired=False, size_in_bytes=len(archives[number])))
+        run = dict(id=12, run_attempt=2, head_sha=SHA, event='push', head_branch='master',
+            head_repository=dict(full_name=PAGES.REPOSITORY), status='completed', conclusion='failure')
+        def fetch(path):
+            return {'artifacts': artifacts} if '/artifacts?' in path else {'workflow_runs': [run]}
+        expected = list(summaries)
+        with patch.object(PAGES, 'WORKFLOWS', {'archive-sample-performance.yml': expected}), \
+                patch.object(PAGES, 'last_valid_comparison', return_value=None), \
+                patch.object(PAGES, 'collect_dispatches', return_value=([], [])):
+            report = PAGES.collect(SHA, ROOT, fetch, archives.__getitem__)
+            self.assertEqual(4, len(report['results']))
+            self.assertTrue(all(row['status'] == 'incomplete_provenance' for row in report['results']))
+            self.assertTrue(all(row['workflow_status'] == 'failure' for row in report['results']))
+            for summary in summaries.values():
+                summary['run_attempt'] = 1
+                with self.assertRaises(ValueError):
+                    PAGES.validate_summary(summary, run, summary['kind'], summary['runner'])
+
+    def test_percentile_observations_below_thousand_are_not_published(self):
+        report = fixture('filename-identity')
+        for value in report['strata'].values():
+            value['observations'] = 999
+            for metric in ('median', 'p99'):
+                value[metric]['php']['samples'] = value[metric]['rust']['samples'] = 999
+        self.assertEqual('invalid', self.export('filename-identity', report)['status'])
+        report = fixture('per-article-obfuscation')
+        report['strata']['large-range']['samples'] = 999
+        self.assertEqual('invalid', self.export('per-article-obfuscation', report)['status'])
 
     def test_shared_job_and_public_artifacts_are_independent_on_failure(self):
         workflow = (ROOT / '.github/workflows/archive-sample-performance.yml').read_text().split('  filename-identity:', 1)[1]

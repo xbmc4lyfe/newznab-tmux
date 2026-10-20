@@ -134,3 +134,5 @@ docker/Justfile		-binary text eol=lf
 /scripts/benchmark-date-build.py -binary text eol=lf
 /tests/Unit/test_benchmark_date_build.py -binary text eol=lf
 /tests/Unit/test_generate_env.py -binary text eol=lf
+/scripts/export-identity-benchmark-summary.py -binary text eol=lf
+/tests/Unit/test_identity_benchmark_summary.py -binary text eol=lf
