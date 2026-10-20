@@ -36,6 +36,9 @@ final readonly class BinariesConfig
         // starting new pages after this many seconds; later passes resume.
         public int $reconcilePagesPerPass = 1000,
         public int $reconcilePassSeconds = 300,
+        // Skip a range's articles whose subject is randomised per article once this many
+        // share a subject shape without repeating a name; 0 keeps them.
+        public int $perArticleObfuscationMinArticles = 16,
     ) {}
 
     /**
@@ -61,6 +64,16 @@ final readonly class BinariesConfig
             nzbStreamRows: max(500, min(20000, (int) config('nntmux.cbp.nzb_stream_rows', 5000))),
             reconcilePagesPerPass: max(1, (int) config('nntmux.cbp.reconcile_pages_per_pass', 1000)),
             reconcilePassSeconds: max(1, (int) config('nntmux.cbp.reconcile_pass_seconds', 300)),
+            perArticleObfuscationMinArticles: self::obfuscationMinArticles((int) config('nntmux.cbp.per_article_obfuscation_min_articles', 16)),
         );
+    }
+
+    /**
+     * 0 or less disables the check; any other value is held to at least 8 so a handful of
+     * unrelated single articles cannot form a group.
+     */
+    public static function obfuscationMinArticles(int $configured): int
+    {
+        return $configured <= 0 ? 0 : max(8, $configured);
     }
 }
