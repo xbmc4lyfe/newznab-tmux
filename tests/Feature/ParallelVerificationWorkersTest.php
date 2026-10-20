@@ -96,6 +96,7 @@ class ParallelVerificationWorkersTest extends ReleaseVerificationCandidatesTest
         $closed = 0;
         $this->mock(NNTPService::class, static function ($mock) use (&$closed): void {
             $mock->shouldReceive('doConnect')->once()->with(false)->andReturn(true);
+            $mock->shouldReceive('isConnected')->andReturn(true);
             $mock->shouldReceive('verificationArticle')->twice()->andReturn((new YencService)->encode('hello', 'movie.mkv'));
             $mock->shouldReceive('doQuit')->once()->andReturnUsing(static function () use (&$closed): void {
                 $closed++;

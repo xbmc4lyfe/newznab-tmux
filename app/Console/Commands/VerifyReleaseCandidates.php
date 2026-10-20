@@ -190,7 +190,7 @@ class VerifyReleaseCandidates extends Command
                             $diagnostics?->handedOff();
                         } else {
                             $published = config('release_verification.publish_url')
-                                ? app(RemoteReleasePublisher::class)->publish($claim, $result, progress: $progressHeartbeat)
+                                ? $this->publishRemotely($claim, $result, $heartbeat, $batch->pulse(...))
                                 : $publisher->publish($claim, $result, progress: $batch->pulse(...));
                             if ($published === null) {
                                 $result = $this->filteredResult($claim) ?? throw new RuntimeException('Publication did not produce a verified current release.');
@@ -476,6 +476,31 @@ class VerifyReleaseCandidates extends Command
         }
 
         return true;
+    }
+
+    /**
+     * @param  callable(): void  $heartbeat
+     * @param  callable(): void  $queuedProgress
+     */
+    private function publishRemotely(object $claim, VerificationResult $result, callable $heartbeat, callable $queuedProgress): ?int
+    {
+        // Renew once before sending. The primary then owns the active row under its publication
+        // lock and clears its lease on commit; updating it from HTTP progress would block behind
+        // that lock and mistake a successful publication for lost ownership. Queued work is independent.
+        $heartbeat();
+        try {
+            return app(RemoteReleasePublisher::class)->publish($claim, $result, progress: $queuedProgress);
+        } catch (Throwable $error) {
+            // A response can be lost after commit, including on every idempotent retry. Only the
+            // exact published generation permits normal success, scratch cleanup and status output.
+            $releaseId = DB::table('release_verification_candidates')->where('id', $claim->id)->where('version', $claim->version)
+                ->where('manifest_hash', $claim->manifest_hash)->whereNotNull('release_id')->value('release_id');
+            if ($releaseId === null) {
+                throw $error;
+            }
+
+            return (int) $releaseId;
+        }
     }
 
     private function filteredResult(object $claim): ?VerificationResult

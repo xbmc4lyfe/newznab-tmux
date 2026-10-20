@@ -85,6 +85,74 @@ final class NntpVerificationArticleSourceTest extends TestCase
         }
     }
 
+    /** @return iterable<string, array{int, bool}> */
+    public static function failedFeedConnections(): iterable
+    {
+        foreach ([0, 1] as $index) {
+            yield 'connection '.$index.' fails; valid recovery' => [$index, true];
+            yield 'connection '.$index.' fails; identity mismatch on recovery' => [$index, false];
+        }
+    }
+
+    #[DataProvider('failedFeedConnections')]
+    public function test_worker_death_fences_only_its_feed_and_recovers_the_unread_other_connection(int $failedConnection, bool $valid): void
+    {
+        $this->configureRecovery('native');
+        config(['release_verification.download_connections' => 2,
+            'release_verification.pipeline_window' => 2, 'release_verification.download_buffer_bytes' => 256,
+            'release_verification.rust_worker' => $this->framerFixture('fwrite(STDOUT, "\\0"); feed(); exit(9);')]);
+        $pairs = [stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP),
+            stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP)];
+        $next = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        $ids = [['a@example', 'a2@example'], ['b@example', 'b2@example']];
+        $offender = $ids[$failedConnection][0];
+        $unread = $ids[1 - $failedConnection][0];
+        fwrite($pairs[$failedConnection][1], '222 0 <'.$offender."> body\r\nfailed-feed\r\n.\r\n");
+        fwrite($next[1], '222 0 <'.($valid ? $unread : 'wrong@example')."> body\r\nrecovered\r\n.\r\n");
+        $primary = new ReconnectingVerificationNntpHarness([$pairs[0][0], $next[0]], timeout: 5);
+        $secondary = new PipelineSocketNntpHarness($pairs[1][0]);
+        $source = new NntpArticleSource($primary, allowAlternateFallback: false);
+        // Inject only the second connection; requests, framing and recovery remain real.
+        (new \ReflectionProperty($source, 'connections'))->setValue($source, [1 => $secondary]);
+        try {
+            self::assertSame(4, $source->batchSize());
+            $source->prefetch(array_merge(...$ids), static function (): void {});
+            self::assertFalse($primary->isConnected());
+            self::assertFalse($secondary->isConnected());
+            try {
+                $source->fetch($offender);
+                self::fail('The request whose feed failed must remain fenced.');
+            } catch (RuntimeException $error) {
+                self::assertNotInstanceOf(VerificationPipelineRetryException::class, $error);
+                self::assertSame(1, $primary->connects);
+            }
+            if ($valid) {
+                self::assertSame("recovered\r\n", $source->fetchBounded($unread, 64));
+            } else {
+                try {
+                    $source->fetchBounded($unread, 64);
+                    self::fail('Unread recovery must still correlate the response identity.');
+                } catch (RuntimeException $error) {
+                    self::assertStringContainsString('identity', $error->getMessage());
+                }
+            }
+            self::assertSame(2, $primary->connects);
+            foreach ($pairs as $index => $pair) {
+                self::assertSame('BODY <'.$ids[$index][0].">\r\nBODY <".$ids[$index][1].">\r\n", stream_get_contents($pair[1]));
+            }
+            stream_set_blocking($next[1], false);
+            self::assertSame('BODY <'.$unread.">\r\n", stream_get_contents($next[1]));
+        } finally {
+            unset($source);
+            $primary->doQuit();
+            $secondary->closeFixture();
+            foreach ($pairs as $pair) {
+                fclose($pair[1]);
+            }
+            fclose($next[1]);
+        }
+    }
+
     public function test_worker_death_on_a_later_feed_preserves_only_previously_acknowledged_bodies(): void
     {
         $this->configureRecovery('native');

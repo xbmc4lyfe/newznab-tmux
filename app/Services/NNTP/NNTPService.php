@@ -124,6 +124,7 @@ class NNTPService extends NntpClient
         }
         $states = [];
         $results = [];
+        $feedingConnection = null;
         $bytes = 0;
         $count = 0;
         foreach ($batches as $batch) {
@@ -238,7 +239,9 @@ class NNTPService extends NntpClient
                     }
                     $state['last'] = microtime(true);
                     if ($framer !== null) {
+                        $feedingConnection = $stateIndex;
                         $frame = $framer->feed($stateIndex, $chunk);
+                        $feedingConnection = null;
                         foreach ($frame['results'] as $result) {
                             $id = $state['ids'][$result['index']];
                             $results[$id] = $result['status'] === 'missing'
@@ -323,9 +326,11 @@ class NNTPService extends NntpClient
                 unset($state);
             }
         } catch (\Throwable $error) {
-            foreach ($states as &$state) {
+            foreach ($states as $stateIndex => &$state) {
                 if (! $state['done']) {
-                    $fail($state, new \RuntimeException('Verification pipeline interrupted.', previous: $error));
+                    $fail($state, $stateIndex === $feedingConnection
+                        ? new \RuntimeException('Verification pipeline interrupted.', previous: $error)
+                        : new VerificationPipelineRetryException('Verification pipeline interrupted before this response was acknowledged.', previous: $error));
                 }
             }
             unset($state);
@@ -345,8 +350,8 @@ class NNTPService extends NntpClient
                 throw $heartbeatFailure->error;
             }
 
-            // Only completed, acknowledged frames survive; the current request is fenced and
-            // unread trailing requests can recover through a separately correlated primary BODY.
+            // Only acknowledged frames survive. Fence the request whose feed failed;
+            // unread requests on every other connection can recover through a correlated BODY.
             return $results;
         } finally {
             foreach ($states as $state) {

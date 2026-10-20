@@ -7,7 +7,6 @@ namespace Tests\Feature;
 use App\Services\NNTP\NNTPService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\CandidateSampleBatch;
-use App\Services\Releases\Verification\LeaseHeartbeat;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\NntpArticleSource;
 use App\Services\Releases\Verification\RemotePublishItem;
@@ -133,7 +132,7 @@ class VerificationPublicationProgressTest extends ReleaseVerificationCandidatesT
         $this->assertSame($before, $this->candidateRow($queued)->lease_until);
     }
 
-    public function test_remote_publication_pulses_active_and_queued_work_during_http_progress_and_retries(): void
+    public function test_remote_publication_pulses_queued_work_after_the_primary_clears_the_active_lease(): void
     {
         $this->batchSchema();
         [$batch, $locks, $claim, $queued] = $this->queuedBatch();
@@ -141,31 +140,32 @@ class VerificationPublicationProgressTest extends ReleaseVerificationCandidatesT
         Sleep::fake();
         $requests = 0;
         $pulses = 0;
-        $progressHeartbeat = new LeaseHeartbeat(static function () use ($batch, $claim): void {
-            $batch->pulse();
-            app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
-        }, 30, static fn (): float => (float) now()->getTimestamp());
         Http::fake(function (Request $request, array $options) use (&$requests, &$pulses, $claim, $queued) {
             $requests++;
             $this->assertSame($requests === 1 ? 1 : 3, $pulses, 'Every attempt, including a retry, pulses before transport.');
             $this->assertArrayHasKey('progress', $options);
             if ($requests === 1) {
                 $this->travel(200)->seconds();
+                // The primary maintains its active lease inside publication, before committing it.
+                app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
                 $options['progress'](0, 0, 0, 0);
                 throw new ConnectionException('Lost response; retry the idempotent publication.');
             }
             $this->travel(150)->seconds();
+            DB::table('release_verification_candidates')->where('id', $claim->id)->update([
+                'status' => 'sampled', 'release_id' => 42, 'lease_token' => null, 'lease_until' => null,
+            ]);
             $options['progress'](0, 0, 0, 0);
             $this->assertGreaterThan($queued->lease_until, now()->format('Y-m-d H:i:s'));
             $this->assertGreaterThan(now()->format('Y-m-d H:i:s'), $this->candidateRow($queued)->lease_until);
-            $this->assertGreaterThan(now()->format('Y-m-d H:i:s'), $this->candidateRow($claim)->lease_until);
+            $this->assertNull($this->candidateRow($claim)->lease_until);
 
             return Http::response(['release_id' => 42]);
         });
         try {
-            $id = app(RemoteReleasePublisher::class)->publish($claim, $this->sampled($claim), progress: function () use ($progressHeartbeat, &$pulses): void {
+            $id = app(RemoteReleasePublisher::class)->publish($claim, $this->sampled($claim), progress: function () use ($batch, &$pulses): void {
                 $pulses++;
-                $progressHeartbeat();
+                $batch->pulse();
             });
             $this->assertSame(42, $id);
             $this->assertSame(2, $requests);
