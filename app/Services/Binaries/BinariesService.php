@@ -70,6 +70,8 @@ class BinariesService
 
     private int $headersBlackListed = 0;
 
+    private int $headersObfuscated = 0;
+
     /** @var array<int, true> */
     private array $headersReceived = [];
 
@@ -309,7 +311,7 @@ class BinariesService
         $this->groupMySQL = $groupMySQL;
         $this->last = $last;
         $this->first = $first;
-        $this->notYEnc = $this->headersBlackListed = 0;
+        $this->notYEnc = $this->headersBlackListed = $this->headersObfuscated = 0;
         $this->headersReceived = [];
 
         $returnArray = [];
@@ -351,6 +353,24 @@ class BinariesService
             ? null
             : array_fill_keys(array_map('intval', $missingParts), true);
         $totalHeaders = \count($headers);
+        // Detect across the whole range: one chunk can hold too few of an upload's articles. A
+        // sparse part repair lists scattered missing articles of real uploads, so it is exempt; a
+        // repair listing every number of its range is a range deferred before download (or lost
+        // whole) and is filtered like the scan it replaces.
+        $sparseRepair = $partRepair && ($missingParts === null || \count($missingParts) !== $last - $first + 1);
+        $obfuscated = $this->headerParser->markPerArticleObfuscated(
+            $headers,
+            $sparseRepair ? 0 : $this->config->perArticleObfuscationMinArticles
+        );
+        if ($obfuscated > 0) {
+            Log::info('Skipping articles obfuscated per article', [
+                'groups_id' => $groupMySQL['id'],
+                'first' => $first,
+                'last' => $last,
+                'skipped' => $obfuscated,
+                'received' => $totalHeaders,
+            ]);
+        }
         for ($offset = 0; $offset < $totalHeaders; $offset += $this->config->headerChunkSize) {
             $rawChunk = array_slice($headers, $offset, $this->config->headerChunkSize);
             $this->headerParser->reset();
@@ -364,6 +384,7 @@ class BinariesService
             }
             $this->notYEnc += (int) $parseResult['notYEnc'];
             $this->headersBlackListed += (int) $parseResult['blacklisted'];
+            $this->headersObfuscated += (int) ($parseResult['obfuscated'] ?? 0);
             $this->headerParser->flushBlacklistUpdates();
 
             if ($parseResult['headers'] !== []) {
@@ -1216,7 +1237,8 @@ class BinariesService
         cli()->primary(
             'Received '.\count($this->headersReceived).
             ' articles of '.number_format($this->last - $this->first + 1).' requested, '.
-            $this->headersBlackListed.' blacklisted, '.$this->notYEnc.' not yEnc.'
+            $this->headersBlackListed.' blacklisted, '.$this->notYEnc.' not yEnc, '
+            .$this->headersObfuscated.' obfuscated per article.'
         );
     }
 
