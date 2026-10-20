@@ -1621,12 +1621,12 @@ final class CandidateRepository
     }
 
     /** Return an admitted candidate that never began verification, without changing a newer generation. */
-    public function returnQueuedClaim(object $claim): void
+    public function returnQueuedClaim(object $claim): bool
     {
-        DB::table('release_verification_candidates')->where('id', $claim->id)->where('status', 'verifying')
+        return DB::table('release_verification_candidates')->where('id', $claim->id)->where('status', 'verifying')
             ->where('lease_token', $claim->lease_token)->where('version', $claim->version)->whereNull('release_id')
             ->update(['status' => $claim->status === 'verifying' ? 'pending' : $claim->status,
-                'lease_token' => null, 'lease_until' => null]);
+                'lease_token' => null, 'lease_until' => null]) === 1;
     }
 
     public function heartbeat(int $id, string $token): void

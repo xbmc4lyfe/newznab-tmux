@@ -28,6 +28,12 @@ final class VerificationRunDiagnostics
 
     private int $claimsAdmitted = 0;
 
+    private int $queuedReturned = 0;
+
+    private int $queuedLost = 0;
+
+    private int $queuedReturnFailed = 0;
+
     /** @var array{complete: int, repaired: int, sampled: int, unknown: int, unrepairable: int, other: int} */
     private array $verdicts = ['complete' => 0, 'repaired' => 0, 'sampled' => 0, 'unknown' => 0, 'unrepairable' => 0, 'other' => 0];
 
@@ -122,6 +128,21 @@ final class VerificationRunDiagnostics
         $this->claimsAdmitted++;
     }
 
+    public function queuedReturned(): void
+    {
+        $this->queuedReturned++;
+    }
+
+    public function queuedLost(): void
+    {
+        $this->queuedLost++;
+    }
+
+    public function queuedReturnFailed(): void
+    {
+        $this->queuedReturnFailed++;
+    }
+
     public function verified(string $verdict): void
     {
         $this->verdicts[array_key_exists($verdict, $this->verdicts) ? $verdict : 'other']++;
@@ -208,6 +229,9 @@ final class VerificationRunDiagnostics
             'loop_started' => $this->loopStarted !== null,
             'claim_calls' => $this->claimCalls,
             'claims_admitted' => $this->claimsAdmitted,
+            'queued_returned' => $this->queuedReturned,
+            'queued_lost' => $this->queuedLost,
+            'queued_return_failed' => $this->queuedReturnFailed,
             'stop_reason' => $this->stopReason,
             'limit_reached' => $this->limitReached,
             'deadline_reached_at_stop' => $this->deadlineReached,

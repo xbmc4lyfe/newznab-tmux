@@ -209,7 +209,7 @@ final class NntpArticleSource implements ArticleSource
                 // The prefetch has fully drained/closed before returning. Retry just this request
                 // once, retaining the pipeline parser's response identity fence on the fresh BODY.
                 $results = NNTPService::verificationArticleBatch([['connection' => $this->nntp, 'ids' => [$messageId]]],
-                    $maximumBytes, $maximumBytes, $heartbeat ?? static function (): void {});
+                    $maximumBytes, $maximumBytes, $heartbeat ?? static function (): void {}, 'body', false);
                 $raw = $results[$messageId];
                 if ($raw instanceof RuntimeException) {
                     throw $raw;

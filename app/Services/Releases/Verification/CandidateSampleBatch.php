@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Releases\Verification;
 
 use Closure;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
 use Throwable;
@@ -71,18 +72,32 @@ final class CandidateSampleBatch
     {
         $error = null;
         foreach ($this->pending as $id => $claim) {
-            try {
-                $this->repository->returnQueuedClaim($claim);
-            } catch (Throwable $failure) {
-                $error ??= $failure;
-            } finally {
-                unset($this->pending[$id]);
-                $this->locks->releaseCandidate($id);
-            }
+            $failure = $this->returnQueued($id, $claim);
+            $error ??= $failure;
         }
         $this->source->clearPrefetched();
         if ($error !== null) {
             throw $error;
+        }
+    }
+
+    private function returnQueued(int $id, object $claim): ?Throwable
+    {
+        try {
+            if ($this->repository->returnQueuedClaim($claim)) {
+                $this->diagnostics?->queuedReturned();
+            } else {
+                $this->diagnostics?->queuedLost();
+            }
+
+            return null;
+        } catch (Throwable $failure) {
+            $this->diagnostics?->queuedReturnFailed();
+
+            return $failure;
+        } finally {
+            unset($this->pending[$id]);
+            $this->locks->releaseCandidate($id);
         }
     }
 
@@ -99,8 +114,21 @@ final class CandidateSampleBatch
                 }
                 $this->repository->heartbeat($id, $claim->lease_token);
             } catch (LeaseLostException) {
+                $this->diagnostics?->queuedLost();
                 unset($this->pending[$id]);
                 $this->locks->releaseCandidate($id);
+            } catch (Throwable $failure) {
+                // A failed statement may have rolled back a publisher's transaction. Never
+                // continue that transaction; outside it, only the affected queued claim is returned.
+                if (DB::transactionLevel() > 0) {
+                    throw $failure;
+                }
+                $this->returnQueued($id, $claim);
+                try {
+                    Log::warning('Queued verification lease renewal failed; queued work released for retry.', ['error_type' => $failure::class]);
+                } catch (Throwable) {
+                    // Diagnostic failure must not turn a queued renewal into active-candidate failure.
+                }
             }
         }
     }
@@ -179,13 +207,10 @@ final class CandidateSampleBatch
                     }
                 }
                 if ($ids !== []) {
-                    try {
-                        $this->prefetchStartedAt = $this->clock === null ? microtime(true) : ($this->clock)();
-                        $this->source->prefetch(array_values(array_unique($ids)), new LeaseHeartbeat($this->heartbeat(...), 1.0));
-                    } catch (Throwable $error) {
-                        // The transport closes interrupted pipelines before ordinary reads can retry.
-                        Log::warning('Verification sample prefetch failed; candidates will retry individually.', ['error_type' => $error::class]);
-                    }
+                    $this->prefetchStartedAt = $this->clock === null ? microtime(true) : ($this->clock)();
+                    // Ownership and preflight failures abort the batch. Transport failures are
+                    // returned as correlated outcomes so they cannot trigger an unfenced retry.
+                    $this->source->prefetch(array_values(array_unique($ids)), new LeaseHeartbeat($this->heartbeat(...), 1.0));
                 }
                 $this->diagnostics?->phase('prefetch', $prefetchStarted);
             }

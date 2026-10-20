@@ -10,6 +10,7 @@ use App\Services\Releases\Verification\CandidateSampleBatch;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\NntpArticleSource;
 use App\Services\Releases\Verification\SpotCheckPlanner;
+use App\Services\Releases\Verification\VerificationRunDiagnostics;
 use App\Services\Releases\Verification\VerificationWorkerLocks;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Events\TransactionRolledBack;
@@ -191,8 +192,9 @@ class CandidateSampleBatchTest extends ReleaseVerificationCandidatesTest
         $nntp->shouldReceive('doConnect')->andReturn(false);
         $locks = new VerificationWorkerLocks;
         $this->assertTrue($locks->start(1));
+        $diagnostics = new VerificationRunDiagnostics(hrtime(true), '2026-10-20T10:00:00Z', 3, 0, 1);
         $batch = new CandidateSampleBatch($repository, app(ManifestStore::class), $locks,
-            new NntpArticleSource($nntp), (array) config('release_verification'));
+            new NntpArticleSource($nntp), (array) config('release_verification'), $diagnostics);
         try {
             $first = $batch->next(3, static fn (): bool => true);
             $heartbeats = 0;
@@ -214,6 +216,11 @@ class CandidateSampleBatchTest extends ReleaseVerificationCandidatesTest
                 'lease_token' => null, 'version' => (int) $invalid->version + 1]);
             $batch->releasePending();
             $this->assertFalse($batch->hasPending());
+            $report = $diagnostics->report(hrtime(true));
+            $this->assertSame(3, $report['claims_admitted']);
+            $this->assertSame(1, $report['queued_returned']);
+            $this->assertSame(1, $report['queued_lost']);
+            $this->assertSame(0, $report['queued_return_failed']);
             $returned = DB::table('release_verification_candidates')->where('identity', 'b')->first();
             $this->assertSame('ready', $returned->status);
             $this->assertNull($returned->lease_token);
@@ -222,6 +229,67 @@ class CandidateSampleBatchTest extends ReleaseVerificationCandidatesTest
             $this->assertSame('dirty', DB::table('release_verification_candidates')->where('identity', 'c')->value('status'));
             $this->assertTrue($locks->protects((int) $first->id), 'The active candidate is not returned by queued cleanup.');
         } finally {
+            $locks->close();
+        }
+    }
+
+    /** @return iterable<string, array{bool}> */
+    public static function queuedRenewalTransactions(): iterable
+    {
+        yield 'outside publication transaction' => [false];
+        yield 'inside publication transaction' => [true];
+    }
+
+    #[DataProvider('queuedRenewalTransactions')]
+    public function test_queued_renewal_failure_is_isolated_only_outside_a_publication_transaction(bool $transaction): void
+    {
+        config(['release_verification.sample_batch_size' => 2, 'release_verification.download_connections' => 1,
+            'release_verification.pipeline_window' => 4]);
+        $repository = app(CandidateRepository::class);
+        foreach (['a', 'b'] as $id) {
+            $repository->enqueue(['identity' => $id, 'groups_id' => 1, 'expected_files' => 1,
+                'files' => [['key' => 'file', 'totalparts' => 1, 'segments' => [['number' => 1, 'messageid' => $id.'@test', 'bytes' => 5]]]]]);
+        }
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('doConnect')->andReturn(false);
+        $locks = new VerificationWorkerLocks;
+        $this->assertTrue($locks->start(1));
+        $batch = new CandidateSampleBatch($repository, app(ManifestStore::class), $locks,
+            new NntpArticleSource($nntp), (array) config('release_verification'));
+        try {
+            $first = $batch->next(2, static fn (): bool => true);
+            $queuedId = (int) DB::table('release_verification_candidates')->where('identity', 'b')->value('id');
+            $armed = true;
+            $failure = new \RuntimeException('Queued lease database failure');
+            DB::listen(static function (QueryExecuted $query) use (&$armed, $queuedId, $failure): void {
+                if ($armed && str_starts_with($query->sql, 'update "release_verification_candidates"')
+                    && in_array($queuedId, $query->bindings, true)) {
+                    $armed = false;
+                    throw $failure;
+                }
+            });
+            if ($transaction) {
+                DB::beginTransaction();
+            }
+            try {
+                $batch->heartbeat();
+                $this->assertFalse($transaction, 'An error inside publication must escape rather than mask a rollback.');
+            } catch (\RuntimeException $error) {
+                $this->assertTrue($transaction);
+                $this->assertSame($failure, $error);
+            } finally {
+                if ($transaction) {
+                    DB::rollBack();
+                }
+            }
+            $this->assertSame('verifying', DB::table('release_verification_candidates')->where('id', $first->id)->value('status'));
+            if (! $transaction) {
+                $this->assertSame('ready', DB::table('release_verification_candidates')->where('id', $queuedId)->value('status'));
+                $this->assertFalse($batch->hasPending());
+                $this->assertFalse($locks->protects($queuedId));
+            }
+        } finally {
+            $batch->releasePending();
             $locks->close();
         }
     }

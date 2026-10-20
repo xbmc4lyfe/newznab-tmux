@@ -106,7 +106,7 @@ class NNTPService extends NntpClient
      * @param  list<array{connection: NNTPService, ids: list<string>}>  $batches
      * @return array<string, string|\RuntimeException>
      */
-    public static function verificationArticleBatch(array $batches, int $maximumBytes, int $bufferBytes, callable $heartbeat, string $mode = 'body'): array
+    public static function verificationArticleBatch(array $batches, int $maximumBytes, int $bufferBytes, callable $heartbeat, string $mode = 'body', bool $allowRust = true): array
     {
         if (! in_array($mode, ['body', 'stat'], true) || $maximumBytes < 1 || $bufferBytes < $maximumBytes || count($batches) > 8) {
             throw new \RuntimeException('Invalid verification pipeline budget.');
@@ -124,18 +124,18 @@ class NNTPService extends NntpClient
                 self::verificationMessageId($id, $maximumBytes);
             }
         }
-        $framer = null;
-        $worker = (string) config('release_verification.rust_worker', '');
-        if ($worker !== '') {
+        $heartbeatFailure = new class
+        {
+            public ?\Throwable $error = null;
+        };
+        $guardHeartbeat = static function () use ($heartbeat, $heartbeatFailure): void {
             try {
-                $framer = new RustVerificationFramer($worker,
-                    array_map(static fn (array $batch): array => ['ids' => $batch['ids'], 'mode' => $mode], array_values($batches)),
-                    $maximumBytes, $bufferBytes, $heartbeat);
-            } catch (\RuntimeException) {
-                // No NNTP command has been sent; the native pipeline is still a safe fallback.
-                self::reportVerificationFramerFallback($worker);
+                $heartbeat();
+            } catch (\Throwable $error) {
+                $heartbeatFailure->error = $error;
+                throw $error;
             }
-        }
+        };
         $fail = static function (array &$state, \RuntimeException $error) use (&$results): void {
             foreach (array_slice($state['ids'], $state['position']) as $offset => $id) {
                 $results[$id] = $offset > 0
@@ -148,6 +148,21 @@ class NNTPService extends NntpClient
             $state['done'] = true;
         };
         try {
+            $framer = null;
+            $worker = $allowRust ? (string) config('release_verification.rust_worker', '') : '';
+            if ($worker !== '') {
+                try {
+                    $framer = new RustVerificationFramer($worker,
+                        array_map(static fn (array $batch): array => ['ids' => $batch['ids'], 'mode' => $mode], array_values($batches)),
+                        $maximumBytes, $bufferBytes, $guardHeartbeat);
+                } catch (\RuntimeException $error) {
+                    if ($error === $heartbeatFailure->error) {
+                        throw $error;
+                    }
+                    // No NNTP command has been sent; the native pipeline is still a safe fallback.
+                    self::reportVerificationFramerFallback($worker);
+                }
+            }
             foreach (array_values($batches) as $index => $batch) {
                 $connection = $batch['connection'];
                 $socket = $connection->_socket;
@@ -162,7 +177,7 @@ class NNTPService extends NntpClient
 
                     continue;
                 }
-                $heartbeat();
+                $guardHeartbeat();
                 $command = implode('', array_map(static fn (string $id): string => strtoupper($mode).' <'.$id.">\r\n", $batch['ids']));
                 $states[$index] = ['connection' => $connection, 'socket' => $socket, 'ids' => $batch['ids'],
                     'position' => 0, 'body' => false, 'raw' => '', 'buffer' => '', 'done' => $batch['ids'] === [], 'last' => microtime(true)];
@@ -176,7 +191,7 @@ class NNTPService extends NntpClient
             $lastHeartbeat = microtime(true);
             while (array_filter($states, static fn (array $state): bool => ! $state['done']) !== []) {
                 if (microtime(true) - $lastHeartbeat >= 1.0) {
-                    $heartbeat();
+                    $guardHeartbeat();
                     $lastHeartbeat = microtime(true);
                 }
                 $read = [];
@@ -303,7 +318,25 @@ class NNTPService extends NntpClient
                 }
             }
             unset($state);
-            throw $error;
+            foreach ($batches as $batch) {
+                $connection = $batch['connection'];
+                if (is_resource($connection->_socket)) {
+                    fclose($connection->_socket);
+                    $connection->_resetProperties();
+                }
+                foreach ($batch['ids'] as $id) {
+                    if (! array_key_exists($id, $results)) {
+                        $results[$id] = new VerificationPipelineRetryException('Verification pipeline ended before this request was sent.', previous: $error);
+                    }
+                }
+            }
+            if ($error === $heartbeatFailure->error) {
+                throw $error;
+            }
+
+            // Only completed, acknowledged frames survive; the current request is fenced and
+            // unread trailing requests can recover through a separately correlated primary BODY.
+            return $results;
         } finally {
             foreach ($states as $state) {
                 if (is_resource($state['socket'])) {
