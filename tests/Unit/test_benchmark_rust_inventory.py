@@ -24,8 +24,8 @@ class RustInventoryTest(unittest.TestCase):
     def test_every_current_export_has_a_source_location_and_explicit_scope(self):
         self.assertTrue(SCRIPT.exists(), 'source-derived inventory helper is missing')
         rows = module().inventory(ROOT)
-        self.assertEqual(len(rows), 43)
-        self.assertEqual(len({row['name'] for row in rows}), 43)
+        self.assertEqual(len(rows), 44)
+        self.assertEqual(len({row['name'] for row in rows}), 44)
         self.assertEqual(module().check(ROOT), [])
         for row in rows:
             path = ROOT / row['target']

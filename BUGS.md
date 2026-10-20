@@ -470,6 +470,44 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Fix:** branch `codex/expired-stale-collection-retention`. A stale collection that archival could only record as expired is deleted directly. These are collections that are not legacy-inserted, have no candidate under their hash, and whose newest article (`last_seen_at`, else `dateadded`/`added`) is past the candidate expiry. Each one is rechecked under its row lock before deletion. Header storage locks the parent first, so a new article either lands before the recheck or waits for it. Such deletions don't count against the 25-archival budget. A pass keeps paging through such windows for up to `CBP_VERIFICATION_SWEEP_SECONDS` (default 60, at most 120). Collections that can still join or create a live candidate keep the archival path.
 - **Open follow-up:** the inflow itself. Sampled group 109 uploads were stored as one collection per article, so they can never complete. Group 1 needs the same check. Collection hashing for these groups needs its own investigation.
 
+### 65. Uploads obfuscated per article become one collection per article and never complete (Fixed)
+
+- **Where:** header ingestion (`HeaderParser::parse()` → `CollectionHandler::getOrCreateCollections()`). The collection hash is `sha1(CollectionsCleaningService::collectionsCleaner(subject base) . totalfiles)`.
+- **Root cause:** collection hashing works, but the uploads are designed so it cannot group them. With nyuu article obfuscation, each article gets its own random subject token. Each also gets its own random message-ID, and in alt.binaries.boneless its own random poster (199 distinct From values in 202 rows). Two forms were seen:
+  - In alt.binaries.kenpsx, `[40/62] "<32 random chars>" yEnc (n/687)`: the file counter is constant, and the quoted name changes on every article.
+  - In alt.binaries.boneless, `[<2 random chars>] - <40 random chars> yEnc (n/1250)`.
+  The cleaner strips the file and part counters correctly, but the random token stays in the base name. So every article gets its own binary (1 of N parts) and its own collection, and none can ever complete.
+- **Symptom:** about 81M stale `filecheck=0` collections in group 109 and about 40M in group 1 (2026-10-19), each holding 1 binary and 1 part (about 740 KB). These made up most of the roughly 690,000 new collections an hour that grow the stale-collection backlog. A read-only simulation over the newest 200,000 collections found the same pattern in alt.binaries.test (99) and alt.binaries.multimedia (14). No other group had a matching signature.
+- **Fix:** branch `codex/skip-per-article-obfuscated-headers`. Before chunked storage, `BinariesService::scan()` passes the whole downloaded range to `HeaderParser::markPerArticleObfuscated()`, which considers only multi-part articles whose base name holds a random-looking token (16 or more alphanumeric characters).
+  - It groups those articles by subject shape (alphanumeric runs collapsed), part total and file counter.
+  - When a group has at least `CBP_PER_ARTICLE_OBFUSCATION_MIN_ARTICLES` articles (default 16; non-zero values are floored at 8) and at least 90% of its base names are distinct, the articles whose name appears only once are skipped. Repeated names (a real upload sharing the group) and first or last parts (a real upload cut by the range boundary) are kept. The skipped articles must also span at least that many part positions, so a slice of files posted round-robin with their own random names (one article each at one or two positions) is kept. Digit runs outside the token are ignored when comparing names.
+  - Skipped articles still count as received, so they are not queued for part repair. The CLI reports them as "obfuscated per article".
+  - A legitimate upload repeats its base name on nearly every part, and numbered volumes (`<hash>.part07.rar`) share one name, so legitimate groups stay out.
+  - A sparse part repair and a value of `0` disable the check. A repair listing every number of its range (deferred while the verification backlog was full) is filtered like a scan.
+  - Header-only indexing can't reconstruct these uploads; they're only usable from an NZB.
+  - Each skipping range logs `Skipping articles obfuscated per article` with the group and count.
+  - The detection runs in Rust (`nntmux_per_article_obfuscation_v2` in `libnzbyenc`, through `NativePerArticleObfuscation`) and falls back to the PHP rule when FFI or the library is unavailable.
+    - **Marshalling:** PHP hands Rust the XOVER number column as text, the subject lengths and the subjects, as three bulk buffers. Rust parses numbers as PHP's `(int)` does; any other number form declines, and PHP retries with its exact filter.
+    - **Matching:** the subject scan is linear. Counts and numbers follow PHP's `(int)` exactly: they saturate up to the largest double, become 0 beyond it, and decline only at the double-rounding boundary itself. A range with a subject over 512 bytes stays on PHP, below where PHP's `pcre.backtrack_limit` can stop the subject pattern, so both sides mark alike. Only a decline over article numbers is retried with PHP's own filtered numbers. The library loads only on x86_64 and arm64, the architectures CI requires to qualify.
+    - **Routing:**
+      - Ranges under 16,000 headers stay on PHP through an inline size check in `HeaderParser`.
+      - For larger ranges, `PerArticleObfuscationGate` keeps a range on PHP when under a quarter of 16 sampled subjects (one per sixteenth) hold ` (`.
+      - Otherwise `PerArticleObfuscationRouter` classifies one sampled header from each of 32 to 128 slices (one per 128 headers) with string scans. Sample positions are pseudo-random but seeded from the range's size and first and last article numbers, so the same range always routes the same way. It prices each by class and subject length and sends the range to Rust only when the predicted speedup reaches 2×.
+      - Before a process has loaded the library, the predicted saving must also reach 4 ms.
+      - The wrapper is built only for a range routed to Rust. No range is routed once loading has failed.
+    - **Evidence:** a run of `scripts/benchmark-per-article-obfuscation.php` at source commit `d73956a01`, on XOVER-shaped ranges with FFI and marshalling included (Linux arm64). Rust and PHP marked the same articles. CI requires the same benchmark to qualify on Linux x86_64 and arm64. On ranges routed to Rust:
+      - warm medians (200 samples) were 1.86–2.82×;
+      - warm p99 (1,000 samples) was 2.58–3.21×;
+      - every warm 95% lower bound was at or above 1.84×;
+      - cold first calls in 41 fresh processes were 1.67–2.91×, with every lower bound at or above 1.62×;
+      - uncommon p99 with start-up included (start-up p99 0.76 ms) was 2.51–3.15×, with every lower bound at or above 2.12×.
+
+      Ranges kept on PHP pay only the routing check: 0.96–1.00× warm and 0.92–1.02× cold.
+  - Remaining risk (all rare) — these real articles would still be skipped:
+    - 16 or more unrelated real files in one range that share a subject shape with a long random token, have the same part total and no file counter, and each show a single middle article, at 16 or more different part positions.
+    - A real upload in an obfuscated group whose only article in the range is a middle part (uploads posted over several connections arrive out of order).
+    - One uploader posting 16 or more files with their own random names at staggered offsets when the range holds exactly one article from each file.
+
 ## Issues in the docker/ stack itself (all fixed)
 
 | Issue | Fix |
