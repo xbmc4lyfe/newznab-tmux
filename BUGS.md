@@ -488,21 +488,21 @@ These bugs turned up while building and running the self-hosted stack in `docker
   - Each skipping range logs `Skipping articles obfuscated per article` with the group and count.
   - The detection runs in Rust (`nntmux_per_article_obfuscation_v2` in `libnzbyenc`, through `NativePerArticleObfuscation`) and falls back to the PHP rule when FFI or the library is unavailable.
     - **Marshalling:** PHP hands Rust the XOVER number column as text, the subject lengths and the subjects, as three bulk buffers. Rust parses numbers as PHP's `(int)` does; any other number form declines, and PHP retries with its exact filter.
-    - **Matching:** the subject scan is linear. Counts and numbers follow PHP's `(int)` exactly: they saturate up to the largest double, become 0 beyond it, and decline only at the double-rounding boundary itself. A range with a subject over 512 bytes stays on PHP, below where PHP's `pcre.backtrack_limit` can stop the subject pattern, so both sides mark alike. Only a decline over article numbers is retried with PHP's own filtered numbers.
+    - **Matching:** the subject scan is linear. Counts and numbers follow PHP's `(int)` exactly: they saturate up to the largest double, become 0 beyond it, and decline only at the double-rounding boundary itself. A range with a subject over 512 bytes stays on PHP, below where PHP's `pcre.backtrack_limit` can stop the subject pattern, so both sides mark alike. Only a decline over article numbers is retried with PHP's own filtered numbers. The library loads only on x86_64 and arm64, the architectures CI requires to qualify.
     - **Routing:**
       - Ranges under 16,000 headers stay on PHP through an inline size check in `HeaderParser`.
       - For larger ranges, `PerArticleObfuscationGate` keeps a range on PHP when under a quarter of 16 sampled subjects (one per sixteenth) hold ` (`.
       - Otherwise `PerArticleObfuscationRouter` classifies one sampled header from each of 32 to 128 slices (one per 128 headers) with string scans. Sample positions are pseudo-random but seeded from the range's size and first and last article numbers, so the same range always routes the same way. It prices each by class and subject length and sends the range to Rust only when the predicted speedup reaches 2×.
       - Before a process has loaded the library, the predicted saving must also reach 4 ms.
       - The wrapper is built only for a range routed to Rust. No range is routed once loading has failed.
-    - **Evidence:** a run of `scripts/benchmark-per-article-obfuscation.php` at source commit `f2ad79b49`, on XOVER-shaped ranges with FFI and marshalling included (Linux arm64). Rust and PHP marked the same articles. On ranges routed to Rust:
-      - **Warm medians** (200 samples): 1.87–2.76×.
-      - **Warm p99** (1,000 samples): 2.65–2.89×.
-      - **Warm lower bounds:** every 95% lower bound was at or above 1.83×.
-      - **Cold first calls** in 41 fresh processes: 1.76–2.86×, with lower bounds at or above 1.71×. These count routing, building the wrapper, loading the library and its probe.
-      - **Uncommon p99 with start-up included:** the warm Rust p99 plus the start-up p99 over 200 fresh processes (1.13 ms). This came to 2.51–2.85×, with lower bounds at or above 2.04×.
+    - **Evidence:** a run of `scripts/benchmark-per-article-obfuscation.php` at source commit `d73956a01`, on XOVER-shaped ranges with FFI and marshalling included (Linux arm64). Rust and PHP marked the same articles. CI requires the same benchmark to qualify on Linux x86_64 and arm64. On ranges routed to Rust:
+      - warm medians (200 samples) were 1.86–2.82×;
+      - warm p99 (1,000 samples) was 2.58–3.21×;
+      - every warm 95% lower bound was at or above 1.84×;
+      - cold first calls in 41 fresh processes were 1.67–2.91×, with every lower bound at or above 1.62×;
+      - uncommon p99 with start-up included (start-up p99 0.76 ms) was 2.51–3.15×, with every lower bound at or above 2.12×.
 
-      Ranges kept on PHP pay only the routing check: 0.95–1.00× warm and 0.92–1.05× cold.
+      Ranges kept on PHP pay only the routing check: 0.96–1.00× warm and 0.92–1.02× cold.
   - Remaining risk (all rare) — these real articles would still be skipped:
     - 16 or more unrelated real files in one range that share a subject shape with a long random token, have the same part total and no file counter, and each show a single middle article, at 16 or more different part positions.
     - A real upload in an obfuscated group whose only article in the range is a middle part (uploads posted over several connections arrive out of order).
