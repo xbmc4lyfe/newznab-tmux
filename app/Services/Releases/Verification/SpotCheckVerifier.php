@@ -44,10 +44,9 @@ final class SpotCheckVerifier
             $partial = $inventory->completeness($manifest);
         }
 
-        $articleLimit = max(0, min(16, (int) ($this->options['spot_check_articles'] ?? 1)));
         $byteLimit = max(0, min(1048576, (int) ($this->options['spot_check_bytes'] ?? 1048576)));
         $articleByteLimit = max(0, min($byteLimit, (int) ($this->options['spot_check_article_bytes'] ?? 1048576)));
-        $sample = ($this->planner ?? new SpotCheckPlanner)->select($manifest, $articleLimit, $byteLimit, $articleByteLimit);
+        $sample = $this->sample($manifest);
         if ($sample === []) {
             return self::deterministic('No article fits the configured spot-check budget.');
         }
@@ -59,6 +58,22 @@ final class SpotCheckVerifier
         }
         if (array_diff_key($inferredTotals, array_fill_keys(array_column($sample, 'file_key'), true)) !== []) {
             return self::deterministic('Inferred article totals cannot be proved within the spot-check budget.');
+        }
+
+        if (($this->options['stat_all_articles'] ?? false) && $this->source instanceof NntpArticleSource) {
+            $ids = [];
+            foreach ($manifest['files'] as $file) {
+                foreach ($file['segments'] as $segment) {
+                    $ids[] = $segment['messageid'];
+                    if (count($ids) === 16) {
+                        $heartbeat();
+                        $this->source->stat($ids, $heartbeat);
+                        $ids = [];
+                    }
+                }
+            }
+            $heartbeat();
+            $this->source->stat($ids, $heartbeat);
         }
 
         $bytes = 0;
@@ -144,6 +159,18 @@ final class SpotCheckVerifier
         }
 
         return new VerificationResult('sampled', 'Sampled article checks passed; the full payload was not downloaded.', $sampled);
+    }
+
+    /** @param array<string, mixed> $manifest
+     * @return list<array{file_key:string,totalparts:int,totalparts_inferred:bool,number:int,messageid:string,bytes:int}>
+     */
+    public function sample(array $manifest): array
+    {
+        $articleLimit = max(0, min(16, (int) ($this->options['spot_check_articles'] ?? 1)));
+        $byteLimit = max(0, min(1048576, (int) ($this->options['spot_check_bytes'] ?? 1048576)));
+        $articleByteLimit = max(0, min($byteLimit, (int) ($this->options['spot_check_article_bytes'] ?? 1048576)));
+
+        return ($this->planner ?? new SpotCheckPlanner)->select($manifest, $articleLimit, $byteLimit, $articleByteLimit);
     }
 
     /**

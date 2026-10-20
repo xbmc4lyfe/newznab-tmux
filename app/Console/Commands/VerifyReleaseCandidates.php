@@ -7,6 +7,7 @@ namespace App\Console\Commands;
 use App\Services\NNTP\NNTPService;
 use App\Services\Releases\Verification\AuditReleaseDeletion;
 use App\Services\Releases\Verification\CandidateRepository;
+use App\Services\Releases\Verification\CandidateSampleBatch;
 use App\Services\Releases\Verification\LeaseHeartbeat;
 use App\Services\Releases\Verification\ManifestStore;
 use App\Services\Releases\Verification\NntpArticleSource;
@@ -30,7 +31,7 @@ use Throwable;
 
 class VerifyReleaseCandidates extends Command
 {
-    protected $signature = 'releases:verify-candidates {--limit=1 : Maximum candidates in this run} {--slot=0 : Worker slot; zero selects a free slot} {--max-seconds=0 : Stop claiming after this duration; finish the active candidate} {--no-summary : Skip global candidate status counts} {--diagnostics : Log bounded natural verification run counters and timings}';
+    protected $signature = 'releases:verify-candidates {--limit=1 : Maximum candidates in this run} {--slot=0 : Worker slot; zero selects a free slot} {--max-seconds=0 : Stop claiming after this duration; finish the admitted batch} {--no-summary : Skip global candidate status counts} {--diagnostics : Log bounded natural verification run counters and timings}';
 
     protected $description = 'Spot check bounded articles before publishing complete candidate NZBs';
 
@@ -117,8 +118,13 @@ class VerifyReleaseCandidates extends Command
             $runStarted = hrtime(true);
             $diagnostics?->loopStarted($runStarted);
             $maxSeconds = max(0, (int) $this->option('max-seconds'));
+            $verificationOptions = (array) config('release_verification');
+            $source = new NntpArticleSource(app(NNTPService::class), decoder: $decoder,
+                maximumBytes: min((int) $verificationOptions['spot_check_bytes'], (int) $verificationOptions['spot_check_article_bytes']),
+                allowAlternateFallback: false);
+            $batch = new CandidateSampleBatch($repository, $store, $locks, $source, $verificationOptions, $diagnostics);
             for ($index = 0; $index < max(1, (int) $this->option('limit')); $index++) {
-                if ($index > 0 && $maxSeconds > 0 && (hrtime(true) - $runStarted) / 1e9 >= $maxSeconds) {
+                if (! $batch->hasPending() && $index > 0 && $maxSeconds > 0 && (hrtime(true) - $runStarted) / 1e9 >= $maxSeconds) {
                     $diagnostics?->stop('deadline', hrtime(true));
                     break;
                 }
@@ -126,24 +132,16 @@ class VerifyReleaseCandidates extends Command
                 if (! $locks->held()) {
                     throw new RuntimeException('Verification worker locks were lost.');
                 }
-                if (! $locks->admitting()) {
+                if (! $batch->hasPending() && ! $locks->admitting()) {
                     $diagnostics?->stop('draining', hrtime(true));
                     break;
                 }
-                $phase = $diagnostics === null ? null : hrtime(true);
-                try {
-                    $preferReady = $locks->preferReady();
-                    $diagnostics?->claimCalled();
-                    $claim = $repository->claim(fn (int $id): bool => $locks->tryCandidate($id), $preferReady);
-                } finally {
-                    // Also on a throwing claim, which the outer handler reports as fatal.
-                    $diagnostics?->phase('claim', $phase);
-                }
+                $claim = $batch->next(max(1, (int) $this->option('limit')) - $index,
+                    static fn (): bool => $locks->admitting() && ($maxSeconds === 0 || (hrtime(true) - $runStarted) / 1e9 < $maxSeconds));
                 if ($claim === null) {
                     $diagnostics?->stop('no_claim', hrtime(true));
                     break;
                 }
-                $diagnostics?->claimed();
                 $directory = $root.'/scratch/'.$claim->id.'-'.$claim->version;
                 // The phase charged if an operation throws.
                 $active = 'bookkeeping';
@@ -151,16 +149,15 @@ class VerifyReleaseCandidates extends Command
                 $handedOff = false;
                 try {
                     $phase = $diagnostics === null ? null : hrtime(true);
-                    $heartbeat = static fn () => $repository->heartbeat((int) $claim->id, $claim->lease_token);
+                    $heartbeat = static function () use ($repository, $claim, $batch): void {
+                        $batch->heartbeat();
+                        $repository->heartbeat((int) $claim->id, $claim->lease_token);
+                    };
                     $heartbeat();
                     $progressHeartbeat = new LeaseHeartbeat($heartbeat, max(0.1, min(30, (int) config('release_verification.lease_seconds') / 3)));
                     $scratchInventory->register((int) $claim->id, (int) $claim->version);
                     $scratchEntryId = $scratchInventory->entryId((int) $claim->id, (int) $claim->version);
                     $scratchBudget->reconcile($scratchEntryId, $locks, $progressHeartbeat);
-                    $verificationOptions = (array) config('release_verification');
-                    $source ??= new NntpArticleSource(app(NNTPService::class), decoder: $decoder,
-                        maximumBytes: min((int) $verificationOptions['spot_check_bytes'], (int) $verificationOptions['spot_check_article_bytes']),
-                        allowAlternateFallback: false);
                     $verifier = new SpotCheckVerifier($source, $verificationOptions, $decoder);
                     foreach ($scratchInventory->olderVersions((int) $claim->id, (int) $claim->version) as $old) {
                         $oldDirectory = $root.'/scratch/'.$old->candidate_id.'-'.$old->version;
@@ -264,7 +261,7 @@ class VerifyReleaseCandidates extends Command
                     }
                 } finally {
                     unset($verifier, $manifest, $result, $progressHeartbeat, $heartbeat);
-                    $locks->releaseCandidate();
+                    $locks->releaseCandidate((int) $claim->id);
                 }
             }
             $diagnostics?->stop('limit', hrtime(true));

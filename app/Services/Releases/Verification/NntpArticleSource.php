@@ -39,6 +39,7 @@ final class NntpArticleSource implements ArticleSource
     public function prefetch(array $ids, callable $heartbeat): void
     {
         $this->prefetched = [];
+        $ids = array_values(array_unique(array_map(fn (string $id): string => NNTPService::verificationMessageId($id, $this->maximumArticleBytes()), $ids)));
         if ($ids === [] || $this->batchSize() === 1) {
             return;
         }
@@ -94,6 +95,40 @@ final class NntpArticleSource implements ArticleSource
             max($maximumBytes, (int) config('release_verification.download_buffer_bytes', 67108864)), $heartbeat);
     }
 
+    /** STAT is extra availability evidence; it never replaces the sampled BODY checks.
+     * @param  list<string>  $ids
+     */
+    public function stat(array $ids, callable $heartbeat): void
+    {
+        if ($ids === []) {
+            return;
+        }
+        if (count($ids) > 16) {
+            throw new RuntimeException('Too many verification STAT requests.');
+        }
+        if (! $this->connected || ! $this->nntp->isConnected()) {
+            if ($this->nntp->doConnect(false) !== true) {
+                throw new RuntimeException('Primary verification connection is unavailable.');
+            }
+            $this->connected = true;
+        }
+        if (! $this->nntp->verificationPipelineAvailable()) {
+            throw new RuntimeException('Raw verification connection is unavailable.');
+        }
+        $ids = array_map(static fn (string $id): string => NNTPService::verificationMessageId($id, 1), $ids);
+        try {
+            $results = NNTPService::verificationArticleBatch([['connection' => $this->nntp, 'ids' => $ids]],
+                1, count($ids), $heartbeat, 'stat');
+        } finally {
+            $this->connected = $this->nntp->isConnected();
+        }
+        foreach ($ids as $id) {
+            if (! array_key_exists($id, $results) || $results[$id] instanceof RuntimeException) {
+                throw $results[$id] ?? new RuntimeException('Verification STAT response is unavailable.');
+            }
+        }
+    }
+
     public function fetch(string $messageId): string
     {
         $fetched = $this->fetchFromProviders($messageId);
@@ -139,6 +174,10 @@ final class NntpArticleSource implements ArticleSource
                 unset($this->prefetched[$messageId]);
                 if ($raw instanceof RuntimeException) {
                     throw $raw;
+                }
+
+                if (strlen($raw) > $maximumBytes) {
+                    throw new ArticleBudgetExceeded('Article exceeds verification memory budget.');
                 }
 
                 return $this->checkIntegrity($raw, $validate);

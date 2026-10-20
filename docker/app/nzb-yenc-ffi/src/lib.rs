@@ -15,6 +15,7 @@ mod article_dates;
 pub mod article_fingerprint;
 mod article_identity;
 mod article_xref;
+pub mod bulk_verification;
 pub mod cpu_snapshot;
 mod formats;
 mod header_filename_identity;

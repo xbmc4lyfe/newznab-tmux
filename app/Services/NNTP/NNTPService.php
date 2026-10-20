@@ -102,9 +102,9 @@ class NNTPService extends NntpClient
      * @param  list<array{connection: NNTPService, ids: list<string>}>  $batches
      * @return array<string, string|\RuntimeException>
      */
-    public static function verificationArticleBatch(array $batches, int $maximumBytes, int $bufferBytes, callable $heartbeat): array
+    public static function verificationArticleBatch(array $batches, int $maximumBytes, int $bufferBytes, callable $heartbeat, string $mode = 'body'): array
     {
-        if ($maximumBytes < 1 || $bufferBytes < $maximumBytes || count($batches) > 8) {
+        if (! in_array($mode, ['body', 'stat'], true) || $maximumBytes < 1 || $bufferBytes < $maximumBytes || count($batches) > 8) {
             throw new \RuntimeException('Invalid verification pipeline budget.');
         }
         $states = [];
@@ -120,9 +120,21 @@ class NNTPService extends NntpClient
                 self::verificationMessageId($id, $maximumBytes);
             }
         }
+        $framer = null;
+        $worker = (string) config('release_verification.rust_worker', '');
+        if ($worker !== '') {
+            try {
+                $framer = new RustVerificationFramer($worker,
+                    array_map(static fn (array $batch): array => ['ids' => $batch['ids'], 'mode' => $mode], array_values($batches)),
+                    $maximumBytes, $bufferBytes, $heartbeat);
+            } catch (\RuntimeException) {
+                // No NNTP command has been sent; the native pipeline is still a safe fallback.
+            }
+        }
         $fail = static function (array &$state, \RuntimeException $error) use (&$results): void {
-            foreach (array_slice($state['ids'], $state['position']) as $id) {
-                $results[$id] = $error;
+            foreach (array_slice($state['ids'], $state['position']) as $offset => $id) {
+                $results[$id] = $offset > 0 && $error instanceof ArticleBudgetExceeded
+                    ? new \RuntimeException('Verification pipeline was closed after an oversized article.', previous: $error) : $error;
             }
             if (is_resource($state['socket'])) {
                 fclose($state['socket']);
@@ -131,7 +143,7 @@ class NNTPService extends NntpClient
             $state['done'] = true;
         };
         try {
-            foreach ($batches as $index => $batch) {
+            foreach (array_values($batches) as $index => $batch) {
                 $connection = $batch['connection'];
                 $socket = $connection->_socket;
                 if (! is_resource($socket) || $connection->_compressionEnabled) {
@@ -142,7 +154,7 @@ class NNTPService extends NntpClient
                     continue;
                 }
                 $heartbeat();
-                $command = implode('', array_map(static fn (string $id): string => 'BODY <'.$id.">\r\n", $batch['ids']));
+                $command = implode('', array_map(static fn (string $id): string => strtoupper($mode).' <'.$id.">\r\n", $batch['ids']));
                 $states[$index] = ['connection' => $connection, 'socket' => $socket, 'ids' => $batch['ids'],
                     'position' => 0, 'body' => false, 'raw' => '', 'buffer' => '', 'done' => $batch['ids'] === [], 'last' => microtime(true)];
                 if (fwrite($socket, $command) !== strlen($command)) {
@@ -176,7 +188,7 @@ class NNTPService extends NntpClient
                 if (stream_select($read, $write, $except, 1) === false) {
                     throw new \RuntimeException('Cannot poll verification connections.');
                 }
-                foreach ($states as &$state) {
+                foreach ($states as $stateIndex => &$state) {
                     if ($state['done'] || ! in_array($state['socket'], $read, true)) {
                         continue;
                     }
@@ -190,11 +202,33 @@ class NNTPService extends NntpClient
                         continue;
                     }
                     $state['last'] = microtime(true);
+                    if ($framer !== null) {
+                        $frame = $framer->feed($stateIndex, $chunk);
+                        foreach ($frame['results'] as $result) {
+                            $id = $state['ids'][$result['index']];
+                            $results[$id] = $result['status'] === 'missing'
+                                ? new \RuntimeException('Verification article is unavailable.') : $result['body'];
+                            $state['position']++;
+                        }
+                        if ($frame['error'] !== null) {
+                            $fail($state, $frame['error'] === 'Verification article exceeds byte budget'
+                                ? new ArticleBudgetExceeded('Article exceeds verification memory budget.') : new \RuntimeException($frame['error']));
+                        } else {
+                            $state['done'] = $frame['done'];
+                        }
+
+                        continue;
+                    }
                     $state['buffer'] .= $chunk;
                     while (($end = strpos($state['buffer'], "\n")) !== false && ! $state['done']) {
                         $line = substr($state['buffer'], 0, $end + 1);
                         $state['buffer'] = substr($state['buffer'], $end + 1);
                         $id = $state['ids'][$state['position']];
+                        if ($state['body'] && $line !== ".\r\n" && $line !== ".\n"
+                            && strlen($state['raw']) + strlen($line) - (str_starts_with($line, '..') ? 1 : 0) > $maximumBytes) {
+                            $fail($state, new ArticleBudgetExceeded('Article exceeds verification memory budget.'));
+                            break;
+                        }
                         if (strlen($line) > 65536) {
                             $fail($state, new \RuntimeException('Verification pipeline line exceeds its limit.'));
                             break;
@@ -204,12 +238,17 @@ class NNTPService extends NntpClient
                                 $fail($state, new \RuntimeException('Invalid verification pipeline status.'));
                                 break;
                             }
-                            if ((int) $status[1] === 222) {
+                            if ((int) $status[1] === ($mode === 'stat' ? 223 : 222)) {
                                 if (preg_match('/<([^<>]+)>/', $line, $identity) !== 1 || $identity[1] !== $id) {
                                     $fail($state, new \RuntimeException('Verification response identity differs from its request.'));
                                     break;
                                 }
-                                $state['body'] = true;
+                                if ($mode === 'stat') {
+                                    $results[$id] = '';
+                                    $state['position']++;
+                                } else {
+                                    $state['body'] = true;
+                                }
                             } elseif (in_array((int) $status[1], [430, 423], true)) {
                                 $results[$id] = new \RuntimeException('Verification article is unavailable.');
                                 $state['position']++;
@@ -235,10 +274,14 @@ class NNTPService extends NntpClient
                         }
                         $state['done'] = $state['position'] >= count($state['ids']);
                     }
+                    if (! $state['done'] && $state['body'] && ! in_array($state['buffer'], ['.', ".\r"], true)
+                        && strlen($state['raw']) + strlen($state['buffer']) - (str_starts_with($state['buffer'], '..') ? 1 : 0) > $maximumBytes) {
+                        $fail($state, new ArticleBudgetExceeded('Article exceeds verification memory budget.'));
+                    }
                     if (! $state['done'] && strlen($state['buffer']) >= 65536) {
                         $fail($state, new \RuntimeException('Verification pipeline line is truncated or oversized.'));
                     }
-                    if ($state['done'] && $state['buffer'] !== '') {
+                    if ($state['done'] && $state['position'] >= count($state['ids']) && $state['buffer'] !== '') {
                         $fail($state, new \RuntimeException('Unexpected data after verification pipeline.'));
                     }
                 }

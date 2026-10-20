@@ -72,7 +72,7 @@ final class VerificationRunDiagnosticsTest extends TestCase
         $report = $diagnostics->report(2_000_000_000);
 
         self::assertSame(1, $report['publish_returned']);
-        self::assertSame(3, $report['schema_version']);
+        self::assertSame(4, $report['schema_version']);
         self::assertSame(2, $report['handed_off']);
         self::assertSame(1, $report['outbox_fallbacks']);
         self::assertSame(250.0, $report['outbox_wait_ms']);
@@ -102,7 +102,7 @@ final class VerificationRunDiagnosticsTest extends TestCase
 
         $phases = $diagnostics->report(hrtime(true))['phases'];
 
-        self::assertSame(['claim', 'bookkeeping', 'manifest_read', 'verify_passed', 'verify_other', 'publish', 'finish', 'status_write'], array_keys($phases));
+        self::assertSame(['claim', 'prefetch', 'bookkeeping', 'manifest_read', 'verify_passed', 'verify_other', 'publish', 'finish', 'status_write'], array_keys($phases));
         self::assertSame(2, $phases['claim']['count']);
         self::assertGreaterThanOrEqual(3.0, $phases['claim']['ms']);
         self::assertSame(['ms' => 0.0, 'count' => 0], $phases['finish']);

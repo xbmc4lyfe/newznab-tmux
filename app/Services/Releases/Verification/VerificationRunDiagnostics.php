@@ -58,10 +58,10 @@ final class VerificationRunDiagnostics
     private float $maintenanceMilliseconds = 0.0;
 
     /**
-     * Fixed phases of the claim loop. Passed verification includes article fetch and decode; an
+     * Fixed phases of the claim loop. Prefetch includes batch manifest reads and network; verification includes remaining fetch and decode; an
      * operation that throws is charged to its own phase.
      */
-    private const array PHASES = ['claim', 'bookkeeping', 'manifest_read', 'verify_passed', 'verify_other', 'publish', 'finish', 'status_write'];
+    private const array PHASES = ['claim', 'prefetch', 'bookkeeping', 'manifest_read', 'verify_passed', 'verify_other', 'publish', 'finish', 'status_write'];
 
     /** @var array<string, array{ms: float, count: int}> */
     private array $phases = [];
@@ -199,7 +199,7 @@ final class VerificationRunDiagnostics
     public function report(int $finished): array
     {
         return [
-            'schema_version' => 3,
+            'schema_version' => 4,
             'started_at' => $this->startedAt,
             'requested_slot' => $this->requestedSlot,
             'limit' => $this->limit,

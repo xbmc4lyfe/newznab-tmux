@@ -84,6 +84,12 @@ return [
     // PHP memory limit for verification workers and the candidate preparer. A candidate at the metadata
     // budget's limit peaks near 250 MiB above PHP's baseline (more with short message-IDs).
     'worker_memory' => (string) env('RELEASE_VERIFICATION_WORKER_MEMORY', '512M'),
+    // Batch samples across leased candidates, retaining one full manifest at a time.
+    'sample_batch_size' => (int) env('RELEASE_VERIFICATION_SAMPLE_BATCH_SIZE', 1),
+    // Experimental Rust framing transport; empty keeps the native PHP pipeline.
+    'rust_worker' => (string) env('RELEASE_VERIFICATION_RUST_WORKER', ''),
+    // Check every article with STAT as well as verifying the selected BODY samples.
+    'stat_all_articles' => (bool) env('RELEASE_VERIFICATION_STAT_ALL_ARTICLES', false),
     'download_connections' => (int) env('RELEASE_VERIFICATION_DOWNLOAD_CONNECTIONS', 2),
     'pipeline_window' => (int) env('RELEASE_VERIFICATION_PIPELINE_WINDOW', 4),
     'download_buffer_bytes' => (int) env('RELEASE_VERIFICATION_DOWNLOAD_BUFFER_BYTES', 67108864),
