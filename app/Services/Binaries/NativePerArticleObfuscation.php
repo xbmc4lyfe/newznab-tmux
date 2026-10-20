@@ -21,7 +21,7 @@ final class NativePerArticleObfuscation
     /** Mirrors MAX_SUBJECT_LENGTH in the Rust port; longer subjects are declined before packing. */
     public const int MAX_SUBJECT_LENGTH = 512;
 
-    /** Headers sampled to decide whether a range is worth marshalling to Rust: one in 64, 32 to 128. */
+    /** Headers sampled to decide whether a range is worth marshalling to Rust: one in 128, 32 to 128. */
     private const int SAMPLE_MIN = 32;
 
     private const int SAMPLE_MAX = 128;
@@ -123,7 +123,7 @@ final class NativePerArticleObfuscation
         $count = count($values);
         // One random header from each of $samples equal slices, so no periodic ordering of the
         // range decides the prediction.
-        $samples = min(self::SAMPLE_MAX, max(self::SAMPLE_MIN, intdiv($count, 64)));
+        $samples = min(self::SAMPLE_MAX, max(self::SAMPLE_MIN, intdiv($count, 128)));
         $random = self::$sampler ??= new Randomizer(new Xoshiro256StarStar);
         $php = $rust = 0;
         for ($slice = 0; $slice < $samples; $slice++) {
