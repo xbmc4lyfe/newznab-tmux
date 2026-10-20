@@ -16,6 +16,7 @@ use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schedule as ScheduleFacade;
 use RuntimeException;
 
 class VerificationReadyQueueTest extends ReleaseVerificationCandidatesTest
@@ -456,11 +457,15 @@ class VerificationReadyQueueTest extends ReleaseVerificationCandidatesTest
         $commands = function (string $limit): array {
             config(['release_verification.worker_memory' => $limit]);
             $schedule = new Schedule;
-            $this->app->instance(Schedule::class, $schedule);
+            // Through the facade routes/console.php uses: it may have resolved the app's schedule already.
+            ScheduleFacade::swap($schedule);
             require base_path('routes/console.php');
 
-            return array_values(array_filter(array_map(static fn ($event): string => (string) $event->command, $schedule->events()),
+            $commands = array_values(array_filter(array_map(static fn ($event): string => (string) $event->command, $schedule->events()),
                 static fn (string $command): bool => str_contains($command, 'releases:prepare-candidates') || str_contains($command, 'releases:verify-candidates')));
+            $this->assertNotEmpty($commands, 'The verification workers must be scheduled.');
+
+            return $commands;
         };
 
         foreach ($commands('768M') as $command) {
