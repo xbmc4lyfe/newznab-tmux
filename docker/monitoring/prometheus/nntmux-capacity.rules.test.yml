@@ -1,0 +1,27 @@
+# promtool test rules docker/monitoring/prometheus/nntmux-capacity.rules.test.yml
+rule_files: [rules/nntmux-capacity.rules.yml]
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'nntmux_nntp_connections{server="primary",state="active"}'
+        values: '70x300'
+      - series: 'nntmux_processing_total_work'
+        values: '6000+10x300'
+      - series: 'nntmux_releases'
+        values: '1000x300'
+      - series: 'nntmux_table_rows{table="collections"}'
+        values: '100x300'
+    alert_rule_test:
+      - eval_time: 4h
+        alertname: NntmuxAtCapacity
+        exp_alerts: [{exp_labels: {}, exp_annotations: {summary: "NNTP connections saturated while backlog grows: add connections/workers or cut per-item cost."}}]
+      - eval_time: 4h
+        alertname: NntmuxReleaseCreationStalled
+        exp_alerts: [{exp_labels: {}, exp_annotations: {summary: "No new releases in 2h while collections are waiting."}}]
+      - eval_time: 4h
+        alertname: NntmuxPostprocessBacklogGrowing
+        exp_alerts: [{exp_labels: {}, exp_annotations: {summary: "Post-processing backlog growing for 2h: identification is behind."}}]
+      - eval_time: 4h
+        alertname: NntmuxUnderUtilized
+        exp_alerts: []

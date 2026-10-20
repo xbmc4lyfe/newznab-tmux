@@ -16,6 +16,7 @@ services:
       - '127.0.0.1:${FORWARD_PROMETHEUS_PORT:-9090}:9090'
     volumes:
       - './docker/monitoring/prometheus/prometheus.dev.yml:/etc/prometheus/prometheus.yml:ro'
+      - './docker/monitoring/prometheus/rules:/etc/prometheus/rules:ro'
       - 'sail-prometheus:/prometheus'
     networks:
       - sail

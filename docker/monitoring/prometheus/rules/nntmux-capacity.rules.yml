@@ -1,0 +1,118 @@
+# NNTmux capacity and stall alerts, loaded by both Prometheus configs
+# (docker/config/prometheus/prometheus.yml, docker/monitoring/prometheus/prometheus.dev.yml).
+# Built only from metrics exported today: node/mysqld/redis exporters plus
+# `monitoring:export-metrics` pushed to the Pushgateway as job="nntmux".
+# There is no Alertmanager yet; firing alerts show on Prometheus /alerts and as ALERTS{}.
+# Thresholds are starting points to calibrate against a week of production data.
+groups:
+  - name: nntmux-capacity-recording
+    interval: 1m
+    rules:
+      - record: nntmux:releases_added:increase1h
+        expr: clamp_min(delta(nntmux_releases[1h]), 0)
+      - record: nntmux:processing_backlog:deriv2h
+        expr: deriv(nntmux_processing_total_work[2h])
+      # Primary provider's connection limit (docker/config/seed/tuning.sql budgets against 73).
+      # Edit here if the account changes; no metric exports the configured limit yet.
+      - record: nntmux:nntp_primary_connection_limit
+        expr: vector(73)
+      # Established sockets seen from the indexer container only (`ss` in Tmux::getUSPConnections);
+      # Horizon fingerprint and scheduler verification connections are not counted.
+      - record: nntmux:nntp_primary_utilization:ratio
+        expr: |
+          sum(nntmux_nntp_connections{server="primary", state="active"})
+            / scalar(nntmux:nntp_primary_connection_limit)
+      - record: nntmux:metrics_age_seconds
+        expr: time() - push_time_seconds{job="nntmux"}
+
+  - name: nntmux-telemetry
+    rules:
+      - alert: NntmuxAppMetricsStale
+        expr: nntmux:metrics_age_seconds > 300
+        for: 5m
+        annotations: {summary: "App metrics not pushed for >5m; every other app alert is blind."}
+      - alert: NntmuxTmuxSnapshotStale
+        expr: nntmux_tmux_snapshot_age_seconds > 600
+        for: 10m
+        annotations: {summary: "tmux monitor snapshot older than 10m; backlog/release gauges are frozen."}
+      - alert: NntmuxCollectorErrors
+        expr: nntmux_metrics_collector_errors > 0
+        for: 10m
+      - alert: ExporterDown
+        expr: up == 0
+        for: 3m
+
+  - name: nntmux-throughput
+    rules:
+      - alert: NntmuxTmuxNotRunning
+        expr: nntmux_tmux_running == 0
+        for: 5m
+        annotations: {summary: "tmux processing session is not running (ingest/release creation stopped)."}
+      - alert: NntmuxReleaseCreationStalled
+        expr: nntmux:releases_added:increase1h == 0 and on() nntmux_table_rows{table="collections"} > 0
+        for: 2h
+        annotations: {summary: "No new releases in 2h while collections are waiting."}
+      - alert: NntmuxCollectionsPilingUp
+        expr: deriv(nntmux_table_rows{table="collections"}[2h]) > 0 and nntmux_table_rows{table="collections"} > 500000
+        for: 2h
+        annotations: {summary: "Collections table growing for 2h: release creation slower than ingest."}
+      - alert: NntmuxPostprocessBacklogGrowing
+        expr: nntmux:processing_backlog:deriv2h > 0 and nntmux_processing_total_work > 5000
+        for: 2h
+        annotations: {summary: "Post-processing backlog growing for 2h: identification is behind."}
+      - alert: NntmuxVerificationBacklogOld
+        expr: nntmux_release_verification_backlog_age_seconds > 86400 and on() nntmux_release_verification_backlog_age_measurement_available == 1
+        for: 30m
+
+  - name: nntmux-capacity
+    rules:
+      # At capacity = connections pinned AND work still accumulating.
+      - alert: NntmuxAtCapacity
+        expr: |
+          nntmux:nntp_primary_utilization:ratio >= 0.85
+            and on() (nntmux:processing_backlog:deriv2h > 0)
+        for: 30m
+        annotations: {summary: "NNTP connections saturated while backlog grows: add connections/workers or cut per-item cost."}
+      - alert: NntmuxUnderUtilized
+        expr: |
+          nntmux:nntp_primary_utilization:ratio < 0.5
+            and on() nntmux_processing_total_work > 5000
+        for: 1h
+        annotations: {summary: "Backlog exists but <50% of NNTP connections busy: workers/threads are the bottleneck, not the provider."}
+      - alert: NntmuxQueueWaitHigh
+        expr: nntmux_queue_wait_seconds > 600
+        for: 15m
+      - alert: NntmuxHorizonDown
+        expr: nntmux_horizon_up == 0
+        for: 2m
+      - alert: NntmuxFailedJobsRising
+        expr: delta(nntmux_failed_jobs[15m]) > 10
+
+  - name: nntmux-services
+    rules:
+      - alert: MariadbConnectionsHigh
+        expr: mysql_global_status_threads_connected / mysql_global_variables_max_connections > 0.8
+        for: 10m
+      - alert: MariadbDeadlocks
+        expr: increase(mysql_global_status_innodb_deadlocks[10m]) > 5
+      - alert: MariadbRowLockWaitHigh
+        expr: rate(mysql_global_status_innodb_row_lock_time[10m]) > 1000
+        for: 10m
+        annotations: {summary: "InnoDB spending >1s/s waiting on row locks (ingest/release writers contending)."}
+      - alert: MariadbBufferPoolMissHigh
+        expr: |
+          rate(mysql_global_status_innodb_buffer_pool_reads[10m])
+            / clamp_min(rate(mysql_global_status_innodb_buffer_pool_read_requests[10m]), 1) > 0.01
+        for: 30m
+      - alert: RedisMemoryHigh
+        expr: redis_memory_used_bytes / (redis_memory_max_bytes > 0) > 0.85
+        for: 10m
+      - alert: RedisEvicting
+        expr: increase(redis_evicted_keys_total[10m]) > 0
+        annotations: {summary: "Redis is evicting keys; Horizon/queue data may be lost."}
+      - alert: HostDiskLow
+        expr: node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes < 0.10
+        for: 10m
+      - alert: HostMemoryPressure
+        expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.10
+        for: 15m
