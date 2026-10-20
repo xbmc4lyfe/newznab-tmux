@@ -1,10 +1,7 @@
 use flate2::{Compression, write::GzEncoder};
 use nntmux_fingerprint_worker::database::{self, Claim};
 use sha2::{Digest, Sha256};
-use std::{
-    io::Write,
-    sync::{Arc, atomic::AtomicU32},
-};
+use std::io::Write;
 fn claim() -> Claim {
     let xml = b"<nzb>fixture</nzb>";
     let mut encoder = GzEncoder::new(vec![], Compression::default());
@@ -19,7 +16,6 @@ fn claim() -> Claim {
         source_digest: hex::encode(sha.finalize()),
         token: database::token(),
         attempts: 1,
-        held_slots: Arc::new(AtomicU32::new(0)),
     }
 }
 #[test]

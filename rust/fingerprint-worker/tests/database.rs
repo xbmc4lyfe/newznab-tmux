@@ -1,7 +1,9 @@
 use flate2::{Compression, write::GzEncoder};
 use nntmux_fingerprint_worker::{
     collect,
+    connections::{Connections, Contention},
     database::{self, Claim},
+    nntp::Provider,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -126,39 +128,57 @@ async fn real_mariadb_claims_fencing_global_slots_and_binary() {
     .execute(&pool)
     .await
     .unwrap();
-    assert_eq!(
-        database::slot(&pool, &current, "integration-test", "a")
-            .await
-            .unwrap(),
-        1
-    );
-    let mut competing = current.clone();
-    competing.token = database::token();
-    competing.held_slots = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let provider = Provider {
+        account: "integration-test".into(),
+        host: "127.0.0.1".into(),
+        port: 1,
+        tls: false,
+        username: String::new(),
+        password: String::new(),
+    };
+    let contention = std::sync::Arc::new(Contention::default());
+    let mut holder = Connections::new("a".into(), Duration::from_secs(20), contention.clone());
+    let held = holder.checkout(&pool, &provider).await.unwrap();
+    let held_slot: u32 = sqlx::query_scalar(
+        "SELECT slot FROM release_fingerprint_connections WHERE provider='integration-test' AND lease_token=?",
+    )
+    .bind(&held.token)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(held_slot, 1);
+    let mut competing = Connections::new("b".into(), Duration::from_secs(20), contention);
     let p = pool.clone();
-    let c = competing.clone();
-    let waiting =
-        tokio::spawn(async move { database::slot(&p, &c, "integration-test", "b").await });
+    let provider_b = provider.clone();
+    let waiting = tokio::spawn(async move {
+        let checkout = competing.checkout(&p, &provider_b).await;
+        (competing, checkout)
+    });
     tokio::time::sleep(Duration::from_millis(350)).await;
     assert!(!waiting.is_finished());
-    database::release_slots(&pool, &current).await.unwrap();
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(2), waiting)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap(),
-        1
-    );
-    database::release_slots(&pool, &competing).await.unwrap();
-    current.held_slots.store(0, Ordering::SeqCst);
-    // A lost shared connection lease also fences its worker, even with a live job lease.
-    database::slot(&pool, &current, "integration-test", "a")
+    drop(held);
+    holder.settle(&pool).await.unwrap();
+    let (mut competing, checkout) = tokio::time::timeout(Duration::from_secs(2), waiting)
         .await
+        .unwrap()
         .unwrap();
+    let taken_slot: u32 = sqlx::query_scalar(
+        "SELECT slot FROM release_fingerprint_connections WHERE provider='integration-test' AND lease_token=?",
+    )
+    .bind(&checkout.unwrap().token)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(taken_slot, 1);
+    competing.close(&pool).await.unwrap();
+    // A lost shared connection lease also fences its worker, even with a live job lease.
+    assert!(database::renew(&pool, &current).await.unwrap());
+    let held = holder.checkout(&pool, &provider).await.unwrap();
+    assert!(holder.leases().renew(&pool).await.unwrap());
     sqlx::query("UPDATE release_fingerprint_connections SET lease_until=TIMESTAMPADD(SECOND,-1,UTC_TIMESTAMP(6)) WHERE provider='integration-test'").execute(&pool).await.unwrap();
-    assert!(!database::renew(&pool, &current).await.unwrap());
-    database::release_slots(&pool, &current).await.unwrap();
+    assert!(!holder.leases().renew(&pool).await.unwrap());
+    drop(held);
+    holder.close(&pool).await.unwrap();
     setup(&pool).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();

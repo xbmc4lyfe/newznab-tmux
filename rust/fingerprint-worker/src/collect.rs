@@ -1,5 +1,6 @@
 use crate::{
     breaker,
+    connections::Connections,
     database::{self, Claim},
     manifest::{self, File, Sample},
     nntp::{Article, Client, Provider},
@@ -37,6 +38,8 @@ pub struct Timings {
     pub articles_ms: u64,
     /// Provider connections opened for this release.
     pub connections_opened: u32,
+    /// Retained provider connections reused instead of opened.
+    pub connections_reused: u32,
 }
 fn elapsed_ms(since: Instant) -> u64 {
     u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -56,10 +59,10 @@ pub struct ProviderEvidence {
 pub async fn run(
     pool: &MySqlPool,
     claim: &Claim,
-    worker: &str,
     providers: &[Provider],
     alternate_percent: u32,
     timeout: u64,
+    connections: &mut Connections,
 ) -> Result<Collected> {
     let xml = database::decode_nzb(claim)?;
     let files = manifest::parse(&xml)?;
@@ -100,19 +103,30 @@ pub async fn run(
             continue;
         }
         let phase = Instant::now();
-        database::slot(pool, claim, &p.account, worker).await?;
+        let mut checkout = connections.checkout(pool, p).await?;
         timings.slot_ms += elapsed_ms(phase);
-        let phase = Instant::now();
-        let mut client = Client::connect(p, timeout).await.ok();
-        timings.connect_ms += elapsed_ms(phase);
-        timings.connections_opened += 1;
+        // A retained connection is already connected, authenticated and profiled.
+        let reused = checkout.reused;
+        let mut client = checkout.client.take();
+        if reused {
+            timings.connections_reused += 1;
+        } else {
+            let phase = Instant::now();
+            client = Client::connect(p, timeout).await.ok();
+            timings.connect_ms += elapsed_ms(phase);
+            timings.connections_opened += 1;
+        }
+        // The first command on a reused socket may find that the provider closed it silently.
+        let mut unproven = reused;
         let mut entries = BTreeMap::new();
         let mut implementation = None;
         let mut profile = "ok".to_string();
         let mut unavailable = false;
         let phase = Instant::now();
         if let Some(connection) = client.as_mut() {
-            if connection.profile().await.is_err() {
+            if reused {
+                // Only a primary connection is retained, and the primary has no breaker.
+            } else if connection.profile().await.is_err() {
                 profile = "ProfileResponseInvalid".into();
                 if let Some(decision) = decision.as_ref() {
                     breaker::release_probe(pool, &p.account, decision).await?;
@@ -142,25 +156,42 @@ pub async fn run(
                     unavailable = true;
                 }
             }
-            let article = if unavailable {
+            let mut article = if unavailable {
                 Err("NntpProviderUnavailableException".into())
             } else if let Some(connection) = client.as_mut() {
                 connection
                     .article(&sample.messageid)
                     .await
-                    .map_err(|error| {
-                        if error.to_string().contains("NntpArticleMissingException") {
-                            "NntpArticleMissingException".to_string()
-                        } else {
-                            "RuntimeException".to_string()
-                        }
-                    })
+                    .map_err(|error| article_error(&error))
             } else {
                 Err("NntpProviderUnavailableException".into())
             };
+            if unproven
+                && !unavailable
+                && article.is_err()
+                && client.as_ref().is_none_or(Client::poisoned)
+            {
+                // The retained socket died between the readiness check and its first command:
+                // the failure says nothing about the article, so retry once on a fresh socket.
+                drop(client.take());
+                let reconnect = Instant::now();
+                client = Client::connect(p, timeout).await.ok();
+                timings.connect_ms += elapsed_ms(reconnect);
+                timings.connections_opened += 1;
+                if let Some(connection) = client.as_mut() {
+                    article = connection
+                        .article(&sample.messageid)
+                        .await
+                        .map_err(|error| article_error(&error));
+                }
+            }
+            unproven = false;
             entries.insert(sample.messageid.clone(), article);
         }
         timings.articles_ms += elapsed_ms(phase);
+        // Keep a healthy primary connection for the next release; otherwise close it and
+        // release its budget row. A failed release is retried when the job settles.
+        let _ = connections.finish(pool, p, checkout, client).await;
         evidence.push(ProviderEvidence {
             account: p.account.clone(),
             host: p.host.clone(),
@@ -175,6 +206,13 @@ pub async fn run(
     let mut collected = analyze(&files, &evidence);
     collected.timings = timings;
     Ok(collected)
+}
+fn article_error(error: &anyhow::Error) -> String {
+    if error.to_string().contains("NntpArticleMissingException") {
+        "NntpArticleMissingException".to_string()
+    } else {
+        "RuntimeException".to_string()
+    }
 }
 fn headers(article: &Article) -> BTreeMap<String, String> {
     let mut out: BTreeMap<String, String> = BTreeMap::new();

@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     net::TcpStream,
@@ -13,6 +16,23 @@ use tokio_rustls::{
 
 pub const MAX_BODY: usize = 2_000_000;
 const MAX_HEADERS: usize = 65_536;
+/// One shared TLS configuration: building the root store per connection costs CPU, and a shared
+/// configuration lets rustls resume sessions to a provider it already knows.
+fn tls_config() -> Arc<ClientConfig> {
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let roots = RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            };
+            Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            )
+        })
+        .clone()
+}
 pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 #[derive(Clone, Debug)]
@@ -36,6 +56,7 @@ pub struct Client {
     timeout: Duration,
     pub implementation: Option<String>,
     poisoned: bool,
+    profiled: bool,
 }
 impl Client {
     pub async fn connect(p: &Provider, seconds: u64) -> Result<Self> {
@@ -45,17 +66,11 @@ impl Client {
             .context("NNTP connect timeout")??;
         stream.set_nodelay(true)?;
         let io: Box<dyn Io> = if p.tls {
-            let roots = RootCertStore {
-                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-            };
-            let cfg = ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth();
             let name = ServerName::try_from(p.host.clone()).context("NNTP TLS hostname")?;
             Box::new(
                 timeout(
                     duration,
-                    TlsConnector::from(Arc::new(cfg)).connect(name, stream),
+                    TlsConnector::from(tls_config()).connect(name, stream),
                 )
                 .await
                 .context("NNTP TLS timeout")??,
@@ -68,6 +83,7 @@ impl Client {
             timeout: duration,
             implementation: None,
             poisoned: false,
+            profiled: false,
         };
         let greeting = this.line(4096).await?;
         if !greeting.starts_with(b"200 ") && !greeting.starts_with(b"201 ") {
@@ -153,12 +169,48 @@ impl Client {
     pub fn poisoned(&self) -> bool {
         self.poisoned
     }
+    /// True once CAPABILITIES/OVERVIEW.FMT succeeded on this exact connection.
+    pub fn profiled(&self) -> bool {
+        self.profiled
+    }
     pub async fn profile(&mut self) -> Result<()> {
         let result = self.profile_inner().await;
         if result.is_err() {
             self.poisoned = true;
+        } else {
+            self.profiled = true;
         }
         result
+    }
+    /// Decide whether a connection that sat idle may carry the next release.
+    ///
+    /// A healthy idle NNTP connection is silent: any readable byte, EOF or error means the
+    /// server closed it or desynchronised the stream, so it is poisoned instead of reused.
+    /// `ping` additionally spends one round trip on `DATE` for connections idle long enough
+    /// that a silent middlebox drop is plausible.
+    pub async fn ready_for_reuse(&mut self, ping: bool) -> bool {
+        if self.poisoned || !self.profiled {
+            return false;
+        }
+        if !self.io.buffer().is_empty() || timeout(Duration::ZERO, self.io.fill_buf()).await.is_ok()
+        {
+            self.poisoned = true;
+            return false;
+        }
+        if ping {
+            match self.command("DATE").await {
+                // A server without DATE answers 500; either proves the stream is in step.
+                Ok(response)
+                    if response.starts_with("111 ")
+                        || response.starts_with("500 ")
+                        || response.starts_with("501 ") => {}
+                _ => {
+                    self.poisoned = true;
+                    return false;
+                }
+            }
+        }
+        true
     }
     async fn profile_inner(&mut self) -> Result<()> {
         let response = self.command("CAPABILITIES").await?;

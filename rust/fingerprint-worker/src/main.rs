@@ -1,6 +1,11 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use nntmux_fingerprint_worker::{collect, database, manifest, nntp::Provider};
+use nntmux_fingerprint_worker::{
+    collect,
+    connections::{Connections, Contention},
+    database, manifest,
+    nntp::Provider,
+};
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
 use std::{
     io::Read,
@@ -69,6 +74,10 @@ struct Args {
     alternate_percent: u32,
     #[arg(long,env="NNTP_TIMEOUT",default_value_t=20,value_parser=clap::value_parser!(u64).range(1..=60))]
     timeout: u64,
+    /// Seconds a provider connection may wait for its next release before it is closed and its
+    /// shared budget row released; 0 opens a connection per release.
+    #[arg(long,env="FINGERPRINT_CONNECTION_IDLE",default_value_t=20,value_parser=clap::value_parser!(u64).range(0..=60))]
+    connection_idle: u64,
     #[arg(long)]
     once: bool,
     #[arg(long, default_value_t = 0)]
@@ -161,6 +170,8 @@ async fn main() -> Result<()> {
     let mut tasks = JoinSet::new();
     let providers = Arc::new(providers);
     let args = Arc::new(args);
+    // Shared by all tasks: a task waiting for a budget row makes every holder give one back.
+    let contention = Arc::new(Contention::default());
     for _ in 0..args.concurrency {
         let pool = pool.clone();
         let worker = worker.clone();
@@ -168,9 +179,15 @@ async fn main() -> Result<()> {
         let providers = providers.clone();
         let args = args.clone();
         let mut stop = stop_rx.clone();
+        let contention = contention.clone();
         tasks.spawn(async move {
-            loop {
+            // This task's provider connections: retained between releases, closed on drain.
+            let mut conns = Connections::new(worker.clone(), Duration::from_secs(args.connection_idle), contention);
+            let leases = conns.leases();
+            let outcome = async { loop {
                 if *stop.borrow() { return Ok::<(), anyhow::Error>(()); }
+                // Idle connections give their shared budget rows back instead of hoarding them.
+                let _ = tokio::time::timeout(Duration::from_secs(10), conns.expire_idle(&pool)).await;
                 let ticket = next.fetch_add(1, Ordering::SeqCst);
                 if maximum > 0 && ticket >= maximum { return Ok(()); }
                 let claim_started = std::time::Instant::now();
@@ -190,20 +207,21 @@ async fn main() -> Result<()> {
                     continue;
                 };
                 let result = {
-                    let work = tokio::time::timeout(Duration::from_secs(1800), collect::run(&pool, &claim, &worker, &providers, args.alternate_percent, args.timeout));
+                    let work = tokio::time::timeout(Duration::from_secs(1800), collect::run(&pool, &claim, &providers, args.alternate_percent, args.timeout, &mut conns));
                     tokio::pin!(work);
                     loop {
                         tokio::select! {
                             result = &mut work => break result.context("Fingerprint job timed out").and_then(|result| result),
                             _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                                match tokio::time::timeout(Duration::from_secs(10), database::renew(&pool, &claim)).await {
+                                let renewal = async { Ok::<bool, anyhow::Error>(database::renew(&pool, &claim).await? && leases.renew(&pool).await?) };
+                                match tokio::time::timeout(Duration::from_secs(10), renewal).await {
                                     Ok(Ok(true)) => {},
                                     _ => break Err(anyhow::anyhow!("ClaimLeaseLost")),
                                 }
                             }
                         }
                     }
-                }; // Cancelling collection drops all sockets before releasing their shared slots.
+                }; // Cancelling collection drops its sockets before `settle` releases their shared slots.
                 let mutation = async {
                     match result {
                         Ok(result) => {
@@ -211,9 +229,9 @@ async fn main() -> Result<()> {
                             if database::finish(&pool, &claim, &result.status, &result.data).await? {
                                 let t = result.timings;
                                 println!(
-                                    "{{\"event\":\"completed\",\"release_id\":{},\"status\":\"{}\",\"timings_ms\":{{\"claim\":{},\"slot\":{},\"connect\":{},\"profile\":{},\"articles\":{},\"finish\":{},\"total\":{}}},\"connections_opened\":{}}}",
+                                    "{{\"event\":\"completed\",\"release_id\":{},\"status\":\"{}\",\"timings_ms\":{{\"claim\":{},\"slot\":{},\"connect\":{},\"profile\":{},\"articles\":{},\"finish\":{},\"total\":{}}},\"connections_opened\":{},\"connections_reused\":{}}}",
                                     claim.release_id, result.status, claim_ms, t.slot_ms, t.connect_ms, t.profile_ms, t.articles_ms,
-                                    elapsed_ms(finish_started), elapsed_ms(claim_started), t.connections_opened
+                                    elapsed_ms(finish_started), elapsed_ms(claim_started), t.connections_opened, t.connections_reused
                                 );
                             } else {
                                 println!("{{\"event\":\"stale_result_discarded\",\"release_id\":{}}}", claim.release_id);
@@ -228,12 +246,15 @@ async fn main() -> Result<()> {
                 };
                 let mutation = tokio::time::timeout(Duration::from_secs(10), mutation).await;
                 // Always attempt cleanup even when persistence failed; expired slots recover if DB is down.
-                let cleanup = tokio::time::timeout(Duration::from_secs(10), database::release_slots(&pool, &claim)).await;
+                let cleanup = tokio::time::timeout(Duration::from_secs(10), conns.settle(&pool)).await;
                 if !matches!(mutation, Ok(Ok(()))) || !matches!(cleanup, Ok(Ok(()))) {
                     if maximum > 0 { bail!("Database result/cleanup failed; job leases recover automatically"); }
                     eprintln!("{{\"event\":\"database_write_unavailable\"}}");
                 }
-            }
+            } }.await;
+            // Drain: sockets first, then every budget row this task still holds.
+            let _ = tokio::time::timeout(Duration::from_secs(10), conns.close(&pool)).await;
+            outcome
         });
     }
     let shutdown = shutdown_signal();
