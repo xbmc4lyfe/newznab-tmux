@@ -508,6 +508,13 @@ These bugs turned up while building and running the self-hosted stack in `docker
     - A real upload in an obfuscated group whose only article in the range is a middle part (uploads posted over several connections arrive out of order).
     - One uploader posting 16 or more files with their own random names at staggered offsets when the range holds exactly one article from each file.
 
+### 66. Prefetched verification bodies bypass the remaining transfer limit (Fixed)
+
+- **Where:** `NntpArticleSource::fetchFromProviders()` returned a cached body without checking the smaller limit supplied by `fetchBounded()`.
+- **Effect:** a prefetched article could exceed the caller's remaining transfer budget. The verifier's later byte check still prevented publication, but the bounded source contract differed between cached and direct reads.
+- **Fix:** cached reads enforce the same limit and throw `ArticleBudgetExceeded`. Batch framing preserves that type only for the offending oversized article; unread later responses remain retryable transport failures. A damaged prefetch reconnects before subsequent STAT requests. Socket regressions exercise native and Rust framing.
+- **Rust experiment:** bounded cross-candidate sample batches, optional full-manifest STAT, and a Rust framing subprocess are available for validation. Batch size defaults to one and the Rust executable path defaults empty. A paired 20-observation caller screen found median times of 36.83/16.36/19.31 ms (sequential/PHP batch/Rust batch, 32 KiB bodies) and 189.96/156.20/185.56 ms (500 KiB bodies). This synthetic socket screen does not qualify p99 or TCP/TLS performance; Rust remains disabled because the required speedups were not established. The native implementation remains available.
+
 ## Issues in the docker/ stack itself (all fixed)
 
 | Issue | Fix |
