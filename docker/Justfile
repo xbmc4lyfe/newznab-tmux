@@ -39,31 +39,23 @@ LOAD_ENV := '''preset=" "
         [ -z "${!key:-}" ] || preset="$preset$key "
     done
     interpolated=" "
+    # One `dotenv KEY FLAG VALUE` line per key present, every word shell-quoted, from the parser
+    # docker/bin/compose shares: Compose's rules (escapes in double quotes decoded, last one wins).
+    dotenv() {
+        # Compose interpolates unquoted and double-quoted values; this reader does not, nor does it
+        # read a value across lines (FLAG is then not "-"). Single-quoted values are literal in Compose.
+        case "$1" in
+            COMPOSE_FILE|DC|DB_DATABASE|DB_ROOTPASSWORD|HELPER_IMAGE|BASE_IMAGE|APP_IMAGE|WEB_IMAGE|HORIZON_IMAGE|SCHEDULER_IMAGE|INDEXER_IMAGE)
+                [ "$2" = - ] || interpolated="$interpolated$1 " ;;
+        esac
+        # Arguments and the environment win over the file.
+        case "$preset" in *" $1 "*) ;; *) printf -v "$1" '%s' "$3" ;; esac
+    }
     if [ -f "''' + ENV_FILE + '''" ]; then
-        while IFS= read -r line || [ -n "$line" ]; do
-            [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?(COMPOSE_FILE|DC|DEPLOY_BY|APP_PORT|DB_DATABASE|DB_ROOTPASSWORD|HELPER_IMAGE|BASE_IMAGE|APP_IMAGE|WEB_IMAGE|HORIZON_IMAGE|SCHEDULER_IMAGE|INDEXER_IMAGE|DEPLOY_MIN_INTERVAL|DEPLOY_DRAIN_TIMEOUT|DEPLOY_SCHEDULER_DRAIN_TIMEOUT|DEPLOY_HEALTH_TIMEOUT|DEPLOY_LEGACY_DRAIN_TIMEOUT)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
-            key=${BASH_REMATCH[2]} value=${BASH_REMATCH[3]}
-            quote=
-            if [[ "$value" =~ ^\"([^\"]*)\"[[:space:]]*(#.*)?$ ]]; then
-                quote='"' value=${BASH_REMATCH[1]}
-            elif [[ "$value" =~ ^\'([^\']*)\'[[:space:]]*(#.*)?$ ]]; then
-                quote="'" value=${BASH_REMATCH[1]}
-            else
-                value=${value%%[[:space:]]#*}
-                value=${value%"${value##*[![:space:]]}"}
-            fi
-            # Compose interpolates unquoted and double-quoted values; this parser does not. The last
-            # assignment wins, so only it can be interpolated. Single-quoted values are literal in Compose.
-            case "$key" in
-                COMPOSE_FILE|DC|DB_DATABASE|DB_ROOTPASSWORD|HELPER_IMAGE|BASE_IMAGE|APP_IMAGE|WEB_IMAGE|HORIZON_IMAGE|SCHEDULER_IMAGE|INDEXER_IMAGE)
-                    interpolated=${interpolated// $key / }
-                    if [ "$quote" != "'" ] && [[ "$value" == *'$'* ]]; then interpolated="$interpolated$key "; fi ;;
-            esac
-            # Arguments and the environment win; within the file the last assignment wins (as Compose).
-            case "$preset" in *" $key "*) ;; *) printf -v "$key" '%s' "$value" ;; esac
-        done < "''' + ENV_FILE + '''"
+        dotenv_values=$(python3 -I "''' + CURDIR + '''/bin/compose_dotenv.py" "''' + ENV_FILE + '''" COMPOSE_FILE DC DEPLOY_BY APP_PORT DB_DATABASE DB_ROOTPASSWORD HELPER_IMAGE BASE_IMAGE APP_IMAGE WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE DEPLOY_MIN_INTERVAL DEPLOY_DRAIN_TIMEOUT DEPLOY_SCHEDULER_DRAIN_TIMEOUT DEPLOY_HEALTH_TIMEOUT DEPLOY_LEGACY_DRAIN_TIMEOUT) || exit 1
+        eval "$dotenv_values"
         if [ "$interpolated" != " " ]; then
-            printf '%s\n' "docker/.env:${interpolated% } must be literal but uses \$ interpolation, which the Justfile and docker/bin/compose do not evaluate. Write the final value or single-quote it." >&2
+            printf '%s\n' "docker/.env:${interpolated% } must be literal but uses \$ interpolation (or a multi-line value), which the Justfile and docker/bin/compose do not evaluate. Write the final value or single-quote it." >&2
             exit 1
         fi
     fi

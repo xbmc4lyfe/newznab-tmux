@@ -22,13 +22,19 @@ verify
 
 # Capture first: a failing plan inside eval "$(...)" would be ignored, and a stale MODE in the
 # caller's environment must never stand in for the plan's output.
-unset MODE MIGRATE DIRTY_APP DIRTY_DATA DIRTY_INFRA RECONCILE_DATA RECONCILE_INFRA START_DATA PRE_DRAIN POST_DRAIN AFTER_APP DATABASE_SERVICE DATABASE_TARGET REMOVED_DATA BUILD_TARGETS GLOBAL_FALLBACK
+unset MODE MIGRATE DIRTY_APP DIRTY_DATA DIRTY_INFRA RECONCILE_DATA RECONCILE_INFRA START_DATA PRE_DRAIN POST_DRAIN AFTER_APP DATABASE_SERVICE DATABASE_TARGET DATABASE_TARGET_LEGACY REMOVED_DATA BUILD_TARGETS GLOBAL_FALLBACK
 actions=$("$DIR/bin/deploy-plan" --deploy-actions)
 eval "$actions"
 # The plan's build targets ignore FORCE (the build above already honoured it): any target still
 # dirty means an image tag was replaced after the build, which no .build.stamp vouches for.
 if [ -n "$BUILD_TARGETS" ]; then
     echo "deploy-app: image tags changed after the build (dirty targets: $BUILD_TARGETS); aborting before any change. Run the deployment again." >&2
+    exit 1
+fi
+# A removed data service's orphan may hold its successor's storage: data services start only after
+# the writers stop and the orphan is stopped (the plan routes them through the drain), never before.
+if [ -n "$REMOVED_DATA" ] && [ -n "$START_DATA" ]; then
+    echo "deploy-app: the plan would start $START_DATA before the drain while the orphaned $REMOVED_DATA may still run; aborting before any change." >&2
     exit 1
 fi
 
@@ -51,13 +57,46 @@ barrier_keep=0
 database_fresh=0
 fresh_on_up=0
 fresh_old_id=
-# A barrier is adopted only while it fences this rollout's database: its lock session and durable
-# pause live on the database it was started against.
+# A barrier is adopted, or replaced, only while it fences this rollout's database: its lock session
+# and durable pause live on the database it was started against. A lost or stopped barrier's pause
+# outlives its session, so its container is compared whatever its state, before anything removes
+# it; without a container, the owed-release marker names the database of the pause it left.
+# Barriers labelled before hosts were normalized carry DATABASE_TARGET_LEGACY for the same settings.
+same_database() {
+    [ "$1" = "$DATABASE_TARGET" ] || { [ -n "${DATABASE_TARGET_LEGACY:-}" ] && [ "$1" = "$DATABASE_TARGET_LEGACY" ]; }
+}
 refuse_foreign_barrier() {
-    barrier_running || return 0
-    ! docker logs "$barrier_name" 2>&1 | grep -q '^barrier lost' || return 0
-    if [ "$(docker inspect --format '{{index .Config.Labels "nntmux.deploy.database"}}' "$barrier_name" 2>/dev/null)" != "$DATABASE_TARGET" ]; then
-        echo "deploy-app: the verification barrier $barrier_name left by an earlier attempt fences another database than this rollout's. Release its pause on that database (releases:verification-barrier --release there), stop it, then retry." >&2
+    labelled=
+    # Existence first, by a query that fails only when Docker does: any error (an unreachable daemon)
+    # aborts, since it could hide a foreign barrier that a later check would adopt or remove.
+    if ! present=$(docker ps -aq --filter "name=^/$barrier_name\$"); then
+        echo "deploy-app: cannot list the verification barrier $barrier_name; not adopting or replacing it unchecked." >&2
+        exit 1
+    fi
+    if [ -n "$present" ]; then
+        if ! labelled=$(docker inspect --format '{{index .Config.Labels "nntmux.deploy.database"}}' "$barrier_name"); then
+            echo "deploy-app: cannot inspect the verification barrier $barrier_name; not adopting or replacing it unchecked." >&2
+            exit 1
+        fi
+        if ! same_database "$labelled"; then
+            echo "deploy-app: the verification barrier $barrier_name left by an earlier attempt fences another database than this rollout's. Release its pause on that database (releases:verification-barrier --release there), remove it, then retry." >&2
+            exit 1
+        fi
+    fi
+    owed_database=
+    # A marker that exists but cannot be read names an unknown database: never overwrite it.
+    if [ -e "$barrier_owed" ] && [ ! -d "$barrier_owed" ] && ! owed_database=$(head -n 1 "$barrier_owed"); then
+        echo "deploy-app: cannot read the owed verification-pause marker $barrier_owed; repair it before retrying." >&2
+        exit 1
+    fi
+    # An empty marker (written before it recorded the database) names none: without a labelled
+    # container it is this database's only while the database is unchanged (a switch migrates).
+    if [ -f "$barrier_owed" ] && [ -z "$owed_database" ] && [ -z "$labelled" ] && [ "$MIGRATE" = 1 ]; then
+        echo "deploy-app: an earlier attempt left a verification pause owed ($barrier_owed) without naming its database, and this rollout may switch databases. Release the pause on the database it was taken on (releases:verification-barrier --release there), remove the marker, then retry." >&2
+        exit 1
+    fi
+    if [ -n "$owed_database" ] && ! same_database "$owed_database"; then
+        echo "deploy-app: an earlier attempt left a verification pause owed on another database than this rollout's ($barrier_owed). Release it on that database (releases:verification-barrier --release there), remove the marker, then retry." >&2
         exit 1
     fi
 }
@@ -65,6 +104,8 @@ barrier_running() {
     [ "$(docker inspect --format '{{.State.Running}} {{index .Config.Labels "com.docker.compose.project"}}' "$barrier_name" 2>/dev/null)" = "true $project" ]
 }
 hold_barrier() {
+    # Before the marker below is rewritten for this database, or any earlier container removed.
+    refuse_foreign_barrier
     # Owed from before the first pause until a release succeeds: any failure from here on, even
     # one that leaves no barrier container, makes the next run take a barrier and release it.
     owe_barrier
@@ -73,7 +114,6 @@ hold_barrier() {
     # mid-migration, and this barrier's release would clear the durable pause it left behind.
     [ "$owed_at_start" != 1 ] || barrier_keep=1
     if barrier_running && ! docker logs "$barrier_name" 2>&1 | grep -q '^barrier lost'; then
-        refuse_foreign_barrier
         barrier_keep=1
     else
         docker rm -f "$barrier_name" >/dev/null 2>&1 || true
@@ -126,8 +166,9 @@ owed_at_start=0
 # Without the marker a crash could leave a durable pause nothing ever clears: never pause unrecorded.
 # `printf` rather than `:`, whose failed redirection would exit dash outright. Once a barrier is held
 # (recovery, failed release) a write failure only warns, so the EXIT trap still restores the writers.
+# It records the database the pause is on, so a later rollout against another one refuses it.
 owe_barrier() {
-    if ! printf '' 2>/dev/null >"$barrier_owed"; then
+    if ! printf '%s\n' "$DATABASE_TARGET" 2>/dev/null >"$barrier_owed"; then
         if [ "${1:-}" = held ]; then
             echo "Could not record the owed barrier release in $barrier_owed; clear the verification pause by hand after repairing it." >&2
             return 0
