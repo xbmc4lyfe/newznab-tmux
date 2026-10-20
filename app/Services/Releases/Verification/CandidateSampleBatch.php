@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use Closure;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
 use Throwable;
@@ -16,10 +17,15 @@ final class CandidateSampleBatch
 
     private int $admitted = 0;
 
+    private ?float $prefetchStartedAt = null;
+
+    private int $verifiedBytes = 0;
+
     /** @param array<string, mixed> $options */
     public function __construct(private readonly CandidateRepository $repository, private readonly ManifestStore $store,
         private readonly VerificationWorkerLocks $locks, private readonly NntpArticleSource $source,
-        private readonly array $options, private readonly ?VerificationRunDiagnostics $diagnostics = null) {}
+        private readonly array $options, private readonly ?VerificationRunDiagnostics $diagnostics = null,
+        private readonly ?Closure $clock = null) {}
 
     public function hasPending(): bool
     {
@@ -29,6 +35,18 @@ final class CandidateSampleBatch
     public function limitReached(int $maximumClaims): bool
     {
         return $this->admitted >= $maximumClaims;
+    }
+
+    /** Report completed verified bytes over the whole shared download/verification interval. */
+    public function verifiedBytesPerSecond(int $bytes, float $candidateStartedAt): float
+    {
+        $now = $this->clock === null ? microtime(true) : ($this->clock)();
+        if ($this->prefetchStartedAt === null) {
+            return $bytes / max(0.001, $now - $candidateStartedAt);
+        }
+        $this->verifiedBytes += $bytes;
+
+        return $this->verifiedBytes / max(0.001, $now - $this->prefetchStartedAt);
     }
 
     /** Renew queued work as well as the candidate currently being verified by the caller. */
@@ -59,9 +77,10 @@ final class CandidateSampleBatch
             if ($remaining < 1) {
                 return null;
             }
-            $articles = max(1, min(16, (int) ($this->options['spot_check_articles'] ?? 1)));
+            $this->prefetchStartedAt = null;
+            $this->verifiedBytes = 0;
             $limit = min(max(1, $remaining), max(1, min(16, (int) ($this->options['sample_batch_size'] ?? 1))),
-                max(1, intdiv($this->source->batchSize(), $articles)));
+                max(1, $this->source->batchSize()));
             $ids = [];
             for ($index = 0; $index < $limit && $mayClaim(); $index++) {
                 $this->heartbeat();
@@ -92,7 +111,12 @@ final class CandidateSampleBatch
                         $manifest = $this->store->read($claim->manifest_path);
                         $assessment = (new CandidateHeaderInventory)->assessment($manifest);
                         if ($assessment['reason'] === null || ($assessment['status'] === 'waiting_upload' && $this->repository->partialAllowed($claim))) {
-                            $ids = array_merge($ids, array_column((new SpotCheckVerifier($this->source, $this->options))->sample($manifest), 'messageid'));
+                            $sample = (new SpotCheckVerifier($this->source, $this->options))->sample($manifest);
+                            if ($sample !== []) {
+                                // Only the first article is safe before its actual raw byte count is known.
+                                // Subsequent articles use the verifier's decreasing remaining allowance.
+                                $ids[] = $sample[0]['messageid'];
+                            }
                         }
                     } catch (Throwable) {
                         // The ordinary per-candidate path owns reporting and retrying a bad manifest.
@@ -102,6 +126,7 @@ final class CandidateSampleBatch
                 }
                 if ($ids !== []) {
                     try {
+                        $this->prefetchStartedAt = $this->clock === null ? microtime(true) : ($this->clock)();
                         $this->source->prefetch(array_values(array_unique($ids)), new LeaseHeartbeat($this->heartbeat(...), 1.0));
                     } catch (Throwable $error) {
                         // The transport closes interrupted pipelines before ordinary reads can retry.

@@ -209,7 +209,7 @@ class VerifyReleaseCandidates extends Command
                     $active = 'status_write';
                     $bytes = $result->passed()
                         ? (int) ($result->manifest['spot_check']['bytes'] ?? $result->manifest['verified_bytes'] ?? 0) : 0;
-                    $snapshot = json_encode(['verified_bytes_per_second' => $bytes / max(0.001, microtime(true) - $started),
+                    $snapshot = json_encode(['verified_bytes_per_second' => $batch->verifiedBytesPerSecond($bytes, $started),
                         'scratch_bytes' => null, 'scratch_bytes_status' => 'unknown'], JSON_THROW_ON_ERROR);
                     $statusTemporary = $root.'/status-'.bin2hex(random_bytes(8)).'.tmp';
                     try {
