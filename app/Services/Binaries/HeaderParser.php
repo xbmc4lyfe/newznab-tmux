@@ -11,15 +11,40 @@ use App\Services\BlacklistService;
  */
 final class HeaderParser
 {
+    /**
+     * Base name, part number and part total of a yEnc subject such as `name (12/45)`.
+     */
+    private const string SUBJECT_PATTERN = '/^\s*(?!Usenet Index Post)(.+?)\s+\((\d+)\/(\d+)\)/';
+
+    /**
+     * File counter inside a subject base name, such as `[03/62]` or `(3 of 62)`.
+     */
+    public const string FILE_COUNTER_PATTERN = '/[[(\s](\d{1,5})(\/|[\s_]of[\s_]|-)(\d{1,5})[])[\s$:]/i';
+
     private BlacklistService $blacklistService;
 
     private int $notYEnc = 0;
 
     private int $blacklisted = 0;
 
-    public function __construct(?BlacklistService $blacklistService = null)
+    private int $obfuscated = 0;
+
+    /** @var array<int, true> Article numbers whose subject is randomised per article. */
+    private array $perArticleObfuscated = [];
+
+    /**
+     * Mirrors NativePerArticleObfuscation::MIN_HEADERS. Smaller ranges stay on PHP without loading
+     * any routing or Rust class (each costs a compile per process without opcache).
+     */
+    public const int NATIVE_MIN_HEADERS = 16000;
+
+    /** Rust port of markPerArticleObfuscated(); false keeps the PHP rule only, null builds it on first need. */
+    private NativePerArticleObfuscation|false|null $native;
+
+    public function __construct(?BlacklistService $blacklistService = null, NativePerArticleObfuscation|false|null $native = null)
     {
         $this->blacklistService = $blacklistService ?? new BlacklistService;
+        $this->native = $native;
     }
 
     /**
@@ -29,6 +54,113 @@ final class HeaderParser
     {
         $this->notYEnc = 0;
         $this->blacklisted = 0;
+        $this->obfuscated = 0;
+    }
+
+    /**
+     * Find articles whose subject is randomised per article across a downloaded range.
+     *
+     * Some uploaders (nyuu's article obfuscation) give every article its own random
+     * subject token, and often its own random poster, so no two parts of a file share
+     * a binary or a collection. Each such article becomes a one-part collection that
+     * can never complete. Multi-part articles whose base name holds a random-looking
+     * token (16+ alphanumerics) are grouped by the subject's shape (alphanumeric runs
+     * collapsed), part total and file counter; a group of at least $minArticles in
+     * which at least 90% of base names are distinct (digit runs outside the token
+     * ignored) has its once-seen names, other than first and last parts, skipped by
+     * parse() when they span at least $minArticles part positions. A
+     * legitimate upload repeats its base name for every part, which keeps its group
+     * out. Pass 0 to disable, as part repair does for its sparse ranges.
+     *
+     * @param  array<int, array<string, mixed>>  $headers  Raw headers from NNTP
+     * @return int Number of articles marked
+     */
+    public function markPerArticleObfuscated(array $headers, int $minArticles): int
+    {
+        $this->perArticleObfuscated = [];
+        if ($minArticles < 1) {
+            return 0;
+        }
+        // The Rust port marks the same articles about 1.7-2.9x faster on ranges it is routed to (scripts/benchmark-per-article-obfuscation.php);
+        // null means it is unavailable or declined, and the PHP rule below decides.
+        // Routing runs before the wrapper exists, so a range kept on PHP never loads its class.
+        $marked = null;
+        if ($this->native !== false && \count($headers) >= self::NATIVE_MIN_HEADERS && ! ($this->native?->unavailable() ?? false)
+            && PerArticleObfuscationGate::worthNativeMarking($headers, $this->native?->loaded() ?? false)) {
+            $this->native ??= new NativePerArticleObfuscation;
+            $marked = $this->native->markWithoutSampling($headers, $minArticles);
+        }
+        if ($marked !== null) {
+            $this->perArticleObfuscated = array_fill_keys($marked, true);
+
+            return \count($this->perArticleObfuscated);
+        }
+
+        /** @var array<string, array{names: array<string, list<array{int, int}>>, articles: int, total: int}> $signatures */
+        $signatures = [];
+        foreach ($headers as $header) {
+            if (! isset($header['Number'], $header['Subject']) || ! is_numeric($header['Number'])
+                || ! is_string($header['Subject'])
+                || ! preg_match(self::SUBJECT_PATTERN, $header['Subject'], $matches)
+                || (int) $matches[3] < 2
+                || ! preg_match('/[A-Za-z0-9]{16,}/', $matches[1])) {
+                continue;
+            }
+
+            // Digit runs outside the long tokens are ignored, so numbered volumes
+            // (`<hash>.part07.rar`) of one upload share a name while random tokens stay whole.
+            $name = implode('', array_map(
+                static fn (string $piece): string => preg_match('/^[A-Za-z0-9]{16,}$/', $piece) === 1
+                    ? $piece
+                    : (preg_replace('/\d+/', '', $piece) ?? $piece),
+                preg_split('/([A-Za-z0-9]{16,})/', $matches[1], -1, PREG_SPLIT_DELIM_CAPTURE) ?: [$matches[1]]
+            ));
+            $fileCounter = preg_match(self::FILE_COUNTER_PATTERN, $matches[1], $counter) ? $counter[1].'/'.$counter[3] : '';
+            $key = (preg_replace('/[A-Za-z0-9]+/', 'x', $matches[1]) ?? $matches[1])."\0".$matches[3]."\0".$fileCounter;
+            // Write in place: copying the growing arrays per article would be quadratic.
+            $signatures[$key] ??= ['names' => [], 'articles' => 0, 'total' => (int) $matches[3]];
+            $signatures[$key]['names'][$name][] = [(int) $header['Number'], (int) $matches[2]];
+            $signatures[$key]['articles']++;
+        }
+
+        foreach ($signatures as $signature) {
+            $articles = $signature['articles'];
+            // A stray duplicate line must not shield the group; a real upload repeats on nearly every part.
+            if ($articles < $minArticles || \count($signature['names']) * 10 < $articles * 9) {
+                continue;
+            }
+            // Only once-seen names are skipped, so a real upload sharing the group keeps its
+            // repeated parts. A first or last part is kept too: a real upload cut by the range
+            // boundary can show just that one article, and part repair would never restore it.
+            $candidates = [];
+            foreach ($signature['names'] as $articlesForName) {
+                [$number, $part] = $articlesForName[0];
+                if (\count($articlesForName) === 1 && $part !== 1 && $part !== $signature['total']) {
+                    $candidates[$number] = $part;
+                }
+            }
+            // Obfuscated articles spread over many part positions. A slice of files posted
+            // round-robin, each with its own random name, shows one article per file at only
+            // one or two positions (more positions would repeat each name).
+            if (\count(array_unique($candidates)) < $minArticles) {
+                continue;
+            }
+            foreach ($candidates as $number => $part) {
+                $this->perArticleObfuscated[$number] = true;
+            }
+        }
+
+        return \count($this->perArticleObfuscated);
+    }
+
+    /**
+     * Article numbers marked by the last markPerArticleObfuscated() call.
+     *
+     * @return list<int>
+     */
+    public function perArticleObfuscatedNumbers(): array
+    {
+        return array_keys($this->perArticleObfuscated);
     }
 
     /**
@@ -71,8 +203,14 @@ final class HeaderParser
                 $headersRepaired[] = $header['Number'];
             }
 
+            if (isset($this->perArticleObfuscated[(int) $header['Number']])) {
+                $this->obfuscated++;
+
+                continue;
+            }
+
             // Parse subject to get base name and part/total like "(12/45)"
-            if (! preg_match('/^\s*(?!Usenet Index Post)(.+?)\s+\((\d+)\/(\d+)\)/', $header['Subject'], $matches)) {
+            if (! preg_match(self::SUBJECT_PATTERN, $header['Subject'], $matches)) {
                 $this->notYEnc++;
 
                 continue;
@@ -106,6 +244,7 @@ final class HeaderParser
             'received' => $receivedNumbers,
             'notYEnc' => $this->notYEnc,
             'blacklisted' => $this->blacklisted,
+            'obfuscated' => $this->obfuscated,
         ];
     }
 
