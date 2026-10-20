@@ -40,7 +40,8 @@ final class RemoteReleasePublisher
     /** Items of the current {@see publishMany()} call that already have an outcome. */
     private int $completed = 0;
 
-    public function publish(object $claim, VerificationResult $result): ?int
+    /** @param (callable(): void)|null $progress Caller ownership checks; failures propagate, unlike publishMany's best-effort markers. */
+    public function publish(object $claim, VerificationResult $result, ?callable $progress = null): ?int
     {
         if (! $result->passed()) {
             return null;
@@ -57,8 +58,8 @@ final class RemoteReleasePublisher
         try {
             $response = Http::acceptJson()->asJson()->connectTimeout(5)
                 ->timeout(max(10, (int) config('release_verification.publish_timeout', 120)))
-                ->withOptions($this->progressOptions())
-                ->withRequestMiddleware($this->cancellationGate())
+                ->withOptions($this->progressOptions($progress))
+                ->withRequestMiddleware($this->cancellationGate($progress))
                 ->retry(3, 1000, fn (\Throwable $error): bool => $error instanceof ConnectionException && ! $this->cancelledNow(), throw: false)
                 ->post((string) config('release_verification.publish_url'), $payload);
         } catch (\Throwable $error) {
@@ -405,10 +406,18 @@ final class RemoteReleasePublisher
         return $outcomes;
     }
 
-    /** @return array{progress?: callable} Guzzle's progress option, which cURL calls about once a second while waiting. */
-    private function progressOptions(): array
+    /**
+     * @param  (callable(): void)|null  $progress
+     * @return array{progress?: callable} Guzzle's progress option, which cURL calls about once a second while waiting.
+     */
+    private function progressOptions(?callable $progress = null): array
     {
-        return $this->progress === null ? [] : ['progress' => fn () => $this->tick()];
+        return $this->progress === null && $progress === null ? [] : ['progress' => function () use ($progress): void {
+            if ($progress !== null) {
+                $progress();
+            }
+            $this->tick();
+        }];
     }
 
     /**
@@ -416,13 +425,17 @@ final class RemoteReleasePublisher
      * is asked before the delay, so a cancellation during the delay is only seen here; the attempt then
      * fails as an unreachable primary, without a request. Without a cancellation check it does nothing.
      *
+     * @param  (callable(): void)|null  $progress
      * @return callable(RequestInterface): RequestInterface
      */
-    private function cancellationGate(): callable
+    private function cancellationGate(?callable $progress = null): callable
     {
-        return function (RequestInterface $request): RequestInterface {
+        return function (RequestInterface $request) use ($progress): RequestInterface {
             if ($this->cancelledNow()) {
                 throw new ConnectionException('Publication was cancelled before this attempt was sent.');
+            }
+            if ($progress !== null) {
+                $progress();
             }
 
             return $request;

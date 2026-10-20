@@ -37,8 +37,9 @@ final class VerifiedReleasePublisher
      * @param  array{path: string, manifest: array<string, mixed>}|null  $archived  The archived manifest the caller already read, and its path.
      *                                                                              Manifests are named by the hash of their contents, so it is
      *                                                                              reused only while the claim's row names that same path.
+     * @param  (callable(): void)|null  $progress  Renew other work owned by the caller; failures abort publication, including its transaction.
      */
-    public function publish(object $claim, VerificationResult $result, string $source = 'local', PublicationTiming|false|null $timing = null, ?array $archived = null): ?int
+    public function publish(object $claim, VerificationResult $result, string $source = 'local', PublicationTiming|false|null $timing = null, ?array $archived = null, ?callable $progress = null): ?int
     {
         if (! $result->passed()) {
             return null;
@@ -105,7 +106,7 @@ final class VerifiedReleasePublisher
             $timing->setManifestFacts($segments, $keys !== []);
         }
         try {
-            $id = DB::transaction(function () use ($claim, $result, $timing, $preResolved, $keys, $incoming, $prelock, &$outcome): ?int {
+            $id = DB::transaction(function () use ($claim, $result, $timing, $preResolved, $keys, $incoming, $prelock, $progress, &$outcome): ?int {
                 $timing?->beginAttempt();
                 $returned = false;
                 $outcome = 'threw';
@@ -208,7 +209,7 @@ final class VerifiedReleasePublisher
                     if ($upgrade !== null) {
                         // A complete copy published meanwhile is reused like any covering duplicate; the partial is
                         // then settled rather than upgraded into a second release of the same articles.
-                        $duplicate = $this->findCoveredDuplicate($claim, $manifest, $metadata, $size, $timing, $incoming, $prelock->coverageIds, $prelock->coverageKnown);
+                        $duplicate = $this->findCoveredDuplicate($claim, $manifest, $metadata, $size, $timing, $incoming, $prelock->coverageIds, $prelock->coverageKnown, $progress);
                         if ($duplicate['release_id'] !== null && $duplicate['release_id'] !== (int) $upgrade->id) {
                             // Unless an earlier generation's committed NZB is still staged: the settle sweep installs it first.
                             app(CandidateRepository::class)->releaseLateArticleFence([(int) $upgrade->id], null);
@@ -223,7 +224,7 @@ final class VerifiedReleasePublisher
                         $retain = isset($manifest['partial']) && $this->awaitsLateArticles($manifest);
                         $id = $this->upgradePartial($upgrade, $manifest, $metadata, $size, $totalParts, (int) $candidate->id, $retain, $timing, $incoming, $prelock->body);
                         $this->recordGroups($id, $manifest['groups']);
-                        app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
+                        $this->heartbeat($claim, $progress);
                         $this->markPublished($candidate->id, $id, $result, $timing, retainManifest: $retain);
 
                         $returned = true;
@@ -231,7 +232,7 @@ final class VerifiedReleasePublisher
 
                         return $id;
                     }
-                    $duplicate ??= $legacy === null ? $this->findCoveredDuplicate($claim, $manifest, $metadata, $size, $timing, $incoming, $prelock->coverageIds, $prelock->coverageKnown) : ['release_id' => null, 'metadata_conflict' => false];
+                    $duplicate ??= $legacy === null ? $this->findCoveredDuplicate($claim, $manifest, $metadata, $size, $timing, $incoming, $prelock->coverageIds, $prelock->coverageKnown, $progress) : ['release_id' => null, 'metadata_conflict' => false];
                     $duplicateId = $duplicate['release_id'];
                     if ($duplicateId !== null || $duplicate['metadata_conflict']) {
                         $timing?->nextPhase('sql_accounting');
@@ -248,7 +249,7 @@ final class VerifiedReleasePublisher
                             return null;
                         }
                         $this->recordGroups($duplicateId, $manifest['groups']);
-                        app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
+                        $this->heartbeat($claim, $progress);
                         // A covered candidate never keeps inventory: its articles are a subset of the reused release,
                         // and merging late articles into that subset could replace a more complete partial.
                         $this->markPublished($candidate->id, $duplicateId, $result, $timing);
@@ -304,7 +305,7 @@ final class VerifiedReleasePublisher
                         }
                     });
                     $this->recordGroups((int) $id, $manifest['groups']);
-                    app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
+                    $this->heartbeat($claim, $progress);
                     // A partial release keeps its inventory so late articles can complete it.
                     $this->markPublished($candidate->id, (int) $id, $result, $timing, retainManifest: isset($manifest['partial']) && $this->awaitsLateArticles($manifest));
 
@@ -326,24 +327,34 @@ final class VerifiedReleasePublisher
         }
     }
 
+    /** @param (callable(): void)|null $progress */
+    private function heartbeat(object $claim, ?callable $progress): void
+    {
+        app(CandidateRepository::class)->heartbeat((int) $claim->id, $claim->lease_token);
+        // Never swallow a queued renewal error: the database may have rolled this transaction back.
+        if ($progress !== null) {
+            $progress();
+        }
+    }
+
     /**
      * @param  array<string, mixed>  $manifest
      * @param  array<string, mixed>  $metadata
      * @param  array{xml: ?\SimpleXMLElement, fingerprint: ?string}|null  $incoming  The pre-lock parse, when it ran.
      * @param  array<string, true>|null  $coverageIds  coverageIds() of that parse, when computed before the lock.
      * @param  bool  $coverageKnown  Whether $coverageIds was computed, so null means "no usable inventory" rather than "not computed".
+     * @param  (callable(): void)|null  $progress
      * @return array{release_id: ?int, metadata_conflict: bool}
      */
     private function findCoveredDuplicate(object $claim, array $manifest, array $metadata, int $size, ?PublicationTiming $timing,
-        ?array $incoming = null, ?array $coverageIds = null, bool $coverageKnown = false): array
+        ?array $incoming = null, ?array $coverageIds = null, bool $coverageKnown = false, ?callable $progress = null): array
     {
         $lastHeartbeat = 0.0;
-        $repository = app(CandidateRepository::class);
         $guard = app(NzbSourceGuard::class);
         $target = (int) ($manifest['upgrades_release_id'] ?? 0);
-        $heartbeat = function (Release $candidate) use ($repository, $claim, &$lastHeartbeat, $guard, $target): void {
+        $heartbeat = function (Release $candidate) use ($claim, &$lastHeartbeat, $guard, $target, $progress): void {
             if (microtime(true) - $lastHeartbeat >= 1) {
-                $repository->heartbeat((int) $claim->id, $claim->lease_token);
+                $this->heartbeat($claim, $progress);
                 $lastHeartbeat = microtime(true);
             }
             // Hold the nominated published row stable while reading its retained generation.
@@ -386,7 +397,7 @@ final class VerifiedReleasePublisher
         $duplicate = $xml === null || ($coverageKnown && $coverageIds === null) ? null : $coverage->findCoveredUpload($size, $fingerprint, $xml,
             $metadata['name'], $metadata['searchname'], $metadata['predb_id'], publishedOnly: true,
             onCandidate: $heartbeat, acceptCovered: $acceptCovered, requiredIds: $coverageIds);
-        $repository->heartbeat((int) $claim->id, $claim->lease_token);
+        $this->heartbeat($claim, $progress);
 
         return ['release_id' => $duplicate === null ? null : (int) $duplicate->id, 'metadata_conflict' => $metadataConflict];
     }

@@ -23,13 +23,12 @@ final class VerificationWorkerLocks
 
     private ?VerificationLock $slot = null;
 
-    private ?VerificationLock $candidate = null;
+    /** @var array<int, VerificationLock> */
+    private array $candidates = [];
 
     private ?VerificationLock $gc = null;
 
     private ?VerificationLock $expiry = null;
-
-    private ?int $candidateId = null;
 
     private bool $exclusive = false;
 
@@ -331,17 +330,17 @@ final class VerificationWorkerLocks
 
     public function tryCandidate(int $id): bool
     {
-        if ($this->candidateId === $id && $this->candidate !== null) {
-            return true;
+        if (isset($this->candidates[$id])) {
+            return $this->store()->holds($this->candidates[$id]);
         }
-        if ($this->candidate !== null || $this->global === null) {
-            throw new RuntimeException('Candidate lock requires an active worker and no other candidate lock.');
+        if ($this->global === null || count($this->candidates) >= 16) {
+            throw new RuntimeException('Candidate lock requires an active worker and a bounded batch.');
         }
-        $this->candidate = $this->store()->exclusive('candidate-'.$id);
-        if ($this->candidate === null) {
+        $lock = $this->store()->exclusive('candidate-'.$id);
+        if ($lock === null) {
             return false;
         }
-        $this->candidateId = $id;
+        $this->candidates[$id] = $lock;
 
         return true;
     }
@@ -353,7 +352,7 @@ final class VerificationWorkerLocks
             return $this->global !== null && $this->store()->holds($this->global);
         }
 
-        return $this->candidate !== null && $this->candidateId === $id && $this->store()->holds($this->candidate);
+        return isset($this->candidates[$id]) && $this->store()->holds($this->candidates[$id]);
     }
 
     /** Whether this worker still holds its group and slot locks. */
@@ -399,10 +398,14 @@ final class VerificationWorkerLocks
         return $expiryFirst;
     }
 
-    public function releaseCandidate(): void
+    public function releaseCandidate(?int $id = null): void
     {
-        $this->release($this->candidate);
-        $this->candidateId = null;
+        foreach ($id === null ? array_keys($this->candidates) : [$id] as $key) {
+            if (isset($this->candidates[$key])) {
+                $this->store()->release($this->candidates[$key]);
+                unset($this->candidates[$key]);
+            }
+        }
     }
 
     public function releaseGc(): void
