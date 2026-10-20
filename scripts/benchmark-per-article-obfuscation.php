@@ -35,6 +35,8 @@ const PER_ARTICLE_BOOTSTRAP = 2000;
 const PER_ARTICLE_ROUTED_FLOOR = 0.9;
 const PER_ARTICLE_TAIL_SAMPLES = 1000;
 const PER_ARTICLE_COLD_RUNS = 21;
+/** Cold rows the routing keeps on PHP compare sub-millisecond first calls, so take more of them. */
+const PER_ARTICLE_COLD_RUNS_ROUTED = 41;
 
 try {
     exit(perArticleBenchmarkMain());
@@ -159,7 +161,8 @@ function perArticleBenchmarkMain(): int
         }
         $cold = ['php' => [], 'rust' => []];
         $usedRust = false;
-        for ($run = 0; $run < PER_ARTICLE_COLD_RUNS; $run++) {
+        $runs = $stratum['category'] === 'routed' ? PER_ARTICLE_COLD_RUNS_ROUTED : PER_ARTICLE_COLD_RUNS;
+        for ($run = 0; $run < $runs; $run++) {
             foreach ($random->getInt(0, 1) === 0 ? ['php', 'rust'] : ['rust', 'php'] as $side) {
                 $output = shell_exec(implode(' ', array_map('escapeshellarg', [PHP_BINARY, '-d', 'ffi.enable=true', '-d', 'memory_limit=3G', __FILE__,
                     '--cold-stratum='.$name, '--cold-side='.$side, '--native='.$options['native'], '--seed='.$seed])));
@@ -172,12 +175,11 @@ function perArticleBenchmarkMain(): int
         [$coldLow, $coldHigh] = perArticleBootstrap($cold, 0.5, $random);
         $report['cold'][$name] = ['php_ms' => round(perArticleQuantile($cold['php'], 0.5) / 1e6, 3),
             'rust_ms' => round(perArticleQuantile($cold['rust'], 0.5) / 1e6, 3), 'speedup' => round($coldSpeedup, 2),
-            'speedup_ci95' => [round($coldLow, 2), round($coldHigh, 2)], 'samples' => PER_ARTICLE_COLD_RUNS, 'raw' => $cold];
-        // A cold first call that took Rust must clear the threshold at its lower bound. One the
-        // routing kept on PHP must not regress; with 21 sub-millisecond runs a median is noisy, so it
-        // fails only when its whole interval sits below the floor.
+            'speedup_ci95' => [round($coldLow, 2), round($coldHigh, 2)], 'samples' => $runs, 'raw' => $cold];
+        // A cold first call that took Rust must clear the threshold at its lower bound; one the
+        // routing kept on PHP must keep its median at the floor.
         $required = $usedRust ? PER_ARTICLE_THRESHOLD : PER_ARTICLE_ROUTED_FLOOR;
-        if ($usedRust ? $coldSpeedup < $required : $coldHigh < $required) {
+        if ($coldSpeedup < $required) {
             $report['status'] = $report['status'] === 'invalid' ? 'invalid' : 'not-qualified';
         } elseif ($usedRust && $coldLow < $required && $report['status'] === 'qualified') {
             $report['status'] = 'inconclusive';
@@ -194,7 +196,7 @@ function perArticleBenchmarkMain(): int
                 $row['statistic'], $row['php_ms'], $row['rust_ms'], $row['speedup'], $row['speedup_ci95'][0], $row['speedup_ci95'][1]);
     }
     $markdown .= "\nStatus: **{$report['status']}** (threshold ".PER_ARTICLE_THRESHOLD."x; {$repeats} paired samples per stratum, ".PER_ARTICLE_TAIL_SAMPLES." for uncommon strata; Rust strata need the 95% lower bound at the threshold).\n";
-    $markdown .= "\nCold first call per fresh process (median of ".PER_ARTICLE_COLD_RUNS.", same thresholds):\n\n".$coldMarkdown;
+    $markdown .= "\nCold first call per fresh process (median of ".PER_ARTICLE_COLD_RUNS.' runs, '.PER_ARTICLE_COLD_RUNS_ROUTED." for routed strata; same thresholds):\n\n".$coldMarkdown;
     file_put_contents($directory.'/report.json', json_encode($report, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR));
     file_put_contents($directory.'/summary.md', $markdown);
     echo $markdown;

@@ -968,7 +968,8 @@ fn per_article_obfuscation_articles<'a>(
 }
 
 /// `-?[0-9]+` as PHP's `(int)` reads it, saturating at the i64 bounds; anything else, or a run of
-/// `PHP_INT_DOUBLE_DIGITS` or more significant digits (where PHP's `(int)` gives 0), is `None`.
+/// `PHP_INT_DOUBLE_DIGITS` or more significant digits (where PHP's double can overflow and its
+/// `(int)` give 0), is `None`.
 fn php_decimal(text: &[u8]) -> Option<i64> {
     let (negative, digits) = match text.split_first() {
         Some((b'-', rest)) => (true, rest),

@@ -11,7 +11,7 @@ use Throwable;
 
 /**
  * Rust port of {@see HeaderParser::markPerArticleObfuscated()}, adopted after
- * scripts/benchmark-per-article-obfuscation.php measured it at 1.9-3.1x the PHP rule on the ranges it is routed to with identical
+ * scripts/benchmark-per-article-obfuscation.php measured it at 1.7-3.6x the PHP rule on the ranges it is routed to (warm and cold) with identical
  * marks. Null means "use PHP": not a Linux CLI with FFI, library missing, failing its known-answer
  * probe, or input the native side declines (a subject longer than MAX_SUBJECT_LENGTH, where PHP's
  * backtrack limit could stop the subject pattern).
@@ -52,6 +52,13 @@ final class NativePerArticleObfuscation
      */
     private const int FIRST_LOAD_SAVING_NS = 4_000_000;
 
+    private const string DIGITS = '0123456789';
+
+    private const string ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+
+    /** PCRE's non-UTF `\s`. */
+    private const string WHITESPACE = " \t\n\v\f\r";
+
     /** @var array<string, FFI|null> */
     private static array $libraries = [];
 
@@ -62,7 +69,11 @@ final class NativePerArticleObfuscation
 
     private bool $resolved = false;
 
-    public function __construct(private readonly ?string $libraryPath = null) {}
+    public function __construct(private readonly ?string $libraryPath = null)
+    {
+        // Seeded here, with the service, so a process's first range does not pay for it.
+        self::$sampler ??= new Randomizer(new Xoshiro256StarStar);
+    }
 
     /** Whether a verified native library backs this instance. */
     public function available(): bool
@@ -104,11 +115,12 @@ final class NativePerArticleObfuscation
     /** @param  array<int, array<string, mixed>>  $headers */
     private function worthMarshalling(array $headers): bool
     {
-        $values = array_is_list($headers) ? $headers : array_values($headers);
-        $count = count($values);
-        if ($count < self::MIN_HEADERS) {
+        // A library that failed to load or probe leaves only PHP; sampling it would be wasted.
+        if (count($headers) < self::MIN_HEADERS || ($this->resolved && $this->library === null)) {
             return false;
         }
+        $values = array_is_list($headers) ? $headers : array_values($headers);
+        $count = count($values);
         // One random header from each of $samples equal slices, so no periodic ordering of the
         // range decides the prediction.
         $samples = min(self::SAMPLE_MAX, max(self::SAMPLE_MIN, intdiv($count, 64)));
@@ -140,15 +152,48 @@ final class NativePerArticleObfuscation
     /**
      * 0: no part count; 1: a part count only; 2: a candidate as the PHP rule sees it, a first
      * whitespace-led `(n/total)` with total of at least 2 and a 16+ alphanumeric token before it.
-     * Both patterns run in linear time (the int cast drops leading zeros, so no `0*` overlaps `\d+`).
+     * String scans rather than regexes, so a fresh process does not pay to compile patterns, and
+     * linear in the subject length.
      */
     private static function classify(mixed $subject): int
     {
-        if (! is_string($subject) || preg_match('/\s\(\d+\/(\d+)\)/', $subject, $match, PREG_OFFSET_CAPTURE) !== 1) {
+        if (! is_string($subject)) {
             return 0;
         }
+        for ($open = strpos($subject, '('); $open !== false; $open = strpos($subject, '(', $open + 1)) {
+            if ($open === 0 || strspn($subject, self::WHITESPACE, $open - 1, 1) === 0) {
+                continue;
+            }
+            $part = strspn($subject, self::DIGITS, $open + 1);
+            $totalAt = $open + 2 + $part;
+            if ($part === 0 || ($subject[$totalAt - 1] ?? '') !== '/') {
+                continue;
+            }
+            $total = strspn($subject, self::DIGITS, $totalAt);
+            if ($total === 0 || ($subject[$totalAt + $total] ?? '') !== ')') {
+                continue;
+            }
 
-        return (int) $match[1][0] >= 2 && preg_match('/[A-Za-z0-9]{16}/', substr($subject, 0, $match[0][1])) === 1 ? 2 : 1;
+            return (int) substr($subject, $totalAt, $total) >= 2 && self::hasToken($subject, $open) ? 2 : 1;
+        }
+
+        return 0;
+    }
+
+    /** Whether `$subject` holds a run of 16+ ASCII alphanumerics before byte `$end`. */
+    private static function hasToken(string $subject, int $end): bool
+    {
+        $at = strcspn($subject, self::ALNUM, 0, $end);
+        while ($at < $end) {
+            $run = strspn($subject, self::ALNUM, $at, $end - $at);
+            if ($run >= 16) {
+                return true;
+            }
+            $at += $run;
+            $at += strcspn($subject, self::ALNUM, $at, $end - $at);
+        }
+
+        return false;
     }
 
     private function library(): ?FFI
