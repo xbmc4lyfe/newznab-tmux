@@ -3931,6 +3931,20 @@ SH);
         file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=mariadb\nAPP_DEBUG=true\n");
         $this->assertStringNotContainsString('code/config changed', $this->make(['deploy-plan'], $config)->mustRun()->getOutput());
 
+        // phpdotenv ends an unquoted value at any `#`: `db2#cutover` is db2.
+        file_put_contents($this->directory.'/runtime/app.env', "DB_HOST=db2#cutover\n");
+        $this->assertSame('db2', $this->planActions($config)['DATABASE_SERVICE']);
+
+        // Apps rendering mounts but none at /app/.env name no database file.
+        $unmounted = $json;
+        foreach (['web', 'horizon', 'scheduler', 'indexer'] as $app) {
+            $unmounted['services'][$app] = ['volumes' => [['type' => 'bind', 'source' => $this->directory.'/runtime', 'target' => '/srv/runtime']]];
+        }
+        $plan = $this->planProcess(['NNTMUX_CONFIG_ID' => (string) json_encode($unmounted, JSON_UNESCAPED_SLASHES)]);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('does not mount /app/.env', $plan->getErrorOutput());
+
         // Apps mounting different files select no single database.
         $json['services']['indexer'] = ['volumes' => [['type' => 'bind', 'source' => $this->directory.'/docker/config/app.env', 'target' => '/app/.env', 'read_only' => true]]];
         $plan = $this->planProcess(['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)]);

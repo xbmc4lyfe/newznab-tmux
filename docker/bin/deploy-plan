@@ -645,7 +645,8 @@ def read_dotenv(path: Path, interpolated: set[str] | None = None, multiline: set
             end = closing_quote(value, escapes=not literal_single)
             closed = end > 0 and re.match(r"^\s*(?:#.*)?$", value[end + 1:])
             quoted = re.match(r"""^(["'])(.*)\1$""", value[:end + 1], re.S) if closed else None
-            values[m.group(1)] = quoted.group(2) if quoted else re.sub(r"\s#.*$", "", value).strip()
+            # An unquoted value ends at ` #` in Compose, at any `#` in phpdotenv (`db2#note` is `db2`).
+            values[m.group(1)] = quoted.group(2) if quoted else re.sub(r"#.*$" if phpdotenv else r"\s#.*$", "", value).strip()
             if quoted and quoted.group(1) == '"':
                 # Compose and phpdotenv decode escapes inside double quotes only: `"a\nb"` installs a
                 # newline while `'a\nb'` stays literal, so the two must not hash alike.
@@ -1498,13 +1499,19 @@ def app_env_path(docker_dir: Path) -> Path:
         if not isinstance(cfg, dict):
             continue
         source: str | None = None
-        for volume in cfg.get("volumes") or []:
+        volumes = cfg.get("volumes") or []
+        for volume in volumes:
             if not (isinstance(volume, dict) and str(volume.get("target", "")).rstrip("/") == "/app/.env"):
                 continue
             if volume.get("type") != "bind" or not isinstance(volume.get("source"), str):
                 sys.exit(f"deploy-plan: app service {app} mounts /app/.env from a {volume.get('type')} mount; selective "
                          "deployment reads the database settings from a bind-mounted file. Bind-mount the app.env file.")
             source = compose_path(volume["source"])
+        if volumes and not source:
+            # Mounts rendered, but none at /app/.env (an override removed it): no file says which
+            # database the app uses, and the default config/app.env reaches no container.
+            sys.exit(f"deploy-plan: app service {app} does not mount /app/.env; selective deployment reads the database "
+                     "settings from the app.env the apps mount. Keep the shipped /app/.env bind mount.")
         # Symlinks to one file (the split production layout) are the same file.
         sources.setdefault(os.path.realpath(source) if source else None, source)
     if len(sources) > 1:
