@@ -683,6 +683,8 @@ final class CompactFingerprintCollector
      * then calls the structure incomplete and skips the CRC comparison, so this accepts exactly that
      * form when everything else is proven: a numbered header part, a valid =ypart range, a hex pcrc32
      * equal to the decoded bytes' CRC, no trailer total, and no other missing or conflicting field.
+     * Tools also write the pcrc32 without leading zeros ("pcrc32=9474e27"); the analyzer calls that
+     * malformed and the structure invalid, which for an otherwise trailerless part is the same case.
      *
      * @param  array<string, mixed>  $yenc
      */
@@ -692,10 +694,11 @@ final class CompactFingerprintCollector
         $header = is_array($yenc['header_fields'] ?? null) ? $yenc['header_fields'] : [];
         $declared = $trailer['pcrc32'] ?? null;
         $observed = $yenc['observed_decoded_crc32'] ?? null;
+        $structure = [$yenc['multipart_structure_status'] ?? null, $yenc['multipart_pcrc32_status'] ?? null];
+        $unpaddedPcrc32 = is_string($declared) && preg_match('/\A[0-9a-f]{1,7}\z/i', $declared) === 1;
 
         return ($yenc['multipart'] ?? null) === true
-            && ($yenc['multipart_structure_status'] ?? null) === 'incomplete'
-            && ($yenc['multipart_pcrc32_status'] ?? null) === 'present-hex'
+            && ($structure === ['incomplete', 'present-hex'] || ($structure === ['invalid', 'malformed'] && $unpaddedPcrc32))
             && ! array_key_exists('part', $trailer) && ! array_key_exists('total', $trailer)
             && isset($header['part'], $header['size'], $trailer['size'])
             && is_int($yenc['part'] ?? null) && $yenc['part'] >= 1
