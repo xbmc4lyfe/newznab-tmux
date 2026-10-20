@@ -664,6 +664,8 @@ def coverage(root):
             label, detail = 'Auxiliary correctness only', 'CI evidence and rendering utility; running it does not measure its own performance.'
         elif name == 'lib':
             label, detail = 'Mixed coverage', 'FFI exports: decoding/rendering comparisons; metadata profiles; some APIs unbenchmarked.'
+        elif name in ('bulk_verification', 'nntmux-verification-framer'):
+            label, detail = 'No automated benchmark', 'Explicit coverage gap: local paired BODY/STAT caller screens include Rust startup and IPC, but have no p99/TCP/TLS adoption qualification or automated evidence collection. Rust remains disabled by default; the PHP pipeline is retained.'
         elif name in ('article_fingerprint', 'nntmux-article-fingerprint', 'benchmark-article-fingerprint'):
             label, detail = 'Comparative archived-candidate benchmark', 'Application fingerprinting uses PHP. Nine archived Rust candidate PHP/FFI/worker strata, cold/repeated lifecycle costs; tail estimates require 1000 pairs via dispatch. PHP process startup excluded; Rust worker startup included.'
         elif name in ('cpu_snapshot', 'nntmux-cpu-snapshot', 'benchmark-cpu-snapshot'):

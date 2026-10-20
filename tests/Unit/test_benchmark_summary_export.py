@@ -219,6 +219,33 @@ class BenchmarkSummaryExportTest(unittest.TestCase):
             self.assertEqual(wrong["status"], "invalid")
             self.assertEqual(wrong["provenance_status"], "invalid")
 
+    def test_bulk_verification_sources_remain_required_without_qualifying_adoption(self):
+        paths = ("docker/app/nzb-yenc-ffi/src/bulk_verification.rs",
+                 "docker/app/nzb-yenc-ffi/src/bin/nntmux-verification-framer.rs")
+        for kind in ("cpp", "php", "profile", "presentation"):
+            records = (profile() if kind == "profile" else presentation() if kind == "presentation"
+                       else paired(kind))
+            if kind == "presentation":
+                for record in records:
+                    record["source_sha256"].update(dict.fromkeys(paths, "a" * 64))
+            with self.subTest(kind=kind):
+                summary = self.run_export(kind, records)
+                self.assertEqual(summary["provenance_status"], "verified_current")
+                self.assertIs(summary["adoption_qualified"], False)
+                for path in paths:
+                    self.assertEqual(summary["source_sha256"][path], "a" * 64)
+            for path in paths:
+                missing = dict(RUST_SOURCES)
+                del missing[path]
+                changed = {**RUST_SOURCES, path: "f" * 64}
+                for label, sources in (("missing", missing), ("mismatched", changed)):
+                    with self.subTest(kind=kind, path=path, receipt=label):
+                        rejected = self.run_export(kind, records, runtime={"rust_source_sha256": sources})
+                        self.assertEqual(rejected["status"], "invalid")
+                        self.assertEqual(rejected["provenance_status"], "invalid")
+                        self.assertEqual(rejected["rust_payload_mode"], "unknown")
+                        self.assertIs(rejected["adoption_qualified"], False)
+
     def test_profile_keeps_experiment_candidate_source_separate(self):
         summary = self.run_export("profile", profile(), runtime={"candidate_git_head": "e" * 40,
             "candidate_source_sha256": dict(RUST_SOURCES), "candidate_library_sha256": "c" * 64,

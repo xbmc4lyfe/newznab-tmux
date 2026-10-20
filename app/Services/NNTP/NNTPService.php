@@ -13,6 +13,7 @@ use App\Services\YencService;
 use DariusIII\NetNntp\Client as NntpClient;
 use DariusIII\NetNntp\Error as NntpError;
 use DariusIII\NetNntp\Protocol\ResponseCode;
+use Illuminate\Container\Container;
 
 /**
  * NNTP Service for connecting to usenet, retrieving articles and article headers,
@@ -24,6 +25,9 @@ use DariusIII\NetNntp\Protocol\ResponseCode;
 class NNTPService extends NntpClient
 {
     private bool $readingBoundedArticleStatus = false;
+
+    /** @var array<string, true> */
+    private static array $reportedVerificationFramerFailures = [];
 
     public static function verificationMessageId(string $messageId, int $maximumBytes): string
     {
@@ -113,13 +117,14 @@ class NNTPService extends NntpClient
      * @param  list<array{connection: NNTPService, ids: list<string>}>  $batches
      * @return array<string, string|\RuntimeException>
      */
-    public static function verificationArticleBatch(array $batches, int $maximumBytes, int $bufferBytes, callable $heartbeat): array
+    public static function verificationArticleBatch(array $batches, int $maximumBytes, int $bufferBytes, callable $heartbeat, string $mode = 'body', bool $allowRust = true): array
     {
-        if ($maximumBytes < 1 || $bufferBytes < $maximumBytes || count($batches) > 8) {
+        if (! in_array($mode, ['body', 'stat'], true) || $maximumBytes < 1 || $bufferBytes < $maximumBytes || count($batches) > 8) {
             throw new \RuntimeException('Invalid verification pipeline budget.');
         }
         $states = [];
         $results = [];
+        $feedingConnection = null;
         $bytes = 0;
         $count = 0;
         foreach ($batches as $batch) {
@@ -131,9 +136,22 @@ class NNTPService extends NntpClient
                 self::verificationMessageId($id, $maximumBytes);
             }
         }
+        $heartbeatFailure = new class
+        {
+            public ?\Throwable $error = null;
+        };
+        $guardHeartbeat = static function () use ($heartbeat, $heartbeatFailure): void {
+            try {
+                $heartbeat();
+            } catch (\Throwable $error) {
+                $heartbeatFailure->error = $error;
+                throw $error;
+            }
+        };
         $fail = static function (array &$state, \RuntimeException $error) use (&$results): void {
-            foreach (array_slice($state['ids'], $state['position']) as $id) {
-                $results[$id] = $error;
+            foreach (array_slice($state['ids'], $state['position']) as $offset => $id) {
+                $results[$id] = $offset > 0
+                    ? new VerificationPipelineRetryException('Verification pipeline closed before this response was read.', previous: $error) : $error;
             }
             if (is_resource($state['socket'])) {
                 fclose($state['socket']);
@@ -142,18 +160,37 @@ class NNTPService extends NntpClient
             $state['done'] = true;
         };
         try {
-            foreach ($batches as $index => $batch) {
+            $framer = null;
+            $worker = $allowRust ? (string) config('release_verification.rust_worker', '') : '';
+            if ($worker !== '') {
+                try {
+                    $framer = new RustVerificationFramer($worker,
+                        array_map(static fn (array $batch): array => ['ids' => $batch['ids'], 'mode' => $mode], array_values($batches)),
+                        $maximumBytes, $bufferBytes, $guardHeartbeat);
+                } catch (\RuntimeException $error) {
+                    if ($heartbeatFailure->error !== null) {
+                        throw $heartbeatFailure->error;
+                    }
+                    // No NNTP command has been sent; the native pipeline is still a safe fallback.
+                    self::reportVerificationFramerFallback($worker);
+                }
+            }
+            foreach (array_values($batches) as $index => $batch) {
                 $connection = $batch['connection'];
                 $socket = $connection->_socket;
                 if (! is_resource($socket) || $connection->_compressionEnabled) {
+                    if (is_resource($socket)) {
+                        fclose($socket);
+                    }
+                    $connection->_resetProperties();
                     foreach ($batch['ids'] as $id) {
-                        $results[$id] = new \RuntimeException('Raw verification connection is unavailable.');
+                        $results[$id] = new VerificationPipelineRetryException('Raw verification connection is unavailable.');
                     }
 
                     continue;
                 }
-                $heartbeat();
-                $command = implode('', array_map(static fn (string $id): string => 'BODY <'.$id.">\r\n", $batch['ids']));
+                $guardHeartbeat();
+                $command = implode('', array_map(static fn (string $id): string => strtoupper($mode).' <'.$id.">\r\n", $batch['ids']));
                 $states[$index] = ['connection' => $connection, 'socket' => $socket, 'ids' => $batch['ids'],
                     'position' => 0, 'body' => false, 'raw' => '', 'buffer' => '', 'done' => $batch['ids'] === [], 'last' => microtime(true)];
                 if (fwrite($socket, $command) !== strlen($command)) {
@@ -166,7 +203,7 @@ class NNTPService extends NntpClient
             $lastHeartbeat = microtime(true);
             while (array_filter($states, static fn (array $state): bool => ! $state['done']) !== []) {
                 if (microtime(true) - $lastHeartbeat >= 1.0) {
-                    $heartbeat();
+                    $guardHeartbeat();
                     $lastHeartbeat = microtime(true);
                 }
                 $read = [];
@@ -187,7 +224,7 @@ class NNTPService extends NntpClient
                 if (stream_select($read, $write, $except, 1) === false) {
                     throw new \RuntimeException('Cannot poll verification connections.');
                 }
-                foreach ($states as &$state) {
+                foreach ($states as $stateIndex => &$state) {
                     if ($state['done'] || ! in_array($state['socket'], $read, true)) {
                         continue;
                     }
@@ -201,11 +238,35 @@ class NNTPService extends NntpClient
                         continue;
                     }
                     $state['last'] = microtime(true);
+                    if ($framer !== null) {
+                        $feedingConnection = $stateIndex;
+                        $frame = $framer->feed($stateIndex, $chunk);
+                        $feedingConnection = null;
+                        foreach ($frame['results'] as $result) {
+                            $id = $state['ids'][$result['index']];
+                            $results[$id] = $result['status'] === 'missing'
+                                ? new NntpArticleMissingException('Verification article is unavailable.') : $result['body'];
+                            $state['position']++;
+                        }
+                        if ($frame['error'] !== null) {
+                            $fail($state, $frame['error'] === 'Verification article exceeds byte budget'
+                                ? new ArticleBudgetExceeded('Article exceeds verification memory budget.') : new \RuntimeException($frame['error']));
+                        } else {
+                            $state['done'] = $frame['done'];
+                        }
+
+                        continue;
+                    }
                     $state['buffer'] .= $chunk;
                     while (($end = strpos($state['buffer'], "\n")) !== false && ! $state['done']) {
                         $line = substr($state['buffer'], 0, $end + 1);
                         $state['buffer'] = substr($state['buffer'], $end + 1);
                         $id = $state['ids'][$state['position']];
+                        if ($state['body'] && $line !== ".\r\n" && $line !== ".\n"
+                            && strlen($state['raw']) + strlen($line) - (str_starts_with($line, '..') ? 1 : 0) > $maximumBytes) {
+                            $fail($state, new ArticleBudgetExceeded('Article exceeds verification memory budget.'));
+                            break;
+                        }
                         if (strlen($line) > 65536) {
                             $fail($state, new \RuntimeException('Verification pipeline line exceeds its limit.'));
                             break;
@@ -215,14 +276,19 @@ class NNTPService extends NntpClient
                                 $fail($state, new \RuntimeException('Invalid verification pipeline status.'));
                                 break;
                             }
-                            if ((int) $status[1] === 222) {
+                            if ((int) $status[1] === ($mode === 'stat' ? 223 : 222)) {
                                 if (preg_match('/<([^<>]+)>/', $line, $identity) !== 1 || $identity[1] !== $id) {
                                     $fail($state, new \RuntimeException('Verification response identity differs from its request.'));
                                     break;
                                 }
-                                $state['body'] = true;
+                                if ($mode === 'stat') {
+                                    $results[$id] = '';
+                                    $state['position']++;
+                                } else {
+                                    $state['body'] = true;
+                                }
                             } elseif (in_array((int) $status[1], [430, 423], true)) {
-                                $results[$id] = new \RuntimeException('Verification article is unavailable.');
+                                $results[$id] = new NntpArticleMissingException('Verification article is unavailable.');
                                 $state['position']++;
                             } else {
                                 $fail($state, new \RuntimeException('Unexpected verification pipeline status.'));
@@ -246,23 +312,47 @@ class NNTPService extends NntpClient
                         }
                         $state['done'] = $state['position'] >= count($state['ids']);
                     }
+                    if (! $state['done'] && $state['body'] && ! in_array($state['buffer'], ['.', ".\r"], true)
+                        && strlen($state['raw']) + strlen($state['buffer']) - (str_starts_with($state['buffer'], '..') ? 1 : 0) > $maximumBytes) {
+                        $fail($state, new ArticleBudgetExceeded('Article exceeds verification memory budget.'));
+                    }
                     if (! $state['done'] && strlen($state['buffer']) >= 65536) {
                         $fail($state, new \RuntimeException('Verification pipeline line is truncated or oversized.'));
                     }
-                    if ($state['done'] && $state['buffer'] !== '') {
+                    if ($state['done'] && $state['position'] >= count($state['ids']) && $state['buffer'] !== '') {
                         $fail($state, new \RuntimeException('Unexpected data after verification pipeline.'));
                     }
                 }
                 unset($state);
             }
         } catch (\Throwable $error) {
-            foreach ($states as &$state) {
+            foreach ($states as $stateIndex => &$state) {
                 if (! $state['done']) {
-                    $fail($state, new \RuntimeException('Verification pipeline interrupted.', previous: $error));
+                    $fail($state, $stateIndex === $feedingConnection
+                        ? new \RuntimeException('Verification pipeline interrupted.', previous: $error)
+                        : new VerificationPipelineRetryException('Verification pipeline interrupted before this response was acknowledged.', previous: $error));
                 }
             }
             unset($state);
-            throw $error;
+            foreach ($batches as $batch) {
+                $connection = $batch['connection'];
+                if (is_resource($connection->_socket)) {
+                    fclose($connection->_socket);
+                    $connection->_resetProperties();
+                }
+                foreach ($batch['ids'] as $id) {
+                    if (! array_key_exists($id, $results)) {
+                        $results[$id] = new VerificationPipelineRetryException('Verification pipeline ended before this request was sent.', previous: $error);
+                    }
+                }
+            }
+            if ($heartbeatFailure->error !== null) {
+                throw $heartbeatFailure->error;
+            }
+
+            // Only acknowledged frames survive. Fence the request whose feed failed;
+            // unread requests on every other connection can recover through a correlated BODY.
+            return $results;
         } finally {
             foreach ($states as $state) {
                 if (is_resource($state['socket'])) {
@@ -272,6 +362,30 @@ class NNTPService extends NntpClient
         }
 
         return $results;
+    }
+
+    private static function reportVerificationFramerFallback(string $worker): void
+    {
+        if (isset(self::$reportedVerificationFramerFailures[$worker])) {
+            return;
+        }
+        self::$reportedVerificationFramerFailures[$worker] = true;
+        $message = 'Rust verification framer startup failed; using PHP framing.';
+        try {
+            $container = Container::getInstance();
+            if ($container->bound('log')) {
+                $container->make('log')->warning($message);
+
+                return;
+            }
+        } catch (\Throwable) {
+            // Standalone callers and failed logger bindings still get a safe fallback.
+        }
+        try {
+            @error_log($message);
+        } catch (\Throwable) {
+            // Logging cannot prevent the native parser from servicing standalone callers.
+        }
     }
 
     public function verificationPipelineAvailable(): bool
