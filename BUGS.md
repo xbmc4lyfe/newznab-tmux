@@ -490,11 +490,14 @@ These bugs turned up while building and running the self-hosted stack in `docker
     - **Marshalling:** PHP hands Rust the XOVER number column as text, the subject lengths and the subjects, as three bulk buffers. Rust parses numbers as PHP's `(int)` does; any other number form declines, and PHP retries with its exact filter.
     - **Matching:** the subject scan is linear. Counts beyond PHP's integer range saturate as PHP's `(int)` does; PHP returns 0 only for values at or above the largest double, so Rust declines every count or number of 309 or more significant digits. A range with a subject over 512 bytes stays on PHP, below where PHP's `pcre.backtrack_limit` can stop the subject pattern, so both sides mark alike.
     - **Routing:** ranges under 4,000 headers stay on PHP, as does every range once the library has failed to load. Otherwise one random header from each of 32 to 128 slices (one per 128 headers) is classified with string scans, then priced by class and subject length. The range goes to Rust only when the predicted speedup reaches 2×. Before a process has loaded the library, the predicted saving must also reach 4 ms.
-    - **Evidence:** `scripts/benchmark-per-article-obfuscation.php` measures XOVER-shaped ranges, including FFI and marshalling (Linux arm64). It found identical marks and these speedups on ranges routed to Rust:
-      - warm medians 1.8–2.9× from 200 samples and p99 2.6–3.6× from 1,000, with every 95% lower bound at or above 1.78×;
-      - cold first calls in fresh processes, which also load the library, 1.7–3.0×, with every lower bound at or above 1.61×.
+    - **Evidence:** run of `scripts/benchmark-per-article-obfuscation.php` at source commit `73187bde2`, on XOVER-shaped ranges with FFI and marshalling included (Linux arm64). Rust and PHP marked the same articles. On ranges routed to Rust:
+      - **Warm medians** (200 samples): 1.86–2.87×.
+      - **Warm p99** (1,000 samples): 2.82–3.23×.
+      - **Warm lower bound:** every 95% lower bound is at or above 1.84×.
+      - **Cold first calls** in fresh processes, which load the library: 1.82–3.15×, with lower bounds at or above 1.70×.
+      - **Excluded from the cold rows:** the one-time wrapper construction with the service. It is measured separately: median 0.26 ms, p90 0.34 ms per process.
 
-      Ranges kept on PHP pay only the sampling cost: 0.93–1.03× warm and 0.91–1.04× cold.
+      Ranges kept on PHP pay only the sampling cost: 0.96–1.01× warm and 0.92–0.99× cold.
   - Remaining risk (all rare) — these real articles would still be skipped:
     - 16 or more unrelated real files in one range that share a subject shape with a long random token, have the same part total and no file counter, and each show a single middle article, at 16 or more different part positions.
     - A real upload in an obfuscated group whose only article in the range is a middle part (uploads posted over several connections arrive out of order).
