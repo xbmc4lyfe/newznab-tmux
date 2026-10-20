@@ -160,6 +160,22 @@ impl Worker {
                 break;
             };
             if length > MAX_LINE || (length == MAX_LINE && end.is_none()) {
+                // A line this long cannot be a dot terminator. Prefer proven article
+                // overflow so retry classification never depends on socket chunking.
+                if connection.in_body {
+                    let mut prefix = connection.line.iter().chain(input[..take].iter());
+                    let stuffed = prefix.next() == Some(&b'.') && prefix.next() == Some(&b'.');
+                    let contribution = length - usize::from(stuffed);
+                    if connection
+                        .body
+                        .len()
+                        .checked_add(contribution)
+                        .is_none_or(|size| size > self.maximum_bytes)
+                    {
+                        connection.fail("Verification article exceeds byte budget");
+                        break;
+                    }
+                }
                 connection.fail("Verification line exceeds limit");
                 break;
             }
@@ -441,6 +457,39 @@ mod tests {
         assert_eq!(indices, [0, 1, 2]);
         assert_eq!(bodies, expected);
         assert!(worker.connections[0].done());
+    }
+
+    #[test]
+    fn bulk_verification_article_overflow_wins_over_line_overflow_at_every_feed_split() {
+        for (first, stuffed) in [5_000, 20_000, 32_000, 40_000]
+            .into_iter()
+            .flat_map(|first| [(first, false), (first, true)])
+        {
+            let mut value = config(&["a@b", "b@b"]);
+            value["maximum_bytes"] = json!(32_768);
+            value["buffer_bytes"] = json!(131_072);
+            let mut worker = worker(value);
+            assert!(
+                worker
+                    .feed(0, b"222 0 <a@b> body\r\n")
+                    .unwrap()
+                    .metadata
+                    .error
+                    .is_none()
+            );
+            let mut body = vec![b'x'; 70_000];
+            if stuffed {
+                body[..2].copy_from_slice(b"..");
+            }
+            worker.feed(0, &body[..first]).unwrap();
+            let reply = worker.feed(0, &body[first..]).unwrap();
+            assert_eq!(
+                reply.metadata.error,
+                Some("Verification article exceeds byte budget"),
+                "split {first}"
+            );
+            assert!(reply.metadata.results.is_empty());
+        }
     }
 
     #[test]
