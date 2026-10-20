@@ -125,6 +125,24 @@ class ReleasesRunnerRollingTest extends TestCase
         }
     }
 
+    public function test_a_pass_that_cannot_start_ends_the_rolling_round_and_fails_it(): void
+    {
+        config(['nntmux.cbp.release_rolling_interval' => 1]);
+        $runner = new RollingReleasesRunner($this->marker, slowGroup: 2, slowSeconds: 0, unstartableGroup: 2);
+
+        $started = microtime(true);
+        try {
+            $this->runRound($runner);
+            $this->fail('Expected the round to report the group that could not start.');
+        } catch (RuntimeException $exception) {
+            $this->assertStringContainsString('2 failure', (string) $exception->getPrevious()?->getMessage());
+        }
+
+        $this->assertLessThan(10, microtime(true) - $started, 'Follow-ups must stop once no first pass remains.');
+        $this->assertSame([1 => 1], $this->fullPasses());
+        $this->assertSame('failure', $runner->outcomes()[2]['status']);
+    }
+
     private function runRound(ReleasesRunner $runner): void
     {
         ob_start();
@@ -177,7 +195,13 @@ class RollingReleasesRunner extends ReleasesRunner
         private int $slowSeconds,
         private bool $drainAfterFirstFullPass = false,
         private ?int $failingGroup = null,
+        private ?int $unstartableGroup = null,
     ) {}
+
+    /** @var array<string|int, int> */
+    private array $starts = [];
+
+    private float $startedAt = 0.0;
 
     /** @return array<string|int, array{status: string, exit_code: ?int}> */
     public function outcomes(): array
@@ -199,8 +223,22 @@ class RollingReleasesRunner extends ReleasesRunner
             $this->marker, (string) $id, (string) $sleep, (string) $exit];
     }
 
+    protected function workerStarting(string|int $key): void
+    {
+        $this->startedAt = $this->startedAt ?: microtime(true);
+        $this->starts[$key] = ($this->starts[$key] ?? 0) + 1;
+        // The first start is the ready pass; the full pass after it cannot start.
+        if ((int) $key === $this->unstartableGroup && $this->starts[$key] > 1) {
+            throw new RuntimeException('Cannot start the worker.');
+        }
+    }
+
     protected function workerCompleted(string|int $key, string $output): void
     {
+        // Without a bound a wedged round would hang the suite; a drain ends it so the test fails instead.
+        if ($this->startedAt > 0 && microtime(true) - $this->startedAt > 12) {
+            app(ProcessingRuntimeStateRepository::class)->requestStop();
+        }
         if ($this->drainAfterFirstFullPass && (int) $key !== $this->slowGroup && str_contains((string) file_get_contents($this->marker), 'full:')) {
             app(ProcessingRuntimeStateRepository::class)->requestStop();
         }

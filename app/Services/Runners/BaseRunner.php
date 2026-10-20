@@ -239,7 +239,7 @@ abstract class BaseRunner
                         } : null);
                     } catch (\Throwable) {
                         $this->recordWorkerOutcome($key, 'failure', null);
-                        unset($running[$key]);
+                        unset($running[$key], $firstRuns[$key]);
                     }
                 }
                 foreach ($running as $key => $process) {
