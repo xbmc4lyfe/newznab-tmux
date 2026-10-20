@@ -3750,7 +3750,7 @@ SH);
         mkdir($this->directory.'/docker/config', 0777, true);
         file_put_contents($this->directory.'/docker/config/app.env', "DB_URL=mysql://u:p@192.0.2.9/nntmux?host=External-DB.example.\n");
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
-        file_put_contents($this->directory.'/docker/config/app.env', "DB_URL=mysql://u:p@192.0.2.9/nntmux?host=external-db.example\n");
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_URL=mysql://u:p@192.0.2.9/nntmux?host=External-DB.example%2E\n");
         $this->assertStringContainsString('Run Migrations  : no', $this->make(['deploy-plan'])->mustRun()->getOutput());
     }
 
@@ -3800,6 +3800,33 @@ SH);
         // Horizon alone respells it: the apps still share one connection, so nothing migrates.
         $json['services']['horizon'] = ['environment' => ['DB_URL' => 'mysql://u:p@external-db.example/nntmux']];
         $this->assertStringContainsString('Run Migrations  : no', $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun()->getOutput());
+    }
+
+    public function test_an_unreadable_owed_marker_is_never_overwritten(): void
+    {
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
+        $marker = $this->directory.'/docker/.deploy.stamp.barrier-owed';
+        file_put_contents($marker, "another-database\n");
+        chmod($marker, 0200);
+        $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0']);
+        $process->run();
+        chmod($marker, 0644);
+        $this->assertFalse($process->isSuccessful());
+        $this->assertStringContainsString('cannot read the owed verification-pause marker', $process->getErrorOutput());
+        $this->assertSame("another-database\n", file_get_contents($marker));
+    }
+
+    public function test_a_hostname_with_spaces_is_another_connection(): void
+    {
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['horizon'] = ['environment' => ['DB_HOST' => ' 192.0.2.10 ']];
+        foreach (['web', 'scheduler', 'indexer'] as $app) {
+            $json['services'][$app] = ['environment' => ['DB_HOST' => '192.0.2.10']];
+        }
+        $plan = $this->planProcess(['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)]);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('connects to another database than web', $plan->getErrorOutput());
     }
 
     public function test_a_failed_barrier_inspection_never_counts_as_no_barrier(): void

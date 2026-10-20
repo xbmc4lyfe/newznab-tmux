@@ -26,9 +26,10 @@ ESCAPES = {"a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v"
 
 
 def decode_double_quoted(body: str) -> tuple[str, bool]:
-    """The decoded value and whether an unescaped `$` makes Compose interpolate it."""
+    """The decoded value and whether an unescaped `$` makes Compose interpolate it. As in Compose,
+    escapes are expanded first (`\\$` becoming the literal `$$`), then `$$` reads as one `$` and any
+    other `$` interpolates, so `"\\0044$HOME"` (an octal `$` before `$HOME`) is the literal `$HOME`."""
     out: list[str] = []
-    interpolates = False
     index = 0
     while index < len(body):
         char = body[index]
@@ -38,15 +39,17 @@ def decode_double_quoted(body: str) -> tuple[str, bool]:
                 digits = body[index + 2:index + 5]
                 if len(digits) == 3 and all(c in "01234567" for c in digits) and int(digits, 8) <= 0o377:
                     out.append(chr(int(digits, 8)))  # `\0NNN`: one octal byte
-                    # Compose expands escapes before variables: an encoded `$` interpolates too.
-                    interpolates = interpolates or out[-1] == "$"
                     index += 5
                     continue
                 # Any other `\0` loses its `0` and keeps the backslash (`\0b` is `\b`, `\0777` is `\777`).
                 out.append(char)
                 index += 2
                 continue
-            if escaped in ESCAPES or escaped in '$"\\':
+            if escaped == "$":
+                out.append("$$")  # Literal through the variable pass below.
+                index += 2
+                continue
+            if escaped in ESCAPES or escaped in '"\\':
                 out.append(ESCAPES.get(escaped, escaped))
                 index += 2
                 continue
@@ -54,12 +57,23 @@ def decode_double_quoted(body: str) -> tuple[str, bool]:
             out.append(char)
             index += 1
             continue
-        if char == "$" and body[index + 1:index + 2] == "$":
-            out.append("$")  # `$$` is a literal `$`
+        out.append(char)
+        index += 1
+    return unescape_dollars("".join(out))
+
+
+def unescape_dollars(text: str) -> tuple[str, bool]:
+    """`$$` is one literal `$`; any other `$` makes Compose interpolate the value."""
+    out: list[str] = []
+    interpolates = False
+    index = 0
+    while index < len(text):
+        if text[index] == "$" and text[index + 1:index + 2] == "$":
+            out.append("$")
             index += 2
             continue
-        interpolates = interpolates or char == "$"
-        out.append(char)
+        interpolates = interpolates or text[index] == "$"
+        out.append(text[index])
         index += 1
     return "".join(out), interpolates
 

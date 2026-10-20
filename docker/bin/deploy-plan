@@ -10,7 +10,7 @@ import re
 import shlex
 import stat
 import subprocess
-from urllib.parse import parse_qs, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, unquote_plus, urlsplit, urlunsplit
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -1516,7 +1516,8 @@ def app_env_path(docker_dir: Path) -> Path:
 
 def normalize_host(host: str) -> str:
     """DNS names are case-insensitive and may be written fully qualified (`mariadb.`)."""
-    return host.strip().lower().rstrip(".")
+    # No whitespace strip: a quoted `" mariadb "` reaches the app with its spaces, another host.
+    return host.lower().removesuffix(".")
 
 
 def normalize_db_url(url: str) -> str:
@@ -1539,7 +1540,8 @@ def normalize_db_url(url: str) -> str:
 
 def normalize_query_host(query: str) -> str:
     """A `host=` query option (it overrides the URL's host in Laravel) normalized like the host."""
-    return re.sub(r"(^|&)(host=)([^&]*)", lambda m: m.group(1) + m.group(2) + normalize_host(m.group(3)), query)
+    # Decoded first (`MariaDB%2E` is `mariadb.`), as matched_database_service reads it, then re-encoded.
+    return re.sub(r"(^|&)(host=)([^&]*)", lambda m: m.group(1) + m.group(2) + quote(normalize_host(unquote_plus(m.group(3))), safe=""), query)
 
 
 def matched_database_service(docker_dir: Path) -> str | None:

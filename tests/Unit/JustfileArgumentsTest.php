@@ -194,6 +194,12 @@ SH);
         $octal->run();
         $this->assertFalse($octal->isSuccessful());
 
+        // Escapes expand before `$$` is read: an octal `$` before `$HOME` is the literal `$HOME`.
+        file_put_contents($this->directory.'/docker/.env', "DB_ROOTPASSWORD=\"\\0044\$HOME\"\nDB_DATABASE=nntmux\n");
+        $expanded = $this->just('docker/Justfile', ['mysql'], ['DC' => $this->directory.'/bin/fake', 'DB_DATABASE' => false]);
+        $expanded->mustRun();
+        $this->assertContains('-p$HOME', $this->arguments($expanded));
+
         // `$$` is Compose's literal `$`: no interpolation, one dollar.
         file_put_contents($this->directory.'/docker/.env', "DB_ROOTPASSWORD=\"pa\$\$word\"\nDB_DATABASE=nntmux\n");
         $dollars = $this->just('docker/Justfile', ['mysql'], ['DC' => $this->directory.'/bin/fake', 'DB_DATABASE' => false]);

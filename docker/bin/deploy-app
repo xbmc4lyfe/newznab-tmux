@@ -83,7 +83,12 @@ refuse_foreign_barrier() {
             exit 1
         fi
     fi
-    owed_database=$(head -n 1 "$barrier_owed" 2>/dev/null || true)
+    owed_database=
+    # A marker that exists but cannot be read names an unknown database: never overwrite it.
+    if [ -e "$barrier_owed" ] && [ ! -d "$barrier_owed" ] && ! owed_database=$(head -n 1 "$barrier_owed"); then
+        echo "deploy-app: cannot read the owed verification-pause marker $barrier_owed; repair it before retrying." >&2
+        exit 1
+    fi
     # An empty marker (written before it recorded the database) names none: without a labelled
     # container it is this database's only while the database is unchanged (a switch migrates).
     if [ -f "$barrier_owed" ] && [ -z "$owed_database" ] && [ -z "$labelled" ] && [ "$MIGRATE" = 1 ]; then
