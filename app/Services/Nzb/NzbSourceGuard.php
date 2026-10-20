@@ -17,7 +17,8 @@ use Throwable;
  * @phpstan-type SourceSnapshot array{guid: string, path: string, contents: string, digest: string}
  * @phpstan-type InodeDeletionAnchor array{version: 1, kind: 'inode', guid: string, path: string, anchor: string, dev: string, ino: string}
  * @phpstan-type AbsentDeletionAnchor array{version: 1, kind: 'absent', guid: string, path: string}
- * @phpstan-type DeletionAnchor InodeDeletionAnchor|AbsentDeletionAnchor
+ * @phpstan-type DatabaseDeletionAnchor array{version: 1, kind: 'database', guid: string, path: string, generation: string|null}
+ * @phpstan-type DeletionAnchor InodeDeletionAnchor|AbsentDeletionAnchor|DatabaseDeletionAnchor
  */
 final class NzbSourceGuard
 {
@@ -91,6 +92,14 @@ final class NzbSourceGuard
         });
     }
 
+    public function installCompressed(object $release, string $body, ?string $expectedDigest = null): NzbSourceInstallation
+    {
+        $digest = app(DatabaseNzbStore::class)->putLocked($release, $body, $expectedDigest);
+
+        return new NzbSourceInstallation($this, (string) $release->guid, NzbService::databaseReference((string) $release->guid),
+            $digest, null, DB::connection()->getPdo(), database: true);
+    }
+
     /**
      * Caller registers receipt rollback/close with its outer transaction.
      * The optional digest is a compare-and-swap for parser repairs.
@@ -103,6 +112,14 @@ final class NzbSourceGuard
     public function install(object $release, string $temporary, string $destination, ?string $expectedDigest = null, ?callable $move = null, ?int $stageFor = null): NzbSourceInstallation
     {
         $this->lockRelease($release);
+        if (DatabaseNzbStore::enabled()) {
+            $body = file_get_contents($temporary);
+            if ($body === false) {
+                throw new RuntimeException('Cannot read legacy NZB for database installation.');
+            }
+
+            return $this->installCompressed($release, $body, $expectedDigest);
+        }
 
         return $this->withGuidLock((string) $release->guid, function () use ($release, $temporary, $destination, $expectedDigest, $move, $stageFor): NzbSourceInstallation {
             // A repair compares against the committed generation, never one an earlier upgrade has yet to swap in.
@@ -275,6 +292,9 @@ final class NzbSourceGuard
     /** @return list<string> */
     private function stagedSiblings(string $guid): array
     {
+        if (DatabaseNzbStore::enabled()) {
+            return []; // Generations commit atomically; no filesystem staging remains.
+        }
         // Staged beside the installation path, or beside an existing copy readers found first at another base path
         // or split level, which may have gone missing since: every directory readers search.
         $directories = array_unique(array_map(dirname(...), [$this->nzb->getNzbPath($guid), ...$this->nzb->nzbPathCandidates($guid)]));
@@ -341,6 +361,13 @@ final class NzbSourceGuard
                 return false;
             }
 
+            if (DatabaseNzbStore::enabled()) {
+                DB::table('release_nzb_contents')->where('guid', $guid)->delete();
+                DB::table('release_fingerprint_jobs')->where('release_id', $release->id)->delete();
+
+                return true;
+            }
+
             return $this->withGuidLock($guid, function () use ($guid): bool {
                 $path = $this->nzb->nzbPath($guid);
 
@@ -372,6 +399,13 @@ final class NzbSourceGuard
     public function captureDeletionAnchor(object $release): array
     {
         $this->lockRelease($release);
+
+        if (DatabaseNzbStore::enabled()) {
+            $row = DB::table('release_nzb_contents')->where('guid', $release->guid)->lockForUpdate()->first(['generation']);
+
+            return ['version' => 1, 'kind' => 'database', 'guid' => (string) $release->guid,
+                'path' => NzbService::databaseReference((string) $release->guid), 'generation' => $row === null ? null : (string) $row->generation];
+        }
 
         return $this->withGuidLock((string) $release->guid, function () use ($release): array {
             $guid = (string) $release->guid;
@@ -430,6 +464,18 @@ final class NzbSourceGuard
      */
     public function deleteAnchoredSource(array $receipt): bool
     {
+        if (($receipt['kind'] ?? null) === 'database') {
+            if (($receipt['version'] ?? null) !== 1 || ! is_string($receipt['guid'] ?? null) || preg_match('/^[a-zA-Z0-9_-]{1,40}$/D', $receipt['guid']) !== 1
+                || ($receipt['path'] ?? null) !== NzbService::databaseReference($receipt['guid'])
+                || (($receipt['generation'] ?? null) !== null && preg_match('/^[a-f0-9]{32}$/D', (string) $receipt['generation']) !== 1)) {
+                throw new RuntimeException('Malformed database NZB ownership receipt.');
+            }
+
+            // The release foreign key already deleted its source in the audit transaction. A new publication
+            // may reuse the GUID, but it can never reuse the random generation owned by this receipt.
+            return ! DB::table('release_nzb_contents')->where('guid', $receipt['guid'])
+                ->where('generation', $receipt['generation'] ?? '')->exists();
+        }
         $anchor = $this->validateAnchor($receipt);
         if ($anchor['kind'] === 'absent') {
             // Absence means the audit owned no source, never permission to
@@ -484,7 +530,7 @@ final class NzbSourceGuard
 
     /**
      * @param  array<string, mixed>  $receipt
-     * @return DeletionAnchor
+     * @return InodeDeletionAnchor|AbsentDeletionAnchor
      */
     private function validateAnchor(array $receipt): array
     {
@@ -585,6 +631,12 @@ final class NzbSourceGuard
     /** @return SourceSnapshot|null */
     private function readCurrent(string $guid): ?array
     {
+        if (DatabaseNzbStore::enabled()) {
+            $contents = app(DatabaseNzbStore::class)->read($guid);
+
+            return is_string($contents) ? ['guid' => $guid, 'path' => NzbService::databaseReference($guid),
+                'contents' => $contents, 'digest' => self::digest($contents)] : null;
+        }
         $path = $this->nzb->nzbPath($guid);
         if ($path === false) {
             return null;
@@ -611,6 +663,9 @@ final class NzbSourceGuard
      */
     private function withGuidLock(string $guid, callable $callback): mixed
     {
+        if (DatabaseNzbStore::enabled()) {
+            return $callback(); // The caller holds the release row lock on the shared database.
+        }
         $root = rtrim($this->nzb->buildNzbPath($guid, 0, true), DIRECTORY_SEPARATOR);
         $path = $root.DIRECTORY_SEPARATOR.'.archive-source-'.substr(hash('sha256', $guid), 0, 2).'.lock';
         if (isset(self::$lockedPaths[$path])) {

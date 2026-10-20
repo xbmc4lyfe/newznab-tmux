@@ -6,6 +6,10 @@ return [
     'items_per_cover_page' => env('ITEMS_PER_COVER_PAGE', 20),
     'max_pager_results' => env('MAX_PAGER_RESULTS', 125000),
     'echocli' => env('ECHOCLI', true),
+    // Published NZBs live in the database; files is only a legacy rollback mode.
+    'nzb_storage' => env('NZB_STORAGE', 'database'),
+    // Rust workers consume database jobs. Legacy is retained only for migration rollback.
+    'fingerprint_worker' => env('FINGERPRINT_WORKER', 'rust'),
     // Release fingerprint record format: 'compact' (bounded samples, compact-v1) or 'full' (legacy schema 39).
     'fingerprint_format' => env('FINGERPRINT_FORMAT', 'compact'),
     // Percentage of releases whose compact fingerprint also samples the alternate NNTP provider.

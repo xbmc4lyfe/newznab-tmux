@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Jobs\CollectReleaseFingerprintMetadata;
+use App\Services\Releases\Fingerprint\FingerprintDispatch;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 
@@ -35,7 +36,7 @@ final class BackfillReleaseFingerprintMetadata extends Command
 
         foreach ($releaseIds as $releaseId) {
             // A recovered refresh keeps its intent: one that exhausts its tries returns to stale, not failed.
-            CollectReleaseFingerprintMetadata::dispatch((int) $releaseId, $this->option('stale') ? 'stale-sweep' : '');
+            FingerprintDispatch::enqueue((int) $releaseId, $this->option('stale') ? 'stale-sweep' : '', true);
             if ($delayMs > 0) {
                 usleep($delayMs * 1000);
             }

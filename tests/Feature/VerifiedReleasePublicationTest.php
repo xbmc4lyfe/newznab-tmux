@@ -21,6 +21,7 @@ use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -597,6 +598,33 @@ class VerifiedReleasePublicationTest extends ReleaseVerificationCandidatesTest
         });
 
         return $reports;
+    }
+
+    public function test_publication_commits_manifest_nzb_and_rust_job_without_a_published_file(): void
+    {
+        config(['release_verification.manifest_storage' => 'database', 'nntmux.nzb_storage' => 'database', 'nntmux.fingerprint_worker' => 'rust']);
+        if (! Schema::hasTable('release_verification_manifests')) {
+            (require database_path('migrations/2026_10_17_000000_create_release_verification_manifests_table.php'))->up();
+        }
+        if (! Schema::hasTable('release_verification_locks')) {
+            (require database_path('migrations/2026_10_17_120000_create_release_verification_locks_table.php'))->up();
+            (require database_path('migrations/2026_10_17_180000_add_release_verification_publication_stripes.php'))->up();
+        }
+        ['claim' => $claim, 'manifest' => $manifest] = $this->publishableCandidate();
+        $this->assertSame(1, DB::table('release_verification_manifests')->count());
+        foreach (['2026_10_12_120000_create_release_fingerprint_metadata_table.php',
+            '2026_10_18_000000_add_run_token_to_release_fingerprint_metadata.php',
+            '2026_10_20_200000_create_database_fingerprint_storage.php'] as $file) {
+            (require database_path('migrations/'.$file))->up();
+        }
+        Queue::fake();
+        $id = app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('complete', 'Downloaded and verified', $manifest));
+        $this->assertIsInt($id);
+        $release = DB::table('releases')->where('id', $id)->first();
+        $this->assertSame(app(VerifiedNzbWriter::class)->document($manifest), app(NzbService::class)->readNzbContents($release->guid));
+        $this->assertSame('pending', DB::table('release_fingerprint_jobs')->where('release_id', $id)->value('status'));
+        $this->assertSame([], glob(config('nntmux_settings.path_to_nzbs').'/*'));
+        Queue::assertNothingPushed();
     }
 
     public function test_prelock_work_is_reused_by_the_locked_section_and_the_nzb_bytes_are_unchanged(): void

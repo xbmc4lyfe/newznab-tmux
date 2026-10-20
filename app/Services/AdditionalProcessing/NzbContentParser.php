@@ -6,6 +6,7 @@ namespace App\Services\AdditionalProcessing;
 
 use App\Services\AdditionalProcessing\Config\ProcessingConfiguration;
 use App\Services\AdditionalProcessing\Enums\VideoContainer;
+use App\Services\Nzb\DatabaseNzbStore;
 use App\Services\Nzb\NzbParserService;
 use App\Services\Nzb\NzbService;
 use App\Services\Nzb\NzbSourceGuard;
@@ -175,6 +176,22 @@ class NzbContentParser
 
         if ($fixed === $raw) {
             return $raw;
+        }
+        if (DatabaseNzbStore::enabled()) {
+            try {
+                DB::transaction(function () use ($guid, $fixed, $raw): void {
+                    $release = DB::table('releases')->where('guid', $guid)->lockForUpdate()->first(['id', 'guid']);
+                    $body = gzencode($fixed);
+                    if ($release === null || $body === false) {
+                        throw new \RuntimeException('NZB source is unavailable during repair.');
+                    }
+                    (new NzbSourceGuard($this->nzb))->installCompressed($release, $body, NzbSourceGuard::digest($raw));
+                });
+
+                return $fixed;
+            } catch (\Throwable) {
+                return null;
+            }
         }
         $temporary = NzbService::temporaryNzbPathFor($originalPath);
         try {

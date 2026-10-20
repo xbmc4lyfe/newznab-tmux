@@ -6,7 +6,6 @@ namespace App\Services\Nzb;
 
 use App\Enums\NzbImportStatus;
 use App\Exceptions\NzbPasswordMetadataRejected;
-use App\Jobs\CollectReleaseFingerprintMetadata;
 use App\Models\Category;
 use App\Models\Predb;
 use App\Models\Release;
@@ -15,6 +14,7 @@ use App\Services\BlacklistService;
 use App\Services\Categorization\CategorizationService;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\ReleaseCleaningService;
+use App\Services\Releases\Fingerprint\FingerprintDispatch;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\Verification\CandidateAdmissionDeferredException;
 use App\Services\Releases\Verification\CandidateCapacityException;
@@ -340,7 +340,7 @@ class NzbImportService
                         $reportResult($nzbFilePath, NzbImportStatus::Inserted, $this->relId, $this->relGuid, inputCapture: $inputCapture);
                         if ($this->relId !== null) {
                             try {
-                                CollectReleaseFingerprintMetadata::dispatch($this->relId);
+                                FingerprintDispatch::enqueue($this->relId);
                             } catch (\Throwable $dispatchException) {
                                 Log::warning('Could not queue imported release fingerprint metadata collection.', [
                                     'release_id' => $this->relId,
@@ -638,6 +638,12 @@ class NzbImportService
     {
         $path = null;
         try {
+            if (DatabaseNzbStore::enabled()) {
+                $release = (object) ['id' => $this->relId, 'guid' => $this->relGuid];
+                app(DatabaseNzbStore::class)->put($release, $nzbString);
+
+                return [true, NzbService::databaseReference($this->relGuid)];
+            }
             $path = $this->nzb->getNzbPath($this->relGuid, 0, true);
             $stored = DB::transaction(function () use ($path, $nzbString): bool {
                 $release = Release::query()->where('id', $this->relId)->where('guid', $this->relGuid)->lockForUpdate()->first();

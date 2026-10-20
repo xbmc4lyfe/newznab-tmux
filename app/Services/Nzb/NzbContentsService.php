@@ -233,19 +233,10 @@ class NzbContentsService
      */
     public function loadNzb(string $guid): SimpleXMLElement|false
     {
-        // Fetch the NZB file path using the GUID
-        $nzbPath = $this->nzbService->nzbPath($guid);
-        if ($nzbPath === false) {
-            return false;
-        }
-
-        // Attempt to decompress the NZB file
-        $nzbContents = unzipGzipFile($nzbPath);
+        $nzbContents = $this->nzbService->readNzbContents($guid);
         if (empty($nzbContents)) {
             if ($this->echoOutput) {
-                $perms = fileperms($nzbPath);
-                $formattedPerms = $perms !== false ? decoct($perms & 0777) : 'unknown';
-                echo PHP_EOL."Unable to decompress: {$nzbPath} - {$formattedPerms} - may have bad file permissions, skipping.".PHP_EOL;
+                echo PHP_EOL."Unable to read NZB source for {$guid}, skipping.".PHP_EOL;
             }
 
             return false;

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Services\Nzb\DatabaseNzbStore;
 use App\Services\Nzb\NzbService;
 use App\Services\Nzb\NzbSourceGuard;
 use App\Services\Nzb\NzbSourceInstallation;
@@ -42,6 +43,9 @@ final class VerifiedNzbWriter
     public function writeWithReceipt(array $manifest, string $guid, object $release, ?PublicationTiming $timing = null, ?string $body = null,
         ?int $replaceFor = null): NzbSourceInstallation
     {
+        if (DatabaseNzbStore::enabled()) {
+            return (new NzbSourceGuard($this->nzb))->installCompressed($release, $body ?? $this->compress($this->document($manifest)));
+        }
         $path = $replaceFor !== null ? $this->upgradePath($guid) : $this->nzb->getNzbPath($guid, createIfNotExist: true);
         $body ??= $this->compress($this->document($manifest));
         $timing?->nextPhase('durable_install');

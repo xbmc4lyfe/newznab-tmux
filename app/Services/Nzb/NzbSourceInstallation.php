@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Nzb;
 
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use PDO;
 use Throwable;
@@ -23,7 +24,7 @@ final class NzbSourceInstallation
      */
     private static array $pendingStaged = [];
 
-    /** @param resource $handle */
+    /** @param resource|null $handle */
     public function __construct(
         private readonly NzbSourceGuard $sources,
         public readonly string $guid,
@@ -33,6 +34,7 @@ final class NzbSourceInstallation
         public readonly PDO $pdo,
         // An in-place upgrade's generation, beside $path until its transaction commits: close() swaps it in.
         public readonly ?string $staged = null,
+        public readonly bool $database = false,
     ) {
         $this->handle = $handle;
         if ($staged !== null) {
@@ -51,6 +53,12 @@ final class NzbSourceInstallation
 
     public function ownsCurrentPath(): bool
     {
+        if ($this->database) {
+            $digest = DB::table('release_nzb_contents')->where('guid', $this->guid)->value('source_digest');
+
+            return is_string($digest) && hash_equals($this->digest, $digest);
+        }
+
         return $this->owns($this->path);
     }
 
@@ -61,6 +69,11 @@ final class NzbSourceInstallation
 
     public function rollback(): void
     {
+        if ($this->database) {
+            $this->finished = true;
+
+            return; // SQL rollback already restores the previous source and queued job.
+        }
         // Rolled back: a staged generation is only ever removed, never swapped in.
         $this->finished = true;
         try {

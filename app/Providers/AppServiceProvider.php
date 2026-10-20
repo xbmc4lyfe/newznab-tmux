@@ -37,6 +37,7 @@ use App\Observers\UsenetGroupObserver;
 use App\Observers\VideoObserver;
 use App\Services\LogViewer\Index\LogIndex;
 use App\Services\Monitoring\Collectors\ApplicationCollector;
+use App\Services\Monitoring\Collectors\DatabaseFingerprintCollector;
 use App\Services\Monitoring\Collectors\FailedJobsCollector;
 use App\Services\Monitoring\Collectors\HorizonCollector;
 use App\Services\Monitoring\Collectors\MetricsCollector;
@@ -143,6 +144,7 @@ class AppServiceProvider extends ServiceProvider
             ApplicationCollector::class,
             TmuxSnapshotCollector::class,
             HorizonCollector::class,
+            DatabaseFingerprintCollector::class,
             FailedJobsCollector::class,
             ReleaseVerificationCollector::class,
             ServiceStatusCollector::class,

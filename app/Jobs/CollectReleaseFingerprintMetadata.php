@@ -8,6 +8,7 @@ use App\Models\Release;
 use App\Models\ReleaseFingerprintMetadata;
 use App\Services\Nzb\NzbSourceGuard;
 use App\Services\Releases\Fingerprint\CompactFingerprintCollector;
+use App\Services\Releases\Fingerprint\DatabaseFingerprintQueue;
 use App\Services\Releases\Fingerprint\ReleaseFingerprintCollector;
 use App\Support\ReleaseArchiveNamingEvidence;
 use Illuminate\Bus\Queueable;
@@ -80,11 +81,18 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
 
     private static function compactFormat(): bool
     {
-        return config('nntmux.fingerprint_format', 'compact') !== 'full';
+        return config('nntmux.fingerprint_worker', 'rust') === 'rust' || config('nntmux.fingerprint_format', 'compact') !== 'full';
     }
 
     public function handle(CompactFingerprintCollector|ReleaseFingerprintCollector|null $collector = null): void
     {
+        if (config('nntmux.fingerprint_worker', 'rust') === 'rust') {
+            if (! app(DatabaseFingerprintQueue::class)->enqueue($this->releaseId)) {
+                throw new \RuntimeException('Fingerprint source must be imported to the database before processing.');
+            }
+
+            return;
+        }
         $collector ??= self::compactFormat() ? app(CompactFingerprintCollector::class) : app(ReleaseFingerprintCollector::class);
         $release = Release::query()->find($this->releaseId);
         if ($release === null) {

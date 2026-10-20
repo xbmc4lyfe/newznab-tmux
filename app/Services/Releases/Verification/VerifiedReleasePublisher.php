@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace App\Services\Releases\Verification;
 
 use App\Facades\Search;
-use App\Jobs\CollectReleaseFingerprintMetadata;
 use App\Models\Release;
 use App\Models\ReleaseRegex;
 use App\Services\Nzb\NzbArticleCoverage;
@@ -13,6 +12,7 @@ use App\Services\Nzb\NzbArticleFingerprint;
 use App\Services\Nzb\NzbService;
 use App\Services\Nzb\NzbSourceGuard;
 use App\Services\Nzb\ReleaseArticleFingerprintStore;
+use App\Services\Releases\Fingerprint\FingerprintDispatch;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\ReleaseGroupResolver;
@@ -296,7 +296,7 @@ final class VerifiedReleasePublisher
                         'naming_regex_id' => $metadata['naming_regex_id']]);
                     DB::afterCommit(static function () use ($id): void {
                         try {
-                            CollectReleaseFingerprintMetadata::dispatch((int) $id);
+                            FingerprintDispatch::enqueue((int) $id);
                         } catch (Throwable $dispatchException) {
                             Log::warning('Could not queue verified release fingerprint metadata collection.', [
                                 'release_id' => $id,
@@ -663,7 +663,7 @@ final class VerifiedReleasePublisher
         DB::afterCommit(static function () use ($id, $holderLabel): void {
             try {
                 // Its own unique key: a collection still holding the release's lock would drop a plain dispatch.
-                CollectReleaseFingerprintMetadata::dispatch($id, 'upgrade-'.$holderLabel);
+                FingerprintDispatch::enqueue($id, 'upgrade-'.$holderLabel);
             } catch (Throwable $dispatchException) {
                 Log::warning('Could not queue upgraded release fingerprint metadata collection.', [
                     'release_id' => $id,
