@@ -39,6 +39,19 @@ jobs:
       - name: Install archive and PAR2 verification tools
         run: sudo apt-get update -qq && sudo apt-get install -y par2 unrar
 
+      # Ubuntu's packaged just (1.21) predates stable modules and quote(); pin a verified release.
+      - name: Install just
+        env:
+          JUST_VERSION: 1.43.0
+          JUST_SHA256: a1bc93654f31669fd964ea3011a5e5e9676b9b6f8adcd762606e5140632ea72d
+        run: |
+          archive="just-${JUST_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/casey/just/releases/download/${JUST_VERSION}/${archive}"
+          echo "${JUST_SHA256}  $RUNNER_TEMP/$archive" | sha256sum -c -
+          sudo tar -xzf "$RUNNER_TEMP/$archive" -C /usr/local/bin just
+          just --version
+
       - name: Copy env file
         run:
           cp .env.test .env

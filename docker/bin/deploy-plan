@@ -1,0 +1,2325 @@
+#!/usr/bin/env python3
+"""Per-service content fingerprinting and selective deployment planner for the docker/ stack."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shlex
+import stat
+import subprocess
+from urllib.parse import parse_qs, quote, unquote_plus, urlsplit, urlunsplit
+import sys
+from datetime import datetime
+from pathlib import Path
+
+APP_SERVICES = ("web", "horizon", "scheduler", "indexer")
+DATA_SERVICES = ("mariadb", "redis", "manticore")
+INFRA_SERVICES = (
+    "proxy",
+    "mailpit",
+    "prometheus",
+    "pushgateway",
+    "grafana",
+    "node-exporter",
+    "mysqld-exporter",
+    "redis-exporter",
+)
+ALL_SERVICES = (*APP_SERVICES, *DATA_SERVICES, *INFRA_SERVICES)
+
+SERVICE_TARGET = {
+    "web": "selfhosted-web",
+    "horizon": "selfhosted-horizon",
+    "scheduler": "selfhosted-scheduler",
+    "indexer": "selfhosted-indexer",
+}
+
+IGNORED_EXACT = {
+    ".editorconfig",
+    ".gitattributes",
+    ".gitignore",
+    ".prettierignore",
+    ".prettierrc",
+    ".vale-plugin.toml",
+    "LICENSE",
+    "Justfile",
+    "Makefile",
+    "boost.json",
+    "captainhook.json",
+    "commit",
+    "debug_scrapers.php",
+    "docker-compose.monitoring.yml",
+    "docker-compose.yml.prod-dist",
+    "docker-entrypoint.sh",
+    "docker/Justfile",
+    "docker/Makefile",
+    "nntmux",
+    "pint.json",
+    "rector.php",
+    "sail",
+    "skills-lock.json",
+}
+
+IGNORED_PREFIXES = (
+    ".agents/",
+    ".ai/",
+    ".claude/",
+    ".codex/",
+    ".cursor/",
+    ".github/",
+    ".idea/",
+    ".junie/",
+    ".phpunit",
+    ".superpowers/",
+    ".vscode/",
+    "benchmarks/",
+    "deploy/aws/",
+    "deploy/cloud/tests/",
+    "docker/.build.stamp",
+    "docker/.deploy",
+    "docker/backups/",
+    "docker/data/",
+    "docker/docs/",
+    "docker/logs/",
+    "docs/",
+    "github-pages/",
+    "infra/",
+    "misc/",
+    "phpstan",
+    "phpunit.xml",
+    "scripts/",
+)
+
+# Role-specific ownership is limited to inputs no other role can execute: static/Vite assets that
+# only the web image serves, and files copied only into one role's image. Any PHP, config, route or
+# view file can be reached from another role (queued jobs, scheduled commands, tmux scripts, service
+# providers), so it stays shared-app and rebuilds all four app services.
+WEB_ONLY_EXACT = {
+    "docker/app/Caddyfile",
+    "package-lock.json",
+    "package.json",
+    "tsconfig.json",
+    "vite.config.js",
+}
+
+WEB_ONLY_PREFIXES = (
+    "resources/css/",
+    "resources/js/",
+)
+
+SCHEDULER_ONLY_EXACT = {
+    "docker/app/bin/scheduler.py",
+}
+
+INDEXER_ONLY_EXACT = {
+    "docker/app/bin/indexer.sh",
+    "docker/app/php/yenc-ffi.ini",
+}
+
+class BuildContext:
+    """Which repository files can reach an image: inside the Docker build context (.dockerignore,
+    with Docker's matching rules) and named by a Dockerfile COPY/ADD from that context."""
+
+    def __init__(self, repo: Path) -> None:
+        ignore_lines = self._lines(repo / ".dockerignore")
+        self.ignore = [self._compile(line) for line in ignore_lines]
+        # Normalized text of every re-including (`!`) pattern and COPY source, for directory pruning.
+        self.negated = [os.path.normpath(line[1:]).lstrip("/") for line in ignore_lines if line.startswith("!")]
+        copy_sources = self._copy_sources(repo / "Dockerfile")
+        self.source_text = [os.path.normpath(src).lstrip("/") for src in copy_sources]
+        self.sources = [self._compile(src)[1] for src in copy_sources]
+
+    @staticmethod
+    def _lines(path: Path) -> list[str]:
+        try:
+            text = path.read_text(encoding="utf-8", errors="surrogateescape")
+        except OSError:
+            return []
+        return [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+
+    @staticmethod
+    def _compile(pattern: str) -> tuple[bool, re.Pattern[str]]:
+        negate = pattern.startswith("!")
+        pattern = os.path.normpath(pattern[1:] if negate else pattern).lstrip("/")
+        regex = ""
+        i = 0
+        while i < len(pattern):
+            char = pattern[i]
+            if pattern.startswith("**", i):
+                i += 2
+                # moby/patternmatcher: `**` (and a following separator) matches any directories,
+                # or everything when it ends the pattern.
+                if pattern.startswith("/", i):
+                    i += 1
+                regex += ".*" if i >= len(pattern) else "(?:.*/)?"
+                continue
+            if char == "*":
+                regex += "[^/]*"
+            elif char == "?":
+                regex += "[^/]"
+            elif char == "[":
+                end = pattern.find("]", i + 1)
+                if end == -1:
+                    regex += re.escape(char)
+                else:
+                    body = pattern[i + 1:end]
+                    regex += "[" + ("^" + body[1:] if body.startswith("^") else body) + "]"
+                    i = end
+            else:
+                regex += re.escape(char)
+            i += 1
+        return negate, re.compile(regex)
+
+    @staticmethod
+    def _copy_sources(dockerfile: Path) -> list[str]:
+        try:
+            text = dockerfile.read_text(encoding="utf-8", errors="surrogateescape")
+        except OSError:
+            return ["."]
+        sources: list[str] = []
+        for instruction in re.sub(r"\\\n", " ", text).splitlines():
+            words = instruction.strip().split(None, 1)
+            if len(words) < 2 or words[0].upper() not in ("COPY", "ADD"):
+                continue
+            try:
+                args = shlex.split(words[1])
+            except ValueError:
+                return ["."]
+            if any(arg.startswith("--from") for arg in args):
+                continue
+            paths = [arg for arg in args if not arg.startswith("--")]
+            sources.extend(paths[:-1])
+        return sources
+
+    @staticmethod
+    def _matches(regex: re.Pattern[str], rel_path: str) -> bool:
+        parts = rel_path.split("/")
+        return any(regex.fullmatch("/".join(parts[:end])) for end in range(len(parts), 0, -1))
+
+    def in_context(self, rel_path: str) -> bool:
+        excluded = False
+        for negate, regex in self.ignore:
+            if self._matches(regex, rel_path):
+                excluded = not negate
+        return not excluded
+
+    def copied(self, rel_path: str) -> bool:
+        return any(source.pattern == "\\." or self._matches(source, rel_path) for source in self.sources)
+
+    def image_input(self, rel_path: str) -> bool:
+        return self.in_context(rel_path) and self.copied(rel_path)
+
+    @staticmethod
+    def _could_reach_below(patterns: list[str], rel_dir: str) -> bool:
+        # A pattern naming a path below rel_dir, or any glob (conservatively), can match inside it.
+        return any(p == "." or p.startswith(rel_dir + "/") or any(c in p for c in "*?[") for p in patterns)
+
+    def may_contain_input(self, rel_dir: str) -> bool:
+        """False only when nothing below rel_dir can be an image input: the directory is excluded by
+        .dockerignore with no re-include below it, or no COPY source covers or reaches into it."""
+        if not self.in_context(rel_dir) and not self._could_reach_below(self.negated, rel_dir):
+            return False
+        return self.copied(rel_dir) or self._could_reach_below(self.source_text, rel_dir)
+
+
+# Set by main(); without it every path is treated as a possible image input (fail safe).
+BUILD_CONTEXT: BuildContext | None = None
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_text(text: str) -> str:
+    return sha256_bytes(text.encode("utf-8", errors="surrogateescape"))
+
+
+def classify_path(rel_path: str) -> tuple[str, ...]:
+    """Return the logical ownership bucket(s) for a repository-relative path."""
+    if rel_path == "tests/Fixtures/nzb-article-fingerprint/NzbArticleFingerprint.php":
+        return ("shared-app",)
+    if rel_path in ("Dockerfile", ".dockerignore"):
+        return ("shared-app",)
+    # Root-level documentation only; nested .md files inside copied directories are image inputs.
+    if ("/" not in rel_path and rel_path.endswith(".md")) or rel_path in IGNORED_EXACT:
+        return ()
+    # Mounted service configuration is fingerprinted through the rendered Compose bind sources,
+    # and runtime env files through the configuration hashes; neither can change an image.
+    if BUILD_CONTEXT is not None and not BUILD_CONTEXT.image_input(rel_path):
+        return ()
+    if rel_path.startswith("install") and rel_path.endswith(".sh"):
+        return ()
+    # Excluded from the image build context by .dockerignore (root .env.*, runtime state, host-only
+    # deploy selector); they can never change an image.
+    if (rel_path.startswith((".env.", "storage/", "_install/", "bootstrap/cache/")) or rel_path == "deploy/select.sh"):
+        return ()
+    if any(rel_path.startswith(prefix) for prefix in IGNORED_PREFIXES):
+        return ()
+    if rel_path.startswith("tests/"):
+        return ()
+    if rel_path.startswith("docker/8.5/") and rel_path != "docker/8.5/php.ini":
+        return ()
+    if rel_path.startswith("docker/bin/"):
+        return ()
+    if rel_path == "docker/docker-compose.yml":
+        # Tracked via rendered compose config --format json per service.
+        return ()
+
+    # Outside the image build context (.dockerignore). Runtime env files feed the configuration
+    # hashes and mounted service configuration the rendered Compose bind sources.
+    if rel_path.startswith(("docker/.env", "docker/config/", "docker/monitoring/")):
+        return ()
+
+    if rel_path.startswith("database/migrations/"):
+        return ("migrations", "shared-app")
+    if rel_path in WEB_ONLY_EXACT or any(rel_path.startswith(p) for p in WEB_ONLY_PREFIXES):
+        return ("web",)
+    if rel_path in SCHEDULER_ONLY_EXACT:
+        return ("scheduler",)
+    if rel_path in INDEXER_ONLY_EXACT:
+        return ("indexer",)
+
+    # Everything else (PHP, config, routes, views, composer, Dockerfile, ...) affects all 4 app services.
+    return ("shared-app",)
+
+
+def file_record(repo: Path, rel_path: str) -> str:
+    """Compute a deterministic content+mode+symlink record for a working-tree file."""
+    full = repo / rel_path
+    try:
+        st = os.lstat(full)
+    except OSError:
+        return f"deleted {rel_path}"
+    mode = f"{stat.S_IMODE(st.st_mode):04o}"
+    if os.path.islink(full):
+        target = os.readlink(full)
+        try:
+            target_bytes = full.read_bytes()
+            content_hash = sha256_bytes(target_bytes)
+        except OSError:
+            content_hash = "dangling"
+        return f"link {content_hash} {rel_path} -> {target}"
+    if os.path.isfile(full):
+        return f"file {mode} {sha256_bytes(full.read_bytes())} {rel_path}"
+    return f"other {mode} {rel_path}"
+
+
+def collect_ignored_inputs(repo: Path) -> set[str]:
+    """Git-ignored files Docker still copies: Docker reads .dockerignore, never .gitignore.
+    `--directory` lists a wholly ignored directory as one entry, so trees such as vendor/ or
+    node_modules/ are never enumerated unless the build context could copy something inside them."""
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"],
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr.decode("utf-8", errors="replace"))
+        sys.exit("deploy-plan: git ls-files failed; cannot fingerprint the checkout.")
+
+    def walk_error(error: OSError) -> None:
+        raise error
+
+    found: set[str] = set()
+    for raw in proc.stdout.split(b"\x00"):
+        entry = raw.decode("utf-8", errors="surrogateescape")
+        if not entry:
+            continue
+        rel = entry.rstrip("/")
+        if not entry.endswith("/"):
+            found.add(rel)
+            continue
+        if BUILD_CONTEXT is not None and not BUILD_CONTEXT.may_contain_input(rel):
+            continue
+        try:
+            for root, dirs, files in os.walk(repo / rel, onerror=walk_error):
+                rel_root = Path(root).relative_to(repo).as_posix()
+                if BUILD_CONTEXT is not None:
+                    dirs[:] = [d for d in dirs if BUILD_CONTEXT.may_contain_input(f"{rel_root}/{d}")]
+                # Directory symlinks are not followed; Docker copies them as links.
+                found.update(f"{rel_root}/{name}" for name in files)
+                found.update(f"{rel_root}/{d}" for d in dirs if os.path.islink(Path(root) / d))
+        except OSError as error:
+            sys.exit(f"deploy-plan: cannot fingerprint ignored build input {rel}: {error.strerror or error}")
+    return found
+
+
+def collect_repo_records(repo: Path) -> list[tuple[str, str]]:
+    """Return sorted (rel_path, record_line) for all runtime files on disk in repo."""
+    candidates: set[str] = set()
+    ls_files = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        capture_output=True,
+        check=False,
+    )
+    if ls_files.returncode != 0:
+        # Never fall back to walking the tree: unfiltered vendor/storage content makes every
+        # fingerprint slow and unstable.
+        sys.stderr.write(ls_files.stderr.decode("utf-8", errors="replace"))
+        sys.exit("deploy-plan: git ls-files failed; cannot fingerprint the checkout.")
+    for raw in ls_files.stdout.split(b"\x00"):
+        if raw:
+            candidates.add(raw.decode("utf-8", errors="surrogateescape"))
+    diff_head = subprocess.run(
+        ["git", "-C", str(repo), "diff", "--name-only", "-z", "HEAD"],
+        capture_output=True,
+        check=False,
+    )
+    if diff_head.returncode != 0:
+        sys.stderr.write(diff_head.stderr.decode("utf-8", errors="replace"))
+        sys.exit("deploy-plan: git diff failed; cannot fingerprint the checkout.")
+    for raw in diff_head.stdout.split(b"\x00"):
+        if raw:
+            candidates.add(raw.decode("utf-8", errors="surrogateescape"))
+    candidates.update(collect_ignored_inputs(repo))
+
+    # The guard's own lock, log, stamps and their temporary/sidecar files, wherever DEPLOY_* puts
+    # them, change during every run and are never image inputs.
+    docker_dir = Path(__file__).resolve().parent.parent
+    guard_state = []
+    for key, default in (
+        ("DEPLOY_LOCK_DIR", ".deploy.lock"), ("DEPLOY_STAMP", ".deploy.stamp"), ("DEPLOY_LOG", ".deploy.log"),
+        ("DEPLOY_SUCCESS_TIME", ".deploy.time"), ("", ".build.stamp"),
+    ):
+        path = Path((os.environ.get(key) if key else None) or str(docker_dir / default))
+        guard_state.append(os.path.join(os.path.realpath(path.parent), path.name))
+    repo_root = os.path.realpath(repo)
+
+    records: list[tuple[str, str]] = []
+    for rel_path in sorted(candidates):
+        if any(os.path.join(repo_root, rel_path).startswith(prefix) for prefix in guard_state):
+            continue
+        if not classify_path(rel_path):
+            continue
+        records.append((rel_path, file_record(repo, rel_path)))
+    return records
+
+
+def dockerfile_base_hash(repo: Path) -> str:
+    dockerfile = repo / "Dockerfile"
+    if not dockerfile.is_file():
+        return "missing"
+    text = dockerfile.read_text(encoding="utf-8", errors="surrogateescape")
+    # Hash up through the end of the `FROM base-os AS base` stage
+    marker = "FROM dunglas/frankenphp:1-php8.5-bookworm AS yenc"
+    prefix = text.split(marker, 1)[0] if marker in text else text
+    return sha256_text(prefix)
+
+
+def compose_command(docker_dir: Path) -> list[str]:
+    return [str(docker_dir / "bin/compose")]
+
+
+def service_top_level_compose_deps(parsed: dict[str, object], svc_cfg: object) -> dict[str, object]:
+    """Extract top-level networks, volumes, configs, secrets, and global keys referenced by a service."""
+    if not isinstance(svc_cfg, dict):
+        return {}
+    deps: dict[str, object] = {}
+    for section in ("networks", "volumes", "configs", "secrets"):
+        top_sec = parsed.get(section)
+        if not isinstance(top_sec, dict):
+            continue
+        svc_sec = svc_cfg.get(section)
+        referenced: set[str] = set()
+        if isinstance(svc_sec, dict):
+            referenced.update(svc_sec.keys())
+        elif isinstance(svc_sec, list):
+            for item in svc_sec:
+                if isinstance(item, str):
+                    referenced.add(item.split(":", 1)[0])
+                elif isinstance(item, dict):
+                    src = item.get("source")
+                    if isinstance(src, str):
+                        referenced.add(src)
+        elif section == "networks" and "default" in top_sec:
+            referenced.add("default")
+        if referenced:
+            deps[section] = {k: top_sec[k] for k in sorted(referenced) if k in top_sec}
+    for key, val in parsed.items():
+        # `x-*` extension blocks are already merged into the services that reference them; hashing
+        # them for every service would make an app-only edit recreate stateful services.
+        if key not in ("services", "networks", "volumes", "configs", "secrets") and not key.startswith("x-"):
+            deps[f"top:{key}"] = val
+    return deps
+
+
+def reject_alternate_env_file() -> None:
+    """Configs and secrets resolve variables from the default .env files; an alternate one would be
+    read by Compose but not by the fingerprint."""
+    if os.environ.get("COMPOSE_ENV_FILES"):
+        sys.exit("deploy-plan: COMPOSE_ENV_FILES is set; selective deployment fingerprints only the default .env files. "
+                 "Unset it and put those values in docker/.env or the environment instead.")
+    try:
+        argv = shlex.split(os.environ.get("DC", ""))
+    except ValueError:
+        return
+    if any(arg == "--env-file" or arg.startswith("--env-file=") for arg in argv):
+        sys.exit("deploy-plan: DC passes --env-file; selective deployment fingerprints only the default .env files. "
+                 "Put those values in docker/.env or the environment instead.")
+    # Docker's own daemon selection before `compose` would send Compose elsewhere than the direct
+    # docker calls (build, inspect, the barrier) and the recorded daemon identity.
+    # Only plain `docker` (or `docker-compose`) with logging options may precede the subcommand:
+    # --context/-c/--host/-H (attached or not), --config, or an `env VAR=...` prefix all move it.
+    # A standalone docker-compose has no docker global options before a subcommand to scan, but takes
+    # the daemon selectors itself (-H/--host, -c/--context) anywhere among its own options.
+    standalone = bool(argv) and os.path.basename(argv[0]) == "docker-compose"
+    globals_end = argv.index("compose") if "compose" in argv else (1 if standalone else len(argv))
+    allowed = ("-D", "--debug", "-l", "--log-level")
+    # A wrapper executable could select any daemon itself; only docker or docker-compose is known.
+    selects_daemon = bool(argv) and os.path.basename(argv[0]) not in ("docker", "docker-compose")
+    previous = ""
+    for arg in argv[1:globals_end]:
+        if arg.startswith("-") and arg not in allowed and not arg.startswith("--log-level="):
+            selects_daemon = True
+        elif not arg.startswith("-") and previous not in ("-l", "--log-level"):
+            selects_daemon = True
+        previous = arg
+    for arg in argv[1:] if standalone else []:
+        # `-H tcp://...`, `-Htcp://...`, `--host=...`, `-c remote`, `--context=remote`.
+        if arg in ("--host", "--context") or arg.startswith(("--host=", "--context=")) or (
+            not arg.startswith("--") and arg.startswith(("-H", "-c"))
+        ):
+            selects_daemon = True
+    if selects_daemon:
+        sys.exit("deploy-plan: DC passes Docker options before compose (or an env prefix) that can select another "
+                 "daemon; use DOCKER_CONTEXT or DOCKER_HOST instead, so every docker call and the recorded daemon "
+                 "identity agree.")
+
+
+def verify_planned_images(docker_dir: Path, stamp_path: Path, services: list[str], running: bool) -> None:
+    """Exit non-zero unless each app service's image tag (or, with running, its container) is still
+    the image this run planned; a tag replaced during the drain must never be rolled out or stamped."""
+    snapshot = parse_stamp(Path(f"{stamp_path}.plan"))
+    for svc in services:
+        planned = snapshot.get(f"image:{svc}", "")
+        if "@" not in planned:
+            if svc not in APP_SERVICES:
+                # No local image when planned (Compose will pull it): nothing pinned to compare.
+                continue
+            sys.exit(f"deploy-plan: no planned image for {svc}")
+        tag, planned_id = planned.rsplit("@", 1)
+        current = running_image(docker_dir, svc) if running else image_id(tag)
+        if current != planned_id:
+            where = "its container runs" if running else f"{tag} now names"
+            sys.exit(f"deploy-plan: {svc}: {where} {current or 'nothing'}, not the planned {planned_id}; not rolling out a replaced image.")
+
+
+def project_directory(docker_dir: Path) -> Path:
+    try:
+        argv = shlex.split(os.environ.get("DC", ""))
+    except ValueError:
+        argv = []
+    for index, arg in enumerate(argv):
+        if arg == "--project-directory" and index + 1 < len(argv):
+            return Path(argv[index + 1]).resolve()
+        if arg.startswith("--project-directory="):
+            return Path(arg.split("=", 1)[1]).resolve()
+    return docker_dir.resolve()
+
+
+# Rendered Compose service definitions from the last get_compose_service_hashes() call.
+RENDERED_SERVICES: dict[str, object] = {}
+
+HOST_SYSTEM_PREFIXES = ("/proc", "/sys", "/dev", "/run", "/var/run", "/private/var/run")
+
+
+def is_host_system(path: str) -> bool:
+    """`/` and the kernel/runtime trees node-exporter-style services observe (path-boundary exact)."""
+    return path == "/" or any(path == prefix or path.startswith(prefix + "/") for prefix in HOST_SYSTEM_PREFIXES)
+
+
+def bind_source_record(source: str, read_only: bool, project_dir: Path) -> str:
+    """Content of a bind-mounted configuration source: any file, or a read-only directory inside the
+    Compose project (data, log and host-system directories are not configuration). Anything that
+    cannot be hashed completely aborts the plan, so an unreadable edit is never stamped as deployed."""
+
+    def fail(reason: str) -> None:
+        sys.exit(f"deploy-plan: cannot fingerprint mounted configuration {source}: {reason}")
+
+    def walk_error(error: OSError) -> None:
+        raise error
+
+    path = Path(source)
+    try:
+        # os.stat, not Path.is_file()/exists(): from Python 3.14 those return False on permission
+        # errors, which would record an unreadable mount as missing instead of failing closed.
+        try:
+            mode = os.stat(path).st_mode
+        except FileNotFoundError:
+            return f"missing {source}"
+        if stat.S_ISREG(mode):
+            # A symlinked file is mounted as its resolved target; retargeting it to identical bytes
+            # still changes what a new container would mount. A plain file keeps its earlier record.
+            resolved_file = path.resolve()
+            target = f" -> {resolved_file}" if str(resolved_file) != os.path.abspath(source) else ""
+            return f"file {sha256_bytes(path.read_bytes())} {source}{target}"
+        if not stat.S_ISDIR(mode):
+            return f"other {source}"
+        resolved = path.resolve()
+        # Writable mounts are data or logs; host-system trees are observed, not configuration.
+        if not read_only or is_host_system(str(resolved)):
+            # Contents are state, but where a symlinked source points (e.g. a cutover to restored
+            # storage) is configuration. A source that is no symlink keeps its earlier record.
+            if str(resolved) != os.path.abspath(source):
+                return f"dir {source} -> {resolved}"
+            return f"dir {source}"
+        lines: list[str] = []
+        for root, dirs, files in os.walk(resolved, onerror=walk_error):
+            dirs.sort()
+            # os.walk does not follow directory symlinks; their targets decide what the container
+            # resolves through them, so each link and its target text is part of the content.
+            for name in dirs:
+                full = Path(root) / name
+                if os.path.islink(full):
+                    if len(lines) >= 2000:
+                        fail("more than 2000 files")
+                    lines.append(f"{full.relative_to(resolved).as_posix()} -> {os.readlink(full)}")
+            for name in sorted(files):
+                # Finder metadata (.DS_Store, AppleDouble ._*) appears whenever a macOS host browses
+                # the directory; no service reads it, and it must not drain writers.
+                if name == ".DS_Store" or name.startswith("._"):
+                    continue
+                full = Path(root) / name
+                if len(lines) >= 2000:
+                    fail("more than 2000 files")
+                lines.append(f"{full.relative_to(resolved).as_posix()} {sha256_bytes(full.read_bytes())}")
+        root_target = f" -> {resolved}" if str(resolved) != os.path.abspath(source) else ""
+        return f"tree {sha256_text(chr(10).join(lines))} {source}{root_target}"
+    except OSError as error:
+        fail(error.strerror or str(error))
+    raise AssertionError("unreachable")
+
+
+def service_bind_records(svc_cfg: object, project_dir: Path) -> list[str]:
+    if not isinstance(svc_cfg, dict) or not isinstance(svc_cfg.get("volumes"), list):
+        return []
+    records: list[str] = []
+    for volume in svc_cfg["volumes"]:
+        if isinstance(volume, dict) and volume.get("type") == "bind" and isinstance(volume.get("source"), str):
+            records.append(bind_source_record(compose_path(volume["source"]), bool(volume.get("read_only")), project_dir))
+    return records
+
+
+def closing_quote(value: str, escapes: bool = True) -> int:
+    """The index of the unescaped quote closing a value that opens with one, else -1. Without
+    `escapes` (phpdotenv's single quotes) a backslash is literal and the first quote closes it."""
+    if value[:1] not in ("'", '"'):
+        return -1
+    position = 1
+    while position < len(value):
+        if escapes and value[position] == "\\":
+            position += 2
+            continue
+        if value[position] == value[0]:
+            return position
+        position += 1
+    return -1
+
+
+def read_dotenv(path: Path, interpolated: set[str] | None = None, multiline: set[str] | None = None,
+                phpdotenv: bool = False) -> dict[str, str]:
+    """The keys of a Compose .env file (same rules as bin/compose); last assignment wins. Keys whose
+    last value Compose would interpolate (unquoted or double-quoted, containing `$`) are added to
+    `interpolated`; keys whose last value spans lines (only its first line is read) to `multiline`."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="surrogateescape")
+    except FileNotFoundError:
+        return {}
+    except OSError as error:
+        sys.exit(f"deploy-plan: cannot read {path}: {error.strerror or error}")
+    values: dict[str, str] = {}
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        raw = lines[index]
+        index += 1
+        m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", raw)
+        if m:
+            value = m.group(2)
+            # Escape-aware, as Compose and phpdotenv read it: `"p\"w"` is one closed value.
+            # app.env is read by phpdotenv only: its single quotes are literal (`'C:\tmp\'` closes) and
+            # never span lines; Compose (docker/.env) honours `\'` in them.
+            literal_single = phpdotenv and value[:1] == "'"
+            end = closing_quote(value, escapes=not literal_single)
+            closed = end > 0 and re.match(r"^\s*(?:#.*)?$", value[end + 1:])
+            quoted = re.match(r"""^(["'])(.*)\1$""", value[:end + 1], re.S) if closed else None
+            # An unquoted value ends at ` #` in Compose, at any `#` in phpdotenv (`db2#note` is `db2`).
+            values[m.group(1)] = quoted.group(2) if quoted else re.sub(r"#.*$" if phpdotenv else r"\s#.*$", "", value).strip()
+            if quoted and quoted.group(1) == '"':
+                # Compose and phpdotenv decode escapes inside double quotes only: `"a\nb"` installs a
+                # newline while `'a\nb'` stays literal, so the two must not hash alike.
+                values[m.group(1)] = re.sub(r"\\([nrt\\\"$])", lambda e: {"n": "\n", "r": "\r", "t": "\t"}.get(e.group(1), e.group(1)), values[m.group(1)])
+            # An opening quote with no closing one starts a multi-line value, which this line-based
+            # parser cannot read whole.
+            # An opening quote with no unescaped closing one on its line starts a multi-line value.
+            spans_lines = value[:1] in ("'", '"') and end < 0 and not literal_single
+            if spans_lines:
+                # Its continuation lines belong to it (phpdotenv and Compose read up to the closing
+                # quote): never assignments of their own, e.g. a `DB_HOST=` line inside a note.
+                while index < len(lines) and closing_quote(value[0] + lines[index], escapes=not literal_single) < 0:
+                    index += 1
+                index += 1
+            if multiline is not None:
+                multiline.discard(m.group(1))
+                if spans_lines:
+                    multiline.add(m.group(1))
+            if interpolated is not None:
+                interpolated.discard(m.group(1))
+                if spans_lines or ("$" in values[m.group(1)] and not (quoted and quoted.group(1) == "'")):
+                    interpolated.add(m.group(1))
+    return values
+
+
+def service_resource_sources(parsed: dict[str, object], svc_cfg: object, docker_dir: Path, project_dir: Path) -> list[str]:
+    """The data behind each top-level config and secret the service uses. The rendered definition
+    names only a file path or an environment variable (compose-go even drops secret content from
+    its JSON), so the file content or the variable's value is hashed here; never logged."""
+    deps = service_top_level_compose_deps(parsed, svc_cfg)
+    records: list[str] = []
+    dotenv: dict[str, str] | None = None
+    for section in ("configs", "secrets"):
+        definitions = deps.get(section)
+        if not isinstance(definitions, dict):
+            continue
+        for name in sorted(definitions):
+            definition = definitions[name]
+            if not isinstance(definition, dict):
+                continue
+            source_file = definition.get("file")
+            source_env = definition.get("environment")
+            if isinstance(source_file, str):
+                records.append(f"{section}:{name} {bind_source_record(compose_path(source_file), True, project_dir)}")
+            elif isinstance(source_env, str):
+                value = os.environ.get(source_env)
+                if value is None:
+                    if dotenv is None:
+                        dotenv_interpolated: set[str] = set()
+                        dotenv = {**read_dotenv(docker_dir / ".env", dotenv_interpolated), **read_dotenv(project_dir / ".env", dotenv_interpolated)}
+                    value = dotenv.get(source_env)
+                    if value is not None and source_env in dotenv_interpolated:
+                        # Compose installs the interpolated value; hashing the literal reference
+                        # would miss a rotation of what it points at.
+                        sys.exit(f"deploy-plan: {source_env} behind {section[:-1]} {name} uses interpolation or a multi-line "
+                                 "value in a .env file; export it in the environment or give it a single-line literal "
+                                 "(single-quoted) value.")
+                if value is None:
+                    sys.exit(f"deploy-plan: cannot resolve environment variable {source_env} behind {section[:-1]} {name}; "
+                             "set it in the environment or docker/.env.")
+                digest = sha256_text(f"nntmux-deploy-{section}:{name}\n{value}")
+                records.append(f"{section}:{name} env {source_env} {digest}")
+    return records
+
+
+def reject_unsupported_service(svc: str, cfg: object) -> None:
+    """Fail closed on service definitions whose effect no per-service fingerprint can represent."""
+    if not isinstance(cfg, dict):
+        return
+    if "build" in cfg:
+        # The rendered model holds the build context path, not its contents.
+        sys.exit(f"deploy-plan: service {svc} has a Compose build: section; selective deployment cannot "
+                 "fingerprint its build context. Build the image separately and reference it with image:.")
+    for key in ("network_mode", "ipc", "pid"):
+        value = cfg.get(key)
+        if isinstance(value, str) and value.startswith(("service:", "container:")):
+            sys.exit(f"deploy-plan: service {svc} uses {key}: {value}; selective deployment cannot recreate "
+                     "consumers of another container's namespace. Remove it from the effective Compose files.")
+    depends = cfg.get("depends_on")
+    if isinstance(depends, dict):
+        for provider, condition in depends.items():
+            if isinstance(condition, dict) and condition.get("condition") == "service_completed_successfully":
+                # Applied alone with --no-deps --wait, a one-shot provider's successful exit reads as failure.
+                sys.exit(f"deploy-plan: service {svc} waits for {provider} to complete successfully; selective "
+                         "deployment applies services one at a time and cannot wait for a one-shot exit.")
+            if isinstance(condition, dict) and condition.get("restart"):
+                # Compose would restart this service after an update of the provider; deploy-app
+                # recreates the provider alone with --no-deps.
+                sys.exit(f"deploy-plan: service {svc} sets depends_on.{provider}.restart; selective deployment "
+                         "recreates a provider without restarting its dependents. Remove `restart: true`.")
+    if str(cfg.get("pull_policy", "")).lower() in ("always", "build", "daily", "weekly") or str(cfg.get("pull_policy", "")).lower().startswith("every_"):
+        # Compose would fetch or build another image during the apply than the one the plan pinned.
+        sys.exit(f"deploy-plan: service {svc} sets pull_policy: {cfg['pull_policy']}; selective deployment applies "
+                 "only images it has inspected. Pull deliberately before deploying and use the default policy.")
+    if svc in APP_SERVICES and isinstance(cfg.get("image"), str) and cfg["image"] != service_image_name(svc):
+        # Health, image and stamp checks compare against the role image; another tag would never match.
+        sys.exit(f"deploy-plan: app service {svc} runs image {cfg['image']}, not its role image "
+                 f"{service_image_name(svc)}; set the role image variables (e.g. {svc.upper()}_IMAGE) instead of "
+                 "overriding image: for app services.")
+    health = cfg.get("healthcheck")
+    if svc in APP_SERVICES and (not isinstance(health, dict) or not health or health.get("disable") or (
+        isinstance(health.get("test"), list) and health["test"][:1] == ["NONE"]
+    )):
+        # Success requires each app container to report healthy; without a health check it never does
+        # (a removed one, e.g. `!reset null`, drops the shipped probe deploy-current relies on).
+        sys.exit(f"deploy-plan: app service {svc} disables or removes its health check; selective deployment verifies app "
+                 "services by their health. Keep the shipped health check.")
+    deploy = cfg.get("deploy")
+    replicas = deploy.get("replicas") if isinstance(deploy, dict) else None
+    if svc in APP_SERVICES and ((isinstance(replicas, int) and replicas != 1) or (isinstance(cfg.get("scale"), int) and cfg["scale"] != 1)):
+        # Health, image and recreation checks inspect exactly one container per service (zero would
+        # stop it for good and fail every retry).
+        sys.exit(f"deploy-plan: app service {svc} sets a replica count other than one; selective deployment checks "
+                 "exactly one container per app service. Remove the scale/replicas override.")
+    if cfg.get("volumes_from"):
+        sys.exit(f"deploy-plan: service {svc} uses volumes_from; selective deployment cannot recreate "
+                 "consumers of another container's volumes. Remove it from the effective Compose files.")
+
+
+# Per-service rendered definition hashes (no mounted contents) from get_compose_service_hashes().
+DEFINITIONS: dict[str, str] = {}
+
+# Effective Compose project name from the last get_compose_service_hashes() call.
+RENDERED_PROJECT: str | None = None
+
+# Top-level `networks:` of the last get_compose_service_hashes() call (names services join).
+RENDERED_NETWORKS: dict[str, object] = {}
+
+
+def get_compose_service_hashes(docker_dir: Path) -> tuple[str, dict[str, str]]:
+    """Return (global_config_hash, per_service_config_hashes)."""
+    global RENDERED_PROJECT, RENDERED_NETWORKS
+    reject_alternate_env_file()
+    env = dict(os.environ)
+    env.setdefault("COMPOSE_FILE", str(docker_dir / "docker-compose.yml"))
+    proc = subprocess.run(
+        [*compose_command(docker_dir), "config", "--format", "json"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        sys.exit(proc.returncode or 1)
+    raw = proc.stdout.strip()
+    context_meta = f"{os.environ.get('DC', '')}\n{os.environ.get('DOCKER_CONTEXT', '')}\n{os.environ.get('DOCKER_HOST', '')}"
+    per_service: dict[str, str] = {}
+    project_dir = project_directory(docker_dir)
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and isinstance(parsed.get("services"), dict):
+            services_map = parsed["services"]
+            name = parsed.get("name")
+            RENDERED_PROJECT = name if isinstance(name, str) and name else None
+            RENDERED_NETWORKS = parsed["networks"] if isinstance(parsed.get("networks"), dict) else {}
+            for svc in sorted(services_map):
+                reject_unsupported_service(svc, services_map[svc])
+            # Every rendered service gets a record, so an added Compose service is started rather
+            # than silently stamped as deployed (data_services()/infra_services() decide how).
+            for svc in sorted(set(ALL_SERVICES) | set(services_map)):
+                if svc in services_map:
+                    # The Compose command text and context only feed the global hash: an equivalent
+                    # rendering must not drain writers or recreate stateful services.
+                    RENDERED_SERVICES[svc] = services_map[svc]
+                    svc_payload: dict[str, object] = {
+                        "service": services_map[svc],
+                        "top_level": service_top_level_compose_deps(parsed, services_map[svc]),
+                        "mounted": service_bind_records(services_map[svc], project_dir),
+                    }
+                    sources = service_resource_sources(parsed, services_map[svc], docker_dir, project_dir)
+                    if sources:
+                        # Only when present, so existing per-service records stay valid.
+                        svc_payload["sources"] = sources
+                    svc_json = json.dumps(svc_payload, sort_keys=True)
+                    per_service[svc] = sha256_text(svc_json)
+                    # The rendered definition alone, without mounted contents: a shared app.env edit
+                    # changes every app's compose record but is no cutover (the database record is).
+                    DEFINITIONS[svc] = sha256_text(json.dumps({k: svc_payload[k] for k in ("service", "top_level")}, sort_keys=True))
+                else:
+                    per_service[svc] = "absent"
+            # The residual: everything no per-service record explains (top-level sections, the
+            # Compose command text and context). Per-service changes are tracked per service.
+            # Top-level networks/volumes/configs/secrets entries are already part of the record of
+            # every service that references them.
+            # `x-*` extension blocks are ignored by Compose; their merged effects are already in the
+            # services that use them.
+            residual = {
+                key: value for key, value in parsed.items()
+                if key not in ("services", "networks", "volumes", "configs", "secrets") and not key.startswith("x-")
+            }
+            global_hash = sha256_text(f"{json.dumps(residual, sort_keys=True)}\n{context_meta}")
+            return global_hash, per_service
+    except (ValueError, TypeError):
+        pass
+    # Never guess per-service state (it would recreate every data service and hide mount changes).
+    sys.exit("deploy-plan: cannot parse the rendered Compose configuration (compose config --format json).")
+
+
+def service_image_name(svc: str) -> str:
+    env_key = f"{svc.upper()}_IMAGE"
+    default_role_img = f"nntmux/{svc}:local"
+    role_img = os.environ.get(env_key, "")
+    app_img = os.environ.get("APP_IMAGE", "")
+    if role_img and (role_img != default_role_img or not app_img or app_img == "nntmux/app:local"):
+        return role_img
+    if app_img and app_img != "nntmux/app:local":
+        return app_img
+    return default_role_img
+
+
+def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[str, str]:
+    buckets: dict[str, list[str]] = {
+        "shared-app": [],
+        "migrations": [],
+        **{svc: [] for svc in ALL_SERVICES},
+    }
+    runtime_records: list[str] = []
+
+    for rel_path, record in collect_repo_records(repo):
+        owners = classify_path(rel_path)
+        if not owners:
+            continue
+        runtime_records.append(record)
+        for owner in owners:
+            if owner in buckets:
+                buckets[owner].append(record)
+
+    env_hashes: list[str] = []
+    for env_file in (docker_dir / ".env", docker_dir / "config/app.env"):
+        # os.stat, not is_file(): from Python 3.14 that hides permission errors as "missing".
+        try:
+            os.stat(env_file)
+        except FileNotFoundError:
+            env_hashes.append("missing")
+            continue
+        except OSError as error:
+            sys.exit(f"deploy-plan: cannot read {env_file}: {error.strerror or error}")
+        try:
+            env_hashes.append(sha256_bytes(env_file.read_bytes()))
+        except OSError as error:
+            sys.exit(f"deploy-plan: cannot read {env_file}: {error.strerror or error}")
+    base_img = os.environ.get("BASE_IMAGE", "nntmux/base:local")
+    image_tags = [base_img, *(service_image_name(svc) for svc in APP_SERVICES)]
+    configuration_hash = sha256_text("\n".join([*env_hashes, *image_tags]))
+    app_env_hash = env_hashes[1]
+    effective_hash = "none"
+    fingerprint_effective = ""
+    per_service_compose: dict[str, str] = {svc: "none" for svc in ALL_SERVICES}
+    compose_rendered = False
+    config_cmd = os.environ.get("DEPLOY_CONFIG_COMMAND", "")
+    if config_cmd:
+        proc = subprocess.run([config_cmd, "--fingerprint"], capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            sys.stderr.write(proc.stderr)
+            sys.exit(proc.returncode or 1)
+        effective_hash = proc.stdout.strip()
+        if Path(config_cmd).name == "deploy-current":
+            # Mounted configuration contents are not part of the rendered Compose text; fold them in
+            # so a changed bind-mounted file is never skipped as an unchanged deployment.
+            residual_hash, per_service_compose = get_compose_service_hashes(docker_dir)
+            compose_rendered = True
+            mounted = json.dumps(per_service_compose, sort_keys=True)
+            fingerprint_effective = sha256_text(f"{effective_hash}\n{mounted}")
+            effective_hash = residual_hash
+        elif include_compose:
+            per_service_compose = {svc: effective_hash for svc in ALL_SERVICES}
+    elif include_compose:
+        effective_hash, per_service_compose = get_compose_service_hashes(docker_dir)
+        compose_rendered = True
+
+    # The database the app connects to: pointing app.env at another (e.g. a restored copy) migrates.
+    # Read from the file the app services actually mount as /app/.env once Compose is rendered.
+    db_env_file = app_env_path(docker_dir) if compose_rendered else docker_dir / "config/app.env"
+    app_env_values = read_dotenv(db_env_file, phpdotenv=True)
+    default_app_env = docker_dir / "config/app.env"
+    if os.path.realpath(db_env_file) != os.path.realpath(default_app_env):
+        # The apps read another file as /app/.env: it, not the unused default, decides their rollout.
+        try:
+            app_env_hash = sha256_bytes(db_env_file.read_bytes())
+        except OSError as error:
+            sys.exit(f"deploy-plan: cannot read {db_env_file}: {error.strerror or error}")
+    # DB_URL's credentials are not the database's identity (rotating a password never migrates).
+    try:
+        db_url = urlsplit(app_env_values.get("DB_URL", ""))
+        # An equivalent DNS spelling (case, a root dot) is the same database.
+        db_url_identity = urlunsplit((db_url.scheme, normalize_host(db_url.hostname or ""), db_url.path, normalize_query_host(db_url.query), "")) + (
+            f"|{db_url.port}" if db_url.netloc and db_url.port else "")
+    except ValueError:
+        # Unparseable (e.g. a bad or `${PORT}` port): compare everything after the credentials.
+        db_url_identity = "unparsed " + app_env_values.get("DB_URL", "").rsplit("@", 1)[-1]
+    identity_keys = ("DB_URL", "DB_CONNECTION", "DB_HOST", "DB_PORT", "DB_SOCKET", "DB_DATABASE")
+    # phpdotenv (which reads app.env as /app/.env) only expands `${NAME}`; a bare `$`, e.g. in a
+    # password, is literal. DB_URL is checked after its credentials are stripped.
+    if "${" in db_url_identity or any("${" in app_env_values.get(key, "") for key in identity_keys[1:]):
+        # A nested reference (DB_HOST=${DB_TARGET}) can point elsewhere without changing these
+        # values; any app.env change then counts as a possible database switch.
+        try:
+            db_url_identity = f"nested {sha256_bytes(db_env_file.read_bytes())}"
+        except OSError as error:
+            sys.exit(f"deploy-plan: cannot read {db_env_file}: {error.strerror or error}")
+    database_hash = sha256_text("\n".join(
+        [f"DB_URL={db_url_identity}"]
+        + [f"{key}={normalize_host(app_env_values.get(key, '')) if key == 'DB_HOST' else app_env_values.get(key, '')}"
+           for key in identity_keys[1:]]
+    ))
+
+    runtime_tree_hash = sha256_text("\n".join(runtime_records))
+    shared_app_hash = sha256_text("\n".join(buckets["shared-app"]))
+    migration_hash = sha256_text("\n".join(buckets["migrations"]))
+    base_hash = sha256_text(f"{dockerfile_base_hash(repo)}\n{base_img}")
+
+    state: dict[str, str] = {
+        # The fingerprint also covers mounted contents; `effective` (the global Compose rule) is the
+        # rendered configuration only, so a recorded mount change never forces an app rollout.
+        "fingerprint": f"{runtime_tree_hash} {configuration_hash} {fingerprint_effective or effective_hash}",
+        "base": base_hash,
+        "migration": migration_hash,
+        "shared_app": shared_app_hash,
+        "app_env": app_env_hash,
+        "database": database_hash,
+        "effective": effective_hash,
+    }
+
+    for svc in APP_SERVICES:
+        img = service_image_name(svc)
+        svc_files_hash = sha256_text("\n".join(buckets[svc]))
+        build_hash = sha256_text(f"{base_hash}\n{shared_app_hash}\n{svc_files_hash}\n{img}")
+        deploy_hash = sha256_text(f"{build_hash}\n{app_env_hash}\n{per_service_compose[svc]}")
+        state[f"build:{svc}"] = build_hash
+        state[f"service:{svc}"] = deploy_hash
+        state[f"compose:{svc}"] = per_service_compose[svc]
+        if svc in APP_SERVICES and svc in DEFINITIONS:
+            state[f"definition:{svc}"] = DEFINITIONS[svc]
+
+    if compose_rendered and RENDERED_PROJECT:
+        # The project identity every `compose ps` and `up` resolves containers in (see the planner).
+        state["project"] = RENDERED_PROJECT
+        # And the daemon they run on: another one sees every container as absent.
+        state["daemon"] = docker_daemon_identity()
+        # DB settings Compose itself gives an app service (an override's environment) select the
+        # database as much as app.env does. Only present ones count, so existing records hold.
+        rendered_db = []
+        for svc in APP_SERVICES:
+            env = RENDERED_SERVICES.get(svc, {}).get("environment") if isinstance(RENDERED_SERVICES.get(svc), dict) else None
+            if isinstance(env, dict):
+                for key in ("DB_URL", "DB_CONNECTION", "DB_HOST", "DB_PORT", "DB_SOCKET", "DB_DATABASE"):
+                    if env.get(key) is not None:  # A null pass-through is unset in the container.
+                        value = normalize_host(str(env[key])) if key == "DB_HOST" else str(env[key])
+                        if key == "DB_URL":
+                            # Host and `host=` normalized as app_connection compares them.
+                            value = normalize_db_url(value).rsplit("@", 1)[-1]
+                        rendered_db.append(f"{svc}:{key}={value}")
+        if rendered_db:
+            state["database"] = sha256_text("\n".join([state["database"], *rendered_db]))
+    extra = sorted(set(per_service_compose) - set(ALL_SERVICES)) if compose_rendered else []
+    for svc in (*DATA_SERVICES, *INFRA_SERVICES, *extra):
+        svc_files_hash = sha256_text("\n".join(buckets.get(svc, [])))
+        deploy_hash = sha256_text(f"{svc_files_hash}\n{per_service_compose[svc]}")
+        state[f"service:{svc}"] = deploy_hash
+        state[f"compose:{svc}"] = per_service_compose[svc]
+        if svc in APP_SERVICES and svc in DEFINITIONS:
+            state[f"definition:{svc}"] = DEFINITIONS[svc]
+
+    return state
+
+
+def parse_stamp(stamp_path: Path) -> dict[str, str]:
+    try:
+        text = stamp_path.read_text(encoding="utf-8", errors="surrogateescape")
+    except FileNotFoundError:
+        return {}
+    except OSError as error:
+        # An unreadable stamp is not a first deployment.
+        sys.exit(f"deploy-plan: cannot read {stamp_path}: {error.strerror or error}")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return {}
+    parsed: dict[str, str] = {"fingerprint": lines[0]}
+    has_kv = False
+    for line in lines[1:]:
+        if "=" in line:
+            has_kv = True
+            k, _, v = line.partition("=")
+            parsed[k.strip()] = v.strip()
+    if not has_kv:
+        parsed["__legacy__"] = "1"
+        tokens = lines[0].split()
+        if len(tokens) >= 3:
+            parsed["effective"] = tokens[2]
+    return parsed
+
+
+def with_image_ids(state: dict[str, str]) -> dict[str, str]:
+    stamped = dict(state)
+    base_img = os.environ.get("BASE_IMAGE", "nntmux/base:local")
+    base_id = image_id(base_img)
+    if base_id:
+        stamped["image:base"] = f"{base_img}@{base_id}"
+    for svc in APP_SERVICES:
+        img = service_image_name(svc)
+        svc_id = image_id(img)
+        if svc_id:
+            stamped[f"image:{svc}"] = f"{img}@{svc_id}"
+    return stamped
+
+
+def with_built_image_ids(state: dict[str, str], stamp_path: Path) -> dict[str, str]:
+    """The build stamp's image records: the current image of each tag build-images built in this run
+    (it lists them in <stamp>.built), the previous record of every other one. A tag this run did not
+    build must still name its recorded image: one replaced meanwhile is never stamped as built."""
+    previous = parse_stamp(stamp_path)
+    try:
+        built = dict((line.split() + [""])[:2] for line in Path(f"{stamp_path}.built").read_text(encoding="utf-8").splitlines() if line.strip())
+    except FileNotFoundError:
+        built = {}
+    except OSError as error:
+        sys.exit(f"deploy-plan: cannot read {stamp_path}.built: {error.strerror or error}")
+    stamped = dict(state)
+    roles = [("image:base", os.environ.get("BASE_IMAGE", "nntmux/base:local"))]
+    roles += [(f"image:{svc}", service_image_name(svc)) for svc in APP_SERVICES]
+    for key, tag in roles:
+        current = image_id(tag)
+        if normalize_ref(tag) in built:
+            # The image the build produced (recorded right after it), not whatever the tag names now.
+            if current != built[normalize_ref(tag)]:
+                sys.exit(f"deploy-plan: {tag} now names {current or 'nothing'}, not the {built[normalize_ref(tag)] or 'unrecorded'} "
+                         "this build produced; not stamping a replaced image as built.")
+            stamped[key] = f"{tag}@{current}"
+            continue
+        record = previous.get(key)
+        if not record:
+            # Never verified: the next build plans it again.
+            continue
+        if record != f"{tag}@{current}":
+            sys.exit(f"deploy-plan: {tag} now names {current or 'nothing'}, not its recorded {record.rsplit('@', 1)[-1]}, "
+                     "and this build did not build it; not stamping a replaced image as built.")
+        stamped[key] = record
+    return stamped
+
+
+def format_stamp(state: dict[str, str], refresh_images: bool = True) -> str:
+    stamped = with_image_ids(state) if refresh_images else dict(state)
+    lines = [stamped["fingerprint"]]
+    for key in sorted(k for k in stamped if k != "fingerprint"):
+        lines.append(f"{key}={stamped[key]}")
+    return "\n".join(lines) + "\n"
+
+
+def image_exists(image: str) -> bool:
+    proc = subprocess.run(
+        ["docker", "image", "inspect", image],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
+def image_id(image: str) -> str | None:
+    proc = subprocess.run(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", image],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        # Only a missing image is "no image"; any other failure must not read as one.
+        if "no such image" in proc.stderr.lower():
+            return None
+        sys.exit(f"deploy-plan: cannot inspect image {image}: {proc.stderr.strip()}")
+    return proc.stdout.strip()
+
+
+def current_container_id(docker_dir: Path, svc: str) -> str:
+    """The running container of a service, or "" when none runs. A failed query exits."""
+    env = dict(os.environ)
+    env.setdefault("COMPOSE_FILE", str(docker_dir / "docker-compose.yml"))
+    ps = subprocess.run([*compose_command(docker_dir), "ps", "-q", svc], capture_output=True, text=True, env=env, check=False)
+    if ps.returncode != 0:
+        sys.exit(f"deploy-plan: cannot list the {svc} container: {ps.stderr.strip()}")
+    lines = ps.stdout.strip().splitlines()
+    return lines[0] if lines else ""
+
+
+def check_app_container(docker_dir: Path, svc: str, verify_image: bool = True) -> tuple[bool, str]:
+    """Return (is_ok, reason) for a running app service container."""
+    env = dict(os.environ)
+    env.setdefault("COMPOSE_FILE", str(docker_dir / "docker-compose.yml"))
+    ps = subprocess.run(
+        [*compose_command(docker_dir), "ps", "-q", svc],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    if ps.returncode != 0:
+        # A failed query is not a missing container (that would recreate every app service).
+        sys.exit(f"deploy-plan: cannot list the {svc} container: {ps.stderr.strip()}")
+    if not ps.stdout.strip():
+        return False, "missing"
+    container = ps.stdout.strip().splitlines()[0]
+    status_proc = subprocess.run(
+        ["docker", "inspect", "--format", "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}", container],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if status_proc.returncode != 0:
+        sys.exit(f"deploy-plan: cannot inspect the {svc} container: {status_proc.stderr.strip()}")
+    if status_proc.stdout.strip() != "running healthy":
+        return False, f"unhealthy ({status_proc.stdout.strip()})"
+    if verify_image:
+        expected = image_id(service_image_name(svc))
+        if not expected:
+            return False, "missing-image"
+        img_proc = subprocess.run(
+            ["docker", "inspect", "--format", "{{.Image}}", container],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if img_proc.returncode != 0:
+            sys.exit(f"deploy-plan: cannot inspect the {svc} container image: {img_proc.stderr.strip()}")
+        if img_proc.stdout.strip() != expected:
+            return False, "stale-image"
+    return True, "healthy"
+
+
+def running_image(docker_dir: Path, svc: str) -> str | None:
+    env = dict(os.environ)
+    env.setdefault("COMPOSE_FILE", str(docker_dir / "docker-compose.yml"))
+    ps = subprocess.run([*compose_command(docker_dir), "ps", "-q", svc], capture_output=True, text=True, env=env, check=False)
+    if ps.returncode != 0:
+        sys.exit(f"deploy-plan: cannot list the {svc} container: {ps.stderr.strip()}")
+    if not ps.stdout.strip():
+        return None
+    container = ps.stdout.strip().splitlines()[0]
+    proc = subprocess.run(["docker", "inspect", "--format", "{{.Image}}", container], capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        sys.exit(f"deploy-plan: cannot inspect the {svc} container image: {proc.stderr.strip()}")
+    return proc.stdout.strip()
+
+
+def stale_service_images(docker_dir: Path, rendered: dict[str, object] | None = None) -> list[str]:
+    """Running data/infrastructure services whose container image ID differs from the local ID of
+    their image tag (e.g. after `docker pull` replaced the tag in place). The tag is the rendered
+    one when known, else the one the container was created from. Image IDs never enter the
+    fingerprint; this check runs instead. One query lists the containers, one inspects them all."""
+    env = dict(os.environ)
+    env.setdefault("COMPOSE_FILE", str(docker_dir / "docker-compose.yml"))
+    ps = subprocess.run([*compose_command(docker_dir), "ps", "-q"], capture_output=True, text=True, env=env, check=False)
+    if ps.returncode != 0:
+        sys.exit(f"deploy-plan: cannot list the running containers: {ps.stderr.strip()}")
+    containers = ps.stdout.split()
+    if not containers:
+        return []
+    proc = subprocess.run(
+        ["docker", "inspect", "--format", '{{index .Config.Labels "com.docker.compose.service"}} {{.Image}} {{.Config.Image}}', *containers],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        sys.exit(f"deploy-plan: cannot inspect the running containers: {proc.stderr.strip()}")
+    expected: dict[str, str | None] = {}
+    stale: set[str] = set()
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 3:
+            sys.exit(f"deploy-plan: unexpected container inspection output: {line!r}")
+        svc, running, tag = parts
+        if svc in APP_SERVICES:
+            # App services are compared with their stamped/role image elsewhere.
+            continue
+        if rendered is not None and svc not in rendered:
+            # An orphan of a service removed from Compose: the planner leaves it running and can
+            # never reconcile it, so it must not hold every later rollout unstamped.
+            continue
+        cfg = (rendered or {}).get(svc)
+        if isinstance(cfg, dict) and isinstance(cfg.get("image"), str):
+            tag = cfg["image"]
+        if tag not in expected:
+            expected[tag] = image_id(tag)
+        # A tag with no local image (removed or never pulled) carries no newer image to roll out.
+        if expected[tag] and expected[tag] != running:
+            stale.add(svc)
+    return sorted(stale)
+
+
+def container_config_hash(docker_dir: Path, svc: str) -> str:
+    """The Compose configuration hash label of the service's running container ("" when none)."""
+    env = dict(os.environ)
+    env.setdefault("COMPOSE_FILE", str(docker_dir / "docker-compose.yml"))
+    ps = subprocess.run([*compose_command(docker_dir), "ps", "-q", svc], capture_output=True, text=True, env=env, check=False)
+    if ps.returncode != 0:
+        sys.exit(f"deploy-plan: cannot list the {svc} container: {ps.stderr.strip()}")
+    if not ps.stdout.strip():
+        return ""
+    container = ps.stdout.strip().splitlines()[0]
+    proc = subprocess.run(
+        ["docker", "inspect", "--format", '{{index .Config.Labels "com.docker.compose.config-hash"}}', container],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        sys.exit(f"deploy-plan: cannot inspect the {svc} container configuration: {proc.stderr.strip()}")
+    return proc.stdout.strip()
+
+
+def compose_config_hash(docker_dir: Path, svc: str) -> str:
+    """`compose config --hash <svc>`: the configuration hash a container created now would carry."""
+    env = dict(os.environ)
+    env.setdefault("COMPOSE_FILE", str(docker_dir / "docker-compose.yml"))
+    proc = subprocess.run([*compose_command(docker_dir), "config", "--hash", svc], capture_output=True, text=True, env=env, check=False)
+    if proc.returncode != 0:
+        sys.exit(f"deploy-plan: cannot compute the {svc} configuration hash: {proc.stderr.strip()}")
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == svc and parts[1]:
+            return parts[1]
+    sys.exit(f"deploy-plan: compose config --hash printed no hash for {svc}.")
+
+
+def container_exists(docker_dir: Path, svc: str) -> bool:
+    env = dict(os.environ)
+    env.setdefault("COMPOSE_FILE", str(docker_dir / "docker-compose.yml"))
+    ps = subprocess.run([*compose_command(docker_dir), "ps", "-a", "-q", svc], capture_output=True, text=True, env=env, check=False)
+    if ps.returncode != 0:
+        sys.exit(f"deploy-plan: cannot list the {svc} container: {ps.stderr.strip()}")
+    return bool(ps.stdout.strip())
+
+
+def container_started_at(docker_dir: Path, svc: str) -> float | None:
+    """Start time of the service's container as a POSIX timestamp, None when it has no container.
+    Raises ValueError when an existing container's start time cannot be read."""
+    env = dict(os.environ)
+    env.setdefault("COMPOSE_FILE", str(docker_dir / "docker-compose.yml"))
+    ps = subprocess.run([*compose_command(docker_dir), "ps", "-a", "-q", svc], capture_output=True, text=True, env=env, check=False)
+    if ps.returncode != 0:
+        raise ValueError(f"compose ps failed for {svc}")
+    if not ps.stdout.strip():
+        return None
+    container = ps.stdout.strip().splitlines()[0]
+    proc = subprocess.run(["docker", "inspect", "--format", "{{.State.StartedAt}}", container], capture_output=True, text=True, check=False)
+    match = re.match(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$", proc.stdout.strip())
+    if proc.returncode != 0 or not match:
+        raise ValueError(f"unreadable start time for {svc}")
+    offset = "+00:00" if match.group(3) == "Z" else match.group(3)
+    fraction = (match.group(2) or "0")[:6].ljust(6, "0")
+    return datetime.fromisoformat(f"{match.group(1)}.{fraction}{offset}").timestamp()
+
+
+def mounts_changed_since_start(docker_dir: Path, svc: str) -> bool:
+    """True when a mounted configuration source was modified after the container started, so the
+    running process cannot have loaded it. Used without a per-service stamp. An unreadable or
+    missing mount source reports True; an unknown container start time aborts the plan."""
+    cfg = RENDERED_SERVICES.get(svc)
+    if isinstance(cfg, dict) and (cfg.get("configs") or cfg.get("secrets")):
+        # Compose copies config and secret sources in at creation; with no record of what the
+        # running container got, recreate it rather than guess from timestamps.
+        return True
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("volumes"), list):
+        return False
+    for volume in cfg["volumes"]:
+        if isinstance(volume, dict) and volume.get("type") == "bind" and isinstance(volume.get("source"), str):
+            source = compose_path(volume["source"])
+            # The source itself counts wherever it lives (an external `/srv/database/current`), but
+            # not the host-system trees observed through links such as macOS `/var/run/docker.sock`.
+            own_link = os.path.islink(source.rstrip("/")) and not is_host_system(os.path.abspath(source))
+            if own_link or symlinked_below(source, project_directory(docker_dir)):
+                # A symlinked data source may have been retargeted; with no record of what the
+                # container mounted, recreate it rather than reconcile it in place.
+                return True
+    try:
+        started = container_started_at(docker_dir, svc)
+    except ValueError as error:
+        # Fail closed without guessing: "changed" would force-recreate a data service.
+        sys.exit(f"deploy-plan: cannot determine when {svc} started: {error}")
+    if started is None:
+        return False
+    for volume in cfg["volumes"]:
+        if not (isinstance(volume, dict) and volume.get("type") == "bind" and isinstance(volume.get("source"), str)):
+            continue
+        path = Path(compose_path(volume["source"]))
+        try:
+            try:
+                info = os.stat(path)
+            except FileNotFoundError:
+                # Deleted after the container started: nothing says what the container loaded, and
+                # an unchanged bind path never makes Compose recreate it (the recorded-stamp path
+                # also sees a missing source as a change).
+                return True
+            if stat.S_ISREG(info.st_mode):
+                newest = info.st_mtime
+            elif stat.S_ISDIR(info.st_mode) and volume.get("read_only"):
+                if is_host_system(str(path.resolve())):
+                    continue
+
+                def walk_error(error: OSError) -> None:
+                    raise error
+
+                # Directory mtimes too: deleting or renaming a nested file only touches its parent.
+                newest = max(
+                    stamp
+                    for root, _, files in os.walk(path, onerror=walk_error)
+                    for stamp in [os.stat(root).st_mtime, *(os.stat(Path(root) / name).st_mtime for name in files)]
+                )
+            else:
+                continue
+        except OSError:
+            return True
+        if newest > started:
+            return True
+    return False
+
+
+def compute_build_targets(repo: Path, docker_dir: Path, stamp_path: Path, force: bool | None = None) -> list[str]:
+    state = compute_state(repo, docker_dir, include_compose=False)
+    stamped = parse_stamp(stamp_path)
+    if force is None:
+        force = os.environ.get("FORCE", "0") == "1"
+
+    targets: list[str] = []
+    base_img = os.environ.get("BASE_IMAGE", "nntmux/base:local")
+    base_id = image_id(base_img)
+    if (
+        force
+        or stamped.get("base") != state["base"]
+        or not base_id
+        or stamped.get("image:base") != f"{base_img}@{base_id}"
+    ):
+        targets.append("base")
+
+    for svc in APP_SERVICES:
+        img = service_image_name(svc)
+        svc_id = image_id(img)
+        if (
+            force
+            or f"build:{svc}" not in stamped
+            or stamped.get(f"build:{svc}") != state[f"build:{svc}"]
+            or not svc_id
+            or stamped.get(f"image:{svc}") != f"{img}@{svc_id}"
+        ):
+            targets.append(svc)
+
+    if "base" in targets:
+        # Role builds hash the base's Dockerfile text, not its image ID: a rebuilt base (e.g. after
+        # refreshing its upstream image) reaches the roles only when every role is rebuilt on it.
+        targets = ["base", *APP_SERVICES]
+    return targets
+
+
+STATELESS_LABEL = "nntmux.deploy.stateless"
+
+
+def orphan_running(svc: str) -> bool:
+    """True while a container of this project's (unrendered) service still runs. A failed query exits."""
+    if not RENDERED_PROJECT:
+        sys.exit("deploy-plan: the rendered Compose configuration names no project; cannot look for orphans.")
+    proc = subprocess.run(
+        ["docker", "ps", "-q", "--filter", f"label=com.docker.compose.project={RENDERED_PROJECT}",
+         "--filter", f"label=com.docker.compose.service={svc}"],
+        capture_output=True, text=True, check=False,
+    )
+    if proc.returncode != 0:
+        sys.exit(f"deploy-plan: cannot list the {svc} containers: {proc.stderr.strip()}")
+    return bool(proc.stdout.strip())
+
+
+def scaled_to_zero(svc: str) -> bool:
+    """`scale: 0` or `deploy.replicas: 0`: rendered, but Compose never creates a container for it."""
+    cfg = RENDERED_SERVICES.get(svc)
+    if not isinstance(cfg, dict):
+        return False
+    deploy = cfg.get("deploy")
+    replicas = deploy.get("replicas") if isinstance(deploy, dict) else None
+    return cfg.get("scale") == 0 or replicas == 0
+
+
+def declared_stateless(svc: str) -> bool:
+    """An added service is stateless only when it carries the label `nntmux.deploy.stateless: "true"`."""
+    cfg = RENDERED_SERVICES.get(svc)
+    labels = cfg.get("labels") if isinstance(cfg, dict) else None
+    if isinstance(labels, dict):
+        value = labels.get(STATELESS_LABEL)
+    elif isinstance(labels, list):
+        value = next((item.split("=", 1)[1] for item in labels if isinstance(item, str) and item.startswith(STATELESS_LABEL + "=")), None)
+    else:
+        value = None
+    return isinstance(value, str) and value.strip().lower() == "true"
+
+
+def extra_services(state: dict[str, str]) -> list[str]:
+    rendered = {key.split(":", 1)[1] for key in state if key.startswith("service:")}
+    return sorted(rendered - set(ALL_SERVICES))
+
+
+def data_services(state: dict[str, str]) -> list[str]:
+    """Known data services plus every added service not declared stateless: an unknown service may
+    hold state (e.g. a replacement database during a cutover), so it changes only with writers quiesced."""
+    return [*DATA_SERVICES, *(svc for svc in extra_services(state) if not declared_stateless(svc))]
+
+
+def infra_services(state: dict[str, str]) -> list[str]:
+    """Known infrastructure plus every added service labelled `nntmux.deploy.stateless: "true"`."""
+    return [*INFRA_SERVICES, *(svc for svc in extra_services(state) if declared_stateless(svc))]
+
+
+def symlinked_below(source: str, root: Path) -> bool:
+    """True when the source, or a directory between the project root and it, is a symlink (e.g.
+    `docker/data -> /Volumes/disk1`). Links above the project (macOS `/var`) do not count."""
+    real_root = os.path.realpath(root)
+    path = os.path.abspath(source).rstrip("/")
+    while path and path != os.path.dirname(path):
+        parent = os.path.dirname(path)
+        real_parent = os.path.realpath(parent)
+        inside = real_parent == real_root or real_parent.startswith(real_root + os.sep)
+        if inside and os.path.islink(path):
+            return True
+        path = parent
+    return False
+
+
+def normalize_ref(ref: str) -> str:
+    """Docker's canonical image reference (as build-images compares them): no docker.io/ or
+    library/ prefix, :latest when untagged."""
+    for prefix in ("docker.io/", "index.docker.io/"):
+        if ref.startswith(prefix):
+            ref = ref[len(prefix):]
+    if ref.startswith("library/"):
+        ref = ref[len("library/"):]
+    last = ref.rsplit("/", 1)[-1]
+    return ref if (":" in last or "@" in last) else f"{ref}:latest"
+
+
+def compose_path(path: str) -> str:
+    """A path from `compose config` output: Compose escapes a literal `$` as `$$` there."""
+    return path.replace("$$", "$")
+
+
+def app_env_path(docker_dir: Path) -> Path:
+    """The dotenv file the app services read as /app/.env: the source of their rendered bind mount
+    (an override may remap it, e.g. to a persistent runtime copy), else config/app.env. Every rendered
+    app service must mount the same file: otherwise no one file says which database they use."""
+    sources: dict[str | None, str | None] = {}
+    for app in APP_SERVICES:
+        cfg = RENDERED_SERVICES.get(app)
+        if not isinstance(cfg, dict):
+            continue
+        source: str | None = None
+        volumes = cfg.get("volumes") or []
+        for volume in volumes:
+            if not (isinstance(volume, dict) and str(volume.get("target", "")).rstrip("/") == "/app/.env"):
+                continue
+            if volume.get("type") != "bind" or not isinstance(volume.get("source"), str):
+                sys.exit(f"deploy-plan: app service {app} mounts /app/.env from a {volume.get('type')} mount; selective "
+                         "deployment reads the database settings from a bind-mounted file. Bind-mount the app.env file.")
+            source = compose_path(volume["source"])
+        if volumes and not source:
+            # Mounts rendered, but none at /app/.env (an override removed it): no file says which
+            # database the app uses, and the default config/app.env reaches no container.
+            sys.exit(f"deploy-plan: app service {app} does not mount /app/.env; selective deployment reads the database "
+                     "settings from the app.env the apps mount. Keep the shipped /app/.env bind mount.")
+        # Symlinks to one file (the split production layout) are the same file.
+        sources.setdefault(os.path.realpath(source) if source else None, source)
+    if len(sources) > 1:
+        sys.exit("deploy-plan: the app services mount different files (or none) as /app/.env; selective deployment "
+                 "reads one app.env to know which database they migrate and fence. Mount the same file in all four.")
+    source = next(iter(sources.values()), None)
+    return Path(source) if source else docker_dir / "config/app.env"
+
+
+def normalize_host(host: str) -> str:
+    """DNS names are case-insensitive and may be written fully qualified (`mariadb.`)."""
+    # No whitespace strip: a quoted `" mariadb "` reaches the app with its spaces, another host.
+    return host.lower().removesuffix(".")
+
+
+def normalize_db_url(url: str) -> str:
+    """DB_URL with only its host normalized; credentials, database name and query keep their case."""
+    try:
+        parts = urlsplit(url)
+        if not parts.hostname:
+            return url
+    except ValueError:
+        return url
+    userinfo, at, hostport = parts.netloc.rpartition("@")
+    if hostport.startswith("["):
+        end = hostport.find("]") + 1
+        hostport = hostport[:end].lower() + hostport[end:]
+    else:
+        name, colon, port = hostport.rpartition(":") if ":" in hostport else (hostport, "", "")
+        hostport = normalize_host(name) + colon + port
+    return urlunsplit((parts.scheme, userinfo + at + hostport, parts.path, normalize_query_host(parts.query), parts.fragment))
+
+
+def normalize_query_host(query: str) -> str:
+    """A `host=` query option (it overrides the URL's host in Laravel) normalized like the host."""
+    # Decoded first (`MariaDB%2E` is `mariadb.`), as matched_database_service reads it, then re-encoded.
+    return re.sub(r"(^|&)(host=)([^&]*)", lambda m: m.group(1) + m.group(2) + quote(normalize_host(unquote_plus(m.group(3))), safe=""), query)
+
+
+def matched_database_service(docker_dir: Path) -> str | None:
+    """The rendered service the app's database runs in, or None when its host names no rendered
+    service (an external database). Per app service: its rendered Compose environment wins over
+    app.env, DB_URL's host over DB_HOST, and a `host=` query option over the URL's host (Laravel's
+    order). All apps must agree."""
+    interpolated: set[str] = set()
+    multiline: set[str] = set()
+    env_path = app_env_path(docker_dir)
+    app_env = read_dotenv(env_path, interpolated, multiline, phpdotenv=True)
+
+    def selected(values: dict) -> list[str]:
+        hosts = []
+        try:
+            url = urlsplit(str(values.get("DB_URL") or ""))
+            # Laravel merges the URL's query options last: `?host=db2` is the host it connects to.
+            query_host = parse_qs(url.query, keep_blank_values=True).get("host")
+            if query_host is not None:
+                if not query_host[-1].strip():
+                    sys.exit("deploy-plan: DB_URL sets an empty host= query option, so the database it selects cannot "
+                             "be determined; remove it or name the host.")
+                hosts.append(query_host[-1])
+            hosts.append(url.hostname or "")
+        except ValueError:
+            pass
+        hosts.append(str(values.get("DB_HOST") or ""))
+        return hosts
+
+    # Every name Docker DNS resolves to a service, case-insensitively: its service name, network
+    # aliases, `hostname:`, container name (explicit, or Compose's `<project>-<svc>-1`) and `links:`
+    # aliases; any of them may also be qualified with `.<network>` for a network the service joins.
+    dns_names: dict[str, set[str]] = {}
+    joined: dict[str, set[str]] = {}
+    for name, svc_cfg in RENDERED_SERVICES.items():
+        cfg_map = svc_cfg if isinstance(svc_cfg, dict) else {}
+        names = [name]
+        networks = cfg_map.get("networks")
+        if isinstance(networks, dict):
+            for net in networks.values():
+                names.extend(str(a) for a in ((net.get("aliases") or []) if isinstance(net, dict) else []))
+        # The networks' real names (Docker DNS knows `<project>_default`, not the Compose key); a
+        # service with `network_mode` joins none.
+        keys = [] if cfg_map.get("network_mode") else (list(networks) if isinstance(networks, (dict, list)) else ["default"])
+        for key in keys:
+            top = RENDERED_NETWORKS.get(key)
+            real = top.get("name") if isinstance(top, dict) else None
+            if isinstance(real, str) and real:
+                joined.setdefault(name, set()).add(real.lower())
+            elif RENDERED_PROJECT:
+                joined.setdefault(name, set()).add(f"{RENDERED_PROJECT}_{key}".lower())
+        for key in ("container_name", "hostname"):
+            if cfg_map.get(key):
+                names.append(str(cfg_map[key]))
+        if RENDERED_PROJECT:
+            names.extend(f"{RENDERED_PROJECT}{sep}{name}{sep}1" for sep in ("-", "_"))
+        for link in cfg_map.get("links") or []:
+            target, _, alias = str(link).partition(":")
+            if alias and target in RENDERED_SERVICES:
+                dns_names.setdefault(alias.lower(), set()).add(target)
+        for alias in names:
+            dns_names.setdefault(alias.lower(), set()).add(name)
+
+    def resolve(host: str) -> set[str]:
+        host = normalize_host(host)
+        if host in dns_names:
+            return dns_names[host]
+        # Any other dotted name (db2.prod.example) goes to the upstream resolver, whatever its first
+        # label: only a suffix naming a network the service is on stays local.
+        found: set[str] = set()
+        for index, char in enumerate(host):
+            if char == ".":
+                found.update(svc for svc in dns_names.get(host[:index], set()) if host[index + 1:] in joined.get(svc, set()))
+        return found
+
+    targets = set()
+    for app in APP_SERVICES:
+        cfg = RENDERED_SERVICES.get(app)
+        env = cfg.get("environment") if isinstance(cfg, dict) else None
+        # A pass-through key Compose leaves unset (`environment: [DB_HOST]`) renders null: app.env decides.
+        rendered = {k: v for k, v in env.items() if v is not None} if isinstance(env, dict) else {}
+        # Keys Compose sets for this app shadow app.env's (Laravel reads the process environment first).
+        merged = {**app_env, **{k: v for k, v in rendered.items() if k in ("DB_URL", "DB_HOST", "DB_CONNECTION", "DB_PORT", "DB_SOCKET", "DB_DATABASE")}}
+        for key in ("DB_URL", "DB_HOST", "DB_CONNECTION", "DB_PORT", "DB_SOCKET", "DB_DATABASE"):
+            value = app_env.get(key, "")
+            # phpdotenv expands only `${NAME}` (a bare `$`, e.g. in a password, is literal); a
+            # multi-line value cannot be read whole here either.
+            if key not in rendered and (key in multiline or (key in interpolated and "${" in value)):
+                # Expanded, the literal is not the host Laravel connects to.
+                sys.exit(f"deploy-plan: config/app.env's {key} uses `${{...}}` interpolation (or a multi-line value), so the database it "
+                         "selects cannot be determined; write it literally (single-quoted to keep a literal `${`).")
+        for host in selected(merged):
+            if host:
+                services = resolve(host)
+                if len(services) > 1:
+                    # DNS may answer with any of them.
+                    sys.exit(f"deploy-plan: the database host {host} names several services ({', '.join(sorted(services))}); "
+                             "selective deployment must know which one it migrates and fences.")
+                targets.update(services)
+                break
+    if len(targets) > 1:
+        sys.exit(f"deploy-plan: the app services select different database services ({', '.join(sorted(targets))}); "
+                 "selective deployment migrates and fences one database. Give every app the same DB_HOST/DB_URL.")
+    database_target(docker_dir)  # Same host, another schema: rejected there too.
+    if not targets:
+        return None
+    matched = targets.pop()
+    cfg = RENDERED_SERVICES.get(matched)
+    deploy = cfg.get("deploy") if isinstance(cfg, dict) else None
+    replicas = deploy.get("replicas") if isinstance(deploy, dict) else None
+    if (isinstance(replicas, int) and replicas != 1) or (isinstance(cfg, dict) and isinstance(cfg.get("scale"), int) and cfg["scale"] != 1):
+        # A rollout would drain the writers and converge the database to that many containers: none
+        # left for the barrier and the migration, or several answering one host.
+        sys.exit(f"deploy-plan: the database service {matched} sets a replica count other than one; selective deployment "
+                 "migrates and fences exactly one database container. Remove the scale/replicas override.")
+    return matched
+
+
+def database_service(docker_dir: Path) -> str:
+    """The rendered database service, or `mariadb` when the app's host names no rendered service (an
+    external database; the default then need not be rendered, and may be scaled to zero)."""
+    return matched_database_service(docker_dir) or "mariadb"
+
+
+def app_connection(app: str, app_env: dict, normalized: bool = True) -> dict:
+    """The connection settings an app service uses: its rendered environment over app.env's. The DNS
+    host (DB_HOST, DB_URL's host) is compared case-insensitively unless `normalized` is False."""
+    cfg = RENDERED_SERVICES.get(app)
+    env = cfg.get("environment") if isinstance(cfg, dict) else None
+    rendered = {k: v for k, v in env.items() if v is not None} if isinstance(env, dict) else {}
+    keys = ("DB_CONNECTION", "DB_URL", "DB_HOST", "DB_PORT", "DB_SOCKET", "DB_DATABASE")
+    values = {key: str(rendered[key] if key in rendered else app_env.get(key, "")) for key in keys}
+    if normalized:
+        values["DB_HOST"] = normalize_host(values["DB_HOST"])
+        values["DB_URL"] = normalize_db_url(values["DB_URL"])
+    return values
+
+
+def database_target(docker_dir: Path, normalized: bool = True) -> str:
+    """A digest of the connection web (and so the verification barrier) uses: a barrier adopted from
+    an earlier attempt fences only this database if its recorded target matches. Every app must use
+    the same connection, or web would migrate a schema another app does not read. With `normalized`
+    False: the digest of the literal settings, as barriers were labelled before host normalization
+    (the same connection, so deploy-app accepts either)."""
+    app_env = read_dotenv(app_env_path(docker_dir), phpdotenv=True)
+    web = app_connection("web", app_env)
+    for app in APP_SERVICES:
+        if app in RENDERED_SERVICES and app_connection(app, app_env) != web:
+            sys.exit(f"deploy-plan: app service {app} connects to another database than web (its DB_* settings differ); "
+                     "selective deployment migrates through web and fences one database. Give every app the same DB_* settings.")
+    if not normalized:
+        web = app_connection("web", app_env, normalized=False)
+    return hashlib.sha256(json.dumps(web, sort_keys=True).encode()).hexdigest()[:32]
+
+
+def docker_daemon_identity() -> str:
+    """The daemon the Docker CLI actually connects to: DOCKER_HOST wins over DOCKER_CONTEXT (with both
+    set, `docker context show` reports `default` and the CLI dials DOCKER_HOST), which wins over the
+    current context."""
+    host = os.environ.get("DOCKER_HOST", "")
+    context = os.environ.get("DOCKER_CONTEXT", "")
+    if host:
+        # With both set, either one changing is another daemon under some CLI's precedence.
+        return f"host:{host}+context:{context}" if context else f"host:{host}"
+    if not context:
+        # The current context, so an exported DOCKER_CONTEXT naming it compares equal.
+        proc = subprocess.run(["docker", "context", "show"], capture_output=True, text=True, check=False)
+        context = proc.stdout.strip() if proc.returncode == 0 else ""
+    if not context:
+        return "default"
+    # A context updated in place to another endpoint is another daemon under the same name.
+    proc = subprocess.run(["docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}", context],
+                          capture_output=True, text=True, check=False)
+    endpoint = proc.stdout.strip() if proc.returncode == 0 else ""
+    return f"context:{context}@{endpoint}" if endpoint else f"context:{context}"
+
+
+def service_providers(svc: str) -> set[str]:
+    """The services `svc` starts after: `depends_on` and `links` (`name` or `name:alias`)."""
+    cfg = RENDERED_SERVICES.get(svc)
+    if not isinstance(cfg, dict):
+        return set()
+    providers: set[str] = set()
+    deps = cfg.get("depends_on")
+    if isinstance(deps, (dict, list)):
+        providers.update(d for d in deps if isinstance(d, str))
+    links = cfg.get("links")
+    if isinstance(links, list):
+        providers.update(link.split(":", 1)[0] for link in links if isinstance(link, str))
+    return providers
+
+
+def transitive_dependencies(svc: str) -> set[str]:
+    """Every rendered service `svc` depends on, directly or through others."""
+    found: set[str] = set()
+    pending = [svc]
+    while pending:
+        for dep in service_providers(pending.pop()):
+            if isinstance(dep, str) and dep not in found:
+                found.add(dep)
+                pending.append(dep)
+    return found
+
+
+def dependency_order(services: list[str]) -> list[str]:
+    """Order services so each comes after the rendered services it `depends_on` (transitively),
+    keeping the given order otherwise; a dependency cycle keeps the given order unchanged."""
+    def deps_of(svc: str) -> list[str]:
+        return sorted(service_providers(svc))
+
+    order: dict[str, int] = {}
+    visiting: set[str] = set()
+
+    def visit(svc: str) -> bool:
+        if svc in order:
+            return True
+        if svc in visiting:
+            return False
+        visiting.add(svc)
+        for dep in deps_of(svc):
+            if dep in RENDERED_SERVICES and not visit(dep):
+                return False
+        visiting.discard(svc)
+        order[svc] = len(order)
+        return True
+
+    for svc in services:
+        if not visit(svc):
+            return list(services)
+    return sorted(services, key=lambda svc: order[svc])
+
+
+def compose_present(state: dict[str, str], svc: str) -> bool:
+    """False when the effective Compose configuration does not render this service."""
+    return state.get(f"compose:{svc}", "none") != "absent"
+
+
+def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_force: bool | None = None) -> dict[str, object]:
+    state = compute_state(repo, docker_dir, include_compose=True)
+    stamped = parse_stamp(stamp_path)
+    if stamped.get("daemon") and state.get("daemon") and stamped["daemon"] != state["daemon"]:
+        sys.exit(
+            f"deploy-plan: the Docker daemon changed from {stamped['daemon']} to {state['daemon']} since the last "
+            "deployment (DOCKER_CONTEXT/DOCKER_HOST); refusing to start a second stack. Select the original daemon, "
+            "or move the stamp aside under the guard after stopping the old stack."
+        )
+    if stamped.get("project") and state.get("project") and stamped["project"] != state["project"]:
+        # Every `compose ps` would resolve the new project and see the old project's still-running
+        # writers and data services as absent, then start a second stack on the same data.
+        sys.exit(
+            f"deploy-plan: the effective Compose project changed from {stamped['project']} to {state['project']} "
+            "since the last deployment; refusing to reconcile a different project. Restore COMPOSE_PROJECT_NAME "
+            "(or the project directory), or stop the old project and move its stamp aside under the guard."
+        )
+    force = os.environ.get("FORCE", "0") == "1"
+    first_deploy = not bool(stamped)
+    legacy_stamp = "__legacy__" in stamped
+    # Data/infra containers whose image tag now names a different local image (one query per poll).
+    stale_images = set(stale_service_images(docker_dir, RENDERED_SERVICES))
+    # Without a per-service stamp (none, or the legacy one-line format) nothing records which mounted
+    # configuration the running containers loaded. Compose reconciles every rendered data and infra
+    # service (recreating only rendered drift, never forcing); a service whose mounted file changed
+    # after its container started is recreated so the stamp never records unloaded configuration.
+
+    dirty_app: list[str] = []
+    app_reasons: dict[str, str] = {}
+
+    for svc in APP_SERVICES:
+        ok, reason = check_app_container(docker_dir, svc, verify_image=True)
+        if force:
+            dirty_app.append(svc)
+            app_reasons[svc] = "forced (FORCE=1)"
+        elif first_deploy:
+            dirty_app.append(svc)
+            app_reasons[svc] = "initial deployment"
+        elif legacy_stamp:
+            dirty_app.append(svc)
+            app_reasons[svc] = "legacy stamp upgrade"
+        elif stamped.get(f"service:{svc}") != state[f"service:{svc}"]:
+            dirty_app.append(svc)
+            app_reasons[svc] = "code/config changed"
+        elif f"image:{svc}" not in stamped or running_image(docker_dir, svc) != stamped[f"image:{svc}"].rsplit("@", 1)[-1]:
+            # The running container must be the exact image recorded by the last verified rollout.
+            dirty_app.append(svc)
+            app_reasons[svc] = "running image differs from stamp"
+        elif not ok:
+            dirty_app.append(svc)
+            app_reasons[svc] = reason
+        else:
+            app_reasons[svc] = "unchanged"
+
+    dirty_data: list[str] = []
+    reconcile_data: list[str] = []
+    start_data: list[str] = []
+    data_reasons: dict[str, str] = {}
+    # A recorded data service that is no longer rendered may have been renamed onto the same storage
+    # as a new one; then no new data service may start before the writers are quiesced.
+    # deploy-app stops each such predecessor (an orphan Compose leaves running) once writers stop.
+    removed_data = {
+        key.split(":", 1)[1] for key in stamped
+        if key.startswith("compose:") and stamped[key] != "absent"
+        and key.split(":", 1)[1] not in RENDERED_SERVICES
+        and key.split(":", 1)[1] not in APP_SERVICES and key.split(":", 1)[1] not in INFRA_SERVICES
+    }
+    # Its record outlives the stamp that first saw it unrendered (a no-op poll replaces the stamp):
+    # an `orphan:` record stays while its container still runs, so a successor added by a later poll
+    # still waits for the writers' drain and the orphan's stop.
+    recorded_orphans = {key.split(":", 1)[1] for key in stamped if key.startswith("orphan:")} - set(RENDERED_SERVICES)
+    running_orphans = {svc for svc in removed_data | recorded_orphans if orphan_running(svc)}
+    removed_data = sorted(removed_data | running_orphans)
+    for svc in running_orphans:
+        state[f"orphan:{svc}"] = "running"
+    data_removed = bool(removed_data)
+    # The apps' database when it names a rendered service (None for an external one).
+    matched_database = matched_database_service(docker_dir)
+    if matched_database and matched_database not in data_services(state):
+        # Only data services are changed with writers quiesced, migrated and fenced.
+        sys.exit(f"deploy-plan: the apps' database host names {matched_database}, which is not a data service; selective "
+                 "deployment migrates and fences only a data service. Point DB_HOST/DB_URL at the database service.")
+    for svc in data_services(state):
+        if not compose_present(state, svc):
+            data_reasons[svc] = "not rendered"
+        elif scaled_to_zero(svc) and not container_exists(docker_dir, svc):
+            data_reasons[svc] = "scaled to zero"
+        elif not container_exists(docker_dir, svc):
+            stamped_hash = stamped.get(f"service:{svc}")
+            if force:
+                # FORCE=1 stops every writer anyway, so it is reconciled after they stop.
+                reconcile_data.append(svc)
+                data_reasons[svc] = "start (no container)"
+            elif svc == matched_database:
+                # E.g. a database added beside its predecessor for a cutover: started before the drain,
+                # remote workers could reach it before the barrier and the migration. deploy-app starts
+                # a missing database only after the writers stop, and fences it at once.
+                dirty_data.append(svc)
+                data_reasons[svc] = "database (no container)"
+            elif not data_removed and (
+                first_deploy or legacy_stamp or stamped_hash is None
+                or stamped.get(f"compose:{svc}") == "absent"
+                or stamped_hash == state[f"service:{svc}"]
+            ):
+                # New, previously unrendered, or unchanged since its recorded deployment: no writer
+                # can be using it under this configuration, so it starts without a quiesce.
+                start_data.append(svc)
+                data_reasons[svc] = "start (no container)"
+            else:
+                # Missing and changed (e.g. a cutover to a replacement data directory): writers
+                # must not reconnect to it before they are quiesced and the migration has run.
+                dirty_data.append(svc)
+                data_reasons[svc] = "config/compose changed (no container)"
+        elif svc in stale_images:
+            dirty_data.append(svc)
+            data_reasons[svc] = "running image differs from its tag"
+        elif (no_record := (
+            first_deploy or legacy_stamp or f"service:{svc}" not in stamped
+            # Recorded as unrendered while an (orphaned) container kept running: nothing says
+            # which configuration that container loaded.
+            or stamped.get(f"compose:{svc}") == "absent"
+        )) and mounts_changed_since_start(docker_dir, svc):
+            # A mounted file changed after the container started: only a recreate loads it.
+            dirty_data.append(svc)
+            data_reasons[svc] = "mounted config newer than container"
+        elif no_record:
+            # No per-service record: Compose reconciles drift while writers are stopped, without
+            # force-recreating stateful services.
+            reconcile_data.append(svc)
+            data_reasons[svc] = "reconcile (no stamp)" if first_deploy else "reconcile (no record)"
+        elif stamped.get(f"service:{svc}") != state[f"service:{svc}"]:
+            dirty_data.append(svc)
+            data_reasons[svc] = "config/compose changed"
+        else:
+            data_reasons[svc] = "unchanged"
+
+    dirty_infra: list[str] = []
+    reconcile_infra: list[str] = []
+    infra_reasons: dict[str, str] = {}
+    for svc in infra_services(state):
+        if not compose_present(state, svc):
+            infra_reasons[svc] = "not rendered"
+        elif svc in stale_images:
+            dirty_infra.append(svc)
+            infra_reasons[svc] = "running image differs from its tag"
+        elif scaled_to_zero(svc) and not container_exists(docker_dir, svc):
+            infra_reasons[svc] = "scaled to zero"
+        elif not container_exists(docker_dir, svc):
+            # Removed (not merely stopped, which may be an operator's choice): recreate it.
+            reconcile_infra.append(svc)
+            infra_reasons[svc] = "no container"
+        elif (first_deploy or legacy_stamp or f"service:{svc}" not in stamped) and mounts_changed_since_start(docker_dir, svc):
+            dirty_infra.append(svc)
+            infra_reasons[svc] = "mounted config newer than container"
+        elif first_deploy or legacy_stamp or f"service:{svc}" not in stamped:
+            # Also covers a service added to Compose: a non-forced up creates it.
+            reconcile_infra.append(svc)
+            infra_reasons[svc] = "reconcile (no stamp)" if first_deploy else "reconcile (no record)"
+        elif stamped.get(f"service:{svc}") != state[f"service:{svc}"]:
+            dirty_infra.append(svc)
+            infra_reasons[svc] = "config/compose changed"
+        else:
+            infra_reasons[svc] = "unchanged"
+
+    compose_global_changed = not first_deploy and stamped.get("effective") != state["effective"]
+    reconciling = bool(reconcile_data or reconcile_infra or start_data)
+    # Services the stamp recorded as rendered that the effective Compose no longer renders: their
+    # removal explains a rendered-config change by itself (the container is left as an orphan, as
+    # Compose would), so it must not fall back to a full app rollout.
+    removed = sorted(
+        key.split(":", 1)[1]
+        for key, value in stamped.items()
+        if key.startswith("service:")
+        and key.split(":", 1)[1] not in APP_SERVICES
+        and (key not in state or (not compose_present(state, key.split(":", 1)[1]) and value != state[key]))
+    )
+    for svc in removed:
+        (data_reasons if svc in DATA_SERVICES else infra_reasons)[svc] = "removed from Compose"
+    # A residual change (top-level Compose sections, the Compose command or context) is explained by
+    # no service record: redeploy every app service and migrate.
+    global_fallback = compose_global_changed
+    if global_fallback:
+        for svc in APP_SERVICES:
+            if svc not in dirty_app:
+                dirty_app.append(svc)
+                app_reasons[svc] = "compose config changed"
+    # Roles sharing one image tag with a service whose image is rebuilt run that rebuilt image only
+    # once recreated, so they are recreated in the same drain rather than a later rollout.
+    rebuilt_tags = {
+        normalize_ref(service_image_name(svc)) for svc in dirty_app if stamped.get(f"build:{svc}") != state[f"build:{svc}"]
+    }
+    for svc in APP_SERVICES:
+        if svc not in dirty_app and normalize_ref(service_image_name(svc)) in rebuilt_tags:
+            dirty_app.append(svc)
+            app_reasons[svc] = "shares a rebuilt image"
+    # A Compose change to all four app services (e.g. a database cutover) migrates too. Only recorded
+    # app definitions count: a forgotten record means the migration record decides.
+    # The rendered definitions decide (a shared mounted-file edit is not a cutover); stamps from
+    # before definition records fall back to the compose records.
+    def app_definition_changed(svc: str) -> bool:
+        key = f"definition:{svc}" if f"definition:{svc}" in stamped and f"definition:{svc}" in state else f"compose:{svc}"
+        return key in stamped and stamped[key] != state.get(key)
+    all_app_compose_changed = global_fallback or all(app_definition_changed(svc) for svc in APP_SERVICES)
+
+    migrate = (
+        force
+        or first_deploy
+        or legacy_stamp
+        or stamped.get("migration") != state["migration"]
+        or all_app_compose_changed
+        # A changed database service (e.g. storage swapped for a restored copy) may hold an older
+        # schema; the idempotent migration always follows it, and its forgotten record makes a retry
+        # repeat it until it completes.
+        or database_service(docker_dir) in dirty_data
+        # Reconciling it may recreate it on a changed definition too (e.g. restored storage).
+        or database_service(docker_dir) in reconcile_data
+        # The app now connects to another database. Stamps from before this record never migrate for it.
+        or ("database" in stamped and stamped["database"] != state["database"])
+    )
+
+    # Reconcile-only work (e.g. a service added to Compose) is a rollout, never a no-op skip.
+    if not dirty_app and not dirty_data and not dirty_infra and not migrate and not reconciling:
+        mode = "noop"
+    elif migrate or dirty_data or reconcile_data:
+        # deploy-app stops every writer before touching a data service, reconcile included.
+        mode = "full"
+        for svc in APP_SERVICES:
+            if svc not in dirty_app:
+                dirty_app.append(svc)
+                if app_reasons.get(svc) == "unchanged":
+                    app_reasons[svc] = "migration quiesce" if migrate else "data service restart"
+    else:
+        mode = "selective"
+
+    # deploy-app applies each list one service at a time with `--no-deps`: providers first.
+    dirty_data, reconcile_data, start_data = (dependency_order(lst) for lst in (dirty_data, reconcile_data, start_data))
+    dirty_infra, reconcile_infra = (dependency_order(lst) for lst in (dirty_infra, reconcile_infra))
+    # Infrastructure between apps (gateway depends on web, indexer on gateway) has no phase order
+    # that starts each provider before its consumer; reject it.
+    for svc in infra_services(state):
+        if svc in RENDERED_SERVICES and any(dep in APP_SERVICES for dep in transitive_dependencies(svc)):
+            consumers = sorted(app for app in APP_SERVICES if svc in transitive_dependencies(app))
+            if consumers:
+                sys.exit(f"deploy-plan: infrastructure service {svc} depends on an app service and app service "
+                         f"{consumers[0]} depends on it; selective deployment cannot order that. Break the cycle.")
+    # A missing database is started (and fenced) ahead of the other data services; it cannot wait
+    # for one of them.
+    database = database_service(docker_dir)
+    data_providers = sorted(dep for dep in transitive_dependencies(database) if dep in data_services(state))
+    if data_providers:
+        sys.exit(f"deploy-plan: the database service {database} depends on data service {data_providers[0]}; "
+                 "selective deployment starts the database first. Remove that dependency.")
+    # A stateful service changes only with every writer stopped, so it cannot wait for an app provider.
+    for svc in [*dirty_data, *reconcile_data, *start_data]:
+        app_providers = sorted(dep for dep in transitive_dependencies(svc) if dep in APP_SERVICES)
+        if app_providers:
+            sys.exit(f"deploy-plan: data service {svc} depends on app service {app_providers[0]}; selective deployment "
+                     "changes data services only with every writer stopped. Remove that dependency.")
+
+    # build_force=False (deploy-app, after its build): FORCE already rebuilt everything, so any
+    # target still dirty means an image tag changed after the build.
+    build_targets = compute_build_targets(repo, docker_dir, docker_dir / ".build.stamp", force=build_force)
+
+    return {
+        "mode": mode,
+        "migrate": migrate,
+        "dirty_app": dirty_app,
+        "dirty_data": dirty_data,
+        "dirty_infra": dirty_infra,
+        "reconcile_data": reconcile_data,
+        "start_data": start_data,
+        "removed_data": removed_data,
+        "global_fallback": global_fallback,
+        "reconcile_infra": reconcile_infra,
+        "build_targets": build_targets,
+        "app_reasons": app_reasons,
+        "data_reasons": data_reasons,
+        "infra_reasons": infra_reasons,
+        "state": state,
+    }
+
+
+def main() -> None:
+    global BUILD_CONTEXT
+    docker_dir = Path(__file__).resolve().parent.parent
+    repo = Path(os.environ.get("DEPLOY_REPO", docker_dir.parent)).resolve()
+    BUILD_CONTEXT = BuildContext(repo)
+    stamp_path = Path(os.environ.get("DEPLOY_STAMP", docker_dir / ".deploy.stamp"))
+    if len(sys.argv) > 1 and sys.argv[1] != "--classify":
+        # Before any Compose call: DC must not reach another daemon or env file than the checks see.
+        reject_alternate_env_file()
+
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "--explain"
+
+    if cmd in ("--invalidate", "--forget", "--pending", "--record", "--record-healthy"):
+        # Mid-run stamp maintenance under the guard. --invalidate before the first mutation, --forget
+        # before a service is stopped or recreated, --record after it is healthy (from the plan
+        # snapshot, i.e. the state the run deployed, never a later re-read). Until the guard publishes
+        # a complete stamp, the fingerprint line stays "stale" so no poll can report "unchanged".
+        stamped = parse_stamp(stamp_path)
+        if not stamped:
+            if cmd != "--record":
+                return
+        record = {} if "__legacy__" in stamped else {k: v for k, v in stamped.items() if k != "fingerprint"}
+        items = sys.argv[2:]
+        keys = [key for item in items for key in (
+            (item,) if item in ("migration", "effective") else (f"service:{item}", f"compose:{item}", f"definition:{item}", f"image:{item}", f"build:{item}"))]
+        if cmd == "--forget":
+            for key in keys:
+                # An app service's compose record is the definition the migration state matches; it
+                # survives the recreate and moves only when the migration (or rollout) completes.
+                if key.startswith(("compose:", "definition:")) and key.split(":", 1)[1] in APP_SERVICES:
+                    continue
+                record.pop(key, None)
+        elif cmd == "--pending":
+            # A service whose recreate is about to start: if the run stops before it is healthy,
+            # the retry must still force-recreate it rather than fall back to the mtime rule.
+            for key in keys:
+                record.pop(key, None)
+            for item in items:
+                if item not in ("migration", "effective"):
+                    record[f"service:{item}"] = "pending"
+        elif cmd == "--record-healthy":
+            # After a partially failed app start: keep the services that are running healthy on the
+            # image this run planned and were created from the configuration it renders, so the
+            # retry repeats only the ones that did not come up. A `compose up` that failed before
+            # replacing a container leaves the old one healthy on the same image; only its Compose
+            # configuration-hash label tells it apart. Any failed query exits before writing.
+            snapshot = parse_stamp(Path(f"{stamp_path}.plan"))
+            # The container IDs deploy-app captured before `compose up`: one still running under the
+            # same ID was never replaced (its bind-mounted inputs are outside Compose's hash).
+            previous = dict(
+                entry.split("=", 1) for entry in os.environ.get("DEPLOY_PREVIOUS_CONTAINERS", "").split() if "=" in entry
+            )
+            for item in items:
+                if item not in previous:
+                    continue
+                current = current_container_id(docker_dir, item)
+                if not current or current == previous[item]:
+                    continue
+                planned = snapshot.get(f"image:{item}", "").rsplit("@", 1)[-1]
+                ok, _ = check_app_container(docker_dir, item, verify_image=False)
+                if not (ok and planned and running_image(docker_dir, item) == planned):
+                    continue
+                label = container_config_hash(docker_dir, item)
+                if not label or label != compose_config_hash(docker_dir, item):
+                    continue
+                for key in (f"service:{item}", f"compose:{item}", f"definition:{item}", f"image:{item}", f"build:{item}"):
+                    if key in snapshot:
+                        record[key] = snapshot[key]
+        elif cmd == "--record":
+            snapshot = parse_stamp(Path(f"{stamp_path}.plan"))
+            if not snapshot:
+                sys.exit("deploy-plan: no plan snapshot to record from.")
+            if "migration" in items:
+                # The completed migration covers the app definitions and the database this run deploys.
+                keys += [f"{kind}:{svc}" for svc in APP_SERVICES for kind in ("compose", "definition")] + ["database"]
+            for key in keys:
+                if key in snapshot:
+                    record[key] = snapshot[key]
+                else:
+                    record.pop(key, None)
+            for identity in ("project", "daemon"):
+                if identity in snapshot:
+                    # Partial records belong to this project and daemon, even before the final stamp.
+                    record[identity] = snapshot[identity]
+        tmp = stamp_path.with_name(f"{stamp_path.name}.tmp.{os.getpid()}")
+        tmp.write_text("stale\n" + "".join(f"{key}={record[key]}\n" for key in sorted(record)))
+        os.replace(tmp, stamp_path)
+        return
+
+    if cmd == "--classify":
+        # Operator/test aid: print each path's ownership buckets ("-" when it cannot reach an image).
+        for rel_path in sys.argv[2:]:
+            print(f"{rel_path} {','.join(classify_path(rel_path)) or '-'}")
+        return
+
+    if cmd == "--fingerprint":
+        state = compute_state(repo, docker_dir, include_compose=False)
+        print(state["fingerprint"])
+        return
+
+    if cmd == "--stamp-data":
+        include_compose = bool(os.environ.get("DEPLOY_CONFIG_COMMAND", "")) or (len(sys.argv) > 2 and sys.argv[2] == "deploy")
+        state = compute_state(repo, docker_dir, include_compose=include_compose)
+        if len(sys.argv) > 2 and sys.argv[2] == "deploy":
+            # The image IDs this run planned and verified on the running containers, not the tags'
+            # current IDs: a tag replaced after the final check must not be stamped as deployed.
+            state = with_image_ids(state)
+            snapshot = parse_stamp(Path(f"{stamp_path}.plan"))
+            for key in ("image:base", *(f"image:{svc}" for svc in APP_SERVICES)):
+                if key in snapshot:
+                    state[key] = snapshot[key]
+            # The orphans this run planned around; the next plan drops each one whose container is gone.
+            state.update({key: value for key, value in snapshot.items() if key.startswith("orphan:")})
+            sys.stdout.write(format_stamp(state, refresh_images=False))
+            return
+        if len(sys.argv) > 2 and sys.argv[2] == "build":
+            # Only the roles this build rebuilt get their tags' current image IDs.
+            sys.stdout.write(format_stamp(with_built_image_ids(state, stamp_path), refresh_images=False))
+            return
+        sys.stdout.write(format_stamp(state))
+        return
+
+    if cmd == "--build-targets":
+        build_stamp = Path(os.environ.get("DEPLOY_STAMP", docker_dir / ".build.stamp"))
+        targets = compute_build_targets(repo, docker_dir, build_stamp)
+        print(" ".join(targets))
+        return
+
+    if cmd == "--verify-images":
+        running = len(sys.argv) > 2 and sys.argv[2] == "--running"
+        verify_planned_images(docker_dir, stamp_path, sys.argv[3 if running else 2:], running)
+        return
+
+    if cmd == "--stale-images":
+        # deploy-current: running data/infra services whose image tag now names another image.
+        # Only services the effective Compose configuration renders (`ps` also lists orphans).
+        get_compose_service_hashes(docker_dir)
+        stale = stale_service_images(docker_dir, RENDERED_SERVICES)
+        # A rendered data or infrastructure service with no container at all also needs a rollout
+        # (healthy apps do not prove that, e.g., a deleted Manticore came back).
+        missing = [svc for svc in RENDERED_SERVICES if svc not in APP_SERVICES and svc not in stale
+                   and not scaled_to_zero(svc) and not container_exists(docker_dir, svc)]
+        print(" ".join([*stale, *missing]))
+        return
+
+    if cmd == "--deploy-actions":
+        # Runs after deploy-app's build: FORCE is not a reason to rebuild again.
+        plan = compute_deploy_plan(repo, docker_dir, stamp_path, build_force=False)
+        snapshot = Path(f"{stamp_path}.plan")
+        tmp = snapshot.with_name(f"{snapshot.name}.tmp.{os.getpid()}")
+        planned_state = dict(plan["state"])  # type: ignore[arg-type]
+        # The data/infrastructure images this plan inspected, for apply_each to verify each against.
+        for svc, cfg in RENDERED_SERVICES.items():
+            if svc not in APP_SERVICES and isinstance(cfg, dict) and isinstance(cfg.get("image"), str):
+                local = image_id(cfg["image"])
+                if local:
+                    planned_state[f"image:{svc}"] = f"{cfg['image']}@{local}"
+        tmp.write_text(format_stamp(planned_state))
+        os.replace(tmp, snapshot)
+        print(f"MODE={shlex.quote(str(plan['mode']))}")
+        print(f"MIGRATE={'1' if plan['migrate'] else '0'}")
+        print(f"DIRTY_APP={shlex.quote(' '.join(plan['dirty_app']))}")
+        print(f"DIRTY_DATA={shlex.quote(' '.join(plan['dirty_data']))}")
+        print(f"DIRTY_INFRA={shlex.quote(' '.join(plan['dirty_infra']))}")
+        print(f"RECONCILE_DATA={shlex.quote(' '.join(plan['reconcile_data']))}")
+        print(f"RECONCILE_INFRA={shlex.quote(' '.join(plan['reconcile_infra']))}")
+        print(f"START_DATA={shlex.quote(' '.join(plan['start_data']))}")
+        print(f"DATABASE_SERVICE={shlex.quote(database_service(docker_dir))}")
+        print(f"DATABASE_TARGET={shlex.quote(database_target(docker_dir))}")
+        # The same connection's digest before host normalization, which earlier barriers carry.
+        print(f"DATABASE_TARGET_LEGACY={shlex.quote(database_target(docker_dir, normalized=False))}")
+        print(f"REMOVED_DATA={shlex.quote(' '.join(plan['removed_data']))}")  # type: ignore[arg-type]
+        # Everything applied before the drain, in one depends_on order across the three lists:
+        # `up --no-deps` never starts a provider, whichever list it is in.
+        marks = {**{svc: "forget" for svc in plan["start_data"]}, **{svc: "forget" for svc in plan["reconcile_infra"]},
+                 **{svc: "pending" for svc in plan["dirty_infra"]}}
+        pre_drain = dependency_order([*plan["start_data"], *plan["reconcile_infra"], *plan["dirty_infra"]])
+        # A stateful service cannot wait for an app provider (writers are quiesced around it), and
+        # infrastructure whose app provider has no container yet waits until the apps are up.
+        post_services = set(plan["dirty_data"]) | set(plan["reconcile_data"])
+        after_app: list[str] = []
+        after_data: list[str] = []
+        for svc in pre_drain:
+            deps = transitive_dependencies(svc)
+            app_providers = [dep for dep in deps if dep in APP_SERVICES]
+            # An app provider that is missing, stopped or unhealthy (e.g. writers stopped by a failed
+            # run) is up again only after the app rollout.
+            if any(not check_app_container(docker_dir, dep, verify_image=False)[0] for dep in app_providers):
+                after_app.append(svc)
+            elif deps & post_services:
+                # Its data provider changes only after the drain. If an app provider is stopped by
+                # then (every writer in full mode), it waits for the app rollout; otherwise it
+                # follows its data provider.
+                stopping = set(APP_SERVICES) if plan["mode"] == "full" else {app for app in plan["dirty_app"] if app != "web"}
+                (after_app if any(dep in stopping for dep in app_providers) else after_data).append(svc)
+        pre_drain = [svc for svc in pre_drain if svc not in after_app and svc not in after_data]
+        # Compose would pull an absent image during the apply, which no check here has inspected.
+        for svc in [*pre_drain, *after_app, *plan["dirty_data"], *plan["reconcile_data"], *after_data]:
+            cfg = RENDERED_SERVICES.get(svc)
+            if isinstance(cfg, dict) and isinstance(cfg.get("image"), str) and not image_id(cfg["image"]):
+                sys.exit(f"deploy-plan: image {cfg['image']} for {svc} is not present locally; pull it deliberately "
+                         "(docker compose pull) before deploying, so the plan inspects what it applies.")
+        print(f"PRE_DRAIN={shlex.quote(' '.join(f'{marks[svc]}:{svc}' for svc in pre_drain))}")
+        print(f"AFTER_APP={shlex.quote(' '.join(f'{marks[svc]}:{svc}' for svc in after_app))}")
+        # The data services applied after the writers stop, likewise in one depends_on order.
+        post_marks = {**{svc: "pending" for svc in plan["dirty_data"]}, **{svc: "forget" for svc in plan["reconcile_data"]},
+                      **{svc: marks[svc] for svc in after_data}}
+        post_drain = dependency_order([*plan["dirty_data"], *plan["reconcile_data"], *after_data])
+        print(f"POST_DRAIN={shlex.quote(' '.join(f'{post_marks[svc]}:{svc}' for svc in post_drain))}")
+        print(f"GLOBAL_FALLBACK={'1' if plan['global_fallback'] else '0'}")
+        print(f"BUILD_TARGETS={shlex.quote(' '.join(plan['build_targets']))}")
+        return
+
+    if cmd == "--explain":
+        plan = compute_deploy_plan(repo, docker_dir, stamp_path)
+        print(f"Deployment Mode : {plan['mode']}")
+        print(f"Build Targets   : {', '.join(plan['build_targets']) if plan['build_targets'] else 'none (all cached)'}")
+        print(f"Run Migrations  : {'yes (full writer quiesce)' if plan['migrate'] else 'no'}")
+        print("")
+        print(f"{'Service':<18} {'Category':<10} {'Action':<18} {'Reason'}")
+        print("-" * 72)
+        for svc in APP_SERVICES:
+            reason = plan["app_reasons"][svc]
+            if reason in ("migration quiesce", "data service restart"):
+                action = "quiesce+restart"
+            elif svc in plan["dirty_app"]:
+                action = "recreate" if svc == "web" else "drain+recreate"
+            else:
+                action = "skip"
+            print(f"{svc:<18} {'app':<10} {action:<18} {reason}")
+        for svc in plan["data_reasons"]:
+            if svc in plan["dirty_data"]:
+                action = "drain+recreate"
+            elif svc in plan["reconcile_data"]:
+                action = "reconcile"
+            elif svc in plan["start_data"]:
+                action = "start"
+            else:
+                action = "skip"
+            print(f"{svc:<18} {'data':<10} {action:<18} {plan['data_reasons'][svc]}")
+        for svc in plan["infra_reasons"]:
+            if svc in plan["dirty_infra"]:
+                action = "recreate"
+            elif svc in plan["reconcile_infra"]:
+                action = "reconcile"
+            else:
+                action = "skip"
+            print(f"{svc:<18} {'infra':<10} {action:<18} {plan['infra_reasons'][svc]}")
+        return
+
+    sys.exit(f"Unknown option: {cmd}")
+
+
+if __name__ == "__main__":
+    main()

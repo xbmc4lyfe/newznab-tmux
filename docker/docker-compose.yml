@@ -1,5 +1,5 @@
 # NNTmux self-hosted stack. All persistent state is bind-mounted under docker/data and docker/logs.
-# Design: docker/docs/2026-10-08-nntmux-docker-stack-design.md   Lifecycle: make -C docker help
+# Design: docker/docs/2026-10-08-nntmux-docker-stack-design.md   Lifecycle: just --justfile docker/Justfile help
 name: ${COMPOSE_PROJECT_NAME:-nntmux}
 
 x-app: &app
@@ -58,6 +58,7 @@ services:
 
   web:
     <<: *app
+    image: ${WEB_IMAGE:-nntmux/web:local}
     environment:
       TZ: ${TZ:-UTC}
       SHELL: /bin/bash
@@ -72,6 +73,7 @@ services:
 
   horizon:
     <<: *app
+    image: ${HORIZON_IMAGE:-nntmux/horizon:local}
     # Fingerprint jobs can run for 1800s; Horizon allows 1860s before worker timeout.
     stop_grace_period: 1920s
     command: ["php", "artisan", "horizon"]
@@ -85,6 +87,7 @@ services:
 
   scheduler:
     <<: *app
+    image: ${SCHEDULER_IMAGE:-nntmux/scheduler:local}
     # Detached scheduled tasks remain owned by the subreaper through shutdown.
     stop_grace_period: 1920s
     command: ["python3", "/app/docker/app/bin/scheduler.py"]
@@ -98,6 +101,7 @@ services:
 
   indexer:
     <<: *app
+    image: ${INDEXER_IMAGE:-nntmux/indexer:local}
     command: ["/usr/local/bin/nntmux-indexer"]
     tty: true
     stdin_open: true

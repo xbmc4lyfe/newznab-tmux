@@ -18,7 +18,7 @@
 - Runtime settings: `Settings::settingValue()`
 - Laravel 13 route/middleware wiring lives in `bootstrap/app.php`; use that file when adding route groups, aliases, or middleware (for example the `/rss` mount)
 - Custom global middleware in `app/Http/Middleware/`: `DegradeWhenRedisUnreachable` (prepended; short-circuits requests when Redis is down via `StatusProbes`), `BlockAbusiveServices` (blocks AIOStreams, Oracle Cloud, UsenetStreamer, Cloudflare WARP), `NoCacheForAuthenticatedUsers` (CDN cache busting), `ContentSecurityPolicy`, `EnforceSessionToken`, `TrustedDevice2FAMiddleware`
-- In Docker/Sail, `Makefile` exports `.env` `SEARCH_DRIVER` as `COMPOSE_PROFILES`, so only the matching Manticore/Elasticsearch service starts
+- In Docker/Sail, the root `Justfile` exports `.env` `SEARCH_DRIVER` as `COMPOSE_PROFILES`, so only the matching Manticore/Elasticsearch service starts
 
 ### Manticore `releases_rt` signed columns
 
@@ -28,7 +28,7 @@
 ### Commands
 - 80+ auto-registered in `app/Console/Commands/`
 - Create with `php artisan make:` + `--no-interaction`
-- Prefer host `php artisan …` / `./vendor/bin/…` (see Command execution precedence). Use `Makefile` / Sail only for Compose lifecycle or when the user asks for containerized runs (`make artisan cmd="..."`, `make test filter=TestName`, etc.)
+- Prefer host `php artisan …` / `./vendor/bin/…` (see Command execution precedence). Use the `Justfile` / Sail only for Compose lifecycle or when the user asks for containerized runs (`just artisan cmd="..."`, `just test filter=TestName`, etc.)
 - Use macOS or Linux host tools. If Docker is unavailable, check Docker Desktop or the configured Linux VM on macOS. Check the Docker service and socket access on Linux.
 - This workspace may have cached routes under `bootstrap/cache/routes-*.php`; after adding/changing routes, refresh with `php artisan route:cache` if a route appears missing
 

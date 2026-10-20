@@ -20,6 +20,10 @@ tests/Fixtures/nzb-article-fingerprint/*
 .vscode/
 infra/
 misc/
+benchmarks/
+docs/
+github-pages/
+scripts/
 storage/
 storage-runtime/
 _install/
@@ -32,12 +36,37 @@ __pycache__/
 .env
 .env.*
 *.log
+*.md
+LICENSE
+Justfile
+Makefile
+docker/Justfile
+docker/Makefile
+docker/bin/
+docker/config/
+docker/monitoring/
+docker/docker-compose.yml
+docker-compose.monitoring.yml
+docker-compose.yml.prod-dist
+docker-entrypoint.sh
 phpstan*
+phpunit.xml*
 .phpunit*
-AGENTS.md
-CONTRIBUTING.md
-DOCKER.md
-CAPTCHA_CONFIGURATION.md
+rector.php
+pint.json
+captainhook.json
+boost.json
+skills-lock.json
+.vale-plugin.toml
+.prettier*
+.editorconfig
+.gitattributes
+.gitignore
+sail
+commit
+nntmux
+install*.sh
+debug_scrapers.php
 # Keep the production PHP configuration available to COPY.
 auth.json
 config.php
@@ -72,6 +101,8 @@ docker/.deploy.lock.claim
 docker/.deploy.lock.recovery-hold
 docker/.deploy.log
 docker/.deploy.stamp
+docker/.deploy.stamp.*
+docker/.build.stamp.*
 
 # Agent research, live samples and validation artifacts are never runtime assets.
 .superpowers/
@@ -79,3 +110,5 @@ docker/.deploy.stamp
 # Separate successful image builds from healthy application rollouts.
 docker/.build.stamp
 docker/.deploy.time
+# Finder metadata is never an image input (it would rebuild every role).
+**/.DS_Store

@@ -122,6 +122,8 @@ deploy/**/__pycache__/
 /docker/.build.stamp
 /docker/.deploy.time
 /docker/.deploy.stamp
+/docker/.deploy.stamp.*
+/docker/.build.stamp.*
 /docker/.deploy.log
 /docker/.deploy.lock
 /docker/.deploy.lock.claim

@@ -39,7 +39,7 @@ listen.group = www-data
 listen.mode = 0660
 EOF
 
-# Vite is started separately with `make npm-dev`. A hot file left behind by a
+# Vite is started separately with `just npm-dev`. A hot file left behind by a
 # previous dev-server process makes Laravel request assets from a dead port.
 unlink /var/www/html/public/hot 2>/dev/null || true
 

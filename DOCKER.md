@@ -4,7 +4,8 @@
 
 ## Prerequisites
 
-- Docker & **Docker Compose v2.22+** (the Makefile uses `pull --ignore-buildable`)
+- [just](https://github.com/casey/just) 1.43 or newer (older distribution packages lack modules and `module_directory()`)
+- Docker & **Docker Compose v2.22+** (the Justfile uses `pull --ignore-buildable`)
 - A GitHub (scopeless) token for Composer private packages
 - [Laravel Sail](https://laravel.com/docs/12.x/sail) (included as a dev dependency)
 
@@ -17,14 +18,14 @@ cp .env.example .env
 # "Docker service hostnames" block at the bottom.
 
 # 2. Build and start
-make build
-make up
+just build
+just up
 
 # 3. Install NNTmux (first run only)
-make artisan cmd="nntmux:install"
+just artisan cmd="nntmux:install"
 
 # 4. Build frontend assets
-make npm-build
+just npm-build
 ```
 
 ## Environment Configuration
@@ -82,100 +83,109 @@ or if `searchd` prints a backtrace during binlog replay, use
 the service file descriptor limit, preserve crash evidence, quarantine bad
 binlogs if needed, and finish `dpkg` configuration.
 
-## Make Targets
+## Just Recipes
 
-Run `make` or `make help` to see all targets, grouped by section.
+Run `just` or `just help` to see all recipes, or `just docker <recipe>` (or `just --justfile docker/Justfile <recipe>`) for the self-hosted `docker/` stack.
+
+### Self-Hosted Stack (`docker/Justfile`)
+
+| Recipe | Description |
+|--------|-------------|
+| `just deploy-plan` | Show per-service change classification, dirty image targets, and selective rollout plan |
+| `just deploy` | Smart guarded deploy: skips non-runtime edits, builds/drains/recreates only affected services |
+| `just docker build-base` | Build the cached OS + PHP extension base image (`nntmux/base:local`) |
+| `just docker build` | Build dirty self-hosted service image targets (`selfhosted-web`, `selfhosted-horizon`, `selfhosted-scheduler`, `selfhosted-indexer`) |
+| `just docker up` | Initial bringup or guarded deploy when app containers exist |
 
 ### Lifecycle
 
-| Target            | Description                                                     |
+| Recipe            | Description                                                     |
 |-------------------|-----------------------------------------------------------------|
-| `make up`         | Start all services (detached)                                   |
-| `make down`       | Stop all services                                               |
-| `make restart`    | Restart all services                                            |
-| `make recreate`   | Force-recreate containers without rebuilding                    |
-| `make build`      | Build the app image (cached)                                    |
-| `make rebuild`    | Pull fresh base images + `--no-cache` build + force-recreate    |
-| `make pull`       | Pull latest enabled-profile base images (skips buildable ones)  |
-| `make update`     | Infra-only: pull + `--pull` build + restart                     |
-| `make upgrade`    | App upgrade: `update` + composer + npm + migrate + caches       |
-| `make fresh`      | **Destroy volumes**, pull, rebuild, recreate (DATA LOSS)        |
+| `just up`         | Start all services (detached)                                   |
+| `just down`       | Stop all services                                               |
+| `just restart`    | Restart all services                                            |
+| `just recreate`   | Force-recreate containers without rebuilding                    |
+| `just build`      | Build the app image (cached)                                    |
+| `just rebuild`    | Pull fresh base images + `--no-cache` build + force-recreate    |
+| `just pull`       | Pull latest enabled-profile base images (skips buildable ones)  |
+| `just update`     | Infra-only: pull + `--pull` build + restart                     |
+| `just upgrade`    | App upgrade: `update` + composer + npm + migrate + caches       |
+| `just fresh`      | **Destroy volumes**, pull, rebuild, recreate (DATA LOSS)        |
 
 ### Development
 
-| Target              | Description                                           |
+| Recipe              | Description                                           |
 |---------------------|-------------------------------------------------------|
-| `make shell`        | Bash shell in the app container                       |
-| `make root-shell`   | Root bash shell in the app container                  |
-| `make tinker`       | Laravel Tinker REPL                                   |
-| `make artisan cmd=` | Run any artisan command                               |
-| `make migrate`      | Run pending migrations                                |
-| `make migrate-fresh`| Drop all tables and re-migrate (DATA LOSS)            |
-| `make seed`         | Run database seeders                                  |
-| `make cache-clear`  | Clear config / route / view / app caches (and stale `bootstrap/cache` files) |
-| `make optimize`     | Dev-safe: warm view cache + spatie/laravel-data           |
-| `make optimize-deploy` | Production: also caches config/routes (bakes absolute paths) |
-| `make queue-work`   | Foreground queue worker                               |
-| `make queue-restart`| Signal queue workers to restart                       |
-| `make tmux-start`   | Start the NNTmux tmux processing engine               |
-| `make tmux-stop`    | Stop the tmux processing engine                       |
-| `make tmux-attach`  | Attach to the running tmux session                    |
-| `make horizon`      | Show Horizon queue status                             |
-| `make fix-permissions` | Chown project to host UID + register git `safe.directory` |
-| `make fix-permissions` | Chown project to `sail` + register git safe.directory |
+| `just shell`        | Bash shell in the app container                       |
+| `just root-shell`   | Root bash shell in the app container                  |
+| `just tinker`       | Laravel Tinker REPL                                   |
+| `just artisan cmd=` | Run any artisan command                               |
+| `just migrate`      | Run pending migrations                                |
+| `just migrate-fresh`| Drop all tables and re-migrate (DATA LOSS)            |
+| `just seed`         | Run database seeders                                  |
+| `just cache-clear`  | Clear config / route / view / app caches (and stale `bootstrap/cache` files) |
+| `just optimize`     | Dev-safe: warm view cache + spatie/laravel-data           |
+| `just optimize-deploy` | Production: also caches config/routes (bakes absolute paths) |
+| `just queue-work`   | Foreground queue worker                               |
+| `just queue-restart`| Signal queue workers to restart                       |
+| `just tmux-start`   | Start the NNTmux tmux processing engine               |
+| `just tmux-stop`    | Stop the tmux processing engine                       |
+| `just tmux-attach`  | Attach to the running tmux session                    |
+| `just horizon`      | Show Horizon queue status                             |
+| `just fix-permissions` | Chown project to host UID + register git `safe.directory` |
 
 ### Testing & Quality
 
-| Target           | Description                                          |
+| Recipe           | Description                                          |
 |------------------|------------------------------------------------------|
-| `make test`      | PHPUnit tests (`filter=Name` optional)               |
-| `make pint`      | Pint formatter on dirty files                        |
-| `make pint-all`  | Pint formatter on all files                          |
-| `make phpstan`   | PHPStan static analysis (2G memory limit)            |
-| `make rector`    | Rector dry-run (no changes)                          |
-| `make rector-fix`| Apply Rector refactorings                            |
+| `just test`      | PHPUnit tests (`filter=Name` optional)               |
+| `just pint`      | Pint formatter on dirty files                        |
+| `just pint-all`  | Pint formatter on all files                          |
+| `just phpstan`   | PHPStan static analysis (2G memory limit)            |
+| `just rector`    | Rector dry-run (no changes)                          |
+| `just rector-fix`| Apply Rector refactorings                            |
 
 ### Frontend & Types
 
-| Target                | Description                          |
+| Recipe                | Description                          |
 |-----------------------|--------------------------------------|
-| `make npm-build`      | `npm install` + `npm run build`      |
-| `make npm-dev`        | Start Vite dev server                |
-| `make ts-types`       | Regenerate TypeScript types          |
-| `make ts-types-check` | CI: fail if generated types drift    |
-| `make data-cache`     | Cache spatie/laravel-data structures |
+| `just npm-build`      | `npm install` + `npm run build`      |
+| `just npm-dev`        | Start Vite dev server                |
+| `just ts-types`       | Regenerate TypeScript types          |
+| `just ts-types-check` | CI: fail if generated types drift    |
+| `just data-cache`     | Cache spatie/laravel-data structures |
 
 ### Logs & Status
 
-| Target              | Description                                                      |
+| Recipe              | Description                                                      |
 |---------------------|------------------------------------------------------------------|
-| `make logs`         | Tail all container logs (or `SERVICE=name` for one)              |
-| `make tail-laravel` | Tail `storage/logs/laravel.log` inside the app container         |
-| `make status` / `ps`| Show running containers                                          |
-| `make top`          | Show processes inside each container                             |
-| `make images`       | Show images used by each service                                 |
-| `make health`       | Healthcheck status per service                                   |
+| `just logs`         | Tail all container logs (or `SERVICE=name` for one)              |
+| `just tail-laravel` | Tail `storage/logs/laravel.log` inside the app container         |
+| `just status` / `ps`| Show running containers                                          |
+| `just top`          | Show processes inside each container                             |
+| `just images`       | Show images used by each service                                 |
+| `just health`       | Healthcheck status per service                                   |
 
 ### Monitoring
 
-Prometheus, Grafana, the Pushgateway and exporters from `docker-compose.monitoring.yml`. Run `php artisan monitoring:install --sail` once (it sets `MONITORING_ENABLED=true`); from then on `make up`, `make down` and the other lifecycle targets include them. Grafana is embedded at **Admin → System → Monitoring** (proxied at `/grafana/`).
+Prometheus, Grafana, the Pushgateway and exporters from `docker-compose.monitoring.yml`. Run `php artisan monitoring:install --sail` once (it sets `MONITORING_ENABLED=true`); from then on `just up`, `just down` and the other lifecycle recipes include them. Grafana is embedded at **Admin → System → Monitoring** (proxied at `/grafana/`).
 
-| Target                 | Description                                                    |
+| Recipe                 | Description                                                    |
 |------------------------|----------------------------------------------------------------|
-| `make monitoring-up`   | Start only the monitoring containers                           |
-| `make monitoring-down` | Stop and remove only them (volumes are kept)                   |
-| `make monitoring-logs` | Follow their logs                                              |
+| `just monitoring-up`   | Start only the monitoring containers                           |
+| `just monitoring-down` | Stop and remove only them (volumes are kept)                   |
+| `just monitoring-logs` | Follow their logs                                              |
 
 ### Cleanup
 
-| Target        | Description                                                   |
+| Recipe        | Description                                                   |
 |---------------|---------------------------------------------------------------|
-| `make clean`  | Prune stopped containers / dangling images                    |
-| `make nuke`   | **Remove ALL** project containers, images, volumes (DATA LOSS)|
+| `just clean`  | Prune stopped containers / dangling images                    |
+| `just nuke`   | **Remove ALL** project containers, images, volumes (DATA LOSS)|
 
 ### Flags
 
-These can be combined with the targets above:
+These can be combined with the recipes above:
 
 | Flag           | Effect                                                                |
 |----------------|-----------------------------------------------------------------------|
@@ -183,18 +193,40 @@ These can be combined with the targets above:
 | `MAINTENANCE=1`| Wrap `upgrade` migrations in `artisan down` / `artisan up`            |
 | `SERVICE=name` | Restrict `logs` to a specific compose service                         |
 | `CMD="…"`      | Free-form command for `artisan` (alternative to `cmd=`)               |
-| `filter=Name`  | Pass `--filter=Name` to `make test`                                   |
+| `MONITORING_ENABLED=true\|false` | Override `.env` for this run of any lifecycle recipe (`up`, `down`, `restart`, `recreate`, `pull`, `build`, `rebuild`, `update`, `upgrade`, `fresh`, `logs`, `status`, `nuke`, `check-env`) |
+| `filter=Name`  | Pass `--filter=Name` to `just test`                                   |
 
 Examples:
 
 ```bash
-make fresh FORCE=1                      # non-interactive teardown + rebuild
-make upgrade MAINTENANCE=1              # zero-downtime-ish upgrade with maint mode
-make logs SERVICE=mariadb               # tail only mariadb
-make test filter=ReleaseSearchTest      # run a single test
+just fresh FORCE=1                      # non-interactive teardown + rebuild
+just upgrade MAINTENANCE=1              # zero-downtime-ish upgrade with maint mode
+just logs SERVICE=mariadb               # tail only mariadb
+just test filter=ReleaseSearchTest      # run a single test
+just up MONITORING_ENABLED=true         # include the monitoring overlay even though .env disables it
+just artisan cmd='some:command --label="two words"'   # cmd is parsed with shell quoting, never globbed
 ```
 
-> **Note:** `make pull` / `update` / `rebuild` use `docker compose pull --ignore-buildable`,
+`cmd=` (and `CMD`) is split with shell quoting rules into a real argument array, so quoted words
+stay together and `*` is passed literally; an unbalanced quote is an error. The same applies to
+`just docker artisan cmd=…`.
+
+### Trailing `KEY=VALUE` arguments for `docker/Justfile`
+
+Precedence is trailing arguments, then the environment, then `docker/.env`, then defaults. An
+explicitly empty trailing argument counts as supplied: `just deploy COMPOSE_FILE= WEB_IMAGE=`
+discards the `docker/.env` values and uses the defaults (`docker/docker-compose.yml`, and the
+`nntmux/web:local` or `APP_IMAGE`-derived tag). An empty `COMPOSE_FILE` therefore means "the default
+stack file", not "no file". Only arguments can clear a value; an empty variable in the environment is
+indistinguishable from an unset one and does not override `docker/.env`.
+
+`DC`, `COMPOSE_FILE` and the `HELPER_`/`BASE_`/`APP_`/`WEB_`/`HORIZON_`/`SCHEDULER_`/`INDEXER_IMAGE` keys
+in `docker/.env` must be literal values. The Justfile and `docker/bin/compose` read them without
+Compose's `$` interpolation, so an unquoted or double-quoted value containing `$` (for example
+`APP_IMAGE=${REGISTRY}/nntmux:${TAG}`) stops the recipe with an error; single-quote the value for a
+verbatim `$`. Other keys, such as `MARIADB_IMAGE`, are left to Compose and may interpolate.
+
+> **Note:** `just pull` / `update` / `rebuild` use `docker compose pull --ignore-buildable`,
 > which only pulls images for services in the active `COMPOSE_PROFILES` and skips images
 > that are built locally (e.g. `sail-8.5/app`). Requires Docker Compose v2.22+.
 
@@ -231,7 +263,7 @@ DB_PASSWORD=
 DB_DATABASE=nntmux
 ```
 
-Import an existing SQL dump or run `make artisan cmd="nntmux:install"` for
+Import an existing SQL dump or run `just artisan cmd="nntmux:install"` for
 a fresh installation.
 
 ## Backups
@@ -278,18 +310,18 @@ docker compose up -d
 
 | Problem                         | Solution                                                              |
 |---------------------------------|-----------------------------------------------------------------------|
-| Permission errors on storage/   | `make fix-permissions` (chowns project to your host UID)              |
-| `composer install` permission denied | `make fix-permissions`, then re-run `make composer-install`      |
-| `npm`/`ncu` EACCES on host (`package.json`) | `make fix-permissions` chowns to host UID, not container `sail` |
-| `fatal: detected dubious ownership` (git) | `make fix-permissions` registers `safe.directory` in the container |
-| Container `sail` UID ≠ host UID  | Set `WWWUSER=$(id -u)` / `WWWGROUP=$(id -g)` in `.env`, then `make rebuild` |
-| Host artisan/npm fails with `/var/www/html/...` paths | Stale `bootstrap/cache/config.php` from a container `config:cache`. Run `make cache-clear` and prefer `make optimize` (dev-safe) over `optimize-deploy` in development |
+| Permission errors on storage/   | `just fix-permissions` (chowns project to your host UID)              |
+| `composer install` permission denied | `just fix-permissions`, then re-run `just composer-install`      |
+| `npm`/`ncu` EACCES on host (`package.json`) | `just fix-permissions` chowns to host UID, not container `sail` |
+| `fatal: detected dubious ownership` (git) | `just fix-permissions` registers `safe.directory` in the container |
+| Container `sail` UID ≠ host UID  | Set `WWWUSER=$(id -u)` / `WWWGROUP=$(id -g)` in `.env`, then `just rebuild` |
+| Host artisan/npm fails with `/var/www/html/...` paths | Stale `bootstrap/cache/config.php` from a container `config:cache`. Run `just cache-clear` and prefer `just optimize` (dev-safe) over `optimize-deploy` in development |
 | Port already in use             | Change `APP_PORT`, `FORWARD_DB_PORT`, etc. in `.env`                  |
-| Containers won't start          | `make logs` to inspect, or `make rebuild` to start fresh              |
-| Stale images after upgrade      | `make update` (pulls base images + rebuild + restart)                 |
-| Need a completely clean slate   | `make fresh` (destroys all volumes; add `FORCE=1` for non-interactive)|
-| CI / scripted teardown          | `make fresh FORCE=1` or `make nuke FORCE=1` to skip prompts           |
-| supervisorctl not connecting    | `make root-shell` then `supervisorctl status` to verify socket path   |
+| Containers won't start          | `just logs` to inspect, or `just rebuild` to start fresh              |
+| Stale images after upgrade      | `just update` (pulls base images + rebuild + restart)                 |
+| Need a completely clean slate   | `just fresh` (destroys all volumes; add `FORCE=1` for non-interactive)|
+| CI / scripted teardown          | `just fresh FORCE=1` or `just nuke FORCE=1` to skip prompts           |
+| supervisorctl not connecting    | `just root-shell` then `supervisorctl status` to verify socket path   |
 
 ## Nginx (GetPageSpeed + Brotli)
 
@@ -308,5 +340,5 @@ drift.
 To revert to stock Ubuntu nginx, remove the GetPageSpeed apt key, list, and
 preferences entries from `docker/8.5/Dockerfile`, drop `nginx-module-brotli`
 from the install line, re-comment the brotli block in `docker/8.5/nginx.conf`,
-and run `make rebuild`.
+and run `just rebuild`.
 
