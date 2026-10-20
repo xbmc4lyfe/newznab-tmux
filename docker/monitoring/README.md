@@ -11,6 +11,8 @@ Shared configuration for both ways of running NNTmux monitoring:
 | `grafana/provisioning/dashboards/nntmux.yml` | Sail and the installer. Loads the dashboards from `/etc/grafana/dashboards/nntmux`. |
 | `grafana/dashboards/*.json` | Sail and the installer. |
 | `prometheus/prometheus.dev.yml` | Sail only. The installer writes its own `/etc/prometheus/prometheus.yml`. |
+| `prometheus/rules/*.yml` | Sail and the `docker/` stack, mounted at `/etc/prometheus/rules`. Capacity and stall alerts; the installer's generated config doesn't load them yet. |
+| `prometheus/nntmux-capacity.rules.test.yml` | `promtool test rules` unit tests for those alerts. Kept outside `rules/` so Prometheus doesn't load it. |
 | `../../docker-compose.monitoring.yml` | Sail only. Prometheus, Grafana, the Pushgateway and exporters. |
 
 ## Metrics sources

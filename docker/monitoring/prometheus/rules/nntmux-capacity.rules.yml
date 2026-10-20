@@ -4,13 +4,15 @@
 # `monitoring:export-metrics` pushed to the Pushgateway as job="nntmux".
 # There is no Alertmanager yet; firing alerts show on Prometheus /alerts and as ALERTS{}.
 # Thresholds are starting points to calibrate against a week of production data.
+# Unit tests: promtool test rules docker/monitoring/prometheus/nntmux-capacity.rules.test.yml
 groups:
   - name: nntmux-capacity-recording
     interval: 1m
     rules:
-      - record: nntmux:releases_added:increase1h
-        expr: clamp_min(delta(nntmux_releases[1h]), 0)
-      - record: nntmux:processing_backlog:deriv2h
+      # Net change of the release total: deletions by cleanup/retention offset new releases.
+      - record: nntmux:releases_net:delta1h
+        expr: delta(nntmux_releases[1h])
+      - record: nntmux:processing_total_work:deriv2h
         expr: deriv(nntmux_processing_total_work[2h])
       # Primary provider's connection limit (docker/config/seed/tuning.sql budgets against 73).
       # Edit here if the account changes; no metric exports the configured limit yet.
@@ -31,70 +33,86 @@ groups:
         expr: nntmux:metrics_age_seconds > 300
         for: 5m
         annotations: {summary: "App metrics not pushed for >5m; every other app alert is blind."}
+      # The snapshot expires after monitoring.tmux_snapshot.ttl (900s), after which only
+      # nntmux_tmux_snapshot_available=0 is exported and every processing gauge disappears.
+      - alert: NntmuxTmuxSnapshotMissing
+        expr: nntmux_tmux_snapshot_available == 0
+        for: 5m
+        annotations: {summary: "No tmux monitor snapshot: the monitor is down and processing gauges are absent."}
       - alert: NntmuxTmuxSnapshotStale
-        expr: nntmux_tmux_snapshot_age_seconds > 600
-        for: 10m
-        annotations: {summary: "tmux monitor snapshot older than 10m; backlog/release gauges are frozen."}
+        expr: nntmux_tmux_snapshot_age_seconds > 180
+        for: 3m
+        annotations: {summary: "tmux monitor snapshot older than 3m; processing gauges are frozen."}
       - alert: NntmuxCollectorErrors
         expr: nntmux_metrics_collector_errors > 0
         for: 10m
+        annotations: {summary: "A metrics collector has failed for 10m."}
       - alert: ExporterDown
         expr: up == 0
         for: 3m
+        annotations: {summary: "A Prometheus scrape target is down."}
 
   - name: nntmux-throughput
     rules:
-      - alert: NntmuxTmuxNotRunning
+      # is_running is the run/pause flag; deploy drains and operator pauses also set it to 0.
+      - alert: NntmuxProcessingPaused
         expr: nntmux_tmux_running == 0
-        for: 5m
-        annotations: {summary: "tmux processing session is not running (ingest/release creation stopped)."}
+        for: 30m
+        annotations: {summary: "tmux processing has been paused for 30m (flag off; check for an unfinished drain)."}
       - alert: NntmuxReleaseCreationStalled
-        expr: nntmux:releases_added:increase1h == 0 and on() nntmux_table_rows{table="collections"} > 0
+        expr: nntmux:releases_net:delta1h <= 0 and on() nntmux_table_rows{table="collections"} > 0
         for: 2h
-        annotations: {summary: "No new releases in 2h while collections are waiting."}
+        annotations: {summary: "Release total has not grown for about 3h while collections are waiting (deletions can mask creation)."}
       - alert: NntmuxCollectionsPilingUp
-        expr: deriv(nntmux_table_rows{table="collections"}[2h]) > 0 and nntmux_table_rows{table="collections"} > 500000
+        expr: deriv(nntmux_table_rows{table="collections"}[2h]) > 0.5 and nntmux_table_rows{table="collections"} > 500000
         for: 2h
-        annotations: {summary: "Collections table growing for 2h: release creation slower than ingest."}
+        annotations: {summary: "Collections growing >0.5 rows/s for 2h: release creation is slower than ingest."}
       - alert: NntmuxPostprocessBacklogGrowing
-        expr: nntmux:processing_backlog:deriv2h > 0 and nntmux_processing_total_work > 5000
+        expr: nntmux:processing_total_work:deriv2h > 0.05 and nntmux_processing_total_work > 5000
         for: 2h
-        annotations: {summary: "Post-processing backlog growing for 2h: identification is behind."}
+        annotations: {summary: "Post-processing backlog growing >180/h for 2h: identification is behind."}
       - alert: NntmuxVerificationBacklogOld
         expr: nntmux_release_verification_backlog_age_seconds > 86400 and on() nntmux_release_verification_backlog_age_measurement_available == 1
         for: 30m
+        annotations: {summary: "Oldest release-verification candidate is over a day old."}
 
   - name: nntmux-capacity
     rules:
-      # At capacity = connections pinned AND work still accumulating.
+      # At capacity = primary connections near the budget AND work still accumulating.
+      # tuning.sql budgets about 60 of 73 (0.82) for indexer workers.
       - alert: NntmuxAtCapacity
         expr: |
-          nntmux:nntp_primary_utilization:ratio >= 0.85
-            and on() (nntmux:processing_backlog:deriv2h > 0)
+          nntmux:nntp_primary_utilization:ratio >= 0.8
+            and on() (nntmux:processing_total_work:deriv2h > 0.05)
         for: 30m
-        annotations: {summary: "NNTP connections saturated while backlog grows: add connections/workers or cut per-item cost."}
+        annotations: {summary: "NNTP connections near budget while backlog grows: add connections/workers or cut per-item cost."}
       - alert: NntmuxUnderUtilized
         expr: |
           nntmux:nntp_primary_utilization:ratio < 0.5
             and on() nntmux_processing_total_work > 5000
         for: 1h
-        annotations: {summary: "Backlog exists but <50% of NNTP connections busy: workers/threads are the bottleneck, not the provider."}
+        annotations: {summary: "Backlog exists but <50% of NNTP connections busy: workers, not the provider, are the bottleneck."}
       - alert: NntmuxQueueWaitHigh
         expr: nntmux_queue_wait_seconds > 600
         for: 15m
+        annotations: {summary: "A Horizon queue's estimated wait exceeds 10m."}
       - alert: NntmuxHorizonDown
         expr: nntmux_horizon_up == 0
         for: 2m
+        annotations: {summary: "Horizon is not running."}
       - alert: NntmuxFailedJobsRising
         expr: delta(nntmux_failed_jobs[15m]) > 10
+        annotations: {summary: "More than 10 new failed jobs in 15m."}
 
   - name: nntmux-services
     rules:
       - alert: MariadbConnectionsHigh
         expr: mysql_global_status_threads_connected / mysql_global_variables_max_connections > 0.8
         for: 10m
+        annotations: {summary: "MariaDB connections above 80% of max_connections."}
       - alert: MariadbDeadlocks
         expr: increase(mysql_global_status_innodb_deadlocks[10m]) > 5
+        annotations: {summary: "More than 5 InnoDB deadlocks in 10m."}
       - alert: MariadbRowLockWaitHigh
         expr: rate(mysql_global_status_innodb_row_lock_time[10m]) > 1000
         for: 10m
@@ -104,15 +122,20 @@ groups:
           rate(mysql_global_status_innodb_buffer_pool_reads[10m])
             / clamp_min(rate(mysql_global_status_innodb_buffer_pool_read_requests[10m]), 1) > 0.01
         for: 30m
+        annotations: {summary: "Over 1% of InnoDB page reads miss the buffer pool."}
+      # Redis runs with maxmemory-policy noeviction, so a full Redis rejects queue, cache and
+      # session writes instead of evicting; this is the effective guard.
       - alert: RedisMemoryHigh
-        expr: redis_memory_used_bytes / (redis_memory_max_bytes > 0) > 0.85
+        expr: redis_memory_used_bytes / (redis_memory_max_bytes > 0) > 0.7
         for: 10m
-      - alert: RedisEvicting
-        expr: increase(redis_evicted_keys_total[10m]) > 0
-        annotations: {summary: "Redis is evicting keys; Horizon/queue data may be lost."}
+        annotations: {summary: "Redis above 70% of maxmemory; writes fail at 100% (noeviction)."}
       - alert: HostDiskLow
-        expr: node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes < 0.10
+        expr: |
+          node_filesystem_avail_bytes{fstype!~"tmpfs|ramfs|devtmpfs|overlay|squashfs|nsfs|autofs|fuse\\..*",mountpoint!~"/(run|snap|var/lib/docker)(/.*)?"}
+            / node_filesystem_size_bytes < 0.10
         for: 10m
+        annotations: {summary: "A filesystem has under 10% free."}
       - alert: HostMemoryPressure
         expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.10
         for: 15m
+        annotations: {summary: "Under 10% of host memory available."}
