@@ -215,8 +215,7 @@ abstract class BaseRunner
                     }
                     $now = microtime(true);
                     foreach (array_keys($queue) as $queuedKey) {
-                        // A start failure can end the last first run inside this loop, before the outer prune.
-                        if (isset($followUps[$queuedKey]) && ($firstRuns === [] || $followUps[$queuedKey] > $now)) {
+                        if (isset($followUps[$queuedKey]) && ($followUps[$queuedKey] > $now || ! $this->firstRunsPending($firstRuns, $running))) {
                             continue;
                         }
                         $group = $this->workerConcurrencyKey($queuedKey);
@@ -347,6 +346,24 @@ abstract class BaseRunner
         }
 
         return $results;
+    }
+
+    /**
+     * Whether a first run is still queued or actually running. A start failure or an exit not yet
+     * harvested by the completion loop can end the last one before the loop's own bookkeeping does.
+     *
+     * @param  array<string|int, true>  $firstRuns
+     * @param  array<string|int, Process>  $running
+     */
+    private function firstRunsPending(array $firstRuns, array $running): bool
+    {
+        foreach (array_keys($firstRuns) as $key) {
+            if (! isset($running[$key]) || $running[$key]->isRunning()) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function isCancellationRequested(): bool
