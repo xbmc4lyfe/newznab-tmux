@@ -129,16 +129,10 @@ class ExportMonitoringMetricsCommandTest extends TestCase
         $this->assertTrue($event->shouldSkipDueToOverlapping());
         Http::assertNothingSent();
 
-        // Expire the abandoned lock directly; comparing it with a travelled clock is not reliable in CI.
-        $locks[$event->mutexName()]['expiresAt'] = now()->subMinute();
-        $this->assertTrue($event->filtersPass($this->app), json_encode([
-            'filters' => array_map(fn ($f) => $this->app->call($f), (fn () => $this->filters)->call($event)),
-            'rejects' => array_map(fn ($r) => $this->app->call($r), (fn () => $this->rejects)->call($event)),
-            'locks' => array_map(static fn ($l) => [$l['owner'], $l['expiresAt']?->format('Y-m-d H:i:s.u')], app('cache')->store()->getStore()->locks),
-            'mutex_cache_same' => (fn () => $this->cache)->call($event->mutex) === app('cache'),
-            'now' => now()->format('Y-m-d H:i:s.u'),
-            'real' => date('Y-m-d H:i:s'),
-        ]));
+        // Production's cache store drops the key when its TTL runs out. The array store keeps it, and
+        // since Laravel 13.37 the mutex treats any owned array lock as held, so evict it like the TTL would.
+        unset($locks[$event->mutexName()]);
+        $this->assertTrue($event->filtersPass($this->app));
         $this->assertFalse($event->mutex->exists($event));
         $this->artisan('monitoring:export-metrics')->assertSuccessful();
 
