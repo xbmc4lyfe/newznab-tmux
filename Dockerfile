@@ -43,7 +43,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo test --release --locked \
     && cargo build --release --locked \
     && install -D -m 0644 target/release/libnzbyenc.so /out/libnzbyenc.so \
-    && install -D -m 0755 target/release/nntmux-article-fingerprint /out/nntmux-article-fingerprint
+    && install -D -m 0755 target/release/nntmux-article-fingerprint /out/nntmux-article-fingerprint \
+    && install -D -m 0755 target/release/nntmux-verification-framer /out/nntmux-verification-framer
 
 # ── Runtime stages with native FFI & PHP configuration ──
 FROM base-os AS runtime
@@ -51,6 +52,7 @@ ENV LANG=C.UTF-8
 WORKDIR /app
 COPY --from=yenc /out/libnzbyenc.so /usr/local/lib/nntmux/libnzbyenc.so
 COPY --from=yenc /out/nntmux-article-fingerprint /usr/local/bin/nntmux-article-fingerprint
+COPY --from=yenc /out/nntmux-verification-framer /usr/local/bin/nntmux-verification-framer
 COPY docker/app/php/release-presentation.h docker/app/php/release-presentation-preload.php /usr/local/lib/nntmux/
 COPY docker/8.5/php.ini /usr/local/etc/php/conf.d/99-nntmux.ini
 COPY docker/app/php/yenc-ffi.ini /usr/local/etc/php/indexer-conf.d/99-yenc-ffi.ini
@@ -58,6 +60,7 @@ COPY docker/app/php/yenc-ffi.ini /usr/local/etc/php/indexer-conf.d/99-yenc-ffi.i
 FROM base AS selfhost-runtime
 COPY --from=yenc /out/libnzbyenc.so /usr/local/lib/nntmux/libnzbyenc.so
 COPY --from=yenc /out/nntmux-article-fingerprint /usr/local/bin/nntmux-article-fingerprint
+COPY --from=yenc /out/nntmux-verification-framer /usr/local/bin/nntmux-verification-framer
 COPY docker/app/php/release-presentation.h docker/app/php/release-presentation-preload.php /usr/local/lib/nntmux/
 COPY docker/8.5/php.ini /usr/local/etc/php/conf.d/99-nntmux.ini
 COPY docker/app/php/zz-docker.ini /usr/local/etc/php/conf.d/zz-docker.ini

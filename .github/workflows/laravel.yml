@@ -4,7 +4,8 @@ on: [push]
 
 jobs:
   tests:
-    runs-on: ubuntu-latest
+    # Avoid self-hosted workers that also advertise ubuntu-latest but have no Docker daemon.
+    runs-on: ubuntu-24.04
 
     strategy:
       fail-fast: true
@@ -83,10 +84,17 @@ jobs:
       - name: Install the pinned Rust build toolchain
         run: rustup toolchain install 1.98.0 --profile minimal
 
-      - name: Build native utilities and archived experimental Rust fingerprint
+      - name: Build native utilities and verification framer
         env:
           RUSTUP_TOOLCHAIN: 1.98.0
-        run: bash scripts/build-nntmux-native.sh
+          CARGO_TARGET_DIR: ${{ github.workspace }}/docker/app/nzb-yenc-ffi/target
+        run: |
+          bash scripts/build-nntmux-native.sh
+          test -x "$CARGO_TARGET_DIR/release/nntmux-verification-framer"
+          echo "NNTMUX_VERIFICATION_FRAMER=$CARGO_TARGET_DIR/release/nntmux-verification-framer" >> "$GITHUB_ENV"
+
+      - name: Qualify real PHP and Rust verification framing
+        run: php -d memory_limit=2G vendor/bin/phpunit --fail-on-skipped tests/Unit/NntpVerificationArticleSourceTest.php tests/Unit/RustVerificationFramerTest.php
 
       - name: Test production PHP article identity without FFI or process spawning
         run: php -d ffi.enable=false -d disable_functions=proc_open vendor/bin/phpunit --fail-on-skipped tests/Unit/Nzb/NzbArticleFingerprintTest.php

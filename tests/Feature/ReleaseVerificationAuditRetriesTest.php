@@ -121,7 +121,8 @@ class ReleaseVerificationAuditRetriesTest extends TestCase
             $mock->shouldReceive('readNzbContents')->andReturn($xml);
         });
         $this->mock(NNTPService::class, function ($mock): void {
-            $mock->shouldReceive('doConnect')->with(false)->andReturn(true);
+            $mock->shouldReceive('doConnect')->once()->with(false)->andReturn(true);
+            $mock->shouldReceive('isConnected')->andReturn(true);
             $mock->shouldReceive('verificationArticle')->with('a@b', 1048576)->andReturn(YencArticles::part('11111', 'movie.mkv', 15, 1, 1, 3));
             $mock->shouldReceive('doQuit')->andReturn(null);
         });

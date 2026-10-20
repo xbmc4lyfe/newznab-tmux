@@ -4,11 +4,14 @@ declare(strict_types=1);
 
 namespace Tests\Unit;
 
+use App\Services\NNTP\NntpArticleMissingException;
 use App\Services\NNTP\NNTPService;
+use App\Services\NNTP\VerificationPipelineRetryException;
 use App\Services\Releases\Verification\ArticleBudgetExceeded;
 use App\Services\Releases\Verification\ArticleIntegrityFailure;
 use App\Services\Releases\Verification\NntpArticleSource;
 use App\Services\Releases\Verification\PayloadVerifier;
+use App\Services\Releases\Verification\SpotCheckVerifier;
 use App\Services\Releases\Verification\VerifiedArticle;
 use App\Services\Yenc\PayloadDecoder;
 use App\Services\Yenc\PhpPayloadDecoder;
@@ -18,11 +21,841 @@ use Illuminate\Container\Container;
 use Illuminate\Filesystem\Filesystem;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use Psr\Log\AbstractLogger;
+use Psr\Log\NullLogger;
 use RuntimeException;
+use Stringable;
 use Tests\Fixtures\YencArticles;
 
 final class NntpVerificationArticleSourceTest extends TestCase
 {
+    /** @var list<string> */
+    private array $framerPaths = [];
+
+    /** @return iterable<string, array{bool}> */
+    public static function recoveryIdentities(): iterable
+    {
+        yield 'valid recovery' => [true];
+        yield 'wrong recovery identity' => [false];
+    }
+
+    #[DataProvider('recoveryIdentities')]
+    public function test_worker_death_preserves_the_offender_fence_and_recovers_the_unread_tail_in_php(bool $valid): void
+    {
+        $this->configureRecovery('native');
+        $worker = $this->framerFixture('fwrite(STDOUT, "\\0"); feed(); exit(9);');
+        config(['release_verification.rust_worker' => $worker]);
+        $first = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        $next = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        fwrite($first[1], "222 0 <wrong@example> body\r\nplausible\r\n.\r\n");
+        $identity = $valid ? 'b@example' : 'wrong@example';
+        fwrite($next[1], '222 0 <'.$identity."> body\r\nbee\r\n.\r\n");
+        $nntp = new ReconnectingVerificationNntpHarness([$first[0], $next[0]], timeout: 5);
+        $source = new NntpArticleSource($nntp, allowAlternateFallback: false);
+        try {
+            $source->prefetch(['a@example', 'b@example'], static function (): void {});
+            self::assertFalse($nntp->isConnected());
+            try {
+                $source->fetch('a@example');
+                self::fail('The worker failure must fence the unacknowledged offending response.');
+            } catch (RuntimeException $error) {
+                self::assertNotInstanceOf(VerificationPipelineRetryException::class, $error);
+                self::assertSame(1, $nntp->connects);
+            }
+            if ($valid) {
+                self::assertSame("bee\r\n", $source->fetchBounded('b@example', 64));
+            } else {
+                try {
+                    $source->fetchBounded('b@example', 64);
+                    self::fail('Recovery must validate the response identity.');
+                } catch (RuntimeException $error) {
+                    self::assertStringContainsString('identity', $error->getMessage());
+                }
+            }
+            self::assertSame(2, $nntp->connects);
+            self::assertSame($worker, config('release_verification.rust_worker'));
+            self::assertSame("BODY <a@example>\r\nBODY <b@example>\r\n", stream_get_contents($first[1]));
+            stream_set_blocking($next[1], false);
+            self::assertSame("BODY <b@example>\r\n", stream_get_contents($next[1]));
+        } finally {
+            unset($source);
+            $nntp->doQuit();
+            fclose($first[1]);
+            fclose($next[1]);
+        }
+    }
+
+    /** @return iterable<string, array{int, bool}> */
+    public static function failedFeedConnections(): iterable
+    {
+        foreach ([0, 1] as $index) {
+            yield 'connection '.$index.' fails; valid recovery' => [$index, true];
+            yield 'connection '.$index.' fails; identity mismatch on recovery' => [$index, false];
+        }
+    }
+
+    #[DataProvider('failedFeedConnections')]
+    public function test_worker_death_fences_only_its_feed_and_recovers_the_unread_other_connection(int $failedConnection, bool $valid): void
+    {
+        $this->configureRecovery('native');
+        config(['release_verification.download_connections' => 2,
+            'release_verification.pipeline_window' => 2, 'release_verification.download_buffer_bytes' => 256,
+            'release_verification.rust_worker' => $this->framerFixture('fwrite(STDOUT, "\\0"); feed(); exit(9);')]);
+        $pairs = [stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP),
+            stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP)];
+        $next = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        $ids = [['a@example', 'a2@example'], ['b@example', 'b2@example']];
+        $offender = $ids[$failedConnection][0];
+        $unread = $ids[1 - $failedConnection][0];
+        fwrite($pairs[$failedConnection][1], '222 0 <'.$offender."> body\r\nfailed-feed\r\n.\r\n");
+        fwrite($next[1], '222 0 <'.($valid ? $unread : 'wrong@example')."> body\r\nrecovered\r\n.\r\n");
+        $primary = new ReconnectingVerificationNntpHarness([$pairs[0][0], $next[0]], timeout: 5);
+        $secondary = new PipelineSocketNntpHarness($pairs[1][0]);
+        $source = new NntpArticleSource($primary, allowAlternateFallback: false);
+        // Inject only the second connection; requests, framing and recovery remain real.
+        (new \ReflectionProperty($source, 'connections'))->setValue($source, [1 => $secondary]);
+        try {
+            self::assertSame(4, $source->batchSize());
+            $source->prefetch(array_merge(...$ids), static function (): void {});
+            self::assertFalse($primary->isConnected());
+            self::assertFalse($secondary->isConnected());
+            try {
+                $source->fetch($offender);
+                self::fail('The request whose feed failed must remain fenced.');
+            } catch (RuntimeException $error) {
+                self::assertNotInstanceOf(VerificationPipelineRetryException::class, $error);
+                self::assertSame(1, $primary->connects);
+            }
+            if ($valid) {
+                self::assertSame("recovered\r\n", $source->fetchBounded($unread, 64));
+            } else {
+                try {
+                    $source->fetchBounded($unread, 64);
+                    self::fail('Unread recovery must still correlate the response identity.');
+                } catch (RuntimeException $error) {
+                    self::assertStringContainsString('identity', $error->getMessage());
+                }
+            }
+            self::assertSame(2, $primary->connects);
+            foreach ($pairs as $index => $pair) {
+                self::assertSame('BODY <'.$ids[$index][0].">\r\nBODY <".$ids[$index][1].">\r\n", stream_get_contents($pair[1]));
+            }
+            stream_set_blocking($next[1], false);
+            self::assertSame('BODY <'.$unread.">\r\n", stream_get_contents($next[1]));
+        } finally {
+            unset($source);
+            $primary->doQuit();
+            $secondary->closeFixture();
+            foreach ($pairs as $pair) {
+                fclose($pair[1]);
+            }
+            fclose($next[1]);
+        }
+    }
+
+    public function test_worker_death_on_a_later_feed_preserves_only_previously_acknowledged_bodies(): void
+    {
+        $this->configureRecovery('native');
+        $marker = $this->framerPath();
+        $worker = $this->framerFixture('fwrite(STDOUT, "\\0"); feed();'
+            .'reply(["done" => false, "error" => null, "results" => [["index" => 0, "status" => "body", "length" => 5]]], "see\\r\\n");'
+            .'file_put_contents('.var_export($marker, true).', "ack"); feed(); exit(9);');
+        config(['release_verification.rust_worker' => $worker]);
+        $first = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        $next = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        $child = pcntl_fork();
+        if ($child === 0) {
+            fclose($first[0]);
+            fclose($next[0]);
+            fclose($next[1]);
+            stream_set_timeout($first[1], 5);
+            foreach (['c@example', 'a@example', 'b@example'] as $id) {
+                if (fgets($first[1]) !== 'BODY <'.$id.">\r\n") {
+                    exit(2);
+                }
+            }
+            fwrite($first[1], "222 0 <c@example> body\r\nsee\r\n.\r\n");
+            $deadline = hrtime(true) + 5_000_000_000;
+            while (! is_file($marker)) {
+                if (hrtime(true) >= $deadline) {
+                    exit(3);
+                }
+                usleep(1000);
+            }
+            fwrite($first[1], "222 0 <wrong@example> body\r\nunacknowledged\r\n.\r\n");
+            fclose($first[1]);
+            exit(0);
+        }
+        self::assertGreaterThan(0, $child);
+        fclose($first[1]);
+        fwrite($next[1], "222 0 <b@example> body\r\nbee\r\n.\r\n");
+        $nntp = new ReconnectingVerificationNntpHarness([$first[0], $next[0]], timeout: 5);
+        $source = new NntpArticleSource($nntp, allowAlternateFallback: false);
+        try {
+            $source->prefetch(['c@example', 'a@example', 'b@example'], static function (): void {});
+            self::assertSame("see\r\n", $source->fetch('c@example'));
+            try {
+                $source->fetch('a@example');
+                self::fail('The incomplete feed must remain fenced.');
+            } catch (RuntimeException $error) {
+                self::assertNotInstanceOf(VerificationPipelineRetryException::class, $error);
+                self::assertSame(1, $nntp->connects);
+            }
+            self::assertSame("bee\r\n", $source->fetchBounded('b@example', 64));
+            self::assertSame(2, $nntp->connects);
+            stream_set_blocking($next[1], false);
+            self::assertSame("BODY <b@example>\r\n", stream_get_contents($next[1]));
+        } finally {
+            unset($source);
+            $nntp->doQuit();
+            fclose($next[1]);
+            pcntl_waitpid($child, $status);
+            self::assertSame(0, pcntl_wexitstatus($status));
+        }
+    }
+
+    /** @return iterable<string, array{bool}> */
+    public static function heartbeatErrors(): iterable
+    {
+        yield 'RuntimeException' => [false];
+        yield 'Error' => [true];
+    }
+
+    #[DataProvider('heartbeatErrors')]
+    public function test_source_startup_heartbeat_failure_never_falls_back_or_sends_requests(bool $error): void
+    {
+        $this->configureRecovery('native');
+        $started = $this->framerPath();
+        $worker = $this->framerFixture('file_put_contents('.var_export($started, true).', "started"); usleep(400000); fwrite(STDOUT, "\\0"); feed();');
+        config(['release_verification.rust_worker' => $worker]);
+        Container::getInstance()->instance('log', new NullLogger);
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        fwrite($pair[1], "222 0 <a@example> body\r\naye\r\n.\r\n222 0 <b@example> body\r\nbee\r\n.\r\n");
+        $nntp = new ReconnectingVerificationNntpHarness([$pair[0]], timeout: 5);
+        $source = new NntpArticleSource($nntp, allowAlternateFallback: false);
+        $cancelled = $error ? new \Error('Owner lost during startup.') : new RuntimeException('Owner lost during startup.');
+        $fired = false;
+        try {
+            try {
+                $source->prefetch(['a@example', 'b@example'], static function () use ($started, $cancelled, &$fired): void {
+                    if (! $fired && is_file($started)) {
+                        $fired = true;
+                        throw $cancelled;
+                    }
+                });
+                self::fail('A startup heartbeat failure must abort the source.');
+            } catch (\Throwable $caught) {
+                self::assertSame($cancelled, $caught);
+            }
+            self::assertTrue($fired);
+            self::assertFalse($nntp->isConnected());
+            stream_set_blocking($pair[1], false);
+            self::assertSame('', stream_get_contents($pair[1]));
+        } finally {
+            unset($source);
+            $nntp->doQuit();
+            fclose($pair[1]);
+        }
+    }
+
+    /** @return iterable<string, array{string, class-string<\Throwable>}> */
+    public static function inflightHeartbeatFailures(): iterable
+    {
+        foreach (['native', 'rust'] as $engine) {
+            foreach ([RuntimeException::class, \Exception::class, \Error::class] as $failure) {
+                yield $engine.' '.$failure => [$engine, $failure];
+            }
+        }
+    }
+
+    #[DataProvider('inflightHeartbeatFailures')]
+    public function test_source_inflight_heartbeat_failure_propagates_the_exact_error_and_closes_the_socket(string $engine, string $failure): void
+    {
+        $this->configureRecovery($engine);
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        if ($engine === 'rust') {
+            fwrite($pair[1], "222 0 <a@example> body\r\naye\r\n.\r\n");
+        }
+        stream_set_blocking($pair[1], false);
+        $nntp = new ReconnectingVerificationNntpHarness([$pair[0]], timeout: 5);
+        $source = new NntpArticleSource($nntp, allowAlternateFallback: false);
+        $cancelled = new $failure('Owner lost during pipeline.');
+        $request = '';
+        try {
+            try {
+                $source->prefetch(['a@example', 'b@example'], static function () use ($pair, $cancelled, &$request): void {
+                    $request .= stream_get_contents($pair[1]);
+                    if ($request !== '') {
+                        throw $cancelled;
+                    }
+                });
+                self::fail('An in-flight heartbeat failure must abort the source.');
+            } catch (\Throwable $caught) {
+                self::assertSame($cancelled, $caught);
+            }
+            self::assertSame("BODY <a@example>\r\nBODY <b@example>\r\n", $request);
+            self::assertFalse($nntp->isConnected());
+            self::assertSame(1, $nntp->connects);
+        } finally {
+            unset($source);
+            $nntp->doQuit();
+            fclose($pair[1]);
+        }
+    }
+
+    private function framerPath(): string
+    {
+        $path = tempnam(sys_get_temp_dir(), 'verification-source-worker-');
+        self::assertNotFalse($path);
+        unlink($path);
+        $this->framerPaths[] = $path;
+
+        return $path;
+    }
+
+    private function framerFixture(string $body): string
+    {
+        $path = $this->framerPath();
+        $source = '#!'.PHP_BINARY."\n<?php\n".<<<'PHP'
+function exact(int $length): string {
+    $bytes = '';
+    while (strlen($bytes) < $length) {
+        $chunk = fread(STDIN, $length - strlen($bytes));
+        if ($chunk === false || $chunk === '') { exit(10); }
+        $bytes .= $chunk;
+    }
+    return $bytes;
+}
+function feed(): array { return [ord(exact(1)), exact(unpack('N', exact(4))[1])]; }
+function reply(array $metadata, string $body = ''): void {
+    $json = json_encode($metadata, JSON_THROW_ON_ERROR);
+    $wire = pack('N', strlen($json)).$json.$body;
+    while ($wire !== '') { $n = fwrite(STDOUT, $wire); $wire = substr($wire, $n); }
+}
+$init = json_decode(exact(unpack('N', exact(4))[1]), true, flags: JSON_THROW_ON_ERROR);
+PHP;
+        file_put_contents($path, $source."\n".$body);
+        chmod($path, 0700);
+
+        return $path;
+    }
+
+    /** @return iterable<string, array{bool}> */
+    public static function recoveryOperations(): iterable
+    {
+        yield 'STAT then BODY' => [true];
+        yield 'BODY directly' => [false];
+    }
+
+    #[DataProvider('recoveryOperations')]
+    public function test_a_damaged_prefetch_reconnects_before_the_next_stat_pass(bool $stat): void
+    {
+        config(['release_verification.article_bytes' => 64, 'release_verification.download_buffer_bytes' => 128,
+            'release_verification.download_connections' => 1, 'release_verification.pipeline_window' => 2]);
+        $first = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        $next = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        fwrite($first[1], "222 0 <wrong@example> body\r\n");
+        if ($stat) {
+            fwrite($next[1], "223 0 <new@example> present\r\n");
+        }
+        $nntp = new class([$first[0], $next[0]]) extends NNTPService
+        {
+            public int $connects = 0;
+
+            /** @param list<resource> $sockets */
+            public function __construct(private array $sockets)
+            {
+                $this->_socketTimeout = 1;
+            }
+
+            public function doConnect(bool $compression = true, bool $alternate = false): mixed
+            {
+                $this->connects++;
+                $this->_socket = array_shift($this->sockets);
+
+                return $this->isConnected();
+            }
+
+            public function doQuit(bool $force = false): mixed
+            {
+                if (is_resource($this->_socket)) {
+                    fclose($this->_socket);
+                }
+                $this->_socket = null;
+
+                return true;
+            }
+        };
+        $source = new NntpArticleSource($nntp, maximumBytes: 64, allowAlternateFallback: false);
+        try {
+            $source->prefetch(['old@example', 'old2@example'], static function (): void {});
+            if ($stat) {
+                $source->stat(['new@example'], static function (): void {});
+            }
+            fwrite($next[1], "222 0 <new@example> body\r\nbody\r\n.\r\n");
+            $this->assertSame("body\r\n", $source->fetchBounded('new@example', 64));
+            $this->assertSame(2, $nntp->connects);
+        } finally {
+            unset($source);
+            $nntp->doQuit();
+            fclose($first[1]);
+            fclose($next[1]);
+        }
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function engines(): iterable
+    {
+        yield 'native' => ['native'];
+        yield 'rust' => ['rust'];
+    }
+
+    #[DataProvider('engines')]
+    public function test_oversized_batch_classifies_only_the_offending_article_as_deterministic(string $engine): void
+    {
+        if ($engine === 'rust') {
+            $binary = getenv('NNTMUX_VERIFICATION_FRAMER');
+            if (! is_string($binary) || ! is_executable($binary)) {
+                $this->markTestSkipped('Release-built Rust executable required.');
+            }
+            config(['release_verification.rust_worker' => $binary]);
+        }
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        fwrite($pair[1], "222 0 <big@example> body\r\n".str_repeat('x', 20)."\r\n.\r\n222 0 <next@example> body\r\nbody\r\n.\r\n");
+        $primary = new PipelineSocketNntpHarness($pair[0]);
+        try {
+            $result = NNTPService::verificationArticleBatch([['connection' => $primary,
+                'ids' => ['big@example', 'next@example']]], 16, 32, static function (): void {});
+            $this->assertInstanceOf(ArticleBudgetExceeded::class, $result['big@example']);
+            $this->assertInstanceOf(RuntimeException::class, $result['next@example']);
+            $this->assertNotInstanceOf(ArticleBudgetExceeded::class, $result['next@example']);
+        } finally {
+            $primary->closeFixture();
+            fclose($pair[1]);
+        }
+    }
+
+    #[DataProvider('engines')]
+    public function test_healthy_trailing_articles_retry_once_after_the_oversized_pipeline_closes(string $engine): void
+    {
+        $this->configureRecovery($engine);
+        $first = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        $next = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        fwrite($first[1], "222 0 <big@example> body\r\n".str_repeat('x', 65)."\r\n.\r\n");
+        fwrite($next[1], "222 0 <b@example> body\r\nbee\r\n.\r\n");
+        $nntp = new ReconnectingVerificationNntpHarness([$first[0], $next[0]]);
+        $source = new NntpArticleSource($nntp, allowAlternateFallback: false);
+        try {
+            $source->prefetch(['big@example', 'b@example', 'c@example'], static function (): void {});
+            self::assertFalse($nntp->isConnected());
+            try {
+                $source->fetch('big@example');
+                self::fail('Oversized article must stay deterministic.');
+            } catch (ArticleBudgetExceeded) {
+                self::assertSame(1, $nntp->connects);
+            }
+            self::assertSame("bee\r\n", $source->fetch('b@example'));
+            fwrite($next[1], "222 0 <c@example> body\r\nsee\r\n.\r\n");
+            self::assertSame("see\r\n", $source->fetch('c@example'));
+            self::assertSame(2, $nntp->connects);
+            self::assertSame("BODY <big@example>\r\nBODY <b@example>\r\nBODY <c@example>\r\n", stream_get_contents($first[1]));
+            stream_set_blocking($next[1], false);
+            self::assertSame("BODY <b@example>\r\nBODY <c@example>\r\n", stream_get_contents($next[1]));
+        } finally {
+            unset($source);
+            $nntp->doQuit();
+            fclose($first[1]);
+            fclose($next[1]);
+        }
+    }
+
+    #[DataProvider('engines')]
+    public function test_bounded_recovery_renews_the_callers_heartbeat_while_a_body_is_incomplete(string $engine): void
+    {
+        $this->configureRecovery($engine);
+        $first = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        $next = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        fwrite($first[1], "222 0 <big@example> body\r\n".str_repeat('x', 65)."\r\n.\r\n");
+        stream_set_blocking($next[1], false);
+        $nntp = new ReconnectingVerificationNntpHarness([$first[0], $next[0]], timeout: 5);
+        $source = new NntpArticleSource($nntp, allowAlternateFallback: false);
+        $request = '';
+        $started = null;
+        $completed = false;
+        $waitingPulses = 0;
+        try {
+            $source->prefetch(['big@example', 'b@example'], static function (): void {});
+            $body = $source->fetchBounded('b@example', 64, static function () use ($next, &$request, &$started, &$completed, &$waitingPulses): void {
+                $request .= stream_get_contents($next[1]);
+                if ($request === '') {
+                    return;
+                }
+                self::assertSame("BODY <b@example>\r\n", $request);
+                if ($started === null) {
+                    $started = hrtime(true);
+                    fwrite($next[1], "222 0 <b@example> body\r\nbe");
+                } elseif (! $completed && hrtime(true) - $started >= 1_000_000_000) {
+                    $waitingPulses++;
+                    $completed = true;
+                    fwrite($next[1], "e\r\n.\r\n");
+                }
+            });
+            self::assertSame("bee\r\n", $body);
+            self::assertTrue($completed);
+            self::assertSame(1, $waitingPulses);
+            self::assertSame(2, $nntp->connects);
+            self::assertTrue($nntp->isConnected());
+        } finally {
+            unset($source);
+            $nntp->doQuit();
+            fclose($first[1]);
+            fclose($next[1]);
+        }
+    }
+
+    #[DataProvider('engines')]
+    public function test_bounded_recovery_cancellation_closes_the_pending_socket_without_another_retry(string $engine): void
+    {
+        $this->configureRecovery($engine);
+        $first = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        $next = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        fwrite($first[1], "222 0 <big@example> body\r\n".str_repeat('x', 65)."\r\n.\r\n");
+        stream_set_blocking($next[1], false);
+        $nntp = new ReconnectingVerificationNntpHarness([$first[0], $next[0]], timeout: 5);
+        $source = new NntpArticleSource($nntp, allowAlternateFallback: false);
+        $cancelled = new RuntimeException('Owner lease lost.');
+        $request = '';
+        try {
+            $source->prefetch(['big@example', 'b@example'], static function (): void {});
+            try {
+                $source->fetchBounded('b@example', 64, static function () use ($next, $cancelled, &$request): void {
+                    $request .= stream_get_contents($next[1]);
+                    if ($request !== '') {
+                        throw $cancelled;
+                    }
+                });
+                self::fail('Recovery must observe owner cancellation.');
+            } catch (RuntimeException $error) {
+                self::assertSame($cancelled, $error);
+            }
+            self::assertSame("BODY <b@example>\r\n", $request);
+            self::assertSame(2, $nntp->connects);
+            self::assertFalse($nntp->isConnected());
+        } finally {
+            unset($source);
+            $nntp->doQuit();
+            fclose($first[1]);
+            fclose($next[1]);
+        }
+    }
+
+    #[DataProvider('engines')]
+    public function test_recovery_never_downgrades_response_identity_validation(string $engine): void
+    {
+        $this->configureRecovery($engine);
+        $first = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        $next = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        fwrite($first[1], "222 0 <wrong@example> body\r\n");
+        fwrite($next[1], "222 0 <also-wrong@example> body\r\nvalid-looking\r\n.\r\n");
+        $nntp = new ReconnectingVerificationNntpHarness([$first[0], $next[0]]);
+        $source = new NntpArticleSource($nntp, allowAlternateFallback: false);
+        try {
+            $source->prefetch(['a@example', 'b@example'], static function (): void {});
+            foreach (['a@example', 'b@example'] as $id) {
+                try {
+                    $source->fetch($id);
+                    self::fail('An uncorrelated body must never be returned.');
+                } catch (RuntimeException) {
+                    self::assertFalse($nntp->isConnected());
+                }
+            }
+            self::assertSame(2, $nntp->connects);
+            stream_set_blocking($next[1], false);
+            self::assertSame("BODY <b@example>\r\n", stream_get_contents($next[1]));
+        } finally {
+            unset($source);
+            $nntp->doQuit();
+            fclose($first[1]);
+            fclose($next[1]);
+        }
+    }
+
+    #[DataProvider('engines')]
+    public function test_transport_failure_fences_the_offending_request_and_recovers_only_its_unread_tail(string $engine): void
+    {
+        $this->configureRecovery($engine);
+        $first = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        $next = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        fwrite($first[1], "222 0 <a@example> body\r\npartial\r\n");
+        stream_socket_shutdown($first[1], STREAM_SHUT_WR);
+        fwrite($next[1], "222 0 <b@example> body\r\nokay\r\n.\r\n");
+        $nntp = new ReconnectingVerificationNntpHarness([$first[0], $next[0]]);
+        $source = new NntpArticleSource($nntp, allowAlternateFallback: false);
+        try {
+            $source->prefetch(['a@example', 'b@example'], static function (): void {});
+            try {
+                $source->fetch('a@example');
+                self::fail('Truncated article must propagate without retry.');
+            } catch (RuntimeException $error) {
+                self::assertNotInstanceOf(ArticleBudgetExceeded::class, $error);
+                self::assertSame(1, $nntp->connects);
+            }
+            self::assertSame("okay\r\n", $source->fetch('b@example'));
+            self::assertSame(2, $nntp->connects);
+            stream_set_blocking($next[1], false);
+            self::assertSame("BODY <b@example>\r\n", stream_get_contents($next[1]));
+        } finally {
+            unset($source);
+            $nntp->doQuit();
+            fclose($first[1]);
+            fclose($next[1]);
+        }
+    }
+
+    public function test_setup_failure_retries_primary_once_and_a_failed_reconnect_stays_bounded(): void
+    {
+        $this->configureRecovery('native');
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        fwrite($pair[1], "222 0 <a@example> body\r\nokay\r\n.\r\n");
+        $nntp = new ReconnectingVerificationNntpHarness([false, $pair[0]]);
+        $source = new NntpArticleSource($nntp, allowAlternateFallback: false);
+        try {
+            $source->prefetch(['a@example', 'b@example'], static function (): void {});
+            self::assertSame("okay\r\n", $source->fetch('a@example'));
+            self::assertSame(2, $nntp->connects);
+        } finally {
+            unset($source);
+            $nntp->doQuit();
+            fclose($pair[1]);
+        }
+        $nntp = new ReconnectingVerificationNntpHarness([false, false]);
+        $source = new NntpArticleSource($nntp, allowAlternateFallback: false);
+        $source->prefetch(['a@example', 'b@example'], static function (): void {});
+        try {
+            $source->fetch('a@example');
+            self::fail('Failed recovery must propagate.');
+        } catch (RuntimeException) {
+            self::assertSame(2, $nntp->connects);
+        }
+    }
+
+    #[DataProvider('engines')]
+    public function test_prefetched_missing_articles_are_typed_and_never_reissued(string $engine): void
+    {
+        $this->configureRecovery($engine);
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        fwrite($pair[1], "430 absent\r\n423 absent\r\n222 0 <c@example> body\r\nokay\r\n.\r\n");
+        $nntp = new ReconnectingVerificationNntpHarness([$pair[0]]);
+        $source = new NntpArticleSource($nntp, allowAlternateFallback: false);
+        try {
+            $source->prefetch(['a@example', 'b@example', 'c@example'], static function (): void {});
+            foreach (['a@example', 'b@example'] as $id) {
+                try {
+                    $source->fetch($id);
+                    self::fail('Missing article must propagate.');
+                } catch (NntpArticleMissingException) {
+                    self::assertTrue($nntp->isConnected());
+                }
+            }
+            self::assertSame("okay\r\n", $source->fetch('c@example'));
+            stream_set_blocking($pair[1], false);
+            self::assertSame("BODY <a@example>\r\nBODY <b@example>\r\nBODY <c@example>\r\n", stream_get_contents($pair[1]));
+        } finally {
+            unset($source);
+            $nntp->doQuit();
+            fclose($pair[1]);
+        }
+    }
+
+    public function test_clearing_prefetched_articles_at_a_new_batch_forces_fresh_transport(): void
+    {
+        $this->configureRecovery('native');
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        fwrite($pair[1], "222 0 <a@example> body\r\nstale\r\n.\r\n430 absent\r\n");
+        $nntp = new ReconnectingVerificationNntpHarness([$pair[0]]);
+        $source = new NntpArticleSource($nntp, allowAlternateFallback: false);
+        try {
+            $source->prefetch(['a@example', 'b@example'], static function (): void {});
+            $source->clearPrefetched();
+            fwrite($pair[1], "222 0 <a@example> body\r\nfresh\r\n.\r\n222 0 <b@example> body\r\nnew\r\n.\r\n");
+            self::assertSame("fresh\r\n", $source->fetch('a@example'));
+            self::assertSame("new\r\n", $source->fetch('b@example'));
+            stream_set_blocking($pair[1], false);
+            self::assertSame("BODY <a@example>\r\nBODY <b@example>\r\nBODY <a@example>\r\nBODY <b@example>\r\n", stream_get_contents($pair[1]));
+        } finally {
+            unset($source);
+            $nntp->doQuit();
+            fclose($pair[1]);
+        }
+    }
+
+    public function test_non_utf8_opaque_ids_fall_back_before_any_pipeline_command_is_sent(): void
+    {
+        config(['release_verification.rust_worker' => '/unsupported-json-framer']);
+        Container::getInstance()->instance('log', new NullLogger);
+        $id = "opaque-\xff@example";
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        fwrite($pair[1], '222 0 <'.$id."> body\r\nokay\r\n.\r\n");
+        $nntp = new PipelineSocketNntpHarness($pair[0]);
+        try {
+            $results = NNTPService::verificationArticleBatch([['connection' => $nntp, 'ids' => [$id]]],
+                64, 64, static function (): void {});
+            self::assertSame("okay\r\n", $results[$id]);
+            self::assertSame('BODY <'.$id.">\r\n", fgets($pair[1]));
+        } finally {
+            $nntp->closeFixture();
+            fclose($pair[1]);
+        }
+    }
+
+    public function test_failed_rust_startup_logs_once_per_worker_without_sensitive_context(): void
+    {
+        $logger = new class extends AbstractLogger
+        {
+            /** @var list<array{mixed, string|Stringable, array<mixed>}> */
+            public array $records = [];
+
+            public function log($level, string|Stringable $message, array $context = []): void
+            {
+                $this->records[] = [$level, $message, $context];
+            }
+        };
+        Container::getInstance()->instance('log', $logger);
+        config(['release_verification.rust_worker' => '/missing-private-worker-'.bin2hex(random_bytes(8))]);
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        $nntp = new PipelineSocketNntpHarness($pair[0]);
+        try {
+            foreach (['first', 'second'] as $body) {
+                fwrite($pair[1], "222 0 <private@example> body\r\n".$body."\r\n.\r\n");
+                $results = NNTPService::verificationArticleBatch([['connection' => $nntp, 'ids' => ['private@example']]],
+                    64, 64, static function (): void {});
+                self::assertSame($body."\r\n", $results['private@example']);
+            }
+            self::assertCount(1, $logger->records);
+            self::assertSame(['warning', 'Rust verification framer startup failed; using PHP framing.', []], $logger->records[0]);
+        } finally {
+            $nntp->closeFixture();
+            fclose($pair[1]);
+        }
+    }
+
+    /** @return iterable<string, array{bool}> */
+    public static function unavailableLoggers(): iterable
+    {
+        yield 'standalone container' => [false];
+        yield 'broken logger' => [true];
+    }
+
+    #[DataProvider('unavailableLoggers')]
+    public function test_rust_fallback_survives_an_unavailable_application_logger(bool $broken): void
+    {
+        if ($broken) {
+            Container::getInstance()->instance('log', new class extends AbstractLogger
+            {
+                public function log($level, string|Stringable $message, array $context = []): void
+                {
+                    throw new RuntimeException('Private logger setup failure.');
+                }
+            });
+        }
+        $log = tempnam(sys_get_temp_dir(), 'framer-warning-');
+        $previous = ini_set('error_log', $log);
+        config(['release_verification.rust_worker' => '/missing-private-worker-'.bin2hex(random_bytes(8))]);
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        $nntp = new PipelineSocketNntpHarness($pair[0]);
+        try {
+            fwrite($pair[1], "222 0 <private@example> body\r\nsecret\r\n.\r\n");
+            $results = NNTPService::verificationArticleBatch([['connection' => $nntp, 'ids' => ['private@example']]],
+                64, 64, static function (): void {});
+            self::assertSame("secret\r\n", $results['private@example']);
+            $warning = file_get_contents($log);
+            self::assertStringContainsString('using PHP framing', $warning);
+            self::assertStringNotContainsString('private', $warning);
+            self::assertStringNotContainsString('secret', $warning);
+        } finally {
+            ini_set('error_log', $previous);
+            unlink($log);
+            $nntp->closeFixture();
+            fclose($pair[1]);
+        }
+    }
+
+    private function configureRecovery(string $engine): void
+    {
+        config(['release_verification.article_bytes' => 64, 'release_verification.download_buffer_bytes' => 192,
+            'release_verification.download_connections' => 1, 'release_verification.pipeline_window' => 3]);
+        if ($engine === 'rust') {
+            $binary = getenv('NNTMUX_VERIFICATION_FRAMER');
+            if (! is_string($binary) || ! is_executable($binary)) {
+                self::markTestSkipped('Release-built Rust executable required.');
+            }
+            config(['release_verification.rust_worker' => $binary]);
+        }
+    }
+
+    public function test_stat_pipelines_correlate_statuses_without_treating_availability_as_body_evidence(): void
+    {
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        fwrite($pair[1], "223 0 <a@example> exists\r\n430 absent\r\n223 0 <c@example> exists\r\n");
+        $primary = new PipelineSocketNntpHarness($pair[0]);
+        try {
+            $result = NNTPService::verificationArticleBatch([['connection' => $primary,
+                'ids' => ['a@example', 'b@example', 'c@example']]], 1, 3, static function (): void {}, 'stat');
+            $this->assertSame('', $result['a@example']);
+            $this->assertInstanceOf(RuntimeException::class, $result['b@example']);
+            $this->assertSame('', $result['c@example']);
+            $this->assertSame("STAT <a@example>\r\n", fgets($pair[1]));
+            $this->assertSame("STAT <b@example>\r\n", fgets($pair[1]));
+            $this->assertSame("STAT <c@example>\r\n", fgets($pair[1]));
+        } finally {
+            $primary->closeFixture();
+            fclose($pair[1]);
+        }
+    }
+
+    public function test_full_stat_pass_cannot_publish_when_any_unsampled_article_is_missing(): void
+    {
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        fwrite($pair[1], "223 0 <a@example> exists\r\n430 absent\r\n");
+        $primary = new PipelineSocketNntpHarness($pair[0]);
+        $source = new NntpArticleSource($primary, maximumBytes: 1024, allowAlternateFallback: false);
+        $verifier = new SpotCheckVerifier($source,
+            ['stat_all_articles' => true, 'spot_check_articles' => 1, 'spot_check_bytes' => 1024, 'spot_check_article_bytes' => 1024]);
+        try {
+            $result = $verifier->verify(['identity' => 'test', 'expected_files' => 1, 'files' => [['key' => 'file',
+                'totalparts' => 2, 'segments' => [['number' => 1, 'messageid' => 'a@example', 'bytes' => 5],
+                    ['number' => 2, 'messageid' => 'b@example', 'bytes' => 5]]]]], static function (): void {});
+            $this->assertFalse($result->passed());
+            $this->assertStringContainsString('unavailable', $result->reason);
+            stream_set_blocking($pair[1], false);
+            $this->assertSame("STAT <a@example>\r\nSTAT <b@example>\r\n", stream_get_contents($pair[1]));
+        } finally {
+            unset($source);
+            $primary->closeFixture();
+            fclose($pair[1]);
+        }
+    }
+
+    public function test_prefetched_sample_cannot_bypass_its_remaining_transfer_budget(): void
+    {
+        config(['release_verification.article_bytes' => 64, 'release_verification.download_buffer_bytes' => 128,
+            'release_verification.download_connections' => 1, 'release_verification.pipeline_window' => 2]);
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        fwrite($pair[1], "222 0 <a@example> body\r\nabcdefgh\r\n.\r\n222 0 <b@example> body\r\nabcdefgh\r\n.\r\n");
+        $primary = new PipelineSocketNntpHarness($pair[0]);
+        $source = new NntpArticleSource($primary, maximumBytes: 64, allowAlternateFallback: false);
+        try {
+            $source->prefetch(['a@example', 'b@example'], static function (): void {});
+            $this->assertSame("abcdefgh\r\n", $source->fetchBounded('a@example', 64));
+            $this->expectException(ArticleBudgetExceeded::class);
+            $source->fetchBounded('b@example', 4);
+        } finally {
+            unset($source);
+            $primary->closeFixture();
+            fclose($pair[1]);
+        }
+    }
+
     /** @return iterable<string, array{int}> */
     public static function sessionFailures(): iterable
     {
@@ -272,20 +1105,34 @@ final class NntpVerificationArticleSourceTest extends TestCase
 
     protected function tearDown(): void
     {
+        foreach ($this->framerPaths as $path) {
+            if (is_file($path)) {
+                unlink($path);
+            }
+        }
         Container::setInstance($this->previousContainer);
     }
 
-    /** @return iterable<string, array{string}> */
+    /** @return iterable<string, array{string, string}> */
     public static function pipelineFrames(): iterable
     {
-        yield 'ordered dot-stuffed responses and missing middle article' => ['valid'];
-        yield 'wrong response identity disconnects only that connection' => ['identity'];
-        yield 'oversized body disconnects only that connection' => ['oversized'];
+        foreach (['native', 'rust'] as $engine) {
+            foreach (['valid', 'identity', 'oversized'] as $fault) {
+                yield $engine.' '.$fault => [$fault, $engine];
+            }
+        }
     }
 
     #[DataProvider('pipelineFrames')]
-    public function test_actual_socket_pipelines_are_dispatched_concurrently_and_keep_bounded_response_correlation(string $fault): void
+    public function test_actual_socket_pipelines_are_dispatched_concurrently_and_keep_bounded_response_correlation(string $fault, string $engine): void
     {
+        if ($engine === 'rust') {
+            $binary = getenv('NNTMUX_VERIFICATION_FRAMER');
+            if (! is_string($binary) || ! is_executable($binary)) {
+                $this->markTestSkipped('Set NNTMUX_VERIFICATION_FRAMER to the release-built Rust executable.');
+            }
+            config(['release_verification.rust_worker' => $binary]);
+        }
         if (! function_exists('pcntl_fork')) {
             $this->markTestSkipped('Socket server fixture needs pcntl.');
         }
@@ -839,5 +1686,35 @@ final class VerificationNntpHarness extends NNTPService
     public function nextLine(): string|false
     {
         return fgets($this->_socket);
+    }
+}
+
+/** Replaces connection setup only; framing, socket writes and reads use NNTPService. */
+final class ReconnectingVerificationNntpHarness extends NNTPService
+{
+    public int $connects = 0;
+
+    /** @param list<resource|false> $sockets */
+    public function __construct(private array $sockets, int $timeout = 1)
+    {
+        $this->_socketTimeout = $timeout;
+    }
+
+    public function doConnect(bool $compression = true, bool $alternate = false): mixed
+    {
+        $this->connects++;
+        $this->_socket = array_shift($this->sockets) ?: null;
+
+        return $this->isConnected();
+    }
+
+    public function doQuit(bool $force = false): mixed
+    {
+        if (is_resource($this->_socket)) {
+            fclose($this->_socket);
+        }
+        $this->_socket = null;
+
+        return true;
     }
 }
