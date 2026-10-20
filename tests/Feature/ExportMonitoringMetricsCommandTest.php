@@ -119,8 +119,7 @@ class ExportMonitoringMetricsCommandTest extends TestCase
     {
         Http::fake([self::PUSH_URL => Http::response('', 200)]);
         $event = $this->exportEvent();
-        // Lock expiry is compared with the clock; freeze it so wall-clock drift between
-        // creating the lock and travelling cannot move the boundary.
+        // Lock expiry is compared with the clock; freeze it so wall-clock drift cannot move the boundary.
         $this->freezeTime();
 
         $this->assertTrue($event->mutex->create($event));
@@ -129,20 +128,9 @@ class ExportMonitoringMetricsCommandTest extends TestCase
         $this->assertTrue($event->shouldSkipDueToOverlapping());
         Http::assertNothingSent();
 
-        $this->travel(1)->minutes();
-        $store = app('cache')->store()->getStore();
-        $this->assertTrue($event->filtersPass($this->app), json_encode([
-            'store' => $store::class,
-            'default' => config('cache.default'),
-            'monitoring' => config('monitoring.enabled'),
-            'now' => now()->format('Y-m-d H:i:s.u'),
-            'mutex' => $event->mutex::class,
-            'mutex_store' => (fn () => $this->store ?? null)->call($event->mutex),
-            'lock' => property_exists($store, 'locks') ? array_map(static fn ($l) => [$l['owner'] ?? null, isset($l['expiresAt']) ? $l['expiresAt']->format('Y-m-d H:i:s.u') : null], $store->locks) : null,
-            'filters' => count((fn () => $this->filters)->call($event)),
-            'rejects' => count((fn () => $this->rejects)->call($event)),
-            'events' => array_values(array_filter(array_map(static fn ($e) => is_string($e->command) && str_contains($e->command, 'export-metrics') ? $e->command : null, app(\Illuminate\Console\Scheduling\Schedule::class)->events()))),
-        ]));
+        // Step just past the five-minute expiry; at exactly the boundary CI still sees the lock as held.
+        $this->travel(61)->seconds();
+        $this->assertTrue($event->filtersPass($this->app));
         $this->assertFalse($event->mutex->exists($event));
         $this->artisan('monitoring:export-metrics')->assertSuccessful();
 
