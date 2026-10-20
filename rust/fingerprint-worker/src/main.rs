@@ -173,6 +173,7 @@ async fn main() -> Result<()> {
                 if *stop.borrow() { return Ok::<(), anyhow::Error>(()); }
                 let ticket = next.fetch_add(1, Ordering::SeqCst);
                 if maximum > 0 && ticket >= maximum { return Ok(()); }
+                let claim_started = std::time::Instant::now();
                 let claim = match database::claim(&pool, &worker).await {
                     Ok(claim) => claim,
                     Err(error) => {
@@ -182,6 +183,7 @@ async fn main() -> Result<()> {
                         continue;
                     }
                 };
+                let claim_ms = elapsed_ms(claim_started);
                 let Some(claim) = claim else {
                     if maximum > 0 { return Ok(()); }
                     tokio::select! { _ = tokio::time::sleep(Duration::from_secs(2)) => {}, _ = stop.changed() => {} }
@@ -205,8 +207,14 @@ async fn main() -> Result<()> {
                 let mutation = async {
                     match result {
                         Ok(result) => {
+                            let finish_started = std::time::Instant::now();
                             if database::finish(&pool, &claim, &result.status, &result.data).await? {
-                                println!("{{\"event\":\"completed\",\"release_id\":{},\"status\":\"{}\"}}", claim.release_id, result.status);
+                                let t = result.timings;
+                                println!(
+                                    "{{\"event\":\"completed\",\"release_id\":{},\"status\":\"{}\",\"timings_ms\":{{\"claim\":{},\"slot\":{},\"connect\":{},\"profile\":{},\"articles\":{},\"finish\":{},\"total\":{}}},\"connections_opened\":{}}}",
+                                    claim.release_id, result.status, claim_ms, t.slot_ms, t.connect_ms, t.profile_ms, t.articles_ms,
+                                    elapsed_ms(finish_started), elapsed_ms(claim_started), t.connections_opened
+                                );
                             } else {
                                 println!("{{\"event\":\"stale_result_discarded\",\"release_id\":{}}}", claim.release_id);
                             }
@@ -244,6 +252,10 @@ async fn main() -> Result<()> {
     }
     pool.close().await;
     Ok(())
+}
+
+fn elapsed_ms(since: std::time::Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 async fn shutdown_signal() -> Result<()> {

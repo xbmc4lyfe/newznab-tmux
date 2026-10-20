@@ -11,12 +11,35 @@ use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::MySqlPool;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Instant,
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Collected {
     pub status: String,
     pub data: Value,
+    /// Where one job's wall time went; logged by the worker, never stored in compact-v1.
+    #[serde(skip)]
+    pub timings: Timings,
+}
+/// Wall-clock milliseconds spent in each phase of one collection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Timings {
+    /// Waiting for a shared provider-connection budget row.
+    pub slot_ms: u64,
+    /// TCP connect, TLS handshake, greeting and AUTHINFO.
+    pub connect_ms: u64,
+    /// CAPABILITIES and LIST OVERVIEW.FMT.
+    pub profile_ms: u64,
+    /// Sequential ARTICLE retrievals.
+    pub articles_ms: u64,
+    /// Provider connections opened for this release.
+    pub connections_opened: u32,
+}
+fn elapsed_ms(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProviderEvidence {
@@ -42,6 +65,7 @@ pub async fn run(
     let files = manifest::parse(&xml)?;
     let (samples, _) = manifest::samples(&files);
     let mut evidence = vec![];
+    let mut timings = Timings::default();
     for p in providers {
         if p.account == "alternate"
             && crc32fast::hash(claim.release_id.to_string().as_bytes()) % 100
@@ -75,12 +99,18 @@ pub async fn run(
             });
             continue;
         }
+        let phase = Instant::now();
         database::slot(pool, claim, &p.account, worker).await?;
+        timings.slot_ms += elapsed_ms(phase);
+        let phase = Instant::now();
         let mut client = Client::connect(p, timeout).await.ok();
+        timings.connect_ms += elapsed_ms(phase);
+        timings.connections_opened += 1;
         let mut entries = BTreeMap::new();
         let mut implementation = None;
         let mut profile = "ok".to_string();
         let mut unavailable = false;
+        let phase = Instant::now();
         if let Some(connection) = client.as_mut() {
             if connection.profile().await.is_err() {
                 profile = "ProfileResponseInvalid".into();
@@ -98,10 +128,15 @@ pub async fn run(
                 unavailable = true;
             }
         }
+        timings.profile_ms += elapsed_ms(phase);
+        let phase = Instant::now();
         for sample in &samples {
             if !unavailable && client.as_ref().is_none_or(Client::poisoned) {
                 drop(client.take());
+                let reconnect = Instant::now();
                 client = Client::connect(p, timeout).await.ok();
+                timings.connect_ms += elapsed_ms(reconnect);
+                timings.connections_opened += 1;
                 if client.is_none() && decision.is_some() {
                     breaker::unavailable(pool, &p.account).await?;
                     unavailable = true;
@@ -125,6 +160,7 @@ pub async fn run(
             };
             entries.insert(sample.messageid.clone(), article);
         }
+        timings.articles_ms += elapsed_ms(phase);
         evidence.push(ProviderEvidence {
             account: p.account.clone(),
             host: p.host.clone(),
@@ -136,7 +172,9 @@ pub async fn run(
             articles: entries,
         });
     }
-    Ok(analyze(&files, &evidence))
+    let mut collected = analyze(&files, &evidence);
+    collected.timings = timings;
+    Ok(collected)
 }
 fn headers(article: &Article) -> BTreeMap<String, String> {
     let mut out: BTreeMap<String, String> = BTreeMap::new();
@@ -341,6 +379,7 @@ pub fn analyze(files: &[File], evidence: &[ProviderEvidence]) -> Collected {
     Collected {
         status: if complete { "complete" } else { "partial" }.into(),
         data,
+        timings: Timings::default(),
     }
 }
 fn total_bytes(files: &[File]) -> Option<i64> {
