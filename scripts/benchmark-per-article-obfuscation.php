@@ -91,7 +91,7 @@ function perArticleBenchmarkMain(): int
         'name' => 'per-article-obfuscation-v1', 'seed' => $seed, 'repeats' => $repeats, 'min_articles' => PER_ARTICLE_MIN_ARTICLES,
         'threshold' => PER_ARTICLE_THRESHOLD, 'bootstrap_resamples' => PER_ARTICLE_BOOTSTRAP, 'timing' => 'hrtime around each whole-range call; random side order per observation; 3 warm-ups; GC disabled',
         'rust_path' => 'pack records + FFI call + unpack + array_fill_keys, PHP fallback on decline',
-    ], 'environment' => ['php' => PHP_VERSION, 'machine' => php_uname('m'), 'os' => php_uname('s').' '.php_uname('r'),
+    ], 'environment' => ['source_commit' => perArticleSourceCommit(), 'php' => PHP_VERSION, 'machine' => php_uname('m'), 'os' => php_uname('s').' '.php_uname('r'),
         'library_sha256' => hash_file('sha256', (string) $options['native'])], 'strata' => [], 'status' => 'qualified'];
     $random = new Randomizer(new Mt19937($seed));
     foreach (PerArticleObfuscationCorpus::strata() as $name => $stratum) {
@@ -160,7 +160,7 @@ function perArticleBenchmarkMain(): int
             continue;
         }
         $cold = ['php' => [], 'rust' => []];
-        $usedRust = false;
+        $rustRuns = 0;
         $runs = $stratum['category'] === 'routed' ? PER_ARTICLE_COLD_RUNS_ROUTED : PER_ARTICLE_COLD_RUNS;
         for ($run = 0; $run < $runs; $run++) {
             foreach ($random->getInt(0, 1) === 0 ? ['php', 'rust'] : ['rust', 'php'] as $side) {
@@ -168,9 +168,12 @@ function perArticleBenchmarkMain(): int
                     '--cold-stratum='.$name, '--cold-side='.$side, '--native='.$options['native'], '--seed='.$seed])));
                 $result = json_decode((string) $output, true, 4, JSON_THROW_ON_ERROR);
                 $cold[$side][] = (int) $result['ns'];
-                $usedRust = $usedRust || ($side === 'rust' && $result['rust'] === true);
+                $rustRuns += $side === 'rust' && $result['rust'] === true ? 1 : 0;
             }
         }
+        // The side most of this stratum's cold runs took decides its gate, so one run the sampler
+        // happened to send the other way cannot hold a PHP-routed stratum to the Rust threshold.
+        $usedRust = $rustRuns * 2 > $runs;
         $coldSpeedup = perArticleQuantile($cold['php'], 0.5) / max(1, perArticleQuantile($cold['rust'], 0.5));
         [$coldLow, $coldHigh] = perArticleBootstrap($cold, 0.5, $random);
         $report['cold'][$name] = ['php_ms' => round(perArticleQuantile($cold['php'], 0.5) / 1e6, 3),
@@ -185,6 +188,7 @@ function perArticleBenchmarkMain(): int
             $report['status'] = 'inconclusive';
         }
         $report['cold'][$name]['used_rust'] = $usedRust;
+        $report['cold'][$name]['rust_runs'] = $rustRuns;
         $coldMarkdown .= sprintf("| %s | %s | %s | %.3f | %.3f | %.2fx | %.2f-%.2fx |\n", $name, $stratum['category'], $usedRust ? 'Rust' : 'PHP',
             $report['cold'][$name]['php_ms'], $report['cold'][$name]['rust_ms'], $coldSpeedup, $coldLow, $coldHigh);
     }
@@ -195,13 +199,26 @@ function perArticleBenchmarkMain(): int
             : sprintf("| %s | %s | %d | %d | %s | %.3f | %.3f | %.2fx | %.2f-%.2fx |\n", $name, $row['category'], $row['headers'], $row['marked'],
                 $row['statistic'], $row['php_ms'], $row['rust_ms'], $row['speedup'], $row['speedup_ci95'][0], $row['speedup_ci95'][1]);
     }
+    $markdown .= "\nSource commit: `".$report['environment']['source_commit'].'`; library sha256 `'.$report['environment']['library_sha256']."`.\n";
     $markdown .= "\nStatus: **{$report['status']}** (threshold ".PER_ARTICLE_THRESHOLD."x; {$repeats} paired samples per stratum, ".PER_ARTICLE_TAIL_SAMPLES." for uncommon strata; Rust strata need the 95% lower bound at the threshold).\n";
-    $markdown .= "\nCold first call per fresh process (median of ".PER_ARTICLE_COLD_RUNS.' runs, '.PER_ARTICLE_COLD_RUNS_ROUTED." for routed strata; same thresholds):\n\n".$coldMarkdown;
+    $markdown .= "\nCold first call per fresh process (median of ".PER_ARTICLE_COLD_RUNS.' runs, '.PER_ARTICLE_COLD_RUNS_ROUTED.' for routed strata; same thresholds; the side most runs took sets the gate; excludes the one-time wrapper construction with the service, about 0.4-0.6 ms per process):'."\n\n".$coldMarkdown;
     file_put_contents($directory.'/report.json', json_encode($report, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR));
     file_put_contents($directory.'/summary.md', $markdown);
     echo $markdown;
 
     return $report['status'] === 'invalid' ? 2 : 0;
+}
+
+/** The measured source revision: GITHUB_SHA in CI, otherwise the checkout's HEAD when git can read it. */
+function perArticleSourceCommit(): string
+{
+    $sha = getenv('GITHUB_SHA');
+    if (is_string($sha) && $sha !== '') {
+        return $sha;
+    }
+    $head = shell_exec('git -C '.escapeshellarg(dirname(__DIR__)).' rev-parse HEAD 2>/dev/null');
+
+    return is_string($head) && trim($head) !== '' ? trim($head) : 'unknown';
 }
 
 /** Time one first call of $side on $name in this fresh process, as JSON nanoseconds. */
@@ -212,8 +229,9 @@ function perArticleColdChild(string $name, string $side, string $library, int $s
     {
         public function __construct() {}
     }, false);
-    // Built before timing, as HeaderParser builds it with the service; loading the library and
-    // its probe still happen inside the first mark().
+    // The wrapper is built before timing, as HeaderParser builds it once with the service: that
+    // one-time class load and sampler seeding (about 0.4-0.6 ms per process, measured separately)
+    // is excluded. Loading the library and its probe fall inside the timed first call.
     $native = new NativePerArticleObfuscation($library);
     $start = hrtime(true);
     $marked = $side === 'rust' ? $native->mark($headers, PER_ARTICLE_MIN_ARTICLES) : null;
