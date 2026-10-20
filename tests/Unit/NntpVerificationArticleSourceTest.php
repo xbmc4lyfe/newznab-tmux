@@ -190,8 +190,18 @@ final class NntpVerificationArticleSourceTest extends TestCase
         }
     }
 
-    #[DataProvider('engines')]
-    public function test_source_inflight_heartbeat_failure_propagates_the_exact_error_and_closes_the_socket(string $engine): void
+    /** @return iterable<string, array{string, class-string<\Throwable>}> */
+    public static function inflightHeartbeatFailures(): iterable
+    {
+        foreach (['native', 'rust'] as $engine) {
+            foreach ([RuntimeException::class, \Exception::class, \Error::class] as $failure) {
+                yield $engine.' '.$failure => [$engine, $failure];
+            }
+        }
+    }
+
+    #[DataProvider('inflightHeartbeatFailures')]
+    public function test_source_inflight_heartbeat_failure_propagates_the_exact_error_and_closes_the_socket(string $engine, string $failure): void
     {
         $this->configureRecovery($engine);
         $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
@@ -201,7 +211,7 @@ final class NntpVerificationArticleSourceTest extends TestCase
         stream_set_blocking($pair[1], false);
         $nntp = new ReconnectingVerificationNntpHarness([$pair[0]], timeout: 5);
         $source = new NntpArticleSource($nntp, allowAlternateFallback: false);
-        $cancelled = new RuntimeException('Owner lost during pipeline.');
+        $cancelled = new $failure('Owner lost during pipeline.');
         $request = '';
         try {
             try {
@@ -212,7 +222,7 @@ final class NntpVerificationArticleSourceTest extends TestCase
                     }
                 });
                 self::fail('An in-flight heartbeat failure must abort the source.');
-            } catch (RuntimeException $caught) {
+            } catch (\Throwable $caught) {
                 self::assertSame($cancelled, $caught);
             }
             self::assertSame("BODY <a@example>\r\nBODY <b@example>\r\n", $request);

@@ -156,8 +156,8 @@ class NNTPService extends NntpClient
                         array_map(static fn (array $batch): array => ['ids' => $batch['ids'], 'mode' => $mode], array_values($batches)),
                         $maximumBytes, $bufferBytes, $guardHeartbeat);
                 } catch (\RuntimeException $error) {
-                    if ($error === $heartbeatFailure->error) {
-                        throw $error;
+                    if ($heartbeatFailure->error !== null) {
+                        throw $heartbeatFailure->error;
                     }
                     // No NNTP command has been sent; the native pipeline is still a safe fallback.
                     self::reportVerificationFramerFallback($worker);
@@ -330,8 +330,8 @@ class NNTPService extends NntpClient
                     }
                 }
             }
-            if ($error === $heartbeatFailure->error) {
-                throw $error;
+            if ($heartbeatFailure->error !== null) {
+                throw $heartbeatFailure->error;
             }
 
             // Only completed, acknowledged frames survive; the current request is fenced and
