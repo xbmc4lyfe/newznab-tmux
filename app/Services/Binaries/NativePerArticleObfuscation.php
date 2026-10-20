@@ -9,7 +9,7 @@ use Throwable;
 
 /**
  * Rust port of {@see HeaderParser::markPerArticleObfuscated()}, adopted after
- * scripts/benchmark-per-article-obfuscation.php measured it at 1.8-3.1x the PHP rule on the ranges it is routed to (warm and cold) with identical
+ * scripts/benchmark-per-article-obfuscation.php measured it at about 1.7-2.9x the PHP rule on the ranges it is routed to (warm and cold) with identical
  * marks. Null means "use PHP": not a Linux CLI with FFI, library missing, failing its known-answer
  * probe, or input the native side declines (a subject longer than MAX_SUBJECT_LENGTH, where PHP's
  * backtrack limit could stop the subject pattern).

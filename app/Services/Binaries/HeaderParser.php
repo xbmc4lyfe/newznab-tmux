@@ -81,7 +81,7 @@ final class HeaderParser
         if ($minArticles < 1) {
             return 0;
         }
-        // The Rust port marks the same articles about 1.8-3.1x faster on ranges it is routed to (scripts/benchmark-per-article-obfuscation.php);
+        // The Rust port marks the same articles about 1.7-2.9x faster on ranges it is routed to (scripts/benchmark-per-article-obfuscation.php);
         // null means it is unavailable or declined, and the PHP rule below decides.
         // Routing runs before the wrapper exists, so a range kept on PHP never loads its class.
         $marked = null;
