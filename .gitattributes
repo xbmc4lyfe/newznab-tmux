@@ -134,3 +134,9 @@ docker/Justfile		-binary text eol=lf
 /scripts/benchmark-date-build.py -binary text eol=lf
 /tests/Unit/test_benchmark_date_build.py -binary text eol=lf
 /tests/Unit/test_generate_env.py -binary text eol=lf
+
+# Standalone database worker source and lockfile must remain reviewable.
+/rust/fingerprint-worker/Cargo.toml -binary text eol=lf
+/rust/fingerprint-worker/Cargo.lock -binary text eol=lf
+/rust/fingerprint-worker/**/*.rs -binary text eol=lf
+/rust/fingerprint-worker/**/*.py -binary text eol=lf

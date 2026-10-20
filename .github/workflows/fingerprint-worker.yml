@@ -1,0 +1,77 @@
+name: Database Rust fingerprint worker
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - 'rust/fingerprint-worker/**'
+      - 'app/Services/Nzb/**'
+      - 'app/Services/Releases/Fingerprint/**'
+      - 'database/migrations/*fingerprint*'
+      - 'tests/Feature/DatabaseNzbStorageTest.php'
+      - 'tests/Integration/DatabaseNzbStorageMariaDbTest.php'
+      - 'tests/Fixtures/bootstrap-fingerprint-database.php'
+      - '.github/workflows/fingerprint-worker.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'rust/fingerprint-worker/**'
+      - 'app/Services/Nzb/**'
+      - 'app/Services/Releases/Fingerprint/**'
+      - 'database/migrations/*fingerprint*'
+      - '.github/workflows/fingerprint-worker.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  standalone-worker:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      mariadb:
+        image: mariadb:11.4.8
+        env:
+          MARIADB_ROOT_PASSWORD: fingerprint-fixture-only
+          MARIADB_DATABASE: fingerprint_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.0
+      FINGERPRINT_TEST_DATABASE_URL: mysql://root:fingerprint-fixture-only@127.0.0.1:3306/fingerprint_test
+      XDEBUG_MODE: 'off'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: bcmath, curl, dom, exif, ffi, gd, intl, libxml, mbstring, pcntl, pdo_mysql, pdo_sqlite, simplexml, sockets, sodium, xmlwriter, zip
+          coverage: none
+      - name: Install test dependencies
+        run: |
+          cp .env.test .env
+          composer install --prefer-dist --no-interaction --no-progress --no-scripts --no-plugins
+          rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
+      - name: Initialize disposable database
+        run: php tests/Fixtures/bootstrap-fingerprint-database.php
+      - name: Launchd installer and private configuration tests
+        run: python3 rust/fingerprint-worker/scripts/test_launchd.py
+      - name: Rust formatting and lint
+        run: |
+          cargo fmt --manifest-path rust/fingerprint-worker/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path rust/fingerprint-worker/Cargo.toml --all-targets -- -D warnings
+      - name: Rust unit, protocol, and distributed database tests
+        run: |
+          cargo test --locked --manifest-path rust/fingerprint-worker/Cargo.toml
+          cargo build --locked --manifest-path rust/fingerprint-worker/Cargo.toml
+      - name: Collector parity and database storage tests
+        run: |
+          php -d memory_limit=1G rust/fingerprint-worker/tests/parity.php
+          php -d memory_limit=1G vendor/bin/phpunit tests/Feature/DatabaseNzbStorageTest.php tests/Integration/DatabaseNzbStorageMariaDbTest.php

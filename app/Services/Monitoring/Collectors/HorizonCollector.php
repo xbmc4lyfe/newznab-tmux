@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace App\Services\Monitoring\Collectors;
 
+use App\Services\Monitoring\BoundedMetricQuery;
 use App\Services\Monitoring\Prometheus\MetricFamily;
+use Illuminate\Support\Facades\DB;
 use Laravel\Horizon\Contracts\JobRepository;
 use Laravel\Horizon\Contracts\MasterSupervisorRepository;
 use Laravel\Horizon\Contracts\MetricsRepository;
@@ -37,10 +39,19 @@ class HorizonCollector implements MetricsCollector
         $queues = $this->workload->get();
 
         foreach ($queues as $queue) {
+            if ($queue['name'] === 'release-fingerprint' && config('nntmux.fingerprint_worker', 'rust') === 'rust') {
+                continue;
+            }
             $labels = ['queue' => $queue['name']];
             $length->add((int) $queue['length'], $labels);
             $wait->add((float) $queue['wait'], $labels);
             $processes->add((int) $queue['processes'], $labels);
+        }
+
+        if (config('nntmux.fingerprint_worker', 'rust') === 'rust') {
+            $pending = app(BoundedMetricQuery::class)->get(DB::table('release_fingerprint_jobs')
+                ->where('status', 'pending')->selectRaw('COUNT(*) AS total'));
+            $length->add((int) $pending[0]->total, ['queue' => 'release-fingerprint']);
         }
 
         yield $length;

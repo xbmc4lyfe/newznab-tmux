@@ -6,6 +6,7 @@ namespace App\Services\Releases\Verification;
 
 use App\Facades\Search;
 use App\Models\Release;
+use App\Services\Nzb\DatabaseNzbStore;
 use App\Services\Nzb\NzbService;
 use App\Services\Nzb\NzbSourceGuard;
 use App\Services\ReleaseImageService;
@@ -30,6 +31,9 @@ final class AuditReleaseDeletion
         $generation = ['late_article_candidate_id', 'articles_found', 'articles_expected', 'files_found', 'files_expected', 'size'];
         if ($current === null || array_any($generation, static fn (string $column): bool => $current->getAttribute($column) != $release->getAttribute($column))) {
             throw new RuntimeException('Audited release changed before deletion.');
+        }
+        if (DatabaseNzbStore::enabled() && ! DB::table('release_nzb_contents')->where('guid', $current->guid)->lockForUpdate()->exists()) {
+            throw new RuntimeException('Unimported database NZB cannot qualify a release for audit deletion.');
         }
         $receipt = (new NzbSourceGuard($this->nzb))->captureDeletionAnchor($current);
         $paths = [$receipt['path'], ...$this->images->releaseFiles($release->guid)];
@@ -73,7 +77,7 @@ final class AuditReleaseDeletion
             throw new RuntimeException('Audit NZB artifact path is invalid.');
         }
         $nzbParent = dirname($nzbPath);
-        if (file_exists($nzbParent) && (! is_dir($nzbParent) || ! is_readable($nzbParent) || ! is_executable($nzbParent))) {
+        if (($receipt['kind'] ?? null) !== 'database' && file_exists($nzbParent) && (! is_dir($nzbParent) || ! is_readable($nzbParent) || ! is_executable($nzbParent))) {
             throw new RuntimeException('Audit artifact directory is inaccessible.');
         }
         if (! (new NzbSourceGuard($this->nzb))->deleteAnchoredSource($receipt)) {

@@ -25,15 +25,11 @@ class FileListApiController extends Controller
             return response()->json(['error' => 'Release not found'], 404);
         }
 
-        $nzbpath = $nzb->nzbPath($guid);
+        $nzbfile = $nzb->readNzbContents($guid);
 
-        if (! file_exists($nzbpath)) {
+        if (! is_string($nzbfile)) {
             return response()->json(['error' => 'NZB file not found'], 404);
         }
-
-        ob_start();
-        @readgzfile($nzbpath);
-        $nzbfile = ob_get_clean();
 
         $files = $nzbParser->parseNzbFileList($nzbfile);
 

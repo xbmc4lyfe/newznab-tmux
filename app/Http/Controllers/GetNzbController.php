@@ -14,7 +14,6 @@ use Exception;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
-use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use STS\ZipStream\Builder;
 use Symfony\Component\HttpFoundation\HeaderUtils;
@@ -28,8 +27,6 @@ class GetNzbController extends BasePageController
      * Request attribute that switches error responses from newznab XML to JSON (API v2).
      */
     public const string JSON_ERRORS_ATTRIBUTE = 'nntmux.getnzb.json_errors';
-
-    private const int BUFFER_SIZE = 1000000;
 
     private const string NZB_SUFFIX = '.nzb';
 
@@ -295,8 +292,8 @@ class GetNzbController extends BasePageController
         string $releaseId
     ): JsonResponse|Response|StreamedResponse {
         // Get NZB file path and validate
-        $nzbPath = app(NzbService::class)->nzbPath($releaseId);
-        if ($nzbPath === false) {
+        $nzbContents = app(NzbService::class)->readNzbContents($releaseId);
+        if (! is_string($nzbContents)) {
             return $this->apiError(300, 'NZB file not found!');
         }
 
@@ -317,7 +314,9 @@ class GetNzbController extends BasePageController
         $asciiFallbackName = FilenameSanitizer::asciiFallback($cleanName, "release-{$releaseId}");
 
         $response = response()->stream(
-            fn () => $this->streamModifiedNzbContent($nzbPath, $uid),
+            static function () use ($nzbContents, $uid): void {
+                echo str_replace('file poster="', 'file poster="'.$uid.'-', $nzbContents);
+            },
             200,
             $headers
         );
@@ -387,64 +386,6 @@ class GetNzbController extends BasePageController
         $headers['X-DNZB-RText'] = 'OK, NZB content follows.';
 
         return $headers;
-    }
-
-    /**
-     * Stream modified NZB content with user-specific modifications
-     */
-    private function streamModifiedNzbContent(string $nzbPath, int $uid): void
-    {
-        if (! File::exists($nzbPath)) {
-            Log::warning('NZB file not found during streaming', ['path' => $nzbPath]);
-            echo '<?xml version="1.0" encoding="UTF-8"?><error>NZB file not found</error>';
-
-            return;
-        }
-
-        $fileHandle = @gzopen($nzbPath, 'rb');
-        if ($fileHandle === false) {
-            Log::warning('Failed to open NZB file for streaming', ['path' => $nzbPath]);
-            echo '<?xml version="1.0" encoding="UTF-8"?><error>Failed to read NZB file</error>';
-
-            return;
-        }
-
-        $buffer = '';
-        $lastChunk = false;
-
-        // Stream and modify content in chunks
-        while (! gzeof($fileHandle)) {
-            $chunk = gzread($fileHandle, self::BUFFER_SIZE);
-            if ($chunk === false) {
-                break;
-            }
-
-            // Combine with previous buffer to handle boundaries
-            $buffer .= $chunk;
-
-            // Check if this is the last chunk
-            if (gzeof($fileHandle)) { // @phpstan-ignore if.alwaysFalse
-                $lastChunk = true;
-            }
-
-            // Process buffer
-            if ($lastChunk) { // @phpstan-ignore if.alwaysFalse
-                // On last chunk, modify poster attributes
-                $buffer = preg_replace('/file poster="/', 'file poster="'.$uid.'-', $buffer);
-                echo $buffer;
-            } else {
-                // For intermediate chunks, keep some data in buffer to handle boundaries
-                $safeLength = mb_strlen($buffer) - 1000; // Keep last 1KB in buffer
-                if ($safeLength > 0) {
-                    $output = mb_substr($buffer, 0, $safeLength);
-                    $output = preg_replace('/file poster="/', 'file poster="'.$uid.'-', $output);
-                    echo $output;
-                    $buffer = mb_substr($buffer, $safeLength);
-                }
-            }
-        }
-
-        gzclose($fileHandle);
     }
 
     /**
