@@ -150,8 +150,8 @@ class VerifyReleaseCandidates extends Command
                 $active = 'bookkeeping';
                 // Once true, the forwarder owns the live lease: nothing after that may finish the candidate.
                 $handedOff = false;
+                $phase = $diagnostics === null ? null : hrtime(true);
                 try {
-                    $phase = $diagnostics === null ? null : hrtime(true);
                     $heartbeat = static function () use ($repository, $claim, $batch): void {
                         $batch->pulse();
                         $repository->heartbeat((int) $claim->id, $claim->lease_token);
@@ -190,7 +190,8 @@ class VerifyReleaseCandidates extends Command
                             $diagnostics?->handedOff();
                         } else {
                             $published = config('release_verification.publish_url')
-                                ? app(RemoteReleasePublisher::class)->publish($claim, $result) : $publisher->publish($claim, $result);
+                                ? app(RemoteReleasePublisher::class)->publish($claim, $result, progress: $progressHeartbeat)
+                                : $publisher->publish($claim, $result, progress: $batch->pulse(...));
                             if ($published === null) {
                                 $result = $this->filteredResult($claim) ?? throw new RuntimeException('Publication did not produce a verified current release.');
                                 $diagnostics?->filtered();

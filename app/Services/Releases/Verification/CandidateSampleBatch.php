@@ -34,7 +34,7 @@ final class CandidateSampleBatch
         $owner = WeakReference::create($this);
         $this->pendingHeartbeat = new LeaseHeartbeat(static function () use ($owner): void {
             $owner->get()?->heartbeat();
-        }, max(0.1, min(30, (int) ($this->options['lease_seconds'] ?? 300) / 3)));
+        }, max(0.1, min(30, (int) ($this->options['lease_seconds'] ?? 300) / 3)), $this->clock);
     }
 
     public function hasPending(): bool

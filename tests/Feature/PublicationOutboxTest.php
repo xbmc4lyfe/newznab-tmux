@@ -227,7 +227,7 @@ class PublicationOutboxTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(0, DB::table('release_verification_scratch')->count());
         $this->assertTrue(Carbon::parse($row->lease_until)->greaterThan(now()->addSeconds(250)));
         $this->assertSame([], glob($this->outbox()->directory().'/pending/.*.tmp') ?: []);
-        $this->assertSame(3, $report['schema_version']);
+        $this->assertSame(4, $report['schema_version']);
         $this->assertSame(1, $report['handed_off']);
         $this->assertSame(0, $report['publish_returned']);
         $this->assertSame(0, $report['outbox_fallbacks']);
