@@ -119,14 +119,19 @@ class ExportMonitoringMetricsCommandTest extends TestCase
     {
         Http::fake([self::PUSH_URL => Http::response('', 200)]);
         $event = $this->exportEvent();
+        $this->freezeTime();
 
         $this->assertTrue($event->mutex->create($event));
-        $this->travel(4)->minutes();
+        $locks = &app('cache')->store()->getStore()->locks;
+        $lock = $locks[$event->mutexName()];
+        $this->assertSame(300, (int) round(now()->diffInSeconds($lock['expiresAt'], true)), 'The exporter lock must last five minutes.');
         $this->assertFalse($event->filtersPass($this->app));
         $this->assertTrue($event->shouldSkipDueToOverlapping());
         Http::assertNothingSent();
 
-        $this->travel(1)->minutes();
+        // Production's cache store drops the key when its TTL runs out. The array store keeps it, and
+        // since Laravel 13.37 the mutex treats any owned array lock as held, so evict it like the TTL would.
+        unset($locks[$event->mutexName()]);
         $this->assertTrue($event->filtersPass($this->app));
         $this->assertFalse($event->mutex->exists($event));
         $this->artisan('monitoring:export-metrics')->assertSuccessful();
