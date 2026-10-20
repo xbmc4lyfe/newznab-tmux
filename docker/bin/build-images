@@ -19,6 +19,15 @@ else
 fi
 export BASE_IMAGE APP_IMAGE WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE
 
+# The tags this run builds, for the build stamp: a role it did not build keeps its verified image
+# record, so a tag replaced meanwhile is never stamped as built (deploy-plan --stamp-data build).
+built_list="${DEPLOY_STAMP:-$DIR/.build.stamp}.built"
+: >"$built_list"
+# Each built tag with the image ID it got right after its build: a retag before the stamp is
+# written is caught there rather than stamped as built.
+record_built() {
+    printf '%s %s\n' "$(normalize_ref "$1")" "$(docker image inspect --format '{{.Id}}' "$1")" >>"$built_list"
+}
 targets=$(DEPLOY_STAMP="${DEPLOY_STAMP:-$DIR/.build.stamp}" "$DIR/bin/deploy-plan" --build-targets)
 [ -n "$targets" ] || exit 0
 
@@ -56,6 +65,7 @@ for target in $targets; do
     case "$target" in
         base)
             docker build --target base -t "$BASE_IMAGE" -f "$REPO/Dockerfile" "$REPO"
+            record_built "$BASE_IMAGE"
             ;;
         web|horizon|scheduler|indexer)
             role_tag=$(tag_for_role "$target")
@@ -68,6 +78,7 @@ for target in $targets; do
                 docker build --target "selfhosted-$target" -t "$role_tag" -f "$REPO/Dockerfile" "$REPO"
             fi
             built_tags="$built_tags$(normalize_ref "$role_tag") "
+            record_built "$role_tag"
             ;;
     esac
 done
