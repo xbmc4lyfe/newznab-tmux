@@ -20,7 +20,8 @@ final class PerArticleObfuscationRouter
      * Per-header cost by sampled class (no part count, a part count only, a candidate) as
      * [PHP base ns, PHP tenths of a ns per subject byte, Rust base ns, Rust tenths of a ns per byte].
      * Fitted to XOVER-shaped ranges of 60-480 byte subjects with
-     * scripts/benchmark-per-article-obfuscation.php on Linux arm64.
+     * scripts/benchmark-per-article-obfuscation.php on Linux arm64; CI requires that benchmark to
+     * qualify on both Linux x86_64 and arm64 (archive-sample-performance.yml).
      */
     private const array COSTS = [[210, 5, 265, 10], [80, 80, 110, 39], [1350, 60, 330, 37]];
 

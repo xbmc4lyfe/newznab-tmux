@@ -359,8 +359,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           # A missed threshold exits 0; 2 is an invalid run (parity or setup failure).
           exit "$status"
-      # HeaderParser::markPerArticleObfuscated() uses this library's port; a parity failure fails
-      # the job, a missed 1.5x threshold is reported.
+      # HeaderParser::markPerArticleObfuscated() uses this library's port; a parity failure or a
+      # report that is not qualified (1.5x, routed floor) fails the job on each architecture.
       - name: Verify per-article obfuscation parity and measure PHP versus Rust including FFI
         shell: bash
         env:
@@ -373,6 +373,10 @@ jobs:
             --native="$NNTMUX_TEST_NATIVE_LIBRARY" \
             --output-dir="$GITHUB_WORKSPACE/filename-identity-evidence/per-article-obfuscation" \
             | tee -a "$GITHUB_STEP_SUMMARY"
+          # HeaderParser adopts the Rust path on every Linux architecture CI covers, so each must
+          # qualify: a not-qualified or inconclusive report fails the job.
+          python3 -c 'import json, sys; status = json.load(open(sys.argv[1]))["status"]; print("per-article obfuscation:", status); sys.exit(status != "qualified")' \
+            "$GITHUB_WORKSPACE/filename-identity-evidence/per-article-obfuscation/report.json"
       - name: Capture all visible resource limits after measurement
         if: always()
         shell: bash
