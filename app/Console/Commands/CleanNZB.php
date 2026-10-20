@@ -124,7 +124,7 @@ class CleanNZB extends Command
 
     private function hasNzbOnDisk(NzbService $nzb, string $guid, bool $delete): bool
     {
-        if ($nzb->nzbPath($guid) !== false) {
+        if ($nzb->hasNzb($guid)) {
             return true;
         }
         // A committed upgrade's NZB may still be staged beside the missing canonical file.

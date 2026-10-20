@@ -354,17 +354,14 @@ if (! function_exists('getStreamingZip')) {
         $nzb = app(NzbService::class);
         $zipped = ZipStream::create(now()->format('Ymdhis').'.zip');
         foreach ($guids as $guid) {
-            $nzbPath = $nzb->nzbPath($guid);
-            if ($nzbPath) {
-                $nzbContents = unzipGzipFile($nzbPath);
-                if ($nzbContents) {
-                    $filename = $guid;
-                    $r = Release::query()->where('guid', $guid)->first();
-                    if ($r) {
-                        $filename = $r['searchname'];
-                    }
-                    $zipped->addRaw($nzbContents, $filename.'.nzb');
+            $nzbContents = $nzb->readNzbContents($guid);
+            if ($nzbContents !== false) {
+                $filename = $guid;
+                $r = Release::query()->where('guid', $guid)->first();
+                if ($r) {
+                    $filename = $r['searchname'];
                 }
+                $zipped->addRaw($nzbContents, $filename.'.nzb');
             }
         }
 

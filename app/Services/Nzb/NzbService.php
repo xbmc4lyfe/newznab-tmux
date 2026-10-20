@@ -21,8 +21,8 @@ use Illuminate\Support\Str;
 use Throwable;
 
 /**
- * Service for managing NZB files on disk.
- * Handles reading, writing, and path management for NZB files.
+ * Service for managing release NZBs: database rows (see NzbBlobStore) and legacy files on disk.
+ * Handles reading, writing, and path management for NZBs.
  */
 class NzbService
 {
@@ -87,6 +87,8 @@ class NzbService
     }
 
     private readonly BinariesConfig $binariesConfig;
+
+    private ?NzbBlobStore $blobs = null;
 
     /**
      * Write an NZB file for a release.
@@ -316,8 +318,10 @@ class NzbService
             Log::warning('Failed to delete collections for release '.$release->id.': '.$e->getMessage());
         }
 
-        // Chmod to fix issues some users have with file permissions.
-        chmod($path, 0777);
+        // Chmod to fix issues some users have with file permissions; database storage leaves no file.
+        if (is_file($path)) {
+            chmod($path, 0777);
+        }
 
         return NzbCreationResult::success($path, $collectionIds);
     }
@@ -450,7 +454,8 @@ class NzbService
     }
 
     /**
-     * Determine if an NZB exists, returning the path+filename, if not return false.
+     * Determine if a legacy NZB file exists, returning the path+filename, if not return false.
+     * NZBs stored in the database have no path; use hasNzb() or the read methods for any NZB.
      *
      * @param  string  $releaseGuid  The guid of the release.
      * @return false|string On success: (string) Path+file name of the nzb.
@@ -486,22 +491,123 @@ class NzbService
         return array_values(array_unique($candidates));
     }
 
+    /** The release_nzbs rows this service reads and writes; see NzbBlobStore. */
+    public function blobs(): NzbBlobStore
+    {
+        return $this->blobs ??= new NzbBlobStore;
+    }
+
+    /** Whether new NZBs are stored in the database rather than as files. */
+    public function usesDatabaseStorage(): bool
+    {
+        return NzbBlobStore::usesDatabase();
+    }
+
     /**
-     * Read and decompress an NZB file contents.
+     * Whether a release has a stored NZB: a database row, or a legacy file not yet imported.
+     *
+     * @phpstan-impure It reads the database and the filesystem.
+     */
+    public function hasNzb(string $releaseGuid): bool
+    {
+        $id = $this->blobs()->releaseId($releaseGuid);
+
+        return ($id !== null && $this->blobs()->exists($id)) || $this->nzbPath($releaseGuid) !== false;
+    }
+
+    /**
+     * The stored (gzipped) NZB: its database row, else its legacy file.
+     *
+     * @phpstan-impure It reads the database and the filesystem.
+     */
+    public function readNzbCompressed(string $releaseGuid): string|false
+    {
+        $id = $this->blobs()->releaseId($releaseGuid);
+        $row = $id === null ? null : $this->blobs()->body($id);
+        if ($row !== null) {
+            return $row;
+        }
+        $path = $this->nzbPath($releaseGuid);
+        $file = $path === false ? false : @file_get_contents($path);
+        if ($file !== false && $file !== '') {
+            return $file;
+        }
+
+        // nzb:import-files commits a row before deleting its file, so a file that vanished between
+        // the two lookups is now readable from the database.
+        return ($id === null ? null : $this->blobs()->body($id)) ?? false;
+    }
+
+    /**
+     * Read and decompress an NZB's contents.
      *
      * @param  string  $releaseGuid  The release GUID
      * @return string|false The decompressed NZB contents or false on failure
      */
     public function readNzbContents(string $releaseGuid): string|false
     {
-        $nzbPath = $this->nzbPath($releaseGuid);
-        if ($nzbPath === false) {
-            return false;
+        $id = $this->blobs()->releaseId($releaseGuid);
+        $row = $id === null ? null : $this->blobs()->body($id);
+        if ($row === null) {
+            $nzbPath = $this->nzbPath($releaseGuid);
+            $contents = $nzbPath === false ? false : unzipGzipFile($nzbPath);
+            if (! empty($contents)) {
+                return $contents;
+            }
+            // Imported (and its file removed) between the two lookups.
+            $row = $id === null ? null : $this->blobs()->body($id);
+            if ($row === null) {
+                return false;
+            }
+        }
+        $contents = '';
+        foreach (self::decodedChunks($row) as $chunk) {
+            $contents .= $chunk;
         }
 
-        $contents = unzipGzipFile($nzbPath);
+        return $contents !== '' ? $contents : false;
+    }
 
-        return ! empty($contents) ? $contents : false;
+    /**
+     * Decode a stored gzipped NZB in pieces of about $chunkBytes, across concatenated gzip members as
+     * gzread() does. Stops (without throwing) at the first undecodable byte.
+     *
+     * @return \Generator<int, string>
+     */
+    public static function decodedChunks(string $compressed, int $chunkBytes = 1048576): \Generator
+    {
+        $length = strlen($compressed);
+        $offset = 0;
+        while ($offset < $length) {
+            $inflater = @inflate_init(ZLIB_ENCODING_GZIP);
+            if ($inflater === false) {
+                return;
+            }
+            $member = $offset;
+            while ($offset < $length) {
+                $piece = substr($compressed, $offset, $chunkBytes);
+                $chunk = @inflate_add($inflater, $piece, ZLIB_SYNC_FLUSH);
+                if ($chunk === false) {
+                    return;
+                }
+                if (inflate_get_status($inflater) === ZLIB_STREAM_END) {
+                    // The member ended inside this piece; the next one starts after what it consumed.
+                    $offset = $member + inflate_get_read_len($inflater);
+                    if ($chunk !== '') {
+                        yield $chunk;
+                    }
+
+                    continue 2;
+                }
+                $offset += strlen($piece);
+                if ($chunk !== '') {
+                    yield $chunk;
+                }
+            }
+
+            // Truncated: what decoded so far was yielded, as gzread() returns it.
+            return;
+        }
     }
 
     /**
@@ -514,11 +620,18 @@ class NzbService
         if ($maxCompressedBytes <= 0 || $maxDecodedBytes <= 0) {
             return false;
         }
-        $path = $this->nzbPath($releaseGuid);
-        if (! is_string($path)) {
-            return false;
+        $compressed = false;
+        $id = $this->blobs()->releaseId($releaseGuid);
+        $stored = $id === null ? null : $this->blobs()->bytes($id);
+        if ($stored !== null) {
+            $compressed = $stored > $maxCompressedBytes ? false : ($this->blobs()->body($id) ?? false);
+        } else {
+            $path = $this->nzbPath($releaseGuid);
+            if (! is_string($path)) {
+                return false;
+            }
+            $compressed = @file_get_contents($path, false, null, 0, $maxCompressedBytes + 1);
         }
-        $compressed = @file_get_contents($path, false, null, 0, $maxCompressedBytes + 1);
         if ($compressed === false || strlen($compressed) > $maxCompressedBytes || ! str_starts_with($compressed, "\x1f\x8b")) {
             $decodedBytes = $maxDecodedBytes;
 

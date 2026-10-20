@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Services\Nzb\NzbBlobStore;
 use App\Services\Nzb\NzbService;
 use App\Services\Nzb\NzbSourceGuard;
 use App\Services\Nzb\NzbSourceInstallation;
@@ -36,15 +37,20 @@ final class VerifiedNzbWriter
      * @param  array<string, mixed>  $manifest
      * @param  string|null  $body  compress(document($manifest)) when the caller rendered it earlier, outside any lock;
      *                             it must come from this same manifest. Null renders and compresses here.
-     * @param  int|null  $replaceFor  The candidate whose in-place upgrade replaces the release's source: the NZB is staged and
-     *                                swapped in by the receipt's close() after commit (see NzbSourceGuard::install()).
+     * @param  int|null  $replaceFor  The candidate whose in-place upgrade replaces the release's source: with file storage the
+     *                                NZB is staged and swapped in by the receipt's close() after commit (see
+     *                                NzbSourceGuard::install()); a database row is replaced in the transaction itself.
      */
     public function writeWithReceipt(array $manifest, string $guid, object $release, ?PublicationTiming $timing = null, ?string $body = null,
         ?int $replaceFor = null): NzbSourceInstallation
     {
-        $path = $replaceFor !== null ? $this->upgradePath($guid) : $this->nzb->getNzbPath($guid, createIfNotExist: true);
         $body ??= $this->compress($this->document($manifest));
         $timing?->nextPhase('durable_install');
+        if (NzbBlobStore::usesDatabase()) {
+            // The row commits or rolls back with the caller's transaction, so an upgrade needs no staged file.
+            return (new NzbSourceGuard($this->nzb))->installStored($release, $body);
+        }
+        $path = $replaceFor !== null ? $this->upgradePath($guid) : $this->nzb->getNzbPath($guid, createIfNotExist: true);
         $temporary = $path.'.'.bin2hex(random_bytes(8)).'.tmp';
         $handle = fopen($temporary, 'xb');
         if ($handle === false) {

@@ -17,6 +17,7 @@
     <env name="DB_DATABASE" value=":memory:" force="true"/>
     <!-- Suites that predate database manifests build only the tables they use; ManifestDatabaseStorageTest and the *DatabaseManifestTest classes cover database storage. -->
     <env name="RELEASE_VERIFICATION_MANIFEST_STORAGE" value="files" force="true"/>
+    <env name="NZB_STORAGE" value="files" force="true"/>
     <env name="BCRYPT_ROUNDS" value="4"/>
     <env name="CACHE_STORE" value="array"/>
     <env name="SESSION_DRIVER" value="array"/>

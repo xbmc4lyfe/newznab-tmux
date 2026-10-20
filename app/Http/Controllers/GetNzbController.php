@@ -14,7 +14,6 @@ use Exception;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
-use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use STS\ZipStream\Builder;
 use Symfony\Component\HttpFoundation\HeaderUtils;
@@ -294,9 +293,9 @@ class GetNzbController extends BasePageController
         string $rssToken,
         string $releaseId
     ): JsonResponse|Response|StreamedResponse {
-        // Get NZB file path and validate
-        $nzbPath = app(NzbService::class)->nzbPath($releaseId);
-        if ($nzbPath === false) {
+        // Read the stored NZB (database row or legacy file) and validate
+        $nzbBody = app(NzbService::class)->readNzbCompressed($releaseId);
+        if ($nzbBody === false) {
             return $this->apiError(300, 'NZB file not found!');
         }
 
@@ -317,7 +316,7 @@ class GetNzbController extends BasePageController
         $asciiFallbackName = FilenameSanitizer::asciiFallback($cleanName, "release-{$releaseId}");
 
         $response = response()->stream(
-            fn () => $this->streamModifiedNzbContent($nzbPath, $uid),
+            fn () => $this->streamModifiedNzbContent($nzbBody, $uid),
             200,
             $headers
         );
@@ -392,59 +391,33 @@ class GetNzbController extends BasePageController
     /**
      * Stream modified NZB content with user-specific modifications
      */
-    private function streamModifiedNzbContent(string $nzbPath, int $uid): void
+    private function streamModifiedNzbContent(string $compressed, int $uid): void
     {
-        if (! File::exists($nzbPath)) {
-            Log::warning('NZB file not found during streaming', ['path' => $nzbPath]);
-            echo '<?xml version="1.0" encoding="UTF-8"?><error>NZB file not found</error>';
-
-            return;
+        $buffer = '';
+        $started = false;
+        foreach (NzbService::decodedChunks($compressed, self::BUFFER_SIZE) as $chunk) {
+            $started = true;
+            $buffer .= $chunk;
+            // Hold back everything after the last '>': a poster attribute never spans one, so none is split
+            // between what is written now and what follows.
+            $cut = strrpos($buffer, '>');
+            if ($cut !== false) {
+                echo $this->tagPosters(substr($buffer, 0, $cut + 1), $uid);
+                $buffer = substr($buffer, $cut + 1);
+            }
         }
-
-        $fileHandle = @gzopen($nzbPath, 'rb');
-        if ($fileHandle === false) {
-            Log::warning('Failed to open NZB file for streaming', ['path' => $nzbPath]);
+        if (! $started) {
+            Log::warning('Failed to decode NZB for streaming');
             echo '<?xml version="1.0" encoding="UTF-8"?><error>Failed to read NZB file</error>';
 
             return;
         }
+        echo $this->tagPosters($buffer, $uid);
+    }
 
-        $buffer = '';
-        $lastChunk = false;
-
-        // Stream and modify content in chunks
-        while (! gzeof($fileHandle)) {
-            $chunk = gzread($fileHandle, self::BUFFER_SIZE);
-            if ($chunk === false) {
-                break;
-            }
-
-            // Combine with previous buffer to handle boundaries
-            $buffer .= $chunk;
-
-            // Check if this is the last chunk
-            if (gzeof($fileHandle)) { // @phpstan-ignore if.alwaysFalse
-                $lastChunk = true;
-            }
-
-            // Process buffer
-            if ($lastChunk) { // @phpstan-ignore if.alwaysFalse
-                // On last chunk, modify poster attributes
-                $buffer = preg_replace('/file poster="/', 'file poster="'.$uid.'-', $buffer);
-                echo $buffer;
-            } else {
-                // For intermediate chunks, keep some data in buffer to handle boundaries
-                $safeLength = mb_strlen($buffer) - 1000; // Keep last 1KB in buffer
-                if ($safeLength > 0) {
-                    $output = mb_substr($buffer, 0, $safeLength);
-                    $output = preg_replace('/file poster="/', 'file poster="'.$uid.'-', $output);
-                    echo $output;
-                    $buffer = mb_substr($buffer, $safeLength);
-                }
-            }
-        }
-
-        gzclose($fileHandle);
+    private function tagPosters(string $xml, int $uid): string
+    {
+        return preg_replace('/file poster="/', 'file poster="'.$uid.'-', $xml) ?? $xml;
     }
 
     /**

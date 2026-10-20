@@ -14,6 +14,7 @@ use Elastic\Elasticsearch\Client as ElasticsearchClient;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Schema;
 use Throwable;
 
 class NntmuxResetDb extends Command
@@ -113,6 +114,7 @@ class NntmuxResetDb extends Command
                 'par2_rename_candidate_progress',
                 'par2_rename_progress',
                 'releases',
+                ...(Schema::hasTable('release_nzbs') ? ['release_nzbs'] : []),
                 'anidb_titles',
                 'anidb_info',
                 'releases_groups',

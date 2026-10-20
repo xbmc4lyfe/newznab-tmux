@@ -10,6 +10,10 @@ return [
     'extract_using_rarinfo' => env('EXTRACT_USING_RARINFO', false),
     'fetch_last_file' => env('FETCH_LAST_FILE', true),
     'path_to_nzbs' => env('PATH_TO_NZBS', storage_path('nzb')),
+    // database: release NZBs live in release_nzbs (shared by every host and written in the release's
+    // transaction), falling back to legacy files under path_to_nzbs until nzb:import-files copies them in.
+    // files: the previous per-host .nzb.gz files under path_to_nzbs.
+    'nzb_storage' => env('NZB_STORAGE', 'database'),
     'private_profiles' => env('PRIVATE_PROFILES', true),
     'store_user_ip' => env('STORE_USER_IP', false),
     'ffmpeg_path' => env('FFMPEG_PATH', '/usr/bin/ffmpeg'),

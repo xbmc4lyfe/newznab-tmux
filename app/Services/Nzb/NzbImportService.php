@@ -457,7 +457,7 @@ class NzbImportService
                 return false;
             }
 
-            $stored = File::isFile($path);
+            $stored = NzbBlobStore::usesDatabase() ? $this->nzb->hasNzb($this->relGuid) : File::isFile($path);
 
             return $stored;
         } catch (\Throwable $exception) {

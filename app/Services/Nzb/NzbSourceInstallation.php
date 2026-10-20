@@ -8,7 +8,11 @@ use Illuminate\Support\Facades\Log;
 use PDO;
 use Throwable;
 
-/** A retained descriptor prevents the installed inode being reused before cleanup. */
+/**
+ * A retained descriptor prevents the installed inode being reused before cleanup. A database installation
+ * (a release_nzbs row written in the caller's transaction) holds no descriptor: its rollback is the
+ * transaction's, and its close() removes the legacy files the committed row now shadows.
+ */
 final class NzbSourceInstallation
 {
     /** @var resource|null */
@@ -23,7 +27,7 @@ final class NzbSourceInstallation
      */
     private static array $pendingStaged = [];
 
-    /** @param resource $handle */
+    /** @param resource|null $handle */
     public function __construct(
         private readonly NzbSourceGuard $sources,
         public readonly string $guid,
@@ -33,6 +37,7 @@ final class NzbSourceInstallation
         public readonly PDO $pdo,
         // An in-place upgrade's generation, beside $path until its transaction commits: close() swaps it in.
         public readonly ?string $staged = null,
+        public readonly bool $database = false,
     ) {
         $this->handle = $handle;
         if ($staged !== null) {
@@ -90,6 +95,22 @@ final class NzbSourceInstallation
     public function close(): void
     {
         $this->release();
+        if ($this->database && ! $this->finished) {
+            $this->finished = true;
+            try {
+                $this->sources->removeLegacyCopies($this->guid);
+            } catch (Throwable $exception) {
+                try {
+                    Log::warning('Could not remove legacy NZB files after a database installation.', [
+                        'release_guid' => $this->guid, 'exception' => $exception::class,
+                    ]);
+                } catch (Throwable) {
+                    // Readers prefer the row; nzb:import-files --delete-files removes them later.
+                }
+            }
+
+            return;
+        }
         if ($this->staged === null || $this->finished) {
             return;
         }

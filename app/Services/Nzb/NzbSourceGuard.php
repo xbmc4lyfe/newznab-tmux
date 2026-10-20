@@ -14,6 +14,12 @@ use Throwable;
  * Serializes retained NZB replacement and naming observations. The stable lock
  * files are shared with the NZBs and must never be removed during cleanup.
  *
+ * With database storage (see NzbBlobStore) a release's source is its release_nzbs
+ * row, written in the caller's transaction, so an installation commits or rolls
+ * back with it and an in-place upgrade needs no staged file. A release without a
+ * row keeps its legacy file (and any staged generation beside it) until
+ * nzb:import-files copies the committed generation in.
+ *
  * @phpstan-type SourceSnapshot array{guid: string, path: string, contents: string, digest: string}
  * @phpstan-type InodeDeletionAnchor array{version: 1, kind: 'inode', guid: string, path: string, anchor: string, dev: string, ino: string}
  * @phpstan-type AbsentDeletionAnchor array{version: 1, kind: 'absent', guid: string, path: string}
@@ -24,7 +30,12 @@ final class NzbSourceGuard
     /** @var array<string, true> */
     private static array $lockedPaths = [];
 
-    public function __construct(private readonly NzbService $nzb) {}
+    private readonly NzbBlobStore $blobs;
+
+    public function __construct(private readonly NzbService $nzb)
+    {
+        $this->blobs = new NzbBlobStore;
+    }
 
     public static function digest(string $decoded): string
     {
@@ -109,12 +120,132 @@ final class NzbSourceGuard
             if ($expectedDigest !== null && ($this->readSettledLocked($release)['digest'] ?? null) !== $expectedDigest) {
                 throw new RuntimeException('NZB source changed before replacement.');
             }
+            if (NzbBlobStore::usesDatabase()) {
+                $handle = @fopen($temporary, 'rb');
+                $compressed = $handle === false ? false : stream_get_contents($handle);
+                if ($handle !== false) {
+                    fclose($handle);
+                }
+                if ($compressed === false) {
+                    throw new RuntimeException('Cannot open staged NZB installation.');
+                }
+                if (! str_ends_with(strtolower($destination), '.gz')) {
+                    $compressed = gzencode($compressed);
+                }
+                $receipt = $this->storeRowLocked($release, $compressed);
+                @unlink($temporary);
+
+                return $receipt;
+            }
+            // Files mode: a row left by database storage would shadow the file installed here.
+            $this->blobs->delete((int) $release->id);
 
             return $this->installFile((string) $release->guid, $temporary, $destination,
                 static function (string $digest) use ($release): void {
                     app(ReleaseArchiveNamingEvidence::class)->sourceReplacedLocked($release, $digest);
                 }, $move, $stageFor === null ? null : $destination.'.c'.$stageFor.'-'.bin2hex(random_bytes(8)).'.next');
         });
+    }
+
+    /**
+     * Database storage only: install an already compressed NZB as the release's row, in the caller's transaction.
+     * The optional digest is a compare-and-swap for parser repairs, as for install().
+     */
+    public function installStored(object $release, string $compressed, ?string $expectedDigest = null): NzbSourceInstallation
+    {
+        if (! NzbBlobStore::usesDatabase()) {
+            throw new RuntimeException('NZB database storage is not enabled.');
+        }
+        $this->lockRelease($release);
+
+        return $this->withGuidLock((string) $release->guid, function () use ($release, $compressed, $expectedDigest): NzbSourceInstallation {
+            if ($expectedDigest !== null && ($this->readSettledLocked($release)['digest'] ?? null) !== $expectedDigest) {
+                throw new RuntimeException('NZB source changed before replacement.');
+            }
+
+            return $this->storeRowLocked($release, $compressed);
+        });
+    }
+
+    /** With the release row and source locks held: record the new source's digest and write its row. */
+    private function storeRowLocked(object $release, string|false $compressed): NzbSourceInstallation
+    {
+        $contents = $compressed === false || $compressed === '' ? false : @gzdecode($compressed);
+        if ($compressed === false || $contents === false || $contents === '') {
+            throw new RuntimeException('Cannot decode staged NZB installation.');
+        }
+        $digest = self::digest($contents);
+        app(ReleaseArchiveNamingEvidence::class)->sourceReplacedLocked($release, $digest);
+        $this->blobs->store((int) $release->id, $compressed, $digest);
+        $guid = (string) $release->guid;
+
+        return new NzbSourceInstallation($this, $guid, $this->nzb->getNzbPath($guid), $digest, null, DB::connection()->getPdo(), database: true);
+    }
+
+    /**
+     * Copy a release's legacy NZB file into its row: the committed generation (a staged one is put in place first),
+     * only while it matches the digest naming evidence recorded. The file stays until removeLegacyCopies().
+     *
+     * @return 'imported'|'already'|'missing'|'unresolved'|'conflict'
+     */
+    public function importLegacyFile(string $guid): string
+    {
+        return DB::transaction(function () use ($guid): string {
+            $release = DB::table('releases')->where('guid', $guid)->lockForUpdate()->first(['id', 'guid']);
+            if ($release === null) {
+                return 'missing';
+            }
+
+            return $this->withGuidLock($guid, function () use ($release, $guid): string {
+                if ($this->blobs->body((int) $release->id, true) !== null) {
+                    return 'already';
+                }
+                $source = $this->readSettledLocked($release, filesOnly: true);
+                if ($source === null) {
+                    return $this->nzb->nzbPath($guid) === false && $this->stagedSiblings($guid) === [] ? 'missing' : 'unresolved';
+                }
+                $committed = app(ReleaseArchiveNamingEvidence::class)->committedSourceDigestLocked($release);
+                if ($committed !== null && ! hash_equals($committed, $source['digest'])) {
+                    return 'conflict';
+                }
+                $raw = @file_get_contents($source['path']);
+                if ($raw === false || ! str_ends_with(strtolower($source['path']), '.gz') || @gzdecode($raw) !== $source['contents']) {
+                    return 'unresolved';
+                }
+                $this->blobs->store((int) $release->id, $raw, $source['digest']);
+
+                return 'imported';
+            });
+        }, 5);
+    }
+
+    /**
+     * Once a release's row is committed, readers never reach its legacy files again: remove them, with any staged
+     * generation beside them. Nothing is removed unless the row exists (an installation that rolled back, or whose
+     * COMMIT failed, keeps them).
+     */
+    public function removeLegacyCopies(string $guid): void
+    {
+        // Most releases never had a file: skip the transaction when none is there to remove.
+        if (! is_dir($this->nzb->getSiteNzbPath()) || ($this->nzb->nzbPath($guid) === false && $this->stagedSiblings($guid) === [])) {
+            return;
+        }
+        DB::transaction(function () use ($guid): void {
+            $release = DB::table('releases')->where('guid', $guid)->lockForUpdate()->first(['id', 'guid']);
+            if ($release === null) {
+                return;
+            }
+            $this->withGuidLock($guid, function () use ($release, $guid): void {
+                if (! $this->blobs->exists((int) $release->id)) {
+                    return;
+                }
+                foreach (array_unique([...$this->nzb->nzbPathCandidates($guid), ...$this->stagedSiblings($guid)]) as $path) {
+                    if (is_file($path) && ! @unlink($path)) {
+                        Log::info('Could not remove a legacy NZB file shadowed by its database row.', ['source' => $path]);
+                    }
+                }
+            });
+        }, 5);
     }
 
     /**
@@ -156,11 +287,19 @@ final class NzbSourceGuard
      * so a canonical file differing from the committed digest may have the committed generation staged beside it
      * still: that is put in place before anything reads, or records evidence for, the source.
      *
+     * A release's row is its committed source: it is written in the same transaction as the digest.
+     *
      * @return SourceSnapshot|null
      */
-    private function readSettledLocked(object $release, bool $deferUnresolved = false): ?array
+    private function readSettledLocked(object $release, bool $deferUnresolved = false, bool $filesOnly = false): ?array
     {
         $guid = (string) $release->guid;
+        if (! $filesOnly) {
+            $row = $this->readRow($release);
+            if ($row !== null) {
+                return $row === false ? null : $row;
+            }
+        }
         $source = $this->readCurrent($guid);
         $committed = app(ReleaseArchiveNamingEvidence::class)->committedSourceDigestLocked($release);
         if ($committed === null || ($source !== null && hash_equals($committed, $source['digest']))) {
@@ -341,10 +480,11 @@ final class NzbSourceGuard
                 return false;
             }
 
-            return $this->withGuidLock($guid, function () use ($guid): bool {
+            return $this->withGuidLock($guid, function () use ($guid, $release): bool {
+                $row = $this->blobs->delete((int) $release->id);
                 $path = $this->nzb->nzbPath($guid);
 
-                return $path !== false && @unlink($path);
+                return ($path !== false && @unlink($path)) || $row;
             });
         });
     }
@@ -527,6 +667,10 @@ final class NzbSourceGuard
     /** Ownership-aware cleanup, including when another writer installed identical bytes. */
     public function rollbackInstallation(NzbSourceInstallation $installation): void
     {
+        if ($installation->database) {
+            // The row was written in the rolled-back transaction; nothing outside it changed.
+            return;
+        }
         $connection = DB::connection();
         $pdo = $installation->pdo;
         if ($connection->getPdo() !== $pdo) {
@@ -580,6 +724,26 @@ final class NzbSourceGuard
         if ($actual === null) {
             throw new RuntimeException('NZB release identity changed.');
         }
+    }
+
+    /**
+     * The release's row, read under the release lock: null without one, false when it does not decode.
+     *
+     * @return SourceSnapshot|false|null
+     */
+    private function readRow(object $release): array|false|null
+    {
+        $body = $this->blobs->body((int) $release->id, true);
+        if ($body === null) {
+            return null;
+        }
+        $contents = @gzdecode($body);
+        if ($contents === false || $contents === '') {
+            return false;
+        }
+        $guid = (string) $release->guid;
+
+        return ['guid' => $guid, 'path' => $this->nzb->getNzbPath($guid), 'contents' => $contents, 'digest' => self::digest($contents)];
     }
 
     /** @return SourceSnapshot|null */

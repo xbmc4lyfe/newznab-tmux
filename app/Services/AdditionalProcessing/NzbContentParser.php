@@ -6,6 +6,7 @@ namespace App\Services\AdditionalProcessing;
 
 use App\Services\AdditionalProcessing\Config\ProcessingConfiguration;
 use App\Services\AdditionalProcessing\Enums\VideoContainer;
+use App\Services\Nzb\NzbBlobStore;
 use App\Services\Nzb\NzbParserService;
 use App\Services\Nzb\NzbService;
 use App\Services\Nzb\NzbSourceGuard;
@@ -176,6 +177,9 @@ class NzbContentParser
         if ($fixed === $raw) {
             return $raw;
         }
+        if (NzbBlobStore::usesDatabase()) {
+            return $this->storeRepairedRow($raw, $fixed, $guid) ? $fixed : null;
+        }
         $temporary = NzbService::temporaryNzbPathFor($originalPath);
         try {
             if ($guid === '') {
@@ -208,6 +212,35 @@ class NzbContentParser
         }
 
         return $fixed;
+    }
+
+    /** Replace the release's row with the repaired document, only while it still holds $raw. */
+    private function storeRepairedRow(string $raw, string $fixed, string $guid): bool
+    {
+        $body = $guid === '' ? false : gzencode($fixed);
+        if ($body === false) {
+            return false;
+        }
+        try {
+            DB::transaction(function () use ($guid, $body, $raw): void {
+                $release = DB::table('releases')->where('guid', $guid)->lockForUpdate()->first(['id', 'guid']);
+                if ($release === null) {
+                    throw new \RuntimeException('NZB release disappeared during repair.');
+                }
+                $receipt = (new NzbSourceGuard($this->nzb))->installStored($release, $body, NzbSourceGuard::digest($raw));
+                DB::afterRollBack(static fn () => $receipt->rollback());
+                DB::afterCommit(static fn () => $receipt->close());
+            });
+        } catch (\Throwable $e) {
+            if ($this->debugMode) {
+                Log::debug('Failed to persist repaired NZB: '.$e->getMessage());
+            }
+
+            // Proposed bytes are never evidence when the replacement failed.
+            return false;
+        }
+
+        return true;
     }
 
     /**
