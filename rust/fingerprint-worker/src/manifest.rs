@@ -5,6 +5,59 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
+/// Decode only after the archive digest has been checked against its original bytes.
+pub fn decode_xml(bytes: &[u8]) -> Result<String> {
+    let utf16 = if bytes.starts_with(b"\xff\xfe") {
+        Some((true, &bytes[2..]))
+    } else if bytes.starts_with(b"\xfe\xff") {
+        Some((false, &bytes[2..]))
+    } else if bytes.starts_with(b"<\0?\0") {
+        Some((true, bytes))
+    } else if bytes.starts_with(b"\0<\0?") {
+        Some((false, bytes))
+    } else {
+        None
+    };
+    if let Some((little, bytes)) = utf16 {
+        if bytes.len() % 2 != 0 {
+            bail!("NzbXmlEncodingInvalid");
+        }
+        let units: Vec<_> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| {
+                if little {
+                    u16::from_le_bytes([b[0], b[1]])
+                } else {
+                    u16::from_be_bytes([b[0], b[1]])
+                }
+            })
+            .collect();
+        return Ok(String::from_utf16(&units)?);
+    }
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    let mut reader = Reader::from_reader(bytes);
+    let label = match reader.read_event()? {
+        Event::Decl(decl) => decl.encoding().transpose()?.map(|s| s.into_owned()),
+        _ => None,
+    };
+    let label = label.as_deref().unwrap_or(b"UTF-8");
+    // XML ISO-8859-1 is Latin-1, including C1 characters; WHATWG aliases it to Windows-1252.
+    if label.eq_ignore_ascii_case(b"ISO-8859-1") {
+        return Ok(bytes.iter().map(|b| char::from(*b)).collect());
+    }
+    let encoding = encoding_rs::Encoding::for_label(label)
+        .ok_or_else(|| anyhow::anyhow!("NzbXmlEncodingUnsupported"))?;
+    if encoding == encoding_rs::UTF_16LE || encoding == encoding_rs::UTF_16BE {
+        bail!("NzbXmlEncodingInvalid");
+    }
+    encoding
+        .decode_without_bom_handling_and_without_replacement(bytes)
+        .map(|s| s.into_owned())
+        .ok_or_else(|| anyhow::anyhow!("NzbXmlEncodingInvalid"))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Segment {
     pub number: i64,

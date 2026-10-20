@@ -115,3 +115,53 @@ tests:
       - eval_time: 5m
         alertname: RedisDown
         exp_alerts: []
+
+  # Rust is independent of Horizon: an unstarted or disconnected client must be visible.
+  - interval: 1m
+    input_series:
+      - series: 'nntmux_fingerprint_jobs{status="pending"}'
+        values: '100x10'
+      - series: 'nntmux_fingerprint_jobs{status="processing"}'
+        values: '0x10'
+      - series: 'nntmux_fingerprint_live_claims'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: NntmuxRustFingerprintWorkersMissing
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: NntmuxRustFingerprintWorkersMissing
+        exp_alerts:
+          - exp_annotations: {summary: "Database fingerprint jobs have waited without a live Rust claim for 5m; start or repair the standalone workers."}
+
+  # Idle queues and active workers are healthy, including work on another host.
+  - interval: 1m
+    input_series:
+      - series: 'nntmux_fingerprint_jobs{status="pending"}'
+        values: '0x6 100x6'
+      - series: 'nntmux_fingerprint_jobs{status="processing"}'
+        values: '0x6 1x6'
+      - series: 'nntmux_fingerprint_live_claims{worker="other-host"}'
+        values: '0x6 1x6'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: NntmuxRustFingerprintWorkersMissing
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: NntmuxRustFingerprintWorkersMissing
+        exp_alerts: []
+
+  # Expired processing claims also require a live worker to reclaim them.
+  - interval: 1m
+    input_series:
+      - series: 'nntmux_fingerprint_jobs{status="pending"}'
+        values: '0x10'
+      - series: 'nntmux_fingerprint_jobs{status="processing"}'
+        values: '1x10'
+      - series: 'nntmux_fingerprint_live_claims'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: NntmuxRustFingerprintWorkersMissing
+        exp_alerts:
+          - exp_annotations: {summary: "Database fingerprint jobs have waited without a live Rust claim for 5m; start or repair the standalone workers."}
