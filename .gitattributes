@@ -139,3 +139,4 @@ docker/Justfile		-binary text eol=lf
 /rust/fingerprint-worker/Cargo.toml -binary text eol=lf
 /rust/fingerprint-worker/Cargo.lock -binary text eol=lf
 /rust/fingerprint-worker/**/*.rs -binary text eol=lf
+/rust/fingerprint-worker/**/*.py -binary text eol=lf

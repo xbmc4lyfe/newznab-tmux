@@ -304,6 +304,10 @@ async fn real_mariadb_claims_fencing_global_slots_and_binary() {
     .unwrap();
     assert!(generation.is_none());
     three_process_clients(&pool, &url).await;
+    #[cfg(unix)]
+    for signal in ["-TERM", "-INT"] {
+        graceful_signal(&pool, &url, signal).await;
+    }
     cleanup(&pool).await;
     pool.close().await;
 }
@@ -462,4 +466,154 @@ async fn three_process_clients(pool: &MySqlPool, url: &str) {
         "Three independent Rust clients completed six unique releases; peak NNTP connections={} with shared budget=2",
         maximum.load(Ordering::SeqCst)
     );
+}
+
+#[cfg(unix)]
+async fn graceful_signal(pool: &MySqlPool, url: &str, signal: &str) {
+    setup(pool).await;
+    let id = ID + 1;
+    let guid = format!("{id:032x}");
+    sqlx::query("DELETE FROM release_fingerprint_metadata WHERE releases_id=?")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM releases WHERE id=?")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO releases(id,guid) VALUES(?,?)")
+        .bind(id)
+        .bind(&guid)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO release_nzb_contents(guid,releases_id,body,source_digest,generation,decoded_bytes,created_at,updated_at) SELECT ?,?,body,source_digest,?,decoded_bytes,UTC_TIMESTAMP(6),UTC_TIMESTAMP(6) FROM release_nzb_contents WHERE guid=?").bind(&guid).bind(id).bind(database::token()).bind(GUID).execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO release_fingerprint_jobs(release_id,source_digest,status,available_at,created_at,updated_at) SELECT ?,source_digest,'pending','2000-01-01',UTC_TIMESTAMP(6),UTC_TIMESTAMP(6) FROM release_nzb_contents WHERE guid=?").bind(id).bind(&guid).execute(pool).await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut io = BufReader::new(stream);
+        io.write_all(b"200 fixture\r\n").await.unwrap();
+        let mut started = Some(started_tx);
+        loop {
+            let mut command = String::new();
+            if io.read_line(&mut command).await.unwrap() == 0 {
+                break;
+            }
+            match command.trim() {
+                "CAPABILITIES" => io
+                    .write_all(b"101 capabilities\r\nIMPLEMENTATION Fixture\r\n.\r\n")
+                    .await
+                    .unwrap(),
+                "ARTICLE <x@y>" => {
+                    if let Some(started) = started.take() {
+                        let _ = started.send(());
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let payload = b"abc";
+                    let encoded: Vec<u8> = payload.iter().map(|b| b.wrapping_add(42)).collect();
+                    let mut response=b"220 0 <x@y> follows\r\nMessage-ID: <x@y>\r\n\r\n=ybegin line=128 size=3 name=x.rar\r\n".to_vec();
+                    response.extend(encoded);
+                    response.extend(
+                        format!(
+                            "\r\n=yend size=3 crc32={:08x}\r\n.\r\n",
+                            crc32fast::hash(payload)
+                        )
+                        .as_bytes(),
+                    );
+                    io.write_all(&response).await.unwrap();
+                }
+                _ => panic!("unexpected fixture command"),
+            }
+        }
+    });
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_nntmux-fingerprint-worker"))
+        .args([
+            "--concurrency",
+            "1",
+            "--worker-id",
+            "signal-test",
+            "--nntp-server",
+            "127.0.0.1",
+            "--nntp-port",
+            &port.to_string(),
+            "--nntp-tls",
+            "false",
+            "--alternate-percent",
+            "0",
+        ])
+        .env("DATABASE_URL", url)
+        .env_remove("NNTP_SERVER_A")
+        .env_remove("NNTP_USERNAME")
+        .env_remove("NNTP_PASSWORD")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), started_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let pid = child.id().unwrap();
+    assert!(
+        tokio::process::Command::new("/bin/kill")
+            .args([signal, &pid.to_string()])
+            .status()
+            .await
+            .unwrap()
+            .success()
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "worker killed its in-flight job instead of draining"
+    );
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("draining"));
+    server.await.unwrap();
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM release_fingerprint_jobs WHERE release_id=?")
+            .bind(ID)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "complete");
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM release_fingerprint_jobs WHERE release_id=?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "pending");
+    let attempts: u32 =
+        sqlx::query_scalar("SELECT attempts FROM release_fingerprint_jobs WHERE release_id=?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(attempts, 0);
+    sqlx::query("DELETE FROM release_fingerprint_metadata WHERE releases_id=?")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM releases WHERE id=?")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    cleanup(pool).await;
+    println!("{signal} drained the active release and left the next release unclaimed");
 }

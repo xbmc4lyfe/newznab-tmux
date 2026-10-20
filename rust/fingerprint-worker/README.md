@@ -11,6 +11,14 @@ The application still publishes releases and enqueues database jobs.
 cargo build --release --locked --manifest-path rust/fingerprint-worker/Cargo.toml
 ```
 
+During a staged production cutover, set `NZB_STORAGE=database`, `FINGERPRINT_WORKER=rust`,
+and temporarily `NZB_DATABASE_LEGACY_READS=true`. All new sources are written only to SQL;
+old unimported sources remain readable. Drain the PHP fingerprint supervisor before
+transferring its queue with `php artisan releases:fingerprint-transfer --import-legacy`.
+The transfer imports each queued source atomically before acknowledging Redis. Storage-only
+archive imports do not enqueue millions of historical fingerprints. Disable legacy reads
+after the retained archive has been imported and verified.
+
 Apply the application's database-storage migration, import retained NZBs with
 `php artisan nzbs:import-database --root=/legacy/nzb/root`, transfer retained Horizon jobs with `php artisan releases:fingerprint-transfer`,
 and enqueue outstanding releases with
@@ -83,3 +91,41 @@ network throughput and aggregate completion rate before replacing the live worke
 NZB storage accepts up to 128 MiB decoded, while the compact manifest analyzer retains
 the PHP collector's 32 MiB parsing ceiling. Larger manifests fail collection rather
 than being silently truncated or reported complete.
+
+## macOS login service
+
+Create a private environment file with shell-quoted `KEY=value` assignments and
+`chmod 600 /absolute/path/worker.env`. Values are parsed as literal data; `$HOME`,
+`$(...)`, backticks and other shell expressions are never expanded or executed.
+The supported keys are the worker environment variables listed above.
+
+```sh
+python3 rust/fingerprint-worker/scripts/install_launchd.py \
+  --binary /absolute/path/nntmux-fingerprint-worker \
+  --config /absolute/path/worker.env \
+  --label com.nntmux.fingerprint-worker \
+  --dry-run
+```
+
+Remove `--dry-run` to install and load the service. Run as the worker's login user,
+without sudo. The installer creates a private binary, runner and `worker.env` under
+`~/Library/Application Support/NNTmux/fingerprint-worker`, plus a per-user LaunchAgent
+plist. A unique worker ID is generated if the config omitted one. Credentials stay
+out of the plist, command arguments and installer output. `--install-only` prepares
+files without loading; `--domain user` selects the headless user domain instead of
+`gui`. Binary/config paths containing spaces or quotes are supported.
+
+The LaunchAgent starts at login, restarts failed workers and uses a 30-second restart
+throttle. Logs are `logs/worker.stdout.log` and `logs/worker.stderr.log` under the
+installation directory. SIGTERM and SIGINT stop new claims and drain active releases;
+launchd allows 1,900 seconds before forced termination, above the job's 1,800-second
+processing ceiling. To stop or upgrade an installed service, use `launchctl bootout`
+on its `gui/<uid>/<label>` service and wait for exit before reinstalling. The installer
+refuses to overwrite a loaded label. Sending SIGTERM alone drains the process but
+KeepAlive subsequently restarts it.
+
+Installer verification is fully offline and never loads a service:
+
+```sh
+python3 rust/fingerprint-worker/scripts/test_launchd.py -v
+```

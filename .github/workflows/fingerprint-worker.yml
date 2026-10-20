@@ -61,6 +61,8 @@ jobs:
           rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
       - name: Initialize disposable database
         run: php tests/Fixtures/bootstrap-fingerprint-database.php
+      - name: Launchd installer and private configuration tests
+        run: python3 rust/fingerprint-worker/scripts/test_launchd.py
       - name: Rust formatting and lint
         run: |
           cargo fmt --manifest-path rust/fingerprint-worker/Cargo.toml -- --check

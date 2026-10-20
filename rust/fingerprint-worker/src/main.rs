@@ -228,9 +228,32 @@ async fn main() -> Result<()> {
             }
         });
     }
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    let mut stopping = false;
     loop {
-        tokio::select! {r=tasks.join_next()=>match r{Some(r)=>{r??;},None=>break},_=tokio::signal::ctrl_c()=>{let _=stop_tx.send(true);}}
+        tokio::select! {
+            result=tasks.join_next()=>match result{Some(result)=>{result??;},None=>break},
+            signal=&mut shutdown,if !stopping=>{
+                signal?;
+                stopping=true;
+                let _=stop_tx.send(true);
+                eprintln!("{{\"event\":\"draining\"}}");
+            }
+        }
     }
     pool.close().await;
+    Ok(())
+}
+
+async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {result=tokio::signal::ctrl_c()=>result?,_=terminate.recv()=>{}}
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await?;
     Ok(())
 }
