@@ -83,3 +83,18 @@ tests:
         exp_alerts:
           - exp_labels: {fstype: ext4, mountpoint: /}
             exp_annotations: {summary: "A filesystem has under 10% free."}
+
+  # No push has ever reached the Pushgateway, then pushes resume.
+  - interval: 1m
+    input_series:
+      - series: 'push_time_seconds{job="nntmux"}'
+        values: '_x20 1260+60x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: NntmuxAppMetricsStale
+        exp_alerts:
+          - exp_labels: {job: nntmux}
+            exp_annotations: {summary: "App metrics missing or not pushed for >5m; every other app alert is blind."}
+      - eval_time: 30m
+        alertname: NntmuxAppMetricsStale
+        exp_alerts: []

@@ -29,10 +29,11 @@ groups:
 
   - name: nntmux-telemetry
     rules:
+      # absent() covers a Pushgateway restart or a scheduler that never pushed.
       - alert: NntmuxAppMetricsStale
-        expr: nntmux:metrics_age_seconds > 300
+        expr: nntmux:metrics_age_seconds > 300 or absent(push_time_seconds{job="nntmux"})
         for: 5m
-        annotations: {summary: "App metrics not pushed for >5m; every other app alert is blind."}
+        annotations: {summary: "App metrics missing or not pushed for >5m; every other app alert is blind."}
       # The snapshot expires after monitoring.tmux_snapshot.ttl (900s), after which only
       # nntmux_tmux_snapshot_available=0 is exported and every processing gauge disappears.
       - alert: NntmuxTmuxSnapshotMissing
