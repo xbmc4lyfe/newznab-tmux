@@ -30,11 +30,9 @@ use App\Support\Data\ReleaseDeleteStats;
 use App\Support\ReleaseSearchIndexSync;
 use DateTimeInterface;
 use Illuminate\Database\Query\Builder;
-use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Schema;
 use Throwable;
 
 /**
@@ -57,10 +55,6 @@ final class ReleaseProcessingService
     private const int READY_WINDOW_SIZE = 50;
 
     private const int MAX_RETRIES = 5;
-
-    private const int RETRY_BASE_DELAY_US = 20000;
-
-    private const int BATCH_PAUSE_US = 10000;
 
     private const int CATEGORIZE_CHUNK_SIZE = 1000;
 
@@ -756,7 +750,8 @@ final class ReleaseProcessingService
         if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
             return;
         }
-        $this->processStuckCollections($normalizedGroupId ?? 0);
+        // A capped walk can leave rows waiting past collectionTimeout. Do not run the
+        // legacy stuck sweep before resuming: retention cleanup owns their age limit.
         $this->reconcileIncompleteCollections($normalizedGroupId, $afterReconciliation);
 
         $count = $this->countCompleteCollections($normalizedGroupId);
@@ -1608,114 +1603,6 @@ final class ReleaseProcessingService
         $groupInfo = UsenetGroup::getByName($groupID);
 
         return $groupInfo !== null ? (int) $groupInfo['id'] : null;
-    }
-
-    /**
-     * @throws Throwable
-     */
-    private function processStuckCollections(int $groupID): void
-    {
-        if (config('release_verification.required', true)) {
-            return;
-        }
-        $totalDeleted = 0;
-
-        do {
-            $affected = $this->withCollectionReconciliationBarrier(
-                fn (): int => $this->deleteStuckCollectionBatch($groupID, $this->calculateStuckCollectionsCutoff())
-            );
-            $totalDeleted += $affected;
-
-            if ($affected < self::BATCH_SIZE) {
-                break;
-            }
-
-            usleep(self::BATCH_PAUSE_US);
-        } while (true);
-
-        if ($this->echoCLI && $totalDeleted > 0) {
-            cli()->primary("Deleted {$totalDeleted} broken/stuck collections.", true);
-        }
-    }
-
-    private function calculateStuckCollectionsCutoff(): Carbon
-    {
-        $lastRun = $this->settings->lastRunTime;
-        $threshold = null;
-
-        if ($lastRun !== null) {
-            try {
-                $threshold = Carbon::createFromFormat('Y-m-d H:i:s', $lastRun);
-            } catch (Throwable) {
-                $threshold = null;
-            }
-        }
-
-        return ($threshold ?? now())->copy()->subHours($this->settings->collectionTimeout);
-    }
-
-    private function deleteStuckCollectionBatch(int $groupID, Carbon $cutoff): int
-    {
-        $attempt = 0;
-        $affected = 0;
-
-        do {
-            try {
-                $query = DB::table('collections')
-                    ->whereIn('filecheck', [
-                        CollectionFileCheckStatus::Default->value,
-                        CollectionFileCheckStatus::CompleteCollection->value,
-                        CollectionFileCheckStatus::TempComplete->value,
-                        CollectionFileCheckStatus::ZeroPart->value,
-                        10,
-                    ])
-                    // No ORDER BY: each batch deletes what it selected and the next query
-                    // starts over (see deleteCollectionQueryInBatches()).
-                    ->limit(self::BATCH_SIZE);
-                if (Schema::hasColumn('collections', 'last_seen_at')) {
-                    // Same as COALESCE(last_seen_at, dateadded, added) < cutoff, but written
-                    // so the (groups_id, filecheck, last_seen_at, id) index can range-scan it;
-                    // the COALESCE form made MariaDB read every collection in the group.
-                    $query->where(static function ($stale) use ($cutoff): void {
-                        $stale->where('last_seen_at', '<', $cutoff)
-                            ->orWhere(static function ($unseen) use ($cutoff): void {
-                                $unseen->whereNull('last_seen_at')
-                                    ->whereRaw('COALESCE(dateadded, added) < ?', [$cutoff]);
-                            });
-                    });
-                } else {
-                    $query->where('added', '<', $cutoff);
-                }
-                if ($groupID !== 0) {
-                    $query->where('groups_id', '=', $groupID);
-                }
-
-                $ids = $query->pluck('id')->all();
-                if ($ids === []) {
-                    break;
-                }
-
-                $affected = $this->collectionCleanupService->deleteCollectionsAndDescendants(
-                    $ids,
-                    'Stuck collections cleanup',
-                    $this->echoCLI
-                );
-                break;
-            } catch (Throwable $e) {
-                $attempt++;
-                if ($attempt >= self::MAX_RETRIES) {
-                    if ($this->echoCLI) {
-                        cli()->error(
-                            'Stuck collections delete failed after retries: '.$e->getMessage()
-                        );
-                    }
-                    break;
-                }
-                usleep(self::RETRY_BASE_DELAY_US * $attempt);
-            }
-        } while (true);
-
-        return $affected;
     }
 
     // ========================================================================

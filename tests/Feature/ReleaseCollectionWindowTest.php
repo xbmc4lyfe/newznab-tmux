@@ -593,6 +593,26 @@ class ReleaseCollectionWindowTest extends TestCase
         $this->assertSame([[1, 2]], $walk(), 'A finished walk starts again from the lowest id.');
     }
 
+    public function test_deferred_reconciliation_survives_crossing_the_stuck_collection_timeout(): void
+    {
+        config(['release_verification.required' => false]);
+        $this->freezeTime();
+        $this->insertStaleIncompleteCollections([1, 2]);
+        DB::table('collections')->update(['dateadded' => now()->subHours(47), 'added' => now()->subHours(47)]);
+        DB::table('parts')->insert([['binaries_id' => 1, 'size' => 5000], ['binaries_id' => 2, 'size' => 5000]]);
+        $service = $this->service(new WindowTestReleaseCreationService,
+            binariesConfig: new BinariesConfig(reconcileBatchSize: 1, reconcilePagesPerPass: 1));
+
+        $service->processIncompleteCollections(1);
+        $this->assertSame(0, (int) DB::table('collections')->where('id', 2)->value('filecheck'));
+        $this->travel(2)->hours();
+        $service->processIncompleteCollections(1);
+
+        $this->assertSame(2, DB::table('collections')->count());
+        $this->assertSame(2, DB::table('parts')->count());
+        $this->assertSame(2, (int) DB::table('collections')->where('id', 2)->value('filecheck'));
+    }
+
     public function test_stale_walk_resumes_from_a_cursor_returned_as_a_numeric_string(): void
     {
         config(['release_verification.required' => true]);
