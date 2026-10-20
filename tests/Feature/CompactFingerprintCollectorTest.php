@@ -64,7 +64,7 @@ final class CompactFingerprintCollectorTest extends TestCase
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile() + ['implementation' => 'IMPLEMENTATION Fixture']);
         $nntp->shouldNotReceive('getFingerprintServerProfile')->with(true);
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(CompactFingerprintCollector::SAMPLE_LIMIT)
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(CompactFingerprintCollector::SAMPLE_LIMIT)
             ->withArgs(fn (string $id, int $body, int $header, bool $alternate): bool => $alternate === false)
             // f0/f1 are the single-segment PAR2 files; RAR volumes have five segments.
             ->andReturnUsing(fn (string $id): array => self::segmentArticle($id, preg_match('/\Af[01]-/', $id) === 1 ? 1 : 5));
@@ -97,7 +97,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(3)
             ->andReturnUsing(function (string $id): array {
                 if (str_starts_with($id, 'f1-')) {
                     throw new NntpArticleMissingException('Article headers are unavailable.');
@@ -121,7 +121,7 @@ final class CompactFingerprintCollectorTest extends TestCase
         $nntp->shouldReceive('getFingerprintServerProfile')->twice()->with(false)->andReturn(self::profile());
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(true)
             ->andThrow(new NntpProviderUnavailableException('Unable to connect to the requested NNTP provider.'));
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(6)
             ->withArgs(fn (string $id, int $body, int $header, bool $alternate): bool => $alternate === false)
             ->andReturnUsing(fn (string $id): array => self::article($id));
 
@@ -142,7 +142,7 @@ final class CompactFingerprintCollectorTest extends TestCase
         $data = str_repeat('fixture payload ', 1200);
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(3)
             ->andReturnUsing(fn (string $id): array => ['body' => YencArticles::article($id === 'par2-index@fixture' ? $par2 : $data)] + self::article($id));
         $xml = '<?xml version="1.0" encoding="UTF-8"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">';
         foreach (['par2-index' => 'movie.par2', 'f0' => 'offline-0000.bin', 'f1' => 'offline-0001.bin'] as $id => $name) {
@@ -167,7 +167,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->andReturnUsing(fn (string $id): array => self::article($id));
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->andReturnUsing(fn (string $id): array => self::article($id));
         $xml = '<?xml version="1.0" encoding="UTF-8"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">';
         for ($index = 0; $index < 400; $index++) {
             $xml .= '<file poster="p@example" date="1790812800" subject="&quot;'.str_repeat('n', 300).$index.'.rar&quot; yEnc (1/1)">'
@@ -189,7 +189,7 @@ final class CompactFingerprintCollectorTest extends TestCase
         $name = str_repeat('名', 2_000);
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile() + ['implementation' => $name]);
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(12)->andReturnUsing(fn (string $id): array => [
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(12)->andReturnUsing(fn (string $id): array => [
             'body' => str_replace('name=fixture file.bin', 'name='.$name, YencArticles::article('0123456789abcdef')),
         ] + self::article($id));
         $xml = '<?xml version="1.0" encoding="UTF-8"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">';
@@ -211,12 +211,28 @@ final class CompactFingerprintCollectorTest extends TestCase
     }
 
     #[Test]
+    public function the_article_status_line_must_name_the_requested_article(): void
+    {
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(3)->andReturnUsing(fn (string $id): array => [
+            'article_response' => ['response_code' => 220, 'response_text' => '0 <'.($id === 'volume@fixture' ? 'other@fixture' : $id).'>'],
+        ] + self::article($id));
+
+        $data = $this->collector()->collectFromNzb(self::par2Nzb(['offline-0000.bin']), 7)['data'];
+
+        $this->assertSame([['account' => 'primary', 'error_type' => 'ArticleIdentityMismatch', 'count' => 1]], $data['errors']);
+        // The record keeps the BODY success code although one ARTICLE request fetched each copy.
+        $this->assertSame([222, 222, 222], array_map(static fn (array $article): ?int => $article['provider_results']['primary']['code'], $data['articles']));
+    }
+
+    #[Test]
     public function an_unusable_par2_index_does_not_block_a_later_volume(): void
     {
         $par2 = ArchiveParsingBenchmarkFixtures::par2(1);
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(fn (string $id): array => [
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(3)->andReturnUsing(fn (string $id): array => [
             'body' => YencArticles::article($id === 'volume@fixture' ? $par2 : 'not a par2 packet stream'),
         ] + self::article($id));
         $xml = '<?xml version="1.0" encoding="UTF-8"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">';
@@ -240,7 +256,7 @@ final class CompactFingerprintCollectorTest extends TestCase
         $par2 = ArchiveParsingBenchmarkFixtures::par2(1);
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(fn (string $id): array => [
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(3)->andReturnUsing(fn (string $id): array => [
             'body' => YencArticles::article(match ($id) {
                 'index@fixture' => $creatorOnly,
                 'volume@fixture' => $par2,
@@ -258,7 +274,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(4)->andReturnUsing(fn (string $id): array => [
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(4)->andReturnUsing(fn (string $id): array => [
             'body' => YencArticles::article($id === 'index@fixture' ? ArchiveParsingBenchmarkFixtures::par2(1) : 'payload'),
         ] + self::article($id));
 
@@ -273,7 +289,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(function (string $id): array {
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(3)->andReturnUsing(function (string $id): array {
             $article = self::article($id);
             if (str_starts_with($id, 'f1-')) {
                 $article['body'] = (string) preg_replace('/crc32=[0-9a-f]{8}/', 'crc32=00000000', $article['body']);
@@ -294,7 +310,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(function (string $id): array {
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(3)->andReturnUsing(function (string $id): array {
             $article = self::article($id);
             if (str_starts_with($id, 'f2-')) {
                 $article['body'] = (string) preg_replace('/=yend size=16/', '=yend size=999', $article['body']);
@@ -344,7 +360,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(function (string $id) use ($corrupt): array {
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(3)->andReturnUsing(function (string $id) use ($corrupt): array {
             $article = self::article($id);
             if (str_starts_with($id, 'f1-')) {
                 $article['body'] = $corrupt($article['body']);
@@ -366,7 +382,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)->andReturnUsing(function (string $id) use ($corrupt): array {
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(6)->andReturnUsing(function (string $id) use ($corrupt): array {
             $article = self::segmentArticle($id, 2);
 
             return $id === 'f1-s1@fixture' ? ['body' => $corrupt($article['body'])] + $article : $article;
@@ -383,7 +399,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)->andReturnUsing(fn (string $id): array => self::segmentArticle($id, 2));
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(6)->andReturnUsing(fn (string $id): array => self::segmentArticle($id, 2));
 
         $result = $this->collector()->collectFromNzb(self::nzb(3, 2, false), 7);
 
@@ -396,7 +412,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(3)
             ->andReturnUsing(fn (string $id): array => ['body' => YencArticles::article('')] + self::article($id));
 
         $result = $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7);
@@ -417,7 +433,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(3)
             ->andReturnUsing(fn (string $id): array => ['body' => str_replace('line=128', $line, YencArticles::article(''))] + self::article($id));
 
         $result = $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7);
@@ -431,7 +447,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(function (string $id): array {
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(3)->andReturnUsing(function (string $id): array {
             $article = self::article($id);
             if (str_starts_with($id, 'f1-')) {
                 $article['body'] = str_replace('=yend size=16 ', '=yend ', $article['body']);
@@ -479,7 +495,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->twice()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->andReturnUsing(fn (string $id): array => self::article($id));
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->andReturnUsing(fn (string $id): array => self::article($id));
 
         $data = $this->collector()->collectFromNzb(self::nzb(201, 1, false), 7)['data'];
 
@@ -493,7 +509,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andThrow(new \RuntimeException('CAPABILITIES failed.'));
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(fn (string $id): array => self::article($id));
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(3)->andReturnUsing(fn (string $id): array => self::article($id));
 
         $result = $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7);
 
@@ -508,7 +524,7 @@ final class CompactFingerprintCollectorTest extends TestCase
         $par2 = ArchiveParsingBenchmarkFixtures::par2(1);
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(function (string $id) use ($par2): array {
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(3)->andReturnUsing(function (string $id) use ($par2): array {
             if ($id === 'index@fixture') {
                 throw new NntpArticleMissingException('Article headers are unavailable.');
             }
@@ -567,7 +583,7 @@ final class CompactFingerprintCollectorTest extends TestCase
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)
             ->andReturn(['capabilities_response_code' => null, 'capabilities_error_type' => 'Error', 'capabilities_raw' => []]);
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(fn (string $id): array => self::article($id));
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(3)->andReturnUsing(fn (string $id): array => self::article($id));
 
         $result = $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7);
 
@@ -581,7 +597,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andThrow(new \RuntimeException('Article headers are unavailable.'));
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(3)->andThrow(new \RuntimeException('Article headers are unavailable.'));
 
         $articles = $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7)['data']['providers'][0]['articles'];
 
@@ -593,7 +609,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->twice()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->andReturnUsing(fn (string $id): array => self::article($id));
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->andReturnUsing(fn (string $id): array => self::article($id));
         $mixed = str_replace('date="1790812801"', 'date="0"', self::nzb(2, 1, false));
         $allZero = (string) preg_replace('/date="\d+"/', 'date="0"', self::nzb(2, 1, false));
 
@@ -607,7 +623,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->andReturnUsing(fn (string $id): array => self::article($id));
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->andReturnUsing(fn (string $id): array => self::article($id));
         // Two segments of file 0 claim the same number.
         $xml = str_replace('number="2">f0-s2@fixture', 'number="1">f0-s2@fixture', self::nzb(2, 3, false));
 
@@ -623,7 +639,7 @@ final class CompactFingerprintCollectorTest extends TestCase
         config(['nntmux.fingerprint_alternate_percent' => 100]);
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->twice()->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')
             ->andReturnUsing(fn (string $id, int $body, int $header, bool $alternate): array => [
                 'body' => YencArticles::article($id === 'index@fixture' && $alternate ? ArchiveParsingBenchmarkFixtures::par2(1) : 'not par2'),
             ] + self::article($id));
@@ -638,7 +654,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(fn (string $id): array => str_starts_with($id, 'f1-')
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(3)->andReturnUsing(fn (string $id): array => str_starts_with($id, 'f1-')
             ? self::article('wrong@fixture') : self::article($id));
 
         $result = $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7);
@@ -654,7 +670,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(fn (string $id): array => [
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(3)->andReturnUsing(fn (string $id): array => [
             'body' => YencArticles::article($id === 'index@fixture'
                 ? ArchiveParsingBenchmarkFixtures::par2(1).str_replace('offline-', 'other-', ArchiveParsingBenchmarkFixtures::par2(2))
                 : 'payload'),
@@ -670,7 +686,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->andReturnUsing(fn (string $id): array => self::article($id));
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->andReturnUsing(fn (string $id): array => self::article($id));
         $xml = '<?xml version="1.0" encoding="UTF-8"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">';
         foreach (['a.rar', 'b.nfo'] as $position => $name) {
             $xml .= '<file poster="p@example" date="1790812800" subject="&quot;'.$name.'&quot; yEnc (1/1)"><groups><group>a.b.test</group></groups>'
@@ -706,7 +722,7 @@ final class CompactFingerprintCollectorTest extends TestCase
         // Real posting tools end parts with "=yend size=16 pcrc32=..." and no part= field.
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)->andReturnUsing(function (string $id): array {
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(6)->andReturnUsing(function (string $id): array {
             $article = self::segmentArticle($id, 2);
             $article['body'] = (string) preg_replace('/(=yend size=16) part=\d+/', '$1', $article['body']);
 
@@ -728,7 +744,7 @@ final class CompactFingerprintCollectorTest extends TestCase
         $data = str_repeat('y', 20_000);
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)->andReturnUsing(function (string $id) use ($data): array {
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(6)->andReturnUsing(function (string $id) use ($data): array {
             $part = preg_match('/-s(\d+)@/', $id, $match) === 1 ? (int) $match[1] : 1;
             $body = YencArticles::part($data, 'big.bin', 40_000, $part, 20_000 * ($part - 1) + 1, 2);
 
@@ -754,7 +770,7 @@ final class CompactFingerprintCollectorTest extends TestCase
         $this->assertSame('000da322', hash('crc32b', $data));
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)->andReturnUsing(function (string $id) use ($data, $corrupt): array {
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(6)->andReturnUsing(function (string $id) use ($data, $corrupt): array {
             $part = preg_match('/-s(\d+)@/', $id, $match) === 1 ? (int) $match[1] : 1;
             $body = YencArticles::part($data, 'segment.bin', 32, $part, 16 * ($part - 1) + 1, 2);
             $body = (string) preg_replace('/=yend size=16 part=\d+ pcrc32=000da322/', '=yend size=16 pcrc32=da322', $body);
@@ -806,7 +822,7 @@ final class CompactFingerprintCollectorTest extends TestCase
         // The pcrc32 still matches the decoded bytes, but the trailer size disagrees with them.
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)->andReturnUsing(function (string $id): array {
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(6)->andReturnUsing(function (string $id): array {
             $article = self::segmentArticle($id, 2);
             $article['body'] = (string) preg_replace('/=yend size=16 part=\d+/', '=yend size=17', $article['body']);
 
@@ -837,7 +853,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)->andReturnUsing(function (string $id) use ($corrupt): array {
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(6)->andReturnUsing(function (string $id) use ($corrupt): array {
             $article = self::segmentArticle($id, 2);
             $article['body'] = (string) preg_replace('/(=yend size=16) part=\d+/', '$1', $article['body']);
             if ($id === 'f1-s1@fixture') {
@@ -858,7 +874,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(6)->andReturnUsing(fn (string $id): array => $id === 'f1-s2@fixture'
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(6)->andReturnUsing(fn (string $id): array => $id === 'f1-s2@fixture'
             ? ['headers' => self::article($id)['headers']] + self::segmentArticle('f1-s1@fixture', 2)
             : self::segmentArticle($id, 2));
 
@@ -873,7 +889,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(function (string $id): array {
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(3)->andReturnUsing(function (string $id): array {
             $article = self::article($id);
             if ($id === 'f1-s1@fixture') {
                 $article['headers'][0] = 'Message-ID: <F1-S1@fixture>';
@@ -909,7 +925,7 @@ final class CompactFingerprintCollectorTest extends TestCase
         $data = str_repeat('x', 20_000);
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->times(3)->andReturnUsing(function (string $id) use ($data): array {
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->times(3)->andReturnUsing(function (string $id) use ($data): array {
             $body = YencArticles::article($data);
             if ($id === 'f1-s1@fixture') {
                 $body = (string) preg_replace('/crc32=[0-9a-f]{8}/', 'crc32=00000000', $body);
@@ -934,7 +950,7 @@ final class CompactFingerprintCollectorTest extends TestCase
             ->andThrow(new NntpProviderUnavailableException('Unable to connect to the requested NNTP provider.'));
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(true)
             ->andReturn(['capabilities_response_code' => null, 'capabilities_error_type' => 'Error']);
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->andReturnUsing(fn (string $id): array => self::article($id));
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->andReturnUsing(fn (string $id): array => self::article($id));
 
         $this->collector()->collectFromNzb(self::nzb(3, 1, false), 7);
         $this->travel(901)->seconds();
@@ -953,7 +969,7 @@ final class CompactFingerprintCollectorTest extends TestCase
     {
         $nntp = $this->mock(NNTPService::class);
         $nntp->shouldReceive('getFingerprintServerProfile')->once()->with(false)->andReturn(self::profile());
-        $nntp->shouldReceive('getFingerprintArticleByMessageID')->andReturnUsing(fn (string $id): array => self::article($id));
+        $nntp->shouldReceive('getFingerprintFullArticleByMessageID')->andReturnUsing(fn (string $id): array => self::article($id));
         // One file's segment bytes overflow, so the analyzer reports its size as unknown.
         $xml = '<?xml version="1.0" encoding="UTF-8"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">'
             .'<file poster="p@example" date="1790812800" subject="&quot;a.rar&quot; yEnc (1/2)"><groups><group>a.b.test</group></groups><segments>'
@@ -996,8 +1012,7 @@ final class CompactFingerprintCollectorTest extends TestCase
                 'User-Agent: ngPost v4.16',
             ],
             'body' => YencArticles::article('0123456789abcdef'),
-            'head_response' => ['response_code' => 221, 'response_text' => '221 ok'],
-            'body_response' => ['response_code' => 222, 'response_text' => '222 ok'],
+            'article_response' => ['response_code' => 220, 'response_text' => '220 ok'],
         ];
     }
 

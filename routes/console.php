@@ -90,6 +90,8 @@ Schedule::command('metrics:collect --cleanup')->dailyAt('03:00');
 // Push NNTmux application metrics to the Prometheus Pushgateway (see config/monitoring.php)
 // Stop slow exports before the five-minute overlap lock can expire.
 Schedule::command('monitoring:export-metrics --scheduled')->everyMinute()->withoutOverlapping(5)->when(static fn (): bool => (bool) config('monitoring.enabled'));
+// Bound Horizon's runtime average to recent completions instead of accumulating it across days.
+Schedule::command('horizon:snapshot')->everyFiveMinutes()->withoutOverlapping(5)->when(static fn (): bool => config('queue.default') === 'redis');
 // Cleanup old user activity stats weekly (keep last 90 days)
 Schedule::call(function () {
     UserActivityStat::cleanupOldStats(90);

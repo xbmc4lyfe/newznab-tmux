@@ -4,16 +4,70 @@ declare(strict_types=1);
 
 namespace Tests\Feature;
 
+use App\Services\Monitoring\BoundedMetricQuery;
 use App\Services\Monitoring\Collectors\ReleaseVerificationCollector;
 use App\Services\Monitoring\Prometheus\TextFormatter;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\ScratchBudget;
+use Illuminate\Database\Query\Builder;
+use Illuminate\Database\QueryException;
+use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Http;
 use RuntimeException;
 
 class ReleaseVerificationMetricsTest extends ReleaseVerificationCandidatesTest
 {
+    public function test_a_database_age_timeout_does_not_block_other_metrics_or_publish_zero_age(): void
+    {
+        $pdoException = new \PDOException('Query execution was interrupted');
+        $pdoException->errorInfo = ['70100', 1969, 'max_statement_time exceeded'];
+        $failure = new QueryException('testing', 'select min(last_unique_at)', [], $pdoException);
+        $this->mock(BoundedMetricQuery::class)->shouldReceive('get')->andReturnUsing(static function (Builder $query) use ($failure): array {
+            if (str_contains($query->toSql(), 'MIN(last_unique_at)')) {
+                throw $failure;
+            }
+
+            return $query->get()->all();
+        });
+        config(['monitoring.enabled' => true, 'monitoring.pushgateway.url' => 'http://pushgateway.test:9091', 'queue.default' => 'sync']);
+        Http::fake(['*' => Http::response('', 200)]);
+
+        $this->artisan('monitoring:export-metrics')->assertSuccessful();
+
+        Http::assertSent(static fn (Request $request): bool => str_contains($request->body(), "nntmux_up 1\n")
+            && str_contains($request->body(), 'nntmux_release_verification_backlog_age_measurement_available 0')
+            && ! str_contains($request->body(), 'nntmux_release_verification_backlog_age_seconds '));
+    }
+
+    public function test_a_successful_age_measurement_remains_exact(): void
+    {
+        $this->freezeTime();
+        app(CandidateRepository::class)->enqueue(['identity' => sha1('oldest'), 'groups_id' => 1, 'files' => []]);
+        DB::table('release_verification_candidates')->update(['status' => 'pending', 'last_unique_at' => now()->subHours(2)]);
+
+        $text = $this->metrics();
+
+        $this->assertStringContainsString('nntmux_release_verification_backlog_age_measurement_available 1', $text);
+        $this->assertStringContainsString('nntmux_release_verification_backlog_age_seconds 7200', $text);
+    }
+
+    public function test_timing_out_both_large_aggregates_preserves_the_cheap_metrics(): void
+    {
+        $cause = new \PDOException('Query execution was interrupted');
+        $cause->errorInfo = ['HY000', 3024, 'max execution time exceeded'];
+        $this->mock(BoundedMetricQuery::class)->shouldReceive('get')
+            ->andThrow(new QueryException('testing', 'select', [], $cause));
+
+        $text = $this->metrics();
+
+        $this->assertStringContainsString('nntmux_release_verification_candidates_measurement_available 0', $text);
+        $this->assertStringContainsString('nntmux_release_verification_backlog_age_measurement_available 0', $text);
+        $this->assertStringContainsString('nntmux_release_verification_pending_bytes ', $text);
+        $this->assertStringNotContainsString('nntmux_release_verification_candidates{', $text);
+    }
+
     public function test_per_claim_metrics_do_not_walk_retained_audit_scratch_before_the_next_claim(): void
     {
         DB::table('release_verification_scratch_budget')->where('id', 1)->update(['initialized' => true]);
