@@ -120,7 +120,7 @@ class VerifyReleaseCandidates extends Command
             $maxSeconds = max(0, (int) $this->option('max-seconds'));
             $verificationOptions = (array) config('release_verification');
             $source = new NntpArticleSource(app(NNTPService::class), decoder: $decoder,
-                maximumBytes: min((int) $verificationOptions['spot_check_bytes'], (int) $verificationOptions['spot_check_article_bytes']),
+                maximumBytes: max(0, min(1048576, (int) $verificationOptions['spot_check_bytes'], (int) $verificationOptions['spot_check_article_bytes'])),
                 allowAlternateFallback: false);
             $batch = new CandidateSampleBatch($repository, $store, $locks, $source, $verificationOptions, $diagnostics);
             for ($index = 0; $index < max(1, (int) $this->option('limit')); $index++) {
