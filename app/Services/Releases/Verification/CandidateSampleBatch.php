@@ -8,6 +8,7 @@ use Closure;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
 use Throwable;
+use WeakReference;
 
 /** Keep only leases and sample IDs between reads; never retain a batch of full manifests. */
 final class CandidateSampleBatch
@@ -21,11 +22,19 @@ final class CandidateSampleBatch
 
     private int $verifiedBytes = 0;
 
+    private readonly LeaseHeartbeat $pendingHeartbeat;
+
     /** @param array<string, mixed> $options */
     public function __construct(private readonly CandidateRepository $repository, private readonly ManifestStore $store,
         private readonly VerificationWorkerLocks $locks, private readonly NntpArticleSource $source,
         private readonly array $options, private readonly ?VerificationRunDiagnostics $diagnostics = null,
-        private readonly ?Closure $clock = null) {}
+        private readonly ?Closure $clock = null)
+    {
+        $owner = WeakReference::create($this);
+        $this->pendingHeartbeat = new LeaseHeartbeat(static function () use ($owner): void {
+            $owner->get()?->heartbeat();
+        }, max(0.1, min(30, (int) ($this->options['lease_seconds'] ?? 300) / 3)));
+    }
 
     public function hasPending(): bool
     {
@@ -47,6 +56,34 @@ final class CandidateSampleBatch
         $this->verifiedBytes += $bytes;
 
         return $this->verifiedBytes / max(0.001, $now - $this->prefetchStartedAt);
+    }
+
+    /** Per-file bookkeeping may force the active lease while queued renewals remain coalesced. */
+    public function pulse(): void
+    {
+        if ($this->pending !== []) {
+            ($this->pendingHeartbeat)();
+        }
+    }
+
+    /** Return only work that has not been handed to the per-candidate verifier. */
+    public function releasePending(): void
+    {
+        $error = null;
+        foreach ($this->pending as $id => $claim) {
+            try {
+                $this->repository->returnQueuedClaim($claim);
+            } catch (Throwable $failure) {
+                $error ??= $failure;
+            } finally {
+                unset($this->pending[$id]);
+                $this->locks->releaseCandidate($id);
+            }
+        }
+        $this->source->clearPrefetched();
+        if ($error !== null) {
+            throw $error;
+        }
     }
 
     /** Renew queued work as well as the candidate currently being verified by the caller. */
@@ -77,6 +114,7 @@ final class CandidateSampleBatch
             if ($remaining < 1) {
                 return null;
             }
+            $this->source->clearPrefetched();
             $this->prefetchStartedAt = null;
             $this->verifiedBytes = 0;
             $limit = min(max(1, $remaining), max(1, min(16, (int) ($this->options['sample_batch_size'] ?? 1))),
@@ -87,9 +125,25 @@ final class CandidateSampleBatch
                 $preferReady = $this->locks->preferReady();
                 $phase = $this->diagnostics === null ? null : hrtime(true);
                 $this->diagnostics?->claimCalled();
+                $acquired = [];
+                $claim = null;
                 try {
-                    $claim = $this->repository->claim(fn (int $id): bool => $this->locks->tryCandidate($id), $preferReady);
+                    $claim = $this->repository->claim(function (int $id) use (&$acquired): bool {
+                        if (! $this->locks->tryCandidate($id)) {
+                            return false;
+                        }
+                        if (! isset($this->pending[$id])) {
+                            $acquired[] = $id;
+                        }
+
+                        return true;
+                    }, $preferReady);
                 } finally {
+                    foreach ($acquired as $id) {
+                        if ($claim === null || $id !== (int) $claim->id) {
+                            $this->locks->releaseCandidate($id);
+                        }
+                    }
                     $this->diagnostics?->phase('claim', $phase);
                 }
                 if ($claim === null) {

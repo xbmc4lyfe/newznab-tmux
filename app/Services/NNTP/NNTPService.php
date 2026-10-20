@@ -13,6 +13,7 @@ use App\Services\YencService;
 use DariusIII\NetNntp\Client as NntpClient;
 use DariusIII\NetNntp\Error as NntpError;
 use DariusIII\NetNntp\Protocol\ResponseCode;
+use Illuminate\Container\Container;
 
 /**
  * NNTP Service for connecting to usenet, retrieving articles and article headers,
@@ -24,6 +25,9 @@ use DariusIII\NetNntp\Protocol\ResponseCode;
 class NNTPService extends NntpClient
 {
     private bool $readingBoundedArticleStatus = false;
+
+    /** @var array<string, true> */
+    private static array $reportedVerificationFramerFailures = [];
 
     public static function verificationMessageId(string $messageId, int $maximumBytes): string
     {
@@ -129,12 +133,13 @@ class NNTPService extends NntpClient
                     $maximumBytes, $bufferBytes, $heartbeat);
             } catch (\RuntimeException) {
                 // No NNTP command has been sent; the native pipeline is still a safe fallback.
+                self::reportVerificationFramerFallback($worker);
             }
         }
         $fail = static function (array &$state, \RuntimeException $error) use (&$results): void {
             foreach (array_slice($state['ids'], $state['position']) as $offset => $id) {
-                $results[$id] = $offset > 0 && $error instanceof ArticleBudgetExceeded
-                    ? new \RuntimeException('Verification pipeline was closed after an oversized article.', previous: $error) : $error;
+                $results[$id] = $offset > 0
+                    ? new VerificationPipelineRetryException('Verification pipeline closed before this response was read.', previous: $error) : $error;
             }
             if (is_resource($state['socket'])) {
                 fclose($state['socket']);
@@ -147,8 +152,12 @@ class NNTPService extends NntpClient
                 $connection = $batch['connection'];
                 $socket = $connection->_socket;
                 if (! is_resource($socket) || $connection->_compressionEnabled) {
+                    if (is_resource($socket)) {
+                        fclose($socket);
+                    }
+                    $connection->_resetProperties();
                     foreach ($batch['ids'] as $id) {
-                        $results[$id] = new \RuntimeException('Raw verification connection is unavailable.');
+                        $results[$id] = new VerificationPipelineRetryException('Raw verification connection is unavailable.');
                     }
 
                     continue;
@@ -207,7 +216,7 @@ class NNTPService extends NntpClient
                         foreach ($frame['results'] as $result) {
                             $id = $state['ids'][$result['index']];
                             $results[$id] = $result['status'] === 'missing'
-                                ? new \RuntimeException('Verification article is unavailable.') : $result['body'];
+                                ? new NntpArticleMissingException('Verification article is unavailable.') : $result['body'];
                             $state['position']++;
                         }
                         if ($frame['error'] !== null) {
@@ -250,7 +259,7 @@ class NNTPService extends NntpClient
                                     $state['body'] = true;
                                 }
                             } elseif (in_array((int) $status[1], [430, 423], true)) {
-                                $results[$id] = new \RuntimeException('Verification article is unavailable.');
+                                $results[$id] = new NntpArticleMissingException('Verification article is unavailable.');
                                 $state['position']++;
                             } else {
                                 $fail($state, new \RuntimeException('Unexpected verification pipeline status.'));
@@ -304,6 +313,30 @@ class NNTPService extends NntpClient
         }
 
         return $results;
+    }
+
+    private static function reportVerificationFramerFallback(string $worker): void
+    {
+        if (isset(self::$reportedVerificationFramerFailures[$worker])) {
+            return;
+        }
+        self::$reportedVerificationFramerFailures[$worker] = true;
+        $message = 'Rust verification framer startup failed; using PHP framing.';
+        try {
+            $container = Container::getInstance();
+            if ($container->bound('log')) {
+                $container->make('log')->warning($message);
+
+                return;
+            }
+        } catch (\Throwable) {
+            // Standalone callers and failed logger bindings still get a safe fallback.
+        }
+        try {
+            @error_log($message);
+        } catch (\Throwable) {
+            // Logging cannot prevent the native parser from servicing standalone callers.
+        }
     }
 
     public function verificationPipelineAvailable(): bool

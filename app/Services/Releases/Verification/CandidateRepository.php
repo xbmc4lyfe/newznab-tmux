@@ -1620,6 +1620,15 @@ final class CandidateRepository
             ->where(fn ($query) => $query->whereNull('lease_until')->orWhere('lease_until', '<', $cutoff));
     }
 
+    /** Return an admitted candidate that never began verification, without changing a newer generation. */
+    public function returnQueuedClaim(object $claim): void
+    {
+        DB::table('release_verification_candidates')->where('id', $claim->id)->where('status', 'verifying')
+            ->where('lease_token', $claim->lease_token)->where('version', $claim->version)->whereNull('release_id')
+            ->update(['status' => $claim->status === 'verifying' ? 'pending' : $claim->status,
+                'lease_token' => null, 'lease_until' => null]);
+    }
+
     public function heartbeat(int $id, string $token): void
     {
         $changed = DB::table('release_verification_candidates')->where('id', $id)->where('lease_token', $token)

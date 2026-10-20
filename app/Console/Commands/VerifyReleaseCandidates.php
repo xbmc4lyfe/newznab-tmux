@@ -31,7 +31,7 @@ use Throwable;
 
 class VerifyReleaseCandidates extends Command
 {
-    protected $signature = 'releases:verify-candidates {--limit=1 : Maximum candidates in this run} {--slot=0 : Worker slot; zero selects a free slot} {--max-seconds=0 : Stop claiming after this duration; finish the admitted batch} {--no-summary : Skip global candidate status counts} {--diagnostics : Log bounded natural verification run counters and timings}';
+    protected $signature = 'releases:verify-candidates {--limit=1 : Maximum candidates in this run} {--slot=0 : Worker slot; zero selects a free slot} {--max-seconds=0 : Stop claiming after this duration; finish the active candidate} {--no-summary : Skip global candidate status counts} {--diagnostics : Log bounded natural verification run counters and timings}';
 
     protected $description = 'Spot check bounded articles before publishing complete candidate NZBs';
 
@@ -124,7 +124,7 @@ class VerifyReleaseCandidates extends Command
                 allowAlternateFallback: false);
             $batch = new CandidateSampleBatch($repository, $store, $locks, $source, $verificationOptions, $diagnostics);
             for ($index = 0; $index < max(1, (int) $this->option('limit')); $index++) {
-                if (! $batch->hasPending() && $index > 0 && $maxSeconds > 0 && (hrtime(true) - $runStarted) / 1e9 >= $maxSeconds) {
+                if ($index > 0 && $maxSeconds > 0 && (hrtime(true) - $runStarted) / 1e9 >= $maxSeconds) {
                     $diagnostics?->stop('deadline', hrtime(true));
                     break;
                 }
@@ -132,14 +132,17 @@ class VerifyReleaseCandidates extends Command
                 if (! $locks->held()) {
                     throw new RuntimeException('Verification worker locks were lost.');
                 }
-                if (! $batch->hasPending() && ! $locks->admitting()) {
+                if (! $locks->admitting()) {
                     $diagnostics?->stop('draining', hrtime(true));
                     break;
                 }
                 $claim = $batch->next(max(1, (int) $this->option('limit')),
                     static fn (): bool => $locks->admitting() && ($maxSeconds === 0 || (hrtime(true) - $runStarted) / 1e9 < $maxSeconds));
                 if ($claim === null) {
-                    $diagnostics?->stop($batch->limitReached(max(1, (int) $this->option('limit'))) ? 'limit' : 'no_claim', hrtime(true));
+                    $reason = ! $locks->admitting() ? 'draining'
+                        : ($maxSeconds > 0 && (hrtime(true) - $runStarted) / 1e9 >= $maxSeconds ? 'deadline'
+                            : ($batch->limitReached(max(1, (int) $this->option('limit'))) ? 'limit' : 'no_claim'));
+                    $diagnostics?->stop($reason, hrtime(true));
                     break;
                 }
                 $directory = $root.'/scratch/'.$claim->id.'-'.$claim->version;
@@ -150,7 +153,7 @@ class VerifyReleaseCandidates extends Command
                 try {
                     $phase = $diagnostics === null ? null : hrtime(true);
                     $heartbeat = static function () use ($repository, $claim, $batch): void {
-                        $batch->heartbeat();
+                        $batch->pulse();
                         $repository->heartbeat((int) $claim->id, $claim->lease_token);
                     };
                     $heartbeat();
@@ -276,8 +279,20 @@ class VerifyReleaseCandidates extends Command
 
             throw $error;
         } finally {
-            unset($source);
-            $locks->close();
+            try {
+                if (isset($batch)) {
+                    $batch->releasePending();
+                }
+            } catch (Throwable $error) {
+                try {
+                    Log::warning('Queued verification leases could not all be returned; expiry will recover them.', ['error_type' => $error::class]);
+                } catch (Throwable) {
+                    // Cleanup must preserve the original failure even when logging is unavailable.
+                }
+            } finally {
+                unset($batch, $source);
+                $locks->close();
+            }
         }
 
         return self::SUCCESS;

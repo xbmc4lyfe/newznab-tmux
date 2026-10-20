@@ -356,9 +356,9 @@ PHP);
 
     public function test_real_rust_executable_frames_interleaved_body_and_stat_responses(): void
     {
-        $binary = getenv('NNTMUX_VERIFICATION_TEST_BINARY') ?: dirname(__DIR__, 2).'/docker/app/nzb-yenc-ffi/target/release/nntmux-verification-framer';
+        $binary = getenv('NNTMUX_VERIFICATION_FRAMER') ?: getenv('NNTMUX_VERIFICATION_TEST_BINARY') ?: dirname(__DIR__, 2).'/docker/app/nzb-yenc-ffi/target/release/nntmux-verification-framer';
         if (! is_executable($binary)) {
-            self::markTestSkipped('Set NNTMUX_VERIFICATION_TEST_BINARY to the compiled Rust framer.');
+            self::markTestSkipped('Set NNTMUX_VERIFICATION_FRAMER to the compiled Rust framer.');
         }
         $worker = new RustVerificationFramer($binary, [
             ['ids' => ['a@b', 'c@d'], 'mode' => 'body'], ['ids' => ['e@f'], 'mode' => 'stat'],

@@ -89,7 +89,7 @@ final class SpotCheckVerifier
                 return self::deterministic('Spot-check transfer budget is exhausted.');
             }
             $raw = $this->source instanceof NntpArticleSource
-                ? $this->source->fetchBounded($segment['messageid'], $remaining)
+                ? $this->source->fetchBounded($segment['messageid'], $remaining, $heartbeat)
                 : $this->source->fetch($segment['messageid']);
             // An empty response is a fetch problem, not a property of the article.
             if ($raw === '') {

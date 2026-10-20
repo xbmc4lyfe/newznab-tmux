@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Releases\Verification;
 
 use App\Services\NNTP\NNTPService;
+use App\Services\NNTP\VerificationPipelineRetryException;
 use App\Services\YencService;
 use Exception;
 use RuntimeException;
@@ -35,10 +36,15 @@ final class NntpArticleSource implements ArticleSource
         return $connections * $window;
     }
 
+    public function clearPrefetched(): void
+    {
+        $this->prefetched = [];
+    }
+
     /** @param list<string> $ids */
     public function prefetch(array $ids, callable $heartbeat): void
     {
-        $this->prefetched = [];
+        $this->clearPrefetched();
         $ids = array_values(array_unique(array_map(fn (string $id): string => NNTPService::verificationMessageId($id, $this->maximumArticleBytes()), $ids)));
         if ($ids === [] || $this->batchSize() === 1) {
             return;
@@ -50,15 +56,17 @@ final class NntpArticleSource implements ArticleSource
         $connectionCount = min(count($ids), max(1, min(8, (int) config('release_verification.download_connections', 1))));
         $window = (int) ceil(count($ids) / $connectionCount);
         $batches = [];
-        if (! $this->connected) {
+        if (! $this->connected || ! $this->nntp->isConnected()) {
             try {
                 if ($this->nntp->doConnect(false) !== true) {
                     throw new RuntimeException('Primary verification connection is unavailable.');
                 }
                 $this->connected = true;
             } catch (Exception) {
+                $this->disconnect($this->nntp);
+                $this->connected = false;
                 foreach ($ids as $id) {
-                    $this->prefetched[$id] = new RuntimeException('Primary verification connection is unavailable.');
+                    $this->prefetched[$id] = new VerificationPipelineRetryException('Primary verification connection is unavailable.');
                 }
 
                 return;
@@ -86,8 +94,9 @@ final class NntpArticleSource implements ArticleSource
                 }
                 $batches[] = ['connection' => $connection, 'ids' => $batchIds];
             } catch (Exception) {
+                $this->disconnect($connection);
                 foreach ($batchIds as $id) {
-                    $this->prefetched[$id] = new RuntimeException('Primary verification connection is unavailable.');
+                    $this->prefetched[$id] = new VerificationPipelineRetryException('Primary verification connection is unavailable.');
                 }
             }
         }
@@ -140,12 +149,12 @@ final class NntpArticleSource implements ArticleSource
         return $fetched instanceof FetchedArticle ? $fetched->raw : $fetched;
     }
 
-    public function fetchBounded(string $messageId, int $remainingBytes): string
+    public function fetchBounded(string $messageId, int $remainingBytes, ?callable $heartbeat = null): string
     {
         if ($remainingBytes < 1) {
             throw new RuntimeException('Spot-check transfer budget is exhausted.');
         }
-        $fetched = $this->fetchFromProviders($messageId, maximumBytes: $remainingBytes);
+        $fetched = $this->fetchFromProviders($messageId, maximumBytes: $remainingBytes, heartbeat: $heartbeat);
 
         return $fetched instanceof FetchedArticle ? $fetched->raw : $fetched;
     }
@@ -168,29 +177,45 @@ final class NntpArticleSource implements ArticleSource
     }
 
     /** @param (callable(VerifiedArticle): void)|null $validate */
-    private function fetchFromProviders(string $messageId, ?callable $validate = null, ?int $maximumBytes = null): string|FetchedArticle
+    private function fetchFromProviders(string $messageId, ?callable $validate = null, ?int $maximumBytes = null, ?callable $heartbeat = null): string|FetchedArticle
     {
         $maximumBytes = min($this->maximumArticleBytes(), $maximumBytes ?? PHP_INT_MAX);
         $messageId = NNTPService::verificationMessageId($messageId, $maximumBytes);
         try {
+            $retryPrefetch = false;
             if (array_key_exists($messageId, $this->prefetched)) {
                 $raw = $this->prefetched[$messageId];
                 unset($this->prefetched[$messageId]);
-                if ($raw instanceof RuntimeException) {
+                if ($raw instanceof VerificationPipelineRetryException) {
+                    $retryPrefetch = true;
+                } elseif ($raw instanceof RuntimeException) {
                     throw $raw;
-                }
-
-                if (strlen($raw) > $maximumBytes) {
+                } elseif (strlen($raw) > $maximumBytes) {
                     throw new ArticleBudgetExceeded('Article exceeds verification memory budget.');
                 }
 
-                return $this->checkIntegrity($raw, $validate);
+                if (! $retryPrefetch) {
+                    return $this->checkIntegrity($raw, $validate);
+                }
             }
-            if (! $this->connected) {
+            if (! $this->connected || ! $this->nntp->isConnected()) {
                 if ($this->nntp->doConnect(false) !== true) {
                     throw new RuntimeException('NNTP is unavailable.');
                 }
                 $this->connected = true;
+            }
+
+            if ($retryPrefetch) {
+                // The prefetch has fully drained/closed before returning. Retry just this request
+                // once, retaining the pipeline parser's response identity fence on the fresh BODY.
+                $results = NNTPService::verificationArticleBatch([['connection' => $this->nntp, 'ids' => [$messageId]]],
+                    $maximumBytes, $maximumBytes, $heartbeat ?? static function (): void {});
+                $raw = $results[$messageId];
+                if ($raw instanceof RuntimeException) {
+                    throw $raw;
+                }
+
+                return $this->checkIntegrity($raw, $validate);
             }
 
             return $this->checkIntegrity($this->nntp->verificationArticle($messageId, $maximumBytes), $validate);
