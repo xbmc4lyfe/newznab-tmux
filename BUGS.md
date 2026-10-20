@@ -483,7 +483,7 @@ These bugs turned up while building and running the self-hosted stack in `docker
   - When a group has at least `CBP_PER_ARTICLE_OBFUSCATION_MIN_ARTICLES` articles (default 16; non-zero values are floored at 8) and at least 90% of its base names are distinct, the articles whose name appears only once are skipped. Repeated names (a real upload sharing the group) and first or last parts (a real upload cut by the range boundary) are kept. The skipped articles must also span at least that many part positions, so a slice of files posted round-robin with their own random names (one article each at one or two positions) is kept. Digit runs outside the token are ignored when comparing names.
   - Skipped articles still count as received, so they are not queued for part repair. The CLI reports them as "obfuscated per article".
   - A legitimate upload repeats its base name on nearly every part, and numbered volumes (`<hash>.part07.rar`) share one name, so legitimate groups stay out.
-  - Part repair (sparse ranges) and a value of `0` disable the check.
+  - A sparse part repair and a value of `0` disable the check. A repair listing every number of its range (deferred while the verification backlog was full) is filtered like a scan.
   - Header-only indexing can't reconstruct these uploads; they're only usable from an NZB.
   - Each skipping range logs `Skipping articles obfuscated per article` with the group and count.
   - The detection runs in Rust (`nntmux_per_article_obfuscation_v2` in `libnzbyenc`, through `NativePerArticleObfuscation`) and falls back to the PHP rule when FFI or the library is unavailable.
