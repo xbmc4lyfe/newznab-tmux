@@ -37,6 +37,8 @@ const PER_ARTICLE_TAIL_SAMPLES = 1000;
 const PER_ARTICLE_COLD_RUNS = 21;
 /** Cold rows the routing keeps on PHP compare sub-millisecond first calls, so take more of them. */
 const PER_ARTICLE_COLD_RUNS_ROUTED = 41;
+/** Fresh processes timing the one-time start-up cost (construction, library load and probe). */
+const PER_ARTICLE_STARTUP_RUNS = 200;
 
 try {
     exit(perArticleBenchmarkMain());
@@ -47,8 +49,15 @@ try {
 
 function perArticleBenchmarkMain(): int
 {
-    $options = getopt('', ['native:', 'output-dir:', 'repeats:', 'seed:', 'cold-stratum:', 'cold-side:']);
+    $options = getopt('', ['native:', 'output-dir:', 'repeats:', 'seed:', 'cold-stratum:', 'cold-side:', 'startup-child']);
     require_once dirname(__DIR__).'/vendor/autoload.php';
+    if (isset($options['startup-child'])) {
+        $start = hrtime(true);
+        $available = (new NativePerArticleObfuscation((string) ($options['native'] ?? '')))->available();
+        echo json_encode(['ns' => hrtime(true) - $start, 'available' => $available], JSON_THROW_ON_ERROR).PHP_EOL;
+
+        return 0;
+    }
     if (isset($options['cold-stratum'])) {
         echo perArticleColdChild((string) $options['cold-stratum'], (string) ($options['cold-side'] ?? ''), (string) ($options['native'] ?? ''), (int) ($options['seed'] ?? 20261019)).PHP_EOL;
 
@@ -152,6 +161,48 @@ function perArticleBenchmarkMain(): int
         $report['raw'][$name] = $samples;
     }
 
+    // Uncommon p99 with start-up included. A process pays construction, library load and probe
+    // once, before its first range; adding the p99 of that cost (from fresh processes) to the warm
+    // Rust p99 bounds the cold uncommon p99 from above. PHP's own first-call costs are left out, so
+    // the bound only understates the speedup. Every uncommon stratum, large-range included, must
+    // clear the threshold at the bootstrap lower bound.
+    $startup = [];
+    for ($run = 0; $run < PER_ARTICLE_STARTUP_RUNS; $run++) {
+        $output = shell_exec(implode(' ', array_map('escapeshellarg', [PHP_BINARY, '-d', 'ffi.enable=true', __FILE__,
+            '--startup-child', '--native='.$options['native']])));
+        $result = json_decode((string) $output, true, 4, JSON_THROW_ON_ERROR);
+        if ($result['available'] !== true) {
+            throw new RuntimeException('Native library failed to load in a fresh process.');
+        }
+        $startup[] = (int) $result['ns'];
+    }
+    $report['startup'] = ['runs' => PER_ARTICLE_STARTUP_RUNS, 'median_ms' => round(perArticleQuantile($startup, 0.5) / 1e6, 3),
+        'p99_ms' => round(perArticleQuantile($startup, 0.99) / 1e6, 3), 'raw' => $startup];
+    $boundMarkdown = "| Stratum | PHP p99 ms | Rust p99 + start-up p99 ms | Bounded speedup | 95% CI |\n|---|---:|---:|---:|---|\n";
+    foreach (PerArticleObfuscationCorpus::strata() as $name => $stratum) {
+        if ($stratum['category'] !== 'uncommon' || ! isset($report['raw'][$name])) {
+            continue;
+        }
+        $samples = $report['raw'][$name];
+        $bounded = static fn (array $php, array $rust, array $start): float => perArticleQuantile($php, 0.99)
+            / max(1, perArticleQuantile($rust, 0.99) + perArticleQuantile($start, 0.99));
+        $point = $bounded($samples['php'], $samples['rust'], $startup);
+        $ratios = [];
+        for ($resample = 0; $resample < PER_ARTICLE_BOOTSTRAP; $resample++) {
+            $pick = static fn (array $values): array => array_map(static fn (): int => $values[$random->getInt(0, count($values) - 1)], $values);
+            $ratios[] = $bounded($pick($samples['php']), $pick($samples['rust']), $pick($startup));
+        }
+        [$boundLow, $boundHigh] = [perArticleQuantile($ratios, 0.025), perArticleQuantile($ratios, 0.975)];
+        $report['startup_bounded_p99'][$name] = ['speedup' => round($point, 2), 'speedup_ci95' => [round($boundLow, 2), round($boundHigh, 2)]];
+        if ($point < PER_ARTICLE_THRESHOLD) {
+            $report['status'] = $report['status'] === 'invalid' ? 'invalid' : 'not-qualified';
+        } elseif ($boundLow < PER_ARTICLE_THRESHOLD && $report['status'] === 'qualified') {
+            $report['status'] = 'inconclusive';
+        }
+        $boundMarkdown .= sprintf("| %s | %.3f | %.3f | %.2fx | %.2f-%.2fx |\n", $name, perArticleQuantile($samples['php'], 0.99) / 1e6,
+            (perArticleQuantile($samples['rust'], 0.99) + perArticleQuantile($startup, 0.99)) / 1e6, $point, $boundLow, $boundHigh);
+    }
+
     // Cold observations: each is the first call in a fresh process, so the Rust side pays for
     // loading the library and running its probe, as a finite indexing command does.
     $constructions = [];
@@ -206,6 +257,8 @@ function perArticleBenchmarkMain(): int
     }
     $markdown .= "\nSource commit: `".$report['environment']['source_commit'].'`; library sha256 `'.$report['environment']['library_sha256']."`.\n";
     $markdown .= "\nStatus: **{$report['status']}** (threshold ".PER_ARTICLE_THRESHOLD."x; {$repeats} paired samples per stratum, ".PER_ARTICLE_TAIL_SAMPLES." for uncommon strata; Rust strata need the 95% lower bound at the threshold).\n";
+    $markdown .= "\nUncommon p99 with start-up included (warm Rust p99 plus the p99 of construction, library load and probe over "
+        .PER_ARTICLE_STARTUP_RUNS.' fresh processes: median '.$report['startup']['median_ms'].' ms, p99 '.$report['startup']['p99_ms']." ms):\n\n".$boundMarkdown;
     $markdown .= "\nCold first call per fresh process (median of ".PER_ARTICLE_COLD_RUNS.' runs, '.PER_ARTICLE_COLD_RUNS_ROUTED.' for routed strata; same thresholds; the side most runs took sets the gate). The one-time wrapper construction with the service is measured separately and not added: median '.$report['cold_construct_median_ms'].' ms, p90 '.$report['cold_construct_p90_ms']." ms per process.\n\n".$coldMarkdown;
     file_put_contents($directory.'/report.json', json_encode($report, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR));
     file_put_contents($directory.'/summary.md', $markdown);
