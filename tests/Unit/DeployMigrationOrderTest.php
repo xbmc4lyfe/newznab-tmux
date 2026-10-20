@@ -43,9 +43,12 @@ case "$*" in
         [ ! -f "$NNTMUX_REPO/recreated-$last" ] || printf 'r%s-' "$(wc -c < "$NNTMUX_REPO/recreated-$last" | tr -d ' ')"
         echo "fixture-container-$last" ;;
     # The barrier container exists while it runs or after it exited (barrier.stopped), until `rm -f`.
-    'inspect --format {{index .Config.Labels "nntmux.deploy.database"}} '*)
+    'ps -aq --filter name=^/'*'-verification-barrier$')
+        # NNTMUX_BARRIER_INSPECT_FAIL: the daemon cannot be reached.
         [ "${NNTMUX_BARRIER_INSPECT_FAIL:-0}" != 1 ] || { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
-        [ -f "$NNTMUX_REPO/barrier.running" ] || [ -f "$NNTMUX_REPO/barrier.stopped" ] || { echo "Error: No such object" >&2; exit 1; }
+        if [ -f "$NNTMUX_REPO/barrier.running" ] || [ -f "$NNTMUX_REPO/barrier.stopped" ]; then echo barrier-container; fi ;;
+    'inspect --format {{index .Config.Labels "nntmux.deploy.database"}} '*)
+        [ -f "$NNTMUX_REPO/barrier.running" ] || [ -f "$NNTMUX_REPO/barrier.stopped" ] || { echo "error: no such object" >&2; exit 1; }
         cat "$NNTMUX_REPO/barrier.database" 2>/dev/null; exit 0 ;;
     'ps -q --filter label=com.docker.compose.project='*) [ -z "${NNTMUX_ORPHAN:-}" ] || case "$*" in *"service=$NNTMUX_ORPHAN") echo "fixture-container-$NNTMUX_ORPHAN" ;; esac ;;
     'stop fixture-container-'*) ;;
@@ -3751,6 +3754,38 @@ SH);
         $this->assertStringContainsString('Run Migrations  : no', $this->make(['deploy-plan'])->mustRun()->getOutput());
     }
 
+    public function test_the_database_must_be_a_data_service_and_multi_line_values_select_nothing(): void
+    {
+        mkdir($this->directory.'/docker/config', 0777, true);
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['mariadb'] = ['image' => 'mariadb:one'];
+        $json['services']['db2'] = ['image' => 'mariadb:one'];
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+
+        // A `DB_HOST=` line inside a multi-line value is part of that value.
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=mariadb\nNOTE='cutover plan\nDB_HOST=db2\nlater'\n");
+        $this->assertSame('mariadb', $this->planActions($config)['DATABASE_SERVICE']);
+
+        // An infrastructure service is never migrated and fenced as the database.
+        file_put_contents($this->directory.'/docker/config/app.env', "DB_HOST=proxy\n");
+        $plan = $this->planProcess($config);
+        $plan->run();
+        $this->assertNotSame(0, $plan->getExitCode());
+        $this->assertStringContainsString('names proxy, which is not a data service', $plan->getErrorOutput());
+    }
+
+    public function test_a_rendered_db_url_spelled_differently_is_the_same_database(): void
+    {
+        $json = json_decode($this->composeJson(), true);
+        foreach (['web', 'horizon', 'scheduler', 'indexer'] as $app) {
+            $json['services'][$app] = ['environment' => ['DB_URL' => 'mysql://u:p@External-DB.example./nntmux']];
+        }
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun();
+        // Horizon alone respells it: the apps still share one connection, so nothing migrates.
+        $json['services']['horizon'] = ['environment' => ['DB_URL' => 'mysql://u:p@external-db.example/nntmux']];
+        $this->assertStringContainsString('Run Migrations  : no', $this->make(['deploy-plan'], ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)])->mustRun()->getOutput());
+    }
+
     public function test_a_failed_barrier_inspection_never_counts_as_no_barrier(): void
     {
         $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'])->mustRun();
@@ -3763,7 +3798,7 @@ SH);
         $process = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], ['NNTMUX_BARRIER_INSPECT_FAIL' => '1']);
         $process->run();
         $this->assertFalse($process->isSuccessful());
-        $this->assertStringContainsString('cannot inspect the verification barrier', $process->getErrorOutput());
+        $this->assertStringContainsString('not adopting or replacing it unchecked', $process->getErrorOutput());
         $this->assertStringNotContainsString('rm -f nntmux-verification-barrier', $this->events());
         $this->assertFileExists($this->directory.'/barrier.running');
     }

@@ -613,7 +613,11 @@ def read_dotenv(path: Path, interpolated: set[str] | None = None, multiline: set
     except OSError as error:
         sys.exit(f"deploy-plan: cannot read {path}: {error.strerror or error}")
     values: dict[str, str] = {}
-    for raw in text.splitlines():
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        raw = lines[index]
+        index += 1
         m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", raw)
         if m:
             value = m.group(2)
@@ -626,6 +630,12 @@ def read_dotenv(path: Path, interpolated: set[str] | None = None, multiline: set
             # An opening quote with no closing one starts a multi-line value, which this line-based
             # parser cannot read whole.
             spans_lines = not quoted and value[:1] in ("'", '"')
+            if spans_lines:
+                # Its continuation lines belong to it (phpdotenv and Compose read up to the closing
+                # quote): never assignments of their own, e.g. a `DB_HOST=` line inside a note.
+                while index < len(lines) and not re.search(rf"(?<!\\){re.escape(value[0])}", lines[index]):
+                    index += 1
+                index += 1
             if multiline is not None:
                 multiline.discard(m.group(1))
                 if spans_lines:
@@ -962,7 +972,8 @@ def compute_state(repo: Path, docker_dir: Path, include_compose: bool) -> dict[s
                     if env.get(key) is not None:  # A null pass-through is unset in the container.
                         value = normalize_host(str(env[key])) if key == "DB_HOST" else str(env[key])
                         if key == "DB_URL":
-                            value = value.rsplit("@", 1)[-1]
+                            # Host and `host=` normalized as app_connection compares them.
+                            value = normalize_db_url(value).rsplit("@", 1)[-1]
                         rendered_db.append(f"{svc}:{key}={value}")
         if rendered_db:
             state["database"] = sha256_text("\n".join([state["database"], *rendered_db]))
@@ -1820,6 +1831,10 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
     data_removed = bool(removed_data)
     # The apps' database when it names a rendered service (None for an external one).
     matched_database = matched_database_service(docker_dir)
+    if matched_database and matched_database not in data_services(state):
+        # Only data services are changed with writers quiesced, migrated and fenced.
+        sys.exit(f"deploy-plan: the apps' database host names {matched_database}, which is not a data service; selective "
+                 "deployment migrates and fences only a data service. Point DB_HOST/DB_URL at the database service.")
     for svc in data_services(state):
         if not compose_present(state, svc):
             data_reasons[svc] = "not rendered"
