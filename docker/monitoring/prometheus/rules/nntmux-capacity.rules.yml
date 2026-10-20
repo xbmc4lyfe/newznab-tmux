@@ -107,6 +107,15 @@ groups:
 
   - name: nntmux-services
     rules:
+      # The exporters stay scrapeable (up == 1) when they lose their backend.
+      - alert: MariadbDown
+        expr: mysql_up == 0
+        for: 2m
+        annotations: {summary: "mysqld-exporter cannot reach MariaDB."}
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 2m
+        annotations: {summary: "redis-exporter cannot reach Redis."}
       - alert: MariadbConnectionsHigh
         expr: mysql_global_status_threads_connected / mysql_global_variables_max_connections > 0.8
         for: 10m

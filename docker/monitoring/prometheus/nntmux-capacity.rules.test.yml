@@ -98,3 +98,20 @@ tests:
       - eval_time: 30m
         alertname: NntmuxAppMetricsStale
         exp_alerts: []
+
+  # Exporters scrape fine but lost their backends.
+  - interval: 1m
+    input_series:
+      - series: 'mysql_up{job="mariadb"}'
+        values: '0x10'
+      - series: 'redis_up{job="redis"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: MariadbDown
+        exp_alerts:
+          - exp_labels: {job: mariadb}
+            exp_annotations: {summary: "mysqld-exporter cannot reach MariaDB."}
+      - eval_time: 5m
+        alertname: RedisDown
+        exp_alerts: []
