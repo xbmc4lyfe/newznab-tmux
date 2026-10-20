@@ -215,7 +215,8 @@ abstract class BaseRunner
                     }
                     $now = microtime(true);
                     foreach (array_keys($queue) as $queuedKey) {
-                        if (($followUps[$queuedKey] ?? 0.0) > $now) {
+                        // A start failure can end the last first run inside this loop, before the outer prune.
+                        if (isset($followUps[$queuedKey]) && ($firstRuns === [] || $followUps[$queuedKey] > $now)) {
                             continue;
                         }
                         $group = $this->workerConcurrencyKey($queuedKey);

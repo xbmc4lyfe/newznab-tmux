@@ -143,6 +143,21 @@ class ReleasesRunnerRollingTest extends TestCase
         $this->assertSame('failure', $runner->outcomes()[2]['status']);
     }
 
+    public function test_a_due_follow_up_does_not_start_after_the_last_first_pass_fails_to_start(): void
+    {
+        config(['nntmux.cbp.release_rolling_interval' => 1]);
+        ConfigurationTestBuilder::update(ConfigurationDomain::Ingestion, ['release_threads' => 1]);
+        $runner = new RollingReleasesRunner($this->marker, slowGroup: 1, slowSeconds: 2, unstartableGroup: 2);
+
+        try {
+            $this->runRound($runner);
+            $this->fail('Expected the round to report the group that could not start.');
+        } catch (RuntimeException) {
+            $this->assertSame([1 => 1], $this->fullPasses());
+            $this->assertSame('failure', $runner->outcomes()[2]['status']);
+        }
+    }
+
     private function runRound(ReleasesRunner $runner): void
     {
         ob_start();
