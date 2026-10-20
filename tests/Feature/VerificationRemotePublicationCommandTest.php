@@ -90,10 +90,13 @@ class VerificationRemotePublicationCommandTest extends ReleaseVerificationCandid
     {
         [$active, $queued] = $this->prepareWorker();
         $requests = 0;
-        $inFlight = false;
+        $transport = new class
+        {
+            public bool $inFlight = false;
+        };
         $renewed = [];
-        DB::listen(static function (QueryExecuted $query) use (&$inFlight, &$renewed, $active, $queued): void {
-            if ($inFlight && str_starts_with($query->sql, 'update "release_verification_candidates" set "lease_until" =')) {
+        DB::listen(static function (QueryExecuted $query) use ($transport, &$renewed, $active, $queued): void {
+            if ($transport->inFlight && str_starts_with($query->sql, 'update "release_verification_candidates" set "lease_until" =')) {
                 foreach ([$active->id, $queued->id] as $id) {
                     if (in_array($id, $query->bindings, true)) {
                         $renewed[] = (int) $id;
@@ -101,7 +104,7 @@ class VerificationRemotePublicationCommandTest extends ReleaseVerificationCandid
                 }
             }
         });
-        Http::fake(function (Request $request, array $options) use (&$requests, &$inFlight, $active, $mode) {
+        Http::fake(function (Request $request, array $options) use (&$requests, $transport, $active, $mode) {
             $requests++;
             if ($requests === 1) {
                 $this->retainScratch((object) $request['claim']);
@@ -113,11 +116,11 @@ class VerificationRemotePublicationCommandTest extends ReleaseVerificationCandid
             VerificationWorkerLocks::pause('publication-progress-test', 'Stop after this publication.');
             // Cross the real coalescing interval (1s lease / 3) without a 30s production wait.
             usleep(350_000);
-            $inFlight = true;
+            $transport->inFlight = true;
             try {
                 $options['progress'](0, 0, 0, 0);
             } finally {
-                $inFlight = false;
+                $transport->inFlight = false;
             }
             if ($mode === 'all_lost' || ($mode === 'first_lost' && $requests === 1)) {
                 throw new ConnectionException('The primary committed but its response was lost.');
@@ -176,6 +179,7 @@ class VerificationRemotePublicationCommandTest extends ReleaseVerificationCandid
                             'version' => (int) $row->version + 1,
                             'manifest_hash' => str_repeat('f', 64),
                             'release_id' => null,
+                            default => throw new \InvalidArgumentException('Unknown publication mutation: '.$changed),
                         },
                     ]);
                 }
