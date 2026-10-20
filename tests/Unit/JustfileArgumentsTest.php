@@ -26,6 +26,7 @@ class JustfileArgumentsTest extends TestCase
         copy(__DIR__.'/../../Justfile', $this->directory.'/Justfile');
         copy(__DIR__.'/../../docker/Justfile', $this->directory.'/docker/Justfile');
         copy(__DIR__.'/../../docker/bin/compose', $this->directory.'/docker/bin/compose');
+        copy(__DIR__.'/../../docker/bin/compose_dotenv.py', $this->directory.'/docker/bin/compose_dotenv.py');
         copy(__DIR__.'/../../scripts/dotenv-get', $this->directory.'/scripts/dotenv-get');
         chmod($this->directory.'/docker/bin/compose', 0755);
         chmod($this->directory.'/scripts/dotenv-get', 0755);
@@ -135,6 +136,81 @@ SH);
         $process = $this->just('docker/Justfile', ['ps'], ['DC' => $this->directory.'/bin/fake']);
         $process->mustRun();
         $this->assertStringContainsString('WEB_IMAGE=[registry/$literal:1]', $process->getOutput());
+    }
+
+    public function test_double_quoted_docker_env_escapes_are_decoded_like_compose(): void
+    {
+        // Compose initializes MariaDB with `pa\ss"q`; the recipes must pass the same password.
+        file_put_contents($this->directory.'/docker/.env', "DB_ROOTPASSWORD=\"pa\\\\ss\\\"q\" # root\nDB_DATABASE='nn\\\\tmux'\nAPP_IMAGE=\"registry/app:\\\"1\\\"\"\n");
+        // phpunit.xml's DB_DATABASE would win over docker/.env.
+        $process = $this->just('docker/Justfile', ['mysql'], ['DC' => $this->directory.'/bin/fake', 'DB_DATABASE' => false]);
+        $process->mustRun();
+        $this->assertContains('-ppa\\ss"q', $this->arguments($process));
+        // Single-quoted values stay literal.
+        $this->assertContains('nn\\\\tmux', $this->arguments($process));
+
+        // The Compose wrapper reads docker/.env with the same parser.
+        $wrapper = new Process([$this->directory.'/docker/bin/compose'], env: $this->environment(['DC' => 'env']));
+        $wrapper->mustRun();
+        $this->assertStringContainsString("\nWEB_IMAGE=registry/app:\"1\"\n", "\n".$wrapper->getOutput());
+
+        // Other backslash sequences stay as written; `\0NNN` is octal (Compose gives `a\cbA`).
+        file_put_contents($this->directory.'/docker/.env', "DB_ROOTPASSWORD=\"a\\cb\\0101\"\nDB_DATABASE=nntmux\n");
+        $kept = $this->just('docker/Justfile', ['mysql'], ['DC' => $this->directory.'/bin/fake', 'DB_DATABASE' => false]);
+        $kept->mustRun();
+        $this->assertContains('-pa\\cbA', $this->arguments($kept));
+
+        // An escaped backslash before the closing quote still closes it; `\'` unescapes in single quotes.
+        file_put_contents($this->directory.'/docker/.env', "DB_ROOTPASSWORD=\"secret\\\\\" # trailing\nDB_DATABASE='it\\'s'\n");
+        $closed = $this->just('docker/Justfile', ['mysql'], ['DC' => $this->directory.'/bin/fake', 'DB_DATABASE' => false]);
+        $closed->mustRun();
+        $this->assertContains('-psecret\\', $this->arguments($closed));
+        $this->assertContains("it's", $this->arguments($closed));
+
+        // A multi-line value's continuation lines are no assignments of their own.
+        file_put_contents($this->directory.'/docker/.env', "APP_IMAGE=registry/app:1\nNOTE='first\nAPP_IMAGE=evil/app:1\nlast'\n");
+        $multiline = new Process([$this->directory.'/docker/bin/compose'], env: $this->environment(['DC' => 'env']));
+        $multiline->mustRun();
+        $this->assertStringContainsString("\nWEB_IMAGE=registry/app:1\n", "\n".$multiline->getOutput());
+
+        // Compose keeps only the quoted part before trailing text, and reads `KEY: value` and a BOM.
+        file_put_contents($this->directory.'/docker/.env', "\u{FEFF}APP_IMAGE: registry/yaml:1\nDB_ROOTPASSWORD=\"s3cret\" rotated\nDB_DATABASE=nntmux\n");
+        $forms = new Process([$this->directory.'/docker/bin/compose'], env: $this->environment(['DC' => 'env']));
+        $forms->mustRun();
+        $this->assertStringContainsString("\nWEB_IMAGE=registry/yaml:1\n", "\n".$forms->getOutput());
+        $trailing = $this->just('docker/Justfile', ['mysql'], ['DC' => $this->directory.'/bin/fake', 'DB_DATABASE' => false]);
+        $trailing->mustRun();
+        $this->assertContains('-ps3cret', $this->arguments($trailing));
+
+        // `KEY:value` needs no space after the colon.
+        file_put_contents($this->directory.'/docker/.env', "APP_IMAGE:registry/tight:1\n");
+        $tight = new Process([$this->directory.'/docker/bin/compose'], env: $this->environment(['DC' => 'env']));
+        $tight->mustRun();
+        $this->assertStringContainsString("\nWEB_IMAGE=registry/tight:1\n", "\n".$tight->getOutput());
+
+        // An octal-encoded `$` interpolates in Compose too, so a literal key refuses it.
+        file_put_contents($this->directory.'/docker/.env', "DB_ROOTPASSWORD=\"\\0044HOME\"\nDB_DATABASE=nntmux\n");
+        $octal = $this->just('docker/Justfile', ['mysql'], ['DC' => $this->directory.'/bin/fake', 'DB_DATABASE' => false]);
+        $octal->run();
+        $this->assertFalse($octal->isSuccessful());
+
+        // Escapes expand before `$$` is read: an octal `$` before `$HOME` is the literal `$HOME`.
+        file_put_contents($this->directory.'/docker/.env', "DB_ROOTPASSWORD=\"\\0044\$HOME\"\nDB_DATABASE=nntmux\n");
+        $expanded = $this->just('docker/Justfile', ['mysql'], ['DC' => $this->directory.'/bin/fake', 'DB_DATABASE' => false]);
+        $expanded->mustRun();
+        $this->assertContains('-p$HOME', $this->arguments($expanded));
+
+        // `$$` is Compose's literal `$`: no interpolation, one dollar.
+        file_put_contents($this->directory.'/docker/.env', "DB_ROOTPASSWORD=\"pa\$\$word\"\nDB_DATABASE=nntmux\n");
+        $dollars = $this->just('docker/Justfile', ['mysql'], ['DC' => $this->directory.'/bin/fake', 'DB_DATABASE' => false]);
+        $dollars->mustRun();
+        $this->assertContains('-ppa$word', $this->arguments($dollars));
+
+        // An escaped `$` is literal in Compose, so it is no interpolation either.
+        file_put_contents($this->directory.'/docker/.env', "APP_IMAGE=\"registry/\\\$app:1\"\n");
+        $literal = $this->just('docker/Justfile', ['ps'], ['DC' => $this->directory.'/bin/fake']);
+        $literal->mustRun();
+        $this->assertStringContainsString('WEB_IMAGE=[registry/$app:1]', $literal->getOutput());
     }
 
     // T43 ----------------------------------------------------------------------------------------
@@ -328,7 +404,7 @@ SH);
 
     /**
      * @param  list<string>  $arguments
-     * @param  array<string, string>  $environment
+     * @param  array<string, string|false>  $environment
      */
     private function just(string $justfile, array $arguments, array $environment = []): Process
     {
@@ -340,7 +416,7 @@ SH);
     }
 
     /**
-     * @param  array<string, string>  $environment
+     * @param  array<string, string|false>  $environment
      * @return array<string, string|false>
      */
     private function environment(array $environment): array
