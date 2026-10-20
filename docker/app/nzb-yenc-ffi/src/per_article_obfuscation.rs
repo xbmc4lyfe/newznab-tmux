@@ -1,0 +1,637 @@
+//! Rust port of `HeaderParser::markPerArticleObfuscated()`, used through the guarded
+//! `NativePerArticleObfuscation` wrapper with the PHP rule as fallback; parity and speed are
+//! measured by scripts/benchmark-per-article-obfuscation.php. Every pattern is matched byte for byte with
+//! the PCRE semantics PHP uses for these non-UTF patterns: `\s` is ASCII 0x09-0x0D and space,
+//! `\d` is ASCII digits and `.` is any byte but `\n`.
+
+use std::borrow::Cow;
+use std::collections::HashMap;
+
+const TOKEN_LENGTH: usize = 16;
+/// Longer subjects decline. PHP's `pcre.backtrack_limit` (1,000,000) can stop the subject pattern
+/// on crafted whitespace from about 800 bytes, so up to this length both sides match alike.
+const MAX_SUBJECT_LENGTH: usize = 512;
+const USENET_INDEX_POST: &[u8] = b"Usenet Index Post";
+
+/// One article: its number and raw subject.
+pub struct Article<'a> {
+    pub number: i64,
+    pub subject: &'a [u8],
+}
+
+struct Signature<'a> {
+    /// Per distinct name: its first article number and part, and how many articles carry it.
+    names: Vec<(i64, i64, u32)>,
+    /// Names borrow the subject unless normalization changed them.
+    index: HashMap<Cow<'a, [u8]>, usize>,
+    articles: usize,
+    total: i64,
+}
+
+/// Marked article numbers, distinct and ascending; `None` declines (a subject longer than
+/// `MAX_SUBJECT_LENGTH`, or a part or total at PHP's double-rounding boundary), so the caller keeps
+/// the PHP result.
+pub fn mark<'a>(articles: &[Article<'a>], min_articles: usize) -> Option<Vec<i64>> {
+    if min_articles == 0 {
+        return Some(Vec::new());
+    }
+    let mut signatures: Vec<Signature<'a>> = Vec::new();
+    let mut by_key: HashMap<Vec<u8>, usize> = HashMap::new();
+    // Reused buffers: lookups borrow them, and only a new key or name is copied.
+    let mut key = Vec::new();
+    let mut normalized = Vec::new();
+    for article in articles {
+        if article.subject.len() > MAX_SUBJECT_LENGTH {
+            return None;
+        }
+        let Some((name, part, total)) = subject_parts(article.subject) else {
+            continue;
+        };
+        if !has_token(name) {
+            continue;
+        }
+        let total_value = php_int(total)?;
+        if total_value < 2 {
+            continue;
+        }
+        let part_value = php_int(part)?;
+        key.clear();
+        normalized.clear();
+        let changed = shape_and_normalized(name, &mut key, &mut normalized);
+        let normalized_name: &[u8] = if changed { &normalized } else { name };
+        key.push(0);
+        key.extend_from_slice(total);
+        key.push(0);
+        if let Some((files, of)) = file_counter(name) {
+            key.extend_from_slice(files);
+            key.push(b'/');
+            key.extend_from_slice(of);
+        }
+        let slot = match by_key.get(key.as_slice()) {
+            Some(&slot) => slot,
+            None => {
+                signatures.push(Signature {
+                    names: Vec::new(),
+                    index: HashMap::new(),
+                    articles: 0,
+                    total: total_value,
+                });
+                by_key.insert(key.clone(), signatures.len() - 1);
+                signatures.len() - 1
+            }
+        };
+        let signature = &mut signatures[slot];
+        let position = match signature.index.get(normalized_name) {
+            Some(&position) => position,
+            None => {
+                signature.names.push((article.number, part_value, 0));
+                let owned = if changed {
+                    Cow::Owned(normalized.clone())
+                } else {
+                    Cow::Borrowed(name)
+                };
+                signature.index.insert(owned, signature.names.len() - 1);
+                signature.names.len() - 1
+            }
+        };
+        signature.names[position].2 += 1;
+        signature.articles += 1;
+    }
+
+    let mut marked = Vec::new();
+    let mut candidates: Vec<(i64, i64)> = Vec::new();
+    let mut parts: Vec<i64> = Vec::new();
+    for signature in &signatures {
+        if signature.articles < min_articles || signature.names.len() * 10 < signature.articles * 9
+        {
+            continue;
+        }
+        candidates.clear();
+        candidates.extend(
+            signature
+                .names
+                .iter()
+                .filter(|(_, part, count)| *count == 1 && *part != 1 && *part != signature.total)
+                .map(|(number, part, _)| (*number, *part)),
+        );
+        // Keyed by number with the last write winning, as PHP's `$candidates[$number] = $part`.
+        candidates.reverse();
+        candidates.sort_by_key(|(number, _)| *number);
+        candidates.dedup_by_key(|(number, _)| *number);
+        parts.clear();
+        parts.extend(candidates.iter().map(|(_, part)| *part));
+        parts.sort_unstable();
+        parts.dedup();
+        if parts.len() < min_articles {
+            continue;
+        }
+        marked.extend(candidates.iter().map(|(number, _)| *number));
+    }
+    marked.sort_unstable();
+    marked.dedup();
+    Some(marked)
+}
+
+const SPACE: u8 = 1;
+const ALNUM: u8 = 2;
+/// `[`, `(` or whitespace: where a file counter can open.
+const OPENER: u8 = 4;
+
+/// Byte classes, so each scan tests one table entry instead of a chain of comparisons.
+static CLASSES: [u8; 256] = {
+    let mut classes = [0_u8; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        let b = byte as u8;
+        if matches!(b, b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b' ') {
+            classes[byte] |= SPACE | OPENER;
+        }
+        if b.is_ascii_alphanumeric() {
+            classes[byte] |= ALNUM;
+        }
+        if b == b'[' || b == b'(' {
+            classes[byte] |= OPENER;
+        }
+        byte += 1;
+    }
+    classes
+};
+
+fn is_space(byte: u8) -> bool {
+    CLASSES[usize::from(byte)] & SPACE != 0
+}
+
+fn is_alnum(byte: u8) -> bool {
+    CLASSES[usize::from(byte)] & ALNUM != 0
+}
+
+fn digits(bytes: &[u8], from: usize) -> usize {
+    bytes[from..]
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count()
+}
+
+/// `^\s*(?!Usenet Index Post)(.+?)\s+\((\d+)\/(\d+)\)`: base name, part and total, in time
+/// linear in the subject length. PCRE tries starts from the end of the leading whitespace back to
+/// 0 and, for each, the shortest name not crossing a `\n`.
+fn subject_parts(subject: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
+    let lead = subject.iter().take_while(|byte| is_space(**byte)).count();
+    let newline = subject[lead..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(subject.len(), |offset| lead + offset);
+    // The first name end after the leading whitespace; the same for every start, as long as no
+    // `\n` lies between that start and `lead`.
+    let after_lead = first_tail(subject, lead + 1, newline);
+    if !subject[lead..].starts_with(USENET_INDEX_POST)
+        && let Some((end, part, total)) = after_lead
+    {
+        return Some((&subject[lead..end], part, total));
+    }
+    // A start inside the leading whitespace (never `Usenet Index Post`): every end before `lead`
+    // sits in that whitespace run, so its tail is the parenthesized count at `lead`; an end at
+    // `lead` itself has no whitespace before it.
+    let inside = parenthesized(subject, lead);
+    let mut newline_seen = false;
+    for start in (0..lead).rev() {
+        if subject[start] == b'\n' {
+            // `.` cannot match here, and lower starts cannot reach past it.
+            newline_seen = true;
+            continue;
+        }
+        if let (true, Some((part, total))) = (start + 1 < lead, inside) {
+            return Some((&subject[start..start + 1], part, total));
+        }
+        if let (false, Some((end, part, total))) = (newline_seen, after_lead) {
+            return Some((&subject[start..end], part, total));
+        }
+    }
+    None
+}
+
+/// The first `end` in `from..=last` where `\s+\((\d+)\/(\d+)\)` matches. A match needs a `(`
+/// preceded by whitespace, and every end inside that whitespace run shares the same tail, so only
+/// `(` positions are examined; the end is the run's first byte at or after `from`.
+fn first_tail(subject: &[u8], from: usize, last: usize) -> Option<(usize, &[u8], &[u8])> {
+    let mut search = from;
+    while let Some(offset) = subject.get(search..)?.iter().position(|byte| *byte == b'(') {
+        let open = search + offset;
+        let run_start = subject[..open]
+            .iter()
+            .rposition(|byte| !is_space(*byte))
+            .map_or(0, |index| index + 1);
+        let end = run_start.max(from);
+        if end > last {
+            return None;
+        }
+        if end < open
+            && let Some((part, total)) = parenthesized(subject, open)
+        {
+            return Some((end, part, total));
+        }
+        search = open + 1;
+    }
+    None
+}
+
+/// `\((\d+)\/(\d+)\)` at `at`.
+fn parenthesized(subject: &[u8], at: usize) -> Option<(&[u8], &[u8])> {
+    if subject.get(at) != Some(&b'(') {
+        return None;
+    }
+    let mut cursor = at + 1;
+    let part_length = digits(subject, cursor);
+    if part_length == 0 || subject.get(cursor + part_length) != Some(&b'/') {
+        return None;
+    }
+    let part = &subject[cursor..cursor + part_length];
+    cursor += part_length + 1;
+    let total_length = digits(subject, cursor);
+    if total_length == 0 || subject.get(cursor + total_length) != Some(&b')') {
+        return None;
+    }
+    Some((part, &subject[cursor..cursor + total_length]))
+}
+
+/// The first 17 digits of a 309-digit value where PHP's double rounds either to `f64::MAX` or to
+/// infinity; below it PHP's `(int)` saturates, above it (and from 310 digits) the value is
+/// infinite and `(int)` gives 0.
+const PHP_DOUBLE_OVERFLOW_PREFIX: &[u8] = b"17976931348623158";
+
+/// PHP's `(int)` of a digit string with an optional minus sign: exact values in the i64 range,
+/// saturation beyond it, and 0 once PHP's double is infinite. `None` only for 309-digit values
+/// whose first 17 digits are `PHP_DOUBLE_OVERFLOW_PREFIX`, where the rounding needs PHP itself.
+pub fn php_int_signed(negative: bool, digits: &[u8]) -> Option<i64> {
+    let significant = &digits[digits.iter().take_while(|byte| **byte == b'0').count()..];
+    let saturated = if negative { i64::MIN } else { i64::MAX };
+    match significant.len() {
+        310.. => return Some(0),
+        309 => {
+            return match significant[..PHP_DOUBLE_OVERFLOW_PREFIX.len()]
+                .cmp(PHP_DOUBLE_OVERFLOW_PREFIX)
+            {
+                std::cmp::Ordering::Less => Some(saturated),
+                std::cmp::Ordering::Equal => None,
+                std::cmp::Ordering::Greater => Some(0),
+            };
+        }
+        _ => {}
+    }
+    Some(
+        significant
+            .iter()
+            .try_fold(0_i64, |value, byte| {
+                let digit = i64::from(byte - b'0');
+                value
+                    .checked_mul(10)?
+                    .checked_add(if negative { -digit } else { digit })
+            })
+            .unwrap_or(saturated),
+    )
+}
+
+/// PHP's `(int)` of an unsigned ASCII digit string; see `php_int_signed`.
+fn php_int(digits: &[u8]) -> Option<i64> {
+    php_int_signed(false, digits)
+}
+
+fn alnum_runs(name: &[u8]) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut index = 0;
+    std::iter::from_fn(move || {
+        while index < name.len() && !is_alnum(name[index]) {
+            index += 1;
+        }
+        if index >= name.len() {
+            return None;
+        }
+        let start = index;
+        while index < name.len() && is_alnum(name[index]) {
+            index += 1;
+        }
+        Some((start, index))
+    })
+}
+
+fn has_token(name: &[u8]) -> bool {
+    let mut run = 0;
+    for &byte in name {
+        if is_alnum(byte) {
+            run += 1;
+            if run >= TOKEN_LENGTH {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+fn shape(name: &[u8]) -> Vec<u8> {
+    let (mut shape, mut normalized) = (Vec::new(), Vec::new());
+    shape_and_normalized(name, &mut shape, &mut normalized);
+    shape
+}
+
+#[cfg(test)]
+fn normalized_name(name: &[u8]) -> Vec<u8> {
+    let (mut shape, mut normalized) = (Vec::new(), Vec::new());
+    if shape_and_normalized(name, &mut shape, &mut normalized) {
+        normalized
+    } else {
+        name.to_vec()
+    }
+}
+
+/// One pass over the name: the shape (alphanumeric runs collapsed to `x`) and the normalized
+/// name (digits dropped except inside alphanumeric runs of token length). Returns whether the
+/// normalized name differs from the name; when it does not, `normalized` is left empty.
+fn shape_and_normalized(name: &[u8], shape: &mut Vec<u8>, normalized: &mut Vec<u8>) -> bool {
+    let mut cursor = 0;
+    let mut changed = false;
+    for (start, end) in alnum_runs(name) {
+        shape.extend_from_slice(&name[cursor..start]);
+        shape.push(b'x');
+        let run = &name[start..end];
+        if run.len() < TOKEN_LENGTH && run.iter().any(u8::is_ascii_digit) {
+            if !changed {
+                normalized.extend_from_slice(&name[..start]);
+                changed = true;
+            } else {
+                normalized.extend_from_slice(&name[cursor..start]);
+            }
+            normalized.extend(run.iter().filter(|byte| !byte.is_ascii_digit()));
+        } else if changed {
+            normalized.extend_from_slice(&name[cursor..end]);
+        }
+        cursor = end;
+    }
+    shape.extend_from_slice(&name[cursor..]);
+    if changed {
+        normalized.extend_from_slice(&name[cursor..]);
+    }
+    changed
+}
+
+/// `[[(\s](\d{1,5})(\/|[\s_]of[\s_]|-)(\d{1,5})[])[\s$:]` (case-insensitive): first match.
+fn file_counter(name: &[u8]) -> Option<(&[u8], &[u8])> {
+    for open in 0..name.len() {
+        if CLASSES[usize::from(name[open])] & OPENER == 0 {
+            continue;
+        }
+        let first = open + 1;
+        let first_length = digits(name, first);
+        if !(1..=5).contains(&first_length) {
+            continue;
+        }
+        let separator = first + first_length;
+        let second = match name.get(separator) {
+            Some(b'/') | Some(b'-') => separator + 1,
+            Some(&byte)
+                if (is_space(byte) || byte == b'_')
+                    && name.len() >= separator + 4
+                    && name[separator + 1..separator + 3].eq_ignore_ascii_case(b"of")
+                    && (is_space(name[separator + 3]) || name[separator + 3] == b'_') =>
+            {
+                separator + 4
+            }
+            _ => continue,
+        };
+        let second_length = digits(name, second);
+        if !(1..=5).contains(&second_length) {
+            continue;
+        }
+        match name.get(second + second_length) {
+            Some(&close)
+                if matches!(close, b']' | b')' | b'[' | b'$' | b':') || is_space(close) =>
+            {
+                return Some((
+                    &name[first..separator],
+                    &name[second..second + second_length],
+                ));
+            }
+            _ => continue,
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn articles(subjects: &[(i64, String)]) -> Vec<Article<'_>> {
+        subjects
+            .iter()
+            .map(|(number, subject)| Article {
+                number: *number,
+                subject: subject.as_bytes(),
+            })
+            .collect()
+    }
+
+    fn token(seed: u64) -> String {
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let mut state = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (0..32)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                alphabet[(state >> 33) as usize % alphabet.len()] as char
+            })
+            .collect()
+    }
+
+    #[test]
+    fn per_article_obfuscation_marks_random_names_but_not_first_or_last_parts() {
+        let subjects: Vec<(i64, String)> = (0..40)
+            .map(|i| {
+                (
+                    1000 + i,
+                    format!("[40/62] \"{}\" yEnc ({}/687)", token(i as u64), i + 1),
+                )
+            })
+            .collect();
+        let marked = mark(&articles(&subjects), 16).unwrap();
+        assert_eq!(marked.len(), 39);
+        assert!(!marked.contains(&1000));
+    }
+
+    #[test]
+    fn per_article_obfuscation_keeps_repeating_and_round_robin_names() {
+        let repeating: Vec<(i64, String)> = (0..40)
+            .map(|i| {
+                (
+                    i,
+                    format!(
+                        "[40/62] \"{}\" yEnc ({}/687)",
+                        token((i / 2) as u64),
+                        i % 2 + 2
+                    ),
+                )
+            })
+            .collect();
+        assert!(mark(&articles(&repeating), 16).unwrap().is_empty());
+        let round_robin: Vec<(i64, String)> = (0..20)
+            .map(|i| (i, format!("\"{}\" yEnc (2/100)", token(900 + i as u64))))
+            .collect();
+        assert!(mark(&articles(&round_robin), 16).unwrap().is_empty());
+    }
+
+    #[test]
+    fn per_article_obfuscation_matches_php_patterns() {
+        assert_eq!(
+            subject_parts(b"  name.bin (3/9) yEnc"),
+            Some((&b"name.bin"[..], &b"3"[..], &b"9"[..]))
+        );
+        assert_eq!(subject_parts(b"Usenet Index Post (1/2)"), None);
+        assert_eq!(
+            subject_parts(b" Usenet Index Post (1/2)"),
+            Some((&b" Usenet Index Post"[..], &b"1"[..], &b"2"[..]))
+        );
+        assert_eq!(subject_parts(b"a\nb (1/2)"), None);
+        assert_eq!(
+            subject_parts(b" \n  (1/2)"),
+            Some((&b" "[..], &b"1"[..], &b"2"[..]))
+        );
+        assert_eq!(subject_parts(b"\n (1/2)"), None);
+        assert_eq!(
+            subject_parts(b"   (1/2)"),
+            Some((&b" "[..], &b"1"[..], &b"2"[..]))
+        );
+        assert_eq!(
+            subject_parts(b" \nx (1/2)"),
+            Some((&b"x"[..], &b"1"[..], &b"2"[..]))
+        );
+        for subject in [&b"\n\n  (1/2)"[..], b" \n (1/2)"] {
+            assert_eq!(
+                subject_parts(subject),
+                Some((&b" "[..], &b"1"[..], &b"2"[..]))
+            );
+        }
+        assert_eq!(
+            subject_parts(b"  x  (1/2)"),
+            Some((&b"x"[..], &b"1"[..], &b"2"[..]))
+        );
+        assert_eq!(
+            subject_parts(b"  Usenet Index Post (1/2)"),
+            Some((&b" Usenet Index Post"[..], &b"1"[..], &b"2"[..]))
+        );
+        assert_eq!(file_counter(b"x [03/62] y"), Some((&b"03"[..], &b"62"[..])));
+        assert_eq!(
+            file_counter(b"x (3 OF 62) y"),
+            Some((&b"3"[..], &b"62"[..]))
+        );
+        assert_eq!(file_counter(b"x [123456/62] y"), None);
+        assert_eq!(shape(b"[40/62] \"abc.def\""), b"[x/x] \"x.x\"".to_vec());
+        assert_eq!(
+            normalized_name(b"abcdefghijklmno7.part07.rar"),
+            b"abcdefghijklmno7.part.rar".to_vec()
+        );
+        assert_eq!(
+            normalized_name(b"short7.part07.rar"),
+            b"short.part.rar".to_vec()
+        );
+        assert_eq!(php_int(b"0000000000000000000000002"), Some(2));
+        assert_eq!(php_int(b"9223372036854775807"), Some(i64::MAX));
+        assert_eq!(php_int(b"9223372036854775808"), Some(i64::MAX));
+        assert_eq!(php_int(b"000009999999999999999999"), Some(i64::MAX));
+        assert_eq!(php_int("9".repeat(308).as_bytes()), Some(i64::MAX));
+        assert_eq!(
+            php_int(format!("000{}", "9".repeat(308)).as_bytes()),
+            Some(i64::MAX)
+        );
+        let at = |prefix: &str| format!("{prefix}{}", "0".repeat(292));
+        assert_eq!(php_int(at("17976931348623157").as_bytes()), Some(i64::MAX));
+        assert_eq!(php_int(at("17976931348623158").as_bytes()), None);
+        assert_eq!(php_int(at("17976931348623159").as_bytes()), Some(0));
+        assert_eq!(php_int("9".repeat(309).as_bytes()), Some(0));
+        assert_eq!(php_int("1".repeat(310).as_bytes()), Some(0));
+        assert_eq!(php_int_signed(true, "9".repeat(309).as_bytes()), Some(0));
+        assert_eq!(
+            php_int_signed(true, format!("1{}", "0".repeat(308)).as_bytes()),
+            Some(i64::MIN)
+        );
+    }
+
+    /// The previous direct translation of the PCRE search (cubic on whitespace), kept as the
+    /// reference for the linear scan.
+    fn subject_parts_reference(subject: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
+        let lead = subject.iter().take_while(|byte| is_space(**byte)).count();
+        for start in (0..=lead).rev() {
+            if subject[start..].starts_with(USENET_INDEX_POST) {
+                continue;
+            }
+            for end in start + 1..=subject.len() {
+                if subject[end - 1] == b'\n' {
+                    break;
+                }
+                let spaces = subject[end..]
+                    .iter()
+                    .take_while(|byte| is_space(**byte))
+                    .count();
+                if spaces > 0
+                    && let Some((part, total)) = parenthesized(subject, end + spaces)
+                {
+                    return Some((&subject[start..end], part, total));
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn per_article_obfuscation_linear_scan_matches_the_reference_exhaustively() {
+        let alphabet = b" \n\tx(1/)";
+        let mut subject = Vec::new();
+        for length in 0..=7_u32 {
+            for mut code in 0..alphabet.len().pow(length) {
+                subject.clear();
+                for _ in 0..length {
+                    subject.push(alphabet[code % alphabet.len()]);
+                    code /= alphabet.len();
+                }
+                assert_eq!(
+                    subject_parts(&subject),
+                    subject_parts_reference(&subject),
+                    "{subject:?}"
+                );
+                let mut prefixed = b" Usenet Index Post".to_vec();
+                prefixed.extend_from_slice(&subject);
+                assert_eq!(
+                    subject_parts(&prefixed[1..]),
+                    subject_parts_reference(&prefixed[1..])
+                );
+                assert_eq!(subject_parts(&prefixed), subject_parts_reference(&prefixed));
+            }
+        }
+    }
+
+    #[test]
+    fn per_article_obfuscation_is_linear_on_crafted_whitespace() {
+        let started = std::time::Instant::now();
+        for length in [MAX_SUBJECT_LENGTH, 100_000] {
+            let half = " ".repeat(length / 2);
+            for subject in [
+                " ".repeat(length),
+                format!("{})", " ".repeat(length)),
+                format!("{half}x{half}("),
+                format!("{half}{}", "x (1/".repeat(length / 10)),
+            ] {
+                assert_eq!(subject_parts(subject.as_bytes()), None);
+            }
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let long = " ".repeat(MAX_SUBJECT_LENGTH + 1);
+        let headers = [Article {
+            number: 1,
+            subject: long.as_bytes(),
+        }];
+        assert_eq!(mark(&headers, 16), None);
+    }
+}
