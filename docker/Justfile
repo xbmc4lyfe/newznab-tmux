@@ -23,6 +23,7 @@ export DEPLOY_DRAIN_TIMEOUT := env("DEPLOY_DRAIN_TIMEOUT", "")
 export DEPLOY_SCHEDULER_DRAIN_TIMEOUT := env("DEPLOY_SCHEDULER_DRAIN_TIMEOUT", "")
 export DEPLOY_HEALTH_TIMEOUT := env("DEPLOY_HEALTH_TIMEOUT", "")
 export DEPLOY_BY := env("DEPLOY_BY", "")
+export DEPLOY_TARGETS := env("DEPLOY_TARGETS", "")
 export FORCE := env("FORCE", "")
 export s := env("s", "")
 export cmd := env("cmd", "")
@@ -32,10 +33,11 @@ export cmd := env("cmd", "")
 # the database credentials stay unexported shell variables (Compose parses .env itself).
 ENV_FILE := CURDIR + "/.env"
 LOAD_ENV := '''preset=" "
+    TARGET_ARGS=""
     for arg in "$@"; do
-        if [[ "$arg" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]]; then export "$arg"; preset="$preset${BASH_REMATCH[1]} "; fi
+        if [[ "$arg" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]]; then export "$arg"; preset="$preset${BASH_REMATCH[1]} "; else TARGET_ARGS="${TARGET_ARGS:+$TARGET_ARGS }$arg"; fi
     done
-    for key in COMPOSE_FILE DC DEPLOY_BY APP_PORT DB_DATABASE DB_ROOTPASSWORD HELPER_IMAGE BASE_IMAGE APP_IMAGE WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE DEPLOY_MIN_INTERVAL DEPLOY_DRAIN_TIMEOUT DEPLOY_SCHEDULER_DRAIN_TIMEOUT DEPLOY_HEALTH_TIMEOUT DEPLOY_LEGACY_DRAIN_TIMEOUT; do
+    for key in COMPOSE_FILE DC DEPLOY_BY DEPLOY_TARGETS APP_PORT DB_DATABASE DB_ROOTPASSWORD HELPER_IMAGE BASE_IMAGE APP_IMAGE WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE DEPLOY_MIN_INTERVAL DEPLOY_DRAIN_TIMEOUT DEPLOY_SCHEDULER_DRAIN_TIMEOUT DEPLOY_HEALTH_TIMEOUT DEPLOY_LEGACY_DRAIN_TIMEOUT; do
         [ -z "${!key:-}" ] || preset="$preset$key "
     done
     interpolated=" "
@@ -52,7 +54,7 @@ LOAD_ENV := '''preset=" "
         case "$preset" in *" $1 "*) ;; *) printf -v "$1" '%s' "$3" ;; esac
     }
     if [ -f "''' + ENV_FILE + '''" ]; then
-        dotenv_values=$(python3 -I "''' + CURDIR + '''/bin/compose_dotenv.py" "''' + ENV_FILE + '''" COMPOSE_FILE DC DEPLOY_BY APP_PORT DB_DATABASE DB_ROOTPASSWORD HELPER_IMAGE BASE_IMAGE APP_IMAGE WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE DEPLOY_MIN_INTERVAL DEPLOY_DRAIN_TIMEOUT DEPLOY_SCHEDULER_DRAIN_TIMEOUT DEPLOY_HEALTH_TIMEOUT DEPLOY_LEGACY_DRAIN_TIMEOUT) || exit 1
+        dotenv_values=$(python3 -I "''' + CURDIR + '''/bin/compose_dotenv.py" "''' + ENV_FILE + '''" COMPOSE_FILE DC DEPLOY_BY DEPLOY_TARGETS APP_PORT DB_DATABASE DB_ROOTPASSWORD HELPER_IMAGE BASE_IMAGE APP_IMAGE WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE DEPLOY_MIN_INTERVAL DEPLOY_DRAIN_TIMEOUT DEPLOY_SCHEDULER_DRAIN_TIMEOUT DEPLOY_HEALTH_TIMEOUT DEPLOY_LEGACY_DRAIN_TIMEOUT) || exit 1
         eval "$dotenv_values"
         if [ "$interpolated" != " " ]; then
             printf '%s\n' "docker/.env:${interpolated% } must be literal but uses \$ interpolation (or a multi-line value), which the Justfile and docker/bin/compose do not evaluate. Write the final value or single-quote it." >&2
@@ -63,7 +65,7 @@ LOAD_ENV := '''preset=" "
     : "${DC:=docker compose --project-directory ''' + quote(CURDIR) + '''}"
     : "${COMPOSE_FILE:=''' + CURDIR + '''/docker-compose.yml}" "${HELPER_IMAGE:=alpine:3.22.2}" "${BASE_IMAGE:=nntmux/base:local}" "${APP_IMAGE:=nntmux/app:local}"
     : "${DEPLOY_MIN_INTERVAL:=900}" "${DEPLOY_DRAIN_TIMEOUT:=900}" "${DEPLOY_SCHEDULER_DRAIN_TIMEOUT:=1800}" "${DEPLOY_HEALTH_TIMEOUT:=240}"
-    export COMPOSE_FILE DC DEPLOY_BY HELPER_IMAGE BASE_IMAGE APP_IMAGE DEPLOY_MIN_INTERVAL DEPLOY_DRAIN_TIMEOUT DEPLOY_SCHEDULER_DRAIN_TIMEOUT DEPLOY_HEALTH_TIMEOUT
+    export COMPOSE_FILE DC DEPLOY_BY DEPLOY_TARGETS HELPER_IMAGE BASE_IMAGE APP_IMAGE DEPLOY_MIN_INTERVAL DEPLOY_DRAIN_TIMEOUT DEPLOY_SCHEDULER_DRAIN_TIMEOUT DEPLOY_HEALTH_TIMEOUT
     for key in WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE DEPLOY_LEGACY_DRAIN_TIMEOUT; do [ -z "${!key:-}" ] || export "$key"; done'''
 
 # Runs argv[2:] followed by argv[1] parsed with shell quoting (shlex): no eval, no word splitting of
@@ -121,6 +123,8 @@ build *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
+    case "$preset" in *" DEPLOY_TARGETS "*) ;; *) [ -z "$TARGET_ARGS" ] || DEPLOY_TARGETS="$TARGET_ARGS" ;; esac
+    export DEPLOY_TARGETS
     if [ "${APP_IMAGE:-nntmux/app:local}" != "nntmux/app:local" ]; then
         [ -n "${WEB_IMAGE:-}" ] && [ "$WEB_IMAGE" != "nntmux/web:local" ] || WEB_IMAGE="$APP_IMAGE"
         [ -n "${HORIZON_IMAGE:-}" ] && [ "$HORIZON_IMAGE" != "nntmux/horizon:local" ] || HORIZON_IMAGE="$APP_IMAGE"
@@ -135,7 +139,7 @@ build *args:
     export WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE
     SKIP_IF_UNCHANGED=1 STAMP_ON_SUCCESS=1 \
         REQUIRE_IMAGE="$WEB_IMAGE $HORIZON_IMAGE $SCHEDULER_IMAGE $INDEXER_IMAGE" \
-        DEPLOY_STAMP="{{CURDIR}}/.build.stamp" FORCE="$FORCE" \
+        DEPLOY_STAMP="{{CURDIR}}/.build.stamp" FORCE="$FORCE" DEPLOY_TARGETS="$DEPLOY_TARGETS" \
         DEPLOY_MIN_INTERVAL=0 RECORD_DEPLOY_TIME=0 \
         DEPLOY_CONFIG_COMMAND= CHECK_UNCHANGED_COMMAND= CHECK_HEALTH_COMMAND= \
         DEPLOY_BY="$DEPLOY_BY" exec "{{CURDIR}}/bin/deploy-guard" run build -- \
@@ -146,6 +150,8 @@ build-images *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
+    case "$preset" in *" DEPLOY_TARGETS "*) ;; *) [ -z "$TARGET_ARGS" ] || DEPLOY_TARGETS="$TARGET_ARGS" ;; esac
+    export DEPLOY_TARGETS
     "{{CURDIR}}/bin/build-images"
 
 # Inspect per-service change detection, build targets, and selective rollout actions without deploying
@@ -153,16 +159,20 @@ deploy-plan *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
+    case "$preset" in *" DEPLOY_TARGETS "*) ;; *) [ -z "$TARGET_ARGS" ] || DEPLOY_TARGETS="$TARGET_ARGS" ;; esac
+    export DEPLOY_TARGETS
     if [ ! -f "{{CURDIR}}/.env" ]; then
         export DB_PASSWORD="${DB_PASSWORD:-preview}" DB_ROOTPASSWORD="${DB_ROOTPASSWORD:-preview}"
     fi
     DEPLOY_CONFIG_COMMAND="{{CURDIR}}/bin/deploy-current" "{{CURDIR}}/bin/deploy-plan" --explain
 
-# Smart selective deploy: skips non-runtime changes, builds/drains/recreates only affected containers
+# Smart selective deploy: skips non-runtime changes, builds/drains/recreates only affected (or requested) containers
 deploy *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
+    case "$preset" in *" DEPLOY_TARGETS "*) ;; *) [ -z "$TARGET_ARGS" ] || DEPLOY_TARGETS="$TARGET_ARGS" ;; esac
+    export DEPLOY_TARGETS
     if [ "${DRY_RUN:-0}" = "1" ]; then
         if [ ! -f "{{CURDIR}}/.env" ]; then
             export DB_PASSWORD="${DB_PASSWORD:-preview}" DB_ROOTPASSWORD="${DB_ROOTPASSWORD:-preview}"
@@ -192,9 +202,58 @@ deploy *args:
         DEPLOY_SCHEDULER_DRAIN_TIMEOUT="$DEPLOY_SCHEDULER_DRAIN_TIMEOUT" \
         DEPLOY_HEALTH_TIMEOUT="$DEPLOY_HEALTH_TIMEOUT" \
         APP_IMAGE="$APP_IMAGE" WEB_IMAGE="$WEB_IMAGE" HORIZON_IMAGE="$HORIZON_IMAGE" \
-        SCHEDULER_IMAGE="$SCHEDULER_IMAGE" INDEXER_IMAGE="$INDEXER_IMAGE" FORCE="$FORCE" \
+        SCHEDULER_IMAGE="$SCHEDULER_IMAGE" INDEXER_IMAGE="$INDEXER_IMAGE" \
+        FORCE="$FORCE" DEPLOY_TARGETS="$DEPLOY_TARGETS" \
         DEPLOY_BY="$DEPLOY_BY" exec "{{CURDIR}}/bin/deploy-guard" run deploy -- \
         "{{CURDIR}}/bin/deploy-app"
+
+# Deploy only the web service
+deploy-web *args:
+    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy web "$@"
+
+# Deploy only the Horizon queue worker service
+deploy-horizon *args:
+    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy horizon "$@"
+
+# Deploy only the scheduler service (with cooperative drain)
+deploy-scheduler *args:
+    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy scheduler "$@"
+
+# Deploy only the indexer service (with cooperative tmux:drain)
+deploy-indexer *args:
+    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy indexer "$@"
+
+# Deploy only the Caddy reverse proxy service
+deploy-proxy *args:
+    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy proxy "$@"
+
+# Deploy only the monitoring services (Prometheus, Grafana, Pushgateway, exporters)
+deploy-monitoring *args:
+    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy monitoring "$@"
+
+# Deploy only the Redis service (drains writers first)
+deploy-redis *args:
+    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy redis "$@"
+
+# Deploy only the Manticore search service (drains writers first)
+deploy-manticore *args:
+    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy manticore "$@"
+
+# Deploy only the MariaDB database service (drains writers and migrates)
+deploy-mariadb *args:
+    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy mariadb "$@"
+
+# Deploy only the Mailpit service
+deploy-mailpit *args:
+    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy mailpit "$@"
+
+# Deploy only the Grafana service
+deploy-grafana *args:
+    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy grafana "$@"
+
+# Deploy only the Prometheus service
+deploy-prometheus *args:
+    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy prometheus "$@"
 
 # First-time install: build, migrate+seed, indexes, groups, tuning, predb seed, start
 init *args:

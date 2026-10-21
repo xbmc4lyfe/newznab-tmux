@@ -392,6 +392,50 @@ SH);
         $this->assertSame("plain-ps\n", $process->getOutput());
     }
 
+    public function test_component_deploy_recipes_and_positional_targets_forward_deploy_targets(): void
+    {
+        file_put_contents($this->directory.'/docker/bin/deploy-guard', <<<'SH'
+#!/bin/sh
+printf 'DEPLOY_TARGETS=[%s]\n' "${DEPLOY_TARGETS-unset}"
+printf 'DEPLOY_BY=[%s]\n' "${DEPLOY_BY-unset}"
+printf 'FORCE=[%s]\n' "${FORCE-unset}"
+SH);
+        chmod($this->directory.'/docker/bin/deploy-guard', 0755);
+        file_put_contents($this->directory.'/docker/bin/deploy-plan', <<<'SH'
+#!/bin/sh
+printf 'PLAN_TARGETS=[%s]\n' "${DEPLOY_TARGETS-unset}"
+SH);
+        chmod($this->directory.'/docker/bin/deploy-plan', 0755);
+
+        $components = [
+            'web', 'horizon', 'scheduler', 'indexer', 'proxy', 'monitoring',
+            'redis', 'manticore', 'mariadb', 'mailpit', 'grafana', 'prometheus',
+        ];
+        foreach ($components as $component) {
+            foreach (['Justfile', 'docker/Justfile'] as $justfile) {
+                $positional = $this->just($justfile, ['deploy', $component, 'DEPLOY_BY=tester'], ['DC' => $this->directory.'/bin/fake']);
+                $positional->mustRun();
+                $this->assertStringContainsString("DEPLOY_TARGETS=[{$component}]", $positional->getOutput(), "{$justfile} deploy {$component}");
+                $this->assertStringContainsString('DEPLOY_BY=[tester]', $positional->getOutput(), "{$justfile} deploy {$component}");
+
+                $shortcut = $this->just($justfile, ["deploy-{$component}", 'DEPLOY_BY=tester', 'FORCE=1'], ['DC' => $this->directory.'/bin/fake']);
+                $shortcut->mustRun();
+                $this->assertStringContainsString("DEPLOY_TARGETS=[{$component}]", $shortcut->getOutput(), "{$justfile} deploy-{$component}");
+                $this->assertStringContainsString('DEPLOY_BY=[tester]', $shortcut->getOutput(), "{$justfile} deploy-{$component}");
+                $this->assertStringContainsString('FORCE=[1]', $shortcut->getOutput(), "{$justfile} deploy-{$component}");
+            }
+        }
+
+        $plan = $this->just('Justfile', ['deploy-plan', 'web', 'proxy'], ['DC' => $this->directory.'/bin/fake']);
+        $plan->mustRun();
+        $this->assertStringContainsString('PLAN_TARGETS=[web proxy]', $plan->getOutput());
+
+        $build = $this->just('Justfile', ['build-stack', 'indexer', 'DEPLOY_BY=tester'], ['DC' => $this->directory.'/bin/fake']);
+        $build->mustRun();
+        $this->assertStringContainsString('DEPLOY_TARGETS=[indexer]', $build->getOutput());
+        $this->assertStringContainsString('DEPLOY_BY=[tester]', $build->getOutput());
+    }
+
     // helpers ------------------------------------------------------------------------------------
 
     /** @return list<string> the `arg:[...]` lines printed by bin/fake */
@@ -423,7 +467,7 @@ SH);
     {
         // Drop anything of the developer's shell that the recipes would otherwise pick up.
         $clean = [];
-        foreach (['COMPOSE_FILE', 'COMPOSE_PROFILES', 'DC', 'DOCKER_COMPOSE', 'SAIL', 'CMD', 'cmd', 'FORCE', 'MONITORING_ENABLED', 'APP_IMAGE', 'WEB_IMAGE', 'HORIZON_IMAGE', 'SCHEDULER_IMAGE', 'INDEXER_IMAGE', 'BASE_IMAGE', 'HELPER_IMAGE', 'DEPLOY_BY', 'SEARCH_DRIVER', 'FAKE_PS_FAIL'] as $name) {
+        foreach (['COMPOSE_FILE', 'COMPOSE_PROFILES', 'DC', 'DOCKER_COMPOSE', 'SAIL', 'CMD', 'cmd', 'FORCE', 'MONITORING_ENABLED', 'APP_IMAGE', 'WEB_IMAGE', 'HORIZON_IMAGE', 'SCHEDULER_IMAGE', 'INDEXER_IMAGE', 'BASE_IMAGE', 'HELPER_IMAGE', 'DEPLOY_BY', 'DEPLOY_TARGETS', 'SEARCH_DRIVER', 'FAKE_PS_FAIL'] as $name) {
             $clean[$name] = false;
         }
 

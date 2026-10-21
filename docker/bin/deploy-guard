@@ -212,17 +212,21 @@ acquire() {
 
 unchanged() {
     [ "${FORCE:-0}" != 1 ] || return 1
+    [ "${target:-}" = "build" ] || [ -z "${DEPLOY_TARGETS:-}" ] || return 1
     # An owed barrier release must run even when everything else matches again (e.g. reverted).
     [ ! -e "$STAMP.barrier-owed" ] || return 1
     [ "${SKIP_IF_UNCHANGED:-0}" = 1 ] || return 1
     [ -f "$STAMP" ] || return 1
     [ "$(head -n 1 "$STAMP")" = "$(fingerprint)" ] || return 1
     if [ -n "${REQUIRE_IMAGE:-}" ]; then
-        for req_img in $REQUIRE_IMAGE; do
-            docker image inspect "$req_img" >/dev/null 2>&1 || return 1
-        done
-        # A pending build (e.g. a base image refreshed in place) is not "unchanged", for the deploy
-        # target too. Its targets live in the build stamp, not the deployment stamp.
+        if [ -z "${DEPLOY_TARGETS:-}" ]; then
+            for req_img in $REQUIRE_IMAGE; do
+                docker image inspect "$req_img" >/dev/null 2>&1 || return 1
+            done
+        fi
+        # A pending build (e.g. a base image refreshed in place, or an earlier targeted build) is
+        # not "unchanged", for the deploy target too. Its targets live in the build stamp, not the
+        # deployment stamp.
         build_stamp=$STAMP
         [ "${target:-}" = "build" ] || build_stamp="$DIR/.build.stamp"
         # A failing planner is not "nothing to build".
@@ -237,6 +241,7 @@ unchanged() {
 
 cooldown() {
     [ "${FORCE:-0}" != 1 ] || return 1
+    [ -z "${DEPLOY_TARGETS:-}" ] || return 1
     # Never defer an owed barrier release: remote workers stay paused until it runs.
     [ ! -e "$STAMP.barrier-owed" ] || return 1
     interval=${DEPLOY_MIN_INTERVAL:-0}
@@ -411,7 +416,12 @@ cmd_run() {
             echo "deploy-guard: $target completed but its stamp could not be written; the next run re-plans." >&2
             rc=1
         elif [ "$(head -n 1 "$stamp_tmp")" = "$before" ]; then
-            mv -f "$stamp_tmp" "$STAMP"
+            if grep -q '^partial=1$' "$stamp_tmp"; then
+                { echo stale; grep -v '^partial=1$' "$stamp_tmp" | tail -n +2; } >"$stamp_tmp.partial" && mv -f "$stamp_tmp.partial" "$STAMP"
+                rm -f "$stamp_tmp" "$stamp_tmp.partial"
+            else
+                mv -f "$stamp_tmp" "$STAMP"
+            fi
             if [ -f "$DEPLOY_NOOP_MARKER" ]; then
                 noop=1
             elif [ "${RECORD_DEPLOY_TIME:-0}" = 1 ]; then
