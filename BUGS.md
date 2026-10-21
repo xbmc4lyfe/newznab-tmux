@@ -6,20 +6,20 @@ These bugs turned up while building and running the self-hosted stack in `docker
 
 ## App code
 
-### 1. `UsenetGroup::deleteGroup()` throws a TypeError after deleting the group (Open)
+### 1. `UsenetGroup::deleteGroup()` throws a TypeError after deleting the group (Fixed)
 
-- **Where:** `app/Models/UsenetGroup.php:316-321`. Called from `AdminAjaxController.php:96`, which handles the administrator action that deletes a group.
+- **Where:** `app/Models/UsenetGroup.php:420-425`. Called from `AdminAjaxController.php:96`, which handles the administrator action that deletes a group.
 - **Bug:** the method is declared `: bool`, but it returns `self::query()->where('id', $id)->delete()`, which is an `int`.
 - **Symptom:** `Return value must be of type bool, int returned`. By the time the error fires, the purge and the delete have already happened, so the administrator UI reports an error for an action that actually succeeded.
 - **Reproduce:** call `UsenetGroup::deleteGroup($id)` for any group. This surfaced while pruning groups.
-- **Fix:** `return self::query()->where('id', $id)->delete() > 0;`
+- **Fix:** `return self::query()->where('id', $id)->delete() > 0;`. Covered by `AdminGroupControllerTest::test_delete_group_returns_bool_and_purges_group_artifacts_via_admin_ajax`.
 
-### 2. Purging or deleting a group leaves its collections, binaries and parts behind (Open)
+### 2. Purging or deleting a group leaves its collections, binaries and parts behind (Fixed)
 
-- **Where:** `UsenetGroup::purge($id)` → `reset($id)` (`app/Models/UsenetGroup.php:330-345, 390-410`).
+- **Where:** `UsenetGroup::purge($id)` → `reset($id)` (`app/Models/UsenetGroup.php:434-510`).
 - **Bug:** `reset($id)` deletes only `missed_parts` for the group. `collections` rows are removed only by `resetall()`, which truncates every group.
 - **Symptom:** after deleting a group, its unfinished collections stay in the database with a `groups_id` that no longer exists. Binaries and parts cascade from collections, so they stay too. Pruning about 40k groups left **16,756** orphaned collections that had to be deleted by hand.
-- **Fix:** in `reset($id)`, run `Collection::query()->where('groups_id', $id)->delete()`. The binaries and parts foreign keys are `ON DELETE CASCADE`, so this also removes them.
+- **Fix:** in `reset($id)`, delete the group's `collections` rows (`Collection::query()->where('groups_id', $id)->delete()`, with explicit descendant cleanup on SQLite where foreign keys are not enforced). On MariaDB/MySQL, the `binaries`, `parts`, and `collection_groups` foreign keys are `ON DELETE CASCADE`, so this also removes them. Covered by `AdminGroupControllerTest::test_reset_group_deletes_group_collections_binaries_parts_and_missed_parts`.
 
 ### 3. Music and Games browse pages show broken cover images (Fixed)
 
