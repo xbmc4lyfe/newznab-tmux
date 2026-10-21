@@ -30,7 +30,7 @@ services:
                 condition: service_healthy
     worker:
         command: >
-            sh -c "php artisan tmux-ui:start & php artisan horizon"
+            sh -c "php artisan tmux:start & php artisan horizon"
         image: pyrowman/nntmux:latest
         extra_hosts:
             - 'host.docker.internal:host-gateway'

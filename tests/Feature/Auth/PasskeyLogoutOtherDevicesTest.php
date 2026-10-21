@@ -6,7 +6,6 @@ namespace Tests\Feature\Auth;
 
 use App\Events\UserLoggedIn;
 use Illuminate\Auth\Events\OtherDeviceLogout;
-use Illuminate\Contracts\Auth\Authenticatable;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Route;
 use Spatie\LaravelPasskeys\Models\Passkey;
@@ -62,13 +61,11 @@ final class PasskeyLogoutOtherDevicesTest extends PasskeyAuthenticationTest
         $user = $this->createUser('passkey-stale-session@example.test');
         $user->forceFill(['session_token' => 'current_user_token'])->save();
 
-        /** @var Authenticatable $auth */
-        $auth = $user;
-
-        $this->actingAs($auth)
+        $this->actingAs($user)
             ->withSession(['session_token_web' => 'stale_wrong_token'])
             ->get('/__session_token_probe')
-            ->assertRedirect(route('login'));
+            ->assertRedirect(route('login'))
+            ->assertSessionHas('info', 'You were logged out because your account was signed in on another device or session.');
 
         $this->assertGuest();
     }
@@ -78,10 +75,7 @@ final class PasskeyLogoutOtherDevicesTest extends PasskeyAuthenticationTest
         $user = $this->createUser('passkey-adopt-session@example.test');
         $user->forceFill(['session_token' => 'adopt_me_token'])->save();
 
-        /** @var Authenticatable $auth */
-        $auth = $user;
-
-        $this->actingAs($auth)
+        $this->actingAs($user)
             ->get('/__session_token_probe')
             ->assertOk();
 

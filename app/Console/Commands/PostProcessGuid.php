@@ -37,11 +37,17 @@ class PostProcessGuid extends Command
      */
     protected $description = 'Post process releases by GUID character';
 
+    private ?AdditionalProcessingOrchestrator $additionalProcessor = null;
+
     public function __construct(
-        private readonly PostProcessService $postProcessService,
-        private readonly AdditionalProcessingOrchestrator $additionalProcessor
+        private readonly PostProcessService $postProcessService
     ) {
         parent::__construct();
+    }
+
+    private function additionalProcessor(): AdditionalProcessingOrchestrator
+    {
+        return $this->additionalProcessor ??= app(AdditionalProcessingOrchestrator::class);
     }
 
     /**
@@ -97,7 +103,7 @@ class PostProcessGuid extends Command
 
         try {
             for ($batch = 0; $batch < $maxBatches && microtime(true) < $deadline; $batch++) {
-                $result = $this->additionalProcessor->start('', $guid, $workerToken, $excludedReleaseIds);
+                $result = $this->additionalProcessor()->start('', $guid, $workerToken, $excludedReleaseIds);
                 if ((bool) $this->option('profile')) {
                     $this->writeAdditionalProfile($guid, $batch + 1, $result);
                 }
@@ -110,7 +116,7 @@ class PostProcessGuid extends Command
                 ]));
             }
         } finally {
-            $this->additionalProcessor->finish();
+            $this->additionalProcessor()->finish();
         }
     }
 

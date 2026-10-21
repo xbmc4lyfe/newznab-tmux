@@ -581,14 +581,21 @@ class NNTPService extends NntpClient
      */
     public function doConnect(bool $compression = true, bool $alternate = false): mixed
     {
+        $primaryAddresses = @gethostbynamel($this->_configServer);
+        $alternateAddresses = $this->_configAlternateServer !== ''
+            ? @gethostbynamel($this->_configAlternateServer)
+            : false;
         $primaryUSP = [
-            'ip' => gethostbyname($this->_configServer),
+            'host' => $this->_configServer,
+            'ip' => is_array($primaryAddresses) && $primaryAddresses !== [] ? $primaryAddresses[0] : gethostbyname($this->_configServer),
+            'ips' => is_array($primaryAddresses) ? $primaryAddresses : [],
             'port' => $this->_configPort,
-        ];
-        $alternateUSP = [
-            'ip_a' => gethostbyname($this->_configAlternateServer),
+            'host_a' => $this->_configAlternateServer,
+            'ip_a' => is_array($alternateAddresses) && $alternateAddresses !== [] ? $alternateAddresses[0] : ($this->_configAlternateServer !== '' ? gethostbyname($this->_configAlternateServer) : false),
+            'ips_a' => is_array($alternateAddresses) ? $alternateAddresses : [],
             'port_a' => $this->_configAlternatePort,
         ];
+        $alternateUSP = $primaryUSP;
         $primaryConnections = $this->_tmux->getUSPConnections('primary', $primaryUSP);
         $alternateConnections = $this->_tmux->getUSPConnections('alternate', $alternateUSP);
         if ($this->_isConnected() && $this->_usingAlternateServer === $alternate && (($alternate && $this->_currentServer === $this->_configAlternateServer && ($this->_primaryNntpConnections < $alternateConnections['alternate']['active'])) || (! $alternate && $this->_currentServer === $this->_configServer && ($this->_primaryNntpConnections < $primaryConnections['primary']['active'])))) {

@@ -1240,8 +1240,7 @@ class NntmuxPopulateSearchIndexes extends Command
                 DB::statement('SET UNIQUE_CHECKS = 0');
                 DB::statement('SET AUTOCOMMIT = 0');
 
-                // Increase buffer sizes
-                DB::statement('SET SESSION innodb_buffer_pool_size = 1073741824'); // 1GB
+                // Increase session buffer sizes (innodb_buffer_pool_size is global-only)
                 DB::statement('SET SESSION bulk_insert_buffer_size = 268435456'); // 256MB
                 DB::statement('SET SESSION read_buffer_size = 2097152'); // 2MB
                 DB::statement('SET SESSION sort_buffer_size = 16777216'); // 16MB

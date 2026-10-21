@@ -87,9 +87,11 @@ class NntmuxResetDb extends Command
             $arr = [
                 'binaries',
                 'collections',
+                'collection_groups',
                 'parts',
                 'missed_parts',
                 'videos',
+                'videos_aliases',
                 'tv_episodes',
                 'tv_info',
                 'release_nfos',
@@ -100,6 +102,9 @@ class NntmuxResetDb extends Command
                 'user_series',
                 'movieinfo',
                 'musicinfo',
+                'bookinfo',
+                'consoleinfo',
+                'gamesinfo',
                 'release_files',
                 'audio_data',
                 'release_subtitles',
@@ -112,6 +117,11 @@ class NntmuxResetDb extends Command
                 'par2_hash_retry',
                 'par2_rename_candidate_progress',
                 'par2_rename_progress',
+                'release_regexes',
+                'release_unique',
+                'release_reports',
+                'release_nzb_creation_failures',
+                'release_nzb_passwords',
                 'releases',
                 'anidb_titles',
                 'anidb_info',
@@ -304,7 +314,7 @@ class NntmuxResetDb extends Command
                 $this->info('All done! ElasticSearch indexes are deleted and recreated.');
             } else {
                 Search::truncateIndex([
-                    'releases_rt', 'predb_rt', 'movies_rt', 'tvshows_rt',
+                    'releases_rt', 'movies_rt', 'tvshows_rt',
                     'music_rt', 'books_rt', 'games_rt', 'console_rt', 'steam_rt', 'anime_rt',
                 ]);
             }
