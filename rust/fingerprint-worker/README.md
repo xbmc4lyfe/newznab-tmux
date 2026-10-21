@@ -45,6 +45,21 @@ Use a unique worker ID on each laptop. `NNTP_SERVER_A`, `NNTP_PORT_A`, `NNTP_SSL
 and the configured hostname.
 `NNTP_TIMEOUT` defaults to 20 seconds per I/O operation.
 
+Each task keeps its authenticated, profiled primary connection between releases instead of
+connecting, authenticating and profiling for every release; the shared budget row stays leased
+for as long as the connection lives. A connection is dropped (socket closed first, then its row
+released) when it is poisoned or stale, has waited more than `FINGERPRINT_CONNECTION_IDLE`
+seconds (default 20, `0` restores a connection per release), is 60 seconds old, loses its
+lease, belongs to a cancelled job, or the worker drains. A task of the same process that cannot
+lease a row makes every holder give its row back at the end of its job, so oversubscribing
+`FINGERPRINT_CONCURRENCY` against the shared budget still rotates rows. Other hosts' waiters are
+invisible, so each connection is retired every 60 seconds to offer its row to them. Keep each
+host's `FINGERPRINT_CONCURRENCY` at or below its share of the budget. The alternate provider
+is not retained: it serves a small share of releases from a small budget, and its shared
+cooldown and single-prober recovery are unchanged. Every `completed` log line reports where
+the job's time went (`timings_ms`: claim, slot, connect, profile, articles, finish, total) and
+how many connections were opened or reused.
+
 All clients share the rows in `release_fingerprint_connections`: one row permits one
 live connection. The migration reserves 32 primary and 8 alternate slots in total,
 not per laptop. Reserve the remaining account allowance for other application
@@ -84,10 +99,15 @@ server, temporarily cap the shared primary budget at two, verify six unique resu
 and the observed socket cap, then restore the previous slot inventory. Without that variable, the database test prints a skip explanation; unit/socket
 and gzip tests still run. Do not point this variable at production.
 
-The first version opens provider connections per release and reuses them for that
-release's sampled articles; it does not yet retain connections between releases.
-No production speedup is assumed from the Rust rewrite. Benchmark provider setup,
-network throughput and aggregate completion rate before replacing the live workers.
+Reuse removes only per-release connection setup (TCP, TLS, greeting, AUTHINFO,
+CAPABILITIES, OVERVIEW.FMT). The sampled ARTICLE retrievals stay sequential on one
+connection, so on transfer-bound providers the gain is bounded by the setup share of the
+slot-hold time. `timings_ms` in the `completed` log shows that share for a real provider.
+For a paired old/new measurement against a latency-injecting scripted NNTP server, build
+`examples/bench_reuse` (`cargo build --release --examples`) and point it at two worker
+binaries and a disposable database; it needs the same migrated schema as the integration tests.
+No production speedup is assumed. Benchmark provider setup, network throughput and aggregate
+completion rate before replacing the live workers.
 NZB storage accepts up to 128 MiB decoded, while the compact manifest analyzer retains
 the PHP collector's 32 MiB parsing ceiling. Larger manifests fail collection rather
 than being silently truncated or reported complete.
