@@ -57,7 +57,7 @@ final class ProcessingRuntimeStateRepository
 
     public function state(): ProcessingRuntimeState
     {
-        if (! $this->tableExists()) {
+        if (! Schema::hasTable('processing_runtime_states')) {
             return (new ProcessingRuntimeState)->forceFill([
                 'id' => ProcessingRuntimeState::SINGLETON_ID,
                 'tmux_running' => false,
@@ -85,15 +85,6 @@ final class ProcessingRuntimeStateRepository
     {
         if (! Schema::hasTable('processing_runtime_states')) {
             throw new RuntimeException('The processing runtime state table is not available. Run migrations before starting workers.');
-        }
-    }
-
-    private function tableExists(): bool
-    {
-        try {
-            return Schema::hasTable('processing_runtime_states');
-        } catch (\Throwable) {
-            return false;
         }
     }
 }

@@ -74,7 +74,7 @@ final class ReleaseProcessingService
 
     private bool $echoCLI;
 
-    private readonly ProcessReleasesSettings $settings;
+    private ?ProcessReleasesSettings $settings = null;
 
     private readonly NzbService $nzb;
 
@@ -90,7 +90,7 @@ final class ReleaseProcessingService
 
     private readonly ?PostProcessService $postProcessService;
 
-    private readonly BinariesConfig $binariesConfig;
+    private ?BinariesConfig $binariesConfig = null;
 
     public function __construct(
         ?NzbService $nzb = null,
@@ -118,10 +118,22 @@ final class ReleaseProcessingService
                 app(ReleaseDuplicateFinder::class)
             );
         $this->postProcessService = $postProcessService;
-        $this->binariesConfig = $binariesConfig ?? BinariesConfig::fromSettings();
+        $this->binariesConfig = $binariesConfig;
+    }
 
-        $this->settings = $this->loadSettings();
-        $this->validateSettings();
+    private function binariesConfig(): BinariesConfig
+    {
+        return $this->binariesConfig ??= BinariesConfig::fromSettings();
+    }
+
+    private function settings(): ProcessReleasesSettings
+    {
+        if ($this->settings === null) {
+            $this->settings = $this->loadSettings();
+            $this->validateSettings();
+        }
+
+        return $this->settings;
     }
 
     /**
@@ -140,7 +152,7 @@ final class ReleaseProcessingService
      */
     private function validateSettings(): void
     {
-        if (! $this->settings->hasValidCompletion()) {
+        if ($this->settings !== null && ! $this->settings->hasValidCompletion()) {
             cli()->error(
                 PHP_EOL.'Invalid completion setting. Value must be between 0 and 100.'
             );
@@ -156,7 +168,7 @@ final class ReleaseProcessingService
      */
     public function getCompletion(): int
     {
-        return $this->settings->completion;
+        return $this->settings()->completion;
     }
 
     /**
@@ -164,7 +176,7 @@ final class ReleaseProcessingService
      */
     public function getReleaseCreationLimit(): int
     {
-        return $this->settings->releaseCreationLimit;
+        return $this->settings()->releaseCreationLimit;
     }
 
     /**
@@ -172,7 +184,7 @@ final class ReleaseProcessingService
      */
     public function getCollectionDelayTime(): int
     {
-        return $this->settings->collectionDelayTime;
+        return $this->settings()->collectionDelayTime;
     }
 
     /**
@@ -180,7 +192,7 @@ final class ReleaseProcessingService
      */
     public function getCrossPostTime(): int
     {
-        return $this->settings->crossPostTime;
+        return $this->settings()->crossPostTime;
     }
 
     /**
@@ -297,7 +309,7 @@ final class ReleaseProcessingService
         ?callable $afterPass = null,
     ): array {
         $totals = ['releases' => 0, 'nzbs' => 0, 'dupes' => 0, 'iterations' => 0];
-        $limit = max(1, $this->settings->releaseCreationLimit);
+        $limit = max(1, $this->settings()->releaseCreationLimit);
         $windowSize = min(self::BATCH_SIZE, $limit);
         $normalizedGroupId = $this->normalizeGroupId($groupID);
         $candidateQuery = config('release_verification.required', true)
@@ -407,7 +419,7 @@ final class ReleaseProcessingService
         if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
             return ['releases' => 0, 'nzbs' => 0, 'dupes' => 0, 'iterations' => 0];
         }
-        $limit = min(self::READY_WINDOW_SIZE, max(1, $this->settings->releaseCreationLimit));
+        $limit = min(self::READY_WINDOW_SIZE, max(1, $this->settings()->releaseCreationLimit));
         $cursorKey = self::READY_WINDOW_CURSOR_PREFIX.$groupId;
         $savedState = Cache::get($cursorKey);
         $state = $this->isValidPriorityWindowState($savedState, $groupId) ? $savedState : ['max_id' => (int) Collection::query()->max('id'), 'group_ids' => [$groupId], 'position' => 0, 'cursors' => [], 'exhausted' => []];
@@ -448,7 +460,7 @@ final class ReleaseProcessingService
         if (app(ProcessingRuntimeStateRepository::class)->stopRequested()) {
             return $totals;
         }
-        $windowSize = max(1, min(self::BATCH_SIZE, $this->settings->releaseCreationLimit));
+        $windowSize = max(1, min(self::BATCH_SIZE, $this->settings()->releaseCreationLimit));
 
         $this->processIncompleteCollections($groupId, function (array $ids) use ($groupId, $windowSize, $afterCreation, &$totals): void {
             foreach (array_chunk($ids, $windowSize) as $windowIds) {
@@ -616,13 +628,13 @@ final class ReleaseProcessingService
             $probes++;
             $groupSettings = UsenetGroup::getGroupByID($probeGroupId);
             $applyNumeric = $groupId !== null || (int) ($groupSettings['active'] ?? 0) === 1;
-            $minSize = $applyNumeric ? max((int) ($groupSettings['minsizetoformrelease'] ?? 0), $this->settings->minSizeToFormRelease) : 0;
-            $minFiles = $applyNumeric ? max((int) ($groupSettings['minfilestoformrelease'] ?? 0), $this->settings->minFilesToFormRelease) : 0;
+            $minSize = $applyNumeric ? max((int) ($groupSettings['minsizetoformrelease'] ?? 0), $this->settings()->minSizeToFormRelease) : 0;
+            $minFiles = $applyNumeric ? max((int) ($groupSettings['minfilestoformrelease'] ?? 0), $this->settings()->minFilesToFormRelease) : 0;
             $query = Collection::query()->where('groups_id', $probeGroupId)
                 ->where('filecheck', CollectionFileCheckStatus::Sized->value)
                 ->where('filesize', '>=', max(1, $minSize))->where('id', '<=', $state['max_id']);
-            if ($applyNumeric && $this->settings->maxSizeToFormRelease > 0) {
-                $query->where('filesize', '<=', $this->settings->maxSizeToFormRelease);
+            if ($applyNumeric && $this->settings()->maxSizeToFormRelease > 0) {
+                $query->where('filesize', '<=', $this->settings()->maxSizeToFormRelease);
             }
             if ($minFiles > 0) {
                 $query->where('totalfiles', '>=', $minFiles);
@@ -776,11 +788,11 @@ final class ReleaseProcessingService
         // The capped reconciliation walk may not have reached a page yet, so each page is
         // reconciled from its stored parts before it is promoted.
         $pages = 0;
-        $deadline = now()->addSeconds($this->binariesConfig->reconcilePassSeconds);
+        $deadline = now()->addSeconds($this->binariesConfig()->reconcilePassSeconds);
         $statuses = $this->reconcileStatuses();
         do {
             if (app(ProcessingRuntimeStateRepository::class)->stopRequested()
-                || $pages >= $this->binariesConfig->reconcilePagesPerPass || now()->gte($deadline)) {
+                || $pages >= $this->binariesConfig()->reconcilePagesPerPass || now()->gte($deadline)) {
                 break;
             }
             $pages++;
@@ -789,7 +801,7 @@ final class ReleaseProcessingService
                 ->where('filecheck', CollectionFileCheckStatus::CompleteParts->value)
                 ->when($normalizedGroupId !== null, static fn ($q) => $q->where('groups_id', $normalizedGroupId))
                 ->orderBy('id')
-                ->limit($this->binariesConfig->reconcileBatchSize)
+                ->limit($this->binariesConfig()->reconcileBatchSize)
                 ->pluck('id')->map(static fn ($id): int => (int) $id)->all();
             if ($ids === []) {
                 break;
@@ -803,7 +815,7 @@ final class ReleaseProcessingService
             });
             $lastId = (int) end($ids);
             $updated += $sized;
-        } while (\count($ids) === $this->binariesConfig->reconcileBatchSize);
+        } while (\count($ids) === $this->binariesConfig()->reconcileBatchSize);
 
         $this->outputStat('Collections sized', $updated);
         $this->outputElapsedTime($startTime);
@@ -829,7 +841,7 @@ final class ReleaseProcessingService
         $cursorKey = self::RECONCILE_CURSOR_PREFIX.($groupId === null ? 'all' : 'group:'.$groupId);
         [$lastId, $maxId] = $this->reconcileCursor($cursorKey);
         $pages = 0;
-        $deadline = now()->addSeconds($this->binariesConfig->reconcilePassSeconds);
+        $deadline = now()->addSeconds($this->binariesConfig()->reconcilePassSeconds);
         $statuses = $this->reconcileStatuses();
 
         do {
@@ -848,13 +860,13 @@ final class ReleaseProcessingService
                                     [CollectionFileCheckStatus::CompleteParts->value]
                                 )))->whereRaw(
                                     'COALESCE(dateadded, added) < ?',
-                                    [now()->subHours($this->settings->collectionDelayTime)]
+                                    [now()->subHours($this->settings()->collectionDelayTime)]
                                 );
                             });
                     })
                     ->when($groupId !== null, static fn ($q) => $q->where('groups_id', $groupId))
                     ->orderBy('id')
-                    ->limit($this->binariesConfig->reconcileBatchSize);
+                    ->limit($this->binariesConfig()->reconcileBatchSize);
                 $ids = $query->pluck('id')->map(static fn ($id): int => (int) $id)->all();
                 if ($ids !== []) {
                     $this->reconcileCollectionIds($ids, $statuses);
@@ -867,7 +879,7 @@ final class ReleaseProcessingService
                 break;
             }
             $lastId = (int) end($ids);
-            $finished = \count($ids) < $this->binariesConfig->reconcileBatchSize || $lastId >= $maxId;
+            $finished = \count($ids) < $this->binariesConfig()->reconcileBatchSize || $lastId >= $maxId;
             // Store the position before creating releases, so a failed page is not walked again first.
             if ($finished) {
                 Cache::forget($cursorKey);
@@ -878,7 +890,7 @@ final class ReleaseProcessingService
                 $afterReconciliation($ids);
             }
             $pages++;
-        } while (! $finished && $pages < $this->binariesConfig->reconcilePagesPerPass && now()->lt($deadline));
+        } while (! $finished && $pages < $this->binariesConfig()->reconcilePagesPerPass && now()->lt($deadline));
     }
 
     /**
@@ -927,7 +939,7 @@ final class ReleaseProcessingService
         }
 
         return app(CollectionReconciliationBarrier::class)
-            ->withReconciliationBarrier($this->settings->collectionDelayTime, $work);
+            ->withReconciliationBarrier($this->settings()->collectionDelayTime, $work);
     }
 
     /**
@@ -959,7 +971,7 @@ final class ReleaseProcessingService
             ->orderBy('id')
             ->get(['id', 'totalparts', 'currentparts', 'partsize', 'partcheck']);
 
-        foreach ($binaries->chunk(max(1, $this->binariesConfig->sqlChunkSize)) as $chunk) {
+        foreach ($binaries->chunk(max(1, $this->binariesConfig()->sqlChunkSize)) as $chunk) {
             $parts = DB::table('parts')
                 ->whereIn('binaries_id', $chunk->pluck('id')->all())
                 ->groupBy('binaries_id')
@@ -1010,7 +1022,7 @@ final class ReleaseProcessingService
                 COALESCE(SUM(partsize), 0) AS filesize')
             ->get()
             ->keyBy('collections_id');
-        $staleBefore = now()->subHours($this->settings->collectionDelayTime)->format('Y-m-d H:i:s');
+        $staleBefore = now()->subHours($this->settings()->collectionDelayTime)->format('Y-m-d H:i:s');
         $changes = [];
 
         foreach ($collections as $collection) {
@@ -1052,7 +1064,7 @@ final class ReleaseProcessingService
      */
     private function writeCollectionAggregates(array $changes): void
     {
-        foreach (array_chunk($changes, max(1, min(500, $this->binariesConfig->sqlChunkSize))) as $chunk) {
+        foreach (array_chunk($changes, max(1, min(500, $this->binariesConfig()->sqlChunkSize))) as $chunk) {
             $set = ['filesize' => [], 'totalfiles' => [], 'filecheck' => []];
             $guard = [];
             $bindings = ['filesize' => [], 'totalfiles' => [], 'filecheck' => [], 'guard' => [], 'ids' => []];
@@ -1143,7 +1155,7 @@ final class ReleaseProcessingService
                 continue;
             }
 
-            $effectiveMinSize = max($groupMinSize, $this->settings->minSizeToFormRelease);
+            $effectiveMinSize = max($groupMinSize, $this->settings()->minSizeToFormRelease);
             if ($effectiveMinSize > 0) {
                 $ids = Collection::query()
                     ->where('filecheck', CollectionFileCheckStatus::Sized->value)
@@ -1156,18 +1168,18 @@ final class ReleaseProcessingService
                 $stats['minSize'] += $this->deleteCollectionQueryInBatches($ids, 'Min-size cleanup', $rejectedIds);
             }
 
-            if ($this->settings->maxSizeToFormRelease > 0) {
+            if ($this->settings()->maxSizeToFormRelease > 0) {
                 $ids = Collection::query()
                     ->where('filecheck', CollectionFileCheckStatus::Sized->value)
                     ->where('groups_id', (int) $grpID['id'])
-                    ->where('filesize', '>', $this->settings->maxSizeToFormRelease);
+                    ->where('filesize', '>', $this->settings()->maxSizeToFormRelease);
                 if ($windowIds !== null) {
                     $ids->whereIn('id', $windowIds);
                 }
                 $stats['maxSize'] += $this->deleteCollectionQueryInBatches($ids, 'Max-size cleanup', $rejectedIds);
             }
 
-            $effectiveMinFiles = max($groupMinFiles, $this->settings->minFilesToFormRelease);
+            $effectiveMinFiles = max($groupMinFiles, $this->settings()->minFilesToFormRelease);
             if ($effectiveMinFiles > 0) {
                 $ids = Collection::query()
                     ->where('filecheck', CollectionFileCheckStatus::Sized->value)
@@ -1197,7 +1209,7 @@ final class ReleaseProcessingService
     {
         $result = $this->releaseCreationService->createReleases(
             $groupID,
-            $this->settings->releaseCreationLimit,
+            $this->settings()->releaseCreationLimit,
             $this->echoCLI,
             $allowedIds
         );
@@ -1244,7 +1256,7 @@ final class ReleaseProcessingService
         $retryCount = 0;
         $deletedCount = 0;
         $claimToken = bin2hex(random_bytes(16));
-        $limit = max(1, $this->settings->releaseCreationLimit);
+        $limit = max(1, $this->settings()->releaseCreationLimit);
         if ($maxReleases !== null) {
             $limit = min($limit, max(1, $maxReleases));
         }
@@ -1620,7 +1632,7 @@ final class ReleaseProcessingService
             ->whereRaw(
                 'GREATEST(IFNULL(usenet_groups.minsizetoformrelease, 0), ?) > 0 '.
                 'AND releases.size < GREATEST(IFNULL(usenet_groups.minsizetoformrelease, 0), ?)',
-                [$this->settings->minSizeToFormRelease, $this->settings->minSizeToFormRelease]
+                [$this->settings()->minSizeToFormRelease, $this->settings()->minSizeToFormRelease]
             )
             ->select(['releases.id', 'releases.guid'])
             ->get();
@@ -1636,13 +1648,13 @@ final class ReleaseProcessingService
      */
     private function deleteReleasesOverMaxSize(int|string $groupId, array &$stats): void
     {
-        if ($this->settings->maxSizeToFormRelease <= 0) {
+        if ($this->settings()->maxSizeToFormRelease <= 0) {
             return;
         }
 
         $releases = Release::query()
             ->where('groups_id', $groupId)
-            ->where('size', '>', $this->settings->maxSizeToFormRelease)
+            ->where('size', '>', $this->settings()->maxSizeToFormRelease)
             ->select(['id', 'guid'])
             ->get();
 
@@ -1657,7 +1669,7 @@ final class ReleaseProcessingService
      */
     private function deleteReleasesUnderMinFiles(int|string $groupId, array &$stats): void
     {
-        if ($this->settings->minFilesToFormRelease <= 0) {
+        if ($this->settings()->minFilesToFormRelease <= 0) {
             return;
         }
 
@@ -1667,7 +1679,7 @@ final class ReleaseProcessingService
             ->whereRaw(
                 'GREATEST(IFNULL(usenet_groups.minfilestoformrelease, 0), ?) > 0 '.
                 'AND releases.totalpart < GREATEST(IFNULL(usenet_groups.minfilestoformrelease, 0), ?)',
-                [$this->settings->minFilesToFormRelease, $this->settings->minFilesToFormRelease]
+                [$this->settings()->minFilesToFormRelease, $this->settings()->minFilesToFormRelease]
             )
             ->select(['releases.id', 'releases.guid'])
             ->get();
@@ -1680,11 +1692,11 @@ final class ReleaseProcessingService
 
     private function deleteReleasesOverRetention(ReleaseDeleteStats $stats): ReleaseDeleteStats
     {
-        if (! $this->settings->hasRetentionCleanup()) {
+        if (! $this->settings()->hasRetentionCleanup()) {
             return $stats;
         }
 
-        $cutoff = now()->subDays($this->settings->releaseRetentionDays);
+        $cutoff = now()->subDays($this->settings()->releaseRetentionDays);
 
         Release::query()
             ->where('postdate', '<', $cutoff)
@@ -1703,7 +1715,7 @@ final class ReleaseProcessingService
 
     private function deletePasswordedReleases(ReleaseDeleteStats $stats): ReleaseDeleteStats
     {
-        if (! $this->settings->deletePasswordedRelease) {
+        if (! $this->settings()->deletePasswordedRelease) {
             return $stats;
         }
 
@@ -1743,14 +1755,14 @@ final class ReleaseProcessingService
     private function incompleteReleases(): \Illuminate\Database\Eloquent\Builder
     {
         return Release::query()
-            ->where('completion', '<', $this->settings->completion)
+            ->where('completion', '<', $this->settings()->completion)
             ->where('completion', '>', 0)
             ->when(Release::hasPartialArticleCounts(), static fn ($query) => $query->whereNull('articles_expected'));
     }
 
     private function deleteIncompleteReleases(ReleaseDeleteStats $stats): ReleaseDeleteStats
     {
-        if (! $this->settings->hasCompletionCleanup()) {
+        if (! $this->settings()->hasCompletionCleanup()) {
             return $stats;
         }
 
@@ -1857,8 +1869,8 @@ final class ReleaseProcessingService
 
     private function deleteMiscReleases(ReleaseDeleteStats $stats): ReleaseDeleteStats
     {
-        if ($this->settings->miscOtherRetentionHours > 0) {
-            $cutoff = now()->subHours($this->settings->miscOtherRetentionHours);
+        if ($this->settings()->miscOtherRetentionHours > 0) {
+            $cutoff = now()->subHours($this->settings()->miscOtherRetentionHours);
 
             Release::query()
                 ->where('categories_id', Category::OTHER_MISC)
@@ -1874,8 +1886,8 @@ final class ReleaseProcessingService
                 });
         }
 
-        if ($this->settings->miscHashedRetentionHours > 0) {
-            $cutoff = now()->subHours($this->settings->miscHashedRetentionHours);
+        if ($this->settings()->miscHashedRetentionHours > 0) {
+            $cutoff = now()->subHours($this->settings()->miscHashedRetentionHours);
 
             Release::query()
                 ->where('categories_id', Category::OTHER_HASHED)
@@ -2096,7 +2108,7 @@ final class ReleaseProcessingService
                 $this->outputStat('Cross-posted', $stats->duplicate);
             }
             if ($stats->completion > 0) {
-                $this->outputStat("Under {$this->settings->completion}% complete", $stats->completion);
+                $this->outputStat("Under {$this->settings()->completion}% complete", $stats->completion);
             }
             if ($stats->disabledCategory > 0) {
                 $this->outputStat('Disabled categories', $stats->disabledCategory);

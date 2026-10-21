@@ -283,7 +283,7 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Bug:** when it boots the app, Larastan resolves every console command. Without a reachable database, building `UpdatePostProcess` throws a `QueryException` (connection refused).
 - **Symptom:** `Internal error: App\Console\Commands\UpdatePostProcess while analysing file …/ProcessReleasesCommand.php`, "Result is incomplete because of severe errors." This happens for any file under `app/Console/Commands`, so commands get no static analysis in CI or build containers.
 - **Workaround:** run PHPStan with `DB_CONNECTION=sqlite DB_DATABASE=:memory:`.
-- **Fix (staged):** fall back to defaults when `ConfigurationProvider` or `ProcessingRuntimeStateRepository` cannot reach the database during schema checks, defer `CategorizationPipeline` ingestion settings until `categorize()`, and avoid throwing from `Tmux::__construct()` when `DB::connection()->getPdo()` is unavailable during command discovery.
+- **Fix (staged):** defer `CategorizationPipeline` ingestion settings until `categorize()`, defer `NfoService`, `GamesProcessor`, `AnimeProcessor`, `CollectionCleanupService`, `NzbService`, and `ReleaseProcessingService` configuration lookups until processing runs, resolve `AdditionalProcessingOrchestrator` lazily in `PostProcessGuid`, and avoid throwing from `Tmux::__construct()` when `DB::connection()->getPdo()` is unavailable during command discovery.
 
 ### 37. Release reconcile deadlocked with header storage on busy groups (Fixed)
 

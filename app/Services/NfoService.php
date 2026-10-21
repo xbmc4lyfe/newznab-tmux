@@ -142,7 +142,7 @@ class NfoService
 
     private string|false $timeoutPath;
 
-    private int $timeoutSeconds;
+    private ?int $timeoutSeconds = null;
 
     public const NFO_FAILED = -9; // We failed to get a NFO after admin set max retries.
 
@@ -167,7 +167,11 @@ class NfoService
         $this->tmpPath = rtrim((string) config('nntmux.tmp_unrar_path'), '/\\').'/';
         $this->unrarPath = config('nntmux_settings.unrar_path') ?: false;
         $this->timeoutPath = config('nntmux_settings.timeout_path') ?: false;
-        $this->timeoutSeconds = (int) (app(ConfigurationProvider::class)->postProcessing()->timeoutSeconds ?: 60);
+    }
+
+    private function getTimeoutSeconds(): int
+    {
+        return $this->timeoutSeconds ??= (int) (app(ConfigurationProvider::class)->postProcessing()->timeoutSeconds ?: 60);
     }
 
     private function getNzbs(): int
@@ -682,12 +686,13 @@ class NfoService
                     $extractDir,
                 ];
 
-                if ($this->timeoutPath && $this->timeoutSeconds > 0) {
+                $timeoutSeconds = $this->getTimeoutSeconds();
+                if ($this->timeoutPath && $timeoutSeconds > 0) {
                     $command = [
                         $this->timeoutPath,
                         '--foreground',
                         '--signal=KILL',
-                        (string) $this->timeoutSeconds,
+                        (string) $timeoutSeconds,
                         ...$command,
                     ];
                 }
