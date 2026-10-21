@@ -414,11 +414,11 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom:** when the alternate rejects its login, each sample repeats the full connect and retry cycle. Horizon logs one "Authentication rejected" about every 2 minutes, and `CollectReleaseFingerprintMetadata` jobs run for minutes or hit their timeout.
 - **Fix:** connection failures raise `NntpProviderUnavailableException`. The collector then records the remaining alternate samples as unavailable without reconnecting. The primary still retries per sample.
 
-### 56. The ARM paired-decoding benchmark fails on most runs (Open)
+### 56. The ARM paired-decoding benchmark fails on most runs (Fixed)
 
 - **Where:** the `paired-decoding (ubuntu-24.04-arm)` job in the "Paired native yEnc performance" workflow.
 - **Symptom:** the run summary is `inconclusive`, and the job exits 1, whenever any stratum's paired comparison is inconclusive. On #246, 22 of 24 strata showed a useful improvement and 2 were inconclusive. The job failed on the rerun too, and it fails on most master runs since 2026-10-16. The x86 job passes.
-- **Suggested fix:** report inconclusive strata without failing the job, or add pairs on ARM until the bootstrap interval resolves. Until then a red ARM job here says nothing about the change under test.
+- **Fix:** `paired-decoding (ubuntu-24.04-arm)` retains the `inconclusive` run summary in its artifacts and public benchmark report without failing the job when all 24 strata complete with zero invalid pairs and zero regressions (and at least one `useful_improvement` stratum); any regression or invalid pair still fails the job, and `ubuntu-latest` retains its strict gate.
 
 ### 57. Orphaned MariaDB sessions hold row locks for hours after a DB outage (Mitigated)
 
