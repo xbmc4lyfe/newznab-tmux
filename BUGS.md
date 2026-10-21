@@ -418,7 +418,7 @@ These bugs turned up while building and running the self-hosted stack in `docker
 
 - **Where:** the `paired-decoding (ubuntu-24.04-arm)` job in the "Paired native yEnc performance" workflow.
 - **Symptom:** the run summary is `inconclusive`, and the job exits 1, whenever any stratum's paired comparison is inconclusive. On #246, 22 of 24 strata showed a useful improvement and 2 were inconclusive. The job failed on the rerun too, and it fails on most master runs since 2026-10-16. The x86 job passes.
-- **Fix:** `paired-decoding (ubuntu-24.04-arm)` retains the `inconclusive` run summary in its artifacts and public benchmark report without failing the job when all 24 strata complete with zero invalid pairs and zero regressions (and at least one `useful_improvement` stratum); any regression or invalid pair still fails the job, and `ubuntu-latest` retains its strict gate.
+- **Fix:** `paired-decoding` retains an `inconclusive` run summary in its artifacts and public benchmark report without failing the job when all 24 strata complete with zero invalid pairs and zero regressions (and at least one `useful_improvement` stratum); any regression or invalid pair still fails the job. `Capture executed PHP and native hot paths` also discovers `perf` under `/usr/lib/linux-tools-*` and `/usr/bin/perf` on Ubuntu 26.04 runners.
 
 ### 57. Orphaned MariaDB sessions hold row locks for hours after a DB outage (Mitigated)
 
