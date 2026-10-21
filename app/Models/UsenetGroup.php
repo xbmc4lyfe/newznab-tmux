@@ -11,10 +11,11 @@ use App\Services\Releases\ReleaseManagementService;
 use App\Support\SizeUnit;
 use Carbon\CarbonImmutable;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
-use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 
 /**
  * App\Models\Group.
@@ -32,7 +33,7 @@ use Illuminate\Support\Facades\DB;
  * @property bool $active
  * @property bool $backfill
  * @property string|null $description
- * @property-read Collection|Release[] $release
+ * @property-read EloquentCollection|Release[] $release
  *
  * @method static \Illuminate\Database\Eloquent\Builder|\App\Models\UsenetGroup whereActive($value)
  * @method static \Illuminate\Database\Eloquent\Builder|\App\Models\UsenetGroup whereBackfill($value)
@@ -420,7 +421,7 @@ class UsenetGroup extends Model
     {
         self::purge($id);
 
-        return self::query()->where('id', $id)->delete();
+        return self::query()->where('id', $id)->delete() > 0;
     }
 
     /**
@@ -435,6 +436,9 @@ class UsenetGroup extends Model
         // Remove rows from part repair.
         MissedPart::query()->where('groups_id', $id)->delete();
 
+        // Remove unfinished collections and their binaries/parts for this group.
+        self::deleteGroupCollections($id);
+
         // Reset the group stats.
         return self::query()->where('id', $id)->update(
             [
@@ -447,6 +451,62 @@ class UsenetGroup extends Model
                 'active' => 0,
             ]
         );
+    }
+
+    /**
+     * Delete collections and descendant CBP rows for a single group.
+     *
+     * On MariaDB/MySQL, foreign key cascades on binaries, parts, and collection_groups
+     * remove descendants automatically. On SQLite or schemas without foreign keys enabled,
+     * descendants are removed explicitly in chunked batches.
+     */
+    private static function deleteGroupCollections(int|string $id): void
+    {
+        if (! Schema::hasTable('collections')) {
+            return;
+        }
+
+        if (DB::getDriverName() === 'sqlite') {
+            $hasBinaries = Schema::hasTable('binaries');
+            $hasParts = Schema::hasTable('parts');
+            $hasCollectionGroups = Schema::hasTable('collection_groups');
+
+            Collection::query()
+                ->where('groups_id', $id)
+                ->select('id')
+                ->orderBy('id')
+                ->chunkById(1000, static function ($collections) use ($hasBinaries, $hasParts, $hasCollectionGroups): void {
+                    $collectionIds = $collections->pluck('id')->map(static fn ($collectionId): int => (int) $collectionId)->all();
+                    if ($collectionIds === []) {
+                        return;
+                    }
+
+                    if ($hasBinaries) {
+                        if ($hasParts) {
+                            $binaryIds = DB::table('binaries')
+                                ->whereIn('collections_id', $collectionIds)
+                                ->pluck('id')
+                                ->map(static fn ($binaryId): int => (int) $binaryId)
+                                ->all();
+                            if ($binaryIds !== []) {
+                                DB::table('parts')->whereIn('binaries_id', $binaryIds)->delete();
+                            }
+                        }
+
+                        DB::table('binaries')->whereIn('collections_id', $collectionIds)->delete();
+                    }
+
+                    if ($hasCollectionGroups) {
+                        DB::table('collection_groups')->whereIn('collections_id', $collectionIds)->delete();
+                    }
+
+                    Collection::query()->whereIn('id', $collectionIds)->delete();
+                });
+
+            return;
+        }
+
+        Collection::query()->where('groups_id', $id)->delete();
     }
 
     /**
