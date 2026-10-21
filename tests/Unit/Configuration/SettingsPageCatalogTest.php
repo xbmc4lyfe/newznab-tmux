@@ -66,5 +66,14 @@ final class SettingsPageCatalogTest extends TestCase
         $this->assertSame([0 => 'Disabled', 1 => 'Enabled'], $fields[0]->options);
         $this->assertSame('Process Movies', $fields[1]->label);
         $this->assertSame([0 => 'Disabled', 1 => 'All releases', 2 => 'Renamed releases only'], $fields[1]->options);
+
+        $extractUsingRarInfo = array_values(array_filter(
+            $fields,
+            static fn ($field): bool => $field->column === 'extract_using_rar_info',
+        ))[0] ?? null;
+
+        $this->assertNotNull($extractUsingRarInfo);
+        $this->assertSame('List Archives Without Extracting (Disables Media Extraction)', $extractUsingRarInfo->label);
+        $this->assertStringContainsString('disables media extraction', $extractUsingRarInfo->help);
     }
 }
