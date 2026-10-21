@@ -81,8 +81,10 @@ class InstallNntmux extends Command
 
         if ($this->addAdminUser()) {
             File::put(base_path().'/_install/install.lock', 'application install locked on '.now());
-            $this->info('Generating application key');
-            $this->call('key:generate', ['--force' => true]);
+            if (empty(config('app.key'))) {
+                $this->info('Generating application key');
+                $this->call('key:generate', ['--force' => true]);
+            }
             $this->info('NNTmux installation completed successfully');
             exit();
         }
@@ -192,7 +194,7 @@ class InstallNntmux extends Command
     {
         $covers_path = config('nntmux_settings.covers_path');
         $nzb_path = config('nntmux_settings.path_to_nzbs');
-        $zip_path = config('nntmux_settings.tmp_unzip_path');
+        $zip_path = config('nntmux.tmp_unzip_path');
         $unrar_path = config('nntmux.tmp_unrar_path');
 
         // Validate that all required paths are configured
@@ -215,7 +217,7 @@ class InstallNntmux extends Command
         }
 
         if (empty($zip_path)) {
-            $this->warn('Unzip path (nntmux_settings.tmp_unzip_path) is not configured. Please check your .env or config files.');
+            $this->warn('Unzip path (nntmux.tmp_unzip_path) is not configured. Please check your .env or config files.');
 
             return false;
         }

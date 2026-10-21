@@ -29,9 +29,9 @@ class CategorizationPipeline
      */
     protected Collection $pipes; // @phpstan-ignore missingType.generics
 
-    protected bool $categorizeForeign;
+    protected ?bool $categorizeForeign = null;
 
-    protected bool $catWebDL;
+    protected ?bool $catWebDL = null;
 
     protected NzbSplitUnwrapper $nzbSplitUnwrapper;
 
@@ -48,8 +48,6 @@ class CategorizationPipeline
         $this->pipes = collect($pipes)
             ->sortBy(fn (AbstractCategorizationPipe $p) => $p->getPriority());
 
-        $this->categorizeForeign = (bool) app(ConfigurationProvider::class)->ingestion()->categorizeForeign;
-        $this->catWebDL = (bool) app(ConfigurationProvider::class)->ingestion()->categorizeWebDl;
         $this->nzbSplitUnwrapper = $nzbSplitUnwrapper ?? new NzbSplitUnwrapper;
         $this->obfuscatedSubjectExtractor = $obfuscatedSubjectExtractor ?? new ObfuscatedSubjectExtractor;
     }
@@ -88,6 +86,12 @@ class CategorizationPipeline
         }
 
         $groupName = UsenetGroup::whereId($groupId)->value('name') ?? '';
+
+        if ($this->categorizeForeign === null || $this->catWebDL === null) {
+            $ingestion = app(ConfigurationProvider::class)->ingestion();
+            $this->categorizeForeign ??= (bool) $ingestion->categorizeForeign;
+            $this->catWebDL ??= (bool) $ingestion->categorizeWebDl;
+        }
 
         $context = new ReleaseContext(
             releaseName: $releaseName,

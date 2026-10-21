@@ -75,11 +75,11 @@ class CollectionCleanupService
 
     private ?bool $cascadeDeleteReady = null;
 
-    private readonly BinariesConfig $binariesConfig;
+    private ?BinariesConfig $binariesConfig;
 
     public function __construct(?BinariesConfig $binariesConfig = null)
     {
-        $this->binariesConfig = $binariesConfig ?? BinariesConfig::fromSettings();
+        $this->binariesConfig = $binariesConfig;
     }
 
     /**
@@ -718,7 +718,7 @@ class CollectionCleanupService
 
     private function sqlChunkSize(): int
     {
-        return $this->binariesConfig->sqlChunkSize;
+        return ($this->binariesConfig ??= BinariesConfig::fromSettings())->sqlChunkSize;
     }
 
     /**

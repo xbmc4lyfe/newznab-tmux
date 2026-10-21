@@ -26,9 +26,9 @@ class Tmux
     private readonly ProcessingRuntimeStateRepository $runtimeState;
 
     /**
-     * @var \PDO
+     * @var \PDO|null
      */
-    public \Closure|\PDO $pdo;
+    public \Closure|\PDO|null $pdo = null;
 
     public mixed $tmux_session;
 
@@ -41,7 +41,11 @@ class Tmux
     ) {
         $this->configuration = $configuration ?? app(ConfigurationProvider::class);
         $this->runtimeState = $runtimeState ?? app(ProcessingRuntimeStateRepository::class);
-        $this->pdo = DB::connection()->getPdo();
+        try {
+            $this->pdo = DB::connection()->getPdo();
+        } catch (\Throwable) {
+            $this->pdo = null;
+        }
     }
 
     /**
@@ -50,13 +54,18 @@ class Tmux
     public function getConnectionsInfo(mixed $constants)
     {
         $runVar['connections']['port_a'] = $runVar['connections']['host_a'] = $runVar['connections']['ip_a'] = false;
+        $runVar['connections']['ips_a'] = [];
         $runVar['connections']['port'] = config('nntmux_nntp.port');
         $runVar['connections']['host'] = config('nntmux_nntp.server');
-        $runVar['connections']['ip'] = gethostbyname($runVar['connections']['host']);
+        $primaryIps = $this->resolveHostAddresses((string) ($runVar['connections']['host'] ?? ''));
+        $runVar['connections']['ips'] = $primaryIps;
+        $runVar['connections']['ip'] = $primaryIps[0] ?? (string) ($runVar['connections']['host'] ?? '');
         if ($constants['alternate_nntp'] === '1') {
             $runVar['connections']['port_a'] = config('nntmux_nntp.alternate_server_port');
             $runVar['connections']['host_a'] = config('nntmux_nntp.alternate_server');
-            $runVar['connections']['ip_a'] = gethostbyname($runVar['connections']['host_a']);
+            $alternateIps = $this->resolveHostAddresses((string) ($runVar['connections']['host_a'] ?? ''));
+            $runVar['connections']['ips_a'] = $alternateIps;
+            $runVar['connections']['ip_a'] = $alternateIps[0] ?? (string) ($runVar['connections']['host_a'] ?? '');
         }
 
         return $runVar['connections'];
@@ -68,25 +77,65 @@ class Tmux
      */
     public function getUSPConnections(string $which, array $connections, ?string $socketSnapshot = null): array
     {
-        [$ipKey, $portKey] = $which === 'alternate'
-            ? ['ip_a', 'port_a']
-            : ['ip', 'port'];
+        [$ipKey, $ipsKey, $hostKey, $portKey, $otherIpKey, $otherIpsKey, $otherHostKey, $otherPortKey] = $which === 'alternate'
+            ? ['ip_a', 'ips_a', 'host_a', 'port_a', 'ip', 'ips', 'host', 'port']
+            : ['ip', 'ips', 'host', 'port', 'ip_a', 'ips_a', 'host_a', 'port_a'];
 
-        $ip = (string) ($connections[$ipKey] ?? '');
-        $port = (string) ($connections[$portKey] ?? '');
-        $needles = array_values(array_filter([
-            $ip !== '' && $port !== '' ? $ip.':'.$port : null,
-            $ip !== '' ? $ip.':https' : null,
-            $port !== '' ? $port : null,
-            $ip !== '' ? $ip : null,
-        ]));
-        $lines = preg_split('/\R/', $socketSnapshot ?? $this->getSocketSnapshot()) ?: [];
+        $port = trim((string) ($connections[$portKey] ?? ''));
+        $otherPort = trim((string) ($connections[$otherPortKey] ?? ''));
+        $ips = $this->extractConnectionAddresses($connections, $ipKey, $ipsKey, $hostKey);
+        $otherIps = $this->extractConnectionAddresses($connections, $otherIpKey, $otherIpsKey, $otherHostKey);
+        $samePortAsOther = $port !== '' && $port === $otherPort;
 
-        foreach ($needles as $needle) {
-            $matchingLines = array_filter(
+        $lines = array_values(array_filter(
+            preg_split('/\R/', $socketSnapshot ?? $this->getSocketSnapshot()) ?: [],
+            static fn (string $line): bool => trim($line) !== '',
+        ));
+
+        if ($port !== '') {
+            $portLines = array_values(array_filter(
                 $lines,
-                static fn (string $line): bool => str_contains($line, $needle),
-            );
+                fn (string $line): bool => $this->socketLineHasPeerPort($line, $port),
+            ));
+
+            if ($portLines !== []) {
+                if ($samePortAsOther) {
+                    if ($which === 'alternate') {
+                        $matchingLines = $ips === []
+                            ? []
+                            : array_values(array_filter(
+                                $portLines,
+                                fn (string $line): bool => $this->socketLineMatchesAnyAddress($line, $ips, $port),
+                            ));
+                    } else {
+                        $matchingLines = $otherIps === []
+                            ? $portLines
+                            : array_values(array_filter(
+                                $portLines,
+                                fn (string $line): bool => ! $this->socketLineMatchesAnyAddress($line, $otherIps, $port),
+                            ));
+                    }
+                } else {
+                    $matchingLines = $portLines;
+                }
+
+                return [
+                    $which => [
+                        'active' => count(array_filter(
+                            $matchingLines,
+                            static fn (string $line): bool => str_contains($line, 'ESTAB'),
+                        )),
+                        'total' => count($matchingLines),
+                    ],
+                ];
+            }
+        }
+
+        if ($ips !== []) {
+            $matchingLines = array_values(array_filter(
+                $lines,
+                fn (string $line): bool => $this->socketLineMatchesAnyAddress($line, $ips, $port),
+            ));
 
             if ($matchingLines !== []) {
                 return [
@@ -102,6 +151,124 @@ class Tmux
         }
 
         return [$which => ['active' => 0, 'total' => 0]];
+    }
+
+    /**
+     * @return list<string>
+     */
+    protected function resolveHostAddresses(string $host): array
+    {
+        $host = trim($host);
+        if ($host === '') {
+            return [];
+        }
+
+        if (filter_var($host, FILTER_VALIDATE_IP) !== false) {
+            return [$host];
+        }
+
+        $addresses = @gethostbynamel($host);
+        if (is_array($addresses) && $addresses !== []) {
+            return array_values(array_unique(array_filter($addresses, static fn (string $ip): bool => $ip !== '')));
+        }
+
+        $single = gethostbyname($host);
+
+        return $single !== '' && $single !== $host ? [$single] : [];
+    }
+
+    /**
+     * @param  array<string, mixed>  $connections
+     * @return list<string>
+     */
+    private function extractConnectionAddresses(array $connections, string $ipKey, string $ipsKey, string $hostKey): array
+    {
+        $addresses = [];
+
+        if (isset($connections[$ipsKey]) && is_array($connections[$ipsKey])) {
+            foreach ($connections[$ipsKey] as $candidate) {
+                $candidateStr = trim((string) $candidate);
+                if ($candidateStr !== '' && $candidateStr !== '0') {
+                    $addresses[] = $candidateStr;
+                }
+            }
+        }
+
+        $singleIp = isset($connections[$ipKey]) && $connections[$ipKey] !== false
+            ? trim((string) $connections[$ipKey])
+            : '';
+        if ($singleIp !== '' && $singleIp !== '0') {
+            if (filter_var($singleIp, FILTER_VALIDATE_IP) !== false) {
+                $addresses[] = $singleIp;
+            } else {
+                $addresses = array_merge($addresses, $this->resolveHostAddresses($singleIp));
+            }
+        }
+
+        if ($addresses === [] && isset($connections[$hostKey]) && $connections[$hostKey] !== false) {
+            $host = trim((string) $connections[$hostKey]);
+            if ($host !== '') {
+                $addresses = $this->resolveHostAddresses($host);
+            }
+        }
+
+        return array_values(array_unique($addresses));
+    }
+
+    private function socketLineHasPeerPort(string $line, string $port): bool
+    {
+        $peer = $this->extractPeerEndpoint($line);
+        if ($peer !== null) {
+            $colonPos = strrpos($peer, ':');
+            if ($colonPos !== false) {
+                $peerPort = substr($peer, $colonPos + 1);
+
+                return $peerPort === $port || ($port === '443' && $peerPort === 'https');
+            }
+        }
+
+        return preg_match('/(?:^|\s)\S+:'.preg_quote($port, '/').'(?:\s|$)/', $line) === 1;
+    }
+
+    /**
+     * @param  list<string>  $addresses
+     */
+    private function socketLineMatchesAnyAddress(string $line, array $addresses, string $port): bool
+    {
+        $peer = $this->extractPeerEndpoint($line);
+
+        foreach ($addresses as $ip) {
+            if ($peer !== null) {
+                if (
+                    $peer === $ip
+                    || ($port !== '' && $peer === $ip.':'.$port)
+                    || $peer === $ip.':https'
+                    || str_starts_with($peer, $ip.':')
+                    || str_starts_with($peer, '['.$ip.']:')
+                ) {
+                    return true;
+                }
+
+                continue;
+            }
+
+            if (
+                ($port !== '' && str_contains($line, $ip.':'.$port))
+                || str_contains($line, $ip.':https')
+                || str_contains($line, $ip)
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function extractPeerEndpoint(string $line): ?string
+    {
+        $columns = preg_split('/\s+/', trim($line)) ?: [];
+
+        return $columns[4] ?? null;
     }
 
     public function getSocketSnapshot(): string

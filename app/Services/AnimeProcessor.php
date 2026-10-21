@@ -22,8 +22,8 @@ class AnimeProcessor
 
     public PaList $palist;
 
-    /** @var int number of AniDB releases to process */
-    private int $aniqty;
+    /** @var int|null number of AniDB releases to process */
+    private ?int $aniqty = null;
 
     /** @var int|null The status of the release being processed */
     private ?int $status;
@@ -51,10 +51,17 @@ class AnimeProcessor
     {
         $this->echooutput = $echooutput && (bool) config('nntmux.echocli');
         $this->palist = new PaList;
-
-        $quantity = (int) app(ConfigurationProvider::class)->metadata()->maxAnimeProcessed;
-        $this->aniqty = $quantity > 0 ? $quantity : 100;
         $this->status = null;
+    }
+
+    private function getAnimeQuantity(): int
+    {
+        if ($this->aniqty === null) {
+            $quantity = (int) app(ConfigurationProvider::class)->metadata()->maxAnimeProcessed;
+            $this->aniqty = $quantity > 0 ? $quantity : 100;
+        }
+
+        return $this->aniqty;
     }
 
     /**
@@ -98,7 +105,7 @@ class AnimeProcessor
         }
 
         $results = $query->orderByDesc('postdate')
-            ->limit($this->aniqty)
+            ->limit($this->getAnimeQuantity())
             ->get();
 
         if ($results->count() > 0) {

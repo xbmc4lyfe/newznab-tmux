@@ -12,7 +12,6 @@ use App\Services\CollectionCleanupService;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Releases\Fingerprint\FingerprintDispatch;
 use App\Support\Data\NzbCreationResult;
-use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
@@ -65,11 +64,11 @@ class NzbService
         private readonly CollectionCleanupService $collectionCleanupService,
         ?BinariesConfig $binariesConfig = null,
     ) {
-        $this->binariesConfig = $binariesConfig ?? BinariesConfig::fromSettings();
+        $this->binariesConfig = $binariesConfig;
         try {
             $nzbSplitLevel = (int) app(ConfigurationProvider::class)->ingestion()->nzbSplitLevel;
-        } catch (QueryException $e) {
-            // Table doesn't exist yet (e.g., during migrations or tests)
+        } catch (Throwable) {
+            // Table or database connection isn't available yet (e.g., during migrations, command discovery, or tests)
             $nzbSplitLevel = 1;
         }
         $this->nzbSplitLevel = $nzbSplitLevel;
@@ -85,7 +84,12 @@ class NzbService
         );
     }
 
-    private readonly BinariesConfig $binariesConfig;
+    private ?BinariesConfig $binariesConfig;
+
+    private function binariesConfig(): BinariesConfig
+    {
+        return $this->binariesConfig ??= BinariesConfig::fromSettings();
+    }
 
     public function usesDatabase(): bool
     {
@@ -256,7 +260,7 @@ class NzbService
                         'partnumber' => (int) $row->partnumber,
                     ];
                 }
-            } while (\count($page) === $this->binariesConfig->nzbStreamRows);
+            } while (\count($page) === $this->binariesConfig()->nzbStreamRows);
 
             if ($openBinaryId > 0) {
                 $XMLWriter->endElement(); // segments
@@ -389,7 +393,7 @@ class NzbService
      */
     private function loadNzbRowPage(int $releaseId, array $cursor): array
     {
-        $limit = $this->binariesConfig->nzbStreamRows;
+        $limit = $this->binariesConfig()->nzbStreamRows;
 
         return DB::select(
             'SELECT b.collections_id AS collection_id, b.id AS binary_id, b.name AS binary_name,
