@@ -58,7 +58,20 @@ pub fn decode_nzb(claim: &Claim) -> Result<String> {
     Ok(String::from_utf8(body)?)
 }
 pub async fn claim(pool: &MySqlPool, worker: &str) -> Result<Option<Claim>> {
-    let candidates=sqlx::query("SELECT release_id FROM release_fingerprint_jobs WHERE (status='pending' AND available_at <= UTC_TIMESTAMP(6)) OR (status='processing' AND lease_until < UTC_TIMESTAMP(6)) ORDER BY available_at, release_id LIMIT 32").fetch_all(pool).await?;
+    // One indexed range per state: an OR across both states forces a filesort of every pending row.
+    let candidates = sqlx::query(
+        "SELECT release_id FROM (\
+         (SELECT release_id, available_at FROM release_fingerprint_jobs \
+          WHERE status='pending' AND available_at <= UTC_TIMESTAMP(6) \
+          ORDER BY available_at, release_id LIMIT 32) \
+         UNION ALL \
+         (SELECT release_id, available_at FROM release_fingerprint_jobs \
+          WHERE status='processing' AND lease_until < UTC_TIMESTAMP(6) \
+          ORDER BY available_at, release_id LIMIT 32)\
+         ) candidates ORDER BY available_at, release_id LIMIT 32",
+    )
+    .fetch_all(pool)
+    .await?;
     for candidate in candidates {
         let id: u64 = candidate.try_get("release_id")?;
         let mut tx = pool.begin().await?;
