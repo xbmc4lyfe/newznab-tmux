@@ -61,11 +61,11 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Bug:** `SET SESSION innodb_buffer_pool_size = …` is invalid, because that variable is global-only. The error is caught, which also skips the `bulk_insert_buffer_size`, `read_buffer_size` and `sort_buffer_size` statements after it.
 - **Fix (staged):** drop the `innodb_buffer_pool_size` line so the valid session buffer statements execute.
 
-### 9. Dead configuration keys (Open, low priority)
+### 9. Dead configuration keys (Fixed)
 
-- `NNTP_CONNECTIONS_A` is read into `NNTPService::$_alternateNntpConnections` (`NNTPService.php:172`) but never used.
-- `lame_path` (`LAME_PATH`) is defined in `config/nntmux_settings.php`, but nothing in `app/` references it.
-- `FFProbe::create()` (`MediaExtractionService.php:481`) ignores `FFPROBE_PATH`. It finds `ffprobe` on `PATH` instead.
+- `NNTP_CONNECTIONS_A` is read into `NNTPService::$_alternateNntpConnections` (`NNTPService.php:172`) and is now used for the alternate server's active connection threshold in `NNTPService::doConnect()`.
+- `lame_path` (`LAME_PATH`) had no references in `app/` and was removed from `config/nntmux_settings.php`, `.env.example`, and `.env.dist`.
+- `FFProbe::create()` in `MediaToolFactory::ffprobe()` uses `ffprobe.binaries` from `FFPROBE_PATH` (`ProcessingConfiguration::resolveFfprobePath()`).
 
 ### 10. Misleading forced-logout message (Fixed)
 
@@ -74,17 +74,17 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom:** confusing when two browsers or tabs, or a script, log in as the same user. This made the Grafana debugging look like an auth failure.
 - **Fix (staged):** updated the flash message in `EnforceSessionToken` to `'You were logged out because your account was signed in on another device or session.'`, covered by `PasskeyLogoutOtherDevicesTest`.
 
-### 18. `CHECK_PASSWORDED_RARS=false` (the default) silently disables all additional post-processing (Open)
+### 18. `CHECK_PASSWORDED_RARS=false` (the default) silently disables all additional post-processing (Fixed)
 
 - **Where:** `app/Models/Release.php:207`: `$passwordStatus = config('nntmux_settings.check_passworded_rars') === true ? -1 : 0;`. The default is `false` in `config/nntmux_settings.php:6` and `.env.example:339`.
-- **Bug:** `passwordstatus = -1` is the only "needs additional processing" marker. `AdditionalCandidateQuery::applyPredicates()` (`app/Services/AdditionalProcessing/AdditionalCandidateQuery.php:107`) selects `passwordstatus = -1 AND haspreview = -1`. With the flag off, every new release is inserted with `passwordstatus = 0`, so it never enters the queue.
+- **Bug:** `passwordstatus = -1` was the only "needs additional processing" marker. `AdditionalCandidateQuery::applyPredicates()` (`app/Services/AdditionalProcessing/AdditionalCandidateQuery.php:107`) selected `passwordstatus = -1 AND haspreview = -1`. With the flag off, every new release was inserted with `passwordstatus = 0`, so it never entered the queue.
 - **Symptom:** none of the additional-processing work ever runs:
   - no ffmpeg samples or previews, and no mediainfo (`video_data` and `audio_data` stay empty)
   - no RAR/ZIP file lists (`release_files`) and no JPG previews
   - no PAR2/file-name based renames
 
   The tmux pane only reports "no additional work" and nothing else. On the docker stack, 480,988 releases built up with zero media data, and 99% sat in Misc, because obfuscated posts can only be renamed from their PAR2 and file lists.
-- **Fix:** decouple the queue marker from the password-check feature. Always insert `-1`, and let `ProcessingConfiguration::$processPasswords` decide only whether a password result is recorded; `ReleaseFileManager.php:274` already does this. At minimum, document that the flag gates all post-processing.
+- **Fix:** `AdditionalCandidateQuery` (`applyPasswordStatus()` and `claimBatch()`) selects both `passwordstatus = -1` and `passwordstatus = 0` when `check_passworded_rars` is disabled while `haspreview = -1`, and `ProcessingConfiguration::$processPasswords` decides whether password checks run.
 
 ### 19. Every `unrar` extraction fails: a lone `-` is passed as the end-of-switches marker (Fixed)
 
@@ -97,12 +97,12 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Reproduce:** run `unrar e -ai -ep -c- -id -inul -kb -or -p- -r -y -@ - first.rar out/`. It exits 7. With `--` it extracts. On a real release, the `--` form pulled 2.3 MB of an `.mkv` from the first volume, and mediainfo read it as HEVC 1920×1072.
 - **Fix (staged):** use `'--'` at all three sites. Regression test: `tests/Feature/UnrarArgumentsTest.php`, using the stored-RAR fixture `tests/Fixtures/archives/stored-sample.rar`. After the fix, the live pipeline produced `(vRAW)`, `m` and `s`, with rows in `media_infos`, `video_data` and `audio_data`, and a preview.
 
-### 20. `extract_using_rar_info = 1` turns off all archive extraction without saying so (Open, documentation)
+### 20. `extract_using_rar_info = 1` turns off all archive extraction without saying so (Fixed)
 
 - **Where:** `post_processing_configurations.extract_using_rar_info`. It is read in `ArchiveExtractionService::extractArchive()` and `prepareExtractionDirectories()`. Its default is `false` (`database/support/LegacySettingsManifest.php:121`).
 - **Bug:** with it on, only the PHP RAR/ZIP parser runs. It lists the files but extracts nothing, so mediainfo, samples, and previews never get a file.
 - **Symptom:** this stack's database had it at `1`, even though the manifest default is `false`; what set it is unknown. That hid bug #19, because `unrar` was never even called.
-- **Fix:** label the administrator setting so it's clear that enabling it disables media extraction. The docker stack's `tuning.sql` now sets it to `0`.
+- **Fix:** `SettingsPageCatalog` labels the administrator setting `List Archives Without Extracting (Disables Media Extraction)` and explains that enabling it skips `unrar`/`7z` extraction for mediainfo, samples, and previews. The docker stack's `tuning.sql` sets it to `0`.
 
 ### 21. The alternate NNTP provider can't be used as an article fallback alone (Fixed)
 
@@ -234,23 +234,23 @@ These bugs turned up while building and running the self-hosted stack in `docker
 
 ## Documentation
 
-### 15. Stale `README` and wiki content (Open)
+### 15. Stale `README` and wiki content (Fixed)
 
-- **predb.ovh no longer resolves in DNS** (checked 2026-10-08), but the README (`README.md:346`) and the wiki recommend it. Live alternatives: predb.club (JSON and RSS), api.predb.net (JSON), and `predb.me` (RSS). These are now supported by `predb:import-feed`.
-- **Env names in the README that the code doesn't read:**
+- **predb.ovh no longer resolves in DNS** (checked 2026-10-08), and `README.md` now lists the live alternatives supported by `predb:import-feed` (`predb.club`, `api.predb.net`, and `predb.me`).
+- **Env names in the README that the code doesn't read** were updated in `README.md`:
 
-  | README uses | Code reads |
+  | README used | Code reads |
   |---|---|
   | `SEARCH_ENGINE` | `SEARCH_DRIVER` |
   | `MANTICORE_HOST` | `MANTICORESEARCH_HOST` |
   | `TMDB_API_KEY` | `TMDB_APIKEY` |
   | `TRAKT_CLIENT_ID` | `TRAKTTV_APIKEY` |
-  | `SCRAPE_IRC_CHANNELS` | nothing: channels are hard-coded in `config/irc_settings.php` |
+  | `SCRAPE_IRC_CHANNELS` | nothing: channels are configured in `config/irc_settings.php` |
 
-- **Commands in the README that don't exist:** `nntmux:create-admin` (`README.md:312`), `nntmux:convert-collation` (`:205`), `nntmux:index-manticore`, `nntmux:reset-password` and `nntmux:test-nntp`, among others.
+- **Commands in the README that don't exist** (`nntmux:create-admin`, `nntmux:convert-collation`, `nntmux:index-manticore`, `nntmux:reset-password`, and `nntmux:test-nntp`) were replaced with current Artisan commands in `README.md`.
 - **Wiki "Database Tuning"** lists `innodb_buffer_pool_instances`, which MariaDB removed in 10.6.
-- **DOCKER.md** describes a GetPageSpeed nginx build with Brotli. Neither is in `docker/8.5/Dockerfile` or `docker/8.5/nginx.conf`.
-- **MySQL 8 support:** the README claims support for "MySQL 8+" even though the schema dumps use the MariaDB-only collation `utf8mb4_uca1400_ai_ci`.
+- **DOCKER.md** no longer describes the removed GetPageSpeed nginx build with Brotli.
+- **MySQL 8 support:** `README.md` specifies MariaDB 10.11+ instead of claiming MySQL 8+ support for MariaDB-only `utf8mb4_uca1400_ai_ci` schema dumps.
 
 ## Observed on the running stack (not yet root-caused)
 
@@ -402,11 +402,11 @@ These bugs turned up while building and running the self-hosted stack in `docker
 
   The quote-insensitive counter benefits both drivers. `ReleaseVerificationDatabaseManifestMariaDbTest` reruns the suite with database manifests. Both pass all 15 tests.
 
-### 54. `RELEASE_VERIFICATION_CANDIDATE_WORKERS` above 8 is silently ignored (Open)
+### 54. `RELEASE_VERIFICATION_CANDIDATE_WORKERS` above 8 is silently ignored (Fixed)
 
-- **Where:** `routes/console.php` schedules `min(8, candidate_workers)` slots, and `VerificationWorkerLocks` clamps to the same 8.
-- **Symptom:** production sets 48 and runs 8 verification workers.
-- **Suggested fix:** make the ceiling configurable, after BUGS #52, because more workers only add waiters to the capacity row.
+- **Where:** `routes/console.php` and `VerificationWorkerLocks`.
+- **Symptom:** production sets 48 and ran only 8 verification workers when the ceiling was clamped to 8.
+- **Fix:** `VerificationWorkerLocks::MAX_SLOTS` is raised to 64 (with `MAX_SLOT_NUMBER = 256`), and `routes/console.php` schedules slots up to `VerificationWorkerLocks::lastSlot()`.
 
 ### 55. Fingerprint metadata jobs retry a rejected alternate provider for every sample (Fixed)
 

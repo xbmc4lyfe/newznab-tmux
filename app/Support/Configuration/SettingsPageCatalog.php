@@ -110,6 +110,7 @@ final class SettingsPageCatalog
             'movie_lookup' => 'Process Movies',
             'post_non_mode' => 'TV, Anime and Movie Panes',
             'post_amazon_mode' => 'Book, Music, Console and Game Panes',
+            'extract_using_rar_info' => 'List Archives Without Extracting (Disables Media Extraction)',
             default => Str::headline($column),
         };
         $guidance = match ($domain) {
@@ -222,6 +223,7 @@ final class SettingsPageCatalog
             'max_movies_processed' => 'Maximum movies processed per run.',
             'post_non_mode' => 'Enable the tmux TV, anime and movie panes. Movie Lookup must also be enabled for the Movies pane to process releases.',
             'post_amazon_mode' => 'Enable the tmux book, music, console and game panes. Each metadata lookup must also be enabled.',
+            'extract_using_rar_info' => 'Use the built-in PHP RAR/ZIP header parser only. Lists inner files without running unrar/7z, which disables media extraction (mediainfo, samples, and previews).',
             default => 'Controls '.Str::lower(Str::headline($column)).'.',
         };
     }

@@ -50,6 +50,44 @@ final class NNTPServiceConnectFailureTest extends TestCase
         $this->assertSame([1, 2, 3], $service->pauses);
     }
 
+    public function test_alternate_do_connect_checks_alternate_connection_threshold(): void
+    {
+        $tmux = $this->getMockBuilder(Tmux::class)->disableOriginalConstructor()->onlyMethods(['getUSPConnections'])->getMock();
+        $tmux->method('getUSPConnections')->willReturnCallback(static fn (string $which): array => [
+            $which => ['active' => $which === 'alternate' ? 3 : 0, 'total' => $which === 'alternate' ? 3 : 0],
+        ]);
+
+        $service = new class($tmux) extends NNTPService
+        {
+            public int $quitCalls = 0;
+
+            public function _isConnected(): bool
+            {
+                return true;
+            }
+
+            public function doQuit(bool $force = false): mixed
+            {
+                $this->quitCalls++;
+
+                return true;
+            }
+        };
+
+        foreach ([
+            '_usingAlternateServer' => true,
+            '_currentServer' => 'alt.example.test',
+            '_configAlternateServer' => 'alt.example.test',
+            '_primaryNntpConnections' => 50,
+            '_alternateNntpConnections' => 2,
+        ] as $property => $value) {
+            (new \ReflectionProperty(NNTPService::class, $property))->setValue($service, $value);
+        }
+
+        $this->assertTrue($service->doConnect(true, true));
+        $this->assertSame(0, $service->quitCalls);
+    }
+
     private function retryProbe(bool $connectSucceeds): NNTPService
     {
         $tmux = $this->getMockBuilder(Tmux::class)->disableOriginalConstructor()->onlyMethods(['getUSPConnections'])->getMock();
