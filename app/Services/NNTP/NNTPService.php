@@ -598,7 +598,7 @@ class NNTPService extends NntpClient
         $alternateUSP = $primaryUSP;
         $primaryConnections = $this->_tmux->getUSPConnections('primary', $primaryUSP);
         $alternateConnections = $this->_tmux->getUSPConnections('alternate', $alternateUSP);
-        if ($this->_isConnected() && $this->_usingAlternateServer === $alternate && (($alternate && $this->_currentServer === $this->_configAlternateServer && ($this->_primaryNntpConnections < $alternateConnections['alternate']['active'])) || (! $alternate && $this->_currentServer === $this->_configServer && ($this->_primaryNntpConnections < $primaryConnections['primary']['active'])))) {
+        if ($this->_isConnected() && $this->_usingAlternateServer === $alternate && (($alternate && $this->_currentServer === $this->_configAlternateServer && ($this->_alternateNntpConnections < $alternateConnections['alternate']['active'])) || (! $alternate && $this->_currentServer === $this->_configServer && ($this->_primaryNntpConnections < $primaryConnections['primary']['active'])))) {
             return true;
         }
 
