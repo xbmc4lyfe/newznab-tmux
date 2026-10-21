@@ -42,7 +42,7 @@ final class EnforceSessionToken
             }
 
             return redirect()->route('login')
-                ->with('info', 'You were logged out because a passkey login was started on another device.');
+                ->with('info', 'You were logged out because your account was signed in on another device or session.');
         }
 
         return $next($request);

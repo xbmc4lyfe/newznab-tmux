@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Tmux;
 
 use App\Facades\Yenc;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
 
 /**
@@ -472,7 +473,8 @@ class TmuxOutput extends Tmux
             )
         );
 
-        $info = $this->pdo->getAttribute(\PDO::ATTR_SERVER_INFO);
+        $pdo = $this->pdo instanceof \PDO ? $this->pdo : DB::connection()->getPdo();
+        $info = $pdo->getAttribute(\PDO::ATTR_SERVER_INFO);
         $pieces = [];
         foreach ([
             ['Threads', '/.*\bThreads: (\d+)\b.*/'],

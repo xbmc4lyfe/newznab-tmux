@@ -119,4 +119,37 @@ class TmuxMonitorServiceTest extends TestCase
             $tmux->getUSPConnections('alternate', $connections, $snapshot),
         );
     }
+
+    public function test_connection_counts_include_all_round_robin_addresses_and_separate_same_port_alternate(): void
+    {
+        $reflection = new ReflectionClass(Tmux::class);
+        /** @var Tmux $tmux */
+        $tmux = $reflection->newInstanceWithoutConstructor();
+        $snapshot = implode("\n", [
+            'ESTAB 0 0 10.0.0.2:41001 185.90.196.65:563',
+            'ESTAB 0 0 10.0.0.2:41002 185.90.196.97:563',
+            'ESTAB 0 0 10.0.0.2:41003 85.12.62.250:563',
+            'TIME-WAIT 0 0 10.0.0.2:41004 85.12.62.251:563',
+            'ESTAB 0 0 10.0.0.2:41005 198.51.100.40:563',
+            'ESTAB 0 0 10.0.0.2:41006 198.51.100.41:563',
+            'CLOSE-WAIT 0 0 10.0.0.2:41007 198.51.100.41:563',
+        ]);
+        $connections = [
+            'ip' => '185.90.196.65',
+            'ips' => ['185.90.196.65', '185.90.196.97', '185.90.196.129'],
+            'port' => 563,
+            'ip_a' => '198.51.100.40',
+            'ips_a' => ['198.51.100.40', '198.51.100.41'],
+            'port_a' => 563,
+        ];
+
+        $this->assertSame(
+            ['primary' => ['active' => 3, 'total' => 4]],
+            $tmux->getUSPConnections('primary', $connections, $snapshot),
+        );
+        $this->assertSame(
+            ['alternate' => ['active' => 2, 'total' => 3]],
+            $tmux->getUSPConnections('alternate', $connections, $snapshot),
+        );
+    }
 }

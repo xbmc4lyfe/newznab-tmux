@@ -129,6 +129,10 @@ final class ConfigurationProvider
 
     private function tableExists(string $table): bool
     {
-        return Schema::hasTable($table);
+        try {
+            return Schema::hasTable($table);
+        } catch (\Throwable) {
+            return false;
+        }
     }
 }

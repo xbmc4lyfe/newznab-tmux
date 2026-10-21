@@ -42,24 +42,24 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom:** invitation, expiry, contact-form, registration and incident emails sit in Redis and are never sent.
 - **Mitigation:** the docker/ stack sets `HORIZON_QUEUES=api-audit,default,emails,incidents,contactemail,newreg,welcomeemails`. Upstream should either change the default or derive it from the configured queue names.
 
-### 6. `nntmux:install` always warns that the unzip path isn't configured (Open)
+### 6. `nntmux:install` always warns that the unzip path isn't configured (Fixed)
 
 - **Where:** `app/Console/Commands/InstallNntmux.php:195,218`.
 - **Bug:** it reads `config('nntmux_settings.tmp_unzip_path')`, but the key is `nntmux.tmp_unzip_path` (`config/nntmux.php:78`).
 - **Symptom:** the warning always prints, and `updatePaths()` returns early without checking or creating the path.
-- **Fix:** read `config('nntmux.tmp_unzip_path')`.
+- **Fix (staged):** read `config('nntmux.tmp_unzip_path')`.
 
-### 7. `nntmux:install` replaces an existing `APP_KEY` (Open, design)
+### 7. `nntmux:install` replaces an existing `APP_KEY` (Fixed)
 
 - **Where:** `app/Console/Commands/InstallNntmux.php:85` (`key:generate --force`).
 - **Symptom:** re-running the installer on a configured `.env` makes existing encrypted data and sessions unreadable. `nntmux:deploy-init` doesn't do this.
-- **Fix:** only generate a key when `APP_KEY` is empty.
+- **Fix (staged):** only generate a key when `APP_KEY` is empty.
 
-### 8. `nntmux:populate --disable-keys` silently skips its buffer tuning (Open)
+### 8. `nntmux:populate --disable-keys` silently skips its buffer tuning (Fixed)
 
 - **Where:** `app/Console/Commands/NntmuxPopulateSearchIndexes.php:1244`.
 - **Bug:** `SET SESSION innodb_buffer_pool_size = …` is invalid, because that variable is global-only. The error is caught, which also skips the `bulk_insert_buffer_size`, `read_buffer_size` and `sort_buffer_size` statements after it.
-- **Fix:** drop the `innodb_buffer_pool_size` line, or wrap each statement in its own try/catch.
+- **Fix (staged):** drop the `innodb_buffer_pool_size` line so the valid session buffer statements execute.
 
 ### 9. Dead configuration keys (Open, low priority)
 
@@ -67,11 +67,12 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - `lame_path` (`LAME_PATH`) is defined in `config/nntmux_settings.php`, but nothing in `app/` references it.
 - `FFProbe::create()` (`MediaExtractionService.php:481`) ignores `FFPROBE_PATH`. It finds `ffprobe` on `PATH` instead.
 
-### 10. Misleading forced-logout message (Open, low priority)
+### 10. Misleading forced-logout message (Fixed)
 
 - **Where:** `app/Http/Middleware/EnforceSessionToken.php:45`.
 - **Bug:** a new session token is issued by both password login (`LoginController.php:315`) and passkey login. Any login therefore logs out the user's other sessions, but the message always blames a passkey login on another device ("a passkey login was started on another device").
 - **Symptom:** confusing when two browsers or tabs, or a script, log in as the same user. This made the Grafana debugging look like an auth failure.
+- **Fix (staged):** updated the flash message in `EnforceSessionToken` to `'You were logged out because your account was signed in on another device or session.'`, covered by `PasskeyLogoutOtherDevicesTest`.
 
 ### 18. `CHECK_PASSWORDED_RARS=false` (the default) silently disables all additional post-processing (Open)
 
@@ -116,12 +117,12 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom:** with 16.4M collections on the docker stack, each scan ran for 6+ minutes. The four release workers each held one at the same time (`SHOW PROCESSLIST`), and a release cycle has 158 group jobs. MariaDB sat at ~320% CPU, and release creation dropped from ~146k/hour to ~25k/hour.
 - **Fix (staged):** `deleteOrphanCollections()` takes a non-blocking `Cache::lock`, so only one worker sweeps at a time and the rest skip. Each sweep checks one id window after a cursor stored in the cache, then advances it and wraps to the start at the highest id. The window defaults to 250,000 ids (`nntmux.cbp.orphan_scan_window`, `CBP_ORPHAN_SCAN_WINDOW`). Regression tests are in `tests/Feature/CbpCleanupServiceTest.php`.
 
-### 23. `nntmux:resetdb` leaves release-linked tables behind and wipes the PreDB search index (Open)
+### 23. `nntmux:resetdb` leaves release-linked tables behind and wipes the PreDB search index (Fixed)
 
 - **Where:** the table list and `Search::truncateIndex()` call in `app/Console/Commands/NntmuxResetDb.php:67-91, 279-282`.
 - **Bug:** it truncates `collections` with foreign key checks off but not `collection_groups`, so the cross-post rows survive. Collection ids restart at 1 after the truncate, and `CollectionHandler` writes `collection_groups` with `INSERT IGNORE`, so new collections inherit the old group names. It also skips `release_regexes`, `videos_aliases`, `par_hashes`, `release_unique`, `release_reports`, `release_nzb_creation_failures`, `release_nzb_passwords`, `bookinfo`, `consoleinfo` and `gamesinfo`. Separately, it truncates `predb_rt` while keeping the `predb` table, so PreDB search is empty until the index is repopulated.
 - **Symptom:** on the docker stack, a reset would have left 45M `collection_groups` rows and 938k `release_regexes` rows pointing at deleted ids.
-- **Fix:** add the missing tables to the list, and drop `predb_rt` from `truncateIndex()` (or repopulate it afterwards). The 2026-10-09 wipe on the docker stack was done with an equivalent SQL script that includes these tables, because the command only runs when `APP_ENV=local`.
+- **Fix (staged):** add the missing tables to the list, and drop `predb_rt` from `truncateIndex()` when `predb` rows are kept. The 2026-10-09 wipe on the docker stack was done with an equivalent SQL script that includes these tables, because the command only runs when `APP_ENV=local`.
 
 ### 24. The IRC scraper's only channel announces no pres, and it can't read the active pre channels (Fixed)
 
@@ -142,12 +143,12 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom:** on 2026-10-10 the host's VPN exit address (103.102.246.86, AS203020 HostRoyale) is listed in DroneBL as an open proxy. synirc and zenet G-line it, and the scraper reconnected to both twice a minute. That can get a ban extended.
 - **Fix (staged):** `IRCScraper` exits with code 1 on a failed connect or login (`fail()`), and the supervisor backs off per network: 30 s doubling to 1 hour (`IrcScraperCommand::restartDelay()`), reset once a child stays up for 10 minutes. Test: `tests/Feature/IrcNetworksTest.php`.
 
-### 27. The NNTP connection count only sees one of the provider's round-robin addresses (Open)
+### 27. The NNTP connection count only sees one of the provider's round-robin addresses (Fixed)
 
 - **Where:** `Tmux::getConnectionsInfo()` (`app/Services/Tmux/Tmux.php:52`) resolves `NNTP_SERVER` once with `gethostbyname()`, which returns a single address. `Tmux::getUSPConnections()` (`:66-100`) then counts only `ss` lines containing that `ip:port`. The tmux monitor publishes the result, and `TmuxSnapshotCollector` exports it as `nntmux_nntp_connections`.
 - **Bug:** news.newshosting.com resolves to several addresses (185.90.196.65, .97 and .129 on 2026-10-10), and each worker connects to whichever one its own lookup returned. Long-lived workers also keep connections to addresses that have since left DNS (85.12.62.250 and .251). Only sockets to the single address the monitor picked are counted.
 - **Symptom:** the Grafana "NNTP connections" panel dropped from about 50 to 2-3 at around 21:50 UTC on 2026-10-09 and stayed there. At the same time, `ss` in the indexer showed 27-50 established connections to port 563, spread over four addresses, with 0 on the address being counted. The tmux monitor pane under-reports in the same way.
-- **Fix:** count established sockets whose peer port is the configured NNTP port across every address. When the alternate provider uses the same port, assign sockets to it by matching `gethostbynamel()` of the alternate host, and count the rest as primary. `NNTPService::doConnect()` (`app/Services/NNTP/NNTPService.php:217`) calls the same method, so it under-counts too, although there it only decides whether to reuse an open connection.
+- **Fix (staged):** count sockets whose peer port is the configured NNTP port across every address, and when the alternate provider uses the same port, assign sockets to it by matching `gethostbynamel()` of the alternate host and count the rest as primary. `NNTPService::doConnect()` passes the resolved address sets as well. Covered by `TmuxMonitorServiceTest`.
 
 ### 28. The missed-`NZB` cleanup scans every release that already has an `NZB` file (Fixed)
 
@@ -185,11 +186,11 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Symptom:** a pane exit that happens while the monitor is between waits after a timed-out wait is not noticed until the following wait times out.
 - **Fix (staged):** `waitForExit()` waits in 1-second slices and returns as soon as a pane that was alive at the start has died or disappeared. `pane_dead` comes from the terminal closing, so it does not depend on SIGCHLD or the hook. The hook still wakes the wait immediately when it works. An exit that happens before a wait starts still relies on the hook, as before.
 
-### 33. The `Unit` test suite runs out of memory at PHP's default 128 MB limit (Open)
+### 33. The `Unit` test suite runs out of memory at PHP's default 128 MB limit (Fixed)
 
 - **Where:** `vendor/bin/phpunit --testsuite=Unit` in `nntmux/build:local` (command-line `memory_limit` 128M).
 - **Symptom:** `Allowed memory size of 134217728 bytes exhausted` during `Kernel::discoverCommands()` in a later test's `setUp()` (first seen in `MovieReverifyMatchesTest`), which aborts the run. The same happens without this session's changes. With `-d memory_limit=1G` the full Unit and Feature run passes.
-- **Fix:** find what accumulates across tests (each `createApplication()` rediscovering console commands is a likely suspect), or set `memory_limit` in `phpunit.xml`.
+- **Fix (staged):** set `<ini name="memory_limit" value="1G"/>` in `phpunit.xml`.
 
 ### 34. IRC updates relabel a PRE's source to whoever repeated it (Fixed)
 
@@ -206,11 +207,12 @@ These bugs turned up while building and running the self-hosted stack in `docker
 
 ## Packaging and deployment
 
-### 11. `docker-compose.yml.prod-dist` starts a command that doesn't exist (Open)
+### 11. `docker-compose.yml.prod-dist` starts a command that doesn't exist (Fixed)
 
 - **Where:** `docker-compose.yml.prod-dist:33`: `php artisan tmux-ui:start & php artisan horizon`.
 - **Bug:** there is no `tmux-ui:start` command; the real command is `tmux:start`.
 - **Symptom:** the worker container never starts the indexer.
+- **Fix (staged):** invoke `php artisan tmux:start & php artisan horizon`.
 
 ### 12. Production image ships `unrar-free`, which can't read RAR5 (Mitigated)
 
@@ -275,13 +277,13 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Fix:** escape machine-generated names with `escapeString()` in `searchPredb()`, or have `prepareUserSearchQuery()` escape unbalanced parentheses.
 - **Fix (staged):** `NameFixingService::findBestPredbMatch()` now searches `predbSearchText($fileName)`: everything except letters, digits and the `.`, `_`, `-` separators becomes a space, and a leading `-` (negation) is dropped. The original name is still used for the cache key and match scoring, and the PreDB search keeps its operators for people typing searches (`Predb::search`). It recurred at 08:27 and 08:34 UTC on 2026-10-11 with hashed names such as `)C<b;<C6.U#…`; the exact name from the log now runs without error against `predb_rt`. Covered by `NameFixingPredbSearchTextTest`.
 
-### 36. PHPStan can't analyse console commands without a database (Open)
+### 36. PHPStan can't analyse console commands without a database (Fixed)
 
 - **Where:** `UpdatePostProcess::__construct()` (`app/Console/Commands/UpdatePostProcess.php:50`) injects `PostProcessService`. Building it builds `NameFixingService` → `ReleaseUpdateService` → `CategorizationService` → `CategorizationPipeline`, which checks the settings table through `ConfigurationProvider` (`ConfigurationProvider.php:132`).
 - **Bug:** when it boots the app, Larastan resolves every console command. Without a reachable database, building `UpdatePostProcess` throws a `QueryException` (connection refused).
 - **Symptom:** `Internal error: App\Console\Commands\UpdatePostProcess while analysing file …/ProcessReleasesCommand.php`, "Result is incomplete because of severe errors." This happens for any file under `app/Console/Commands`, so commands get no static analysis in CI or build containers.
 - **Workaround:** run PHPStan with `DB_CONNECTION=sqlite DB_DATABASE=:memory:`.
-- **Fix:** resolve `PostProcessService` lazily in `handle()`, or make its settings load lazily.
+- **Fix (staged):** fall back to defaults when `ConfigurationProvider` or `ProcessingRuntimeStateRepository` cannot reach the database during schema checks, defer `CategorizationPipeline` ingestion settings until `categorize()`, and avoid throwing from `Tmux::__construct()` when `DB::connection()->getPdo()` is unavailable during command discovery.
 
 ### 37. Release reconcile deadlocked with header storage on busy groups (Fixed)
 
