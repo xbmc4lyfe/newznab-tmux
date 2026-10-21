@@ -522,11 +522,11 @@ These bugs turned up while building and running the self-hosted stack in `docker
 - **Connection fixture correction:** persistent-session and partial-audit mocks now report `isConnected()` explicitly. The full CI suite exposed four failures because those healthy-transport fixtures rejected the new health probe before their second article; all four reproduce locally and pass with the fixture contract restored.
 - **Rust experiment:** bounded cross-candidate sample batches, optional full-manifest STAT, and a Rust framing subprocess are available for validation. Batch size defaults to one and the Rust executable path defaults empty. A paired 20-observation caller screen found median times of 36.83/16.36/19.31 ms (sequential/PHP batch/Rust batch, 32 KiB bodies) and 189.96/156.20/185.56 ms (500 KiB bodies). This synthetic socket screen does not qualify p99 or TCP/TLS performance; Rust remains disabled because the required speedups were not established. The native implementation remains available.
 
-### 67. Docker CI jobs can land on workers without a Docker daemon (Fixed)
+### 67. Docker and Node CI jobs can land on workers without a Docker daemon or Node.js (Fixed)
 
-- **Where:** the PHP and release-presentation workflows used `ubuntu-latest`, also advertised by repository self-hosted workers.
-- **Effect:** PHP service-container setup and presentation web-container qualification failed before their intended checks because `/var/run/docker.sock` did not exist.
-- **Fix:** select the explicit `ubuntu-24.04` hosted image for these two Docker-dependent jobs. The inspected self-hosted inventory does not advertise that label; validation and benchmark gates remain unchanged. The paired x86 decoder job accepts an optional administrator-configured disposable VBMI2 runner label while retaining its measured kernel and speedup requirements.
+- **Where:** the PHP, release-presentation, and Benchmark Pages workflows used `ubuntu-latest`, also advertised by repository self-hosted workers.
+- **Effect:** PHP service-container setup and presentation web-container qualification failed before their intended checks because `/var/run/docker.sock` did not exist, and Benchmark Pages failed on `node: command not found`.
+- **Fix:** select the explicit `ubuntu-24.04` hosted image for these Docker- and Node-dependent jobs. The inspected self-hosted inventory does not advertise that label; validation and benchmark gates remain unchanged. The paired x86 decoder job accepts an optional administrator-configured disposable VBMI2 runner label while retaining its measured kernel and speedup requirements.
 
 ## Issues in the docker/ stack itself (all fixed)
 
