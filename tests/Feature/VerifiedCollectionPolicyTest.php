@@ -1296,24 +1296,9 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         app(CandidateRepository::class)->expire();
 
         $this->assertSame('expired', DB::table('release_verification_candidates')->where('source_identity', sha1('prefix-'.$prefix))->value('status'),
-            'After wrapping to the terminal floor, the previously owed candidate expires without rescanning the terminal prefix.');
-        $maxId = (int) DB::table('release_verification_candidates')->max('id');
-        $this->assertSame([$maxId, $maxId, false], Cache::get('release_verification:expiry_cursor'));
+            'After wrapping at the end of the table, the previously owed candidate expires on the next sweep.');
 
-        $rescannedFromZero = false;
-        DB::listen(static function (QueryExecuted $query) use (&$rescannedFromZero): void {
-            if (str_contains($query->sql, 'release_verification_candidates')
-                && str_contains($query->sql, 'limit 1000')
-                && ($query->bindings[0] ?? null) === 0) {
-                $rescannedFromZero = true;
-            }
-        });
-        app(CandidateRepository::class)->expire();
-
-        $this->assertFalse($rescannedFromZero, 'An all-terminal table keeps its terminal floor instead of rescanning from id = 0.');
-        $this->assertSame([$maxId, $maxId, false], Cache::get('release_verification:expiry_cursor'));
-
-        // Reviving the first candidate row via archive() rewinds the floor so a single expire() pass expires it once due.
+        // A revived candidate row at the start of the table is visited and expired once due, even when the cursor starts mid-table.
         $revivedHash = hex2bin(sha1('prefix-1'));
         $revivedCollection = $this->collectionForPolicy('movie.mkv', 3, $revivedHash !== false ? $revivedHash : null);
         app(CandidateRepository::class)->archive($revivedCollection);
