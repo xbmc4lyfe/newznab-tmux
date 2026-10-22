@@ -2236,6 +2236,86 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
     }
 
+    public function test_partial_promotion_defers_overdue_uploads_and_promotes_owed_uploads_behind_them(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $this->limits();
+        config(['release_verification.partial_after_hours' => 4, 'release_verification.partial_ready_limit' => 1]);
+        $expiry = (int) config('release_verification.expiry_hours');
+        $due = now()->subMinute()->format('Y-m-d H:i:s');
+        $row = static fn (string $name, int $hoursAgo): array => ['identity' => sha1($name), 'source_identity' => sha1($name), 'groups_id' => 1,
+            'manifest_path' => hash('sha256', $name).'.json.gz', 'manifest_bytes' => 0, 'manifest_hash' => hash('sha256', $name), 'status' => 'waiting_upload',
+            'version' => 1, 'last_unique_at' => now()->subHours($hoursAgo)->format('Y-m-d H:i:s'), 'next_attempt_at' => $due];
+        DB::table('release_verification_candidates')->insert($row('overdue-a', $expiry + 5));
+        DB::table('release_verification_candidates')->insert($row('overdue-b', $expiry + 6));
+        DB::table('release_verification_candidates')->insert($row('owed', 5));
+
+        $promoted = app(CandidateRepository::class)->promotePartial(1);
+
+        $this->assertSame(1, $promoted);
+        $this->assertSame('ready', DB::table('release_verification_candidates')->where('source_identity', sha1('owed'))->value('status'));
+        $this->assertSame(['waiting_upload', 'waiting_upload'], DB::table('release_verification_candidates')
+            ->whereIn('source_identity', [sha1('overdue-a'), sha1('overdue-b')])->orderBy('id')->pluck('status')->all());
+        $this->assertSame(2, DB::table('release_verification_candidates')
+            ->whereIn('source_identity', [sha1('overdue-a'), sha1('overdue-b')])
+            ->where('next_attempt_at', '>', now()->format('Y-m-d H:i:s'))->count());
+    }
+
+    public function test_candidate_expiry_pages_with_a_cursor_across_passes(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $this->limits();
+        $old = now()->subHours((int) config('release_verification.expiry_hours') + 5)->format('Y-m-d H:i:s');
+        $rows = [];
+        foreach (range(1, 101) as $n) {
+            $rows[] = ['identity' => sha1('expirable-'.$n), 'source_identity' => sha1('expirable-'.$n), 'groups_id' => 1,
+                'manifest_path' => '', 'manifest_bytes' => 0, 'manifest_hash' => hash('sha256', 'expirable-'.$n), 'status' => 'waiting_upload',
+                'version' => 1, 'last_unique_at' => $old, 'next_attempt_at' => $old];
+        }
+        DB::table('release_verification_candidates')->insert($rows);
+        $hundredthId = (int) DB::table('release_verification_candidates')->where('source_identity', sha1('expirable-100'))->value('id');
+
+        app(CandidateRepository::class)->expire();
+        $this->assertSame($hundredthId, (int) Cache::get('release_verification:expire_cursor'));
+        $this->assertSame('waiting_upload', DB::table('release_verification_candidates')->where('source_identity', sha1('expirable-101'))->value('status'));
+
+        app(CandidateRepository::class)->expire();
+        $this->assertSame(0, (int) Cache::get('release_verification:expire_cursor'));
+        $this->assertSame('expired', DB::table('release_verification_candidates')->where('source_identity', sha1('expirable-101'))->value('status'));
+    }
+
+    public function test_partial_deferral_reports_partial_deferred_timing_outcome_instead_of_threw(): void
+    {
+        config(['release_verification.partial_after_hours' => 4, 'release_verification.publication_timing_sample_every' => 1]);
+        $repository = app(CandidateRepository::class);
+        $repository->archive($this->collectionForPolicy('movie.mkv', 3));
+        $this->travel(5)->hours();
+        $this->limits(files: 2);
+        $repository->promotePartial(10);
+        $claim = $repository->claim();
+        $manifest = app(ManifestStore::class)->read($claim->manifest_path);
+        $manifest += ['verification_mode' => 'spot_check', 'verified_file_names' => ['movie.mkv'],
+            'spot_check' => ['articles' => 1, 'bytes' => 5, 'sampled_files' => 1, 'method' => 'yenc-crc-and-identity'],
+            'partial' => ['articles_found' => 1, 'articles_expected' => 3, 'files_found' => 1, 'files_expected' => 1]];
+        $this->publicationSchema();
+        $reports = [];
+        Log::shouldReceive('warning')->andReturnNull();
+        Log::shouldReceive('info')->andReturnUsing(function (string $message, array $context) use (&$reports): void {
+            if ($message === 'Verified release publication timing.') {
+                $reports[] = $context;
+            }
+        });
+
+        try {
+            app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('sampled', 'Partial sample.', $manifest));
+            $this->fail('A partial upload below policy must be deferred.');
+        } catch (PartialPublicationDeferredException) {
+        }
+
+        $this->assertCount(1, $reports);
+        $this->assertSame('partial_deferred', $reports[0]['outcome']);
+    }
+
     private function limits(int $min = 0, int $max = 0, int $files = 0, int $groupMin = 0, int $groupFiles = 0): void
     {
         Cache::put('configuration:ingestion', new IngestionConfigurationData(...array_replace(IngestionConfigurationData::defaults()->toArray(),

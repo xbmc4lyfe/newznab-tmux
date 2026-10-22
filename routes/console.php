@@ -150,7 +150,7 @@ Schedule::command("releases:fix-names 8 --update --category={$par2Category} --se
     ->when(static fn (): bool => (bool) config('tmux.fix_names.par2_scheduled'));
 
 // One metadata preparer parks uploads without consuming a spot-verification slot.
-$preparationCommand = escapeshellarg(PHP_BINARY).' -d '.$verificationMemory().' '
+$preparationCommand = escapeshellarg(PHP_BINARY).' -d ffi.enable=true -d '.$verificationMemory().' '
     .escapeshellarg(base_path('artisan')).' releases:prepare-candidates --limit=5000 --max-seconds=30 --diagnostics';
 Schedule::exec($preparationCommand)->everyMinute()->runInBackground()
     ->when(static fn (): bool => (bool) config('release_verification.scheduled'));

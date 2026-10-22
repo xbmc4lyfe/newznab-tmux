@@ -14,7 +14,7 @@ final class DatabaseNzbStore
 {
     public const MAX_COMPRESSED_BYTES = 33554432;
 
-    public const MAX_DECODED_BYTES = 134217728;
+    public const MAX_DECODED_BYTES = 268435456;
 
     public static function enabled(): bool
     {

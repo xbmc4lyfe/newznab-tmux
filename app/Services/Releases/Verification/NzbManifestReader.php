@@ -13,7 +13,7 @@ final class NzbManifestReader
     /** @return array<string, mixed> */
     public function read(string $xml, object $release): array
     {
-        if (strlen($xml) > 33554432) {
+        if (strlen($xml) > 268435456) {
             throw new RuntimeException('NZB exceeds audit metadata budget.');
         }
         $previous = libxml_use_internal_errors(true);

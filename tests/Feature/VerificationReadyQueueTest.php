@@ -481,7 +481,8 @@ class VerificationReadyQueueTest extends ReleaseVerificationCandidatesTest
         $events = array_values(array_filter(app(Schedule::class)->events(), static fn ($event): bool => is_string($event->command)
             && str_contains($event->command, 'releases:prepare-candidates')));
         $this->assertCount(1, $events);
-        $this->assertStringContainsString("'memory_limit=512M'", $events[0]->command);
+        $this->assertStringContainsString('-d ffi.enable=true', $events[0]->command);
+        $this->assertStringContainsString("'memory_limit=1536M'", $events[0]->command);
         $this->assertStringContainsString('--limit=5000 --max-seconds=30 --diagnostics', $events[0]->command);
         $this->assertSame('* * * * *', $events[0]->expression);
         config(['release_verification.scheduled' => false]);
