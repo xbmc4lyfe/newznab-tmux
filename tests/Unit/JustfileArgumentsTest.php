@@ -462,6 +462,12 @@ SH);
         $this->assertStringContainsString('DEPLOY_LOG=[/srv/runtime/.deploy.log]', $envPaths->getOutput());
         $this->assertStringContainsString('DEPLOY_STAMP=[/srv/runtime/.deploy.stamp]', $envPaths->getOutput());
         $this->assertStringContainsString('DEPLOY_SUCCESS_TIME=[/srv/runtime/.deploy.time]', $envPaths->getOutput());
+
+        // COMPOSE_OVERLAY_FILE in docker/.env appends to the stack's docker-compose.yml when COMPOSE_FILE is unset.
+        file_put_contents($this->directory.'/docker/.env', "COMPOSE_OVERLAY_FILE=/srv/cutover.yml\n");
+        $overlay = $this->just('docker/Justfile', ['ps'], ['DC' => $this->directory.'/bin/fake']);
+        $overlay->mustRun();
+        $this->assertStringContainsString('COMPOSE_FILE=['.realpath($this->directory).'/docker/docker-compose.yml:/srv/cutover.yml]', $overlay->getOutput());
     }
 
     // helpers ------------------------------------------------------------------------------------
@@ -495,7 +501,7 @@ SH);
     {
         // Drop anything of the developer's shell that the recipes would otherwise pick up.
         $clean = [];
-        foreach (['COMPOSE_FILE', 'COMPOSE_PROFILES', 'DC', 'DOCKER_COMPOSE', 'SAIL', 'CMD', 'cmd', 'FORCE', 'MONITORING_ENABLED', 'APP_IMAGE', 'WEB_IMAGE', 'HORIZON_IMAGE', 'SCHEDULER_IMAGE', 'INDEXER_IMAGE', 'BASE_IMAGE', 'HELPER_IMAGE', 'DEPLOY_BY', 'DEPLOY_TARGETS', 'DEPLOY_REPO', 'DEPLOY_LOCK_DIR', 'DEPLOY_LOG', 'DEPLOY_STAMP', 'DEPLOY_SUCCESS_TIME', 'SEARCH_DRIVER', 'FAKE_PS_FAIL'] as $name) {
+        foreach (['COMPOSE_FILE', 'COMPOSE_OVERLAY_FILE', 'COMPOSE_PROFILES', 'DC', 'DOCKER_COMPOSE', 'SAIL', 'CMD', 'cmd', 'FORCE', 'MONITORING_ENABLED', 'APP_IMAGE', 'WEB_IMAGE', 'HORIZON_IMAGE', 'SCHEDULER_IMAGE', 'INDEXER_IMAGE', 'BASE_IMAGE', 'HELPER_IMAGE', 'DEPLOY_BY', 'DEPLOY_TARGETS', 'DEPLOY_REPO', 'DEPLOY_LOCK_DIR', 'DEPLOY_LOG', 'DEPLOY_STAMP', 'DEPLOY_SUCCESS_TIME', 'SEARCH_DRIVER', 'FAKE_PS_FAIL'] as $name) {
             $clean[$name] = false;
         }
 
