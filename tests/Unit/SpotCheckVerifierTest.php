@@ -634,6 +634,7 @@ final class SpotCheckVerifierTest extends TestCase
             ['"Xk29dPq8LmZ0Yt5R.mkv" yEnc', 'Xk29dPq8LmZ0Yt5R.mkv'],
             ['"45GQ78oFFVnPmDiiFNdYa" yEnc', 'movie.mkv'],
             ['"45GQ78oFFVnPmDiiFNdYa" yEnc', 'README'],
+            ['movie.part00001 yEnc', 'movie.part00001'],
         ] as [$subject, $yencName]) {
             $raw = YencArticles::part($par2Payload, $yencName, strlen($par2Payload), 1, 1, 1);
             $source = new class($raw) implements ArticleSource
@@ -656,7 +657,12 @@ final class SpotCheckVerifierTest extends TestCase
             self::assertTrue($result->deterministic);
         }
 
-        foreach (['45GQ78oFFVnPmDiiFNdYa', '6d7097ef2ba33be4b4fb6681.par2'] as $yencName) {
+        foreach ([
+            ['"45GQ78oFFVnPmDiiFNdYa" yEnc', '45GQ78oFFVnPmDiiFNdYa'],
+            ['"45GQ78oFFVnPmDiiFNdYa" yEnc', '6d7097ef2ba33be4b4fb6681.par2'],
+            ['45GQ78oFFVnPmDiiFNdYa yEnc (1/1) "comment"', '45GQ78oFFVnPmDiiFNdYa'],
+            ["Poster's 45GQ78oFFVnPmDiiFNdYa yEnc", '45GQ78oFFVnPmDiiFNdYa'],
+        ] as [$subject, $yencName]) {
             $raw = YencArticles::part($par2Payload, $yencName, strlen($par2Payload), 1, 1, 1);
             $source = new class($raw) implements ArticleSource
             {
@@ -667,8 +673,8 @@ final class SpotCheckVerifierTest extends TestCase
                     return $this->raw;
                 }
             };
-            $manifest = ['identity' => sha1('parity-'.$yencName), 'expected_files' => 1, 'files' => [
-                ['key' => 'par-file', 'subject' => '"45GQ78oFFVnPmDiiFNdYa" yEnc', 'totalparts' => 1,
+            $manifest = ['identity' => sha1('parity-'.$subject.'-'.$yencName), 'expected_files' => 1, 'files' => [
+                ['key' => 'par-file', 'subject' => $subject, 'totalparts' => 1,
                     'segments' => [['number' => 1, 'messageid' => 'par@article', 'bytes' => strlen($raw)]]],
             ]];
             $result = (new SpotCheckVerifier($source, [], new YencService))->verify($manifest, static function (): void {});

@@ -93,8 +93,7 @@ final class CollectionReleasePolicy
         $verifiedNames = array_values(array_filter($manifest['verified_file_names'] ?? [], 'is_string'));
         $allSampledArePar2 = $verifiedNames !== []
             && count($emitted) <= (int) ($sample['sampled_files'] ?? 0)
-            && array_filter($verifiedNames, static fn (string $name): bool => preg_match('/\.par2\z/i', rtrim($name, ". \t")) !== 1
-                && preg_match('/\.par2\z/i', rtrim((string) preg_replace('/:.*\z/s', '', $name), ". \t")) !== 1) === [];
+            && array_filter($verifiedNames, static fn (string $name): bool => ! HeaderFilenameIdentity::isPar2Filename($name)) === [];
         if ($allSampledArePar2) {
             $nonParityEmitted = [];
         }

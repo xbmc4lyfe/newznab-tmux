@@ -108,10 +108,12 @@ final class Par2CandidateRecovery
                 if (! self::owns($guard)) {
                     return Par2RenameOutcome::Deferred;
                 }
+                $maxPayloadBytes = isset($snapshot['max_payload_bytes']) ? (int) $snapshot['max_payload_bytes'] : null;
                 $fileComplete = $identity === null || $decodedOffset === $identity['size'];
                 $terminal = ($cursor === $segmentCount && $fileComplete && $inventory->isComplete())
                     || ($inventory->hasCompleteMainInventory() && $inventory->exportState()['skip_remaining'] > 0)
-                    || Par2Processor::exceedsPayloadBudget($inventory, isset($snapshot['max_payload_bytes']) ? (int) $snapshot['max_payload_bytes'] : null);
+                    || ($cursor > 0 && $maxPayloadBytes !== null && $maxPayloadBytes <= 0)
+                    || Par2Processor::exceedsPayloadBudget($inventory, $maxPayloadBytes);
                 $outcome = $this->postprocess->applyPAR2InventoryForRename($inventory, $snapshot['id'], $groupId, $show, $guard, $terminal, $snapshot);
                 if ($outcome === Par2RenameOutcome::Renamed) {
                     return $outcome;

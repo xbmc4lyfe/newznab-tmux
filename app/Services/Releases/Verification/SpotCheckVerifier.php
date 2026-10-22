@@ -113,7 +113,7 @@ final class SpotCheckVerifier
                 return self::deterministic('Spot-check article identity differs from its header.');
             }
             $fileKey = $segment['file_key'];
-            if ($isPar2Packet || $this->isPar2Filename($article->name)) {
+            if ($isPar2Packet || HeaderFilenameIdentity::isPar2Filename($article->name)) {
                 $parityFileKeys[$fileKey] = true;
             }
             if ($segment['totalparts_inferred'] && ($article->totalParts !== null || $article->part === $segment['totalparts'])) {
@@ -265,33 +265,10 @@ final class SpotCheckVerifier
             if (($file['key'] ?? null) !== $key) {
                 continue;
             }
-            $subject = (string) ($file['subject'] ?? '');
-            if (! HeaderFilenameIdentity::matches($subject, $actual)) {
-                return false;
-            }
-            if ($isPar2Packet) {
-                if (HeaderFilenameIdentity::provesPayload($actual)) {
-                    return false;
-                }
-                $trimmed = rtrim($actual, ". \t");
-                if ((str_contains($subject, '"') || str_contains($subject, "'"))
-                    && ! $this->isPar2Filename($actual)
-                    && ! HeaderFilenameIdentity::matches($subject, $trimmed.'.par2')) {
-                    return false;
-                }
-            }
 
-            return true;
+            return HeaderFilenameIdentity::matches((string) ($file['subject'] ?? ''), $actual, $isPar2Packet);
         }
 
         return false;
-    }
-
-    private function isPar2Filename(string $name): bool
-    {
-        $trimmed = rtrim($name, ". \t");
-        $bare = rtrim((string) preg_replace('/:.*\z/s', '', $name), ". \t");
-
-        return preg_match('/\.par2\z/i', $trimmed) === 1 || preg_match('/\.par2\z/i', $bare) === 1;
     }
 }

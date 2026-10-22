@@ -104,8 +104,12 @@ class Par2Processor
             return Par2RenameOutcome::Deferred;
         }
         $metadataComplete = ! (new Par2FileList)->hasUnresolvedDescriptors($this->par2Info);
-        if (! self::setFitsPayloadBudget($files, self::resolveMaxPayloadBytes($query))) {
-            return $metadataComplete ? Par2RenameOutcome::NoMatch : Par2RenameOutcome::Retryable;
+        $maxPayloadBytes = self::resolveMaxPayloadBytes($query);
+        if (! self::setFitsPayloadBudget($files, $maxPayloadBytes)) {
+            return Par2RenameOutcome::NoMatch;
+        }
+        if ($maxPayloadBytes !== null && ! $metadataComplete) {
+            return Par2RenameOutcome::Retryable;
         }
 
         return $this->applyMetadataFiles($query, $files, $show, $canPersist, $metadataComplete);
@@ -143,15 +147,21 @@ class Par2Processor
             return $expectedSnapshot === null ? Par2RenameOutcome::NoMatch : Par2RenameOutcome::Deferred;
         }
         $maxPayloadBytes = self::resolveMaxPayloadBytes($query, $expectedSnapshot);
+        $streamComplete = $allowTerminalMetadata && $inventory->isComplete();
         $complete = $allowTerminalMetadata && (
             $inventory->isComplete()
             || $inventory->hasCompleteMainInventory()
+            || ($maxPayloadBytes !== null && $maxPayloadBytes <= 0)
             || self::exceedsPayloadBudget($inventory, $maxPayloadBytes)
         );
         $files = [];
         $evidence = [];
-        foreach ($inventory->filesBySet() as $setFiles) {
+        $parsers = $maxPayloadBytes !== null ? $inventory->parsersBySet() : [];
+        foreach ($inventory->filesBySet() as $set => $setFiles) {
             if (! self::setFitsPayloadBudget($setFiles, $maxPayloadBytes)) {
+                continue;
+            }
+            if ($maxPayloadBytes !== null && ! self::setHasCompleteDescriptors($parsers[$set] ?? null, $streamComplete)) {
                 continue;
             }
             foreach ($setFiles as $file) {
@@ -283,19 +293,26 @@ class Par2Processor
         }
         $state = $inventory->exportState();
         if ($maxPayloadBytes <= 0) {
-            return $state['packets'] !== [] || $state['skip_remaining'] > 0;
+            return $state['packets'] !== [] || $state['skip_remaining'] > 0 || $state['tail'] !== '';
         }
         $sets = $inventory->filesBySet();
         if ($sets === []) {
             return false;
         }
+        $hasResolvedDescriptor = false;
         foreach ($sets as $setFiles) {
+            foreach ($setFiles as $file) {
+                if (isset($file['name']) || isset($file['size']) || isset($file['size_decimal'])) {
+                    $hasResolvedDescriptor = true;
+                    break;
+                }
+            }
             if (self::setFitsPayloadBudget($setFiles, $maxPayloadBytes)) {
                 return false;
             }
         }
 
-        return true;
+        return $hasResolvedDescriptor;
     }
 
     /**
@@ -316,6 +333,9 @@ class Par2Processor
         foreach ($setFiles as $file) {
             $rawDecimal = $file['size_decimal'] ?? null;
             $rawSize = $file['size'] ?? null;
+            if ($rawDecimal === null && $rawSize === null && ! isset($file['name'])) {
+                continue;
+            }
             if (is_int($rawSize) && $rawSize >= 0 && ($rawDecimal === null || $rawDecimal === (string) $rawSize)) {
                 $fileBytes = $rawSize;
             } else {
@@ -339,6 +359,23 @@ class Par2Processor
         }
 
         return true;
+    }
+
+    private static function setHasCompleteDescriptors(?Par2Info $parser, bool $streamComplete): bool
+    {
+        if ($parser === null || (new Par2FileList)->hasUnresolvedDescriptors($parser)) {
+            return false;
+        }
+        if ($streamComplete) {
+            return true;
+        }
+        foreach ($parser->getPackets(true) ?: [] as $packet) {
+            if (($packet['head_type'] ?? null) === Par2Info::PACKET_MAIN) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /** @param array<string, mixed>|null $expectedSnapshot */
