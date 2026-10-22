@@ -276,7 +276,7 @@ final class PostProcessService
 
     /**
      * @param  null|callable(): bool  $canPersist
-     * @param  array{id: int, guid: string, name: ?string, searchname: ?string}|null  $expectedSnapshot
+     * @param  array{id: int, guid: string, name: ?string, searchname: ?string, max_payload_bytes?: int}|null  $expectedSnapshot
      */
     public function applyPAR2InventoryForRename(Par2PacketAccumulator $inventory, int $relID, int $groupID, int $show, ?callable $canPersist = null, bool $allowTerminalMetadata = true, ?array $expectedSnapshot = null): Par2RenameOutcome
     {

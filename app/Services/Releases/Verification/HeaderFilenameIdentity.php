@@ -20,11 +20,14 @@ final class HeaderFilenameIdentity
 
     private const string EXECUTABLE = '/\.(?:exe|scr|bat|cmd|com|msi|msix|msp|lnk|pif|cpl|hta|reg|scf|js|jse|vbs|vbe|wsf|wsh|ps1|psm1|jar|apk|dll|sh|command|app|dmg|pkg|chm|msc|ps1xml|psd1|cab|appx|appxbundle|msixbundle|application|gadget|inf|url|xll|ws|wsc|sct|vb|ocx|sys|iso|img|vhd|vhdx|desktop|appimage|deb|rpm|snap|run|msu|py|pyw|pl|rb|php|so|dylib|bundle|ko|node|class|wasm|pyc|pyo)\z/i';
 
-    public static function matches(string $subject, string $actual): bool
+    public static function matches(string $subject, string $actual, bool $isPar2Packet = false): bool
     {
         $subject = trim($subject);
         // Article names are validated as UTF-8 before this check; anything else cannot be compared.
         if (! mb_check_encoding($actual, 'UTF-8')) {
+            return false;
+        }
+        if ($isPar2Packet && self::parityClass($actual) === 'payload') {
             return false;
         }
         $count = preg_match_all(self::QUOTED, $subject, $matches, PREG_SET_ORDER | PREG_OFFSET_CAPTURE);
@@ -80,7 +83,7 @@ final class HeaderFilenameIdentity
         // Parity and payload are not interchangeable: a declared PAR2 file is not payload evidence, and a
         // declared payload file is not satisfied by a PAR2 body, even when another quoted value names it.
         $declaredClass = self::parityClass($declared);
-        $bodyClass = self::parityClass($actual);
+        $bodyClass = $isPar2Packet ? 'parity' : self::parityClass($actual);
         if ($declaredClass !== null && $bodyClass !== null && $declaredClass !== $bodyClass) {
             return false;
         }
@@ -131,7 +134,7 @@ final class HeaderFilenameIdentity
      */
     private static function parityClass(string $name): ?string
     {
-        if (preg_match('/\.par2\z/i', self::trimmed($name)) === 1 || preg_match('/\.par2\z/i', self::bare($name)) === 1) {
+        if (self::isPar2Filename($name)) {
             return 'parity';
         }
         if (self::extension(self::trimmed($name)) !== '' || self::extension(self::bare($name)) !== '' || self::provesPayload($name)) {
@@ -141,9 +144,14 @@ final class HeaderFilenameIdentity
         return null;
     }
 
+    public static function isPar2Filename(string $name): bool
+    {
+        return preg_match('/\.par2\z/i', self::trimmed($name)) === 1 || preg_match('/\.par2\z/i', self::bare($name)) === 1;
+    }
+
     public static function provesPayload(string $name): bool
     {
-        if (preg_match('/\.par2\z/i', self::trimmed($name)) === 1 || preg_match('/\.par2\z/i', self::bare($name)) === 1) {
+        if (self::isPar2Filename($name)) {
             return false;
         }
 

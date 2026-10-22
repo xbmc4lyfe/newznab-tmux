@@ -87,12 +87,22 @@ final class CollectionReleasePolicy
             return 'Declared file count is below the configured minimum.';
         }
 
-        $subjects = array_map(static fn (array $file): string => (string) ($file['subject'] ?? ''), $emitted);
+        $parityKeys = array_fill_keys(array_map('strval', (array) ($sample['parity_file_keys'] ?? [])), true);
+        $nonParityEmitted = array_values(array_filter($emitted,
+            static fn (array $file): bool => ! isset($parityKeys[(string) ($file['key'] ?? '')])));
+        $verifiedNames = array_values(array_filter($manifest['verified_file_names'] ?? [], 'is_string'));
+        $allSampledArePar2 = $verifiedNames !== []
+            && count($emitted) <= (int) ($sample['sampled_files'] ?? 0)
+            && array_filter($verifiedNames, static fn (string $name): bool => ! HeaderFilenameIdentity::isPar2Filename($name)) === [];
+        if ($allSampledArePar2) {
+            $nonParityEmitted = [];
+        }
+        $subjects = array_map(static fn (array $file): string => (string) ($file['subject'] ?? ''), $nonParityEmitted);
         $hasPayload = array_filter($subjects,
             static fn (string $subject): bool => preg_match('/\.par2(?:["\'\s]|$)/i', $subject) !== 1) !== [];
         // An obfuscated, extensionless body name is not evidence of a source payload.
-        $sampledNames = array_filter($manifest['verified_file_names'] ?? [],
-            static fn (mixed $name): bool => is_string($name) && HeaderFilenameIdentity::provesPayload($name));
+        $sampledNames = $nonParityEmitted === [] ? [] : array_filter($verifiedNames,
+            static fn (string $name): bool => HeaderFilenameIdentity::provesPayload($name));
         if (! $hasPayload && $sampledNames === []) {
             return 'Header inventory contains only PAR2 files without a declared source payload.';
         }
