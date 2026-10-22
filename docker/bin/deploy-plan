@@ -17,15 +17,18 @@ from pathlib import Path
 
 APP_SERVICES = ("web", "horizon", "scheduler", "indexer")
 DATA_SERVICES = ("mariadb", "redis", "manticore")
-INFRA_SERVICES = (
-    "proxy",
-    "mailpit",
+MONITORING_SERVICES = (
     "prometheus",
     "pushgateway",
     "grafana",
     "node-exporter",
     "mysqld-exporter",
     "redis-exporter",
+)
+INFRA_SERVICES = (
+    "proxy",
+    "mailpit",
+    *MONITORING_SERVICES,
 )
 ALL_SERVICES = (*APP_SERVICES, *DATA_SERVICES, *INFRA_SERVICES)
 
@@ -1066,6 +1069,25 @@ def with_built_image_ids(state: dict[str, str], stamp_path: Path) -> dict[str, s
     except OSError as error:
         sys.exit(f"deploy-plan: cannot read {stamp_path}.built: {error.strerror or error}")
     stamped = dict(state)
+    requested = parse_deploy_targets()
+    if requested:
+        app_scope = {svc for svc in APP_SERVICES if svc in requested}
+        if "migration" in requested:
+            app_scope.add("web")
+        base_tag = normalize_ref(os.environ.get("BASE_IMAGE", "nntmux/base:local"))
+        base_rebuilt = base_tag in built
+        if not app_scope and not base_rebuilt:
+            if "base" in previous:
+                stamped["base"] = previous["base"]
+            else:
+                stamped.pop("base", None)
+        for svc in APP_SERVICES:
+            role_tag = normalize_ref(service_image_name(svc))
+            if svc not in app_scope and role_tag not in built:
+                if base_rebuilt or f"build:{svc}" not in previous:
+                    stamped.pop(f"build:{svc}", None)
+                else:
+                    stamped[f"build:{svc}"] = previous[f"build:{svc}"]
     roles = [("image:base", os.environ.get("BASE_IMAGE", "nntmux/base:local"))]
     roles += [(f"image:{svc}", service_image_name(svc)) for svc in APP_SERVICES]
     for key, tag in roles:
@@ -1365,11 +1387,71 @@ def mounts_changed_since_start(docker_dir: Path, svc: str) -> bool:
     return False
 
 
+def parse_deploy_targets(rendered: dict[str, object] | None = None) -> list[str]:
+    """Expand DEPLOY_TARGETS (service names or group aliases) in order, failing closed on unknown,
+    unrendered, or scaled-to-zero targets."""
+    raw = os.environ.get("DEPLOY_TARGETS", "")
+    if not raw:
+        return []
+    tokens = [tok for part in raw.replace(",", " ").split() if (tok := part.strip())]
+    if not tokens:
+        sys.exit(f"deploy-plan: DEPLOY_TARGETS={raw!r} contains no target names.")
+    known_groups = {
+        "app": list(APP_SERVICES),
+        "apps": list(APP_SERVICES),
+        "monitoring": list(MONITORING_SERVICES),
+        "data": list(DATA_SERVICES),
+        "infra": list(INFRA_SERVICES),
+    }
+    known_services = set(ALL_SERVICES) | (set(rendered) if rendered is not None else set())
+    expanded: list[str] = []
+    for tok in tokens:
+        if tok in ("migration", "migrations"):
+            if "migration" not in expanded:
+                expanded.append("migration")
+            continue
+        if tok in known_groups:
+            group_svcs = known_groups[tok]
+            if rendered is not None:
+                group_svcs = [s for s in group_svcs if s in rendered and not scaled_to_zero(s)]
+                if not group_svcs:
+                    sys.exit(f"deploy-plan: deployment target group {tok!r} has no active services in the effective Compose configuration.")
+            for s in group_svcs:
+                if s not in expanded:
+                    expanded.append(s)
+            continue
+        if tok not in known_services:
+            valid = ", ".join([*APP_SERVICES, *DATA_SERVICES, *INFRA_SERVICES, "app", "monitoring", "data", "infra", "migration"])
+            sys.exit(f"deploy-plan: unknown deployment target {tok!r}; valid targets: {valid}")
+        if rendered is not None:
+            if tok not in rendered:
+                sys.exit(f"deploy-plan: deployment target {tok!r} is not rendered in the effective Compose configuration.")
+            if scaled_to_zero(tok):
+                sys.exit(f"deploy-plan: deployment target {tok!r} is scaled to zero in the effective Compose configuration.")
+        if tok not in expanded:
+            expanded.append(tok)
+    return expanded
+
+
 def compute_build_targets(repo: Path, docker_dir: Path, stamp_path: Path, force: bool | None = None) -> list[str]:
+    requested = parse_deploy_targets()
     state = compute_state(repo, docker_dir, include_compose=False)
     stamped = parse_stamp(stamp_path)
     if force is None:
         force = os.environ.get("FORCE", "0") == "1"
+
+    if requested:
+        app_scope = [svc for svc in APP_SERVICES if svc in requested]
+        if "migration" in requested and "web" not in app_scope:
+            app_scope.append("web")
+        if any(t not in INFRA_SERVICES for t in requested):
+            for svc in APP_SERVICES:
+                if svc not in app_scope and not image_id(service_image_name(svc)):
+                    app_scope.append(svc)
+        if not app_scope:
+            return []
+    else:
+        app_scope = list(APP_SERVICES)
 
     targets: list[str] = []
     base_img = os.environ.get("BASE_IMAGE", "nntmux/base:local")
@@ -1382,7 +1464,7 @@ def compute_build_targets(repo: Path, docker_dir: Path, stamp_path: Path, force:
     ):
         targets.append("base")
 
-    for svc in APP_SERVICES:
+    for svc in app_scope:
         img = service_image_name(svc)
         svc_id = image_id(img)
         if (
@@ -1396,8 +1478,8 @@ def compute_build_targets(repo: Path, docker_dir: Path, stamp_path: Path, force:
 
     if "base" in targets:
         # Role builds hash the base's Dockerfile text, not its image ID: a rebuilt base (e.g. after
-        # refreshing its upstream image) reaches the roles only when every role is rebuilt on it.
-        targets = ["base", *APP_SERVICES]
+        # refreshing its upstream image) reaches the roles only when every role in scope is rebuilt on it.
+        targets = ["base", *app_scope]
     return targets
 
 
@@ -1788,6 +1870,7 @@ def compose_present(state: dict[str, str], svc: str) -> bool:
 
 def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_force: bool | None = None) -> dict[str, object]:
     state = compute_state(repo, docker_dir, include_compose=True)
+    requested = parse_deploy_targets(RENDERED_SERVICES)
     stamped = parse_stamp(stamp_path)
     if stamped.get("daemon") and state.get("daemon") and stamped["daemon"] != state["daemon"]:
         sys.exit(
@@ -1950,6 +2033,41 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
         else:
             infra_reasons[svc] = "unchanged"
 
+    if requested:
+        dirty_app = [svc for svc in dirty_app if svc in requested]
+        for svc in APP_SERVICES:
+            if svc in requested:
+                if force and svc not in dirty_app:
+                    dirty_app.append(svc)
+                    app_reasons[svc] = "forced (FORCE=1)"
+            elif app_reasons.get(svc) != "unchanged":
+                app_reasons[svc] = f"deferred ({app_reasons[svc]})"
+
+        dirty_data = [svc for svc in dirty_data if svc in requested]
+        reconcile_data = [svc for svc in reconcile_data if svc in requested]
+        start_data = [svc for svc in start_data if svc in requested]
+        for svc in data_services(state):
+            if svc in requested:
+                if force and svc not in dirty_data and svc not in reconcile_data and svc not in start_data:
+                    dirty_data.append(svc)
+                    data_reasons[svc] = "forced (FORCE=1)"
+            elif data_reasons.get(svc) not in ("unchanged", "not rendered", "scaled to zero"):
+                data_reasons[svc] = f"deferred ({data_reasons[svc]})"
+
+        dirty_infra = [svc for svc in dirty_infra if svc in requested]
+        reconcile_infra = [svc for svc in reconcile_infra if svc in requested]
+        for svc in infra_services(state):
+            if svc in requested:
+                if force:
+                    if svc in reconcile_infra:
+                        reconcile_infra.remove(svc)
+                    if svc not in dirty_infra:
+                        dirty_infra.append(svc)
+                    infra_reasons[svc] = "forced (FORCE=1)"
+            elif infra_reasons.get(svc) not in ("unchanged", "not rendered", "scaled to zero"):
+                infra_reasons[svc] = f"deferred ({infra_reasons[svc]})"
+
+    all_apps_requested = not requested or all(svc in requested for svc in APP_SERVICES)
     compose_global_changed = not first_deploy and stamped.get("effective") != state["effective"]
     reconciling = bool(reconcile_data or reconcile_infra or start_data)
     # Services the stamp recorded as rendered that the effective Compose no longer renders: their
@@ -1966,7 +2084,7 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
         (data_reasons if svc in DATA_SERVICES else infra_reasons)[svc] = "removed from Compose"
     # A residual change (top-level Compose sections, the Compose command or context) is explained by
     # no service record: redeploy every app service and migrate.
-    global_fallback = compose_global_changed
+    global_fallback = compose_global_changed and all_apps_requested
     if global_fallback:
         for svc in APP_SERVICES:
             if svc not in dirty_app:
@@ -1978,7 +2096,7 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
         normalize_ref(service_image_name(svc)) for svc in dirty_app if stamped.get(f"build:{svc}") != state[f"build:{svc}"]
     }
     for svc in APP_SERVICES:
-        if svc not in dirty_app and normalize_ref(service_image_name(svc)) in rebuilt_tags:
+        if (not requested or svc in requested) and svc not in dirty_app and normalize_ref(service_image_name(svc)) in rebuilt_tags:
             dirty_app.append(svc)
             app_reasons[svc] = "shares a rebuilt image"
     # A Compose change to all four app services (e.g. a database cutover) migrates too. Only recorded
@@ -1990,7 +2108,7 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
         return key in stamped and stamped[key] != state.get(key)
     all_app_compose_changed = global_fallback or all(app_definition_changed(svc) for svc in APP_SERVICES)
 
-    migrate = (
+    full_migrate = (
         force
         or first_deploy
         or legacy_stamp
@@ -2005,6 +2123,15 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
         # The app now connects to another database. Stamps from before this record never migrate for it.
         or ("database" in stamped and stamped["database"] != state["database"])
     )
+    if requested:
+        migrate = (
+            "migration" in requested
+            or database_service(docker_dir) in dirty_data
+            or database_service(docker_dir) in reconcile_data
+            or (all_apps_requested and full_migrate)
+        )
+    else:
+        migrate = full_migrate
 
     # Reconcile-only work (e.g. a service added to Compose) is a rollout, never a no-op skip.
     if not dirty_app and not dirty_data and not dirty_infra and not migrate and not reconciling:
@@ -2015,8 +2142,7 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
         for svc in APP_SERVICES:
             if svc not in dirty_app:
                 dirty_app.append(svc)
-                if app_reasons.get(svc) == "unchanged":
-                    app_reasons[svc] = "migration quiesce" if migrate else "data service restart"
+                app_reasons[svc] = "migration quiesce" if migrate else "data service restart"
     else:
         mode = "selective"
 
@@ -2071,9 +2197,9 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
 def main() -> None:
     global BUILD_CONTEXT
     docker_dir = Path(__file__).resolve().parent.parent
-    repo = Path(os.environ.get("DEPLOY_REPO", docker_dir.parent)).resolve()
+    repo = Path(os.environ.get("DEPLOY_REPO") or docker_dir.parent).resolve()
     BUILD_CONTEXT = BuildContext(repo)
-    stamp_path = Path(os.environ.get("DEPLOY_STAMP", docker_dir / ".deploy.stamp"))
+    stamp_path = Path(os.environ.get("DEPLOY_STAMP") or (docker_dir / ".deploy.stamp"))
     if len(sys.argv) > 1 and sys.argv[1] != "--classify":
         # Before any Compose call: DC must not reach another daemon or env file than the checks see.
         reject_alternate_env_file()
@@ -2172,6 +2298,7 @@ def main() -> None:
         include_compose = bool(os.environ.get("DEPLOY_CONFIG_COMMAND", "")) or (len(sys.argv) > 2 and sys.argv[2] == "deploy")
         state = compute_state(repo, docker_dir, include_compose=include_compose)
         if len(sys.argv) > 2 and sys.argv[2] == "deploy":
+            requested_targets = parse_deploy_targets(RENDERED_SERVICES)
             # The image IDs this run planned and verified on the running containers, not the tags'
             # current IDs: a tag replaced after the final check must not be stamped as deployed.
             state = with_image_ids(state)
@@ -2181,6 +2308,26 @@ def main() -> None:
                     state[key] = snapshot[key]
             # The orphans this run planned around; the next plan drops each one whose container is gone.
             state.update({key: value for key, value in snapshot.items() if key.startswith("orphan:")})
+            if requested_targets:
+                recorded = parse_stamp(stamp_path)
+                saved_targets = os.environ.pop("DEPLOY_TARGETS", None)
+                saved_force = os.environ.get("FORCE")
+                os.environ["FORCE"] = "0"
+                try:
+                    full_plan = compute_deploy_plan(repo, docker_dir, stamp_path, build_force=False)
+                finally:
+                    if saved_targets is not None:
+                        os.environ["DEPLOY_TARGETS"] = saved_targets
+                    if saved_force is None:
+                        os.environ.pop("FORCE", None)
+                    else:
+                        os.environ["FORCE"] = saved_force
+                if full_plan["mode"] != "noop" or full_plan["build_targets"]:
+                    partial_state = {k: v for k, v in recorded.items() if k != "__legacy__"}
+                    partial_state["fingerprint"] = state["fingerprint"]
+                    partial_state["partial"] = "1"
+                    sys.stdout.write(format_stamp(partial_state, refresh_images=False))
+                    return
             sys.stdout.write(format_stamp(state, refresh_images=False))
             return
         if len(sys.argv) > 2 and sys.argv[2] == "build":
@@ -2190,8 +2337,13 @@ def main() -> None:
         sys.stdout.write(format_stamp(state))
         return
 
+    if cmd == "--resolve-targets":
+        get_compose_service_hashes(docker_dir)
+        print(" ".join(parse_deploy_targets(RENDERED_SERVICES)))
+        return
+
     if cmd == "--build-targets":
-        build_stamp = Path(os.environ.get("DEPLOY_STAMP", docker_dir / ".build.stamp"))
+        build_stamp = Path(os.environ.get("DEPLOY_STAMP") or (docker_dir / ".build.stamp"))
         targets = compute_build_targets(repo, docker_dir, build_stamp)
         print(" ".join(targets))
         return
@@ -2205,12 +2357,16 @@ def main() -> None:
         # deploy-current: running data/infra services whose image tag now names another image.
         # Only services the effective Compose configuration renders (`ps` also lists orphans).
         get_compose_service_hashes(docker_dir)
+        requested = parse_deploy_targets(RENDERED_SERVICES)
         stale = stale_service_images(docker_dir, RENDERED_SERVICES)
         # A rendered data or infrastructure service with no container at all also needs a rollout
         # (healthy apps do not prove that, e.g., a deleted Manticore came back).
         missing = [svc for svc in RENDERED_SERVICES if svc not in APP_SERVICES and svc not in stale
                    and not scaled_to_zero(svc) and not container_exists(docker_dir, svc)]
-        print(" ".join([*stale, *missing]))
+        combined = [*stale, *missing]
+        if requested:
+            combined = [svc for svc in combined if svc in requested]
+        print(" ".join(combined))
         return
 
     if cmd == "--deploy-actions":
@@ -2218,14 +2374,48 @@ def main() -> None:
         plan = compute_deploy_plan(repo, docker_dir, stamp_path, build_force=False)
         snapshot = Path(f"{stamp_path}.plan")
         tmp = snapshot.with_name(f"{snapshot.name}.tmp.{os.getpid()}")
-        planned_state = dict(plan["state"])  # type: ignore[arg-type]
+        planned_state = with_image_ids(dict(plan["state"]))  # type: ignore[arg-type]
+        requested_targets = parse_deploy_targets(RENDERED_SERVICES)
+        if requested_targets:
+            stamped_now = parse_stamp(stamp_path)
+            all_apps_in_targets = all(svc in requested_targets for svc in APP_SERVICES)
+
+            def _def_changed(svc: str) -> bool:
+                k = f"definition:{svc}" if f"definition:{svc}" in stamped_now and f"definition:{svc}" in plan["state"] else f"compose:{svc}"
+                return k in stamped_now and stamped_now[k] != plan["state"].get(k)  # type: ignore[index]
+
+            defer_all_app_compose = not plan["migrate"] and all(_def_changed(svc) for svc in APP_SERVICES)
+            for svc in APP_SERVICES:
+                if svc not in requested_targets:
+                    preserved_keys = (f"service:{svc}", f"build:{svc}", f"compose:{svc}", f"definition:{svc}")
+                    if "migration" in requested_targets and svc == "web":
+                        preserved_keys = (f"service:{svc}", f"compose:{svc}", f"definition:{svc}")
+                    for key in preserved_keys:
+                        if key in stamped_now:
+                            planned_state[key] = stamped_now[key]
+                        else:
+                            planned_state.pop(key, None)
+                elif defer_all_app_compose:
+                    for key in (f"compose:{svc}", f"definition:{svc}"):
+                        if key in stamped_now:
+                            planned_state[key] = stamped_now[key]
+                        else:
+                            planned_state.pop(key, None)
+            if not all_apps_in_targets and "migration" not in requested_targets:
+                for key in ("migration", "effective"):
+                    if key in stamped_now:
+                        planned_state[key] = stamped_now[key]
+                    else:
+                        planned_state.pop(key, None)
+            if not plan["migrate"] and "database" in stamped_now:
+                planned_state["database"] = stamped_now["database"]
         # The data/infrastructure images this plan inspected, for apply_each to verify each against.
         for svc, cfg in RENDERED_SERVICES.items():
             if svc not in APP_SERVICES and isinstance(cfg, dict) and isinstance(cfg.get("image"), str):
                 local = image_id(cfg["image"])
                 if local:
                     planned_state[f"image:{svc}"] = f"{cfg['image']}@{local}"
-        tmp.write_text(format_stamp(planned_state))
+        tmp.write_text(format_stamp(planned_state, refresh_images=False))
         os.replace(tmp, snapshot)
         print(f"MODE={shlex.quote(str(plan['mode']))}")
         print(f"MIGRATE={'1' if plan['migrate'] else '0'}")

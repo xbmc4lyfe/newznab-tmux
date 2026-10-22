@@ -35,7 +35,27 @@ service_image() {
     fi
 }
 
-for service in web horizon scheduler indexer; do
+app_services="web horizon scheduler indexer"
+if [ -n "${DEPLOY_TARGETS:-}" ] && [ "${1:-}" != --healthy ]; then
+    targets=$("$DIR/bin/deploy-plan" --resolve-targets) || exit 1
+    full_apps=0
+    selected_apps=""
+    for item in $targets; do
+        case "$item" in
+            web|horizon|scheduler|indexer)
+                selected_apps="${selected_apps:+$selected_apps }$item"
+                ;;
+            mariadb|redis|manticore|migration)
+                full_apps=1
+                ;;
+        esac
+    done
+    if [ "$full_apps" != 1 ]; then
+        app_services="$selected_apps"
+    fi
+fi
+
+for service in $app_services; do
     container=$(compose ps -q "$service") || exit 1
     [ -n "$container" ] || exit 1
     status=$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container") || exit 1

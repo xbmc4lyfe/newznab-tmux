@@ -51,6 +51,8 @@ class NzbContentsService
     /** @var list<array<string, mixed>> */
     private array $par2Manifest = [];
 
+    private int $par2NonExplicitBytes = 0;
+
     public function __construct(
         ?NzbService $nzbService = null,
         ?NzbParserService $parserService = null,
@@ -154,6 +156,13 @@ class NzbContentsService
         // Initialize NFO flags based on whether we are checking for NFOs.
         $foundNFO = $hiddenNFO = $nfoCheck === false;
         $nfoMessageId = null; // Store potential NFO message ID here
+        $hasNonPar2File = false;
+        foreach ($nzbFile->file as $nzbContents) {
+            if (preg_match('/\.par2(?:["\s]|$)/i', (string) $nzbContents->attributes()->subject) !== 1) {
+                $hasNonPar2File = true;
+                break;
+            }
+        }
 
         foreach ($nzbFile->file as $nzbContents) {
             $segmentCountInFile = 0;
@@ -194,7 +203,7 @@ class NzbContentsService
 
             // --- PAR2 Detection ---
             // Look specifically for the .par2 index file (often small, but not always 1/1)
-            if ($this->lookupPar2 && ! $foundPAR2 && isset($firstSegmentId) && $this->parserService->detectPar2IndexFile($subject)) {
+            if ($this->lookupPar2 && $hasNonPar2File && ! $foundPAR2 && isset($firstSegmentId) && $this->parserService->detectPar2IndexFile($subject)) {
                 // Attempt to parse the PAR2 file using its first segment ID
                 if ($this->postProcessService->parsePAR2($firstSegmentId, $relID, $groupID, $this->nntp, 1) === true) {
                     Release::query()->where('id', $relID)->update(['proc_par2' => 1]);
@@ -283,11 +292,12 @@ class NzbContentsService
                 return Par2RenameOutcome::Deferred;
             }
 
-            $release = Release::query()->where('id', $relID)->first(['id', 'guid', 'name', 'searchname', 'groups_id', 'proc_par2', 'isrenamed', 'predb_id']);
+            $release = Release::query()->where('id', $relID)->first();
             if ($release === null || $release->guid !== $guid || (int) $release->groups_id !== $groupID) {
                 return Par2RenameOutcome::Deferred;
             }
             $snapshot = ['id' => $relID, 'guid' => $guid, 'name' => $release->name, 'searchname' => $release->searchname];
+            $releaseSize = (int) ($release->size ?? 0);
             $readerOwnership = new class
             {
                 public bool $held = true;
@@ -353,7 +363,13 @@ class NzbContentsService
                 if (! $this->canContinuePar2($guard)) {
                     return Par2RenameOutcome::Deferred;
                 }
-                $result = $recovery->recover($candidates[$index], $snapshot, $signature, $groupID, $show,
+                $candidateSnapshot = $snapshot;
+                if ($releaseSize > 0) {
+                    $candidateBytes = array_sum(array_column($candidates[$index]['segments'], 'bytes'));
+                    $nonPar2Bytes = max(0, $this->par2NonExplicitBytes - ($candidates[$index]['explicit'] ? 0 : $candidateBytes));
+                    $candidateSnapshot['max_payload_bytes'] = min($releaseSize, $nonPar2Bytes);
+                }
+                $result = $recovery->recover($candidates[$index], $candidateSnapshot, $signature, $groupID, $show,
                     $budget - $this->par2Stats['candidates_probed'], $maxArticleBytes, $maxStateBytes, $guard, onArticleReceived: $onArticleRead, onRead: $onArticleRead);
                 $this->par2Stats['candidates_probed'] += $result->probes;
                 $this->par2Stats['articles_received'] += $result->articles;
@@ -572,6 +588,7 @@ class NzbContentsService
     {
         $explicit = $volumes = $firstVolumes = $matchingVolumes = $indexFamilies = $families = $legacy = $hidden = [];
         $this->par2Manifest = [];
+        $this->par2NonExplicitBytes = 0;
         $this->par2StructureValid = count($nzb->file) > 0;
         $maxBytes = max(1, (int) config('tmux.fix_names.par2_max_probe_bytes', 2097152));
         foreach ($nzb->file as $file) {
@@ -593,6 +610,11 @@ class NzbContentsService
                 }
             }
             $isExplicit = preg_match('/\.par2(?:["\s]|$)/i', $subject) === 1;
+            if (! $isExplicit) {
+                foreach ($segments as $segment) {
+                    $this->par2NonExplicitBytes += $segment['bytes'];
+                }
+            }
             $classification = $isExplicit ? (preg_match('/\.vol\d+\+\d+\.par2(?:["\s]|$)/i', $subject) === 1 ? 'volume' : 'index') : 'excluded';
             $singlePart = count($segments) === 1 && $this->parserService->extractPartsTotal($subject) <= 1;
             $knownContent = preg_match('/\.(?:rar|r\d{2,4}|\d{3}|7z|zip|mkv|mp4|avi|m2ts|ts|iso|nfo|sfv|srr|srs|jpg|png|mp3|flac)(?:["\s]|$)/i', $subject) === 1;
