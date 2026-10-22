@@ -789,6 +789,110 @@ PHP;
         $this->assertSame(0, (int) $unknown->fresh()->isrenamed);
     }
 
+    public function test_standalone_or_undersized_par2_release_does_not_rename_or_certify_hash_inventory_and_stops_after_first_segment(): void
+    {
+        $par2Data = (string) file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'));
+        $standalone = $this->pendingPar2Release(['size' => 3000]);
+        $xml = new SimpleXMLElement('<nzb/>');
+        $file = $xml->addChild('file');
+        $file->addAttribute('subject', '"45GQ78oFFVnPmDiiFNdYa" yEnc (1/3)');
+        $segments = $file->addChild('segments');
+        foreach ([1 => 'seg-1', 2 => 'seg-2', 3 => 'seg-3'] as $number => $id) {
+            $segment = $segments->addChild('segment', $id);
+            $segment->addAttribute('bytes', '1000');
+            $segment->addAttribute('number', (string) $number);
+        }
+
+        $service = $this->service($xml, ['seg-1' => $par2Data, 'seg-2' => $par2Data, 'seg-3' => $par2Data], rename: true);
+        $this->assertSame(Par2RenameOutcome::NoMatch, $service->checkPar2Result($standalone->guid, $standalone->id, 1, 1, 0));
+        $this->assertSame(['seg-1'], $this->downloaded);
+        $this->assertSame(0, (int) $standalone->fresh()->isrenamed);
+        $this->assertSame(1, (int) $standalone->fresh()->proc_par2);
+        $this->assertSame(0, (int) $standalone->fresh()->rarinnerfilecount);
+        $this->assertSame(0, DB::table('par_file_hashes')->where('releases_id', $standalone->id)->count());
+        $this->assertSame(0, DB::table('par_file_hash_inventories')->where('releases_id', $standalone->id)->count());
+
+        $this->downloaded = [];
+        $complete = $this->pendingPar2Release(['size' => 1100000]);
+        $completeNzb = $this->nzb([
+            ['"45GQ78oFFVnPmDiiFNdYa" yEnc (1/1)', 'par-id', 50000],
+            ['"payload.rar" yEnc (1/1)', 'rar-id', 1050000],
+        ]);
+        $completeService = $this->service($completeNzb, ['par-id' => $par2Data], rename: true);
+        $this->assertSame(Par2RenameOutcome::Renamed, $completeService->checkPar2Result($complete->guid, $complete->id, 1, 1, 0));
+        $this->assertSame(['par-id'], $this->downloaded);
+        $this->assertSame(1, (int) $complete->fresh()->isrenamed);
+        $this->assertSame(1, (int) $complete->fresh()->proc_par2);
+        $this->assertSame(10, (int) $complete->fresh()->rarinnerfilecount);
+        $this->assertSame(10, DB::table('par_file_hashes')->where('releases_id', $complete->id)->count());
+        $this->assertSame(1, DB::table('par_file_hash_inventories')->where('releases_id', $complete->id)->count());
+
+        // Split rename-index.par2 into IFSC-first / Main+FileDesc-second and into partial-FileDesc / Main+remaining-FileDesc.
+        $ifscPackets = $firstDescPacket = $remainingPackets = '';
+        for ($offset = 0; $offset < strlen($par2Data); $offset += $length) {
+            $length = unpack('V', substr($par2Data, $offset + 8, 4))[1];
+            $packet = substr($par2Data, $offset, $length);
+            $type = substr($packet, 48, 16);
+            if ($type === Par2Info::PACKET_FILEVER) {
+                $ifscPackets .= $packet;
+            } elseif ($type === Par2Info::PACKET_FILEDESC && $firstDescPacket === '') {
+                $firstDescPacket = $packet;
+            } else {
+                $remainingPackets .= $packet;
+            }
+        }
+
+        // Segment 1 has only IFSC packets (unresolved descriptors) and Segment 2 has Main + FileDesc: must not stop after Segment 1 when budget fits.
+        $this->downloaded = [];
+        $ifscFirst = $this->pendingPar2Release(['size' => 1100000]);
+        $ifscXml = new SimpleXMLElement('<nzb/>');
+        $parFile = $ifscXml->addChild('file');
+        $parFile->addAttribute('subject', '"release.par2" yEnc (1/2)');
+        $parSegments = $parFile->addChild('segments');
+        foreach ([1 => 'ifsc-1', 2 => 'ifsc-2'] as $number => $id) {
+            $seg = $parSegments->addChild('segment', $id);
+            $seg->addAttribute('bytes', '5000');
+            $seg->addAttribute('number', (string) $number);
+        }
+        $payloadFile = $ifscXml->addChild('file');
+        $payloadFile->addAttribute('subject', '"payload.rar" yEnc (1/1)');
+        $payloadSeg = $payloadFile->addChild('segments')->addChild('segment', 'payload-1');
+        $payloadSeg->addAttribute('bytes', '1100000');
+        $payloadSeg->addAttribute('number', '1');
+        $ifscService = $this->service($ifscXml, ['ifsc-1' => $ifscPackets, 'ifsc-2' => $firstDescPacket.$remainingPackets], rename: true);
+        $this->assertSame(Par2RenameOutcome::Renamed, $ifscService->checkPar2Result($ifscFirst->guid, $ifscFirst->id, 1, 1, 0));
+        $this->assertSame(['ifsc-1', 'ifsc-2'], $this->downloaded);
+
+        // Segment 1 has 1 FileDesc (~142 KB <= 400 KB budget) without Main, Segment 2 has Main + remaining 9 FileDescs (total 1 MB > 400 KB budget):
+        // must not rename or persist hashes on Segment 1 before Segment 2 proves the set exceeds the budget.
+        $this->downloaded = [];
+        $splitOversize = $this->pendingPar2Release(['size' => 400000]);
+        $splitXml = new SimpleXMLElement('<nzb/>');
+        $splitPar = $splitXml->addChild('file');
+        $splitPar->addAttribute('subject', '"release.par2" yEnc (1/2)');
+        $splitSegments = $splitPar->addChild('segments');
+        foreach ([1 => 'split-1', 2 => 'split-2'] as $number => $id) {
+            $seg = $splitSegments->addChild('segment', $id);
+            $seg->addAttribute('bytes', '5000');
+            $seg->addAttribute('number', (string) $number);
+        }
+        $splitPayload = $splitXml->addChild('file');
+        $splitPayload->addAttribute('subject', '"payload.rar" yEnc (1/2)');
+        $splitPayloadSegments = $splitPayload->addChild('segments');
+        foreach ([1 => 'payload-1', 2 => 'payload-2'] as $number => $id) {
+            $seg = $splitPayloadSegments->addChild('segment', $id);
+            $seg->addAttribute('bytes', '200000');
+            $seg->addAttribute('number', (string) $number);
+        }
+        $splitService = $this->service($splitXml, ['split-1' => $firstDescPacket, 'split-2' => $ifscPackets.$remainingPackets], rename: true);
+        $this->assertSame(Par2RenameOutcome::NoMatch, $splitService->checkPar2Result($splitOversize->guid, $splitOversize->id, 1, 1, 0));
+        $this->assertSame(['split-1', 'split-2'], $this->downloaded);
+        $this->assertSame(0, (int) $splitOversize->fresh()->isrenamed);
+        $this->assertSame(1, (int) $splitOversize->fresh()->proc_par2);
+        $this->assertSame(0, DB::table('par_file_hashes')->where('releases_id', $splitOversize->id)->count());
+        $this->assertSame(0, DB::table('par_file_hash_inventories')->where('releases_id', $splitOversize->id)->count());
+    }
+
     private function release(): Release
     {
         return $this->pendingPar2Release();
