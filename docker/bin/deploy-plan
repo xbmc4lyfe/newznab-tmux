@@ -1456,8 +1456,9 @@ def compute_build_targets(repo: Path, docker_dir: Path, stamp_path: Path, force:
     targets: list[str] = []
     base_img = os.environ.get("BASE_IMAGE", "nntmux/base:local")
     base_id = image_id(base_img)
+    force_base = force and (not requested or "base" in requested)
     if (
-        force
+        force_base
         or stamped.get("base") != state["base"]
         or not base_id
         or stamped.get("image:base") != f"{base_img}@{base_id}"
@@ -2067,6 +2068,28 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
             elif infra_reasons.get(svc) not in ("unchanged", "not rendered", "scaled to zero"):
                 infra_reasons[svc] = f"deferred ({infra_reasons[svc]})"
 
+        if (
+            not dirty_app
+            and not dirty_data
+            and not dirty_infra
+            and not reconcile_data
+            and not reconcile_infra
+            and not start_data
+            and "migration" not in requested
+        ):
+            for svc in APP_SERVICES:
+                if svc in requested and svc not in dirty_app:
+                    dirty_app.append(svc)
+                    app_reasons[svc] = "targeted redeploy"
+            for svc in data_services(state):
+                if svc in requested and svc not in dirty_data and svc not in reconcile_data and svc not in start_data:
+                    dirty_data.append(svc)
+                    data_reasons[svc] = "targeted redeploy"
+            for svc in infra_services(state):
+                if svc in requested and svc not in dirty_infra and svc not in reconcile_infra:
+                    dirty_infra.append(svc)
+                    infra_reasons[svc] = "targeted redeploy"
+
     all_apps_requested = not requested or all(svc in requested for svc in APP_SERVICES)
     compose_global_changed = not first_deploy and stamped.get("effective") != state["effective"]
     reconciling = bool(reconcile_data or reconcile_infra or start_data)
@@ -2192,6 +2215,97 @@ def compute_deploy_plan(repo: Path, docker_dir: Path, stamp_path: Path, build_fo
         "infra_reasons": infra_reasons,
         "state": state,
     }
+
+
+def sync_remote_if_configured(repo: Path, docker_dir: Path) -> None:
+    """Ensure standalone `deploy-plan` (`just deploy-plan`) inspects the latest commit on the
+    configured Git remote's default branch, matching `deploy-guard`."""
+    mode = (os.environ.get("DEPLOY_SYNC_REMOTE") or "auto").strip().lower()
+    if mode in ("0", "false", "no", "off"):
+        return
+    if mode not in ("1", "true", "yes", "on", "auto"):
+        sys.exit(f"deploy-plan: DEPLOY_SYNC_REMOTE must be auto, 1, or 0 (got {mode!r}).")
+    remote = (os.environ.get("DEPLOY_GIT_REMOTE") or "origin").strip() or "origin"
+    git_marker = repo / ".git"
+    has_remote = git_marker.exists() and subprocess.run(
+        ["git", "-C", str(repo), "remote", "get-url", remote],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).returncode == 0
+    if not has_remote:
+        if mode == "auto":
+            return
+        sys.exit(f"deploy-plan: git remote {remote!r} is not configured in {repo}; cannot verify latest remote default branch.")
+    branch = (os.environ.get("DEPLOY_GIT_BRANCH") or "").strip()
+    if not branch:
+        ref_proc = subprocess.run(
+            ["git", "-C", str(repo), "symbolic-ref", "-q", "--short", f"refs/remotes/{remote}/HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        remote_head_ref = ref_proc.stdout.strip() if ref_proc.returncode == 0 else ""
+        prefix = f"{remote}/"
+        branch = remote_head_ref[len(prefix):] if remote_head_ref.startswith(prefix) and remote_head_ref[len(prefix):] else "master"
+    cur_proc = subprocess.run(
+        ["git", "-C", str(repo), "symbolic-ref", "-q", "--short", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    current_branch = cur_proc.stdout.strip() if cur_proc.returncode == 0 else ""
+    if current_branch != branch:
+        sys.exit(
+            f"deploy-plan: checkout is on {current_branch or 'detached HEAD'}, not default branch {branch}; "
+            "refusing to plan from a non-default branch (set DEPLOY_SYNC_REMOTE=0 to override)."
+        )
+    fetch_proc = subprocess.run(
+        ["git", "-C", str(repo), "fetch", "--quiet", remote, f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if fetch_proc.returncode != 0:
+        detail = fetch_proc.stderr.strip()
+        sys.exit(
+            f"deploy-plan: failed to fetch latest {branch} from {remote}"
+            + (f" ({detail})" if detail else "")
+            + "; refusing to plan from potentially stale local code."
+        )
+    local_proc = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"], capture_output=True, text=True, check=False)
+    remote_proc = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", f"refs/remotes/{remote}/{branch}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    local_head = local_proc.stdout.strip() if local_proc.returncode == 0 else ""
+    remote_head = remote_proc.stdout.strip() if remote_proc.returncode == 0 else ""
+    if not local_head or not remote_head:
+        sys.exit(f"deploy-plan: cannot resolve HEAD or {remote}/{branch}; refusing to plan.")
+    if local_head != remote_head:
+        lock_path = Path(os.environ.get("DEPLOY_LOCK_DIR") or (docker_dir / ".deploy.lock"))
+        if os.path.lexists(lock_path) or os.path.lexists(f"{lock_path}.recovery-hold"):
+            sys.exit(
+                f"deploy-plan: {remote}/{branch} advanced ({local_head[:9]} -> {remote_head[:9]}) while a deployment lock or hold is active; "
+                "wait for the active deployment to finish before syncing."
+            )
+        ff_proc = subprocess.run(
+            ["git", "-C", str(repo), "merge", "--ff-only", "--quiet", f"refs/remotes/{remote}/{branch}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        verify_proc = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"], capture_output=True, text=True, check=False)
+        if ff_proc.returncode != 0 or verify_proc.stdout.strip() != remote_head:
+            sys.exit(
+                f"deploy-plan: local {branch} ({local_head[:9]}) cannot be fast-forwarded to {remote}/{branch} ({remote_head[:9]}); "
+                "refusing to plan from diverged or unpushed local commits."
+            )
+        print(f"deploy-plan: fast-forwarded {branch} from {local_head[:9]} to {remote}/{branch} ({remote_head[:9]}).")
+        sys.stdout.flush()
+        os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
 def main() -> None:
@@ -2472,6 +2586,8 @@ def main() -> None:
         return
 
     if cmd == "--explain":
+        if not os.environ.get("DEPLOY_GUARD_HELD"):
+            sync_remote_if_configured(repo, docker_dir)
         plan = compute_deploy_plan(repo, docker_dir, stamp_path)
         print(f"Deployment Mode : {plan['mode']}")
         print(f"Build Targets   : {', '.join(plan['build_targets']) if plan['build_targets'] else 'none (all cached)'}")
