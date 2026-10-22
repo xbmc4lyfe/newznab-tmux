@@ -4169,11 +4169,19 @@ SH);
         $this->assertNotSame(0, $scaledZero->getExitCode());
         $this->assertStringContainsString("deployment target 'mariadb' is scaled to zero", $scaledZero->getErrorOutput());
 
-        // Unrendered service fails closed when explicitly targeted.
-        $unrendered = $this->make(['deploy-mailpit'], $config);
+        // Unrendered service fails closed when explicitly targeted (even before building a valid companion target).
+        file_put_contents($this->directory.'/events', '');
+        $unrendered = $this->make(['deploy', 'web', 'mailpit'], $config);
         $unrendered->run();
         $this->assertNotSame(0, $unrendered->getExitCode());
         $this->assertStringContainsString("deployment target 'mailpit' is not rendered", $unrendered->getErrorOutput());
+        $this->assertStringNotContainsString('build --target selfhosted-web', $this->events());
+
+        // Delimiter-only DEPLOY_TARGETS fails closed instead of running a full rollout.
+        $delimiterOnly = $this->make(['deploy', 'DEPLOY_TARGETS=,'], $config);
+        $delimiterOnly->run();
+        $this->assertNotSame(0, $delimiterOnly->getExitCode());
+        $this->assertStringContainsString('contains no target names', $delimiterOnly->getErrorOutput());
     }
 
     /**

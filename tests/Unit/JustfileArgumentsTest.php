@@ -430,10 +430,38 @@ SH);
         $plan->mustRun();
         $this->assertStringContainsString('PLAN_TARGETS=[web proxy]', $plan->getOutput());
 
-        $build = $this->just('Justfile', ['build-stack', 'indexer', 'DEPLOY_BY=tester'], ['DC' => $this->directory.'/bin/fake']);
-        $build->mustRun();
-        $this->assertStringContainsString('DEPLOY_TARGETS=[indexer]', $build->getOutput());
-        $this->assertStringContainsString('DEPLOY_BY=[tester]', $build->getOutput());
+        foreach (['Justfile', 'docker/Justfile'] as $justfile) {
+            $build = $this->just($justfile, ['build-stack', 'indexer', 'DEPLOY_BY=tester'], ['DC' => $this->directory.'/bin/fake']);
+            $build->mustRun();
+            $this->assertStringContainsString('DEPLOY_TARGETS=[indexer]', $build->getOutput(), $justfile);
+            $this->assertStringContainsString('DEPLOY_BY=[tester]', $build->getOutput(), $justfile);
+        }
+
+        // Split-runtime paths in docker/.env reach deploy-guard and deploy-plan.
+        file_put_contents($this->directory.'/docker/bin/deploy-guard', <<<'SH'
+#!/bin/sh
+printf 'DEPLOY_REPO=[%s]\n' "${DEPLOY_REPO-unset}"
+printf 'DEPLOY_LOCK_DIR=[%s]\n' "${DEPLOY_LOCK_DIR-unset}"
+printf 'DEPLOY_LOG=[%s]\n' "${DEPLOY_LOG-unset}"
+printf 'DEPLOY_STAMP=[%s]\n' "${DEPLOY_STAMP-unset}"
+printf 'DEPLOY_SUCCESS_TIME=[%s]\n' "${DEPLOY_SUCCESS_TIME-unset}"
+SH);
+        chmod($this->directory.'/docker/bin/deploy-guard', 0755);
+        file_put_contents($this->directory.'/docker/.env', implode("\n", [
+            'DEPLOY_REPO=/srv/candidate',
+            'DEPLOY_LOCK_DIR=/srv/runtime/.deploy.lock',
+            'DEPLOY_LOG=/srv/runtime/.deploy.log',
+            'DEPLOY_STAMP=/srv/runtime/.deploy.stamp',
+            'DEPLOY_SUCCESS_TIME=/srv/runtime/.deploy.time',
+            '',
+        ]));
+        $envPaths = $this->just('Justfile', ['deploy', 'web'], ['DC' => $this->directory.'/bin/fake']);
+        $envPaths->mustRun();
+        $this->assertStringContainsString('DEPLOY_REPO=[/srv/candidate]', $envPaths->getOutput());
+        $this->assertStringContainsString('DEPLOY_LOCK_DIR=[/srv/runtime/.deploy.lock]', $envPaths->getOutput());
+        $this->assertStringContainsString('DEPLOY_LOG=[/srv/runtime/.deploy.log]', $envPaths->getOutput());
+        $this->assertStringContainsString('DEPLOY_STAMP=[/srv/runtime/.deploy.stamp]', $envPaths->getOutput());
+        $this->assertStringContainsString('DEPLOY_SUCCESS_TIME=[/srv/runtime/.deploy.time]', $envPaths->getOutput());
     }
 
     // helpers ------------------------------------------------------------------------------------
@@ -467,7 +495,7 @@ SH);
     {
         // Drop anything of the developer's shell that the recipes would otherwise pick up.
         $clean = [];
-        foreach (['COMPOSE_FILE', 'COMPOSE_PROFILES', 'DC', 'DOCKER_COMPOSE', 'SAIL', 'CMD', 'cmd', 'FORCE', 'MONITORING_ENABLED', 'APP_IMAGE', 'WEB_IMAGE', 'HORIZON_IMAGE', 'SCHEDULER_IMAGE', 'INDEXER_IMAGE', 'BASE_IMAGE', 'HELPER_IMAGE', 'DEPLOY_BY', 'DEPLOY_TARGETS', 'SEARCH_DRIVER', 'FAKE_PS_FAIL'] as $name) {
+        foreach (['COMPOSE_FILE', 'COMPOSE_PROFILES', 'DC', 'DOCKER_COMPOSE', 'SAIL', 'CMD', 'cmd', 'FORCE', 'MONITORING_ENABLED', 'APP_IMAGE', 'WEB_IMAGE', 'HORIZON_IMAGE', 'SCHEDULER_IMAGE', 'INDEXER_IMAGE', 'BASE_IMAGE', 'HELPER_IMAGE', 'DEPLOY_BY', 'DEPLOY_TARGETS', 'DEPLOY_REPO', 'DEPLOY_LOCK_DIR', 'DEPLOY_LOG', 'DEPLOY_STAMP', 'DEPLOY_SUCCESS_TIME', 'SEARCH_DRIVER', 'FAKE_PS_FAIL'] as $name) {
             $clean[$name] = false;
         }
 

@@ -37,7 +37,7 @@ LOAD_ENV := '''preset=" "
     for arg in "$@"; do
         if [[ "$arg" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]]; then export "$arg"; preset="$preset${BASH_REMATCH[1]} "; else TARGET_ARGS="${TARGET_ARGS:+$TARGET_ARGS }$arg"; fi
     done
-    for key in COMPOSE_FILE DC DEPLOY_BY DEPLOY_TARGETS APP_PORT DB_DATABASE DB_ROOTPASSWORD HELPER_IMAGE BASE_IMAGE APP_IMAGE WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE DEPLOY_MIN_INTERVAL DEPLOY_DRAIN_TIMEOUT DEPLOY_SCHEDULER_DRAIN_TIMEOUT DEPLOY_HEALTH_TIMEOUT DEPLOY_LEGACY_DRAIN_TIMEOUT; do
+    for key in COMPOSE_FILE DC DEPLOY_BY DEPLOY_TARGETS DEPLOY_REPO DEPLOY_LOCK_DIR DEPLOY_LOG DEPLOY_STAMP DEPLOY_SUCCESS_TIME APP_PORT DB_DATABASE DB_ROOTPASSWORD HELPER_IMAGE BASE_IMAGE APP_IMAGE WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE DEPLOY_MIN_INTERVAL DEPLOY_DRAIN_TIMEOUT DEPLOY_SCHEDULER_DRAIN_TIMEOUT DEPLOY_HEALTH_TIMEOUT DEPLOY_LEGACY_DRAIN_TIMEOUT; do
         [ -z "${!key:-}" ] || preset="$preset$key "
     done
     interpolated=" "
@@ -47,14 +47,14 @@ LOAD_ENV := '''preset=" "
         # Compose interpolates unquoted and double-quoted values; this reader does not, nor does it
         # read a value across lines (FLAG is then not "-"). Single-quoted values are literal in Compose.
         case "$1" in
-            COMPOSE_FILE|DC|DB_DATABASE|DB_ROOTPASSWORD|HELPER_IMAGE|BASE_IMAGE|APP_IMAGE|WEB_IMAGE|HORIZON_IMAGE|SCHEDULER_IMAGE|INDEXER_IMAGE)
+            COMPOSE_FILE|DC|DEPLOY_REPO|DEPLOY_LOCK_DIR|DEPLOY_LOG|DEPLOY_STAMP|DEPLOY_SUCCESS_TIME|DB_DATABASE|DB_ROOTPASSWORD|HELPER_IMAGE|BASE_IMAGE|APP_IMAGE|WEB_IMAGE|HORIZON_IMAGE|SCHEDULER_IMAGE|INDEXER_IMAGE)
                 [ "$2" = - ] || interpolated="$interpolated$1 " ;;
         esac
         # Arguments and the environment win over the file.
         case "$preset" in *" $1 "*) ;; *) printf -v "$1" '%s' "$3" ;; esac
     }
     if [ -f "''' + ENV_FILE + '''" ]; then
-        dotenv_values=$(python3 -I "''' + CURDIR + '''/bin/compose_dotenv.py" "''' + ENV_FILE + '''" COMPOSE_FILE DC DEPLOY_BY DEPLOY_TARGETS APP_PORT DB_DATABASE DB_ROOTPASSWORD HELPER_IMAGE BASE_IMAGE APP_IMAGE WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE DEPLOY_MIN_INTERVAL DEPLOY_DRAIN_TIMEOUT DEPLOY_SCHEDULER_DRAIN_TIMEOUT DEPLOY_HEALTH_TIMEOUT DEPLOY_LEGACY_DRAIN_TIMEOUT) || exit 1
+        dotenv_values=$(python3 -I "''' + CURDIR + '''/bin/compose_dotenv.py" "''' + ENV_FILE + '''" COMPOSE_FILE DC DEPLOY_BY DEPLOY_TARGETS DEPLOY_REPO DEPLOY_LOCK_DIR DEPLOY_LOG DEPLOY_STAMP DEPLOY_SUCCESS_TIME APP_PORT DB_DATABASE DB_ROOTPASSWORD HELPER_IMAGE BASE_IMAGE APP_IMAGE WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE DEPLOY_MIN_INTERVAL DEPLOY_DRAIN_TIMEOUT DEPLOY_SCHEDULER_DRAIN_TIMEOUT DEPLOY_HEALTH_TIMEOUT DEPLOY_LEGACY_DRAIN_TIMEOUT) || exit 1
         eval "$dotenv_values"
         if [ "$interpolated" != " " ]; then
             printf '%s\n' "docker/.env:${interpolated% } must be literal but uses \$ interpolation (or a multi-line value), which the Justfile and docker/bin/compose do not evaluate. Write the final value or single-quote it." >&2
@@ -66,7 +66,7 @@ LOAD_ENV := '''preset=" "
     : "${COMPOSE_FILE:=''' + CURDIR + '''/docker-compose.yml}" "${HELPER_IMAGE:=alpine:3.22.2}" "${BASE_IMAGE:=nntmux/base:local}" "${APP_IMAGE:=nntmux/app:local}"
     : "${DEPLOY_MIN_INTERVAL:=900}" "${DEPLOY_DRAIN_TIMEOUT:=900}" "${DEPLOY_SCHEDULER_DRAIN_TIMEOUT:=1800}" "${DEPLOY_HEALTH_TIMEOUT:=240}"
     export COMPOSE_FILE DC DEPLOY_BY DEPLOY_TARGETS HELPER_IMAGE BASE_IMAGE APP_IMAGE DEPLOY_MIN_INTERVAL DEPLOY_DRAIN_TIMEOUT DEPLOY_SCHEDULER_DRAIN_TIMEOUT DEPLOY_HEALTH_TIMEOUT
-    for key in WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE DEPLOY_LEGACY_DRAIN_TIMEOUT; do [ -z "${!key:-}" ] || export "$key"; done'''
+    for key in WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE DEPLOY_LEGACY_DRAIN_TIMEOUT DEPLOY_REPO DEPLOY_LOCK_DIR DEPLOY_LOG DEPLOY_STAMP DEPLOY_SUCCESS_TIME; do [ -z "${!key:-}" ] || export "$key"; done'''
 
 # Runs argv[2:] followed by argv[1] parsed with shell quoting (shlex): no eval, no word splitting of
 # the parsed words and no globbing, so `cmd='some:command --label="two words" *'` reaches Artisan as
@@ -144,6 +144,10 @@ build *args:
         DEPLOY_CONFIG_COMMAND= CHECK_UNCHANGED_COMMAND= CHECK_HEALTH_COMMAND= \
         DEPLOY_BY="$DEPLOY_BY" exec "{{CURDIR}}/bin/deploy-guard" run build -- \
         "{{CURDIR}}/bin/build-images"
+
+# Build dirty self-hosted service images (or all when FORCE=1) without touching running containers
+build-stack *args:
+    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" build "$@"
 
 # Internal: build dirty service image targets without acquiring a second guard
 build-images *args:
