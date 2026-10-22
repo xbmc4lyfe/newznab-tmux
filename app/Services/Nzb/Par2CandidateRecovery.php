@@ -8,6 +8,7 @@ use App\Enums\Par2RenameOutcome;
 use App\Models\UsenetGroup;
 use App\Services\NNTP\NNTPService;
 use App\Services\Par2PacketAccumulator;
+use App\Services\Par2Processor;
 use App\Services\PostProcessService;
 use App\Services\Yenc\YencPart;
 use App\Support\Par2CandidateCheckpoint;
@@ -25,7 +26,7 @@ final class Par2CandidateRecovery
 
     /**
      * @param  array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>}  $candidate
-     * @param  array{id:int,guid:string,name:?string,searchname:?string}  $snapshot
+     * @param  array{id:int,guid:string,name:?string,searchname:?string,max_payload_bytes?:int}  $snapshot
      * @param  callable():bool  $guard
      * @param  null|callable():bool  $onArticleReceived
      * @param  null|callable():bool  $onRead
@@ -109,7 +110,8 @@ final class Par2CandidateRecovery
                 }
                 $fileComplete = $identity === null || $decodedOffset === $identity['size'];
                 $terminal = ($cursor === $segmentCount && $fileComplete && $inventory->isComplete())
-                    || ($inventory->hasCompleteMainInventory() && $inventory->exportState()['skip_remaining'] > 0);
+                    || ($inventory->hasCompleteMainInventory() && $inventory->exportState()['skip_remaining'] > 0)
+                    || Par2Processor::exceedsPayloadBudget($inventory, isset($snapshot['max_payload_bytes']) ? (int) $snapshot['max_payload_bytes'] : null);
                 $outcome = $this->postprocess->applyPAR2InventoryForRename($inventory, $snapshot['id'], $groupId, $show, $guard, $terminal, $snapshot);
                 if ($outcome === Par2RenameOutcome::Renamed) {
                     return $outcome;

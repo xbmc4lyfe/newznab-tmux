@@ -82,6 +82,7 @@ final class SpotCheckVerifier
         $fileIdentities = [];
         $ranges = [];
         $identityHints = [];
+        $parityFileKeys = [];
         foreach ($sample as $segment) {
             $heartbeat();
             $remaining = min($articleByteLimit, $byteLimit - $bytes);
@@ -99,6 +100,7 @@ final class SpotCheckVerifier
                 return self::deterministic('Spot-check article exceeded the configured transfer budget.');
             }
             $article = VerifiedArticle::decode($raw, $this->decoder);
+            $isPar2Packet = $article->offset === 0 && str_starts_with($article->bytes, "PAR2\0PKT");
             if ($article->part !== $segment['number'] || $article->size < 1
                 // OVER reports article octets, including encoding/headers, rather
                 // than decoded payload length. It must at least cover the payload.
@@ -106,11 +108,14 @@ final class SpotCheckVerifier
                 || $article->offset + strlen($article->bytes) > $article->size
                 || ($article->part === 1 && $article->offset !== 0)
                 || ($article->part === $segment['totalparts'] && $article->offset + strlen($article->bytes) !== $article->size)
-                || ! $this->matchesHeaderFilename($manifest, $segment['file_key'], $article->name)
+                || ! $this->matchesHeaderFilename($manifest, $segment['file_key'], $article->name, $isPar2Packet)
                 || ($article->totalParts !== null && $article->totalParts !== $segment['totalparts'])) {
                 return self::deterministic('Spot-check article identity differs from its header.');
             }
             $fileKey = $segment['file_key'];
+            if ($isPar2Packet || $this->isPar2Filename($article->name)) {
+                $parityFileKeys[$fileKey] = true;
+            }
             if ($segment['totalparts_inferred'] && ($article->totalParts !== null || $article->part === $segment['totalparts'])) {
                 $inferredTotals[$fileKey] = true;
             }
@@ -150,9 +155,14 @@ final class SpotCheckVerifier
             return self::deterministic('Candidate has no positive declared size.');
         }
 
-        $sampled = self::withEvidence($manifest, ['articles' => count($sample), 'bytes' => $bytes,
+        $evidence = ['articles' => count($sample), 'bytes' => $bytes,
             'sampled_files' => count(array_unique(array_column($sample, 'file_key'))),
-            'verified_file_names' => array_keys($names), 'identity_hints' => array_column($identityHints, 'name'), 'partial' => $partial !== null]);
+            'verified_file_names' => array_keys($names), 'identity_hints' => array_column($identityHints, 'name'),
+            'partial' => $partial !== null];
+        if ($parityFileKeys !== []) {
+            $evidence['parity_file_keys'] = array_keys($parityFileKeys);
+        }
+        $sampled = self::withEvidence($manifest, $evidence);
         if ($partial !== null) {
             return new VerificationResult('sampled', sprintf('Sampled article checks passed on an incomplete upload: %d of %d articles found.',
                 $partial['articles_found'], $partial['articles_expected']), $sampled);
@@ -187,7 +197,7 @@ final class SpotCheckVerifier
      * The sampled article evidence a remote worker sends instead of the whole manifest.
      *
      * @param  array<string, mixed>  $manifest  A sampled result manifest.
-     * @return array{articles: int, bytes: int, sampled_files: int, verified_file_names: list<string>, identity_hints: list<string>, partial: bool}
+     * @return array{articles: int, bytes: int, sampled_files: int, verified_file_names: list<string>, identity_hints: list<string>, partial: bool, parity_file_keys?: list<string>}
      */
     public static function evidence(array $manifest): array
     {
@@ -195,11 +205,18 @@ final class SpotCheckVerifier
             throw new \RuntimeException('Sampled verdict has no spot-check evidence.');
         }
 
-        return ['articles' => (int) $manifest['spot_check']['articles'], 'bytes' => (int) $manifest['spot_check']['bytes'],
+        $evidence = ['articles' => (int) $manifest['spot_check']['articles'], 'bytes' => (int) $manifest['spot_check']['bytes'],
             'sampled_files' => (int) $manifest['spot_check']['sampled_files'],
             'verified_file_names' => array_values(array_map('strval', (array) ($manifest['verified_file_names'] ?? []))),
             'identity_hints' => array_values(array_map(static fn (mixed $hint): string => (string) ($hint['name'] ?? ''),
                 (array) ($manifest['identity_hints'] ?? []))), 'partial' => isset($manifest['partial'])];
+        $parityKeys = array_values(array_filter(array_map('strval', (array) ($manifest['spot_check']['parity_file_keys'] ?? [])),
+            static fn (string $key): bool => $key !== ''));
+        if ($parityKeys !== []) {
+            $evidence['parity_file_keys'] = $parityKeys;
+        }
+
+        return $evidence;
     }
 
     /**
@@ -207,7 +224,7 @@ final class SpotCheckVerifier
      * remote worker's result is rebuilt exactly as a local one.
      *
      * @param  array<string, mixed>  $manifest
-     * @param  array{articles: int, bytes: int, sampled_files: int, verified_file_names: list<string>, identity_hints: list<string>, partial?: bool}  $evidence
+     * @param  array{articles: int, bytes: int, sampled_files: int, verified_file_names: list<string>, identity_hints: list<string>, partial?: bool, parity_file_keys?: list<string>}  $evidence
      * @return array<string, mixed>
      */
     public static function withEvidence(array $manifest, array $evidence): array
@@ -218,6 +235,11 @@ final class SpotCheckVerifier
         $manifest['verification_mode'] = 'spot_check';
         $manifest['spot_check'] = ['articles' => $evidence['articles'], 'bytes' => $evidence['bytes'],
             'sampled_files' => $evidence['sampled_files'], 'method' => 'yenc-crc-and-identity'];
+        $parityKeys = array_values(array_filter(array_map('strval', (array) ($evidence['parity_file_keys'] ?? [])),
+            static fn (string $key): bool => $key !== ''));
+        if ($parityKeys !== []) {
+            $manifest['spot_check']['parity_file_keys'] = $parityKeys;
+        }
         $manifest['declared_size'] = $declaredSize;
         $manifest['publication_size'] = $declaredSize;
         $manifest['publication_file_count'] = $manifestFileCount;
@@ -234,7 +256,7 @@ final class SpotCheckVerifier
     }
 
     /** @param array<string, mixed> $manifest */
-    private function matchesHeaderFilename(array $manifest, string $key, string $actual): bool
+    private function matchesHeaderFilename(array $manifest, string $key, string $actual, bool $isPar2Packet = false): bool
     {
         foreach ($manifest['files'] ?? [] as $file) {
             if (! is_array($file)) {
@@ -243,10 +265,33 @@ final class SpotCheckVerifier
             if (($file['key'] ?? null) !== $key) {
                 continue;
             }
+            $subject = (string) ($file['subject'] ?? '');
+            if (! HeaderFilenameIdentity::matches($subject, $actual)) {
+                return false;
+            }
+            if ($isPar2Packet) {
+                if (HeaderFilenameIdentity::provesPayload($actual)) {
+                    return false;
+                }
+                $trimmed = rtrim($actual, ". \t");
+                if ((str_contains($subject, '"') || str_contains($subject, "'"))
+                    && ! $this->isPar2Filename($actual)
+                    && ! HeaderFilenameIdentity::matches($subject, $trimmed.'.par2')) {
+                    return false;
+                }
+            }
 
-            return HeaderFilenameIdentity::matches((string) ($file['subject'] ?? ''), $actual);
+            return true;
         }
 
         return false;
+    }
+
+    private function isPar2Filename(string $name): bool
+    {
+        $trimmed = rtrim($name, ". \t");
+        $bare = rtrim((string) preg_replace('/:.*\z/s', '', $name), ". \t");
+
+        return preg_match('/\.par2\z/i', $trimmed) === 1 || preg_match('/\.par2\z/i', $bare) === 1;
     }
 }

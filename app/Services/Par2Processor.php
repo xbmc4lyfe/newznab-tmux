@@ -71,7 +71,7 @@ class Par2Processor
 
         $query = Release::query()
             ->where(['isrenamed' => 0, 'id' => $relID])
-            ->select(['id', 'guid', 'groups_id', 'categories_id', 'name', 'searchname', 'postdate', 'id as releases_id'])
+            ->select(['*', 'id as releases_id'])
             ->first();
 
         if ($query === null) {
@@ -103,16 +103,19 @@ class Par2Processor
         if ($canPersist !== null && ! $canPersist()) {
             return Par2RenameOutcome::Deferred;
         }
+        $metadataComplete = ! (new Par2FileList)->hasUnresolvedDescriptors($this->par2Info);
+        if (! self::setFitsPayloadBudget($files, self::resolveMaxPayloadBytes($query))) {
+            return $metadataComplete ? Par2RenameOutcome::NoMatch : Par2RenameOutcome::Retryable;
+        }
 
-        return $this->applyMetadataFiles($query, $files, $show, $canPersist,
-            ! (new Par2FileList)->hasUnresolvedDescriptors($this->par2Info));
+        return $this->applyMetadataFiles($query, $files, $show, $canPersist, $metadataComplete);
     }
 
     /**
      * Apply validated, recovery-set isolated metadata without fetching another article.
      *
      * @param  null|callable(): bool  $canPersist
-     * @param  array{id: int, guid: string, name: ?string, searchname: ?string}|null  $expectedSnapshot
+     * @param  array{id: int, guid: string, name: ?string, searchname: ?string, max_payload_bytes?: int}|null  $expectedSnapshot
      */
     public function applyInventoryForRename(Par2PacketAccumulator $inventory, int $relID, int $groupID, int $show, ?callable $canPersist = null, bool $allowTerminalMetadata = true, ?array $expectedSnapshot = null): Par2RenameOutcome
     {
@@ -135,14 +138,22 @@ class Par2Processor
                 }
             }
         }
-        $query = $builder->select(['id', 'guid', 'groups_id', 'categories_id', 'name', 'searchname', 'postdate', 'id as releases_id'])->first();
+        $query = $builder->select(['*', 'id as releases_id'])->first();
         if ($query === null) {
             return $expectedSnapshot === null ? Par2RenameOutcome::NoMatch : Par2RenameOutcome::Deferred;
         }
-        $complete = $allowTerminalMetadata && ($inventory->isComplete() || $inventory->hasCompleteMainInventory());
+        $maxPayloadBytes = self::resolveMaxPayloadBytes($query, $expectedSnapshot);
+        $complete = $allowTerminalMetadata && (
+            $inventory->isComplete()
+            || $inventory->hasCompleteMainInventory()
+            || self::exceedsPayloadBudget($inventory, $maxPayloadBytes)
+        );
         $files = [];
         $evidence = [];
         foreach ($inventory->filesBySet() as $setFiles) {
+            if (! self::setFitsPayloadBudget($setFiles, $maxPayloadBytes)) {
+                continue;
+            }
             foreach ($setFiles as $file) {
                 $evidence[] = $file;
                 if (isset($file['name'])) {
@@ -152,26 +163,26 @@ class Par2Processor
         }
         $aborted = new RuntimeException('PAR2 inventory ownership or release snapshot changed.');
         try {
-            return DB::transaction(function () use ($query, $files, $evidence, $inventory, $complete, $show, $canPersist, $aborted): Par2RenameOutcome {
-                $this->assertInventorySnapshot($query, $canPersist, $aborted);
+            return DB::transaction(function () use ($query, $files, $evidence, $inventory, $complete, $show, $canPersist, $expectedSnapshot, $aborted): Par2RenameOutcome {
+                $this->assertInventorySnapshot($query, $canPersist, $aborted, $expectedSnapshot);
                 if (! Par2DescriptorEvidence::remember($inventory,
                     ['id' => (int) $query->id, 'guid' => (string) $query->guid, 'name' => $query->name,
                         'searchname' => $query->searchname, 'predb_id' => 0, 'isrenamed' => 0], $canPersist)) {
                     throw $aborted;
                 }
-                $this->assertInventorySnapshot($query, $canPersist, $aborted);
+                $this->assertInventorySnapshot($query, $canPersist, $aborted, $expectedSnapshot);
                 foreach ($evidence as $file) {
                     if (! isset($file['hash'], $file['hash_16K'])) {
                         continue;
                     }
-                    $this->assertInventorySnapshot($query, $canPersist, $aborted);
+                    $this->assertInventorySnapshot($query, $canPersist, $aborted, $expectedSnapshot);
                     if (! Par2FileHashEvidence::remember((int) $query->id, $file['hash'], $file['hash_16K'],
                         $file['size_decimal'] ?? $file['size'] ?? null,
                         ['id' => (int) $query->id, 'guid' => (string) $query->guid, 'name' => $query->name,
                             'searchname' => $query->searchname, 'predb_id' => 0, 'isrenamed' => 0], $canPersist)) {
                         throw $aborted;
                     }
-                    $this->assertInventorySnapshot($query, $canPersist, $aborted);
+                    $this->assertInventorySnapshot($query, $canPersist, $aborted, $expectedSnapshot);
                 }
                 $hashEvidenceComplete = $complete && $inventory->hasCompleteMainInventory() && $evidence !== [];
                 foreach ($evidence as $file) {
@@ -194,25 +205,25 @@ class Par2Processor
                 if ($this->addPar2) {
                     $createdTime = $query['postdate'] !== null ? Carbon::createFromFormat('Y-m-d H:i:s', $query['postdate']) : now();
                     foreach (array_slice($files, 0, 21) as $file) {
-                        $this->assertInventorySnapshot($query, $canPersist, $aborted);
+                        $this->assertInventorySnapshot($query, $canPersist, $aborted, $expectedSnapshot);
                         $added = ReleaseFile::addReleaseFiles($query->id, $file['name'], $file['size_decimal'] ?? $file['size'] ?? 0,
                             $createdTime, 0, $file['hash_16K'] ?? '');
-                        $this->assertInventorySnapshot($query, $canPersist, $aborted);
+                        $this->assertInventorySnapshot($query, $canPersist, $aborted, $expectedSnapshot);
                         if ($added > 0) {
                             Release::whereId($query->id)->increment('rarinnerfilecount', $added);
                         }
-                        $this->assertInventorySnapshot($query, $canPersist, $aborted);
+                        $this->assertInventorySnapshot($query, $canPersist, $aborted, $expectedSnapshot);
                     }
                 } elseif ($complete && $files !== []) {
-                    $this->assertInventorySnapshot($query, $canPersist, $aborted);
+                    $this->assertInventorySnapshot($query, $canPersist, $aborted, $expectedSnapshot);
                     Release::whereId($query->id)->where('rarinnerfilecount', '<', count($files))
                         ->update(['rarinnerfilecount' => count($files)]);
-                    $this->assertInventorySnapshot($query, $canPersist, $aborted);
+                    $this->assertInventorySnapshot($query, $canPersist, $aborted, $expectedSnapshot);
                 }
 
                 if (\in_array((int) $query['categories_id'], Category::OTHERS_GROUP, true)) {
                     foreach ($files as $file) {
-                        $this->assertInventorySnapshot($query, $canPersist, $aborted);
+                        $this->assertInventorySnapshot($query, $canPersist, $aborted, $expectedSnapshot);
                         $query['textstring'] = $file['name'];
                         if ($this->nameFixingService->checkName($query, true, 'PAR2, ', true, (bool) $show, markProcessed: false)) {
                             if ($canPersist !== null && ! $canPersist()) {
@@ -225,7 +236,7 @@ class Par2Processor
                 } else {
                     $this->existingNameConfirmed = $files !== [];
                 }
-                $this->assertInventorySnapshot($query, $canPersist, $aborted);
+                $this->assertInventorySnapshot($query, $canPersist, $aborted, $expectedSnapshot);
 
                 return $complete ? Par2RenameOutcome::NoMatch : Par2RenameOutcome::Retryable;
             });
@@ -243,22 +254,107 @@ class Par2Processor
      * database collations cannot treat changed case or accents as the original identity.
      *
      * @param  null|callable(): bool  $canPersist
+     * @param  array<string, mixed>|null  $expectedSnapshot
      *
      * @phpstan-impure
      */
-    private function assertInventorySnapshot(Release $expected, ?callable $canPersist, RuntimeException $aborted): void
+    private function assertInventorySnapshot(Release $expected, ?callable $canPersist, RuntimeException $aborted, ?array $expectedSnapshot = null): void
     {
         if ($canPersist !== null && ! $canPersist()) {
             throw $aborted;
         }
-        $current = Release::query()->where('id', $expected->id)->lockForUpdate()->first([
-            'id', 'guid', 'name', 'searchname', 'groups_id', 'predb_id', 'isrenamed', 'proc_par2',
-        ]);
+        $current = Release::query()->where('id', $expected->id)->lockForUpdate()->first();
         if ($current === null || $current->guid !== $expected->guid || $current->name !== $expected->name
             || $current->searchname !== $expected->searchname || (int) $current->groups_id !== (int) $expected->groups_id
-            || (int) $current->predb_id !== 0 || (int) $current->isrenamed !== 0 || (int) $current->proc_par2 === 1) {
+            || (int) $current->predb_id !== 0 || (int) $current->isrenamed !== 0 || (int) $current->proc_par2 === 1
+            || self::resolveMaxPayloadBytes($current, $expectedSnapshot) !== self::resolveMaxPayloadBytes($expected, $expectedSnapshot)) {
             throw $aborted;
         }
+    }
+
+    /**
+     * Whether a PAR2 candidate has already proved it cannot describe this release's payload, so
+     * further articles from the same PAR2 stream need not be downloaded.
+     */
+    public static function exceedsPayloadBudget(Par2PacketAccumulator $inventory, ?int $maxPayloadBytes): bool
+    {
+        if ($maxPayloadBytes === null) {
+            return false;
+        }
+        $state = $inventory->exportState();
+        if ($maxPayloadBytes <= 0) {
+            return $state['packets'] !== [] || $state['skip_remaining'] > 0;
+        }
+        $sets = $inventory->filesBySet();
+        if ($sets === []) {
+            return false;
+        }
+        foreach ($sets as $setFiles) {
+            if (self::setFitsPayloadBudget($setFiles, $maxPayloadBytes)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * A PAR2 recovery set can only describe a release whose non-PAR2 payload can hold its files.
+     *
+     * @param  array<string|int, array{name?: string, size?: int|float, size_decimal?: string, hash?: string, hash_16K?: string, blocks?: int, next_offset?: int}>  $setFiles
+     */
+    public static function setFitsPayloadBudget(array $setFiles, ?int $maxPayloadBytes): bool
+    {
+        if ($maxPayloadBytes === null) {
+            return true;
+        }
+        if ($maxPayloadBytes <= 0) {
+            return false;
+        }
+        $remaining = $maxPayloadBytes;
+        $maxIntDecimal = (string) PHP_INT_MAX;
+        foreach ($setFiles as $file) {
+            $rawDecimal = $file['size_decimal'] ?? null;
+            $rawSize = $file['size'] ?? null;
+            if (is_int($rawSize) && $rawSize >= 0 && ($rawDecimal === null || $rawDecimal === (string) $rawSize)) {
+                $fileBytes = $rawSize;
+            } else {
+                $sizeDecimal = Par2FileHashEvidence::sizeDecimal($rawDecimal ?? $rawSize);
+                if ($sizeDecimal === null) {
+                    if (! is_float($rawSize) || ! is_finite($rawSize) || $rawSize < 0.0 || $rawSize > (float) $remaining) {
+                        return false;
+                    }
+                    $sizeDecimal = number_format($rawSize, 0, '', '');
+                }
+                $len = strlen($sizeDecimal);
+                if ($len > 19 || ($len === 19 && strcmp($sizeDecimal, $maxIntDecimal) > 0)) {
+                    return false;
+                }
+                $fileBytes = (int) $sizeDecimal;
+            }
+            if ($fileBytes > $remaining) {
+                return false;
+            }
+            $remaining -= $fileBytes;
+        }
+
+        return true;
+    }
+
+    /** @param array<string, mixed>|null $expectedSnapshot */
+    private static function resolveMaxPayloadBytes(object $release, ?array $expectedSnapshot = null): ?int
+    {
+        $releaseSize = (int) ($release->size ?? 0);
+        if ($releaseSize <= 0) {
+            return isset($expectedSnapshot['max_payload_bytes'])
+                ? max(0, (int) $expectedSnapshot['max_payload_bytes'])
+                : null;
+        }
+        if (isset($expectedSnapshot['max_payload_bytes'])) {
+            return min($releaseSize, max(0, (int) $expectedSnapshot['max_payload_bytes']));
+        }
+
+        return $releaseSize;
     }
 
     /**

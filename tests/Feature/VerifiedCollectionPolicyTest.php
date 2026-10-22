@@ -14,6 +14,7 @@ use App\Services\Nzb\NzbSourceGuard;
 use App\Services\ReleaseCleaningService;
 use App\Services\ReleaseCreationService;
 use App\Services\ReleaseProcessingService;
+use App\Services\Releases\Verification\ArticleSource;
 use App\Services\Releases\Verification\CandidateHeaderInventory;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\CollectionReleasePolicy;
@@ -277,6 +278,43 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertNull($policy->verifiedRejection(['verified_file_names' => ['payload.mkv ']] + $manifest));
         $this->assertSame('Header inventory contains only PAR2 files without a declared source payload.',
             $policy->verifiedRejection(['verified_file_names' => ['set.vol00+01.par2:payload.mkv']] + $manifest));
+    }
+
+    public function test_obfuscated_subject_whose_sampled_body_is_par2_cannot_publish_without_a_source_payload(): void
+    {
+        config(['release_verification.publish_endpoint' => true, 'release_verification.publish_url' => 'http://primary.test/internal/release-verification/publish']);
+        $id = $this->collectionForPolicy(name: '"45GQ78oFFVnPmDiiFNdYa"');
+        DB::table('collections')->where('id', $id)->update(['filesize' => 100000]);
+        DB::table('parts')->update(['size' => 100000]);
+        $repository = app(CandidateRepository::class);
+        $repository->archive($id);
+        $claim = $repository->claim();
+        $stored = app(ManifestStore::class)->read($claim->manifest_path);
+        $par2Payload = "PAR2\0PKT".str_repeat('p', 56);
+        $raw = (new YencService)->encode($par2Payload, '6d7097ef2ba33be4b4fb6681.par2');
+        $source = new class($raw) implements ArticleSource
+        {
+            public function __construct(private readonly string $raw) {}
+
+            public function fetch(string $messageId): string
+            {
+                return $this->raw;
+            }
+        };
+        $result = (new SpotCheckVerifier($source, [], new YencService))->verify($stored, static function (): void {});
+        $this->assertSame('sampled', $result->verdict);
+        $this->assertSame('Header inventory contains only PAR2 files without a declared source payload.',
+            app(CollectionReleasePolicy::class)->verifiedRejection($result->manifest));
+
+        $this->publicationSchema();
+        Http::fake(function (HttpRequest $request) {
+            $response = $this->postJson('/internal/release-verification/publish', $request->data());
+
+            return Http::response($response->json(), $response->status());
+        });
+        $this->assertNull(app(RemoteReleasePublisher::class)->publish($claim, $result));
+        $this->assertSame(0, DB::table('releases')->count());
+        $this->assertSame('filtered', DB::table('release_verification_candidates')->where('id', $claim->id)->value('status'));
     }
 
     public function test_manual_import_preserves_legacy_bypass_of_collection_size_and_count_filters(): void

@@ -54,6 +54,8 @@ final class RemotePublicationService
             'evidence.identity_hints' => ['present', 'array', 'max:16'],
             'evidence.identity_hints.*' => ['string', 'max:1024'],
             'evidence.partial' => ['sometimes', 'boolean'],
+            'evidence.parity_file_keys' => ['sometimes', 'array', 'max:16'],
+            'evidence.parity_file_keys.*' => ['string', 'max:1024'],
         ];
     }
 
@@ -175,6 +177,9 @@ final class RemotePublicationService
             'verified_file_names' => array_values(array_map('strval', $data['evidence']['verified_file_names'])),
             'identity_hints' => array_values(array_map('strval', $data['evidence']['identity_hints'])),
             'partial' => (bool) ($data['evidence']['partial'] ?? false)];
+        if (isset($data['evidence']['parity_file_keys']) && is_array($data['evidence']['parity_file_keys'])) {
+            $evidence['parity_file_keys'] = array_values(array_map('strval', $data['evidence']['parity_file_keys']));
+        }
         try {
             $settled = $this->settled($claim, $replayResolved);
             $timing?->requestPhase('published_check');

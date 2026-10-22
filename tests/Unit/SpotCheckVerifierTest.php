@@ -624,4 +624,61 @@ final class SpotCheckVerifierTest extends TestCase
         $this->assertFalse(SpotCheckVerifier::evidence(
             SpotCheckVerifier::withEvidence($stored, [...$evidence, 'partial' => false]))['partial']);
     }
+
+    #[Test]
+    public function par2_packet_bodies_reject_payload_headers_and_record_parity_file_keys(): void
+    {
+        $par2Payload = "PAR2\0PKT".str_repeat('p', 56);
+        foreach ([
+            ['"movie.mkv" yEnc', 'movie.mkv'],
+            ['"Xk29dPq8LmZ0Yt5R.mkv" yEnc', 'Xk29dPq8LmZ0Yt5R.mkv'],
+            ['"45GQ78oFFVnPmDiiFNdYa" yEnc', 'movie.mkv'],
+            ['"45GQ78oFFVnPmDiiFNdYa" yEnc', 'README'],
+        ] as [$subject, $yencName]) {
+            $raw = YencArticles::part($par2Payload, $yencName, strlen($par2Payload), 1, 1, 1);
+            $source = new class($raw) implements ArticleSource
+            {
+                public function __construct(private readonly string $raw) {}
+
+                public function fetch(string $messageId): string
+                {
+                    return $this->raw;
+                }
+            };
+            $manifest = ['identity' => sha1($subject.':'.$yencName), 'expected_files' => 1, 'files' => [
+                ['key' => 'par-file', 'subject' => $subject, 'totalparts' => 1,
+                    'segments' => [['number' => 1, 'messageid' => 'par@article', 'bytes' => strlen($raw)]]],
+            ]];
+            $result = (new SpotCheckVerifier($source, [], new YencService))->verify($manifest, static function (): void {});
+
+            self::assertSame('unknown', $result->verdict, $subject.' / '.$yencName);
+            self::assertSame('Spot-check article identity differs from its header.', $result->reason);
+            self::assertTrue($result->deterministic);
+        }
+
+        foreach (['45GQ78oFFVnPmDiiFNdYa', '6d7097ef2ba33be4b4fb6681.par2'] as $yencName) {
+            $raw = YencArticles::part($par2Payload, $yencName, strlen($par2Payload), 1, 1, 1);
+            $source = new class($raw) implements ArticleSource
+            {
+                public function __construct(private readonly string $raw) {}
+
+                public function fetch(string $messageId): string
+                {
+                    return $this->raw;
+                }
+            };
+            $manifest = ['identity' => sha1('parity-'.$yencName), 'expected_files' => 1, 'files' => [
+                ['key' => 'par-file', 'subject' => '"45GQ78oFFVnPmDiiFNdYa" yEnc', 'totalparts' => 1,
+                    'segments' => [['number' => 1, 'messageid' => 'par@article', 'bytes' => strlen($raw)]]],
+            ]];
+            $result = (new SpotCheckVerifier($source, [], new YencService))->verify($manifest, static function (): void {});
+
+            self::assertSame('sampled', $result->verdict, $result->reason);
+            self::assertSame(['par-file'], $result->manifest['spot_check']['parity_file_keys'] ?? null);
+            $evidence = SpotCheckVerifier::evidence($result->manifest);
+            self::assertSame(['par-file'], $evidence['parity_file_keys'] ?? null);
+            $rebuilt = SpotCheckVerifier::withEvidence($manifest, $evidence);
+            self::assertSame(['par-file'], $rebuilt['spot_check']['parity_file_keys'] ?? null);
+        }
+    }
 }

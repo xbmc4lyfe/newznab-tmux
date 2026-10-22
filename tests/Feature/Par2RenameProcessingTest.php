@@ -789,6 +789,45 @@ PHP;
         $this->assertSame(0, (int) $unknown->fresh()->isrenamed);
     }
 
+    public function test_standalone_or_undersized_par2_release_does_not_rename_or_certify_hash_inventory_and_stops_after_first_segment(): void
+    {
+        $par2Data = (string) file_get_contents(base_path('tests/Fixtures/par2/rename-index.par2'));
+        $standalone = $this->pendingPar2Release(['size' => 3000]);
+        $xml = new SimpleXMLElement('<nzb/>');
+        $file = $xml->addChild('file');
+        $file->addAttribute('subject', '"45GQ78oFFVnPmDiiFNdYa" yEnc (1/3)');
+        $segments = $file->addChild('segments');
+        foreach ([1 => 'seg-1', 2 => 'seg-2', 3 => 'seg-3'] as $number => $id) {
+            $segment = $segments->addChild('segment', $id);
+            $segment->addAttribute('bytes', '1000');
+            $segment->addAttribute('number', (string) $number);
+        }
+
+        $service = $this->service($xml, ['seg-1' => $par2Data, 'seg-2' => $par2Data, 'seg-3' => $par2Data], rename: true);
+        $this->assertSame(Par2RenameOutcome::NoMatch, $service->checkPar2Result($standalone->guid, $standalone->id, 1, 1, 0));
+        $this->assertSame(['seg-1'], $this->downloaded);
+        $this->assertSame(0, (int) $standalone->fresh()->isrenamed);
+        $this->assertSame(1, (int) $standalone->fresh()->proc_par2);
+        $this->assertSame(0, (int) $standalone->fresh()->rarinnerfilecount);
+        $this->assertSame(0, DB::table('par_file_hashes')->where('releases_id', $standalone->id)->count());
+        $this->assertSame(0, DB::table('par_file_hash_inventories')->where('releases_id', $standalone->id)->count());
+
+        $this->downloaded = [];
+        $complete = $this->pendingPar2Release(['size' => 1100000]);
+        $completeNzb = $this->nzb([
+            ['"45GQ78oFFVnPmDiiFNdYa" yEnc (1/1)', 'par-id', 50000],
+            ['"payload.rar" yEnc (1/1)', 'rar-id', 1050000],
+        ]);
+        $completeService = $this->service($completeNzb, ['par-id' => $par2Data], rename: true);
+        $this->assertSame(Par2RenameOutcome::Renamed, $completeService->checkPar2Result($complete->guid, $complete->id, 1, 1, 0));
+        $this->assertSame(['par-id'], $this->downloaded);
+        $this->assertSame(1, (int) $complete->fresh()->isrenamed);
+        $this->assertSame(1, (int) $complete->fresh()->proc_par2);
+        $this->assertSame(10, (int) $complete->fresh()->rarinnerfilecount);
+        $this->assertSame(10, DB::table('par_file_hashes')->where('releases_id', $complete->id)->count());
+        $this->assertSame(1, DB::table('par_file_hash_inventories')->where('releases_id', $complete->id)->count());
+    }
+
     private function release(): Release
     {
         return $this->pendingPar2Release();
