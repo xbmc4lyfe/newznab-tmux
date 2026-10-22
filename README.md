@@ -101,13 +101,13 @@ just docker logs s=indexer                     # Follow indexing logs
 just docker tmux                               # Attach to tmux; detach with Ctrl-a, then d
 just docker down                               # Stop containers; retain bind-mounted data
 just docker up DEPLOY_BY=local-start           # Start an initialized stack
-just deploy                                    # Deploy dirty services
-just deploy web                                # Deploy one component (or just deploy-web)
+just deploy                                    # Sync origin/master & deploy dirty services
+just deploy web                                # Redeploy one component (or just deploy-web)
 just docker backup                             # Database dump in docker/backups/
 just docker help                               # All available commands
 ```
 
-After updating the checkout, back up the database and use `just deploy` (or `just deploy <component>` / `just deploy-<component>` for a single component) to rebuild, pause affected application writers, run migrations when needed, and recreate only the affected services. Use `deploy` for updates; `init` reapplies the starter groups and tuning.
+When you run `just deploy-plan`, `just build-stack`, or `just deploy` (or `just deploy <component>` / `just deploy-<component>` for a single component), the deployment guard automatically verifies that the checkout is on the default branch (`master`), fetches `origin/master` from GitHub, and fast-forwards the checkout before planning, building, pausing affected application writers, running migrations when needed, and recreating the targeted or affected services. Use `deploy` for updates; `init` reapplies the starter groups and tuning.
 
 Persistent data lives in `docker/data/`, logs in `docker/logs/`, and database dumps in `docker/backups/`. The backup command covers MariaDB; preserve application configuration and NZB/storage files separately. If initialization fails, inspect `just docker logs` before retrying; a partially initialized database needs recovery rather than a reset.
 

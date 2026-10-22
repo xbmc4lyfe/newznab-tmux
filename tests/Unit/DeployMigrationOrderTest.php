@@ -4182,6 +4182,63 @@ SH);
         $delimiterOnly->run();
         $this->assertNotSame(0, $delimiterOnly->getExitCode());
         $this->assertStringContainsString('contains no target names', $delimiterOnly->getErrorOutput());
+
+        // When all services are already stamped as unchanged, explicit component commands still redeploy the requested component.
+        file_put_contents($this->directory.'/events', '');
+        $planWeb = $this->make(['deploy-plan', 'web'], $config);
+        $planWeb->mustRun();
+        $this->assertMatchesRegularExpression('/web\s+app\s+recreate\s+targeted redeploy/', $planWeb->getOutput());
+
+        $this->make(['deploy-web'], $config)->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web', $events);
+        $this->assertStringNotContainsString('--pull never horizon', $events);
+
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy-proxy'], $config)->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never proxy', $this->events());
+
+        // Plain `just deploy` with no target argument still skips when nothing changed.
+        file_put_contents($this->directory.'/events', '');
+        $noop = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config);
+        $noop->mustRun();
+        $this->assertStringContainsString('nothing changed since the last deploy; skipping', $noop->getOutput());
+    }
+
+    public function test_deploy_plan_and_deploy_automatically_sync_latest_remote_default_branch(): void
+    {
+        $this->composeFiles();
+        $config = ['NNTMUX_CONFIG_ID' => $this->composeJson()];
+
+        $origin = $this->directory.'-origin.git';
+        $upstream = $this->directory.'-upstream';
+        (new Process(['git', 'add', '.'], $this->directory))->mustRun();
+        (new Process(['git', 'commit', '-q', '-m', 'track compose files'], $this->directory))->mustRun();
+        (new Process(['git', 'branch', '-M', 'master'], $this->directory))->mustRun();
+        (new Process(['git', 'init', '-q', '--bare', $origin]))->mustRun();
+        (new Process(['git', 'remote', 'add', 'origin', $origin], $this->directory))->mustRun();
+        (new Process(['git', 'push', '-q', '-u', 'origin', 'master'], $this->directory))->mustRun();
+
+        try {
+            $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+
+            // Push a Caddyfile update to origin/master from another clone without pulling locally.
+            (new Process(['git', 'clone', '-q', '--branch', 'master', $origin, $upstream]))->mustRun();
+            (new Process(['git', 'config', 'user.email', 'test@example.com'], $upstream))->mustRun();
+            (new Process(['git', 'config', 'user.name', 'Test'], $upstream))->mustRun();
+            file_put_contents($upstream.'/docker/config/caddy/Caddyfile', ":8080\n# updated on origin\n");
+            (new Process(['git', 'commit', '-q', '-am', 'update caddy on origin'], $upstream))->mustRun();
+            (new Process(['git', 'push', '-q', 'origin', 'master'], $upstream))->mustRun();
+
+            // `just deploy` automatically fetches origin/master, fast-forwards, and redeploys proxy.
+            file_put_contents($this->directory.'/events', '');
+            $deploy = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config);
+            $deploy->mustRun();
+            $this->assertStringContainsString('fast-forwarded master', $deploy->getOutput());
+            $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never proxy', $this->events());
+        } finally {
+            (new Process(['rm', '-rf', $origin, $upstream]))->run();
+        }
     }
 
     /**
