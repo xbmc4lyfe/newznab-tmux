@@ -60,13 +60,61 @@ help *args:
 
 # ── Production Self-Hosted Stack Shortcuts (delegates to docker/Justfile) ──
 
-# Smart selective deploy of the production docker/ stack
+# Smart selective deploy of the production docker/ stack (or specific component(s): `just deploy web`)
 deploy *args:
     @"$JUST" --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" deploy "$@"
 
-# Show per-service change detection and selective deployment plan
+# Show per-service change detection and selective deployment plan (or for specific component(s))
 deploy-plan *args:
     @"$JUST" --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" deploy-plan "$@"
+
+# Deploy only the web service
+deploy-web *args:
+    @"$JUST" --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" deploy web "$@"
+
+# Deploy only the Horizon queue worker service
+deploy-horizon *args:
+    @"$JUST" --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" deploy horizon "$@"
+
+# Deploy only the scheduler service (with cooperative drain)
+deploy-scheduler *args:
+    @"$JUST" --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" deploy scheduler "$@"
+
+# Deploy only the indexer service (with cooperative tmux:drain)
+deploy-indexer *args:
+    @"$JUST" --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" deploy indexer "$@"
+
+# Deploy only the Caddy reverse proxy service
+deploy-proxy *args:
+    @"$JUST" --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" deploy proxy "$@"
+
+# Deploy only the monitoring services (Prometheus, Grafana, Pushgateway, exporters)
+deploy-monitoring *args:
+    @"$JUST" --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" deploy monitoring "$@"
+
+# Deploy only the Redis service (drains writers first)
+deploy-redis *args:
+    @"$JUST" --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" deploy redis "$@"
+
+# Deploy only the Manticore search service (drains writers first)
+deploy-manticore *args:
+    @"$JUST" --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" deploy manticore "$@"
+
+# Deploy only the MariaDB database service (drains writers and migrates)
+deploy-mariadb *args:
+    @"$JUST" --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" deploy mariadb "$@"
+
+# Deploy only the Mailpit service
+deploy-mailpit *args:
+    @"$JUST" --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" deploy mailpit "$@"
+
+# Deploy only the Grafana service
+deploy-grafana *args:
+    @"$JUST" --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" deploy grafana "$@"
+
+# Deploy only the Prometheus service
+deploy-prometheus *args:
+    @"$JUST" --justfile "{{justfile_directory()}}/docker/Justfile" --working-directory "{{justfile_directory()}}/docker" deploy prometheus "$@"
 
 # Build dirty self-hosted service image targets
 build-stack *args:
