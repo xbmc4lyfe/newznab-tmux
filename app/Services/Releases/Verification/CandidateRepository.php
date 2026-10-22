@@ -322,9 +322,6 @@ final class CandidateRepository
                 } else {
                     $holderId = (int) $existing->id;
                     DB::table('release_verification_candidates')->where('id', $existing->id)->update($values);
-                    if (! $expired) {
-                        $this->rewindExpiryCursor($holderId);
-                    }
                 }
                 if ($previous !== null) {
                     // The new generation now holds the retained inventory and its capacity, and becomes the
@@ -347,6 +344,9 @@ final class CandidateRepository
                 // Last lock request: a full ledger rolls back the deletion, retaining the original headers.
                 if (! $this->ledger->adjust($delta)) {
                     $full();
+                }
+                if ($existing !== null && ! $expired) {
+                    $this->rewindExpiryCursor($holderId);
                 }
                 if ($expired) {
                     DB::afterCommit(function () use ($path): void {
@@ -501,7 +501,6 @@ final class CandidateRepository
                         }
                     } else {
                         DB::table('release_verification_candidates')->where('id', $existing->id)->update($values);
-                        $this->rewindExpiryCursor((int) $existing->id);
                         if ($existing->manifest_path !== '' && $existing->manifest_path !== $path) {
                             DB::afterCommit(function () use ($existing): void {
                                 $this->store->deleteIfUnreferenced($existing->manifest_path);
@@ -510,6 +509,9 @@ final class CandidateRepository
                     }
                     if (! $this->ledger->adjust($delta)) {
                         $full();
+                    }
+                    if ($existing !== null) {
+                        $this->rewindExpiryCursor((int) $existing->id);
                     }
 
                     return true;
@@ -1314,7 +1316,8 @@ final class CandidateRepository
         [$floor, $after, $retained] = is_array($stored) && count($stored) === 3
             ? [max(0, (int) $stored[0]), max(0, (int) $stored[1]), (bool) $stored[2]]
             : [0, 0, false];
-        if ($after < $floor) {
+        $wrapped = $after <= $floor;
+        if ($wrapped) {
             $after = $floor;
             $retained = false;
         }
@@ -1329,8 +1332,14 @@ final class CandidateRepository
                     return;
                 }
                 $rows = $this->expiryPage($after);
+                if ($rows->isEmpty() && ! $wrapped) {
+                    $after = $floor;
+                    $retained = false;
+                    $wrapped = true;
+                    $rows = $this->expiryPage($after);
+                }
                 if ($rows->isEmpty() && $after > 0) {
-                    if ($after > $floor) {
+                    if ($page > 0 || $this->hasTerminalCandidateFloor($floor)) {
                         $after = $floor;
                         $retained = false;
 
@@ -1379,24 +1388,39 @@ final class CandidateRepository
                 if ($rows->count() < 1000) {
                     $after = $floor;
                     $retained = false;
-
-                    return;
+                    if ($wrapped) {
+                        return;
+                    }
+                    $wrapped = true;
                 }
             }
         } finally {
-            $save = static function () use ($cursorKey, &$floor, &$after, &$retained): void {
-                try {
-                    Cache::put($cursorKey, [$floor, $after, $retained], now()->addDay());
-                } catch (Throwable) {
-                    // The next pass starts over.
-                }
-            };
-            if (DB::transactionLevel() === 0) {
-                $save();
-            } else {
-                DB::afterCommit($save);
+            try {
+                Cache::put($cursorKey, [$floor, $after, $retained], now()->addDay());
+            } catch (Throwable) {
+                // The next pass starts over.
+            }
+            if (DB::transactionLevel() > 0) {
+                DB::afterRollBack(static function () use ($cursorKey): void {
+                    try {
+                        Cache::forget($cursorKey);
+                    } catch (Throwable) {
+                    }
+                });
             }
         }
+    }
+
+    private function hasTerminalCandidateFloor(int $floor): bool
+    {
+        if ($floor <= 0) {
+            return false;
+        }
+        $row = DB::table('release_verification_candidates')
+            ->where('id', $floor)
+            ->first(['release_id', 'status']);
+
+        return $row !== null && ($row->release_id !== null || ! in_array($row->status, self::EXPIRABLE_STATUSES, true));
     }
 
     /** @return Collection<int, \stdClass> */
@@ -1472,16 +1496,21 @@ final class CandidateRepository
                 }
                 [$floor, $after, $retained] = [max(0, (int) $stored[0]), max(0, (int) $stored[1]), (bool) $stored[2]];
                 if ($id <= $floor) {
+                    $oldFloor = $floor;
                     $floor = max(0, $id - 1);
-                    $retained = true;
+                    if (! $retained || $after <= $oldFloor) {
+                        $after = $floor;
+                        $retained = false;
+                    } else {
+                        $retained = true;
+                    }
                     Cache::put($cursorKey, [$floor, $after, $retained], now()->addDay());
                 }
             } catch (Throwable) {
             }
         };
-        if (DB::transactionLevel() === 0) {
-            $rewind();
-        } else {
+        $rewind();
+        if (DB::transactionLevel() > 0) {
             DB::afterCommit($rewind);
         }
     }

@@ -1292,10 +1292,38 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame('waiting_upload', DB::table('release_verification_candidates')->where('source_identity', sha1('prefix-'.$prefix))->value('status'));
 
         $this->travel(4)->hours();
+        $this->limits();
         app(CandidateRepository::class)->expire();
 
         $this->assertSame('expired', DB::table('release_verification_candidates')->where('source_identity', sha1('prefix-'.$prefix))->value('status'),
             'After wrapping to the terminal floor, the previously owed candidate expires without rescanning the terminal prefix.');
+        $maxId = (int) DB::table('release_verification_candidates')->max('id');
+        $this->assertSame([$maxId, $maxId, false], Cache::get('release_verification:expiry_cursor'));
+
+        $rescannedFromZero = false;
+        DB::listen(static function (QueryExecuted $query) use (&$rescannedFromZero): void {
+            if (str_contains($query->sql, 'release_verification_candidates')
+                && str_contains($query->sql, 'limit 1000')
+                && ($query->bindings[0] ?? null) === 0) {
+                $rescannedFromZero = true;
+            }
+        });
+        app(CandidateRepository::class)->expire();
+
+        $this->assertFalse($rescannedFromZero, 'An all-terminal table keeps its terminal floor instead of rescanning from id = 0.');
+        $this->assertSame([$maxId, $maxId, false], Cache::get('release_verification:expiry_cursor'));
+
+        // Reviving the first candidate row via archive() rewinds the floor so a single expire() pass expires it once due.
+        $revivedHash = hex2bin(sha1('prefix-1'));
+        $revivedCollection = $this->collectionForPolicy('movie.mkv', 3, $revivedHash !== false ? $revivedHash : null);
+        app(CandidateRepository::class)->archive($revivedCollection);
+        $this->assertSame('waiting_upload', DB::table('release_verification_candidates')->where('source_identity', sha1('prefix-1'))->value('status'));
+
+        $this->travel($expiry + 5)->hours();
+        $this->limits();
+        app(CandidateRepository::class)->expire();
+
+        $this->assertSame('expired', DB::table('release_verification_candidates')->where('source_identity', sha1('prefix-1'))->value('status'));
     }
 
     public function test_the_settle_sweep_pages_through_held_releases_across_passes(): void
