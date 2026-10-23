@@ -27,6 +27,7 @@ use App\Services\Search\Support\ReleaseIndexProjection;
 use App\Services\Search\Support\SearchFailureTracker;
 use App\Support\PredbSearchDocument;
 use App\Support\ReleaseSearchIndexDocument;
+use App\Support\RustPipelineLibrary;
 use App\Support\SecondaryIndexDocuments;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -800,6 +801,16 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
      */
     public static function escapeString(string $string): string
     {
+        $rust = RustPipelineLibrary::manticoreEscapeString($string);
+        if ($rust !== null) {
+            return $rust;
+        }
+
+        return self::escapeStringPhp($string);
+    }
+
+    public static function escapeStringPhp(string $string): string
+    {
         if ($string === '*' || empty($string)) {
             return '';
         }
@@ -815,10 +826,24 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
         return trim($string);
     }
 
-    private static function prepareReleaseFieldSearchQuery(string $field, string $query): string
+    public static function prepareReleaseFieldSearchQuery(string $field, string $query): string
     {
         if ($field !== 'fromname') {
             return self::prepareUserSearchQuery($query);
+        }
+
+        $rust = RustPipelineLibrary::manticorePrepareQuery($query, 1);
+        if ($rust !== null) {
+            return $rust;
+        }
+
+        return self::prepareReleaseFieldSearchQueryPhp($field, $query);
+    }
+
+    public static function prepareReleaseFieldSearchQueryPhp(string $field, string $query): string
+    {
+        if ($field !== 'fromname') {
+            return self::prepareUserSearchQueryPhp($query);
         }
 
         $query = trim($query);
@@ -849,6 +874,16 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
      * \, @, ~, &, /, $, =, ', [, ]
      */
     public static function prepareUserSearchQuery(string $query): string
+    {
+        $rust = RustPipelineLibrary::manticorePrepareQuery($query, 0);
+        if ($rust !== null) {
+            return $rust;
+        }
+
+        return self::prepareUserSearchQueryPhp($query);
+    }
+
+    public static function prepareUserSearchQueryPhp(string $query): string
     {
         $query = trim($query);
         if ($query === '' || $query === '*') {
@@ -972,6 +1007,21 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
      */
     public static function buildFieldSearchExpression(array $searchArray, ?array $allowedFields = null): ?string
     {
+        $supported = false;
+        $rust = RustPipelineLibrary::manticoreBuildFieldSearchExpression($searchArray, $allowedFields, null, $supported);
+        if ($supported) {
+            return $rust;
+        }
+
+        return self::buildFieldSearchExpressionPhp($searchArray, $allowedFields);
+    }
+
+    /**
+     * @param  array<string, mixed>  $searchArray
+     * @param  list<string>|null  $allowedFields
+     */
+    public static function buildFieldSearchExpressionPhp(array $searchArray, ?array $allowedFields = null): ?string
+    {
         $terms = [];
         foreach ($searchArray as $key => $value) {
             if ($allowedFields !== null && (! is_string($key) || ! in_array($key, $allowedFields, true))) {
@@ -980,9 +1030,9 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
             // An explicit check: empty() would also drop the legitimate search term "0".
             if ($value !== null && $value !== '') {
                 $rawValue = (string) $value;
-                $preparedValue = self::prepareUserSearchQuery($rawValue);
+                $preparedValue = self::prepareUserSearchQueryPhp($rawValue);
                 if ($preparedValue !== '') {
-                    $terms[] = self::scopeReleaseSearchQuery($rawValue, $preparedValue, '@'.$key);
+                    $terms[] = self::scopeReleaseSearchQueryPhp($rawValue, $preparedValue, '@'.$key);
                 }
             }
         }
@@ -999,7 +1049,17 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
      * indexing them as part of a word, though, so an ordinary release-name
      * query needs a normalized-token alternative as well.
      */
-    private static function scopeReleaseSearchQuery(string $rawQuery, string $preparedQuery, string $fieldSelector = ''): string
+    public static function scopeReleaseSearchQuery(string $rawQuery, string $preparedQuery, string $fieldSelector = ''): string
+    {
+        $rust = RustPipelineLibrary::manticoreScopeReleaseQuery($rawQuery, $preparedQuery, $fieldSelector);
+        if ($rust !== null) {
+            return $rust;
+        }
+
+        return self::scopeReleaseSearchQueryPhp($rawQuery, $preparedQuery, $fieldSelector);
+    }
+
+    public static function scopeReleaseSearchQueryPhp(string $rawQuery, string $preparedQuery, string $fieldSelector = ''): string
     {
         $primary = self::scopePreparedQueryToField($preparedQuery, $fieldSelector);
 
@@ -1015,7 +1075,7 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
 
         $normalized = preg_replace('/[._-]+/u', ' ', trim($rawQuery));
         $normalized = is_string($normalized) ? trim(preg_replace('/\s+/', ' ', $normalized) ?? '') : '';
-        $normalizedPrepared = self::prepareUserSearchQuery($normalized);
+        $normalizedPrepared = self::prepareUserSearchQueryPhp($normalized);
 
         if ($normalizedPrepared === '' || $normalizedPrepared === $preparedQuery) {
             return $primary;
@@ -2083,46 +2143,18 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
 
             $results = $search->get();
 
-            $ranked = [];
+            $searchnames = [];
             foreach ($results as $doc) {
                 $data = $doc->getData();
-                $searchname = '';
                 foreach ($fields as $field) {
                     if (! empty($data[$field])) {
-                        $searchname = (string) $data[$field];
+                        $searchnames[] = (string) $data[$field];
                         break;
                     }
                 }
-
-                if (empty($searchname)) {
-                    continue;
-                }
-
-                // Create a clean suggestion from the searchname
-                $suggestion = $this->extractSuggestion($searchname, $query);
-                if ($suggestion === null || $suggestion === '') {
-                    continue;
-                }
-
-                $normalized = mb_strtolower(trim((string) preg_replace('/\s+/', ' ', $suggestion)));
-                if ($normalized !== '') {
-                    if (! isset($ranked[$normalized])) {
-                        $ranked[$normalized] = [
-                            'suggest' => $suggestion,
-                            'distance' => 0,
-                            'docs' => 0,
-                            'prefix' => str_starts_with($normalized, mb_strtolower($query)) ? 1 : 0,
-                        ];
-                    }
-                    $ranked[$normalized]['docs']++;
-                }
             }
 
-            uasort($ranked, static fn (array $a, array $b): int => [$b['prefix'], $b['docs']] <=> [$a['prefix'], $a['docs']]);
-            foreach (array_slice($ranked, 0, $maxResults) as $item) {
-                unset($item['prefix']);
-                $suggestions[] = $item;
-            }
+            $suggestions = $this->rankAutocompleteCandidates($searchnames, $query, (int) $maxResults);
         } catch (\Throwable $e) {
             if (config('app.debug')) {
                 Log::warning('ManticoreSearch autocomplete error: '.$e->getMessage());
@@ -2138,13 +2170,79 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
     }
 
     /**
+     * @param  list<string>  $searchnames
+     * @return list<array{suggest: string, distance: int, docs: int}>
+     */
+    public function rankAutocompleteCandidates(array $searchnames, string $query, int $maxResults): array
+    {
+        $rust = RustPipelineLibrary::searchRankAutocompleteBatch($searchnames, $query, $maxResults);
+        if ($rust !== null) {
+            return $rust;
+        }
+
+        return $this->rankAutocompleteCandidatesPhp($searchnames, $query, $maxResults);
+    }
+
+    /**
+     * @param  list<string>  $searchnames
+     * @return list<array{suggest: string, distance: int, docs: int}>
+     */
+    public function rankAutocompleteCandidatesPhp(array $searchnames, string $query, int $maxResults): array
+    {
+        $ranked = [];
+        foreach ($searchnames as $searchname) {
+            if (empty($searchname)) {
+                continue;
+            }
+
+            $suggestion = $this->extractSuggestionPhp($searchname, $query);
+            if ($suggestion === null || $suggestion === '') {
+                continue;
+            }
+
+            $normalized = mb_strtolower(trim((string) preg_replace('/\s+/', ' ', $suggestion)));
+            if ($normalized !== '') {
+                if (! isset($ranked[$normalized])) {
+                    $ranked[$normalized] = [
+                        'suggest' => $suggestion,
+                        'distance' => 0,
+                        'docs' => 0,
+                        'prefix' => str_starts_with($normalized, mb_strtolower($query)) ? 1 : 0,
+                    ];
+                }
+                $ranked[$normalized]['docs']++;
+            }
+        }
+
+        uasort($ranked, static fn (array $a, array $b): int => [$b['prefix'], $b['docs']] <=> [$a['prefix'], $a['docs']]);
+        $suggestions = [];
+        foreach (array_slice($ranked, 0, $maxResults) as $item) {
+            unset($item['prefix']);
+            $suggestions[] = $item;
+        }
+
+        return $suggestions;
+    }
+
+    /**
      * Extract a clean suggestion from a searchname.
      *
      * @param  string  $searchname  The full searchname
      * @param  string  $query  The user's query
      * @return string|null The extracted suggestion
      */
-    private function extractSuggestion(string $searchname, string $query): ?string
+    public function extractSuggestion(string $searchname, string $query): ?string
+    {
+        $supported = false;
+        $rust = RustPipelineLibrary::searchExtractSuggestion($searchname, $query, null, $supported);
+        if ($supported) {
+            return $rust;
+        }
+
+        return $this->extractSuggestionPhp($searchname, $query);
+    }
+
+    public function extractSuggestionPhp(string $searchname, string $query): ?string
     {
         // Clean up the searchname - remove file extensions, quality tags at the end
         $clean = (string) preg_replace('/\.(mkv|avi|mp4|wmv|nfo|nzb|par2|rar|zip|r\d+)$/i', '', $searchname);
@@ -2298,47 +2396,18 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
 
             $results = $search->get();
 
-            // Extract common terms from the results that differ from the query
-            $termCounts = [];
+            $searchnames = [];
             foreach ($results as $doc) {
                 $data = $doc->getData();
-                $searchname = '';
                 foreach ($fields as $field) {
                     if (! empty($data[$field])) {
-                        $searchname = (string) $data[$field];
+                        $searchnames[] = (string) $data[$field];
                         break;
                     }
                 }
-
-                // Extract words from searchname
-                $words = preg_split('/[\s.\-_]+/', strtolower($searchname)) ?: [];
-                foreach ($words as $word) {
-                    if (strlen($word) >= 3 && $word !== strtolower($query)) {
-                        // Check if word is similar to query (within edit distance)
-                        $distance = levenshtein(strtolower($query), $word);
-                        if ($distance > 0 && $distance <= 3) {
-                            if (! isset($termCounts[$word])) {
-                                $termCounts[$word] = ['count' => 0, 'distance' => $distance];
-                            }
-                            $termCounts[$word]['count']++;
-                        }
-                    }
-                }
             }
 
-            // Sort by count (most common first)
-            uasort($termCounts, fn ($a, $b) => $b['count'] - $a['count']);
-
-            $suggestions = [];
-            foreach (array_slice($termCounts, 0, 5, true) as $term => $data) {
-                $suggestions[] = [
-                    'suggest' => $term,
-                    'distance' => $data['distance'],
-                    'docs' => $data['count'],
-                ];
-            }
-
-            return $suggestions;
+            return $this->rankSuggestFallbackCandidates($searchnames, $query, 5);
         } catch (\Throwable $e) {
             if (config('app.debug')) {
                 Log::debug('ManticoreSearch suggest fallback error: '.$e->getMessage());
@@ -2346,6 +2415,56 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
 
             return [];
         }
+    }
+
+    /**
+     * @param  list<string>  $searchnames
+     * @return list<array{suggest: string, distance: int, docs: int}>
+     */
+    public function rankSuggestFallbackCandidates(array $searchnames, string $query, int $maxResults = 5): array
+    {
+        $rust = RustPipelineLibrary::searchSuggestFallbackBatch($searchnames, $query, $maxResults);
+        if ($rust !== null) {
+            return $rust;
+        }
+
+        return $this->rankSuggestFallbackCandidatesPhp($searchnames, $query, $maxResults);
+    }
+
+    /**
+     * @param  list<string>  $searchnames
+     * @return list<array{suggest: string, distance: int, docs: int}>
+     */
+    public function rankSuggestFallbackCandidatesPhp(array $searchnames, string $query, int $maxResults = 5): array
+    {
+        $termCounts = [];
+        foreach ($searchnames as $searchname) {
+            $words = preg_split('/[\s.\-_]+/', strtolower($searchname)) ?: [];
+            foreach ($words as $word) {
+                if (strlen($word) >= 3 && $word !== strtolower($query)) {
+                    $distance = levenshtein(strtolower($query), $word);
+                    if ($distance > 0 && $distance <= 3) {
+                        if (! isset($termCounts[$word])) {
+                            $termCounts[$word] = ['count' => 0, 'distance' => $distance];
+                        }
+                        $termCounts[$word]['count']++;
+                    }
+                }
+            }
+        }
+
+        uasort($termCounts, fn ($a, $b) => $b['count'] - $a['count']);
+
+        $suggestions = [];
+        foreach (array_slice($termCounts, 0, $maxResults, true) as $term => $data) {
+            $suggestions[] = [
+                'suggest' => (string) $term,
+                'distance' => $data['distance'],
+                'docs' => $data['count'],
+            ];
+        }
+
+        return $suggestions;
     }
 
     /**
