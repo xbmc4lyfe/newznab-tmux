@@ -337,6 +337,10 @@ class NfoExtractorRustParityTest extends TestCase
                 'Movies\\Classic Film (1998).mkv',
                 'Movie (year) mkv/mp4',
             ],
+            'movie (year) without title prefix after backslash does not match' => [
+                'Movies\\(1998).avi',
+                null,
+            ],
             'rar archive path' => [
                 'Release.Title.2021/CD1/archive.r01',
                 'RAR archive path',

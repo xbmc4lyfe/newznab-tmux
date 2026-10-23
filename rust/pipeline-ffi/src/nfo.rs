@@ -4632,7 +4632,7 @@ pub(crate) fn filename_extract_candidate_into(filename: &[u8], out: &mut OutCurs
         if check_paren_year(paren_pos) {
             let ext = &filename[filename.len() - 4..];
             if ext.eq_ignore_ascii_case(b".avi") {
-                if let Some(bs) = filename[1..paren_pos].iter().rposition(|&b| b == b'\\') {
+                if let Some(bs) = filename[1..paren_pos - 1].iter().rposition(|&b| b == b'\\') {
                     let r1 = &filename[1 + bs + 1..];
                     let mut new_name = Vec::with_capacity(r1.len() + 20);
                     let mut i = 0usize;
@@ -4649,7 +4649,7 @@ pub(crate) fn filename_extract_candidate_into(filename: &[u8], out: &mut OutCurs
                     return finish_cursor_min_ref(out, 16);
                 }
             } else if ext.eq_ignore_ascii_case(b".iso") {
-                if let Some(bs) = filename[1..paren_pos].iter().rposition(|&b| b == b'\\') {
+                if let Some(bs) = filename[1..paren_pos - 1].iter().rposition(|&b| b == b'\\') {
                     let r1 = &filename[1 + bs + 1..];
                     let mut new_name = Vec::with_capacity(r1.len() + 12);
                     let mut i = 0usize;
@@ -4669,7 +4669,7 @@ pub(crate) fn filename_extract_candidate_into(filename: &[u8], out: &mut OutCurs
                 || ext.eq_ignore_ascii_case(b".mp4")
                 || ext.eq_ignore_ascii_case(b".m4v")
             {
-                if let Some(bs) = filename[1..paren_pos].iter().rposition(|&b| b == b'\\') {
+                if let Some(bs) = filename[1..paren_pos - 1].iter().rposition(|&b| b == b'\\') {
                     let r1 = &filename[1 + bs + 1..filename.len() - 4];
                     let mut new_name = Vec::with_capacity(r1.len() + 19);
                     new_name.extend_from_slice(r1);
