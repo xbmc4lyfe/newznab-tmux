@@ -1,6 +1,7 @@
 use std::slice;
 
 pub mod categorize;
+pub mod cleaning;
 pub mod filename;
 pub mod predb;
 

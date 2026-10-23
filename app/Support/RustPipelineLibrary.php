@@ -921,6 +921,336 @@ final class RustPipelineLibrary
         return $res;
     }
 
+    /**
+     * Compute `NzbSplitUnwrapper::literalPayload` via Rust FFI.
+     */
+    public static function nzbsplitLiteralPayload(string $value, ?string $libraryPath = null, bool &$supported = false): ?string
+    {
+        $supported = false;
+        if ($value === '') {
+            $supported = true;
+
+            return null;
+        }
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($value);
+        $scratch = self::ensureScratch($ffi, max(256, $len + 16));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_nzbsplit_literal_payload($value, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written)) {
+            return null;
+        }
+        if ($written === -3) {
+            $supported = true;
+
+            return null;
+        }
+        if ($written < -3) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_nzbsplit_literal_payload($value, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        $supported = true;
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
+    /**
+     * Compute `NzbSplitUnwrapper::stripLiteralSubjectTrailer` via Rust FFI.
+     */
+    public static function nzbsplitStripLiteralTrailer(string $value, ?string $libraryPath = null): ?string
+    {
+        if ($value === '') {
+            return '';
+        }
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($value);
+        // @phpstan-ignore method.notFound
+        $kept = $ffi->nntmux_nzbsplit_strip_literal_trailer_len($value, $len);
+        if (! \is_int($kept) || $kept < 0 || $kept > $len) {
+            return null;
+        }
+
+        return $kept === $len ? $value : substr($value, 0, $kept);
+    }
+
+    /**
+     * Compute `NzbSplitUnwrapper::unwrap` via Rust FFI.
+     */
+    public static function nzbsplitUnwrap(string $value, ?string $libraryPath = null, bool &$supported = false): ?string
+    {
+        $supported = false;
+        if ($value === '') {
+            $supported = true;
+
+            return null;
+        }
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($value);
+        $scratch = self::ensureScratch($ffi, max(256, $len + 16));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_nzbsplit_unwrap($value, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -2) {
+            return null;
+        }
+        if ($written === -3) {
+            $supported = true;
+
+            return null;
+        }
+        if ($written < -3) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_nzbsplit_unwrap($value, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        $supported = true;
+
+        return $written === 0 ? null : FFI::string($scratch, $written);
+    }
+
+    /**
+     * Compute `FileNameCleaner::isPlausibleReleaseTitle` via Rust FFI.
+     */
+    public static function isPlausibleReleaseTitle(string $title, ?string $libraryPath = null): ?bool
+    {
+        if ($title === '') {
+            return false;
+        }
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $res = $ffi->nntmux_is_plausible_release_title($title, \strlen($title));
+        if (! \is_int($res) || $res < 0) {
+            return null;
+        }
+
+        return $res === 1;
+    }
+
+    /**
+     * Compute `ReleaseCleaningService::fixerCleaner` via Rust FFI.
+     */
+    public static function releaseFixerClean(string $name, ?string $libraryPath = null): ?string
+    {
+        if ($name === '') {
+            return '';
+        }
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($name);
+        $scratch = self::ensureScratch($ffi, max(256, $len + 16));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_release_fixer_clean($name, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -2) {
+            return null;
+        }
+        if ($written < -2) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_release_fixer_clean($name, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
+    /**
+     * Compute `ReleaseCleaningService::releaseNameFromFile` via Rust FFI.
+     */
+    public static function releaseNameFromFile(string $file, ?string $libraryPath = null, bool &$supported = false): ?string
+    {
+        $supported = false;
+        if ($file === '') {
+            $supported = true;
+
+            return null;
+        }
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($file);
+        $scratch = self::ensureScratch($ffi, max(256, $len + 16));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_release_name_from_file($file, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -2) {
+            return null;
+        }
+        if ($written === -3) {
+            $supported = true;
+
+            return null;
+        }
+        if ($written < -3) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_release_name_from_file($file, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        $supported = true;
+
+        return $written === 0 ? null : FFI::string($scratch, $written);
+    }
+
+    /**
+     * Compute `ReleaseCleaningService` generic subject cleaning via Rust FFI (`0=helper`, `1=counter_file`, `2=generic`, `3=teevee`).
+     */
+    public static function releaseGenericClean(string $subject, int $mode, ?string $libraryPath = null, bool &$supported = false): ?string
+    {
+        $supported = false;
+        if ($subject === '') {
+            $supported = true;
+
+            return $mode === 1 ? null : '';
+        }
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($subject);
+        $scratch = self::ensureScratch($ffi, max(256, $len + 16));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_release_generic_clean($subject, $len, $mode, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -2) {
+            return null;
+        }
+        if ($written === -3) {
+            $supported = true;
+
+            return null;
+        }
+        if ($written < -3) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_release_generic_clean($subject, $len, $mode, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        $supported = true;
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
+    /**
+     * Compute `PayloadIdentityResolver::resolve` over hint filenames via Rust FFI.
+     *
+     * @param  list<string>  $filenames
+     */
+    public static function payloadIdentityResolve(array $filenames, ?string $libraryPath = null, bool &$supported = false): ?string
+    {
+        $supported = false;
+        $count = \count($filenames);
+        if ($count === 0) {
+            $supported = true;
+
+            return null;
+        }
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        foreach ($filenames as $fn) {
+            if (str_contains($fn, "\0")) {
+                return null;
+            }
+        }
+        $joined = implode("\0", $filenames);
+        $len = \strlen($joined);
+        $scratch = self::ensureScratch($ffi, 1024);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_payload_identity_resolve_nul($joined, $len, $count, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -2) {
+            return null;
+        }
+        if ($written === -3) {
+            $supported = true;
+
+            return null;
+        }
+        if ($written < -3) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_payload_identity_resolve_nul($joined, $len, $count, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        $supported = true;
+
+        return $written === 0 ? null : FFI::string($scratch, $written);
+    }
+
     public static function resolve(?string $libraryPath = null): ?FFI
     {
         if ($libraryPath === null && self::$defaultLibrary !== null) {
@@ -980,6 +1310,14 @@ final class RustPipelineLibrary
                     ssize_t nntmux_predb_identity_keys_for_row(const char *title, size_t title_len, const char *filename, size_t filename_len, char *out_buf, size_t out_cap);
                     double nntmux_similarity_percent(const char *left, size_t left_len, const char *right, size_t right_len);
                     int32_t nntmux_predb_select_best_match_index(const char *query, size_t query_len, uint32_t has_orig, const char *orig_basename, size_t orig_len, const char *hits, size_t hits_len, size_t count);
+                    ssize_t nntmux_nzbsplit_literal_payload(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    size_t nntmux_nzbsplit_strip_literal_trailer_len(const char *input, size_t input_len);
+                    ssize_t nntmux_nzbsplit_unwrap(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    int32_t nntmux_is_plausible_release_title(const char *input, size_t input_len);
+                    ssize_t nntmux_release_fixer_clean(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_release_name_from_file(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_release_generic_clean(const char *input, size_t input_len, uint32_t mode, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_payload_identity_resolve_nul(const char *input, size_t input_len, size_t count, char *out_buf, size_t out_cap);
                     C, $resolved);
 
                 // @phpstan-ignore method.notFound
