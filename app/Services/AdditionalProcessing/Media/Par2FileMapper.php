@@ -7,6 +7,8 @@ namespace App\Services\AdditionalProcessing\Media;
 use App\Services\AdditionalProcessing\DTO\MappedNzbFile;
 use App\Services\AdditionalProcessing\DTO\Par2FileEntry;
 use App\Services\AdditionalProcessing\Enums\MappingConfidence;
+use App\Support\RustPipelineLibrary;
+use FFI;
 
 /**
  * Matches the files of an NZB to the real names in its PAR2 index.
@@ -25,6 +27,17 @@ final readonly class Par2FileMapper
     /** Posted sizes are sometimes the decoded size; allow a little rounding above it. */
     private const float MAX_SIZE_RATIO = 1.001;
 
+    private const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_par2_map_files(const char *sources, size_t sources_len, const char *files, size_t files_len, const char *verified, size_t verified_len, int64_t article_part_size, char *out_buf, size_t out_cap);
+        ssize_t nntmux_par2_candidate_indexes(const char *sources, size_t sources_len, int64_t file_size, int64_t article_part_size, char *out_buf, size_t out_cap);
+        ssize_t nntmux_nzb_extract_message_ids_nul(const char *group, size_t group_len, const char *titles, size_t titles_len, const char *seg_flags, size_t seg_flags_len, size_t count, uint32_t config_flags, char *out_buf, size_t out_cap);
+        ssize_t nntmux_nzb_source_file_inventory(const char *xml, size_t xml_len, size_t expected_file_count, char *out_buf, size_t out_cap);
+        C;
+
+    public function __construct(
+        private ?string $libraryPath = null,
+    ) {}
+
     /**
      * @param  array<int|string, mixed>  $nzbContents
      * @param  list<Par2FileEntry>  $files
@@ -32,6 +45,25 @@ final readonly class Par2FileMapper
      * @return array<int, MappedNzbFile> keyed by source index
      */
     public function map(array $nzbContents, array $files, ?int $articlePartSize = null, array $verified = []): array
+    {
+        $ffi = RustPipelineLibrary::resolveDomain('additional_nzb_par2', self::FFI_CDEF, $this->libraryPath);
+        if ($ffi !== null) {
+            $rustMapped = $this->mapRust($ffi, $nzbContents, $files, $articlePartSize, $verified);
+            if ($rustMapped !== null) {
+                return $rustMapped;
+            }
+        }
+
+        return $this->mapPhp($nzbContents, $files, $articlePartSize, $verified);
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $nzbContents
+     * @param  list<Par2FileEntry>  $files
+     * @param  array<int, Par2FileEntry>  $verified
+     * @return array<int, MappedNzbFile>
+     */
+    public function mapPhp(array $nzbContents, array $files, ?int $articlePartSize = null, array $verified = []): array
     {
         $mapped = [];
         foreach ($verified as $sourceIndex => $file) {
@@ -132,6 +164,23 @@ final readonly class Par2FileMapper
      */
     public function candidateIndexes(array $nzbContents, Par2FileEntry $file, ?int $articlePartSize = null): array
     {
+        $ffi = RustPipelineLibrary::resolveDomain('additional_nzb_par2', self::FFI_CDEF, $this->libraryPath);
+        if ($ffi !== null) {
+            $rustIndexes = $this->candidateIndexesRust($ffi, $nzbContents, $file, $articlePartSize);
+            if ($rustIndexes !== null) {
+                return $rustIndexes;
+            }
+        }
+
+        return $this->candidateIndexesPhp($nzbContents, $file, $articlePartSize);
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $nzbContents
+     * @return list<int>
+     */
+    public function candidateIndexesPhp(array $nzbContents, Par2FileEntry $file, ?int $articlePartSize = null): array
+    {
         $indexes = [];
         foreach (array_values($nzbContents) as $sourceIndex => $entry) {
             if (! $this->isSingleFile($entry)) {
@@ -154,6 +203,197 @@ final readonly class Par2FileMapper
         }
 
         return $indexes;
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $nzbContents
+     * @param  list<Par2FileEntry>  $files
+     * @param  array<int, Par2FileEntry>  $verified
+     * @return array<int, MappedNzbFile>|null
+     */
+    private function mapRust(FFI $ffi, array $nzbContents, array $files, ?int $articlePartSize, array $verified): ?array
+    {
+        $mapped = [];
+        foreach ($verified as $sourceIndex => $file) {
+            $mapped[$sourceIndex] = new MappedNzbFile($sourceIndex, $file, MappingConfidence::Verified);
+        }
+
+        $remainingFiles = $verified === []
+            ? array_values($files)
+            : array_values(array_filter(
+                $files,
+                static fn (Par2FileEntry $file): bool => ! in_array($file, $verified, true),
+            ));
+
+        if ($remainingFiles !== []) {
+            $packedSources = $this->packSources($nzbContents);
+            if ($packedSources !== '') {
+                $fileSizes = [];
+                foreach ($remainingFiles as $file) {
+                    $fileSizes[] = $file->size;
+                }
+                $packedFiles = pack('q*', ...$fileSizes);
+                $packedVerified = $verified === [] ? '' : pack('q*', ...array_keys($verified));
+
+                $needed = count($remainingFiles) * 8 + 16;
+                $cap = 0;
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, $needed, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_par2_map_files(
+                    $packedSources,
+                    strlen($packedSources),
+                    $packedFiles,
+                    strlen($packedFiles),
+                    $packedVerified,
+                    strlen($packedVerified),
+                    $articlePartSize ?? 0,
+                    $scratch,
+                    $cap,
+                );
+                if (! is_int($written) || $written === -1) {
+                    return null;
+                }
+                if ($written < -1) {
+                    $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                    if ($scratch === null) {
+                        return null;
+                    }
+                    // @phpstan-ignore method.notFound
+                    $written = $ffi->nntmux_par2_map_files(
+                        $packedSources,
+                        strlen($packedSources),
+                        $packedFiles,
+                        strlen($packedFiles),
+                        $packedVerified,
+                        strlen($packedVerified),
+                        $articlePartSize ?? 0,
+                        $scratch,
+                        $cap,
+                    );
+                    if (! is_int($written) || $written < 0) {
+                        return null;
+                    }
+                }
+
+                if ($written > 0) {
+                    /** @var array<int, int>|false $pairs */
+                    $pairs = unpack('L*', FFI::string($scratch, $written));
+                    if ($pairs === false) {
+                        return null;
+                    }
+                    $pairLen = count($pairs);
+                    for ($i = 1; $i <= $pairLen; $i += 2) {
+                        $sourceIndex = $pairs[$i];
+                        $fileIndex = $pairs[$i + 1];
+                        $mapped[$sourceIndex] = new MappedNzbFile(
+                            $sourceIndex,
+                            $remainingFiles[$fileIndex],
+                            MappingConfidence::UniqueSize,
+                        );
+                    }
+                }
+            }
+        }
+
+        if ($verified !== []) {
+            ksort($mapped);
+        }
+
+        return $mapped;
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $nzbContents
+     * @return list<int>|null
+     */
+    private function candidateIndexesRust(FFI $ffi, array $nzbContents, Par2FileEntry $file, ?int $articlePartSize): ?array
+    {
+        $packedSources = $this->packSources($nzbContents);
+        if ($packedSources === '' || $file->size <= 0) {
+            return [];
+        }
+
+        $needed = intdiv(strlen($packedSources), 24) * 4 + 16;
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, $needed, $cap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_par2_candidate_indexes(
+            $packedSources,
+            strlen($packedSources),
+            $file->size,
+            $articlePartSize ?? 0,
+            $scratch,
+            $cap,
+        );
+        if (! is_int($written) || $written === -1) {
+            return null;
+        }
+        if ($written < -1) {
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_par2_candidate_indexes(
+                $packedSources,
+                strlen($packedSources),
+                $file->size,
+                $articlePartSize ?? 0,
+                $scratch,
+                $cap,
+            );
+            if (! is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+        if ($written === 0) {
+            return [];
+        }
+
+        /** @var array<int, int>|false $unpacked */
+        $unpacked = unpack('L*', FFI::string($scratch, $written));
+
+        return $unpacked === false ? null : array_values($unpacked);
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $nzbContents
+     */
+    private function packSources(array $nzbContents): string
+    {
+        /** @var list<array{0: array<int|string, mixed>, 1: string}> $cache */
+        static $cache = [];
+        foreach ($cache as [$cachedNzb, $cachedPacked]) {
+            if ($cachedNzb === $nzbContents) {
+                return $cachedPacked;
+            }
+        }
+
+        $flat = [];
+        foreach (array_values($nzbContents) as $sourceIndex => $entry) {
+            if (! $this->isSingleFile($entry)) {
+                continue;
+            }
+            $flat[] = $sourceIndex;
+            $flat[] = (int) $entry['size'];
+            $flat[] = count($entry['segments']);
+        }
+
+        $packed = $flat === [] ? '' : pack('q*', ...$flat);
+        if (count($cache) >= 8) {
+            array_shift($cache);
+        }
+        $cache[] = [$nzbContents, $packed];
+
+        return $packed;
     }
 
     /**

@@ -10,6 +10,8 @@ use App\Services\Nzb\DatabaseNzbStore;
 use App\Services\Nzb\NzbParserService;
 use App\Services\Nzb\NzbService;
 use App\Services\Nzb\NzbSourceGuard;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
@@ -20,11 +22,27 @@ use Illuminate\Support\Facades\Log;
  */
 class NzbContentParser
 {
+    private const string DEFAULT_AUDIO_FILE_REGEX = '\.(AAC|AIFF|APE|AC3|ASF|DTS|FLAC|MKA|MKS|MP2|MP3|RA|OGG|OGM|W64|WAV|WMA)';
+
+    private const string DEFAULT_IGNORE_BOOK_REGEX = '/\b(epub|lit|mobi|pdf|sipdf|html)\b.*\.rar(?!.{20,})/i';
+
+    private const string DEFAULT_SUPPORT_FILE_REGEX = '\.(?:vol\d{1,3}\+\d{1,3}|par2|srs|sfv|nzb)';
+
+    private const string DEFAULT_VIDEO_FILE_REGEX = '\.(AVI|F4V|IFO|M1V|M2V|M4V|MKV|MOV|MP4|MPEG|MPG|MPGV|MPV|OGV|QT|RM|RMVB|TS|VOB|WMV)';
+
+    private const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_par2_map_files(const char *sources, size_t sources_len, const char *files, size_t files_len, const char *verified, size_t verified_len, int64_t article_part_size, char *out_buf, size_t out_cap);
+        ssize_t nntmux_par2_candidate_indexes(const char *sources, size_t sources_len, int64_t file_size, int64_t article_part_size, char *out_buf, size_t out_cap);
+        ssize_t nntmux_nzb_extract_message_ids_nul(const char *group, size_t group_len, const char *titles, size_t titles_len, const char *seg_flags, size_t seg_flags_len, size_t count, uint32_t config_flags, char *out_buf, size_t out_cap);
+        ssize_t nntmux_nzb_source_file_inventory(const char *xml, size_t xml_len, size_t expected_file_count, char *out_buf, size_t out_cap);
+        C;
+
     public function __construct(
         private readonly NzbService $nzb,
         private readonly NzbParserService $nzbParser,
         private readonly bool $debugMode = false,
-        private readonly bool $echoCLI = false
+        private readonly bool $echoCLI = false,
+        private readonly ?string $libraryPath = null,
     ) {}
 
     /**
@@ -83,7 +101,35 @@ class NzbContentParser
      * @param  array<string, mixed>  $parsedFiles
      * @return list<array{name: string, firstMessageId: string}>|null
      */
-    private function sourceFileInventory(string $decoded, array $parsedFiles): ?array
+    public function sourceFileInventory(string $decoded, array $parsedFiles): ?array
+    {
+        $expectedCount = count($parsedFiles);
+        if ($expectedCount === 0 || $expectedCount > 256) {
+            return null;
+        }
+        foreach ($parsedFiles as $file) {
+            if (! is_array($file) || (int) ($file['filecount'] ?? 0) !== 1) {
+                return null;
+            }
+        }
+
+        $ffi = RustPipelineLibrary::resolveDomain('additional_nzb_par2', self::FFI_CDEF, $this->libraryPath);
+        if ($ffi !== null) {
+            $supported = false;
+            $rustInventory = $this->sourceFileInventoryRust($ffi, $decoded, $expectedCount, $supported);
+            if ($supported) {
+                return $rustInventory;
+            }
+        }
+
+        return $this->sourceFileInventoryPhp($decoded, $parsedFiles);
+    }
+
+    /**
+     * @param  array<string, mixed>  $parsedFiles
+     * @return list<array{name: string, firstMessageId: string}>|null
+     */
+    public function sourceFileInventoryPhp(string $decoded, array $parsedFiles): ?array
     {
         if (stripos($decoded, '<!ENTITY') !== false) {
             return null;
@@ -135,6 +181,75 @@ class NzbContentParser
             $messageIds[$segments[1]] = true;
             $inventory[] = ['name' => $name, 'firstMessageId' => $segments[1]];
         }
+
+        return $inventory;
+    }
+
+    /**
+     * @param-out bool $supported
+     *
+     * @return list<array{name: string, firstMessageId: string}>|null
+     */
+    private function sourceFileInventoryRust(FFI $ffi, string $decoded, int $expectedCount, bool &$supported = false): ?array
+    {
+        $supported = false;
+        $xmlLen = strlen($decoded);
+        if ($xmlLen === 0) {
+            $supported = true;
+
+            return null;
+        }
+
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(1024, $expectedCount * 128), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_nzb_source_file_inventory($decoded, $xmlLen, $expectedCount, $scratch, $cap);
+        if (! is_int($written) || $written === -1) {
+            return null;
+        }
+        if ($written === -2) {
+            $supported = true;
+
+            return null;
+        }
+        if ($written < -2) {
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_nzb_source_file_inventory($decoded, $xmlLen, $expectedCount, $scratch, $cap);
+            if (! is_int($written) || $written === -1) {
+                return null;
+            }
+            if ($written === -2) {
+                $supported = true;
+
+                return null;
+            }
+            if ($written <= 0) {
+                return null;
+            }
+        }
+        if ($written <= 0) {
+            return null;
+        }
+
+        $tokens = explode("\0", FFI::string($scratch, $written));
+        if (count($tokens) !== $expectedCount * 2) {
+            return null;
+        }
+
+        $inventory = [];
+        $n = count($tokens);
+        for ($i = 0; $i < $n; $i += 2) {
+            $inventory[] = ['name' => $tokens[$i], 'firstMessageId' => $tokens[$i + 1]];
+        }
+        $supported = true;
 
         return $inventory;
     }
@@ -246,6 +361,36 @@ class NzbContentParser
         string $groupName,
         ProcessingConfiguration $config
     ): array {
+        if ($this->canUseRustClassifier($config)) {
+            $ffi = RustPipelineLibrary::resolveDomain('additional_nzb_par2', self::FFI_CDEF, $this->libraryPath);
+            if ($ffi !== null) {
+                $rustResult = $this->extractMessageIDsRust($ffi, $nzbContents, $groupName, $config);
+                if ($rustResult !== null) {
+                    return $rustResult;
+                }
+            }
+        }
+
+        return $this->extractMessageIDsPhp($nzbContents, $groupName, $config);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $nzbContents
+     * @return array{
+     *     hasCompressedFile: bool,
+     *     sampleMessageIDs: list<string>,
+     *     jpgMessageIDs: list<string>,
+     *     mediaInfoMessageID: string,
+     *     audioInfoMessageID: string,
+     *     audioInfoExtension: string,
+     *     bookFileCount: int
+     * }
+     */
+    public function extractMessageIDsPhp(
+        array $nzbContents,
+        string $groupName,
+        ProcessingConfiguration $config
+    ): array {
         $result = [
             'hasCompressedFile' => false,
             'sampleMessageIDs' => [],
@@ -316,6 +461,126 @@ class NzbContentParser
         }
 
         return $result;
+    }
+
+    private function canUseRustClassifier(ProcessingConfiguration $config): bool
+    {
+        return $config->audioFileRegex === self::DEFAULT_AUDIO_FILE_REGEX
+            && $config->ignoreBookRegex === self::DEFAULT_IGNORE_BOOK_REGEX
+            && $config->supportFileRegex === self::DEFAULT_SUPPORT_FILE_REGEX
+            && $config->videoFileRegex === self::DEFAULT_VIDEO_FILE_REGEX;
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $nzbContents
+     * @return array{
+     *     hasCompressedFile: bool,
+     *     sampleMessageIDs: list<string>,
+     *     jpgMessageIDs: list<string>,
+     *     mediaInfoMessageID: string,
+     *     audioInfoMessageID: string,
+     *     audioInfoExtension: string,
+     *     bookFileCount: int
+     * }|null
+     */
+    private function extractMessageIDsRust(
+        FFI $ffi,
+        array $nzbContents,
+        string $groupName,
+        ProcessingConfiguration $config
+    ): ?array {
+        if ($config->segmentsToDownload <= 0 || str_contains($groupName, "\0")) {
+            return null;
+        }
+        if ($nzbContents === []) {
+            return [
+                'hasCompressedFile' => false,
+                'sampleMessageIDs' => [],
+                'jpgMessageIDs' => [],
+                'mediaInfoMessageID' => '',
+                'audioInfoMessageID' => '',
+                'audioInfoExtension' => '',
+                'bookFileCount' => 0,
+            ];
+        }
+
+        $fileCount = count($nzbContents);
+        if (! array_is_list($nzbContents)) {
+            return null;
+        }
+        $titles = array_column($nzbContents, 'title');
+        if (count($titles) !== $fileCount) {
+            return null;
+        }
+
+        $configFlags = ($config->processThumbnails ? 1 : 0)
+            | ($config->processJPGSample ? 2 : 0)
+            | ($config->processMediaInfo ? 4 : 0)
+            | ($config->processAudioInfo ? 8 : 0);
+
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, 64, $cap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        $joinedTitles = implode("\0", $titles);
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_nzb_extract_message_ids_nul(
+            $groupName,
+            strlen($groupName),
+            $joinedTitles,
+            strlen($joinedTitles),
+            null,
+            0,
+            $fileCount,
+            $configFlags,
+            $scratch,
+            $cap,
+        );
+        if (! is_int($written) || $written < 28) {
+            return null;
+        }
+
+        $raw = FFI::string($scratch, $written);
+        /** @var array{has_comp: int, book_cnt: int, sample_idx: int, jpg_idx: int, mi_idx: int, audio_idx: int, ext_len: int}|false $hdr */
+        $hdr = unpack('Lhas_comp/Lbook_cnt/lsample_idx/ljpg_idx/lmi_idx/laudio_idx/Lext_len', $raw);
+        if ($hdr === false) {
+            return null;
+        }
+
+        $sampleIdx = $hdr['sample_idx'];
+        $jpgIdx = $hdr['jpg_idx'];
+        $miIdx = $hdr['mi_idx'];
+        $audioIdx = $hdr['audio_idx'];
+        $extLen = $hdr['ext_len'];
+
+        foreach ([$sampleIdx, $jpgIdx, $miIdx, $audioIdx] as $idx) {
+            if ($idx >= 0) {
+                $segs = $nzbContents[$idx]['segments'] ?? null;
+                if (! is_array($segs) || $segs === [] || ! isset($segs[0]) || ! is_scalar($segs[0]) || (string) $segs[0] === '') {
+                    return null;
+                }
+            }
+        }
+
+        return [
+            'hasCompressedFile' => $hdr['has_comp'] !== 0,
+            'sampleMessageIDs' => $sampleIdx >= 0
+                ? $this->extractSegments($nzbContents[$sampleIdx]['segments'], $config->segmentsToDownload)
+                : [],
+            'jpgMessageIDs' => $jpgIdx >= 0
+                ? $this->extractSegments($nzbContents[$jpgIdx]['segments'], $config->segmentsToDownload)
+                : [],
+            'mediaInfoMessageID' => $miIdx >= 0
+                ? (string) $nzbContents[$miIdx]['segments'][0]
+                : '',
+            'audioInfoMessageID' => $audioIdx >= 0
+                ? (string) $nzbContents[$audioIdx]['segments'][0]
+                : '',
+            'audioInfoExtension' => $extLen > 0 ? substr($raw, 28, $extLen) : '',
+            'bookFileCount' => $hdr['book_cnt'],
+        ];
     }
 
     /**
