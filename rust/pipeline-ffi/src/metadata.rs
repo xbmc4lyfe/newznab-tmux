@@ -1022,9 +1022,6 @@ fn steam_tokenize(normalized: &str) -> Vec<&str> {
 }
 
 fn php_byte_levenshtein(a: &[u8], b: &[u8]) -> isize {
-    if a.len() > 255 || b.len() > 255 {
-        return -1;
-    }
     if a == b {
         return 0;
     }
@@ -1033,6 +1030,19 @@ fn php_byte_levenshtein(a: &[u8], b: &[u8]) -> isize {
     }
     if b.is_empty() {
         return a.len() as isize;
+    }
+    if b.len() > 255 {
+        let mut prev: Vec<usize> = (0..=b.len()).collect();
+        let mut curr = vec![0usize; b.len() + 1];
+        for (i, &ca) in a.iter().enumerate() {
+            curr[0] = i + 1;
+            for (j, &cb) in b.iter().enumerate() {
+                let cost = usize::from(ca != cb);
+                curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+            }
+            prev.copy_from_slice(&curr);
+        }
+        return prev[b.len()] as isize;
     }
     let mut prev = [0usize; 256];
     let mut curr = [0usize; 256];
@@ -2274,7 +2284,7 @@ fn extract_edition_marker(value: &str) -> Option<i32> {
                 q += 1;
             }
             if is_ascii_wb(bytes, q) || (q > ed_word_end && is_ascii_wb(bytes, ed_word_end)) {
-                matched_ed = is_ascii_wb(bytes, q);
+                matched_ed = true;
             }
         }
         if matched_ed
@@ -2367,7 +2377,7 @@ pub fn book_score_candidate(
     }
 
     let t_score = book_title_score(parsed_title, cand_title);
-    let has_author = parsed_author.is_some_and(|a| !php_trim(a).is_empty());
+    let has_author = parsed_author.is_some_and(|a| !a.is_empty());
     if has_author {
         let a_score = book_author_score(parsed_author.unwrap_or(""), cand_author);
         (0.65 * t_score) + (0.35 * a_score)

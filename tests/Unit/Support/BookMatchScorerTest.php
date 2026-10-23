@@ -259,6 +259,14 @@ class BookMatchScorerTest extends TestCase
                 ['title' => 'Dune Book 3', 'author' => 'Frank Herbert'],
             ],
             [
+                new BookParseResult(rawName: 'Effective Java 3rd Ed.', title: 'Effective Java 3rd Ed.', author: 'Joshua Bloch'),
+                ['title' => 'Effective Java 2nd Ed. (2018)', 'author' => 'Joshua Bloch'],
+            ],
+            [
+                new BookParseResult(rawName: 'Clean Code', title: 'Clean Code', author: '   '),
+                ['title' => 'Clean Code', 'author' => 'Robert C. Martin'],
+            ],
+            [
                 new BookParseResult(rawName: 'Cien años de soledad by Gabriel García Márquez', title: 'Cien años de soledad', author: 'Gabriel García Márquez'),
                 ['title' => 'Cien años de soledad!', 'author' => 'Márquez, Gabriel García'],
             ],
