@@ -2269,3 +2269,779 @@ mod tests {
         ));
     }
 }
+
+// ---------------------------------------------------------------------------
+// FilePrioritizer / FilenameSanitizer
+// ---------------------------------------------------------------------------
+
+/// End offset where a non-`D` PCRE `$` can match after a pattern that never consumes `\n`.
+#[inline]
+fn fp_dollar_end(s: &[u8]) -> usize {
+    if s.last() == Some(&b'\n') {
+        s.len() - 1
+    } else {
+        s.len()
+    }
+}
+
+#[inline]
+fn fp_ends_with_ci(s: &[u8], suffix: &[u8]) -> bool {
+    s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+}
+
+#[inline]
+fn fp_is_sep(b: u8) -> bool {
+    matches!(b, b'.' | b'-' | b'_')
+}
+
+#[inline]
+fn fp_trailing_digits(s: &[u8]) -> usize {
+    s.iter().rev().take_while(|b| b.is_ascii_digit()).count()
+}
+
+/// `/[\.\-_](sample|proof|subs?|thumbs?)[\.\-_]/i`
+fn fp_is_sample_or_proof(s: &[u8]) -> bool {
+    const WORDS: [&[u8]; 6] = [b"sample", b"proof", b"subs", b"sub", b"thumbs", b"thumb"];
+    let n = s.len();
+    let mut i = 0;
+    while i + 5 <= n {
+        if fp_is_sep(s[i]) && matches!(s[i + 1] | 0x20, b's' | b'p' | b't') {
+            let rest = &s[i + 1..];
+            for w in WORDS {
+                if rest.len() > w.len() && starts_with_ci(rest, w) && fp_is_sep(rest[w.len()]) {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// `\.part\d+\.rar` anchored at the end of `t` (case-insensitive); returns the digit span.
+#[inline]
+fn fp_part_rar_digits(t: &[u8]) -> Option<&[u8]> {
+    if !fp_ends_with_ci(t, b".rar") {
+        return None;
+    }
+    let body = &t[..t.len() - 4];
+    let d = fp_trailing_digits(body);
+    if d == 0 || !fp_ends_with_ci(&body[..body.len() - d], b".part") {
+        return None;
+    }
+    Some(&body[body.len() - d..])
+}
+
+/// `preg_match('/\.rar$/i') && ! preg_match('/\.part\d+\.rar$/i')`
+#[inline]
+fn fp_is_main_rar(s: &[u8]) -> bool {
+    let t = &s[..fp_dollar_end(s)];
+    fp_ends_with_ci(t, b".rar") && fp_part_rar_digits(t).is_none()
+}
+
+/// `/\.part0*1\.rar$/i`
+#[inline]
+fn fp_is_first_split_rar(s: &[u8]) -> bool {
+    match fp_part_rar_digits(&s[..fp_dollar_end(s)]) {
+        Some(d) => d[d.len() - 1] == b'1' && d[..d.len() - 1].iter().all(|&b| b == b'0'),
+        None => false,
+    }
+}
+
+/// `/\.(rar|r\d{2,3})$/i`
+#[inline]
+fn fp_is_any_rar(s: &[u8]) -> bool {
+    let t = &s[..fp_dollar_end(s)];
+    if fp_ends_with_ci(t, b".rar") {
+        return true;
+    }
+    let d = fp_trailing_digits(t);
+    (2..=3).contains(&d)
+        && t.len() >= d + 2
+        && (t[t.len() - d - 1] | 0x20) == b'r'
+        && t[t.len() - d - 2] == b'.'
+}
+
+/// PHP `basename()` for an ASCII-compatible locale (only `/` separates, trailing slashes are stripped).
+#[inline]
+fn fp_php_basename(s: &[u8]) -> &[u8] {
+    let mut end = s.len();
+    while end > 0 && s[end - 1] == b'/' {
+        end -= 1;
+    }
+    let start = s[..end]
+        .iter()
+        .rposition(|&b| b == b'/')
+        .map_or(0, |p| p + 1);
+    &s[start..end]
+}
+
+/// `pathinfo($s, PATHINFO_EXTENSION)`; `None` when the basename has no dot.
+#[inline]
+fn fp_pathinfo_extension(s: &[u8]) -> Option<&[u8]> {
+    let base = fp_php_basename(s);
+    base.iter()
+        .rposition(|&b| b == b'.')
+        .map(|p| &base[p + 1..])
+}
+
+/// `pathinfo($s, PATHINFO_FILENAME)`
+#[inline]
+fn fp_pathinfo_filename(s: &[u8]) -> &[u8] {
+    let base = fp_php_basename(s);
+    match base.iter().rposition(|&b| b == b'.') {
+        Some(p) => &base[..p],
+        None => base,
+    }
+}
+
+#[inline]
+fn fp_is_video(s: &[u8]) -> bool {
+    match fp_pathinfo_extension(s) {
+        Some(ext) => {
+            let mut lower = [0u8; 4];
+            if ext.is_empty() || ext.len() > 4 {
+                return false;
+            }
+            for (i, &b) in ext.iter().enumerate() {
+                lower[i] = b.to_ascii_lowercase();
+            }
+            matches!(
+                &lower[..ext.len()],
+                b"mkv" | b"avi" | b"mp4" | b"m4v" | b"wmv" | b"divx" | b"ts" | b"m2ts"
+            )
+        }
+        None => false,
+    }
+}
+
+/// `preg_match('/[\\\\\/]([^\\\\\/]+)$/', ...)` capture, else the input.
+#[inline]
+fn fp_extract_filename_from_path(s: &[u8]) -> &[u8] {
+    match s.iter().rposition(|&b| b == b'/' || b == b'\\') {
+        Some(k) if k + 1 < s.len() => &s[k + 1..],
+        _ => s,
+    }
+}
+
+#[inline]
+fn fp_trim_with<'a>(s: &'a [u8], chars: &[u8]) -> &'a [u8] {
+    let mut start = 0;
+    let mut end = s.len();
+    while start < end && chars.contains(&s[start]) {
+        start += 1;
+    }
+    while end > start && chars.contains(&s[end - 1]) {
+        end -= 1;
+    }
+    &s[start..end]
+}
+
+/// `^vts[._-]?\d{1,2}[._-]?\d{1,2}$` on the remainder after `vts`.
+fn fp_matches_vts_tail(r: &[u8]) -> bool {
+    let after_sep: &[&[u8]] = if !r.is_empty() && matches!(r[0], b'.' | b'_' | b'-') {
+        &[&r[1..], r]
+    } else {
+        &[r]
+    };
+    for &a in after_sep {
+        for d1 in 1..=2usize {
+            if a.len() < d1 || !a[..d1].iter().all(u8::is_ascii_digit) {
+                break;
+            }
+            let b = &a[d1..];
+            let mut tails: [&[u8]; 2] = [b, b];
+            let mut tcount = 1;
+            if !b.is_empty() && matches!(b[0], b'.' | b'_' | b'-') {
+                tails = [&b[1..], b];
+                tcount = 2;
+            }
+            for &t in &tails[..tcount] {
+                if (1..=2).contains(&t.len()) && t.iter().all(u8::is_ascii_digit) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn fp_should_ignore(s: &[u8]) -> bool {
+    let base = fp_extract_filename_from_path(s);
+    if fp_ends_with_ci(&base[..fp_dollar_end(base)], b".url") {
+        return true;
+    }
+    let t = fp_trim_with(fp_pathinfo_filename(base), b" \t\n\r\0\x0B.-_");
+    // `^(?:audio|video)[._-]?ts$`
+    if (t.len() == 7 || t.len() == 8)
+        && (starts_with_ci(t, b"audio") || starts_with_ci(t, b"video"))
+        && fp_ends_with_ci(t, b"ts")
+        && (t.len() == 7 || matches!(t[5], b'.' | b'_' | b'-'))
+    {
+        return true;
+    }
+    if starts_with_ci(t, b"vts") && fp_matches_vts_tail(&t[3..]) {
+        return true;
+    }
+    (1..=3).contains(&t.len()) && t.iter().all(u8::is_ascii_digit)
+}
+
+#[inline]
+fn fp_is_nfo(s: &[u8]) -> bool {
+    fp_ends_with_ci(s, b".nfo")
+}
+
+#[inline]
+fn fp_is_srr(s: &[u8]) -> bool {
+    fp_ends_with_ci(s, b".srr") || fp_ends_with_ci(s, b".srs")
+}
+
+/// `FilePrioritizer::getCrcPriority()`.
+pub fn file_prioritizer_crc_priority(s: &[u8]) -> i32 {
+    if fp_is_sample_or_proof(s) {
+        100
+    } else if fp_is_video(s) {
+        4
+    } else if fp_is_main_rar(s) {
+        2
+    } else if fp_is_first_split_rar(s) {
+        3
+    } else if fp_is_any_rar(s) {
+        6
+    } else if fp_is_nfo(s) {
+        5
+    } else {
+        50
+    }
+}
+
+/// Splits `count` NUL-separated items; `None` if the item count does not match.
+fn fp_split_nul(bytes: &[u8], count: usize) -> Option<Vec<&[u8]>> {
+    let mut items = Vec::with_capacity(count);
+    let mut rest = bytes;
+    for _ in 0..count.saturating_sub(1) {
+        let p = find_nul(rest)?;
+        items.push(&rest[..p]);
+        rest = &rest[p + 1..];
+    }
+    if count > 0 {
+        if find_nul(rest).is_some() {
+            return None;
+        }
+        items.push(rest);
+    } else if !bytes.is_empty() {
+        return None;
+    }
+    Some(items)
+}
+
+#[inline]
+unsafe fn fp_input<'a>(input: *const u8, input_len: usize) -> Option<&'a [u8]> {
+    if input_len == 0 {
+        Some(&[])
+    } else if input.is_null() {
+        None
+    } else {
+        Some(unsafe { slice::from_raw_parts(input, input_len) })
+    }
+}
+
+/// `FilePrioritizer::prioritizeForMatching()` (`mode = 0`) or `prioritizeForPreDb()` (`mode = 1`).
+/// Returns the ordered input indices.
+pub fn file_prioritizer_categorize(items: &[&[u8]], include_nfo: bool) -> Vec<usize> {
+    let mut srr = Vec::new();
+    let mut main_rar = Vec::new();
+    let mut first_part = Vec::new();
+    let mut video = Vec::new();
+    let mut nfo = Vec::new();
+    let mut other = Vec::new();
+    for (i, &f) in items.iter().enumerate() {
+        if fp_should_ignore(f) || fp_is_sample_or_proof(f) {
+            continue;
+        }
+        if fp_is_srr(f) {
+            srr.push(i);
+        } else if fp_is_main_rar(f) {
+            main_rar.push(i);
+        } else if fp_is_first_split_rar(f) {
+            first_part.push(i);
+        } else if fp_is_video(f) {
+            video.push(i);
+        } else if fp_is_nfo(f) {
+            nfo.push(i);
+        } else {
+            other.push(i);
+        }
+    }
+    video.sort_by_key(|&i| std::cmp::Reverse(items[i].len()));
+    main_rar.sort_by_key(|&i| std::cmp::Reverse(items[i].len()));
+    let mut out = srr;
+    out.extend(main_rar);
+    out.extend(first_part);
+    out.extend(video);
+    if include_nfo {
+        out.extend(nfo);
+    }
+    out.extend(other);
+    out
+}
+
+/// `FilePrioritizer::extractReleaseNameFromRar()`; returns the name core and whether a trailing
+/// `\n` (retained by PHP's non-`D` `$` handling) follows it.
+fn fp_extract_release_name_from_rar(file: &[u8]) -> Option<(&[u8], bool)> {
+    let name = fp_extract_filename_from_path(file);
+
+    // preg_replace('/\.(rar|r\d{2,4}|part\d+\.rar|\d{3})$/i', '', $name)
+    let e = fp_dollar_end(name);
+    let tail_nl = e < name.len();
+    let mut head = &name[..e];
+    for i in 0..e {
+        if name[i] != b'.' {
+            continue;
+        }
+        let t = &name[i + 1..e];
+        let digits_all = |x: &[u8]| x.iter().all(u8::is_ascii_digit);
+        let hit = t.eq_ignore_ascii_case(b"rar")
+            || ((3..=5).contains(&t.len()) && (t[0] | 0x20) == b'r' && digits_all(&t[1..]))
+            || (t.len() >= 9
+                && starts_with_ci(t, b"part")
+                && fp_ends_with_ci(t, b".rar")
+                && digits_all(&t[4..t.len() - 4]))
+            || (t.len() == 3 && digits_all(t));
+        if hit {
+            head = &name[..i];
+            break;
+        }
+    }
+
+    // Normalise `head + (tail_nl ? "\n" : "")` into core + trailing-newline flag.
+    let (core, nl) = if tail_nl {
+        (head, true)
+    } else if head.last() == Some(&b'\n') {
+        (&head[..head.len() - 1], true)
+    } else {
+        (head, false)
+    };
+
+    // /^([a-z0-9][a-z0-9._-]+[a-z0-9])\-([a-z0-9]{2,15})$/i
+    let dash = core.iter().rposition(|&b| b == b'-')?;
+    let (x, y) = (&core[..dash], &core[dash + 1..]);
+    if !(2..=15).contains(&y.len()) || !y.iter().all(u8::is_ascii_alphanumeric) {
+        return None;
+    }
+    if x.len() < 3
+        || !x[0].is_ascii_alphanumeric()
+        || !x[x.len() - 1].is_ascii_alphanumeric()
+        || !x.iter().all(|&b| b.is_ascii_alphanumeric() || fp_is_sep(b))
+    {
+        return None;
+    }
+
+    // preg_replace('/[._-]?(sample|proof|subs?)$/i', '', ...)
+    let mut core = core;
+    for w in [&b"sample"[..], b"proof", b"subs", b"sub"] {
+        if fp_ends_with_ci(core, w) {
+            let mut start = core.len() - w.len();
+            if start > 0 && fp_is_sep(core[start - 1]) {
+                start -= 1;
+            }
+            core = &core[..start];
+            break;
+        }
+    }
+
+    // trim($baseName, '.-_'): a trailing newline blocks the right trim.
+    let mut start = 0;
+    while start < core.len() && fp_is_sep(core[start]) {
+        start += 1;
+    }
+    let mut end = core.len();
+    if !nl {
+        while end > start && fp_is_sep(core[end - 1]) {
+            end -= 1;
+        }
+    }
+    let core = &core[start..end];
+    if core.len() + usize::from(nl) >= 10 {
+        Some((core, nl))
+    } else {
+        None
+    }
+}
+
+/// `FilePrioritizer::findReleaseNameFromRarFiles()`; returns the core and trailing-newline flag.
+pub fn file_prioritizer_rar_release_name<'a>(items: &[&'a [u8]]) -> Option<(&'a [u8], bool)> {
+    let mut order: Vec<((&'a [u8], bool), usize)> = Vec::new();
+    let mut index: std::collections::HashMap<(&'a [u8], bool), usize> =
+        std::collections::HashMap::new();
+    for &file in items {
+        if fp_is_sample_or_proof(file) {
+            continue;
+        }
+        if let Some(key) = fp_extract_release_name_from_rar(file) {
+            match index.get(&key) {
+                Some(&slot) => order[slot].1 += 1,
+                None => {
+                    index.insert(key, order.len());
+                    order.push((key, 1));
+                }
+            }
+        }
+    }
+    let top = order.iter().map(|(_, c)| *c).max()?;
+    let mut best: Option<(&'a [u8], bool)> = None;
+    for &(key, count) in &order {
+        if count != top {
+            continue;
+        }
+        let len = key.0.len() + usize::from(key.1);
+        if best.is_none_or(|b| len > b.0.len() + usize::from(b.1)) {
+            best = Some(key);
+        }
+    }
+    best
+}
+
+/// Returns the ordered input indices of `FilePrioritizer::prioritizeForMatching()` (`mode = 0`)
+/// or `prioritizeForPreDb()` (`mode = 1`), each written as the filename followed by `\0`.
+/// Returns `0` for an empty result, `> 0` bytes written, `-1` if declined, or
+/// `-(required_len as isize)` if `out_cap` is too small.
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_file_prioritizer_categorize_batch_nul(
+    input: *const u8,
+    input_len: usize,
+    count: usize,
+    mode: u32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if mode > 1 {
+        return -1;
+    }
+    let Some(bytes) = (unsafe { fp_input(input, input_len) }) else {
+        return -1;
+    };
+    let Some(items) = fp_split_nul(bytes, count) else {
+        return -1;
+    };
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+    for i in file_prioritizer_categorize(&items, mode == 0) {
+        out.extend(items[i]);
+        out.push(0);
+    }
+    match out.finish() {
+        -1 => -2,
+        n => n,
+    }
+}
+
+/// `FilePrioritizer::getCrcPriority()`. Returns `-1` if the input contains a NUL byte.
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_file_prioritizer_crc_priority(
+    input: *const u8,
+    input_len: usize,
+) -> i32 {
+    let Some(bytes) = (unsafe { fp_input(input, input_len) }) else {
+        return -1;
+    };
+    if find_nul(bytes).is_some() {
+        return -1;
+    }
+    file_prioritizer_crc_priority(bytes)
+}
+
+/// `FilePrioritizer::findReleaseNameFromRarFiles()` for `count` NUL-separated filenames.
+/// Returns `0` for `null`, `> 0` bytes written, `-1` if declined, or
+/// `-(required_len as isize)` if `out_cap` is too small.
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_file_prioritizer_rar_release_name_nul(
+    input: *const u8,
+    input_len: usize,
+    count: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(bytes) = (unsafe { fp_input(input, input_len) }) else {
+        return -1;
+    };
+    let Some(items) = fp_split_nul(bytes, count) else {
+        return -1;
+    };
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+    if let Some((core, nl)) = file_prioritizer_rar_release_name(&items) {
+        out.extend(core);
+        if nl {
+            out.push(b'\n');
+        }
+    }
+    out.finish()
+}
+
+const FS_MAX_FILENAME_LENGTH: usize = 200;
+
+/// `FilenameSanitizer::trimFilename()`.
+#[inline]
+fn fs_trim_filename(s: &[u8]) -> &[u8] {
+    let t = fp_trim_with(s, b" \t\n\r\0\x0B._-");
+    let lead = t.iter().take_while(|&&b| b == b'.').count();
+    &t[lead..]
+}
+
+/// Collapses each run of bytes matching `replace` into a single `_`.
+#[inline]
+fn fs_collapse_runs(s: &[u8], out: &mut Vec<u8>, replace: impl Fn(u8) -> bool) {
+    out.clear();
+    let mut in_run = false;
+    for &b in s {
+        if replace(b) {
+            if !in_run {
+                out.push(b'_');
+                in_run = true;
+            }
+        } else {
+            out.push(b);
+            in_run = false;
+        }
+    }
+}
+
+/// `[^A-Za-z0-9._-]+` → `_`, then `_+` → `_`.
+#[inline]
+fn fs_ascii_safe(s: &[u8], out: &mut Vec<u8>) {
+    fs_collapse_runs(s, out, |b| {
+        !(b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+    });
+}
+
+#[inline]
+fn fs_is_bad_final(s: &[u8]) -> bool {
+    s.is_empty() || s == b"." || s == b".."
+}
+
+/// `FilenameSanitizer::safeFallback()` for printable-ASCII input.
+fn fs_safe_fallback(fallback: &[u8], out: &mut Vec<u8>) {
+    let mut tmp = Vec::with_capacity(fallback.len());
+    fs_ascii_safe(fallback, &mut tmp);
+    let t = fs_trim_filename(&tmp[..tmp.len().min(FS_MAX_FILENAME_LENGTH)]);
+    out.clear();
+    if fs_is_bad_final(t) {
+        out.extend_from_slice(b"download");
+    } else {
+        out.extend_from_slice(t);
+    }
+}
+
+/// `FilenameSanitizer::finalize()` for ASCII input.
+fn fs_finalize(name: &[u8], fallback: &[u8], out: &mut Vec<u8>) {
+    let t = fs_trim_filename(&name[..name.len().min(FS_MAX_FILENAME_LENGTH)]);
+    if fs_is_bad_final(t) {
+        fs_safe_fallback(fallback, out);
+    } else {
+        out.clear();
+        out.extend_from_slice(t);
+    }
+}
+
+/// `FilenameSanitizer::sanitize()` for ASCII `name` and printable-ASCII `fallback`.
+pub fn filename_sanitize(name: &[u8], fallback: &[u8], out: &mut Vec<u8>) {
+    let trimmed = fp_trim_with(name, b" \t\n\r\0\x0B");
+    let mut normalized = Vec::with_capacity(trimmed.len());
+    // Control bytes are dropped first; separators, punctuation, whitespace and commas each
+    // become `_`, and every resulting `_` run collapses to one.
+    let mut in_run = false;
+    for &b in trimmed {
+        if b < 0x20 || b == 0x7F {
+            continue;
+        }
+        if matches!(
+            b,
+            b'/' | b'\\' | b':' | b'*' | b'?' | b'"' | b'<' | b'>' | b'|' | b' ' | b',' | b'_'
+        ) {
+            if !in_run {
+                normalized.push(b'_');
+                in_run = true;
+            }
+        } else {
+            normalized.push(b);
+            in_run = false;
+        }
+    }
+    let n = fs_trim_filename(&normalized);
+    if n.is_empty() {
+        fs_safe_fallback(fallback, out);
+    } else {
+        fs_finalize(n, fallback, out);
+    }
+}
+
+/// `FilenameSanitizer::asciiFallback()` for ASCII `name` and printable-ASCII `fallback`.
+pub fn filename_ascii_fallback(name: &[u8], fallback: &[u8], out: &mut Vec<u8>) {
+    let mut sanitized = Vec::with_capacity(name.len());
+    filename_sanitize(name, fallback, &mut sanitized);
+    let mut ascii = Vec::with_capacity(sanitized.len());
+    fs_ascii_safe(&sanitized, &mut ascii);
+    fs_finalize(&ascii, fallback, out);
+}
+
+/// `FilenameSanitizer::sanitize()` (`ascii_only = 0`) or `asciiFallback()` (`ascii_only = 1`).
+/// Returns `> 0` bytes written, `-1` for invalid arguments, `-2` when `input` is not ASCII or
+/// `fallback` is not printable ASCII (PHP handles Unicode normalisation), or
+/// `-(required_len as isize)` if `out_cap` is too small.
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `fallback` must be valid for reads of `fallback_len` bytes when non-null and `fallback_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_filename_sanitize(
+    input: *const u8,
+    input_len: usize,
+    fallback: *const u8,
+    fallback_len: usize,
+    ascii_only: u32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if ascii_only > 1 {
+        return -1;
+    }
+    let (Some(name), Some(fb)) = (unsafe { fp_input(input, input_len) }, unsafe {
+        fp_input(fallback, fallback_len)
+    }) else {
+        return -1;
+    };
+    if !name.is_ascii() || !fb.iter().all(|&b| (0x20..0x7F).contains(&b)) {
+        return -2;
+    }
+    let mut result = Vec::with_capacity(FS_MAX_FILENAME_LENGTH.min(name.len().max(fb.len())) + 8);
+    if ascii_only == 1 {
+        filename_ascii_fallback(name, fb, &mut result);
+    } else {
+        filename_sanitize(name, fb, &mut result);
+    }
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+    out.extend(&result);
+    out.finish()
+}
+
+#[cfg(test)]
+mod file_prioritizer_tests {
+    use super::*;
+
+    fn categorize(files: &[&str], include_nfo: bool) -> Vec<String> {
+        let items: Vec<&[u8]> = files.iter().map(|f| f.as_bytes()).collect();
+        file_prioritizer_categorize(&items, include_nfo)
+            .into_iter()
+            .map(|i| files[i].to_string())
+            .collect()
+    }
+
+    #[test]
+    fn categorize_orders_and_skips_noise() {
+        let files = [
+            "Film ;-)/VIDEO_TS/VIDEO_TS.VOB",
+            "Film ;-)/VIDEO_TS/VTS_01_1.VOB",
+            "Film ;-)/1.jpg",
+            "Film ;-)/cover the fisher king.jpg",
+            "Film ;-)/Extreem Online Contact.url",
+            "Film ;-)/release.nfo",
+        ];
+        assert_eq!(
+            categorize(&files, true),
+            vec!["Film ;-)/release.nfo", "Film ;-)/cover the fisher king.jpg"]
+        );
+        let files = [
+            "a.mkv",
+            "longer.name.mkv",
+            "x.part01.rar",
+            "x.rar",
+            "rel.srr",
+            "a.sample.mkv",
+            "b.nfo",
+        ];
+        assert_eq!(
+            categorize(&files, true),
+            vec![
+                "rel.srr",
+                "x.rar",
+                "x.part01.rar",
+                "longer.name.mkv",
+                "a.mkv",
+                "b.nfo"
+            ]
+        );
+        assert_eq!(
+            categorize(&files, false),
+            vec![
+                "rel.srr",
+                "x.rar",
+                "x.part01.rar",
+                "longer.name.mkv",
+                "a.mkv"
+            ]
+        );
+    }
+
+    #[test]
+    fn crc_priority_matches_php_rules() {
+        assert_eq!(file_prioritizer_crc_priority(b"Show.sample.mkv"), 100);
+        assert_eq!(file_prioritizer_crc_priority(b"Show.mkv"), 4);
+        assert_eq!(file_prioritizer_crc_priority(b"Show.rar"), 2);
+        assert_eq!(file_prioritizer_crc_priority(b"Show.rar\n"), 2);
+        assert_eq!(file_prioritizer_crc_priority(b"Show.part001.rar"), 3);
+        assert_eq!(file_prioritizer_crc_priority(b"Show.part02.rar"), 6);
+        assert_eq!(file_prioritizer_crc_priority(b"Show.r01"), 6);
+        assert_eq!(file_prioritizer_crc_priority(b"Show.r0001"), 50);
+        assert_eq!(file_prioritizer_crc_priority(b"Show.nfo"), 5);
+        assert_eq!(file_prioritizer_crc_priority(b"Show.txt"), 50);
+    }
+
+    #[test]
+    fn rar_release_name_prefers_most_common_then_longest() {
+        let items: Vec<&[u8]> = vec![
+            b"dir/Some.Release.2020-GRP.part01.rar",
+            b"dir/Some.Release.2020-GRP.part02.rar",
+            b"Other.Release.Name.2021-GRP.rar",
+            b"Some.Release.2020-GRP.sample.rar",
+        ];
+        assert_eq!(
+            file_prioritizer_rar_release_name(&items),
+            Some((&b"Some.Release.2020-GRP"[..], false))
+        );
+        let items: Vec<&[u8]> = vec![b"short-ab.rar"];
+        assert_eq!(file_prioritizer_rar_release_name(&items), None);
+        let items: Vec<&[u8]> = vec![b"Some.Release.2020-subs.rar", b"Some.Release.2020-subs"];
+        assert_eq!(
+            file_prioritizer_rar_release_name(&items),
+            Some((&b"Some.Release.2020"[..], false))
+        );
+    }
+
+    #[test]
+    fn sanitize_matches_php_rules() {
+        let mut out = Vec::new();
+        filename_sanitize(b"Bad\0Name:*?\"<>|\x1FTest", b"download", &mut out);
+        assert_eq!(out, b"BadName_Test");
+        filename_sanitize(b" The   File,  Name , Part 2 ", b"download", &mut out);
+        assert_eq!(out, b"The_File_Name_Part_2");
+        filename_sanitize(b"...___---", b"release-123", &mut out);
+        assert_eq!(out, b"release-123");
+        filename_ascii_fallback(b"Show (2020) [x]", b"download", &mut out);
+        assert_eq!(out, b"Show_2020_x");
+    }
+}
