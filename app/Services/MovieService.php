@@ -14,6 +14,7 @@ use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\TvProcessing\Providers\TraktProvider;
 use App\Support\ReleaseSearchIndexSync;
+use App\Support\RustPipelineLibrary;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
 use Illuminate\Support\Carbon;
@@ -1391,7 +1392,6 @@ class MovieService
         }
 
         $candidates = [];
-
         foreach ($potentialMatches as $match) {
             $percent = $this->similarityPercent($this->currentTitle, $match['title']);
 
@@ -1585,6 +1585,25 @@ class MovieService
     }
 
     protected function parseMovieSearchName(string $releaseName): bool
+    {
+        $title = '';
+        $year = '';
+        $rust = RustPipelineLibrary::movieParseSearchName($releaseName, $title, $year);
+        if ($rust !== null) {
+            if ($rust) {
+                $this->currentTitle = $title;
+                $this->currentYear = $year;
+
+                return true;
+            }
+
+            return false;
+        }
+
+        return $this->parseMovieSearchNamePhp($releaseName);
+    }
+
+    public function parseMovieSearchNamePhp(string $releaseName): bool
     {
         $releaseName = $this->cleanReleaseNameForMovieLookup($releaseName);
 

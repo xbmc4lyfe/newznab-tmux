@@ -12,6 +12,7 @@ use App\Models\Video;
 use App\Services\ReleaseImageService;
 use App\Services\TmdbClient;
 use App\Services\TraktService;
+use App\Support\RustPipelineLibrary;
 use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
@@ -596,6 +597,23 @@ abstract class AbstractTvProvider extends BaseVideoProvider
      */
     public function parseInfo(string $relname): bool|array
     {
+        static $maxTwoDigitYear = null;
+        $maxTwoDigitYear ??= (int) date('y') + 1;
+
+        $supported = false;
+        $rust = RustPipelineLibrary::tvParseInfo($relname, $maxTwoDigitYear, null, $supported);
+        if ($supported && $rust !== null) {
+            return $rust;
+        }
+
+        return $this->parseInfoPhp($relname);
+    }
+
+    /**
+     * @return array<string, mixed>|false
+     */
+    public function parseInfoPhp(string $relname): bool|array
+    {
         $showInfo['name'] = $this->parseName($relname);
 
         if (! empty($showInfo['name'])) {
@@ -603,7 +621,7 @@ abstract class AbstractTvProvider extends BaseVideoProvider
             $showInfo['country'] = $this->parseCountry($showInfo['name']);
 
             // Clean show name.
-            $showInfo['cleanname'] = preg_replace('/ - \d+$/i', '', $this->cleanName($showInfo['name']));
+            $showInfo['cleanname'] = preg_replace('/ - \d+$/i', '', $this->cleanNamePhp($showInfo['name']));
             $showInfo['cleanname'] = $this->normalizeShowTitle($showInfo['cleanname']);
 
             // Get the Season/Episode/Airdate
@@ -909,6 +927,16 @@ abstract class AbstractTvProvider extends BaseVideoProvider
      */
     public function cleanName(string $str): string
     {
+        $rust = RustPipelineLibrary::tvCleanName($str);
+        if ($rust !== null) {
+            return $rust;
+        }
+
+        return $this->cleanNamePhp($str);
+    }
+
+    public function cleanNamePhp(string $str): string
+    {
         $str = str_replace(['.', '_'], ' ', $str);
 
         $str = str_replace(['à', 'á', 'â', 'ã', 'ä', 'æ', 'À', 'Á', 'Â', 'Ã', 'Ä'], 'a', $str);
@@ -1023,11 +1051,11 @@ abstract class AbstractTvProvider extends BaseVideoProvider
             return $date >= 1900 ? $date : null;
         }
 
-        if (! is_string($date) || preg_match('/^(?P<year>(19|20)\d{2})/', trim($date), $match) !== 1) {
+        if (! is_string($date)) {
             return null;
         }
 
-        return (int) $match['year'];
+        return preg_match('/^((?:19|20)\d{2})\b/', trim($date), $m) === 1 ? (int) $m[1] : null;
     }
 
     private function normalizeCountryCode(string $country): string
