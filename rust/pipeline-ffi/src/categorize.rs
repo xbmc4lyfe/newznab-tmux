@@ -1448,6 +1448,3828 @@ pub unsafe extern "C" fn nntmux_misc_inspect_and_categorize(
     cursor.finish()
 }
 
+// ---------------------------------------------------------------------------------------------
+// Categorizer support (GroupName, PC, Console, Music, Book, Movie, TV, XXX)
+//
+// The PHP categorizers are expressed as `preg_match` calls. To keep exact behavioral parity the
+// original PCRE pattern text is reused instead of hand-translating every pattern:
+//
+// * a small PCRE-subset parser (byte oriented, no UTF mode, ASCII case folding) turns each pattern
+//   into an AST. Supported syntax: literals, `.`, `^`, `$`, `\b`, `\B`, `\d\D\s\S\w\W`, `\xHH`,
+//   classes (with ranges and escapes), groups (capturing, `(?:)`, `(?=)`), alternation,
+//   `? * + {n} {n,} {n,m}` and lazy forms;
+// * `Re` is a backtracking matcher over that AST (the reference semantics; used for the studio
+//   capture and anchored tail checks, and as the oracle in the tests);
+// * `DfaSet` compiles every pattern of the `patterns!` table into lazily built DFAs, so a subject is
+//   scanned once per pipeline run and each `preg_match` becomes a bit test (`Subject::hit`).
+//
+// The `nntmux_categorize_*` entry points at the end mirror `categorize()`/`shouldSkip()` of the PHP
+// classes; their return contract is documented there.
+// ---------------------------------------------------------------------------------------------
+
+type ByteSet = [bool; 256];
+
+const NO_POS: usize = usize::MAX;
+const MAX_CAPS: usize = 4;
+const STEP_LIMIT: u32 = 4_000_000;
+const REP_INF: u32 = u32::MAX;
+const MEMO_AFTER_STEPS: u32 = 1500;
+const MEMO_MAX_BITS: usize = 1 << 25;
+
+const LOWER: [u8; 256] = {
+    let mut table = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = if i >= 65 && i <= 90 {
+            (i + 32) as u8
+        } else {
+            i as u8
+        };
+        i += 1;
+    }
+    table
+};
+
+thread_local! {
+    static MATCH_ABORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[inline]
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+enum Ast {
+    Empty,
+    Lit(u8),
+    Set(Box<ByteSet>),
+    Bol,
+    Eol,
+    WordB,
+    NotWordB,
+    Cat(Vec<Ast>),
+    Alt(Vec<Ast>),
+    Rep {
+        ast: Box<Ast>,
+        min: u32,
+        max: u32,
+        greedy: bool,
+    },
+    Group {
+        ast: Box<Ast>,
+        cap: Option<u8>,
+    },
+    Look(Box<Ast>),
+}
+
+struct Parser<'a> {
+    p: &'a [u8],
+    i: usize,
+    icase: bool,
+    ncap: u8,
+}
+
+fn set_digit(set: &mut ByteSet) {
+    for b in b'0'..=b'9' {
+        set[b as usize] = true;
+    }
+}
+
+fn set_space(set: &mut ByteSet) {
+    for b in [b' ', b'\t', b'\n', b'\r', 0x0B, 0x0C] {
+        set[b as usize] = true;
+    }
+}
+
+fn set_word(set: &mut ByteSet) {
+    for b in 0..=255u8 {
+        if is_word_byte(b) {
+            set[b as usize] = true;
+        }
+    }
+}
+
+fn negate_set(set: &mut ByteSet) {
+    for v in set.iter_mut() {
+        *v = !*v;
+    }
+}
+
+enum ClassAtom {
+    Byte(u8),
+    Set(Box<ByteSet>),
+}
+
+impl<'a> Parser<'a> {
+    fn peek(&self) -> Option<u8> {
+        self.p.get(self.i).copied()
+    }
+
+    fn eat(&mut self, b: u8) -> bool {
+        if self.peek() == Some(b) {
+            self.i += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn parse_alt(&mut self) -> Ast {
+        let mut branches = vec![self.parse_cat()];
+        while self.eat(b'|') {
+            branches.push(self.parse_cat());
+        }
+        if branches.len() == 1 {
+            branches.pop().unwrap()
+        } else {
+            Ast::Alt(branches)
+        }
+    }
+
+    fn parse_cat(&mut self) -> Ast {
+        let mut items = Vec::new();
+        while let Some(c) = self.peek() {
+            if c == b'|' || c == b')' {
+                break;
+            }
+            let atom = self.parse_atom();
+            let atom = self.parse_quant(atom);
+            items.push(atom);
+        }
+        match items.len() {
+            0 => Ast::Empty,
+            1 => items.pop().unwrap(),
+            _ => Ast::Cat(items),
+        }
+    }
+
+    fn parse_number(&mut self) -> Option<u32> {
+        let start = self.i;
+        let mut n: u32 = 0;
+        while let Some(c) = self.peek() {
+            if c.is_ascii_digit() {
+                n = n * 10 + u32::from(c - b'0');
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+        if self.i == start { None } else { Some(n) }
+    }
+
+    fn parse_quant(&mut self, atom: Ast) -> Ast {
+        let (min, max) = match self.peek() {
+            Some(b'?') => {
+                self.i += 1;
+                (0, 1)
+            }
+            Some(b'*') => {
+                self.i += 1;
+                (0, REP_INF)
+            }
+            Some(b'+') => {
+                self.i += 1;
+                (1, REP_INF)
+            }
+            Some(b'{') => {
+                let save = self.i;
+                self.i += 1;
+                if let Some(lo) = self.parse_number() {
+                    let hi = if self.eat(b',') {
+                        self.parse_number().unwrap_or(REP_INF)
+                    } else {
+                        lo
+                    };
+                    if self.eat(b'}') {
+                        (lo, hi)
+                    } else {
+                        self.i = save;
+                        return atom;
+                    }
+                } else {
+                    self.i = save;
+                    return atom;
+                }
+            }
+            _ => return atom,
+        };
+        let greedy = !self.eat(b'?');
+        assert!(
+            self.peek() != Some(b'+'),
+            "possessive quantifiers unsupported"
+        );
+        Ast::Rep {
+            ast: Box::new(atom),
+            min,
+            max,
+            greedy,
+        }
+    }
+
+    fn lit(&self, b: u8) -> Ast {
+        Ast::Lit(b)
+    }
+
+    fn parse_atom(&mut self) -> Ast {
+        let c = self.p[self.i];
+        self.i += 1;
+        match c {
+            b'(' => {
+                let mut cap = None;
+                let mut look = false;
+                if self.peek() == Some(b'?') {
+                    self.i += 1;
+                    match self.peek() {
+                        Some(b':') => self.i += 1,
+                        Some(b'=') => {
+                            self.i += 1;
+                            look = true;
+                        }
+                        other => panic!("unsupported group syntax {other:?}"),
+                    }
+                } else {
+                    self.ncap += 1;
+                    if (self.ncap as usize) < MAX_CAPS {
+                        cap = Some(self.ncap);
+                    }
+                }
+                let inner = self.parse_alt();
+                assert!(self.eat(b')'), "unterminated group");
+                if look {
+                    Ast::Look(Box::new(inner))
+                } else {
+                    Ast::Group {
+                        ast: Box::new(inner),
+                        cap,
+                    }
+                }
+            }
+            b'[' => self.parse_class(),
+            b'.' => {
+                let mut set = Box::new([true; 256]);
+                set[b'\n' as usize] = false;
+                Ast::Set(set)
+            }
+            b'^' => Ast::Bol,
+            b'$' => Ast::Eol,
+            b'\\' => self.parse_escape(),
+            other => self.lit(other),
+        }
+    }
+
+    fn parse_escape(&mut self) -> Ast {
+        let c = self.p[self.i];
+        self.i += 1;
+        let mut set = Box::new([false; 256]);
+        match c {
+            b'b' => return Ast::WordB,
+            b'B' => return Ast::NotWordB,
+            b'd' => set_digit(&mut set),
+            b'D' => {
+                set_digit(&mut set);
+                negate_set(&mut set);
+            }
+            b's' => set_space(&mut set),
+            b'S' => {
+                set_space(&mut set);
+                negate_set(&mut set);
+            }
+            b'w' => set_word(&mut set),
+            b'W' => {
+                set_word(&mut set);
+                negate_set(&mut set);
+            }
+            b'x' => {
+                let byte = self.parse_hex();
+                return Ast::Lit(byte);
+            }
+            b'n' => return Ast::Lit(b'\n'),
+            b't' => return Ast::Lit(b'\t'),
+            b'r' => return Ast::Lit(b'\r'),
+            other => {
+                assert!(
+                    !other.is_ascii_alphanumeric(),
+                    "unsupported escape \\{}",
+                    other as char
+                );
+                return self.lit(other);
+            }
+        }
+        Ast::Set(set)
+    }
+
+    fn parse_hex(&mut self) -> u8 {
+        let hi = (self.p[self.i] as char).to_digit(16).unwrap() as u8;
+        let lo = (self.p[self.i + 1] as char).to_digit(16).unwrap() as u8;
+        self.i += 2;
+        hi * 16 + lo
+    }
+
+    fn class_atom(&mut self) -> ClassAtom {
+        let c = self.p[self.i];
+        self.i += 1;
+        if c != b'\\' {
+            return ClassAtom::Byte(c);
+        }
+        let e = self.p[self.i];
+        self.i += 1;
+        let mut set = Box::new([false; 256]);
+        match e {
+            b'd' => set_digit(&mut set),
+            b'D' => {
+                set_digit(&mut set);
+                negate_set(&mut set);
+            }
+            b's' => set_space(&mut set),
+            b'S' => {
+                set_space(&mut set);
+                negate_set(&mut set);
+            }
+            b'w' => set_word(&mut set),
+            b'W' => {
+                set_word(&mut set);
+                negate_set(&mut set);
+            }
+            b'x' => return ClassAtom::Byte(self.parse_hex()),
+            b'n' => return ClassAtom::Byte(b'\n'),
+            b't' => return ClassAtom::Byte(b'\t'),
+            b'r' => return ClassAtom::Byte(b'\r'),
+            other => {
+                assert!(!other.is_ascii_alphanumeric(), "unsupported class escape");
+                return ClassAtom::Byte(other);
+            }
+        }
+        ClassAtom::Set(set)
+    }
+
+    fn parse_class(&mut self) -> Ast {
+        let negate = self.eat(b'^');
+        let mut set = Box::new([false; 256]);
+        let mut first = true;
+        loop {
+            let c = self.peek().expect("unterminated class");
+            if c == b']' && !first {
+                self.i += 1;
+                break;
+            }
+            first = false;
+            match self.class_atom() {
+                ClassAtom::Set(s) => {
+                    for (dst, src) in set.iter_mut().zip(s.iter()) {
+                        *dst |= *src;
+                    }
+                }
+                ClassAtom::Byte(lo) => {
+                    if self.peek() == Some(b'-')
+                        && self.p.get(self.i + 1).is_some_and(|&n| n != b']')
+                    {
+                        let save = self.i;
+                        self.i += 1;
+                        match self.class_atom() {
+                            ClassAtom::Byte(hi) => {
+                                assert!(lo <= hi, "invalid class range");
+                                for b in lo..=hi {
+                                    set[b as usize] = true;
+                                }
+                            }
+                            ClassAtom::Set(s) => {
+                                // `[a-\d]`: the hyphen is literal.
+                                self.i = save;
+                                set[lo as usize] = true;
+                                let _ = s;
+                            }
+                        }
+                    } else {
+                        set[lo as usize] = true;
+                    }
+                }
+            }
+        }
+        if self.icase {
+            for b in b'a'..=b'z' {
+                let upper = b.to_ascii_uppercase();
+                if set[b as usize] || set[upper as usize] {
+                    set[b as usize] = true;
+                    set[upper as usize] = true;
+                }
+            }
+        }
+        if negate {
+            negate_set(&mut set);
+        }
+        Ast::Set(set)
+    }
+}
+
+fn ast_first(ast: &Ast, out: &mut ByteSet, icase: bool) -> bool {
+    match ast {
+        Ast::Empty | Ast::Bol | Ast::Eol | Ast::WordB | Ast::NotWordB | Ast::Look(_) => true,
+        Ast::Lit(b) => {
+            out[*b as usize] = true;
+            if icase {
+                out[b.to_ascii_lowercase() as usize] = true;
+                out[b.to_ascii_uppercase() as usize] = true;
+            }
+            false
+        }
+        Ast::Set(s) => {
+            for (dst, src) in out.iter_mut().zip(s.iter()) {
+                *dst |= *src;
+            }
+            false
+        }
+        Ast::Cat(items) => {
+            for item in items {
+                if !ast_first(item, out, icase) {
+                    return false;
+                }
+            }
+            true
+        }
+        Ast::Alt(branches) => {
+            let mut nullable = false;
+            for b in branches {
+                nullable |= ast_first(b, out, icase);
+            }
+            nullable
+        }
+        Ast::Rep { ast, min, .. } => {
+            let nullable = ast_first(ast, out, icase);
+            nullable || *min == 0
+        }
+        Ast::Group { ast, .. } => ast_first(ast, out, icase),
+    }
+}
+
+fn ast_min_len(ast: &Ast) -> usize {
+    match ast {
+        Ast::Lit(_) | Ast::Set(_) => 1,
+        Ast::Empty | Ast::Bol | Ast::Eol | Ast::WordB | Ast::NotWordB | Ast::Look(_) => 0,
+        Ast::Cat(items) => items.iter().map(ast_min_len).sum(),
+        Ast::Alt(branches) => branches.iter().map(ast_min_len).min().unwrap_or(0),
+        Ast::Rep { ast, min, .. } => ast_min_len(ast) * (*min as usize),
+        Ast::Group { ast, .. } => ast_min_len(ast),
+    }
+}
+
+fn ast_starts_with_bol(ast: &Ast) -> bool {
+    match ast {
+        Ast::Bol => true,
+        Ast::Cat(items) => items.first().is_some_and(ast_starts_with_bol),
+        Ast::Alt(branches) => branches.iter().all(ast_starts_with_bol),
+        Ast::Group { ast, .. } => ast_starts_with_bol(ast),
+        _ => false,
+    }
+}
+
+fn collect_literal_runs(ast: &Ast, seq: &mut Vec<Option<u8>>) {
+    match ast {
+        Ast::Lit(b) => seq.push(Some(*b)),
+        Ast::Cat(items) => {
+            for item in items {
+                collect_literal_runs(item, seq);
+            }
+        }
+        Ast::Group { ast, .. } => collect_literal_runs(ast, seq),
+        Ast::Bol | Ast::Eol | Ast::WordB | Ast::NotWordB | Ast::Empty => seq.push(None),
+        Ast::Rep { ast, min, .. } if *min >= 1 => {
+            if let Ast::Lit(b) = **ast {
+                seq.push(Some(b));
+            }
+            seq.push(None);
+        }
+        _ => seq.push(None),
+    }
+}
+
+/// Longest literal byte run that every match must contain (lowercased when `icase`).
+fn required_literal(ast: &Ast, icase: bool) -> Option<Box<[u8]>> {
+    let mut seq = Vec::new();
+    collect_literal_runs(ast, &mut seq);
+    let mut best: &[Option<u8>] = &[];
+    let mut start = 0usize;
+    for i in 0..=seq.len() {
+        if i == seq.len() || seq[i].is_none() {
+            if i - start > best.len() {
+                best = &seq[start..i];
+            }
+            start = i + 1;
+        }
+    }
+    if best.is_empty() {
+        return None;
+    }
+    Some(
+        best.iter()
+            .map(|b| {
+                let b = b.unwrap();
+                if icase { LOWER[b as usize] } else { b }
+            })
+            .collect::<Vec<u8>>()
+            .into_boxed_slice(),
+    )
+}
+
+fn contains_literal(h: &[u8], needle: &[u8], icase: bool) -> bool {
+    let l = needle.len();
+    if l == 0 {
+        return true;
+    }
+    if h.len() < l {
+        return false;
+    }
+    let first = needle[0];
+    let last_start = h.len() - l;
+    let mut i = 0usize;
+    while i <= last_start {
+        let c = if icase { LOWER[h[i] as usize] } else { h[i] };
+        if c == first {
+            let ok = if icase {
+                (1..l).all(|j| LOWER[h[i + j] as usize] == needle[j])
+            } else {
+                h[i + 1..i + l] == needle[1..]
+            };
+            if ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+struct Branch {
+    start: u32,
+    first: Option<Box<ByteSet>>,
+}
+
+enum Node {
+    Accept,
+    Lit(Box<[u8]>, u32),
+    Class(Box<ByteSet>, u32),
+    Rep {
+        set: Box<ByteSet>,
+        min: u32,
+        max: u32,
+        greedy: bool,
+        next: u32,
+    },
+    Bol(u32),
+    Eol(u32),
+    WordB(u32),
+    NotWordB(u32),
+    Alt(Box<[Branch]>),
+    AltTable(Box<[Box<[u32]>]>),
+    Split {
+        body: u32,
+        next: u32,
+        greedy: bool,
+    },
+    CapOpen(u8, u32),
+    CapClose(u8, u32),
+    Look(u32, u32),
+}
+
+struct State {
+    steps: u32,
+    abort: bool,
+    caps: [usize; MAX_CAPS * 2],
+    /// Failed `(node, position)` pairs; enabled lazily once a search proves expensive.
+    memo: Vec<u64>,
+    memo_on: bool,
+    memo_stride: usize,
+}
+
+impl State {
+    #[inline]
+    fn failed(&self, n: u32, p: usize) -> bool {
+        let bit = n as usize * self.memo_stride + p;
+        self.memo[bit >> 6] & (1u64 << (bit & 63)) != 0
+    }
+
+    #[inline]
+    fn mark_failed(&mut self, n: u32, p: usize) {
+        let bit = n as usize * self.memo_stride + p;
+        self.memo[bit >> 6] |= 1u64 << (bit & 63);
+    }
+}
+
+pub struct Re {
+    nodes: Vec<Node>,
+    start: u32,
+    icase: bool,
+    anchored: bool,
+    first: Option<Box<ByteSet>>,
+    required: Option<Box<[u8]>>,
+}
+
+struct Compiler {
+    nodes: Vec<Node>,
+    icase: bool,
+}
+
+impl Compiler {
+    fn push(&mut self, node: Node) -> u32 {
+        self.nodes.push(node);
+        (self.nodes.len() - 1) as u32
+    }
+
+    fn single_set(&self, ast: &Ast) -> Option<Box<ByteSet>> {
+        match ast {
+            Ast::Lit(b) => {
+                let mut set = Box::new([false; 256]);
+                set[*b as usize] = true;
+                if self.icase {
+                    set[b.to_ascii_lowercase() as usize] = true;
+                    set[b.to_ascii_uppercase() as usize] = true;
+                }
+                Some(set)
+            }
+            Ast::Set(s) => Some(s.clone()),
+            Ast::Group { ast, cap: None } => self.single_set(ast),
+            _ => None,
+        }
+    }
+
+    fn comp(&mut self, ast: &Ast, next: u32) -> u32 {
+        match ast {
+            Ast::Empty => next,
+            Ast::Lit(b) => {
+                let byte = if self.icase { LOWER[*b as usize] } else { *b };
+                self.push(Node::Lit(vec![byte].into_boxed_slice(), next))
+            }
+            Ast::Set(s) => self.push(Node::Class(s.clone(), next)),
+            Ast::Bol => self.push(Node::Bol(next)),
+            Ast::Eol => self.push(Node::Eol(next)),
+            Ast::WordB => self.push(Node::WordB(next)),
+            Ast::NotWordB => self.push(Node::NotWordB(next)),
+            Ast::Group { ast, cap: None } => self.comp(ast, next),
+            Ast::Group { ast, cap: Some(k) } => {
+                let close = self.push(Node::CapClose(*k, next));
+                let inner = self.comp(ast, close);
+                self.push(Node::CapOpen(*k, inner))
+            }
+            Ast::Look(inner) => {
+                let accept = self.push(Node::Accept);
+                let body = self.comp(inner, accept);
+                self.push(Node::Look(body, next))
+            }
+            Ast::Cat(items) => {
+                let mut cur = next;
+                let mut i = items.len();
+                while i > 0 {
+                    i -= 1;
+                    if let Ast::Lit(_) = items[i] {
+                        let end = i;
+                        while i > 0 && matches!(items[i - 1], Ast::Lit(_)) {
+                            i -= 1;
+                        }
+                        let bytes: Vec<u8> = items[i..=end]
+                            .iter()
+                            .map(|a| match a {
+                                Ast::Lit(b) => {
+                                    if self.icase {
+                                        LOWER[*b as usize]
+                                    } else {
+                                        *b
+                                    }
+                                }
+                                _ => unreachable!(),
+                            })
+                            .collect();
+                        cur = self.push(Node::Lit(bytes.into_boxed_slice(), cur));
+                    } else {
+                        cur = self.comp(&items[i], cur);
+                    }
+                }
+                cur
+            }
+            Ast::Alt(branches) => {
+                let compiled: Vec<Branch> = branches
+                    .iter()
+                    .map(|b| {
+                        let start = self.comp(b, next);
+                        let mut set = Box::new([false; 256]);
+                        let nullable = ast_first(b, &mut set, self.icase);
+                        Branch {
+                            start,
+                            first: if nullable { None } else { Some(set) },
+                        }
+                    })
+                    .collect();
+                if compiled.len() >= 6 {
+                    // Dispatch on the next input byte (index 256 = end of input).
+                    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); 257];
+                    for br in &compiled {
+                        match &br.first {
+                            None => {
+                                for bucket in buckets.iter_mut() {
+                                    bucket.push(br.start);
+                                }
+                            }
+                            Some(set) => {
+                                for (b, member) in set.iter().enumerate() {
+                                    if *member {
+                                        buckets[b].push(br.start);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let table: Vec<Box<[u32]>> =
+                        buckets.into_iter().map(Vec::into_boxed_slice).collect();
+                    return self.push(Node::AltTable(table.into_boxed_slice()));
+                }
+                self.push(Node::Alt(compiled.into_boxed_slice()))
+            }
+            Ast::Rep {
+                ast,
+                min,
+                max,
+                greedy,
+            } => {
+                if let Some(set) = self.single_set(ast) {
+                    return self.push(Node::Rep {
+                        set,
+                        min: *min,
+                        max: *max,
+                        greedy: *greedy,
+                        next,
+                    });
+                }
+                assert!(
+                    *max == REP_INF && ast_min_len(ast) > 0 || *max != REP_INF,
+                    "unbounded repeat of nullable group"
+                );
+                let mut tail = next;
+                if *max == REP_INF {
+                    let split = self.push(Node::Split {
+                        body: 0,
+                        next,
+                        greedy: *greedy,
+                    });
+                    let body = self.comp(ast, split);
+                    self.nodes[split as usize] = Node::Split {
+                        body,
+                        next,
+                        greedy: *greedy,
+                    };
+                    tail = split;
+                } else {
+                    for _ in 0..(*max - *min) {
+                        let body = self.comp(ast, tail);
+                        tail = self.push(Node::Split {
+                            body,
+                            next,
+                            greedy: *greedy,
+                        });
+                    }
+                }
+                for _ in 0..*min {
+                    tail = self.comp(ast, tail);
+                }
+                tail
+            }
+        }
+    }
+}
+
+impl Re {
+    pub fn new(pattern: &str, icase: bool) -> Re {
+        let mut parser = Parser {
+            p: pattern.as_bytes(),
+            i: 0,
+            icase,
+            ncap: 0,
+        };
+        let ast = parser.parse_alt();
+        assert!(parser.i == parser.p.len(), "unbalanced pattern: {pattern}");
+        let mut compiler = Compiler {
+            nodes: Vec::new(),
+            icase,
+        };
+        let accept = compiler.push(Node::Accept);
+        let start = compiler.comp(&ast, accept);
+        let mut first_set = Box::new([false; 256]);
+        let nullable = ast_first(&ast, &mut first_set, icase);
+        Re {
+            nodes: compiler.nodes,
+            start,
+            icase,
+            anchored: ast_starts_with_bol(&ast),
+            first: if nullable { None } else { Some(first_set) },
+            required: required_literal(&ast, icase),
+        }
+    }
+
+    #[inline]
+    fn m(&self, h: &[u8], n: u32, p: usize, st: &mut State) -> bool {
+        if st.memo_on {
+            if st.failed(n, p) {
+                return false;
+            }
+            let ok = self.m_run(h, n, p, st);
+            if !ok && !st.abort {
+                st.mark_failed(n, p);
+            }
+            return ok;
+        }
+        self.m_run(h, n, p, st)
+    }
+
+    #[cold]
+    fn enable_memo(&self, h: &[u8], st: &mut State) {
+        let stride = h.len() + 1;
+        let bits = self.nodes.len().saturating_mul(stride);
+        if bits <= MEMO_MAX_BITS {
+            st.memo = vec![0u64; bits.div_ceil(64)];
+            st.memo_stride = stride;
+            st.memo_on = true;
+        }
+    }
+
+    fn m_run(&self, h: &[u8], mut n: u32, mut p: usize, st: &mut State) -> bool {
+        loop {
+            st.steps += 1;
+            if st.steps == MEMO_AFTER_STEPS && !st.memo_on {
+                self.enable_memo(h, st);
+            }
+            if st.steps > STEP_LIMIT {
+                st.abort = true;
+                return false;
+            }
+            match &self.nodes[n as usize] {
+                Node::Accept => return true,
+                Node::Lit(bytes, next) => {
+                    let l = bytes.len();
+                    if h.len() - p < l {
+                        return false;
+                    }
+                    let hs = &h[p..p + l];
+                    if self.icase {
+                        for i in 0..l {
+                            if LOWER[hs[i] as usize] != bytes[i] {
+                                return false;
+                            }
+                        }
+                    } else if hs != &**bytes {
+                        return false;
+                    }
+                    p += l;
+                    n = *next;
+                }
+                Node::Class(set, next) => {
+                    if p < h.len() && set[h[p] as usize] {
+                        p += 1;
+                        n = *next;
+                    } else {
+                        return false;
+                    }
+                }
+                Node::Rep {
+                    set,
+                    min,
+                    max,
+                    greedy,
+                    next,
+                } => {
+                    let min = *min as usize;
+                    let avail = h.len() - p;
+                    let cap = if *max == REP_INF {
+                        avail
+                    } else {
+                        (*max as usize).min(avail)
+                    };
+                    if *greedy {
+                        let mut cnt = 0usize;
+                        while cnt < cap && set[h[p + cnt] as usize] {
+                            cnt += 1;
+                        }
+                        if cnt < min {
+                            return false;
+                        }
+                        while cnt > min {
+                            if self.m(h, *next, p + cnt, st) {
+                                return true;
+                            }
+                            if st.abort {
+                                return false;
+                            }
+                            cnt -= 1;
+                        }
+                        p += min;
+                        n = *next;
+                    } else {
+                        let mut cnt = 0usize;
+                        while cnt < min {
+                            if cnt >= avail || !set[h[p + cnt] as usize] {
+                                return false;
+                            }
+                            cnt += 1;
+                        }
+                        loop {
+                            if self.m(h, *next, p + cnt, st) {
+                                return true;
+                            }
+                            if st.abort {
+                                return false;
+                            }
+                            if cnt < cap && set[h[p + cnt] as usize] {
+                                cnt += 1;
+                            } else {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                Node::Bol(next) => {
+                    if p != 0 {
+                        return false;
+                    }
+                    n = *next;
+                }
+                Node::Eol(next) => {
+                    if !(p == h.len() || (p + 1 == h.len() && h[p] == b'\n')) {
+                        return false;
+                    }
+                    n = *next;
+                }
+                Node::WordB(next) => {
+                    let before = p > 0 && is_word_byte(h[p - 1]);
+                    let after = p < h.len() && is_word_byte(h[p]);
+                    if before == after {
+                        return false;
+                    }
+                    n = *next;
+                }
+                Node::NotWordB(next) => {
+                    let before = p > 0 && is_word_byte(h[p - 1]);
+                    let after = p < h.len() && is_word_byte(h[p]);
+                    if before != after {
+                        return false;
+                    }
+                    n = *next;
+                }
+                Node::Alt(branches) => {
+                    for br in branches.iter() {
+                        if let Some(first) = &br.first
+                            && (p >= h.len() || !first[h[p] as usize])
+                        {
+                            continue;
+                        }
+                        if self.m(h, br.start, p, st) {
+                            return true;
+                        }
+                        if st.abort {
+                            return false;
+                        }
+                    }
+                    return false;
+                }
+                Node::AltTable(buckets) => {
+                    let idx = if p < h.len() { h[p] as usize } else { 256 };
+                    for &start in buckets[idx].iter() {
+                        if self.m(h, start, p, st) {
+                            return true;
+                        }
+                        if st.abort {
+                            return false;
+                        }
+                    }
+                    return false;
+                }
+                Node::Split { body, next, greedy } => {
+                    if *greedy {
+                        if self.m(h, *body, p, st) {
+                            return true;
+                        }
+                        if st.abort {
+                            return false;
+                        }
+                        n = *next;
+                    } else {
+                        if self.m(h, *next, p, st) {
+                            return true;
+                        }
+                        if st.abort {
+                            return false;
+                        }
+                        n = *body;
+                    }
+                }
+                Node::CapOpen(k, next) => {
+                    let slot = *k as usize * 2;
+                    let old = st.caps[slot];
+                    st.caps[slot] = p;
+                    if self.m(h, *next, p, st) {
+                        return true;
+                    }
+                    st.caps[slot] = old;
+                    return false;
+                }
+                Node::CapClose(k, next) => {
+                    let slot = *k as usize * 2 + 1;
+                    let old = st.caps[slot];
+                    st.caps[slot] = p;
+                    if self.m(h, *next, p, st) {
+                        return true;
+                    }
+                    st.caps[slot] = old;
+                    return false;
+                }
+                Node::Look(body, next) => {
+                    if !self.m(h, *body, p, st) {
+                        return false;
+                    }
+                    n = *next;
+                }
+            }
+        }
+    }
+
+    fn exec(&self, h: &[u8], from: usize, anchored_at: bool) -> (bool, [usize; MAX_CAPS * 2]) {
+        let mut st = State {
+            steps: 0,
+            abort: false,
+            caps: [NO_POS; MAX_CAPS * 2],
+            memo: Vec::new(),
+            memo_on: false,
+            memo_stride: 0,
+        };
+        let found = if anchored_at {
+            self.m(h, self.start, from, &mut st)
+        } else if self
+            .required
+            .as_deref()
+            .is_some_and(|lit| !contains_literal(h, lit, self.icase))
+        {
+            false
+        } else if self.anchored {
+            self.m(h, self.start, 0, &mut st)
+        } else {
+            let mut s = from;
+            loop {
+                if let Some(first) = &self.first {
+                    while s < h.len() && !first[h[s] as usize] {
+                        s += 1;
+                    }
+                    if s >= h.len() {
+                        break false;
+                    }
+                }
+                if self.m(h, self.start, s, &mut st) {
+                    break true;
+                }
+                if st.abort {
+                    break false;
+                }
+                s += 1;
+                if s > h.len() {
+                    break false;
+                }
+            }
+        };
+        if st.abort {
+            MATCH_ABORTED.with(|c| c.set(true));
+        }
+        (found, st.caps)
+    }
+
+    #[inline]
+    pub fn is_match(&self, h: &[u8]) -> bool {
+        self.exec(h, 0, false).0
+    }
+
+    /// Anchored match attempt at byte offset `pos` (pattern-level `^`/`\b` still see the full subject).
+    #[inline]
+    pub fn matches_at(&self, h: &[u8], pos: usize) -> bool {
+        self.exec(h, pos, true).0
+    }
+
+    /// Returns the byte range of capture group `k` (1-based) of the leftmost match.
+    pub fn capture(&self, h: &[u8], k: usize) -> Option<(usize, usize)> {
+        let (found, caps) = self.exec(h, 0, false);
+        if !found || k >= MAX_CAPS {
+            return None;
+        }
+        let (s, e) = (caps[k * 2], caps[k * 2 + 1]);
+        if s == NO_POS || e == NO_POS || e < s {
+            None
+        } else {
+            Some((s, e))
+        }
+    }
+}
+
+/// A subject string plus the set of table patterns it matches (computed by one DFA pass) and a few
+/// per-call memoized predicates.
+pub struct Subject<'a> {
+    b: &'a [u8],
+    bits: Bits,
+    memo: [std::cell::Cell<u8>; 8],
+}
+
+impl<'a> Subject<'a> {
+    #[inline]
+    pub fn new(b: &'a [u8]) -> Self {
+        Subject {
+            b,
+            bits: scan_patterns(b, false),
+            memo: Default::default(),
+        }
+    }
+
+    /// Subject for a group name or poster (longer-lived cache than release names).
+    #[inline]
+    pub fn aux(b: &'a [u8]) -> Self {
+        Subject {
+            b,
+            bits: scan_patterns(b, true),
+            memo: Default::default(),
+        }
+    }
+
+    /// Whether table pattern `id` matches the subject (the equivalent of one `preg_match`).
+    #[inline]
+    fn hit(&self, id: usize) -> bool {
+        self.bits[id >> 6] >> (id & 63) & 1 == 1
+    }
+
+    #[inline]
+    fn memoized(&self, slot: usize, f: impl FnOnce() -> bool) -> bool {
+        match self.memo[slot].get() {
+            1 => false,
+            2 => true,
+            _ => {
+                let v = f();
+                self.memo[slot].set(if v { 2 } else { 1 });
+                v
+            }
+        }
+    }
+}
+
+impl Re {
+    /// Anchored attempt at `pos` against a prepared subject.
+    #[inline]
+    pub fn test_at(&self, s: &Subject, pos: usize) -> bool {
+        self.exec(s.b, pos, true).0
+    }
+
+    /// Capture group `k` of the leftmost match against a prepared subject.
+    pub fn capture_s(&self, s: &Subject, k: usize) -> Option<(usize, usize)> {
+        self.capture(s.b, k)
+    }
+}
+
+macro_rules! bt {
+    ($pat:expr) => {{
+        static CELL: std::sync::OnceLock<Re> = std::sync::OnceLock::new();
+        CELL.get_or_init(|| Re::new($pat, true))
+    }};
+}
+
+// ---------------------------------------------------------------------------------------------
+// Categorizer ports (GroupName, PC, Console, Music, Book, Movie, TV, XXX)
+//
+// Return contract of every `nntmux_categorize_*` entry point:
+//   < 0  : decline (engine abort / internal error) -> PHP falls back to its native implementation
+//   == 0 : no match (`CategorizationResult::noMatch()`)
+//   > 0  : category id (bits 0..15) | confidence in 1/1000 (bits 16..31) | rule id (bits 32..47)
+//          or `NATIVE_SKIP` when `FLAG_CHECK_SKIP` was passed and `shouldSkip()` is true
+// `flags`: bit 0 = categorizeForeign, bit 1 = catWebDL, bit 2 = evaluate `shouldSkip()` first.
+// Rule ids index the `*_rules::NAMES` tables, which the PHP classes mirror in `NATIVE_RULES`
+// (`nntmux_categorize_rule_name` exports them so the parity test can verify the mirror).
+// ---------------------------------------------------------------------------------------------
+
+const FLAG_FOREIGN: u32 = 1;
+const FLAG_WEBDL: u32 = 2;
+const FLAG_CHECK_SKIP: u32 = 4;
+const NO_MATCH: i64 = 0;
+
+mod cat {
+    pub const GAME_NDS: u16 = 1010;
+    pub const GAME_PSP: u16 = 1020;
+    pub const GAME_WII: u16 = 1030;
+    pub const GAME_XBOX: u16 = 1040;
+    pub const GAME_XBOX360: u16 = 1050;
+    pub const GAME_PS3: u16 = 1080;
+    pub const GAME_OTHER: u16 = 1999;
+    pub const GAME_3DS: u16 = 1110;
+    pub const GAME_PSVITA: u16 = 1120;
+    pub const GAME_WIIU: u16 = 1130;
+    pub const GAME_XBOXONE: u16 = 1140;
+    pub const GAME_PS4: u16 = 1180;
+    pub const MOVIE_FOREIGN: u16 = 2010;
+    pub const MOVIE_OTHER: u16 = 2999;
+    pub const MOVIE_SD: u16 = 2030;
+    pub const MOVIE_HD: u16 = 2040;
+    pub const MOVIE_UHD: u16 = 2045;
+    pub const MOVIE_3D: u16 = 2050;
+    pub const MOVIE_BLURAY: u16 = 2060;
+    pub const MOVIE_DVD: u16 = 2070;
+    pub const MOVIE_WEBDL: u16 = 2080;
+    pub const MOVIE_X265: u16 = 2090;
+    pub const MUSIC_MP3: u16 = 3010;
+    pub const MUSIC_VIDEO: u16 = 3020;
+    pub const MUSIC_AUDIOBOOK: u16 = 3030;
+    pub const MUSIC_LOSSLESS: u16 = 3040;
+    pub const MUSIC_PODCAST: u16 = 3050;
+    pub const MUSIC_OTHER: u16 = 3999;
+    pub const MUSIC_FOREIGN: u16 = 3060;
+    pub const PC_0DAY: u16 = 4010;
+    pub const PC_ISO: u16 = 4020;
+    pub const PC_MAC: u16 = 4030;
+    pub const PC_PHONE_OTHER: u16 = 4040;
+    pub const PC_GAMES: u16 = 4050;
+    pub const PC_PHONE_IOS: u16 = 4060;
+    pub const PC_PHONE_ANDROID: u16 = 4070;
+    pub const TV_WEBDL: u16 = 5010;
+    pub const TV_FOREIGN: u16 = 5020;
+    pub const TV_SD: u16 = 5030;
+    pub const TV_HD: u16 = 5040;
+    pub const TV_UHD: u16 = 5045;
+    pub const TV_OTHER: u16 = 5999;
+    pub const TV_SPORT: u16 = 5060;
+    pub const TV_ANIME: u16 = 5070;
+    pub const TV_DOCU: u16 = 5080;
+    pub const TV_X265: u16 = 5090;
+    pub const XXX_DVD: u16 = 6010;
+    pub const XXX_WMV: u16 = 6020;
+    pub const XXX_XVID: u16 = 6030;
+    pub const XXX_X264: u16 = 6040;
+    pub const XXX_CLIPHD: u16 = 6041;
+    pub const XXX_CLIPSD: u16 = 6042;
+    pub const XXX_UHD: u16 = 6045;
+    pub const XXX_VR: u16 = 6046;
+    pub const XXX_ONLYFANS: u16 = 6047;
+    pub const XXX_PACK: u16 = 6050;
+    pub const XXX_IMAGESET: u16 = 6060;
+    pub const XXX_OTHER: u16 = 6999;
+    pub const XXX_SD: u16 = 6080;
+    pub const XXX_WEBDL: u16 = 6090;
+    pub const BOOKS_MAGAZINES: u16 = 7010;
+    pub const BOOKS_EBOOK: u16 = 7020;
+    pub const BOOKS_COMICS: u16 = 7030;
+    pub const BOOKS_TECHNICAL: u16 = 7040;
+}
+
+macro_rules! rules {
+    ($m:ident { $($id:ident = $s:literal),+ $(,)? }) => {
+        mod $m {
+            #[allow(non_camel_case_types, dead_code, clippy::upper_case_acronyms)]
+            #[repr(u16)]
+            enum Index {
+                $($id),+
+            }
+            $(
+                #[allow(dead_code)]
+                pub const $id: u16 = Index::$id as u16;
+            )+
+            pub const NAMES: &[&str] = &[$($s),+];
+        }
+    };
+}
+
+rules!(group_rules {
+    ANIME = "group_name_anime", TV = "group_name_tv", MOVIE = "group_name_movie",
+    XXX = "group_name_xxx", MUSIC = "group_name_music", GAME = "group_name_game",
+    PC = "group_name_pc", BOOK = "group_name_book",
+});
+rules!(pc_rules {
+    IOS = "ios", ANDROID = "android", PHONE_OTHER = "phone_other", MAC = "mac", MACOS = "macos",
+    PC_GAME = "pc_game", PC_GAME_POSTER = "pc_game_poster", ISO = "iso", TRAINING_ISO = "training_iso",
+    MSIX = "0day_msix_installer", EXPLICIT = "0day_explicit", SYSTEM = "0day_system",
+    SOFTWARE = "0day_software",
+});
+rules!(console_rules {
+    PS4 = "ps4", PS3 = "ps3", PSVITA = "psvita", PSP = "psp", XBOXONE = "xboxone",
+    XBOX360 = "xbox360", XBOX = "xbox", WIIU = "wiiu", WII = "wii", DS3 = "3ds", NDS = "nds",
+    RETRO = "retro_console",
+});
+rules!(music_rules {
+    AUDIOBOOK = "audiobook", AUDIOBOOK_PATTERN = "audiobook_pattern", AUDIOBOOK_LEGACY = "audiobook_legacy",
+    PODCAST = "podcast", PODCAST_NETWORK = "podcast_network", PODCAST_SIMPLE = "podcast_simple",
+    MUSIC_VIDEO_FOREIGN = "music_video_foreign", MUSIC_VIDEO = "music_video",
+    MUSIC_VIDEO_ARTIST = "music_video_artist", LOSSLESS_FOREIGN = "lossless_foreign",
+    LOSSLESS = "lossless", FLAC_FOREIGN = "flac_foreign", FLAC = "flac",
+    LOSSLESS_FORMAT_FOREIGN = "lossless_format_foreign", LOSSLESS_FORMAT = "lossless_format",
+    MP3_FOREIGN = "mp3_foreign", MP3 = "mp3", MP3_SCENE_FOREIGN = "mp3_scene_foreign",
+    MP3_SCENE = "mp3_scene", MP3_BITRATE_FOREIGN = "mp3_bitrate_foreign", MP3_BITRATE = "mp3_bitrate",
+    OTHER_FOREIGN = "music_other_foreign", OTHER = "music_other", ALBUM_FOREIGN = "music_album_foreign",
+    ALBUM = "music_album", DJ_FOREIGN = "music_dj_foreign", DJ = "music_dj",
+});
+rules!(book_rules {
+    COMIC_FORMAT = "comic_format", COMIC_PUBLISHER = "comic_publisher", MANGA = "manga",
+    TECHNICAL_PUBLISHER = "technical_publisher", TECHNICAL_SUBJECT = "technical_subject",
+    MAGAZINE_FREQUENCY = "magazine_frequency", MAGAZINE_TITLE = "magazine_title",
+    EBOOK_FORMAT = "ebook_format", EBOOK_INDICATOR = "ebook_indicator",
+    EBOOK_PDF_FORMAT = "ebook_pdf_format", EBOOK_PDF_INDICATOR = "ebook_pdf_indicator",
+    EBOOK_PLATFORM = "ebook_platform", EBOOK_BOOK_SIGNALS = "ebook_book_signals",
+});
+rules!(movie_rules {
+    FOREIGN_LANGUAGE = "foreign_language", FOREIGN_CASTELLANO = "foreign_castellano",
+    FOREIGN_PATTERN = "foreign_pattern", X265_GROUP = "x265_group", UHD = "uhd", THREE_D = "3d",
+    BLURAY = "bluray", DVD = "dvd", WEBDL = "webdl", HD = "hd", HD_WEBDL_FALLBACK = "hd_webdl_fallback",
+    SD = "sd", CAM = "cam",
+});
+rules!(tv_rules {
+    ANIME_TOSHO_POSTER = "anime_tosho_poster", ANIME_GROUP_NAME = "anime_group_name",
+    ANIME_GROUP = "anime_group", ANIME_HASH = "anime_hash", ANIME_PATTERN = "anime_pattern",
+    ANIME_JAPANESE_TITLE = "anime_japanese_title", ANIME_EPISODE_BLURAY = "anime_episode_bluray",
+    ANIME_ROMAN = "anime_roman_numeral_season", SPORT = "sport", DOCUMENTARY = "documentary",
+    FOREIGN_LANGUAGE = "foreign_language", X265_GROUP = "x265_group", WEBDL = "webdl",
+    UHD_EPISODE = "uhd_episode", UHD_SEASON = "uhd_season", UHD_STREAMING = "uhd_streaming",
+    HD_RESOLUTION = "hd_resolution", HD_WEBDL_FALLBACK = "hd_webdl_fallback", SD_FORMAT = "sd_format",
+    SD_CODEC = "sd_codec", TV_OTHER = "tv_other", TV_SEASON_PACK = "tv_season_pack",
+});
+rules!(xxx_rules {
+    ONLYFANS = "onlyfans", VR_SITE = "vr_site", VR_SITE_GENERIC = "vr_site_generic",
+    VR_DEVICE = "vr_device", VR_180_360 = "vr_180_360", UHD_GROUP = "uhd_group", UHD = "uhd",
+    CLIP_HD_STUDIO = "clip_hd_studio", CLIP_HD_STUDIO_DATE = "clip_hd_studio_date",
+    STUDIO_DATE = "studio_date", CLIP_HD_DATE_4DIGIT = "clip_hd_date_4digit",
+    CLIP_HD_DATE = "clip_hd_date", CLIP_HD_JAV_DATE = "clip_hd_jav_date", JAV_DATE = "jav_date",
+    CLIP_HD_STUDIO_XXX = "clip_hd_studio_xxx", CLIP_HD_XXX = "clip_hd_xxx", PACK = "pack",
+    CLIP_SD_POSTER = "clip_sd_poster", CLIP_SD = "clip_sd", SD = "sd", WEBDL = "webdl",
+    X264 = "x264", XVID = "xvid", IMAGESET = "imageset", WMV = "wmv", DVD = "dvd", OTHER = "other",
+});
+
+#[inline]
+fn hit(rule: u16, category: u16, milli: u16) -> i64 {
+    i64::from(category) | (i64::from(milli) << 16) | (i64::from(rule) << 32)
+}
+
+fn flag(flags: u32, bit: u32) -> bool {
+    flags & bit != 0
+}
+
+#[inline]
+fn is_sep(b: u8) -> bool {
+    matches!(b, b'.' | b'-' | b'_' | b' ')
+}
+
+const PC_GROUPS: &str = r#"0x0007|ALiAS|ANOMALY|BACKLASH|BAT|BLASTCiTY|CHRONOS|CODEX|CONSPIRACY|CPY|CROSSFiRE|DARKS(?:iDERS|IDERS)|DELiGHT|DEViANCE|DINOByTES|DOGE|DODI|DVN|ELAMIGOS|EMPRESS|ENiGMA|FANiSO|FAS(?:DOX|iSO)|FCKDRM|FITGIRL|FLT|FLTDOX|GGS|GOG(?:-?GAMES)?|GOLDBERG|HATRED|HI2U|HOODLUM|I_KnoW|iNLAWS|iNTERNAL|JAGUAR|KACZKRULL|KAOS|KaOsKrew|LAZARUS|LiGHTFORCE|MEPHISTO|OUTLAWS|PARADOX|PHOENIX|PLAZA|POSTMORTEM|PROPHET|PROVOKED|RADIUM|RAZOR(?:1911|DOX)|RELOADED|REVOLUTiON|RUNE|SAFARi|SCRUBS|SiLENTGATE|SiMPLEX|SKIDROW|SPLiNTERCELL|STEAMPUNKS|SUXXORS|TENOKE|TiNYiSO|UNLEASHED|VENGEANCE|ViTALiTY|VENOM|VACE|ZEKE|P2P"#;
+const PC_KEYWORDS: &str = r#"PC[ _.-]?GAMES?|\[PC\]|\(PC\)|Steam[._-]?Rip|Retail\s*PC|DRM-?Free"#;
+const FOREIGN_LANGUAGES: &str = r#"arabic|brazilian|bulgarian|cantonese|chinese|croatian|czech|danish|deutsch|dutch|estonian|finnish|flemish|french|german|greek|hebrew|hungarian|icelandic|indian|iranian|italian|japanese|korean|latin|latvian|lithuanian|macedonian|mandarin|nordic|norwegian|persian|polish|portuguese|romanian|russian|serbian|slovenian|spanish|spanisch|swedish|thai|turkish|ukrainian|vietnamese"#;
+const LANGUAGE_CODES: &str = r#"ar|bg|bl|cs|cz|da|de|dk|el|es|et|fi|fr|ger|gr|heb|hr|hu|hun|is|it|ita|jp|jap|ko|kor|lt|lv|mk|nl|no|pl|pt|ro|rs|ru|se|sk|sl|sr|sv|th|tr|ua|vi|zh"#;
+const JACQUIE_ET_MICHEL: &str = r#"Jacquie[._ -]?Et[._ -]?Michel(?:[._ -]?(?:TV|Elite))?"#;
+const KNOWN_STUDIOS: &str = r#"Brazzers|NaughtyAmerica|RealityKings|Bangbros|BangBros18|TeenFidelity|PornPros|SexArt|WowGirls|Vixen|Blacked|Tushy|Deeper|Bellesa|Defloration|MetArt|MetArtX|TheLifeErotic|VivThomas|JoyMii|Nubiles|NubileFilms|Anilos|FamilyStrokes|X-Art|Babes|Twistys|WetAndPuffy|WowPorn|MomsTeachSex|Mofos|BangBus|Passion-HD|EvilAngel|DorcelClub|Private|Hustler|CherryPimps|PureTaboo|Lady[._ -]?Lyne|TeamSkeet|GirlsWay|SweetSinner|NewSensations|Digital[._ -]?Playground|Wicked|Penthouse|Playboy|Kink|HardX|ArchAngel|JulesJordan|ManuelFerrara|LesbianX|AllAnal|DarkX|Elegant[._ -]?Angel|ZeroTolerance|Score|PornFidelity|Kelly[._ -]?Madison|DDF[._ -]?Network|21Sextury|21Naturals|Colette|SexMex|Bang|SpankBang|PornWorld|LegalPorno|AnalVids|GonzoXXX|RoccoSiffredi|Fake[._ -]?Hub|FakeAgent|FakeTaxi|FakeHostel|PublicAgent|StrandedTeens|Property[._ -]?Sex|Dane[._ -]?Jones|Lets[._ -]?Doe[._ -]?It|Office[._ -]?Obsession|SexyHub|Massage[._ -]?Rooms|Fitness[._ -]?Rooms|Female[._ -]?Agent|MissaX|All[._ -]?Girl[._ -]?Massage|Fantasy[._ -]?Massage|Nurumassage|Soapymassage|Reality[._ -]?Junkies|Perv[._ -]?Mom|Bad[._ -]?Milfs|Milf[._ -]?Body|Step[._ -]?Siblings|Sis[._ -]?Loves[._ -]?Me|Brother[._ -]??Crush|Dad[._ -]?Crush|Mom[._ -]?Knows[._ -]?Best|Bratty[._ -]?Sis|My[._ -]?Family[._ -]?Pies|Family[._ -]?Therapy|Nubiles[._ -]?Porn|Step[._ -]?Fantasy|Caught[._ -]?Fapping|She[._ -]?Will[._ -]?Cheat|Dirty[._ -]?Wives[._ -]?Club|Big[._ -]?Tits[._ -]?Round[._ -]?Asses|Ass[._ -]?Parade|Monsters[._ -]?Of[._ -]?Cock|Brown[._ -]?Bunnies|Teens[._ -]?Love[._ -]?Huge[._ -]?Cocks|Ass[._ -]?Masterpiece|Bang[._ -]?Casting|Holed|Tiny4K|Lubed|POVD|Exotic4K|CastingCouch[._ -]?X|Casting[._ -]?Couch|Creampie[._ -]?Angels|Digital[._ -]?Desire|Femjoy|Hegre|Joymii|Met[._ -]?Art|MPL[._ -]?Studios|Rylsky[._ -]?Art|Showy[._ -]?Beauty|Stunning18|Photodromm|Watch4Beauty|Wow[._ -]?Girls|Yonitale|Mommys[._ -]?Boy|AllOver30|MyFirst|10musume|Caribbeancom|Heyzo|Pacopacomama|1Pondo|TokyoHot|Mommy[._ -]?Blows[._ -]?Best|Milfs[._ -]?Like[._ -]?It[._ -]?Big|Mommy[._ -]?Got[._ -]?Boobs|My[._ -]?Friends[._ -]?Hot[._ -]?Mom|Seduced[._ -]?By[._ -]?A[._ -]?Cougar|Hot[._ -]?Mom[._ -]?Next[._ -]?Door"#;
+const ADULT_KEYWORDS: &str = r#"Anal|Ass|BBW|BDSM|Blow|Boob|Bukkake|Casting|Couch|Cock|Compilation|Creampie|Cum|Dick|Dildo|Facial|Fetish|Fuck|Gang|Hardcore|Homemade|Horny|Interracial|Lesbian|MILF|Masturbat|Nympho|Oral|Orgasm|Penetrat|Pornstar|POV|Pussy|Riding|Seduct|Sex|Shaved|Slut|Squirt|Suck|Swallow|Threesome|Tits|Titty|Toy|Virgin|Whore"#;
+const VR_SITES: &str = r#"SexBabesVR|LittleCapriceVR|VRoomed|VRMagic|TonightsGirlfriend|NaughtyAmericaVR|BaDoinkVR|WankzVR|VRBangers|StripzVR|RealJamVR|TmwVRnet|MilfVR|KinkVR|CzechVR(?:Fetish)?|HoloGirlsVR|WetVR|XSinsVR|VRCosplayX|BIBIVR|SLR|SexLikeReal|CutiesVR|18VR|PornCornVR|DarkRoomVR|JackAndJillVR|PasstroughVR|JUVR|KIWVR|KAVR|NKKVR|VRSPy|BadoinkVR|SinsVR|FuckPassVR|CRVR|CatalinaCruzVR|StockingsVR|VirtualRealPorn|VRHush|VRConk|SwallowBay"#;
+const GENERIC_VR_SITE: &str = r#"\b[A-Z][A-Za-z0-9]{2,}VR(?:\.com|\.net|\.tv)?\b"#;
+const VR_DEVICES: &str = r#"GearVR|Oculus|Quest[123]?|PSVR|Vive|Index|Pimax"#;
+const SPORTS_MARKER_REGEX: &str = r#"\b(NFL|NBA|NHL|MLB|MLS|EPL|UFC|WWE|Boxing|F1|Formula[._ -]?1|NASCAR|PGA|Tennis|Golf|Soccer|Football|Cricket|Rugby|Olympics?|Olympic[._ -]?Games?|Paralympics?)\b"#;
+const SPORTS_EVENT_CONTEXT_REGEX: &str = r#"\d{4}|\b(Season|Week|Round|Match|Game|vs|Playoffs?|Finals?|Qualifying|Opening|Closing|Ceremony|Championship)\b"#;
+const ANIME_GROUPS_REGEX: &str = r#"(?:^|[.\-_ \[])(URANiME|ANiHLS|HaiKU|ANiURL|SkyAnime|Erai-raws|LostYears|Vodes|SubsPlease|Judas|Ember|EMBER|YuiSubs|ASW|Tsundere-Raws|Anime-Raws|Kekkan|SSA|MoyaiSubs|QCE|Nyanpasu|UCCUSS|NS|DKB|MTBB|NanDesuKa|smol|Cleo|ToshY|Kawaiika-Raws|Beatrice-Raws|Reaktor|FLE|Commie|HorribleSubs|Doki|FFF|UTW|Coalgirls|CoalGuys|Mezashite|Vivid|Kaylith|Underwater|gg|Chihiro|Hatsuyuki|Mazui|WhyNot|Migoto|Doutei|GJM|Asenshi|Inka-Subs|Akatsuki)(?:[.\-_ \]]|$)"#;
+
+macro_rules! patterns {
+    (@icase i) => { true };
+    (@icase s) => { false };
+    ($($id:ident = $mode:ident $pat:expr;)+) => {
+        mod pid {
+            #[allow(non_camel_case_types, dead_code, clippy::upper_case_acronyms)]
+            #[repr(usize)]
+            enum Index {
+                $($id),+,
+                Count,
+            }
+            $(
+                #[allow(dead_code)]
+                pub const $id: usize = Index::$id as usize;
+            )+
+            pub const COUNT: usize = Index::Count as usize;
+        }
+        use pid::*;
+
+        /// Every pattern evaluated by the DFA scanner: `(pattern, case_insensitive)` in id order.
+        fn pattern_table() -> Vec<(String, bool)> {
+            vec![$((($pat).to_string(), patterns!(@icase $mode))),+]
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Multi-pattern scanner: every categorizer pattern is compiled into one NFA and executed by a
+// lazily built DFA, so a subject is scanned once and each `preg_match` becomes a bit test.
+// Assertions (`^ $ \b \B` and the single-byte lookahead used by the season token) are resolved
+// when the next byte is known, exactly like the backtracking engine above.
+// ---------------------------------------------------------------------------------------------
+
+const BITS_W: usize = pid::COUNT.div_ceil(64);
+type Bits = [u64; BITS_W];
+
+const DFA_UNKNOWN: u32 = u32::MAX;
+const DFA_CELL_UNKNOWN: u16 = u16::MAX;
+const DFA_MATCH_FLAG: u16 = 1 << 15;
+const DFA_MAX_STATES: usize = 30_000;
+/// After this many capacity flushes the input mix defeats the cache; the scanner then declines so
+/// PHP keeps using its own `preg_match` calls instead of rebuilding states forever.
+const DFA_MAX_FLUSHES: u32 = 4;
+
+#[derive(Clone, Copy)]
+enum Assertion {
+    Bol,
+    Eol,
+    WordB,
+    NotWordB,
+    /// Lookahead `(?=$|[class])`: the next byte is in `set`, or the subject ends when `or_end`.
+    NextIn(u32, bool),
+}
+
+#[derive(Clone, Copy)]
+enum NState {
+    Byte(u32, u32),
+    Split(u32, u32),
+    Assert(Assertion, u32),
+    Match(u32),
+}
+
+struct Nfa {
+    states: Vec<NState>,
+    sets: Vec<[u64; 4]>,
+    starts: Vec<u32>,
+}
+
+struct NfaBuilder {
+    states: Vec<NState>,
+    sets: Vec<[u64; 4]>,
+    set_ids: std::collections::HashMap<[u64; 4], u32>,
+    icase: bool,
+}
+
+fn pack_set(set: &ByteSet) -> [u64; 4] {
+    let mut out = [0u64; 4];
+    for (b, member) in set.iter().enumerate() {
+        if *member {
+            out[b >> 6] |= 1u64 << (b & 63);
+        }
+    }
+    out
+}
+
+#[inline]
+fn set_has(set: &[u64; 4], b: u8) -> bool {
+    set[(b >> 6) as usize] & (1u64 << (b & 63)) != 0
+}
+
+impl NfaBuilder {
+    fn push(&mut self, st: NState) -> u32 {
+        self.states.push(st);
+        (self.states.len() - 1) as u32
+    }
+
+    fn set_id(&mut self, packed: [u64; 4]) -> u32 {
+        if let Some(id) = self.set_ids.get(&packed) {
+            return *id;
+        }
+        let id = self.sets.len() as u32;
+        self.sets.push(packed);
+        self.set_ids.insert(packed, id);
+        id
+    }
+
+    fn lit_set(&mut self, b: u8) -> u32 {
+        let mut set = [false; 256];
+        set[b as usize] = true;
+        if self.icase {
+            set[b.to_ascii_lowercase() as usize] = true;
+            set[b.to_ascii_uppercase() as usize] = true;
+        }
+        self.set_id(pack_set(&set))
+    }
+
+    /// Reduces a one-byte lookahead body (`$`, a class, or alternations of those) to a class + end flag.
+    fn lookahead_shape(ast: &Ast, set: &mut ByteSet, or_end: &mut bool) {
+        match ast {
+            Ast::Eol => *or_end = true,
+            Ast::Set(s) => {
+                for (dst, src) in set.iter_mut().zip(s.iter()) {
+                    *dst |= *src;
+                }
+            }
+            Ast::Lit(b) => set[*b as usize] = true,
+            Ast::Alt(items) => {
+                for item in items {
+                    Self::lookahead_shape(item, set, or_end);
+                }
+            }
+            Ast::Group { ast, .. } => Self::lookahead_shape(ast, set, or_end),
+            _ => panic!("unsupported lookahead body"),
+        }
+    }
+
+    fn comp(&mut self, ast: &Ast, next: u32) -> u32 {
+        match ast {
+            Ast::Empty => next,
+            Ast::Lit(b) => {
+                let set = self.lit_set(*b);
+                self.push(NState::Byte(set, next))
+            }
+            Ast::Set(s) => {
+                let set = self.set_id(pack_set(s));
+                self.push(NState::Byte(set, next))
+            }
+            Ast::Bol => self.push(NState::Assert(Assertion::Bol, next)),
+            Ast::Eol => self.push(NState::Assert(Assertion::Eol, next)),
+            Ast::WordB => self.push(NState::Assert(Assertion::WordB, next)),
+            Ast::NotWordB => self.push(NState::Assert(Assertion::NotWordB, next)),
+            Ast::Group { ast, .. } => self.comp(ast, next),
+            Ast::Look(inner) => {
+                let mut set = [false; 256];
+                let mut or_end = false;
+                Self::lookahead_shape(inner, &mut set, &mut or_end);
+                let id = self.set_id(pack_set(&set));
+                self.push(NState::Assert(Assertion::NextIn(id, or_end), next))
+            }
+            Ast::Cat(items) => {
+                let mut cur = next;
+                for item in items.iter().rev() {
+                    cur = self.comp(item, cur);
+                }
+                cur
+            }
+            Ast::Alt(branches) => {
+                let starts: Vec<u32> = branches.iter().map(|b| self.comp(b, next)).collect();
+                let mut cur = *starts.last().unwrap();
+                for &s in starts.iter().rev().skip(1) {
+                    cur = self.push(NState::Split(s, cur));
+                }
+                cur
+            }
+            Ast::Rep { ast, min, max, .. } => {
+                let mut tail = next;
+                if *max == REP_INF {
+                    let split = self.push(NState::Split(0, next));
+                    let body = self.comp(ast, split);
+                    self.states[split as usize] = NState::Split(body, next);
+                    tail = split;
+                } else {
+                    for _ in 0..(*max - *min) {
+                        let body = self.comp(ast, tail);
+                        tail = self.push(NState::Split(body, next));
+                    }
+                }
+                for _ in 0..*min {
+                    tail = self.comp(ast, tail);
+                }
+                tail
+            }
+        }
+    }
+}
+
+impl Nfa {
+    /// Builds one NFA; several entries may share a pattern id (alternation branches of one pattern).
+    fn build(patterns: &[(usize, Ast, bool)]) -> Nfa {
+        let mut builder = NfaBuilder {
+            states: Vec::new(),
+            sets: Vec::new(),
+            set_ids: std::collections::HashMap::new(),
+            icase: true,
+        };
+        let mut starts = Vec::with_capacity(patterns.len());
+        for (idx, ast, icase) in patterns {
+            builder.icase = *icase;
+            let accept = builder.push(NState::Match(*idx as u32));
+            starts.push(builder.comp(ast, accept));
+        }
+        Nfa {
+            states: builder.states,
+            sets: builder.sets,
+            starts,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Ctx {
+    /// 0 = start of subject, 1 = previous byte is a word byte, 2 = previous byte is not.
+    prev: u8,
+    next: Option<u8>,
+    nl_final: bool,
+}
+
+/// A DFA state is `(pp, c, extra)`: the context class `pp` before the last consumed byte, the class
+/// `c` of that byte, and the NFA threads that have consumed two or more bytes. The threads that
+/// started at the last byte are implied by `(pp, c)` (see `Dfa::start_contrib`), which keeps the
+/// per-state data small.
+struct Dfa {
+    nfa: Nfa,
+    classes: [u8; 256],
+    reps: Vec<u8>,
+    /// Number of byte classes; the extra class `ncls` stands for a final `\n`.
+    ncls: usize,
+    /// Transition columns per state (`ncls + 1`).
+    stride: usize,
+    states: Vec<(u8, u8, Box<[u32]>)>,
+    /// Hash of a state key -> first state id with that hash; `chain` links colliding states.
+    state_ids: std::collections::HashMap<u64, u32>,
+    chain: Vec<u32>,
+    stack: Vec<u32>,
+    flushes: u32,
+    /// `next state | DFA_MATCH_FLAG`, or `DFA_CELL_UNKNOWN` before it is computed.
+    trans: Vec<u16>,
+    /// Match-set id of a transition whose cell carries `DFA_MATCH_FLAG`.
+    tmatch: Vec<u16>,
+    matchsets: Vec<Bits>,
+    matchset_ids: std::collections::HashMap<Bits, u32>,
+    final_match: Vec<u32>,
+    /// Pattern-start contribution keyed by `(prev, d)`; column `stride` holds the end-of-subject one.
+    start_cache: Vec<Option<(Box<[u32]>, Bits)>>,
+    /// Successors of the implied start threads keyed by `(pp, c, d)`.
+    ss_cache: Vec<Option<(Box<[u32]>, Bits)>>,
+    stamp: Vec<u32>,
+    generation: u32,
+}
+
+const DFA_STATE_MASK: u16 = (1 << 15) - 1;
+
+impl Dfa {
+    fn new(patterns: &[(usize, Ast, bool)]) -> Dfa {
+        let nfa = Nfa::build(patterns);
+        // Partition bytes by membership in every NFA class plus the properties assertions look at.
+        let mut signatures: std::collections::HashMap<Vec<u64>, u8> =
+            std::collections::HashMap::new();
+        let mut classes = [0u8; 256];
+        let mut reps = Vec::new();
+        let words = nfa.sets.len().div_ceil(64);
+        for b in 0..=255u8 {
+            let mut sig = vec![0u64; words + 1];
+            for (i, set) in nfa.sets.iter().enumerate() {
+                if set_has(set, b) {
+                    sig[i >> 6] |= 1u64 << (i & 63);
+                }
+            }
+            sig[words] = u64::from(is_word_byte(b)) | (u64::from(b == b'\n') << 1);
+            let next_id = signatures.len();
+            let id = *signatures.entry(sig).or_insert_with(|| {
+                reps.push(b);
+                next_id as u8
+            });
+            classes[b as usize] = id;
+        }
+        let ncls = reps.len();
+        assert!(ncls < 250, "too many byte classes");
+        let nstates = nfa.states.len();
+        let mut dfa = Dfa {
+            nfa,
+            classes,
+            reps,
+            ncls,
+            stride: ncls + 1,
+            states: Vec::new(),
+            state_ids: std::collections::HashMap::new(),
+            chain: Vec::new(),
+            stack: Vec::new(),
+            flushes: 0,
+            trans: Vec::new(),
+            tmatch: Vec::new(),
+            matchsets: Vec::new(),
+            matchset_ids: std::collections::HashMap::new(),
+            final_match: Vec::new(),
+            start_cache: Vec::new(),
+            ss_cache: Vec::new(),
+            stamp: vec![0; nstates],
+            generation: 0,
+        };
+        dfa.start_cache = vec![None; 3 * (dfa.stride + 1)];
+        dfa.ss_cache = vec![None; 3 * (dfa.ncls + 2) * dfa.stride];
+        dfa.reset();
+        dfa
+    }
+
+    /// Class index meaning "no byte consumed yet".
+    fn none_class(&self) -> u8 {
+        (self.ncls + 1) as u8
+    }
+
+    fn reset(&mut self) {
+        self.states.clear();
+        self.state_ids.clear();
+        self.chain.clear();
+        self.trans.clear();
+        self.tmatch.clear();
+        self.matchsets.clear();
+        self.matchset_ids.clear();
+        self.final_match.clear();
+        self.matchsets.push([0; BITS_W]);
+        self.matchset_ids.insert([0; BITS_W], 0);
+        let none = self.none_class();
+        self.intern(0, none, &[]);
+    }
+
+    fn state_hash(pp: u8, c: u8, extra: &[u32]) -> u64 {
+        let mut h = 0xCBF2_9CE4_8422_2325u64 ^ (u64::from(pp) << 8) ^ u64::from(c);
+        for &k in extra {
+            h = (h ^ u64::from(k)).wrapping_mul(0x0000_0100_0000_01B3);
+            h ^= h >> 29;
+        }
+        h
+    }
+
+    fn intern(&mut self, pp: u8, c: u8, extra: &[u32]) -> u32 {
+        let hash = Self::state_hash(pp, c, extra);
+        let mut cursor = self.state_ids.get(&hash).copied();
+        while let Some(id) = cursor {
+            let (p, cl, k) = &self.states[id as usize];
+            if *p == pp && *cl == c && k.as_ref() == extra {
+                return id;
+            }
+            let next = self.chain[id as usize];
+            cursor = if next == DFA_UNKNOWN {
+                None
+            } else {
+                Some(next)
+            };
+        }
+        let id = self.states.len() as u32;
+        self.states.push((pp, c, extra.into()));
+        self.chain
+            .push(self.state_ids.insert(hash, id).unwrap_or(DFA_UNKNOWN));
+        self.trans
+            .extend(std::iter::repeat_n(DFA_CELL_UNKNOWN, self.stride));
+        self.tmatch.extend(std::iter::repeat_n(0, self.stride));
+        self.final_match.push(DFA_UNKNOWN);
+        id
+    }
+
+    fn matchset_id(&mut self, bits: Bits) -> u32 {
+        if let Some(id) = self.matchset_ids.get(&bits) {
+            return *id;
+        }
+        let id = self.matchsets.len() as u32;
+        self.matchsets.push(bits);
+        self.matchset_ids.insert(bits, id);
+        id
+    }
+
+    fn assertion_holds(&self, a: Assertion, ctx: Ctx) -> bool {
+        match a {
+            Assertion::Bol => ctx.prev == 0,
+            Assertion::Eol => ctx.next.is_none() || ctx.nl_final,
+            Assertion::WordB | Assertion::NotWordB => {
+                let before = ctx.prev == 1;
+                let after = ctx.next.is_some_and(is_word_byte);
+                (before != after) == matches!(a, Assertion::WordB)
+            }
+            Assertion::NextIn(set, or_end) => match ctx.next {
+                None => or_end,
+                Some(c) => (ctx.nl_final && or_end) || set_has(&self.nfa.sets[set as usize], c),
+            },
+        }
+    }
+
+    /// Epsilon closure of `roots` under `ctx`: appends the NFA states reached after consuming
+    /// `ctx.next` to `kernel` and the matching patterns to `matches`.
+    fn closure(&mut self, roots: &[u32], ctx: Ctx, kernel: &mut Vec<u32>, matches: &mut Bits) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.stamp.iter_mut().for_each(|v| *v = 0);
+            self.generation = 1;
+        }
+        let mut stack = std::mem::take(&mut self.stack);
+        stack.clear();
+        stack.extend_from_slice(roots);
+        while let Some(st) = stack.pop() {
+            if self.stamp[st as usize] == self.generation {
+                continue;
+            }
+            self.stamp[st as usize] = self.generation;
+            match self.nfa.states[st as usize] {
+                NState::Byte(set, next) => {
+                    if let Some(c) = ctx.next
+                        && set_has(&self.nfa.sets[set as usize], c)
+                    {
+                        kernel.push(next);
+                    }
+                }
+                NState::Split(a, b) => {
+                    stack.push(a);
+                    stack.push(b);
+                }
+                NState::Assert(a, next) => {
+                    if self.assertion_holds(a, ctx) {
+                        stack.push(next);
+                    }
+                }
+                NState::Match(p) => matches[(p >> 6) as usize] |= 1u64 << (p & 63),
+            }
+        }
+        self.stack = stack;
+    }
+
+    /// Byte used for context decisions for class `c` (`ncls` = final newline).
+    fn class_rep(&self, c: u8) -> (u8, bool) {
+        if c as usize == self.ncls {
+            (b'\n', true)
+        } else {
+            (self.reps[c as usize], false)
+        }
+    }
+
+    /// `prev` context value after consuming a byte of class `c`.
+    fn prev_after(&self, c: u8) -> u8 {
+        if c == self.none_class() {
+            0
+        } else if is_word_byte(self.class_rep(c).0) {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Fills the pattern-start contribution for next-byte class `d` (`d == stride` = end of
+    /// subject) after context `prev`: the NFA states reached after consuming `d`, and the patterns
+    /// that match at this position. Returns its cache index.
+    fn ensure_start(&mut self, prev: u8, d: usize) -> usize {
+        let idx = prev as usize * (self.stride + 1) + d;
+        if self.start_cache[idx].is_some() {
+            return idx;
+        }
+        let ctx = if d == self.stride {
+            Ctx {
+                prev,
+                next: None,
+                nl_final: false,
+            }
+        } else {
+            let (rep, nl_final) = self.class_rep(d as u8);
+            Ctx {
+                prev,
+                next: Some(rep),
+                nl_final,
+            }
+        };
+        let roots = std::mem::take(&mut self.nfa.starts);
+        let mut kernel = Vec::new();
+        let mut matches = [0; BITS_W];
+        self.closure(&roots, ctx, &mut kernel, &mut matches);
+        self.nfa.starts = roots;
+        kernel.sort_unstable();
+        kernel.dedup();
+        self.start_cache[idx] = Some((kernel.into_boxed_slice(), matches));
+        idx
+    }
+
+    /// Fills the successors (and matches) of the threads implied by `(pp, c)` for next-byte class
+    /// `d`. Returns its cache index.
+    fn ensure_implied(&mut self, pp: u8, c: u8, d: usize, ctx: Ctx) -> usize {
+        let idx = (pp as usize * (self.ncls + 2) + c as usize) * self.stride + d;
+        if self.ss_cache[idx].is_some() {
+            return idx;
+        }
+        let start_idx = self.ensure_start(pp, c as usize);
+        let roots = self.start_cache[start_idx]
+            .as_ref()
+            .map(|entry| entry.0.to_vec())
+            .unwrap_or_default();
+        let mut successors = Vec::new();
+        let mut matches = [0; BITS_W];
+        self.closure(&roots, ctx, &mut successors, &mut matches);
+        successors.sort_unstable();
+        successors.dedup();
+        self.ss_cache[idx] = Some((successors.into_boxed_slice(), matches));
+        idx
+    }
+
+    /// Computes the transition from `s` on class `d` (`d == ncls` is a final `\n`) and stores it.
+    fn compute(&mut self, s: u32, d: usize) -> (u16, u16) {
+        let (pp, c, extra) = self.states[s as usize].clone();
+        let prev = self.prev_after(c);
+        let (rep, nl_final) = self.class_rep(d as u8);
+        let ctx = Ctx {
+            prev,
+            next: Some(rep),
+            nl_final,
+        };
+        let start_idx = self.ensure_start(prev, d);
+        let mut matches = self.start_cache[start_idx]
+            .as_ref()
+            .map_or([0; BITS_W], |e| e.1);
+        let mut next_extra: Vec<u32> = Vec::new();
+        if c != self.none_class() {
+            let idx = self.ensure_implied(pp, c, d, ctx);
+            if let Some((succ, implied_matches)) = &self.ss_cache[idx] {
+                next_extra.extend_from_slice(succ);
+                for i in 0..BITS_W {
+                    matches[i] |= implied_matches[i];
+                }
+            }
+        }
+        self.closure(&extra, ctx, &mut next_extra, &mut matches);
+        next_extra.sort_unstable();
+        next_extra.dedup();
+
+        let reset = self.states.len() >= DFA_MAX_STATES || self.matchsets.len() >= 60_000;
+        if reset {
+            self.flushes += 1;
+            self.reset();
+        }
+        let next_state = self.intern(prev, d as u8, &next_extra);
+        let has_matches = matches != [0; BITS_W];
+        let match_id = if has_matches {
+            self.matchset_id(matches)
+        } else {
+            0
+        };
+        let cell = next_state as u16 | if has_matches { DFA_MATCH_FLAG } else { 0 };
+        if !reset {
+            let idx = s as usize * self.stride + d;
+            self.trans[idx] = cell;
+            self.tmatch[idx] = match_id as u16;
+        }
+        (cell, match_id as u16)
+    }
+
+    fn final_matches(&mut self, s: u32) -> Bits {
+        let cached = self.final_match[s as usize];
+        if cached != DFA_UNKNOWN {
+            return self.matchsets[cached as usize];
+        }
+        let (pp, c, extra) = self.states[s as usize].clone();
+        let prev = self.prev_after(c);
+        let ctx = Ctx {
+            prev,
+            next: None,
+            nl_final: false,
+        };
+        let end_idx = self.ensure_start(prev, self.stride);
+        let mut matches = self.start_cache[end_idx]
+            .as_ref()
+            .map_or([0; BITS_W], |e| e.1);
+        let mut roots: Vec<u32> = extra.to_vec();
+        if c != self.none_class() {
+            let idx = self.ensure_start(pp, c as usize);
+            if let Some((kernel, _)) = &self.start_cache[idx] {
+                roots.extend_from_slice(kernel);
+            }
+        }
+        let mut sink = Vec::new();
+        self.closure(&roots, ctx, &mut sink, &mut matches);
+        let id = self.matchset_id(matches);
+        self.final_match[s as usize] = id;
+        matches
+    }
+
+    fn scan(&mut self, h: &[u8]) -> Bits {
+        let mut acc: Bits = [0; BITS_W];
+        if h.is_empty() {
+            return acc;
+        }
+        if self.flushes >= DFA_MAX_FLUSHES {
+            DFA_DEGRADED.with(|c| c.set(true));
+            MATCH_ABORTED.with(|c| c.set(true));
+            return acc;
+        }
+        let (body, trailing_newline) = match h.split_last() {
+            Some((b'\n', rest)) => (rest, true),
+            _ => (h, false),
+        };
+        let mut s = 0u32;
+        let stride = self.stride;
+        for &b in body {
+            let cls = self.classes[b as usize] as usize;
+            let idx = s as usize * stride + cls;
+            let mut t = self.trans[idx];
+            let mut mid = 0;
+            if t == DFA_CELL_UNKNOWN {
+                (t, mid) = self.compute(s, cls);
+            } else if t & DFA_MATCH_FLAG != 0 {
+                mid = self.tmatch[idx];
+            }
+            if t & DFA_MATCH_FLAG != 0 {
+                let set = &self.matchsets[mid as usize];
+                for i in 0..BITS_W {
+                    acc[i] |= set[i];
+                }
+            }
+            s = u32::from(t & DFA_STATE_MASK);
+        }
+        if trailing_newline {
+            let cls = self.ncls;
+            let idx = s as usize * stride + cls;
+            let mut t = self.trans[idx];
+            let mut mid = 0;
+            if t == DFA_CELL_UNKNOWN {
+                (t, mid) = self.compute(s, cls);
+            } else if t & DFA_MATCH_FLAG != 0 {
+                mid = self.tmatch[idx];
+            }
+            if t & DFA_MATCH_FLAG != 0 {
+                let set = &self.matchsets[mid as usize];
+                for i in 0..BITS_W {
+                    acc[i] |= set[i];
+                }
+            }
+            s = u32::from(t & DFA_STATE_MASK);
+        }
+        let fin = self.final_matches(s);
+        for i in 0..BITS_W {
+            acc[i] |= fin[i];
+        }
+        acc
+    }
+}
+
+/// Whether `ast` loops over a wide byte class (such as `.*`): the DFA must then remember which
+/// earlier parts of the pattern were already seen, which multiplies the number of states.
+fn ast_has_wide_loop(ast: &Ast) -> bool {
+    match ast {
+        Ast::Rep {
+            ast: inner, max, ..
+        } => {
+            let wide = |a: &Ast| match a {
+                Ast::Set(set) => set.iter().filter(|member| **member).count() >= 60,
+                _ => false,
+            };
+            (*max == REP_INF && wide(inner)) || ast_has_wide_loop(inner)
+        }
+        Ast::Cat(items) | Ast::Alt(items) => items.iter().any(ast_has_wide_loop),
+        Ast::Group { ast, .. } | Ast::Look(ast) => ast_has_wide_loop(ast),
+        _ => false,
+    }
+}
+
+/// The pattern table split into independent scanners: patterns with wide gaps (`A.*B.*C`) live in
+/// their own DFA so that their "seen A" memory does not multiply the states of the plain patterns.
+struct DfaSet {
+    groups: Vec<Dfa>,
+}
+
+impl DfaSet {
+    fn new() -> DfaSet {
+        let mut plain: Vec<(usize, Ast, bool)> = Vec::new();
+        let mut gapped: Vec<(usize, Ast, bool)> = Vec::new();
+        for (idx, (pattern, icase)) in pattern_table().into_iter().enumerate() {
+            let mut parser = Parser {
+                p: pattern.as_bytes(),
+                i: 0,
+                icase,
+                ncap: 0,
+            };
+            let ast = parser.parse_alt();
+            assert!(parser.i == parser.p.len(), "unbalanced pattern: {pattern}");
+            // Top-level alternation branches are independent: only the gapped ones need the
+            // memory-tracking scanner, the rest stay with the plain patterns.
+            let branches = match ast {
+                Ast::Alt(branches) => branches,
+                other => vec![other],
+            };
+            for branch in branches {
+                if ast_has_wide_loop(&branch) {
+                    gapped.push((idx, branch, icase));
+                } else {
+                    plain.push((idx, branch, icase));
+                }
+            }
+        }
+        DfaSet {
+            groups: [plain, gapped]
+                .iter()
+                .filter(|patterns| !patterns.is_empty())
+                .map(|patterns| Dfa::new(patterns))
+                .collect(),
+        }
+    }
+
+    fn scan(&mut self, h: &[u8]) -> Bits {
+        let mut acc: Bits = [0; BITS_W];
+        for group in &mut self.groups {
+            let bits = group.scan(h);
+            for i in 0..BITS_W {
+                acc[i] |= bits[i];
+            }
+        }
+        acc
+    }
+}
+
+thread_local! {
+    /// Set once the DFA cache has been flushed too often; every scan then declines.
+    static DFA_DEGRADED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DFA: std::cell::RefCell<Option<DfaSet>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Most-recently-scanned subjects, compared by content (never by address) so that the several
+/// categorizers a pipeline runs on one release name share a single DFA pass.
+struct ScanCache {
+    entries: Vec<(Vec<u8>, Bits)>,
+    next: usize,
+    slots: usize,
+}
+
+impl ScanCache {
+    const fn new(slots: usize) -> Self {
+        ScanCache {
+            entries: Vec::new(),
+            next: 0,
+            slots,
+        }
+    }
+
+    #[inline]
+    fn find(&self, h: &[u8]) -> Option<Bits> {
+        self.entries
+            .iter()
+            .find(|entry| entry.0.as_slice() == h)
+            .map(|entry| entry.1)
+    }
+
+    fn insert(&mut self, h: &[u8], bits: Bits) {
+        if self.entries.len() < self.slots {
+            self.entries.push((h.to_vec(), bits));
+        } else {
+            let entry = &mut self.entries[self.next];
+            entry.0.clear();
+            entry.0.extend_from_slice(h);
+            entry.1 = bits;
+            self.next = (self.next + 1) % self.slots;
+        }
+    }
+}
+
+const SCAN_CACHE_MAX_LEN: usize = 512;
+
+thread_local! {
+    /// Release names: the current name is reused by every categorizer of one pipeline run.
+    static NAME_CACHE: std::cell::RefCell<ScanCache> = const { std::cell::RefCell::new(ScanCache::new(2)) };
+    /// Group names and posters repeat across many releases.
+    static AUX_CACHE: std::cell::RefCell<ScanCache> = const { std::cell::RefCell::new(ScanCache::new(16)) };
+}
+
+/// Scans `h` once and returns the bitset of table patterns that match it.
+fn scan_patterns(h: &[u8], aux: bool) -> Bits {
+    if h.is_empty() {
+        return [0; BITS_W];
+    }
+    if DFA_DEGRADED.with(|c| c.get()) {
+        MATCH_ABORTED.with(|c| c.set(true));
+        return [0; BITS_W];
+    }
+    let cache = if aux { &AUX_CACHE } else { &NAME_CACHE };
+    let cacheable = h.len() <= SCAN_CACHE_MAX_LEN;
+    if cacheable && let Some(bits) = cache.with(|c| c.borrow().find(h)) {
+        return bits;
+    }
+    let bits = DFA.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let dfa = guard.get_or_insert_with(DfaSet::new);
+        dfa.scan(h)
+    });
+    if cacheable && !DFA_DEGRADED.with(|c| c.get()) {
+        cache.with(|c| c.borrow_mut().insert(h, bits));
+    }
+    bits
+}
+
+patterns! {
+    HAS_ONLY_FANS_MARKER_1 = i r"\bOnly[-_ ]?Fans\b";
+    HAS_ADULT_MARKERS_UNCACHED_1 = i r"\b(XXX|Porn|Anal|Brazzers|BangBros|Bangbros|NaughtyAmerica|RealityKings|Tushy|Vixen|Blacked|OnlyFans|MetArt|JoyMii|Creampie|MP4-XXX|PureTaboo|Lady[._ -]?Lyne|TeamSkeet|GirlsWay|EvilAngel|Kink|FakeHub|FakeTaxi|SexArt|Nubiles|Defloration|Deeper|Bellesa|Twistys|Mofos|MissaX|LegalPorno|AnalVids|JAV|Hentai|RoccoSiffredi|DivineBitches|Device[._ -]?Bondage|Hogtied|Wired[._ -]?Pussy|Fucking[._ -]?Machines|Ultimate[._ -]?Surrender|Public[._ -]?Disgrace|Sex[._ -]?And[._ -]?Submission|Bound[._ -]?Gang[._ -]?Bangs|Electro[._ -]?Sluts|Whipped[._ -]?Ass|TS[._ -]?Seduction|Infernal[._ -]?Restraints|Sexually[._ -]?Broken)\b";
+    HAS_ADULT_MARKERS_UNCACHED_2 = i r"\b(Fuck|Fucked|Fucking|Cock|Dick|Pussy|Cum|Cumshot|Blowjob|Handjob|MILF|Teen|Lesbian|Threesome|Gangbang|Hardcore|Interracial)\b";
+    HAS_ADULT_MARKERS_UNCACHED_3 = i r"\b(720p|1080p|2160p|4k|mp4)\b";
+    HAS_STANDALONE_SEASON_TOKEN_1 = i r"(?:^|[._ -])S\d{1,3}(?=$|[._ -])";
+    TV_SEASON_SKIP_1 = i r"[._ -]S\d{1,3}[._ -]?(E\d|Complete|Full|1080|720|480|2160|WEB|HDTV|BluRay)";
+    CATEGORIZE_GROUP_NAME_1 = i r"alt\.binaries\..*anime";
+    CATEGORIZE_GROUP_NAME_2 = i r"alt\.binaries\..*?(tv|hdtv|tvseries)";
+    CATEGORIZE_GROUP_NAME_3 = i r"alt\.binaries\..*?(movies?|dvd|bluray|x264)";
+    CATEGORIZE_GROUP_NAME_4 = i r"alt\.binaries\..*?(erotica|pictures\.erotica|xxx)";
+    CATEGORIZE_GROUP_NAME_5 = i r"alt\.binaries\..*?(sounds?|mp3|music|lossless)";
+    CATEGORIZE_GROUP_NAME_6 = i r"alt\.binaries\..*?(games?|console|psx|nintendo)";
+    CATEGORIZE_GROUP_NAME_7 = i r"alt\.binaries\..*?(warez|0day|apps?|software)";
+    CATEGORIZE_GROUP_NAME_8 = i r"alt\.binaries\..*?(e-?book|ebook|comics?)";
+    PC_CHECK_PHONE_1 = i r"[^a-z0-9](IPHONE|ITOUCH|IPAD)[._ -]";
+    PC_CHECK_PHONE_2 = i r"[._ -]?(ANDROID)[._ -]";
+    PC_CHECK_PHONE_3 = i r"[^a-z0-9](symbian|xscale|wm5|wm6)[._ -]";
+    PC_CHECK_MAC_1 = i r"(\b|[._ -])mac([\.\s])?osx(\b|[\-_. ])";
+    PC_CHECK_MAC_2 = i r"\b(Mac\s?OS\s?X|macOS)\b";
+    PC_CHECK_PC_GAME_1 = i r"\b(PS5|PS4|PS3|PlayStation|PS(Vita|V)\b|Xbox\s?(Series|One|360)|XBOX(ONE|360|SERIES|SX|SS)?|XSX|XSS|XBSX|NSW|Switch|WiiU|Wii|3DS|NDS|PSP|PSV(ita)?|GameCube|NGC|CUSA\d{5}|XCI|NSP|PKG)\b";
+    PC_CHECK_PC_GAME_2 = i r"\b(S\d{1,4}[._ -]?E\d{1,4}|S\d{1,4}[._ -]?D\d{1,4}|\d{1,2}x\d{2,3}|Season[._ -]?\d{1,3}|Episode[._ -]?\d{1,4}|HDTV|PDTV|DSR|WEB[._ -]?DL|WEB[._ -]?RIP|TVRip)\b";
+    PC_CHECK_PC_GAME_3 = i &format!("[-.]({PC_GROUPS})$");
+    PC_CHECK_PC_GAME_4 = i PC_KEYWORDS;
+    PC_CHECK_PC_GAME_5 = i r"<PC@MASTER\.RACE>";
+    PC_CHECK_ISO_1 = i r"[._ -]([a-zA-Z]{2,10})?iso[ _.-]|[\-. ]([a-z]{2,10})?iso$";
+    PC_CHECK_ISO_2 = i r"[._ -](DYNAMiCS|INFINITESKILLS|UDEMY|kEISO|PLURALSIGHT|DIGITALTUTORS|TUTSPLUS|OSTraining|PRODEV|CBT\.Nuggets|COMPRISED)";
+    PC_CHECK_0DAY_1 = i r"\.(msix|msixbundle|appx|appxbundle|msi)$";
+    PC_CHECK_0DAY_2 = i r"[._ -]exe$|[._ -](utorrent|Virtualbox)[._ -]|\b0DAY\b|incl.+crack| DRM$|>DRM<";
+    PC_CHECK_0DAY_3 = i r"[._ -]((32|64)bit|converter|i\d86|key(gen|maker)|freebsd|GAMEGUiDE|hpux|irix|linux|multilingual|Patch|Pro v\d{1,3}|portable|regged|software|solaris|template|unix|win2kxp2k3|win64|win(2k|32|64|all|dows|nt(2k)?(xp)?|xp)|win9x(me|nt)?|x(32|64|86))[._ -]";
+    PC_CHECK_0DAY_4 = i r"\b(Adobe|auto(cad|desk)|-BEAN|Cracked|Cucusoft|CYGNUS|Divx[._ -]Plus|\.(deb|exe)|DIGERATI|FOSI|-FONT|Key(filemaker|gen|maker)|Lynda\.com|lz0|MULTiLANGUAGE|Microsoft\s*(Office|Windows|Server)|MultiOS|-(iNViSiBLE|SPYRAL|SUNiSO|UNION|TE)|v\d{1,3}.*?Pro|[._ -]v\d{1,3}[._ -]|\(x(64|86)\)|Xilisoft)\b";
+    CATEGORIZE_CONSOLE_1 = i r"^PS4[_\.\-]";
+    CATEGORIZE_CONSOLE_2 = i r"CUSA\d{5}";
+    CATEGORIZE_CONSOLE_3 = i r"\.PS4-DUPLEX$";
+    CATEGORIZE_CONSOLE_4 = i r"\bPS4\b|PlayStation\s*4";
+    CATEGORIZE_CONSOLE_5 = i r"\bPS3\b|PlayStation\s*3";
+    CATEGORIZE_CONSOLE_6 = i r"\bPS\s?Vita\b|PSV(ita)?\b";
+    CATEGORIZE_CONSOLE_7 = i r"\bPSP\b|PlayStation\s*Portable";
+    CATEGORIZE_CONSOLE_8 = i r"\b(XboxOne|XBOX\s*One|XBONE|XB1|Xbox\s*Series[._ -]?[SX]|XSX|XSS)\b";
+    CATEGORIZE_CONSOLE_9 = i r"\b(Xbox360|XBOX360|X360)\b";
+    CATEGORIZE_CONSOLE_10 = i r"\bXBOX\b";
+    CATEGORIZE_CONSOLE_11 = i r"\b(XBOX\s?360|XBOX\s?ONE|Series)\b";
+    CATEGORIZE_CONSOLE_12 = i r"\bWii\s*U\b|WiiU";
+    CATEGORIZE_CONSOLE_13 = i r"\bWii\b";
+    CATEGORIZE_CONSOLE_14 = i r"WiiU";
+    CATEGORIZE_CONSOLE_15 = i r"\b3DS\b|Nintendo\s*3DS";
+    CATEGORIZE_CONSOLE_16 = i r"\bNDS\b|Nintendo\s*DS";
+    CATEGORIZE_CONSOLE_17 = i r"\b(PS[12X]|PS2|SNES|NES|SEGA|GB[AC]?|Dreamcast|Saturn|Atari|N64)\b";
+    CATEGORIZE_CONSOLE_18 = i r"\b(EUR|JP|JPN|NTSC|PAL|USA|ROM)\b";
+    MUSIC_FOREIGN_1 = i &format!(
+        r"(?:^|[\s\.\-_])(?:{FOREIGN_LANGUAGES}|{LANGUAGE_CODES})(?:$|[\s\.\-_])"
+    );
+    MUSIC_CHECK_AUDIOBOOK_1 = i r"(?:^|[^a-zA-Z0-9])(?:Audiobook|Audio\s*Book|Talking\s*Book|ABEE|Audible)";
+    MUSIC_CHECK_AUDIOBOOK_2 = i r"\b(?:Unabridged|Abridged|Narrated|Narrator|MP3|M4A|M4B|AAC|Read\s+By|Tantor|Blackstone|Brilliance|GraphicAudio|Penguin|Audible)\b";
+    MUSIC_CHECK_AUDIOBOOK_3 = i r"\d+\s*CDs|\d+\s*Hours|Spoken\s+Word";
+    MUSIC_CHECK_AUDIOBOOK_4 = i r"\.(mp3|m4a|m4b|aac|flac|ogg|wma)$";
+    MUSIC_CHECK_AUDIOBOOK_5 = i r"(?:[\(_\[])(?:Audiobook|AB|Unabridged)(?:[\)_\]])";
+    MUSIC_CHECK_AUDIOBOOK_6 = i r"Read\s+By\s+[A-Z][a-z]+\s+[A-Z][a-z]+";
+    MUSIC_CHECK_AUDIOBOOK_7 = i r"(Audiobook|Audio.?Book)";
+    MUSIC_CHECK_PODCAST_1 = i r"(?:^|[^a-zA-Z0-9])(?:Podcast|Pod[._ -]?cast|Pod[._ -]Show)";
+    MUSIC_CHECK_PODCAST_2 = i r"\b(?:NPR|BBC[._ -]Sounds|Gimlet|Wondery|Stitcher|iHeart[._ -]?Radio|Joe[._ -]Rogan|RadioLab|Serial)\b";
+    MUSIC_CHECK_PODCAST_3 = i r"\b(?:Podcast|Episode|EP?[._ -]?\d+|Show)\b";
+    MUSIC_CHECK_PODCAST_4 = i r"podcast";
+    MUSIC_CHECK_VIDEO_1 = i r"(?:^|[^a-zA-Z0-9])(?:Music\s*Video|Concert|Live\s*Show|Tour|Festival|MV|MTV)|\b(?:MVID|MVid)\b";
+    MUSIC_CHECK_VIDEO_2 = i r"\b(?:720p|1080[pi]|2160p|BDRip|BluRay|DVDRip|HDTV|WebRip|WEB-DL|x264|x265)\b";
+    MUSIC_CHECK_VIDEO_3 = i r"\b(?:Live|Unplugged|Acoustic|World\s*Tour|in\s*Concert|Official\s*Video|Bootleg|Remastered)\b";
+    MUSIC_CHECK_VIDEO_4 = i r"\.(mkv|mp4|avi|ts|m2ts|mpg|mpeg|mov|wmv|vob|m4v)$";
+    MUSIC_CHECK_VIDEO_5 = i r"^[A-Z0-9][A-Za-z0-9\.\s\&'\(\)\-]+\s+\-\s+[A-Z0-9][A-Za-z0-9\.\s\&'\(\)\-]+.*?\b(720p|1080[pi]|2160p|Bluray|x264|x265)\b";
+    MUSIC_CHECK_LOSSLESS_1 = i r"(?:^|[^a-zA-Z0-9])(?:FLAC|APE|WAV|ALAC|DSD|DSF|AIFF|PCM|Lossless)|\b(?:FLAC|APE|WAV|ALAC|DSD|DSF|AIFF|PCM)\b";
+    MUSIC_CHECK_LOSSLESS_2 = i r"\b(?:24[Bb]it|96kHz|192kHz|Hi[- ]?Res|HD[- ]?Tracks|Vinyl[- ]?Rip|CD[- ]?Rip|WEB[- ]?Rip|HDtracks|Qobuz|Tidal|MQA|SACD)\b";
+    MUSIC_CHECK_LOSSLESS_3 = i r"\.(flac|ape|wav|aiff|dsf|dff|m4a|tak)$";
+    MUSIC_CHECK_LOSSLESS_4 = i r#"\[(19|20)\d\d\][._ -]\[FLAC\]|([\(\[])flac([\)\]])|FLAC\-(19|20)\d\d\-[a-z0-9]{1,12}|\.flac"|(19|20)\d\d\sFLAC|[._ -]FLAC.+(19|20)\d\d[._ -]| FLAC$"#;
+    MUSIC_CHECK_LOSSLESS_5 = i r"\d{3,4}kbps[._ -]FLAC|\[FLAC\]|\(FLAC\)|FLACME|FLAC[._ -]\d{3,4}(kbps)?|WEB[._ -]FLAC";
+    MUSIC_CHECK_LOSSLESS_6 = i r"\b(?:APE|Monkey's[._ -]Audio|WavPack|WV|TAK|TTA|ALAC|Apple[._ -]Lossless)\b|\.(ape|wv|tak|tta)$";
+    MUSIC_CHECK_MP3_1 = i r"(?:^|[^a-zA-Z0-9])(?:MP3|320kbps|256kbps|192kbps|128kbps|CBR|VBR)|\b(?:MP3)\b|[\._-](?:MP3)[\._-]|\.mp3$";
+    MUSIC_CHECK_MP3_2 = i r"\b(?:320|256|192|128)[._-]?kbps|\b(?:320|256|192|128)[._-]?K|\((?:320|256|192|128)\)|\[(?:320|256|192|128)\]|V0|V2|VBR";
+    MUSIC_CHECK_MP3_3 = i r"\b(?:CD[._-]?Rip|Web[._-]?Rip|WEB|iTunes|AmazonRip|Spotify[._-]?Rip|MP3\s*\-\s*\d{3}kbps)\b";
+    MUSIC_CHECK_MP3_4 = i r#"\.(m3u|mp3)"|rip(?:192|256|320)|[._-]FM[._-].+MP3"#;
+    MUSIC_CHECK_MP3_5 = i r"^[a-zA-Z0-9]{1,12}[._-](19|20)\d\d[._-][a-zA-Z0-9]{1,12}$|[a-z0-9]{1,12}\-(19|20)\d\d\-[a-z0-9]{1,12}";
+    MUSIC_CHECK_MP3_6 = i r"[\.\-\(\[_ ]\d{2,3}k[\.\-\)\]_ ]|\((192|256|320)\)|(320|cd|eac|vbr)[._-]+mp3|(cd|eac|mp3|vbr)[._-]+320";
+    MUSIC_CHECK_OTHER_1 = i r"(?:^|[^a-zA-Z0-9])(?:Compilation|Various[._ -]Artists|OST|Soundtrack|B-Sides|Greatest[._ -]Hits|Anthology)|\b(?:VA|V\.A|Bonus[._ -]Track|Discography|Box[._ -]Set)\b";
+    MUSIC_CHECK_OTHER_2 = i r"(?:\d)[._ -](?:CD|Albums|LP)[._ -](?:Set|Compilation)|CD[._ -](Collection|Box|SET)|(\d)-?CD[._ -]";
+    MUSIC_CHECK_OTHER_3 = i r"Vinyl[._ -](?:24[._ -]96|2496|Collection|RIP)|WEB[._ -](?:Single|Album)|EP[._ -]\d{4}|\bEP\b.+(?:19|20)\d\d|Live[._ -](?:at|At|@)";
+    MUSIC_CHECK_OTHER_4 = i r"\b(?:Ministry[._ -]of[._ -]Sound|Hed[._ -]Kandi|Cream|Fabric[._ -]Live|Ultra[._ -]Music)\b";
+    MUSIC_CHECK_OTHER_5 = i r"\b(?:DJ[._ -]Mix|Mixed[._ -]By|Tiesto[._ -]Club|Radio[._ -]Show|Club[._ -]Hits)\b";
+    BOOK_HAS_SOFTWARE_MARKERS_1 = i r"\b(?:Setup|Install(?:er)?|Portable|Crack(?:ed)?|Keygen|Serial|Regged|Pre-?Activated|Patch(?:ed)?|NFO|ReadNFO|Win(?:dows)?|macOS|Linux|x64|x86|amd64|AIO|Retail|Incl)\b";
+    BOOK_HAS_SOFTWARE_MARKERS_2 = i r"\b(?:Adobe|Foxit|Autodesk|AutoCAD|Corel|Microsoft[._ -]Office|Office(?:365)?|Visual[._ -]Studio|IntelliJ|PyCharm|VMware|VirtualBox)\b";
+    BOOK_HAS_SOFTWARE_MARKERS_3 = i r"\.(?:exe|msi|dmg|pkg)$";
+    BOOK_HAS_VIDEO_COURSE_MARKERS_1 = i &format!(r"\b(?:{BOOK_COURSE_SITES})\b");
+    BOOK_HAS_VIDEO_RELEASE_MARKERS_1 = i r"\b(?:720p|1080p|2160p|4k)\b";
+    BOOK_HAS_VIDEO_RELEASE_MARKERS_2 = i r"\b(?:WEB[._ -]?DL|WEBRip|HDTV|BluRay|BDRip|DVDRip|x264|x265|HEVC|HDR|Remux|AVC)\b";
+    BOOK_HAS_CORROBORATOR_1 = i r"\b(?:ISBN(?:-1[03])?|Edition|Ed\.|Author|Novel|Volume|Vol\.|Chapter|Press|Paperback|Hardcover|E-?book|Kindle|Kobo)\b";
+    BOOK_HAS_CORROBORATOR_2 = i &format!(r"\b(?:{BOOK_PUBLISHERS})\b");
+    BOOK_HAS_CORROBORATOR_3 = i r"\.(?:epub|mobi|azw\d?|fb2|djvu|lit|pdf)$";
+    BOOK_SHOULD_SKIP_1 = i r"\.PS4-[A-Z0-9]+$";
+    BOOK_SHOULD_SKIP_2 = i r"\b(?:PS[1-5]|PlayStation|Xbox|Switch|Nintendo|Wii|3DS|GameCube)\b";
+    BOOK_SHOULD_SKIP_3 = i r"\b(?:PPSA\d{4,6}|CUSA\d{5}|XCI|NSP|PKG)\b";
+    BOOK_SHOULD_SKIP_4 = i r"\bv?\d+(?:\.\d+){1,4}\b.*\b(?:Multilingual|x64|x86|Portable|Setup|Patch|Install(?:er)?|Crack(?:ed)?|Keygen|Serial|Regged|Pre-?Activated)\b";
+    BOOK_SHOULD_SKIP_5 = i r"\b(?:WEB[\.\-_ ]?FLAC|FLAC|MP3|M4A|M4B|AAC|OGG|ALAC|WAV|LOSSLESS|320kbps|256kbps|192kbps|128kbps|VBR|CBR|discography|FALCON|OST|Soundtrack|Vinyl[._ -]?Rip|CD[._ -]?Rip)\b";
+    BOOK_SHOULD_SKIP_6 = i r"\b(?:Ubuntu|Debian|Fedora|Kali|Arch(?:Linux)?|CentOS|OpenSUSE|LinuxMint)\b.*\b(?:ISO|img|amd64|x86_64|installer)\b";
+    BOOK_SHOULD_SKIP_7 = i r"\b(?:ISO|IMG|DMG|bootable)\b";
+    BOOK_SHOULD_SKIP_8 = i r"\b(?:Font(?:s)?|Typeface|OpenType|TrueType)\b";
+    BOOK_SHOULD_SKIP_9 = i r"\.(?:otf|ttf|woff2?)$";
+    BOOK_SHOULD_SKIP_10 = i r"\b(19|20)\d{2}\b.*\b(1080p|720p|2160p|BluRay|WEB-DL|BDRip|DVDRip)\b";
+    BOOK_CHECK_COMIC_1 = i r"\b(?:CBR|CBZ|C2C)\b|\.(?:cbr|cbz)$";
+    BOOK_CHECK_COMIC_2 = i r"\b(?:Marvel|DC[._ -]Comics|Image[._ -]Comics|Dark[._ -]Horse|IDW)\b";
+    BOOK_CHECK_COMIC_3 = i r"\b(?:Comics?|Annual|Issue|Vol|TPB)\b";
+    BOOK_CHECK_COMIC_4 = i r"\b(?:Manga|Manhwa|Manhua|Webtoon)\b";
+    BOOK_CHECK_TECHNICAL_1 = i &format!(r"\b({BOOK_PUBLISHERS})\b");
+    BOOK_CHECK_TECHNICAL_2 = i r"\b(Programming|Python|JavaScript|Java|Database|Linux|DevOps|Machine[._ -]Learning|Data[._ -]Science)\b";
+    BOOK_CHECK_TECHNICAL_3 = i r"\b(?:Book|Guide|Tutorial|Learn|Handbook|Cookbook|Reference)\b";
+    BOOK_CHECK_MAGAZINE_1 = i r"\b(Forbes|Fortune|GQ|National[._ -]Geographic|Newsweek|Vogue|Wired|The[._ -]?Economist|New[._ -]?Yorker|Scientific[._ -]?American|Popular[._ -]?Mechanics|Cosmopolitan|Elle|Esquire|Vanity[._ -]?Fair|Rolling[._ -]?Stone|Entertainment[._ -]?Weekly|People|Playboy)\b";
+    BOOK_CHECK_MAGAZINE_2 = i r"(?:^|[._ -])Issue[._ -]?\d{1,4}(?:$|[._ -,])";
+    BOOK_CHECK_MAGAZINE_3 = i r"\b(?:19|20)\d{2}\b|(?:^|[._ -])(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[._ -]?(?:19|20)?\d{2}\b";
+    BOOK_CHECK_MAGAZINE_4 = i r"[._ -](Monthly|Weekly|Quarterly|Annual)[._ -]";
+    BOOK_CHECK_MAGAZINE_5 = i r"\b([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)\s*-\s*Issue\s+\d+";
+    BOOK_CHECK_MAGAZINE_6 = i r"\bMCN[._ -](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|January|February|March|April|June|July|August|September|October|November|December)[._ -]\d{1,2}[._ -](?:19|20)\d{2}\b";
+    BOOK_CHECK_MAGAZINE_7 = i r"\bMAGAZINE\b";
+    BOOK_CHECK_EBOOK_1 = i r"\.(EPUB|MOBI|AZW\d?|FB2|DJVU|LIT)$";
+    BOOK_CHECK_EBOOK_2 = i r"\b(EPUB|MOBI|AZW\d?|FB2|DJVU|LIT)\b";
+    BOOK_CHECK_EBOOK_3 = i r"\.PDF$";
+    BOOK_CHECK_EBOOK_4 = i r"\bPDF\b";
+    BOOK_CHECK_EBOOK_5 = i r"\b(E-?book|Kindle|Kobo|Nook)\b";
+    BOOK_CHECK_EBOOK_6 = s r"\b(19|20)\d{2}\b";
+    MOVIE_SHOULD_SKIP_1 = i r"[._ -]S\d{1,3}[._ -]?(E\d|D\d|Complete|Full|1080|720|480|2160|WEB|HDTV|BluRay|NF|AMZN)";
+    MOVIE_SHOULD_SKIP_2 = i r"[._ -]E\d{1,4}[._ -]";
+    MOVIE_SHOULD_SKIP_3 = i r"(?:^|[.\-_ \[])(URANiME|ANiHLS|HaiKU|ANiURL|SkyAnime|Erai-raws|LostYears|Vodes|SubsPlease|Judas|Ember|YuiSubs|ASW|Tsundere-Raws|Anime-Raws)(?:[.\-_ \]]|$)";
+    MOVIE_LOOKS_LIKE_1 = i r"[._ -]AVC|[BH][DR]RIP|(Bluray|Blu-Ray)|BD[._ -]?(25|50)?|\bBR\b|Camrip|[._ -]\d{4}[._ -].+(720p|1080p|Cam|HDTS|2160p)|DIVX|[._ -]DVD[._ -]|DVD-?(5|9|R|Rip)|Untouched|VHSRip|XVID|[._ -](DTS|TVrip|webrip|WEBDL|WEB-DL)[._ -]|\b(2160)p\b.*\b(Netflix|Amazon|NF|AMZN|Disney)\b";
+    MOVIE_CHECK_FOREIGN_1 = i r"(danish|flemish|Deutsch|dutch|french|german|heb|hebrew|nl[._ -]?sub|dub(bed|s)?|\.NL|norwegian|swedish|swesub|spanish|Staffel)[._ -]|\(german\)|Multisub";
+    MOVIE_CHECK_FOREIGN_2 = i r"(720p|1080p|AC3|AVC|DIVX|DVD(5|9|RIP|R)|XVID)[._ -](Dutch|French|German|ITA)|\(?(Dutch|French|German|ITA)\)?[._ -](720P|1080p|AC3|AVC|DIVX|DVD(5|9|RIP|R)|WEB(-DL|-?RIP)|HD[._ -]|XVID)";
+    MOVIE_CHECK_X265_1 = i r"(\w+[\.-_\s]+).*(x265).*(Tigole|SESKAPiLE|CHD|IAMABLE|THREESOME|OohLaLa|DEFLATE|NCmt)";
+    MOVIE_CHECK_UHD_1 = i r"(S\d+).*(2160p).*(Netflix|Amazon|NF|AMZN).*(TrollUHD|NTb|VLAD|DEFLATE|CMRG)";
+    MOVIE_CHECK_UHD_2 = i r"\b(UHD|Ultra[._ -]HD|4K)\b";
+    MOVIE_CHECK_UHD_3 = i r"\b(HDR|HDR10|HDR10\+|Dolby[._ -]?Vision)\b";
+    MOVIE_CHECK_UHD_4 = i r"\b(HEVC|H\.?265|x265)\b";
+    MOVIE_CHECK_UHD_5 = i r"\b(BR|BluRay|Blu[._ -]?Ray)\b";
+    MOVIE_CHECK_3D_1 = i r"[._ -]3D\s?[\.\-_\[ ](1080p|(19|20)\d\d|AVC|BD(25|50)|Blu[._ -]?ray|CEE|Complete|GER|MVC|MULTi|SBS|H(-)?SBS)[._ -]";
+    MOVIE_CHECK_BLURAY_1 = i r"bluray-|[._ -]bd?[._ -]?(25|50)|blu-ray|Bluray\s-\sUntouched|[._ -]untouched[._ -]";
+    MOVIE_CHECK_BLURAY_2 = i r"SecretUsenet\.com$";
+    MOVIE_CHECK_DVD_1 = i r"(dvd\-?r|[._ -]dvd|dvd9|dvd5|[._ -]r5)[._ -]";
+    MEDIA_WEB_DL_1 = i r"web[._ -]dl|web-?rip";
+    MOVIE_CHECK_HD_1 = i r"720p|1080p|AVC|VC1|VC-1|web-dl|wmvhd|x264|XvidHD|bdrip";
+    MOVIE_CHECK_SD_1 = i r"(divx|dvdscr|extrascene|dvdrip|\.CAM|HDTS(-LINE)?|vhsrip|xvid(vd)?)[._ -]";
+    MOVIE_CHECK_OTHER_1 = i r"[._ -]cam[._ -]";
+    TV_ANIME_GROUPS_1 = i ANIME_GROUPS_REGEX;
+    TV_ANIME_HASH_1 = i r"^\[.+\].*\d{2,3}.*\[[a-fA-F0-9]{8}\]";
+    TV_IS_SPORT_EVENT_1 = i SPORTS_MARKER_REGEX;
+    TV_IS_SPORT_EVENT_2 = i SPORTS_EVENT_CONTEXT_REGEX;
+    TV_SEASON_EPISODE_1 = i r"[._ -]s\d{1,3}[._ -]?(e|d(isc)?)\d{1,3}([._ -]|$)";
+    TV_LOOKS_LIKE_1 = i r"[._ -]S\d{1,3}[._ -]?(Complete|COMPLETE|Full|FULL)";
+    TV_LOOKS_LIKE_2 = i r"[._ -]S\d{1,3}[._ -](480p|720p|1080[pi]|2160p|4K|UHD|WEB|HDTV|BluRay|NF|AMZN|DSNP|ATVP|HMAX)";
+    TV_LOOKS_LIKE_3 = i r"\b(Episode|Ep)[._ -]?\d{1,4}\b";
+    TV_LOOKS_LIKE_4 = i r"\b(HDTV|PDTV|DSR|TVRip|SATRip|DTHRip)\b";
+    TV_LOOKS_LIKE_5 = i r"[._ -](19|20)\d{2}[._ -]\d{2}[._ -]\d{2}[._ -]";
+    TV_CHECK_ANIME_STRONG_1 = i r"animetosho\.org";
+    TV_CHECK_ANIME_1 = i r"[._ -]Anime[._ -]";
+    TV_CHECK_ANIME_2 = i r"[._ ]no[._ ]";
+    TV_CHECK_ANIME_3 = i r"[._ ](I{1,3}|IV|V|VI{0,3}|IX|X)[._ ]?E\d{1,4}[._ ]";
+    TV_CHECK_ANIME_4 = i r"[._ ]E\d{1,4}[._ ]";
+    TV_CHECK_ANIME_5 = i r"[._ ]S\d{1,3}[._ ]?E\d";
+    TV_CHECK_ANIME_6 = i r"\b(BluRay|BD|BDRip)\b";
+    TV_CHECK_ANIME_7 = i r"\bS\d{1,3}\b";
+    TV_CHECK_ANIME_8 = i r"[._ ](I{1,3}|IV|V|VI{0,3}|IX|X)[._ ]E\d{1,4}[._ ]";
+    TV_CHECK_X265_1 = i r"(S\d+).*(x265).*(rmteam|MeGusta|HETeam|PSA|ONLY|H4S5S|TrollHD|ImE)";
+    TV_CHECK_UHD_1 = i r"S\d+[._ -]?E\d+";
+    TV_CHECK_UHD_2 = i r"2160p";
+    TV_CHECK_UHD_3 = i r"[._ -]S\d+[._ -].*2160p";
+    TV_CHECK_UHD_4 = i r"(S\d+).*(2160p).*(Netflix|Amazon|NF|AMZN).*(TrollUHD|NTb|VLAD|DEFLATE|POFUDUK|CMRG)";
+    TV_CHECK_HD_1 = i r"1080([ip])|720p|bluray";
+    TV_CHECK_SD_1 = i r"(360|480|576)p|Complete[._ -]Season|dvdr(ip)?|dvd5|dvd9|\.pdtv|SD[._ -]TV|TVRip|NTSC|BDRip|hdtv|xvid";
+    TV_CHECK_SD_2 = i r"(([HP])D[._ -]?TV|DSR|WebRip)[._ -]x264";
+    CATEGORIZE_TV_1 = i r"\b(Documentary|Docu[._ -]?Series|DOCU)\b";
+    CATEGORIZE_TV_2 = i r"(danish|flemish|Deutsch|dutch|french|german|hebrew|nl[._ -]?sub|dub(bed|s)?|\.NL|norwegian|swedish|swesub|spanish|Staffel)[._ -]|\(german\)|Multisub";
+    XXX_STUDIOS_1 = i &format!(r"\b({KNOWN_STUDIOS}|{JACQUIE_ET_MICHEL})\b");
+    XXX_ADULT_KEYWORDS_1 = i &format!(r"\b({ADULT_KEYWORDS})\b");
+    XXX_VR_SITES_1 = i &format!(r"\b({VR_SITES})\b");
+    XXX_GENERIC_VR_1 = i GENERIC_VR_SITE;
+    XXX_VR_DEVICES_1 = i &format!(r"\b(?:{VR_DEVICES})\b");
+    XXX_MARKER_1 = i r"\bXXX\b";
+    XXX_LOOKS_LIKE_1 = i r"\b(WEB-?DL|WEBRip|BluRay|BDRip|HDRip|HDTV|DVDRip|Remux|PROPER|REPACK|HC|KORSUB)\b";
+    XXX_LOOKS_LIKE_2 = i r"\b(720p|1080p|2160p|4K|VR180|VR360)\b";
+    XXX_LOOKS_LIKE_3 = i r"\b(720p|1080p|2160p|4k|mp4|mkv|avi|wmv)\b";
+    XXX_LOOKS_LIKE_4 = s r"\b(AV|JAV)\b";
+    XXX_LOOKS_LIKE_5 = i r"^[A-Za-z]+[.\-_ ](19|20)?\d{2}[.\-_ ]\d{2}[.\-_ ]\d{2}[.\-_ ][A-Za-z]";
+    XXX_LOOKS_LIKE_6 = i r"\d{2}[.\-_ ]([a-z]+)[.\-_ ]([a-z]+)[.\-_ ]";
+    XXX_LOOKS_LIKE_7 = i r"\b(S\d{1,2}E\d{1,2}|Episode|Season|HDTV|PDTV)\b";
+    XXX_CHECK_ONLYFANS_1 = i r"\b(photo(?:set)?s?|image(?:set)?s?|pics?|wallpapers?|collections?|packs?)\b";
+    XXX_CHECK_ONLYFANS_2 = i r"\b(mp4|mkv|mov|wmv|avi|webm|h\.?264|x264|h\.?265|x265)\b";
+    XXX_CHECK_VR_1 = i r"\bVR(?:180|360)\b";
+    XXX_CHECK_UHD_1 = i r"\b(2160p|4k|UHD|Ultra[._ -]?HD)\b";
+    XXX_CHECK_UHD_2 = i r"\b(Hardcore|Porn|Sex|Anal|Creampie|MILF|Lesbian|Teen|Interracial)\b";
+    XXX_CHECK_UHD_3 = i r"XXX.+2160p[\w\-.]+M[PO][V4]-(KTR|GUSH|FaiLED|SEXORS|hUSHhUSH|YAPG|WRB|NBQ|FETiSH)";
+    XXX_CHECK_CLIP_HD_1 = i r"^(Complete|Pack|Collection|Anthology|Siterip|SiteRip)\b";
+    XXX_CHECK_CLIP_HD_2 = i r"\b(S\d{1,2}E\d{1,2}|S\d{1,2}|Season\s\d{1,2})\b";
+    XXX_CHECK_CLIP_HD_3 = i r"\b(720p|1080p|2160p|HD|4K)\b";
+    XXX_CHECK_CLIP_HD_4 = i &format!(
+        r"^(?:(?:{KNOWN_STUDIOS}|{JACQUIE_ET_MICHEL})\.|{JACQUIE_ET_MICHEL}[.\-_ ])([A-Z][a-z]+).*?(720p|1080p|2160p|HD|4K)"
+    );
+    XXX_CHECK_CLIP_HD_5 = i &format!(
+        r"^({KNOWN_STUDIOS}|{JACQUIE_ET_MICHEL})[.\-_ ](19|20)?\d{{2}}[.\-_ ]\d{{2}}[.\-_ ]\d{{2}}"
+    );
+    XXX_CHECK_CLIP_HD_6 = i r"^([A-Z][a-zA-Z0-9]+)[.\-_ ](19|20)\d{2}[.\-_ ]\d{2}[.\-_ ]\d{2}[.\-_ ]";
+    XXX_CHECK_CLIP_HD_7 = i r"\b(S\d{2}E\d{2}|Documentary|Series)\b";
+    XXX_CHECK_CLIP_HD_8 = i r"^([A-Z][a-zA-Z0-9]+)\.(\d{2})\.(\d{2})\.(\d{2})\..*?(720p|1080p|2160p|HD|4K)";
+    XXX_CHECK_CLIP_HD_9 = i &format!(r"^({KNOWN_STUDIOS}|{JACQUIE_ET_MICHEL})[.\-_ ](\d{{6}})");
+    XXX_CHECK_CLIP_HD_10 = i &format!(
+        r"^({KNOWN_STUDIOS}|{JACQUIE_ET_MICHEL})[.\-_ ].*\bXXX\b.*?(720p|1080p|2160p|HD|4K)"
+    );
+    XXX_CHECK_CLIP_HD_11 = i r"\b(XXX|MILF|Anal|Sex|Porn)[._ -]+(720p|1080p|2160p|HD|4K)\b";
+    XXX_CHECK_CLIP_HD_12 = i r"\b(720p|1080p|2160p|HD|4K)[._ -]+(XXX|MILF|Anal|Sex|Porn)\b";
+    XXX_CHECK_PACK_1 = i r"[ .]PACK[ .]";
+    XXX_CHECK_CLIP_SD_1 = i r"anon@y[.]com|@md-hobbys[.]com|oz@lot[.]com";
+    XXX_CHECK_CLIP_SD_2 = i r"(iPT\sTeam|KLEENEX)";
+    XXX_CHECK_SD_1 = i r"SDX264XXX|XXX\.HR\.";
+    XXX_CHECK_WEBDL_1 = i r"\b(S\d{1,2}E\d{1,2})\b";
+    XXX_CHECK_WEBDL_2 = i r"\b(XXX|Porn|Adult|JAV|Hentai)\b";
+    XXX_CHECK_X264_1 = i r"\b(x265|hevc)\b";
+    XXX_CHECK_X264_2 = i r"\b((x|h)[\.\-_ ]?264|AVC)\b";
+    XXX_CHECK_X264_3 = i r"\bwmv\b|S\d{1,2}E\d{1,2}|\d+x\d+";
+    XXX_CHECK_X264_4 = i &format!(
+        r"\bXXX\b|a\.b\.erotica|BangBros|{JACQUIE_ET_MICHEL}|Cum|Defloration|Err?oticax?|JoyMii|MetArt|Nubiles|Porn|SexArt|Tushy|Vixen|JAV|Brazzers|NaughtyAmerica|RealityKings"
+    );
+    XXX_CHECK_XVID_1 = i r"(b[dr]|dvd)rip|detoxication|divx|nympho|pornolation|swe6|tesoro|xvid";
+    XXX_CHECK_IMAGESET_1 = i r"IMAGESET|PICTURESET|ABPEA";
+    XXX_CHECK_WMV_1 = i r"\b(720p|1080p|2160p|x264|x265|h264|h265|hevc|XviD|MP4-|\.mp4)[._ -]";
+    XXX_CHECK_WMV_2 = i r"\b(WMV|Windows\s?Media\s?Video)\b|\.wmv$|[._ -]wmv[._ -]";
+    XXX_CHECK_DVD_1 = i r"dvdr[^i]|dvd[59]";
+    XXX_CHECK_OTHER_1 = i r"[._ -]Brazzers|Creampie|[._ -]JAV[._ -]|North\.Pole|She[._ -]?Male|Transsexual|OLDER ANGELS";
+    LIT_CASTELLANO = i r"castellano";
+    LIT_UHD = i r"uhd";
+    LIT_SDPORN = i r"sdporn";
+}
+
+// ----- shared ReleaseContext helpers -----
+
+fn has_only_fans_marker(n: &Subject) -> bool {
+    n.memoized(7, || {
+        n.b.starts_with(b"OF.") || n.hit(HAS_ONLY_FANS_MARKER_1)
+    })
+}
+
+fn has_adult_markers(n: &Subject) -> bool {
+    n.memoized(0, || has_adult_markers_uncached(n))
+}
+
+fn has_adult_markers_uncached(n: &Subject) -> bool {
+    if has_only_fans_marker(n) {
+        return true;
+    }
+    if n.hit(HAS_ADULT_MARKERS_UNCACHED_1) {
+        return true;
+    }
+    n.hit(HAS_ADULT_MARKERS_UNCACHED_2) && n.hit(HAS_ADULT_MARKERS_UNCACHED_3)
+}
+
+fn has_standalone_season_token(n: &Subject) -> bool {
+    n.memoized(1, || n.hit(HAS_STANDALONE_SEASON_TOKEN_1))
+}
+
+fn tv_season_skip(n: &Subject) -> bool {
+    n.memoized(2, || n.hit(TV_SEASON_SKIP_1))
+}
+
+// ----- GroupName -----
+
+fn categorize_group_name(g: &Subject) -> i64 {
+    if g.b.is_empty() || g.b == b"0" {
+        return NO_MATCH;
+    }
+    if g.hit(CATEGORIZE_GROUP_NAME_1) {
+        return hit(group_rules::ANIME, cat::TV_ANIME, 800);
+    }
+    if g.hit(CATEGORIZE_GROUP_NAME_2) {
+        return hit(group_rules::TV, cat::TV_OTHER, 600);
+    }
+    if g.hit(CATEGORIZE_GROUP_NAME_3) {
+        return hit(group_rules::MOVIE, cat::MOVIE_OTHER, 600);
+    }
+    if g.hit(CATEGORIZE_GROUP_NAME_4) {
+        return hit(group_rules::XXX, cat::XXX_OTHER, 700);
+    }
+    if g.hit(CATEGORIZE_GROUP_NAME_5) {
+        return hit(group_rules::MUSIC, cat::MUSIC_OTHER, 600);
+    }
+    if g.hit(CATEGORIZE_GROUP_NAME_6) {
+        return hit(group_rules::GAME, cat::GAME_OTHER, 600);
+    }
+    if g.hit(CATEGORIZE_GROUP_NAME_7) {
+        return hit(group_rules::PC, cat::PC_0DAY, 600);
+    }
+    if g.hit(CATEGORIZE_GROUP_NAME_8) {
+        return hit(group_rules::BOOK, cat::BOOKS_EBOOK, 500);
+    }
+    NO_MATCH
+}
+
+// ----- PC -----
+
+fn pc_should_skip(n: &Subject) -> bool {
+    has_adult_markers(n) || tv_season_skip(n)
+}
+
+fn pc_check_phone(n: &Subject) -> Option<i64> {
+    if n.hit(PC_CHECK_PHONE_1) {
+        return Some(hit(pc_rules::IOS, cat::PC_PHONE_IOS, 900));
+    }
+    if n.hit(PC_CHECK_PHONE_2) {
+        return Some(hit(pc_rules::ANDROID, cat::PC_PHONE_ANDROID, 900));
+    }
+    if n.hit(PC_CHECK_PHONE_3) {
+        return Some(hit(pc_rules::PHONE_OTHER, cat::PC_PHONE_OTHER, 850));
+    }
+    None
+}
+
+fn pc_check_mac(n: &Subject) -> Option<i64> {
+    if n.hit(PC_CHECK_MAC_1) {
+        return Some(hit(pc_rules::MAC, cat::PC_MAC, 900));
+    }
+    if n.hit(PC_CHECK_MAC_2) {
+        return Some(hit(pc_rules::MACOS, cat::PC_MAC, 900));
+    }
+    None
+}
+
+fn pc_check_pc_game(n: &Subject, poster: &Subject) -> Option<i64> {
+    if n.hit(PC_CHECK_PC_GAME_1) || n.hit(PC_CHECK_MAC_2) {
+        return None;
+    }
+    if n.hit(PC_CHECK_PC_GAME_2) {
+        return None;
+    }
+    if n.hit(PC_CHECK_PC_GAME_3) || n.hit(PC_CHECK_PC_GAME_4) {
+        return Some(hit(pc_rules::PC_GAME, cat::PC_GAMES, 900));
+    }
+    if poster.hit(PC_CHECK_PC_GAME_5) {
+        return Some(hit(pc_rules::PC_GAME_POSTER, cat::PC_GAMES, 850));
+    }
+    None
+}
+
+fn pc_check_iso(n: &Subject) -> Option<i64> {
+    if n.hit(PC_CHECK_ISO_1) {
+        return Some(hit(pc_rules::ISO, cat::PC_ISO, 850));
+    }
+    if n.hit(PC_CHECK_ISO_2) {
+        return Some(hit(pc_rules::TRAINING_ISO, cat::PC_ISO, 900));
+    }
+    None
+}
+
+fn pc_check_0day(n: &Subject) -> Option<i64> {
+    if n.hit(PC_CHECK_0DAY_1) {
+        return Some(hit(pc_rules::MSIX, cat::PC_0DAY, 900));
+    }
+    if n.hit(PC_CHECK_0DAY_2) {
+        return Some(hit(pc_rules::EXPLICIT, cat::PC_0DAY, 900));
+    }
+    if n.hit(PC_CHECK_0DAY_3) {
+        return Some(hit(pc_rules::SYSTEM, cat::PC_0DAY, 850));
+    }
+    if n.hit(PC_CHECK_0DAY_4) {
+        return Some(hit(pc_rules::SOFTWARE, cat::PC_0DAY, 850));
+    }
+    None
+}
+
+fn categorize_pc(n: &Subject, poster: &Subject) -> i64 {
+    pc_check_phone(n)
+        .or_else(|| pc_check_mac(n))
+        .or_else(|| pc_check_pc_game(n, poster))
+        .or_else(|| pc_check_iso(n))
+        .or_else(|| pc_check_0day(n))
+        .unwrap_or(NO_MATCH)
+}
+
+// ----- Console -----
+
+fn console_should_skip(n: &Subject) -> bool {
+    has_adult_markers(n) || tv_season_skip(n)
+}
+
+fn categorize_console(n: &Subject) -> i64 {
+    if n.hit(CATEGORIZE_CONSOLE_1)
+        || n.hit(CATEGORIZE_CONSOLE_2)
+        || n.hit(CATEGORIZE_CONSOLE_3)
+        || n.hit(CATEGORIZE_CONSOLE_4)
+    {
+        return hit(console_rules::PS4, cat::GAME_PS4, 900);
+    }
+    if n.hit(CATEGORIZE_CONSOLE_5) {
+        return hit(console_rules::PS3, cat::GAME_PS3, 900);
+    }
+    if n.hit(CATEGORIZE_CONSOLE_6) {
+        return hit(console_rules::PSVITA, cat::GAME_PSVITA, 900);
+    }
+    if n.hit(CATEGORIZE_CONSOLE_7) {
+        return hit(console_rules::PSP, cat::GAME_PSP, 900);
+    }
+    if n.hit(CATEGORIZE_CONSOLE_8) {
+        return hit(console_rules::XBOXONE, cat::GAME_XBOXONE, 900);
+    }
+    if n.hit(CATEGORIZE_CONSOLE_9) {
+        return hit(console_rules::XBOX360, cat::GAME_XBOX360, 900);
+    }
+    if n.hit(CATEGORIZE_CONSOLE_10) && !n.hit(CATEGORIZE_CONSOLE_11) {
+        return hit(console_rules::XBOX, cat::GAME_XBOX, 850);
+    }
+    if n.hit(CATEGORIZE_CONSOLE_12) {
+        return hit(console_rules::WIIU, cat::GAME_WIIU, 900);
+    }
+    if n.hit(CATEGORIZE_CONSOLE_13) && !n.hit(CATEGORIZE_CONSOLE_14) {
+        return hit(console_rules::WII, cat::GAME_WII, 850);
+    }
+    if n.hit(CATEGORIZE_CONSOLE_15) {
+        return hit(console_rules::DS3, cat::GAME_3DS, 900);
+    }
+    if n.hit(CATEGORIZE_CONSOLE_16) {
+        return hit(console_rules::NDS, cat::GAME_NDS, 900);
+    }
+    if n.hit(CATEGORIZE_CONSOLE_17) && n.hit(CATEGORIZE_CONSOLE_18) {
+        return hit(console_rules::RETRO, cat::GAME_OTHER, 800);
+    }
+    NO_MATCH
+}
+
+// ----- Music -----
+
+fn music_should_skip(n: &Subject) -> bool {
+    has_adult_markers(n) || tv_season_skip(n)
+}
+
+fn music_foreign(n: &Subject) -> bool {
+    n.hit(MUSIC_FOREIGN_1)
+}
+
+fn music_pick(
+    n: &Subject,
+    foreign: bool,
+    foreign_rule: (u16, u16),
+    rule: (u16, u16),
+    cat_foreign: u16,
+    cat_plain: u16,
+) -> i64 {
+    if foreign && music_foreign(n) {
+        hit(foreign_rule.0, cat_foreign, foreign_rule.1)
+    } else {
+        hit(rule.0, cat_plain, rule.1)
+    }
+}
+
+fn music_check_audiobook(n: &Subject) -> Option<i64> {
+    if n.hit(MUSIC_CHECK_AUDIOBOOK_1)
+        && (n.hit(MUSIC_CHECK_AUDIOBOOK_2)
+            || n.hit(MUSIC_CHECK_AUDIOBOOK_3)
+            || n.hit(MUSIC_CHECK_AUDIOBOOK_4))
+    {
+        return Some(hit(music_rules::AUDIOBOOK, cat::MUSIC_AUDIOBOOK, 950));
+    }
+    if n.hit(MUSIC_CHECK_AUDIOBOOK_5) || n.hit(MUSIC_CHECK_AUDIOBOOK_6) {
+        return Some(hit(
+            music_rules::AUDIOBOOK_PATTERN,
+            cat::MUSIC_AUDIOBOOK,
+            900,
+        ));
+    }
+    if n.hit(MUSIC_CHECK_AUDIOBOOK_7) {
+        return Some(hit(
+            music_rules::AUDIOBOOK_LEGACY,
+            cat::MUSIC_AUDIOBOOK,
+            850,
+        ));
+    }
+    None
+}
+
+fn music_check_podcast(n: &Subject) -> Option<i64> {
+    if n.hit(MUSIC_CHECK_PODCAST_1) {
+        return Some(hit(music_rules::PODCAST, cat::MUSIC_PODCAST, 900));
+    }
+    if n.hit(MUSIC_CHECK_PODCAST_2) && n.hit(MUSIC_CHECK_PODCAST_3) {
+        return Some(hit(music_rules::PODCAST_NETWORK, cat::MUSIC_PODCAST, 850));
+    }
+    if n.hit(MUSIC_CHECK_PODCAST_4) {
+        return Some(hit(music_rules::PODCAST_SIMPLE, cat::MUSIC_PODCAST, 800));
+    }
+    None
+}
+
+fn music_check_video(n: &Subject, foreign: bool) -> Option<i64> {
+    if n.hit(MUSIC_CHECK_VIDEO_1)
+        && (n.hit(MUSIC_CHECK_VIDEO_2) || n.hit(MUSIC_CHECK_VIDEO_3) || n.hit(MUSIC_CHECK_VIDEO_4))
+    {
+        if foreign && music_foreign(n) {
+            return Some(hit(
+                music_rules::MUSIC_VIDEO_FOREIGN,
+                cat::MUSIC_FOREIGN,
+                850,
+            ));
+        }
+        return Some(hit(music_rules::MUSIC_VIDEO, cat::MUSIC_VIDEO, 900));
+    }
+    if n.hit(MUSIC_CHECK_VIDEO_5) {
+        if foreign && music_foreign(n) {
+            return Some(hit(
+                music_rules::MUSIC_VIDEO_FOREIGN,
+                cat::MUSIC_FOREIGN,
+                800,
+            ));
+        }
+        return Some(hit(music_rules::MUSIC_VIDEO_ARTIST, cat::MUSIC_VIDEO, 800));
+    }
+    None
+}
+
+fn music_check_lossless(n: &Subject, foreign: bool) -> Option<i64> {
+    if n.hit(MUSIC_CHECK_LOSSLESS_1)
+        && (n.hit(MUSIC_CHECK_LOSSLESS_2) || n.hit(MUSIC_CHECK_LOSSLESS_3))
+    {
+        return Some(music_pick(
+            n,
+            foreign,
+            (music_rules::LOSSLESS_FOREIGN, 900),
+            (music_rules::LOSSLESS, 900),
+            cat::MUSIC_FOREIGN,
+            cat::MUSIC_LOSSLESS,
+        ));
+    }
+    if n.hit(MUSIC_CHECK_LOSSLESS_4) || n.hit(MUSIC_CHECK_LOSSLESS_5) {
+        return Some(music_pick(
+            n,
+            foreign,
+            (music_rules::FLAC_FOREIGN, 850),
+            (music_rules::FLAC, 850),
+            cat::MUSIC_FOREIGN,
+            cat::MUSIC_LOSSLESS,
+        ));
+    }
+    if n.hit(MUSIC_CHECK_LOSSLESS_6) {
+        return Some(music_pick(
+            n,
+            foreign,
+            (music_rules::LOSSLESS_FORMAT_FOREIGN, 850),
+            (music_rules::LOSSLESS_FORMAT, 850),
+            cat::MUSIC_FOREIGN,
+            cat::MUSIC_LOSSLESS,
+        ));
+    }
+    None
+}
+
+fn music_check_mp3(n: &Subject, foreign: bool) -> Option<i64> {
+    if n.hit(MUSIC_CHECK_MP3_1)
+        && (n.hit(MUSIC_CHECK_MP3_2) || n.hit(MUSIC_CHECK_MP3_3) || n.hit(MUSIC_CHECK_MP3_4))
+    {
+        return Some(music_pick(
+            n,
+            foreign,
+            (music_rules::MP3_FOREIGN, 850),
+            (music_rules::MP3, 850),
+            cat::MUSIC_FOREIGN,
+            cat::MUSIC_MP3,
+        ));
+    }
+    if n.hit(MUSIC_CHECK_MP3_5) {
+        return Some(music_pick(
+            n,
+            foreign,
+            (music_rules::MP3_SCENE_FOREIGN, 750),
+            (music_rules::MP3_SCENE, 750),
+            cat::MUSIC_FOREIGN,
+            cat::MUSIC_MP3,
+        ));
+    }
+    if n.hit(MUSIC_CHECK_MP3_6) {
+        return Some(music_pick(
+            n,
+            foreign,
+            (music_rules::MP3_BITRATE_FOREIGN, 800),
+            (music_rules::MP3_BITRATE, 800),
+            cat::MUSIC_FOREIGN,
+            cat::MUSIC_MP3,
+        ));
+    }
+    None
+}
+
+fn music_check_other(n: &Subject, foreign: bool) -> Option<i64> {
+    if n.hit(MUSIC_CHECK_OTHER_1) {
+        return Some(music_pick(
+            n,
+            foreign,
+            (music_rules::OTHER_FOREIGN, 800),
+            (music_rules::OTHER, 800),
+            cat::MUSIC_FOREIGN,
+            cat::MUSIC_OTHER,
+        ));
+    }
+    if n.hit(MUSIC_CHECK_OTHER_2) || n.hit(MUSIC_CHECK_OTHER_3) {
+        return Some(music_pick(
+            n,
+            foreign,
+            (music_rules::ALBUM_FOREIGN, 750),
+            (music_rules::ALBUM, 750),
+            cat::MUSIC_FOREIGN,
+            cat::MUSIC_OTHER,
+        ));
+    }
+    if n.hit(MUSIC_CHECK_OTHER_4) || n.hit(MUSIC_CHECK_OTHER_5) {
+        return Some(music_pick(
+            n,
+            foreign,
+            (music_rules::DJ_FOREIGN, 750),
+            (music_rules::DJ, 750),
+            cat::MUSIC_FOREIGN,
+            cat::MUSIC_OTHER,
+        ));
+    }
+    None
+}
+
+fn categorize_music(n: &Subject, flags: u32) -> i64 {
+    let foreign = flag(flags, FLAG_FOREIGN);
+    music_check_audiobook(n)
+        .or_else(|| music_check_podcast(n))
+        .or_else(|| music_check_video(n, foreign))
+        .or_else(|| music_check_lossless(n, foreign))
+        .or_else(|| music_check_mp3(n, foreign))
+        .or_else(|| music_check_other(n, foreign))
+        .unwrap_or(NO_MATCH)
+}
+
+// ----- Book -----
+
+const BOOK_PUBLISHERS: &str =
+    r"Apress|Addison[._ -]Wesley|Manning|No[._ -]Starch|O['’]?Reilly|Packt|Pragmatic|Wiley|Wrox";
+const BOOK_COURSE_SITES: &str = r"Udemy|Pluralsight|Lynda\.?com|Coursera|LinkedIn[._ -]?Learning|Skillshare|MasterClass|CBT[._ -]?Nuggets|Digital-?Tutors";
+
+fn book_has_software_markers(n: &Subject) -> bool {
+    n.hit(BOOK_HAS_SOFTWARE_MARKERS_1)
+        || n.hit(BOOK_HAS_SOFTWARE_MARKERS_2)
+        || n.hit(BOOK_HAS_SOFTWARE_MARKERS_3)
+}
+
+fn book_has_video_course_markers(n: &Subject) -> bool {
+    n.hit(BOOK_HAS_VIDEO_COURSE_MARKERS_1)
+}
+
+fn book_has_video_release_markers(n: &Subject) -> bool {
+    n.hit(BOOK_HAS_VIDEO_RELEASE_MARKERS_1) && n.hit(BOOK_HAS_VIDEO_RELEASE_MARKERS_2)
+}
+
+fn book_has_corroborator(n: &Subject) -> bool {
+    n.hit(BOOK_HAS_CORROBORATOR_1)
+        || n.hit(BOOK_HAS_CORROBORATOR_2)
+        || n.hit(BOOK_HAS_CORROBORATOR_3)
+}
+
+fn book_should_skip(n: &Subject) -> bool {
+    has_adult_markers(n)
+        || n.hit(BOOK_SHOULD_SKIP_1)
+        || n.hit(BOOK_SHOULD_SKIP_2)
+        || n.hit(BOOK_SHOULD_SKIP_3)
+        || n.hit(BOOK_SHOULD_SKIP_4)
+        || book_has_software_markers(n)
+        || n.hit(BOOK_SHOULD_SKIP_5)
+        || book_has_video_course_markers(n)
+        || book_has_video_release_markers(n)
+        || n.hit(BOOK_SHOULD_SKIP_6)
+        || n.hit(BOOK_SHOULD_SKIP_7)
+        || n.hit(BOOK_SHOULD_SKIP_8)
+        || n.hit(BOOK_SHOULD_SKIP_9)
+        || tv_season_skip(n)
+        || n.hit(BOOK_SHOULD_SKIP_10)
+}
+
+fn book_check_comic(n: &Subject) -> Option<i64> {
+    if n.hit(BOOK_CHECK_COMIC_1) {
+        return Some(hit(book_rules::COMIC_FORMAT, cat::BOOKS_COMICS, 900));
+    }
+    if n.hit(BOOK_CHECK_COMIC_2) && n.hit(BOOK_CHECK_COMIC_3) {
+        return Some(hit(book_rules::COMIC_PUBLISHER, cat::BOOKS_COMICS, 850));
+    }
+    if n.hit(BOOK_CHECK_COMIC_4) {
+        return Some(hit(book_rules::MANGA, cat::BOOKS_COMICS, 850));
+    }
+    None
+}
+
+fn book_check_technical(n: &Subject) -> Option<i64> {
+    if book_has_software_markers(n) || book_has_video_course_markers(n) {
+        return None;
+    }
+    if n.hit(BOOK_CHECK_TECHNICAL_1) {
+        return Some(hit(
+            book_rules::TECHNICAL_PUBLISHER,
+            cat::BOOKS_TECHNICAL,
+            900,
+        ));
+    }
+    if n.hit(BOOK_CHECK_TECHNICAL_2) && n.hit(BOOK_CHECK_TECHNICAL_3) && book_has_corroborator(n) {
+        return Some(hit(
+            book_rules::TECHNICAL_SUBJECT,
+            cat::BOOKS_TECHNICAL,
+            850,
+        ));
+    }
+    None
+}
+
+fn book_check_magazine(n: &Subject) -> Option<i64> {
+    let has_title = n.hit(BOOK_CHECK_MAGAZINE_1);
+    let has_issue_number = n.hit(BOOK_CHECK_MAGAZINE_2);
+    let has_date_signal = || n.hit(BOOK_CHECK_MAGAZINE_3);
+    let has_frequency = n.hit(BOOK_CHECK_MAGAZINE_4);
+    let has_issue_style_title = || n.hit(BOOK_CHECK_MAGAZINE_5);
+    let has_mcn = || n.hit(BOOK_CHECK_MAGAZINE_6) && n.hit(BOOK_CHECK_MAGAZINE_7);
+
+    if (has_frequency && (has_issue_number || has_date_signal() || has_title))
+        || (has_issue_number && (has_date_signal() || has_title || has_issue_style_title()))
+        || has_mcn()
+    {
+        return Some(hit(
+            book_rules::MAGAZINE_FREQUENCY,
+            cat::BOOKS_MAGAZINES,
+            900,
+        ));
+    }
+    if has_title {
+        return Some(hit(book_rules::MAGAZINE_TITLE, cat::BOOKS_MAGAZINES, 850));
+    }
+    None
+}
+
+fn book_check_ebook(n: &Subject) -> Option<i64> {
+    if book_has_software_markers(n) {
+        return None;
+    }
+    if n.hit(BOOK_CHECK_EBOOK_1) {
+        return Some(hit(book_rules::EBOOK_FORMAT, cat::BOOKS_EBOOK, 900));
+    }
+    if n.hit(BOOK_CHECK_EBOOK_2) {
+        return Some(hit(book_rules::EBOOK_INDICATOR, cat::BOOKS_EBOOK, 850));
+    }
+    if n.hit(BOOK_CHECK_EBOOK_3) && book_has_corroborator(n) {
+        return Some(hit(book_rules::EBOOK_PDF_FORMAT, cat::BOOKS_EBOOK, 750));
+    }
+    if n.hit(BOOK_CHECK_EBOOK_4) && book_has_corroborator(n) {
+        return Some(hit(book_rules::EBOOK_PDF_INDICATOR, cat::BOOKS_EBOOK, 650));
+    }
+    if n.hit(BOOK_CHECK_EBOOK_5) {
+        return Some(hit(book_rules::EBOOK_PLATFORM, cat::BOOKS_EBOOK, 800));
+    }
+    if book_has_corroborator(n) && n.hit(BOOK_CHECK_EBOOK_6) {
+        return Some(hit(book_rules::EBOOK_BOOK_SIGNALS, cat::BOOKS_EBOOK, 600));
+    }
+    None
+}
+
+fn categorize_book(n: &Subject) -> i64 {
+    book_check_comic(n)
+        .or_else(|| book_check_technical(n))
+        .or_else(|| book_check_magazine(n))
+        .or_else(|| book_check_ebook(n))
+        .unwrap_or(NO_MATCH)
+}
+
+// ----- Movie -----
+
+fn movie_should_skip(n: &Subject) -> bool {
+    has_adult_markers(n)
+        || has_standalone_season_token(n)
+        || n.hit(MOVIE_SHOULD_SKIP_1)
+        || n.hit(MOVIE_SHOULD_SKIP_2)
+        || n.hit(MOVIE_SHOULD_SKIP_3)
+}
+
+fn movie_looks_like(n: &Subject) -> bool {
+    n.hit(MOVIE_LOOKS_LIKE_1)
+}
+
+fn movie_check_foreign(n: &Subject) -> Option<i64> {
+    if n.hit(MOVIE_CHECK_FOREIGN_1) {
+        return Some(hit(movie_rules::FOREIGN_LANGUAGE, cat::MOVIE_FOREIGN, 800));
+    }
+    if n.hit(LIT_CASTELLANO) {
+        return Some(hit(
+            movie_rules::FOREIGN_CASTELLANO,
+            cat::MOVIE_FOREIGN,
+            800,
+        ));
+    }
+    if n.hit(MOVIE_CHECK_FOREIGN_2) {
+        return Some(hit(movie_rules::FOREIGN_PATTERN, cat::MOVIE_FOREIGN, 850));
+    }
+    None
+}
+
+fn movie_check_x265(n: &Subject) -> Option<i64> {
+    if n.hit(MOVIE_CHECK_X265_1) {
+        return Some(hit(movie_rules::X265_GROUP, cat::MOVIE_X265, 900));
+    }
+    None
+}
+
+fn movie_check_uhd(n: &Subject) -> Option<i64> {
+    if n.hit(MOVIE_CHECK_UHD_1) {
+        return None;
+    }
+    if n.hit(TV_CHECK_UHD_2)
+        || n.hit(MOVIE_CHECK_UHD_2)
+        || (n.hit(MOVIE_CHECK_UHD_3) && n.hit(MOVIE_CHECK_UHD_4))
+        || (n.hit(LIT_UHD) && n.hit(MOVIE_CHECK_UHD_5))
+    {
+        return Some(hit(movie_rules::UHD, cat::MOVIE_UHD, 900));
+    }
+    None
+}
+
+fn movie_check_3d(n: &Subject) -> Option<i64> {
+    if n.hit(MOVIE_CHECK_3D_1) {
+        return Some(hit(movie_rules::THREE_D, cat::MOVIE_3D, 900));
+    }
+    None
+}
+
+fn movie_check_bluray(n: &Subject) -> Option<i64> {
+    if n.hit(MOVIE_CHECK_BLURAY_1) && !n.hit(MOVIE_CHECK_BLURAY_2) {
+        return Some(hit(movie_rules::BLURAY, cat::MOVIE_BLURAY, 900));
+    }
+    None
+}
+
+fn movie_check_dvd(n: &Subject) -> Option<i64> {
+    if n.hit(MOVIE_CHECK_DVD_1) {
+        return Some(hit(movie_rules::DVD, cat::MOVIE_DVD, 850));
+    }
+    None
+}
+
+fn media_web_dl(n: &Subject) -> bool {
+    n.memoized(3, || n.hit(MEDIA_WEB_DL_1))
+}
+
+fn movie_check_webdl(n: &Subject) -> Option<i64> {
+    if media_web_dl(n) {
+        return Some(hit(movie_rules::WEBDL, cat::MOVIE_WEBDL, 850));
+    }
+    None
+}
+
+fn movie_check_hd(n: &Subject, cat_webdl: bool) -> Option<i64> {
+    if n.hit(MOVIE_CHECK_HD_1) {
+        return Some(hit(movie_rules::HD, cat::MOVIE_HD, 850));
+    }
+    if !cat_webdl && media_web_dl(n) {
+        return Some(hit(movie_rules::HD_WEBDL_FALLBACK, cat::MOVIE_HD, 800));
+    }
+    None
+}
+
+fn movie_check_sd(n: &Subject) -> Option<i64> {
+    if n.hit(MOVIE_CHECK_SD_1) {
+        return Some(hit(movie_rules::SD, cat::MOVIE_SD, 800));
+    }
+    None
+}
+
+fn movie_check_other(n: &Subject) -> Option<i64> {
+    if n.hit(MOVIE_CHECK_OTHER_1) {
+        return Some(hit(movie_rules::CAM, cat::MOVIE_OTHER, 600));
+    }
+    None
+}
+
+fn categorize_movie(n: &Subject, flags: u32) -> i64 {
+    if !movie_looks_like(n) {
+        return NO_MATCH;
+    }
+    let cat_webdl = flag(flags, FLAG_WEBDL);
+    if flag(flags, FLAG_FOREIGN)
+        && let Some(r) = movie_check_foreign(n)
+    {
+        return r;
+    }
+    movie_check_x265(n)
+        .or_else(|| movie_check_uhd(n))
+        .or_else(|| movie_check_3d(n))
+        .or_else(|| movie_check_bluray(n))
+        .or_else(|| movie_check_dvd(n))
+        .or_else(|| {
+            if cat_webdl {
+                movie_check_webdl(n)
+            } else {
+                None
+            }
+        })
+        .or_else(|| movie_check_hd(n, cat_webdl))
+        .or_else(|| movie_check_sd(n))
+        .or_else(|| movie_check_other(n))
+        .unwrap_or(NO_MATCH)
+}
+
+// ----- TV -----
+
+fn tv_anime_groups(n: &Subject) -> bool {
+    n.hit(TV_ANIME_GROUPS_1)
+}
+
+fn tv_anime_hash(n: &Subject) -> bool {
+    n.hit(TV_ANIME_HASH_1)
+}
+
+fn tv_is_sport_event(n: &Subject) -> bool {
+    n.hit(TV_IS_SPORT_EVENT_1) && n.hit(TV_IS_SPORT_EVENT_2)
+}
+
+fn tv_season_episode(n: &Subject) -> bool {
+    n.hit(TV_SEASON_EPISODE_1)
+}
+
+fn tv_looks_like(n: &Subject) -> bool {
+    has_standalone_season_token(n)
+        || tv_season_episode(n)
+        || n.hit(MOVIE_SHOULD_SKIP_2)
+        || n.hit(TV_LOOKS_LIKE_1)
+        || n.hit(TV_LOOKS_LIKE_2)
+        || n.hit(TV_LOOKS_LIKE_3)
+        || n.hit(TV_LOOKS_LIKE_4)
+        || n.hit(TV_LOOKS_LIKE_5)
+        || tv_is_sport_event(n)
+        || tv_anime_groups(n)
+}
+
+fn tv_check_anime_strong(n: &Subject, group: &Subject, poster: &Subject) -> Option<i64> {
+    if !poster.b.is_empty() && poster.hit(TV_CHECK_ANIME_STRONG_1) {
+        return Some(hit(tv_rules::ANIME_TOSHO_POSTER, cat::TV_ANIME, 980));
+    }
+    if !group.b.is_empty() && group.hit(CATEGORIZE_GROUP_NAME_1) {
+        return Some(hit(tv_rules::ANIME_GROUP_NAME, cat::TV_ANIME, 900));
+    }
+    if tv_anime_groups(n) {
+        return Some(hit(tv_rules::ANIME_GROUP, cat::TV_ANIME, 920));
+    }
+    if tv_anime_hash(n) {
+        return Some(hit(tv_rules::ANIME_HASH, cat::TV_ANIME, 900));
+    }
+    None
+}
+
+fn tv_check_anime(n: &Subject, poster: &Subject) -> Option<i64> {
+    if !poster.b.is_empty() && poster.hit(TV_CHECK_ANIME_STRONG_1) {
+        return Some(hit(tv_rules::ANIME_TOSHO_POSTER, cat::TV_ANIME, 980));
+    }
+    if n.hit(TV_CHECK_ANIME_1) {
+        return Some(hit(tv_rules::ANIME_PATTERN, cat::TV_ANIME, 950));
+    }
+    if tv_anime_groups(n) {
+        return Some(hit(tv_rules::ANIME_GROUP, cat::TV_ANIME, 950));
+    }
+    if tv_anime_hash(n) {
+        return Some(hit(tv_rules::ANIME_HASH, cat::TV_ANIME, 900));
+    }
+    if n.hit(TV_CHECK_ANIME_2)
+        && (n.hit(TV_CHECK_ANIME_3) || (n.hit(TV_CHECK_ANIME_4) && !n.hit(TV_CHECK_ANIME_5)))
+    {
+        return Some(hit(tv_rules::ANIME_JAPANESE_TITLE, cat::TV_ANIME, 900));
+    }
+    if n.hit(MOVIE_SHOULD_SKIP_2) && n.hit(TV_CHECK_ANIME_6) && !n.hit(TV_CHECK_ANIME_7) {
+        return Some(hit(tv_rules::ANIME_EPISODE_BLURAY, cat::TV_ANIME, 800));
+    }
+    if n.hit(TV_CHECK_ANIME_8) && !n.hit(TV_CHECK_ANIME_5) {
+        return Some(hit(tv_rules::ANIME_ROMAN, cat::TV_ANIME, 850));
+    }
+    None
+}
+
+fn tv_check_x265(n: &Subject) -> Option<i64> {
+    if n.hit(TV_CHECK_X265_1) {
+        return Some(hit(tv_rules::X265_GROUP, cat::TV_X265, 900));
+    }
+    None
+}
+
+fn tv_check_uhd(n: &Subject) -> Option<i64> {
+    if n.hit(TV_CHECK_UHD_1) && n.hit(TV_CHECK_UHD_2) {
+        return Some(hit(tv_rules::UHD_EPISODE, cat::TV_UHD, 900));
+    }
+    if n.hit(TV_CHECK_UHD_3) {
+        return Some(hit(tv_rules::UHD_SEASON, cat::TV_UHD, 900));
+    }
+    if n.hit(TV_CHECK_UHD_4) {
+        return Some(hit(tv_rules::UHD_STREAMING, cat::TV_UHD, 900));
+    }
+    None
+}
+
+fn tv_check_hd(n: &Subject, cat_webdl: bool) -> Option<i64> {
+    if n.hit(TV_CHECK_HD_1) {
+        return Some(hit(tv_rules::HD_RESOLUTION, cat::TV_HD, 850));
+    }
+    if !cat_webdl && media_web_dl(n) {
+        return Some(hit(tv_rules::HD_WEBDL_FALLBACK, cat::TV_HD, 800));
+    }
+    None
+}
+
+fn tv_check_sd(n: &Subject) -> Option<i64> {
+    if n.hit(TV_CHECK_SD_1) {
+        return Some(hit(tv_rules::SD_FORMAT, cat::TV_SD, 800));
+    }
+    if n.hit(TV_CHECK_SD_2) {
+        return Some(hit(tv_rules::SD_CODEC, cat::TV_SD, 800));
+    }
+    None
+}
+
+fn categorize_tv(n: &Subject, group: &Subject, poster: &Subject, flags: u32) -> i64 {
+    if let Some(r) = tv_check_anime_strong(n, group, poster) {
+        return r;
+    }
+    if !tv_looks_like(n) {
+        return NO_MATCH;
+    }
+    if let Some(r) = tv_check_anime(n, poster) {
+        return r;
+    }
+    if tv_is_sport_event(n) {
+        return hit(tv_rules::SPORT, cat::TV_SPORT, 850);
+    }
+    if n.hit(CATEGORIZE_TV_1) {
+        return hit(tv_rules::DOCUMENTARY, cat::TV_DOCU, 850);
+    }
+    if flag(flags, FLAG_FOREIGN) && n.hit(CATEGORIZE_TV_2) {
+        return hit(tv_rules::FOREIGN_LANGUAGE, cat::TV_FOREIGN, 800);
+    }
+    if let Some(r) = tv_check_x265(n) {
+        return r;
+    }
+    let cat_webdl = flag(flags, FLAG_WEBDL);
+    if cat_webdl && media_web_dl(n) {
+        return hit(tv_rules::WEBDL, cat::TV_WEBDL, 850);
+    }
+    tv_check_uhd(n)
+        .or_else(|| tv_check_hd(n, cat_webdl))
+        .or_else(|| tv_check_sd(n))
+        .or_else(|| {
+            if tv_season_episode(n) {
+                Some(hit(tv_rules::TV_OTHER, cat::TV_OTHER, 600))
+            } else if has_standalone_season_token(n) {
+                Some(hit(tv_rules::TV_SEASON_PACK, cat::TV_OTHER, 600))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(NO_MATCH)
+}
+
+// ----- XXX -----
+
+fn xxx_studios_group(n: &Subject) -> Option<(usize, usize)> {
+    if !xxx_studios(n) {
+        return None;
+    }
+    bt!(&format!(r"\b({KNOWN_STUDIOS}|{JACQUIE_ET_MICHEL})\b")).capture_s(n, 1)
+}
+
+fn xxx_studios(n: &Subject) -> bool {
+    n.memoized(4, || n.hit(XXX_STUDIOS_1))
+}
+
+fn xxx_adult_keywords(n: &Subject) -> bool {
+    n.memoized(5, || n.hit(XXX_ADULT_KEYWORDS_1))
+}
+
+fn xxx_vr_sites(n: &Subject) -> bool {
+    n.hit(XXX_VR_SITES_1)
+}
+
+fn xxx_generic_vr(n: &Subject) -> bool {
+    n.hit(XXX_GENERIC_VR_1)
+}
+
+fn xxx_vr_devices(n: &Subject) -> bool {
+    n.hit(XXX_VR_DEVICES_1)
+}
+
+fn xxx_marker(n: &Subject) -> bool {
+    n.memoized(6, || n.hit(XXX_MARKER_1))
+}
+
+fn xxx_looks_like(n: &Subject) -> bool {
+    if xxx_marker(n) {
+        return true;
+    }
+
+    if let Some((start, end)) = xxx_studios_group(n) {
+        let studio = &n.b[start..end];
+        let len = studio.len();
+        // `^<studio>[.\-_ ]` with the studio text matched above (case-insensitive).
+        if n.b.len() > len && n.b[..len].eq_ignore_ascii_case(studio) && is_sep(n.b[len]) {
+            if bt!(r"(?:[A-Za-z]+[.\-_ ])*(?:19|20)\d{2}[.\-_ ](?:720p|1080p|2160p|4K|UHD)")
+                .test_at(n, len + 1)
+                && n.hit(XXX_LOOKS_LIKE_1)
+                && !xxx_adult_keywords(n)
+            {
+                return false;
+            }
+            if bt!(r"(19|20)?\d{2}[.\-_ ]\d{2}[.\-_ ]\d{2}[.\-_ ]").test_at(n, len + 1) {
+                return true;
+            }
+        }
+        return true;
+    }
+
+    if xxx_vr_sites(n) || xxx_generic_vr(n) {
+        return true;
+    }
+
+    if xxx_vr_devices(n) && n.hit(XXX_LOOKS_LIKE_2) {
+        return true;
+    }
+
+    if xxx_adult_keywords(n) && n.hit(XXX_LOOKS_LIKE_3) {
+        return true;
+    }
+
+    if n.hit(XXX_LOOKS_LIKE_4) && xxx_studios(n) {
+        return true;
+    }
+
+    if n.hit(XXX_LOOKS_LIKE_5) {
+        if xxx_adult_keywords(n) {
+            return true;
+        }
+        if n.hit(XXX_LOOKS_LIKE_6) && !n.hit(XXX_LOOKS_LIKE_7) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn xxx_check_onlyfans(n: &Subject) -> Option<i64> {
+    // `str_replace('_', ' ', ...)` changes `\b` semantics, so the substituted subject is matched.
+    let mut stack = [0u8; 512];
+    let heap;
+    let replaced_bytes: &[u8] = if n.b.len() <= stack.len() {
+        for (dst, src) in stack.iter_mut().zip(n.b.iter()) {
+            *dst = if *src == b'_' { b' ' } else { *src };
+        }
+        &stack[..n.b.len()]
+    } else {
+        heap =
+            n.b.iter()
+                .map(|&b| if b == b'_' { b' ' } else { b })
+                .collect::<Vec<u8>>();
+        &heap
+    };
+    let replaced = &Subject::new(replaced_bytes);
+
+    if replaced.hit(XXX_CHECK_ONLYFANS_1) && !replaced.hit(XXX_CHECK_ONLYFANS_2) {
+        return None;
+    }
+    if has_only_fans_marker(n) {
+        return Some(hit(xxx_rules::ONLYFANS, cat::XXX_ONLYFANS, 950));
+    }
+    None
+}
+
+fn xxx_check_vr(n: &Subject) -> Option<i64> {
+    let known_site = xxx_vr_sites(n);
+    let generic_site = xxx_generic_vr(n);
+    let device = xxx_vr_devices(n);
+    let vr_180_360 = n.hit(XXX_CHECK_VR_1);
+
+    if !vr_180_360 && !known_site && !generic_site && !device {
+        return None;
+    }
+    // The PHP `$vrPattern` guard is implied by the flags above (each flag is one of its alternatives).
+    if known_site {
+        return Some(hit(xxx_rules::VR_SITE, cat::XXX_VR, 950));
+    }
+    if generic_site {
+        return Some(hit(xxx_rules::VR_SITE_GENERIC, cat::XXX_VR, 900));
+    }
+    if device && (xxx_marker(n) || xxx_adult_keywords(n) || xxx_studios(n)) {
+        return Some(hit(xxx_rules::VR_DEVICE, cat::XXX_VR, 900));
+    }
+    if vr_180_360 && (xxx_marker(n) || xxx_adult_keywords(n) || xxx_vr_sites(n)) {
+        return Some(hit(xxx_rules::VR_180_360, cat::XXX_VR, 900));
+    }
+    None
+}
+
+fn xxx_check_uhd(n: &Subject) -> Option<i64> {
+    if !n.hit(XXX_CHECK_UHD_1) {
+        return None;
+    }
+    let adult = xxx_marker(n) || xxx_studios(n) || n.hit(XXX_CHECK_UHD_2);
+    if !adult {
+        return None;
+    }
+    if n.hit(XXX_CHECK_UHD_3) {
+        return Some(hit(xxx_rules::UHD_GROUP, cat::XXX_UHD, 950));
+    }
+    Some(hit(xxx_rules::UHD, cat::XXX_UHD, 900))
+}
+
+fn xxx_check_clip_hd(n: &Subject) -> Option<i64> {
+    if n.hit(XXX_CHECK_CLIP_HD_1) {
+        return None;
+    }
+    if n.hit(XXX_CHECK_CLIP_HD_2) {
+        return None;
+    }
+    let has_hd = n.hit(XXX_CHECK_CLIP_HD_3);
+
+    if n.hit(XXX_CHECK_CLIP_HD_4) {
+        return Some(hit(xxx_rules::CLIP_HD_STUDIO, cat::XXX_CLIPHD, 900));
+    }
+
+    if n.hit(XXX_CHECK_CLIP_HD_5) {
+        if has_hd {
+            return Some(hit(xxx_rules::CLIP_HD_STUDIO_DATE, cat::XXX_CLIPHD, 950));
+        }
+        return Some(hit(xxx_rules::STUDIO_DATE, cat::XXX_X264, 850));
+    }
+
+    if n.hit(XXX_CHECK_CLIP_HD_6)
+        && !n.hit(XXX_CHECK_CLIP_HD_7)
+        && (has_hd || xxx_adult_keywords(n))
+    {
+        return Some(hit(xxx_rules::CLIP_HD_DATE_4DIGIT, cat::XXX_CLIPHD, 850));
+    }
+
+    if n.hit(XXX_CHECK_CLIP_HD_8) && !n.hit(XXX_CHECK_CLIP_HD_7) {
+        return Some(hit(xxx_rules::CLIP_HD_DATE, cat::XXX_CLIPHD, 850));
+    }
+
+    if n.hit(XXX_CHECK_CLIP_HD_9) {
+        if has_hd {
+            return Some(hit(xxx_rules::CLIP_HD_JAV_DATE, cat::XXX_CLIPHD, 900));
+        }
+        return Some(hit(xxx_rules::JAV_DATE, cat::XXX_X264, 850));
+    }
+
+    if n.hit(XXX_CHECK_CLIP_HD_10) {
+        return Some(hit(xxx_rules::CLIP_HD_STUDIO_XXX, cat::XXX_CLIPHD, 900));
+    }
+
+    if n.hit(XXX_CHECK_CLIP_HD_11) || n.hit(XXX_CHECK_CLIP_HD_12) {
+        return Some(hit(xxx_rules::CLIP_HD_XXX, cat::XXX_CLIPHD, 800));
+    }
+    None
+}
+
+fn xxx_check_pack(n: &Subject) -> Option<i64> {
+    if n.hit(XXX_CHECK_PACK_1) {
+        return Some(hit(xxx_rules::PACK, cat::XXX_PACK, 850));
+    }
+    None
+}
+
+fn xxx_check_clip_sd(n: &Subject, poster: &Subject) -> Option<i64> {
+    if poster.hit(XXX_CHECK_CLIP_SD_1) {
+        return Some(hit(xxx_rules::CLIP_SD_POSTER, cat::XXX_CLIPSD, 850));
+    }
+    if n.hit(XXX_CHECK_CLIP_SD_2) || n.hit(LIT_SDPORN) {
+        return Some(hit(xxx_rules::CLIP_SD, cat::XXX_CLIPSD, 850));
+    }
+    None
+}
+
+fn xxx_check_sd(n: &Subject) -> Option<i64> {
+    if n.hit(XXX_CHECK_SD_1) {
+        return Some(hit(xxx_rules::SD, cat::XXX_SD, 850));
+    }
+    None
+}
+
+fn xxx_check_webdl(n: &Subject) -> Option<i64> {
+    if n.hit(XXX_CHECK_WEBDL_1) {
+        return None;
+    }
+    if media_web_dl(n) && (xxx_adult_keywords(n) || xxx_studios(n) || n.hit(XXX_CHECK_WEBDL_2)) {
+        return Some(hit(xxx_rules::WEBDL, cat::XXX_WEBDL, 850));
+    }
+    None
+}
+
+fn xxx_check_x264(n: &Subject) -> Option<i64> {
+    if n.hit(XXX_CHECK_X264_1) {
+        return None;
+    }
+    if !n.hit(XXX_CHECK_X264_2) {
+        return None;
+    }
+    if n.hit(XXX_CHECK_X264_3) {
+        return None;
+    }
+    if n.hit(XXX_CHECK_X264_4) {
+        return Some(hit(xxx_rules::X264, cat::XXX_X264, 850));
+    }
+    None
+}
+
+fn xxx_check_xvid(n: &Subject) -> Option<i64> {
+    if n.hit(XXX_CHECK_XVID_1) {
+        return Some(hit(xxx_rules::XVID, cat::XXX_XVID, 800));
+    }
+    None
+}
+
+fn xxx_check_imageset(n: &Subject) -> Option<i64> {
+    if n.hit(XXX_CHECK_IMAGESET_1) {
+        return Some(hit(xxx_rules::IMAGESET, cat::XXX_IMAGESET, 900));
+    }
+    None
+}
+
+fn xxx_check_wmv(n: &Subject) -> Option<i64> {
+    if n.hit(XXX_CHECK_WMV_1) {
+        return None;
+    }
+    if n.hit(XXX_CHECK_WMV_2) {
+        return Some(hit(xxx_rules::WMV, cat::XXX_WMV, 800));
+    }
+    None
+}
+
+fn xxx_check_dvd(n: &Subject) -> Option<i64> {
+    if n.hit(XXX_CHECK_DVD_1) {
+        return Some(hit(xxx_rules::DVD, cat::XXX_DVD, 850));
+    }
+    None
+}
+
+fn xxx_check_other(n: &Subject) -> Option<i64> {
+    if n.hit(XXX_CHECK_OTHER_1) {
+        return Some(hit(xxx_rules::OTHER, cat::XXX_OTHER, 700));
+    }
+    None
+}
+
+fn categorize_xxx(n: &Subject, poster: &Subject, flags: u32) -> i64 {
+    if !has_only_fans_marker(n) && !xxx_looks_like(n) {
+        return NO_MATCH;
+    }
+    xxx_check_onlyfans(n)
+        .or_else(|| xxx_check_vr(n))
+        .or_else(|| xxx_check_uhd(n))
+        .or_else(|| xxx_check_clip_hd(n))
+        .or_else(|| xxx_check_pack(n))
+        .or_else(|| xxx_check_clip_sd(n, poster))
+        .or_else(|| xxx_check_sd(n))
+        .or_else(|| {
+            if flag(flags, FLAG_WEBDL) {
+                xxx_check_webdl(n)
+            } else {
+                None
+            }
+        })
+        .or_else(|| xxx_check_x264(n))
+        .or_else(|| xxx_check_xvid(n))
+        .or_else(|| xxx_check_imageset(n))
+        .or_else(|| xxx_check_wmv(n))
+        .or_else(|| xxx_check_dvd(n))
+        .or_else(|| xxx_check_other(n))
+        .unwrap_or(NO_MATCH)
+}
+
+// ----- C ABI -----
+
+/// Returned instead of a categorization when `FLAG_CHECK_SKIP` is set and `shouldSkip` is true.
+const NATIVE_SKIP: i64 = 1 << 62;
+
+#[inline]
+unsafe fn raw_bytes<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
+    if ptr.is_null() || len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(ptr, len) }
+    }
+}
+
+/// Runs a categorizer closure, mapping engine aborts and panics to the "decline" result (-1).
+#[inline]
+fn guarded<F: FnOnce() -> i64 + std::panic::UnwindSafe>(f: F) -> i64 {
+    MATCH_ABORTED.with(|c| c.set(false));
+    let result = std::panic::catch_unwind(f).unwrap_or(-1);
+    if MATCH_ABORTED.with(|c| c.get()) {
+        -1
+    } else {
+        result
+    }
+}
+
+fn root_group_name(group: &[u8]) -> i64 {
+    categorize_group_name(&Subject::aux(group))
+}
+
+fn root_pc(name: &[u8], poster: &[u8], flags: u32) -> i64 {
+    let n = Subject::new(name);
+    if flag(flags, FLAG_CHECK_SKIP) && pc_should_skip(&n) {
+        return NATIVE_SKIP;
+    }
+    categorize_pc(&n, &Subject::aux(poster))
+}
+
+fn root_console(name: &[u8], flags: u32) -> i64 {
+    let n = Subject::new(name);
+    if flag(flags, FLAG_CHECK_SKIP) && console_should_skip(&n) {
+        return NATIVE_SKIP;
+    }
+    categorize_console(&n)
+}
+
+fn root_music(name: &[u8], flags: u32) -> i64 {
+    let n = Subject::new(name);
+    if flag(flags, FLAG_CHECK_SKIP) && music_should_skip(&n) {
+        return NATIVE_SKIP;
+    }
+    categorize_music(&n, flags)
+}
+
+fn root_book(name: &[u8], flags: u32) -> i64 {
+    let n = Subject::new(name);
+    if flag(flags, FLAG_CHECK_SKIP) && book_should_skip(&n) {
+        return NATIVE_SKIP;
+    }
+    categorize_book(&n)
+}
+
+fn root_movie(name: &[u8], flags: u32) -> i64 {
+    let n = Subject::new(name);
+    if flag(flags, FLAG_CHECK_SKIP) && movie_should_skip(&n) {
+        return NATIVE_SKIP;
+    }
+    categorize_movie(&n, flags)
+}
+
+fn root_tv(name: &[u8], group: &[u8], poster: &[u8], flags: u32) -> i64 {
+    let n = Subject::new(name);
+    if flag(flags, FLAG_CHECK_SKIP) && has_adult_markers(&n) {
+        return NATIVE_SKIP;
+    }
+    categorize_tv(&n, &Subject::aux(group), &Subject::aux(poster), flags)
+}
+
+fn root_xxx(name: &[u8], poster: &[u8], flags: u32) -> i64 {
+    categorize_xxx(&Subject::new(name), &Subject::aux(poster), flags)
+}
+
+/// `GroupNameCategorizer::categorize`.
+///
+/// # Safety
+/// `group_ptr` must be valid for `group_len` bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_categorize_group_name(
+    group_ptr: *const u8,
+    group_len: usize,
+) -> i64 {
+    let group = unsafe { raw_bytes(group_ptr, group_len) };
+    guarded(|| root_group_name(group))
+}
+
+/// `PcCategorizer::categorize`; `flags` bit 2 additionally evaluates `shouldSkip` first.
+///
+/// # Safety
+/// Pointers must be valid for their lengths when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_categorize_pc(
+    name_ptr: *const u8,
+    name_len: usize,
+    poster_ptr: *const u8,
+    poster_len: usize,
+    flags: u32,
+) -> i64 {
+    let (name, poster) = unsafe {
+        (
+            raw_bytes(name_ptr, name_len),
+            raw_bytes(poster_ptr, poster_len),
+        )
+    };
+    guarded(|| root_pc(name, poster, flags))
+}
+
+/// `ConsoleCategorizer::categorize`; `flags` bit 2 additionally evaluates `shouldSkip` first.
+///
+/// # Safety
+/// `name_ptr` must be valid for `name_len` bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_categorize_console(
+    name_ptr: *const u8,
+    name_len: usize,
+    flags: u32,
+) -> i64 {
+    let name = unsafe { raw_bytes(name_ptr, name_len) };
+    guarded(|| root_console(name, flags))
+}
+
+/// `MusicCategorizer::categorize` (`flags` bit 0 = categorizeForeign, bit 2 = check `shouldSkip`).
+///
+/// # Safety
+/// `name_ptr` must be valid for `name_len` bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_categorize_music(
+    name_ptr: *const u8,
+    name_len: usize,
+    flags: u32,
+) -> i64 {
+    let name = unsafe { raw_bytes(name_ptr, name_len) };
+    guarded(|| root_music(name, flags))
+}
+
+/// `BookCategorizer::categorize`; `flags` bit 2 additionally evaluates `shouldSkip` first.
+///
+/// # Safety
+/// `name_ptr` must be valid for `name_len` bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_categorize_book(
+    name_ptr: *const u8,
+    name_len: usize,
+    flags: u32,
+) -> i64 {
+    let name = unsafe { raw_bytes(name_ptr, name_len) };
+    guarded(|| root_book(name, flags))
+}
+
+/// `MovieCategorizer::categorize` (`flags` bit 0 = categorizeForeign, bit 1 = catWebDL, bit 2 = check `shouldSkip`).
+///
+/// # Safety
+/// `name_ptr` must be valid for `name_len` bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_categorize_movie(
+    name_ptr: *const u8,
+    name_len: usize,
+    flags: u32,
+) -> i64 {
+    let name = unsafe { raw_bytes(name_ptr, name_len) };
+    guarded(|| root_movie(name, flags))
+}
+
+/// `TvCategorizer::categorize` (`flags` bit 0 = categorizeForeign, bit 1 = catWebDL, bit 2 = check `shouldSkip`).
+///
+/// # Safety
+/// Pointers must be valid for their lengths when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_categorize_tv(
+    name_ptr: *const u8,
+    name_len: usize,
+    group_ptr: *const u8,
+    group_len: usize,
+    poster_ptr: *const u8,
+    poster_len: usize,
+    flags: u32,
+) -> i64 {
+    let (name, group, poster) = unsafe {
+        (
+            raw_bytes(name_ptr, name_len),
+            raw_bytes(group_ptr, group_len),
+            raw_bytes(poster_ptr, poster_len),
+        )
+    };
+    guarded(|| root_tv(name, group, poster, flags))
+}
+
+/// `XxxCategorizer::categorize` (`flags` bit 1 = catWebDL).
+///
+/// # Safety
+/// Pointers must be valid for their lengths when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_categorize_xxx(
+    name_ptr: *const u8,
+    name_len: usize,
+    poster_ptr: *const u8,
+    poster_len: usize,
+    flags: u32,
+) -> i64 {
+    let (name, poster) = unsafe {
+        (
+            raw_bytes(name_ptr, name_len),
+            raw_bytes(poster_ptr, poster_len),
+        )
+    };
+    guarded(|| root_xxx(name, poster, flags))
+}
+
+/// Standalone `shouldSkip`. `kind`: 2 PC, 3 Console, 4 Music, 5 Book, 6 Movie, 7 TV.
+/// Returns 1 (skip), 0 (process) or -1 (decline).
+///
+/// # Safety
+/// `name_ptr` must be valid for `name_len` bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_categorize_should_skip(
+    kind: u32,
+    name_ptr: *const u8,
+    name_len: usize,
+) -> i32 {
+    let name = unsafe { raw_bytes(name_ptr, name_len) };
+    let result = guarded(|| {
+        let n = Subject::new(name);
+        match kind {
+            2 => i64::from(pc_should_skip(&n)),
+            3 => i64::from(console_should_skip(&n)),
+            4 => i64::from(music_should_skip(&n)),
+            5 => i64::from(book_should_skip(&n)),
+            6 => i64::from(movie_should_skip(&n)),
+            7 => i64::from(has_adult_markers(&n)),
+            _ => -1,
+        }
+    });
+    result as i32
+}
+
+/// Writes the matched-rule name for `rule_id` of categorizer `domain` (1 GroupName, 2 PC, 3 Console,
+/// 4 Music, 5 Book, 6 Movie, 7 TV, 8 XXX). Returns the byte length, 0 when unknown, or the negative
+/// required length when `out_cap` is too small.
+///
+/// # Safety
+/// `out_ptr` must be writable for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_categorize_rule_name(
+    domain: u32,
+    rule_id: u32,
+    out_ptr: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let names: &[&str] = match domain {
+        1 => group_rules::NAMES,
+        2 => pc_rules::NAMES,
+        3 => console_rules::NAMES,
+        4 => music_rules::NAMES,
+        5 => book_rules::NAMES,
+        6 => movie_rules::NAMES,
+        7 => tv_rules::NAMES,
+        8 => xxx_rules::NAMES,
+        _ => return 0,
+    };
+    let Some(name) = names.get(rule_id as usize) else {
+        return 0;
+    };
+    let mut cursor = unsafe { OutCursor::new(out_ptr, out_cap) };
+    cursor.extend(name.as_bytes());
+    cursor.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1522,6 +5344,938 @@ mod tests {
                 String::from_utf8_lossy(input)
             );
             assert!(!is_hashed_or_gibberish_bytes(input));
+        }
+    }
+}
+
+#[cfg(test)]
+mod categorizer_tests {
+    use super::*;
+
+    fn matches(pattern: &str, subject: &str) -> bool {
+        Re::new(pattern, true).is_match(subject.as_bytes())
+    }
+
+    fn matches_cs(pattern: &str, subject: &str) -> bool {
+        Re::new(pattern, false).is_match(subject.as_bytes())
+    }
+
+    fn decode(packed: i64) -> (u16, u16, u16) {
+        assert!(packed >= 0, "declined");
+        (
+            (packed & 0xFFFF) as u16,
+            ((packed >> 16) & 0xFFFF) as u16,
+            (packed >> 32) as u16,
+        )
+    }
+
+    fn rule_of(names: &[&str], packed: i64) -> Option<(u16, u16, String)> {
+        if packed == 0 {
+            return None;
+        }
+        let (category, milli, rule) = decode(packed);
+        Some((category, milli, names[rule as usize].to_string()))
+    }
+
+    #[test]
+    fn engine_matches_pcre_semantics() {
+        // Escaped range endpoints: `[\.-_\s]` is the range 0x2E..0x5F plus whitespace.
+        assert!(matches(r"^[\.-_\s]+$", "A9:_ ./"));
+        assert!(!matches(r"^[\.-_\s]+$", "-"));
+        // `[._ -,]` is the range ' '..',' (hyphen between two literals).
+        assert!(matches(r"^[._ -,]$", "!"));
+        assert!(!matches(r"^[._ -,]$", "a"));
+        // Trailing hyphen is literal.
+        assert!(matches(r"^[._ -]$", "-"));
+        // Case-insensitive negated class excludes both cases.
+        assert!(!matches(r"^[^i]$", "I"));
+        assert!(matches_cs(r"^[^i]$", "I"));
+        // `$` matches before a final newline; `.` does not match newline.
+        assert!(matches(r"abc$", "xabc\n"));
+        assert!(!matches(r"a.c", "a\nc"));
+        // Word boundaries are ASCII word characters.
+        assert!(matches(r"\bPS3\b", "Game.PS3-GRP"));
+        assert!(!matches(r"\bPS3\b", "GamePS3x"));
+        assert!(matches(r"\bX\b", "a-X-b"));
+        assert!(!matches(r"\bX\b", "a_X_b"));
+        // Ordered alternation with backtracking into later alternatives.
+        assert!(matches(r"^(ab|a)c$", "ac"));
+        assert!(matches(r"^(?:a|ab)(?:c|bd)$", "abd"));
+        // Lazy versus greedy.
+        let lazy = Re::new(r"(a.*?b)", true);
+        assert_eq!(lazy.capture(b"xaabab", 1), Some((1, 4)));
+        let greedy = Re::new(r"(a.*b)", true);
+        assert_eq!(greedy.capture(b"xaabab", 1), Some((1, 6)));
+        // Counted group repetition and optional group.
+        assert!(matches(r"^v?\d+(?:\.\d+){1,4}$", "1.2.3.4.5"));
+        assert!(!matches(r"^v?\d+(?:\.\d+){1,4}$", "1.2.3.4.5.6"));
+        assert!(matches(r"^a(?:bc)?d$", "abcd"));
+        assert!(matches(r"^(?:[A-Za-z]+[.\-_ ])*x$", "ab.cd-x"));
+        // Lookahead.
+        assert!(has_standalone_season_token(&Subject::new(
+            b"Show.S01.1080p"
+        )));
+        assert!(has_standalone_season_token(&Subject::new(b"Show S02")));
+        assert!(!has_standalone_season_token(&Subject::new(b"Show.S01E01")));
+        // Multibyte class members are individual bytes in non-UTF mode.
+        assert!(!matches("O['\u{2019}]?Reilly", "O\u{2019}Reilly"));
+        assert!(matches("O['\u{2019}]?Reilly", "O'Reilly"));
+        assert!(matches("O['\u{2019}]?Reilly", "OReilly"));
+        // Captured text of the leftmost match.
+        let studios = Re::new(r"\b(Wicked|Brazzers)\b", true);
+        assert_eq!(studios.capture(b"xx Brazzers wicked", 1), Some((3, 11)));
+        // Anchored attempts see the whole subject.
+        let tail = Re::new(r"\d{2}", true);
+        assert!(tail.matches_at(b"ab12", 2));
+        assert!(!tail.matches_at(b"ab12", 1));
+    }
+
+    #[test]
+    fn engine_bounds_pathological_backtracking() {
+        MATCH_ABORTED.with(|c| c.set(false));
+        let subject = format!("{}b", "a".repeat(40));
+        // Nested quantifiers stay linear thanks to failure memoization.
+        assert!(!Re::new(r"^(?:a+)+$", true).is_match(subject.as_bytes()));
+        assert!(!MATCH_ABORTED.with(|c| c.get()));
+        // An aborted match makes the entry point decline so PHP can fall back.
+        assert_eq!(
+            guarded(|| {
+                MATCH_ABORTED.with(|c| c.set(true));
+                7
+            }),
+            -1
+        );
+        assert_eq!(guarded(|| 7), 7);
+    }
+
+    #[test]
+    fn group_name_rules() {
+        let r = |g: &str| rule_of(group_rules::NAMES, root_group_name(g.as_bytes()));
+        assert_eq!(
+            r("alt.binaries.anime").unwrap(),
+            (5070, 800, "group_name_anime".into())
+        );
+        assert_eq!(r("alt.binaries.hdtv").unwrap().2, "group_name_tv");
+        assert_eq!(r("alt.binaries.movies.x264").unwrap().2, "group_name_movie");
+        assert_eq!(r("alt.binaries.erotica").unwrap().2, "group_name_xxx");
+        assert_eq!(r("alt.binaries.sounds.mp3").unwrap().2, "group_name_music");
+        assert_eq!(r("alt.binaries.games").unwrap().2, "group_name_game");
+        assert_eq!(r("alt.binaries.warez").unwrap().2, "group_name_pc");
+        assert_eq!(r("alt.binaries.ebook").unwrap().2, "group_name_book");
+        assert!(r("alt.binaries.misc").is_none());
+        assert!(r("0").is_none());
+        assert!(r("").is_none());
+    }
+
+    #[test]
+    fn pc_rules_and_skip() {
+        let r = |n: &str, p: &str| rule_of(pc_rules::NAMES, root_pc(n.as_bytes(), p.as_bytes(), 0));
+        assert_eq!(r("Cool.App.iPhone.v1.0", "").unwrap().2, "ios");
+        assert_eq!(r("Cool.App.ANDROID.v1.0", "").unwrap().2, "android");
+        assert_eq!(r("Cool.App.macOS", "").unwrap().2, "macos");
+        assert_eq!(
+            r("Some.Game-CODEX", "").unwrap(),
+            (4050, 900, "pc_game".into())
+        );
+        assert_eq!(
+            r("Some.Game.2024", "Bob <PC@MASTER.RACE>").unwrap().2,
+            "pc_game_poster"
+        );
+        assert_eq!(
+            r("Tool.Pro.v1.0.Incl.Crack", "").unwrap().2,
+            "0day_explicit"
+        );
+        assert_eq!(r("Cool.Tool.x64.setup", "").unwrap().2, "0day_system");
+        assert_eq!(r("Cool.Tool.msi", "").unwrap().2, "0day_msix_installer");
+        assert!(
+            r("Some.Game-CODEX.PS4", "").is_none()
+                || r("Some.Game-CODEX.PS4", "").unwrap().2 != "pc_game"
+        );
+        assert!(pc_should_skip(&Subject::new(b"Show.S01E01.720p")));
+        assert!(!pc_should_skip(&Subject::new(b"Some.Game-CODEX")));
+    }
+
+    #[test]
+    fn console_rules() {
+        let r = |n: &str| rule_of(console_rules::NAMES, root_console(n.as_bytes(), 0));
+        assert_eq!(r("PS4_Game_Name").unwrap().2, "ps4");
+        assert_eq!(r("Game.PS3-DUPLEX").unwrap().2, "ps3");
+        assert_eq!(r("Game.PSVita-X").unwrap().2, "psvita");
+        assert_eq!(r("Game.PSP-X").unwrap().2, "psp");
+        assert_eq!(r("Game.XBOXONE-X").unwrap().2, "xboxone");
+        assert_eq!(r("Game.XBOX360-X").unwrap().2, "xbox360");
+        assert_eq!(r("Game.XBOX-X").unwrap().2, "xbox");
+        assert_eq!(r("Game.WiiU-X").unwrap().2, "wiiu");
+        assert_eq!(r("Game.Wii-X").unwrap().2, "wii");
+        assert_eq!(r("Game.3DS-X").unwrap().2, "3ds");
+        assert_eq!(r("Game.NDS-X").unwrap().2, "nds");
+        assert_eq!(r("Game.SNES.USA").unwrap().2, "retro_console");
+        assert!(r("Plain.Name").is_none());
+    }
+
+    #[test]
+    fn music_rules() {
+        let r = |n: &str, f: u32| rule_of(music_rules::NAMES, root_music(n.as_bytes(), f));
+        assert_eq!(
+            r("The Hobbit Audiobook Unabridged", 1).unwrap().2,
+            "audiobook"
+        );
+        assert_eq!(r("Some Podcast Ep 4", 1).unwrap().2, "podcast");
+        assert_eq!(r("Band Live Concert 1080p", 0).unwrap().2, "music_video");
+        assert_eq!(r("Band-Album-2020-FLAC-GRP", 0).unwrap().2, "mp3_scene");
+        assert_eq!(
+            r("Band.German.Album.FLAC.24bit", 1).unwrap().2,
+            "lossless_foreign"
+        );
+        assert_eq!(r("Band.German.Album.FLAC.24bit", 0).unwrap().2, "lossless");
+        assert_eq!(
+            r("Artist-Album-WEB-2021-GRP.MP3.320kbps", 0).unwrap().2,
+            "mp3"
+        );
+        assert_eq!(
+            r("VA - Greatest Hits Compilation", 0).unwrap().2,
+            "music_other"
+        );
+        assert!(r("Plain.Name", 1).is_none());
+    }
+
+    #[test]
+    fn book_rules() {
+        let r = |n: &str| rule_of(book_rules::NAMES, root_book(n.as_bytes(), 0));
+        assert_eq!(r("Spider-Man.Annual.cbr").unwrap().2, "comic_format");
+        assert_eq!(r("Marvel Comics Issue 4").unwrap().2, "comic_publisher");
+        assert_eq!(r("Great.Manga.Volume").unwrap().2, "manga");
+        assert_eq!(r("Packt Learning Rust").unwrap().2, "technical_publisher");
+        assert_eq!(
+            r("Python Programming Guide Author Edition").unwrap().2,
+            "technical_subject"
+        );
+        assert_eq!(
+            r("Forbes Monthly Issue 12 2020").unwrap().2,
+            "magazine_frequency"
+        );
+        assert_eq!(r("Forbes").unwrap().2, "magazine_title");
+        assert_eq!(r("Some Novel.epub").unwrap().2, "ebook_format");
+        assert_eq!(r("Some Novel EPUB").unwrap().2, "ebook_indicator");
+        assert_eq!(r("Kindle Collection").unwrap().2, "ebook_platform");
+        assert_eq!(r("Some Novel Author 2020").unwrap().2, "ebook_book_signals");
+        assert!(book_should_skip(&Subject::new(
+            b"Some.Movie.2020.1080p.BluRay"
+        )));
+        assert!(book_should_skip(&Subject::new(b"Adobe.Photoshop")));
+        assert!(!book_should_skip(&Subject::new(b"Some Novel Author 2020")));
+    }
+
+    #[test]
+    fn movie_rules() {
+        let r = |n: &str, f: u32| rule_of(movie_rules::NAMES, root_movie(n.as_bytes(), f));
+        assert!(r("Plain.Name", 3).is_none());
+        assert_eq!(
+            r("Movie.2020.German.DL.1080p.BluRay.x264-GRP", 3)
+                .unwrap()
+                .2,
+            "foreign_language"
+        );
+        assert_eq!(r("Movie.2020.1080p.BluRay-GRP", 3).unwrap().2, "bluray");
+        assert_eq!(r("Movie.2020.1080p.BluRay.x264-GRP", 3).unwrap().2, "hd");
+        assert_eq!(r("Movie.2160p.BluRay.x265-GRP", 3).unwrap().2, "uhd");
+        assert_eq!(r("Movie.2020.3D.1080p.BluRay-GRP", 3).unwrap().2, "3d");
+        assert_eq!(r("Movie.2020.DVDRip.XviD-GRP", 3).unwrap().2, "sd");
+        assert_eq!(r("Movie.2020.WEB-DL.x264-GRP.BDRip", 3).unwrap().2, "webdl");
+        assert_eq!(r("Movie.2020.WEB-DL.x264-GRP.BDRip", 1).unwrap().2, "hd");
+        assert!(movie_should_skip(&Subject::new(b"Show.S01E01.720p")));
+        assert!(movie_should_skip(&Subject::new(b"Show.S01.1080p")));
+        assert!(movie_should_skip(&Subject::new(b"Anime.E05.1080p")));
+        assert!(!movie_should_skip(&Subject::new(
+            b"Movie.2020.1080p.BluRay.x264-GRP"
+        )));
+    }
+
+    #[test]
+    fn tv_rules() {
+        let r = |n: &str, g: &str, p: &str, f: u32| {
+            rule_of(
+                tv_rules::NAMES,
+                root_tv(n.as_bytes(), g.as_bytes(), p.as_bytes(), f),
+            )
+        };
+        assert_eq!(
+            r("x", "", "foo@animetosho.org", 3).unwrap().2,
+            "anime_tosho_poster"
+        );
+        assert_eq!(
+            r("x", "alt.binaries.anime", "", 3).unwrap().2,
+            "anime_group_name"
+        );
+        assert_eq!(
+            r("[SubsPlease] Show - 08 [1080p]", "", "", 3).unwrap().2,
+            "anime_group"
+        );
+        assert_eq!(
+            r("[Grp] Show - 08 [ABCD1234]", "", "", 3).unwrap().2,
+            "anime_hash"
+        );
+        assert_eq!(
+            r("Show.S01E01.720p.HDTV.x264-GRP", "", "", 3).unwrap().2,
+            "hd_resolution"
+        );
+        assert_eq!(
+            r("Show.S01E01.WEB-DL.x264-GRP", "", "", 3).unwrap().2,
+            "webdl"
+        );
+        assert_eq!(
+            r("Show.S01E01.WEB-DL.x264-GRP", "", "", 1).unwrap().2,
+            "hd_webdl_fallback"
+        );
+        assert_eq!(
+            r("Show.S01E01.2160p.WEB-DL", "", "", 1).unwrap().2,
+            "uhd_episode"
+        );
+        assert_eq!(r("Show.S01E01-GRP", "", "", 3).unwrap().2, "tv_other");
+        assert_eq!(r("Show.S01-GRP", "", "", 3).unwrap().2, "tv_season_pack");
+        assert_eq!(r("NFL.2024.Week.5.720p", "", "", 3).unwrap().2, "sport");
+        assert!(r("Plain.Name", "", "", 3).is_none());
+    }
+
+    #[test]
+    fn xxx_rules() {
+        let r = |n: &str, p: &str, f: u32| {
+            rule_of(xxx_rules::NAMES, root_xxx(n.as_bytes(), p.as_bytes(), f))
+        };
+        assert!(r("Plain.Name", "", 3).is_none());
+        assert_eq!(r("OF.Some.Creator.1080p", "", 3).unwrap().2, "onlyfans");
+        assert_eq!(r("StockingsVR.com.Scene.180", "", 3).unwrap().2, "vr_site");
+        assert_eq!(
+            r("Brazzers.24.01.15.Some.Girl.2160p.XXX", "", 3).unwrap().2,
+            "uhd"
+        );
+        assert_eq!(
+            r("Brazzers.24.01.15.Some.Girl.1080p", "", 3).unwrap().2,
+            "clip_hd_studio_date"
+        );
+        assert_eq!(r("Something.XXX.PACK.2020", "", 3).unwrap().2, "pack");
+        assert_eq!(r("Some.XXX.DVDRip", "", 3).unwrap().2, "xvid");
+        assert_eq!(r("Wicked.2024.1080p.BluRay.x264-GRP", "", 3), None);
+        assert_eq!(
+            r("Some.XXX.1080p", "anon@y.com", 3).unwrap().2,
+            "clip_hd_xxx"
+        );
+    }
+
+    #[test]
+    fn xxx_reports_movie_titles_from_studio_names() {
+        assert!(!xxx_looks_like(&Subject::new(
+            b"Wicked.2024.1080p.WEB-DL.x264-GRP"
+        )));
+        assert!(xxx_looks_like(&Subject::new(
+            b"Wicked.24.01.15.Performer.Name.1080p"
+        )));
+    }
+
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    const TOKENS: &[&str] = &[
+        "Some",
+        "Name",
+        "Show",
+        "Movie",
+        "Game",
+        "Band",
+        "Album",
+        "GRP",
+        "2019",
+        "2024",
+        "1999",
+        "24.01.15",
+        "S01E02",
+        "S01",
+        "S02",
+        "E05",
+        "E12",
+        "Ep.05",
+        "Episode.12",
+        "III",
+        "no",
+        "Anime",
+        "Complete",
+        "1080p",
+        "720p",
+        "2160p",
+        "480p",
+        "HDTV",
+        "PDTV",
+        "WEB-DL",
+        "WEBRip",
+        "BluRay",
+        "BDRip",
+        "DVDRip",
+        "DVDR",
+        "DVD9",
+        "x264",
+        "x265",
+        "HEVC",
+        "AVC",
+        "XviD",
+        "NF",
+        "AMZN",
+        "Netflix",
+        "DEFLATE",
+        "NTb",
+        "MeGusta",
+        "UHD",
+        "4K",
+        "HDR",
+        "3D",
+        "SBS",
+        "BD25",
+        "CAM",
+        "German",
+        "French",
+        "Dutch",
+        "Multisub",
+        "Castellano",
+        "Documentary",
+        "NFL",
+        "UFC",
+        "Week",
+        "vs",
+        "SubsPlease",
+        "PS4",
+        "PS3",
+        "PSVita",
+        "XBOX",
+        "XBOX360",
+        "Wii",
+        "WiiU",
+        "3DS",
+        "NDS",
+        "SNES",
+        "USA",
+        "EUR",
+        "CUSA12345",
+        "CODEX",
+        "PC.GAMES",
+        "Steam.Rip",
+        "iPhone",
+        "ANDROID",
+        "macOS",
+        "ISO",
+        "UDEMY",
+        "Incl.Crack",
+        "x64",
+        "win64",
+        "Setup",
+        "Adobe",
+        "v1.2.3",
+        "FLAC",
+        "MP3",
+        "320kbps",
+        "V0",
+        "VA",
+        "OST",
+        "Audiobook",
+        "Unabridged",
+        "Podcast",
+        "Concert",
+        "Live",
+        "24bit",
+        "EPUB",
+        "PDF",
+        "Kindle",
+        "ISBN",
+        "Edition",
+        "Author",
+        "Packt",
+        "O'Reilly",
+        "Python",
+        "Forbes",
+        "Issue.12",
+        "Monthly",
+        "Jan.2020",
+        "Marvel",
+        "Comics",
+        "CBR",
+        "Manga",
+        "MAGAZINE",
+        "XXX",
+        "Brazzers",
+        "Wicked",
+        "Vixen",
+        "Jacquie.Et.Michel",
+        "MILF",
+        "Anal",
+        "Teen",
+        "StockingsVR",
+        "VR180",
+        "Oculus",
+        "OnlyFans",
+        "OF",
+        "PACK",
+        "IMAGESET",
+        "KTR",
+        "JAV",
+        "Hentai",
+        "Jane.Doe",
+        "Lady.Lyne",
+        "[Grp]",
+        "[ABCD1234]",
+        "mp4",
+        "wmv",
+        "podcast",
+        "alt.binaries.anime",
+        "alt.binaries.tv",
+        "\u{e9}t\u{e9}",
+        "\n",
+    ];
+
+    fn random_subject(state: &mut u64) -> Vec<u8> {
+        let seps: [&str; 6] = [".", ".", " ", "-", "_", ""];
+        let mut out = String::new();
+        let parts = 1 + (xorshift(state) % 8) as usize;
+        for i in 0..parts {
+            let token = TOKENS[(xorshift(state) % TOKENS.len() as u64) as usize];
+            if i > 0 {
+                out.push_str(seps[(xorshift(state) % 6) as usize]);
+            }
+            match xorshift(state) % 8 {
+                0 => out.push_str(&token.to_ascii_lowercase()),
+                1 => out.push_str(&token.to_ascii_uppercase()),
+                _ => out.push_str(token),
+            }
+        }
+        if xorshift(state) % 17 == 0 {
+            out.push('\n');
+        }
+        out.into_bytes()
+    }
+
+    #[test]
+    fn dfa_scanner_agrees_with_backtracking_engine() {
+        let table = pattern_table();
+        let engines: Vec<Re> = table
+            .iter()
+            .map(|(pattern, icase)| Re::new(pattern, *icase))
+            .collect();
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut subjects: Vec<Vec<u8>> = (0..2500).map(|_| random_subject(&mut state)).collect();
+        subjects.extend([
+            Vec::new(),
+            b"\n".to_vec(),
+            b"S01\n".to_vec(),
+            b"Show.S01\n".to_vec(),
+            vec![0xE2, 0x80, 0x99],
+            b"O'Reilly".to_vec(),
+            "Show.S01.\u{e9}".as_bytes().to_vec(),
+        ]);
+        for subject in &subjects {
+            MATCH_ABORTED.with(|c| c.set(false));
+            let bits = scan_patterns(subject, false);
+            for (id, engine) in engines.iter().enumerate() {
+                let expected = engine.is_match(subject);
+                if MATCH_ABORTED.with(|c| c.replace(false)) {
+                    continue;
+                }
+                let actual = bits[id >> 6] >> (id & 63) & 1 == 1;
+                assert_eq!(
+                    actual,
+                    expected,
+                    "pattern #{id} {:?} on {:?}",
+                    table[id].0,
+                    String::from_utf8_lossy(subject)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scan_cache_never_returns_stale_bits() {
+        let a = b"Show.Name.S01E02.720p.HDTV.x264-GRP".to_vec();
+        let b = b"Show.Name.S01E02.720p.HDTV.x264-GRQ".to_vec();
+        let c = b"Brazzers.24.01.15.Some.Girl.1080p".to_vec();
+        let first = scan_patterns(&a, false);
+        let other = scan_patterns(&c, false);
+        assert_ne!(first, other);
+        assert_eq!(scan_patterns(&a, false), first);
+        assert_eq!(scan_patterns(&b, false), first);
+        assert_eq!(scan_patterns(&c, false), other);
+        // Same bytes in a different buffer at a different address.
+        let copy = a.clone();
+        assert_eq!(scan_patterns(&copy, false), first);
+        assert_eq!(scan_patterns(&[], true), [0; BITS_W]);
+    }
+
+    #[test]
+    fn dfa_cache_reset_keeps_results_consistent() {
+        let mut state = 0x1234_5678_9ABC_DEF1u64;
+        let baseline = scan_patterns(b"Show.Name.S01E02.720p.HDTV.x264-GRP", false);
+        DFA.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let dfa = guard.get_or_insert_with(DfaSet::new);
+            for _ in 0..3 {
+                dfa.groups.iter_mut().for_each(Dfa::reset);
+                for _ in 0..200 {
+                    let subject = random_subject(&mut state);
+                    let _ = dfa.scan(&subject);
+                }
+            }
+            assert_eq!(dfa.scan(b"Show.Name.S01E02.720p.HDTV.x264-GRP"), baseline);
+        });
+    }
+
+    #[test]
+    fn rule_tables_are_consistent() {
+        for names in [
+            group_rules::NAMES,
+            pc_rules::NAMES,
+            console_rules::NAMES,
+            music_rules::NAMES,
+            book_rules::NAMES,
+            movie_rules::NAMES,
+            tv_rules::NAMES,
+            xxx_rules::NAMES,
+        ] {
+            let mut sorted: Vec<&str> = names.to_vec();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), names.len(), "duplicate rule name");
+        }
+        let mut buf = [0u8; 64];
+        let len = unsafe { nntmux_categorize_rule_name(2, 0, buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(&buf[..len as usize], b"ios");
+        assert_eq!(
+            unsafe { nntmux_categorize_rule_name(2, 999, buf.as_mut_ptr(), buf.len()) },
+            0
+        );
+        assert_eq!(
+            unsafe { nntmux_categorize_rule_name(99, 0, buf.as_mut_ptr(), buf.len()) },
+            0
+        );
+    }
+
+    #[test]
+    fn entry_points_pack_results_and_skip() {
+        let name = b"Show.Name.S01E02.720p.HDTV.x264-GRP";
+        let packed = unsafe {
+            nntmux_categorize_tv(
+                name.as_ptr(),
+                name.len(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                3,
+            )
+        };
+        assert!(packed > 0);
+        assert_eq!(packed & 0xFFFF, 5040);
+        assert_eq!((packed >> 16) & 0xFFFF, 850);
+        assert_eq!(tv_rules::NAMES[(packed >> 32) as usize], "hd_resolution");
+        let adult = b"Brazzers.24.01.15.Some.Girl.1080p.XXX";
+        let skipped = unsafe {
+            nntmux_categorize_tv(
+                adult.as_ptr(),
+                adult.len(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                3 | FLAG_CHECK_SKIP,
+            )
+        };
+        assert_eq!(skipped, NATIVE_SKIP);
+        assert_eq!(
+            unsafe { nntmux_categorize_should_skip(7, adult.as_ptr(), adult.len()) },
+            1
+        );
+        assert_eq!(
+            unsafe { nntmux_categorize_should_skip(7, name.as_ptr(), name.len()) },
+            0
+        );
+        assert_eq!(
+            unsafe { nntmux_categorize_should_skip(99, name.as_ptr(), name.len()) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_categorize_console(std::ptr::null(), 0, 0) },
+            0
+        );
+    }
+
+    #[test]
+    fn thrashing_dfa_declines_instead_of_rebuilding_forever() {
+        let name = b"Show.Name.S01E02.720p.HDTV.x264-GRP";
+        let healthy = scan_patterns(name, false);
+        assert_ne!(healthy, [0; BITS_W]);
+        DFA.with(|cell| {
+            cell.borrow_mut()
+                .as_mut()
+                .unwrap()
+                .groups
+                .iter_mut()
+                .for_each(|g| g.flushes = DFA_MAX_FLUSHES)
+        });
+        // A scan of an unseen subject notices the thrashing; from then on every scan declines.
+        let unseen = b"Another.Name.S02E03.1080p.WEB-DL-GRP";
+        assert_eq!(
+            guarded(|| i64::from(scan_patterns(unseen, false) != [0; BITS_W])),
+            -1
+        );
+        assert_eq!(
+            guarded(|| i64::from(scan_patterns(name, false) != [0; BITS_W])),
+            -1
+        );
+        assert_eq!(guarded(|| root_console(b"PS4_Game", 0)), -1);
+        // The entry points report a decline (-1) to PHP.
+        let packed = unsafe { nntmux_categorize_console(b"PS4_Game2".as_ptr(), 9, 0) };
+        assert_eq!(packed, -1);
+        DFA.with(|cell| {
+            cell.borrow_mut()
+                .as_mut()
+                .unwrap()
+                .groups
+                .iter_mut()
+                .for_each(|g| g.flushes = 0)
+        });
+        DFA_DEGRADED.with(|c| c.set(false));
+        assert_eq!(scan_patterns(name, false), healthy);
+    }
+
+    #[test]
+    #[ignore = "diagnostic: cargo test --release categorizer_tests::dfa_growth -- --ignored --nocapture"]
+    fn dfa_growth() {
+        let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+        let started = std::time::Instant::now();
+        for round in 0..5 {
+            for _ in 0..40_000 {
+                let subject = random_subject(&mut state);
+                let _ = scan_patterns(&subject, false);
+            }
+            DFA.with(|cell| {
+                let guard = cell.borrow();
+                let set = guard.as_ref().unwrap();
+                let states: Vec<usize> = set.groups.iter().map(|g| g.states.len()).collect();
+                for g in &set.groups {
+                    let unique: std::collections::HashSet<(u8, u8, Vec<u32>)> =
+                        g.states
+                            .iter()
+                            .map(|(pp, c, k)| (*pp, *c, k.to_vec()))
+                            .collect();
+                    println!("  group states={} unique={}", g.states.len(), unique.len());
+                }
+                println!(
+                    "round {round}: states={states:?} classes={:?} nfa_states={:?} patterns={} elapsed={:?}",
+                    set.groups.iter().map(|g| g.ncls).collect::<Vec<_>>(),
+                    set.groups.iter().map(|g| g.nfa.states.len()).collect::<Vec<_>>(),
+                    pid::COUNT,
+                    started.elapsed()
+                );
+            });
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic: cargo test --release categorizer_tests::dfa_noise -- --ignored --nocapture"]
+    fn dfa_noise() {
+        let mut state = 0x0123_4567_89AB_CDEFu64;
+        let alphabets: [&[u8]; 4] = [
+            b"0123456789abcdef",
+            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+            b"abcdefghijklmnopqrstuvwxyz .-_[]()0123456789",
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZ.-_ ",
+        ];
+        for (idx, alphabet) in alphabets.iter().enumerate() {
+            let started = std::time::Instant::now();
+            let mut bytes = 0usize;
+            for _ in 0..50_000 {
+                let len = 16 + (xorshift(&mut state) % 64) as usize;
+                let subject: Vec<u8> = (0..len)
+                    .map(|_| alphabet[(xorshift(&mut state) % alphabet.len() as u64) as usize])
+                    .collect();
+                bytes += subject.len();
+                let _ = scan_patterns(&subject, false);
+            }
+            let states = DFA.with(|cell| {
+                cell.borrow()
+                    .as_ref()
+                    .unwrap()
+                    .groups
+                    .iter()
+                    .map(|g| g.states.len())
+                    .collect::<Vec<_>>()
+            });
+            println!(
+                "alphabet {idx}: {bytes} bytes in {:?} ({:.1} ns/byte), states={states:?}",
+                started.elapsed(),
+                started.elapsed().as_nanos() as f64 / bytes as f64
+            );
+        }
+    }
+
+    /// Release-like names: a few title words (random letters) plus typical scene tags.
+    fn realistic_subject(state: &mut u64) -> Vec<u8> {
+        let tags: &[&str] = &[
+            "720p",
+            "1080p",
+            "2160p",
+            "HDTV",
+            "WEB-DL",
+            "WEBRip",
+            "BluRay",
+            "x264",
+            "x265",
+            "H.264",
+            "AAC",
+            "DDP5.1",
+            "DTS",
+            "PROPER",
+            "REPACK",
+            "MULTi",
+            "iNTERNAL",
+            "FLAC",
+            "MP3",
+            "320kbps",
+            "CD",
+            "VA",
+            "EPUB",
+            "PDF",
+            "PS4",
+            "XBOX360",
+            "ISO",
+            "Incl.Crack",
+            "x64",
+            "Multilingual",
+            "German",
+            "NF",
+            "AMZN",
+            "S01E02",
+            "S03E10",
+            "S01",
+            "2019",
+            "2023",
+        ];
+        let groups: &[&str] = &[
+            "GRP", "NTb", "FLUX", "SPARKS", "CODEX", "SKIDROW", "DEFLATE", "TEPES", "RARBG", "YIFY",
+        ];
+        let seps: [char; 3] = ['.', ' ', '_'];
+        let sep = seps[(xorshift(state) % 3) as usize];
+        let mut out = String::new();
+        let words = 1 + (xorshift(state) % 5) as usize;
+        for w in 0..words {
+            if w > 0 {
+                out.push(sep);
+            }
+            let len = 2 + (xorshift(state) % 9) as usize;
+            for i in 0..len {
+                let c = (b'a' + (xorshift(state) % 26) as u8) as char;
+                out.push(if i == 0 { c.to_ascii_uppercase() } else { c });
+            }
+        }
+        for _ in 0..(1 + xorshift(state) % 5) {
+            out.push(sep);
+            out.push_str(tags[(xorshift(state) % tags.len() as u64) as usize]);
+        }
+        out.push('-');
+        out.push_str(groups[(xorshift(state) % groups.len() as u64) as usize]);
+        out.into_bytes()
+    }
+
+    #[test]
+    #[ignore = "diagnostic: cargo test --release categorizer_tests::dfa_realistic -- --ignored --nocapture"]
+    fn dfa_realistic() {
+        let mut state = 0xFEED_FACE_0BAD_F00Du64;
+        let started = std::time::Instant::now();
+        for round in 0..6 {
+            let mut bytes = 0usize;
+            let t = std::time::Instant::now();
+            for _ in 0..100_000 {
+                let subject = realistic_subject(&mut state);
+                bytes += subject.len();
+                let _ = scan_patterns(&subject, false);
+            }
+            let states = DFA.with(|cell| {
+                cell.borrow()
+                    .as_ref()
+                    .unwrap()
+                    .groups
+                    .iter()
+                    .map(|g| g.states.len())
+                    .collect::<Vec<_>>()
+            });
+            let approx_bytes: usize = DFA.with(|cell| {
+                cell.borrow()
+                    .as_ref()
+                    .unwrap()
+                    .groups
+                    .iter()
+                    .map(|g| {
+                        g.states
+                            .iter()
+                            .map(|(_, _, k)| k.len() * 4 + 16)
+                            .sum::<usize>()
+                            + g.trans.len() * 4
+                            + g.matchsets.len() * BITS_W * 8
+                    })
+                    .sum()
+            });
+            println!(
+                "  approx DFA memory: {:.1} MiB",
+                approx_bytes as f64 / 1048576.0
+            );
+            println!(
+                "round {round}: 100k names {:.0} ns/name, states/flushes={states:?} total={:?}",
+                t.elapsed().as_nanos() as f64 / 100_000.0,
+                started.elapsed()
+            );
+            let _ = bytes;
+        }
+    }
+
+    #[test]
+    #[ignore = "micro benchmark: cargo test --release categorizer_tests::bench_roots -- --ignored --nocapture"]
+    fn bench_roots() {
+        let names: Vec<&[u8]> = vec![
+            b"Show.Name.S01E02.720p.HDTV.x264-GRP",
+            b"Another.Show.S05E10.1080p.WEB-DL.DDP5.1.H.264-NTb",
+            b"Movie.Title.2021.1080p.BluRay.x264-SPARKS",
+            b"Artist-Album-2020-FLAC-GRP",
+            b"Some.Novel.Author.2020.epub",
+            b"Game.Title-CODEX",
+            b"Brazzers.24.01.15.Some.Girl.1080p.MP4-KTR",
+            b"[SubsPlease] Show Title - 08 (1080p) [ABCD1234]",
+        ];
+        for round in 0..2 {
+            let mut report = Vec::new();
+            for (label, f) in [
+                (
+                    "group",
+                    (|n: &[u8]| root_group_name(b"alt.binaries.multimedia") + n.len() as i64)
+                        as fn(&[u8]) -> i64,
+                ),
+                ("pc", |n| root_pc(n, b"", 4)),
+                ("console", |n| root_console(n, 4)),
+                ("music", |n| root_music(n, 7)),
+                ("book", |n| root_book(n, 4)),
+                ("movie", |n| root_movie(n, 7)),
+                ("tv", |n| root_tv(n, b"", b"", 7)),
+                ("xxx", |n| root_xxx(n, b"", 3)),
+            ] {
+                let iters = 200_000usize;
+                let start = std::time::Instant::now();
+                let mut sink = 0i64;
+                for i in 0..iters {
+                    sink = sink.wrapping_add(f(names[i % names.len()]));
+                }
+                let ns = start.elapsed().as_nanos() as f64 / iters as f64;
+                report.push(format!("{label}={ns:.0}ns({})", sink & 1));
+            }
+            if round == 1 {
+                println!("{}", report.join(" "));
+            }
         }
     }
 }

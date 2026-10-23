@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\Nzb;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use SimpleXMLElement;
 
 /**
@@ -22,6 +24,12 @@ final class NzbArticleFingerprint
     private const int BUFFER_BYTES = 1_048_576;
 
     private const int MAX_RUN_LEVELS = 32;
+
+    private const string NATIVE_CDEF = <<<'C'
+        ssize_t nntmux_nzb_article_fingerprint_batch(const char *buf, size_t buf_len, uint32_t count, uint32_t already_validated, char *out_hex_40);
+        C;
+
+    private static FFI|false|null $native = null;
 
     /** @var list<string> */
     private array $buffer = [];
@@ -122,6 +130,16 @@ final class NzbArticleFingerprint
         }
         if ($this->failed || ! $this->dirty) {
             return $this->fingerprint;
+        }
+        // Nothing has spilled to a run: fingerprint the in-memory IDs without temporary I/O. The buffer is kept so
+        // later additions still see every ID.
+        if ($this->temporaryStreamFactory === null && $this->runs === [] && $this->buffer !== []) {
+            $native = self::nativeFingerprint(implode("\0", $this->buffer), count($this->buffer), true);
+            if ($native !== null) {
+                $this->dirty = false;
+
+                return $this->fingerprint = $native;
+            }
         }
         try {
             $this->flushBuffer();
@@ -307,13 +325,62 @@ final class NzbArticleFingerprint
     }
 
     /**
+     * Rust digest of NUL-separated Message-IDs, or null when the library is unavailable or declines the input
+     * (unsupported ID, NUL inside an ID, count mismatch), in which case the PHP implementation decides.
+     */
+    private static function nativeFingerprint(string $joined, int $count, bool $validated): ?string
+    {
+        $ffi = self::$native ??= RustPipelineLibrary::resolveDomain('nzb_fingerprint_writer', self::NATIVE_CDEF) ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        $capacity = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, 64, $capacity);
+        if ($scratch === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_nzb_article_fingerprint_batch($joined, strlen($joined), $count, $validated ? 1 : 0, $scratch);
+
+        return $written === 40 ? FFI::string($scratch, 40) : null;
+    }
+
+    /**
      * @param  iterable<string>  $messageIds  Segment Message-IDs, with or without angle brackets
      */
     public static function fromMessageIds(iterable $messageIds): ?string
     {
-        $fingerprint = new self;
+        $ids = [];
+        $bytes = 0;
+        $fingerprint = null;
         foreach ($messageIds as $messageId) {
+            if ($fingerprint === null) {
+                if (is_string($messageId) && count($ids) < self::BUFFER_IDS && $bytes + strlen($messageId) <= self::BUFFER_BYTES) {
+                    $ids[] = $messageId;
+                    $bytes += strlen($messageId);
+
+                    continue;
+                }
+                $fingerprint = new self;
+                foreach ($ids as $buffered) {
+                    $fingerprint->add($buffered);
+                }
+                $ids = [];
+            }
             $fingerprint->add($messageId);
+        }
+        if ($fingerprint === null) {
+            if ($ids === []) {
+                return null;
+            }
+            $native = self::nativeFingerprint(implode("\0", $ids), count($ids), false);
+            if ($native !== null) {
+                return $native;
+            }
+            $fingerprint = new self;
+            foreach ($ids as $buffered) {
+                $fingerprint->add($buffered);
+            }
         }
 
         return $fingerprint->value();
