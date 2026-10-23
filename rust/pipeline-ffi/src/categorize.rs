@@ -377,11 +377,12 @@ fn try_match_b64_at(name: &[u8], g_start: usize) -> Option<&[u8]> {
     if max_end - g_start < 24 {
         return None;
     }
-    if max_end == len || is_hash_right_boundary(name[max_end]) {
-        return Some(&name[g_start..max_end]);
-    }
-    if max_end > g_start + 24 && is_hash_right_boundary(name[max_end - 1]) {
-        return Some(&name[g_start..max_end - 1]);
+    let mut end = max_end;
+    while end >= g_start + 24 {
+        if end == len || is_hash_right_boundary(name[end]) {
+            return Some(&name[g_start..end]);
+        }
+        end -= 1;
     }
     None
 }
@@ -822,8 +823,7 @@ pub fn is_random_digit_pattern(core_name: &[u8]) -> bool {
         while trailing_digits < s.len() && s[s.len() - 1 - trailing_digits].is_ascii_digit() {
             trailing_digits += 1;
         }
-        if trailing_digits >= 8 && s.len() - trailing_digits >= 2 && trailing_digits + 2 <= s.len()
-        {
+        if trailing_digits >= 8 && s.len() - trailing_digits <= 4 {
             return true;
         }
     }
@@ -1470,9 +1470,14 @@ mod tests {
                 11u8,
             ),
             (b"VGhpc0lzTm90QVNob3dOYW1lMTIzNDU2Nzg5MA==".as_slice(), 5u8),
+            (
+                b"VGhpc0lzTm90QVNob3dOYW1lMTIzNDU2Nzg5MA==-foo:bar".as_slice(),
+                5u8,
+            ),
             (b"aB3c.D4eF.5gH6i.J7kL8m".as_slice(), 14u8),
             (b"xyz.1234.wvut.5678.srqp.9012.rar".as_slice(), 15u8),
             (b"xz.123456789012".as_slice(), 16u8),
+            (b"a1.2345.6789".as_slice(), 16u8),
             (b"xkcdqwrtypsdfghjklmnbvcxz".as_slice(), 8u8),
             (b"A1b2.C3d4.E5f6.G7h8.I9j0".as_slice(), 13u8),
         ];
@@ -1487,6 +1492,7 @@ mod tests {
             );
             assert_eq!(cat, 20);
         }
+        assert!(is_hashed_or_gibberish_bytes(b"123456789012"));
     }
 
     #[test]
@@ -1494,6 +1500,7 @@ mod tests {
         let cases = [
             b"Some.Movie.2024.1080p.BluRay.x264-GROUP".as_slice(),
             b"Show.Name.S03E05.720p.HDTV.x264-GROUP".as_slice(),
+            b"The.Daily.Show.20260419.mkv".as_slice(),
             b"Artist.Name-Album.Title-2024-FLAC-GROUP".as_slice(),
             b"Starfield-RUNE".as_slice(),
             b"Microsoft Office Suite Installer".as_slice(),

@@ -418,7 +418,7 @@ class MiscCategorizer extends AbstractCategorizer
         }
 
         $rawCat = \ord($raw[0]) | (\ord($raw[1]) << 8);
-        $categoryId = ($rawCat === Category::OTHER_HASHED || $rawCat === 7020)
+        $categoryId = $rawCat === Category::OTHER_HASHED
             ? Category::OTHER_HASHED
             : Category::OTHER_MISC;
         $confidence = \ord($raw[2]) / 100.0;
