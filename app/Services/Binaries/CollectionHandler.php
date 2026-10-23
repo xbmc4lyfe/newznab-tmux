@@ -158,6 +158,21 @@ final class CollectionHandler
         $hashesToPrefetch = [];
         $groupNamesByCollectionKey = [];
 
+        $groupsBatchByIndex = null;
+        if (\get_class($this->xrefService) === XrefService::class && \count($headers) > 1) {
+            $xrefList = [];
+            $indexList = [];
+            foreach ($headers as $index => $header) {
+                $xrefList[] = (string) ($header['Xref'] ?? '');
+                $indexList[] = $index;
+            }
+            $extracted = $this->xrefService->extractGroupNamesBatch($xrefList);
+            $groupsBatchByIndex = [];
+            foreach ($indexList as $pos => $index) {
+                $groupsBatchByIndex[$index] = $extracted[$pos];
+            }
+        }
+
         foreach ($headers as $index => $header) {
             $totalFiles = (int) ($totalFilesByIndex[$index] ?? 0);
             $collMatch = $this->collectionsCleaning->collectionsCleaner(
@@ -166,7 +181,9 @@ final class CollectionHandler
             );
 
             $collectionKey = $collMatch['name'].$totalFiles;
-            $groupNames = $this->xrefService->extractGroupNames($header['Xref'] ?? '');
+            $groupNames = $groupsBatchByIndex !== null
+                ? $groupsBatchByIndex[$index]
+                : $this->xrefService->extractGroupNames($header['Xref'] ?? '');
             if ($groupNames === []) {
                 $groupNames = [$groupName];
             }
