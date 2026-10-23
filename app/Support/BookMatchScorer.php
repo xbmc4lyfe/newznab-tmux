@@ -14,6 +14,28 @@ class BookMatchScorer
      */
     public function score(array $candidate, BookParseResult $parsed): float
     {
+        $fast = RustPipelineLibrary::bookScore(
+            $parsed->rawName,
+            $parsed->title,
+            $parsed->hasAuthor() ? (string) $parsed->author : null,
+            $parsed->isbn,
+            (string) ($candidate['title'] ?? ''),
+            (string) ($candidate['author'] ?? ''),
+            isset($candidate['isbn']) ? (string) $candidate['isbn'] : null,
+            isset($candidate['ean']) ? (string) $candidate['ean'] : null,
+        );
+        if ($fast !== null) {
+            return $fast;
+        }
+
+        return $this->scorePhp($candidate, $parsed);
+    }
+
+    /**
+     * @param  array<string, mixed>  $candidate
+     */
+    public function scorePhp(array $candidate, BookParseResult $parsed): float
+    {
         $parsedIsbn = BookIsbn::normalize($parsed->isbn);
         $candidateIdentifiers = $this->candidateIdentifiers($candidate);
         if ($parsedIsbn !== null && $candidateIdentifiers !== []) {
@@ -30,9 +52,9 @@ class BookMatchScorer
             return 0.0;
         }
 
-        $titleScore = $this->titleScore($parsed->title, (string) ($candidate['title'] ?? ''));
+        $titleScore = $this->titleScorePhp($parsed->title, (string) ($candidate['title'] ?? ''));
         $authorScore = $parsed->hasAuthor()
-            ? $this->authorScore((string) $parsed->author, (string) ($candidate['author'] ?? ''))
+            ? $this->authorScorePhp((string) $parsed->author, (string) ($candidate['author'] ?? ''))
             : 0.0;
 
         if ($parsed->hasAuthor()) {
@@ -56,6 +78,16 @@ class BookMatchScorer
     }
 
     public function titleScore(string $left, string $right): float
+    {
+        $fast = RustPipelineLibrary::bookTitleScore($left, $right);
+        if ($fast !== null) {
+            return $fast;
+        }
+
+        return $this->titleScorePhp($left, $right);
+    }
+
+    public function titleScorePhp(string $left, string $right): float
     {
         $leftVariants = $this->titleVariants($left);
         $rightVariants = $this->titleVariants($right);
@@ -96,6 +128,16 @@ class BookMatchScorer
     }
 
     public function authorScore(string $left, string $right): float
+    {
+        $fast = RustPipelineLibrary::bookAuthorScore($left, $right);
+        if ($fast !== null) {
+            return $fast;
+        }
+
+        return $this->authorScorePhp($left, $right);
+    }
+
+    public function authorScorePhp(string $left, string $right): float
     {
         $leftTokens = $this->tokens($left);
         $rightTokens = $this->tokens($right);

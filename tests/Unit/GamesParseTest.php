@@ -43,4 +43,14 @@ class GamesParseTest extends TestCase
             ['Resident.Evil.4.Remake.REPACK-DODI', 'Resident Evil 4 Remake'],
         ];
     }
+
+    #[DataProvider('titlesProvider')]
+    public function test_rust_ffi_parity_with_php_fallbacks(string $input, string $expected): void
+    {
+        $this->assertSame($expected, $this->parser->cleanReleaseNamePhp($input));
+        $this->assertSame(
+            $this->parser->normalizeForMatchPhp($input),
+            $this->parser->normalizeForMatch($input)
+        );
+    }
 }

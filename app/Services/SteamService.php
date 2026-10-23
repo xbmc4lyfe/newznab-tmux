@@ -7,6 +7,7 @@ namespace App\Services;
 use App\Enums\SecondarySearchIndex;
 use App\Facades\Search;
 use App\Models\SteamApp;
+use App\Support\RustPipelineLibrary;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
@@ -822,6 +823,16 @@ class SteamService
      */
     public function cleanTitle(string $title): string
     {
+        $fast = RustPipelineLibrary::steamCleanTitle($title);
+        if ($fast !== null) {
+            return $fast;
+        }
+
+        return $this->cleanTitlePhp($title);
+    }
+
+    public function cleanTitlePhp(string $title): string
+    {
         $title = trim($title);
         if ($title === '') {
             return '';
@@ -941,13 +952,23 @@ class SteamService
      */
     protected function normalizeTitle(string $title): string
     {
+        $fast = RustPipelineLibrary::steamNormalizeTitle($title);
+        if ($fast !== null) {
+            return $fast;
+        }
+
+        return $this->normalizeTitlePhp($title);
+    }
+
+    public function normalizeTitlePhp(string $title): string
+    {
         $s = mb_strtolower($title);
 
         // Replace separators
         $s = (string) preg_replace('/[._\-+]+/u', ' ', $s);
 
         // Convert roman numerals
-        $s = $this->replaceRomanNumerals($s);
+        $s = $this->replaceRomanNumeralsPhp($s);
 
         // Remove common noise
         $noise = array_merge(
@@ -975,6 +996,16 @@ class SteamService
      */
     protected function stripEditionTags(string $title): string
     {
+        $fast = RustPipelineLibrary::steamStripEditionTags($title);
+        if ($fast !== null) {
+            return $fast;
+        }
+
+        return $this->stripEditionTagsPhp($title);
+    }
+
+    public function stripEditionTagsPhp(string $title): string
+    {
         // Remove compound edition phrases first
         $compoundPatterns = [
             '/\b(Game\s+of\s+the\s+Year)[\s._-]*(Edition)?\b/i',
@@ -1000,8 +1031,18 @@ class SteamService
      */
     protected function scoreTitle(string $candidate, string $original): float
     {
-        $normCand = $this->normalizeTitle($candidate);
-        $normOrig = $this->normalizeTitle($original);
+        $fast = RustPipelineLibrary::steamScoreTitle($candidate, $original);
+        if ($fast !== null) {
+            return $fast;
+        }
+
+        return $this->scoreTitlePhp($candidate, $original);
+    }
+
+    public function scoreTitlePhp(string $candidate, string $original): float
+    {
+        $normCand = $this->normalizeTitlePhp($candidate);
+        $normOrig = $this->normalizeTitlePhp($original);
 
         if ($normCand === '' || $normOrig === '') {
             return 0.0;
@@ -1078,6 +1119,16 @@ class SteamService
      * @return list<string>
      */
     protected function replaceRomanNumerals(string $s): string
+    {
+        $fast = RustPipelineLibrary::steamReplaceRomanNumerals($s);
+        if ($fast !== null) {
+            return $fast;
+        }
+
+        return $this->replaceRomanNumeralsPhp($s);
+    }
+
+    public function replaceRomanNumeralsPhp(string $s): string
     {
         $map = [
             'xx' => '20', 'xix' => '19', 'xviii' => '18', 'xvii' => '17', 'xvi' => '16',
