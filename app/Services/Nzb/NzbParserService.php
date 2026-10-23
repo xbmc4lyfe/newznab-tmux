@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\Nzb;
 
+use App\Support\RustPipelineLibrary;
+
 /**
  * Service for parsing and extracting information from NZB file contents.
  * Handles parsing NZB XML structure and extracting file lists, extensions, sizes, etc.
@@ -20,7 +22,95 @@ class NzbParserService
      *                                         - 'strip-count': Strip file/part count from subject for sorting (default: false)
      * @return array<string, mixed> $result Empty if not an NZB or the contents of the NZB.
      */
-    public function parseNzbFileList(string $nzb, array $options = []): array
+    public function parseNzbFileList(string $nzb, array $options = [], bool $useNative = true): array
+    {
+        if (! $nzb) {
+            return [];
+        }
+
+        $defaults = [
+            'no-file-key' => true,
+            'strip-count' => false,
+        ];
+        $options += $defaults;
+
+        if ($useNative) {
+            $lines = RustPipelineLibrary::nzbParseFileLines($nzb);
+            if ($lines !== null) {
+                $result = [];
+                $noFileKey = $options['no-file-key'] !== false;
+                $stripCount = (bool) $options['strip-count'];
+                $numIdx = 0;
+
+                foreach ($lines as $line) {
+                    $fields = explode("\0", $line, 8);
+                    if (\count($fields) !== 8) {
+                        return $this->parseNzbFileListPhp($nzb, $options);
+                    }
+                    [$title, $ext, $firstSeg, $size, $partsActual, $partsTotal, $groupsStr, $segmentsStr] = $fields;
+
+                    if ($noFileKey) {
+                        $key = $numIdx++;
+                    } else {
+                        $key = $title;
+                        if ($stripCount) {
+                            $key = preg_replace('#\d+[- ._]?(/|\||[o0]f)[- ._]?\d+?(?![- ._]\d)#i', '', $key);
+                            if (str_contains($key, '.par2') && ! preg_match('#\.vol\d+\+\d+\.par2#i', $key)) {
+                                $key = str_replace('.par2', '.vol0.par2', $key);
+                            } elseif (preg_match('#\.rar[^a-z0-9]#i', $key) && ! preg_match('#\.part\d+\.rar$#i', $key)) {
+                                $key = preg_replace('#\.rar(?:[^a-z0-9])#i', '.part0.rar', $key);
+                            }
+                        }
+                    }
+
+                    $segs = $segmentsStr === '' ? [] : explode("\t", $segmentsStr);
+                    $grps = $groupsStr === '' ? [] : explode("\t", $groupsStr);
+
+                    if (! isset($result[$key])) {
+                        $entry = [
+                            'title' => $title,
+                            'filecount' => 1,
+                            'ext' => $ext,
+                            'segments' => $segs,
+                            'firstsegment' => $firstSeg === '1',
+                            'size' => (int) $size,
+                        ];
+                        if ($partsTotal !== '') {
+                            $entry['partstotal'] = $partsTotal;
+                        }
+                        $entry['partsactual'] = (int) $partsActual;
+                        $entry['groups'] = $grps;
+                        $result[$key] = $entry;
+                    } else {
+                        $result[$key]['title'] = $title;
+                        $result[$key]['filecount']++;
+                        $result[$key]['ext'] = $ext;
+                        if ($segs !== []) {
+                            array_push($result[$key]['segments'], ...$segs);
+                        }
+                        $result[$key]['size'] = (int) $size;
+                        if ($partsTotal !== '') {
+                            $result[$key]['partstotal'] = $partsTotal;
+                        }
+                        $result[$key]['partsactual'] = (int) $partsActual;
+                        if ($grps !== []) {
+                            array_push($result[$key]['groups'], ...$grps);
+                        }
+                    }
+                }
+
+                return $result;
+            }
+        }
+
+        return $this->parseNzbFileListPhp($nzb, $options);
+    }
+
+    /**
+     * @param  array<string, mixed>  $options
+     * @return array<int|string, mixed>
+     */
+    public function parseNzbFileListPhp(string $nzb, array $options = []): array
     {
         $defaults = [
             'no-file-key' => true,

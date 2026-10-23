@@ -287,6 +287,71 @@ final class RustPipelineLibrary
         return \count($lines) === $count ? $lines : null;
     }
 
+    /**
+     * Detect NZB file extension from subject via Rust FFI, or null if FFI unavailable.
+     */
+    public static function nzbDetectFileExtension(string $subject, ?string $libraryPath = null): ?string
+    {
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $scratch = self::ensureScratch($ffi, 16);
+        if ($scratch === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_nzb_detect_file_extension($subject, \strlen($subject), $scratch);
+        if (! \is_int($written) || $written < 0) {
+            return null;
+        }
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
+    /**
+     * Parse NZB `<file>` nodes into raw `\n`-separated summary records via Rust FFI, or null when declined/unavailable.
+     *
+     * @return list<string>|null
+     */
+    public static function nzbParseFileLines(string $nzb, ?string $libraryPath = null): ?array
+    {
+        $len = \strlen($nzb);
+        if ($len === 0) {
+            return [];
+        }
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $scratch = self::ensureScratch($ffi, max(self::INITIAL_SCRATCH_BYTES, intdiv($len, 2) + 256));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_nzb_parse_files($nzb, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written)) {
+            return null;
+        }
+        if ($written < -1) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_nzb_parse_files($nzb, $len, $scratch, self::$scratchCap);
+        }
+        if (! \is_int($written) || $written < 0) {
+            return null;
+        }
+        if ($written === 0) {
+            return [];
+        }
+
+        return explode("\n", FFI::string($scratch, $written));
+    }
+
     public static function resolve(?string $libraryPath = null): ?FFI
     {
         if (! \in_array(PHP_OS_FAMILY, ['Linux', 'Darwin'], true) || ! \extension_loaded('FFI')) {
@@ -323,6 +388,8 @@ final class RustPipelineLibrary
                     ssize_t nntmux_xref_extract_batch_nul(const char *input, size_t input_len, uint32_t mode, char *out_buf, size_t out_cap);
                     ssize_t nntmux_binary_identity_hash(const char *subject, size_t subject_len, const char *poster, size_t poster_len, int64_t file_number, char *out_hex32);
                     ssize_t nntmux_binary_identity_hash_batch_nul(const char *input, size_t input_len, size_t count, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_nzb_detect_file_extension(const char *subject, size_t subject_len, char *out_buf);
+                    ssize_t nntmux_nzb_parse_files(const char *xml, size_t xml_len, char *out_buf, size_t out_cap);
                     C, $resolved);
 
                 // @phpstan-ignore method.notFound
