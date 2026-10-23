@@ -7,6 +7,8 @@ namespace App\Services\Predb\Feeds\Sources;
 use App\Services\Predb\Feeds\Contracts\CompleteCatalogueSource;
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use App\Support\PredbSearchDocument;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
 
@@ -19,6 +21,28 @@ use RuntimeException;
  */
 final class NzedbArchiveSource extends BoundedHttpFeedSource implements CompleteCatalogueSource
 {
+    private const NATIVE_CDEF = <<<'C'
+        ssize_t nntmux_predb_nzedb_parse_csv(const char *csv, size_t csv_len, size_t max_records, char *out_buf, size_t out_cap);
+        C;
+
+    private const NATIVE_ERRORS = [
+        '1' => 'NZEDB_ARCHIVE export exceeds its record limit.',
+        '2' => 'NZEDB_ARCHIVE returned a truncated or non-twelve-field CSV record.',
+        '3' => 'NZEDB_ARCHIVE returned an invalid MySQL OUTFILE field.',
+        '4' => 'NZEDB_ARCHIVE returned a truncated field escape.',
+        '5' => 'NZEDB_ARCHIVE returned an invalid or truncated field escape.',
+        '6' => 'NZEDB_ARCHIVE returned an unterminated CSV field.',
+    ];
+
+    private const NATIVE_REJECTIONS = [
+        '1' => 'empty_title',
+        '2' => 'outer_title_whitespace',
+        '3' => 'overlength_title',
+        '4' => 'control_title',
+    ];
+
+    private static FFI|false|null $native = null;
+
     /** @var list<PredbFeedEntry>|null */
     private ?array $entries = null;
 
@@ -35,6 +59,7 @@ final class NzedbArchiveSource extends BoundedHttpFeedSource implements Complete
         int $maximumBodyBytes = 1048576,
         private readonly int $maximumCsvBytes = 8388608,
         private readonly int $maximumRecords = 5000,
+        private readonly bool $useNative = true,
     ) {
         if ($maximumBodyBytes < 1 || $maximumBodyBytes > 8388608
             || $maximumCsvBytes < 1 || $maximumCsvBytes > 8388608
@@ -117,8 +142,14 @@ final class NzedbArchiveSource extends BoundedHttpFeedSource implements Complete
     public function parseCsv(string $csv): array
     {
         $this->resetCatalogue();
-        if ($csv === '' || strlen($csv) > $this->maximumCsvBytes
-            || ! mb_check_encoding($csv, 'UTF-8') || str_contains($csv, "\0")) {
+        if ($csv === '' || strlen($csv) > $this->maximumCsvBytes || str_contains($csv, "\0")) {
+            throw new RuntimeException('NZEDB_ARCHIVE returned an invalid or oversized CSV export.');
+        }
+        $native = $this->useNative ? $this->nativeRecords($csv) : null;
+        if ($native !== null) {
+            return $this->entriesFromNative($native);
+        }
+        if (! mb_check_encoding($csv, 'UTF-8')) {
             throw new RuntimeException('NZEDB_ARCHIVE returned an invalid or oversized CSV export.');
         }
         $offset = 0;
@@ -160,6 +191,17 @@ final class NzedbArchiveSource extends BoundedHttpFeedSource implements Complete
             }
             $entries[] = new PredbFeedEntry(title: $title, source: 'nzedb-pre-dumps', category: $category);
         }
+
+        return $this->finishCatalogue($entries, $rejections, $records);
+    }
+
+    /**
+     * @param  list<PredbFeedEntry>  $entries
+     * @param  array<string, int>  $rejections
+     * @return list<PredbFeedEntry>
+     */
+    private function finishCatalogue(array $entries, array $rejections, int $records): array
+    {
         $this->acceptedCount = count($entries);
         $this->rejections = $rejections;
         if ($rejections !== []) {
@@ -172,6 +214,71 @@ final class NzedbArchiveSource extends BoundedHttpFeedSource implements Complete
         }
 
         return $entries;
+    }
+
+    /**
+     * Rust record reader output, or null when PHP must parse the export (library missing, or the
+     * export is not valid UTF-8 so PHP raises its own error).
+     */
+    private function nativeRecords(string $csv): ?string
+    {
+        $ffi = self::$native ??= RustPipelineLibrary::resolveDomain('predb_feeds', self::NATIVE_CDEF) ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        $length = strlen($csv);
+        $capacity = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, $length + 64, $capacity);
+        if ($scratch === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_predb_nzedb_parse_csv($csv, $length, $this->maximumRecords, $scratch, $capacity);
+        if (is_int($written) && $written < -1) {
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_predb_nzedb_parse_csv($csv, $length, $this->maximumRecords, $scratch, $capacity);
+        }
+
+        return is_int($written) && $written > 0 ? FFI::string($scratch, $written) : null;
+    }
+
+    /** @return list<PredbFeedEntry> */
+    private function entriesFromNative(string $output): array
+    {
+        if ($output[0] === 'E') {
+            throw new RuntimeException(self::NATIVE_ERRORS[$output[1] ?? ''] ?? 'NZEDB_ARCHIVE returned an invalid or oversized CSV export.');
+        }
+        $lines = explode("\n", $output);
+        $records = (int) substr($lines[0], 1);
+        $entries = [];
+        $identities = [];
+        $rejections = [];
+        for ($index = 1; $index <= $records; $index++) {
+            $line = $lines[$index];
+            if ($line[0] === 'R') {
+                $reason = self::NATIVE_REJECTIONS[$line[1]];
+                $rejections[$reason] = ($rejections[$reason] ?? 0) + 1;
+
+                continue;
+            }
+            $separator = strpos($line, "\x1f", 1);
+            $title = substr($line, 1, $separator - 1);
+            $identity = PredbSearchDocument::exactValue($title);
+            if (isset($identities[$identity])) {
+                $rejections['duplicate_title'] = ($rejections['duplicate_title'] ?? 0) + 1;
+
+                continue;
+            }
+            $identities[$identity] = true;
+            $category = substr($line, $separator + 1);
+            $entries[] = new PredbFeedEntry(title: $title, source: 'nzedb-pre-dumps', category: $category === '' ? null : $category);
+        }
+
+        return $this->finishCatalogue($entries, $rejections, $records);
     }
 
     private function readField(string $csv, int &$offset): ?string
