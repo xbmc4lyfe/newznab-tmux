@@ -485,9 +485,9 @@ const ASCII_NORM_LUT: [u8; 256] = {
     lut
 };
 
-/// Computes the 32-byte lowercase hex MD5 digest of `data` directly over 64-byte slices without intermediate buffering.
+/// Computes the 16-byte raw MD5 digest of `data` directly over 64-byte slices without intermediate buffering.
 #[inline]
-pub fn md5_hex_slice(data: &[u8]) -> [u8; 32] {
+pub fn md5_raw_slice(data: &[u8]) -> [u8; 16] {
     let mut state = [0x67452301u32, 0xefcdab89, 0x98badcfe, 0x10325476];
 
     #[inline(always)]
@@ -558,13 +558,21 @@ pub fn md5_hex_slice(data: &[u8]) -> [u8; 32] {
     tail[56..64].copy_from_slice(&bit_len.to_le_bytes());
     compress_block(&mut state, &tail);
 
-    let mut hex = [0u8; 32];
+    let mut raw = [0u8; 16];
     for (i, word) in state.iter().enumerate() {
-        for (j, &byte) in word.to_le_bytes().iter().enumerate() {
-            let pos = (i * 4 + j) * 2;
-            hex[pos] = HEX_LOWER[(byte >> 4) as usize];
-            hex[pos + 1] = HEX_LOWER[(byte & 0x0f) as usize];
-        }
+        raw[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    raw
+}
+
+/// Computes the 32-byte lowercase hex MD5 digest of `data` directly over 64-byte slices without intermediate buffering.
+#[inline]
+pub fn md5_hex_slice(data: &[u8]) -> [u8; 32] {
+    let raw = md5_raw_slice(data);
+    let mut hex = [0u8; 32];
+    for (i, &byte) in raw.iter().enumerate() {
+        hex[i * 2] = HEX_LOWER[(byte >> 4) as usize];
+        hex[i * 2 + 1] = HEX_LOWER[(byte & 0x0f) as usize];
     }
     hex
 }
@@ -1795,6 +1803,352 @@ pub unsafe extern "C" fn nntmux_nzb_parse_files(
     out.finish()
 }
 
+const PAR2_PACKET_MARKER: &[u8; 8] = b"PAR2\0PKT";
+const PAR2_TYPE_MAIN: &[u8; 16] = b"PAR 2.0\0Main\0\0\0\0";
+const PAR2_TYPE_FILEDESC: &[u8; 16] = b"PAR 2.0\0FileDesc";
+const PAR2_TYPE_FILEVER: &[u8; 16] = b"PAR 2.0\0IFSC\0\0\0\0";
+const PAR2_TYPE_RECOVERY: &[u8; 16] = b"PAR 2.0\0RecvSlic";
+const PAR2_TYPE_CREATOR: &[u8; 16] = b"PAR 2.0\0Creator\0";
+const PAR2_TYPE_FILENAME_UC: &[u8; 16] = b"PAR 2.0\0UniFileN";
+const PAR2_TYPE_COMMENT_ASCII: &[u8; 16] = b"PAR 2.0\0CommASCI";
+const PAR2_TYPE_COMMENT_UC: &[u8; 16] = b"PAR 2.0\0CommUni\0";
+const PAR2_TYPE_INPUT_BLOCK: &[u8; 16] = b"PAR 2.0\0FileSlic";
+const PAR2_TYPE_RECOVERY_VER: &[u8; 16] = b"PAR 2.0\0RFSC\0\0\0\0";
+const PAR2_TYPE_PACKED_MAIN: &[u8; 16] = b"PAR 2.0\0PkdMain\0";
+const PAR2_TYPE_PACKED_RECOVERY: &[u8; 16] = b"PAR 2.0\0PkdRecvS";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Par2PacketKind {
+    Retained,
+    ValidatedOnly,
+    Skipped,
+}
+
+#[inline]
+fn classify_par2_packet_type(pkt_type: &[u8]) -> Option<Par2PacketKind> {
+    if pkt_type == PAR2_TYPE_MAIN
+        || pkt_type == PAR2_TYPE_FILEDESC
+        || pkt_type == PAR2_TYPE_FILEVER
+    {
+        Some(Par2PacketKind::Retained)
+    } else if pkt_type == PAR2_TYPE_RECOVERY
+        || pkt_type == PAR2_TYPE_INPUT_BLOCK
+        || pkt_type == PAR2_TYPE_PACKED_RECOVERY
+    {
+        Some(Par2PacketKind::Skipped)
+    } else if pkt_type == PAR2_TYPE_CREATOR
+        || pkt_type == PAR2_TYPE_FILENAME_UC
+        || pkt_type == PAR2_TYPE_COMMENT_ASCII
+        || pkt_type == PAR2_TYPE_COMMENT_UC
+        || pkt_type == PAR2_TYPE_RECOVERY_VER
+        || pkt_type == PAR2_TYPE_PACKED_MAIN
+    {
+        Some(Par2PacketKind::ValidatedOnly)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn parse_par2_packet_length(len_bytes: &[u8]) -> Option<u64> {
+    if len_bytes.len() < 8 {
+        return None;
+    }
+    let low = u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]);
+    let high = u32::from_le_bytes([len_bytes[4], len_bytes[5], len_bytes[6], len_bytes[7]]);
+    if high > 0x7FFF_FFFF {
+        return None;
+    }
+    let length = (u64::from(high) << 32) | u64::from(low);
+    if length < 64 || !length.is_multiple_of(4) {
+        return None;
+    }
+    Some(length)
+}
+
+/// Computes the exact byte length of `base64_encode(s)` inside PHP `json_encode` (where `/` is escaped as `\/`).
+#[inline]
+pub fn b64_json_escaped_len(s: &[u8]) -> usize {
+    if s.is_empty() {
+        return 0;
+    }
+    let (chunks, rem) = s.as_chunks::<3>();
+    let mut slashes = 0usize;
+    for &[b0, b1, b2] in chunks {
+        slashes += usize::from((b0 >> 2) == 63);
+        slashes += usize::from(((b0 & 0x03) == 0x03) && ((b1 >> 4) == 0x0F));
+        slashes += usize::from(((b1 & 0x0F) == 0x0F) && ((b2 >> 6) == 0x03));
+        slashes += usize::from((b2 & 0x3F) == 0x3F);
+    }
+    match *rem {
+        [b0] => {
+            slashes += usize::from((b0 >> 2) == 63);
+        }
+        [b0, b1] => {
+            slashes += usize::from((b0 >> 2) == 63);
+            slashes += usize::from(((b0 & 0x03) == 0x03) && ((b1 >> 4) == 0x0F));
+        }
+        _ => {}
+    }
+    s.len().div_ceil(3) * 4 + slashes
+}
+
+#[inline]
+fn decimal_len_u64(mut n: u64) -> usize {
+    let mut len = 1usize;
+    while n >= 10 {
+        n /= 10;
+        len += 1;
+    }
+    len
+}
+
+#[inline]
+fn compute_par2_state_bytes(
+    packets_json_inner_bytes: usize,
+    tail: &[u8],
+    skip_remaining: u64,
+) -> u64 {
+    (54 + packets_json_inner_bytes + b64_json_escaped_len(tail) + decimal_len_u64(skip_remaining))
+        as u64
+}
+
+fn retain_par2_packet(
+    packet: &[u8],
+    kind: Par2PacketKind,
+    existing_pkts: &[&[u8]],
+    new_pkt_ranges: &[(usize, usize)],
+    new_pkts_arena: &[u8],
+    packets_json_inner_bytes: &mut usize,
+) -> isize {
+    let pkt_type = &packet[48..64];
+    let body_len = packet.len() - 64;
+    if (pkt_type == PAR2_TYPE_MAIN && (body_len < 12 || !(body_len - 12).is_multiple_of(16)))
+        || (pkt_type == PAR2_TYPE_FILEDESC && body_len < 56)
+        || (pkt_type == PAR2_TYPE_FILEVER
+            && (body_len < 16 || !(body_len - 16).is_multiple_of(20)))
+    {
+        return -2;
+    }
+    if pkt_type == PAR2_TYPE_MAIN {
+        let count = u32::from_le_bytes([packet[72], packet[73], packet[74], packet[75]]) as usize;
+        if count > (body_len - 12) / 16 {
+            return -2;
+        }
+    }
+    if md5_raw_slice(&packet[32..]) != packet[16..32] {
+        return -2;
+    }
+    if kind != Par2PacketKind::Retained {
+        return 0;
+    }
+    let id_end = if pkt_type == PAR2_TYPE_MAIN { 64 } else { 80 };
+    let identity = &packet[32..id_end];
+    for &existing in existing_pkts {
+        if existing == packet {
+            return 0;
+        }
+        let ex_id_end = if &existing[48..64] == PAR2_TYPE_MAIN {
+            64
+        } else {
+            80
+        };
+        if &existing[32..ex_id_end] == identity {
+            return -2;
+        }
+    }
+    for &(s, e) in new_pkt_ranges {
+        let existing = &new_pkts_arena[s..e];
+        if existing == packet {
+            return 0;
+        }
+        let ex_id_end = if &existing[48..64] == PAR2_TYPE_MAIN {
+            64
+        } else {
+            80
+        };
+        if &existing[32..ex_id_end] == identity {
+            return -2;
+        }
+    }
+    let total_before = existing_pkts.len() + new_pkt_ranges.len();
+    *packets_json_inner_bytes += 2 + b64_json_escaped_len(packet) + usize::from(total_before > 0);
+    1
+}
+
+/// Scans, frames, and validates a PAR2 metadata stream (`Par2PacketAccumulator::consume`).
+///
+/// Return values:
+/// - `>= 16`: bytes written to `out_buf`:
+///   `[skip_remaining: u64 LE][tail_len: u32 LE][new_packets_count: u32 LE][tail_bytes][new_packets_concat]`
+/// - `<= -16`: `-(required_bytes as isize)` when `out_cap` was too small
+/// - `-2`: `InvalidArgumentException`
+/// - `-3`: `LengthException`
+/// - `-1`: internal pointer error
+///
+/// # Safety
+///
+/// `existing`, `tail`, and `incoming` must be valid for reads of their respective lengths when non-null.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_par2_scan_packets(
+    existing: *const u8,
+    existing_len: usize,
+    tail: *const u8,
+    tail_len: usize,
+    skip_remaining: i64,
+    max_state_bytes: i64,
+    incoming: *const u8,
+    incoming_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if (existing.is_null() && existing_len > 0)
+        || (tail.is_null() && tail_len > 0)
+        || (incoming.is_null() && incoming_len > 0)
+        || skip_remaining < 0
+    {
+        return -1;
+    }
+    if max_state_bytes < 55 {
+        return -3;
+    }
+    let max_state = max_state_bytes as u64;
+
+    let existing_bytes: &[u8] = if existing_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(existing, existing_len) }
+    };
+    let tail_bytes: &[u8] = if tail_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(tail, tail_len) }
+    };
+    let incoming_bytes: &[u8] = if incoming_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(incoming, incoming_len) }
+    };
+
+    let mut existing_pkts: Vec<&[u8]> = Vec::new();
+    let mut packets_json_inner_bytes = 0usize;
+    let mut ex_off = 0usize;
+    while ex_off < existing_bytes.len() {
+        if ex_off + 64 > existing_bytes.len() {
+            return -1;
+        }
+        let Some(pkt_len_u64) = parse_par2_packet_length(&existing_bytes[ex_off + 8..ex_off + 16])
+        else {
+            return -1;
+        };
+        let pkt_len = pkt_len_u64 as usize;
+        if ex_off + pkt_len > existing_bytes.len() {
+            return -1;
+        }
+        let pkt = &existing_bytes[ex_off..ex_off + pkt_len];
+        packets_json_inner_bytes +=
+            2 + b64_json_escaped_len(pkt) + usize::from(!existing_pkts.is_empty());
+        existing_pkts.push(pkt);
+        ex_off += pkt_len;
+    }
+
+    let mut cur_tail = Vec::with_capacity(tail_bytes.len().max(256));
+    cur_tail.extend_from_slice(tail_bytes);
+    let mut cur_skip = skip_remaining as u64;
+    let mut new_pkts_arena = Vec::new();
+    let mut new_pkt_ranges: Vec<(usize, usize)> = Vec::new();
+
+    let mut offset = 0usize;
+    while offset < incoming_bytes.len() {
+        if cur_skip > 0 {
+            let avail = (incoming_bytes.len() - offset) as u64;
+            let skip = cur_skip.min(avail);
+            cur_skip -= skip;
+            offset += skip as usize;
+            continue;
+        }
+        if cur_tail.len() < 64 {
+            let take = (64 - cur_tail.len()).min(incoming_bytes.len() - offset);
+            cur_tail.extend_from_slice(&incoming_bytes[offset..offset + take]);
+            offset += take;
+            let prefix_len = cur_tail.len().min(8);
+            if cur_tail[..prefix_len] != PAR2_PACKET_MARKER[..prefix_len] {
+                return -2;
+            }
+            if cur_tail.len() >= 16 && parse_par2_packet_length(&cur_tail[8..16]).is_none() {
+                return -2;
+            }
+            if cur_tail.len() < 64 {
+                if compute_par2_state_bytes(packets_json_inner_bytes, &cur_tail, cur_skip)
+                    > max_state
+                {
+                    return -3;
+                }
+                break;
+            }
+        }
+
+        let Some(length) = parse_par2_packet_length(&cur_tail[8..16]) else {
+            return -2;
+        };
+        let pkt_type = &cur_tail[48..64];
+        let Some(kind) = classify_par2_packet_type(pkt_type) else {
+            return -2;
+        };
+        if kind == Par2PacketKind::Skipped {
+            cur_tail.clear();
+            cur_skip = length - 64;
+            continue;
+        }
+        if length > max_state {
+            return -3;
+        }
+        let pkt_len = length as usize;
+        let need = pkt_len - cur_tail.len();
+        let avail = incoming_bytes.len() - offset;
+        if avail >= need {
+            cur_tail.extend_from_slice(&incoming_bytes[offset..offset + need]);
+            offset += need;
+            let status = retain_par2_packet(
+                &cur_tail,
+                kind,
+                &existing_pkts,
+                &new_pkt_ranges,
+                &new_pkts_arena,
+                &mut packets_json_inner_bytes,
+            );
+            if status < 0 {
+                return status;
+            }
+            if status == 1 {
+                let start = new_pkts_arena.len();
+                new_pkts_arena.extend_from_slice(&cur_tail);
+                new_pkt_ranges.push((start, new_pkts_arena.len()));
+            }
+            cur_tail.clear();
+        } else {
+            cur_tail.extend_from_slice(&incoming_bytes[offset..]);
+            offset = incoming_bytes.len();
+        }
+        if compute_par2_state_bytes(packets_json_inner_bytes, &cur_tail, cur_skip) > max_state {
+            return -3;
+        }
+    }
+
+    if compute_par2_state_bytes(packets_json_inner_bytes, &cur_tail, cur_skip) > max_state {
+        return -3;
+    }
+
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+    out.extend(&cur_skip.to_le_bytes());
+    out.extend(&(cur_tail.len() as u32).to_le_bytes());
+    out.extend(&(new_pkt_ranges.len() as u32).to_le_bytes());
+    out.extend(&cur_tail);
+    out.extend(&new_pkts_arena);
+    out.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1912,5 +2266,49 @@ mod tests {
         assert_eq!(fields[5], b"3");
         assert_eq!(fields[6], b"alt.binaries.misc\talt.binaries.tv");
         assert_eq!(fields[7], b"p1-2@x\tp1-3@x");
+    }
+
+    #[test]
+    fn test_par2_scan_packets_and_b64_json_len() {
+        // 0xFF, 0xFF, 0xFF encodes to "////" in base64 (4 chars + 4 escaped slashes = 8 bytes)
+        assert_eq!(b64_json_escaped_len(&[0xFF, 0xFF, 0xFF]), 8);
+        assert_eq!(b64_json_escaped_len(b"abc"), 4);
+
+        let set = [b's'; 16];
+        let mut body = Vec::new();
+        body.extend_from_slice(&8u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&[b'i'; 16]);
+        let mut hashed = Vec::new();
+        hashed.extend_from_slice(&set);
+        hashed.extend_from_slice(PAR2_TYPE_MAIN);
+        hashed.extend_from_slice(&body);
+        let md5 = md5_raw_slice(&hashed);
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(PAR2_PACKET_MARKER);
+        pkt.extend_from_slice(&((hashed.len() + 32) as u64).to_le_bytes());
+        pkt.extend_from_slice(&md5);
+        pkt.extend_from_slice(&hashed);
+
+        let mut out = vec![0u8; 1024];
+        let written = unsafe {
+            nntmux_par2_scan_packets(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                0,
+                262144,
+                pkt.as_ptr(),
+                pkt.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(written, (16 + pkt.len()) as isize);
+        let new_count = u32::from_le_bytes([out[12], out[13], out[14], out[15]]);
+        assert_eq!(new_count, 1);
+        assert_eq!(&out[16..16 + pkt.len()], &pkt[..]);
     }
 }
