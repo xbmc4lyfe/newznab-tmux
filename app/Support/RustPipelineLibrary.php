@@ -2694,6 +2694,80 @@ final class RustPipelineLibrary
         return $score;
     }
 
+    public static function animeExtractTitle(string $searchname, ?string $libraryPath = null): ?string
+    {
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($searchname);
+        $minCap = max(256, $len + 64);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= $minCap)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, $minCap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_anime_extract_title($searchname, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1 || $written === -2) {
+            return null;
+        }
+        if ($written < -2) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_anime_extract_title($searchname, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
+    public static function animeCleanTitle(string $title, ?string $libraryPath = null): ?string
+    {
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($title);
+        $minCap = max(256, $len + 64);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= $minCap)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, $minCap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_anime_clean_title($title, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1 || $written === -2) {
+            return null;
+        }
+        if ($written < -2) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_anime_clean_title($title, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
     public static function resolve(?string $libraryPath = null): ?FFI
     {
         if ($libraryPath === null && self::$defaultLibrary !== null) {
@@ -2794,6 +2868,8 @@ final class RustPipelineLibrary
                     double nntmux_book_title_score(const char *left, size_t left_len, const char *right, size_t right_len);
                     double nntmux_book_author_score(const char *left, size_t left_len, const char *right, size_t right_len);
                     double nntmux_book_score(const char *raw, size_t raw_len, const char *title, size_t title_len, uint32_t has_author, const char *author, size_t author_len, uint32_t has_isbn, const char *isbn, size_t isbn_len, const char *cand_title, size_t cand_title_len, const char *cand_author, size_t cand_author_len, uint32_t has_cand_isbn, const char *cand_isbn, size_t cand_isbn_len, uint32_t has_cand_ean, const char *cand_ean, size_t cand_ean_len);
+                    ssize_t nntmux_anime_extract_title(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_anime_clean_title(const char *input, size_t input_len, char *out_buf, size_t out_cap);
                     C, $resolved);
 
                 // @phpstan-ignore method.notFound
