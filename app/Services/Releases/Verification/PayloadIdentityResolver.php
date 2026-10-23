@@ -6,6 +6,7 @@ namespace App\Services\Releases\Verification;
 
 use App\Services\NameFixing\PredbIdentityKey;
 use App\Services\ReleaseCleaningService;
+use App\Support\RustPipelineLibrary;
 
 final class PayloadIdentityResolver
 {
@@ -13,6 +14,33 @@ final class PayloadIdentityResolver
 
     /** @param array<string, mixed> $manifest */
     public function resolve(array $manifest): ?string
+    {
+        $hints = $manifest['identity_hints'] ?? [];
+        if (! is_array($hints) || count($hints) > 4096) {
+            return null;
+        }
+        $filenames = [];
+        foreach ($hints as $hint) {
+            if (! is_array($hint) || ! in_array($hint['source'] ?? null, ['yenc', 'par2'], true) || ! is_string($hint['name'] ?? null)) {
+                continue;
+            }
+            $filenames[] = $hint['name'];
+        }
+        if ($filenames === []) {
+            return null;
+        }
+
+        $supported = false;
+        $ffiResult = RustPipelineLibrary::payloadIdentityResolve($filenames, supported: $supported);
+        if ($supported) {
+            return $ffiResult;
+        }
+
+        return $this->resolvePhp($manifest);
+    }
+
+    /** @param array<string, mixed> $manifest */
+    public function resolvePhp(array $manifest): ?string
     {
         $hints = $manifest['identity_hints'] ?? [];
         if (! is_array($hints) || count($hints) > 4096) {
@@ -27,7 +55,7 @@ final class PayloadIdentityResolver
             if (preg_match('/(?:^|[._\-\s])(?:sample|proof|thumbs?|subs?|subtitles)(?:[._\-\s]|$)/i', $filename)) {
                 continue;
             }
-            $name = $this->cleaning->releaseNameFromFile(str_replace('_', ' ', $filename));
+            $name = $this->cleaning->releaseNameFromFilePhp(str_replace('_', ' ', $filename));
             if ($name === null || preg_match('/\b(?:s\d{1,3}e\d{1,3}|(?:19|20)\d{2}|720p|1080p|2160p|flac|mp3|\d{2,3}kbps|v\d+\.\d+)\b/i', $name) !== 1) {
                 continue;
             }

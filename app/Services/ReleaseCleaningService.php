@@ -8,6 +8,7 @@ use App\Models\Predb;
 use App\Services\NameFixing\FileNameCleaner;
 use App\Services\NameFixing\NzbSplitUnwrapper;
 use App\Support\PredbSearchDocument;
+use App\Support\RustPipelineLibrary;
 
 /**
  * Cleans names for releases/imports/namefixer.
@@ -202,6 +203,23 @@ class ReleaseCleaningService
      */
     public function teevee(): array
     {
+        $supported = false;
+        $ffiClean = RustPipelineLibrary::releaseGenericClean($this->subject, 3, supported: $supported);
+        if ($supported && $ffiClean !== null) {
+            return [
+                'cleansubject' => $ffiClean,
+                'properlynamed' => false,
+            ];
+        }
+
+        return $this->teeveePhp();
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function teeveePhp(): array
+    {
         // [140022]-[04] - [01/40] - "140022-04.nfo" yEnc
         if (preg_match('/\[\d+\]-\[.+\] - \[\d+\/\d+\] - "\d+\-.+" yEnc/', $this->subject)) {
             return [
@@ -211,8 +229,8 @@ class ReleaseCleaningService
             ];
         }
 
-        return $this->counterFileSubjectName() ?? [
-            'cleansubject' => $this->releaseCleanerHelper($this->subject),
+        return $this->counterFileSubjectNamePhp() ?? [
+            'cleansubject' => $this->releaseCleanerHelperPhp($this->subject),
             'properlynamed' => false,
         ];
     }
@@ -423,7 +441,24 @@ class ReleaseCleaningService
      */
     public function generic(): array
     {
-        $fromFile = $this->counterFileSubjectName();
+        $supported = false;
+        $ffiClean = RustPipelineLibrary::releaseGenericClean($this->subject, 2, supported: $supported);
+        if ($supported && $ffiClean !== null) {
+            return [
+                'cleansubject' => $ffiClean,
+                'properlynamed' => false,
+            ];
+        }
+
+        return $this->genericPhp();
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function genericPhp(): array
+    {
+        $fromFile = $this->counterFileSubjectNamePhp();
         if ($fromFile !== null) {
             return $fromFile;
         }
@@ -442,7 +477,7 @@ class ReleaseCleaningService
         }
 
         return [
-            'cleansubject' => $this->releaseCleanerHelper($this->subject),
+            'cleansubject' => $this->releaseCleanerHelperPhp($this->subject),
             'properlynamed' => false,
         ];
     }
@@ -452,9 +487,20 @@ class ReleaseCleaningService
      */
     public function releaseNameFromFile(string $file): ?string
     {
+        $supported = false;
+        $ffiResult = RustPipelineLibrary::releaseNameFromFile($file, supported: $supported);
+        if ($supported) {
+            return $ffiResult;
+        }
+
+        return $this->releaseNameFromFilePhp($file);
+    }
+
+    public function releaseNameFromFilePhp(string $file): ?string
+    {
         $fileNameCleaner = new FileNameCleaner;
         // Not fixerCleaner(): it drops every non-ASCII character, and these names may be accented.
-        $name = $fileNameCleaner->stripFileSuffixes($fileNameCleaner->extractFilenameFromPath($file));
+        $name = $fileNameCleaner->stripKnownFileSuffixesPhp($fileNameCleaner->extractFilenameFromPath($file), true);
         $name = preg_replace('/[.\-_](sample|proof|thumbs?)$/i', '', $name) ?? $name;
         $name = trim(preg_replace('/\s\s+/u', ' ', $name) ?? $name, " .-_\t");
 
@@ -463,7 +509,7 @@ class ReleaseCleaningService
         // year, quality or episode tag makes the name plausible.
         $withoutDottedSuffix = preg_replace('/\.([^.\-]+)$/', ' $1', $name) ?? $name;
 
-        return $fileNameCleaner->isPlausibleReleaseTitle($withoutDottedSuffix) ? $name : null;
+        return $fileNameCleaner->isPlausibleReleaseTitlePhp($withoutDottedSuffix) ? $name : null;
     }
 
     /**
@@ -473,7 +519,21 @@ class ReleaseCleaningService
      *
      * @return array{cleansubject: string, properlynamed: false}|null
      */
-    private function counterFileSubjectName(): ?array
+    public function counterFileSubjectName(): ?array
+    {
+        $supported = false;
+        $fromFile = RustPipelineLibrary::releaseGenericClean($this->subject, 1, supported: $supported);
+        if ($supported) {
+            return $fromFile === null ? null : ['cleansubject' => $fromFile, 'properlynamed' => false];
+        }
+
+        return $this->counterFileSubjectNamePhp();
+    }
+
+    /**
+     * @return array{cleansubject: string, properlynamed: false}|null
+     */
+    public function counterFileSubjectNamePhp(): ?array
     {
         // `lRap` is `yEnc` in ROT13: the whole subject is scrambled, so its file name is too.
         if (preg_match(self::COUNTER_FILE_SUBJECT, $this->subject, $hit) !== 1) {
@@ -483,12 +543,23 @@ class ReleaseCleaningService
         if (preg_match('/\blRap\b/i', substr($this->subject, \strlen($hit[0]))) === 1) {
             return null;
         }
-        $fromFile = $this->releaseNameFromFile($hit['file']);
+        $fromFile = $this->releaseNameFromFilePhp($hit['file']);
 
         return $fromFile === null ? null : ['cleansubject' => $fromFile, 'properlynamed' => false];
     }
 
     public function releaseCleanerHelper(string $subject): string
+    {
+        $supported = false;
+        $ffiResult = RustPipelineLibrary::releaseGenericClean($subject, 0, supported: $supported);
+        if ($supported && $ffiResult !== null) {
+            return $ffiResult;
+        }
+
+        return $this->releaseCleanerHelperPhp($subject);
+    }
+
+    public function releaseCleanerHelperPhp(string $subject): string
     {
         $cleanerName = preg_replace('/(\- )?yEnc$/', '', $subject);
 
@@ -502,7 +573,12 @@ class ReleaseCleaningService
      */
     public function fixerCleaner(string $name)
     {
-        $cleanerName = $this->nzbSplitUnwrapper->unwrap($name) ?? $name;
+        return RustPipelineLibrary::releaseFixerClean($name) ?? $this->fixerCleanerPhp($name);
+    }
+
+    public function fixerCleanerPhp(string $name): string
+    {
+        $cleanerName = $this->nzbSplitUnwrapper->unwrapPhp($name) ?? $name;
 
         // Remove sample/proof/thumbs markers from the end
         $cleanerName = preg_replace('/[.\-_](sample|proof|thumbs?)$/i', '', $cleanerName);
@@ -524,6 +600,6 @@ class ReleaseCleaningService
         $cleanerName = preg_replace('/\s\s+/', ' ', $cleanerName);
 
         // Remove invalid characters
-        return trim(mb_convert_encoding(preg_replace('/[^(\x20-\x7F)]*/', '', $cleanerName), 'UTF-8', mb_list_encodings()));
+        return trim(mb_convert_encoding((string) preg_replace('/[^(\x20-\x7F)]*/', '', $cleanerName), 'UTF-8', mb_list_encodings()));
     }
 }
