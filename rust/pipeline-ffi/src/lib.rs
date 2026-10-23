@@ -4,10 +4,14 @@ pub mod additional;
 pub mod categorize;
 pub mod cleaning;
 pub mod filename;
+pub mod imdb;
+pub mod irc;
 pub mod media;
 pub mod metadata;
+pub mod name_checkers;
 pub mod nfo;
 pub mod predb;
+pub mod predb_feeds;
 pub mod search;
 
 /// Returns the ABI version of `libnntmux_pipeline`.

@@ -18,6 +18,9 @@ final class RustPipelineLibrary
     /** @var array<string, FFI|false> */
     private static array $libraries = [];
 
+    /** @var array<string, FFI|false> */
+    private static array $domainLibraries = [];
+
     private static FFI|false|null $defaultLibrary = null;
 
     private static ?CData $scratchBuf = null;
@@ -2996,6 +2999,75 @@ final class RustPipelineLibrary
         }
 
         return null;
+    }
+
+    /**
+     * Resolve a domain-scoped FFI handle against `libnntmux_pipeline` with a dedicated C header block.
+     *
+     * Allows domain services to declare and invoke their own exported `nntmux_*` symbols without
+     * modifying the central `RustPipelineLibrary` C header block.
+     */
+    public static function resolveDomain(string $domain, string $cdef, ?string $libraryPath = null): ?FFI
+    {
+        if ($domain === '' || $cdef === '') {
+            return null;
+        }
+        if (! \in_array(PHP_OS_FAMILY, ['Linux', 'Darwin'], true) || ! \extension_loaded('FFI')) {
+            return null;
+        }
+
+        $cacheKey = $domain.'|'.($libraryPath ?? 'default').'|'.hash('xxh3', $cdef);
+        if (\array_key_exists($cacheKey, self::$domainLibraries)) {
+            $cached = self::$domainLibraries[$cacheKey];
+
+            return $cached === false ? null : $cached;
+        }
+
+        $root = \dirname(__DIR__, 2);
+        $suffix = PHP_OS_FAMILY === 'Darwin' ? 'dylib' : 'so';
+        $candidates = $libraryPath !== null ? [$libraryPath] : [
+            $root.'/storage/app/nntmux-native/libnntmux_pipeline.'.$suffix,
+            $root.'/rust/pipeline-ffi/target/release/libnntmux_pipeline.'.$suffix,
+            '/usr/local/lib/nntmux/libnntmux_pipeline.'.$suffix,
+        ];
+
+        $fullCdef = "uint32_t nntmux_pipeline_abi_version(void);\n".$cdef;
+        foreach ($candidates as $candidate) {
+            $resolved = realpath($candidate);
+            if ($resolved === false || ! is_file($resolved) || ! is_readable($resolved)) {
+                continue;
+            }
+            try {
+                $ffi = FFI::cdef($fullCdef, $resolved);
+                // @phpstan-ignore method.notFound
+                if ($ffi->nntmux_pipeline_abi_version() !== 1) {
+                    continue;
+                }
+
+                self::$domainLibraries[$cacheKey] = $ffi;
+
+                return $ffi;
+            } catch (Throwable) {
+                continue;
+            }
+        }
+
+        self::$domainLibraries[$cacheKey] = false;
+
+        return null;
+    }
+
+    /**
+     * Obtain the shared reusable FFI scratch buffer with at least `$minBytes` capacity.
+     *
+     * @param-out int $capacity
+     */
+    public static function obtainScratch(FFI $ffi, int $minBytes, int &$capacity = 0): ?CData
+    {
+        $scratch = self::ensureScratch($ffi, $minBytes);
+        $capacity = $scratch !== null ? self::$scratchCap : 0;
+
+        return $scratch;
     }
 
     private static function ensureScratch(FFI $ffi, int $minBytes): ?CData

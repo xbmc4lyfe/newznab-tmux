@@ -382,7 +382,10 @@ pub fn strip_known_file_suffixes_len(
 
 #[inline]
 fn is_trim_char(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B | b'.' | b'-' | b'_')
+    matches!(
+        b,
+        b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B | b'.' | b'-' | b'_'
+    )
 }
 
 #[inline]
@@ -1011,9 +1014,7 @@ pub fn is_season_pack(bytes: &[u8]) -> bool {
 
 #[inline]
 fn has_explicit_pack_marker(base: &[u8]) -> bool {
-    matches_admission_season_token(base)
-        || matches_season_word(base)
-        || matches_complete_pack(base)
+    matches_admission_season_token(base) || matches_season_word(base) || matches_complete_pack(base)
 }
 
 /// Matches `SeasonPackDetector::SAMPLE_REGEX`:
@@ -1600,9 +1601,7 @@ fn parse_episode<'a>(name: &'a [u8]) -> Option<ParsedEpisode<'a>> {
                             if p < base.len() && matches!(base[p], b'e' | b'E') {
                                 p += 1;
                                 let d_start = p;
-                                while p < base.len()
-                                    && base[p].is_ascii_digit()
-                                    && p - d_start < 4
+                                while p < base.len() && base[p].is_ascii_digit() && p - d_start < 4
                                 {
                                     p += 1;
                                 }
@@ -1782,7 +1781,9 @@ fn tokenize_rest(rest: &[u8]) -> Vec<(&[u8], &[u8])> {
     tokens
 }
 
-fn trim_to_release_info<'a>(tokens: &'a [(&'a [u8], &'a [u8])]) -> Option<&'a [(&'a [u8], &'a [u8])]> {
+fn trim_to_release_info<'a>(
+    tokens: &'a [(&'a [u8], &'a [u8])],
+) -> Option<&'a [(&'a [u8], &'a [u8])]> {
     for (idx, &(_, tok)) in tokens.iter().enumerate() {
         if is_release_info_token(tok) {
             return Some(&tokens[idx..]);
@@ -1887,10 +1888,11 @@ pub(crate) fn write_season_name_from_episodes(names: &[&[u8]], out: &mut OutCurs
     let mut common_count = 0;
     while common_count < min_tok_len {
         let candidate = first_tokens[first_tokens.len() - 1 - common_count].1;
-        if token_lists[1..]
-            .iter()
-            .all(|list| list[list.len() - 1 - common_count].1.eq_ignore_ascii_case(candidate))
-        {
+        if token_lists[1..].iter().all(|list| {
+            list[list.len() - 1 - common_count]
+                .1
+                .eq_ignore_ascii_case(candidate)
+        }) {
             common_count += 1;
         } else {
             break;
