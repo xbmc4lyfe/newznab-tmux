@@ -2387,6 +2387,865 @@ pub fn book_score_candidate(
 }
 
 // ============================================================================
+// 4. AnimeProcessor & RefreshAnimeData Title Extraction / Cleaning
+// ============================================================================
+
+#[inline]
+fn is_pcre_ascii_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\x0B' | b'\x0C' | b'\r')
+}
+
+#[inline]
+fn is_pcre_utf8_ws_fast(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '\t' | '\n' | '\x0B' | '\x0C' | '\r' | '\u{0085}' | '\u{00A0}'
+    )
+}
+
+#[inline]
+fn is_anime_control_byte(b: u8) -> bool {
+    matches!(b, 0x00..=0x08 | 0x0B..=0x0C | 0x0E..=0x1F | 0x7F)
+}
+
+#[inline]
+fn is_anime_lang_code(word: &[u8]) -> bool {
+    matches!(
+        word.len(),
+        3 | 5 | 7
+    ) && (word.eq_ignore_ascii_case(b"ENG")
+        || word.eq_ignore_ascii_case(b"JAP")
+        || word.eq_ignore_ascii_case(b"JPN")
+        || word.eq_ignore_ascii_case(b"SUB")
+        || word.eq_ignore_ascii_case(b"DUB")
+        || word.eq_ignore_ascii_case(b"RAW")
+        || word.eq_ignore_ascii_case(b"ITA")
+        || word.eq_ignore_ascii_case(b"SPA")
+        || word.eq_ignore_ascii_case(b"FRE")
+        || word.eq_ignore_ascii_case(b"GER")
+        || word.eq_ignore_ascii_case(b"RUS")
+        || word.eq_ignore_ascii_case(b"CHI")
+        || word.eq_ignore_ascii_case(b"KOR")
+        || word.eq_ignore_ascii_case(b"MULTI")
+        || word.eq_ignore_ascii_case(b"HARDSUB")
+        || word.eq_ignore_ascii_case(b"SOFTSUB")
+        || word.eq_ignore_ascii_case(b"HARDDUB")
+        || word.eq_ignore_ascii_case(b"SOFTDUB"))
+}
+
+#[inline]
+fn is_anime_meta_word(word: &[u8]) -> bool {
+    word.eq_ignore_ascii_case(b"JAV")
+        || word.eq_ignore_ascii_case(b"Uncensored")
+        || word.eq_ignore_ascii_case(b"Censored")
+        || word.eq_ignore_ascii_case(b"Mosaic")
+        || word.eq_ignore_ascii_case(b"HD")
+        || word.eq_ignore_ascii_case(b"SD")
+        || word.eq_ignore_ascii_case(b"FHD")
+        || word.eq_ignore_ascii_case(b"UHD")
+}
+
+#[inline]
+fn is_anime_quality_word(word: &[u8]) -> bool {
+    word.eq_ignore_ascii_case(b"480p")
+        || word.eq_ignore_ascii_case(b"720p")
+        || word.eq_ignore_ascii_case(b"1080p")
+        || word.eq_ignore_ascii_case(b"2160p")
+        || word.eq_ignore_ascii_case(b"4K")
+        || word.eq_ignore_ascii_case(b"BD")
+        || word.eq_ignore_ascii_case(b"BDRip")
+        || word.eq_ignore_ascii_case(b"BluRay")
+        || word.eq_ignore_ascii_case(b"HEVC")
+        || word.eq_ignore_ascii_case(b"x264")
+        || word.eq_ignore_ascii_case(b"x265")
+        || word.eq_ignore_ascii_case(b"H264")
+        || word.eq_ignore_ascii_case(b"H265")
+        || word.eq_ignore_ascii_case(b"WEB")
+        || word.eq_ignore_ascii_case(b"WEBRip")
+        || word.eq_ignore_ascii_case(b"DVDRip")
+        || word.eq_ignore_ascii_case(b"TVRip")
+}
+
+#[inline]
+fn is_anime_release_tag_word(word: &[u8]) -> bool {
+    word.eq_ignore_ascii_case(b"PROPER")
+        || word.eq_ignore_ascii_case(b"REPACK")
+        || word.eq_ignore_ascii_case(b"RIP")
+        || word.eq_ignore_ascii_case(b"ISO")
+        || word.eq_ignore_ascii_case(b"CRACK")
+        || word.eq_ignore_ascii_case(b"BETA")
+        || word.eq_ignore_ascii_case(b"ALPHA")
+        || word.eq_ignore_ascii_case(b"FINAL")
+        || word.eq_ignore_ascii_case(b"COMPLETE")
+        || word.eq_ignore_ascii_case(b"FULL")
+}
+
+#[inline]
+fn is_anime_bd_bracket_inner(inner: &[u8]) -> bool {
+    if inner.eq_ignore_ascii_case(b"BD")
+        || inner.eq_ignore_ascii_case(b"BDRip")
+        || inner.eq_ignore_ascii_case(b"BluRay")
+        || inner.eq_ignore_ascii_case(b"Blu-Ray")
+        || inner.eq_ignore_ascii_case(b"HEVC")
+        || inner.eq_ignore_ascii_case(b"x264")
+        || inner.eq_ignore_ascii_case(b"x265")
+        || inner.eq_ignore_ascii_case(b"H264")
+        || inner.eq_ignore_ascii_case(b"H265")
+    {
+        return true;
+    }
+    if (inner.len() == 4 || inner.len() == 5)
+        && matches!(
+            inner[inner.len() - 1],
+            b'i' | b'I' | b'p' | b'P' | b'x' | b'X'
+        )
+        && inner[..inner.len() - 1].iter().all(|b| b.is_ascii_digit())
+    {
+        return true;
+    }
+    false
+}
+
+pub fn anime_fix_encoding(input: &str) -> Option<Cow<'_, str>> {
+    if input.is_ascii() {
+        let bytes = input.as_bytes();
+        if !bytes.iter().any(|&b| is_anime_control_byte(b)) {
+            return Some(Cow::Borrowed(input));
+        }
+        let mut out = Vec::with_capacity(bytes.len());
+        for &b in bytes {
+            if !is_anime_control_byte(b) {
+                out.push(b);
+            }
+        }
+        return String::from_utf8(out).ok().map(Cow::Owned);
+    }
+
+    // Decline codepoints >= U+0300 (other than U+20AC '€') so PHP handles NFC normalization.
+    let mut has_c0_c5 = false;
+    let mut has_ctrl = false;
+    for c in input.chars() {
+        let u = c as u32;
+        if u >= 0x0300 && c != '\u{20AC}' {
+            return None;
+        }
+        if matches!(c, '\u{00C0}'..='\u{00C5}') {
+            has_c0_c5 = true;
+        } else if u < 0x80 && is_anime_control_byte(u as u8) {
+            has_ctrl = true;
+        }
+    }
+
+    if !has_c0_c5 {
+        if !has_ctrl {
+            return Some(Cow::Borrowed(input));
+        }
+        let mut out = String::with_capacity(input.len());
+        for c in input.chars() {
+            if (c as u32) >= 0x80 || !is_anime_control_byte(c as u8) {
+                out.push(c);
+            }
+        }
+        return Some(Cow::Owned(out));
+    }
+
+    // Pass 1: preg_replace('/Ã¢Â[_\sÂ]*/u', '', $text)
+    let s1: Cow<'_, str> = if input.contains("Ã¢Â") {
+        let mut buf = String::with_capacity(input.len());
+        let mut rest = input;
+        while !rest.is_empty() {
+            if let Some(after) = rest.strip_prefix("Ã¢Â") {
+                let mut consumed = 0usize;
+                for c in after.chars() {
+                    if c == '_' || c == 'Â' || is_pcre_utf8_ws_fast(c) {
+                        consumed += c.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                rest = &after[consumed..];
+            } else {
+                let c = rest.chars().next().unwrap();
+                buf.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+        Cow::Owned(buf)
+    } else {
+        Cow::Borrowed(input)
+    };
+
+    // Pass 2..6 combined into a single allocation
+    let mut out = String::with_capacity(s1.len());
+    let mut rest = s1.as_ref();
+    while !rest.is_empty() {
+        if let Some(after) = rest
+            .strip_prefix("Ã¢")
+            .or_else(|| rest.strip_prefix("ÃÂ"))
+            .or_else(|| rest.strip_prefix("Ã©"))
+            .or_else(|| rest.strip_prefix("Ã€"))
+            .or_else(|| rest.strip_prefix("Ã£"))
+        {
+            rest = after;
+            continue;
+        }
+        let c = rest.chars().next().unwrap();
+        rest = &rest[c.len_utf8()..];
+        if c == 'Â' {
+            continue;
+        }
+        if c == 'Ã' {
+            let mut consumed = 0usize;
+            for next_c in rest.chars() {
+                if !is_pcre_utf8_ws_fast(next_c) {
+                    consumed += next_c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            rest = &rest[consumed..];
+            continue;
+        }
+        if (c as u32) < 0x80 && is_anime_control_byte(c as u8) {
+            continue;
+        }
+        if matches!(c, '\u{00C0}'..='\u{00C5}') {
+            continue;
+        }
+        out.push(c);
+    }
+
+    Some(Cow::Owned(out))
+}
+
+fn anime_clean_title_in_place(buf: &mut Vec<u8>, tmp: &mut Vec<u8>) {
+    tmp.clear();
+
+    // 1) Remove all bracketed tags: /\[[^\]]+\]/ -> ' '
+    if buf.contains(&b'[') {
+        let mut i = 0;
+        while i < buf.len() {
+            if buf[i] == b'['
+                && let Some(rel) = buf[i + 1..].iter().position(|&b| b == b']')
+                && rel >= 1
+            {
+                tmp.push(b' ');
+                i += rel + 2;
+                continue;
+            }
+            tmp.push(buf[i]);
+            i += 1;
+        }
+        std::mem::swap(buf, tmp);
+        tmp.clear();
+    }
+
+    // 2) Remove all parenthesized tags: /\([^)]+\)/ -> ' '
+    if buf.contains(&b'(') {
+        let mut i = 0;
+        while i < buf.len() {
+            if buf[i] == b'('
+                && let Some(rel) = buf[i + 1..].iter().position(|&b| b == b')')
+                && rel >= 1
+            {
+                tmp.push(b' ');
+                i += rel + 2;
+                continue;
+            }
+            tmp.push(buf[i]);
+            i += 1;
+        }
+        std::mem::swap(buf, tmp);
+        tmp.clear();
+    }
+
+    // 3, 4, 5) Replace standalone language codes, metadata words, and 6-digit dates with ' '.
+    {
+        let mut i = 0;
+        while i < buf.len() {
+            if is_ascii_word(buf[i]) {
+                let start = i;
+                while i < buf.len() && is_ascii_word(buf[i]) {
+                    i += 1;
+                }
+                let word = &buf[start..i];
+                let is_six_digits = word.len() == 6 && word.iter().all(|b| b.is_ascii_digit());
+                if is_anime_lang_code(word) || is_anime_meta_word(word) || is_six_digits {
+                    tmp.push(b' ');
+                } else {
+                    tmp.extend_from_slice(word);
+                }
+            } else {
+                tmp.push(buf[i]);
+                i += 1;
+            }
+        }
+        std::mem::swap(buf, tmp);
+        tmp.clear();
+    }
+
+    // 6) preg_replace('/[-_]\s*\d{1,4}\s*$/i', '', $title)
+    {
+        let mut p = buf.len();
+        while p > 0 && is_pcre_ascii_ws(buf[p - 1]) {
+            p -= 1;
+        }
+        let d_end = p;
+        while p > 0 && buf[p - 1].is_ascii_digit() {
+            p -= 1;
+        }
+        let d_len = d_end - p;
+        if (1..=4).contains(&d_len) {
+            while p > 0 && is_pcre_ascii_ws(buf[p - 1]) {
+                p -= 1;
+            }
+            if p > 0 && (buf[p - 1] == b'-' || buf[p - 1] == b'_') {
+                buf.truncate(p - 1);
+            }
+        }
+    }
+
+    // 7) preg_replace('/\s+\d{1,4}\s*$/i', '', $title)
+    {
+        let mut p = buf.len();
+        while p > 0 && is_pcre_ascii_ws(buf[p - 1]) {
+            p -= 1;
+        }
+        let d_end = p;
+        while p > 0 && buf[p - 1].is_ascii_digit() {
+            p -= 1;
+        }
+        let d_len = d_end - p;
+        if (1..=4).contains(&d_len) {
+            let ws_end = p;
+            while p > 0 && is_pcre_ascii_ws(buf[p - 1]) {
+                p -= 1;
+            }
+            if p < ws_end {
+                buf.truncate(p);
+            }
+        }
+    }
+
+    let has_dash = buf.contains(&b'-');
+
+    // 8) preg_replace('/\s*-\s*\d+x\d+.*$/i', '', $title)
+    if has_dash {
+        for dash in 0..buf.len() {
+            if buf[dash] != b'-' {
+                continue;
+            }
+            let mut p = dash + 1;
+            while p < buf.len() && is_pcre_ascii_ws(buf[p]) {
+                p += 1;
+            }
+            let d1_start = p;
+            while p < buf.len() && buf[p].is_ascii_digit() {
+                p += 1;
+            }
+            if p > d1_start
+                && p < buf.len()
+                && buf[p].eq_ignore_ascii_case(&b'x')
+                && p + 1 < buf.len()
+                && buf[p + 1].is_ascii_digit()
+            {
+                let mut cut = dash;
+                while cut > 0 && is_pcre_ascii_ws(buf[cut - 1]) {
+                    cut -= 1;
+                }
+                buf.truncate(cut);
+                break;
+            }
+        }
+    }
+
+    // 9) preg_replace('/\s+S\d+E\d+.*$/i', '', $title)
+    for pos in 1..buf.len() {
+        if !buf[pos].eq_ignore_ascii_case(&b's') || !is_pcre_ascii_ws(buf[pos - 1]) {
+            continue;
+        }
+        let mut p = pos + 1;
+        let d1_start = p;
+        while p < buf.len() && buf[p].is_ascii_digit() {
+            p += 1;
+        }
+        if p > d1_start
+            && p < buf.len()
+            && buf[p].eq_ignore_ascii_case(&b'e')
+            && p + 1 < buf.len()
+            && buf[p + 1].is_ascii_digit()
+        {
+            let mut cut = pos;
+            while cut > 0 && is_pcre_ascii_ws(buf[cut - 1]) {
+                cut -= 1;
+            }
+            buf.truncate(cut);
+            break;
+        }
+    }
+
+    // 10) preg_replace('/\s*-\s*\d{1,4}(?:\s*-\s*.*)?\s*$/i', '', $title)
+    if has_dash {
+        for dash in 0..buf.len() {
+            if buf[dash] != b'-' {
+                continue;
+            }
+            let mut p = dash + 1;
+            while p < buf.len() && is_pcre_ascii_ws(buf[p]) {
+                p += 1;
+            }
+            let d_start = p;
+            while p < buf.len() && buf[p].is_ascii_digit() {
+                p += 1;
+            }
+            let d_len = p - d_start;
+            if !(1..=4).contains(&d_len) {
+                continue;
+            }
+            while p < buf.len() && is_pcre_ascii_ws(buf[p]) {
+                p += 1;
+            }
+            if p == buf.len() || buf[p] == b'-' {
+                let mut cut = dash;
+                while cut > 0 && is_pcre_ascii_ws(buf[cut - 1]) {
+                    cut -= 1;
+                }
+                buf.truncate(cut);
+                break;
+            }
+        }
+
+        // 11) preg_replace('/\s*-\s*$/i', '', $title)
+        let mut p = buf.len();
+        while p > 0 && is_pcre_ascii_ws(buf[p - 1]) {
+            p -= 1;
+        }
+        if p > 0 && buf[p - 1] == b'-' {
+            let mut cut = p - 1;
+            while cut > 0 && is_pcre_ascii_ws(buf[cut - 1]) {
+                cut -= 1;
+            }
+            buf.truncate(cut);
+        }
+    }
+
+    // 12) preg_replace('/\s+E(?:p(?:isode)?)?\s*0*\d{1,4}\s*$/i', '', $title)
+    for pos in 1..buf.len() {
+        if !buf[pos].eq_ignore_ascii_case(&b'e') || !is_pcre_ascii_ws(buf[pos - 1]) {
+            continue;
+        }
+        let mut p = pos + 1;
+        if p < buf.len() && buf[p].eq_ignore_ascii_case(&b'p') {
+            p += 1;
+            if p + 5 <= buf.len() && buf[p..p + 5].eq_ignore_ascii_case(b"isode") {
+                p += 5;
+            }
+        }
+        while p < buf.len() && is_pcre_ascii_ws(buf[p]) {
+            p += 1;
+        }
+        let d_start = p;
+        let mut zeros = 0usize;
+        while p < buf.len() && buf[p] == b'0' {
+            zeros += 1;
+            p += 1;
+        }
+        while p < buf.len() && buf[p].is_ascii_digit() {
+            p += 1;
+        }
+        let total_digits = p - d_start;
+        if total_digits >= 1 && total_digits - zeros <= 4 {
+            while p < buf.len() && is_pcre_ascii_ws(buf[p]) {
+                p += 1;
+            }
+            if p == buf.len() {
+                let mut cut = pos;
+                while cut > 0 && is_pcre_ascii_ws(buf[cut - 1]) {
+                    cut -= 1;
+                }
+                buf.truncate(cut);
+                break;
+            }
+        }
+    }
+
+    // 13 & 14) Quality/resolution tags & common release tags -> ' '
+    {
+        let mut i = 0;
+        while i < buf.len() {
+            if is_ascii_word(buf[i]) {
+                if i + 7 <= buf.len()
+                    && buf[i..i + 7].eq_ignore_ascii_case(b"blu-ray")
+                    && is_ascii_wb(buf, i + 7)
+                {
+                    tmp.push(b' ');
+                    i += 7;
+                    continue;
+                }
+                let start = i;
+                while i < buf.len() && is_ascii_word(buf[i]) {
+                    i += 1;
+                }
+                let word = &buf[start..i];
+                if is_anime_quality_word(word) || is_anime_release_tag_word(word) {
+                    tmp.push(b' ');
+                } else {
+                    tmp.extend_from_slice(word);
+                }
+            } else {
+                tmp.push(buf[i]);
+                i += 1;
+            }
+        }
+        std::mem::swap(buf, tmp);
+        tmp.clear();
+    }
+
+    // 15) preg_replace('/\s+Vol\.?\s*\d*\s*$/i', '', $title)
+    for pos in 1..buf.len() {
+        if !is_pcre_ascii_ws(buf[pos - 1])
+            || pos + 3 > buf.len()
+            || !buf[pos..pos + 3].eq_ignore_ascii_case(b"vol")
+        {
+            continue;
+        }
+        let mut p = pos + 3;
+        if p < buf.len() && buf[p] == b'.' {
+            p += 1;
+        }
+        while p < buf.len() && is_pcre_ascii_ws(buf[p]) {
+            p += 1;
+        }
+        while p < buf.len() && buf[p].is_ascii_digit() {
+            p += 1;
+        }
+        while p < buf.len() && is_pcre_ascii_ws(buf[p]) {
+            p += 1;
+        }
+        if p == buf.len() {
+            let mut cut = pos;
+            while cut > 0 && is_pcre_ascii_ws(buf[cut - 1]) {
+                cut -= 1;
+            }
+            buf.truncate(cut);
+            break;
+        }
+    }
+
+    // 16) preg_replace('/\s+Ch\.?\s*\d*\s*$/i', '', $title)
+    for pos in 1..buf.len() {
+        if !is_pcre_ascii_ws(buf[pos - 1])
+            || pos + 2 > buf.len()
+            || !buf[pos..pos + 2].eq_ignore_ascii_case(b"ch")
+        {
+            continue;
+        }
+        let mut p = pos + 2;
+        if p < buf.len() && buf[p] == b'.' {
+            p += 1;
+        }
+        while p < buf.len() && is_pcre_ascii_ws(buf[p]) {
+            p += 1;
+        }
+        while p < buf.len() && buf[p].is_ascii_digit() {
+            p += 1;
+        }
+        while p < buf.len() && is_pcre_ascii_ws(buf[p]) {
+            p += 1;
+        }
+        if p == buf.len() {
+            let mut cut = pos;
+            while cut > 0 && is_pcre_ascii_ws(buf[cut - 1]) {
+                cut -= 1;
+            }
+            buf.truncate(cut);
+            break;
+        }
+    }
+
+    // 17) preg_replace('/\s*[-_]\s*$/', '', $title)
+    {
+        let mut p = buf.len();
+        while p > 0 && is_pcre_ascii_ws(buf[p - 1]) {
+            p -= 1;
+        }
+        if p > 0 && (buf[p - 1] == b'-' || buf[p - 1] == b'_') {
+            let mut cut = p - 1;
+            while cut > 0 && is_pcre_ascii_ws(buf[cut - 1]) {
+                cut -= 1;
+            }
+            buf.truncate(cut);
+        }
+    }
+
+    // 18) Normalize whitespace and trim into `tmp`, then swap into `buf`.
+    let mut in_ws = false;
+    for &b in buf.iter() {
+        if is_pcre_ascii_ws(b) {
+            if !tmp.is_empty() {
+                in_ws = true;
+            }
+        } else {
+            if in_ws {
+                tmp.push(b' ');
+                in_ws = false;
+            }
+            tmp.push(b);
+        }
+    }
+    while let Some(&b) = tmp.last() {
+        if is_php_trim_byte(b) {
+            tmp.pop();
+        } else {
+            break;
+        }
+    }
+    let mut start = 0;
+    while start < tmp.len() && is_php_trim_byte(tmp[start]) {
+        start += 1;
+    }
+    if start > 0 {
+        tmp.drain(0..start);
+    }
+    std::mem::swap(buf, tmp);
+}
+
+pub fn anime_clean_title(input: &str) -> Option<String> {
+    let fixed = anime_fix_encoding(input)?;
+    if fixed.as_bytes().contains(&b'\n') {
+        return None;
+    }
+    let mut buf = fixed.into_owned().into_bytes();
+    let mut tmp = Vec::with_capacity(buf.len());
+    anime_clean_title_in_place(&mut buf, &mut tmp);
+    String::from_utf8(buf).ok()
+}
+
+fn find_anime_episode_truncation(s: &[u8]) -> usize {
+    let len = s.len();
+
+    // 1) /\sS\d+E\d+/i
+    for i in 0..len {
+        if !is_pcre_ascii_ws(s[i]) || i + 1 >= len || !s[i + 1].eq_ignore_ascii_case(&b's') {
+            continue;
+        }
+        let mut p = i + 2;
+        let d1_start = p;
+        while p < len && s[p].is_ascii_digit() {
+            p += 1;
+        }
+        if p > d1_start
+            && p < len
+            && s[p].eq_ignore_ascii_case(&b'e')
+            && p + 1 < len
+            && s[p + 1].is_ascii_digit()
+        {
+            return i;
+        }
+    }
+
+    // 2) /\s\d+x\d+/i
+    for i in 0..len {
+        if !is_pcre_ascii_ws(s[i]) {
+            continue;
+        }
+        let mut p = i + 1;
+        let d1_start = p;
+        while p < len && s[p].is_ascii_digit() {
+            p += 1;
+        }
+        if p > d1_start
+            && p < len
+            && s[p].eq_ignore_ascii_case(&b'x')
+            && p + 1 < len
+            && s[p + 1].is_ascii_digit()
+        {
+            return i;
+        }
+    }
+
+    // 3) /\s-\s*(\d{1,3})\b/
+    for i in 0..len {
+        if !is_pcre_ascii_ws(s[i]) || i + 1 >= len || s[i + 1] != b'-' {
+            continue;
+        }
+        let mut p = i + 2;
+        while p < len && is_pcre_ascii_ws(s[p]) {
+            p += 1;
+        }
+        let d_start = p;
+        while p < len && s[p].is_ascii_digit() && p - d_start < 4 {
+            p += 1;
+        }
+        let d_len = p - d_start;
+        if (1..=3).contains(&d_len) && is_ascii_wb(s, p) {
+            return i;
+        }
+    }
+
+    // 4) /\sE(?:p(?:isode)?)?\s*0*(\d{1,3})\b/i
+    for i in 0..len {
+        if !is_pcre_ascii_ws(s[i]) || i + 1 >= len || !s[i + 1].eq_ignore_ascii_case(&b'e') {
+            continue;
+        }
+        let mut p = i + 2;
+        if p < len && s[p].eq_ignore_ascii_case(&b'p') {
+            p += 1;
+            if p + 5 <= len && s[p..p + 5].eq_ignore_ascii_case(b"isode") {
+                p += 5;
+            }
+        }
+        while p < len && is_pcre_ascii_ws(s[p]) {
+            p += 1;
+        }
+        let d_start = p;
+        let mut zeros = 0usize;
+        while p < len && s[p] == b'0' {
+            zeros += 1;
+            p += 1;
+        }
+        while p < len && s[p].is_ascii_digit() {
+            p += 1;
+        }
+        let total_digits = p - d_start;
+        if total_digits >= 1 && total_digits - zeros <= 3 && is_ascii_wb(s, p) {
+            return i;
+        }
+    }
+
+    // 5) /\b(Movie|OVA|Complete Series|Complete|Full Series)\b/i
+    for i in 0..len {
+        if i > 0 && is_ascii_word(s[i - 1]) {
+            continue;
+        }
+        for kw in [
+            b"movie".as_slice(),
+            b"ova".as_slice(),
+            b"complete".as_slice(),
+            b"full series".as_slice(),
+        ] {
+            if i + kw.len() <= len
+                && s[i..i + kw.len()].eq_ignore_ascii_case(kw)
+                && is_ascii_wb(s, i + kw.len())
+            {
+                return i;
+            }
+        }
+    }
+
+    // 6) /\[(?:BD|BDRip|BluRay|Blu-Ray|\d{3,4}[ipx]|HEVC|x264|x265|H264|H265)\]/i
+    for i in 0..len {
+        if s[i] != b'[' {
+            continue;
+        }
+        if let Some(rel) = s[i + 1..].iter().position(|&b| b == b']')
+            && is_anime_bd_bracket_inner(&s[i + 1..i + 1 + rel])
+        {
+            return i;
+        }
+    }
+
+    len
+}
+
+fn anime_extract_title_into(input: &str, buf: &mut Vec<u8>, tmp: &mut Vec<u8>) -> bool {
+    let Some(fixed) = anime_fix_encoding(input) else {
+        return false;
+    };
+    let fixed_bytes = fixed.as_bytes();
+
+    buf.clear();
+    tmp.clear();
+
+    // Normalize common separators ('_', '.') and whitespace ('\s+'), then trim.
+    let mut in_ws = false;
+    for &b in fixed_bytes {
+        if b == b'_' || b == b'.' || is_pcre_ascii_ws(b) {
+            if !buf.is_empty() {
+                in_ws = true;
+            }
+        } else {
+            if in_ws {
+                buf.push(b' ');
+                in_ws = false;
+            }
+            buf.push(b);
+        }
+    }
+
+    // Strip leading group tags like [Group]: /^(?:\[[^\]]+\]\s*)+/ and trim.
+    let mut start = 0usize;
+    while start < buf.len() && buf[start] == b'[' {
+        if let Some(rel) = buf[start + 1..].iter().position(|&b| b == b']')
+            && rel >= 1
+        {
+            start += rel + 2;
+            while start < buf.len() && is_pcre_ascii_ws(buf[start]) {
+                start += 1;
+            }
+        } else {
+            break;
+        }
+    }
+    let mut end = buf.len();
+    while start < end && is_php_trim_byte(buf[start]) {
+        start += 1;
+    }
+    while end > start && is_php_trim_byte(buf[end - 1]) {
+        end -= 1;
+    }
+    let stripped = &buf[start..end];
+
+    // Remove bracketed and parenthesized language tags: [LANG] and (LANG) -> ' '
+    if stripped.contains(&b'[') || stripped.contains(&b'(') {
+        let mut i = 0usize;
+        while i < stripped.len() {
+            if stripped[i] == b'['
+                && let Some(rel) = stripped[i + 1..].iter().position(|&b| b == b']')
+                && is_anime_lang_code(&stripped[i + 1..i + 1 + rel])
+            {
+                tmp.push(b' ');
+                i += rel + 2;
+                continue;
+            }
+            if stripped[i] == b'('
+                && let Some(rel) = stripped[i + 1..].iter().position(|&b| b == b')')
+                && is_anime_lang_code(&stripped[i + 1..i + 1 + rel])
+            {
+                tmp.push(b' ');
+                i += rel + 2;
+                continue;
+            }
+            tmp.push(stripped[i]);
+            i += 1;
+        }
+        let cut = find_anime_episode_truncation(tmp);
+        tmp.truncate(cut);
+        std::mem::swap(buf, tmp);
+        anime_clean_title_in_place(buf, tmp);
+    } else {
+        if start > 0 || end < buf.len() {
+            buf.copy_within(start..end, 0);
+            buf.truncate(end - start);
+        }
+        let cut = find_anime_episode_truncation(buf);
+        buf.truncate(cut);
+        anime_clean_title_in_place(buf, tmp);
+    }
+
+    true
+}
+
+pub fn anime_extract_title(input: &str) -> Option<String> {
+    let mut buf = Vec::with_capacity(input.len());
+    let mut tmp = Vec::with_capacity(input.len());
+    if !anime_extract_title_into(input, &mut buf, &mut tmp) {
+        return None;
+    }
+    String::from_utf8(buf).ok()
+}
+
+// ============================================================================
 // C-ABI Exports
 // ============================================================================
 
@@ -2641,6 +3500,59 @@ pub unsafe extern "C" fn nntmux_book_score(
     )
 }
 
+thread_local! {
+    static ANIME_SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<u8>)> =
+        std::cell::RefCell::new((Vec::with_capacity(256), Vec::with_capacity(256)));
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_anime_extract_title(
+    input_ptr: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(input) = (unsafe { slice_as_str(input_ptr, input_len) }) else {
+        return -2;
+    };
+    ANIME_SCRATCH.with(|cell| {
+        let (buf, tmp) = &mut *cell.borrow_mut();
+        if !anime_extract_title_into(input, buf, tmp) {
+            return -2;
+        }
+        let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+        cursor.extend(buf);
+        cursor.finish()
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_anime_clean_title(
+    input_ptr: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(input) = (unsafe { slice_as_str(input_ptr, input_len) }) else {
+        return -2;
+    };
+    let Some(fixed) = anime_fix_encoding(input) else {
+        return -2;
+    };
+    if fixed.as_bytes().contains(&b'\n') {
+        return -2;
+    }
+    ANIME_SCRATCH.with(|cell| {
+        let (buf, tmp) = &mut *cell.borrow_mut();
+        buf.clear();
+        buf.extend_from_slice(fixed.as_bytes());
+        anime_clean_title_in_place(buf, tmp);
+        let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+        cursor.extend(buf);
+        cursor.finish()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2718,5 +3630,25 @@ mod tests {
             None,
         );
         assert_eq!(s2, 0.0);
+    }
+
+    #[test]
+    fn test_anime_extract_and_clean() {
+        assert_eq!(
+            anime_extract_title("[HorribleSubs] My Hero Academia - 12 [1080p].mkv").as_deref(),
+            Some("My Hero Academia")
+        );
+        assert_eq!(
+            anime_extract_title("[Group] Neon_Genesis.Evangelion E01 [720p]").as_deref(),
+            Some("Neon Genesis Evangelion")
+        );
+        assert_eq!(
+            anime_extract_title("[SomeGroup] Cowboy Bebop [BD][1080p]").as_deref(),
+            Some("Cowboy Bebop")
+        );
+        assert_eq!(
+            anime_extract_title("Attack on Titan - Complete Series [BD]").as_deref(),
+            Some("Attack on Titan")
+        );
     }
 }
