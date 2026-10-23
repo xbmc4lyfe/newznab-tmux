@@ -1027,6 +1027,375 @@ pub unsafe extern "C" fn nntmux_predb_select_best_match_index(
     }
 }
 
+// ============================================================================
+// NZB article fingerprint, Message-ID normalization and password metadata
+// ============================================================================
+
+/// PHP `trim()` default character set: space, `\t`, `\n`, `\r`, NUL and `\x0B`.
+#[inline]
+fn is_php_trim_byte(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B)
+}
+
+#[inline]
+fn php_trim(mut s: &[u8]) -> &[u8] {
+    while let [first, rest @ ..] = s {
+        if !is_php_trim_byte(*first) {
+            break;
+        }
+        s = rest;
+    }
+    while let [rest @ .., last] = s {
+        if !is_php_trim_byte(*last) {
+            break;
+        }
+        s = rest;
+    }
+    s
+}
+
+/// `NzbArticleFingerprint::normalizeMessageId()`: trim, strip one pair of matching outer quotes (then trim),
+/// strip one pair of outer angle brackets, trim.
+#[inline]
+fn normalize_message_id(id: &[u8]) -> &[u8] {
+    let mut id = php_trim(id);
+    if id.len() >= 2 {
+        let (first, last) = (id[0], id[id.len() - 1]);
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            id = php_trim(&id[1..id.len() - 1]);
+        }
+    }
+    if id.len() >= 2 && id[0] == b'<' && id[id.len() - 1] == b'>' {
+        id = &id[1..id.len() - 1];
+    }
+    php_trim(id)
+}
+
+/// `NzbArticleFingerprint::validatedMessageId()`: normalized, non-empty, at most 255 bytes, no `0x00..=0x20` or `0x7F`.
+#[inline]
+fn validated_message_id(id: &[u8]) -> Option<&[u8]> {
+    let id = normalize_message_id(id);
+    if id.is_empty() || id.len() > 255 || id.iter().any(|&b| b <= 0x20 || b == 0x7F) {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+/// Raw SHA-256 digest of `data` as eight big-endian words.
+fn sha256_words(data: &[u8]) -> [u32; 8] {
+    #[inline(always)]
+    fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
+        let mut w = [0u32; 64];
+        for (i, &chunk) in block.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes(chunk);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(SHA256_K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (s, v) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *s = s.wrapping_add(v);
+        }
+    }
+
+    let mut state: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let (blocks, remainder) = data.as_chunks::<64>();
+    for block in blocks {
+        compress(&mut state, block);
+    }
+    let mut tail = [0u8; 64];
+    tail[..remainder.len()].copy_from_slice(remainder);
+    tail[remainder.len()] = 0x80;
+    if remainder.len() >= 56 {
+        compress(&mut state, &tail);
+        tail.fill(0);
+    }
+    tail[56..64].copy_from_slice(&((data.len() as u64).wrapping_mul(8)).to_be_bytes());
+    compress(&mut state, &tail);
+    state
+}
+
+/// FIPS 180-4 SHA-1 of `data`, as a 40-character lowercase hex string.
+fn sha1_hex(data: &[u8]) -> [u8; 40] {
+    #[inline(always)]
+    fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
+        let mut w = [0u32; 80];
+        for (i, &chunk) in block.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes(chunk);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e] = *state;
+        for (i, &word) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5a827999),
+                20..=39 => (b ^ c ^ d, 0x6ed9eba1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1bbcdc),
+                _ => (b ^ c ^ d, 0xca62c1d6u32),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(word);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+        for (s, v) in state.iter_mut().zip([a, b, c, d, e]) {
+            *s = s.wrapping_add(v);
+        }
+    }
+
+    let mut state: [u32; 5] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
+    let (blocks, remainder) = data.as_chunks::<64>();
+    for block in blocks {
+        compress(&mut state, block);
+    }
+    let mut tail = [0u8; 64];
+    tail[..remainder.len()].copy_from_slice(remainder);
+    tail[remainder.len()] = 0x80;
+    if remainder.len() >= 56 {
+        compress(&mut state, &tail);
+        tail.fill(0);
+    }
+    tail[56..64].copy_from_slice(&((data.len() as u64).wrapping_mul(8)).to_be_bytes());
+    compress(&mut state, &tail);
+
+    let mut hex = [0u8; 40];
+    for (i, &word) in state.iter().enumerate() {
+        for (j, &byte) in word.to_be_bytes().iter().enumerate() {
+            let idx = (i * 4 + j) * 2;
+            hex[idx] = HEX_LOWER[(byte >> 4) as usize];
+            hex[idx + 1] = HEX_LOWER[(byte & 0x0f) as usize];
+        }
+    }
+    hex
+}
+
+/// Normalizes one Message-ID as `NzbArticleFingerprint::normalizeMessageId()` does. The result is never longer
+/// than the input.
+/// Returns:
+/// - `>= 0`: bytes written to `out_buf`
+/// - `< 0`: `-(required_len as isize)` if `out_cap` is too small, or `isize::MIN` for a null input with a length
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_normalize_message_id(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let bytes: &[u8] = if input_len == 0 {
+        &[]
+    } else if input.is_null() {
+        return isize::MIN;
+    } else {
+        unsafe { slice::from_raw_parts(input, input_len) }
+    };
+    let normalized = normalize_message_id(bytes);
+    if normalized.len() > out_cap || (!normalized.is_empty() && out_buf.is_null()) {
+        return -(normalized.len() as isize);
+    }
+    if !normalized.is_empty() {
+        unsafe { std::ptr::copy_nonoverlapping(normalized.as_ptr(), out_buf, normalized.len()) };
+    }
+    normalized.len() as isize
+}
+
+/// Validates one Message-ID as `NzbArticleFingerprint::validatedMessageId()` does and writes the normalized ID.
+/// Returns:
+/// - `> 0`: bytes written to `out_buf` (the validated, normalized ID)
+/// - `0`: the ID is unsupported (`null`)
+/// - `< 0`: `-(required_len as isize)` if `out_cap` is too small (at most 255 bytes are ever required)
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_validate_message_id(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input.is_null() || input_len == 0 {
+        return 0;
+    }
+    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+    let Some(id) = validated_message_id(bytes) else {
+        return 0;
+    };
+    if id.len() > out_cap || out_buf.is_null() {
+        return -(id.len() as isize);
+    }
+    unsafe { std::ptr::copy_nonoverlapping(id.as_ptr(), out_buf, id.len()) };
+    id.len() as isize
+}
+
+/// Computes `NzbArticleFingerprint`'s digest over `count` NUL-separated Message-IDs in `buf[..buf_len]`:
+/// `sha1(pack('J', unique) . pack('N8', lane sums of sha256(id)))` over the sorted unique normalized IDs.
+/// When `already_validated` is zero each ID is normalized and validated first.
+/// Writes the 40-character lowercase hex digest to `out_hex_40` and returns `40`. Returns `0` when `count` is zero,
+/// the buffer does not hold exactly `count` NUL-separated IDs, or any ID is unsupported, so the caller keeps the
+/// PHP behavior.
+///
+/// # Safety
+///
+/// `buf_ptr` must be valid for reads of `buf_len` bytes when non-null and `buf_len > 0`.
+/// `out_hex_40` must be valid for writes of 40 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_article_fingerprint_batch(
+    buf_ptr: *const u8,
+    buf_len: usize,
+    count: u32,
+    already_validated: u32,
+    out_hex_40: *mut u8,
+) -> isize {
+    if count == 0 || out_hex_40.is_null() || (buf_ptr.is_null() && buf_len > 0) {
+        return 0;
+    }
+    let buf: &[u8] = if buf_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(buf_ptr, buf_len) }
+    };
+
+    let mut ids: Vec<&[u8]> = Vec::with_capacity(count as usize);
+    for raw in buf.split(|&b| b == 0) {
+        let id = if already_validated != 0 {
+            if raw.is_empty() {
+                return 0;
+            }
+            raw
+        } else {
+            match validated_message_id(raw) {
+                Some(id) => id,
+                None => return 0,
+            }
+        };
+        if ids.len() == count as usize {
+            return 0;
+        }
+        ids.push(id);
+    }
+    if ids.len() != count as usize {
+        return 0;
+    }
+
+    ids.sort_unstable();
+    ids.dedup();
+
+    let mut lanes = [0u32; 8];
+    for id in &ids {
+        for (lane, word) in lanes.iter_mut().zip(sha256_words(id)) {
+            *lane = lane.wrapping_add(word);
+        }
+    }
+
+    let mut payload = [0u8; 40];
+    payload[..8].copy_from_slice(&(ids.len() as u64).to_be_bytes());
+    for (i, lane) in lanes.iter().enumerate() {
+        payload[8 + i * 4..12 + i * 4].copy_from_slice(&lane.to_be_bytes());
+    }
+    let hex = sha1_hex(&payload);
+    unsafe { std::ptr::copy_nonoverlapping(hex.as_ptr(), out_hex_40, 40) };
+    40
+}
+
+#[inline]
+fn is_valid_password(value: &[u8]) -> bool {
+    if value.len() > 4096 {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(value) else {
+        return false;
+    };
+    text.chars().all(|c| {
+        matches!(
+            c as u32,
+            0x09 | 0x0A | 0x0D | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF
+        )
+    })
+}
+
+/// Validates `NzbPasswordMetadata::isValid()` for a list of `count` NUL-separated strings in `buf[..buf_len]`:
+/// at most 64 strings of at most 4096 bytes, valid UTF-8, every scalar in the XML 1.0 `Char` range without
+/// `U+FFFE`/`U+FFFF`. A NUL inside a value is invalid, so callers frame by joining with NUL and a buffer that
+/// does not split into exactly `count` strings is rejected.
+/// Returns `1` when valid and `0` otherwise (a zero `count` with an empty buffer is valid).
+///
+/// # Safety
+///
+/// `buf_ptr` must be valid for reads of `buf_len` bytes when non-null and `buf_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_validate_passwords(
+    buf_ptr: *const u8,
+    buf_len: usize,
+    count: u32,
+) -> u32 {
+    if count > 64 {
+        return 0;
+    }
+    if count == 0 {
+        return u32::from(buf_len == 0);
+    }
+    if buf_ptr.is_null() && buf_len > 0 {
+        return 0;
+    }
+    let buf: &[u8] = if buf_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(buf_ptr, buf_len) }
+    };
+    let mut seen = 0u32;
+    for value in buf.split(|&b| b == 0) {
+        seen += 1;
+        if seen > count || !is_valid_password(value) {
+            return 0;
+        }
+    }
+    u32::from(seen == count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1063,5 +1432,106 @@ mod tests {
                 b"synthetic.alias-grp.rar.par2".to_vec(),
             ]
         );
+    }
+
+    fn fingerprint(ids: &[&[u8]], validated: u32) -> Option<String> {
+        let buf = ids.join(&0u8);
+        let mut out = [0u8; 40];
+        let rc = unsafe {
+            nntmux_nzb_article_fingerprint_batch(
+                buf.as_ptr(),
+                buf.len(),
+                ids.len() as u32,
+                validated,
+                out.as_mut_ptr(),
+            )
+        };
+        (rc == 40).then(|| String::from_utf8(out.to_vec()).unwrap())
+    }
+
+    #[test]
+    fn sha1_matches_standard_vectors() {
+        assert_eq!(&sha1_hex(b""), b"da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        assert_eq!(
+            &sha1_hex(b"abc"),
+            b"a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert_eq!(
+            &sha1_hex(&[b'a'; 1000]),
+            b"291e9a6c66994949b57ba5e650361e98fc36b1ba"
+        );
+    }
+
+    #[test]
+    fn message_id_normalization_matches_php() {
+        assert_eq!(normalize_message_id(b"  <a@b>  "), b"a@b");
+        assert_eq!(normalize_message_id(b"\" <a@b> \""), b"a@b");
+        assert_eq!(normalize_message_id(b"'<a@b>'"), b"a@b");
+        assert_eq!(normalize_message_id(b"<<a@b>>"), b"<a@b>");
+        assert_eq!(normalize_message_id(b"\"a@b'"), b"\"a@b'");
+        assert_eq!(normalize_message_id(b"\""), b"\"");
+        assert_eq!(normalize_message_id(b"<>"), b"");
+        assert_eq!(normalize_message_id(b"\0\x0b a \x0c"), b"a \x0c");
+        assert_eq!(validated_message_id(b"<a b>"), None);
+        assert_eq!(validated_message_id(b"<a\x7f>"), None);
+        assert_eq!(validated_message_id(b"<>"), None);
+        assert_eq!(validated_message_id(&[b'x'; 255]), Some(&[b'x'; 255][..]));
+        assert_eq!(validated_message_id(&[b'x'; 256]), None);
+    }
+
+    #[test]
+    fn fingerprint_is_order_independent_and_unique() {
+        let a = fingerprint(&[b"<one@x>", b"two@x", b"\"three@x\""], 0).unwrap();
+        let b = fingerprint(&[b"three@x", b"one@x", b"two@x", b"one@x"], 0).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(fingerprint(&[b"one@x", b"bad id"], 0), None);
+        assert_eq!(fingerprint(&[b"one@x", b""], 1), None);
+        assert_eq!(fingerprint(&[b"one@x", b"two@x"], 1).is_some(), true);
+        let mut out = [0u8; 40];
+        assert_eq!(
+            unsafe {
+                nntmux_nzb_article_fingerprint_batch(b"a".as_ptr(), 1, 2, 1, out.as_mut_ptr())
+            },
+            0
+        );
+    }
+
+    #[test]
+    fn password_validation_matches_php_ranges() {
+        let check = |values: &[&[u8]]| {
+            let buf = values.join(&0u8);
+            unsafe { nntmux_nzb_validate_passwords(buf.as_ptr(), buf.len(), values.len() as u32) }
+        };
+        assert_eq!(check(&[]), 1);
+        assert_eq!(check(&[b"", b"pass\tword\n"]), 1);
+        assert_eq!(check(&["\u{10000}\u{E000}\u{FFFD}".as_bytes()]), 1);
+        assert_eq!(check(&[b"bad\x01"]), 0);
+        assert_eq!(check(&["\u{FFFE}".as_bytes()]), 0);
+        assert_eq!(check(&["\u{FFFF}".as_bytes()]), 0);
+        assert_eq!(check(&[b"\xff"]), 0);
+        assert_eq!(check(&[b"\xed\xa0\x80"]), 0);
+        assert_eq!(check(&[&[b'a'; 4097]]), 0);
+        assert_eq!(check(&[&[b'a'; 4096]]), 1);
+        let many = vec![&b"x"[..]; 65];
+        assert_eq!(check(&many), 0);
+        assert_eq!(
+            unsafe { nntmux_nzb_validate_passwords(b"a\0b".as_ptr(), 3, 1) },
+            0
+        );
+    }
+
+    #[test]
+    fn ffi_normalize_reports_required_capacity() {
+        let mut out = [0u8; 2];
+        let rc = unsafe {
+            nntmux_nzb_normalize_message_id(b"<abcd>".as_ptr(), 6, out.as_mut_ptr(), out.len())
+        };
+        assert_eq!(rc, -4);
+        let mut out = [0u8; 8];
+        let rc = unsafe {
+            nntmux_nzb_validate_message_id(b" <abcd> ".as_ptr(), 8, out.as_mut_ptr(), out.len())
+        };
+        assert_eq!(rc, 4);
+        assert_eq!(&out[..4], b"abcd");
     }
 }
