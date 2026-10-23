@@ -1251,6 +1251,181 @@ final class RustPipelineLibrary
         return $written === 0 ? null : FFI::string($scratch, $written);
     }
 
+    /**
+     * Compute `AbstractTvProvider::parseInfo` via Rust FFI.
+     *
+     * @return array<string, mixed>|false|null
+     */
+    public static function tvParseInfo(
+        string $relname,
+        int $maxTwoDigitYear,
+        ?string $libraryPath = null,
+        bool &$supported = false
+    ): array|false|null {
+        $supported = false;
+        if ($relname === '') {
+            $supported = true;
+
+            return false;
+        }
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($relname);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= $len * 2 + 64)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, max(512, $len * 2 + 64));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $packed = $ffi->nntmux_tv_parse_info($relname, $len, $maxTwoDigitYear, $scratch, self::$scratchCap);
+        if (! \is_int($packed) || $packed === -1 || $packed === -2) {
+            return null;
+        }
+        if ($packed === -3) {
+            $supported = true;
+
+            return false;
+        }
+        if ($packed < -3) {
+            $scratch = self::ensureScratch($ffi, -$packed);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $packed = $ffi->nntmux_tv_parse_info($relname, $len, $maxTwoDigitYear, $scratch, self::$scratchCap);
+            if (! \is_int($packed) || $packed < 0) {
+                return null;
+            }
+        }
+
+        $written = $packed & 0xFFFF;
+        $parts = explode("\0", FFI::string($scratch, $written));
+        if (\count($parts) !== 4) {
+            return null;
+        }
+
+        $supported = true;
+        $season = ($packed >> 16) & 0xFFFF;
+        $epRaw = ($packed >> 32) & 0xFFFF;
+        $year = ($packed >> 48) & 0xFFFF;
+
+        $res = [
+            'name' => $parts[0],
+            'country' => $parts[1],
+            'cleanname' => $parts[2],
+            'season' => $season,
+            'episode' => $epRaw === 0xFFFF ? 'all' : $epRaw,
+        ];
+        if ($year > 0) {
+            $res['year'] = $year;
+        }
+        $res['airdate'] = $parts[3];
+
+        return $res;
+    }
+
+    /**
+     * Compute `AbstractTvProvider::cleanName` via Rust FFI.
+     */
+    public static function tvCleanName(string $str, ?string $libraryPath = null): ?string
+    {
+        if ($str === '') {
+            return '';
+        }
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($str);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= $len + 32)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, max(256, $len + 32));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_tv_clean_name($str, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1 || $written === -2) {
+            return null;
+        }
+        if ($written < -2) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tv_clean_name($str, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
+    /**
+     * Compute `MovieService::parseMovieSearchName` via Rust FFI.
+     */
+    public static function movieParseSearchName(
+        string $releaseName,
+        string &$title = '',
+        string &$year = '',
+        ?string $libraryPath = null
+    ): ?bool {
+        if ($releaseName === '' || $releaseName === '0') {
+            return false;
+        }
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($releaseName);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= $len + 64)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, max(256, $len + 16));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $packed = $ffi->nntmux_movie_parse_search_name($releaseName, $len, $scratch, self::$scratchCap);
+        if (! \is_int($packed) || $packed === -1 || $packed === -2) {
+            return null;
+        }
+        if ($packed === -3) {
+            return false;
+        }
+        if ($packed < -3) {
+            $scratch = self::ensureScratch($ffi, -$packed);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $packed = $ffi->nntmux_movie_parse_search_name($releaseName, $len, $scratch, self::$scratchCap);
+            if (! \is_int($packed) || $packed < 0) {
+                return null;
+            }
+        }
+
+        $written = $packed & 0xFFFF;
+        $yearInt = $packed >> 16;
+        $title = FFI::string($scratch, $written);
+        $year = $yearInt > 0 ? (string) $yearInt : '';
+
+        return true;
+    }
+
     public static function resolve(?string $libraryPath = null): ?FFI
     {
         if ($libraryPath === null && self::$defaultLibrary !== null) {
@@ -1318,6 +1493,9 @@ final class RustPipelineLibrary
                     ssize_t nntmux_release_name_from_file(const char *input, size_t input_len, char *out_buf, size_t out_cap);
                     ssize_t nntmux_release_generic_clean(const char *input, size_t input_len, uint32_t mode, char *out_buf, size_t out_cap);
                     ssize_t nntmux_payload_identity_resolve_nul(const char *input, size_t input_len, size_t count, char *out_buf, size_t out_cap);
+                    int64_t nntmux_tv_parse_info(const char *input, size_t input_len, uint32_t max_two_digit_year, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_tv_clean_name(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_movie_parse_search_name(const char *input, size_t input_len, char *out_buf, size_t out_cap);
                     C, $resolved);
 
                 // @phpstan-ignore method.notFound

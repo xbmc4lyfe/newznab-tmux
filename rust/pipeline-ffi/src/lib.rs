@@ -3,6 +3,7 @@ use std::slice;
 pub mod categorize;
 pub mod cleaning;
 pub mod filename;
+pub mod media;
 pub mod predb;
 
 /// Returns the ABI version of `libnntmux_pipeline`.
@@ -1324,7 +1325,11 @@ fn parse_xml_decl(bytes: &[u8], mut pos: usize) -> Option<usize> {
                 seen_version = true;
             }
             b"encoding" => {
-                if !seen_version || seen_encoding || seen_standalone || !val.eq_ignore_ascii_case(b"utf-8") {
+                if !seen_version
+                    || seen_encoding
+                    || seen_standalone
+                    || !val.eq_ignore_ascii_case(b"utf-8")
+                {
                     return None;
                 }
                 seen_encoding = true;
@@ -1831,9 +1836,7 @@ enum Par2PacketKind {
 
 #[inline]
 fn classify_par2_packet_type(pkt_type: &[u8]) -> Option<Par2PacketKind> {
-    if pkt_type == PAR2_TYPE_MAIN
-        || pkt_type == PAR2_TYPE_FILEDESC
-        || pkt_type == PAR2_TYPE_FILEVER
+    if pkt_type == PAR2_TYPE_MAIN || pkt_type == PAR2_TYPE_FILEDESC || pkt_type == PAR2_TYPE_FILEVER
     {
         Some(Par2PacketKind::Retained)
     } else if pkt_type == PAR2_TYPE_RECOVERY
@@ -1930,8 +1933,7 @@ fn retain_par2_packet(
     let body_len = packet.len() - 64;
     if (pkt_type == PAR2_TYPE_MAIN && (body_len < 12 || !(body_len - 12).is_multiple_of(16)))
         || (pkt_type == PAR2_TYPE_FILEDESC && body_len < 56)
-        || (pkt_type == PAR2_TYPE_FILEVER
-            && (body_len < 16 || !(body_len - 16).is_multiple_of(20)))
+        || (pkt_type == PAR2_TYPE_FILEVER && (body_len < 16 || !(body_len - 16).is_multiple_of(20)))
     {
         return -2;
     }
@@ -2256,9 +2258,8 @@ mod tests {
   </file>
 </nzb>"#;
         let mut buf = vec![0u8; 4096];
-        let written = unsafe {
-            nntmux_nzb_parse_files(xml.as_ptr(), xml.len(), buf.as_mut_ptr(), buf.len())
-        };
+        let written =
+            unsafe { nntmux_nzb_parse_files(xml.as_ptr(), xml.len(), buf.as_mut_ptr(), buf.len()) };
         assert!(written > 0);
         let line = &buf[..written as usize];
         let fields: Vec<&[u8]> = line.split(|&b| b == 0).collect();
