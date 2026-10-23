@@ -5,10 +5,14 @@ declare(strict_types=1);
 namespace App\Services;
 
 use App\Support\MetadataSources;
+use App\Support\RustPipelineLibrary;
+use Closure;
+use FFI;
 use GuzzleHttp\Client;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
+use Throwable;
 use voku\helper\HtmlDomParser;
 
 class ImdbScraper
@@ -43,7 +47,21 @@ class ImdbScraper
 
     protected bool $lastFetchWasSkipped = false;
 
-    public function __construct(?Client $client = null)
+    private const string NATIVE_CDEF = <<<'C'
+        int32_t nntmux_imdb_is_waf_response(const char *html, size_t html_len);
+        ssize_t nntmux_imdb_extract_jsonld_and_languages(const char *html, size_t html_len, char *out_buf, size_t out_cap);
+        C;
+
+    private ?FFI $native = null;
+
+    private bool $nativeResolved = false;
+
+    /** Large body whose WAF scan was just answered; fetchById() and parseTitleHtml() check the same page. */
+    private ?string $wafCheckedBody = null;
+
+    private bool $wafCheckedResult = false;
+
+    public function __construct(?Client $client = null, private readonly bool $useNative = true)
     {
         $this->imdbApiDevBaseUrl = rtrim((string) config('nntmux_api.imdbapi_dev_base_url', 'https://api.imdbapi.dev'), '/');
         $this->client = $client ?? new Client([
@@ -197,7 +215,7 @@ class ImdbScraper
             Cache::put($cacheKey, false, $ttl);
 
             return false;
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::debug('IMDb fetch error tt'.$id.': '.$e->getMessage());
             Cache::forget(self::WAF_PROBE_CACHE_KEY);
             if ($this->lastFailureReason === null) {
@@ -289,7 +307,7 @@ class ImdbScraper
             Cache::put($cacheKey, $results, now()->addHours(12));
 
             return $results; // @phpstan-ignore return.type
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::debug('IMDb search error '.$query.': '.$e->getMessage());
             Cache::put($cacheKey, [], now()->addHours(self::HARD_FAILURE_TTL_HOURS));
 
@@ -302,44 +320,56 @@ class ImdbScraper
      */
     private function parseTitleHtml(string $html, string $id): array|false
     {
-        if ($this->isWafResponse(200, $html)) {
+        $blocked = $this->isWafResponse(200, $html);
+        $this->wafCheckedBody = null;
+        if ($blocked) {
             $this->lastRequestWasBlocked = true;
 
             return false;
         }
 
-        $jsonLd = $this->extractPrimaryJsonLdEntity($html);
-        $dom = HtmlDomParser::str_get_html($html);
+        $sections = $this->nativeTitleSections($html);
+        $jsonLd = $sections !== null
+            ? $this->findPrimaryJsonLdEntity($sections['json'])
+            : $this->extractPrimaryJsonLdEntity($html);
 
-        $title = $this->extractTitle($jsonLd, $dom);
+        // The DOM is only built when a JSON-LD field is missing and a selector fallback needs it.
+        $dom = null;
+        $resolveDom = static function () use (&$dom, $html): HtmlDomParser {
+            return $dom ??= HtmlDomParser::str_get_html($html);
+        };
+
+        $title = $this->extractTitle($jsonLd, $resolveDom);
         if ($title === '') {
             return false;
         }
 
         $year = $this->extractYearFromEntity($jsonLd);
         if ($year === '') {
-            $year = $this->extractYearFromDom($dom);
+            $year = $this->extractYearFromDom($resolveDom);
         }
 
-        $plot = $this->extractPlot($jsonLd, $dom);
-        $rating = $this->extractRating($jsonLd, $dom);
-        $cover = $this->extractCover($jsonLd, $dom);
-        $genres = $this->extractGenres($jsonLd, $dom);
+        $plot = $this->extractPlot($jsonLd, $resolveDom);
+        $rating = $this->extractRating($jsonLd, $resolveDom);
+        $cover = $this->extractCover($jsonLd, $resolveDom);
+        $genres = $this->extractGenres($jsonLd, $resolveDom);
         $directors = $this->extractPeople($jsonLd['director'] ?? null);
         $actors = array_slice($this->extractPeople($jsonLd['actor'] ?? null), 0, 10);
-        $language = $this->extractLanguage($jsonLd, $dom);
+        $language = $this->extractLanguage($jsonLd, $resolveDom, $sections['languages'] ?? null);
         $type = $this->extractType($jsonLd);
 
-        if ($dom !== false) {
+        if ($directors === [] || $actors === []) {
+            $peopleDom = $resolveDom();
+
             if ($directors === []) {
-                $directors = $this->extractPeopleFromDom($dom, [
+                $directors = $this->extractPeopleFromDom($peopleDom, [
                     "li[data-testid='title-pc-principal-credit']:contains(Director) a",
                     "li[data-testid='title-pc-principal-credit']:contains(Creator) a",
                 ]);
             }
 
             if ($actors === []) {
-                $actors = array_slice($this->extractPeopleFromDom($dom, [
+                $actors = array_slice($this->extractPeopleFromDom($peopleDom, [
                     "div[data-testid='title-cast-item'] a[data-testid='title-cast-item__actor']",
                 ]), 0, 10);
             }
@@ -415,7 +445,7 @@ class ImdbScraper
             }
 
             return $mapped;
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::debug('imdbapi.dev fetch error tt'.$id.': '.$e->getMessage());
             $this->lastFallbackFailureReason = 'fallback_exception';
             $this->activateImdbApiDevCooldown();
@@ -584,6 +614,11 @@ class ImdbScraper
             return false;
         }
 
+        $native = $this->nativeIsWafBody($body);
+        if ($native !== null) {
+            return $native;
+        }
+
         return Str::contains($body, [
             'window.awsWafCookieDomainList',
             'window.gokuProps',
@@ -591,6 +626,110 @@ class ImdbScraper
             'captcha',
             'awswaf',
         ], true);
+    }
+
+    private function nativeLibrary(): ?FFI
+    {
+        if (! $this->useNative) {
+            return null;
+        }
+
+        if (! $this->nativeResolved) {
+            $this->native = RustPipelineLibrary::resolveDomain('imdb', self::NATIVE_CDEF);
+            $this->nativeResolved = true;
+        }
+
+        return $this->native;
+    }
+
+    /**
+     * Null means the Rust library cannot answer with exact PHP parity and the PHP check must run.
+     */
+    private function nativeIsWafBody(string $body): ?bool
+    {
+        $ffi = $this->nativeLibrary();
+        if ($ffi === null) {
+            return null;
+        }
+
+        if ($this->wafCheckedBody === $body) {
+            return $this->wafCheckedResult;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $result = $ffi->nntmux_imdb_is_waf_response($body, strlen($body));
+        } catch (Throwable) {
+            return null;
+        }
+
+        if ($result < 0) {
+            return null;
+        }
+
+        $this->wafCheckedBody = strlen($body) > 65536 ? $body : null;
+        $this->wafCheckedResult = $result === 1;
+
+        return $this->wafCheckedResult;
+    }
+
+    /**
+     * Single-pass extraction of JSON-LD bodies and title-detail languages from the raw page.
+     * 'languages' is null when the markup needs the DOM selector; the result is null when Rust is unavailable.
+     *
+     * @return array{json: array<int, string>, languages: array<int, string>|null}|null
+     */
+    private function nativeTitleSections(string $html): ?array
+    {
+        $ffi = $this->nativeLibrary();
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            $capacity = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, 4096, $capacity);
+            if ($scratch === null) {
+                return null;
+            }
+
+            $length = strlen($html);
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_imdb_extract_jsonld_and_languages($html, $length, $scratch, $capacity);
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_imdb_extract_jsonld_and_languages($html, $length, $scratch, $capacity);
+            }
+            if ($written < 0) {
+                return null;
+            }
+
+            $raw = $written === 0 ? '' : FFI::string($scratch, $written);
+        } catch (Throwable) {
+            return null;
+        }
+
+        $json = [];
+        $languages = [];
+        $useDom = false;
+        foreach (explode("\0", $raw) as $section) {
+            if ($section === '') {
+                continue;
+            }
+
+            $payload = substr($section, 1);
+            match ($section[0]) {
+                'J' => $json[] = $payload,
+                'L' => $languages[] = $payload,
+                default => $useDom = true,
+            };
+        }
+
+        return ['json' => $json, 'languages' => $useDom ? null : $languages];
     }
 
     /**
@@ -602,7 +741,16 @@ class ImdbScraper
             return [];
         }
 
-        foreach ($matches[1] as $json) {
+        return $this->findPrimaryJsonLdEntity($matches[1]);
+    }
+
+    /**
+     * @param  array<int, string>  $bodies  Raw JSON-LD script bodies in document order.
+     * @return array<string, mixed>
+     */
+    private function findPrimaryJsonLdEntity(array $bodies): array
+    {
+        foreach ($bodies as $json) {
             $decoded = json_decode(html_entity_decode(trim($json), ENT_QUOTES | ENT_HTML5, 'UTF-8'), true);
             if (! is_array($decoded)) {
                 continue;
@@ -653,13 +801,14 @@ class ImdbScraper
             || (isset($payload['name']) && (isset($payload['actor']) || isset($payload['director']) || isset($payload['aggregateRating'])));
     }
 
-    private function extractTitle(array $jsonLd, HtmlDomParser|false $dom): string
+    private function extractTitle(array $jsonLd, Closure $resolveDom): string
     {
         $title = trim((string) ($jsonLd['name'] ?? ''));
         if ($title !== '') {
             return $title;
         }
 
+        $dom = $resolveDom();
         if ($dom !== false) {
             $titleNode = $dom->findOne('h1');
             $title = trim((string) ($titleNode?->text() ?? ''));
@@ -687,8 +836,9 @@ class ImdbScraper
         return $this->extractYearFromText((string) ($jsonLd['dateCreated'] ?? ''));
     }
 
-    private function extractYearFromDom(HtmlDomParser|false $dom): string
+    private function extractYearFromDom(Closure $resolveDom): string
     {
+        $dom = $resolveDom();
         if ($dom === false) {
             return '';
         }
@@ -711,13 +861,14 @@ class ImdbScraper
         return '';
     }
 
-    private function extractPlot(array $jsonLd, HtmlDomParser|false $dom): string
+    private function extractPlot(array $jsonLd, Closure $resolveDom): string
     {
         $plot = trim((string) ($jsonLd['description'] ?? ''));
         if ($plot !== '') {
             return $plot;
         }
 
+        $dom = $resolveDom();
         if ($dom === false) {
             return '';
         }
@@ -741,13 +892,14 @@ class ImdbScraper
         return trim((string) ($descriptionNode?->getAttribute('content') ?? ''));
     }
 
-    private function extractRating(array $jsonLd, HtmlDomParser|false $dom): string
+    private function extractRating(array $jsonLd, Closure $resolveDom): string
     {
         $rating = trim((string) ($jsonLd['aggregateRating']['ratingValue'] ?? ''));
         if ($rating !== '') {
             return $rating;
         }
 
+        $dom = $resolveDom();
         if ($dom === false) {
             return '';
         }
@@ -758,13 +910,14 @@ class ImdbScraper
         return preg_match('/\d+(?:\.\d+)?/', $ratingText, $matches) === 1 ? $matches[0] : '';
     }
 
-    private function extractCover(array $jsonLd, HtmlDomParser|false $dom): string
+    private function extractCover(array $jsonLd, Closure $resolveDom): string
     {
         $cover = $this->normalizeImageUrl($jsonLd['image'] ?? '');
         if ($cover !== '') {
             return $cover;
         }
 
+        $dom = $resolveDom();
         if ($dom === false) {
             return '';
         }
@@ -778,13 +931,14 @@ class ImdbScraper
     /**
      * @return array<int, string>
      */
-    private function extractGenres(array $jsonLd, HtmlDomParser|false $dom): array
+    private function extractGenres(array $jsonLd, Closure $resolveDom): array
     {
         $genres = $this->normalizeStringList($jsonLd['genre'] ?? []);
         if ($genres !== []) {
             return $genres;
         }
 
+        $dom = $resolveDom();
         if ($dom === false) {
             return [];
         }
@@ -864,13 +1018,21 @@ class ImdbScraper
         return array_values(array_unique($people));
     }
 
-    private function extractLanguage(array $jsonLd, HtmlDomParser|false $dom): string
+    /**
+     * @param  array<int, string>|null  $nativeLanguages  Link texts from the raw HTML, or null to use the DOM.
+     */
+    private function extractLanguage(array $jsonLd, Closure $resolveDom, ?array $nativeLanguages = null): string
     {
         $languages = $this->normalizeStringList($jsonLd['inLanguage'] ?? []);
         if ($languages !== []) {
             return implode(', ', $languages);
         }
 
+        if ($nativeLanguages !== null) {
+            return implode(', ', array_values(array_unique($nativeLanguages)));
+        }
+
+        $dom = $resolveDom();
         if ($dom === false) {
             return '';
         }
@@ -1044,7 +1206,7 @@ class ImdbScraper
             }
 
             return $this->parseSearchHtml($html);
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::debug('IMDb HTML search fallback failed for '.$query.': '.$e->getMessage());
 
             return [];

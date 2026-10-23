@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace App\Services\Predb\Feeds\Sources;
 
 use App\Services\Predb\Feeds\PredbFeedEntry;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\Log;
 use JsonException;
 use RuntimeException;
@@ -18,6 +20,12 @@ use stdClass;
  */
 final class KnabenSource extends BoundedHttpFeedSource
 {
+    private const NATIVE_CDEF = <<<'C'
+        int32_t nntmux_predb_knaben_validate_unique_keys(const char *json, size_t json_len);
+        C;
+
+    private static FFI|false|null $native = null;
+
     /** @var array<string, int> */
     private array $rejections = [];
 
@@ -28,6 +36,7 @@ final class KnabenSource extends BoundedHttpFeedSource
         int $pageSize = 100,
         int $timeout = 15,
         string $userAgent = 'NNTmux-PreDB-Importer/1.0',
+        private readonly bool $useNative = true,
     ) {
         $size = min(300, $pageSize);
         $query = http_build_query(['c' => 3000000, 'o' => 'date', 'd' => 'desc', 's' => $size, 'f' => 0]);
@@ -74,8 +83,13 @@ final class KnabenSource extends BoundedHttpFeedSource
 
         try {
             $document = json_decode($json, false, 64, JSON_THROW_ON_ERROR);
-            $offset = 0;
-            $this->checkValueMembers($json, $offset);
+            $unique = $this->useNative ? $this->nativeUniqueMembers($json) : null;
+            if ($unique === null) {
+                $offset = 0;
+                $this->checkValueMembers($json, $offset);
+            } elseif (! $unique) {
+                throw new RuntimeException('KNABEN returned ambiguous duplicate JSON object members.');
+            }
         } catch (JsonException $exception) {
             throw new RuntimeException('KNABEN returned invalid JSON.', previous: $exception);
         }
@@ -128,6 +142,25 @@ final class KnabenSource extends BoundedHttpFeedSource
         }
 
         return $entries;
+    }
+
+    /**
+     * Rust duplicate-member scan of an already decoded document: null when PHP must scan instead.
+     */
+    private function nativeUniqueMembers(string $json): ?bool
+    {
+        $ffi = self::$native ??= RustPipelineLibrary::resolveDomain('predb_feeds', self::NATIVE_CDEF) ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $status = $ffi->nntmux_predb_knaben_validate_unique_keys($json, strlen($json));
+
+        return match ($status) {
+            1 => true,
+            0 => false,
+            default => null,
+        };
     }
 
     private function rejectionReason(stdClass $hit): ?string
