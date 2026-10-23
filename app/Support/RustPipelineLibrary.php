@@ -2768,6 +2768,106 @@ final class RustPipelineLibrary
         return $written === 0 ? '' : FFI::string($scratch, $written);
     }
 
+    /**
+     * Compute `ObfuscatedSubjectExtractor::extract` via Rust FFI.
+     * Sets `$supported = true` when Rust handled the input (even if result is `null`).
+     */
+    public static function extractObfuscatedSubject(
+        string $value,
+        ?string $libraryPath = null,
+        bool &$supported = false
+    ): ?string {
+        $supported = false;
+        if ($value === '') {
+            $supported = true;
+
+            return null;
+        }
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($value);
+        $minCap = max(256, $len + 32);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= $minCap)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, $minCap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_extract_obfuscated_subject($value, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1 || $written === -2) {
+            return null;
+        }
+        if ($written === -3) {
+            $supported = true;
+
+            return null;
+        }
+        if ($written < -3) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_extract_obfuscated_subject($value, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        $supported = true;
+
+        return $written === 0 ? null : FFI::string($scratch, $written);
+    }
+
+    /**
+     * Compute `sanitize()` for a plain string (with empty `$doNotSanitize`) via Rust FFI.
+     */
+    public static function searchSanitizeLucene(string $phrases, ?string $libraryPath = null): ?string
+    {
+        if ($phrases === '') {
+            return '';
+        }
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($phrases);
+        $minCap = max(256, $len * 2 + 16);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= $minCap)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, $minCap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_search_sanitize_lucene($phrases, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1 || $written === -2) {
+            return null;
+        }
+        if ($written < -2) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_search_sanitize_lucene($phrases, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
     public static function resolve(?string $libraryPath = null): ?FFI
     {
         if ($libraryPath === null && self::$defaultLibrary !== null) {
@@ -2870,6 +2970,8 @@ final class RustPipelineLibrary
                     double nntmux_book_score(const char *raw, size_t raw_len, const char *title, size_t title_len, uint32_t has_author, const char *author, size_t author_len, uint32_t has_isbn, const char *isbn, size_t isbn_len, const char *cand_title, size_t cand_title_len, const char *cand_author, size_t cand_author_len, uint32_t has_cand_isbn, const char *cand_isbn, size_t cand_isbn_len, uint32_t has_cand_ean, const char *cand_ean, size_t cand_ean_len);
                     ssize_t nntmux_anime_extract_title(const char *input, size_t input_len, char *out_buf, size_t out_cap);
                     ssize_t nntmux_anime_clean_title(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_extract_obfuscated_subject(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_search_sanitize_lucene(const char *input, size_t input_len, char *out_buf, size_t out_cap);
                     C, $resolved);
 
                 // @phpstan-ignore method.notFound

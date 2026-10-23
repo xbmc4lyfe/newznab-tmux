@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\NameFixing\Extractors;
 
+use App\Support\RustPipelineLibrary;
+
 final class ObfuscatedSubjectExtractor
 {
     /**
@@ -32,6 +34,17 @@ final class ObfuscatedSubjectExtractor
     ];
 
     public function extract(string $value): ?string
+    {
+        $supported = false;
+        $native = RustPipelineLibrary::extractObfuscatedSubject($value, null, $supported);
+        if ($supported) {
+            return $native;
+        }
+
+        return $this->extractPhp($value);
+    }
+
+    public function extractPhp(string $value): ?string
     {
         $original = trim($value);
         if ($original === '') {

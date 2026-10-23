@@ -116,7 +116,9 @@ fn matches_archive_suffix_pattern(filename: &[u8]) -> bool {
         return true;
     }
     // Check `\.z\d{2}$`
-    if ext.len() == 3 && matches!(ext[0], b'z' | b'Z') && ext[1..].iter().all(|b| b.is_ascii_digit())
+    if ext.len() == 3
+        && matches!(ext[0], b'z' | b'Z')
+        && ext[1..].iter().all(|b| b.is_ascii_digit())
     {
         return true;
     }
@@ -163,7 +165,8 @@ fn is_valid_yenc_counter_parens(s: &[u8]) -> bool {
     }
     let inner = &s[1..s.len() - 1];
     if let Some(slash) = inner.iter().position(|&b| b == b'/') {
-        is_positive_integer_digits(&inner[..slash]) && is_positive_integer_digits(&inner[slash + 1..])
+        is_positive_integer_digits(&inner[..slash])
+            && is_positive_integer_digits(&inner[slash + 1..])
     } else {
         is_positive_integer_digits(inner)
     }
@@ -542,7 +545,8 @@ pub fn nzbsplit_unwrap_vec(value: &[u8], out_vec: &mut Vec<u8>) -> Option<bool> 
     // 6. `trim($title, " \t\n\r\0\x0B.-_")`
     let mut start = 0usize;
     let mut end = step4.len();
-    while start < end && (is_php_trim_char(step4[start]) || matches!(step4[start], b'.' | b'-' | b'_'))
+    while start < end
+        && (is_php_trim_char(step4[start]) || matches!(step4[start], b'.' | b'-' | b'_'))
     {
         start += 1;
     }
@@ -586,15 +590,7 @@ fn strip_fixer_archive_ext(s: &[u8]) -> &[u8] {
     {
         return &s[..dot];
     }
-    for word in [
-        &b"par2"[..],
-        b"par",
-        b"nfo",
-        b"sfv",
-        b"nzb",
-        b"rar",
-        b"zip",
-    ] {
+    for word in [&b"par2"[..], b"par", b"nfo", b"sfv", b"nzb", b"rar", b"zip"] {
         if ext.eq_ignore_ascii_case(word) {
             return &s[..dot];
         }
@@ -692,10 +688,7 @@ fn strip_fixer_prefix(s: &[u8]) -> &[u8] {
     if s.len() >= 12 && s[..12].eq_ignore_ascii_case(b"release name") {
         return &s[12..];
     }
-    if s.len() >= 7
-        && s[..6].eq_ignore_ascii_case(b"sample")
-        && matches!(s[6], b'-' | b'_')
-    {
+    if s.len() >= 7 && s[..6].eq_ignore_ascii_case(b"sample") && matches!(s[6], b'-' | b'_') {
         return &s[7..];
     }
     s
@@ -867,7 +860,9 @@ fn is_tv_episode_word(word: &[u8]) -> bool {
         p += 1;
     }
     let s_digits = p - 1;
-    if !(1..=2).contains(&s_digits) || p >= word.len() || !matches!(word[p], b'e' | b'E' | b'x' | b'X')
+    if !(1..=2).contains(&s_digits)
+        || p >= word.len()
+        || !matches!(word[p], b'e' | b'E' | b'x' | b'X')
     {
         return false;
     }
@@ -1527,10 +1522,7 @@ pub unsafe extern "C" fn nntmux_payload_identity_resolve_nul(
         return -2;
     }
     let bytes = unsafe { slice::from_raw_parts(input, input_len) };
-    if bytes
-        .iter()
-        .any(|&b| b >= 0x80 || b == b'\n' || b == b'\r')
-    {
+    if bytes.iter().any(|&b| b >= 0x80 || b == b'\n' || b == b'\r') {
         return -2;
     }
 
@@ -1683,6 +1675,441 @@ pub unsafe extern "C" fn nntmux_release_generic_clean(
     }
 }
 
+#[inline]
+fn find_quoted_3_to_240(s: &[u8], quote: u8) -> Option<&[u8]> {
+    let mut prev: Option<usize> = None;
+    for (idx, &b) in s.iter().enumerate() {
+        if b == quote {
+            if let Some(q1) = prev {
+                let inner_len = idx - q1 - 1;
+                if (3..=240).contains(&inner_len) {
+                    return Some(&s[q1 + 1..idx]);
+                }
+            }
+            prev = Some(idx);
+        }
+    }
+    None
+}
+
+#[inline]
+fn is_obfuscated_trim_char(b: u8) -> bool {
+    is_php_trim_char(b) || matches!(b, b'"' | b'\'' | b'`' | b'-' | b'_' | b'.')
+}
+
+/// Evaluates `ObfuscatedSubjectExtractor::extract(string $value)`.
+/// Returns:
+/// - `>= 0`: bytes written to `out_buf`
+/// - `-3`: `null`
+/// - `-2`: declined to PHP (non-ASCII or multiline input)
+/// - `-1`: null pointer error
+/// - `< -3`: `-(required_len as isize)` when `out_cap` is too small
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_extract_obfuscated_subject(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input_len == 0 {
+        return -3;
+    }
+    if input.is_null() {
+        return -1;
+    }
+    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+    if bytes.iter().any(|&b| b >= 0x80 || b == b'\n' || b == b'\r') {
+        return -2;
+    }
+
+    let original = php_trim_ascii(bytes);
+    if original.is_empty() {
+        return -3;
+    }
+
+    let mut norm = original;
+    let mut looks_obfuscated = false;
+
+    // Prefix 1: `/^\s*N:\/NZB\s*\[\d+\/\d+\]\s*-\s*/i`
+    {
+        let mut p = 0usize;
+        while p < norm.len() && is_pcre_space(norm[p]) {
+            p += 1;
+        }
+        if norm[p..].len() >= 6 && norm[p..p + 6].eq_ignore_ascii_case(b"n:/nzb") {
+            p += 6;
+            while p < norm.len() && is_pcre_space(norm[p]) {
+                p += 1;
+            }
+            if norm.get(p) == Some(&b'[') {
+                p += 1;
+                let d1 = p;
+                while p < norm.len() && norm[p].is_ascii_digit() {
+                    p += 1;
+                }
+                if p > d1 && norm.get(p) == Some(&b'/') {
+                    p += 1;
+                    let d2 = p;
+                    while p < norm.len() && norm[p].is_ascii_digit() {
+                        p += 1;
+                    }
+                    if p > d2 && norm.get(p) == Some(&b']') {
+                        p += 1;
+                        while p < norm.len() && is_pcre_space(norm[p]) {
+                            p += 1;
+                        }
+                        if norm.get(p) == Some(&b'-') {
+                            p += 1;
+                            while p < norm.len() && is_pcre_space(norm[p]) {
+                                p += 1;
+                            }
+                            if p > 0 {
+                                norm = &norm[p..];
+                                looks_obfuscated = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Prefix 2: `/^\s*N[\s._:-]*NZB[\s._-]*\[\d+(?:[\/_]\d+)?\][\s._-]*-\s*/i`
+    {
+        let mut p = 0usize;
+        while p < norm.len() && is_pcre_space(norm[p]) {
+            p += 1;
+        }
+        if norm.get(p).is_some_and(|&b| b.eq_ignore_ascii_case(&b'n')) {
+            p += 1;
+            while p < norm.len()
+                && (is_pcre_space(norm[p]) || matches!(norm[p], b'.' | b'_' | b':' | b'-'))
+            {
+                p += 1;
+            }
+            if norm[p..].len() >= 3 && norm[p..p + 3].eq_ignore_ascii_case(b"nzb") {
+                p += 3;
+                while p < norm.len()
+                    && (is_pcre_space(norm[p]) || matches!(norm[p], b'.' | b'_' | b'-'))
+                {
+                    p += 1;
+                }
+                if norm.get(p) == Some(&b'[') {
+                    p += 1;
+                    let d1 = p;
+                    while p < norm.len() && norm[p].is_ascii_digit() {
+                        p += 1;
+                    }
+                    if p > d1 {
+                        if norm.get(p).is_some_and(|&c| c == b'/' || c == b'_') {
+                            let mut p2 = p + 1;
+                            let d2 = p2;
+                            while p2 < norm.len() && norm[p2].is_ascii_digit() {
+                                p2 += 1;
+                            }
+                            if p2 > d2 {
+                                p = p2;
+                            }
+                        }
+                        if norm.get(p) == Some(&b']') {
+                            p += 1;
+                            let mut run_end = p;
+                            let mut last_dash = None;
+                            while run_end < norm.len()
+                                && (is_pcre_space(norm[run_end])
+                                    || matches!(norm[run_end], b'.' | b'_' | b'-'))
+                            {
+                                if norm[run_end] == b'-' {
+                                    last_dash = Some(run_end);
+                                }
+                                run_end += 1;
+                            }
+                            if let Some(dash_idx) = last_dash {
+                                let mut after = dash_idx + 1;
+                                while after < norm.len() && is_pcre_space(norm[after]) {
+                                    after += 1;
+                                }
+                                if after > 0 {
+                                    norm = &norm[after..];
+                                    looks_obfuscated = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Prefix 3: `/^\s*\[[^\]]{2,80}\]\s*/`
+    {
+        let mut p = 0usize;
+        while p < norm.len() && is_pcre_space(norm[p]) {
+            p += 1;
+        }
+        if norm.get(p) == Some(&b'[')
+            && let Some(rel_close) = norm[p + 1..].iter().position(|&b| b == b']')
+            && (2..=80).contains(&rel_close)
+        {
+            let mut after = p + 1 + rel_close + 1;
+            while after < norm.len() && is_pcre_space(norm[after]) {
+                after += 1;
+            }
+            if after > 0 {
+                norm = &norm[after..];
+                looks_obfuscated = true;
+            }
+        }
+    }
+
+    // Prefix 4: `/^\s*(?:re\s*)?posted\s+by\s+[^-]{2,120}\s*-\s*/i`
+    {
+        let mut p0 = 0usize;
+        while p0 < norm.len() && is_pcre_space(norm[p0]) {
+            p0 += 1;
+        }
+        let mut after_posted = None;
+        if norm[p0..].len() >= 6 && norm[p0..p0 + 6].eq_ignore_ascii_case(b"posted") {
+            after_posted = Some(p0 + 6);
+        } else if norm[p0..].len() >= 8 && norm[p0..p0 + 2].eq_ignore_ascii_case(b"re") {
+            let mut p_re = p0 + 2;
+            while p_re < norm.len() && is_pcre_space(norm[p_re]) {
+                p_re += 1;
+            }
+            if norm[p_re..].len() >= 6 && norm[p_re..p_re + 6].eq_ignore_ascii_case(b"posted") {
+                after_posted = Some(p_re + 6);
+            }
+        }
+        if let Some(ap) = after_posted {
+            let mut p_by = ap;
+            while p_by < norm.len() && is_pcre_space(norm[p_by]) {
+                p_by += 1;
+            }
+            if p_by > ap
+                && norm[p_by..].len() >= 2
+                && norm[p_by..p_by + 2].eq_ignore_ascii_case(b"by")
+            {
+                let after_by = p_by + 2;
+                if after_by < norm.len() && is_pcre_space(norm[after_by]) {
+                    let span_start = after_by + 1;
+                    if let Some(rel_dash) = norm[span_start..].iter().position(|&b| b == b'-') {
+                        let dash_pos = span_start + rel_dash;
+                        let span = &norm[span_start..dash_pos];
+                        let mut c_start = 0usize;
+                        while c_start < span.len() && is_pcre_space(span[c_start]) {
+                            c_start += 1;
+                        }
+                        let mut c_end = span.len();
+                        while c_end > c_start && is_pcre_space(span[c_end - 1]) {
+                            c_end -= 1;
+                        }
+                        if span.len() >= 2 && (c_end - c_start) <= 120 {
+                            let mut after = dash_pos + 1;
+                            while after < norm.len() && is_pcre_space(norm[after]) {
+                                after += 1;
+                            }
+                            if after > 0 {
+                                norm = &norm[after..];
+                                looks_obfuscated = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Quoted extraction
+    if let Some(q) = find_quoted_3_to_240(norm, b'"') {
+        norm = q;
+        looks_obfuscated = true;
+    } else if let Some(q) = find_quoted_3_to_240(norm, b'\'') {
+        norm = q;
+        looks_obfuscated = true;
+    }
+
+    // Trailing archive patterns
+    if looks_obfuscated {
+        // 1. `/\.part\d+\.rar$/i`
+        if norm.len() >= 10 && norm[norm.len() - 4..].eq_ignore_ascii_case(b".rar") {
+            let mut p = norm.len() - 4;
+            let d_end = p;
+            while p > 0 && norm[p - 1].is_ascii_digit() {
+                p -= 1;
+            }
+            if p < d_end && p >= 5 && norm[p - 5..p].eq_ignore_ascii_case(b".part") {
+                norm = &norm[..p - 5];
+            }
+        }
+        // 2. `/\.r\d{2,4}$/i`
+        {
+            let mut p = norm.len();
+            while p > 0 && norm[p - 1].is_ascii_digit() {
+                p -= 1;
+            }
+            let digits = norm.len() - p;
+            if (2..=4).contains(&digits)
+                && p >= 2
+                && norm[p - 2] == b'.'
+                && norm[p - 1].eq_ignore_ascii_case(&b'r')
+            {
+                norm = &norm[..p - 2];
+            }
+        }
+        // 3. `/\.7z\.\d{2,4}$/i`
+        {
+            let mut p = norm.len();
+            while p > 0 && norm[p - 1].is_ascii_digit() {
+                p -= 1;
+            }
+            let digits = norm.len() - p;
+            if (2..=4).contains(&digits) && p >= 4 && norm[p - 4..p].eq_ignore_ascii_case(b".7z.") {
+                norm = &norm[..p - 4];
+            }
+        }
+        // 4. `/\.7z$/i`
+        if norm.len() >= 3 && norm[norm.len() - 3..].eq_ignore_ascii_case(b".7z") {
+            norm = &norm[..norm.len() - 3];
+        }
+        // 5. `/\.rar$/i`
+        if norm.len() >= 4 && norm[norm.len() - 4..].eq_ignore_ascii_case(b".rar") {
+            norm = &norm[..norm.len() - 4];
+        }
+        // 6. `/\.par2?$/i`
+        if norm.len() >= 5 && norm[norm.len() - 5..].eq_ignore_ascii_case(b".par2") {
+            norm = &norm[..norm.len() - 5];
+        } else if norm.len() >= 4 && norm[norm.len() - 4..].eq_ignore_ascii_case(b".par") {
+            norm = &norm[..norm.len() - 4];
+        }
+        // 7. `/\.part$/i`
+        if norm.len() >= 5 && norm[norm.len() - 5..].eq_ignore_ascii_case(b".part") {
+            norm = &norm[..norm.len() - 5];
+        }
+        // 8. `/\.vol\d+[+\-]\d+\.par2?$/i`
+        {
+            let par_trim =
+                if norm.len() >= 5 && norm[norm.len() - 5..].eq_ignore_ascii_case(b".par2") {
+                    Some(norm.len() - 5)
+                } else if norm.len() >= 4 && norm[norm.len() - 4..].eq_ignore_ascii_case(b".par") {
+                    Some(norm.len() - 4)
+                } else {
+                    None
+                };
+            if let Some(mut p) = par_trim {
+                let d2_end = p;
+                while p > 0 && norm[p - 1].is_ascii_digit() {
+                    p -= 1;
+                }
+                if p < d2_end && p > 0 && matches!(norm[p - 1], b'+' | b'-') {
+                    p -= 1;
+                    let d1_end = p;
+                    while p > 0 && norm[p - 1].is_ascii_digit() {
+                        p -= 1;
+                    }
+                    if p < d1_end && p >= 4 && norm[p - 4..p].eq_ignore_ascii_case(b".vol") {
+                        norm = &norm[..p - 4];
+                    }
+                }
+            }
+        }
+        // 9. `/\.\d{3}$/`
+        if norm.len() >= 4
+            && norm[norm.len() - 4] == b'.'
+            && norm[norm.len() - 3..].iter().all(|b| b.is_ascii_digit())
+        {
+            norm = &norm[..norm.len() - 4];
+        }
+    }
+
+    // Transform '_', '+', '.(?=[A-Za-z0-9])' -> ' ', then collapse `\s{2,}` -> ' '
+    let mut stack_buf = [0u8; 512];
+    let mut heap_buf = Vec::new();
+    let use_heap = norm.len() > stack_buf.len();
+    if use_heap {
+        heap_buf.resize(norm.len(), 0);
+    }
+    let stage1: &mut [u8] = if use_heap {
+        &mut heap_buf[..]
+    } else {
+        &mut stack_buf[..norm.len()]
+    };
+    for i in 0..norm.len() {
+        let b = norm[i];
+        stage1[i] = if b == b'_'
+            || b == b'+'
+            || (b == b'.' && norm.get(i + 1).is_some_and(|c| c.is_ascii_alphanumeric()))
+        {
+            b' '
+        } else {
+            b
+        };
+    }
+
+    // Collapse `\s{2,}` in-place inside `stage1`
+    let mut w = 0usize;
+    let mut r = 0usize;
+    while r < stage1.len() {
+        if is_pcre_space(stage1[r]) {
+            let mut r_end = r + 1;
+            while r_end < stage1.len() && is_pcre_space(stage1[r_end]) {
+                r_end += 1;
+            }
+            if r_end - r >= 2 {
+                stage1[w] = b' ';
+            } else {
+                stage1[w] = stage1[r];
+            }
+            w += 1;
+            r = r_end;
+        } else {
+            stage1[w] = stage1[r];
+            w += 1;
+            r += 1;
+        }
+    }
+
+    // Trim `" \t\n\r\0\x0B\"'`-_."`
+    let mut t_start = 0usize;
+    let mut t_end = w;
+    while t_start < t_end && is_obfuscated_trim_char(stage1[t_start]) {
+        t_start += 1;
+    }
+    while t_end > t_start && is_obfuscated_trim_char(stage1[t_end - 1]) {
+        t_end -= 1;
+    }
+    let trimmed = &mut stage1[t_start..t_end];
+
+    // `toReadableTitle`: if no uppercase ASCII letter, apply MB_CASE_TITLE
+    if !trimmed.iter().any(|&b| b.is_ascii_uppercase()) {
+        let mut in_word = false;
+        for b in trimmed.iter_mut() {
+            if b.is_ascii_alphabetic() {
+                if !in_word {
+                    *b = b.to_ascii_uppercase();
+                    in_word = true;
+                } else {
+                    *b = b.to_ascii_lowercase();
+                }
+            } else if !matches!(*b, b'\'' | b'.' | b':' | b'^' | b'`') {
+                in_word = false;
+            }
+        }
+    }
+
+    if trimmed.is_empty() || trimmed == original {
+        return -3;
+    }
+
+    let mut cur = unsafe { OutCursor::new(out_buf, out_cap) };
+    cur.extend(trimmed);
+    cur.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1732,6 +2159,26 @@ mod tests {
         assert_eq!(
             &buf[..len as usize],
             b"Shes.the.Man.2006.BluRay.1080p.DTS-HD.MA.5.1.AVC.REMUX-FraMeSToR"
+        );
+    }
+
+    #[test]
+    fn test_extract_obfuscated_subject() {
+        let mut buf = [0u8; 256];
+        let input =
+            b"N:/NZB [01/25] - \"the.matrix.1999.1080p.bluray.x264-group.part01.rar\" yEnc (1/50)";
+        let len = unsafe {
+            nntmux_extract_obfuscated_subject(
+                input.as_ptr(),
+                input.len(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(len > 0);
+        assert_eq!(
+            &buf[..len as usize],
+            b"The Matrix 1999 1080P Bluray X264-Group"
         );
     }
 }

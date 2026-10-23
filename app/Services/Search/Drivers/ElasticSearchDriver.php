@@ -1808,6 +1808,11 @@ class ElasticSearchDriver implements PredbFilenameCandidateLookup, ReleaseCandid
             return '';
         }
 
+        $native = RustPipelineLibrary::searchSanitizeLucene($terms);
+        if ($native !== null) {
+            return $native;
+        }
+
         // Use the original sanitize() helper function that properly handles
         // Elasticsearch query string escaping
         if (function_exists('sanitize')) {
