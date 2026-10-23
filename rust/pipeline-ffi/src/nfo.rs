@@ -949,19 +949,60 @@ fn is_supported_nfo_bytes(src: &[u8]) -> bool {
     true
 }
 
+const PREDB_WORD: u8 = 1;
+const PREDB_T: u8 = 2;
+const PREDB_S: u8 = 4;
+const PREDB_U: u8 = 8;
+
+const PREDB_BYTE_FLAGS: [u8; 256] = {
+    let mut table = [0u8; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        let c = b as u8;
+        let is_w = c.is_ascii_alphanumeric() || c == b'_';
+        let is_t = is_w
+            || c == b'.'
+            || c == b'\''
+            || c == b'('
+            || c == b')'
+            || c == b'['
+            || c == b']'
+            || c == b'-';
+        let is_sp = c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' || c == 0x0B || c == 0x0C;
+        let is_s = is_sp || c == b'.' || c == b'_' || c == b'-';
+        let is_u = is_t || is_sp;
+        let mut flags = 0u8;
+        if is_w {
+            flags |= PREDB_WORD;
+        }
+        if is_t {
+            flags |= PREDB_T;
+        }
+        if is_s {
+            flags |= PREDB_S;
+        }
+        if is_u {
+            flags |= PREDB_U;
+        }
+        table[b] = flags;
+        b += 1;
+    }
+    table
+};
+
 #[inline]
 fn is_predb_t_byte(b: u8) -> bool {
-    is_word_byte(b) || matches!(b, b'.' | b'\'' | b'(' | b')' | b'[' | b']' | b'-')
+    (PREDB_BYTE_FLAGS[b as usize] & PREDB_T) != 0
 }
 
 #[inline]
 fn is_predb_s_byte(b: u8) -> bool {
-    is_pcre_space(b) || matches!(b, b'.' | b'_' | b'-')
+    (PREDB_BYTE_FLAGS[b as usize] & PREDB_S) != 0
 }
 
 #[inline]
 fn is_predb_u_byte(b: u8) -> bool {
-    is_predb_t_byte(b) || is_pcre_space(b)
+    (PREDB_BYTE_FLAGS[b as usize] & PREDB_U) != 0
 }
 
 /// Evaluates `preg_match(ReleaseUpdateService::PREDB_REGEX, input)` in O(N) time.
@@ -1015,47 +1056,31 @@ fn for_each_predb_regex_match<'a>(identity: &'a [u8], mut f: impl FnMut(&'a [u8]
             continue;
         }
         let mut u_end = i + 1;
+        let mut first_s = usize::MAX;
         while u_end < n && is_predb_u_byte(identity[u_end]) {
+            if first_s == usize::MAX && is_predb_s_byte(identity[u_end]) {
+                first_s = u_end;
+            }
             u_end += 1;
         }
-        while i < u_end {
-            if !is_predb_t_byte(identity[i]) {
-                i += 1;
-                continue;
-            }
-            if u_end - i < 5 {
-                i = u_end;
-                break;
-            }
-            let mut first_s = usize::MAX;
-            for k in (i + 1)..u_end {
-                if is_predb_s_byte(identity[k]) {
-                    first_s = k;
-                    break;
-                }
-            }
-            if first_s == usize::MAX {
-                i = u_end;
-                break;
-            }
+        if u_end - i >= 5 && first_s != usize::MAX {
             let min_d = (i + 3).max(first_s + 2);
-            let mut matched = false;
             if u_end >= min_d + 2 {
                 let mut d = u_end - 2;
                 loop {
                     if matches!(identity[d], b'-' | b'.')
-                        && is_word_byte(identity[d + 1])
+                        && (PREDB_BYTE_FLAGS[identity[d + 1] as usize] & PREDB_WORD) != 0
                         && is_predb_t_byte(identity[d - 1])
                     {
                         let mut end = d + 2;
-                        while end < u_end && is_word_byte(identity[end]) {
+                        while end < u_end
+                            && (PREDB_BYTE_FLAGS[identity[end] as usize] & PREDB_WORD) != 0
+                        {
                             end += 1;
                         }
                         if !f(&identity[i..end]) {
                             return;
                         }
-                        i = end;
-                        matched = true;
                         break;
                     }
                     if d <= min_d {
@@ -1064,11 +1089,8 @@ fn for_each_predb_regex_match<'a>(identity: &'a [u8], mut f: impl FnMut(&'a [u8]
                     d -= 1;
                 }
             }
-            if !matched {
-                i = u_end;
-                break;
-            }
         }
+        i = u_end;
     }
 }
 
@@ -1420,9 +1442,32 @@ pub(crate) fn nfo_predb_candidates_into(src: &[u8], out: &mut OutCursor<'_>) -> 
         return -2;
     }
 
+    let needs_identity_copy = unsafe {
+        !memchr(src.as_ptr(), b'\r' as i32, src.len()).is_null() || {
+            let mut pos = 0usize;
+            let mut found_source = false;
+            while pos < src.len() {
+                let p = memchr(src.as_ptr().add(pos), b'\n' as i32, src.len() - pos);
+                let line_end = if p.is_null() {
+                    src.len()
+                } else {
+                    p.offset_from(src.as_ptr()) as usize
+                };
+                if is_source_header_line(&src[pos..line_end]) {
+                    found_source = true;
+                    break;
+                }
+                pos = line_end + 1;
+            }
+            found_source
+        }
+    };
+
     let mut stack_ident = std::mem::MaybeUninit::<[u8; 16384]>::uninit();
     let mut heap_ident: Vec<u8> = Vec::new();
-    let ident_slice: &[u8] = if src.len() <= 16384 {
+    let ident_slice: &[u8] = if !needs_identity_copy {
+        src
+    } else if src.len() <= 16384 {
         let ptr = stack_ident.as_mut_ptr().cast::<u8>();
         let mut cur = unsafe { OutCursor::new(ptr, 16384) };
         nfo_identity_text_into(src, &mut cur);
@@ -1472,18 +1517,42 @@ pub(crate) fn nfo_predb_candidates_into(src: &[u8], out: &mut OutCursor<'_>) -> 
     };
 
     // 1. `literalNameFields($identity)` -> `cleanForMatching($field)`
-    for line in ident_slice.split(|&b| b == b'\n') {
-        if let Some(field) = extract_literal_name_field(line) {
-            let span = crate::filename::clean_for_matching_span(field, false);
-            if span == -2 {
-                return -2;
+    let mut lpos = 0usize;
+    while lpos < ident_slice.len() {
+        let line_end = unsafe {
+            let p = memchr(
+                ident_slice.as_ptr().add(lpos),
+                b'\n' as i32,
+                ident_slice.len() - lpos,
+            );
+            if p.is_null() {
+                ident_slice.len()
+            } else {
+                p.offset_from(ident_slice.as_ptr()) as usize
             }
-            if span >= 0 {
-                let start = (span >> 32) as usize;
-                let len = (span & 0xFFFF_FFFF) as usize;
-                let cleaned = &field[start..start + len];
-                if !cands.insert(cleaned) {
-                    return -4;
+        };
+        let line = &ident_slice[lpos..line_end];
+        lpos = line_end + 1;
+        if line.len() >= 9 {
+            let mut ws = 0usize;
+            while ws < line.len() && matches!(line[ws], b' ' | b'\t') {
+                ws += 1;
+            }
+            if ws < line.len()
+                && matches!(line[ws], b'f' | b'F' | b'c' | b'C' | b'r' | b'R')
+                && let Some(field) = extract_literal_name_field(line)
+            {
+                let span = crate::filename::clean_for_matching_span(field, false);
+                if span == -2 {
+                    return -2;
+                }
+                if span >= 0 {
+                    let start = (span >> 32) as usize;
+                    let len = (span & 0xFFFF_FFFF) as usize;
+                    let cleaned = &field[start..start + len];
+                    if !cands.insert(cleaned) {
+                        return -4;
+                    }
                 }
             }
         }
@@ -3114,9 +3183,32 @@ pub(crate) fn nfo_extract_pattern_mode_into(
         return -2;
     }
 
+    let needs_identity_copy = unsafe {
+        !memchr(src.as_ptr(), b'\r' as i32, src.len()).is_null() || {
+            let mut pos = 0usize;
+            let mut found_source = false;
+            while pos < src.len() {
+                let p = memchr(src.as_ptr().add(pos), b'\n' as i32, src.len() - pos);
+                let line_end = if p.is_null() {
+                    src.len()
+                } else {
+                    p.offset_from(src.as_ptr()) as usize
+                };
+                if is_source_header_line(&src[pos..line_end]) {
+                    found_source = true;
+                    break;
+                }
+                pos = line_end + 1;
+            }
+            found_source
+        }
+    };
+
     let mut stack_ident = std::mem::MaybeUninit::<[u8; 16384]>::uninit();
     let mut heap_ident: Vec<u8> = Vec::new();
-    let ident_slice: &[u8] = if src.len() <= 16384 {
+    let ident_slice: &[u8] = if !needs_identity_copy {
+        src
+    } else if src.len() <= 16384 {
         let ptr = stack_ident.as_mut_ptr().cast::<u8>();
         let mut cur = unsafe { OutCursor::new(ptr, 16384) };
         nfo_identity_text_into(src, &mut cur);
