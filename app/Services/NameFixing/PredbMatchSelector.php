@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\NameFixing;
 
 use App\Support\PredbSearchDocument;
+use App\Support\RustPipelineLibrary;
 
 /**
  * Selects a PreDB hit whose title or cleaned filename has the query's literal UTF-8 identity.
@@ -12,7 +13,7 @@ use App\Support\PredbSearchDocument;
  */
 class PredbMatchSelector
 {
-    public const PREDB_IDENTITY_POLICY = 'a82a013885530d8e35920bb6bdfd1b75b5b4237e7d4e3938f2ed0c69d2668eba';
+    public const PREDB_IDENTITY_POLICY = '7ed004035636bb0c620a40b1b3349bfea912846d81bdfd64c5f0f738098fa2a7';
 
     private const MAX_RESULTS_TO_SCORE = 50;
 
@@ -65,6 +66,36 @@ class PredbMatchSelector
      * @return array<string, mixed>|null
      */
     private function selectWithinLookup(string $query, array $hits, ?OriginalFilenameEvidence $originalFilename): ?array
+    {
+        if (get_class($this) === self::class && get_class($this->fileNameCleaner) === FileNameCleaner::class) {
+            $slice = array_values(array_slice($hits, 0, self::MAX_RESULTS_TO_SCORE));
+            $supported = false;
+            $idx = RustPipelineLibrary::predbSelectBestMatchIndex(
+                $query,
+                $originalFilename !== null,
+                $originalFilename !== null ? $originalFilename->basename : '',
+                $slice,
+                null,
+                $supported
+            );
+            if ($supported) {
+                if ($idx === null || $idx < 0 || ! isset($slice[$idx])) {
+                    return null;
+                }
+                $winner = $slice[$idx];
+
+                return is_array($winner) ? $winner : (array) $winner;
+            }
+        }
+
+        return $this->selectWithinLookupPhp($query, $hits, $originalFilename);
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>|object>  $hits
+     * @return array<string, mixed>|null
+     */
+    public function selectWithinLookupPhp(string $query, array $hits, ?OriginalFilenameEvidence $originalFilename): ?array
     {
         if (! mb_check_encoding($query, 'UTF-8')) {
             return null;
@@ -293,6 +324,11 @@ class PredbMatchSelector
     {
         if ($left !== '' && $left === $right) {
             return 100.0;
+        }
+
+        $ffiRes = RustPipelineLibrary::similarityPercent($left, $right);
+        if ($ffiRes !== null) {
+            return $ffiRes;
         }
 
         $percent = 0.0;
