@@ -17,6 +17,7 @@ case "$scheduler_timeout" in
     ''|*[!0-9]*) echo "DEPLOY_SCHEDULER_DRAIN_TIMEOUT must be a nonnegative integer." >&2; exit 1 ;;
 esac
 
+[ -z "${DEPLOY_TARGETS:-}" ] || "$DIR/bin/deploy-plan" --resolve-targets >/dev/null
 "${JUST:-just}" --justfile "$DIR/Justfile" --working-directory "$DIR" build
 verify
 
@@ -191,7 +192,7 @@ if [ "$MODE" = "noop" ]; then
         hold_barrier
         # The barrier's drain can take minutes: verify the stack again before releasing remote
         # workers and stamping. A failure exits with the barrier still running, for the next run.
-        if ! "$DIR/bin/deploy-current"; then
+        if ! DEPLOY_TARGETS= "$DIR/bin/deploy-current"; then
             echo "deploy-app: not every app service is running healthy on its expected image; keeping remote verification workers held." >&2
             exit 1
         fi
@@ -576,7 +577,14 @@ done
 # runs before the barrier is released, so remote workers resume only on a verified stack; a failure
 # keeps the barrier and leaves its release owed, and the retry clears it once the stack is healthy.
 [ "$barrier_held" != 1 ] || barrier_keep=1
-if ! "$DIR/bin/deploy-current"; then
+if [ "$barrier_held" = 1 ]; then
+    current_ok=0
+    DEPLOY_TARGETS= "$DIR/bin/deploy-current" && current_ok=1
+else
+    current_ok=0
+    "$DIR/bin/deploy-current" && current_ok=1
+fi
+if [ "$current_ok" != 1 ]; then
     echo "deploy-app: the rollout finished, but not every app service is running healthy on its expected image (or a data/infrastructure container runs a stale image); not recording a successful deployment." >&2
     exit 1
 fi

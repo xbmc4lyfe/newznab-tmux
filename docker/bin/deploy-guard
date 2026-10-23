@@ -212,17 +212,21 @@ acquire() {
 
 unchanged() {
     [ "${FORCE:-0}" != 1 ] || return 1
+    [ "${target:-}" = "build" ] || [ -z "${DEPLOY_TARGETS:-}" ] || return 1
     # An owed barrier release must run even when everything else matches again (e.g. reverted).
     [ ! -e "$STAMP.barrier-owed" ] || return 1
     [ "${SKIP_IF_UNCHANGED:-0}" = 1 ] || return 1
     [ -f "$STAMP" ] || return 1
     [ "$(head -n 1 "$STAMP")" = "$(fingerprint)" ] || return 1
     if [ -n "${REQUIRE_IMAGE:-}" ]; then
-        for req_img in $REQUIRE_IMAGE; do
-            docker image inspect "$req_img" >/dev/null 2>&1 || return 1
-        done
-        # A pending build (e.g. a base image refreshed in place) is not "unchanged", for the deploy
-        # target too. Its targets live in the build stamp, not the deployment stamp.
+        if [ -z "${DEPLOY_TARGETS:-}" ]; then
+            for req_img in $REQUIRE_IMAGE; do
+                docker image inspect "$req_img" >/dev/null 2>&1 || return 1
+            done
+        fi
+        # A pending build (e.g. a base image refreshed in place, or an earlier targeted build) is
+        # not "unchanged", for the deploy target too. Its targets live in the build stamp, not the
+        # deployment stamp.
         build_stamp=$STAMP
         [ "${target:-}" = "build" ] || build_stamp="$DIR/.build.stamp"
         # A failing planner is not "nothing to build".
@@ -237,6 +241,7 @@ unchanged() {
 
 cooldown() {
     [ "${FORCE:-0}" != 1 ] || return 1
+    [ -z "${DEPLOY_TARGETS:-}" ] || return 1
     # Never defer an owed barrier release: remote workers stay paused until it runs.
     [ ! -e "$STAMP.barrier-owed" ] || return 1
     interval=${DEPLOY_MIN_INTERVAL:-0}
@@ -300,6 +305,64 @@ forward_signal() {
     exit "$2"
 }
 
+sync_remote() {
+    mode="${DEPLOY_SYNC_REMOTE:-auto}"
+    case "$mode" in
+        0|false|no|off) return 0 ;;
+        1|true|yes|on|auto) ;;
+        *)
+            echo "deploy-guard: DEPLOY_SYNC_REMOTE must be auto, 1, or 0 (got $mode)." >&2
+            exit 64
+            ;;
+    esac
+    remote="${DEPLOY_GIT_REMOTE:-origin}"
+    if [ ! -e "$REPO/.git" ] || ! git -C "$REPO" remote get-url "$remote" >/dev/null 2>&1; then
+        if [ "$mode" = "auto" ]; then
+            return 0
+        fi
+        log "$target" "result=failed (git remote $remote is not configured)"
+        echo "deploy-guard: git remote '$remote' is not configured in $REPO; cannot verify latest remote default branch." >&2
+        exit 1
+    fi
+    branch="${DEPLOY_GIT_BRANCH:-}"
+    if [ -z "$branch" ]; then
+        remote_head=$(git -C "$REPO" symbolic-ref -q --short "refs/remotes/$remote/HEAD" 2>/dev/null || true)
+        branch="${remote_head#"$remote"/}"
+        if [ -z "$branch" ] || [ "$branch" = "$remote_head" ]; then
+            branch="master"
+        fi
+    fi
+    current_branch=$(git -C "$REPO" symbolic-ref -q --short HEAD 2>/dev/null || true)
+    if [ "$current_branch" != "$branch" ]; then
+        log "$target" "result=failed (checkout is on ${current_branch:-detached HEAD}, expected $branch)"
+        echo "deploy-guard: checkout is on ${current_branch:-detached HEAD}, not default branch $branch; refusing to deploy non-default branch (set DEPLOY_SYNC_REMOTE=0 to override)." >&2
+        exit 1
+    fi
+    if ! git -C "$REPO" fetch --quiet "$remote" "+refs/heads/$branch:refs/remotes/$remote/$branch"; then
+        log "$target" "result=failed (git fetch $remote $branch failed)"
+        echo "deploy-guard: failed to fetch latest $branch from $remote; refusing to deploy potentially stale local code." >&2
+        exit 1
+    fi
+    local_head=$(git -C "$REPO" rev-parse --verify HEAD 2>/dev/null || true)
+    remote_commit=$(git -C "$REPO" rev-parse --verify "refs/remotes/$remote/$branch" 2>/dev/null || true)
+    if [ -z "$local_head" ] || [ -z "$remote_commit" ]; then
+        log "$target" "result=failed (cannot resolve HEAD or $remote/$branch)"
+        echo "deploy-guard: cannot resolve HEAD or $remote/$branch; refusing to deploy." >&2
+        exit 1
+    fi
+    if [ "$local_head" != "$remote_commit" ]; then
+        short_local=$(git -C "$REPO" rev-parse --short "$local_head" 2>/dev/null || printf '%s' "$local_head")
+        short_remote=$(git -C "$REPO" rev-parse --short "$remote_commit" 2>/dev/null || printf '%s' "$remote_commit")
+        if ! git -C "$REPO" merge --ff-only --quiet "refs/remotes/$remote/$branch" || [ "$(git -C "$REPO" rev-parse --verify HEAD 2>/dev/null || true)" != "$remote_commit" ]; then
+            log "$target" "result=failed (cannot fast-forward $branch from $short_local to $remote/$branch $short_remote)"
+            echo "deploy-guard: local $branch ($short_local) cannot be fast-forwarded to $remote/$branch ($short_remote); refusing to deploy diverged or unpushed local commits." >&2
+            exit 1
+        fi
+        log "$target" "result=synced from=$short_local to=$short_remote remote=$remote/$branch"
+        echo "deploy-guard: fast-forwarded $branch from $short_local to $remote/$branch ($short_remote)."
+    fi
+}
+
 cmd_run() {
     [ "$#" -ge 3 ] || { echo "usage: deploy-guard run <target> -- <command...>" >&2; exit 64; }
     target=$1
@@ -307,6 +370,7 @@ cmd_run() {
     [ "$1" = -- ] && shift
 
     check_recovery_hold
+    top_level=0
     if [ -n "${DEPLOY_GUARD_HELD:-}${DEPLOY_GUARD_OWNER_SHA256:-}${DEPLOY_GUARD_LOCK:-}" ]; then
         nested_owner || busy "invalid inherited guard ownership"
         trap 'guard_exit' EXIT
@@ -317,6 +381,7 @@ cmd_run() {
     else
         acquire "$target"
         owned_info=$info
+        top_level=1
         trap 'guard_exit' EXIT
         # A background payload starts with SIGINT ignored (POSIX); TERM is what reaches it.
         trap 'forward_signal TERM 130' INT
@@ -330,6 +395,12 @@ cmd_run() {
 
     # The previous owner could have published a hold after our first check but before acquisition.
     check_recovery_hold
+
+    if [ "$top_level" = 1 ]; then
+        case "$target" in
+            deploy|build) sync_remote ;;
+        esac
+    fi
 
     if unchanged; then
         log "$target" "result=skipped (nothing changed since the last deploy; FORCE=1 to override)"
@@ -411,10 +482,17 @@ cmd_run() {
             echo "deploy-guard: $target completed but its stamp could not be written; the next run re-plans." >&2
             rc=1
         elif [ "$(head -n 1 "$stamp_tmp")" = "$before" ]; then
-            mv -f "$stamp_tmp" "$STAMP"
+            partial_stamp=0
+            if grep -q '^partial=1$' "$stamp_tmp"; then
+                partial_stamp=1
+                { echo stale; grep -v '^partial=1$' "$stamp_tmp" | tail -n +2; } >"$stamp_tmp.partial" && mv -f "$stamp_tmp.partial" "$STAMP"
+                rm -f "$stamp_tmp" "$stamp_tmp.partial"
+            else
+                mv -f "$stamp_tmp" "$STAMP"
+            fi
             if [ -f "$DEPLOY_NOOP_MARKER" ]; then
                 noop=1
-            elif [ "${RECORD_DEPLOY_TIME:-0}" = 1 ]; then
+            elif [ "${RECORD_DEPLOY_TIME:-0}" = 1 ] && [ "$partial_stamp" != 1 ] && [ -z "${DEPLOY_TARGETS:-}" ]; then
                 date +%s >"$SUCCESS_TIME"
             fi
         else

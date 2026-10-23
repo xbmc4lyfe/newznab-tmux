@@ -16,6 +16,7 @@ class DeployMigrationOrderTest extends TestCase
         $this->directory = sys_get_temp_dir().'/deploy-order-'.bin2hex(random_bytes(8));
         mkdir($this->directory.'/docker/bin', 0700, true);
         mkdir($this->directory.'/bin', 0700);
+        copy(__DIR__.'/../../Justfile', $this->directory.'/Justfile');
         copy(__DIR__.'/../../docker/Justfile', $this->directory.'/docker/Justfile');
         foreach (['deploy-guard', 'deploy-app', 'deploy-current', 'deploy-plan', 'build-images', 'up-app', 'compose', 'compose_dotenv.py', 'legacy-drain.php', 'legacy-scheduler-drain.py'] as $script) {
             copy(__DIR__.'/../../docker/bin/'.$script, $this->directory.'/docker/bin/'.$script);
@@ -4042,6 +4043,202 @@ SH);
         $actions = $this->planActions(['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)]);
         $this->assertContains('redis', explode(' ', $actions['DIRTY_DATA']));
         $this->assertNotContains('redis', explode(' ', $actions['RECONCILE_DATA']));
+    }
+
+    public function test_targeted_component_deploys_only_the_requested_service_and_keeps_stamp_stale_until_remaining_dirty_services_deploy(): void
+    {
+        $this->composeFiles();
+        mkdir($this->directory.'/resources/js', 0777, true);
+        mkdir($this->directory.'/app/Services', 0777, true);
+        file_put_contents($this->directory.'/resources/js/app.js', "console.log(1);\n");
+        file_put_contents($this->directory.'/app/Services/Example.php', "<?php // v1\n");
+        $config = ['NNTMUX_CONFIG_ID' => $this->composeJson()];
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+        $initialStamp = (string) file_get_contents($this->directory.'/docker/.deploy.stamp');
+        $this->assertNotSame('stale', strtok($initialStamp, "\n"));
+
+        // Make web, horizon, scheduler, indexer, proxy, and redis all dirty at once.
+        file_put_contents($this->directory.'/resources/js/app.js', "console.log(2);\n");
+        file_put_contents($this->directory.'/app/Services/Example.php', "<?php // v2\n");
+        file_put_contents($this->directory.'/docker/config/caddy/Caddyfile', ":8081\n");
+        file_put_contents($this->directory.'/docker/config/redis/redis.conf', "maxmemory 2gb\n");
+
+        // 1. Deploy only web (`just deploy web`).
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'web'], $config)->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('build --target selfhosted-web', $events);
+        $this->assertStringNotContainsString('build --target selfhosted-horizon', $events);
+        $this->assertStringNotContainsString('build --target selfhosted-scheduler', $events);
+        $this->assertStringNotContainsString('build --target selfhosted-indexer', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web', $events);
+        $this->assertStringNotContainsString('stop --timeout 1920 horizon', $events);
+        $this->assertStringNotContainsString('tmux:drain', $events);
+        $this->assertNotStamped();
+
+        // 2. Deploy only proxy (`just deploy-proxy`).
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy-proxy'], $config)->mustRun();
+        $events = $this->events();
+        $this->assertStringNotContainsString('build --target', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never proxy', $events);
+        $this->assertStringNotContainsString('stop --timeout 1920 horizon', $events);
+        $this->assertNotStamped();
+
+        // 3. Deploy only horizon (`just deploy horizon`).
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'horizon'], $config)->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('build --target selfhosted-horizon', $events);
+        $this->assertStringNotContainsString('build --target selfhosted-web', $events);
+        $this->assertStringContainsString(' stop --timeout 1920 horizon', $events);
+        $this->assertStringNotContainsString('tmux:drain', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never horizon', $events);
+        $this->assertNotStamped();
+
+        // 4. Deploy only scheduler (`just deploy-scheduler`).
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy-scheduler'], $config)->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('build --target selfhosted-scheduler', $events);
+        $this->assertStringContainsString('scheduler.py drain --timeout=1800', $events);
+        $this->assertStringNotContainsString('tmux:drain', $events);
+        $this->assertStringContainsString(' stop scheduler', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never scheduler', $events);
+        $this->assertNotStamped();
+
+        // 5. Deploy only indexer (`just deploy indexer`).
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy', 'indexer'], $config)->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString('build --target selfhosted-indexer', $events);
+        $this->assertStringContainsString('tmux:drain --timeout=900', $events);
+        $this->assertStringNotContainsString('scheduler.py drain', $events);
+        $this->assertStringContainsString(' stop indexer', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never indexer', $events);
+        // Redis is still dirty, so the full stack stamp remains stale.
+        $this->assertNotStamped();
+
+        // 6. Deploy redis (`just deploy-redis`): all previously dirty services are now current, so stamp becomes clean.
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy-redis'], $config)->mustRun();
+        $events = $this->events();
+        $this->assertStringNotContainsString('build --target', $events);
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never redis', $events);
+        $finalStamp = (string) file_get_contents($this->directory.'/docker/.deploy.stamp');
+        $this->assertNotSame('stale', strtok($finalStamp, "\n"));
+
+        // 7. Subsequent full `just deploy` sees no remaining dirty services and skips.
+        file_put_contents($this->directory.'/events', '');
+        $noop = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config);
+        $noop->mustRun();
+        $this->assertStringContainsString('nothing changed since the last deploy; skipping', $noop->getOutput());
+        $this->assertAttemptsClosed();
+    }
+
+    public function test_targeted_monitoring_group_and_invalid_or_unrendered_targets_fail_closed(): void
+    {
+        $json = json_decode($this->composeJson(), true);
+        $json['services']['prometheus'] = ['image' => 'fixture/prometheus:tag'];
+        $json['services']['grafana'] = ['image' => 'fixture/grafana:tag'];
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+
+        $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+
+        // Change prometheus image and deploy via `deploy-monitoring`.
+        $json['services']['prometheus'] = ['image' => 'prom/prometheus:v3'];
+        $config = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy-monitoring'], $config)->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never prometheus', $events);
+        $this->assertStringNotContainsString('--pull never grafana', $events);
+
+        // Unknown target fails closed.
+        $unknown = $this->make(['deploy', 'nonexistent'], $config);
+        $unknown->run();
+        $this->assertNotSame(0, $unknown->getExitCode());
+        $this->assertStringContainsString("unknown deployment target 'nonexistent'", $unknown->getErrorOutput());
+
+        // Scaled-to-zero service (such as mariadb in the split-DB cutover override) fails closed when explicitly targeted.
+        $json['services']['mariadb'] = ['image' => 'mariadb:11', 'deploy' => ['replicas' => 0]];
+        $scaledConfig = ['NNTMUX_CONFIG_ID' => (string) json_encode($json, JSON_UNESCAPED_SLASHES)];
+        $scaledZero = $this->make(['deploy-mariadb'], $scaledConfig);
+        $scaledZero->run();
+        $this->assertNotSame(0, $scaledZero->getExitCode());
+        $this->assertStringContainsString("deployment target 'mariadb' is scaled to zero", $scaledZero->getErrorOutput());
+
+        // Unrendered service fails closed when explicitly targeted (even before building a valid companion target).
+        file_put_contents($this->directory.'/events', '');
+        $unrendered = $this->make(['deploy', 'web', 'mailpit'], $config);
+        $unrendered->run();
+        $this->assertNotSame(0, $unrendered->getExitCode());
+        $this->assertStringContainsString("deployment target 'mailpit' is not rendered", $unrendered->getErrorOutput());
+        $this->assertStringNotContainsString('build --target selfhosted-web', $this->events());
+
+        // Delimiter-only DEPLOY_TARGETS fails closed instead of running a full rollout.
+        $delimiterOnly = $this->make(['deploy', 'DEPLOY_TARGETS=,'], $config);
+        $delimiterOnly->run();
+        $this->assertNotSame(0, $delimiterOnly->getExitCode());
+        $this->assertStringContainsString('contains no target names', $delimiterOnly->getErrorOutput());
+
+        // When all services are already stamped as unchanged, explicit component commands still redeploy the requested component.
+        file_put_contents($this->directory.'/events', '');
+        $planWeb = $this->make(['deploy-plan', 'web'], $config);
+        $planWeb->mustRun();
+        $this->assertMatchesRegularExpression('/web\s+app\s+recreate\s+targeted redeploy/', $planWeb->getOutput());
+
+        $this->make(['deploy-web'], $config)->mustRun();
+        $events = $this->events();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never web', $events);
+        $this->assertStringNotContainsString('--pull never horizon', $events);
+
+        file_put_contents($this->directory.'/events', '');
+        $this->make(['deploy-proxy'], $config)->mustRun();
+        $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never proxy', $this->events());
+
+        // Plain `just deploy` with no target argument still skips when nothing changed.
+        file_put_contents($this->directory.'/events', '');
+        $noop = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config);
+        $noop->mustRun();
+        $this->assertStringContainsString('nothing changed since the last deploy; skipping', $noop->getOutput());
+    }
+
+    public function test_deploy_plan_and_deploy_automatically_sync_latest_remote_default_branch(): void
+    {
+        $this->composeFiles();
+        $config = ['NNTMUX_CONFIG_ID' => $this->composeJson()];
+
+        $origin = $this->directory.'-origin.git';
+        $upstream = $this->directory.'-upstream';
+        (new Process(['git', 'add', '.'], $this->directory))->mustRun();
+        (new Process(['git', 'commit', '-q', '-m', 'track compose files'], $this->directory))->mustRun();
+        (new Process(['git', 'branch', '-M', 'master'], $this->directory))->mustRun();
+        (new Process(['git', 'init', '-q', '--bare', $origin]))->mustRun();
+        (new Process(['git', 'remote', 'add', 'origin', $origin], $this->directory))->mustRun();
+        (new Process(['git', 'push', '-q', '-u', 'origin', 'master'], $this->directory))->mustRun();
+
+        try {
+            $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config)->mustRun();
+
+            // Push a Caddyfile update to origin/master from another clone without pulling locally.
+            (new Process(['git', 'clone', '-q', '--branch', 'master', $origin, $upstream]))->mustRun();
+            (new Process(['git', 'config', 'user.email', 'test@example.com'], $upstream))->mustRun();
+            (new Process(['git', 'config', 'user.name', 'Test'], $upstream))->mustRun();
+            file_put_contents($upstream.'/docker/config/caddy/Caddyfile', ":8080\n# updated on origin\n");
+            (new Process(['git', 'commit', '-q', '-am', 'update caddy on origin'], $upstream))->mustRun();
+            (new Process(['git', 'push', '-q', 'origin', 'master'], $upstream))->mustRun();
+
+            // `just deploy` automatically fetches origin/master, fast-forwards, and redeploys proxy.
+            file_put_contents($this->directory.'/events', '');
+            $deploy = $this->make(['deploy', 'DEPLOY_MIN_INTERVAL=0'], $config);
+            $deploy->mustRun();
+            $this->assertStringContainsString('fast-forwarded master', $deploy->getOutput());
+            $this->assertStringContainsString(' up -d --no-deps --force-recreate --wait --wait-timeout 240 --pull never proxy', $this->events());
+        } finally {
+            (new Process(['rm', '-rf', $origin, $upstream]))->run();
+        }
     }
 
     /**
