@@ -4,7 +4,7 @@
 //! Greedy repetitions and ordered alternatives therefore need no capture state.
 //! No regex crate, system library, or runtime dependency is required.
 
-use std::{slice, sync::OnceLock};
+use std::{mem::MaybeUninit, slice, sync::OnceLock};
 
 // Matches TvNameChecker::check() order (which can differ from getAllPatterns()).
 const TV: &[(&str, &str)] = &[
@@ -243,24 +243,49 @@ fn intersects(a: Bloom, b: Bloom) -> bool {
 }
 
 fn requirements(expr: &Expr) -> Vec<Bloom> {
-    fn literal(expr: &Expr) -> Option<u8> {
-        let Expr::Byte(c) = expr else {
-            return None;
+    // Return the possible first/last bytes of a nonempty expression. Required
+    // repeats and grouped alternatives also contribute guaranteed boundaries.
+    fn small_class(expr: &Expr, last: bool) -> Option<Vec<u8>> {
+        let bytes = match expr {
+            Expr::Byte(c) => (0u8..=127)
+                .filter(|&b| c.contains(b) && !b.is_ascii_uppercase())
+                .collect::<Vec<_>>(),
+            Expr::Repeat(e, min, _) if *min > 0 => return small_class(e, last),
+            Expr::Sequence(seq) => {
+                return small_class(if last { seq.last()? } else { seq.first()? }, last);
+            }
+            Expr::Alt(alts) => {
+                let mut bytes = Vec::new();
+                for alt in alts {
+                    bytes.extend(small_class(alt, last)?);
+                }
+                bytes.sort_unstable();
+                bytes.dedup();
+                bytes
+            }
+            _ => return None,
         };
-        let mut bytes = (0u8..=127).filter(|&b| c.contains(b) && !b.is_ascii_uppercase());
-        let b = bytes.next()?;
-        if bytes.next().is_none() {
-            Some(b)
-        } else {
-            None
-        }
+        (1..=10).contains(&bytes.len()).then_some(bytes)
     }
     match expr {
         Expr::Sequence(seq) => {
             let mut result: Vec<Bloom> = seq.iter().flat_map(requirements).collect();
             for pair in seq.windows(2) {
-                if let (Some(a), Some(b)) = (literal(&pair[0]), literal(&pair[1])) {
-                    result.push(bigram(a, b));
+                if let (Some(a_bytes), Some(b_bytes)) =
+                    (small_class(&pair[0], true), small_class(&pair[1], false))
+                {
+                    if a_bytes.len() * b_bytes.len() <= 40 {
+                        let mut mask = [0; 4];
+                        for &a in &a_bytes {
+                            for &b in &b_bytes {
+                                let pair = bigram(a, b);
+                                for i in 0..4 {
+                                    mask[i] |= pair[i];
+                                }
+                            }
+                        }
+                        result.push(mask);
+                    }
                 }
             }
             result
@@ -421,7 +446,7 @@ impl Parser<'_> {
 #[derive(Debug)]
 enum Op {
     Byte(Class, usize),
-    Repeat(Class, usize, usize, usize),
+    Repeat(Class, usize, u8),
     TailRepeat(Class, usize, Class),
     Split(usize, usize),
     Before(usize),
@@ -462,7 +487,7 @@ fn compile(expr: &Expr, next: usize, ops: &mut Vec<Op>) -> usize {
                     }
                     // Normalize unbounded repeats so every scanned position is
                     // the same zero-minimum state and can share failure memo.
-                    ops.push(Op::Repeat(c, 0, *max, next));
+                    ops.push(Op::Repeat(c, next, 0));
                     let mut entry = ops.len() - 1;
                     for _ in 0..*min {
                         ops.push(Op::Byte(c, entry));
@@ -470,7 +495,20 @@ fn compile(expr: &Expr, next: usize, ops: &mut Vec<Op>) -> usize {
                     }
                     return entry;
                 }
-                Op::Repeat(c, *min, *max, next)
+                // Bounded byte repeats need only an acyclic greedy chain.
+                // Reserve memo rows for unbounded repeat continuations.
+                let mut entry = next;
+                for _ in *min..*max {
+                    ops.push(Op::Byte(c, entry));
+                    let first = ops.len() - 1;
+                    ops.push(Op::Split(first, next));
+                    entry = ops.len() - 1;
+                }
+                for _ in 0..*min {
+                    ops.push(Op::Byte(c, entry));
+                    entry = ops.len() - 1;
+                }
+                return entry;
             } else {
                 // Every repeated group in this pattern set is optional.
                 assert_eq!((*min, *max), (0, 1));
@@ -502,47 +540,79 @@ impl Lookahead {
     }
 }
 
-// A state is marked on entry. Edges other than a repeat's implicit consuming
-// loop point backwards, so revisiting a state means its search already failed.
+// Only unbounded repeat continuations need memoization. Each row records
+// failed candidate positions, rather than every byte/split instruction.
 struct Memo {
+    stack: [MaybeUninit<[u64; 4]>; 4],
     bits: Vec<u64>,
     stride: usize,
 }
 
 impl Memo {
-    fn new(ops: usize, len: usize) -> Self {
+    fn new(repeats: usize, len: usize) -> Self {
+        assert!(repeats <= 4);
+        let mut stack = [MaybeUninit::uninit(); 4];
+        let (bits, stride) = if len <= 256 {
+            for row in &mut stack[..repeats] {
+                row.write([0; 4]);
+            }
+            (Vec::new(), 4)
+        } else {
+            let stride = (len + 1).div_ceil(64);
+            (vec![0; repeats * stride], stride)
+        };
         Self {
-            bits: vec![0; (ops * (len + 1)).div_ceil(64)],
-            stride: len + 1,
+            stack,
+            bits,
+            stride,
         }
     }
 
     #[inline]
-    fn visit(&mut self, pc: usize, pos: usize) -> bool {
-        let bit = pc * self.stride + pos;
-        let word = &mut self.bits[bit >> 6];
-        let mask = 1 << (bit & 63);
+    fn word(&mut self, repeat_idx: u8, pos: usize) -> Option<&mut u64> {
+        if self.stride == 4 {
+            // 256 bytes have 257 positions. Leaving the terminal position
+            // uncached costs constant work and keeps the rows at four words.
+            if pos == 256 {
+                return None;
+            }
+            // SAFETY: new initializes every row assigned to an Op::Repeat;
+            // compiled repeat indices are unique and below the row count.
+            Some(&mut unsafe { self.stack[usize::from(repeat_idx)].assume_init_mut() }[pos >> 6])
+        } else {
+            Some(&mut self.bits[usize::from(repeat_idx) * self.stride + (pos >> 6)])
+        }
+    }
+
+    #[inline]
+    fn seen(&mut self, repeat_idx: u8, pos: usize) -> bool {
+        self.word(repeat_idx, pos)
+            .is_some_and(|word| *word & (1 << (pos & 63)) != 0)
+    }
+
+    #[inline]
+    fn visit(&mut self, repeat_idx: u8, pos: usize) -> bool {
+        let Some(word) = self.word(repeat_idx, pos) else {
+            return false;
+        };
+        let mask = 1 << (pos & 63);
         let seen = *word & mask != 0;
         *word |= mask;
         seen
     }
-    // Claim an implicit zero-minimum repeat's consecutive states in whole
-    // words, stopping before the first suffix that already failed.
-    fn claim_repeat(&mut self, pc: usize, pos: usize, end: usize) -> usize {
-        let base = pc * self.stride;
-        let mut bit = base + pos + 1;
-        let last = base + end;
+    // Reuse a cached title run only up to its first failed continuation. Do
+    // not mark while scanning: those candidates still need their first try.
+    fn repeat_limit(&mut self, repeat_idx: u8, pos: usize, end: usize) -> usize {
+        let mut bit = pos + 1;
+        let last = if self.stride == 4 { end.min(255) } else { end };
         while bit <= last {
-            let word = &mut self.bits[bit >> 6];
             let high = last.min(bit | 63);
             let mask = (u64::MAX << (bit & 63)) & (u64::MAX >> (63 - (high & 63)));
-            let seen = *word & mask;
+            let seen = *self.word(repeat_idx, bit).unwrap() & mask;
             if seen != 0 {
                 let first = (bit & !63) + seen.trailing_zeros() as usize;
-                *word |= mask & ((1u64 << (first & 63)).wrapping_sub(1));
-                return first - base - 1;
+                return first - 1;
             }
-            *word |= mask;
             bit = high + 1;
         }
         end
@@ -564,22 +634,23 @@ impl Subject<'_> {
         pos: usize,
         limit: usize,
         memo: &mut Memo,
-        pc: usize,
-        unbounded: bool,
+        repeat_idx: Option<u8>,
     ) -> usize {
         // Short names cost less to scan than to look up in the run cache.
-        let cache = self.input.len() >= 128 && c.0 == Class::title().0 && unbounded;
+        let cache = self.input.len() >= 128 && c.0 == Class::title().0;
         if cache {
             for &(start, end) in self.title_runs.iter().flatten() {
                 if pos >= start && pos <= end {
-                    return memo.claim_repeat(pc, pos, end.min(limit));
+                    return repeat_idx.map_or(end.min(limit), |idx| {
+                        memo.repeat_limit(idx, pos, end.min(limit))
+                    });
                 }
             }
         }
         let mut end = pos;
         while end < limit && c.contains(self.input[end]) {
             end += 1;
-            if unbounded && memo.visit(pc, end) {
+            if repeat_idx.is_some_and(|idx| memo.seen(idx, end)) {
                 // Revisited suffixes have already failed. Check during the
                 // scan, including non-title classes such as OUTLAWS' dot.
                 return end - 1;
@@ -597,6 +668,7 @@ struct Pattern {
     name: &'static str,
     ops: Vec<Op>,
     entry: usize,
+    repeat_count: usize,
     // All but SPORTS and OUTLAWS/ALIAS start with a word plus a greedy
     // title class. Later word starts in the same run cannot add a match.
     title: Option<Class>,
@@ -655,6 +727,14 @@ impl Pattern {
         };
         let mut ops = vec![Op::Accept];
         let entry = compile(&expr, 0, &mut ops);
+        let mut repeat_count = 0;
+        for op in &mut ops {
+            if let Op::Repeat(_, _, repeat_idx) = op {
+                *repeat_idx = u8::try_from(repeat_count).unwrap();
+                repeat_count += 1;
+            }
+        }
+        assert!(repeat_count <= 4, "{name}: too many memoized repeats");
         let mut first: Vec<Lookahead> = Vec::with_capacity(ops.len());
         for op in &ops {
             let mut look = match *op {
@@ -673,25 +753,12 @@ impl Pattern {
                     first1: if min > 1 { c } else { c.union(end_c) },
                     min_rem: min + 1,
                 },
-                Op::Repeat(c, min, max, next) => {
+                Op::Repeat(c, next, _) => {
                     let rest = first[next];
                     Lookahead {
-                        first0: if min > 0 { c } else { c.union(rest.first0) },
-                        first1: if min > 1 {
-                            c
-                        } else {
-                            let second = if max > 1 {
-                                c.union(rest.first0)
-                            } else {
-                                rest.first0
-                            };
-                            if min == 0 {
-                                second.union(rest.first1)
-                            } else {
-                                second
-                            }
-                        },
-                        min_rem: min + rest.min_rem,
+                        first0: c.union(rest.first0),
+                        first1: c.union(rest.first0).union(rest.first1),
+                        min_rem: rest.min_rem,
                     }
                 }
                 Op::Split(a, b) => Lookahead {
@@ -714,6 +781,7 @@ impl Pattern {
             name,
             ops,
             entry,
+            repeat_count,
             title,
             first,
             required,
@@ -732,9 +800,6 @@ impl Pattern {
     ) -> Result<Option<usize>, ()> {
         let input = subject.input;
         loop {
-            if memo.visit(pc, pos) {
-                return Ok(None);
-            }
             if *budget == 0 {
                 return Err(());
             }
@@ -747,15 +812,16 @@ impl Pattern {
                     pos += 1;
                     pc = next;
                 }
-                Op::Repeat(c, min, max, next) => {
-                    let limit = input.len().min(pos.saturating_add(max));
-                    let end = subject.repeat_end(c, pos, limit, memo, pc, max == usize::MAX);
-                    if end - pos < min {
+                Op::Repeat(c, next, repeat_idx) => {
+                    if memo.seen(repeat_idx, pos) {
                         return Ok(None);
                     }
+                    let end = subject.repeat_end(c, pos, input.len(), memo, Some(repeat_idx));
                     let look = self.first[next];
-                    for candidate in (pos + min..=end).rev() {
-                        if !look.matches(input, candidate) {
+                    for candidate in (pos..=end).rev() {
+                        // Lookahead failures must also be marked so later
+                        // nested repeats cannot rescan the same near-miss run.
+                        if memo.visit(repeat_idx, candidate) || !look.matches(input, candidate) {
                             continue;
                         }
                         if let Some(end) = self.run(next, candidate, subject, budget, memo)? {
@@ -765,7 +831,7 @@ impl Pattern {
                     return Ok(None);
                 }
                 Op::TailRepeat(c, min, end_c) => {
-                    let mut end = subject.repeat_end(c, pos, input.len(), memo, pc, true);
+                    let mut end = subject.repeat_end(c, pos, input.len(), memo, None);
                     if end - pos < min {
                         return Ok(None);
                     }
@@ -839,7 +905,7 @@ impl Pattern {
         } else {
             input.len()
         };
-        let mut memo = Memo::new(self.ops.len(), input.len());
+        let mut memo = Memo::new(self.repeat_count, input.len());
         let mut start = 0;
         while start < input.len() && start <= last_start {
             if !Class::word().contains(input[start]) {
@@ -991,6 +1057,76 @@ mod tests {
     }
 
     #[test]
+    fn rejection_filters_include_small_classes_and_required_repeat_boundaries() {
+        for (regex, positives, negative) in [
+            (r#"s\d{1,2}"#, ["s0", "S99"], "subtitle"),
+            (r#"(19|20)\d\d"#, ["1999", "2024"], "20x"),
+            (r#"PS[345P]"#, ["PS5", "psp"], "PSx"),
+            (r#"[._ -]GOG"#, [".GOG", " gog"], "GOG"),
+        ] {
+            let expr = Parser {
+                bytes: regex.as_bytes(),
+                pos: 0,
+            }
+            .parse();
+            let required = requirements(&expr);
+            let passes = |input: &str| {
+                let mut bloom = [0; 4];
+                for pair in input.as_bytes().windows(2) {
+                    let mask = bigram(pair[0].to_ascii_lowercase(), pair[1].to_ascii_lowercase());
+                    for i in 0..4 {
+                        bloom[i] |= mask[i];
+                    }
+                }
+                required.iter().all(|&mask| intersects(bloom, mask))
+            };
+            for input in positives {
+                assert!(passes(input), "false rejection: {regex} {input}");
+            }
+            assert!(
+                !passes(negative),
+                "missing class constraint: {regex} {negative}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeat_memo_preserves_matches_at_stack_and_heap_boundaries() {
+        let pattern = Pattern::new("boundary", r#"\w[.a]+a{1,3}[.a]+Z$"#);
+        for len in [63, 64, 65, 127, 128, 129, 255, 256, 257, 4096] {
+            let input = format!("X{}Z", "a".repeat(len - 2));
+            assert_eq!(
+                pattern.find(input.as_bytes(), &mut 100_000),
+                Ok(Some(input.as_bytes()))
+            );
+            let miss = format!("X{}!", "a".repeat(len - 2));
+            assert_eq!(pattern.find(miss.as_bytes(), &mut 100_000), Ok(None));
+        }
+    }
+
+    #[test]
+    fn memo_keeps_repeat_rows_independent_without_short_input_heap_storage() {
+        for len in [0, 1, 63, 64, 65, 255, 256, 257, 4096] {
+            for repeats in 1..=4 {
+                let mut memo = Memo::new(repeats, len);
+                if len <= 256 {
+                    assert_eq!(memo.bits.capacity(), 0);
+                }
+                for repeat_idx in 0..repeats as u8 {
+                    for pos in 0..=len {
+                        assert!(!memo.seen(repeat_idx, pos));
+                        assert!(!memo.visit(repeat_idx, pos));
+                        // The extra terminal position has no stack bit.
+                        if len != 256 || pos != 256 {
+                            assert!(memo.visit(repeat_idx, pos));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn nested_repeats_have_linear_work() {
         let pattern = Pattern::new(
             "stress",
@@ -1100,7 +1236,7 @@ mod tests {
                         title_runs: [None; 2],
                         last_digit: input.iter().rposition(u8::is_ascii_digit),
                     };
-                    let mut memo = Memo::new(pattern.ops.len(), input.len());
+                    let mut memo = Memo::new(pattern.repeat_count, input.len());
                     let mut actual = None;
                     for start in 0..input.len() {
                         if let Some(end) = pattern

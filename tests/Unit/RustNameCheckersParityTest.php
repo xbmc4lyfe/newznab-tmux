@@ -167,6 +167,9 @@ class RustNameCheckersParityTest extends TestCase
                 foreach ([$input, strtolower($input), strtoupper($input), '['.$input.']', $input."\n", "prefix\n".$input, "\0".$input."\0", $input.' '.$input] as $i => $variant) {
                     yield "$domain $name $i" => [$domain, $variant, true];
                 }
+                foreach ([255, 256, 257] as $length) {
+                    yield "$domain $name length $length" => [$domain, str_repeat('a', $length - strlen($input)).$input, true];
+                }
             }
             foreach (['', '0', 'random-file.rar', 'nothing to match', "\n\r\t", 's01e01', '2023.1080p', 'Version.v1.2', '___---...', '1234567890', "a\0b\nc"] as $i => $input) {
                 yield "$domain negative $i" => [$domain, $input, true];
