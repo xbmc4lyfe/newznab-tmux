@@ -1181,7 +1181,7 @@ fn try_match_clean_quoted_part_rar(title: &[u8]) -> Option<(&[u8], bool)> {
         return None;
     }
     let q = &title[q1 + 1..q2];
-    if q.len() < 16
+    if q.len() < 20
         || is_php_trim_byte(q[0])
         || !q[q.len() - 4..].eq_ignore_ascii_case(b".rar")
     {
@@ -1205,6 +1205,7 @@ fn try_match_clean_quoted_part_rar(title: &[u8]) -> Option<(&[u8], bool)> {
         .iter()
         .any(|&b| b == b'.' || b == b'\n' || b == b'\r')
         || has_book_word_in_slice(prefix)
+        || find_ascii_ci(prefix, b"sample").is_some()
     {
         return None;
     }
@@ -2133,6 +2134,9 @@ pub unsafe extern "C" fn nntmux_additional_classify_titles_nul(
         }
         if likely_first {
             flags |= 1 << 4;
+        }
+        if set_key.is_some() {
+            flags |= 1 << 5;
         }
         if support {
             flags |= 1 << 6;

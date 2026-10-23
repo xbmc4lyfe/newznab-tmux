@@ -345,7 +345,7 @@ final readonly class AdditionalWorkPlanner
             $title = $titles[$titleIdx++];
             $flags = (int) ($tokens[$cursor++] ?? '0');
             $splitSet = ($flags & (1 << 1)) !== 0 ? ($tokens[$cursor++] ?? '') : null;
-            if (($flags & ((1 << 2) | (1 << 3))) !== 0) {
+            if (($flags & (1 << 5)) !== 0) {
                 if (($flags & (1 << 58)) !== 0) {
                     $setKey = $prevSetKey;
                 } else {
