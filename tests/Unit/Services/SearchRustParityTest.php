@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Unit\Services;
 
+use App\Services\NameFixing\Extractors\ObfuscatedSubjectExtractor;
 use App\Services\Search\Drivers\ManticoreSearchDriver;
 use App\Support\RustPipelineLibrary;
 use PHPUnit\Framework\Attributes\Test;
@@ -140,6 +141,82 @@ class SearchRustParityTest extends TestCase
                 $driver->rankSuggestFallbackCandidates($searchnames, $query, 5),
                 "Mismatch for rankSuggestFallbackCandidates({$query})"
             );
+        }
+    }
+
+    #[Test]
+    public function sanitize_lucene_matches_php(): void
+    {
+        $phrases = [
+            '',
+            'simple movie search',
+            'The.Matrix.1999.1080p.BluRay.x264-GROUP',
+            '+required -excluded !not *wildcard* ?single?',
+            '--double ++plus !!bang **stars**',
+            'special:chars (grouped) [range] {braces} ^boost "quoted" ~fuzzy \\slash /forward &and |or =eq <lt >gt',
+            "tabs\tand\nnewlines\r\nhere",
+            'trailing.dots...',
+            '   leading and trailing spaces   ',
+        ];
+
+        foreach ($phrases as $input) {
+            $wordArray = explode(' ', str_replace('.', ' ', $input));
+            $keywords = [];
+            $tempWords = [];
+            foreach ($wordArray as $words) {
+                $words = preg_split('/\s+/', $words) ?: [];
+                foreach ($words as $st) {
+                    if (str_starts_with($st, '!') || str_starts_with($st, '+') || str_starts_with($st, '-') || str_starts_with($st, '?') || str_starts_with($st, '*')) {
+                        if (strlen($st) > 1 && ! preg_match('/([!+?\-*]){2,}/', $st)) {
+                            $tempWords[] = $st;
+
+                            continue;
+                        }
+                    }
+                    if (str_ends_with($st, '+') || str_ends_with($st, '-') || str_ends_with($st, '?') || str_ends_with($st, '*')) {
+                        if (strlen($st) > 1 && ! preg_match('/([!+?\-*]){2,}/', $st)) {
+                            $tempWords[] = $st;
+
+                            continue;
+                        }
+                    }
+                    $tempWords[] = preg_replace('/([+\-=&|><!(){}\[\]^"~*?:\\\\\\/])/', '\\\\$1', $st) ?? $st;
+                }
+                $keywords = $tempWords;
+            }
+            $expected = implode(' ', $keywords);
+            $actualRust = RustPipelineLibrary::searchSanitizeLucene($input);
+            $this->assertSame($expected, $actualRust, "Mismatch for searchSanitizeLucene({$input})");
+            $this->assertSame($expected, sanitize($input));
+        }
+    }
+
+    #[Test]
+    public function obfuscated_subject_extractor_matches_php(): void
+    {
+        $extractor = new ObfuscatedSubjectExtractor;
+
+        $subjects = [
+            '',
+            '   ',
+            'Already Clean Title',
+            'N:/NZB [01/25] - "the.matrix.1999.1080p.bluray.x264-group.part01.rar" yEnc (1/50)',
+            'N.NZB_[12_40]_-_ "Spider_Man+Across_The_Spider_Verse.2023.2160p.7z.001" yEnc',
+            '[alt.binaries.teevee] "Show.Name.S01E02.1080p.WEB-DL.DDP5.1.H.264-GRP.vol01+02.par2" (1/10)',
+            'Reposted by some_poster - \'movie.title.2024.1080p.webrip.x265-grp.r01\' yEnc',
+            'Posted by poster123 - "another.release.2025.720p.bluray.rar"',
+            '[tag] "lowercase.with\'apostrophe.and:colon.and.dots.001"',
+            'unquoted_lowercase_subject_with+plus.and.dots',
+            'unquoted.UpperCase.Subject.With.Dots',
+        ];
+
+        foreach ($subjects as $input) {
+            $supported = false;
+            $expected = $extractor->extractPhp($input);
+            $actualRust = RustPipelineLibrary::extractObfuscatedSubject($input, null, $supported);
+            $this->assertTrue($supported, "Expected Rust support for: {$input}");
+            $this->assertSame($expected, $actualRust, "Mismatch for extractObfuscatedSubject({$input})");
+            $this->assertSame($expected, $extractor->extract($input));
         }
     }
 }
