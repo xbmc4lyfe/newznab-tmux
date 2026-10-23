@@ -27,6 +27,7 @@ use App\Services\Releases\ReleaseBrowseService;
 use App\Support\Par2FileHashEvidence;
 use App\Support\PredbSearchDocument;
 use App\Support\ReleaseArchiveNamingEvidence;
+use App\Support\RustPipelineLibrary;
 use dariusiii\rarinfo\Par2Info;
 use Illuminate\Contracts\Filesystem\FileNotFoundException;
 use Illuminate\Database\Eloquent\Builder;
@@ -958,6 +959,20 @@ class ReleaseFileManager
      */
     protected function normalizeNfoEncoding(string $data): string
     {
+        if ($data === '') {
+            return '';
+        }
+
+        $native = RustPipelineLibrary::normalizeNfoEncoding($data);
+        if ($native !== null) {
+            return $native;
+        }
+
+        return $this->normalizeNfoEncodingPhp($data);
+    }
+
+    protected function normalizeNfoEncodingPhp(string $data): string
+    {
         // Check for UTF-8 BOM and remove it
         if (str_starts_with($data, "\xEF\xBB\xBF")) {
             $data = substr($data, 3);
@@ -980,7 +995,7 @@ class ReleaseFileManager
         // Try CP437 (DOS encoding - common for scene NFOs with ASCII art)
         // Use the cp437toUTF helper function
         if (function_exists('cp437toUTF')) {
-            return cp437toUTF($data);
+            return (string) iconv('CP437', 'UTF-8//IGNORE//TRANSLIT', $data);
         }
 
         // Fallback: try ISO-8859-1 (Latin-1)

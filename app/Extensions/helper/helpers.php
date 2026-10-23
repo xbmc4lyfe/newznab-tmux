@@ -5,6 +5,7 @@ declare(strict_types=1);
 use App\Models\Country as CountryModel;
 use App\Models\Release;
 use App\Services\Nzb\NzbService;
+use App\Support\RustPipelineLibrary;
 use GuzzleHttp\Client;
 use GuzzleHttp\Cookie\CookieJar;
 use GuzzleHttp\Cookie\SetCookie;
@@ -1003,7 +1004,16 @@ if (! function_exists('cp437toUTF')) {
      */
     function cp437toUTF(string $string): string
     {
-        return iconv('CP437', 'UTF-8//IGNORE//TRANSLIT', $string);
+        if ($string === '') {
+            return '';
+        }
+
+        $native = RustPipelineLibrary::cp437ToUtf8($string);
+        if ($native !== null) {
+            return $native;
+        }
+
+        return (string) iconv('CP437', 'UTF-8//IGNORE//TRANSLIT', $string);
     }
 }
 
