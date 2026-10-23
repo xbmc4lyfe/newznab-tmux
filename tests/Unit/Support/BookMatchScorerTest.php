@@ -245,4 +245,45 @@ class BookMatchScorerTest extends TestCase
 
         $this->assertLessThan(0.68, $score, 'Ambiguous no-author title collision should stay below stricter cutoff');
     }
+
+    public function test_rust_ffi_parity_with_php_fallbacks(): void
+    {
+        $scorer = new BookMatchScorer;
+        $cases = [
+            [
+                new BookParseResult(rawName: 'Clean Code 9780132350884', title: 'Clean Code', author: 'Robert C. Martin', isbn: '9780132350884'),
+                ['title' => 'Clean Code', 'author' => 'Robert C. Martin', 'isbn' => null, 'ean' => '0132350882'],
+            ],
+            [
+                new BookParseResult(rawName: 'Dune Book 2', title: 'Dune Book 2', author: 'Frank Herbert'),
+                ['title' => 'Dune Book 3', 'author' => 'Frank Herbert'],
+            ],
+            [
+                new BookParseResult(rawName: 'Cien años de soledad by Gabriel García Márquez', title: 'Cien años de soledad', author: 'Gabriel García Márquez'),
+                ['title' => 'Cien años de soledad!', 'author' => 'Márquez, Gabriel García'],
+            ],
+            [
+                new BookParseResult(rawName: 'Refactoring', title: 'Refactoring', author: 'Martin Fowler', year: 1999),
+                ['title' => 'Refactoring: Improving the Design of Existing Code', 'author' => 'Martin Fowler'],
+            ],
+        ];
+
+        foreach ($cases as [$parsed, $candidate]) {
+            $this->assertEqualsWithDelta(
+                $scorer->scorePhp($candidate, $parsed),
+                $scorer->score($candidate, $parsed),
+                1e-9
+            );
+            $this->assertEqualsWithDelta(
+                $scorer->titleScorePhp($parsed->title, (string) ($candidate['title'] ?? '')),
+                $scorer->titleScore($parsed->title, (string) ($candidate['title'] ?? '')),
+                1e-9
+            );
+            $this->assertEqualsWithDelta(
+                $scorer->authorScorePhp((string) $parsed->author, (string) ($candidate['author'] ?? '')),
+                $scorer->authorScore((string) $parsed->author, (string) ($candidate['author'] ?? '')),
+                1e-9
+            );
+        }
+    }
 }

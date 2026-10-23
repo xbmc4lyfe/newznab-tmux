@@ -2365,6 +2365,335 @@ final class RustPipelineLibrary
         return $written === 0 ? '' : FFI::string($scratch, $written);
     }
 
+    public static function steamCleanTitle(string $title, ?string $libraryPath = null): ?string
+    {
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($title);
+        $minCap = max(256, $len + 64);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= $minCap)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, $minCap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_steam_clean_title($title, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1) {
+            return null;
+        }
+        if ($written < -1) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_steam_clean_title($title, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
+    public static function steamNormalizeTitle(string $title, ?string $libraryPath = null): ?string
+    {
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($title);
+        $minCap = max(256, $len * 2 + 64);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= $minCap)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, $minCap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_steam_normalize_title($title, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1) {
+            return null;
+        }
+        if ($written < -1) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_steam_normalize_title($title, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
+    public static function steamReplaceRomanNumerals(string $title, ?string $libraryPath = null): ?string
+    {
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($title);
+        $minCap = max(256, $len * 2 + 64);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= $minCap)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, $minCap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_steam_replace_roman_numerals($title, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1) {
+            return null;
+        }
+        if ($written < -1) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_steam_replace_roman_numerals($title, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
+    public static function steamStripEditionTags(string $title, ?string $libraryPath = null): ?string
+    {
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($title);
+        $minCap = max(256, $len + 64);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= $minCap)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, $minCap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_steam_strip_edition_tags($title, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1) {
+            return null;
+        }
+        if ($written < -1) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_steam_strip_edition_tags($title, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
+    public static function steamScoreTitle(string $candidate, string $original, ?string $libraryPath = null): ?float
+    {
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $score = $ffi->nntmux_steam_score_title($candidate, \strlen($candidate), $original, \strlen($original));
+        if (! \is_float($score) || $score < 0.0) {
+            return null;
+        }
+
+        return $score;
+    }
+
+    public static function gamesCleanReleaseName(string $name, ?string $libraryPath = null): ?string
+    {
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($name);
+        $minCap = max(256, $len + 64);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= $minCap)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, $minCap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_games_clean_release_name($name, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1) {
+            return null;
+        }
+        if ($written < -1) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_games_clean_release_name($name, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
+    public static function gamesNormalizeForMatch(string $title, ?string $libraryPath = null): ?string
+    {
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($title);
+        $minCap = max(256, $len + 64);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= $minCap)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, $minCap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_games_normalize_for_match($title, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1) {
+            return null;
+        }
+        if ($written < -1) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_games_normalize_for_match($title, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
+    public static function bookTitleScore(string $left, string $right, ?string $libraryPath = null): ?float
+    {
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $score = $ffi->nntmux_book_title_score($left, \strlen($left), $right, \strlen($right));
+        if (! \is_float($score) || $score < 0.0) {
+            return null;
+        }
+
+        return $score;
+    }
+
+    public static function bookAuthorScore(string $left, string $right, ?string $libraryPath = null): ?float
+    {
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $score = $ffi->nntmux_book_author_score($left, \strlen($left), $right, \strlen($right));
+        if (! \is_float($score) || $score < 0.0) {
+            return null;
+        }
+
+        return $score;
+    }
+
+    public static function bookScore(
+        string $parsedRaw,
+        string $parsedTitle,
+        ?string $parsedAuthor,
+        ?string $parsedIsbn,
+        string $candTitle,
+        string $candAuthor,
+        ?string $candIsbn,
+        ?string $candEan,
+        ?string $libraryPath = null
+    ): ?float {
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+
+        $authorStr = $parsedAuthor ?? '';
+        $isbnStr = $parsedIsbn ?? '';
+        $candIsbnStr = $candIsbn ?? '';
+        $candEanStr = $candEan ?? '';
+
+        // @phpstan-ignore method.notFound
+        $score = $ffi->nntmux_book_score(
+            $parsedRaw,
+            \strlen($parsedRaw),
+            $parsedTitle,
+            \strlen($parsedTitle),
+            $parsedAuthor !== null ? 1 : 0,
+            $authorStr,
+            \strlen($authorStr),
+            $parsedIsbn !== null ? 1 : 0,
+            $isbnStr,
+            \strlen($isbnStr),
+            $candTitle,
+            \strlen($candTitle),
+            $candAuthor,
+            \strlen($candAuthor),
+            $candIsbn !== null ? 1 : 0,
+            $candIsbnStr,
+            \strlen($candIsbnStr),
+            $candEan !== null ? 1 : 0,
+            $candEanStr,
+            \strlen($candEanStr)
+        );
+        if (! \is_float($score) || $score < 0.0) {
+            return null;
+        }
+
+        return $score;
+    }
+
     public static function resolve(?string $libraryPath = null): ?FFI
     {
         if ($libraryPath === null && self::$defaultLibrary !== null) {
@@ -2455,6 +2784,16 @@ final class RustPipelineLibrary
                     ssize_t nntmux_archive_candidate_volume_set_key(const char *input, size_t input_len, char *out_buf, size_t out_cap);
                     ssize_t nntmux_sevenzip_parse_listing(const char *input, size_t input_len, uint8_t flush, char *out_buf, size_t out_cap);
                     ssize_t nntmux_additional_classify_titles_nul(const char *group, size_t group_len, const char *titles, size_t titles_len, size_t count, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_steam_clean_title(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_steam_normalize_title(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_steam_replace_roman_numerals(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_steam_strip_edition_tags(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    double nntmux_steam_score_title(const char *cand, size_t cand_len, const char *orig, size_t orig_len);
+                    ssize_t nntmux_games_clean_release_name(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_games_normalize_for_match(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    double nntmux_book_title_score(const char *left, size_t left_len, const char *right, size_t right_len);
+                    double nntmux_book_author_score(const char *left, size_t left_len, const char *right, size_t right_len);
+                    double nntmux_book_score(const char *raw, size_t raw_len, const char *title, size_t title_len, uint32_t has_author, const char *author, size_t author_len, uint32_t has_isbn, const char *isbn, size_t isbn_len, const char *cand_title, size_t cand_title_len, const char *cand_author, size_t cand_author_len, uint32_t has_cand_isbn, const char *cand_isbn, size_t cand_isbn_len, uint32_t has_cand_ean, const char *cand_ean, size_t cand_ean_len);
                     C, $resolved);
 
                 // @phpstan-ignore method.notFound
