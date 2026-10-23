@@ -1426,6 +1426,473 @@ final class RustPipelineLibrary
         return true;
     }
 
+    /**
+     * Compute `ManticoreSearchDriver::escapeString` via Rust FFI.
+     */
+    public static function manticoreEscapeString(string $string, ?string $libraryPath = null): ?string
+    {
+        if ($string === '' || $string === '*' || $string === '0') {
+            return '';
+        }
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($string);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= $len * 3 + 16)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, max(256, $len * 3 + 16));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_manticore_escape_string($string, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1 || $written === -2) {
+            return null;
+        }
+        if ($written < -2) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_manticore_escape_string($string, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
+    /**
+     * Compute `ManticoreSearchDriver::prepareUserSearchQuery` (`$mode = 0`) or
+     * `ManticoreSearchDriver::prepareReleaseFieldSearchQuery('fromname', $query)` (`$mode = 1`) via Rust FFI.
+     */
+    public static function manticorePrepareQuery(string $query, int $mode = 0, ?string $libraryPath = null): ?string
+    {
+        if ($query === '' || ($mode === 0 && $query === '*')) {
+            return '';
+        }
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($query);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= $len * 2 + 32)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, max(256, $len * 2 + 32));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_manticore_prepare_query($query, $len, $mode, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1 || $written === -2) {
+            return null;
+        }
+        if ($written < -2) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_manticore_prepare_query($query, $len, $mode, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
+    /**
+     * Compute `ManticoreSearchDriver::scopeReleaseSearchQuery` via Rust FFI.
+     */
+    public static function manticoreScopeReleaseQuery(
+        string $rawQuery,
+        string $preparedQuery,
+        string $fieldSelector = '',
+        ?string $libraryPath = null
+    ): ?string {
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $rawLen = \strlen($rawQuery);
+        $prepLen = \strlen($preparedQuery);
+        $fieldLen = \strlen($fieldSelector);
+        $minCap = ($rawLen + $prepLen + $fieldLen) * 3 + 64;
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= $minCap)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, max(256, $minCap));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_manticore_scope_release_query(
+            $rawQuery,
+            $rawLen,
+            $preparedQuery,
+            $prepLen,
+            $fieldSelector,
+            $fieldLen,
+            $scratch,
+            self::$scratchCap
+        );
+        if (! \is_int($written) || $written === -1 || $written === -2) {
+            return null;
+        }
+        if ($written < -2) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_manticore_scope_release_query(
+                $rawQuery,
+                $rawLen,
+                $preparedQuery,
+                $prepLen,
+                $fieldSelector,
+                $fieldLen,
+                $scratch,
+                self::$scratchCap
+            );
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
+    /**
+     * Compute `ManticoreSearchDriver::buildFieldSearchExpression` via Rust FFI.
+     *
+     * @param  array<string, mixed>  $searchArray
+     * @param  list<string>|null  $allowedFields
+     */
+    public static function manticoreBuildFieldSearchExpression(
+        array $searchArray,
+        ?array $allowedFields = null,
+        ?string $libraryPath = null,
+        bool &$supported = false
+    ): ?string {
+        $supported = false;
+        if ($searchArray === []) {
+            $supported = true;
+
+            return null;
+        }
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $flat = [];
+        $pairs = 0;
+        foreach ($searchArray as $key => $value) {
+            if ($allowedFields !== null && (! \is_string($key) || ! \in_array($key, $allowedFields, true))) {
+                continue;
+            }
+            if ($value !== null && $value !== '') {
+                $kStr = (string) $key;
+                $vStr = (string) $value;
+                if (str_contains($kStr, "\0") || str_contains($vStr, "\0")) {
+                    return null;
+                }
+                $flat[] = $kStr;
+                $flat[] = $vStr;
+                $pairs++;
+            }
+        }
+        if ($pairs === 0) {
+            $supported = true;
+
+            return null;
+        }
+        $joined = implode("\0", $flat);
+        $len = \strlen($joined);
+        $minCap = $len * 3 + 64;
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= $minCap)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, max(512, $minCap));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_manticore_build_field_search_expr_nul($joined, $len, $pairs, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1 || $written === -2) {
+            return null;
+        }
+        if ($written === -3) {
+            $supported = true;
+
+            return null;
+        }
+        if ($written < -3) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_manticore_build_field_search_expr_nul($joined, $len, $pairs, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        $supported = true;
+
+        return $written === 0 ? null : FFI::string($scratch, $written);
+    }
+
+    /**
+     * Compute `extractSuggestion` via Rust FFI.
+     */
+    public static function searchExtractSuggestion(
+        string $searchname,
+        string $query,
+        ?string $libraryPath = null,
+        bool &$supported = false
+    ): ?string {
+        $supported = false;
+        if ($searchname === '') {
+            $supported = true;
+
+            return null;
+        }
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= 256)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, 256);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_search_extract_suggestion(
+            $searchname,
+            \strlen($searchname),
+            $query,
+            \strlen($query),
+            $scratch,
+            self::$scratchCap
+        );
+        if (! \is_int($written) || $written === -1 || $written === -2) {
+            return null;
+        }
+        if ($written === -3) {
+            $supported = true;
+
+            return null;
+        }
+
+        $supported = true;
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
+    /**
+     * Batch-rank autocomplete suggestions via Rust FFI.
+     *
+     * @param  list<string>  $searchnames
+     * @return list<array{suggest: string, distance: int, docs: int}>|null
+     */
+    public static function searchRankAutocompleteBatch(
+        array $searchnames,
+        string $query,
+        int $maxResults,
+        ?string $libraryPath = null
+    ): ?array {
+        $count = \count($searchnames);
+        if ($count === 0 || $maxResults <= 0 || $query === '') {
+            return [];
+        }
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $joined = implode("\n", $searchnames);
+        $len = \strlen($joined);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= 2048)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, 2048);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_search_rank_autocomplete_nul(
+            $query,
+            \strlen($query),
+            $joined,
+            $len,
+            $count,
+            $maxResults,
+            $scratch,
+            self::$scratchCap
+        );
+        if (! \is_int($written) || $written === -1 || $written === -2) {
+            return null;
+        }
+        if ($written === 0) {
+            return [];
+        }
+        if ($written < -2) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_search_rank_autocomplete_nul(
+                $query,
+                \strlen($query),
+                $joined,
+                $len,
+                $count,
+                $maxResults,
+                $scratch,
+                self::$scratchCap
+            );
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+            if ($written === 0) {
+                return [];
+            }
+        }
+
+        $raw = FFI::string($scratch, $written);
+        $lines = explode("\n", rtrim($raw, "\n"));
+        $out = [];
+        foreach ($lines as $line) {
+            if ($line === '') {
+                continue;
+            }
+            $parts = explode("\0", $line);
+            if (\count($parts) === 2) {
+                $out[] = [
+                    'suggest' => $parts[0],
+                    'distance' => 0,
+                    'docs' => (int) $parts[1],
+                ];
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Batch-rank Levenshtein spell-fallback suggestions via Rust FFI.
+     *
+     * @param  list<string>  $searchnames
+     * @return list<array{suggest: string, distance: int, docs: int}>|null
+     */
+    public static function searchSuggestFallbackBatch(
+        array $searchnames,
+        string $query,
+        int $maxResults = 5,
+        ?string $libraryPath = null
+    ): ?array {
+        $count = \count($searchnames);
+        if ($count === 0 || $maxResults <= 0 || $query === '') {
+            return [];
+        }
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $joined = implode("\n", $searchnames);
+        $len = \strlen($joined);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= 1024)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, 1024);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_search_suggest_fallback_nul(
+            $query,
+            \strlen($query),
+            $joined,
+            $len,
+            $count,
+            $maxResults,
+            $scratch,
+            self::$scratchCap
+        );
+        if (! \is_int($written) || $written === -1 || $written === -2) {
+            return null;
+        }
+        if ($written === 0) {
+            return [];
+        }
+        if ($written < -2) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_search_suggest_fallback_nul(
+                $query,
+                \strlen($query),
+                $joined,
+                $len,
+                $count,
+                $maxResults,
+                $scratch,
+                self::$scratchCap
+            );
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+            if ($written === 0) {
+                return [];
+            }
+        }
+
+        $raw = FFI::string($scratch, $written);
+        $lines = explode("\n", rtrim($raw, "\n"));
+        $out = [];
+        foreach ($lines as $line) {
+            if ($line === '') {
+                continue;
+            }
+            $parts = explode("\0", $line);
+            if (\count($parts) === 3) {
+                $out[] = [
+                    'suggest' => $parts[0],
+                    'distance' => (int) $parts[1],
+                    'docs' => (int) $parts[2],
+                ];
+            }
+        }
+
+        return $out;
+    }
+
     public static function resolve(?string $libraryPath = null): ?FFI
     {
         if ($libraryPath === null && self::$defaultLibrary !== null) {
@@ -1496,6 +1963,13 @@ final class RustPipelineLibrary
                     int64_t nntmux_tv_parse_info(const char *input, size_t input_len, uint32_t max_two_digit_year, char *out_buf, size_t out_cap);
                     ssize_t nntmux_tv_clean_name(const char *input, size_t input_len, char *out_buf, size_t out_cap);
                     ssize_t nntmux_movie_parse_search_name(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_manticore_escape_string(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_manticore_prepare_query(const char *input, size_t input_len, uint32_t mode, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_manticore_scope_release_query(const char *raw_query, size_t raw_len, const char *prepared_query, size_t prepared_len, const char *field_selector, size_t field_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_manticore_build_field_search_expr_nul(const char *input, size_t input_len, size_t pair_count, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_search_extract_suggestion(const char *searchname, size_t searchname_len, const char *query, size_t query_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_search_rank_autocomplete_nul(const char *query, size_t query_len, const char *input, size_t input_len, size_t count, size_t max_results, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_search_suggest_fallback_nul(const char *query, size_t query_len, const char *input, size_t input_len, size_t count, size_t max_results, char *out_buf, size_t out_cap);
                     C, $resolved);
 
                 // @phpstan-ignore method.notFound

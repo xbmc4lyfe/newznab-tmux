@@ -5,6 +5,7 @@ pub mod cleaning;
 pub mod filename;
 pub mod media;
 pub mod predb;
+pub mod search;
 
 /// Returns the ABI version of `libnntmux_pipeline`.
 #[unsafe(no_mangle)]
