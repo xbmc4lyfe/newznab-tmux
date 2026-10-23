@@ -6,7 +6,7 @@ namespace App\Services\NameFixing;
 
 final class NzbSplitUnwrapper
 {
-    public const PREDB_IDENTITY_POLICY = '8d164fea7ac837a63195af3da05ba4ed09d34087937123240474e20cb555e52e';
+    public const PREDB_IDENTITY_POLICY = '66455350562415af61ba1674d2e26c62e08252938810fe542d30f039bda963c9';
 
     private const string WRAPPER_PATTERN = '/__NZBSPLIT__([a-f0-9]{8,})__NZBSPLIT__(.+)$/i';
 
@@ -73,7 +73,7 @@ final class NzbSplitUnwrapper
 
     public function unwrap(string $value): ?string
     {
-        if (! preg_match(self::WRAPPER_PATTERN, $value, $matches)) {
+        if (stripos($value, '__NZBSPLIT__') === false || ! preg_match(self::WRAPPER_PATTERN, $value, $matches)) {
             return null;
         }
 

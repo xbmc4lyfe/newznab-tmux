@@ -1,5 +1,7 @@
 use std::slice;
 
+pub mod categorize;
+
 /// Returns the ABI version of `libnntmux_pipeline`.
 #[unsafe(no_mangle)]
 pub extern "C" fn nntmux_pipeline_abi_version() -> u32 {
@@ -9,14 +11,14 @@ pub extern "C" fn nntmux_pipeline_abi_version() -> u32 {
 /// Zero-allocation cursor over a caller-supplied output buffer.
 /// Continues tracking the required byte length even if capacity is exceeded so the caller
 /// can reallocate and retry with the exact size.
-struct OutCursor<'a> {
+pub(crate) struct OutCursor<'a> {
     buf: &'a mut [u8],
     pos: usize,
 }
 
 impl<'a> OutCursor<'a> {
     #[inline]
-    unsafe fn new(ptr: *mut u8, cap: usize) -> Self {
+    pub(crate) unsafe fn new(ptr: *mut u8, cap: usize) -> Self {
         let buf = if ptr.is_null() || cap == 0 {
             &mut []
         } else {
@@ -26,7 +28,7 @@ impl<'a> OutCursor<'a> {
     }
 
     #[inline]
-    fn push(&mut self, byte: u8) {
+    pub(crate) fn push(&mut self, byte: u8) {
         if self.pos < self.buf.len() {
             self.buf[self.pos] = byte;
         }
@@ -34,7 +36,7 @@ impl<'a> OutCursor<'a> {
     }
 
     #[inline]
-    fn extend(&mut self, data: &[u8]) {
+    pub(crate) fn extend(&mut self, data: &[u8]) {
         let end = self.pos + data.len();
         if end <= self.buf.len() {
             self.buf[self.pos..end].copy_from_slice(data);
@@ -43,7 +45,7 @@ impl<'a> OutCursor<'a> {
     }
 
     #[inline]
-    fn finish(self) -> isize {
+    pub(crate) fn finish(self) -> isize {
         if self.pos == 0 {
             0
         } else if self.pos <= self.buf.len() {
@@ -456,7 +458,7 @@ unsafe extern "C" {
 }
 
 #[inline]
-fn find_nul(haystack: &[u8]) -> Option<usize> {
+pub(crate) fn find_nul(haystack: &[u8]) -> Option<usize> {
     if haystack.is_empty() {
         return None;
     }

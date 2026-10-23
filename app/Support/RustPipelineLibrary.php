@@ -427,6 +427,102 @@ final class RustPipelineLibrary
         return ['status' => 0, 'payload' => FFI::string($scratch, $written)];
     }
 
+    /**
+     * Check whether a single release or file name is hashed or gibberish via Rust FFI.
+     */
+    public static function isHashedOrGibberish(string $name, ?string $libraryPath = null): ?bool
+    {
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $res = $ffi->nntmux_is_hashed_or_gibberish($name, \strlen($name));
+
+        return \is_int($res) ? ($res === 1) : null;
+    }
+
+    /**
+     * Batch check whether release or file names are hashed or gibberish via Rust FFI.
+     *
+     * @param  list<string>  $names
+     * @return list<bool>|null
+     */
+    public static function isHashedOrGibberishBatch(array $names, ?string $libraryPath = null): ?array
+    {
+        $count = \count($names);
+        if ($count === 0) {
+            return [];
+        }
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+
+        $joined = implode("\0", $names);
+        if (substr_count($joined, "\0") !== $count - 1) {
+            return null;
+        }
+
+        $scratch = self::ensureScratch($ffi, $count + 64);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_is_hashed_or_gibberish_batch_nul($joined, \strlen($joined), $count, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written !== $count) {
+            return null;
+        }
+
+        $raw = FFI::string($scratch, $written);
+        $out = [];
+        for ($i = 0; $i < $count; $i++) {
+            $out[] = $raw[$i] === '1';
+        }
+
+        return $out;
+    }
+
+    /**
+     * Inspect signal markers and categorize a release name for `MiscCategorizer` / `MiscPipe`.
+     *
+     *Returns the 7-byte header + coreName payload, or null when FFI is unavailable.
+     */
+    public static function miscInspectAndCategorize(string $name, ?string $libraryPath = null): ?string
+    {
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+
+        $len = \strlen($name);
+        $scratch = self::ensureScratch($ffi, max(256, $len + 32));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_misc_inspect_and_categorize($name, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written)) {
+            return null;
+        }
+        if ($written < -7) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_misc_inspect_and_categorize($name, $len, $scratch, self::$scratchCap);
+        }
+        if (! \is_int($written) || $written < 7) {
+            return null;
+        }
+
+        return FFI::string($scratch, $written);
+    }
+
     public static function resolve(?string $libraryPath = null): ?FFI
     {
         if (! \in_array(PHP_OS_FAMILY, ['Linux', 'Darwin'], true) || ! \extension_loaded('FFI')) {
@@ -466,6 +562,9 @@ final class RustPipelineLibrary
                     ssize_t nntmux_nzb_detect_file_extension(const char *subject, size_t subject_len, char *out_buf);
                     ssize_t nntmux_nzb_parse_files(const char *xml, size_t xml_len, char *out_buf, size_t out_cap);
                     ssize_t nntmux_par2_scan_packets(const char *existing, size_t existing_len, const char *tail, size_t tail_len, int64_t skip_remaining, int64_t max_state_bytes, const char *incoming, size_t incoming_len, char *out_buf, size_t out_cap);
+                    int32_t nntmux_is_hashed_or_gibberish(const char *input, size_t input_len);
+                    ssize_t nntmux_is_hashed_or_gibberish_batch_nul(const char *input, size_t input_len, size_t count, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_misc_inspect_and_categorize(const char *input, size_t input_len, char *out_buf, size_t out_cap);
                     C, $resolved);
 
                 // @phpstan-ignore method.notFound

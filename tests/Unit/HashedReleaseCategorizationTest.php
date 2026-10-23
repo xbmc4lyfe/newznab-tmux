@@ -19,6 +19,7 @@ use App\Services\Categorization\Pipes\PcPipe;
 use App\Services\Categorization\Pipes\TvPipe;
 use App\Services\Categorization\Pipes\XxxPipe;
 use App\Services\Categorization\ReleaseContext;
+use App\Support\RustPipelineLibrary;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
@@ -426,5 +427,62 @@ class HashedReleaseCategorizationTest extends TestCase
         $this->assertArrayHasKey('debug', $output);
         $this->assertArrayHasKey('locked_to_misc', $output['debug']);
         $this->assertFalse($output['debug']['locked_to_misc']);
+    }
+
+    public function test_rust_ffi_and_php_fallback_parity(): void
+    {
+        $categorizer = new MiscCategorizer;
+        $corpus = [
+            'd41d8cd98f00b204e9800998ecf8427e',
+            '"d41d8cd98f00b204e9800998ecf8427e"',
+            'da39a3ee5e6b4b0d3255bfef95601890afd80709',
+            'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+            '550e8400-e29b-41d4-a716-446655440000',
+            'aabbccdd0011223344ff',
+            'ABCDEFGH1234567890XY',
+            'AA7Jl2toE8Q53yNZmQ5R6G',
+            '[01/10] - "xK9mR2pL4qW7nT3vB.part01.rar"',
+            'VGhpc0lzTm90QVNob3dOYW1lMTIzNDU2Nzg5MA==',
+            'VGhpc0lzTm90QVNob3dOYW1lMTIzNDU2Nzg5MA==-foo:bar',
+            'aB3c.D4eF.5gH6i.J7kL8m',
+            'xyz.1234.wvut.5678.srqp.9012.rar',
+            'xz.123456789012',
+            'a1.2345.6789',
+            '123456789012',
+            'xkcdqwrtypsdfghjklmnbvcxz',
+            'A1b2.C3d4.E5f6.G7h8.I9j0',
+            'ab12.cd34.ef56',
+            'Some.Movie.2024.1080p.BluRay.x264-GROUP',
+            'Show.Name.S03E05.720p.HDTV.x264-GROUP',
+            'The.Daily.Show.20260419.mkv',
+            'Artist.Name-Album.Title-2024-FLAC-GROUP',
+            'Starfield-RUNE',
+            'Microsoft Office Suite Installer',
+            'Adobe Express Photos.Msixbundle',
+            'Backup.2024.sql.dump',
+            'Database.leak.export.2024',
+            'Archive.Collection.2024.7z',
+        ];
+
+        $expectedBatch = [];
+        foreach ($corpus as $name) {
+            [$rustAnalysis, $rustResult] = $categorizer->inspectAndCategorize($name);
+            $phpAnalysis = $categorizer->inspectSignalsPhp($name);
+            $phpResult = $categorizer->categorizePhp($name, $phpAnalysis);
+
+            $this->assertSame($phpAnalysis, $rustAnalysis, "Signal analysis mismatch for: $name");
+            $this->assertSame($phpResult->categoryId, $rustResult->categoryId, "Category mismatch for: $name");
+            $this->assertSame($phpResult->matchedBy, $rustResult->matchedBy, "matchedBy mismatch for: $name");
+            $this->assertEqualsWithDelta($phpResult->confidence, $rustResult->confidence, 1e-6, "Confidence mismatch for: $name");
+            $this->assertSame($phpResult->debug, $rustResult->debug, "Debug mismatch for: $name");
+
+            $isHashedPhp = $categorizer->isHashedOrGibberishPhp($name);
+            $this->assertSame($isHashedPhp, $categorizer->isHashedOrGibberish($name), "isHashedOrGibberish mismatch for: $name");
+            $expectedBatch[] = $isHashedPhp;
+        }
+
+        if (RustPipelineLibrary::available()) {
+            $this->assertSame($expectedBatch, RustPipelineLibrary::isHashedOrGibberishBatch($corpus));
+        }
     }
 }
