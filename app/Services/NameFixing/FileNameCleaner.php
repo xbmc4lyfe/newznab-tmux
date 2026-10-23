@@ -16,7 +16,7 @@ use App\Traits\DetectsHashedNames;
  */
 class FileNameCleaner
 {
-    public const PREDB_IDENTITY_POLICY = 'd91b5390277226539e5ec435ed51c96073bb20f74233b406a0bc635bddab8e71';
+    public const PREDB_IDENTITY_POLICY = 'aff65740cbf277f19a0dbd20091251d35020d3d4d5118e2011d371a021322a3d';
 
     use DetectsHashedNames;
 
@@ -412,6 +412,11 @@ class FileNameCleaner
      */
     public function isPlausibleReleaseTitle(string $title): bool
     {
+        return RustPipelineLibrary::isPlausibleReleaseTitle($title) ?? $this->isPlausibleReleaseTitlePhp($title);
+    }
+
+    public function isPlausibleReleaseTitlePhp(string $title): bool
+    {
         $t = trim($title);
 
         if ($t === '' || strlen($t) < 12) {
@@ -423,7 +428,7 @@ class FileNameCleaner
             return false;
         }
 
-        if ($this->looksLikeHashedName($t)) {
+        if ($this->isHashedOrGibberishPhp($t)) {
             return false;
         }
 
@@ -441,7 +446,7 @@ class FileNameCleaner
         if (preg_match('/[-.][A-Za-z0-9]{2,}$/', $t)) {
             return true;
         }
-        $hasTV = (bool) preg_match('/\bS\d{1,2}[Eex]\d{1,3}\b/i', $t) || SeasonPackDetector::isSeasonPack($t);
+        $hasTV = (bool) preg_match('/\bS\d{1,2}[Eex]\d{1,3}\b/i', $t) || SeasonPackDetector::isSeasonPackPhp($t);
         $hasQuality = (bool) preg_match('/\b(480p|720p|1080p|2160p|4k|webrip|web[ .-]?dl|bluray|bdrip|dvdrip|hdtv|hdrip|xvid|x264|x265|hevc|h\.?264|ts|cam|r5|proper|repack)\b/i', $t);
         if ($hasTV && $hasQuality) {
             return true;

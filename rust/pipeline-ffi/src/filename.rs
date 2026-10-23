@@ -1970,6 +1970,14 @@ pub unsafe extern "C" fn nntmux_clean_for_matching_span(
     clean_for_matching_span(bytes, preserve_leading_number != 0)
 }
 
+#[inline]
+pub fn is_season_pack_bytes(bytes: &[u8]) -> bool {
+    !is_episode_name(bytes)
+        && (matches_season_token(bytes)
+            || matches_season_word(bytes)
+            || matches_complete_pack(bytes))
+}
+
 /// Computes `SeasonPackDetector` boolean flags for `input[..input_len]`:
 /// - Bit 0 (`1`): `isEpisodeName`
 /// - Bit 1 (`2`): `isSeasonPack`
