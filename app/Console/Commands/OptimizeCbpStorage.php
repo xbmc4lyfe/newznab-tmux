@@ -184,9 +184,14 @@ final class OptimizeCbpStorage extends Command
             );
             $values = [];
             $bindings = [];
-            foreach ($rows as $row) {
+            $batchGroups = \get_class($xrefService) === XrefService::class && \count($rows) > 1
+                ? $xrefService->extractGroupNamesBatch(array_map(static fn (object $row): string => (string) $row->xref, $rows))
+                : null;
+            foreach ($rows as $idx => $row) {
                 $lastId = (int) $row->id;
-                $groups = $xrefService->extractGroupNames((string) $row->xref);
+                $groups = $batchGroups !== null
+                    ? $batchGroups[$idx]
+                    : $xrefService->extractGroupNames((string) $row->xref);
                 if ($groups === [] && (string) $row->group_name !== '') {
                     $groups = [(string) $row->group_name];
                 }
