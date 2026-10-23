@@ -20,7 +20,7 @@ A human prompt or goal authorizes agents to commit task changes, push feature br
 ## Review locally before opening a PR
 
 1. Commit the changes and record the head commit hash and destination base commit hash.
-2. Obtain an independent local review of the complete diff against that base using Antigravity (via an independent subagent) or Codex (via a Codex subagent or separate command-line process). The implementation agent can't approve its own work.
+2. Obtain an independent local review of the complete diff against that base using Antigravity (via an independent subagent) or Codex (via a Codex subagent or separate command-line process). If local Codex does not work, you can substitute an independent subagent within whatever harness you are using to do a local review. The implementation agent can't approve its own work.
 3. Address all findings, repeat relevant checks, and obtain another review. Open the PR only when the final review reports no findings and gives an explicit go-ahead for the committed head.
 
 You may push the feature branch before review. Opening a PR still requires a clean local review.
@@ -48,7 +48,7 @@ Every content change after a review invalidates that review. Make the needed cha
 
 Use this fallback when the GitHub Codex app reports that review credits have run out, or when using an independent Antigravity review on the open PR.
 
-- After the PR is open, obtain a fresh independent local review (via Antigravity or Codex) of its current head against its current destination base. The earlier review before PR creation isn't a substitute.
+- After the PR is open, obtain a fresh independent local review (via Antigravity, Codex, or an independent subagent within whatever harness you are using if local Codex does not work) of its current head against its current destination base. The earlier review before PR creation isn't a substitute.
 - When using Codex for this review, use `gpt-6.1-sol` or a stronger model, `high` reasoning effort, and normal speed (`service_tier=default`), and verify the resolved settings. When using Antigravity, use an independent subagent given the contract and diff without the implementer's conclusions.
 - Require no findings and an explicit go-ahead. After any change, repeat the review on the new head.
 - Record the reviewer, reviewed base and head commit hashes, model, effort, and full review result in the PR. Address existing GitHub findings and resolve their threads before merging.

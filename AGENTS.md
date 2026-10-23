@@ -19,10 +19,10 @@ These model rules apply to Codex subagents only; Claude uses `CLAUDE.md`. Keep t
 
 A human prompt or goal authorizes agents to commit task changes, push a feature branch, open a PR, and squash-merge it into `master` in `xbmc4lyfe/newznab-tmux` after all review gates pass. Follow [.ai/rules/git-workflow.md](.ai/rules/git-workflow.md). This permission doesn't authorize deployment, production changes, or dependency changes.
 
-- Before opening a PR, obtain an independent local review with no findings using Antigravity (via an independent subagent) or Codex (via a Codex subagent or separate command-line process).
+- Before opening a PR, obtain an independent local review with no findings using Antigravity (via an independent subagent) or Codex (via a Codex subagent or separate command-line process); if local Codex does not work, you can substitute a subagent within whatever harness you are using to do a local review.
 - After opening the PR, obtain a PR review from Antigravity or request `@codex review`. Address and reply to every finding, resolve each review thread, and obtain another review after fixes or an explanation that a finding doesn't apply.
 - Merge only after the reviewer (Antigravity or Codex) gives an explicit approval or go-ahead for the current PR head and required checks pass. Every change after a review requires a fresh review with no findings.
-- If using the GitHub Codex app and it reports exhausted review credits, use a fresh independent local review of the current PR head via Antigravity or Codex (`gpt-6.1-sol` or a stronger model, `high` effort, and normal speed). Record the review and commit hash in the PR.
+- If using the GitHub Codex app and it reports exhausted review credits, use a fresh independent local review of the current PR head via Antigravity or Codex (`gpt-6.1-sol` or a stronger model, `high` effort, and normal speed), or substitute a subagent within whatever harness you are using if local Codex does not work. Record the review and commit hash in the PR.
 - Feature pull requests target this fork's `master`. Upstream synchronization with `NNTmux/newznab-tmux` uses a merge commit and requires a separate synchronization request.
 
 ## Code review rules
