@@ -1309,51 +1309,38 @@ final class CandidateRepository
         $startAfter = $after;
         $wrapped = $after === 0;
         $partials = (int) config('release_verification.partial_after_hours', 4) > 0;
-        $expiryCutoff = now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
-        $owedCutoff = self::owedPartialCutoff();
-        $now = now()->format('Y-m-d H:i:s');
         $expired = 0;
         try {
             for ($page = 0; $page < 10 && $expired < 100; $page++) {
                 if ($page > 0 && $mayStart !== null && ! $mayStart()) {
                     return;
                 }
-                $rows = $this->expiryPage($after, $wrapped && $startAfter > 0 ? $startAfter : null);
-                if ($rows->isEmpty() && ! $wrapped) {
-                    $after = 0;
-                    $wrapped = true;
-                    $rows = $this->expiryPage(0, $startAfter);
-                }
-                if ($rows->isEmpty()) {
-                    $after = 0;
-
-                    return;
-                }
-                foreach ($rows as $row) {
-                    $id = (int) $row->id;
-                    if (! $this->canExpireCandidate($row, $expiryCutoff, $owedCutoff, $now, $partials)) {
-                        $after = $id;
-
-                        continue;
-                    }
+                $through = $wrapped && $startAfter > 0 ? $startAfter : null;
+                $bounds = $this->expiryPageBounds($after, $through);
+                $pageEnd = isset($bounds[0]) ? (int) $bounds[0] : $through;
+                $hasMore = isset($bounds[1]);
+                foreach ($this->expirableCandidateIds($after, $pageEnd, 100 - $expired, $partials) as $id) {
                     if ($mayStart !== null && ! $mayStart()) {
                         return;
                     }
-                    if ($this->expireCandidate($id, $partials) === 'expired') {
+                    if ($this->expireCandidate((int) $id, $partials) === 'expired') {
                         $expired++;
                     }
-                    $after = $id;
+                    $after = (int) $id;
                     if ($expired >= 100) {
                         return;
                     }
                 }
-                if ($rows->count() < 1000) {
-                    $after = 0;
-                    if ($wrapped) {
-                        return;
-                    }
-                    $wrapped = true;
+                if ($hasMore && $pageEnd !== null) {
+                    $after = $pageEnd;
+
+                    continue;
                 }
+                $after = 0;
+                if ($wrapped) {
+                    return;
+                }
+                $wrapped = true;
             }
         } finally {
             try {
@@ -1364,36 +1351,40 @@ final class CandidateRepository
         }
     }
 
-    /** @return Collection<int, \stdClass> */
-    private function expiryPage(int $after, ?int $through = null): Collection
+    /** @return list<int|string> */
+    private function expiryPageBounds(int $after, ?int $through = null): array
     {
         return DB::table('release_verification_candidates')
             ->when(in_array(DB::getDriverName(), ['mysql', 'mariadb'], true), fn ($query) => $query->forceIndex('PRIMARY'))
             ->where('id', '>', $after)
             ->when($through !== null, fn ($query) => $query->where('id', '<=', $through))
             ->orderBy('id')
-            ->limit(1000)
-            ->get(['id', 'release_id', 'status', 'last_unique_at', 'lease_until', 'reason']);
+            ->offset(999)
+            ->limit(2)
+            ->pluck('id')
+            ->all();
     }
 
-    private function canExpireCandidate(object $row, string $expiryCutoff, string $owedCutoff, string $now, bool $partials): bool
+    /** @return Collection<int, int|string> */
+    private function expirableCandidateIds(int $after, ?int $through, int $limit, bool $partials): Collection
     {
-        // A stalled upload still owed its partial attempt is published, not expired (it would otherwise lose
-        // the race with promotion, and always lose it when the hold reaches the expiry window).
-        if ($row->release_id !== null
-            || ! in_array($row->status, self::EXPIRABLE_STATUSES, true)
-            || $row->last_unique_at >= $expiryCutoff
-            || ($row->lease_until !== null && $row->lease_until >= $now)) {
-            return false;
-        }
-        if (! $partials) {
-            return true;
-        }
-
-        return $row->last_unique_at < $owedCutoff
-            || ! in_array($row->status, ['waiting_upload', 'ready'], true)
-            || ($row->status === 'waiting_upload' && str_starts_with((string) ($row->reason ?? ''), self::PARTIAL_DEFERRED))
-            || ($row->status === 'ready' && $row->reason !== self::PARTIAL_QUEUED);
+        return DB::table('release_verification_candidates')
+            ->when(in_array(DB::getDriverName(), ['mysql', 'mariadb'], true), fn ($query) => $query->forceIndex('PRIMARY'))
+            ->where('id', '>', $after)
+            ->when($through !== null, fn ($query) => $query->where('id', '<=', $through))
+            ->whereNull('release_id')
+            ->whereIn('status', self::EXPIRABLE_STATUSES)
+            ->where('last_unique_at', '<', now()->subHours((int) config('release_verification.expiry_hours')))
+            ->where(fn ($q) => $q->whereNull('lease_until')->orWhere('lease_until', '<', now()))
+            // A stalled upload still owed its partial attempt is published, not expired (it would otherwise lose
+            // the race with promotion, and always lose it when the hold reaches the expiry window).
+            ->when($partials, fn ($query) => $query->where(fn ($owed) => $owed->where('last_unique_at', '<', self::owedPartialCutoff())
+                ->orWhereNotIn('status', ['waiting_upload', 'ready'])
+                ->orWhere(fn ($waiting) => $waiting->where('status', 'waiting_upload')->where('reason', 'like', self::PARTIAL_DEFERRED.'%'))
+                ->orWhere(fn ($ready) => $ready->where('status', 'ready')->where(fn ($r) => $r->whereNull('reason')->orWhere('reason', '!=', self::PARTIAL_QUEUED)))))
+            ->orderBy('id')
+            ->limit(max(1, $limit))
+            ->pluck('id');
     }
 
     /** @return 'expired'|'retained'|'terminal' */
