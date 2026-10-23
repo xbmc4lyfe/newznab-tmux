@@ -133,10 +133,7 @@ pub(crate) fn detect_video_container(head: &[u8]) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn nntmux_video_transport_stream_offset(
-    ptr: *const u8,
-    len: usize,
-) -> isize {
+pub unsafe extern "C" fn nntmux_video_transport_stream_offset(ptr: *const u8, len: usize) -> isize {
     if ptr.is_null() && len > 0 {
         return -1;
     }
@@ -1177,14 +1174,11 @@ fn try_match_clean_quoted_part_rar(title: &[u8]) -> Option<(&[u8], bool)> {
     }
     let q2 = q1 + 1 + (q2_ptr as usize - rem1.as_ptr() as usize);
     let tail = &title[q2 + 1..];
-    if tail.len() >= 19 || ! unsafe { memchr(tail.as_ptr(), b'"' as i32, tail.len()) }.is_null() {
+    if tail.len() >= 19 || !unsafe { memchr(tail.as_ptr(), b'"' as i32, tail.len()) }.is_null() {
         return None;
     }
     let q = &title[q1 + 1..q2];
-    if q.len() < 20
-        || is_php_trim_byte(q[0])
-        || !q[q.len() - 4..].eq_ignore_ascii_case(b".rar")
-    {
+    if q.len() < 20 || is_php_trim_byte(q[0]) || !q[q.len() - 4..].eq_ignore_ascii_case(b".rar") {
         return None;
     }
     let d_end = q.len() - 4;
@@ -1212,8 +1206,19 @@ fn try_match_clean_quoted_part_rar(title: &[u8]) -> Option<(&[u8], bool)> {
     if !tail.iter().all(|&b| {
         matches!(
             b,
-            b' ' | b'\t' | b'(' | b')' | b'/' | b'0'..=b'9' | b'-' | b'[' | b']'
-                | b'y' | b'Y' | b'e' | b'E' | b'n' | b'N' | b'c' | b'C'
+            b' ' | b'\t' | b'(' | b')' | b'/' | b'0'
+                ..=b'9'
+                    | b'-'
+                    | b'['
+                    | b']'
+                    | b'y'
+                    | b'Y'
+                    | b'e'
+                    | b'E'
+                    | b'n'
+                    | b'N'
+                    | b'c'
+                    | b'C'
         )
     }) {
         return None;
@@ -1367,7 +1372,9 @@ fn numbered_volume(title: &[u8]) -> Option<(&[u8], u32)> {
                 }
                 if tok_end - tok_start >= 5
                     && title[tok_end - 4] == b'.'
-                    && title[tok_end - 3..tok_end].iter().all(|b| b.is_ascii_digit())
+                    && title[tok_end - 3..tok_end]
+                        .iter()
+                        .all(|b| b.is_ascii_digit())
                 {
                     // Check lookahead (?=$|\s+(?:yEnc\b|\(\d+\/\d+\))) at tok_end
                     let mut lookahead_ok = tok_end == title.len()
@@ -1417,7 +1424,11 @@ fn numbered_volume(title: &[u8]) -> Option<(&[u8], u32)> {
 fn is_video_ext_ci(ext: &[u8]) -> bool {
     // AVI|F4V|IFO|M1V|M2V|M4V|MKV|MOV|MP4|MPEG|MPG|MPGV|MPV|OGV|QT|RM|RMVB|TS|VOB|WMV
     match ext.len() {
-        2 => ext.eq_ignore_ascii_case(b"qt") || ext.eq_ignore_ascii_case(b"rm") || ext.eq_ignore_ascii_case(b"ts"),
+        2 => {
+            ext.eq_ignore_ascii_case(b"qt")
+                || ext.eq_ignore_ascii_case(b"rm")
+                || ext.eq_ignore_ascii_case(b"ts")
+        }
         3 => {
             ext.eq_ignore_ascii_case(b"avi")
                 || ext.eq_ignore_ascii_case(b"f4v")
@@ -1535,7 +1546,9 @@ fn match_hashed_archive_position(title: &[u8]) -> Option<u32> {
     let mut i = 0;
     while i + 37 <= before_paren.len() {
         if before_paren[i] == b'"'
-            && before_paren[i + 1..i + 33].iter().all(|b| b.is_ascii_hexdigit())
+            && before_paren[i + 1..i + 33]
+                .iter()
+                .all(|b| b.is_ascii_hexdigit())
             && before_paren[i + 33] == b'.'
             && (b'1'..=b'9').contains(&before_paren[i + 34])
         {
@@ -1734,17 +1747,16 @@ fn is_likely_first_volume(
 fn is_support_file(title: &[u8]) -> bool {
     // '/(?:\.(?:vol\d{1,3}\+\d{1,3}|par2|srs|sfv|nzb)|nfo\b|inf\b|ofn\b)($|[ ")]|-])(?!.{20,})/i'
     let check_tail = |end_pos: usize| -> bool {
-        let after_delim = if end_pos == title.len()
-            || (end_pos + 1 == title.len() && title[end_pos] == b'\n')
-        {
-            end_pos
-        } else if matches!(title[end_pos], b' ' | b'"' | b')') {
-            end_pos + 1
-        } else if title[end_pos..].starts_with(b"-]") {
-            end_pos + 2
-        } else {
-            return false;
-        };
+        let after_delim =
+            if end_pos == title.len() || (end_pos + 1 == title.len() && title[end_pos] == b'\n') {
+                end_pos
+            } else if matches!(title[end_pos], b' ' | b'"' | b')') {
+                end_pos + 1
+            } else if title[end_pos..].starts_with(b"-]") {
+                end_pos + 2
+            } else {
+                return false;
+            };
         let rem = &title[after_delim..];
         let line_rem = match rem.iter().position(|&b| b == b'\n') {
             Some(nl) => nl,
@@ -1835,9 +1847,7 @@ fn has_file_extension(title: &[u8]) -> bool {
     false
 }
 
-fn check_image_and_media_exts(
-    title: &[u8],
-) -> (bool, bool, bool, bool, Option<&[u8]>, bool, bool) {
+fn check_image_and_media_exts(title: &[u8]) -> (bool, bool, bool, bool, Option<&[u8]>, bool, bool) {
     // Returns:
     // (ends_with_image_ext, has_image_ext_token, has_video_ext_bracket, has_video_ext_or_end, audio_ext, has_par2, has_par2_vol)
     let trimmed_nl = if title.ends_with(b"\n") {
@@ -1986,7 +1996,11 @@ pub unsafe extern "C" fn nntmux_additional_classify_titles_nul(
     };
 
     let mut out = unsafe { OutCursor::new(out_ptr, out_cap) };
-    out.push(if is_music_group_name(group) { b'1' } else { b'0' });
+    out.push(if is_music_group_name(group) {
+        b'1'
+    } else {
+        b'0'
+    });
 
     if count == 0 {
         return out.finish();
@@ -2004,7 +2018,8 @@ pub unsafe extern "C" fn nntmux_additional_classify_titles_nul(
         out.push(0);
 
         let clean_rar = try_match_clean_quoted_part_rar(title);
-        if let (Some((stem, is_first)), Some((prev_stem, base_flags))) = (clean_rar, prev_clean_rar) {
+        if let (Some((stem, is_first)), Some((prev_stem, base_flags))) = (clean_rar, prev_clean_rar)
+        {
             if stem == prev_stem {
                 let mut flags = base_flags | (1 << 58);
                 if is_first {
@@ -2061,8 +2076,8 @@ pub unsafe extern "C" fn nntmux_additional_classify_titles_nul(
             false
         };
 
-        let is_archive_candidate = media_split.is_some_and(|v| v <= 1)
-            || (media_split.is_none() && is_archive);
+        let is_archive_candidate =
+            media_split.is_some_and(|v| v <= 1) || (media_split.is_none() && is_archive);
         let sk_vec;
         let set_key: Option<&[u8]> = if is_archive_candidate {
             if fname.len() <= 512 {
@@ -2081,9 +2096,7 @@ pub unsafe extern "C" fn nntmux_additional_classify_titles_nul(
             None
         };
         let same_set_key_as_prev = match set_key {
-            Some(sk) => {
-                prev_set_key_len > 0 && sk == &prev_set_key_buf[..prev_set_key_len]
-            }
+            Some(sk) => prev_set_key_len > 0 && sk == &prev_set_key_buf[..prev_set_key_len],
             None => false,
         };
 

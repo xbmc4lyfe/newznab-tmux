@@ -559,10 +559,7 @@ fn is_generic_query(norm: &[u8]) -> bool {
     if norm.iter().all(|b| b.is_ascii_digit()) {
         return true;
     }
-    if matches!(
-        norm,
-        b"audiots" | b"audio ts" | b"videots" | b"video ts"
-    ) {
+    if matches!(norm, b"audiots" | b"audio ts" | b"videots" | b"video ts") {
         return true;
     }
     if norm.starts_with(b"vts") {
@@ -781,7 +778,10 @@ pub unsafe extern "C" fn nntmux_predb_identity_keys_for_row(
         return out.finish();
     }
 
-    let basename = match filename_bytes.iter().rposition(|&b| b == b'/' || b == b'\\') {
+    let basename = match filename_bytes
+        .iter()
+        .rposition(|&b| b == b'/' || b == b'\\')
+    {
         Some(pos) => &filename_bytes[pos + 1..],
         None => filename_bytes,
     };
@@ -996,22 +996,14 @@ pub unsafe extern "C" fn nntmux_predb_select_best_match_index(
         let title_tokens = extract_meaningful_tokens(&norm_title);
         let filename_tokens = extract_meaningful_tokens(&norm_filename);
 
-        let s_title = score_against_field(
-            &normalized_query,
-            &query_tokens,
-            &norm_title,
-            &title_tokens,
-        );
+        let s_title =
+            score_against_field(&normalized_query, &query_tokens, &norm_title, &title_tokens);
         let s_file = score_against_field(
             &normalized_query,
             &query_tokens,
             &norm_filename,
             &filename_tokens,
-        ) + if !norm_filename.is_empty() {
-            5.0
-        } else {
-            0.0
-        };
+        ) + if !norm_filename.is_empty() { 5.0 } else { 0.0 };
         let mut score = s_title.max(s_file);
 
         let cand_has_xxx = has_xxx_word(&norm_title) || has_xxx_word(&norm_filename);
