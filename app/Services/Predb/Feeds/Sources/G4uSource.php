@@ -5,11 +5,13 @@ declare(strict_types=1);
 namespace App\Services\Predb\Feeds\Sources;
 
 use App\Services\Predb\Feeds\PredbFeedEntry;
+use App\Support\RustPipelineLibrary;
 use DOMDocument;
 use DOMElement;
 use DOMNode;
 use DOMText;
 use DOMXPath;
+use FFI;
 use RuntimeException;
 
 /**
@@ -18,6 +20,12 @@ use RuntimeException;
  */
 final class G4uSource extends BoundedHttpFeedSource
 {
+    private const NATIVE_CDEF = <<<'C'
+        int32_t nntmux_predb_html_validate_numeric_refs(const char *html, size_t len, uint32_t mode);
+        C;
+
+    private static FFI|false|null $native = null;
+
     public function key(): string
     {
         return 'g4u';
@@ -150,6 +158,28 @@ final class G4uSource extends BoundedHttpFeedSource
      * libxml silently discards invalid numeric references, which would change a literal name.
      */
     private function validateNumericReferences(string $html): void
+    {
+        // Reference-free pages do not amortize an FFI call. Keep this common
+        // case in PHP's native string search rather than regressing its latency.
+        if (! str_contains($html, '&#')) {
+            return;
+        }
+        $ffi = self::$native ??= RustPipelineLibrary::resolveDomain('predb_sql_html', self::NATIVE_CDEF) ?? false;
+        if ($ffi !== false) {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_predb_html_validate_numeric_refs($html, strlen($html), 0);
+            if ($status === 1) {
+                return;
+            }
+            if ($status === 0) {
+                throw new RuntimeException('G4U returned an invalid character reference.');
+            }
+        }
+
+        $this->validateNumericReferencesPhp($html);
+    }
+
+    private function validateNumericReferencesPhp(string $html): void
     {
         $offset = 0;
         while (preg_match('/&#(?:(\d+)|x([0-9a-f]+));?/i', $html, $reference, PREG_OFFSET_CAPTURE, $offset) === 1) {
