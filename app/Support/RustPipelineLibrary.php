@@ -1893,6 +1893,243 @@ final class RustPipelineLibrary
         return $out;
     }
 
+    public static function cp437ToUtf8(string $input, ?string $libraryPath = null): ?string
+    {
+        if ($input === '') {
+            return '';
+        }
+
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($input);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= 8192)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, max(8192, $len * 3));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_cp437_to_utf8($input, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written)) {
+            return null;
+        }
+        if ($written === -3) {
+            return $input;
+        }
+        if ($written === -1 || $written === -2) {
+            return null;
+        }
+        if ($written === 0) {
+            return '';
+        }
+        if ($written < -3) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_cp437_to_utf8($input, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+            if ($written === 0) {
+                return '';
+            }
+        }
+
+        return FFI::string($scratch, $written);
+    }
+
+    public static function normalizeNfoEncoding(string $input, ?string $libraryPath = null): ?string
+    {
+        if ($input === '') {
+            return '';
+        }
+
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($input);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= 8192)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, max(8192, $len * 3));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_normalize_nfo_encoding($input, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written)) {
+            return null;
+        }
+        if ($written === -3) {
+            return $input;
+        }
+        if ($written === -1 || $written === -2) {
+            return null;
+        }
+        if ($written === 0) {
+            return '';
+        }
+        if ($written < -3) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_normalize_nfo_encoding($input, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+            if ($written === 0) {
+                return '';
+            }
+        }
+
+        return FFI::string($scratch, $written);
+    }
+
+    public static function nfoCleanContent(string $input, ?string $libraryPath = null): ?string
+    {
+        if ($input === '') {
+            return '';
+        }
+
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($input);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= 8192)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, max(8192, $len * 3));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_nfo_clean_content($input, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1 || $written === -2) {
+            return null;
+        }
+        if ($written === 0) {
+            return '';
+        }
+        if ($written < -3) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_nfo_clean_content($input, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+            if ($written === 0) {
+                return '';
+            }
+        }
+
+        return FFI::string($scratch, $written);
+    }
+
+    public static function nfoIdentityText(string $input, ?string $libraryPath = null): ?string
+    {
+        if ($input === '') {
+            return '';
+        }
+
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($input);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= 8192)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, max(8192, $len + 64));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_nfo_identity_text($input, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1 || $written === -2) {
+            return null;
+        }
+        if ($written === 0) {
+            return '';
+        }
+        if ($written < -3) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_nfo_identity_text($input, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+            if ($written === 0) {
+                return '';
+            }
+        }
+
+        return FFI::string($scratch, $written);
+    }
+
+    public static function nfoCheckPreconditions(string $input, ?string $libraryPath = null): ?int
+    {
+        if ($input === '') {
+            return 0;
+        }
+
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $flags = $ffi->nntmux_nfo_check_preconditions($input, \strlen($input));
+
+        return \is_int($flags) && $flags >= 0 ? $flags : null;
+    }
+
+    public static function nfoValidateContent(string $input, ?string $libraryPath = null): ?bool
+    {
+        if (\strlen($input) < 50) {
+            return false;
+        }
+
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $res = $ffi->nntmux_nfo_validate_content($input, \strlen($input));
+        if (! \is_int($res) || $res < 0) {
+            return null;
+        }
+
+        return $res === 1;
+    }
+
     public static function resolve(?string $libraryPath = null): ?FFI
     {
         if ($libraryPath === null && self::$defaultLibrary !== null) {
@@ -1970,6 +2207,12 @@ final class RustPipelineLibrary
                     ssize_t nntmux_search_extract_suggestion(const char *searchname, size_t searchname_len, const char *query, size_t query_len, char *out_buf, size_t out_cap);
                     ssize_t nntmux_search_rank_autocomplete_nul(const char *query, size_t query_len, const char *input, size_t input_len, size_t count, size_t max_results, char *out_buf, size_t out_cap);
                     ssize_t nntmux_search_suggest_fallback_nul(const char *query, size_t query_len, const char *input, size_t input_len, size_t count, size_t max_results, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_cp437_to_utf8(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_normalize_nfo_encoding(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_nfo_clean_content(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_nfo_identity_text(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    int32_t nntmux_nfo_check_preconditions(const char *input, size_t input_len);
+                    int32_t nntmux_nfo_validate_content(const char *input, size_t input_len);
                     C, $resolved);
 
                 // @phpstan-ignore method.notFound
