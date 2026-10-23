@@ -2,6 +2,7 @@ use std::slice;
 
 pub mod categorize;
 pub mod filename;
+pub mod predb;
 
 /// Returns the ABI version of `libnntmux_pipeline`.
 #[unsafe(no_mangle)]
@@ -452,7 +453,7 @@ const MD5_K: [u32; 64] = [
     0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
 ];
 
-const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+pub(crate) const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
 
 unsafe extern "C" {
     fn memchr(s: *const u8, c: i32, n: usize) -> *const u8;

@@ -733,6 +733,194 @@ final class RustPipelineLibrary
         return $written === -2 ? null : FFI::string($scratch, $written);
     }
 
+    /**
+     * Compute `OriginalFilenameEvidence::canonicalNominationKeys()` via Rust FFI.
+     *
+     * @return list<string>|null
+     */
+    public static function originalFilenameNominationKeys(string $basename, ?string $libraryPath = null, bool &$supported = false): ?array
+    {
+        $supported = false;
+        if ($basename === '') {
+            $supported = true;
+
+            return null;
+        }
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($basename);
+        $scratch = self::ensureScratch($ffi, max(1024, $len * 4 + 64));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_original_filename_nomination_keys($basename, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -2) {
+            return null;
+        }
+        if ($written === -1) {
+            $supported = true;
+
+            return null;
+        }
+        if ($written < -2) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_original_filename_nomination_keys($basename, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written <= 0) {
+                return null;
+            }
+        }
+
+        $supported = true;
+
+        return explode("\n", FFI::string($scratch, $written));
+    }
+
+    /**
+     * Compute `PredbIdentityKeys::forRow` via Rust FFI.
+     *
+     * @return list<array{kind: int, key_digest: string}>|null
+     */
+    public static function predbIdentityKeysForRow(string $title, string $filename, ?string $libraryPath = null, bool &$supported = false): ?array
+    {
+        $supported = false;
+        if ($title === '') {
+            $supported = true;
+
+            return null;
+        }
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $scratch = self::ensureScratch($ffi, 4096);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_predb_identity_keys_for_row($title, \strlen($title), $filename, \strlen($filename), $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -2) {
+            return null;
+        }
+        if ($written === -1) {
+            $supported = true;
+
+            return null;
+        }
+        if ($written < -2) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_predb_identity_keys_for_row($title, \strlen($title), $filename, \strlen($filename), $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written <= 0) {
+                return null;
+            }
+        }
+
+        $supported = true;
+        $lines = explode("\n", FFI::string($scratch, $written));
+        $keys = [];
+        foreach ($lines as $line) {
+            $keys[] = [
+                'kind' => $line[0] === '1' ? 1 : 2,
+                'key_digest' => substr($line, 2),
+            ];
+        }
+
+        return $keys;
+    }
+
+    /**
+     * Compute `PredbMatchSelector::similarityPercent` via Rust FFI.
+     */
+    public static function similarityPercent(string $left, string $right, ?string $libraryPath = null): ?float
+    {
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $res = $ffi->nntmux_similarity_percent($left, \strlen($left), $right, \strlen($right));
+
+        return \is_float($res) ? $res : null;
+    }
+
+    /**
+     * Select best matching PreDB hit index (`0..count-1`, or `-1` for none) via Rust FFI.
+     *
+     * @param  list<array<string, mixed>|object>  $hits
+     */
+    public static function predbSelectBestMatchIndex(
+        string $query,
+        bool $hasOrig,
+        string $origBasename,
+        array $hits,
+        ?string $libraryPath = null,
+        bool &$supported = false
+    ): ?int {
+        $supported = false;
+        $count = \count($hits);
+        if ($count === 0) {
+            $supported = true;
+
+            return -1;
+        }
+        if ($count > 50 || $query === '' || str_contains($query, "\0") || str_contains($origBasename, "\0")) {
+            return null;
+        }
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+
+        $flat = [];
+        foreach ($hits as $hit) {
+            if (\is_array($hit)) {
+                $t = (string) ($hit['title'] ?? '');
+                $f = (string) ($hit['filename'] ?? '');
+            } else {
+                $t = (string) ($hit->title ?? '');
+                $f = (string) ($hit->filename ?? '');
+            }
+            if (str_contains($t, "\0") || str_contains($f, "\0")) {
+                return null;
+            }
+            $flat[] = $t;
+            $flat[] = $f;
+        }
+        $joined = implode("\0", $flat);
+
+        // @phpstan-ignore method.notFound
+        $res = $ffi->nntmux_predb_select_best_match_index(
+            $query,
+            \strlen($query),
+            $hasOrig ? 1 : 0,
+            $origBasename,
+            \strlen($origBasename),
+            $joined,
+            \strlen($joined),
+            $count
+        );
+        if (! \is_int($res) || $res === -2) {
+            return null;
+        }
+
+        $supported = true;
+
+        return $res;
+    }
+
     public static function resolve(?string $libraryPath = null): ?FFI
     {
         if ($libraryPath === null && self::$defaultLibrary !== null) {
@@ -788,6 +976,10 @@ final class RustPipelineLibrary
                     int32_t nntmux_has_non_single_episode_evidence_nul(const char *input, size_t input_len, size_t count);
                     ssize_t nntmux_season_name_from_episode(const char *input, size_t input_len, char *out_buf, size_t out_cap);
                     ssize_t nntmux_season_name_from_episodes_nul(const char *input, size_t input_len, size_t count, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_original_filename_nomination_keys(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_predb_identity_keys_for_row(const char *title, size_t title_len, const char *filename, size_t filename_len, char *out_buf, size_t out_cap);
+                    double nntmux_similarity_percent(const char *left, size_t left_len, const char *right, size_t right_len);
+                    int32_t nntmux_predb_select_best_match_index(const char *query, size_t query_len, uint32_t has_orig, const char *orig_basename, size_t orig_len, const char *hits, size_t hits_len, size_t count);
                     C, $resolved);
 
                 // @phpstan-ignore method.notFound

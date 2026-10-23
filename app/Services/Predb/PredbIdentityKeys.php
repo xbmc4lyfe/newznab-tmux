@@ -6,26 +6,45 @@ namespace App\Services\Predb;
 
 use App\Services\NameFixing\OriginalFilenameEvidence;
 use App\Support\PredbSearchDocument;
+use App\Support\RustPipelineLibrary;
 
 /** Complete bounded nominations for one SQL owner; keys never establish identity. */
 final class PredbIdentityKeys
 {
-    public const PREDB_IDENTITY_POLICY = '7879261eb753e6011f1072f9a12a195dc1ebec2ba230071af946d8bf14cdd8f1';
+    public const PREDB_IDENTITY_POLICY = 'cb4556aa6ea5ca655acac3e5f595752c5865bff42475801082b31cbb454de337';
 
     /** @return list<array{kind: int, key_digest: string}>|null */
     public function forRow(object $row): ?array
     {
         $id = $row->id ?? null;
-        if ((! is_int($id) && ! is_string($id))
-            || preg_match('/\A[1-9][0-9]{0,9}\z/D', (string) $id) !== 1
-            || (int) $id > 4294967295) {
+        if (is_int($id)) {
+            if ($id < 1 || $id > 4294967295) {
+                return null;
+            }
+        } elseif (! is_string($id) || preg_match('/\A[1-9][0-9]{0,9}\z/D', $id) !== 1 || (int) $id > 4294967295) {
             return null;
         }
         $title = $row->title ?? null;
         $filename = $row->filename ?? null;
-        if (! is_string($title) || $title === '' || ! $this->supportedText($title)
+        if (! is_string($title) || ! is_string($filename)) {
+            return null;
+        }
+
+        $supported = false;
+        $ffiRes = RustPipelineLibrary::predbIdentityKeysForRow($title, $filename, null, $supported);
+        if ($supported) {
+            return $ffiRes;
+        }
+
+        return $this->forRowPhp($title, $filename);
+    }
+
+    /** @return list<array{kind: int, key_digest: string}>|null */
+    public function forRowPhp(string $title, string $filename): ?array
+    {
+        if ($title === '' || ! $this->supportedText($title)
             || preg_match('~[\\\\/|]~', $title) !== 0
-            || ! is_string($filename) || ! $this->supportedText($filename)) {
+            || ! $this->supportedText($filename)) {
             return null;
         }
         $canonical = PredbSearchDocument::exactValue($title);
@@ -36,7 +55,7 @@ final class PredbIdentityKeys
         if ($filename === '') {
             return $keys;
         }
-        $aliases = (new OriginalFilenameEvidence($filename))->canonicalNominationKeys();
+        $aliases = (new OriginalFilenameEvidence($filename))->canonicalNominationKeysPhp();
         if ($aliases === null) {
             return null;
         }
