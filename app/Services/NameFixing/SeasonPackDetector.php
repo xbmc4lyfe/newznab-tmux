@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\NameFixing;
 
+use App\Support\RustPipelineLibrary;
+
 /**
  * Recognises whole-season TV releases and derives a season-level release name
  * from the episode file names inside them.
@@ -49,7 +51,17 @@ final class SeasonPackDetector
      */
     public static function isSeasonPack(string $name): bool
     {
-        if (self::isEpisodeName($name)) {
+        $flags = RustPipelineLibrary::seasonPackFlags($name);
+        if ($flags !== null) {
+            return ($flags & 2) !== 0;
+        }
+
+        return self::isSeasonPackPhp($name);
+    }
+
+    public static function isSeasonPackPhp(string $name): bool
+    {
+        if (self::isEpisodeNamePhp($name)) {
             return false;
         }
 
@@ -62,6 +74,16 @@ final class SeasonPackDetector
      * Whether a name carries an episode marker (S01E01, 1x05, Episode.5, E05...).
      */
     public static function isEpisodeName(string $name): bool
+    {
+        $flags = RustPipelineLibrary::seasonPackFlags($name);
+        if ($flags !== null) {
+            return ($flags & 1) !== 0;
+        }
+
+        return self::isEpisodeNamePhp($name);
+    }
+
+    public static function isEpisodeNamePhp(string $name): bool
     {
         return preg_match(self::EPISODE_REGEX, $name) === 1;
     }
@@ -82,6 +104,13 @@ final class SeasonPackDetector
      */
     public static function isMultiEpisodeSet(array $names): bool
     {
+        $supported = false;
+        $isMultiEpisode = false;
+        RustPipelineLibrary::seasonNameFromEpisodes($names, null, $supported, $isMultiEpisode);
+        if ($supported) {
+            return $isMultiEpisode;
+        }
+
         return self::parseEpisodeSet($names) !== null;
     }
 
@@ -111,6 +140,17 @@ final class SeasonPackDetector
     }
 
     public static function episodeIdentity(string $name): ?string
+    {
+        $supported = false;
+        $ffiRes = RustPipelineLibrary::seasonPackEpisodeIdentity($name, null, $supported);
+        if ($supported) {
+            return $ffiRes;
+        }
+
+        return self::episodeIdentityPhp($name);
+    }
+
+    public static function episodeIdentityPhp(string $name): ?string
     {
         $base = self::baseName($name);
         if ($base === '' || preg_match(self::SAMPLE_REGEX, $base) === 1 || self::hasExplicitPackMarker($base)
@@ -154,6 +194,19 @@ final class SeasonPackDetector
      * @param  list<string>  $names
      */
     public static function hasNonSingleEpisodeEvidence(array $names): bool
+    {
+        $ffiRes = RustPipelineLibrary::hasNonSingleEpisodeEvidence($names);
+        if ($ffiRes !== null) {
+            return $ffiRes;
+        }
+
+        return self::hasNonSingleEpisodeEvidencePhp($names);
+    }
+
+    /**
+     * @param  list<string>  $names
+     */
+    public static function hasNonSingleEpisodeEvidencePhp(array $names): bool
     {
         foreach ($names as $name) {
             $base = self::baseName($name);
@@ -201,6 +254,20 @@ final class SeasonPackDetector
      */
     public static function seasonNameFromEpisodes(array $names): ?string
     {
+        $supported = false;
+        $ffiRes = RustPipelineLibrary::seasonNameFromEpisodes($names, null, $supported);
+        if ($supported) {
+            return $ffiRes;
+        }
+
+        return self::seasonNameFromEpisodesPhp($names);
+    }
+
+    /**
+     * @param  list<string>  $names
+     */
+    public static function seasonNameFromEpisodesPhp(array $names): ?string
+    {
         $episodes = self::parseEpisodeSet($names);
         if ($episodes === null) {
             return null;
@@ -236,6 +303,17 @@ final class SeasonPackDetector
      * episode number and title; null when no release information follows the episode.
      */
     public static function seasonNameFromEpisode(string $name): ?string
+    {
+        $supported = false;
+        $ffiRes = RustPipelineLibrary::seasonNameFromEpisode($name, null, $supported);
+        if ($supported) {
+            return $ffiRes;
+        }
+
+        return self::seasonNameFromEpisodePhp($name);
+    }
+
+    public static function seasonNameFromEpisodePhp(string $name): ?string
     {
         $episode = self::parseEpisode($name);
         if ($episode === null) {
