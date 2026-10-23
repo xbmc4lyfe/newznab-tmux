@@ -4,6 +4,7 @@ pub mod categorize;
 pub mod cleaning;
 pub mod filename;
 pub mod media;
+pub mod nfo;
 pub mod predb;
 pub mod search;
 

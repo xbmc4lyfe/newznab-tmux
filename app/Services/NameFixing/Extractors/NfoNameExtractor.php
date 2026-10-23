@@ -8,6 +8,7 @@ use App\Services\NameFixing\Data\NameFixResult;
 use App\Services\NameFixing\FileNameCleaner;
 use App\Services\NameFixing\ReleaseUpdateService;
 use App\Support\PredbSearchDocument;
+use App\Support\RustPipelineLibrary;
 
 /**
  * Extracts release names from NFO content.
@@ -16,6 +17,17 @@ use App\Support\PredbSearchDocument;
  */
 class NfoNameExtractor
 {
+    private ?string $libraryPath = null;
+
+    private ?string $lastRawNfo = null;
+
+    private ?string $lastIdentityText = null;
+
+    public function __construct(?string $libraryPath = null)
+    {
+        $this->libraryPath = $libraryPath;
+    }
+
     /**
      * Exclude upstream Source fields from release identity evidence.
      *
@@ -23,6 +35,27 @@ class NfoNameExtractor
      * blank line. The original NFO remains available for technical metadata.
      */
     public function identityText(string $nfoContent): string
+    {
+        if ($this->lastRawNfo === $nfoContent && $this->lastIdentityText !== null) {
+            return $this->lastIdentityText;
+        }
+
+        $native = RustPipelineLibrary::nfoIdentityText($nfoContent, $this->libraryPath);
+        if ($native !== null) {
+            $this->lastRawNfo = $nfoContent;
+            $this->lastIdentityText = $native;
+
+            return $native;
+        }
+
+        $php = $this->identityTextPhp($nfoContent);
+        $this->lastRawNfo = $nfoContent;
+        $this->lastIdentityText = $php;
+
+        return $php;
+    }
+
+    public function identityTextPhp(string $nfoContent): string
     {
         $lines = preg_split('/\r\n|\r|\n/', $nfoContent);
         if ($lines === false) {

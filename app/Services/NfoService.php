@@ -13,6 +13,7 @@ use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbContentsService;
 use App\Services\Nzb\NzbParserService;
 use App\Services\Nzb\NzbService;
+use App\Support\RustPipelineLibrary;
 use dariusiii\rarinfo\Par2Info;
 use dariusiii\rarinfo\SfvInfo;
 use Illuminate\Support\Facades\Cache;
@@ -30,11 +31,39 @@ use Throwable;
  */
 class NfoService
 {
+    private const DEFAULT_NON_NFO_HEADER_REGEX = '/\A(\s*<\?xml|=newz\[NZB\]=|RIFF|\s*[RP]AR|.{0,10}(JFIF|matroska|ftyp|ID3)|PK\x03\x04|\x1f\x8b\x08|MZ|%PDF|GIF8[79]a|\x89PNG)|;\s*Generated\s*by.*SF\w/i';
+
+    private const DEFAULT_BINARY_CHARS_REGEX = '/[\x00-\x08\x0B\x0C\x0E-\x1F]/';
+
+    /** @var list<string> */
+    private const DEFAULT_NFO_KEYWORDS = [
+        // Release information
+        'release', 'group', 'date', 'size', 'format', 'source', 'genre', 'codec',
+        'bitrate', 'resolution', 'language', 'subtitle', 'ripped', 'cracked',
+        'keygen', 'serial', 'patch', 'trainer', 'install', 'notes', 'greets',
+        'nfo', 'ascii', 'artwork', 'presents', 'proudly', 'brings', 'another',
+        // Scene terminology
+        'scene', 'rls', 'nuked', 'proper', 'repack', 'internal', 'retail',
+        'webdl', 'webrip', 'bluray', 'bdrip', 'dvdrip', 'hdtv', 'pdtv',
+        // Media info
+        'video', 'audio', 'duration', 'runtime', 'aspect', 'fps', 'channels',
+        'sample', 'encoder', 'x264', 'x265', 'hevc', 'avc', 'xvid', 'divx',
+        'aac', 'ac3', 'dts', 'truehd', 'atmos', 'flac', 'mp3',
+        // Content info
+        'movie', 'film', 'episode', 'season', 'series', 'title', 'year',
+        'director', 'cast', 'actors', 'plot', 'synopsis', 'imdb', 'rating',
+        // Software
+        'crack', 'readme', 'setup', 'installer', 'license', 'registration',
+        'protection', 'requirements', 'platform', 'operating', 'system',
+        // Contact/Group info
+        'contact', 'irc', 'www', 'http', 'ftp', 'email', 'apply', 'join',
+    ];
+
     /**
      * Regex to detect common non-NFO file headers/signatures.
      * Matches XML, NZB, RIFF (media), PAR/RAR archives, and other binary formats.
      */
-    protected string $_nonNfoHeaderRegex = '/\A(\s*<\?xml|=newz\[NZB\]=|RIFF|\s*[RP]AR|.{0,10}(JFIF|matroska|ftyp|ID3)|PK\x03\x04|\x1f\x8b\x08|MZ|%PDF|GIF8[79]a|\x89PNG)|;\s*Generated\s*by.*SF\w/i';
+    protected string $_nonNfoHeaderRegex = self::DEFAULT_NON_NFO_HEADER_REGEX;
 
     /**
      * Regex to identify text encoding from the 'file' command output.
@@ -144,6 +173,8 @@ class NfoService
 
     private ?int $timeoutSeconds = null;
 
+    private ?string $libraryPath = null;
+
     public const NFO_FAILED = -9; // We failed to get a NFO after admin set max retries.
 
     public const NFO_FAILED_ARCHIVE = -10; // Archive-based NFO extraction also failed; no more retries.
@@ -160,8 +191,9 @@ class NfoService
      * Heavy settings (batch limits, sizes, retries) load on first NFO processing use via getters,
      * so constructing this service does not hit the cache or database.
      */
-    public function __construct()
+    public function __construct(?string $libraryPath = null)
     {
+        $this->libraryPath = $libraryPath;
         $this->echo = (bool) config('nntmux.echocli');
 
         $this->tmpPath = rtrim((string) config('nntmux.tmp_unrar_path'), '/\\').'/';
@@ -322,14 +354,25 @@ class NfoService
             return false;
         }
 
-        // Quick check for known non-NFO file signatures
-        if (preg_match($this->_nonNfoHeaderRegex, $possibleNFO)) {
-            return false;
+        $preconditionFlags = null;
+        if ($this->_nonNfoHeaderRegex === self::DEFAULT_NON_NFO_HEADER_REGEX) {
+            $preconditionFlags = RustPipelineLibrary::nfoCheckPreconditions($possibleNFO, $this->libraryPath);
         }
 
-        // Additional binary format checks
-        if ($this->detectBinaryFormat($possibleNFO)) {
-            return false;
+        if ($preconditionFlags !== null) {
+            if (($preconditionFlags & 3) !== 0) {
+                return false;
+            }
+        } else {
+            // Quick check for known non-NFO file signatures
+            if (preg_match($this->_nonNfoHeaderRegex, $possibleNFO)) {
+                return false;
+            }
+
+            // Additional binary format checks
+            if ($this->detectBinaryFormat($possibleNFO)) {
+                return false;
+            }
         }
 
         $tmpPath = $this->tmpPath.$guid.'.nfo';
@@ -342,9 +385,13 @@ class NfoService
             // Use 'file' command via fileInfo if available
             $result = fileInfo($tmpPath);
             if (! empty($result)) {
+                $hasBinaryChars = ($preconditionFlags !== null && $this->_binaryCharsRegex === self::DEFAULT_BINARY_CHARS_REGEX)
+                    ? (($preconditionFlags & 4) !== 0)
+                    : (bool) preg_match($this->_binaryCharsRegex, $possibleNFO);
+
                 if (preg_match($this->_textFileRegex, $result)) {
                     $isNfo = true;
-                } elseif (preg_match($this->_binaryFileRegex, $result) || preg_match($this->_binaryCharsRegex, $possibleNFO)) {
+                } elseif (preg_match($this->_binaryFileRegex, $result) || $hasBinaryChars) {
                     $isNfo = false;
                 }
 
@@ -373,7 +420,10 @@ class NfoService
             }
 
             // Check for binary characters
-            if (preg_match($this->_binaryCharsRegex, $possibleNFO)) {
+            $hasBinaryChars = ($preconditionFlags !== null && $this->_binaryCharsRegex === self::DEFAULT_BINARY_CHARS_REGEX)
+                ? (($preconditionFlags & 4) !== 0)
+                : (bool) preg_match($this->_binaryCharsRegex, $possibleNFO);
+            if ($hasBinaryChars) {
                 return false;
             }
 
@@ -404,6 +454,20 @@ class NfoService
      * @return bool True if binary format detected.
      */
     protected function detectBinaryFormat(string $data): bool
+    {
+        if (\strlen($data) < 4) {
+            return false;
+        }
+
+        $flags = RustPipelineLibrary::nfoCheckPreconditions($data, $this->libraryPath);
+        if ($flags !== null) {
+            return ($flags & 2) !== 0;
+        }
+
+        return $this->detectBinaryFormatPhp($data);
+    }
+
+    protected function detectBinaryFormatPhp(string $data): bool
     {
         if (strlen($data) < 4) {
             return false;
@@ -458,6 +522,22 @@ class NfoService
      * @return bool True if content appears to be a valid NFO.
      */
     protected function validateNfoContent(string $content): bool
+    {
+        if (\strlen($content) < 50) {
+            return false;
+        }
+
+        if ($this->_nfoKeywords === self::DEFAULT_NFO_KEYWORDS) {
+            $native = RustPipelineLibrary::nfoValidateContent($content, $this->libraryPath);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->validateNfoContentPhp($content);
+    }
+
+    protected function validateNfoContentPhp(string $content): bool
     {
         $length = strlen($content);
 
@@ -1517,8 +1597,22 @@ class NfoService
      */
     public function cleanNfoContent(string $nfoContent): string
     {
+        if ($nfoContent === '') {
+            return '';
+        }
+
+        $native = RustPipelineLibrary::nfoCleanContent($nfoContent, $this->libraryPath);
+        if ($native !== null) {
+            return $native;
+        }
+
+        return $this->cleanNfoContentPhp($nfoContent);
+    }
+
+    public function cleanNfoContentPhp(string $nfoContent): string
+    {
         // Convert to UTF-8 if needed (CP437 is common for NFOs)
-        $content = cp437toUTF($nfoContent);
+        $content = (string) iconv('CP437', 'UTF-8//IGNORE//TRANSLIT', $nfoContent);
 
         // Normalize line endings
         $content = str_replace(["\r\n", "\r"], "\n", $content);
