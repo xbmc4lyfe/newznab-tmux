@@ -472,7 +472,7 @@ class VerificationReadyQueueTest extends ReleaseVerificationCandidatesTest
             $this->assertStringContainsString("-d 'memory_limit=768M'", $command);
         }
         foreach ($commands('1G; rm -rf /') as $command) {
-            $this->assertStringContainsString("-d 'memory_limit=512M'", $command, 'Anything but a size falls back to the default.');
+            $this->assertStringContainsString("-d 'memory_limit=1536M'", $command, 'Anything but a size falls back to the default.');
         }
     }
 

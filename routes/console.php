@@ -28,9 +28,9 @@ Artisan::command('inspire', function () {
 // Verification workers and the preparer hold one candidate's whole manifest in memory (about 1 KiB per
 // article at the metadata budget's limit), so their limit follows the budget rather than PHP's default.
 $verificationMemory = static function (): string {
-    $limit = (string) config('release_verification.worker_memory', '512M');
+    $limit = (string) config('release_verification.worker_memory', '1536M');
 
-    return escapeshellarg('memory_limit='.(preg_match('/^[1-9][0-9]*[KMG]?$/i', $limit) === 1 ? $limit : '512M'));
+    return escapeshellarg('memory_limit='.(preg_match('/^[1-9][0-9]*[KMG]?$/i', $limit) === 1 ? $limit : '1536M'));
 };
 
 // Each host sharing the database runs its own disjoint range of verification slots.
