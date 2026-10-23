@@ -152,6 +152,13 @@ class GetArticleRange extends Command
                 return self::SUCCESS;
             }
 
+            if ($binaries->completedRangeEnd() === null) {
+                $this->queueRangeForRepair($groupName, $firstArticle, $lastArticle);
+                $this->error('Header download did not complete; queued this range for part repair.');
+
+                return self::FAILURE;
+            }
+
             if (empty($return)) {
                 return self::SUCCESS;
             }
