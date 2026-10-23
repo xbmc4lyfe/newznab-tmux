@@ -18,6 +18,8 @@ final class RustPipelineLibrary
     /** @var array<string, FFI|false> */
     private static array $libraries = [];
 
+    private static FFI|false|null $defaultLibrary = null;
+
     private static ?CData $scratchBuf = null;
 
     private static int $scratchCap = 0;
@@ -523,14 +525,228 @@ final class RustPipelineLibrary
         return FFI::string($scratch, $written);
     }
 
-    public static function resolve(?string $libraryPath = null): ?FFI
+    /**
+     * Compute the truncated prefix byte length for `FileNameCleaner::stripKnownFileSuffixes`,
+     * or null when declined/unavailable.
+     */
+    public static function stripKnownFileSuffixesLen(string $fileName, bool $preserveCodecAfterWrapper, ?string $libraryPath = null): ?int
     {
-        if (! \in_array(PHP_OS_FAMILY, ['Linux', 'Darwin'], true) || ! \extension_loaded('FFI')) {
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
             return null;
         }
 
-        $pid = (int) getmypid();
-        $cacheKey = $pid.':'.($libraryPath ?? 'default');
+        // @phpstan-ignore method.notFound
+        $res = $ffi->nntmux_strip_known_file_suffixes($fileName, \strlen($fileName), $preserveCodecAfterWrapper ? 1 : 0);
+
+        return \is_int($res) && $res >= 0 ? $res : null;
+    }
+
+    /**
+     * Compute `FileNameCleaner::computeForMatching` as a packed `(start << 32) | len` span (`>= 0`),
+     * `-1` for `false`, or `null` when declined to PHP fallback / FFI unavailable.
+     */
+    public static function cleanForMatchingSpan(string $fileName, bool $preserveLeadingNumber, ?string $libraryPath = null): ?int
+    {
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $res = $ffi->nntmux_clean_for_matching_span($fileName, \strlen($fileName), $preserveLeadingNumber ? 1 : 0);
+
+        return \is_int($res) && $res >= -1 ? $res : null;
+    }
+
+    /**
+     * Compute `SeasonPackDetector` boolean flags (`1` = episode name, `2` = season pack, `0` = neither),
+     * or null when declined/unavailable.
+     */
+    public static function seasonPackFlags(string $name, ?string $libraryPath = null): ?int
+    {
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $res = $ffi->nntmux_season_pack_flags($name, \strlen($name));
+
+        return \is_int($res) && $res >= 0 ? $res : null;
+    }
+
+    /**
+     * Compute `SeasonPackDetector::episodeIdentity` via Rust FFI.
+     */
+    public static function seasonPackEpisodeIdentity(string $name, ?string $libraryPath = null, bool &$supported = false): ?string
+    {
+        $supported = false;
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($name);
+        $scratch = self::ensureScratch($ffi, max(256, $len + 32));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_season_pack_episode_identity($name, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1) {
+            return null;
+        }
+        if ($written < -1) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_season_pack_episode_identity($name, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        $supported = true;
+
+        return $written === 0 ? null : FFI::string($scratch, $written);
+    }
+
+    /**
+     * Batch check `SeasonPackDetector::hasNonSingleEpisodeEvidence` via Rust FFI.
+     *
+     * @param  list<string>  $names
+     */
+    public static function hasNonSingleEpisodeEvidence(array $names, ?string $libraryPath = null): ?bool
+    {
+        $count = \count($names);
+        if ($count === 0) {
+            return false;
+        }
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $joined = implode("\0", $names);
+        if (substr_count($joined, "\0") !== $count - 1) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $res = $ffi->nntmux_has_non_single_episode_evidence_nul($joined, \strlen($joined), $count);
+
+        return \is_int($res) && $res >= 0 ? ($res === 1) : null;
+    }
+
+    /**
+     * Compute `SeasonPackDetector::seasonNameFromEpisode` via Rust FFI.
+     */
+    public static function seasonNameFromEpisode(string $name, ?string $libraryPath = null, bool &$supported = false): ?string
+    {
+        $supported = false;
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($name);
+        $scratch = self::ensureScratch($ffi, max(256, $len + 32));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_season_name_from_episode($name, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1) {
+            return null;
+        }
+        if ($written < -1) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_season_name_from_episode($name, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        $supported = true;
+
+        return $written === 0 ? null : FFI::string($scratch, $written);
+    }
+
+    /**
+     * Compute `SeasonPackDetector::seasonNameFromEpisodes` and `isMultiEpisodeSet` via Rust FFI.
+     *
+     * @param  list<string>  $names
+     */
+    public static function seasonNameFromEpisodes(array $names, ?string $libraryPath = null, bool &$supported = false, bool &$isMultiEpisode = false): ?string
+    {
+        $supported = false;
+        $isMultiEpisode = false;
+        $count = \count($names);
+        if ($count < 2) {
+            $supported = true;
+
+            return null;
+        }
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $joined = implode("\0", $names);
+        if (substr_count($joined, "\0") !== $count - 1) {
+            return null;
+        }
+        $len = \strlen($joined);
+        $scratch = self::ensureScratch($ffi, max(256, $len + 64));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_season_name_from_episodes_nul($joined, $len, $count, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1) {
+            return null;
+        }
+        if ($written < -2) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_season_name_from_episodes_nul($joined, $len, $count, $scratch, self::$scratchCap);
+            if (! \is_int($written) || ($written < 0 && $written !== -2)) {
+                return null;
+            }
+        }
+
+        $supported = true;
+        if ($written === 0) {
+            return null;
+        }
+        $isMultiEpisode = true;
+
+        return $written === -2 ? null : FFI::string($scratch, $written);
+    }
+
+    public static function resolve(?string $libraryPath = null): ?FFI
+    {
+        if ($libraryPath === null && self::$defaultLibrary !== null) {
+            return self::$defaultLibrary === false ? null : self::$defaultLibrary;
+        }
+        if (! \in_array(PHP_OS_FAMILY, ['Linux', 'Darwin'], true) || ! \extension_loaded('FFI')) {
+            if ($libraryPath === null) {
+                self::$defaultLibrary = false;
+            }
+
+            return null;
+        }
+
+        $cacheKey = $libraryPath ?? 'default';
         if (\array_key_exists($cacheKey, self::$libraries)) {
             $cached = self::$libraries[$cacheKey];
 
@@ -565,6 +781,13 @@ final class RustPipelineLibrary
                     int32_t nntmux_is_hashed_or_gibberish(const char *input, size_t input_len);
                     ssize_t nntmux_is_hashed_or_gibberish_batch_nul(const char *input, size_t input_len, size_t count, char *out_buf, size_t out_cap);
                     ssize_t nntmux_misc_inspect_and_categorize(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_strip_known_file_suffixes(const char *input, size_t input_len, uint32_t preserve_codec);
+                    int64_t nntmux_clean_for_matching_span(const char *input, size_t input_len, uint32_t preserve_leading_number);
+                    int32_t nntmux_season_pack_flags(const char *input, size_t input_len);
+                    ssize_t nntmux_season_pack_episode_identity(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    int32_t nntmux_has_non_single_episode_evidence_nul(const char *input, size_t input_len, size_t count);
+                    ssize_t nntmux_season_name_from_episode(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_season_name_from_episodes_nul(const char *input, size_t input_len, size_t count, char *out_buf, size_t out_cap);
                     C, $resolved);
 
                 // @phpstan-ignore method.notFound
@@ -573,6 +796,9 @@ final class RustPipelineLibrary
                 }
 
                 self::$libraries[$cacheKey] = $ffi;
+                if ($libraryPath === null) {
+                    self::$defaultLibrary = $ffi;
+                }
 
                 return $ffi;
             } catch (Throwable) {
@@ -581,12 +807,18 @@ final class RustPipelineLibrary
         }
 
         self::$libraries[$cacheKey] = false;
+        if ($libraryPath === null) {
+            self::$defaultLibrary = false;
+        }
 
         return null;
     }
 
     private static function ensureScratch(FFI $ffi, int $minBytes): ?CData
     {
+        if (self::$scratchCap >= $minBytes && self::$scratchBuf !== null) {
+            return self::$scratchBuf;
+        }
         $required = max(self::INITIAL_SCRATCH_BYTES, $minBytes);
         if (self::$scratchBuf !== null && self::$scratchCap >= $required) {
             return self::$scratchBuf;

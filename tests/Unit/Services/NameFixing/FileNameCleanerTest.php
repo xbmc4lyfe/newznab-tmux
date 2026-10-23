@@ -62,4 +62,42 @@ class FileNameCleanerTest extends TestCase
         self::assertSame('Artist.Track', $cleaner->cleanForMatching('01.Artist.Track.flac'));
         self::assertSame('01.Artist.Track', $cleaner->cleanForMatching('01.Artist.Track.flac', preserveLeadingNumber: true));
     }
+
+    public function test_rust_ffi_and_php_fallback_produce_identical_cleaning_results(): void
+    {
+        $cleaner = new FileNameCleaner;
+        $samples = [
+            'Show.S01.1080p-GRP/Show.S01E01.Pilot.1080p.WEB-DL.DDP5.1.H.264-GRP.part01.rar',
+            'Movie.2026.2160p.UHD.BluRay.REMUX.HEVC.DTS-HD.MA.7.1-GROUP.mkv',
+            'Exact.Release.2026.1080p.WEB.x264-GRP.DTS.part12345.rar',
+            '01.Artist.Track.Name.2026.FLAC-GRP.flac',
+            'Film ;-)/VIDEO_TS/VTS_01_1.VOB',
+            'Film ;-)/cover the fisher king.jpg',
+            'Archive.Release.2026-GRP.vol00+01.par2',
+            'Game.Setup.2026-GRP.7z.001',
+            'Book.Title.2026.Retail-GRP.epub.rar',
+            'Film ;-)/Extreem Online Contact.url',
+            'VIDEO_TS/VTS_011.VOB',
+            'VIDEO_TS/vts0101.vob',
+            '.hidden_file.mkv',
+        ];
+
+        foreach ($samples as $sample) {
+            self::assertSame(
+                $cleaner->stripKnownFileSuffixesPhp($sample, true),
+                $cleaner->stripFileSuffixes($sample),
+                $sample
+            );
+            self::assertSame(
+                $cleaner->computeForMatchingPhp($sample, false),
+                $cleaner->cleanForMatching($sample, false),
+                $sample
+            );
+            self::assertSame(
+                $cleaner->computeForMatchingPhp($sample, true),
+                $cleaner->cleanForMatching($sample, true),
+                $sample
+            );
+        }
+    }
 }
