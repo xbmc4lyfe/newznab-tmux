@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services;
 
 use App\Support\Par2FileHashEvidence;
+use App\Support\RustPipelineLibrary;
 use dariusiii\rarinfo\Par2Info;
 use InvalidArgumentException;
 use LengthException;
@@ -27,8 +28,12 @@ final class Par2PacketAccumulator
         $this->assertStateLimit();
     }
 
-    public function append(string $bytes): void
+    public function append(string $bytes, bool $useNative = true): void
     {
+        if ($useNative && $this->consumeNative($bytes)) {
+            return;
+        }
+
         $next = clone $this;
         $next->consume($bytes);
         $this->packets = $next->packets;
@@ -48,7 +53,7 @@ final class Par2PacketAccumulator
     }
 
     /** @param array<string, mixed> $state */
-    public static function fromState(array $state, int $maxStateBytes = 262144): self
+    public static function fromState(array $state, int $maxStateBytes = 262144, bool $useNative = true): self
     {
         $keys = array_keys($state);
         sort($keys);
@@ -62,16 +67,26 @@ final class Par2PacketAccumulator
             throw new InvalidArgumentException('Invalid PAR2 accumulator state');
         }
         $result = new self($maxStateBytes);
-        if (strlen(json_encode($state, JSON_THROW_ON_ERROR)) > $maxStateBytes) {
+        if (self::encodedStateBytes($state['packets'], $state['tail'], $state['skip_remaining']) > $maxStateBytes) {
             throw new LengthException('PAR2 metadata state exceeds byte ceiling');
         }
+        $decodedChunks = [];
         foreach ($state['packets'] as $packet) {
             if (! is_string($packet)) {
                 throw new InvalidArgumentException('Invalid PAR2 packet inventory');
             }
-            $result->append(self::decode($packet));
+            $decodedChunks[] = self::decode($packet);
         }
-        $result->append(self::decode($state['tail']));
+        $decodedTail = self::decode($state['tail']);
+        if ($useNative) {
+            $decodedChunks[] = $decodedTail;
+            $result->append(implode('', $decodedChunks), useNative: true);
+        } else {
+            foreach ($decodedChunks as $decodedPacket) {
+                $result->append($decodedPacket, useNative: false);
+            }
+            $result->append($decodedTail, useNative: false);
+        }
         $result->skipRemaining = $state['skip_remaining'];
         $canonical = ['version' => $state['version'], 'packets' => $state['packets'], 'tail' => $state['tail'], 'skip_remaining' => $state['skip_remaining']];
         if ($result->exportState() !== $canonical) {
@@ -84,7 +99,21 @@ final class Par2PacketAccumulator
 
     public function stateBytes(): int
     {
-        return strlen(json_encode($this->exportState(), JSON_THROW_ON_ERROR));
+        $bytes = 54 + strlen((string) $this->skipRemaining);
+        if ($this->tail !== '') {
+            $tailB64 = base64_encode($this->tail);
+            $bytes += strlen($tailB64) + substr_count($tailB64, '/');
+        }
+        $count = count($this->packets);
+        if ($count > 0) {
+            $bytes += $count * 2 + ($count - 1);
+            foreach ($this->packets as $packet) {
+                $b64 = base64_encode($packet);
+                $bytes += strlen($b64) + substr_count($b64, '/');
+            }
+        }
+
+        return $bytes;
     }
 
     public function isComplete(): bool
@@ -92,9 +121,8 @@ final class Par2PacketAccumulator
         if ($this->tail !== '' || $this->skipRemaining !== 0 || $this->packets === []) {
             return false;
         }
-        $fileList = new Par2FileList;
-        foreach ($this->parsersBySet() as $parser) {
-            if ($fileList->hasUnresolvedDescriptors($parser)) {
+        foreach ($this->packetsBySet() as $setPackets) {
+            if (self::setPacketsHaveUnresolvedDescriptors($setPackets)) {
                 return false;
             }
         }
@@ -108,15 +136,15 @@ final class Par2PacketAccumulator
         if ($this->tail !== '' || $this->packets === []) {
             return false;
         }
-        $mainSets = [];
-        foreach ($this->packets as $packet) {
-            if (substr($packet, 48, 16) === Par2Info::PACKET_MAIN) {
-                $mainSets[bin2hex(substr($packet, 32, 16))] = true;
+        foreach ($this->packetsBySet() as $setPackets) {
+            $hasMain = false;
+            foreach ($setPackets as $packet) {
+                if (substr($packet, 48, 16) === Par2Info::PACKET_MAIN) {
+                    $hasMain = true;
+                    break;
+                }
             }
-        }
-        $fileList = new Par2FileList;
-        foreach ($this->parsersBySet() as $set => $parser) {
-            if (! isset($mainSets[$set]) || $fileList->hasUnresolvedDescriptors($parser)) {
+            if (! $hasMain || self::setPacketsHaveUnresolvedDescriptors($setPackets)) {
                 return false;
             }
         }
@@ -149,17 +177,62 @@ final class Par2PacketAccumulator
     public function filesBySet(): array
     {
         $files = [];
-        $fileList = new Par2FileList;
-        foreach ($this->parsersBySet() as $set => $parser) {
-            $files[$set] = $fileList->getFiles($parser);
-        }
-        foreach ($this->packets as $packet) {
-            if (substr($packet, 48, 16) === Par2Info::PACKET_FILEDESC) {
-                $set = bin2hex(substr($packet, 32, 16));
-                $fileId = bin2hex(substr($packet, 64, 16));
-                $files[$set][$fileId]['name'] = rtrim(substr($packet, 120), "\0");
-                $files[$set][$fileId]['size_decimal'] = Par2FileHashEvidence::littleEndianSize(substr($packet, 112, 8));
+        foreach ($this->packetsBySet() as $set => $setPackets) {
+            $ret = [];
+            $offset = 0;
+            foreach ($setPackets as $packet) {
+                $pktLen = strlen($packet);
+                $nextOffset = $offset + $pktLen;
+                $type = substr($packet, 48, 16);
+                if ($type === Par2Info::PACKET_FILEDESC) {
+                    $fileId = bin2hex(substr($packet, 64, 16));
+                    if (! isset($ret[$fileId])) {
+                        $lenParts = unpack('Vlow/Vhigh', substr($packet, 112, 8));
+                        $fileLength = $lenParts['low'] + ($lenParts['high'] * 0x100000000);
+                        $ret[$fileId] = [
+                            'name' => rtrim(substr($packet, 120), "\0"),
+                            'size' => $fileLength,
+                            'hash' => bin2hex(substr($packet, 80, 16)),
+                            'hash_16K' => bin2hex(substr($packet, 96, 16)),
+                            'blocks' => 0,
+                            'next_offset' => $nextOffset,
+                            'size_decimal' => Par2FileHashEvidence::littleEndianSize(substr($packet, 112, 8)),
+                        ];
+                    }
+                } elseif ($type === Par2Info::PACKET_FILEVER) {
+                    $fileId = bin2hex(substr($packet, 64, 16));
+                    if (empty($ret[$fileId]['blocks'])) {
+                        $ret[$fileId]['blocks'] = intdiv($pktLen - 80, 20);
+                    }
+                }
+                $offset = $nextOffset;
             }
+            $offset = 0;
+            foreach ($setPackets as $packet) {
+                $pktLen = strlen($packet);
+                $nextOffset = $offset + $pktLen;
+                if (substr($packet, 48, 16) === Par2Info::PACKET_FILEDESC) {
+                    $fileId = bin2hex(substr($packet, 64, 16));
+                    if (! isset($ret[$fileId]['name'])) {
+                        $lenParts = unpack('Vlow/Vhigh', substr($packet, 112, 8));
+                        $fileLength = $lenParts['low'] + ($lenParts['high'] * 0x100000000);
+                        $ret[$fileId] = [
+                            'name' => rtrim(substr($packet, 120), "\0"),
+                            'size' => $fileLength,
+                            'hash' => bin2hex(substr($packet, 80, 16)),
+                            'hash_16K' => bin2hex(substr($packet, 96, 16)),
+                            'blocks' => $ret[$fileId]['blocks'] ?? 0,
+                            'next_offset' => $nextOffset,
+                            'size_decimal' => Par2FileHashEvidence::littleEndianSize(substr($packet, 112, 8)),
+                        ];
+                    } else {
+                        $ret[$fileId]['name'] = rtrim(substr($packet, 120), "\0");
+                        $ret[$fileId]['size_decimal'] = Par2FileHashEvidence::littleEndianSize(substr($packet, 112, 8));
+                    }
+                }
+                $offset = $nextOffset;
+            }
+            $files[$set] = $ret;
         }
 
         return $files;
@@ -192,6 +265,122 @@ final class Par2PacketAccumulator
         }
 
         return $descriptors;
+    }
+
+    private function consumeNative(string $bytes): bool
+    {
+        $res = RustPipelineLibrary::par2ScanPackets(
+            implode('', $this->packets),
+            $this->tail,
+            $this->skipRemaining,
+            $this->maxStateBytes,
+            $bytes
+        );
+        if ($res === null) {
+            return false;
+        }
+        if ($res['status'] === -2) {
+            throw new InvalidArgumentException('Invalid PAR2 packet stream');
+        }
+        if ($res['status'] === -3) {
+            throw new LengthException('PAR2 metadata state exceeds byte ceiling');
+        }
+
+        $payload = $res['payload'];
+        /** @var array{skip: int, tailLen: int, newCount: int}|false $hdr */
+        $hdr = unpack('Pskip/VtailLen/VnewCount', substr($payload, 0, 16));
+        if (! is_array($hdr)) {
+            return false;
+        }
+
+        $tailLen = $hdr['tailLen'];
+        $newCount = $hdr['newCount'];
+        $this->skipRemaining = $hdr['skip'];
+        $this->tail = $tailLen > 0 ? substr($payload, 16, $tailLen) : '';
+
+        $off = 16 + $tailLen;
+        for ($i = 0; $i < $newCount; $i++) {
+            /** @var array{low: int, high: int} $lenParts */
+            $lenParts = unpack('Vlow/Vhigh', substr($payload, $off + 8, 8));
+            $pktLen = $lenParts['high'] * 0x100000000 + $lenParts['low'];
+            $this->packets[] = substr($payload, $off, $pktLen);
+            $off += $pktLen;
+        }
+
+        return true;
+    }
+
+    /**
+     * @return array<string, list<string>>
+     */
+    private function packetsBySet(): array
+    {
+        $sets = [];
+        foreach ($this->packets as $packet) {
+            $set = bin2hex(substr($packet, 32, 16));
+            $sets[$set][] = $packet;
+        }
+
+        return $sets;
+    }
+
+    /**
+     * @param  list<string>  $setPackets
+     */
+    private static function setPacketsHaveUnresolvedDescriptors(array $setPackets): bool
+    {
+        $required = [];
+        $described = [];
+        foreach ($setPackets as $packet) {
+            $type = substr($packet, 48, 16);
+            if ($type === Par2Info::PACKET_MAIN) {
+                $len = strlen($packet);
+                for ($off = 76; $off < $len; $off += 16) {
+                    $required[substr($packet, $off, 16)] = true;
+                }
+            } elseif ($type === Par2Info::PACKET_FILEVER) {
+                $required[substr($packet, 64, 16)] = true;
+            } elseif ($type === Par2Info::PACKET_FILEDESC) {
+                $fileId = substr($packet, 64, 16);
+                $required[$fileId] = true;
+                if (! array_key_exists($fileId, $described)) {
+                    $name = rtrim(substr($packet, 120), "\0");
+                    $described[$fileId] = trim($name) !== '';
+                }
+            }
+        }
+        if ($described === []) {
+            return true;
+        }
+        foreach ($required as $fileId => $_) {
+            if (! ($described[$fileId] ?? false)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @param  list<mixed>  $encodedPackets
+     */
+    private static function encodedStateBytes(array $encodedPackets, string $encodedTail, int $skipRemaining): int
+    {
+        $bytes = 54 + strlen((string) $skipRemaining);
+        if ($encodedTail !== '') {
+            $bytes += strlen($encodedTail) + substr_count($encodedTail, '/');
+        }
+        $count = count($encodedPackets);
+        if ($count > 0) {
+            $bytes += $count * 2 + ($count - 1);
+            foreach ($encodedPackets as $pkt) {
+                if (is_string($pkt)) {
+                    $bytes += strlen($pkt) + substr_count($pkt, '/');
+                }
+            }
+        }
+
+        return $bytes;
     }
 
     private function consume(string $bytes): void

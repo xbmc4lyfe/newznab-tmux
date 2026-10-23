@@ -352,6 +352,81 @@ final class RustPipelineLibrary
         return explode("\n", FFI::string($scratch, $written));
     }
 
+    /**
+     * Scans and validates a PAR2 packet stream via Rust FFI (`nntmux_par2_scan_packets`).
+     *
+     * @return array{status: int, payload: string}|null
+     */
+    public static function par2ScanPackets(
+        string $existingConcat,
+        string $tail,
+        int $skipRemaining,
+        int $maxStateBytes,
+        string $incoming,
+        ?string $libraryPath = null
+    ): ?array {
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+
+        $exLen = \strlen($existingConcat);
+        $tailLen = \strlen($tail);
+        $inLen = \strlen($incoming);
+        $estBytes = max(1024, $tailLen + $inLen + 64);
+        $scratch = self::ensureScratch($ffi, $estBytes);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_par2_scan_packets(
+            $existingConcat,
+            $exLen,
+            $tail,
+            $tailLen,
+            $skipRemaining,
+            $maxStateBytes,
+            $incoming,
+            $inLen,
+            $scratch,
+            self::$scratchCap
+        );
+        if (! \is_int($written)) {
+            return null;
+        }
+        if ($written <= -16) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_par2_scan_packets(
+                $existingConcat,
+                $exLen,
+                $tail,
+                $tailLen,
+                $skipRemaining,
+                $maxStateBytes,
+                $incoming,
+                $inLen,
+                $scratch,
+                self::$scratchCap
+            );
+        }
+        if (! \is_int($written)) {
+            return null;
+        }
+        if ($written === -2 || $written === -3) {
+            return ['status' => $written, 'payload' => ''];
+        }
+        if ($written < 16) {
+            return null;
+        }
+
+        return ['status' => 0, 'payload' => FFI::string($scratch, $written)];
+    }
+
     public static function resolve(?string $libraryPath = null): ?FFI
     {
         if (! \in_array(PHP_OS_FAMILY, ['Linux', 'Darwin'], true) || ! \extension_loaded('FFI')) {
@@ -390,6 +465,7 @@ final class RustPipelineLibrary
                     ssize_t nntmux_binary_identity_hash_batch_nul(const char *input, size_t input_len, size_t count, char *out_buf, size_t out_cap);
                     ssize_t nntmux_nzb_detect_file_extension(const char *subject, size_t subject_len, char *out_buf);
                     ssize_t nntmux_nzb_parse_files(const char *xml, size_t xml_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_par2_scan_packets(const char *existing, size_t existing_len, const char *tail, size_t tail_len, int64_t skip_remaining, int64_t max_state_bytes, const char *incoming, size_t incoming_len, char *out_buf, size_t out_cap);
                     C, $resolved);
 
                 // @phpstan-ignore method.notFound
