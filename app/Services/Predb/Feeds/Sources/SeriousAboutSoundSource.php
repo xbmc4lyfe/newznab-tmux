@@ -5,9 +5,11 @@ declare(strict_types=1);
 namespace App\Services\Predb\Feeds\Sources;
 
 use App\Services\Predb\Feeds\PredbFeedEntry;
+use App\Support\RustPipelineLibrary;
 use DOMDocument;
 use DOMElement;
 use DOMXPath;
+use FFI;
 use RuntimeException;
 
 /**
@@ -16,6 +18,13 @@ use RuntimeException;
  */
 final class SeriousAboutSoundSource extends BoundedHttpFeedSource
 {
+    private const NATIVE_CDEF = <<<'C'
+        int32_t nntmux_predb_html_validate_numeric_refs(const char *html, size_t len, uint32_t mode);
+        int32_t nntmux_predb_html_validate_listing_scope(const char *html, size_t len, uint32_t mode);
+        C;
+
+    private static FFI|false|null $native = null;
+
     private const ATTRIBUTE_REDEFINED = 42;
 
     public function key(): string
@@ -155,6 +164,28 @@ final class SeriousAboutSoundSource extends BoundedHttpFeedSource
     /** Reject references libxml could discard before literal title validation. */
     private function validateNumericReferences(string $html): void
     {
+        // Reference-free pages do not amortize an FFI call. Keep this common
+        // case in PHP's native string search rather than regressing its latency.
+        if (! str_contains($html, '&#')) {
+            return;
+        }
+        $ffi = self::$native ??= RustPipelineLibrary::resolveDomain('predb_sql_html', self::NATIVE_CDEF) ?? false;
+        if ($ffi !== false) {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_predb_html_validate_numeric_refs($html, strlen($html), 1);
+            if ($status === 1) {
+                return;
+            }
+            if ($status === 0) {
+                throw new RuntimeException('SERIOUSABOUTSOUND returned an invalid character reference.');
+            }
+        }
+
+        $this->validateNumericReferencesPhp($html);
+    }
+
+    private function validateNumericReferencesPhp(string $html): void
+    {
         $offset = 0;
         while (preg_match('/&#(?:(\d+)|x([0-9a-f]+));?/i', $html, $reference, PREG_OFFSET_CAPTURE, $offset) === 1) {
             $decimal = $reference[1][0];
@@ -178,6 +209,26 @@ final class SeriousAboutSoundSource extends BoundedHttpFeedSource
      * Require those boundaries before libxml can close a truncated listing for us.
      */
     private function validateClosedListingStructure(string $html): void
+    {
+        $ffi = self::$native ??= RustPipelineLibrary::resolveDomain('predb_sql_html', self::NATIVE_CDEF) ?? false;
+        if ($ffi !== false) {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_predb_html_validate_listing_scope($html, strlen($html), 1);
+            if ($status === 1) {
+                return;
+            }
+            if ($status === 0) {
+                throw new RuntimeException('SERIOUSABOUTSOUND returned an incomplete listing document.');
+            }
+            if ($status === -2) {
+                throw new RuntimeException('SERIOUSABOUTSOUND returned an incomplete listing scope.');
+            }
+        }
+
+        $this->validateClosedListingStructurePhp($html);
+    }
+
+    private function validateClosedListingStructurePhp(string $html): void
     {
         $markup = preg_replace('~<!--.*?(?:-->|\z)|<(script|style)\b[^>]*>.*?(?:</\1\s*>|\z)~is', '', $html);
         if ($markup === null || preg_match('~</html\s*>\s*\z~i', $markup) !== 1
