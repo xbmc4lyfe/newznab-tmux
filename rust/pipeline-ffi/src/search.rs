@@ -1361,6 +1361,1097 @@ pub unsafe extern "C" fn nntmux_search_sanitize_lucene(
     cur.finish()
 }
 
+#[inline]
+fn is_known_unicode_c(c: char) -> bool {
+    let u = c as u32;
+    if u <= 0x1F || (0x7F..=0x9F).contains(&u) {
+        return true;
+    }
+    if (0xE000..=0xF8FF).contains(&u)
+        || (0xF0000..=0xFFFFD).contains(&u)
+        || (0x100000..=0x10FFFD).contains(&u)
+    {
+        return true;
+    }
+    if (0xFDD0..=0xFDEF).contains(&u) || (u & 0xFFFE) == 0xFFFE {
+        return true;
+    }
+    matches!(
+        u,
+        0x00AD
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
+}
+
+#[inline]
+fn is_known_non_c_unicode(c: char) -> bool {
+    let u = c as u32;
+    (0x00A0..=0x024F).contains(&u) || u == 0x1F3B5
+}
+
+/// Validates a `title` or `filename` field for `PredbSearchDocument::filenameCandidate`.
+/// Returns `Some(false)` when definitely invalid, `Some(true)` when valid and all codepoints are
+/// verified non-`\p{C}`, or `None` when UTF-8/length/separator rules pass but non-ASCII codepoints
+/// require PHP PCRE2 `/\p{C}/u` verification.
+#[inline]
+fn validate_predb_text_field(bytes: &[u8], max_chars: usize, forbid_separators: bool) -> Option<bool> {
+    if bytes.len() > max_chars * 4 {
+        return Some(false);
+    }
+    if bytes.is_ascii() {
+        if bytes.len() > max_chars {
+            return Some(false);
+        }
+        if forbid_separators {
+            for &b in bytes {
+                if b < 0x20 || b == 0x7F || matches!(b, b'/' | b'\\' | b'|') {
+                    return Some(false);
+                }
+            }
+        } else {
+            for &b in bytes {
+                if b < 0x20 || b == 0x7F {
+                    return Some(false);
+                }
+            }
+        }
+        return Some(true);
+    }
+
+    if forbid_separators && bytes.iter().any(|&b| matches!(b, b'/' | b'\\' | b'|')) {
+        return Some(false);
+    }
+    let Ok(s) = std::str::from_utf8(bytes) else {
+        return Some(false);
+    };
+    let mut count = 0usize;
+    let mut needs_pcre = false;
+    for c in s.chars() {
+        count += 1;
+        if count > max_chars || is_known_unicode_c(c) {
+            return Some(false);
+        }
+        if !c.is_ascii() && !is_known_non_c_unicode(c) {
+            needs_pcre = true;
+        }
+    }
+    if needs_pcre {
+        None
+    } else {
+        Some(true)
+    }
+}
+
+/// Accelerates `PredbSearchDocument::filenameCandidate` validation in a single zero-allocation call.
+/// Returns the positive `i64` document ID when valid, `0` when invalid (`null`), `-1` on null pointers,
+/// or `-2` when non-ASCII codepoints in `title`/`filename` should be checked by PHP `preg_match('/\p{C}/u', ...)`.
+///
+/// # Safety
+///
+/// All non-empty byte slice pointers (`id_str`, `title`, `filename`, `source`) must be valid for reads of their lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_predb_validate_filename_candidate(
+    id_str: *const u8,
+    id_len: usize,
+    id_int: i64,
+    has_id_int: u32,
+    title: *const u8,
+    title_len: usize,
+    filename: *const u8,
+    filename_len: usize,
+    source: *const u8,
+    source_len: usize,
+) -> i64 {
+    if (has_id_int == 0 && id_len > 0 && id_str.is_null())
+        || (title_len > 0 && title.is_null())
+        || (filename_len > 0 && filename.is_null())
+        || (source_len > 0 && source.is_null())
+    {
+        return -1;
+    }
+
+    let valid_id = if has_id_int != 0 {
+        if id_int <= 0 {
+            return 0;
+        }
+        id_int
+    } else {
+        if id_len == 0 {
+            return 0;
+        }
+        let id_bytes = unsafe { slice::from_raw_parts(id_str, id_len) };
+        let mut acc: i64 = 0;
+        for &b in id_bytes {
+            if !b.is_ascii_digit() {
+                return 0;
+            }
+            acc = match acc.checked_mul(10).and_then(|v| v.checked_add(i64::from(b - b'0'))) {
+                Some(v) => v,
+                None => return 0,
+            };
+        }
+        if acc <= 0 {
+            return 0;
+        }
+        acc
+    };
+
+    if title_len == 0 || title_len > 255 * 4 || filename_len > 255 * 4 || source_len > 50 * 4 {
+        return 0;
+    }
+
+    if source_len > 0 {
+        let src_bytes = unsafe { slice::from_raw_parts(source, source_len) };
+        if src_bytes.is_ascii() {
+            if source_len > 50 {
+                return 0;
+            }
+        } else {
+            let Ok(s) = std::str::from_utf8(src_bytes) else {
+                return 0;
+            };
+            if s.chars().count() > 50 {
+                return 0;
+            }
+        }
+    }
+
+    let title_bytes = unsafe { slice::from_raw_parts(title, title_len) };
+    let mut needs_pcre = false;
+    match validate_predb_text_field(title_bytes, 255, true) {
+        Some(true) => {}
+        Some(false) => return 0,
+        None => needs_pcre = true,
+    }
+
+    if filename_len > 0 {
+        let fname_bytes = unsafe { slice::from_raw_parts(filename, filename_len) };
+        match validate_predb_text_field(fname_bytes, 255, false) {
+            Some(true) => {}
+            Some(false) => return 0,
+            None => needs_pcre = true,
+        }
+    }
+
+    if needs_pcre {
+        -2
+    } else {
+        valid_id
+    }
+}
+
+struct SliceOut<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl<'a> SliceOut<'a> {
+    #[inline(always)]
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, len: 0 }
+    }
+
+    #[inline(always)]
+    fn push_byte(&mut self, b: u8) {
+        if self.len < self.buf.len() {
+            unsafe {
+                *self.buf.as_mut_ptr().add(self.len) = b;
+            }
+        }
+        self.len += 1;
+    }
+
+    #[inline(always)]
+    fn push_2bytes(&mut self, a: u8, b: u8) {
+        if self.len + 2 <= self.buf.len() {
+            unsafe {
+                let p = self.buf.as_mut_ptr().add(self.len);
+                *p = a;
+                *p.add(1) = b;
+            }
+        }
+        self.len += 2;
+    }
+
+    #[inline(always)]
+    fn push_slice(&mut self, bytes: &[u8]) {
+        let blen = bytes.len();
+        let next = self.len + blen;
+        if next <= self.buf.len() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    self.buf.as_mut_ptr().add(self.len),
+                    blen,
+                );
+            }
+        }
+        self.len = next;
+    }
+
+    #[inline(always)]
+    fn finish(&self) -> isize {
+        if self.len > self.buf.len() {
+            -(self.len.max(4) as isize)
+        } else {
+            self.len as isize
+        }
+    }
+}
+
+#[inline(always)]
+fn prometheus_escape_help(help: &[u8], cur: &mut SliceOut<'_>) {
+    let hlen = help.len();
+    if cur.len + hlen * 2 <= cur.buf.len() {
+        unsafe {
+            let base = cur.buf.as_mut_ptr();
+            let mut wp = base.add(cur.len);
+            for &b in help {
+                if b == b'\\' {
+                    *wp = b'\\';
+                    *wp.add(1) = b'\\';
+                    wp = wp.add(2);
+                } else if b == b'\n' {
+                    *wp = b'\\';
+                    *wp.add(1) = b'n';
+                    wp = wp.add(2);
+                } else {
+                    *wp = b;
+                    wp = wp.add(1);
+                }
+            }
+            cur.len = wp.offset_from(base) as usize;
+        }
+        return;
+    }
+    for &b in help {
+        match b {
+            b'\\' => cur.push_2bytes(b'\\', b'\\'),
+            b'\n' => cur.push_2bytes(b'\\', b'n'),
+            _ => cur.push_byte(b),
+        }
+    }
+}
+
+#[inline(always)]
+fn prometheus_escape_label_value(v: &[u8], cur: &mut SliceOut<'_>) {
+    let vlen = v.len();
+    if cur.len + vlen * 2 <= cur.buf.len() {
+        unsafe {
+            let base = cur.buf.as_mut_ptr();
+            let mut wp = base.add(cur.len);
+            for &b in v {
+                match b {
+                    b'\\' => {
+                        *wp = b'\\';
+                        *wp.add(1) = b'\\';
+                        wp = wp.add(2);
+                    }
+                    b'"' => {
+                        *wp = b'\\';
+                        *wp.add(1) = b'"';
+                        wp = wp.add(2);
+                    }
+                    b'\n' => {
+                        *wp = b'\\';
+                        *wp.add(1) = b'n';
+                        wp = wp.add(2);
+                    }
+                    _ => {
+                        *wp = b;
+                        wp = wp.add(1);
+                    }
+                }
+            }
+            cur.len = wp.offset_from(base) as usize;
+        }
+        return;
+    }
+    for &b in v {
+        match b {
+            b'\\' => cur.push_2bytes(b'\\', b'\\'),
+            b'"' => cur.push_2bytes(b'\\', b'"'),
+            b'\n' => cur.push_2bytes(b'\\', b'n'),
+            _ => cur.push_byte(b),
+        }
+    }
+}
+
+#[inline]
+fn prometheus_format_float_bytes(bytes: &[u8], cur: &mut SliceOut<'_>) -> bool {
+    match bytes {
+        b"NAN" | b"NaN" | b"nan" => {
+            cur.push_slice(b"NaN");
+            return true;
+        }
+        b"INF" | b"+INF" | b"Inf" | b"+Inf" | b"inf" | b"+inf" => {
+            cur.push_slice(b"+Inf");
+            return true;
+        }
+        b"-INF" | b"-Inf" | b"-inf" => {
+            cur.push_slice(b"-Inf");
+            return true;
+        }
+        b"0" | b"-0" | b"0.0" | b"-0.0" => {
+            cur.push_byte(b'0');
+            return true;
+        }
+        _ => {}
+    }
+    if !bytes.is_empty() && bytes.len() <= 14 {
+        let start = usize::from(bytes[0] == b'-');
+        if start < bytes.len() {
+            let mut dot_pos: Option<usize> = None;
+            let mut all_valid = true;
+            for (i, &b) in bytes[start..].iter().enumerate() {
+                if b == b'.' {
+                    if dot_pos.is_some() || i == 0 {
+                        all_valid = false;
+                        break;
+                    }
+                    dot_pos = Some(start + i);
+                } else if !b.is_ascii_digit() {
+                    all_valid = false;
+                    break;
+                }
+            }
+            if all_valid {
+                if let Some(dp) = dot_pos {
+                    let frac_len = bytes.len() - dp - 1;
+                    if (1..=6).contains(&frac_len) {
+                        let mut end = bytes.len();
+                        while end > dp + 1 && bytes[end - 1] == b'0' {
+                            end -= 1;
+                        }
+                        if end == dp + 1 {
+                            end = dp;
+                        }
+                        let trimmed = &bytes[..end];
+                        if trimmed == b"-0" || trimmed == b"0" {
+                            cur.push_byte(b'0');
+                        } else {
+                            cur.push_slice(trimmed);
+                        }
+                        return true;
+                    }
+                } else {
+                    if bytes == b"-0" || bytes == b"0" {
+                        cur.push_byte(b'0');
+                    } else {
+                        cur.push_slice(bytes);
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+    let Ok(s) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let Ok(val) = s.parse::<f64>() else {
+        return false;
+    };
+    if val.is_nan() {
+        cur.push_slice(b"NaN");
+        return true;
+    }
+    if val.is_infinite() {
+        cur.push_slice(if val.is_sign_positive() { b"+Inf" } else { b"-Inf" });
+        return true;
+    }
+    let mut buf = [0u8; 64];
+    let mut w = std::io::Cursor::new(&mut buf[..]);
+    if std::io::Write::write_fmt(&mut w, format_args!("{:.6}", val)).is_err() {
+        return false;
+    }
+    let mut len = w.position() as usize;
+    while len > 0 && buf[len - 1] == b'0' {
+        len -= 1;
+    }
+    if len > 0 && buf[len - 1] == b'.' {
+        len -= 1;
+    }
+    let formatted = &buf[..len];
+    if formatted == b"-0" || formatted.is_empty() {
+        cur.push_byte(b'0');
+    } else {
+        cur.push_slice(formatted);
+    }
+    true
+}
+
+#[inline]
+fn parse_usize_ascii(bytes: &[u8]) -> Option<usize> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut acc = 0usize;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        acc = acc.checked_mul(10)?.checked_add(usize::from(b - b'0'))?;
+    }
+    Some(acc)
+}
+
+#[inline]
+fn php_ser_expect(slice: &[u8], pos: &mut usize, expected: &[u8]) -> bool {
+    if slice.len().saturating_sub(*pos) < expected.len() {
+        return false;
+    }
+    if &slice[*pos..*pos + expected.len()] != expected {
+        return false;
+    }
+    *pos += expected.len();
+    true
+}
+
+#[inline(always)]
+fn php_ser_read_usize_until(slice: &[u8], pos: &mut usize, delim: u8) -> Option<usize> {
+    let mut p = *pos;
+    let n = slice.len();
+    if p >= n || !slice[p].is_ascii_digit() {
+        return None;
+    }
+    let mut acc = usize::from(slice[p] - b'0');
+    p += 1;
+    while p < n {
+        let b = slice[p];
+        if b == delim {
+            *pos = p + 1;
+            return Some(acc);
+        }
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        acc = acc.checked_mul(10)?.checked_add(usize::from(b - b'0'))?;
+        p += 1;
+    }
+    None
+}
+
+#[inline(always)]
+fn php_ser_read_str<'a>(slice: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
+    let p = *pos;
+    if p + 4 > slice.len() || slice[p] != b's' || slice[p + 1] != b':' {
+        return None;
+    }
+    *pos = p + 2;
+    let len = php_ser_read_usize_until(slice, pos, b':')?;
+    let q = *pos;
+    if q + len + 3 > slice.len() || slice[q] != b'"' || slice[q + 1 + len] != b'"' || slice[q + 2 + len] != b';' {
+        return None;
+    }
+    *pos = q + 3 + len;
+    Some(&slice[q + 1..q + 1 + len])
+}
+
+#[inline]
+fn php_ser_skip_key(slice: &[u8], pos: &mut usize) -> bool {
+    if *pos >= slice.len() {
+        return false;
+    }
+    if slice[*pos] == b'i' {
+        if !php_ser_expect(slice, pos, b"i:") {
+            return false;
+        }
+        let start = *pos;
+        if *pos < slice.len() && slice[*pos] == b'-' {
+            *pos += 1;
+        }
+        while *pos < slice.len() && slice[*pos].is_ascii_digit() {
+            *pos += 1;
+        }
+        if *pos == start || !php_ser_expect(slice, pos, b";") {
+            return false;
+        }
+        true
+    } else if slice[*pos] == b's' {
+        php_ser_read_str(slice, pos).is_some()
+    } else {
+        false
+    }
+}
+
+#[inline]
+fn php_ser_skip_samples(slice: &[u8], pos: &mut usize, sample_count: usize) -> bool {
+    let n = slice.len();
+    let mut p = *pos;
+    for _ in 0..sample_count {
+        if p + 26 >= n || slice[p] != b'i' || slice[p + 1] != b':' {
+            return false;
+        }
+        p += 2;
+        while p < n && slice[p] != b';' {
+            p += 1;
+        }
+        // Skip `;a:2:{s:6:"labels";a:` (21 bytes)
+        p += 21;
+        if p >= n {
+            return false;
+        }
+        let mut label_count = 0usize;
+        while p < n && slice[p].is_ascii_digit() {
+            label_count = label_count
+                .wrapping_mul(10)
+                .wrapping_add(usize::from(slice[p] - b'0'));
+            p += 1;
+        }
+        // Skip `:{` (2 bytes)
+        p += 2;
+        for _ in 0..(label_count * 2) {
+            // Skip `s:` (2 bytes)
+            p += 2;
+            if p >= n {
+                return false;
+            }
+            let mut slen = 0usize;
+            while p < n && slice[p].is_ascii_digit() {
+                slen = slen
+                    .wrapping_mul(10)
+                    .wrapping_add(usize::from(slice[p] - b'0'));
+                p += 1;
+            }
+            // Skip `:"` + slen + `";` (4 + slen bytes)
+            p = p.saturating_add(4).saturating_add(slen);
+        }
+        // Skip `}s:5:"value";` + `i:`/`d:` (15 bytes)
+        p += 15;
+        while p < n && slice[p] != b';' {
+            p += 1;
+        }
+        // Skip `;}` (2 bytes)
+        p += 2;
+    }
+    if p > n {
+        return false;
+    }
+    *pos = p;
+    true
+}
+
+fn prometheus_format_php_serialized(slice: &[u8], cur: &mut SliceOut<'_>) -> bool {
+    let mut pos = 0usize;
+    if !php_ser_expect(slice, &mut pos, b"a:") {
+        return false;
+    }
+    let Some(family_count) = php_ser_read_usize_until(slice, &mut pos, b':') else {
+        return false;
+    };
+    if !php_ser_expect(slice, &mut pos, b"{") {
+        return false;
+    }
+
+    const MF_HEADER: &[u8] = b"O:47:\"App\\Services\\Monitoring\\Prometheus\\MetricFamily\":4:{";
+    const SAMPLES_PROP: &[u8] = b"\0App\\Services\\Monitoring\\Prometheus\\MetricFamily\0samples";
+
+    for _ in 0..family_count {
+        if !php_ser_skip_key(slice, &mut pos) {
+            return false;
+        }
+        if !php_ser_expect(slice, &mut pos, MF_HEADER) {
+            return false;
+        }
+
+        let mut name_slice: Option<&[u8]> = None;
+        let mut help_slice: Option<&[u8]> = None;
+        let mut type_slice: Option<&[u8]> = None;
+        let mut samples_info: Option<(usize, &[u8])> = None;
+
+        for _ in 0..4 {
+            let Some(pname) = php_ser_read_str(slice, &mut pos) else {
+                return false;
+            };
+            match pname {
+                b"name" => {
+                    name_slice = php_ser_read_str(slice, &mut pos);
+                    if name_slice.is_none() {
+                        return false;
+                    }
+                }
+                b"help" => {
+                    help_slice = php_ser_read_str(slice, &mut pos);
+                    if help_slice.is_none() {
+                        return false;
+                    }
+                }
+                b"type" => {
+                    type_slice = php_ser_read_str(slice, &mut pos);
+                    if type_slice.is_none() {
+                        return false;
+                    }
+                }
+                SAMPLES_PROP => {
+                    if !php_ser_expect(slice, &mut pos, b"a:") {
+                        return false;
+                    }
+                    let Some(sc) = php_ser_read_usize_until(slice, &mut pos, b':') else {
+                        return false;
+                    };
+                    if !php_ser_expect(slice, &mut pos, b"{") {
+                        return false;
+                    }
+                    let s_start = pos;
+                    if sc > 0 && !php_ser_skip_samples(slice, &mut pos, sc) {
+                        return false;
+                    }
+                    let s_end = pos;
+                    if !php_ser_expect(slice, &mut pos, b"}") {
+                        return false;
+                    }
+                    samples_info = Some((sc, &slice[s_start..s_end]));
+                }
+                _ => return false,
+            }
+        }
+
+        if !php_ser_expect(slice, &mut pos, b"}") {
+            return false;
+        }
+
+        let (Some(name), Some(help), Some(kind), Some((sample_count, samples_bytes))) =
+            (name_slice, help_slice, type_slice, samples_info)
+        else {
+            return false;
+        };
+
+        if sample_count == 0 {
+            continue;
+        }
+
+        cur.push_slice(b"# HELP ");
+        cur.push_slice(name);
+        cur.push_byte(b' ');
+        prometheus_escape_help(help, cur);
+        cur.push_byte(b'\n');
+
+        cur.push_slice(b"# TYPE ");
+        cur.push_slice(name);
+        cur.push_byte(b' ');
+        cur.push_slice(kind);
+        cur.push_byte(b'\n');
+
+        let mut spos = 0usize;
+        for _ in 0..sample_count {
+            if !php_ser_skip_key(samples_bytes, &mut spos) {
+                return false;
+            }
+            if !php_ser_expect(samples_bytes, &mut spos, b"a:2:{s:6:\"labels\";a:") {
+                return false;
+            }
+            let Some(label_count) = php_ser_read_usize_until(samples_bytes, &mut spos, b':') else {
+                return false;
+            };
+            if !php_ser_expect(samples_bytes, &mut spos, b"{") {
+                return false;
+            }
+
+            cur.push_slice(name);
+            if label_count > 0 {
+                cur.push_byte(b'{');
+                for l_idx in 0..label_count {
+                    if l_idx > 0 {
+                        cur.push_byte(b',');
+                    }
+                    let Some(k) = php_ser_read_str(samples_bytes, &mut spos) else {
+                        return false;
+                    };
+                    let Some(v) = php_ser_read_str(samples_bytes, &mut spos) else {
+                        return false;
+                    };
+                    cur.push_slice(k);
+                    cur.push_2bytes(b'=', b'"');
+                    prometheus_escape_label_value(v, cur);
+                    cur.push_byte(b'"');
+                }
+                cur.push_byte(b'}');
+            }
+
+            if !php_ser_expect(samples_bytes, &mut spos, b"}s:5:\"value\";") {
+                return false;
+            }
+            let vtag = samples_bytes[spos];
+            spos += 2; // 'i:' or 'd:'
+            let v_start = spos;
+            while spos < samples_bytes.len() && samples_bytes[spos] != b';' {
+                spos += 1;
+            }
+            if spos == v_start || spos >= samples_bytes.len() {
+                return false;
+            }
+            let vbytes = &samples_bytes[v_start..spos];
+            spos += 1;
+            if !php_ser_expect(samples_bytes, &mut spos, b"}") {
+                return false;
+            }
+
+            cur.push_byte(b' ');
+            if vtag == b'i' {
+                cur.push_slice(vbytes);
+            } else if !prometheus_format_float_bytes(vbytes, cur) {
+                return false;
+            }
+            cur.push_byte(b'\n');
+        }
+    }
+
+    php_ser_expect(slice, &mut pos, b"}") && pos == slice.len()
+}
+
+#[inline]
+fn read_nul_token<'a>(slice: &'a [u8], pos: &mut usize, allow_eof: bool) -> Option<&'a [u8]> {
+    let start = *pos;
+    if start > slice.len() {
+        return None;
+    }
+    let mut p = start;
+    while p < slice.len() && slice[p] != 0 {
+        p += 1;
+    }
+    if p < slice.len() {
+        *pos = p + 1;
+        Some(&slice[start..p])
+    } else if allow_eof && start < slice.len() {
+        *pos = slice.len();
+        Some(&slice[start..])
+    } else {
+        None
+    }
+}
+
+fn prometheus_format_nul_packed(slice: &[u8], cur: &mut SliceOut<'_>) -> bool {
+    let mut pos = 0usize;
+    while pos < slice.len() {
+        let Some(name) = read_nul_token(slice, &mut pos, false) else {
+            return false;
+        };
+        if name.is_empty() {
+            return false;
+        }
+        let Some(help) = read_nul_token(slice, &mut pos, false) else {
+            return false;
+        };
+        let Some(kind) = read_nul_token(slice, &mut pos, false) else {
+            return false;
+        };
+        let Some(sc_bytes) = read_nul_token(slice, &mut pos, true) else {
+            return false;
+        };
+        let Some(sample_count) = parse_usize_ascii(sc_bytes) else {
+            return false;
+        };
+        if sample_count == 0 {
+            continue;
+        }
+
+        cur.push_slice(b"# HELP ");
+        cur.push_slice(name);
+        cur.push_byte(b' ');
+        prometheus_escape_help(help, cur);
+        cur.push_byte(b'\n');
+
+        cur.push_slice(b"# TYPE ");
+        cur.push_slice(name);
+        cur.push_byte(b' ');
+        cur.push_slice(kind);
+        cur.push_byte(b'\n');
+
+        for s_idx in 0..sample_count {
+            let Some(lc_bytes) = read_nul_token(slice, &mut pos, false) else {
+                return false;
+            };
+            let Some(label_count) = parse_usize_ascii(lc_bytes) else {
+                return false;
+            };
+
+            cur.push_slice(name);
+            if label_count > 0 {
+                cur.push_byte(b'{');
+                for l_idx in 0..label_count {
+                    if l_idx > 0 {
+                        cur.push_byte(b',');
+                    }
+                    let Some(k) = read_nul_token(slice, &mut pos, false) else {
+                        return false;
+                    };
+                    let Some(v) = read_nul_token(slice, &mut pos, false) else {
+                        return false;
+                    };
+                    cur.push_slice(k);
+                    cur.push_2bytes(b'=', b'"');
+                    prometheus_escape_label_value(v, cur);
+                    cur.push_byte(b'"');
+                }
+                cur.push_byte(b'}');
+            }
+
+            let allow_eof = s_idx + 1 == sample_count;
+            let Some(vbytes) = read_nul_token(slice, &mut pos, allow_eof) else {
+                return false;
+            };
+            if vbytes.is_empty() {
+                return false;
+            }
+            cur.push_byte(b' ');
+            let is_plain_int = vbytes != b"-0"
+                && vbytes.len() <= 19
+                && if vbytes[0] == b'-' {
+                    vbytes.len() > 1 && vbytes[1..].iter().all(|b| b.is_ascii_digit())
+                } else {
+                    vbytes.iter().all(|b| b.is_ascii_digit())
+                };
+            if is_plain_int {
+                cur.push_slice(vbytes);
+            } else if !prometheus_format_float_bytes(vbytes, cur) {
+                return false;
+            }
+            cur.push_byte(b'\n');
+        }
+    }
+    true
+}
+
+/// Accelerates `Prometheus\TextFormatter::format` over either a PHP `serialize()` payload of
+/// `MetricFamily[]` (`a:<count>:{...}`) or a NUL-separated packed stream
+/// `name\0help\0type\0sample_count\0(label_count\0(k\0v\0)*value_str\0)*`.
+/// Returns `>= 0` written bytes, `-2` when declined to PHP, `-1` on null input, or `< -2` when `out_buf` is too small.
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_prometheus_format_text(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input_len == 0 {
+        return 0;
+    }
+    if input.is_null() {
+        return -1;
+    }
+    let slice = unsafe { slice::from_raw_parts(input, input_len) };
+    let mut empty = [0u8; 0];
+    let out_slice = if out_buf.is_null() || out_cap == 0 {
+        &mut empty[..]
+    } else {
+        unsafe { slice::from_raw_parts_mut(out_buf, out_cap) }
+    };
+    let mut cur = SliceOut::new(out_slice);
+
+    let is_php_serialized = slice.starts_with(b"a:") && {
+        let mut p = 2usize;
+        while p < slice.len() && slice[p].is_ascii_digit() {
+            p += 1;
+        }
+        p > 2 && slice[p..].starts_with(b":{")
+    };
+
+    let ok = if is_php_serialized {
+        prometheus_format_php_serialized(slice, &mut cur)
+    } else {
+        prometheus_format_nul_packed(slice, &mut cur)
+    };
+
+    if !ok {
+        return -2;
+    }
+    cur.finish()
+}
+
+/// Accelerates `ReleaseSearchIndexDocument::plainSearchName`:
+/// `trim((string) preg_replace('/[._-]+/', ' ', $value))`.
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_plain_search_name(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input_len == 0 {
+        return 0;
+    }
+    if input.is_null() {
+        return -1;
+    }
+    let slice = unsafe { slice::from_raw_parts(input, input_len) };
+    let mut out = SmallBytes::new();
+    let mut in_sep = false;
+    for &b in slice {
+        if matches!(b, b'.' | b'_' | b'-') {
+            if !in_sep {
+                out.push(b' ');
+                in_sep = true;
+            }
+        } else {
+            out.push(b);
+            in_sep = false;
+        }
+    }
+    let trimmed = trim_php_ws(out.as_slice());
+    let mut cur = OutCursor::new(out_buf, out_cap);
+    cur.push_slice(trimmed);
+    cur.finish()
+}
+
+#[inline]
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+}
+
+#[inline]
+fn days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(y) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+#[inline]
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = y - i64::from(m <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + i64::from(doe) - 719468
+}
+
+#[inline]
+fn parse_2digits(b: &[u8]) -> Option<u32> {
+    if b.len() >= 2 && b[0].is_ascii_digit() && b[1].is_ascii_digit() {
+        Some(u32::from(b[0] - b'0') * 10 + u32::from(b[1] - b'0'))
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn parse_4digits(b: &[u8]) -> Option<i64> {
+    if b.len() >= 4
+        && b[0].is_ascii_digit()
+        && b[1].is_ascii_digit()
+        && b[2].is_ascii_digit()
+        && b[3].is_ascii_digit()
+    {
+        Some(
+            i64::from(b[0] - b'0') * 1000
+                + i64::from(b[1] - b'0') * 100
+                + i64::from(b[2] - b'0') * 10
+                + i64::from(b[3] - b'0'),
+        )
+    } else {
+        None
+    }
+}
+
+/// Parses a standard UTC `YYYY-MM-DD HH:MM:SS`, `YYYY-MM-DDTHH:MM:SS[Z]`, or `YYYY-MM-DD` datetime string
+/// into a Unix timestamp (`i64`), or returns `i64::MIN` when declined to PHP `strtotime`.
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_datetime_to_unix_utc(input: *const u8, input_len: usize) -> i64 {
+    if input_len == 0 {
+        return 0;
+    }
+    if input.is_null() {
+        return i64::MIN;
+    }
+    let s = trim_php_ws(unsafe { slice::from_raw_parts(input, input_len) });
+    if s.is_empty() {
+        return 0;
+    }
+    if !matches!(s.len(), 10 | 19 | 20) {
+        return i64::MIN;
+    }
+    if s[4] != b'-' || s[7] != b'-' {
+        return i64::MIN;
+    }
+    let Some(year) = parse_4digits(&s[0..4]) else {
+        return i64::MIN;
+    };
+    let Some(month) = parse_2digits(&s[5..7]) else {
+        return i64::MIN;
+    };
+    let Some(day) = parse_2digits(&s[8..10]) else {
+        return i64::MIN;
+    };
+    if !(1902..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+    {
+        return i64::MIN;
+    }
+
+    let (hour, min, sec) = if s.len() == 10 {
+        (0u32, 0u32, 0u32)
+    } else {
+        if !matches!(s[10], b' ' | b'T' | b't') || s[13] != b':' || s[16] != b':' {
+            return i64::MIN;
+        }
+        if s.len() == 20 && !matches!(s[19], b'Z' | b'z') {
+            return i64::MIN;
+        }
+        let Some(h) = parse_2digits(&s[11..13]) else {
+            return i64::MIN;
+        };
+        let Some(m) = parse_2digits(&s[14..16]) else {
+            return i64::MIN;
+        };
+        let Some(sc) = parse_2digits(&s[17..19]) else {
+            return i64::MIN;
+        };
+        if h > 23 || m > 59 || sc > 59 {
+            return i64::MIN;
+        }
+        (h, m, sc)
+    };
+
+    days_from_civil(year, month, day) * 86_400
+        + i64::from(hour) * 3_600
+        + i64::from(min) * 60
+        + i64::from(sec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1400,5 +2491,89 @@ mod tests {
             &buf[..n as usize],
             b"movie title +1080p -cam \\-\\-double *wild* \\(test\\:1\\)"
         );
+    }
+
+    #[test]
+    fn test_predb_validate_filename_candidate_rules() {
+        let title = b"Canonical.Release-GRP";
+        let fname = b"C:\\directory\\Alias.Release-GRP.rar";
+        let src = b"srrdb";
+        let id = unsafe {
+            nntmux_predb_validate_filename_candidate(
+                b"07".as_ptr(),
+                2,
+                0,
+                0,
+                title.as_ptr(),
+                title.len(),
+                fname.as_ptr(),
+                fname.len(),
+                src.as_ptr(),
+                src.len(),
+            )
+        };
+        assert_eq!(id, 7);
+
+        // Forbidden title separator
+        let bad_title = b"bad/title";
+        let id_bad = unsafe {
+            nntmux_predb_validate_filename_candidate(
+                std::ptr::null(),
+                0,
+                7,
+                1,
+                bad_title.as_ptr(),
+                bad_title.len(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+            )
+        };
+        assert_eq!(id_bad, 0);
+
+        // Control character U+200B in filename
+        let zwsp_fname = "/bad\u{200B}directory/Alias.rar".as_bytes();
+        let id_zwsp = unsafe {
+            nntmux_predb_validate_filename_candidate(
+                std::ptr::null(),
+                0,
+                7,
+                1,
+                title.as_ptr(),
+                title.len(),
+                zwsp_fname.as_ptr(),
+                zwsp_fname.len(),
+                std::ptr::null(),
+                0,
+            )
+        };
+        assert_eq!(id_zwsp, 0);
+    }
+
+    #[test]
+    fn test_prometheus_format_text_nul_and_escapes() {
+        let input = b"nntmux_test\0Line one\nline \\ two\0gauge\02\01\0server\0news \"primary\"\\eu\nwest\01\01\0case\0fraction\00.250000\0";
+        let mut buf = [0u8; 512];
+        let n = unsafe {
+            nntmux_prometheus_format_text(input.as_ptr(), input.len(), buf.as_mut_ptr(), buf.len())
+        };
+        assert!(n > 0);
+        let expected = b"# HELP nntmux_test Line one\\nline \\\\ two\n# TYPE nntmux_test gauge\nnntmux_test{server=\"news \\\"primary\\\"\\\\eu\\nwest\"} 1\nnntmux_test{case=\"fraction\"} 0.25\n";
+        assert_eq!(&buf[..n as usize], &expected[..]);
+    }
+
+    #[test]
+    fn test_datetime_to_unix_utc_and_plain_search_name() {
+        let dt = b"2026-01-02 03:04:05";
+        let ts = unsafe { nntmux_datetime_to_unix_utc(dt.as_ptr(), dt.len()) };
+        assert_eq!(ts, 1_767_323_045);
+
+        let sn = b"..Release._-Name--2026_.";
+        let mut buf = [0u8; 64];
+        let n = unsafe {
+            nntmux_release_plain_search_name(sn.as_ptr(), sn.len(), buf.as_mut_ptr(), buf.len())
+        };
+        assert_eq!(&buf[..n as usize], b"Release Name 2026");
     }
 }

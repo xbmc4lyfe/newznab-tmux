@@ -4,11 +4,25 @@ declare(strict_types=1);
 
 namespace App\Support;
 
+use FFI;
+use Throwable;
+
 /**
  * Normalizes release rows into search index document fields (Manticore + Elasticsearch).
  */
 final class ReleaseSearchIndexDocument
 {
+    private const string FFI_CDEF = <<<'C'
+        int64_t nntmux_predb_validate_filename_candidate(const char *id_str, size_t id_len, int64_t id_int, uint32_t has_id_int, const char *title, size_t title_len, const char *filename, size_t filename_len, const char *source, size_t source_len);
+        ssize_t nntmux_prometheus_format_text(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_release_plain_search_name(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        int64_t nntmux_datetime_to_unix_utc(const char *input, size_t input_len);
+        C;
+
+    private static FFI|false|null $ffi = null;
+
+    private static bool $useNative = true;
+
     /**
      * Fields that may be returned to browse/search consumers.
      * Sensitive release data must never be added to this list.
@@ -141,6 +155,33 @@ final class ReleaseSearchIndexDocument
 
     private static function datetimeToUnix(mixed $value): int
     {
+        if ($value === null || $value === '' || $value === 0 || $value === '0') {
+            return 0;
+        }
+        if (is_int($value) || is_float($value)) {
+            return (int) $value;
+        }
+        $str = (string) $value;
+        $len = strlen($str);
+        if (self::$useNative && ($len === 19 || $len === 10 || $len === 20) && date_default_timezone_get() === 'UTC') {
+            $ffi = self::$ffi ??= (RustPipelineLibrary::resolveDomain('search_doc_metrics', self::FFI_CDEF) ?? false);
+            if ($ffi !== false) {
+                try {
+                    // @phpstan-ignore method.notFound
+                    $ts = $ffi->nntmux_datetime_to_unix_utc($str, $len);
+                    if (is_int($ts) && $ts !== PHP_INT_MIN) {
+                        return $ts;
+                    }
+                } catch (Throwable) {
+                }
+            }
+        }
+
+        return self::datetimeToUnixPhp($value);
+    }
+
+    private static function datetimeToUnixPhp(mixed $value): int
+    {
         if ($value === null || $value === '') {
             return 0;
         }
@@ -152,6 +193,11 @@ final class ReleaseSearchIndexDocument
         return $ts !== false ? $ts : 0;
     }
 
+    /**
+     * Retains native PHP `preg_replace` under the < 1.5x FFI bailout rule (`1.04x` with per-call
+     * `FFI::string` allocation overhead); `nntmux_release_plain_search_name` remains exported in
+     * `rust/pipeline-ffi/src/search.rs` for C-ABI parity.
+     */
     private static function plainSearchName(mixed $value): string
     {
         return trim((string) preg_replace('/[._-]+/', ' ', (string) $value));
