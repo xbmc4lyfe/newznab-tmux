@@ -266,10 +266,7 @@ fn strip_game_extension(s: &str) -> &str {
 
 fn replace_brackets_with_space(s: &str) -> Cow<'_, str> {
     let bytes = s.as_bytes();
-    if !bytes
-        .iter()
-        .any(|&b| matches!(b, b'[' | b'(' | b'{'))
-    {
+    if !bytes.iter().any(|&b| matches!(b, b'[' | b'(' | b'{')) {
         return Cow::Borrowed(s);
     }
     let len = bytes.len();
@@ -355,8 +352,7 @@ fn finish_edition_suffix(bytes: &[u8], core_end: usize) -> Option<usize> {
     let len = bytes.len();
     let mut sep_end = core_end;
     while sep_end < len
-        && (bytes[sep_end].is_ascii_whitespace()
-            || matches!(bytes[sep_end], b'.' | b'_' | b'-'))
+        && (bytes[sep_end].is_ascii_whitespace() || matches!(bytes[sep_end], b'.' | b'_' | b'-'))
     {
         sep_end += 1;
     }
@@ -487,16 +483,14 @@ fn match_standalone_edition_word(bytes: &[u8], pos: usize) -> Option<usize> {
 }
 
 fn apply_steam_compound_editions(s: &mut String) {
-    replace_ascii_wb_in_place(s, |bytes, pos| {
-        match bytes.get(pos)?.to_ascii_lowercase() {
-            b'g' => match_goty_phrase(bytes, pos)
-                .or_else(|| match_goty_word(bytes, pos))
-                .or_else(|| match_named_edition(bytes, pos)),
-            b'd' => match_named_edition(bytes, pos).or_else(|| match_remaster_edition(bytes, pos)),
-            b'u' | b'c' | b'e' | b's' | b'p' | b'l' => match_named_edition(bytes, pos),
-            b'r' | b'h' | b'a' => match_remaster_edition(bytes, pos),
-            _ => None,
-        }
+    replace_ascii_wb_in_place(s, |bytes, pos| match bytes.get(pos)?.to_ascii_lowercase() {
+        b'g' => match_goty_phrase(bytes, pos)
+            .or_else(|| match_goty_word(bytes, pos))
+            .or_else(|| match_named_edition(bytes, pos)),
+        b'd' => match_named_edition(bytes, pos).or_else(|| match_remaster_edition(bytes, pos)),
+        b'u' | b'c' | b'e' | b's' | b'p' | b'l' => match_named_edition(bytes, pos),
+        b'r' | b'h' | b'a' => match_remaster_edition(bytes, pos),
+        _ => None,
     });
     replace_ascii_wb_in_place(s, match_standalone_edition_word);
 }
@@ -729,7 +723,10 @@ pub fn steam_replace_roman_numerals(input: &str) -> String {
         let ch_len = ch.len_utf8();
         let curr_is_word = is_uni_word(ch);
 
-        if !prev_is_word && curr_is_word && matches!(bytes[pos], b'i' | b'I' | b'v' | b'V' | b'x' | b'X') {
+        if !prev_is_word
+            && curr_is_word
+            && matches!(bytes[pos], b'i' | b'I' | b'v' | b'V' | b'x' | b'X')
+        {
             let mut w_end = pos + 1;
             while w_end < len && matches!(bytes[w_end], b'i' | b'I' | b'v' | b'V' | b'x' | b'X') {
                 w_end += 1;
@@ -851,32 +848,31 @@ fn match_steam_noise_at(s: &str, bytes: &[u8], pos: usize) -> Option<usize> {
     // Check multi-word EDITION_TAGS in lowercase
     match word {
         b"game" => {
-            if pos + 16 <= len && &bytes[pos..pos + 16] == b"game of the year" && is_uni_wb_end(s, pos + 16) {
+            if pos + 16 <= len
+                && &bytes[pos..pos + 16] == b"game of the year"
+                && is_uni_wb_end(s, pos + 16)
+            {
                 return Some(pos + 16);
             }
         }
         b"hd" => {
-            if pos + 11 <= len && &bytes[pos..pos + 11] == b"hd remaster" && is_uni_wb_end(s, pos + 11) {
+            if pos + 11 <= len
+                && &bytes[pos..pos + 11] == b"hd remaster"
+                && is_uni_wb_end(s, pos + 11)
+            {
                 return Some(pos + 11);
             }
         }
         b"directors" => {
-            if pos + 13 <= len && &bytes[pos..pos + 13] == b"directors cut" && is_uni_wb_end(s, pos + 13) {
+            if pos + 13 <= len
+                && &bytes[pos..pos + 13] == b"directors cut"
+                && is_uni_wb_end(s, pos + 13)
+            {
                 return Some(pos + 13);
             }
         }
-        b"definitive"
-        | b"deluxe"
-        | b"ultimate"
-        | b"complete"
-        | b"anniversary"
-        | b"enhanced"
-        | b"special"
-        | b"collectors"
-        | b"gold"
-        | b"premium"
-        | b"legendary"
-        | b"standard"
+        b"definitive" | b"deluxe" | b"ultimate" | b"complete" | b"anniversary" | b"enhanced"
+        | b"special" | b"collectors" | b"gold" | b"premium" | b"legendary" | b"standard"
         | b"digital" => {
             let ed_end = w_end + 8;
             if ed_end <= len && &bytes[w_end..ed_end] == b" edition" && is_uni_wb_end(s, ed_end) {
@@ -1423,7 +1419,7 @@ fn clean_version_tokens(name: &str) -> String {
         } else {
             let mut v = Vec::with_capacity(128);
             for &b in &tokens[..tcount] {
-                v.push( unsafe { str::from_utf8_unchecked(b) });
+                v.push(unsafe { str::from_utf8_unchecked(b) });
             }
             v.push(tok);
             overflow = Some(v);
@@ -1442,7 +1438,10 @@ fn clean_version_tokens(name: &str) -> String {
             if starts_with_v || is_pure_digits {
                 let mut j = i + 1;
                 let mut num_run = 0usize;
-                while j < v.len() && !v[j].is_empty() && v[j].as_bytes().iter().all(|b| b.is_ascii_digit()) {
+                while j < v.len()
+                    && !v[j].is_empty()
+                    && v[j].as_bytes().iter().all(|b| b.is_ascii_digit())
+                {
                     num_run += 1;
                     j += 1;
                 }
@@ -1683,7 +1682,11 @@ pub fn games_clean_release_name(input: &str) -> Option<String> {
     }
 
     // Replace `[._+]+` with `' '`
-    if name.as_bytes().iter().any(|&b| matches!(b, b'.' | b'_' | b'+')) {
+    if name
+        .as_bytes()
+        .iter()
+        .any(|&b| matches!(b, b'.' | b'_' | b'+'))
+    {
         let mut next_name = String::with_capacity(name.len());
         let mut in_sep = false;
         for &b in name.as_bytes() {
@@ -1846,24 +1849,36 @@ pub fn games_normalize_for_match(input: &str) -> Option<String> {
         }
         match word {
             b"game" => {
-                if pos + 16 <= len && &bytes[pos..pos + 16] == b"game of the year" && is_ascii_wb(bytes, pos + 16) {
+                if pos + 16 <= len
+                    && &bytes[pos..pos + 16] == b"game of the year"
+                    && is_ascii_wb(bytes, pos + 16)
+                {
                     return Some(pos + 16);
                 }
             }
             b"hd" => {
-                if pos + 11 <= len && &bytes[pos..pos + 11] == b"hd remaster" && is_ascii_wb(bytes, pos + 11) {
+                if pos + 11 <= len
+                    && &bytes[pos..pos + 11] == b"hd remaster"
+                    && is_ascii_wb(bytes, pos + 11)
+                {
                     return Some(pos + 11);
                 }
             }
             b"directors" | b"director" => {
                 let cut_end = w_end + 4;
-                if cut_end <= len && &bytes[w_end..cut_end] == b" cut" && is_ascii_wb(bytes, cut_end) {
+                if cut_end <= len
+                    && &bytes[w_end..cut_end] == b" cut"
+                    && is_ascii_wb(bytes, cut_end)
+                {
                     return Some(cut_end);
                 }
             }
             b"definitive" | b"deluxe" | b"ultimate" | b"complete" | b"anniversary" => {
                 let ed_end = w_end + 8;
-                if ed_end <= len && &bytes[w_end..ed_end] == b" edition" && is_ascii_wb(bytes, ed_end) {
+                if ed_end <= len
+                    && &bytes[w_end..ed_end] == b" edition"
+                    && is_ascii_wb(bytes, ed_end)
+                {
                     return Some(ed_end);
                 }
             }
@@ -2317,7 +2332,8 @@ pub fn book_has_structural_conflict(
     }
 
     if let Some(cv) = c_vol {
-        let p_vol = extract_volume_marker(parsed_raw).or_else(|| extract_volume_marker(parsed_title));
+        let p_vol =
+            extract_volume_marker(parsed_raw).or_else(|| extract_volume_marker(parsed_title));
         if let Some(pv) = p_vol
             && pv != cv
         {
@@ -2325,7 +2341,8 @@ pub fn book_has_structural_conflict(
         }
     }
     if let Some(ce) = c_ed {
-        let p_ed = extract_edition_marker(parsed_raw).or_else(|| extract_edition_marker(parsed_title));
+        let p_ed =
+            extract_edition_marker(parsed_raw).or_else(|| extract_edition_marker(parsed_title));
         if let Some(pe) = p_ed
             && pe != ce
         {
@@ -2410,27 +2427,25 @@ fn is_anime_control_byte(b: u8) -> bool {
 
 #[inline]
 fn is_anime_lang_code(word: &[u8]) -> bool {
-    matches!(
-        word.len(),
-        3 | 5 | 7
-    ) && (word.eq_ignore_ascii_case(b"ENG")
-        || word.eq_ignore_ascii_case(b"JAP")
-        || word.eq_ignore_ascii_case(b"JPN")
-        || word.eq_ignore_ascii_case(b"SUB")
-        || word.eq_ignore_ascii_case(b"DUB")
-        || word.eq_ignore_ascii_case(b"RAW")
-        || word.eq_ignore_ascii_case(b"ITA")
-        || word.eq_ignore_ascii_case(b"SPA")
-        || word.eq_ignore_ascii_case(b"FRE")
-        || word.eq_ignore_ascii_case(b"GER")
-        || word.eq_ignore_ascii_case(b"RUS")
-        || word.eq_ignore_ascii_case(b"CHI")
-        || word.eq_ignore_ascii_case(b"KOR")
-        || word.eq_ignore_ascii_case(b"MULTI")
-        || word.eq_ignore_ascii_case(b"HARDSUB")
-        || word.eq_ignore_ascii_case(b"SOFTSUB")
-        || word.eq_ignore_ascii_case(b"HARDDUB")
-        || word.eq_ignore_ascii_case(b"SOFTDUB"))
+    matches!(word.len(), 3 | 5 | 7)
+        && (word.eq_ignore_ascii_case(b"ENG")
+            || word.eq_ignore_ascii_case(b"JAP")
+            || word.eq_ignore_ascii_case(b"JPN")
+            || word.eq_ignore_ascii_case(b"SUB")
+            || word.eq_ignore_ascii_case(b"DUB")
+            || word.eq_ignore_ascii_case(b"RAW")
+            || word.eq_ignore_ascii_case(b"ITA")
+            || word.eq_ignore_ascii_case(b"SPA")
+            || word.eq_ignore_ascii_case(b"FRE")
+            || word.eq_ignore_ascii_case(b"GER")
+            || word.eq_ignore_ascii_case(b"RUS")
+            || word.eq_ignore_ascii_case(b"CHI")
+            || word.eq_ignore_ascii_case(b"KOR")
+            || word.eq_ignore_ascii_case(b"MULTI")
+            || word.eq_ignore_ascii_case(b"HARDSUB")
+            || word.eq_ignore_ascii_case(b"SOFTSUB")
+            || word.eq_ignore_ascii_case(b"HARDDUB")
+            || word.eq_ignore_ascii_case(b"SOFTDUB"))
 }
 
 #[inline]

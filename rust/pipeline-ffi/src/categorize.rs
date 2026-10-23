@@ -525,7 +525,10 @@ fn match_usenet_archive_suffix(s: &[u8]) -> Option<usize> {
         while i < s.len() && s[i].is_ascii_digit() {
             i += 1;
         }
-        if i > 4 && i + 5 <= s.len() && s[i..i + 4].eq_ignore_ascii_case(b".rar") && s[i + 4] == b'"'
+        if i > 4
+            && i + 5 <= s.len()
+            && s[i..i + 4].eq_ignore_ascii_case(b".rar")
+            && s[i + 4] == b'"'
         {
             return Some(i + 5);
         }
@@ -1042,9 +1045,7 @@ pub fn compute_signal_markers_mask(name: &[u8]) -> u16 {
                 if matches!(
                     lw,
                     b"x264" | b"x265" | b"h264" | b"h265" | b"hevc" | b"xvid" | b"av1"
-                ) || (prev_was_h
-                    && sep_byte == Some(b'.')
-                    && matches!(lw, b"264" | b"265"))
+                ) || (prev_was_h && sep_byte == Some(b'.') && matches!(lw, b"264" | b"265"))
                 {
                     mask |= 1 << 3;
                 }
@@ -1263,9 +1264,9 @@ pub fn misc_inspect_and_categorize(name: &[u8]) -> (u16, u8, u8, u16, bool, Core
     let signal_score = markers_mask.count_ones();
     let core_s = strip_trailing_pcre_newline(core_name);
     let is_core_token = !core_s.is_empty()
-        && core_s.iter().all(|&b| {
-            b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'_' | b'=' | b'-')
-        });
+        && core_s
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'_' | b'=' | b'-'));
     let strong_words = has_strong_word_structure(name, core_name);
     let low_signal = signal_score == 0 && is_core_token && core_name.len() >= 12 && !strong_words;
 
