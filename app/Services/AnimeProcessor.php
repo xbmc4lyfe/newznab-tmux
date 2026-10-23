@@ -10,6 +10,7 @@ use App\Models\Category;
 use App\Models\Release;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\PopulateAniListService as PaList;
+use App\Support\RustPipelineLibrary;
 
 class AnimeProcessor
 {
@@ -132,6 +133,17 @@ class AnimeProcessor
      */
     private function extractTitleEpisode(string $cleanName = ''): array
     {
+        $rustTitle = RustPipelineLibrary::animeExtractTitle($cleanName);
+        if ($rustTitle !== null) {
+            if ($rustTitle === '') {
+                $this->status = self::PROC_EXTFAIL;
+
+                return [];
+            }
+
+            return ['title' => $rustTitle];
+        }
+
         // Fix UTF-8 encoding issues (double-encoding, corrupted sequences)
         $s = $this->fixEncoding($cleanName);
 
@@ -238,6 +250,11 @@ class AnimeProcessor
      */
     private function cleanTitle(string $title): string
     {
+        $rustTitle = RustPipelineLibrary::animeCleanTitle($title);
+        if ($rustTitle !== null) {
+            return $rustTitle;
+        }
+
         // Fix encoding issues first
         $title = $this->fixEncoding($title);
 

@@ -8,6 +8,7 @@ use App\Models\AnidbInfo;
 use App\Models\Category;
 use App\Models\Release;
 use App\Services\PopulateAniListService;
+use App\Support\RustPipelineLibrary;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 
@@ -361,6 +362,11 @@ class RefreshAnimeData extends Command
             return [];
         }
 
+        $rustTitle = RustPipelineLibrary::animeExtractTitle($searchname);
+        if ($rustTitle !== null) {
+            return $rustTitle === '' ? [] : ['title' => $rustTitle];
+        }
+
         // Fix UTF-8 encoding issues (double-encoding, corrupted sequences)
         $s = $this->fixEncoding($searchname);
 
@@ -464,6 +470,11 @@ class RefreshAnimeData extends Command
      */
     private function cleanTitle(string $title): string
     {
+        $rustTitle = RustPipelineLibrary::animeCleanTitle($title);
+        if ($rustTitle !== null) {
+            return $rustTitle;
+        }
+
         // Fix encoding issues first
         $title = $this->fixEncoding($title);
 
