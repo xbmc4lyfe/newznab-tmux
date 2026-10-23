@@ -23,6 +23,7 @@ use App\Services\Search\Support\ReleaseIndexProjection;
 use App\Services\Search\Support\SearchFailureTracker;
 use App\Support\PredbSearchDocument;
 use App\Support\ReleaseSearchIndexDocument;
+use App\Support\RustPipelineLibrary;
 use App\Support\SecondaryIndexDocuments;
 use Elastic\Elasticsearch\Client;
 use Elastic\Elasticsearch\Exception\ElasticsearchException;
@@ -551,22 +552,34 @@ class ElasticSearchDriver implements PredbFilenameCandidateLookup, ReleaseCandid
 
             $response = $client->search($searchParams);
 
-            // Extract common terms from results that differ from the query
-            $termCounts = [];
+            $searchnames = [];
             if (isset($response['hits']['hits'])) {
                 foreach ($response['hits']['hits'] as $hit) {
-                    $searchname = $hit['_source']['searchname'] ?? '';
-                    $words = preg_split('/[\s.\-_]+/', strtolower($searchname));
+                    $sn = $hit['_source']['searchname'] ?? '';
+                    if (is_string($sn) && $sn !== '') {
+                        $searchnames[] = $sn;
+                    }
+                }
+            }
 
-                    foreach ($words as $word) {
-                        if (strlen($word) >= 3 && $word !== strtolower($query)) {
-                            $distance = levenshtein(strtolower($query), $word);
-                            if ($distance > 0 && $distance <= 3) {
-                                if (! isset($termCounts[$word])) {
-                                    $termCounts[$word] = ['count' => 0, 'distance' => $distance];
-                                }
-                                $termCounts[$word]['count']++;
+            $rust = RustPipelineLibrary::searchSuggestFallbackBatch($searchnames, $query, 5);
+            if ($rust !== null) {
+                return $rust;
+            }
+
+            // Extract common terms from results that differ from the query
+            $termCounts = [];
+            foreach ($searchnames as $searchname) {
+                $words = preg_split('/[\s.\-_]+/', strtolower($searchname)) ?: [];
+
+                foreach ($words as $word) {
+                    if (strlen($word) >= 3 && $word !== strtolower($query)) {
+                        $distance = levenshtein(strtolower($query), $word);
+                        if ($distance > 0 && $distance <= 3) {
+                            if (! isset($termCounts[$word])) {
+                                $termCounts[$word] = ['count' => 0, 'distance' => $distance];
                             }
+                            $termCounts[$word]['count']++;
                         }
                     }
                 }
@@ -578,7 +591,7 @@ class ElasticSearchDriver implements PredbFilenameCandidateLookup, ReleaseCandid
             $suggestions = [];
             foreach (array_slice($termCounts, 0, 5, true) as $term => $data) {
                 $suggestions[] = [
-                    'suggest' => $term,
+                    'suggest' => (string) $term,
                     'distance' => $data['distance'],
                     'docs' => $data['count'],
                 ];
@@ -603,6 +616,12 @@ class ElasticSearchDriver implements PredbFilenameCandidateLookup, ReleaseCandid
      */
     private function extractSuggestion(string $searchname, string $query): ?string
     {
+        $supported = false;
+        $rust = RustPipelineLibrary::searchExtractSuggestion($searchname, $query, null, $supported);
+        if ($supported) {
+            return $rust;
+        }
+
         // Clean up the searchname - remove file extensions
         $clean = preg_replace('/\.(mkv|avi|mp4|wmv|nfo|nzb|par2|rar|zip|r\d+)$/i', '', $searchname);
 
