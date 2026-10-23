@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace App\Services;
 
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
+use App\Support\RustPipelineLibrary;
+use FFI;
 
 /**
  * Basic IRC client for fetching IRCScraper.
@@ -400,27 +402,20 @@ class IRCClient
             }
             $this->_readSocket();
 
-            // If the server pings us, return it a pong.
-            if (preg_match('/^PING\s*:(.+?)$/', $this->_buffer, $hits)) {
-                if ($hits[1] === $this->_remote_host_received) {
-                    $this->_pong($hits[1]);
-                }
-
-                // Check for a channel message.
-            } elseif (preg_match(
-                '/^:(?P<nickname>.+?)!.+?\s+PRIVMSG\s+(?P<channel>#.+?)\s+:\s*(?P<message>.+?)\s*$/',
-                $this->_stripControlCharacters($this->_buffer),
-                $hits
-            )
-            ) {
-                $this->_channelData =
-                    [
-                        'nickname' => $hits['nickname'],
-                        'channel' => $hits['channel'],
-                        'message' => $hits['message'],
+            $frame = $this->parseInboundLine($this->_buffer);
+            if ($frame !== null) {
+                if ($frame[0] === 'P') {
+                    if ($frame[1] === $this->_remote_host_received) {
+                        $this->_pong($frame[1]);
+                    }
+                } else {
+                    $this->_channelData = [
+                        'nickname' => $frame[1],
+                        'channel' => $frame[2],
+                        'message' => $frame[3],
                     ];
-
-                $this->processChannelMessages();
+                    $this->processChannelMessages();
+                }
             }
 
             // Ping the server if it has not sent us a ping in a while.
@@ -791,10 +786,85 @@ class IRCClient
         return \is_resource($this->_socket) && ! feof($this->_socket);
     }
 
+    /** @return list<string>|null P + payload, or M + nickname, channel, message. */
+    protected function parseInboundLine(string $line): ?array
+    {
+        static $native = null;
+        static $buffer = null;
+        static $capacity = 0;
+        $native ??= RustPipelineLibrary::resolveDomain('irc_pre_announce',
+            'ssize_t nntmux_irc_parse_inbound_line(const char *input, size_t input_len, char *out_buf, size_t out_cap);') ?? false;
+        if ($native instanceof FFI) {
+            $length = strlen($line);
+            if ($buffer === null || $capacity < $length + 4) {
+                $buffer = RustPipelineLibrary::obtainScratch($native, $length + 4, $capacity);
+            }
+            if ($buffer !== null) {
+                // @phpstan-ignore method.notFound
+                $written = $native->nntmux_irc_parse_inbound_line($line, $length, $buffer, $capacity);
+                if ($written === 0) {
+                    return null;
+                }
+                if ($written > 0) {
+                    return explode("\0", FFI::string($buffer, $written));
+                }
+            }
+        }
+
+        return $this->parseInboundLinePhp($line);
+    }
+
+    /** @return list<string>|null */
+    protected function parseInboundLinePhp(string $line): ?array
+    {
+        if (preg_match('/^PING\s*:(.+?)$/', $line, $hits)) {
+            return ['P', $hits[1]];
+        }
+        if (preg_match(
+            '/^:(?P<nickname>.+?)!.+?\s+PRIVMSG\s+(?P<channel>#.+?)\s+:\s*(?P<message>.+?)\s*$/',
+            $this->_stripControlCharactersPhp($line),
+            $hits
+        )) {
+            return ['M', $hits['nickname'], $hits['channel'], $hits['message']];
+        }
+
+        return null;
+    }
+
+    /**
+     * Strip with reusable native scratch, retaining PHP when FFI is unavailable.
+     */
+    protected function _stripControlCharacters(string $text): string
+    {
+        $length = strlen($text);
+        if ($length === 0 || ($text[0] !== "\x03" && strcspn($text, "\x02\x03\x04\x0f\x11\x16\x1d\x1e\x1f") === $length)) {
+            return $text;
+        }
+        static $native = null;
+        static $buffer = null;
+        static $capacity = 0;
+        $native ??= RustPipelineLibrary::resolveDomain('irc_pre_announce',
+            'ssize_t nntmux_irc_strip_control_chars(const char *input, size_t input_len, char *out_buf, size_t out_cap);') ?? false;
+        if ($native instanceof FFI) {
+            if ($buffer === null || $capacity < $length) {
+                $buffer = RustPipelineLibrary::obtainScratch($native, max(1, $length), $capacity);
+            }
+            if ($buffer !== null) {
+                // @phpstan-ignore method.notFound
+                $written = $native->nntmux_irc_strip_control_chars($text, $length, $buffer, $capacity);
+                if ($written >= 0) {
+                    return $written === 0 ? '' : FFI::string($buffer, $written);
+                }
+            }
+        }
+
+        return $this->_stripControlCharactersPhp($text);
+    }
+
     /**
      * Strips control characters from a IRC message.
      */
-    protected function _stripControlCharacters(string $text): string
+    protected function _stripControlCharactersPhp(string $text): string
     {
         $result = preg_replace(
             [
