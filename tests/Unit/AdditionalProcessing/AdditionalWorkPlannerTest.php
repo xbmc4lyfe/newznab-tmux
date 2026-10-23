@@ -6,6 +6,9 @@ namespace Tests\Unit\AdditionalProcessing;
 
 use App\Services\AdditionalProcessing\AdditionalWorkPlanner;
 use App\Services\AdditionalProcessing\DTO\ArchiveCandidate;
+use App\Services\AdditionalProcessing\Enums\VideoContainer;
+use App\Services\AdditionalProcessing\Media\ImageCandidateRanker;
+use App\Services\AdditionalProcessing\SevenZipListingParser;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
@@ -615,5 +618,78 @@ class AdditionalWorkPlannerTest extends TestCase
             $this->assertSame(['<m1-1>'], $plan->archiveCandidates[0]->messageIds);
             $this->assertSame('split:movie.2026.mkv', $plan->archiveCandidates[0]->setKey);
         }
+    }
+
+    #[Test]
+    public function it_preserves_exact_rust_and_php_fallback_parity_across_additional_processing_helpers(): void
+    {
+        $config = $this->makeConfig([
+            'processThumbnails' => true,
+            'processJPGSample' => true,
+            'processMediaInfo' => true,
+            'processAudioInfo' => true,
+            'processPasswords' => true,
+            'par2MediaMapping' => true,
+            'mediaMainVideoFallback' => true,
+            'audioFileRegex' => '\.(AAC|AIFF|APE|AC3|ASF|DTS|FLAC|MKA|MKS|MP2|MP3|RA|OGG|OGM|W64|WAV|WMA)',
+            'ignoreBookRegex' => '/\b(epub|lit|mobi|pdf|sipdf|html)\b.*\.rar(?!.{20,})/i',
+            'supportFileRegex' => '\.(?:vol\d{1,3}\+\d{1,3}|par2|srs|sfv|nzb)',
+            'videoFileRegex' => '\.(AVI|F4V|IFO|M1V|M2V|M4V|MKV|MOV|MP4|MPEG|MPG|MPGV|MPV|OGV|QT|RM|RMVB|TS|VOB|WMV)',
+        ]);
+
+        $nzb = [
+            ['title' => 'Group Post [01/10] - "Show.S01E01.part01.rar" yEnc (1/20)', 'segments' => ['<r1-1>', '<r1-2>'], 'size' => 50000000, 'filecount' => 1, 'firstsegment' => false],
+            ['title' => 'Group Post [02/10] - "Show.S01E01.part02.rar" yEnc (1/20)', 'segments' => ['<r2-1>', '<r2-2>'], 'size' => 50000000, 'filecount' => 1, 'firstsegment' => true],
+            ['title' => '"Movie.2026.mkv.002" yEnc (1/80)', 'segments' => ['<mv-2a>', '<mv-2b>'], 'size' => 50000000, 'filecount' => 1],
+            ['title' => '"Movie.2026.mkv.001" yEnc (1/80)', 'segments' => ['<mv-1a>', '<mv-1b>'], 'size' => 50000000, 'filecount' => 1],
+            ['title' => '"Archive.2026.002" yEnc (1/50)', 'segments' => ['<ar-2>'], 'size' => 50000000, 'filecount' => 1],
+            ['title' => '"Archive.2026.001" yEnc (1/50)', 'segments' => ['<ar-1>'], 'size' => 50000000, 'filecount' => 1],
+            ['title' => '"Show.S01E01.7z.001" yEnc (1/10)', 'segments' => ['<7z-1>'], 'size' => 40000000, 'filecount' => 1],
+            ['title' => '"Show.S01E01.7z.002" yEnc (1/10)', 'segments' => ['<7z-2a>', '<7z-2b>'], 'size' => 40000000, 'filecount' => 1],
+            ['title' => '"Show.S01E01.sample.mkv" yEnc (1/4)', 'segments' => ['<s-1>', '<s-2>'], 'size' => 12000000, 'filecount' => 1],
+            ['title' => '"Show.S01E01.1080p.mkv" yEnc (1/90)', 'segments' => ['<main-v1>'], 'size' => 500000000, 'filecount' => 1],
+            ['title' => '"Show.S01E01.screens.jpg" yEnc (1/1)', 'segments' => ['<img-1>'], 'size' => 250000, 'filecount' => 1],
+            ['title' => '"Show.S01E01.cover.jpg" yEnc (1/1)', 'segments' => ['<img-2>'], 'size' => 180000, 'filecount' => 1],
+            ['title' => '"Show.S01E01.par2" yEnc (1/1)', 'segments' => ['<p-idx>'], 'size' => 32768, 'filecount' => 1],
+            ['title' => '"Show.S01E01.vol00+01.par2" yEnc (1/2)', 'segments' => ['<p-v1>'], 'size' => 500000, 'filecount' => 1],
+            ['title' => '"Show.S01E01.track.FLAC" yEnc (1/2)', 'segments' => ['<aud-1>'], 'size' => 15000000, 'filecount' => 1],
+            ['title' => '"ebook.epub.rar" yEnc (1/2)', 'segments' => ['<bk-1>'], 'size' => 500000, 'filecount' => 1],
+        ];
+
+        $rustPlanner = new AdditionalWorkPlanner($config);
+        $fallbackPlanner = new AdditionalWorkPlanner($config, '/nonexistent/libnntmux_pipeline.dylib');
+
+        $expectedPlan = $rustPlanner->planPhp($nzb, 'alt.binaries.tv');
+        $actualRustPlan = $rustPlanner->plan($nzb, 'alt.binaries.tv');
+        $actualFallbackPlan = $fallbackPlanner->plan($nzb, 'alt.binaries.tv');
+
+        $this->assertEquals($expectedPlan, $actualRustPlan);
+        $this->assertEquals($expectedPlan, $actualFallbackPlan);
+        $this->assertSame(1, $actualRustPlan->bookFileCount);
+        $this->assertSame([9], $actualRustPlan->mainVideoSourceIndexes);
+
+        $ts = 'prefix'.str_repeat("\x47".str_repeat("\x11", 187), 5);
+        $this->assertSame(6, VideoContainer::transportStreamOffset($ts));
+        $this->assertSame(6, VideoContainer::transportStreamOffset($ts, '/nonexistent'));
+        $this->assertSame(VideoContainer::MpegTransport, VideoContainer::detect($ts));
+        $this->assertSame(VideoContainer::MpegTransport, VideoContainer::detect($ts, '/nonexistent'));
+
+        $this->assertSame(0, ImageCandidateRanker::rank('"Movie.screens.jpg" yEnc'));
+        $this->assertSame(0, ImageCandidateRanker::rank('"Movie.screens.jpg" yEnc', '/nonexistent'));
+
+        $this->assertSame('rar:movie.2026', ArchiveCandidate::volumeSetKey('Movie.2026.part01.rar yEnc (1/10)'));
+        $this->assertSame('rar:movie.2026', ArchiveCandidate::volumeSetKey('Movie.2026.part01.rar yEnc (1/10)', '/nonexistent'));
+
+        $slt = "Path = video/clip.mkv\nSize = 12345\nModified = 2026-10-10 12:00:00.123\nCRC = 00ABCDEF\nEncrypted = +\nMethod = LZMA2\n\n";
+        $parserRust = new SevenZipListingParser;
+        $parserRust->feed($slt);
+        $parserRust->finish();
+
+        $parserFallback = new SevenZipListingParser('/nonexistent');
+        $parserFallback->feed($slt);
+        $parserFallback->finish();
+
+        $this->assertSame($parserFallback->files, $parserRust->files);
+        $this->assertSame($parserFallback->reliable, $parserRust->reliable);
     }
 }

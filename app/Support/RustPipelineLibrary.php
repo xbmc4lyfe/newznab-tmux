@@ -2130,6 +2130,241 @@ final class RustPipelineLibrary
         return $res === 1;
     }
 
+    public static function videoTransportStreamOffset(string $data, ?string $libraryPath = null, bool &$supported = false): ?int
+    {
+        $supported = false;
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $supported = true;
+        if (\strlen($data) <= 752) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $offset = $ffi->nntmux_video_transport_stream_offset($data, \strlen($data));
+
+        return \is_int($offset) && $offset >= 0 ? $offset : null;
+    }
+
+    public static function videoContainerDetect(string $head, ?string $libraryPath = null): ?int
+    {
+        if (\strlen($head) < 12) {
+            return 0;
+        }
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $code = $ffi->nntmux_video_container_detect($head, \strlen($head));
+
+        return \is_int($code) && $code >= 0 ? $code : null;
+    }
+
+    public static function imageCandidateRank(string $name, ?string $libraryPath = null): ?int
+    {
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $rank = $ffi->nntmux_image_candidate_rank($name, \strlen($name));
+
+        return \is_int($rank) && $rank >= 0 ? $rank : null;
+    }
+
+    public static function archiveCandidateFileName(string $subject, ?string $libraryPath = null): ?string
+    {
+        if ($subject === '') {
+            return '';
+        }
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($subject);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= $len + 16)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, max(256, $len + 16));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_archive_candidate_file_name($subject, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1 || $written === -2) {
+            return null;
+        }
+        if ($written < -3) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_archive_candidate_file_name($subject, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
+    public static function archiveCandidateVolumeSetKey(string $subject, ?string $libraryPath = null): ?string
+    {
+        if ($subject === '') {
+            return 'file:';
+        }
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($subject);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= $len + 32)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, max(256, $len + 32));
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_archive_candidate_volume_set_key($subject, $len, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1 || $written === -2) {
+            return null;
+        }
+        if ($written < -3) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_archive_candidate_volume_set_key($subject, $len, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
+    public static function sevenZipParseListing(string $input, bool $flush, ?string $libraryPath = null): ?string
+    {
+        if ($input === '') {
+            return '';
+        }
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($input);
+        $minCap = max(4096, $len + 64);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= $minCap)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, $minCap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_sevenzip_parse_listing($input, $len, $flush ? 1 : 0, $scratch, self::$scratchCap);
+        if (! \is_int($written) || $written === -1 || $written === -2) {
+            return null;
+        }
+        if ($written === 0) {
+            return '';
+        }
+        if ($written < -3) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_sevenzip_parse_listing($input, $len, $flush ? 1 : 0, $scratch, self::$scratchCap);
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+            if ($written === 0) {
+                return '';
+            }
+        }
+
+        return FFI::string($scratch, $written);
+    }
+
+    public static function additionalClassifyTitles(
+        string $groupName,
+        string $joinedTitles,
+        int $count,
+        ?string $libraryPath = null
+    ): ?string {
+        $ffi = ($libraryPath === null && self::$defaultLibrary instanceof FFI)
+            ? self::$defaultLibrary
+            : self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $groupLen = \strlen($groupName);
+        $titlesLen = \strlen($joinedTitles);
+        $minCap = max(4096, $titlesLen * 2 + $count * 32 + 64);
+        $scratch = (self::$scratchBuf !== null && self::$scratchCap >= $minCap)
+            ? self::$scratchBuf
+            : self::ensureScratch($ffi, $minCap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_additional_classify_titles_nul(
+            $groupName,
+            $groupLen,
+            $joinedTitles,
+            $titlesLen,
+            $count,
+            $scratch,
+            self::$scratchCap
+        );
+        if (! \is_int($written) || $written === -1 || $written === -2) {
+            return null;
+        }
+        if ($written < -3) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_additional_classify_titles_nul(
+                $groupName,
+                $groupLen,
+                $joinedTitles,
+                $titlesLen,
+                $count,
+                $scratch,
+                self::$scratchCap
+            );
+            if (! \is_int($written) || $written < 0) {
+                return null;
+            }
+        }
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
     public static function resolve(?string $libraryPath = null): ?FFI
     {
         if ($libraryPath === null && self::$defaultLibrary !== null) {
@@ -2213,6 +2448,13 @@ final class RustPipelineLibrary
                     ssize_t nntmux_nfo_identity_text(const char *input, size_t input_len, char *out_buf, size_t out_cap);
                     int32_t nntmux_nfo_check_preconditions(const char *input, size_t input_len);
                     int32_t nntmux_nfo_validate_content(const char *input, size_t input_len);
+                    ssize_t nntmux_video_transport_stream_offset(const char *input, size_t input_len);
+                    int32_t nntmux_video_container_detect(const char *input, size_t input_len);
+                    int32_t nntmux_image_candidate_rank(const char *input, size_t input_len);
+                    ssize_t nntmux_archive_candidate_file_name(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_archive_candidate_volume_set_key(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_sevenzip_parse_listing(const char *input, size_t input_len, uint8_t flush, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_additional_classify_titles_nul(const char *group, size_t group_len, const char *titles, size_t titles_len, size_t count, char *out_buf, size_t out_cap);
                     C, $resolved);
 
                 // @phpstan-ignore method.notFound

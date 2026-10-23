@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\AdditionalProcessing\DTO;
 
+use App\Support\RustPipelineLibrary;
+
 final readonly class ArchiveCandidate
 {
     /**
@@ -25,7 +27,7 @@ final readonly class ArchiveCandidate
      */
     public function volumeSet(): string
     {
-        return self::volumeSetKey($this->title);
+        return $this->setKey !== '' ? $this->setKey : self::volumeSetKey($this->title);
     }
 
     /**
@@ -34,9 +36,21 @@ final readonly class ArchiveCandidate
      * "split:movie.mkv" for movie.mkv.001. Only genuine sibling volumes share a key; a
      * movie.zip or movie.7z next to movie.part01.rar is a different set.
      */
-    public static function volumeSetKey(string $subject): string
+    public static function volumeSetKey(string $subject, ?string $libraryPath = null): string
     {
-        $name = self::fileName($subject);
+        if (! str_contains($subject, "\0")) {
+            $rust = RustPipelineLibrary::archiveCandidateVolumeSetKey($subject, $libraryPath);
+            if ($rust !== null) {
+                return $rust;
+            }
+        }
+
+        return self::volumeSetKeyPhp($subject);
+    }
+
+    public static function volumeSetKeyPhp(string $subject): string
+    {
+        $name = self::fileNamePhp($subject);
         $families = [
             'rar' => '/^(.+?)\.(?:part\d+\.rar|rar|r\d{2,3})$/',
             '7z' => '/^(.+?)\.7z(?:\.\d{3})?$/',
@@ -61,7 +75,19 @@ final readonly class ArchiveCandidate
      * spaces and any poster prefix included, as the name can't be told apart from it:
      * "First Movie.rar" and "Second Movie.rar" must never share a name.
      */
-    public static function fileName(string $subject): string
+    public static function fileName(string $subject, ?string $libraryPath = null): string
+    {
+        if (! str_contains($subject, "\0")) {
+            $rust = RustPipelineLibrary::archiveCandidateFileName($subject, $libraryPath);
+            if ($rust !== null) {
+                return $rust;
+            }
+        }
+
+        return self::fileNamePhp($subject);
+    }
+
+    public static function fileNamePhp(string $subject): string
     {
         if (preg_match('/"([^"\r\n]+)"/', $subject, $quoted) === 1) {
             return strtolower(trim($quoted[1]));

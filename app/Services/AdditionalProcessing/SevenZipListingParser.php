@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\AdditionalProcessing;
 
+use App\Support\RustPipelineLibrary;
+
 /**
  * Incremental parser for `7z l -slt -ba` output, fed in arbitrary chunks.
  *
@@ -33,7 +35,40 @@ final class SevenZipListingParser
 
     private bool $recordMalformed = false;
 
+    /** @var array<string, int> */
+    private array $modifiedCache = [];
+
+    public function __construct(private readonly ?string $libraryPath = null) {}
+
     public function feed(string $chunk): void
+    {
+        if ($chunk === '') {
+            return;
+        }
+        if ($this->record === [] && ! $this->recordMalformed && RustPipelineLibrary::available($this->libraryPath)) {
+            $this->partialLine .= $chunk;
+            if (! str_contains($chunk, "\n") || ! self::hasPotentialBlankLine($this->partialLine)) {
+                return;
+            }
+            $raw = RustPipelineLibrary::sevenZipParseListing($this->partialLine, false, $this->libraryPath);
+            if ($raw !== null) {
+                if ($raw !== '') {
+                    $this->applyRustListing($raw);
+                }
+
+                return;
+            }
+            $pending = $this->partialLine;
+            $this->partialLine = '';
+            $this->feedPhp($pending);
+
+            return;
+        }
+
+        $this->feedPhp($chunk);
+    }
+
+    public function feedPhp(string $chunk): void
     {
         $start = 0;
         while (($end = strpos($chunk, "\n", $start)) !== false) {
@@ -49,11 +84,83 @@ final class SevenZipListingParser
      */
     public function finish(): void
     {
+        if ($this->record === [] && ! $this->recordMalformed && RustPipelineLibrary::available($this->libraryPath)) {
+            if ($this->partialLine === '') {
+                return;
+            }
+            $raw = RustPipelineLibrary::sevenZipParseListing($this->partialLine, true, $this->libraryPath);
+            if ($raw !== null) {
+                if ($raw !== '') {
+                    $this->applyRustListing($raw);
+                }
+                $this->partialLine = '';
+
+                return;
+            }
+            $pending = $this->partialLine;
+            $this->partialLine = '';
+            $this->feedPhp($pending);
+            $this->finishPhp();
+
+            return;
+        }
+
+        $this->finishPhp();
+    }
+
+    public function finishPhp(): void
+    {
         if ($this->partialLine !== '') {
             $this->line($this->partialLine);
             $this->partialLine = '';
         }
         $this->endRecord();
+    }
+
+    private static function hasPotentialBlankLine(string $buf): bool
+    {
+        if ($buf === '') {
+            return false;
+        }
+        $first = $buf[0];
+        if ($first === "\n" || $first === "\r" || $first === ' ' || $first === "\t") {
+            return true;
+        }
+
+        return str_contains($buf, "\n\n")
+            || str_contains($buf, "\n\r\n")
+            || str_contains($buf, "\n ")
+            || str_contains($buf, "\n\t");
+    }
+
+    private function applyRustListing(string $raw): void
+    {
+        $tokens = explode("\0", $raw);
+        $consumed = (int) $tokens[0];
+        if (($tokens[1] ?? '1') === '0') {
+            $this->reliable = false;
+        }
+        $this->partialLine = $consumed >= strlen($this->partialLine)
+            ? ''
+            : substr($this->partialLine, $consumed);
+
+        $count = count($tokens) - 1;
+        for ($i = 2; $i + 4 < $count; $i += 5) {
+            $modified = $tokens[$i + 2];
+            $date = $modified === '' ? 0 : ($this->modifiedCache[$modified] ??= (int) strtotime($modified));
+            $flags = ord($tokens[$i + 3]) - 48;
+            $file = [
+                'name' => $tokens[$i],
+                'size' => (int) $tokens[$i + 1],
+                'date' => $date,
+                'pass' => $flags & 1,
+                'compressed' => ($flags >> 1) & 1,
+            ];
+            if ($tokens[$i + 4] !== '') {
+                $file['crc32'] = $tokens[$i + 4];
+            }
+            $this->files[] = $file;
+        }
     }
 
     private function line(string $line): void

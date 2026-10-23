@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\AdditionalProcessing\Media;
 
+use App\Support\RustPipelineLibrary;
+
 /**
  * Orders the images of a release by how well they show what it contains.
  *
@@ -21,7 +23,17 @@ final class ImageCandidateRanker
     /**
      * Lower is better.
      */
-    public static function rank(string $name): int
+    public static function rank(string $name, ?string $libraryPath = null): int
+    {
+        $rust = RustPipelineLibrary::imageCandidateRank($name, $libraryPath);
+        if ($rust !== null) {
+            return $rust;
+        }
+
+        return self::rankPhp($name);
+    }
+
+    public static function rankPhp(string $name): int
     {
         $name = self::fileName($name);
 
@@ -44,9 +56,39 @@ final class ImageCandidateRanker
      * @param  callable(T): int  $sizeOf
      * @return list<T>
      */
-    public static function sort(array $items, callable $nameOf, callable $sizeOf): array
+    public static function sort(array $items, callable $nameOf, callable $sizeOf, ?string $libraryPath = null): array
     {
-        usort($items, static fn (mixed $a, mixed $b): int => [self::rank($nameOf($a)), -$sizeOf($a)] <=> [self::rank($nameOf($b)), -$sizeOf($b)]);
+        $count = count($items);
+        if ($count <= 1) {
+            return array_values($items);
+        }
+
+        $ranks = [];
+        $negSizes = [];
+        $order = [];
+        $list = array_values($items);
+        foreach ($list as $index => $item) {
+            $ranks[$index] = self::rank($nameOf($item), $libraryPath);
+            $negSizes[$index] = -$sizeOf($item);
+            $order[$index] = $index;
+        }
+
+        array_multisort($ranks, SORT_ASC, $negSizes, SORT_ASC, $order, SORT_ASC, $list);
+
+        return $list;
+    }
+
+    /**
+     * @template T
+     *
+     * @param  list<T>  $items
+     * @param  callable(T): string  $nameOf
+     * @param  callable(T): int  $sizeOf
+     * @return list<T>
+     */
+    public static function sortPhp(array $items, callable $nameOf, callable $sizeOf): array
+    {
+        usort($items, static fn (mixed $a, mixed $b): int => [self::rankPhp($nameOf($a)), -$sizeOf($a)] <=> [self::rankPhp($nameOf($b)), -$sizeOf($b)]);
 
         return $items;
     }

@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\AdditionalProcessing\Enums;
 
+use App\Support\RustPipelineLibrary;
+
 /**
  * Video container formats, named by their ffmpeg demuxer.
  *
@@ -23,7 +25,30 @@ enum VideoContainer: string
     /**
      * Recognise a container from the first bytes of a file.
      */
-    public static function detect(string $head): ?self
+    public static function detect(string $head, ?string $libraryPath = null): ?self
+    {
+        if (strlen($head) < 12) {
+            return null;
+        }
+
+        $rust = RustPipelineLibrary::videoContainerDetect($head, $libraryPath);
+        if ($rust !== null) {
+            return match ($rust) {
+                1 => self::Matroska,
+                2 => self::Avi,
+                3 => self::MpegProgram,
+                4 => self::MpegTransport,
+                5 => self::Mp4,
+                6 => self::Asf,
+                7 => self::Ogg,
+                default => null,
+            };
+        }
+
+        return self::detectPhp($head);
+    }
+
+    public static function detectPhp(string $head): ?self
     {
         if (strlen($head) < 12) {
             return null;
@@ -36,7 +61,7 @@ enum VideoContainer: string
             substr($head, 4, 4) === 'ftyp', substr($head, 4, 4) === 'moov' => self::Mp4,
             str_starts_with($head, "\x30\x26\xB2\x75\x8E\x66\xCF\x11") => self::Asf,
             str_starts_with($head, 'OggS') => self::Ogg,
-            self::transportStreamOffset($head) !== null => self::MpegTransport,
+            self::transportStreamOffsetPhp($head) !== null => self::MpegTransport,
             default => null,
         };
     }
@@ -65,7 +90,18 @@ enum VideoContainer: string
     /**
      * Offset of the first transport stream packet, checking several packets of 188 or 192 bytes.
      */
-    public static function transportStreamOffset(string $data): ?int
+    public static function transportStreamOffset(string $data, ?string $libraryPath = null): ?int
+    {
+        $supported = false;
+        $rust = RustPipelineLibrary::videoTransportStreamOffset($data, $libraryPath, $supported);
+        if ($supported) {
+            return $rust;
+        }
+
+        return self::transportStreamOffsetPhp($data);
+    }
+
+    public static function transportStreamOffsetPhp(string $data): ?int
     {
         foreach ([188, 192] as $stride) {
             for ($offset = 0, $limit = min(strlen($data) - $stride * 4, $stride); $offset < $limit; $offset++) {
