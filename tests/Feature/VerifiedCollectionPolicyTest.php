@@ -2390,6 +2390,38 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(0, (int) DB::table('release_verification_state')->value('pending_bytes'));
     }
 
+    public function test_partial_deferral_reports_partial_deferred_timing_outcome_instead_of_threw(): void
+    {
+        config(['release_verification.partial_after_hours' => 4, 'release_verification.publication_timing_sample_every' => 1]);
+        $repository = app(CandidateRepository::class);
+        $repository->archive($this->collectionForPolicy('movie.mkv', 3));
+        $this->travel(5)->hours();
+        $this->limits(files: 2);
+        $repository->promotePartial(10);
+        $claim = $repository->claim();
+        $manifest = app(ManifestStore::class)->read($claim->manifest_path);
+        $manifest += ['verification_mode' => 'spot_check', 'verified_file_names' => ['movie.mkv'],
+            'spot_check' => ['articles' => 1, 'bytes' => 5, 'sampled_files' => 1, 'method' => 'yenc-crc-and-identity'],
+            'partial' => ['articles_found' => 1, 'articles_expected' => 3, 'files_found' => 1, 'files_expected' => 1]];
+        $this->publicationSchema();
+        $reports = [];
+        Log::shouldReceive('warning')->andReturnNull();
+        Log::shouldReceive('info')->andReturnUsing(function (string $message, array $context) use (&$reports): void {
+            if ($message === 'Verified release publication timing.') {
+                $reports[] = $context;
+            }
+        });
+
+        try {
+            app(VerifiedReleasePublisher::class)->publish($claim, new VerificationResult('sampled', 'Partial sample.', $manifest));
+            $this->fail('A partial upload below policy must be deferred.');
+        } catch (PartialPublicationDeferredException) {
+        }
+
+        $this->assertCount(1, $reports);
+        $this->assertSame('partial_deferred', $reports[0]['outcome']);
+    }
+
     private function limits(int $min = 0, int $max = 0, int $files = 0, int $groupMin = 0, int $groupFiles = 0): void
     {
         Cache::put('configuration:ingestion', new IngestionConfigurationData(...array_replace(IngestionConfigurationData::defaults()->toArray(),

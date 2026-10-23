@@ -155,6 +155,8 @@ final class VerifiedReleasePublisher
                         : app(CollectionReleasePolicy::class)->verifiedRejection($manifest);
                     if ($filteredReason !== null && isset($manifest['partial']) && ! CollectionReleasePolicy::irrecoverable($filteredReason)) {
                         // Missing files or articles may still satisfy the policy; never filter terminally.
+                        $outcome = 'partial_deferred';
+
                         throw new PartialPublicationDeferredException($filteredReason);
                     }
                     if ($filteredReason !== null) {
@@ -322,7 +324,7 @@ final class VerifiedReleasePublisher
             return $id;
         } finally {
             // An exception after the callback (a failed commit or after-commit hook) is a throw, not a publication.
-            $timing?->setOutcome($status === 'returned' || $outcome === 'stale' ? $outcome : 'threw');
+            $timing?->setOutcome($status === 'returned' || in_array($outcome, ['stale', 'partial_deferred'], true) ? $outcome : 'threw');
             $timing?->report($status);
         }
     }

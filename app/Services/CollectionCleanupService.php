@@ -377,8 +377,12 @@ class CollectionCleanupService
         $rows = DB::table('collections')
             ->when($lock && in_array(DB::getDriverName(), ['mysql', 'mariadb'], true), fn ($query) => $query->forceIndex('PRIMARY'))
             ->whereIn('id', $ids)->orderBy('id')->when($lock, fn ($query) => $query->lockForUpdate())->get();
+        $unlocked = app(OversizedCollectionDeferrals::class)->unlockedIds($ids);
         $sources = [];
         foreach ($rows as $row) {
+            if (isset($unlocked[(int) $row->id])) {
+                continue;
+            }
             $arrival = $row->last_seen_at ?? $row->dateadded ?? $row->added ?? null;
             if ((int) $row->filecheck === CollectionFileCheckStatus::Inserted->value || ! is_string($row->collectionhash)
                 || $arrival === null || Carbon::parse($arrival)->format('Y-m-d H:i:s') >= $expiresBefore) {
