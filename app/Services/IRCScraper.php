@@ -12,7 +12,9 @@ use App\Services\Predb\Irc\IrcNetworks;
 use App\Services\Predb\Irc\PreAnnounceParser;
 use App\Services\Predb\PredbIdentityWriter;
 use App\Support\PredbSearchDocument;
+use App\Support\RustPipelineLibrary;
 use Carbon\CarbonImmutable;
+use FFI;
 use Illuminate\Database\Connection;
 use Illuminate\Database\QueryException;
 use Illuminate\Database\UniqueConstraintViolationException;
@@ -218,12 +220,8 @@ class IRCScraper extends IRCClient
             return;
         }
 
-        if (preg_match(
-            '/^(NEW|UPD|NUK): \[DT: (?P<time>.+?)\]\s?\[TT: (?P<title>.+?)\]\s?\[SC: (?P<source>.+?)\]\s?\[CT: (?P<category>.+?)\]\s?\[RQ: (?P<req>.+?)\]'.
-            '\s?\[SZ: (?P<size>.+?)\]\s?\[FL: (?P<files>.+?)\]\s?(\[FN: (?P<filename>.+?)\]\s?)?(\[(?P<nuked>(UN|MOD|RE|OLD)?NUKED?): (?P<reason>.+?)\])?$/i',
-            $this->_channelData['message'],
-            $hits
-        )) {
+        $hits = self::parseBotMessage($this->_channelData['message']);
+        if ($hits !== null) {
             if ($this->_debug && ! $this->_silent) {
                 echo '[DEBUG] Regex matched! Title: '.$hits['title'].' | Source: '.$hits['source'].' | Category: '.$hits['category'].PHP_EOL;
             }
@@ -260,9 +258,9 @@ class IRCScraper extends IRCClient
             if ($hits['category'] !== 'N/A') {
                 $this->_curPre['category'] = $hits['category'];
             }
-            if ($hits['req'] !== 'N/A' && preg_match('/^(?P<req>\d+):(?P<group>.+)$/i', $hits['req'], $matches2)) {
-                $this->_curPre['reqid'] = $matches2['req'];
-                $this->_curPre['group_id'] = $this->_getGroupID($matches2['group']);
+            if ($hits['req_id'] !== '') {
+                $this->_curPre['reqid'] = $hits['req_id'];
+                $this->_curPre['group_id'] = $this->_getGroupID($hits['req_group']);
             }
             if ($hits['size'] !== 'N/A') {
                 $this->_curPre['size'] = $hits['size'];
@@ -276,22 +274,8 @@ class IRCScraper extends IRCClient
             }
 
             if (isset($hits['nuked'])) {
-                switch ($hits['nuked']) {
-                    case 'NUKED':
-                        $this->_curPre['nuked'] = Predb::PRE_NUKED;
-                        break;
-                    case 'UNNUKED':
-                        $this->_curPre['nuked'] = Predb::PRE_UNNUKED;
-                        break;
-                    case 'MODNUKED':
-                        $this->_curPre['nuked'] = Predb::PRE_MODNUKE;
-                        break;
-                    case 'RENUKED':
-                        $this->_curPre['nuked'] = Predb::PRE_RENUKED;
-                        break;
-                    case 'OLDNUKE':
-                        $this->_curPre['nuked'] = Predb::PRE_OLDNUKE;
-                        break;
+                if ($hits['nuke_status'] !== '') {
+                    $this->_curPre['nuked'] = (int) $hits['nuke_status'];
                 }
                 $this->_curPre['reason'] = (isset($hits['reason']) ? substr($hits['reason'], 0, 255) : '');
                 $this->_nuked = true; // flag for output
@@ -302,6 +286,107 @@ class IRCScraper extends IRCClient
                 echo '[DEBUG] Message did not match PRE regex pattern'.PHP_EOL;
             }
         }
+    }
+
+    /**
+     * Parse bot captures, request IDs and nuke status in a single native call.
+     * Short messages (< 512 bytes) default to PCRE JIT where single-call array
+     * materialization across FFI is < 1.5x; long messages (>= 512 bytes) and
+     * explicit `$useRust = true` callers use the 3.00x native parser.
+     *
+     * @return array<string, string>|null
+     */
+    protected static function parseBotMessage(string $message, bool $useRust = false): ?array
+    {
+        $length = strlen($message);
+        if ($useRust || $length >= 512) {
+            static $native = null;
+            static $buffer = null;
+            static $capacity = 0;
+            $native ??= RustPipelineLibrary::resolveDomain('irc_pre_announce',
+                // Require the fused symbol as well: older candidates emitted a different bot record.
+                'ssize_t nntmux_irc_parse_inbound_line(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+                 ssize_t nntmux_irc_parse_bot_message(const char *input, size_t input_len, char *out_buf, size_t out_cap);') ?? false;
+            if ($native instanceof FFI) {
+                if ($buffer === null || $capacity < $length * 2 + 32) {
+                    // req_group is also part of the original req capture in the wire record.
+                    $buffer = RustPipelineLibrary::obtainScratch($native, $length * 2 + 32, $capacity);
+                }
+                if ($buffer !== null) {
+                    // @phpstan-ignore method.notFound
+                    $written = $native->nntmux_irc_parse_bot_message($message, $length, $buffer, $capacity);
+                    if ($written === 0) {
+                        return null;
+                    }
+                    if ($written > 0) {
+                        $values = explode("\0", FFI::string($buffer, $written));
+                        if (! isset($values[9])) {
+                            return [
+                                'time' => $values[0], 'title' => $values[1],
+                                'source' => $values[2], 'category' => $values[3],
+                                'req' => $values[4], 'size' => $values[5], 'files' => $values[6],
+                                'req_id' => $values[7], 'req_group' => $values[8], 'nuke_status' => '',
+                            ];
+                        }
+                        if (! isset($values[10])) {
+                            return [
+                                'time' => $values[0], 'title' => $values[1],
+                                'source' => $values[2], 'category' => $values[3],
+                                'req' => $values[4], 'size' => $values[5], 'files' => $values[6],
+                                'filename' => $values[9],
+                                'req_id' => $values[7], 'req_group' => $values[8], 'nuke_status' => '',
+                            ];
+                        }
+
+                        return [
+                            'time' => $values[0], 'title' => $values[1],
+                            'source' => $values[2], 'category' => $values[3],
+                            'req' => $values[4], 'size' => $values[5], 'files' => $values[6],
+                            'filename' => $values[9], 'nuked' => $values[10], 'reason' => $values[11],
+                            'req_id' => $values[7], 'req_group' => $values[8], 'nuke_status' => $values[12],
+                        ];
+                    }
+                }
+            }
+        }
+
+        $hits = self::parseBotMessagePhp($message);
+
+        if ($hits === null) {
+            return null;
+        }
+        $hits = array_filter($hits, static fn ($key) => is_string($key), ARRAY_FILTER_USE_KEY);
+        $hits['req_id'] = '';
+        $hits['req_group'] = '';
+        if ($hits['req'] !== 'N/A' && preg_match('/^(?P<req>\d+):(?P<group>.+)$/i', $hits['req'], $req)) {
+            $hits['req_id'] = $req['req'];
+            $hits['req_group'] = $req['group'];
+        }
+        $hits['nuke_status'] = match ($hits['nuked'] ?? '') {
+            'NUKED' => (string) Predb::PRE_NUKED,
+            'UNNUKED' => (string) Predb::PRE_UNNUKED,
+            'MODNUKED' => (string) Predb::PRE_MODNUKE,
+            'RENUKED' => (string) Predb::PRE_RENUKED,
+            'OLDNUKE' => (string) Predb::PRE_OLDNUKE,
+            default => '',
+        };
+
+        return $hits;
+    }
+
+    /** @return array<int|string, string>|null */
+    protected static function parseBotMessagePhp(string $message): ?array
+    {
+        if (preg_match(
+            '/^(NEW|UPD|NUK): \[DT: (?P<time>.+?)\]\s?\[TT: (?P<title>.+?)\]\s?\[SC: (?P<source>.+?)\]\s?\[CT: (?P<category>.+?)\]\s?\[RQ: (?P<req>.+?)\]'.
+            '\s?\[SZ: (?P<size>.+?)\]\s?\[FL: (?P<files>.+?)\]\s?(\[FN: (?P<filename>.+?)\]\s?)?(\[(?P<nuked>(UN|MOD|RE|OLD)?NUKED?): (?P<reason>.+?)\])?$/i',
+            $message,
+            $hits
+        )) {
+            return $hits;
+        }
+
+        return null;
     }
 
     /**
