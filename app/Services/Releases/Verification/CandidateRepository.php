@@ -274,6 +274,10 @@ final class CandidateRepository
                 $path = $prepared === null ? $this->store->write($manifest) : $this->store->writePrepared($prepared);
                 $size = $this->store->size($path);
                 $arrivalAt = Carbon::parse($collection->last_seen_at ?? $collection->dateadded ?? $collection->added ?? now())->format('Y-m-d H:i:s');
+                if (is_string($collection->collectionhash)
+                    && app(OversizedCollectionDeferrals::class)->unlockedByRaisedBudget($collectionId, $collection->collectionhash)) {
+                    $arrivalAt = max($arrivalAt, now()->format('Y-m-d H:i:s'));
+                }
                 $lastUniqueAt = $existing === null ? (! $merges ? $arrivalAt : max($arrivalAt, $previous->last_unique_at))
                     : ($newArticles ? max($arrivalAt, $existing->last_unique_at) : $existing->last_unique_at);
                 $expired = $lastUniqueAt < now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');

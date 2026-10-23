@@ -472,7 +472,7 @@ class VerificationReadyQueueTest extends ReleaseVerificationCandidatesTest
             $this->assertStringContainsString("-d 'memory_limit=768M'", $command);
         }
         foreach ($commands('1G; rm -rf /') as $command) {
-            $this->assertStringContainsString("-d 'memory_limit=512M'", $command, 'Anything but a size falls back to the default.');
+            $this->assertStringContainsString("-d 'memory_limit=1536M'", $command, 'Anything but a size falls back to the default.');
         }
     }
 
@@ -481,7 +481,8 @@ class VerificationReadyQueueTest extends ReleaseVerificationCandidatesTest
         $events = array_values(array_filter(app(Schedule::class)->events(), static fn ($event): bool => is_string($event->command)
             && str_contains($event->command, 'releases:prepare-candidates')));
         $this->assertCount(1, $events);
-        $this->assertStringContainsString("'memory_limit=512M'", $events[0]->command);
+        $this->assertStringContainsString('-d ffi.enable=true', $events[0]->command);
+        $this->assertStringContainsString("'memory_limit=1536M'", $events[0]->command);
         $this->assertStringContainsString('--limit=5000 --max-seconds=30 --diagnostics', $events[0]->command);
         $this->assertSame('* * * * *', $events[0]->expression);
         config(['release_verification.scheduled' => false]);
