@@ -1737,3 +1737,665 @@ mod tests {
         assert_eq!(knaben(&deep), -1);
     }
 }
+
+#[cfg(test)]
+mod sql_html_tests {
+    use super::*;
+
+    #[test]
+    fn sql_scan_carries_quotes_and_rejects_binary_tail() {
+        unsafe {
+            let s = b"'a;\\";
+            assert_eq!(
+                nntmux_predb_scene_sql_scan_statement(s.as_ptr(), s.len(), 0, 0),
+                -4
+            );
+            let s = b"';x';tail";
+            assert_eq!(
+                nntmux_predb_scene_sql_scan_statement(s.as_ptr(), s.len(), 1, 1),
+                4
+            );
+            assert_eq!(
+                nntmux_predb_scene_sql_scan_statement(b";\0".as_ptr(), 2, 0, 0),
+                -5
+            );
+        }
+    }
+
+    #[test]
+    fn sql_insert_hashes_and_errors() {
+        let s = b"INSERT INTO `predb` VALUES (1,'TV','A.B-GRP','grp',0,NULL,0,NULL,1);";
+        let mut out = [0u8; 512];
+        unsafe {
+            assert_eq!(
+                nntmux_predb_scene_sql_parse_insert(
+                    s.as_ptr(),
+                    s.len(),
+                    0,
+                    out.as_mut_ptr(),
+                    out.len()
+                ),
+                88
+            );
+            assert_eq!(&out[..8], &[1, 0, 0, 0, 1, 0, 0, 0]);
+            assert_eq!(&out[24..56], &scene_digest(b"id\0", b"1"));
+            assert_eq!(&out[56..88], &scene_digest(b"title\0", b"a.b-grp"));
+            assert_eq!(
+                nntmux_predb_scene_sql_parse_insert(
+                    s.as_ptr(),
+                    s.len(),
+                    1,
+                    out.as_mut_ptr(),
+                    out.len()
+                ),
+                8
+            );
+            assert_eq!(&out[..8], b"A.B-GRP\0");
+            assert_eq!(
+                nntmux_predb_scene_sql_parse_insert(s.as_ptr(), s.len(), 0, out.as_mut_ptr(), 1),
+                -100
+            );
+            let s = b"INSERT INTO `predb` VALUES (0,'TV','A-GRP','grp',0,NULL,0,NULL,1);";
+            assert_eq!(
+                nntmux_predb_scene_sql_parse_insert(
+                    s.as_ptr(),
+                    s.len(),
+                    0,
+                    out.as_mut_ptr(),
+                    out.len()
+                ),
+                -11
+            );
+        }
+    }
+}
+
+// SQL return codes: -1 prefix, -2 boundary, -3 arity, -4 trailing data,
+// -5 truncated escape, -6 unknown escape, -7 unterminated string, -8 scalar,
+// -9 string schema, -10 numeric schema, -11 ID, -100 output capacity, -101 ABI.
+// Validation output: six LE u32s (rows, eligible, noncanonical, group conflict,
+// first noncanonical row, first conflicting row), then two raw SHA-256s per row.
+// No input-sized allocations: decoded fields and digest preimages live on the stack.
+
+/// Returns a boundary offset, or -(1 + quoted + 2*escaped), or -5 for NUL.
+/// The entire chunk is checked for NUL, including bytes following a boundary.
+/// # Safety
+/// `input` must point to `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_predb_scene_sql_scan_statement(
+    input: *const u8,
+    len: usize,
+    quoted: u8,
+    escaped: u8,
+) -> i64 {
+    if input.is_null() || quoted > 1 || escaped > 1 {
+        return -6;
+    }
+    let bytes = unsafe { slice::from_raw_parts(input, len) };
+    if bytes.contains(&0) {
+        return -5;
+    }
+    let mut q = quoted != 0;
+    let mut e = escaped != 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if e {
+            e = false;
+        } else if q && b == b'\\' {
+            e = true;
+        } else if b == b'\'' {
+            q = !q;
+        } else if !q && b == b';' {
+            return i as i64;
+        }
+    }
+    -(1 + i64::from(q) + 2 * i64::from(e))
+}
+
+#[derive(Clone, Copy)]
+struct SceneScalar {
+    bytes: [u8; 255],
+    len: usize,
+    null: bool,
+}
+impl SceneScalar {
+    fn push(&mut self, b: u8) {
+        if self.len < self.bytes.len() {
+            self.bytes[self.len] = b;
+        }
+        self.len += 1;
+    }
+    fn value(&self) -> &[u8] {
+        &self.bytes[..self.len.min(255)]
+    }
+}
+fn scene_integer(s: &[u8]) -> bool {
+    let digits = s.strip_prefix(b"-").unwrap_or(s);
+    !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
+}
+fn scene_scalar(s: &[u8], p: &mut usize) -> Result<SceneScalar, isize> {
+    let mut v = SceneScalar {
+        bytes: [0; 255],
+        len: 0,
+        null: false,
+    };
+    if s.get(*p) == Some(&b'\'') {
+        *p += 1;
+        while let Some(&b) = s.get(*p) {
+            *p += 1;
+            match b {
+                b'\'' => {
+                    if s.get(*p) != Some(&b'\'') {
+                        return Ok(v);
+                    }
+                    *p += 1;
+                    v.push(b'\'');
+                }
+                b'\\' => {
+                    let b = *s.get(*p).ok_or(-5isize)?;
+                    *p += 1;
+                    v.push(match b {
+                        b'0' => 0,
+                        b'b' => 8,
+                        b'n' => 10,
+                        b'r' => 13,
+                        b't' => 9,
+                        b'Z' => 26,
+                        b'\'' | b'"' | b'\\' => b,
+                        _ => return Err(-6),
+                    });
+                }
+                _ => v.push(b),
+            }
+        }
+        return Err(-7);
+    }
+    let start = *p;
+    while *p < s.len() && !matches!(s[*p], b',' | b')') {
+        *p += 1;
+    }
+    let raw = &s[start..*p];
+    if raw == b"NULL" {
+        v.null = true;
+    } else {
+        if !scene_integer(raw) {
+            return Err(-8);
+        }
+        for &b in raw {
+            v.push(b);
+        }
+    }
+    Ok(v)
+}
+fn scene_validate(row: &[SceneScalar; 9]) -> Result<(), isize> {
+    for (column, max) in [(1, 20), (2, 255), (3, 50), (5, 255)] {
+        if (row[column].null && column != 5) || (!row[column].null && row[column].len > max) {
+            return Err(-9);
+        }
+    }
+    for column in [0, 4, 6, 7, 8] {
+        let v = &row[column];
+        if v.null && matches!(column, 7 | 8) {
+            continue;
+        }
+        if v.null || v.len > 11 || !scene_integer(v.value()) {
+            return Err(-10);
+        }
+    }
+    let id = row[0].value();
+    if id.first().is_none_or(|b| !matches!(b, b'1'..=b'9'))
+        || !id.iter().all(u8::is_ascii_digit)
+        || id.iter().fold(0u64, |n, b| n * 10 + u64::from(b - b'0')) > 2147483647
+    {
+        return Err(-11);
+    }
+    Ok(())
+}
+fn scene_reason(row: &[SceneScalar; 9]) -> usize {
+    let title = row[2].value();
+    let Some(hyphen) = title.iter().rposition(|&b| b == b'-') else {
+        return 2;
+    };
+    if hyphen == 0
+        || hyphen + 1 == title.len()
+        || !title[..hyphen]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || b"_.()&'+,-".contains(b))
+        || !title[hyphen + 1..]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+    {
+        return 2;
+    }
+    let group = row[3].value();
+    if group.is_empty()
+        || title.len() <= group.len()
+        || title[title.len() - group.len() - 1] != b'-'
+        || !title[title.len() - group.len()..].eq_ignore_ascii_case(group)
+    {
+        return 3;
+    }
+    1
+}
+fn scene_digest(prefix: &[u8], value: &[u8]) -> [u8; 32] {
+    // This base exposes sha256_hex_slice, not sha256_bytes. Reuse its implementation
+    // without changing the shared module; the conversion is bounded and allocation-free.
+    let mut preimage = [0u8; 261];
+    preimage[..prefix.len()].copy_from_slice(prefix);
+    for (out, b) in preimage[prefix.len()..].iter_mut().zip(value) {
+        *out = b.to_ascii_lowercase();
+    }
+    let hex = crate::predb::sha256_hex_slice(&preimage[..prefix.len() + value.len()]);
+    let mut digest = [0u8; 32];
+    for (i, pair) in hex.chunks_exact(2).enumerate() {
+        fn nibble(b: u8) -> u8 {
+            if b <= b'9' { b - b'0' } else { b - b'a' + 10 }
+        }
+        digest[i] = nibble(pair[0]) * 16 + nibble(pair[1]);
+    }
+    digest
+}
+fn scene_insert(s: &[u8], mode: u32, out: &mut [u8]) -> Result<usize, isize> {
+    let prefix = b"INSERT INTO `predb` VALUES ";
+    if !s.starts_with(prefix) {
+        return Err(-1);
+    }
+    let mut p = prefix.len();
+    let mut counts = [0u32; 6];
+    let mut written: usize = if mode == 0 { 24 } else { 0 };
+    loop {
+        if s.get(p) != Some(&b'(') {
+            return Err(-2);
+        }
+        p += 1;
+        let mut row = [SceneScalar {
+            bytes: [0; 255],
+            len: 0,
+            null: false,
+        }; 9];
+        let mut columns = 0;
+        loop {
+            let v = scene_scalar(s, &mut p)?;
+            if columns < 9 {
+                row[columns] = v;
+            }
+            columns += 1;
+            let delimiter = s.get(p).copied();
+            p += 1;
+            if delimiter == Some(b',') {
+                continue;
+            }
+            if delimiter != Some(b')') || columns != 9 {
+                return Err(-3);
+            }
+            break;
+        }
+        scene_validate(&row)?;
+        counts[0] += 1;
+        let reason = scene_reason(&row);
+        counts[reason] += 1;
+        if reason >= 2 && counts[reason + 2] == 0 {
+            counts[reason + 2] = counts[0];
+        }
+        if mode == 0 {
+            if written + 64 <= out.len() {
+                out[written..written + 32].copy_from_slice(&scene_digest(b"id\0", row[0].value()));
+                out[written + 32..written + 64]
+                    .copy_from_slice(&scene_digest(b"title\0", row[2].value()));
+            }
+            written += 64;
+        } else if reason == 1 {
+            let title = row[2].value();
+            if written + title.len() + 1 <= out.len() {
+                out[written..written + title.len()].copy_from_slice(title);
+                out[written + title.len()] = 0;
+            }
+            written += title.len() + 1;
+        }
+        if s.get(p) == Some(&b',') {
+            p += 1;
+            continue;
+        }
+        if s.get(p) != Some(&b';') || p + 1 != s.len() {
+            return Err(-4);
+        }
+        if written > out.len() {
+            return Err(-100);
+        }
+        if mode == 0 {
+            for (i, n) in counts.iter().enumerate() {
+                out[i * 4..i * 4 + 4].copy_from_slice(&n.to_le_bytes());
+            }
+        }
+        return Ok(written);
+    }
+}
+/// # Safety
+/// Input/output must be valid non-overlapping buffers of the declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_predb_scene_sql_parse_insert(
+    input: *const u8,
+    len: usize,
+    mode: u32,
+    output: *mut u8,
+    cap: usize,
+) -> isize {
+    if input.is_null() || output.is_null() || mode > 1 {
+        return -101;
+    }
+    match scene_insert(unsafe { slice::from_raw_parts(input, len) }, mode, unsafe {
+        slice::from_raw_parts_mut(output, cap)
+    }) {
+        Ok(n) => n as isize,
+        Err(e) => e,
+    }
+}
+
+#[cfg(test)]
+mod html_validator_tests {
+    use super::*;
+    fn refs(s: &str, mode: u32) -> i32 {
+        unsafe { nntmux_predb_html_validate_numeric_refs(s.as_ptr(), s.len(), mode) }
+    }
+    fn scope(s: &str, mode: u32) -> i32 {
+        unsafe { nntmux_predb_html_validate_listing_scope(s.as_ptr(), s.len(), mode) }
+    }
+    #[test]
+    fn html_numeric_reference_modes_and_overflow() {
+        for s in [
+            "plain",
+            "&#9;&#10;&#13;&#32;",
+            "&#x10ffff",
+            "&#x;",
+            "&#;",
+            "&#00000000000000000000000065",
+            "&#x000000000000000041",
+        ] {
+            assert_eq!(refs(s, 0), 1, "{s}");
+        }
+        for s in [
+            "&#0",
+            "&#8;",
+            "&#11",
+            "&#xD800",
+            "&#1114112",
+            "&#999999999999999999999999",
+            "&#xFFFFFFFFFFFFFFFF",
+        ] {
+            assert_eq!(refs(s, 0), 0, "{s}");
+        }
+        assert_eq!(refs("&#65534;&#xFFFF", 0), 1);
+        assert_eq!(refs("&#65534;&#xFFFF", 1), 0);
+        assert_eq!(refs("&#128512;", 1), 1);
+    }
+    #[test]
+    fn html_scope_structure_and_error_priority() {
+        assert_eq!(
+            scope("<html><body><div title='>'></div></body></html>\n", 0),
+            1
+        );
+        assert_eq!(
+            scope("<HTML><BODY><div-x></div ignored='>'></BODY></HTML >", 0),
+            1
+        );
+        assert_eq!(scope("<html><body><div/></body></html>", 0), -2);
+        assert_eq!(scope("<html><body><div></body>", 0), 0);
+        assert_eq!(scope("<html><body><div></body></html>", 0), -2);
+        assert_eq!(scope("<html><body><li></body></html>", 0), 1);
+        assert_eq!(scope("<html><body><li></body></html>", 1), -2);
+        assert_eq!(
+            scope("<html><body></body></html><html><body></body></html>", 1),
+            -2
+        );
+        assert_eq!(scope("<html><body></body></html bogus>", 0), 0);
+        assert_eq!(
+            scope(
+                "<html><body><div>&#1114111;&#1114111</div></body></html</html>",
+                0
+            ),
+            -1
+        );
+    }
+    #[test]
+    fn html_scope_stripping_and_fallback() {
+        assert_eq!(
+            scope(
+                "<!--x--><html><body><script>x<div></script><style>bad</style></body></html><!--tail-->",
+                0
+            ),
+            1
+        );
+        assert_eq!(scope("<html><body></body></html><!--unterminated", 0), 1);
+        assert_eq!(scope("<html><body><script>unterminated", 0), 0);
+        assert_eq!(scope("<ht<!--join-->ml><body></body></html>", 0), -1);
+        assert_eq!(
+            scope("<html><body><div x='<!--x-->'></div></body></html>", 0),
+            -1
+        );
+        let deep = format!(
+            "<html><body>{}{}</body></html>",
+            "<div>".repeat(300),
+            "</div>".repeat(300)
+        );
+        assert_eq!(scope(&deep, 0), -1);
+    }
+}
+
+/// Validate numeric references before libxml can discard their characters.
+/// # Safety
+/// `input` must point to `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_predb_html_validate_numeric_refs(
+    input: *const u8,
+    len: usize,
+    mode: u32,
+) -> i32 {
+    if input.is_null() || mode > 1 {
+        return -1;
+    }
+    let s = unsafe { slice::from_raw_parts(input, len) };
+    let mut p = 0;
+    while p + 2 < s.len() {
+        let found = unsafe { crate::memchr(s[p..].as_ptr(), i32::from(b'&'), s.len() - p) };
+        if found.is_null() {
+            break;
+        }
+        p = unsafe { found.offset_from_unsigned(s.as_ptr()) };
+        if s.get(p + 1) != Some(&b'#') {
+            p += 1;
+            continue;
+        }
+        p += 2;
+        let base = if s.get(p).is_some_and(|b| b.eq_ignore_ascii_case(&b'x')) {
+            p += 1;
+            16
+        } else {
+            10
+        };
+        let start = p;
+        let mut value = 0u32;
+        while let Some(&b) = s.get(p) {
+            let digit = match b {
+                b'0'..=b'9' => u32::from(b - b'0'),
+                b'a'..=b'f' if base == 16 => u32::from(b - b'a' + 10),
+                b'A'..=b'F' if base == 16 => u32::from(b - b'A' + 10),
+                _ => break,
+            };
+            value = value * base + digit;
+            if value > 0x10ffff {
+                return 0;
+            }
+            p += 1;
+        }
+        if p != start
+            && ((value < 32 && !matches!(value, 9 | 10 | 13))
+                || (0xd800..=0xdfff).contains(&value)
+                || (mode == 1 && matches!(value, 0xfffe | 0xffff)))
+        {
+            return 0;
+        }
+    }
+    1
+}
+
+fn html_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+}
+fn html_word(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+fn html_prefix(s: &[u8], p: usize, name: &[u8]) -> bool {
+    s.get(p..p + name.len())
+        .is_some_and(|v| v.eq_ignore_ascii_case(name))
+}
+// Mirrors the stripping regex, including its quote-insensitive script/style opener.
+fn html_removal(s: &[u8], p: usize) -> Option<usize> {
+    if s[p..].starts_with(b"<!--") {
+        return Some(
+            s[p + 4..]
+                .windows(3)
+                .position(|v| v == b"-->")
+                .map_or(s.len(), |i| p + 4 + i + 3),
+        );
+    }
+    for name in [b"script".as_slice(), b"style".as_slice()] {
+        let end = p + 1 + name.len();
+        if !html_prefix(s, p + 1, name) || s.get(end).is_some_and(|b| html_word(*b)) {
+            continue;
+        }
+        let Some(open_end) = s[end..].iter().position(|&b| b == b'>') else {
+            continue;
+        };
+        let mut q = end + open_end + 1;
+        while q < s.len() {
+            if s[q] == b'<' && s.get(q + 1) == Some(&b'/') && html_prefix(s, q + 2, name) {
+                let mut close = q + 2 + name.len();
+                while s.get(close).is_some_and(|b| html_space(*b)) {
+                    close += 1;
+                }
+                if s.get(close) == Some(&b'>') {
+                    return Some(close + 1);
+                }
+            }
+            q += 1;
+        }
+        return Some(s.len());
+    }
+    None
+}
+
+fn html_listing_scope(s: &[u8], mode: u32) -> i32 {
+    let mut stack = [0u8; 256];
+    let (mut depth, mut documents, mut bodies) = (0usize, 0usize, 0usize);
+    let mut bad_scope = false;
+    let mut trailing_html = false;
+    let mut p = 0;
+    while p < s.len() {
+        if s[p] != b'<' {
+            let found = unsafe { crate::memchr(s[p..].as_ptr(), i32::from(b'<'), s.len() - p) };
+            let end = if found.is_null() {
+                s.len()
+            } else {
+                unsafe { found.offset_from_unsigned(s.as_ptr()) }
+            };
+            if trailing_html && !s[p..end].iter().all(|b| html_space(*b)) {
+                trailing_html = false;
+            }
+            p = end;
+            continue;
+        }
+        if let Some(end) = html_removal(s, p) {
+            // Removing bytes within partial tokens can synthesize a new regex match.
+            // Such uncommon joins use PHP instead of allocating a cleaned document.
+            if (p > 0 && s[p - 1] != b'>' && !html_space(s[p - 1]))
+                || (end < s.len() && s[end] != b'<' && !html_space(s[end]))
+            {
+                return -1;
+            }
+            p = end;
+            continue;
+        }
+        trailing_html = false;
+        let closing = s.get(p + 1) == Some(&b'/');
+        let start = p + 1 + usize::from(closing);
+        let names: &[&[u8]] = if mode == 0 {
+            &[b"html", b"body", b"div", b"h2", b"h5", b"a"]
+        } else {
+            &[
+                b"html", b"body", b"ol", b"ul", b"li", b"div", b"h4", b"a", b"span",
+            ]
+        };
+        let Some((id, name)) = names.iter().enumerate().find(|(_, name)| {
+            html_prefix(s, start, name) && s.get(start + name.len()).is_none_or(|b| !html_word(*b))
+        }) else {
+            p += 1;
+            continue;
+        };
+        let mut q = start + name.len();
+        let mut quote = 0u8;
+        let mut only_space = true;
+        while q < s.len() {
+            let b = s[q];
+            // The trailing-document regex scans independently of matched tags.
+            // A nested '<' can expose its suffix even when the tag regex consumes it.
+            if b == b'<' {
+                return -1;
+            }
+            if quote != 0 {
+                if b == quote {
+                    quote = 0;
+                }
+            } else if matches!(b, b'\'' | b'"') {
+                quote = b;
+            } else if b == b'>' {
+                break;
+            }
+            only_space &= html_space(b);
+            q += 1;
+        }
+        if q == s.len() {
+            return -1;
+        }
+        trailing_html = closing && id == 0 && only_space;
+        if closing {
+            if depth == 0 {
+                bad_scope = true;
+            } else {
+                depth -= 1;
+                if stack[depth] != id as u8 {
+                    bad_scope = true;
+                }
+            }
+        } else {
+            documents += usize::from(id == 0);
+            bodies += usize::from(id == 1);
+            if depth == stack.len() {
+                return -1;
+            }
+            stack[depth] = id as u8;
+            depth += 1;
+        }
+        p = q + 1;
+    }
+    if !trailing_html {
+        0
+    } else if bad_scope || depth != 0 || documents != 1 || bodies != 1 {
+        -2
+    } else {
+        1
+    }
+}
+
+/// Validate explicitly closed listing boundaries; -1 requests PHP fallback.
+/// # Safety
+/// `input` must point to `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_predb_html_validate_listing_scope(
+    input: *const u8,
+    len: usize,
+    mode: u32,
+) -> i32 {
+    if input.is_null() || mode > 1 {
+        return -1;
+    }
+    html_listing_scope(unsafe { slice::from_raw_parts(input, len) }, mode)
+}
