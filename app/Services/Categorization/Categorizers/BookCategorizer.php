@@ -7,10 +7,74 @@ namespace App\Services\Categorization\Categorizers;
 use App\Models\Category;
 use App\Services\Categorization\CategorizationResult;
 use App\Services\Categorization\ReleaseContext;
+use App\Support\RustPipelineLibrary;
+use FFI;
+use Throwable;
 
 class BookCategorizer extends AbstractCategorizer
 {
     protected int $priority = 45;
+
+    /**
+     * Native (Rust FFI) bindings. Rule ids returned by the library index {@see self::NATIVE_RULES}.
+     */
+    private const string NATIVE_CDEF = <<<'CDEF'
+        int64_t nntmux_categorize_book(const char *name, size_t name_len, uint32_t flags);
+CDEF;
+
+    /** @var array<int, string> */
+    private const array NATIVE_RULES = [
+        0 => 'comic_format',
+        1 => 'comic_publisher',
+        2 => 'manga',
+        3 => 'technical_publisher',
+        4 => 'technical_subject',
+        5 => 'magazine_frequency',
+        6 => 'magazine_title',
+        7 => 'ebook_format',
+        8 => 'ebook_indicator',
+        9 => 'ebook_pdf_format',
+        10 => 'ebook_pdf_indicator',
+        11 => 'ebook_platform',
+        12 => 'ebook_book_signals',
+    ];
+
+    /** Returned by the library instead of a result when `shouldSkip` is true. */
+    private const int NATIVE_SKIP = 1 << 62;
+
+    /** Resolved library handle: null until first use, false when the library is unavailable. */
+    private static FFI|false|null $nativeFfi = null;
+
+    private static ?CategorizationResult $nativeNoMatch = null;
+
+    /** Native result computed by `shouldSkip()` for the context that `categorize()` receives next. */
+    private ?ReleaseContext $nativeContext = null;
+
+    private int $nativePacked = 0;
+
+    private static function resolveNative(): FFI|false
+    {
+        return self::$nativeFfi = RustPipelineLibrary::resolveDomain('categorizers', self::NATIVE_CDEF) ?? false;
+    }
+
+    /**
+     * Run the native categorizer without the skip check; null when the library is unavailable or declines.
+     */
+    private function nativeCall(ReleaseContext $context): ?int
+    {
+        $ffi = self::$nativeFfi ?? self::resolveNative();
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $packed = $ffi->nntmux_categorize_book($context->releaseName, \strlen($context->releaseName), ($context->categorizeForeign ? 1 : 0) | ($context->catWebDL ? 2 : 0));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return \is_int($packed) && $packed >= 0 ? $packed : null;
+    }
 
     public function getName(): string
     {
@@ -18,6 +82,38 @@ class BookCategorizer extends AbstractCategorizer
     }
 
     public function shouldSkip(ReleaseContext $context): bool
+    {
+        // One native call decides the skip and, when processing continues, the categorization
+        // that the pipe requests next for the same (immutable) context.
+        $ffi = self::$nativeFfi ?? self::resolveNative();
+        if ($ffi !== false) {
+            try {
+                // @phpstan-ignore method.notFound
+                $packed = $ffi->nntmux_categorize_book($context->releaseName, \strlen($context->releaseName), (($context->categorizeForeign ? 1 : 0) | ($context->catWebDL ? 2 : 0)) | 4);
+            } catch (Throwable) {
+                $packed = -1;
+            }
+            if (\is_int($packed) && $packed >= 0) {
+                if ($packed === self::NATIVE_SKIP) {
+                    $this->nativeContext = null;
+
+                    return true;
+                }
+                $this->nativeContext = $context;
+                $this->nativePacked = $packed;
+
+                return false;
+            }
+        }
+        $this->nativeContext = null;
+
+        return $this->shouldSkipPhp($context);
+    }
+
+    /**
+     * Pure-PHP skip check (fallback when the native library is unavailable).
+     */
+    public function shouldSkipPhp(ReleaseContext $context): bool
     {
         $name = $context->releaseName;
 
@@ -77,6 +173,30 @@ class BookCategorizer extends AbstractCategorizer
     }
 
     public function categorize(ReleaseContext $context): CategorizationResult
+    {
+        if ($this->nativeContext === $context) {
+            $packed = $this->nativePacked;
+            $this->nativeContext = null;
+        } else {
+            $packed = $this->nativeCall($context);
+        }
+        if ($packed !== null) {
+            if ($packed === 0) {
+                return self::$nativeNoMatch ??= CategorizationResult::noMatch();
+            }
+            $rule = self::NATIVE_RULES[$packed >> 32] ?? null;
+            if ($rule !== null) {
+                return new CategorizationResult($packed & 0xFFFF, (($packed >> 16) & 0xFFFF) / 1000, $rule);
+            }
+        }
+
+        return $this->categorizePhp($context);
+    }
+
+    /**
+     * Pure-PHP categorization (fallback when the native library is unavailable).
+     */
+    public function categorizePhp(ReleaseContext $context): CategorizationResult
     {
         $name = $context->releaseName;
         if ($result = $this->checkComic($name)) {
