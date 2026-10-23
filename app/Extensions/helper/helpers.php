@@ -647,6 +647,13 @@ if (! function_exists('sanitize')) {
      */
     function sanitize(array|string $phrases, array $doNotSanitize = []): string
     {
+        if (is_string($phrases) && $doNotSanitize === []) {
+            $native = RustPipelineLibrary::searchSanitizeLucene($phrases);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
         if (! is_array($phrases)) {
             $wordArray = explode(' ', str_replace('.', ' ', $phrases));
         } else {

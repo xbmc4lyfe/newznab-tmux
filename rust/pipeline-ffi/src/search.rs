@@ -1245,6 +1245,122 @@ pub unsafe extern "C" fn nntmux_search_suggest_fallback_nul(
     cur.finish()
 }
 
+#[inline]
+fn is_lucene_operator(b: u8) -> bool {
+    matches!(b, b'!' | b'+' | b'-' | b'?' | b'*')
+}
+
+#[inline]
+fn is_lucene_special(b: u8) -> bool {
+    matches!(
+        b,
+        b'+' | b'-'
+            | b'='
+            | b'&'
+            | b'|'
+            | b'>'
+            | b'<'
+            | b'!'
+            | b'('
+            | b')'
+            | b'{'
+            | b'}'
+            | b'['
+            | b']'
+            | b'^'
+            | b'"'
+            | b'~'
+            | b'*'
+            | b'?'
+            | b':'
+            | b'\\'
+            | b'/'
+    )
+}
+
+#[inline]
+fn emit_sanitized_lucene_token(st: &[u8], first: &mut bool, cur: &mut OutCursor) {
+    if !*first {
+        cur.push_byte(b' ');
+    }
+    *first = false;
+    if st.is_empty() {
+        return;
+    }
+    let keep_as_is = st.len() > 1
+        && (is_lucene_operator(st[0]) || matches!(st[st.len() - 1], b'+' | b'-' | b'?' | b'*'))
+        && !st
+            .windows(2)
+            .any(|w| is_lucene_operator(w[0]) && is_lucene_operator(w[1]));
+    if keep_as_is {
+        cur.push_slice(st);
+    } else {
+        for &b in st {
+            if is_lucene_special(b) {
+                cur.push_byte(b'\\');
+            }
+            cur.push_byte(b);
+        }
+    }
+}
+
+/// Accelerates `sanitize(string $phrases)` in `app/Extensions/helper/helpers.php`
+/// (called by `ElasticSearchDriver::sanitizeSearchTerms`).
+/// Returns `-2` when declined to PHP (non-ASCII bytes), or `>= 0` written bytes.
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_search_sanitize_lucene(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input_len == 0 {
+        return 0;
+    }
+    if input.is_null() {
+        return -1;
+    }
+    let slice = unsafe { slice::from_raw_parts(input, input_len) };
+    if slice.iter().any(|&b| b >= 0x80) {
+        return -2;
+    }
+
+    let mut cur = OutCursor::new(out_buf, out_cap);
+    let mut first = true;
+
+    for seg in slice.split(|&b| b == b' ' || b == b'.') {
+        if seg.is_empty() {
+            emit_sanitized_lucene_token(&[], &mut first, &mut cur);
+            continue;
+        }
+        let mut p = 0usize;
+        loop {
+            let start = p;
+            while p < seg.len() && !is_ascii_ws(seg[p]) {
+                p += 1;
+            }
+            emit_sanitized_lucene_token(&seg[start..p], &mut first, &mut cur);
+            if p >= seg.len() {
+                break;
+            }
+            while p < seg.len() && is_ascii_ws(seg[p]) {
+                p += 1;
+            }
+            if p >= seg.len() {
+                emit_sanitized_lucene_token(&[], &mut first, &mut cur);
+                break;
+            }
+        }
+    }
+
+    cur.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1269,6 +1385,20 @@ mod tests {
         assert_eq!(
             out.as_slice(),
             b"(matrix | \"reloaded\\-2\" ) -cam !ts spider\\-man *720p*"
+        );
+    }
+
+    #[test]
+    fn test_search_sanitize_lucene_matches_php() {
+        let input = b"movie.title +1080p -cam --double *wild* (test:1)";
+        let mut buf = [0u8; 256];
+        let n = unsafe {
+            nntmux_search_sanitize_lucene(input.as_ptr(), input.len(), buf.as_mut_ptr(), buf.len())
+        };
+        assert!(n > 0);
+        assert_eq!(
+            &buf[..n as usize],
+            b"movie title +1080p -cam \\-\\-double *wild* \\(test\\:1\\)"
         );
     }
 }
