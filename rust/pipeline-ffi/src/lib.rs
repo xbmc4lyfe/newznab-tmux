@@ -1,6 +1,7 @@
 use std::slice;
 
 pub mod categorize;
+pub mod filename;
 
 /// Returns the ABI version of `libnntmux_pipeline`.
 #[unsafe(no_mangle)]

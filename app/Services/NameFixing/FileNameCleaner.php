@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\NameFixing;
 
 use App\Support\PredbSearchDocument;
+use App\Support\RustPipelineLibrary;
 use App\Traits\DetectsHashedNames;
 
 /**
@@ -15,7 +16,7 @@ use App\Traits\DetectsHashedNames;
  */
 class FileNameCleaner
 {
-    public const PREDB_IDENTITY_POLICY = '65afde111b1c96db73695c3268de2caa001a9a46b6bf0dfb0bc04580b8ea9235';
+    public const PREDB_IDENTITY_POLICY = 'd91b5390277226539e5ec435ed51c96073bb20f74233b406a0bc635bddab8e71';
 
     use DetectsHashedNames;
 
@@ -138,10 +139,28 @@ class FileNameCleaner
      */
     public function isKnownFileSuffix(string $suffix): bool
     {
-        return $suffix === '' || $this->stripKnownFileSuffixes('Title'.$suffix, preserveCodecAfterWrapper: false) === 'Title';
+        if ($suffix === '') {
+            return true;
+        }
+        $strippedLen = RustPipelineLibrary::stripKnownFileSuffixesLen($suffix, preserveCodecAfterWrapper: false);
+        if ($strippedLen !== null) {
+            return $strippedLen === 0;
+        }
+
+        return $this->stripKnownFileSuffixesPhp('Title'.$suffix, preserveCodecAfterWrapper: false) === 'Title';
     }
 
     private function stripKnownFileSuffixes(string $fileName, bool $preserveCodecAfterWrapper): string
+    {
+        $strippedLen = RustPipelineLibrary::stripKnownFileSuffixesLen($fileName, $preserveCodecAfterWrapper);
+        if ($strippedLen !== null) {
+            return $strippedLen === strlen($fileName) ? $fileName : substr($fileName, 0, $strippedLen);
+        }
+
+        return $this->stripKnownFileSuffixesPhp($fileName, $preserveCodecAfterWrapper);
+    }
+
+    public function stripKnownFileSuffixesPhp(string $fileName, bool $preserveCodecAfterWrapper): string
     {
         $wrappers = [
             ...self::archiveSuffixPatterns(),
@@ -212,6 +231,24 @@ class FileNameCleaner
     }
 
     private function computeForMatching(string $fileName, bool $preserveLeadingNumber): string|false
+    {
+        if (get_class($this) === self::class) {
+            $span = RustPipelineLibrary::cleanForMatchingSpan($fileName, $preserveLeadingNumber);
+            if ($span === -1) {
+                return false;
+            }
+            if ($span !== null && $span >= 0) {
+                $start = $span >> 32;
+                $len = $span & 0xFFFFFFFF;
+
+                return $start === 0 && $len === strlen($fileName) ? $fileName : substr($fileName, $start, $len);
+            }
+        }
+
+        return $this->computeForMatchingPhp($fileName, $preserveLeadingNumber);
+    }
+
+    public function computeForMatchingPhp(string $fileName, bool $preserveLeadingNumber): string|false
     {
         if (! mb_check_encoding($fileName, 'UTF-8')
             || preg_match('/(?![\x00-\x7F])\p{C}/u', $fileName) !== 0) {

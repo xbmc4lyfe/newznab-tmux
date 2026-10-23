@@ -184,7 +184,9 @@ class SeasonPackDetectorTest extends TestCase
             'Show.S01E01.1080p.WEB.x264.Complete.Season-GRP.mkv',
         ] as $ambiguous) {
             $this->assertNull(SeasonPackDetector::episodeIdentity($ambiguous), $ambiguous);
+            $this->assertNull(SeasonPackDetector::episodeIdentityPhp($ambiguous), $ambiguous);
             $this->assertTrue(SeasonPackDetector::hasNonSingleEpisodeEvidence([$ambiguous]), $ambiguous);
+            $this->assertTrue(SeasonPackDetector::hasNonSingleEpisodeEvidencePhp([$ambiguous]), $ambiguous);
         }
     }
 }
