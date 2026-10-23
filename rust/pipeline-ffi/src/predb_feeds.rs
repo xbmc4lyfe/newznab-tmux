@@ -2399,3 +2399,1695 @@ pub unsafe extern "C" fn nntmux_predb_html_validate_listing_scope(
     }
     html_listing_scope(unsafe { slice::from_raw_parts(input, len) }, mode)
 }
+
+// ---------------------------------------------------------------------------------------------
+// XML catalogue and RSS documents (`CompleteXmlCatalogueSource`, `DatsPcIsoSource`, `RssFeedSource`)
+// ---------------------------------------------------------------------------------------------
+//
+// A strict well-formed XML 1.0 subset reader that mirrors what libxml2 + SimpleXML expose to the
+// PHP parsers: elements, attributes, character data, CDATA, comments and processing instructions,
+// the five predefined entities and numeric character references, and `\r\n`/`\r` line-end
+// normalisation. Anything outside that subset (DOCTYPE/ENTITY markup, non-UTF-8 encodings, a BOM,
+// non-ASCII names, literal whitespace inside attribute values, unknown entities, excessive depth)
+// and every malformed or schema-invalid document makes the export return `-1`, so PHP repeats
+// the exact `simplexml_load_string` path and raises its own `RuntimeException`. Successful
+// results are produced only when PHP would succeed with the same output.
+
+use std::borrow::Cow;
+use std::collections::HashSet;
+
+const XML_MAX_DEPTH: usize = 200;
+const XML_MAX_NAME: usize = 1000;
+const XML_NS_URI: &[u8] = b"http://www.w3.org/XML/1998/namespace";
+const XMLNS_NS_URI: &[u8] = b"http://www.w3.org/2000/xmlns/";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum XmlNsMode {
+    /// Any namespace declaration or prefixed name is out of scope (the catalogue parsers reject
+    /// documents with namespaces, or only ever see unprefixed names).
+    Strict,
+    /// RSS feeds commonly declare `content:`, `dc:`, `atom:` prefixes. SimpleXML property access
+    /// without a namespace argument only matches unprefixed elements, so prefixed elements are
+    /// tracked for well-formedness and otherwise ignored.
+    Rss,
+}
+
+enum XmlEvent<'a> {
+    Start(&'a [u8]),
+    End,
+    Text(Cow<'a, [u8]>),
+    Eof,
+}
+
+type XmlResult<T> = Result<T, ()>;
+
+/// Rejects inputs PHP guards or libxml treats specially before any structure is read: invalid
+/// UTF-8, a BOM, C0 controls other than tab/LF/CR and the non-characters U+FFFE/U+FFFF.
+/// `<!DOCTYPE`/`<!ENTITY` markup is rejected by the reader wherever raw `<!` can occur.
+fn xml_prescan(s: &[u8]) -> bool {
+    if std::str::from_utf8(s).is_err() || s.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return false;
+    }
+    let mut base = 0;
+    for chunk in s.chunks(64) {
+        let mut control = false;
+        let mut lead = false;
+        for &b in chunk {
+            control |= (b < 0x20) & (b != b'\t') & (b != b'\n') & (b != b'\r');
+            lead |= b == 0xEF;
+        }
+        if control {
+            return false;
+        }
+        if lead {
+            for i in base..base + chunk.len() {
+                if s[i] == 0xEF
+                    && s.get(i + 1) == Some(&0xBF)
+                    && matches!(s.get(i + 2), Some(0xBE | 0xBF))
+                {
+                    return false;
+                }
+            }
+        }
+        base += chunk.len();
+    }
+    true
+}
+
+/// Word-at-a-time `memchr` from `from`.
+#[inline]
+fn xml_memchr(needle: u8, s: &[u8], from: usize) -> Option<usize> {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let repeated = LO.wrapping_mul(u64::from(needle));
+    let mut i = from;
+    while i + 8 <= s.len() {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&s[i..i + 8]);
+        let x = u64::from_le_bytes(word) ^ repeated;
+        if x.wrapping_sub(LO) & !x & HI != 0 {
+            break;
+        }
+        i += 8;
+    }
+    s[i.min(s.len())..]
+        .iter()
+        .position(|&b| b == needle)
+        .map(|p| p + i)
+}
+
+/// `<!DOCTYPE`/`<!ENTITY` (PHP's declaration guard) inside comment, CDATA or PI content.
+fn xml_has_declaration(s: &[u8]) -> bool {
+    let mut from = 0;
+    while let Some(i) = xml_memchr(b'<', s, from) {
+        if s.get(i + 1) == Some(&b'!') {
+            let rest = &s[i + 2..];
+            if starts_with_ci(rest, b"doctype") || starts_with_ci(rest, b"entity") {
+                return true;
+            }
+        }
+        from = i + 1;
+    }
+    false
+}
+
+#[inline]
+fn starts_with_ci(s: &[u8], prefix: &[u8]) -> bool {
+    s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+#[inline]
+fn is_xml_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+#[inline]
+fn is_name_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_' || b == b':'
+}
+
+#[inline]
+fn is_name_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'.' | b'-')
+}
+
+#[inline]
+fn is_xml_char(cp: u32) -> bool {
+    matches!(cp, 0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF)
+}
+
+fn push_utf8(out: &mut Vec<u8>, cp: u32) {
+    let mut buf = [0u8; 4];
+    // is_xml_char excludes surrogates, so the conversion cannot fail.
+    if let Some(c) = char::from_u32(cp) {
+        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    }
+}
+
+/// Decodes one reference at `s[i] == b'&'`; returns the next index.
+fn xml_reference(s: &[u8], i: usize, out: &mut Vec<u8>) -> XmlResult<usize> {
+    let mut j = i + 1;
+    if s.get(j) == Some(&b'#') {
+        j += 1;
+        let hex = s.get(j) == Some(&b'x');
+        if hex {
+            j += 1;
+        }
+        let start = j;
+        let mut cp: u32 = 0;
+        while j < s.len() && s[j] != b';' {
+            let d = if hex {
+                (s[j] as char).to_digit(16)
+            } else {
+                (s[j] as char).to_digit(10)
+            }
+            .ok_or(())?;
+            cp = cp.checked_mul(if hex { 16 } else { 10 }).ok_or(())?;
+            cp = cp.checked_add(d).ok_or(())?;
+            if cp > 0x10FFFF {
+                return Err(());
+            }
+            j += 1;
+        }
+        if j == start || j >= s.len() || !is_xml_char(cp) {
+            return Err(());
+        }
+        push_utf8(out, cp);
+        return Ok(j + 1);
+    }
+    let end = s[j..].iter().position(|&b| b == b';').ok_or(())? + j;
+    let replacement = match &s[j..end] {
+        b"lt" => b'<',
+        b"gt" => b'>',
+        b"amp" => b'&',
+        b"quot" => b'"',
+        b"apos" => b'\'',
+        _ => return Err(()),
+    };
+    out.push(replacement);
+    Ok(end + 1)
+}
+
+/// Character data (`attr == false`) or an attribute value (`attr == true`).
+fn xml_decode(raw: &[u8], attr: bool) -> XmlResult<Cow<'_, [u8]>> {
+    if !attr {
+        let mut special = false;
+        for chunk in raw.chunks(64) {
+            for &b in chunk {
+                special |= (b == b'&') | (b == b'\r') | (b == b']');
+            }
+            if special {
+                break;
+            }
+        }
+        if !special {
+            return Ok(Cow::Borrowed(raw));
+        }
+    }
+    let mut decode = false;
+    for (i, &b) in raw.iter().enumerate() {
+        match b {
+            b'&' => decode = true,
+            b'\r' => {
+                if attr {
+                    return Err(());
+                }
+                decode = true;
+            }
+            b'\t' | b'\n' | b'<' if attr => return Err(()),
+            b']' if !attr && raw[i..].starts_with(b"]]>") => return Err(()),
+            _ => {}
+        }
+    }
+    if !decode {
+        return Ok(Cow::Borrowed(raw));
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i] {
+            b'&' => i = xml_reference(raw, i, &mut out)?,
+            b'\r' => {
+                out.push(b'\n');
+                i += if raw.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    Ok(Cow::Owned(out))
+}
+
+/// CDATA content only needs line-end normalisation.
+fn xml_normalize_newlines(raw: &[u8]) -> Cow<'_, [u8]> {
+    if !raw.contains(&b'\r') {
+        return Cow::Borrowed(raw);
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'\r' {
+            out.push(b'\n');
+            i += if raw.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+        } else {
+            out.push(raw[i]);
+            i += 1;
+        }
+    }
+    Cow::Owned(out)
+}
+
+fn find(s: &[u8], mut from: usize, needle: &[u8]) -> Option<usize> {
+    while let Some(i) = xml_memchr(needle[0], s, from) {
+        if s[i..].starts_with(needle) {
+            return Some(i);
+        }
+        from = i + 1;
+    }
+    None
+}
+
+struct XmlReader<'a> {
+    s: &'a [u8],
+    pos: usize,
+    ns: XmlNsMode,
+    stack: Vec<&'a [u8]>,
+    ns_scope: Vec<(usize, &'a [u8])>,
+    attrs: Vec<(&'a [u8], Cow<'a, [u8]>)>,
+    pending_end: bool,
+    seen_root: bool,
+}
+
+impl<'a> XmlReader<'a> {
+    fn new(s: &'a [u8], ns: XmlNsMode) -> XmlResult<Self> {
+        let mut reader = Self {
+            s,
+            pos: 0,
+            ns,
+            stack: Vec::with_capacity(16),
+            ns_scope: Vec::new(),
+            attrs: Vec::with_capacity(8),
+            pending_end: false,
+            seen_root: false,
+        };
+        if s.starts_with(b"<?xml") && s.len() > 5 && is_xml_space(s[5]) {
+            reader.xml_declaration()?;
+        }
+        Ok(reader)
+    }
+
+    fn depth(&self) -> usize {
+        self.stack.len()
+    }
+
+    fn skip_space(&mut self) -> bool {
+        let start = self.pos;
+        while self.pos < self.s.len() && is_xml_space(self.s[self.pos]) {
+            self.pos += 1;
+        }
+        self.pos > start
+    }
+
+    fn expect(&mut self, token: &[u8]) -> XmlResult<()> {
+        if self.s[self.pos..].starts_with(token) {
+            self.pos += token.len();
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    fn name(&mut self) -> XmlResult<&'a [u8]> {
+        let start = self.pos;
+        if self.pos >= self.s.len() || !is_name_start(self.s[self.pos]) {
+            return Err(());
+        }
+        self.pos += 1;
+        while self.pos < self.s.len() && is_name_char(self.s[self.pos]) {
+            self.pos += 1;
+        }
+        if self.pos - start > XML_MAX_NAME {
+            return Err(());
+        }
+        Ok(&self.s[start..self.pos])
+    }
+
+    fn quoted(&mut self) -> XmlResult<&'a [u8]> {
+        let quote = *self.s.get(self.pos).ok_or(())?;
+        if quote != b'"' && quote != b'\'' {
+            return Err(());
+        }
+        let start = self.pos + 1;
+        let end = self.s[start..].iter().position(|&b| b == quote).ok_or(())? + start;
+        self.pos = end + 1;
+        Ok(&self.s[start..end])
+    }
+
+    fn eq(&mut self) -> XmlResult<()> {
+        self.skip_space();
+        self.expect(b"=")?;
+        self.skip_space();
+        Ok(())
+    }
+
+    /// `<?xml version="1.0" (encoding="UTF-8")? (standalone="yes|no")? ?>`; anything else
+    /// (other versions or encodings) is left to libxml.
+    fn xml_declaration(&mut self) -> XmlResult<()> {
+        self.pos = 5;
+        self.skip_space();
+        self.expect(b"version")?;
+        self.eq()?;
+        if self.quoted()? != b"1.0" {
+            return Err(());
+        }
+        let mut stage = 0;
+        loop {
+            let spaced = self.skip_space();
+            if self.s[self.pos..].starts_with(b"?>") {
+                self.pos += 2;
+                return Ok(());
+            }
+            if !spaced {
+                return Err(());
+            }
+            if stage < 1 && self.s[self.pos..].starts_with(b"encoding") {
+                self.pos += 8;
+                self.eq()?;
+                if !self.quoted()?.eq_ignore_ascii_case(b"utf-8") {
+                    return Err(());
+                }
+                stage = 1;
+            } else if stage < 2 && self.s[self.pos..].starts_with(b"standalone") {
+                self.pos += 10;
+                self.eq()?;
+                if !matches!(self.quoted()?, b"yes" | b"no") {
+                    return Err(());
+                }
+                stage = 2;
+            } else {
+                return Err(());
+            }
+        }
+    }
+
+    fn processing_instruction(&mut self) -> XmlResult<()> {
+        self.pos += 2;
+        let target = self.name()?;
+        if target.contains(&b':') || target.eq_ignore_ascii_case(b"xml") {
+            return Err(());
+        }
+        if self.s[self.pos..].starts_with(b"?>") {
+            self.pos += 2;
+            return Ok(());
+        }
+        if !self.skip_space() {
+            return Err(());
+        }
+        let end = find(self.s, self.pos, b"?>").ok_or(())?;
+        if xml_has_declaration(&self.s[self.pos..end]) {
+            return Err(());
+        }
+        self.pos = end + 2;
+        Ok(())
+    }
+
+    fn comment(&mut self) -> XmlResult<()> {
+        let end = find(self.s, self.pos + 4, b"--").ok_or(())?;
+        if self.s.get(end + 2) != Some(&b'>') || xml_has_declaration(&self.s[self.pos + 4..end]) {
+            return Err(());
+        }
+        self.pos = end + 3;
+        Ok(())
+    }
+
+    fn split_qname(&self, name: &'a [u8]) -> XmlResult<(Option<&'a [u8]>, &'a [u8])> {
+        match name.iter().position(|&b| b == b':') {
+            None => Ok((None, name)),
+            Some(_) if self.ns == XmlNsMode::Strict => Err(()),
+            Some(c) => {
+                let (prefix, local) = (&name[..c], &name[c + 1..]);
+                if prefix.is_empty() || local.is_empty() || local.contains(&b':') {
+                    return Err(());
+                }
+                Ok((Some(prefix), local))
+            }
+        }
+    }
+
+    fn declared(&self, prefix: &[u8]) -> bool {
+        self.ns_scope.iter().any(|&(_, p)| p == prefix)
+    }
+
+    fn start_tag(&mut self) -> XmlResult<XmlEvent<'a>> {
+        if self.seen_root && self.stack.is_empty() {
+            return Err(());
+        }
+        self.pos += 1;
+        let name = self.name()?;
+        self.attrs.clear();
+        let empty;
+        loop {
+            let spaced = self.skip_space();
+            match self.s.get(self.pos) {
+                Some(b'>') => {
+                    self.pos += 1;
+                    empty = false;
+                    break;
+                }
+                Some(b'/') => {
+                    self.expect(b"/>")?;
+                    empty = true;
+                    break;
+                }
+                None => return Err(()),
+                _ => {}
+            }
+            if !spaced {
+                return Err(());
+            }
+            let attr = self.name()?;
+            self.eq()?;
+            let value = xml_decode(self.quoted()?, true)?;
+            if self.attrs.iter().any(|(n, _)| *n == attr) {
+                return Err(());
+            }
+            self.attrs.push((attr, value));
+        }
+
+        let depth = self.stack.len() + 1;
+        if depth > XML_MAX_DEPTH {
+            return Err(());
+        }
+        let (prefix, _) = self.split_qname(name)?;
+        for index in 0..self.attrs.len() {
+            let (attr, value) = (self.attrs[index].0, &self.attrs[index].1);
+            if attr == b"xmlns" {
+                if self.ns == XmlNsMode::Strict
+                    || &**value == XML_NS_URI
+                    || &**value == XMLNS_NS_URI
+                {
+                    return Err(());
+                }
+                continue;
+            }
+            let (attr_prefix, local) = self.split_qname(attr)?;
+            if attr_prefix == Some(b"xmlns") {
+                if local == b"xml"
+                    || local == b"xmlns"
+                    || value.is_empty()
+                    || &**value == XML_NS_URI
+                    || &**value == XMLNS_NS_URI
+                {
+                    return Err(());
+                }
+                self.ns_scope.push((depth, local));
+            }
+        }
+        if let Some(p) = prefix
+            && (p == b"xml" || p == b"xmlns" || !self.declared(p))
+        {
+            return Err(());
+        }
+        if self.ns == XmlNsMode::Rss {
+            let mut locals: Vec<&[u8]> = Vec::with_capacity(self.attrs.len());
+            for (attr, _) in &self.attrs {
+                let (attr_prefix, local) = self.split_qname(attr)?;
+                match attr_prefix {
+                    Some(b"xmlns") => continue,
+                    None if *attr == b"xmlns" => continue,
+                    Some(b"xml") | None => {}
+                    Some(p) if self.declared(p) => {}
+                    Some(_) => return Err(()),
+                }
+                if locals.contains(&local) {
+                    return Err(());
+                }
+                locals.push(local);
+            }
+        }
+        self.stack.push(name);
+        self.seen_root = true;
+        self.pending_end = empty;
+        Ok(XmlEvent::Start(name))
+    }
+
+    fn close(&mut self) {
+        self.stack.pop();
+        let depth = self.stack.len();
+        while self.ns_scope.last().is_some_and(|&(d, _)| d > depth) {
+            self.ns_scope.pop();
+        }
+    }
+
+    fn next(&mut self) -> XmlResult<XmlEvent<'a>> {
+        if self.pending_end {
+            self.pending_end = false;
+            self.close();
+            return Ok(XmlEvent::End);
+        }
+        loop {
+            if self.pos >= self.s.len() {
+                return if self.seen_root && self.stack.is_empty() {
+                    Ok(XmlEvent::Eof)
+                } else {
+                    Err(())
+                };
+            }
+            if self.s[self.pos] != b'<' {
+                let start = self.pos;
+                let end = xml_memchr(b'<', self.s, start).unwrap_or(self.s.len());
+                self.pos = end;
+                let raw = &self.s[start..end];
+                if self.stack.is_empty() {
+                    if !raw.iter().all(|&b| is_xml_space(b)) {
+                        return Err(());
+                    }
+                    continue;
+                }
+                return Ok(XmlEvent::Text(xml_decode(raw, false)?));
+            }
+            match self.s.get(self.pos + 1) {
+                Some(b'/') => {
+                    self.pos += 2;
+                    let name = self.name()?;
+                    self.skip_space();
+                    self.expect(b">")?;
+                    if self.stack.last() != Some(&name) {
+                        return Err(());
+                    }
+                    self.close();
+                    return Ok(XmlEvent::End);
+                }
+                Some(b'?') => self.processing_instruction()?,
+                Some(b'!') => {
+                    if self.s[self.pos..].starts_with(b"<!--") {
+                        self.comment()?;
+                    } else if self.s[self.pos..].starts_with(b"<![CDATA[") && !self.stack.is_empty()
+                    {
+                        let start = self.pos + 9;
+                        let end = find(self.s, start, b"]]>").ok_or(())?;
+                        if xml_has_declaration(&self.s[start..end]) {
+                            return Err(());
+                        }
+                        self.pos = end + 3;
+                        return Ok(XmlEvent::Text(xml_normalize_newlines(&self.s[start..end])));
+                    } else {
+                        return Err(());
+                    }
+                }
+                _ => return self.start_tag(),
+            }
+        }
+    }
+}
+
+/// Non-ASCII characters whose Unicode class (letters/punctuation, never `\s`, `\p{Z}` or
+/// `\p{C}`) and full lowercase mapping are stable across the PCRE2/mbstring and Rust tables.
+/// Anything else declines to PHP so `preg_match`/`mb_strtolower` keep deciding.
+#[inline]
+fn xml_literal_non_ascii(c: char) -> bool {
+    matches!(c as u32,
+        0x00A1..=0x00AC | 0x00AE..=0x017F | 0x2010..=0x2027 | 0x3041..=0x3096
+        | 0x30A1..=0x30FA | 0x4E00..=0x9FA5 | 0xAC00..=0xD7A3)
+}
+
+/// Literal-title check shared by the catalogue parsers: `None` when a character needs PHP,
+/// otherwise `(has \s/\p{Z}/\p{C} character, character count)`.
+fn xml_classify(title: &[u8]) -> Option<(bool, usize)> {
+    let text = std::str::from_utf8(title).ok()?;
+    let mut nonliteral = false;
+    let mut chars = 0;
+    for c in text.chars() {
+        chars += 1;
+        if c.is_ascii() {
+            if (c as u32) <= 0x20 || c as u32 == 0x7F {
+                nonliteral = true;
+            }
+        } else if !xml_literal_non_ascii(c) {
+            return None;
+        }
+    }
+    Some((nonliteral, chars))
+}
+
+/// `mb_strtolower($s, 'UTF-8')` for strings accepted by [`xml_classify`]'s character set.
+fn xml_lower(s: &[u8]) -> Option<Vec<u8>> {
+    if s.is_ascii() {
+        return Some(s.to_ascii_lowercase());
+    }
+    let text = std::str::from_utf8(s).ok()?;
+    let mut out = String::with_capacity(s.len());
+    for c in text.chars() {
+        if c.is_ascii() {
+            out.push(c.to_ascii_lowercase());
+        } else if xml_literal_non_ascii(c) {
+            out.extend(c.to_lowercase());
+        } else {
+            return None;
+        }
+    }
+    Some(out.into_bytes())
+}
+
+fn xml_out_finish(out: OutCursor<'_>) -> isize {
+    let n = out.finish();
+    // A decline is always -1; a too-small buffer reports at least -2.
+    if n == -1 { -2 } else { n }
+}
+
+// --- CompleteXmlCatalogueSource ------------------------------------------------------------
+
+#[derive(Default)]
+struct CatalogueRecord {
+    ids: usize,
+    id_nested: bool,
+    id: Vec<u8>,
+    names: usize,
+    name_nested: bool,
+    name: Vec<u8>,
+}
+
+const CATALOGUE_MISSING: &str = "missing_or_ambiguous_title";
+const CATALOGUE_NONLITERAL: &str = "nonliteral_title";
+const CATALOGUE_OVERLENGTH: &str = "overlength_title";
+
+struct CatalogueResult {
+    total: usize,
+    normalized: usize,
+    rejections: Vec<(&'static str, usize)>,
+    titles: Vec<Vec<u8>>,
+}
+
+fn count_reason(rejections: &mut Vec<(&'static str, usize)>, reason: &'static str) {
+    match rejections.iter_mut().find(|(r, _)| *r == reason) {
+        Some(entry) => entry.1 += 1,
+        None => rejections.push((reason, 1)),
+    }
+}
+
+fn complete_catalogue(xml: &[u8], max_records: usize) -> XmlResult<CatalogueResult> {
+    let mut reader = XmlReader::new(xml, XmlNsMode::Strict)?;
+    let mut total = 0usize;
+    let mut record = CatalogueRecord::default();
+    // Field being captured at depth 3: 1 = first id, 2 = first releasename, 0 = other.
+    let mut field = 0u8;
+    let mut ids: HashSet<i64> = HashSet::new();
+    let mut accepted: Vec<(i64, Vec<u8>, bool)> = Vec::new();
+    let mut rejections: Vec<(&'static str, usize)> = Vec::new();
+    loop {
+        match reader.next()? {
+            XmlEvent::Start(name) => match reader.depth() {
+                1 if name != b"releases" => return Err(()),
+                1 => {}
+                2 => {
+                    if name != b"release" {
+                        return Err(());
+                    }
+                    total += 1;
+                    if total > max_records {
+                        return Err(());
+                    }
+                    record = CatalogueRecord::default();
+                }
+                3 => {
+                    field = 0;
+                    if name == b"id" {
+                        record.ids += 1;
+                        if record.ids == 1 {
+                            field = 1;
+                        }
+                    } else if name == b"releasename" {
+                        record.names += 1;
+                        if record.names == 1 {
+                            field = 2;
+                        }
+                    }
+                }
+                4 => match field {
+                    1 => record.id_nested = true,
+                    2 => record.name_nested = true,
+                    _ => {}
+                },
+                _ => {}
+            },
+            XmlEvent::Text(text) => match reader.depth() {
+                1 if !text.iter().all(|&b| is_xml_space(b)) => return Err(()),
+                3 if field == 1 => record.id.extend_from_slice(&text),
+                3 if field == 2 => record.name.extend_from_slice(&text),
+                _ => {}
+            },
+            XmlEvent::End => match reader.depth() {
+                2 => field = 0,
+                1 => {
+                    let rec = std::mem::take(&mut record);
+                    if rec.ids != 1 || rec.id_nested {
+                        return Err(());
+                    }
+                    let id = &rec.id;
+                    if id.is_empty() || id[0] == b'0' || !id.iter().all(u8::is_ascii_digit) {
+                        return Err(());
+                    }
+                    let id: i64 = std::str::from_utf8(id)
+                        .map_err(|_| ())?
+                        .parse()
+                        .map_err(|_| ())?;
+                    if !ids.insert(id) {
+                        return Err(());
+                    }
+                    let title = php_trim(&rec.name);
+                    let reason = if rec.names != 1 || rec.name_nested || title.is_empty() {
+                        Some(CATALOGUE_MISSING)
+                    } else {
+                        let (nonliteral, chars) = xml_classify(title).ok_or(())?;
+                        if nonliteral {
+                            Some(CATALOGUE_NONLITERAL)
+                        } else if chars > 255 {
+                            Some(CATALOGUE_OVERLENGTH)
+                        } else {
+                            None
+                        }
+                    };
+                    match reason {
+                        Some(r) => count_reason(&mut rejections, r),
+                        None => {
+                            let normalized = title.len() != rec.name.len();
+                            accepted.push((id, title.to_vec(), normalized));
+                        }
+                    }
+                }
+                _ => {}
+            },
+            XmlEvent::Eof => break,
+        }
+    }
+    if total < 1 {
+        return Err(());
+    }
+    accepted.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
+    let mut seen: HashSet<Vec<u8>> = HashSet::with_capacity(accepted.len());
+    let mut titles = Vec::with_capacity(accepted.len());
+    let mut normalized = 0usize;
+    let mut duplicates = 0usize;
+    for (_, title, was_normalized) in accepted {
+        if !seen.insert(xml_lower(&title).ok_or(())?) {
+            duplicates += 1;
+            continue;
+        }
+        normalized += usize::from(was_normalized);
+        titles.push(title);
+    }
+    if duplicates > 0 {
+        rejections.push(("duplicate_title", duplicates));
+    }
+    Ok(CatalogueResult {
+        total,
+        normalized,
+        rejections,
+        titles,
+    })
+}
+
+/// Parses a `CompleteXmlCatalogueSource` export (`<releases><release><id/><releasename/>`).
+///
+/// Output on success: `K<total>\0<boundary normalized>\0<reason count>(\0<reason>\0<count>)*`
+/// followed by `\0<title>` per accepted, deduplicated title in descending catalogue-ID order.
+/// Rejection reasons appear in PHP's first-occurrence order with `duplicate_title` last.
+///
+/// Returns the output length, `-1` when PHP must parse the document itself (including every
+/// invalid export), or `-(needed)` (at most `-2`) when `out_cap` is too small.
+///
+/// # Safety
+/// `xml` must be readable for `len` bytes and `out_buf` writable for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_predb_xml_complete_catalogue(
+    xml: *const u8,
+    len: usize,
+    max_records: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if xml.is_null() || len == 0 {
+        return -1;
+    }
+    let xml = unsafe { slice::from_raw_parts(xml, len) };
+    if !xml_prescan(xml) {
+        return -1;
+    }
+    let Ok(result) = complete_catalogue(xml, max_records) else {
+        return -1;
+    };
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+    out.push(b'K');
+    out.extend(result.total.to_string().as_bytes());
+    out.push(0);
+    out.extend(result.normalized.to_string().as_bytes());
+    out.push(0);
+    out.extend(result.rejections.len().to_string().as_bytes());
+    for (reason, count) in &result.rejections {
+        out.push(0);
+        out.extend(reason.as_bytes());
+        out.push(0);
+        out.extend(count.to_string().as_bytes());
+    }
+    for title in &result.titles {
+        out.push(0);
+        out.extend(title);
+    }
+    xml_out_finish(out)
+}
+
+// --- DatsPcIsoSource -----------------------------------------------------------------------
+
+struct XmlNode<'a> {
+    name: &'a [u8],
+    attrs: Vec<(&'a [u8], Vec<u8>)>,
+    text: Vec<u8>,
+    children: Vec<usize>,
+}
+
+impl XmlNode<'_> {
+    fn attr(&self, name: &[u8]) -> Option<&[u8]> {
+        self.attrs
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| v.as_slice())
+    }
+
+    fn has_attributes(&self, expected: &[&[u8]]) -> bool {
+        self.attrs.len() == expected.len() && expected.iter().all(|e| self.attr(e).is_some())
+    }
+}
+
+fn xml_tree<'a>(xml: &'a [u8], ns: XmlNsMode) -> XmlResult<Vec<XmlNode<'a>>> {
+    let mut reader = XmlReader::new(xml, ns)?;
+    let mut nodes: Vec<XmlNode<'a>> = Vec::new();
+    let mut open: Vec<usize> = Vec::new();
+    loop {
+        match reader.next()? {
+            XmlEvent::Start(name) => {
+                let index = nodes.len();
+                nodes.push(XmlNode {
+                    name,
+                    attrs: reader.attrs.iter().map(|(n, v)| (*n, v.to_vec())).collect(),
+                    text: Vec::new(),
+                    children: Vec::new(),
+                });
+                if let Some(&parent) = open.last() {
+                    nodes[parent].children.push(index);
+                }
+                open.push(index);
+            }
+            XmlEvent::Text(text) => {
+                if let Some(&current) = open.last() {
+                    nodes[current].text.extend_from_slice(&text);
+                }
+            }
+            XmlEvent::End => {
+                open.pop();
+            }
+            XmlEvent::Eof => return Ok(nodes),
+        }
+    }
+}
+
+fn php_trim_empty(s: &[u8]) -> bool {
+    php_trim(s).is_empty()
+}
+
+fn all_hex(s: &[u8], len: usize) -> bool {
+    s.len() == len && s.iter().all(u8::is_ascii_hexdigit)
+}
+
+struct DatsResult {
+    unsupported: usize,
+    titles: Vec<Vec<u8>>,
+}
+
+fn dats_header(nodes: &[XmlNode<'_>], header: &XmlNode<'_>) -> XmlResult<()> {
+    if !header.has_attributes(&[]) || !php_trim_empty(&header.text) {
+        return Err(());
+    }
+    const FIELDS: [&[u8]; 6] = [
+        b"name",
+        b"description",
+        b"category",
+        b"version",
+        b"date",
+        b"clrmamepro",
+    ];
+    if header.children.len() != FIELDS.len() {
+        return Err(());
+    }
+    for (&child, expected) in header.children.iter().zip(FIELDS) {
+        let field = &nodes[child];
+        let attrs: &[&[u8]] = if field.name == b"clrmamepro" {
+            &[b"forcepacking"]
+        } else {
+            &[]
+        };
+        if field.name != expected || !field.children.is_empty() || !field.has_attributes(attrs) {
+            return Err(());
+        }
+    }
+    let text = |i: usize| nodes[header.children[i]].text.as_slice();
+    let clrmamepro = &nodes[header.children[5]];
+    if text(0) != b"PC iSO Games Scene 1998"
+        || text(1) != text(0)
+        || text(2) != b"Scene"
+        || text(3).is_empty()
+        || text(4).is_empty()
+        || clrmamepro.attr(b"forcepacking") != Some(b"unzip")
+        || !clrmamepro.text.is_empty()
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn dats_pciso(xml: &[u8], max_records: usize) -> XmlResult<DatsResult> {
+    let nodes = xml_tree(xml, XmlNsMode::Strict)?;
+    let root = nodes.first().ok_or(())?;
+    if root.name != b"datafile" || !root.has_attributes(&[]) || !php_trim_empty(&root.text) {
+        return Err(());
+    }
+    let named = |parent: &XmlNode<'_>, name: &[u8]| -> Vec<usize> {
+        parent
+            .children
+            .iter()
+            .copied()
+            .filter(|&c| nodes[c].name == name)
+            .collect()
+    };
+    let headers = named(root, b"header");
+    let game_count = named(root, b"game").len();
+    if headers.len() != 1 || game_count < 1 || game_count > max_records {
+        return Err(());
+    }
+    dats_header(&nodes, &nodes[headers[0]])?;
+
+    let mut games: HashSet<Vec<u8>> = HashSet::new();
+    let mut titles: HashSet<Vec<u8>> = HashSet::new();
+    let mut result = DatsResult {
+        unsupported: 0,
+        titles: Vec::new(),
+    };
+    for &child in &root.children {
+        let game = &nodes[child];
+        if game.name == b"header" {
+            continue;
+        }
+        let descriptions = named(game, b"description");
+        let roms = named(game, b"rom");
+        if game.name != b"game"
+            || !game.has_attributes(&[b"name"])
+            || descriptions.len() != 1
+            || !nodes[descriptions[0]].children.is_empty()
+            || !nodes[descriptions[0]].has_attributes(&[])
+            || roms.is_empty()
+            || !php_trim_empty(&game.text)
+        {
+            return Err(());
+        }
+        let nuked = named(game, b"nukedreason");
+        if nuked.len() > 1
+            || nuked.first().is_some_and(|&n| {
+                !nodes[n].children.is_empty()
+                    || !nodes[n].has_attributes(&[])
+                    || nodes[n].text.is_empty()
+            })
+        {
+            return Err(());
+        }
+        let game_name = game.attr(b"name").unwrap_or_default();
+        if game_name.is_empty() || nodes[descriptions[0]].text != game_name {
+            return Err(());
+        }
+        if !games.insert(xml_lower(game_name).ok_or(())?) {
+            return Err(());
+        }
+        let mut rom_names: HashSet<Vec<u8>> = HashSet::new();
+        let mut mia: Vec<&[u8]> = Vec::new();
+        for &r in &game.children {
+            let rom = &nodes[r];
+            if rom.name == b"description" || rom.name == b"nukedreason" {
+                continue;
+            }
+            let name = rom.attr(b"name").unwrap_or_default();
+            if rom.name != b"rom"
+                || !rom.children.is_empty()
+                || !rom.text.is_empty()
+                || name.is_empty()
+            {
+                return Err(());
+            }
+            // `\p{C}` alone: spaces are allowed in archive member names.
+            let text = std::str::from_utf8(name).map_err(|_| ())?;
+            let mut chars = 0;
+            for c in text.chars() {
+                chars += 1;
+                if c.is_ascii() {
+                    if (c as u32) < 0x20 || c as u32 == 0x7F {
+                        return Err(());
+                    }
+                } else if !xml_literal_non_ascii(c) {
+                    return Err(());
+                }
+            }
+            if chars > 255 || !rom_names.insert(xml_lower(name).ok_or(())?) {
+                return Err(());
+            }
+            if rom.attr(b"mia").is_some() {
+                if !rom.has_attributes(&[b"name", b"mia"]) || rom.attr(b"mia") != Some(b"yes") {
+                    return Err(());
+                }
+                mia.push(name);
+            } else {
+                let size = rom.attr(b"size").unwrap_or_default();
+                if !rom.has_attributes(&[b"name", b"size", b"crc", b"md5", b"sha1"])
+                    || size.is_empty()
+                    || !size.iter().all(u8::is_ascii_digit)
+                    || (size.len() > 1 && size[0] == b'0')
+                    || !all_hex(rom.attr(b"crc").unwrap_or_default(), 8)
+                    || !all_hex(rom.attr(b"md5").unwrap_or_default(), 32)
+                    || !all_hex(rom.attr(b"sha1").unwrap_or_default(), 40)
+                {
+                    return Err(());
+                }
+            }
+        }
+        if mia.is_empty() {
+            result.unsupported += 1;
+            continue;
+        }
+        if mia.len() != 1 || roms.len() != 1 {
+            return Err(());
+        }
+        let title = mia[0];
+        let (nonliteral, _) = xml_classify(title).ok_or(())?;
+        let mut suffix = Vec::with_capacity(title.len() + 1);
+        suffix.push(b'-');
+        suffix.extend_from_slice(title);
+        if nonliteral
+            || title.contains(&b'/')
+            || title.contains(&b'\\')
+            || !game_name.ends_with(&suffix)
+            || !titles.insert(xml_lower(title).ok_or(())?)
+        {
+            return Err(());
+        }
+        result.titles.push(title.to_vec());
+    }
+    Ok(result)
+}
+
+/// Parses the DATS.SITE PC ISO 1998 export with `DatsPcIsoSource` semantics.
+///
+/// Output on success: `K<archive-file games>` followed by `\0<title>` per accepted MIA title in
+/// document order. Returns `-1` when PHP must parse (including every invalid export) or
+/// `-(needed)` (at most `-2`) when `out_cap` is too small.
+///
+/// # Safety
+/// `xml` must be readable for `len` bytes and `out_buf` writable for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_predb_xml_dats_pciso(
+    xml: *const u8,
+    len: usize,
+    max_records: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if xml.is_null() || len == 0 {
+        return -1;
+    }
+    let xml = unsafe { slice::from_raw_parts(xml, len) };
+    if !xml_prescan(xml) {
+        return -1;
+    }
+    let Ok(result) = dats_pciso(xml, max_records) else {
+        return -1;
+    };
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+    out.push(b'K');
+    out.extend(result.unsupported.to_string().as_bytes());
+    for title in &result.titles {
+        out.push(0);
+        out.extend(title);
+    }
+    xml_out_finish(out)
+}
+
+// --- RssFeedSource -------------------------------------------------------------------------
+
+const RSS_MAXIMUM_ITEMS: usize = 5000;
+const RSS_SPACED_TITLES: u32 = 1;
+const RSS_STRIP_SIZE_SUFFIX: u32 = 2;
+const RSS_MAP_CATEGORY: u32 = 4;
+
+/// `preg_replace('/ \x{2013} [0-9]+(?:\.[0-9]+)? (?:MB|GB)$/u', '', $title)` on a trimmed title.
+fn rss_strip_size_suffix(t: &[u8]) -> &[u8] {
+    if !(t.ends_with(b" MB") || t.ends_with(b" GB")) {
+        return t;
+    }
+    let end = t.len() - 3;
+    let mut start = end;
+    while start > 0 && (t[start - 1].is_ascii_digit() || t[start - 1] == b'.') {
+        start -= 1;
+    }
+    let number = &t[start..end];
+    let valid = match number.iter().position(|&b| b == b'.') {
+        None => !number.is_empty(),
+        Some(dot) => {
+            dot > 0 && dot + 1 < number.len() && number[dot + 1..].iter().all(u8::is_ascii_digit)
+        }
+    };
+    const DASH: &[u8] = " \u{2013} ".as_bytes();
+    if valid && t[..start].ends_with(DASH) {
+        &t[..start - DASH.len()]
+    } else {
+        t
+    }
+}
+
+/// `RssFeedSource::dotted()`.
+fn rss_dotted(title: &[u8]) -> Vec<u8> {
+    let mut t = php_trim(title);
+    if t.len() >= 4 && t[t.len() - 4..].eq_ignore_ascii_case(b"eztv") {
+        let mut k = t.len() - 4;
+        while k > 0 && is_ws(t[k - 1]) {
+            k -= 1;
+        }
+        if k < t.len() - 4 {
+            t = &t[..k];
+        }
+    }
+    let mut out = Vec::with_capacity(t.len());
+    let mut i = 0;
+    while i < t.len() {
+        if is_ws(t[i]) {
+            while i < t.len() && is_ws(t[i]) {
+                i += 1;
+            }
+            out.push(b'.');
+        } else {
+            out.push(t[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
+
+fn two_digits(s: &[u8]) -> Option<i64> {
+    match s {
+        [a, b] if a.is_ascii_digit() && b.is_ascii_digit() => {
+            Some(i64::from((a - b'0') * 10 + (b - b'0')))
+        }
+        _ => None,
+    }
+}
+
+/// Exact RFC 2822 `pubDate` (`Sun, 11 Oct 2026 14:56:46 +0000` or `GMT`) with a weekday that
+/// matches the date, so `CarbonImmutable::parse($value)->utc()` equals the UTC wall time.
+/// Writes `\x01Y-m-d H:i:s` (UTC); anything else (other formats, PHP's weekday/overflow
+/// adjustments, zone-less dates) is left for PHP to parse.
+fn rss_fast_date(raw: &[u8], out: &mut Vec<u8>) -> bool {
+    const DAYS: [&[u8]; 7] = [b"Sun", b"Mon", b"Tue", b"Wed", b"Thu", b"Fri", b"Sat"];
+    const MONTHS: [&[u8]; 12] = [
+        b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov",
+        b"Dec",
+    ];
+    let parse = || -> Option<i64> {
+        let weekday = DAYS.iter().position(|d| raw.get(..3) == Some(*d))? as i64;
+        if raw.get(3..5)? != b", " {
+            return None;
+        }
+        let day_len = if raw.get(6)? == &b' ' { 1 } else { 2 };
+        let day_digits = raw.get(5..5 + day_len)?;
+        if !day_digits.iter().all(u8::is_ascii_digit) || day_digits[0] == b'0' && day_len == 1 {
+            return None;
+        }
+        let day = std::str::from_utf8(day_digits).ok()?.parse::<i64>().ok()?;
+        let rest = raw.get(5 + day_len..)?;
+        // " Mmm YYYY HH:MM:SS " then the zone.
+        if rest.len() < 22
+            || rest[0] != b' '
+            || rest[4] != b' '
+            || rest[9] != b' '
+            || rest[12] != b':'
+            || rest[15] != b':'
+            || rest[18] != b' '
+        {
+            return None;
+        }
+        let month = MONTHS.iter().position(|m| &rest[1..4] == *m)? as i64 + 1;
+        let year_digits = &rest[5..9];
+        if !year_digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let year = std::str::from_utf8(year_digits).ok()?.parse::<i64>().ok()?;
+        let (hour, minute, second) = (
+            two_digits(&rest[10..12])?,
+            two_digits(&rest[13..15])?,
+            two_digits(&rest[16..18])?,
+        );
+        let offset = match &rest[19..] {
+            b"GMT" => 0,
+            [sign @ (b'+' | b'-'), zone @ ..] if zone.len() == 4 => {
+                let (oh, om) = (two_digits(&zone[..2])?, two_digits(&zone[2..])?);
+                if oh > 14 || om > 59 {
+                    return None;
+                }
+                (oh * 3600 + om * 60) * if *sign == b'-' { -1 } else { 1 }
+            }
+            _ => return None,
+        };
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let month_days = [
+            31,
+            if leap { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
+        if !(1971..=9998).contains(&year)
+            || day < 1
+            || day > month_days[month as usize - 1]
+            || hour > 23
+            || minute > 59
+            || second > 59
+        {
+            return None;
+        }
+        let days = days_from_civil(year, month, day);
+        if (days + 4).rem_euclid(7) != weekday {
+            return None;
+        }
+        Some(days * 86_400 + hour * 3600 + minute * 60 + second - offset)
+    };
+    let Some(timestamp) = parse() else {
+        return false;
+    };
+    let (y, m, d) = civil_from_days(timestamp.div_euclid(86_400));
+    let secs = timestamp.rem_euclid(86_400);
+    out.push(0x01);
+    out.extend_from_slice(
+        format!(
+            "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
+            secs / 3600,
+            secs % 3600 / 60,
+            secs % 60
+        )
+        .as_bytes(),
+    );
+    true
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RssRole {
+    Other,
+    Root,
+    Channel,
+    Item,
+    Title,
+    Category,
+    PubDate,
+}
+
+#[derive(Default)]
+struct RssItem {
+    title: Option<Vec<u8>>,
+    category: Option<Vec<u8>>,
+    pub_date: Option<Vec<u8>>,
+}
+
+fn rss_feed(xml: &[u8], flags: u32, page_size: usize, out: &mut Vec<u8>) -> XmlResult<()> {
+    let mut reader = XmlReader::new(xml, XmlNsMode::Rss)?;
+    let mut roles: Vec<RssRole> = Vec::with_capacity(16);
+    let mut channel_seen = false;
+    let mut items = 0usize;
+    let mut emitted = 0usize;
+    let mut item = RssItem::default();
+    let mut capture: Vec<u8> = Vec::new();
+    loop {
+        match reader.next()? {
+            XmlEvent::Start(name) => {
+                let unprefixed = !name.contains(&b':');
+                let parent = roles.last().copied();
+                let role = match parent {
+                    None if unprefixed && name.eq_ignore_ascii_case(b"rss") => RssRole::Root,
+                    None => return Err(()),
+                    Some(RssRole::Root) if unprefixed && name == b"channel" && !channel_seen => {
+                        channel_seen = true;
+                        RssRole::Channel
+                    }
+                    Some(RssRole::Channel) if unprefixed && name == b"item" => {
+                        items += 1;
+                        if items > RSS_MAXIMUM_ITEMS {
+                            return Err(());
+                        }
+                        item = RssItem::default();
+                        RssRole::Item
+                    }
+                    Some(RssRole::Item) if unprefixed && emitted < page_size => match name {
+                        b"title" if item.title.is_none() => RssRole::Title,
+                        b"category" if item.category.is_none() && flags & RSS_MAP_CATEGORY != 0 => {
+                            RssRole::Category
+                        }
+                        b"pubDate" if item.pub_date.is_none() => RssRole::PubDate,
+                        _ => RssRole::Other,
+                    },
+                    _ => RssRole::Other,
+                };
+                if matches!(role, RssRole::Title | RssRole::Category | RssRole::PubDate) {
+                    capture.clear();
+                }
+                roles.push(role);
+            }
+            XmlEvent::Text(text) => {
+                if matches!(
+                    roles.last(),
+                    Some(RssRole::Title | RssRole::Category | RssRole::PubDate)
+                ) {
+                    capture.extend_from_slice(&text);
+                }
+            }
+            XmlEvent::End => match roles.pop() {
+                Some(RssRole::Title) => item.title = Some(std::mem::take(&mut capture)),
+                Some(RssRole::Category) => item.category = Some(std::mem::take(&mut capture)),
+                Some(RssRole::PubDate) => item.pub_date = Some(std::mem::take(&mut capture)),
+                Some(RssRole::Item) if emitted < page_size => {
+                    let raw = item.title.take().unwrap_or_default();
+                    let mut title = php_trim(&raw);
+                    if flags & RSS_STRIP_SIZE_SUFFIX != 0 {
+                        title = rss_strip_size_suffix(title);
+                    }
+                    let dotted;
+                    if flags & RSS_SPACED_TITLES != 0 {
+                        dotted = rss_dotted(title);
+                        title = &dotted;
+                    }
+                    if title.is_empty() || title.contains(&b' ') {
+                        continue;
+                    }
+                    out.extend_from_slice(title);
+                    out.push(0);
+                    if let Some(category) = &item.category {
+                        out.extend_from_slice(php_trim(category));
+                    }
+                    out.push(0);
+                    if let Some(date) = &item.pub_date
+                        && !rss_fast_date(date, out)
+                    {
+                        out.extend_from_slice(date);
+                    }
+                    out.push(0);
+                    emitted += 1;
+                }
+                _ => {}
+            },
+            XmlEvent::Eof => break,
+        }
+    }
+    if !channel_seen {
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Parses an RSS 2.0 document with `RssFeedSource::parseXml` semantics up to the PHP-side date
+/// handling. `flags`: 1 spaced titles, 2 strip display size suffix, 4 map category.
+///
+/// Output on success: `K` followed by `<title>\0<trimmed category>\0<pubDate>\0` for each of
+/// the first `page_size` accepted items of the first channel (empty strings when absent). The
+/// date is the raw `pubDate` text, or `\x01Y-m-d H:i:s` in UTC for exact RFC 2822 dates. Returns
+/// `-1` when PHP must parse (including every invalid document or the item limit) or `-(needed)`
+/// (at most `-2`) when `out_cap` is too small.
+///
+/// # Safety
+/// `xml` must be readable for `len` bytes and `out_buf` writable for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_predb_xml_rss(
+    xml: *const u8,
+    len: usize,
+    flags: u32,
+    page_size: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if xml.is_null() || len == 0 || flags > 7 {
+        return -1;
+    }
+    let mut xml = unsafe { slice::from_raw_parts(xml, len) };
+    // preg_replace('/\A[ \t\r\n]+(?=<\?xml[ \t\r\n])/', '', $xml)
+    let lead = xml.iter().take_while(|&&b| is_xml_space(b)).count();
+    if lead > 0
+        && xml[lead..].starts_with(b"<?xml")
+        && xml.get(lead + 5).is_some_and(|&b| is_xml_space(b))
+    {
+        xml = &xml[lead..];
+    }
+    if !xml_prescan(xml) {
+        return -1;
+    }
+    let mut body = Vec::new();
+    if rss_feed(xml, flags, page_size, &mut body).is_err() {
+        return -1;
+    }
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+    out.push(b'K');
+    out.extend(&body);
+    xml_out_finish(out)
+}
+
+#[cfg(test)]
+mod xml_tests {
+    use super::*;
+
+    fn call(
+        f: unsafe extern "C" fn(*const u8, usize, usize, *mut u8, usize) -> isize,
+        xml: &str,
+        max: usize,
+    ) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; xml.len() + 256];
+        let n = unsafe { f(xml.as_ptr(), xml.len(), max, buf.as_mut_ptr(), buf.len()) };
+        assert!(n == -1 || n > 0, "unexpected status {n}");
+        (n > 0).then(|| buf[..n as usize].to_vec())
+    }
+
+    fn rss(xml: &str, flags: u32, page: usize) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; xml.len() + 256];
+        let n = unsafe {
+            nntmux_predb_xml_rss(
+                xml.as_ptr(),
+                xml.len(),
+                flags,
+                page,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        (n > 0).then(|| buf[..n as usize].to_vec())
+    }
+
+    fn record(id: &str, title: &str) -> String {
+        format!("<release><id>{id}</id><releasename>{title}</releasename></release>")
+    }
+
+    #[test]
+    fn complete_catalogue_sorts_dedupes_and_counts_in_php_order() {
+        let xml = format!(
+            "<?xml version='1.0' encoding='utf-8'?>\r\n<releases><!-- c -->{}{}{}{}{}</releases>\n",
+            record("1", "exact.title-grp"),
+            record("9", " Exact.Title-GRP\t"),
+            record("3", "Bad Title"),
+            record("4", "L&#233;on-GRP"),
+            record("5", ""),
+        );
+        let out = call(nntmux_predb_xml_complete_catalogue, &xml, 5000).unwrap();
+        assert_eq!(
+            out,
+            "K5\x001\x003\x00nonliteral_title\x001\x00missing_or_ambiguous_title\x001\x00duplicate_title\x001\x00Exact.Title-GRP\x00Léon-GRP".as_bytes()
+        );
+    }
+
+    #[test]
+    fn complete_catalogue_declines_invalid_or_out_of_subset_documents() {
+        let rec = record("1", "A-GRP");
+        for xml in [
+            format!("<releases>{rec}"),
+            format!("<releases>{rec}{rec}</releases>"),
+            format!("<releases xmlns=\"u\">{rec}</releases>"),
+            format!("<!DOCTYPE releases><releases>{rec}</releases>"),
+            format!("<?xml version=\"1.0\" encoding=\"latin1\"?><releases>{rec}</releases>"),
+            format!("<releases>{}</releases>", record("01", "A")),
+            format!("<releases>{}</releases>", record("1", "&nbsp;")),
+            format!("<releases>{}</releases>", record("1", "Ω-GRP")),
+            format!("<releases>{}</releases>", record("1", "A]]>B")),
+            format!("<releases>{rec}<other/></releases>"),
+            "<releases/>".to_string(),
+        ] {
+            assert_eq!(
+                call(nntmux_predb_xml_complete_catalogue, &xml, 5000),
+                None,
+                "{xml}"
+            );
+        }
+        let two = format!("<releases>{rec}{}</releases>", record("2", "B"));
+        assert_eq!(call(nntmux_predb_xml_complete_catalogue, &two, 1), None);
+    }
+
+    #[test]
+    fn small_buffers_report_the_needed_size() {
+        let xml = format!("<releases>{}</releases>", record("1", "A-GRP"));
+        let mut buf = [0u8; 2];
+        let n = unsafe {
+            nntmux_predb_xml_complete_catalogue(
+                xml.as_ptr(),
+                xml.len(),
+                10,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(n <= -2);
+        assert_eq!(-n as usize, "K1\x000\x000\x00A-GRP".len());
+    }
+
+    #[test]
+    fn dats_accepts_only_independent_mia_titles() {
+        let header = "<header><name>PC iSO Games Scene 1998</name><description>PC iSO Games Scene 1998</description><category>Scene</category><version>1</version><date>2026</date><clrmamepro forcepacking=\"unzip\"/></header>";
+        let mia = "<game name=\"1998-01-01-A.Game-GRP\"><description>1998-01-01-A.Game-GRP</description><rom name=\"A.Game-GRP\" mia=\"yes\"/></game>";
+        let file = format!(
+            "<game name=\"1998-01-02-B-GRP\"><description>1998-01-02-B-GRP</description><rom name=\"b file.nfo\" size=\"10\" crc=\"2a869538\" md5=\"{}\" sha1=\"{}\"/></game>",
+            "a".repeat(32),
+            "B".repeat(40)
+        );
+        let xml = format!("<datafile>{header}{mia}{file}</datafile>");
+        assert_eq!(
+            call(nntmux_predb_xml_dats_pciso, &xml, 5000).unwrap(),
+            b"K1\x00A.Game-GRP"
+        );
+        assert_eq!(call(nntmux_predb_xml_dats_pciso, &xml, 1), None);
+        assert_eq!(
+            call(
+                nntmux_predb_xml_dats_pciso,
+                &xml.replace("mia=\"yes\"", "mia=\"no\""),
+                5000
+            ),
+            None
+        );
+        assert_eq!(
+            call(
+                nntmux_predb_xml_dats_pciso,
+                &xml.replace("2a869538", "zz869538"),
+                5000
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rss_reads_unprefixed_fields_of_the_first_channel() {
+        let xml = "\n <?xml version=\"1.0\"?><rss xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><channel><item><dc:title>No</dc:title><title> A.B-GRP </title><category> Cat </category><pubDate>Sun, 11 Oct 2026 14:56:46 +0000</pubDate></item><item><title>has space</title></item></channel><channel><item><title>Second-GRP</title></item></channel></rss>";
+        assert_eq!(
+            rss(xml, 4, 100).unwrap(),
+            b"KA.B-GRP\x00Cat\x00\x012026-10-11 14:56:46\x00"
+        );
+        assert_eq!(
+            rss(xml, 0, 100).unwrap(),
+            b"KA.B-GRP\x00\x00\x012026-10-11 14:56:46\x00"
+        );
+        assert_eq!(
+            rss(
+                "<rss><channel><item><x:title>A</x:title></item></channel></rss>",
+                0,
+                100
+            ),
+            None
+        );
+        assert_eq!(rss("<rss/>", 0, 100), None);
+        assert_eq!(rss("<rss><channel/></rss>", 0, 100).unwrap(), b"K");
+    }
+
+    #[test]
+    fn rss_fast_dates_convert_only_exact_rfc2822_values() {
+        let fast = |raw: &str| {
+            let mut out = Vec::new();
+            rss_fast_date(raw.as_bytes(), &mut out).then(|| String::from_utf8(out).unwrap())
+        };
+        assert_eq!(
+            fast("Sun, 11 Oct 2026 23:30:00 -0130").as_deref(),
+            Some("\x012026-10-12 01:00:00")
+        );
+        assert_eq!(
+            fast("Thu, 1 Jan 2026 00:10:00 +0100").as_deref(),
+            Some("\x012025-12-31 23:10:00")
+        );
+        assert_eq!(
+            fast("Tue, 29 Feb 2028 12:00:00 GMT").as_deref(),
+            Some("\x012028-02-29 12:00:00")
+        );
+        for raw in [
+            "Mon, 11 Oct 2026 14:56:46 +0000",
+            "Sat, 31 Feb 2026 10:00:00 +0000",
+            "Sun, 11 Oct 2026 14:56:60 +0000",
+            "Sun, 11 Oct 2026 14:56:46 UTC",
+            "Sun, 11 Oct 2026 14:56:46 +1500",
+            "Sun, 11 oct 2026 14:56:46 +0000",
+            " Sun, 11 Oct 2026 14:56:46 +0000",
+            "2026-10-11 04:14:20",
+        ] {
+            assert_eq!(fast(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn rss_title_rewrites_match_php_patterns() {
+        assert_eq!(
+            rss_strip_size_suffix("A-GRP \u{2013} 3.1 GB".as_bytes()),
+            b"A-GRP"
+        );
+        assert_eq!(
+            rss_strip_size_suffix("A-GRP \u{2013} 3. GB".as_bytes()),
+            "A-GRP \u{2013} 3. GB".as_bytes()
+        );
+        assert_eq!(
+            rss_strip_size_suffix("A \u{2013} 1.2.3 MB".as_bytes()),
+            "A \u{2013} 1.2.3 MB".as_bytes()
+        );
+        assert_eq!(
+            rss_dotted(b" Show S01E01 720p\t\tWEB-GRP eztv "),
+            b"Show.S01E01.720p.WEB-GRP"
+        );
+        assert_eq!(rss_dotted(b"EZTV"), b"EZTV");
+    }
+}
