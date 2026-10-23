@@ -998,18 +998,22 @@ fn skip_xml_ws(bytes: &[u8], mut pos: usize) -> usize {
     pos
 }
 
-/// Skips whitespace and `<!-- ... -->` comments. Returns `None` on unclosed comment.
+/// Skips whitespace and `<!-- ... -->` comments.
+/// Rejects unclosed comments or `--` inside a comment per XML 1.0 (`Comment ::= '<!--' ((Char - '-') | ('-' (Char - '-')))* '-->'`).
 fn skip_xml_ws_and_comments(bytes: &[u8], mut pos: usize) -> Option<usize> {
     loop {
         pos = skip_xml_ws(bytes, pos);
         if bytes.get(pos..pos + 4) == Some(b"<!--") {
             pos += 4;
             let mut found = false;
-            while pos + 3 <= bytes.len() {
-                if &bytes[pos..pos + 3] == b"-->" {
-                    pos += 3;
-                    found = true;
-                    break;
+            while pos + 2 <= bytes.len() {
+                if &bytes[pos..pos + 2] == b"--" {
+                    if bytes.get(pos + 2) == Some(&b'>') {
+                        pos += 3;
+                        found = true;
+                        break;
+                    }
+                    return None;
                 }
                 pos += 1;
             }
@@ -1022,18 +1026,21 @@ fn skip_xml_ws_and_comments(bytes: &[u8], mut pos: usize) -> Option<usize> {
     }
 }
 
-/// Unescapes standard XML entities into `dst`.
-/// Rejects (`false`) raw `<`, `\0`, `\t`, `\r`, `\n`, or unknown entities so callers fall back to SimpleXML.
-fn unescape_xml_clean(raw: &[u8], dst: &mut Vec<u8>) -> bool {
+/// Unescapes standard XML entities into `dst` (when `Some`) or validates them in place (when `None`).
+/// Rejects (`false`) raw `<`, control chars (`< 0x20`), non-ASCII (`>= 0x7F`), or unknown/control entities
+/// so callers fall back to SimpleXML.
+fn unescape_or_validate_xml_clean(raw: &[u8], mut dst: Option<&mut Vec<u8>>) -> bool {
     let mut i = 0;
     let n = raw.len();
     while i < n {
         let b = raw[i];
-        if matches!(b, b'<' | 0 | b'\t' | b'\r' | b'\n') {
+        if b == b'<' || !(0x20..0x7F).contains(&b) {
             return false;
         }
         if b != b'&' {
-            dst.push(b);
+            if let Some(out) = dst.as_deref_mut() {
+                out.push(b);
+            }
             i += 1;
             continue;
         }
@@ -1043,14 +1050,37 @@ fn unescape_xml_clean(raw: &[u8], dst: &mut Vec<u8>) -> bool {
         };
         let ent = &rest[..semi];
         match ent {
-            b"amp" => dst.push(b'&'),
-            b"lt" => dst.push(b'<'),
-            b"gt" => dst.push(b'>'),
-            b"quot" => dst.push(b'"'),
-            b"apos" => dst.push(b'\''),
+            b"amp" => {
+                if let Some(out) = dst.as_deref_mut() {
+                    out.push(b'&');
+                }
+            }
+            b"lt" => {
+                if let Some(out) = dst.as_deref_mut() {
+                    out.push(b'<');
+                }
+            }
+            b"gt" => {
+                if let Some(out) = dst.as_deref_mut() {
+                    out.push(b'>');
+                }
+            }
+            b"quot" => {
+                if let Some(out) = dst.as_deref_mut() {
+                    out.push(b'"');
+                }
+            }
+            b"apos" => {
+                if let Some(out) = dst.as_deref_mut() {
+                    out.push(b'\'');
+                }
+            }
             _ if ent.starts_with(b"#x") || ent.starts_with(b"#X") => {
                 let hex_digits = &ent[2..];
-                if hex_digits.is_empty() || hex_digits.len() > 6 {
+                if hex_digits.is_empty()
+                    || hex_digits.len() > 6
+                    || !hex_digits.iter().all(u8::is_ascii_hexdigit)
+                {
                     return false;
                 }
                 let Ok(s) = std::str::from_utf8(hex_digits) else {
@@ -1062,15 +1092,20 @@ fn unescape_xml_clean(raw: &[u8], dst: &mut Vec<u8>) -> bool {
                 let Some(ch) = char::from_u32(code) else {
                     return false;
                 };
-                if matches!(ch, '\0' | '\t' | '\r' | '\n') || (code < 0x20) {
+                if code < 0x20 || code == 0x7F {
                     return false;
                 }
-                let mut u8_buf = [0u8; 4];
-                dst.extend_from_slice(ch.encode_utf8(&mut u8_buf).as_bytes());
+                if let Some(out) = dst.as_deref_mut() {
+                    let mut u8_buf = [0u8; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut u8_buf).as_bytes());
+                }
             }
             _ if ent.starts_with(b"#") => {
                 let dec_digits = &ent[1..];
-                if dec_digits.is_empty() || dec_digits.len() > 7 {
+                if dec_digits.is_empty()
+                    || dec_digits.len() > 7
+                    || !dec_digits.iter().all(u8::is_ascii_digit)
+                {
                     return false;
                 }
                 let Ok(s) = std::str::from_utf8(dec_digits) else {
@@ -1082,11 +1117,13 @@ fn unescape_xml_clean(raw: &[u8], dst: &mut Vec<u8>) -> bool {
                 let Some(ch) = char::from_u32(code) else {
                     return false;
                 };
-                if matches!(ch, '\0' | '\t' | '\r' | '\n') || (code < 0x20) {
+                if code < 0x20 || code == 0x7F {
                     return false;
                 }
-                let mut u8_buf = [0u8; 4];
-                dst.extend_from_slice(ch.encode_utf8(&mut u8_buf).as_bytes());
+                if let Some(out) = dst.as_deref_mut() {
+                    let mut u8_buf = [0u8; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut u8_buf).as_bytes());
+                }
             }
             _ => return false,
         }
@@ -1096,15 +1133,20 @@ fn unescape_xml_clean(raw: &[u8], dst: &mut Vec<u8>) -> bool {
 }
 
 #[inline]
-fn matches_tag_ci(bytes: &[u8], pos: usize, tag_lower: &[u8]) -> Option<usize> {
-    let end = pos + tag_lower.len();
-    if end > bytes.len() {
+fn unescape_xml_clean(raw: &[u8], dst: &mut Vec<u8>) -> bool {
+    unescape_or_validate_xml_clean(raw, Some(dst))
+}
+
+#[inline]
+fn validate_xml_clean(raw: &[u8]) -> bool {
+    unescape_or_validate_xml_clean(raw, None)
+}
+
+#[inline]
+fn matches_tag_exact(bytes: &[u8], pos: usize, tag_exact: &[u8]) -> Option<usize> {
+    let end = pos + tag_exact.len();
+    if bytes.get(pos..end) != Some(tag_exact) {
         return None;
-    }
-    for (&a, &b) in bytes[pos..end].iter().zip(tag_lower.iter()) {
-        if a.to_ascii_lowercase() != b {
-            return None;
-        }
     }
     let next = bytes.get(end).copied()?;
     if is_xml_space(next) || next == b'>' || next == b'/' {
@@ -1115,15 +1157,10 @@ fn matches_tag_ci(bytes: &[u8], pos: usize, tag_lower: &[u8]) -> Option<usize> {
 }
 
 #[inline]
-fn expect_closing_tag_ci(bytes: &[u8], pos: usize, close_lower: &[u8]) -> Option<usize> {
-    let end = pos + close_lower.len();
-    if end > bytes.len() {
+fn expect_closing_tag_exact(bytes: &[u8], pos: usize, close_exact: &[u8]) -> Option<usize> {
+    let end = pos + close_exact.len();
+    if bytes.get(pos..end) != Some(close_exact) {
         return None;
-    }
-    for (&a, &b) in bytes[pos..end].iter().zip(close_lower.iter()) {
-        if a.to_ascii_lowercase() != b {
-            return None;
-        }
     }
     let after_ws = skip_xml_ws(bytes, end);
     if bytes.get(after_ws) == Some(&b'>') {
@@ -1134,13 +1171,23 @@ fn expect_closing_tag_ci(bytes: &[u8], pos: usize, close_lower: &[u8]) -> Option
 }
 
 /// Parses attributes of an opening tag starting at `pos` (after the tag name).
-/// Calls `on_attr(attr_name_raw, attr_val_raw)` for each attribute.
-/// Returns `Some((new_pos_after_gt, is_self_closing))` or `None` on malformed syntax/namespaces.
-fn parse_xml_attributes<F>(bytes: &[u8], mut pos: usize, mut on_attr: F) -> Option<(usize, bool)>
+/// Validates attribute syntax, rejects duplicate attributes and namespaces (`:` or `xmlns` when `!allow_xmlns`),
+/// validates every attribute value for clean XML entities/characters, and calls `on_attr(attr_name_raw, attr_val_raw)`.
+/// Returns `Some((new_pos_after_gt, is_self_closing))` or `None` on malformed/unsupported syntax.
+fn parse_xml_attributes<F>(
+    bytes: &[u8],
+    mut pos: usize,
+    allow_xmlns: bool,
+    mut on_attr: F,
+) -> Option<(usize, bool)>
 where
     F: FnMut(&[u8], &[u8]) -> bool,
 {
+    let mut seen_names: [&[u8]; 8] = [&[]; 8];
+    let mut seen_count = 0usize;
+
     loop {
+        let prev_pos = pos;
         pos = skip_xml_ws(bytes, pos);
         let b = *bytes.get(pos)?;
         if b == b'>' {
@@ -1152,7 +1199,15 @@ where
             }
             return None;
         }
+        // Attributes must be separated by whitespace
+        if seen_count > 0 && pos == prev_pos {
+            return None;
+        }
+        if !b.is_ascii_alphabetic() && b != b'_' {
+            return None;
+        }
         let name_start = pos;
+        pos += 1;
         while pos < bytes.len() {
             let c = bytes[pos];
             if c == b':' {
@@ -1164,10 +1219,16 @@ where
                 break;
             }
         }
-        if pos == name_start {
+        let attr_name = &bytes[name_start..pos];
+        if !allow_xmlns && attr_name == b"xmlns" {
             return None;
         }
-        let attr_name = &bytes[name_start..pos];
+        if seen_count >= seen_names.len() || seen_names[..seen_count].contains(&attr_name) {
+            return None;
+        }
+        seen_names[seen_count] = attr_name;
+        seen_count += 1;
+
         pos = skip_xml_ws(bytes, pos);
         if bytes.get(pos) != Some(&b'=') {
             return None;
@@ -1187,8 +1248,81 @@ where
         }
         let attr_val = &bytes[val_start..pos];
         pos += 1;
-        if !on_attr(attr_name, attr_val) {
+        if !validate_xml_clean(attr_val) || !on_attr(attr_name, attr_val) {
             return None;
+        }
+    }
+}
+
+/// Parses an optional leading `<?xml ...?>` declaration at `pos`.
+/// Rejects non-UTF-8 encodings or malformed pseudo-attributes.
+fn parse_xml_decl(bytes: &[u8], mut pos: usize) -> Option<usize> {
+    if bytes.get(pos..pos + 5) != Some(b"<?xml") {
+        return Some(pos);
+    }
+    let after_kw = pos + 5;
+    if !bytes.get(after_kw).copied().is_some_and(is_xml_space) {
+        return None;
+    }
+    pos = after_kw;
+    let mut seen_version = false;
+    let mut seen_encoding = false;
+    let mut seen_standalone = false;
+
+    loop {
+        let prev = pos;
+        pos = skip_xml_ws(bytes, pos);
+        if bytes.get(pos..pos + 2) == Some(b"?>") {
+            return if seen_version { Some(pos + 2) } else { None };
+        }
+        if pos == prev {
+            return None;
+        }
+        let name_start = pos;
+        while pos < bytes.len() && bytes[pos].is_ascii_alphabetic() {
+            pos += 1;
+        }
+        let name = &bytes[name_start..pos];
+        pos = skip_xml_ws(bytes, pos);
+        if bytes.get(pos) != Some(&b'=') {
+            return None;
+        }
+        pos = skip_xml_ws(bytes, pos + 1);
+        let quote = *bytes.get(pos)?;
+        if quote != b'"' && quote != b'\'' {
+            return None;
+        }
+        pos += 1;
+        let val_start = pos;
+        while pos < bytes.len() && bytes[pos] != quote {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            return None;
+        }
+        let val = &bytes[val_start..pos];
+        pos += 1;
+
+        match name {
+            b"version" => {
+                if seen_version || seen_encoding || seen_standalone || val != b"1.0" {
+                    return None;
+                }
+                seen_version = true;
+            }
+            b"encoding" => {
+                if !seen_version || seen_encoding || seen_standalone || !val.eq_ignore_ascii_case(b"utf-8") {
+                    return None;
+                }
+                seen_encoding = true;
+            }
+            b"standalone" => {
+                if !seen_version || seen_standalone || (val != b"yes" && val != b"no") {
+                    return None;
+                }
+                seen_standalone = true;
+            }
+            _ => return None,
         }
     }
 }
@@ -1252,47 +1386,89 @@ pub unsafe extern "C" fn nntmux_nzb_parse_files(
         return -1;
     }
     let bytes = unsafe { slice::from_raw_parts(xml, xml_len) };
-    if bytes.contains(&0x0F) {
-        return -1;
-    }
 
     let mut pos = 0;
     if bytes.starts_with(b"\xEF\xBB\xBF") {
         pos = 3;
     }
 
-    // Skip prologue: whitespace, comments, <?...?>, <!DOCTYPE ...>
+    // Reject control bytes (except \t, \n, \r) and non-ASCII bytes so SimpleXML handles them.
+    for &b in &bytes[pos..] {
+        if (b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r')) || b >= 0x7F {
+            return -1;
+        }
+    }
+
+    let Some(after_decl) = parse_xml_decl(bytes, pos) else {
+        return -1;
+    };
+    pos = after_decl;
+
+    // Skip prologue: whitespace, comments, <!DOCTYPE nzb ...>
     let mut seen_doctype = false;
     loop {
         let Some(next_pos) = skip_xml_ws_and_comments(bytes, pos) else {
             return -1;
         };
         pos = next_pos;
-        if bytes.get(pos..pos + 2) == Some(b"<?") {
-            pos += 2;
-            let mut found = false;
-            while pos + 2 <= bytes.len() {
-                if &bytes[pos..pos + 2] == b"?>" {
-                    pos += 2;
-                    found = true;
-                    break;
-                }
-                pos += 1;
-            }
-            if !found {
-                return -1;
-            }
-        } else if matches_tag_ci(bytes, pos, b"<!doctype").is_some() {
+        if matches_tag_exact(bytes, pos, b"<!DOCTYPE").is_some() {
             if seen_doctype {
                 return -1;
             }
             seen_doctype = true;
-            pos += 9;
-            while pos < bytes.len() && bytes[pos] != b'>' {
-                if bytes[pos] == b'[' || bytes[pos] == b'<' {
+            pos = skip_xml_ws(bytes, pos + 9);
+            let Some(after_name) = matches_tag_exact(bytes, pos, b"nzb") else {
+                return -1;
+            };
+            pos = skip_xml_ws(bytes, after_name);
+            if let Some(after_pub) = matches_tag_exact(bytes, pos, b"PUBLIC") {
+                pos = skip_xml_ws(bytes, after_pub);
+                for qi in 0..2 {
+                    if qi == 1 {
+                        let prev = pos;
+                        pos = skip_xml_ws(bytes, pos);
+                        if pos == prev {
+                            return -1;
+                        }
+                    }
+                    let Some(&q) = bytes.get(pos) else {
+                        return -1;
+                    };
+                    if q != b'"' && q != b'\'' {
+                        return -1;
+                    }
+                    pos += 1;
+                    while pos < bytes.len() && bytes[pos] != q {
+                        if matches!(bytes[pos], b'<' | b'>' | b'[') {
+                            return -1;
+                        }
+                        pos += 1;
+                    }
+                    if bytes.get(pos) != Some(&q) {
+                        return -1;
+                    }
+                    pos += 1;
+                }
+                pos = skip_xml_ws(bytes, pos);
+            } else if let Some(after_sys) = matches_tag_exact(bytes, pos, b"SYSTEM") {
+                pos = skip_xml_ws(bytes, after_sys);
+                let Some(&q) = bytes.get(pos) else {
+                    return -1;
+                };
+                if q != b'"' && q != b'\'' {
                     return -1;
                 }
                 pos += 1;
+                while pos < bytes.len() && bytes[pos] != q {
+                    if matches!(bytes[pos], b'<' | b'>' | b'[') {
+                        return -1;
+                    }
+                    pos += 1;
+                }
+                if bytes.get(pos) != Some(&q) {
+                    return -1;
+                }
+                pos = skip_xml_ws(bytes, pos + 1);
             }
             if bytes.get(pos) != Some(&b'>') {
                 return -1;
@@ -1303,11 +1479,11 @@ pub unsafe extern "C" fn nntmux_nzb_parse_files(
         }
     }
 
-    let Some(nzb_attr_start) = matches_tag_ci(bytes, pos, b"<nzb") else {
+    let Some(nzb_attr_start) = matches_tag_exact(bytes, pos, b"<nzb") else {
         return -1;
     };
     let Some((after_nzb_open, nzb_self_closing)) =
-        parse_xml_attributes(bytes, nzb_attr_start, |_k, _v| true)
+        parse_xml_attributes(bytes, nzb_attr_start, true, |_k, _v| true)
     else {
         return -1;
     };
@@ -1333,7 +1509,7 @@ pub unsafe extern "C" fn nntmux_nzb_parse_files(
         };
         pos = next_pos;
 
-        if let Some(after_nzb_close) = expect_closing_tag_ci(bytes, pos, b"</nzb") {
+        if let Some(after_nzb_close) = expect_closing_tag_exact(bytes, pos, b"</nzb") {
             let Some(end_pos) = skip_xml_ws_and_comments(bytes, after_nzb_close) else {
                 return -1;
             };
@@ -1343,9 +1519,9 @@ pub unsafe extern "C" fn nntmux_nzb_parse_files(
             break;
         }
 
-        if let Some(head_attr_start) = matches_tag_ci(bytes, pos, b"<head") {
+        if let Some(head_attr_start) = matches_tag_exact(bytes, pos, b"<head") {
             let Some((after_head_open, head_self_closing)) =
-                parse_xml_attributes(bytes, head_attr_start, |_k, _v| true)
+                parse_xml_attributes(bytes, head_attr_start, false, |_k, _v| true)
             else {
                 return -1;
             };
@@ -1356,23 +1532,28 @@ pub unsafe extern "C" fn nntmux_nzb_parse_files(
                         return -1;
                     };
                     pos = p;
-                    if let Some(after_head_close) = expect_closing_tag_ci(bytes, pos, b"</head") {
+                    if let Some(after_head_close) = expect_closing_tag_exact(bytes, pos, b"</head")
+                    {
                         pos = after_head_close;
                         break;
                     }
-                    if let Some(meta_attr_start) = matches_tag_ci(bytes, pos, b"<meta") {
+                    if let Some(meta_attr_start) = matches_tag_exact(bytes, pos, b"<meta") {
                         let Some((after_meta_open, meta_self_closing)) =
-                            parse_xml_attributes(bytes, meta_attr_start, |_k, _v| true)
+                            parse_xml_attributes(bytes, meta_attr_start, false, |_k, _v| true)
                         else {
                             return -1;
                         };
                         pos = after_meta_open;
                         if !meta_self_closing {
+                            let text_start = pos;
                             while pos < bytes.len() && bytes[pos] != b'<' {
                                 pos += 1;
                             }
+                            if !validate_xml_clean(&bytes[text_start..pos]) {
+                                return -1;
+                            }
                             let Some(after_meta_close) =
-                                expect_closing_tag_ci(bytes, pos, b"</meta")
+                                expect_closing_tag_exact(bytes, pos, b"</meta")
                             else {
                                 return -1;
                             };
@@ -1386,13 +1567,13 @@ pub unsafe extern "C" fn nntmux_nzb_parse_files(
             continue;
         }
 
-        let Some(file_attr_start) = matches_tag_ci(bytes, pos, b"<file") else {
+        let Some(file_attr_start) = matches_tag_exact(bytes, pos, b"<file") else {
             return -1;
         };
         title_buf.clear();
         let mut seen_subject = false;
         let Some((after_file_open, file_self_closing)) =
-            parse_xml_attributes(bytes, file_attr_start, |k, v| {
+            parse_xml_attributes(bytes, file_attr_start, false, |k, v| {
                 if k == b"subject" {
                     if seen_subject {
                         return false;
@@ -1422,17 +1603,17 @@ pub unsafe extern "C" fn nntmux_nzb_parse_files(
                     return -1;
                 };
                 pos = p;
-                if let Some(after_file_close) = expect_closing_tag_ci(bytes, pos, b"</file") {
+                if let Some(after_file_close) = expect_closing_tag_exact(bytes, pos, b"</file") {
                     pos = after_file_close;
                     break;
                 }
-                if let Some(groups_attr_start) = matches_tag_ci(bytes, pos, b"<groups") {
+                if let Some(groups_attr_start) = matches_tag_exact(bytes, pos, b"<groups") {
                     if seen_groups_block {
                         return -1;
                     }
                     seen_groups_block = true;
                     let Some((after_groups_open, groups_self_closing)) =
-                        parse_xml_attributes(bytes, groups_attr_start, |_k, _v| true)
+                        parse_xml_attributes(bytes, groups_attr_start, false, |_k, _v| true)
                     else {
                         return -1;
                     };
@@ -1444,48 +1625,52 @@ pub unsafe extern "C" fn nntmux_nzb_parse_files(
                             };
                             pos = gp;
                             if let Some(after_groups_close) =
-                                expect_closing_tag_ci(bytes, pos, b"</groups")
+                                expect_closing_tag_exact(bytes, pos, b"</groups")
                             {
                                 pos = after_groups_close;
                                 break;
                             }
-                            let Some(group_attr_start) = matches_tag_ci(bytes, pos, b"<group")
+                            let Some(group_attr_start) = matches_tag_exact(bytes, pos, b"<group")
                             else {
                                 return -1;
                             };
                             let Some((after_group_open, group_self_closing)) =
-                                parse_xml_attributes(bytes, group_attr_start, |_k, _v| true)
+                                parse_xml_attributes(bytes, group_attr_start, false, |_k, _v| true)
                             else {
                                 return -1;
                             };
+                            if group_self_closing {
+                                return -1;
+                            }
                             pos = after_group_open;
                             let g_start = group_arena.len();
-                            if !group_self_closing {
-                                let text_start = pos;
-                                while pos < bytes.len() && bytes[pos] != b'<' {
-                                    pos += 1;
-                                }
-                                if !unescape_xml_clean(&bytes[text_start..pos], &mut group_arena) {
-                                    return -1;
-                                }
-                                let Some(after_group_close) =
-                                    expect_closing_tag_ci(bytes, pos, b"</group")
-                                else {
-                                    return -1;
-                                };
-                                pos = after_group_close;
+                            let text_start = pos;
+                            while pos < bytes.len() && bytes[pos] != b'<' {
+                                pos += 1;
                             }
+                            if !unescape_xml_clean(&bytes[text_start..pos], &mut group_arena) {
+                                return -1;
+                            }
+                            let Some(after_group_close) =
+                                expect_closing_tag_exact(bytes, pos, b"</group")
+                            else {
+                                return -1;
+                            };
+                            pos = after_group_close;
                             let g_end = group_arena.len();
+                            if g_start == g_end {
+                                return -1;
+                            }
                             groups.push((g_start, g_end));
                         }
                     }
-                } else if let Some(segs_attr_start) = matches_tag_ci(bytes, pos, b"<segments") {
+                } else if let Some(segs_attr_start) = matches_tag_exact(bytes, pos, b"<segments") {
                     if seen_segments_block {
                         return -1;
                     }
                     seen_segments_block = true;
                     let Some((after_segs_open, segs_self_closing)) =
-                        parse_xml_attributes(bytes, segs_attr_start, |_k, _v| true)
+                        parse_xml_attributes(bytes, segs_attr_start, false, |_k, _v| true)
                     else {
                         return -1;
                     };
@@ -1497,19 +1682,19 @@ pub unsafe extern "C" fn nntmux_nzb_parse_files(
                             };
                             pos = sp;
                             if let Some(after_segs_close) =
-                                expect_closing_tag_ci(bytes, pos, b"</segments")
+                                expect_closing_tag_exact(bytes, pos, b"</segments")
                             {
                                 pos = after_segs_close;
                                 break;
                             }
-                            let Some(seg_attr_start) = matches_tag_ci(bytes, pos, b"<segment")
+                            let Some(seg_attr_start) = matches_tag_exact(bytes, pos, b"<segment")
                             else {
                                 return -1;
                             };
                             let mut seg_bytes = 0u64;
                             let mut seg_number: Option<i64> = None;
                             let Some((after_seg_open, seg_self_closing)) =
-                                parse_xml_attributes(bytes, seg_attr_start, |k, v| {
+                                parse_xml_attributes(bytes, seg_attr_start, false, |k, v| {
                                     if k == b"bytes" {
                                         let Some(bval) = parse_positive_or_zero_ascii_i64(v) else {
                                             return false;
@@ -1526,24 +1711,28 @@ pub unsafe extern "C" fn nntmux_nzb_parse_files(
                             else {
                                 return -1;
                             };
+                            if seg_self_closing {
+                                return -1;
+                            }
                             pos = after_seg_open;
                             let s_start = seg_arena.len();
-                            if !seg_self_closing {
-                                let text_start = pos;
-                                while pos < bytes.len() && bytes[pos] != b'<' {
-                                    pos += 1;
-                                }
-                                if !unescape_xml_clean(&bytes[text_start..pos], &mut seg_arena) {
-                                    return -1;
-                                }
-                                let Some(after_seg_close) =
-                                    expect_closing_tag_ci(bytes, pos, b"</segment")
-                                else {
-                                    return -1;
-                                };
-                                pos = after_seg_close;
+                            let text_start = pos;
+                            while pos < bytes.len() && bytes[pos] != b'<' {
+                                pos += 1;
                             }
+                            if !unescape_xml_clean(&bytes[text_start..pos], &mut seg_arena) {
+                                return -1;
+                            }
+                            let Some(after_seg_close) =
+                                expect_closing_tag_exact(bytes, pos, b"</segment")
+                            else {
+                                return -1;
+                            };
+                            pos = after_seg_close;
                             let s_end = seg_arena.len();
+                            if s_start == s_end {
+                                return -1;
+                            }
                             if seg_number.is_none() {
                                 has_missing_seg_number = true;
                             }

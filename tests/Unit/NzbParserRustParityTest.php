@@ -132,5 +132,30 @@ XML;
             $parser->parseNzbFileList($cdataNzb, [], useNative: false),
             $parser->parseNzbFileList($cdataNzb, [], useNative: true)
         );
+
+        $edgeXmlInputs = [
+            // Empty <group/> and <segment/>
+            '<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;a.rar&quot; yEnc (1/1)"><groups><group/></groups><segments><segment bytes="10" number="1"/></segments></file></nzb>',
+            // Mismatched tag case
+            '<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;a.rar&quot; yEnc (1/1)"><groups><group>alt.binaries.misc</group></groups><segments><segment bytes="10" number="1">s@x</segment></segments></FILE></nzb>',
+            // Duplicate attributes
+            '<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;a.rar&quot; yEnc (1/1)"><groups><group>alt.binaries.misc</group></groups><segments><segment bytes="10" bytes="20" number="1">s@x</segment></segments></file></nzb>',
+            // Child xmlns
+            '<?xml version="1.0" encoding="UTF-8"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"><file xmlns="http://other" subject="&quot;a.rar&quot; yEnc (1/1)"><groups><group>alt.binaries.misc</group></groups><segments><segment bytes="10" number="1">s@x</segment></segments></file></nzb>',
+            // Invalid -- inside comment
+            '<?xml version="1.0" encoding="UTF-8"?><!-- bad -- comment --><nzb><file subject="&quot;a.rar&quot; yEnc (1/1)"><groups><group>alt.binaries.misc</group></groups><segments><segment bytes="10" number="1">s@x</segment></segments></file></nzb>',
+            // Invalid numeric entity with + sign
+            '<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&#+65;"><groups><group>alt.binaries.misc</group></groups><segments><segment bytes="10" number="1">s@x</segment></segments></file></nzb>',
+            // Unescaped & in non-subject attribute
+            '<?xml version="1.0" encoding="UTF-8"?><nzb><file poster="a & b" subject="&quot;a.rar&quot; yEnc (1/1)"><groups><group>alt.binaries.misc</group></groups><segments><segment bytes="10" number="1">s@x</segment></segments></file></nzb>',
+        ];
+
+        foreach ($edgeXmlInputs as $idx => $edgeXml) {
+            $this->assertSame(
+                $parser->parseNzbFileList($edgeXml, [], useNative: false),
+                $parser->parseNzbFileList($edgeXml, [], useNative: true),
+                "Parity mismatch on edge XML input #{$idx}"
+            );
+        }
     }
 }
