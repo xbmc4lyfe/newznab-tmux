@@ -91,6 +91,14 @@ pub fn analyze(body: &[u8]) -> Analysis {
     let start = starts[0];
     let end = ends[0];
     let (h, hc) = fields(lines[start]);
+    // The PHP frame parser refuses frames missing any mandatory ybegin field.
+    if ["line", "size", "name"]
+        .iter()
+        .any(|key| !h.contains_key(*key))
+    {
+        result.errors.push("YencUnverified".into());
+        return result;
+    }
     let (t, tc) = fields(lines[end]);
     let part_lines: Vec<_> = lines
         .iter()
@@ -277,6 +285,33 @@ mod tests {
         assert!(a.errors.is_empty());
         assert_eq!(a.decoded, b);
         assert_eq!(a.summary.unwrap()["crc_ok"], true);
+    }
+    #[test]
+    fn mandatory_headers_required_for_single_and_multipart() {
+        for multipart in [false, true] {
+            for missing in ["line=128 ", "size=3 ", "name=x"] {
+                let header = "=ybegin line=128 size=3 name=x".replace(missing, "");
+                let (header, trailer) = if multipart {
+                    (
+                        format!(
+                            "{}\r\n=ypart begin=1 end=3",
+                            header.replace("=ybegin ", "=ybegin part=1 total=1 ")
+                        ),
+                        format!("=yend size=3 part=1 pcrc32={:08x}", crc32fast::hash(b"abc")),
+                    )
+                } else {
+                    (
+                        header,
+                        format!("=yend size=3 crc32={:08x}", crc32fast::hash(b"abc")),
+                    )
+                };
+                let a = analyze(&encode(b"abc", &header, &trailer));
+                assert_eq!(a.errors, ["YencUnverified"], "{multipart}: {missing}");
+                assert!(a.summary.is_none());
+                assert!(a.prefix_md5.is_none());
+                assert!(a.decoded.is_empty());
+            }
+        }
     }
     #[test]
     fn mismatch_not_clean() {

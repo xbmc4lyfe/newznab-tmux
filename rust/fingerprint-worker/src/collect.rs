@@ -20,6 +20,9 @@ pub struct Collected {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProviderEvidence {
+    /// Failed attempts retain latency separately; compact-v1 leaves their article ms null.
+    #[serde(default)]
+    pub failed_retrieval_ms: BTreeMap<String, u64>,
     pub account: String,
     pub host: String,
     pub port: String,
@@ -63,6 +66,7 @@ pub async fn run(
                 implementation: None,
                 profile: "NntpProviderUnavailableException".into(),
                 skipped_reason: Some(skipped_reason),
+                failed_retrieval_ms: BTreeMap::new(),
                 articles: samples
                     .iter()
                     .map(|s| {
@@ -78,6 +82,7 @@ pub async fn run(
         database::slot(pool, claim, &p.account, worker).await?;
         let mut client = Client::connect(p, timeout).await.ok();
         let mut entries = BTreeMap::new();
+        let mut failed_retrieval_ms = BTreeMap::new();
         let mut implementation = None;
         let mut profile = "ok".to_string();
         let mut unavailable = false;
@@ -99,6 +104,8 @@ pub async fn run(
             }
         }
         for sample in &samples {
+            let started = std::time::Instant::now();
+            let attempted = !unavailable;
             if !unavailable && client.as_ref().is_none_or(Client::poisoned) {
                 drop(client.take());
                 client = Client::connect(p, timeout).await.ok();
@@ -123,6 +130,12 @@ pub async fn run(
             } else {
                 Err("NntpProviderUnavailableException".into())
             };
+            if attempted && article.is_err() {
+                failed_retrieval_ms.insert(
+                    sample.messageid.clone(),
+                    started.elapsed().as_millis() as u64,
+                );
+            }
             entries.insert(sample.messageid.clone(), article);
         }
         evidence.push(ProviderEvidence {
@@ -133,6 +146,7 @@ pub async fn run(
             implementation,
             profile,
             skipped_reason: None,
+            failed_retrieval_ms,
             articles: entries,
         });
     }
@@ -276,6 +290,9 @@ pub fn analyze(files: &[File], evidence: &[ProviderEvidence]) -> Collected {
                     }
                 }
                 _ => {
+                    if let Some(ms) = p.failed_retrieval_ms.get(&sample.messageid) {
+                        timings.push(*ms);
+                    }
                     let kind = entry
                         .and_then(|e| e.as_ref().err())
                         .map(String::as_str)

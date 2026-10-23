@@ -10,6 +10,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 clap = { version = "4", features = ["derive", "env"] }
 crc32fast = "1"
 flate2 = "1"
+encoding_rs = "0.8"
 hex = "0.4"
 md-5 = "0.10"
 quick-xml = "0.38"

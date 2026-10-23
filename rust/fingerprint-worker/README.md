@@ -7,12 +7,22 @@ The application still publishes releases and enqueues database jobs.
 
 ## Build and run
 
+Database storage and Rust collection are the application defaults. Install, configure
+and start at least one standalone worker as part of deploying this version. Horizon
+runs other application queues and does not launch the Rust executable. A deployment
+without an external worker retains pending work in SQL; it does not switch to PHP.
+Check that `nntmux_fingerprint_live_claims` becomes positive while jobs are waiting
+and that `nntmux_fingerprint_completions_last_five_minutes` grows. The supplied
+Prometheus rules raise `NntmuxRustFingerprintWorkersMissing` after five minutes of
+waiting jobs with no live claims; alerts appear in Prometheus, with no Alertmanager
+notification delivery configured by this repository.
+
 ```sh
 cargo build --release --locked --manifest-path rust/fingerprint-worker/Cargo.toml
 ```
 
 During a staged production cutover, set `NZB_STORAGE=database`, `FINGERPRINT_WORKER=rust`,
-and temporarily `NZB_DATABASE_LEGACY_READS=true`. All new sources are written only to SQL;
+and retain the temporary `NZB_DATABASE_LEGACY_READS=true` migration default. All new sources are written only to SQL;
 old unimported sources remain readable. Drain the PHP fingerprint supervisor before
 transferring its queue with `php artisan releases:fingerprint-transfer --import-legacy`.
 The transfer imports each queued source atomically before acknowledging Redis. Storage-only
@@ -118,8 +128,10 @@ files without loading; `--domain user` selects the headless user domain instead 
 The LaunchAgent starts at login, restarts failed workers and uses a 30-second restart
 throttle. Logs are `logs/worker.stdout.log` and `logs/worker.stderr.log` under the
 installation directory. SIGTERM and SIGINT stop new claims and drain active releases;
-launchd allows 1,900 seconds before forced termination, above the job's 1,800-second
-processing ceiling. To stop or upgrade an installed service, use `launchctl bootout`
+the plist requests a 1,900-second exit timeout, but verify the effective timeout
+with `launchctl print` on the target macOS version. If it is shorter, send SIGTERM
+and wait for the worker to report its drain before unloading or replacing it;
+lease fencing recovers work if the OS terminates it early. To stop or upgrade an installed service, use `launchctl bootout`
 on its `gui/<uid>/<label>` service and wait for exit before reinstalling. The installer
 refuses to overwrite a loaded label. Sending SIGTERM alone drains the process but
 KeepAlive subsequently restarts it.
@@ -129,3 +141,11 @@ Installer verification is fully offline and never loads a service:
 ```sh
 python3 rust/fingerprint-worker/scripts/test_launchd.py -v
 ```
+
+On macOS, a LaunchAgent can be denied Local Network access even when the same
+worker connects successfully from an SSH session. Approve Local Network access for
+its responsible application, or use an SSH connection that remains open while the
+remote worker runs. A supervised SSH controller depends on its controller host
+remaining online. A system LaunchDaemon running as the worker user is another
+installation option, but requires administrator access. See
+[Apple's Local Network Privacy guidance](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy).

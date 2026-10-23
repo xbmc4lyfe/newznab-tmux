@@ -94,7 +94,22 @@ final class NzbSourceGuard
 
     public function installCompressed(object $release, string $body, ?string $expectedDigest = null): NzbSourceInstallation
     {
-        $digest = app(DatabaseNzbStore::class)->putLocked($release, $body, $expectedDigest);
+        $this->lockRelease($release);
+        $store = app(DatabaseNzbStore::class);
+        if ($expectedDigest !== null && ! $store->exists((string) $release->guid)) {
+            // A repair may have read an unimported legacy source. Validate its current bytes
+            // under the release lock, then import and replace within this transaction.
+            $source = $this->readSettledLocked($release);
+            if ($source === null || ! hash_equals($expectedDigest, $source['digest'])) {
+                throw new RuntimeException('NZB source changed before replacement.');
+            }
+            $original = gzencode($source['contents']);
+            if ($original === false) {
+                throw new RuntimeException('Cannot compress legacy NZB for repair.');
+            }
+            $store->putLocked($release, $original, enqueueWork: false);
+        }
+        $digest = $store->putLocked($release, $body, $expectedDigest);
 
         return new NzbSourceInstallation($this, (string) $release->guid, NzbService::databaseReference((string) $release->guid),
             $digest, null, DB::connection()->getPdo(), database: true);

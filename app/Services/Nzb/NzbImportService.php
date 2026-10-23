@@ -659,6 +659,19 @@ class NzbImportService
                 return $stored;
             });
         } catch (\Throwable $exception) {
+            if (DatabaseNzbStore::enabled()) {
+                try {
+                    DB::transaction(function (): void {
+                        $release = Release::query()->where('id', $this->relId)->where('guid', $this->relGuid)->lockForUpdate()->first();
+                        if ($release !== null && (new NzbSourceGuard($this->nzb))->snapshot($this->relGuid) === null) {
+                            // Preserve any generation another writer retained before this cleanup lock.
+                            $release->delete();
+                        }
+                    });
+                } catch (\Throwable $cleanupException) {
+                    Log::error('Could not clean up the failed database NZB import.', ['guid' => $this->relGuid, 'exception' => $cleanupException]);
+                }
+            }
             Log::error('NZB import failed while storing the compressed file.', [
                 'guid' => $this->relGuid,
                 'path' => $path,

@@ -189,17 +189,19 @@ async fn main() -> Result<()> {
                 };
                 let result = {
                     let work = tokio::time::timeout(Duration::from_secs(1800), collect::run(&pool, &claim, &worker, &providers, args.alternate_percent, args.timeout));
-                    tokio::pin!(work);
-                    loop {
-                        tokio::select! {
-                            result = &mut work => break result.context("Fingerprint job timed out").and_then(|result| result),
-                            _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                                match tokio::time::timeout(Duration::from_secs(10), database::renew(&pool, &claim)).await {
-                                    Ok(Ok(true)) => {},
-                                    _ => break Err(anyhow::anyhow!("ClaimLeaseLost")),
-                                }
+                    // Poll collection while renewal waits for an in-flight slot COMMIT/count update.
+                    let heartbeat = async {
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            match tokio::time::timeout(Duration::from_secs(10), database::renew(&pool, &claim)).await {
+                                Ok(Ok(true)) => {},
+                                _ => return Err(anyhow::anyhow!("ClaimLeaseLost")),
                             }
                         }
+                    };
+                    tokio::select! {
+                        result = work => result.context("Fingerprint job timed out").and_then(|result| result),
+                        result = heartbeat => result,
                     }
                 }; // Cancelling collection drops all sockets before releasing their shared slots.
                 let mutation = async {
