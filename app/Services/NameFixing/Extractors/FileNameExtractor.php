@@ -7,6 +7,7 @@ namespace App\Services\NameFixing\Extractors;
 use App\Services\NameFixing\Data\NameFixResult;
 use App\Services\NameFixing\FileNameCleaner;
 use App\Support\RustPipelineLibrary;
+use FFI\CData;
 
 /**
  * Extracts release names from file names and paths.
@@ -50,20 +51,49 @@ class FileNameExtractor
         return $this->extractFromFilePhp($filename);
     }
 
+    private static bool $ffiResolved = false;
+
+    private static ?\FFI $defaultFfi = null;
+
+    private static ?CData $defaultBuf = null;
+
+    private static int $defaultCap = 0;
+
+    private function resolveFfi(): ?\FFI
+    {
+        if ($this->libraryPath !== null) {
+            return RustPipelineLibrary::resolveDomain('nfo_extractors', NfoNameExtractor::FFI_CDEF, $this->libraryPath);
+        }
+        if (! self::$ffiResolved) {
+            self::$defaultFfi = RustPipelineLibrary::resolveDomain('nfo_extractors', NfoNameExtractor::FFI_CDEF);
+            if (self::$defaultFfi !== null) {
+                self::$defaultBuf = RustPipelineLibrary::obtainScratch(self::$defaultFfi, 4096, self::$defaultCap);
+            }
+            self::$ffiResolved = true;
+        }
+
+        return self::$defaultFfi;
+    }
+
     /**
      * @return array{0: bool, 1: ?NameFixResult}
      */
     private function extractFromFileRust(string $filename): array
     {
-        $ffi = RustPipelineLibrary::resolveDomain('nfo_extractors', NfoNameExtractor::FFI_CDEF, $this->libraryPath);
+        $ffi = $this->resolveFfi();
         if ($ffi === null) {
             return [false, null];
         }
 
         try {
             $len = strlen($filename);
-            $cap = 0;
-            $buf = RustPipelineLibrary::obtainScratch($ffi, max(512, min(16384, $len + 64)), $cap);
+            if ($this->libraryPath === null && self::$defaultBuf !== null && $len + 64 <= self::$defaultCap) {
+                $buf = self::$defaultBuf;
+                $cap = self::$defaultCap;
+            } else {
+                $cap = 0;
+                $buf = RustPipelineLibrary::obtainScratch($ffi, max(512, min(16384, $len + 64)), $cap);
+            }
             // @phpstan-ignore method.notFound
             $written = $ffi->nntmux_filename_extract_candidate($filename, $len, $buf, $cap);
             if ($written <= -16) {
@@ -105,7 +135,7 @@ class FileNameExtractor
         if (str_contains($filename, '__NZBSPLIT__')) {
             $unwrapped = $this->cleaner->extractNzbSplitName($filename);
 
-            if ($unwrapped !== null && $this->cleaner->isPlausibleReleaseTitle($unwrapped)) {
+            if ($unwrapped !== null && $this->cleaner->isPlausibleReleaseTitlePhp($unwrapped)) {
                 return NameFixResult::fromMatch($unwrapped, 'NZBSPLIT wrapper', 'File');
             }
 
@@ -113,7 +143,7 @@ class FileNameExtractor
         }
 
         $basename = $this->cleaner->extractFilenameFromPath($filename);
-        $literalTitle = $this->cleaner->stripFileSuffixes($basename);
+        $literalTitle = $this->cleaner->stripKnownFileSuffixesPhp($basename, preserveCodecAfterWrapper: true);
         if ($literalTitle !== $basename
             && preg_match('/\.(?:mkv|avi|mp4|m4v|wmv|mpg|mpeg|mov|ts|m2ts|vob|divx|flv|webm|ogv|3gp|asf|rm|rmvb|f4v|mp3|flac|m4a|aac|ogg|wav|wma|ape|opus|mka|ac3|dts|eac3|truehd|mpc|shn|tak|tta|wv|rar|r\d{2,4}|zip|z\d{2}|7z|par2?|tar|gz|bz2|xz|lz|lzma|zst|tgz|lz4|rev|enc|\d{3})$/iD', $basename)
             && $this->cleaner->isLiteralTechnicalSceneTitle($literalTitle)
@@ -301,7 +331,7 @@ class FileNameExtractor
         }
 
         $basename = basename(str_replace('\\', '/', $filename));
-        $candidate = $this->cleaner->stripFileSuffixes($basename);
+        $candidate = $this->cleaner->stripKnownFileSuffixesPhp($basename, preserveCodecAfterWrapper: true);
 
         if ($candidate !== $basename
             && preg_match('/\.(?:mkv|avi|mp4|m4v|ts|m2ts|rar|r\d{2,4}|7z|par2|nfo|sfv|md5|sha1)$/i', $basename)
@@ -311,7 +341,7 @@ class FileNameExtractor
             && preg_match('/(?<![a-z0-9])(?:720p|1080p|2160p)(?![a-z0-9])/i', $candidate)
             && preg_match('/(?<![a-z0-9])(?:HDTV(?:Light)?|BluRay|BDRip|WEB[- .]?DL|WEBRip|BD)(?![a-z0-9])/i', $candidate)
             && preg_match('/(?<![a-z0-9])(?:x264|x265|HEVC|H[ .]?264|H[ .]?265|XviD)(?![a-z0-9])/i', $candidate)
-            && $this->cleaner->isPlausibleReleaseTitle($this->cleaner->normalizeCandidateTitle($candidate))
+            && $this->cleaner->isPlausibleReleaseTitlePhp($this->cleaner->normalizeCandidateTitle($candidate))
         ) {
             return NameFixResult::fromMatch($candidate, 'Technical video basename', 'File');
         }
@@ -323,7 +353,7 @@ class FileNameExtractor
             && preg_match('/^(.+?)[ ._(\[](?:19|20)\d{2}(?=$|[ ._)\]-])/u', $candidate, $result)
             && preg_match('/[A-Za-z]{3}/', (string) preg_replace('/^(?:\[[^\]]+\]\s*)+/', '', $result[1]))
             && preg_match('/(?<![a-z0-9])(?:720p|1080p|2160p)(?![a-z0-9])/i', $candidate)
-            && $this->cleaner->isPlausibleReleaseTitle($this->cleaner->normalizeCandidateTitle($candidate))
+            && $this->cleaner->isPlausibleReleaseTitlePhp($this->cleaner->normalizeCandidateTitle($candidate))
         ) {
             return NameFixResult::fromMatch($candidate, 'Matching video parent basename', 'File');
         }

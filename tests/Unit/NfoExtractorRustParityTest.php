@@ -114,21 +114,23 @@ class NfoExtractorRustParityTest extends TestCase
         $extractor = new NfoNameExtractor;
         $fallbackExtractor = new NfoNameExtractor('/nonexistent/libnntmux_pipeline.so');
 
-        $rustResult = $extractor->extractFromNfo($nfo);
+        $rustResult = $extractor->extractFromNfoRust($nfo);
         $phpResult = $extractor->extractFromNfoPhp($nfo);
+        $defaultResult = $extractor->extractFromNfo($nfo);
         $fallbackResult = $fallbackExtractor->extractFromNfo($nfo);
 
         $this->assertSame(self::snapshot($phpResult), self::snapshot($rustResult));
+        $this->assertSame(self::snapshot($phpResult), self::snapshot($defaultResult));
         $this->assertSame(self::snapshot($phpResult), self::snapshot($fallbackResult));
         $this->assertSame($expectedMethod, $rustResult?->method);
 
-        // Also verify individual checkFor* methods match their *Php counterparts
-        $this->assertSame(self::snapshot($extractor->checkForTvPhp($nfo)), self::snapshot($extractor->checkForTv($nfo)));
-        $this->assertSame(self::snapshot($extractor->checkForMoviePhp($nfo)), self::snapshot($extractor->checkForMovie($nfo)));
-        $this->assertSame(self::snapshot($extractor->checkForMusicPhp($nfo)), self::snapshot($extractor->checkForMusic($nfo)));
-        $this->assertSame(self::snapshot($extractor->checkForTitleYearPhp($nfo)), self::snapshot($extractor->checkForTitleYear($nfo)));
-        $this->assertSame(self::snapshot($extractor->checkForGamePhp($nfo)), self::snapshot($extractor->checkForGame($nfo)));
-        $this->assertSame(self::snapshot($extractor->checkForIguanaPhp($nfo)), self::snapshot($extractor->checkForIguana($nfo)));
+        // Also verify individual checkFor*Rust methods match their *Php counterparts
+        $this->assertSame(self::snapshot($extractor->checkForTvPhp($nfo)), self::snapshot($extractor->checkForTvRust($nfo)));
+        $this->assertSame(self::snapshot($extractor->checkForMoviePhp($nfo)), self::snapshot($extractor->checkForMovieRust($nfo)));
+        $this->assertSame(self::snapshot($extractor->checkForMusicPhp($nfo)), self::snapshot($extractor->checkForMusicRust($nfo)));
+        $this->assertSame(self::snapshot($extractor->checkForTitleYearPhp($nfo)), self::snapshot($extractor->checkForTitleYearRust($nfo)));
+        $this->assertSame(self::snapshot($extractor->checkForGamePhp($nfo)), self::snapshot($extractor->checkForGameRust($nfo)));
+        $this->assertSame(self::snapshot($extractor->checkForIguanaPhp($nfo)), self::snapshot($extractor->checkForIguanaRust($nfo)));
 
         if ($expectNativeHandled && $nfo !== '') {
             $ffi = RustPipelineLibrary::resolveDomain('nfo_extractors', NfoNameExtractor::FFI_CDEF);

@@ -9,6 +9,7 @@ use App\Services\NameFixing\FileNameCleaner;
 use App\Services\NameFixing\ReleaseUpdateService;
 use App\Support\PredbSearchDocument;
 use App\Support\RustPipelineLibrary;
+use FFI\CData;
 
 /**
  * Extracts release names from NFO content.
@@ -113,20 +114,49 @@ class NfoNameExtractor
         return $this->predbCandidatesPhp($nfoContent);
     }
 
+    private static bool $ffiResolved = false;
+
+    private static ?\FFI $defaultFfi = null;
+
+    private static ?CData $defaultBuf = null;
+
+    private static int $defaultCap = 0;
+
+    private function resolveFfi(): ?\FFI
+    {
+        if ($this->libraryPath !== null) {
+            return RustPipelineLibrary::resolveDomain('nfo_extractors', self::FFI_CDEF, $this->libraryPath);
+        }
+        if (! self::$ffiResolved) {
+            self::$defaultFfi = RustPipelineLibrary::resolveDomain('nfo_extractors', self::FFI_CDEF);
+            if (self::$defaultFfi !== null) {
+                self::$defaultBuf = RustPipelineLibrary::obtainScratch(self::$defaultFfi, 8192, self::$defaultCap);
+            }
+            self::$ffiResolved = true;
+        }
+
+        return self::$defaultFfi;
+    }
+
     /**
      * @return array{titles: list<string>, complete: bool}|null
      */
     private function predbCandidatesRust(string $nfoContent): ?array
     {
-        $ffi = RustPipelineLibrary::resolveDomain('nfo_extractors', self::FFI_CDEF, $this->libraryPath);
+        $ffi = $this->resolveFfi();
         if ($ffi === null) {
             return null;
         }
 
         try {
             $len = strlen($nfoContent);
-            $cap = 0;
-            $buf = RustPipelineLibrary::obtainScratch($ffi, max(512, min(65536, $len + 64)), $cap);
+            if ($this->libraryPath === null && self::$defaultBuf !== null && $len + 64 <= self::$defaultCap) {
+                $buf = self::$defaultBuf;
+                $cap = self::$defaultCap;
+            } else {
+                $cap = 0;
+                $buf = RustPipelineLibrary::obtainScratch($ffi, max(512, min(65536, $len + 64)), $cap);
+            }
             // @phpstan-ignore method.notFound
             $written = $ffi->nntmux_nfo_predb_candidates($nfoContent, $len, $buf, $cap);
             if ($written <= -16) {
@@ -205,7 +235,7 @@ class NfoNameExtractor
             return [true, null];
         }
 
-        $ffi = RustPipelineLibrary::resolveDomain('nfo_extractors', self::FFI_CDEF, $this->libraryPath);
+        $ffi = $this->resolveFfi();
         if ($ffi === null) {
             return [false, null];
         }
@@ -260,19 +290,19 @@ class NfoNameExtractor
      */
     public function checkForTv(string $nfoContent): ?NameFixResult
     {
-        if (get_class($this) === self::class) {
-            [$handled, $result] = $this->extractPatternModeRust($nfoContent, 1);
-            if ($handled) {
-                return $result;
-            }
-        }
-
         return $this->checkForTvPhp($nfoContent);
+    }
+
+    public function checkForTvRust(string $nfoContent): ?NameFixResult
+    {
+        [$handled, $result] = $this->extractPatternModeRust($nfoContent, 1);
+
+        return $handled ? $result : $this->checkForTvPhp($nfoContent);
     }
 
     public function checkForTvPhp(string $nfoContent): ?NameFixResult
     {
-        $nfoContent = $this->identityTextPhp($nfoContent);
+        $nfoContent = $this->identityText($nfoContent);
         $result = [];
 
         // Generic TV pattern 1: path with SxxExx
@@ -293,19 +323,19 @@ class NfoNameExtractor
      */
     public function checkForMovie(string $nfoContent): ?NameFixResult
     {
-        if (get_class($this) === self::class) {
-            [$handled, $result] = $this->extractPatternModeRust($nfoContent, 2);
-            if ($handled) {
-                return $result;
-            }
-        }
-
         return $this->checkForMoviePhp($nfoContent);
+    }
+
+    public function checkForMovieRust(string $nfoContent): ?NameFixResult
+    {
+        [$handled, $result] = $this->extractPatternModeRust($nfoContent, 2);
+
+        return $handled ? $result : $this->checkForMoviePhp($nfoContent);
     }
 
     public function checkForMoviePhp(string $nfoContent): ?NameFixResult
     {
-        $nfoContent = $this->identityTextPhp($nfoContent);
+        $nfoContent = $this->identityText($nfoContent);
         $result = [];
 
         // Generic Movies 1
@@ -331,19 +361,19 @@ class NfoNameExtractor
      */
     public function checkForMusic(string $nfoContent): ?NameFixResult
     {
-        if (get_class($this) === self::class) {
-            [$handled, $result] = $this->extractPatternModeRust($nfoContent, 3);
-            if ($handled) {
-                return $result;
-            }
-        }
-
         return $this->checkForMusicPhp($nfoContent);
+    }
+
+    public function checkForMusicRust(string $nfoContent): ?NameFixResult
+    {
+        [$handled, $result] = $this->extractPatternModeRust($nfoContent, 3);
+
+        return $handled ? $result : $this->checkForMusicPhp($nfoContent);
     }
 
     public function checkForMusicPhp(string $nfoContent): ?NameFixResult
     {
-        $nfoContent = $this->identityTextPhp($nfoContent);
+        $nfoContent = $this->identityText($nfoContent);
         $result = [];
 
         // FM Radio pattern
@@ -363,20 +393,20 @@ class NfoNameExtractor
      */
     public function checkForTitleYear(string $nfoContent): ?NameFixResult
     {
-        if (get_class($this) === self::class) {
-            [$handled, $result] = $this->extractPatternModeRust($nfoContent, 4);
-            if ($handled) {
-                return $result;
-            }
-        }
-
         return $this->checkForTitleYearPhp($nfoContent);
+    }
+
+    public function checkForTitleYearRust(string $nfoContent): ?NameFixResult
+    {
+        [$handled, $result] = $this->extractPatternModeRust($nfoContent, 4);
+
+        return $handled ? $result : $this->checkForTitleYearPhp($nfoContent);
     }
 
     public function checkForTitleYearPhp(string $nfoContent): ?NameFixResult
     {
         $metadata = $nfoContent;
-        $nfoContent = $this->identityTextPhp($nfoContent);
+        $nfoContent = $this->identityText($nfoContent);
         $result = [];
 
         // Skip PDFs and audiobooks
@@ -416,19 +446,19 @@ class NfoNameExtractor
      */
     public function checkForGame(string $nfoContent): ?NameFixResult
     {
-        if (get_class($this) === self::class) {
-            [$handled, $result] = $this->extractPatternModeRust($nfoContent, 5);
-            if ($handled) {
-                return $result;
-            }
-        }
-
         return $this->checkForGamePhp($nfoContent);
+    }
+
+    public function checkForGameRust(string $nfoContent): ?NameFixResult
+    {
+        [$handled, $result] = $this->extractPatternModeRust($nfoContent, 5);
+
+        return $handled ? $result : $this->checkForGamePhp($nfoContent);
     }
 
     public function checkForGamePhp(string $nfoContent): ?NameFixResult
     {
-        $nfoContent = $this->identityTextPhp($nfoContent);
+        $nfoContent = $this->identityText($nfoContent);
         $result = [];
 
         // Check for known game groups
@@ -458,19 +488,19 @@ class NfoNameExtractor
      */
     public function checkForIguana(string $nfoContent): ?NameFixResult
     {
-        if (get_class($this) === self::class) {
-            [$handled, $result] = $this->extractPatternModeRust($nfoContent, 6);
-            if ($handled) {
-                return $result;
-            }
-        }
-
         return $this->checkForIguanaPhp($nfoContent);
+    }
+
+    public function checkForIguanaRust(string $nfoContent): ?NameFixResult
+    {
+        [$handled, $result] = $this->extractPatternModeRust($nfoContent, 6);
+
+        return $handled ? $result : $this->checkForIguanaPhp($nfoContent);
     }
 
     public function checkForIguanaPhp(string $nfoContent): ?NameFixResult
     {
-        $nfoContent = $this->identityTextPhp($nfoContent);
+        $nfoContent = $this->identityText($nfoContent);
         if (! preg_match('/Supplier.+?IGUANA/i', $nfoContent)) {
             return null;
         }
@@ -630,15 +660,6 @@ class NfoNameExtractor
      */
     public function extractFromNfo(string $nfoContent): ?NameFixResult
     {
-        if (get_class($this) === self::class) {
-            [$handled, $result] = $this->extractPatternModeRust($nfoContent, 0);
-            if ($handled) {
-                return $result;
-            }
-
-            return $this->extractFromNfoPhp($nfoContent);
-        }
-
         $cleaner = new FileNameCleaner;
         foreach ($this->literalNameFields($this->identityText($nfoContent)) as $field) {
             $title = $cleaner->cleanForMatching($field);
@@ -679,6 +700,13 @@ class NfoNameExtractor
         }
 
         return null;
+    }
+
+    public function extractFromNfoRust(string $nfoContent): ?NameFixResult
+    {
+        [$handled, $result] = $this->extractPatternModeRust($nfoContent, 0);
+
+        return $handled ? $result : $this->extractFromNfoPhp($nfoContent);
     }
 
     public function extractFromNfoPhp(string $nfoContent): ?NameFixResult
