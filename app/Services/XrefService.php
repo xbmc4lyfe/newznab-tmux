@@ -175,14 +175,14 @@ class XrefService
                 $groupsCache = ['' => []];
                 $result = [];
                 foreach ($lines as $line) {
-                    $tabPos = strpos($line, "\t");
-                    if ($tabPos === false) {
+                    $nulPos = strpos($line, "\0");
+                    if ($nulPos === false) {
                         $result[] = ['xref' => $line, 'groups' => []];
 
                         continue;
                     }
-                    $tokensStr = substr($line, 0, $tabPos);
-                    $groupsStr = substr($line, $tabPos + 1);
+                    $tokensStr = substr($line, 0, $nulPos);
+                    $groupsStr = substr($line, $nulPos + 1);
                     $result[] = [
                         'xref' => $tokensStr,
                         'groups' => $groupsCache[$groupsStr] ??= explode(' ', $groupsStr),

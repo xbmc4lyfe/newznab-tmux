@@ -336,7 +336,7 @@ pub unsafe extern "C" fn nntmux_xref_diff_tokens(
 /// Batch processes NUL-separated (`\0`) Xref strings from `input[..input_len]`.
 /// - `mode = 1`: space-separated tokens per record, records separated by `\n`.
 /// - `mode = 2`: space-separated deduplicated group names per record, records separated by `\n`.
-/// - `mode = 3`: `space_joined_tokens` + `\t` + `space_joined_groups` per record, records separated by `\n`.
+/// - `mode = 3`: `space_joined_tokens` + `\0` + `space_joined_groups` per record, records separated by `\n`.
 ///
 /// # Safety
 ///
@@ -371,7 +371,7 @@ pub unsafe extern "C" fn nntmux_xref_extract_batch_nul(
         }
         if record.is_empty() || record == b"0" {
             if mode == 3 {
-                out.push(b'\t');
+                out.push(0);
             }
             continue;
         }
@@ -422,7 +422,7 @@ pub unsafe extern "C" fn nntmux_xref_extract_batch_nul(
                         }
                     }
                 }
-                out.push(b'\t');
+                out.push(0);
                 seen_groups.write_space_separated(&mut out);
             }
             _ => unreachable!(),

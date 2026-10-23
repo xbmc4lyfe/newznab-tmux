@@ -32,6 +32,7 @@ final class XrefServiceRustParityTest extends TestCase
             'alt.binaries.multimedia alt.binaries.x264:55555',
             'alt.binaries.:123 alt.binaries.test:123foo alt.binaries.valid:789',
             "alt.binaries.line1:111\nignored alt.binaries.line2:222",
+            "alt.binaries.tv\tshow:123 alt.binaries.other:456",
             'ab.binaries.a:1 abc.binaries.b:2 abcd.binaries.c:3 a.binaries.d:4',
         ];
 
