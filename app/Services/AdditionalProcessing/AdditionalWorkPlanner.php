@@ -9,10 +9,19 @@ use App\Services\AdditionalProcessing\DTO\AdditionalWorkPlan;
 use App\Services\AdditionalProcessing\DTO\ArchiveCandidate;
 use App\Services\AdditionalProcessing\DTO\ImageCandidate;
 use App\Services\AdditionalProcessing\Media\ImageCandidateRanker;
+use App\Support\RustPipelineLibrary;
 use Illuminate\Support\Facades\Log;
 
 final readonly class AdditionalWorkPlanner
 {
+    private const string DEFAULT_AUDIO_FILE_REGEX = '\.(AAC|AIFF|APE|AC3|ASF|DTS|FLAC|MKA|MKS|MP2|MP3|RA|OGG|OGM|W64|WAV|WMA)';
+
+    private const string DEFAULT_IGNORE_BOOK_REGEX = '/\b(epub|lit|mobi|pdf|sipdf|html)\b.*\.rar(?!.{20,})/i';
+
+    private const string DEFAULT_SUPPORT_FILE_REGEX = '\.(?:vol\d{1,3}\+\d{1,3}|par2|srs|sfv|nzb)';
+
+    private const string DEFAULT_VIDEO_FILE_REGEX = '\.(AVI|F4V|IFO|M1V|M2V|M4V|MKV|MOV|MP4|MPEG|MPG|MPGV|MPV|OGV|QT|RM|RMVB|TS|VOB|WMV)';
+
     private const string SEVEN_ZIP_PATTERN = '/([^"\s\/]+)\.7z(?:\.(\d{3}))?($|[ ")]|-)/i';
 
     /** A quoted "name.001", or a bare one ending the subject or followed by yEnc or a part count. */
@@ -27,12 +36,30 @@ final readonly class AdditionalWorkPlanner
 
     private const int TYPICAL_ARTICLE_BYTES = 716800;
 
-    public function __construct(private ProcessingConfiguration $config) {}
+    public function __construct(
+        private ProcessingConfiguration $config,
+        private ?string $libraryPath = null,
+    ) {}
 
     /**
      * @param  array<int|string, mixed>  $nzbContents
      */
     public function plan(array $nzbContents, string $groupName): AdditionalWorkPlan
+    {
+        if ($this->canUseRustClassifier()) {
+            $rustPlan = $this->planRust($nzbContents, $groupName);
+            if ($rustPlan !== null) {
+                return $rustPlan;
+            }
+        }
+
+        return $this->planPhp($nzbContents, $groupName);
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $nzbContents
+     */
+    public function planPhp(array $nzbContents, string $groupName): AdditionalWorkPlan
     {
         $sampleMessageIds = [];
         $jpgMessageIds = [];
@@ -243,6 +270,359 @@ final readonly class AdditionalWorkPlanner
             probeIsOnlyFile: $probeIsOnlyFile,
             par2IndexCandidates: $par2IndexCandidates,
             mainVideoSourceIndexes: $this->mainVideoSourceIndexes($nzbContents),
+            imageCandidates: $imageCandidates,
+        );
+    }
+
+    private function canUseRustClassifier(): bool
+    {
+        return $this->config->audioFileRegex === self::DEFAULT_AUDIO_FILE_REGEX
+            && $this->config->ignoreBookRegex === self::DEFAULT_IGNORE_BOOK_REGEX
+            && $this->config->supportFileRegex === self::DEFAULT_SUPPORT_FILE_REGEX
+            && $this->config->videoFileRegex === self::DEFAULT_VIDEO_FILE_REGEX;
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $nzbContents
+     */
+    private function planRust(array $nzbContents, string $groupName): ?AdditionalWorkPlan
+    {
+        if (str_contains($groupName, "\0")) {
+            return null;
+        }
+
+        $filesList = [];
+        $titles = [];
+        foreach (array_values($nzbContents) as $sourceIndex => $file) {
+            if (! is_array($file)) {
+                continue;
+            }
+            $title = (string) ($file['title'] ?? '');
+            if (str_contains($title, "\0")) {
+                return null;
+            }
+            $filesList[$sourceIndex] = $file;
+            $titles[] = $title;
+        }
+
+        $count = count($titles);
+        $raw = RustPipelineLibrary::additionalClassifyTitles(
+            $groupName,
+            implode("\0", $titles),
+            $count,
+            $this->libraryPath,
+        );
+        if ($raw === null) {
+            return null;
+        }
+
+        $tokens = explode("\0", $raw);
+        $cursor = 0;
+        $isMusicGroup = ($tokens[$cursor++] ?? '0') === '1';
+
+        $sampleMessageIds = [];
+        $images = [];
+        $mediaInfoMessageId = '';
+        $audioInfoMessageId = '';
+        $audioInfoExtension = '';
+        $archiveCandidates = [];
+        $candidateSplitSets = [];
+        $anyLikelyFirstMissingHeader = false;
+        $bookFileCount = 0;
+        $duplicateMessageIdCount = 0;
+        $seenMessageIds = [];
+        $sevenZipTails = [];
+        $unnamedForProbe = [];
+        $par2Named = [];
+        $par2Unnamed = [];
+        $mainVideoSizes = [];
+        $wantMainVideo = $this->config->mediaMainVideoFallback && $this->config->processThumbnails;
+        $maxRarSegments = max($this->config->maximumRarSegments, 0);
+        $prevSetKey = '';
+        $titleIdx = 0;
+
+        foreach ($filesList as $sourceIndex => $file) {
+            $title = $titles[$titleIdx++];
+            $flags = (int) ($tokens[$cursor++] ?? '0');
+            $splitSet = ($flags & (1 << 1)) !== 0 ? ($tokens[$cursor++] ?? '') : null;
+            if (($flags & (1 << 5)) !== 0) {
+                if (($flags & (1 << 58)) !== 0) {
+                    $setKey = $prevSetKey;
+                } else {
+                    $setKey = $tokens[$cursor++] ?? '';
+                    $prevSetKey = $setKey;
+                }
+            } else {
+                $setKey = '';
+            }
+            $audioExt = ($flags & (1 << 10)) !== 0 ? ($tokens[$cursor++] ?? '') : '';
+
+            $segments = is_array($file['segments'] ?? null) ? $file['segments'] : [];
+            $hasSegments = isset($segments[0]);
+            $fileCountDefault0 = (int) ($file['filecount'] ?? 0);
+            $fileCountDefault1 = (int) ($file['filecount'] ?? 1);
+            $hasExt = ($flags & (1 << 11)) !== 0;
+
+            if ($hasSegments && $fileCountDefault0 === 1 && ! $hasExt) {
+                $unnamedForProbe[$sourceIndex] = $file;
+            }
+            if ($this->config->par2MediaMapping && $hasSegments && $fileCountDefault1 === 1) {
+                if (($flags & (1 << 12)) !== 0) {
+                    if (($flags & (1 << 13)) === 0) {
+                        $par2Named[$sourceIndex] = $file;
+                    }
+                } elseif (! $hasExt) {
+                    $par2Unnamed[$sourceIndex] = $file;
+                }
+            }
+            if ($wantMainVideo && ($flags & (1 << 14)) !== 0 && $hasSegments && $fileCountDefault1 === 1) {
+                $size = (int) ($file['size'] ?? 0);
+                if ($size >= $this->config->mediaMainVideoMinBytes) {
+                    $mainVideoSizes[$sourceIndex] = $size;
+                }
+            }
+
+            if (($flags & (1 << 0)) !== 0) {
+                $bookFileCount++;
+            }
+
+            if ($splitSet !== null && $segments !== []) {
+                $splitVolNum = ($flags >> 17) & 0x7FF;
+                if (($sevenZipTails[$splitSet][0] ?? -1) < $splitVolNum) {
+                    $sevenZipTails[$splitSet] = [$splitVolNum, (string) $segments[array_key_last($segments)]];
+                }
+            }
+
+            if (($flags & (1 << 2)) !== 0) {
+                $mediaSplitVol = ($flags >> 28) & 0x7FF;
+                $messageIds = $mediaSplitVol <= 1
+                    ? $this->extractSegments($segments, 1, $seenMessageIds, $duplicateMessageIdCount)
+                    : [];
+                if ($messageIds !== []) {
+                    $candIdx = count($archiveCandidates);
+                    $hasFirstSeg = ($file['firstsegment'] ?? true) !== false;
+                    if (! $hasFirstSeg) {
+                        $anyLikelyFirstMissingHeader = true;
+                    }
+                    $archiveCandidates[] = new ArchiveCandidate(
+                        title: $title,
+                        messageIds: $messageIds,
+                        likelyFirstVolume: true,
+                        sourceIndex: $sourceIndex,
+                        hasFirstSegment: $hasFirstSeg,
+                        setKey: $setKey,
+                    );
+                    if ($splitSet !== null) {
+                        $candidateSplitSets[$candIdx] = $splitSet;
+                    }
+                }
+            } elseif (($flags & (1 << 3)) !== 0) {
+                $archiveMessageIds = [];
+                if ($maxRarSegments > 0 && $segments !== []) {
+                    $reqSeen = [];
+                    $taken = 0;
+                    foreach ($segments as $seg) {
+                        $mid = (string) $seg;
+                        if ($mid === '' || isset($reqSeen[$mid])) {
+                            if ($mid !== '') {
+                                $duplicateMessageIdCount++;
+                            }
+                        } else {
+                            $reqSeen[$mid] = true;
+                            $archiveMessageIds[] = $mid;
+                            if (isset($seenMessageIds[$mid])) {
+                                $duplicateMessageIdCount++;
+                            } else {
+                                $seenMessageIds[$mid] = true;
+                            }
+                        }
+                        if (++$taken >= $maxRarSegments) {
+                            break;
+                        }
+                    }
+                }
+                if ($archiveMessageIds !== []) {
+                    $candIdx = count($archiveCandidates);
+                    $hasFirstSeg = ($file['firstsegment'] ?? true) !== false;
+                    $likelyFirst = ($flags & (1 << 4)) !== 0;
+                    if ($likelyFirst && ! $hasFirstSeg) {
+                        $anyLikelyFirstMissingHeader = true;
+                    }
+                    $archiveCandidates[] = new ArchiveCandidate(
+                        title: $title,
+                        messageIds: $archiveMessageIds,
+                        likelyFirstVolume: $likelyFirst,
+                        sourceIndex: $sourceIndex,
+                        hasFirstSegment: $hasFirstSeg,
+                        setKey: $setKey,
+                    );
+                    if ($splitSet !== null) {
+                        $candidateSplitSets[$candIdx] = $splitSet;
+                    }
+                }
+            }
+
+            if (($flags & (1 << 6)) !== 0) {
+                continue;
+            }
+
+            if ($this->config->processThumbnails && $sampleMessageIds === [] && $segments !== []
+                && ($flags & (1 << 7)) !== 0
+            ) {
+                $sampleMessageIds = $this->extractSegments(
+                    $segments,
+                    $this->config->segmentsToDownload,
+                    $seenMessageIds,
+                    $duplicateMessageIdCount,
+                );
+            }
+
+            if ($this->config->processJPGSample && $segments !== []
+                && ! $isMusicGroup
+                && ($flags & (1 << 8)) !== 0
+            ) {
+                $images[] = [$sourceIndex, $title, $segments, (int) ($file['size'] ?? 0), ($flags >> 15) & 3];
+            }
+
+            if ($this->config->processMediaInfo && $mediaInfoMessageId === '' && $hasSegments
+                && ($flags & (1 << 9)) !== 0
+            ) {
+                $mediaInfoMessageId = (string) $segments[0];
+                $this->recordMessageId($mediaInfoMessageId, $seenMessageIds, $duplicateMessageIdCount);
+            }
+
+            if ($this->config->processAudioInfo && $audioInfoMessageId === '' && $hasSegments
+                && ($flags & (1 << 10)) !== 0
+            ) {
+                $audioInfoExtension = $audioExt;
+                $audioInfoMessageId = (string) $segments[0];
+                $this->recordMessageId($audioInfoMessageId, $seenMessageIds, $duplicateMessageIdCount);
+            }
+        }
+
+        foreach ($candidateSplitSets as $index => $splitSet) {
+            $candidate = $archiveCandidates[$index];
+            $tail = $sevenZipTails[$splitSet][1] ?? null;
+            if ($tail !== null && $candidate->likelyFirstVolume && ! in_array($tail, $candidate->messageIds, true)) {
+                $archiveCandidates[$index] = new ArchiveCandidate(
+                    title: $candidate->title,
+                    messageIds: $candidate->messageIds,
+                    likelyFirstVolume: true,
+                    sourceIndex: $candidate->sourceIndex,
+                    tailMessageIds: [$tail],
+                    hasFirstSegment: $candidate->hasFirstSegment,
+                    setKey: $candidate->setKey,
+                );
+            }
+        }
+
+        if ($anyLikelyFirstMissingHeader) {
+            $archiveCandidates = $this->preferRarVolumesWithHeaders($archiveCandidates);
+        }
+
+        $probeCandidates = [];
+        $probeIsOnlyFile = false;
+        if ($archiveCandidates === []) {
+            $probeIsOnlyFile = $unnamedForProbe !== [] && count($nzbContents) === 1;
+            uasort($unnamedForProbe, static fn (array $a, array $b): int => (int) ($b['size'] ?? 0) <=> (int) ($a['size'] ?? 0));
+            foreach (array_slice($unnamedForProbe, 0, $probeIsOnlyFile ? 1 : $this->config->archiveProbeFiles, true) as $sourceIndex => $file) {
+                $messageIds = $this->extractSegments(
+                    $file['segments'],
+                    max(1, $this->config->maximumRarSegments),
+                    $seenMessageIds,
+                    $duplicateMessageIdCount,
+                );
+                if ($messageIds === []) {
+                    continue;
+                }
+                $lastSegment = (string) $file['segments'][array_key_last($file['segments'])];
+                $probeCandidates[] = new ArchiveCandidate(
+                    title: (string) ($file['title'] ?? ''),
+                    messageIds: $messageIds,
+                    likelyFirstVolume: false,
+                    sourceIndex: $sourceIndex,
+                    tailMessageIds: $lastSegment !== $messageIds[0] ? [$lastSegment] : [],
+                );
+            }
+        }
+
+        usort($images, static fn (array $a, array $b): int => [$a[4], -$a[3]] <=> [$b[4], -$b[3]]);
+        $imageCandidates = [];
+        foreach ($images as [$sourceIndex, $title, $segments, $postedSize]) {
+            if ($postedSize > 0 && ($postedSize < self::MIN_IMAGE_POSTED_BYTES || $postedSize > $this->config->mediaImageMaxBytes)) {
+                continue;
+            }
+            $limit = $postedSize > 0
+                ? count($segments)
+                : max($this->config->segmentsToDownload, (int) ceil($this->config->mediaImageMaxBytes / self::TYPICAL_ARTICLE_BYTES));
+            $messageIds = $this->extractSegments($segments, $limit, $seenMessageIds, $duplicateMessageIdCount);
+            if ($messageIds === []) {
+                continue;
+            }
+            $imageCandidates[] = new ImageCandidate($title, $messageIds, $sourceIndex, $postedSize);
+            if (count($imageCandidates) >= self::MAX_IMAGE_CANDIDATES) {
+                break;
+            }
+        }
+        $jpgMessageIds = $imageCandidates[0]->messageIds ?? [];
+
+        $par2IndexCandidates = [];
+        if ($this->config->par2MediaMapping) {
+            $bySize = static fn (array $a, array $b): int => (int) ($a['size'] ?? 0) <=> (int) ($b['size'] ?? 0);
+            uasort($par2Named, $bySize);
+            uasort($par2Unnamed, $bySize);
+            $chosen = $par2Named !== []
+                ? array_slice($par2Named, 0, 1, true)
+                : (count($par2Unnamed) >= 3 ? array_slice($par2Unnamed, 0, 2, true) : []);
+            foreach ($chosen as $sourceIndex => $file) {
+                $par2IndexCandidates[] = new ArchiveCandidate(
+                    title: (string) ($file['title'] ?? ''),
+                    messageIds: array_values(array_unique(array_map(
+                        strval(...),
+                        array_slice($file['segments'], 0, $this->config->par2IndexMaxSegments),
+                    ))),
+                    likelyFirstVolume: false,
+                    sourceIndex: $sourceIndex,
+                );
+            }
+        }
+
+        $mainVideoSourceIndexes = [];
+        if ($mainVideoSizes !== []) {
+            arsort($mainVideoSizes);
+            $mainVideoSourceIndexes = array_slice(array_keys($mainVideoSizes), 0, 2);
+        }
+
+        $bookFlood = $bookFileCount > 80 && ($bookFileCount * 2) >= count($nzbContents);
+        $unsupportedReasons = [];
+        if ($bookFlood) {
+            $unsupportedReasons[] = 'book-flood';
+        }
+        if ($archiveCandidates === []
+            && $sampleMessageIds === []
+            && $jpgMessageIds === []
+            && $mediaInfoMessageId === ''
+            && $audioInfoMessageId === ''
+            && $probeCandidates === []
+        ) {
+            $unsupportedReasons[] = 'no-supported-candidates';
+        }
+
+        return new AdditionalWorkPlan(
+            sampleMessageIds: $sampleMessageIds,
+            jpgMessageIds: $jpgMessageIds,
+            mediaInfoMessageId: $mediaInfoMessageId,
+            audioInfoMessageId: $audioInfoMessageId,
+            audioInfoExtension: $audioInfoExtension,
+            archiveCandidates: $archiveCandidates,
+            bookFileCount: $bookFileCount,
+            bookFlood: $bookFlood,
+            duplicateMessageIdCount: $duplicateMessageIdCount,
+            unsupportedReasons: $unsupportedReasons,
+            probeCandidates: $probeCandidates,
+            probeIsOnlyFile: $probeIsOnlyFile,
+            par2IndexCandidates: $par2IndexCandidates,
+            mainVideoSourceIndexes: $mainVideoSourceIndexes,
             imageCandidates: $imageCandidates,
         );
     }

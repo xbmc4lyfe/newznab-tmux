@@ -1,5 +1,6 @@
 use std::slice;
 
+pub mod additional;
 pub mod categorize;
 pub mod cleaning;
 pub mod filename;
