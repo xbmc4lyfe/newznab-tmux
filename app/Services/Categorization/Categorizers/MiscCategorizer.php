@@ -7,6 +7,7 @@ namespace App\Services\Categorization\Categorizers;
 use App\Models\Category;
 use App\Services\Categorization\CategorizationResult;
 use App\Services\Categorization\ReleaseContext;
+use App\Support\RustPipelineLibrary;
 use App\Traits\DetectsHashedNames;
 
 /**
@@ -18,6 +19,43 @@ class MiscCategorizer extends AbstractCategorizer
 {
     use DetectsHashedNames;
 
+    /** @var array<int, string> */
+    private const array SIGNAL_MARKER_BIT_MAP = [
+        1 => 'season_episode',
+        2 => 'season_pack',
+        4 => 'resolution',
+        8 => 'codec',
+        16 => 'source',
+        32 => 'audio',
+        64 => 'scene_tag',
+        128 => 'year',
+        256 => 'release_group',
+        512 => 'known_extension',
+    ];
+
+    /** @var array<int, string> */
+    private const array MATCHED_BY_NAMES = [
+        1 => 'hash_md5',
+        2 => 'hash_sha1',
+        3 => 'hash_sha256',
+        4 => 'hash_generic',
+        5 => 'hash_base64_like',
+        6 => 'hash_uuid',
+        7 => 'hash_hex',
+        8 => 'gibberish_zero_vowels',
+        9 => 'obfuscated_uppercase',
+        10 => 'obfuscated_mixed_alphanumeric',
+        11 => 'obfuscated_usenet_filename',
+        12 => 'obfuscated_pattern',
+        13 => 'gibberish_no_signal',
+        14 => 'gibberish_random_transitions',
+        15 => 'gibberish_no_word_structure',
+        16 => 'gibberish_random_digits',
+        17 => 'archive',
+        18 => 'dataset',
+        19 => 'data_dump',
+    ];
+
     protected int $priority = 1; // Highest priority - run first to catch hashes
 
     public function getName(): string
@@ -25,16 +63,49 @@ class MiscCategorizer extends AbstractCategorizer
         return 'Misc';
     }
 
+    /**
+     * Combined signal inspection and categorization in a single pass.
+     *
+     * @return array{0: array{coreName: string, coreLength: int, signalScore: int, markers: list<string>, lowSignal: bool}, 1: CategorizationResult}
+     */
+    public function inspectAndCategorize(ReleaseContext|string $context): array
+    {
+        $name = $context instanceof ReleaseContext ? $context->releaseName : $context;
+        $raw = RustPipelineLibrary::miscInspectAndCategorize($name);
+        if ($raw !== null) {
+            return $this->decodeRustInspectAndCategorize($raw);
+        }
+
+        $analysis = $this->inspectSignalsPhp($name);
+        $result = $this->categorizePhp($name, $analysis);
+
+        return [$analysis, $result];
+    }
+
     public function categorize(ReleaseContext $context): CategorizationResult
     {
         $name = $context->releaseName;
+        $raw = RustPipelineLibrary::miscInspectAndCategorize($name);
+        if ($raw !== null) {
+            return $this->decodeRustInspectAndCategorize($raw)[1];
+        }
 
+        return $this->categorizePhp($name);
+    }
+
+    /**
+     * Pure-PHP fallback for miscellaneous categorization.
+     *
+     * @param  array{coreName: string, coreLength: int, signalScore: int, markers: list<string>, lowSignal: bool}|null  $analysis
+     */
+    public function categorizePhp(string $name, ?array $analysis = null): CategorizationResult
+    {
         // Check for hash patterns first
         if ($result = $this->checkHash($name)) {
             return $result;
         }
 
-        $analysis = $this->inspectSignals($name);
+        $analysis ??= $this->inspectSignalsPhp($name);
         if ($this->isZeroVowelLongToken($analysis['coreName'])) {
             return $this->matched(Category::OTHER_HASHED, 0.78, 'gibberish_zero_vowels');
         }
@@ -73,6 +144,22 @@ class MiscCategorizer extends AbstractCategorizer
      * @return array{coreName: string, coreLength: int, signalScore: int, markers: list<string>, lowSignal: bool}
      */
     public function inspectSignals(ReleaseContext|string $context): array
+    {
+        $name = $context instanceof ReleaseContext ? $context->releaseName : $context;
+        $raw = RustPipelineLibrary::miscInspectAndCategorize($name);
+        if ($raw !== null) {
+            return $this->decodeRustInspectAndCategorize($raw)[0];
+        }
+
+        return $this->inspectSignalsPhp($name);
+    }
+
+    /**
+     * Pure-PHP fallback for signal marker inspection.
+     *
+     * @return array{coreName: string, coreLength: int, signalScore: int, markers: list<string>, lowSignal: bool}
+     */
+    public function inspectSignalsPhp(ReleaseContext|string $context): array
     {
         $name = $context instanceof ReleaseContext ? $context->releaseName : $context;
         $cleaned = $this->stripExtensionsForAnalysis($name);
@@ -295,5 +382,57 @@ class MiscCategorizer extends AbstractCategorizer
         }
 
         return null;
+    }
+
+    /**
+     * @return array{0: array{coreName: string, coreLength: int, signalScore: int, markers: list<string>, lowSignal: bool}, 1: CategorizationResult}
+     */
+    private function decodeRustInspectAndCategorize(string $raw): array
+    {
+        $markersMask = \ord($raw[4]) | (\ord($raw[5]) << 8);
+        $markers = [];
+        while ($markersMask !== 0) {
+            $lsb = $markersMask & -$markersMask;
+            if (isset(self::SIGNAL_MARKER_BIT_MAP[$lsb])) {
+                $markers[] = self::SIGNAL_MARKER_BIT_MAP[$lsb];
+            }
+            $markersMask ^= $lsb;
+        }
+
+        $signalScore = \count($markers);
+        $coreName = substr($raw, 7);
+        $coreLength = \strlen($coreName);
+        $lowSignal = \ord($raw[6]) === 1;
+
+        $analysis = [
+            'coreName' => $coreName,
+            'coreLength' => $coreLength,
+            'signalScore' => $signalScore,
+            'markers' => $markers,
+            'lowSignal' => $lowSignal,
+        ];
+
+        $matchedByCode = \ord($raw[3]);
+        if ($matchedByCode === 0) {
+            return [$analysis, $this->noMatch()];
+        }
+
+        $rawCat = \ord($raw[0]) | (\ord($raw[1]) << 8);
+        $categoryId = ($rawCat === Category::OTHER_HASHED || $rawCat === 7020)
+            ? Category::OTHER_HASHED
+            : Category::OTHER_MISC;
+        $confidence = \ord($raw[2]) / 100.0;
+        $matchedBy = self::MATCHED_BY_NAMES[$matchedByCode] ?? 'no_match';
+        $debug = match ($matchedByCode) {
+            12 => ['signal_score' => $signalScore, 'markers' => $markers],
+            13 => [
+                'signal_score' => $signalScore,
+                'markers' => $markers,
+                'core_length' => $coreLength,
+            ],
+            default => [],
+        };
+
+        return [$analysis, $this->matched($categoryId, $confidence, $matchedBy, $debug)];
     }
 }
