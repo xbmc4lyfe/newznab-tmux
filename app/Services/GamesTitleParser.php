@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use App\Support\RustPipelineLibrary;
+
 /**
  * GamesTitleParser - Parse and clean game release titles.
  *
@@ -51,6 +53,16 @@ class GamesTitleParser
      * Clean release name by removing scene artifacts.
      */
     protected function cleanReleaseName(string $name): string
+    {
+        $fast = RustPipelineLibrary::gamesCleanReleaseName($name);
+        if ($fast !== null) {
+            return $fast;
+        }
+
+        return $this->cleanReleaseNamePhp($name);
+    }
+
+    public function cleanReleaseNamePhp(string $name): string
     {
         // Remove simple file extensions at the end
         $name = (string) preg_replace('/\.(zip|rar|7z|iso|nfo|sfv|exe|mkv|mp4|avi)$/i', '', $name);
@@ -198,6 +210,16 @@ class GamesTitleParser
      * Normalize a title for comparison/matching.
      */
     public function normalizeForMatch(string $title): string
+    {
+        $fast = RustPipelineLibrary::gamesNormalizeForMatch($title);
+        if ($fast !== null) {
+            return $fast;
+        }
+
+        return $this->normalizeForMatchPhp($title);
+    }
+
+    public function normalizeForMatchPhp(string $title): string
     {
         $t = mb_strtolower($title);
 
