@@ -77,6 +77,8 @@ class FileNameCleanerTest extends TestCase
             'Game.Setup.2026-GRP.7z.001',
             'Book.Title.2026.Retail-GRP.epub.rar',
             'Film ;-)/Extreem Online Contact.url',
+            'VIDEO_TS/VTS_011.VOB',
+            'VIDEO_TS/vts0101.vob',
             '.hidden_file.mkv',
         ];
 

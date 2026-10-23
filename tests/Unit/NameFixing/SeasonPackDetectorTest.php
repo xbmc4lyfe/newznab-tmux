@@ -132,6 +132,10 @@ class SeasonPackDetectorTest extends TestCase
         );
         $this->assertNull(SeasonPackDetector::seasonNameFromEpisode('Show.S01E01.Pilot-GRP'));
         $this->assertNull(SeasonPackDetector::seasonNameFromEpisode('Movie.2020.1080p.BluRay-GRP'));
+        $this->assertSame(
+            SeasonPackDetector::seasonNameFromEpisodePhp('_.S01E01.1080p.WEB-DL-GRP.mkv'),
+            SeasonPackDetector::seasonNameFromEpisode('_.S01E01.1080p.WEB-DL-GRP.mkv'),
+        );
     }
 
     #[Test]

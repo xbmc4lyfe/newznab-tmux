@@ -427,10 +427,12 @@ fn looks_like_structural_junk(mut s: &[u8]) -> bool {
             p += 1;
         }
         let d1_len = p - d1_start;
-        if (1..=2).contains(&d1_len) {
-            if p < s.len() && matches!(s[p], b'.' | b'_' | b'-') {
-                p += 1;
+        if p == s.len() {
+            if (2..=4).contains(&d1_len) {
+                return true;
             }
+        } else if (1..=2).contains(&d1_len) && matches!(s[p], b'.' | b'_' | b'-') {
+            p += 1;
             let d2_start = p;
             while p < s.len() && s[p].is_ascii_digit() {
                 p += 1;
@@ -653,6 +655,9 @@ fn strip_part_volume_indicator(bytes: &[u8], start: usize, end: usize) -> usize 
 pub fn clean_for_matching_span(bytes: &[u8], preserve_leading_number: bool) -> i64 {
     if bytes.is_empty() {
         return -1;
+    }
+    if bytes.len() > i32::MAX as usize {
+        return -2;
     }
     for &b in bytes {
         if !(0x20..=0x7E).contains(&b) {
@@ -1539,8 +1544,7 @@ struct ParsedEpisode<'a> {
     base: &'a [u8],
     prefix: &'a [u8],
     sep: &'a [u8],
-    key: [u8; 256],
-    key_len: usize,
+    key: Vec<u8>,
     season: u32,
     season_digits_len: usize,
     episode: u32,
@@ -1713,14 +1717,33 @@ fn parse_episode<'a>(name: &'a [u8]) -> Option<ParsedEpisode<'a>> {
         return None;
     }
 
-    let mut key = [0u8; 256];
-    let mut key_out = unsafe { OutCursor::new(key.as_mut_ptr(), key.len()) };
-    if !write_normalized_prefix_key(prefix, &mut key_out) {
-        return None;
+    let mut key = Vec::with_capacity(prefix.len());
+    let mut s = prefix;
+    while let Some(&first) = s.first() {
+        if matches!(first, b'.' | b'_' | b' ' | b'-') {
+            s = &s[1..];
+        } else {
+            break;
+        }
     }
-    let key_len = key_out.finish();
-    if key_len <= 0 {
-        return None;
+    while let Some(&last) = s.last() {
+        if matches!(last, b'.' | b'_' | b' ' | b'-') {
+            s = &s[..s.len() - 1];
+        } else {
+            break;
+        }
+    }
+    let mut in_sep = false;
+    for &b in s {
+        if matches!(b, b'.' | b'_' | b' ' | b'-') {
+            in_sep = true;
+        } else {
+            if in_sep {
+                key.push(b'.');
+                in_sep = false;
+            }
+            key.push(b.to_ascii_lowercase());
+        }
     }
 
     Some(ParsedEpisode {
@@ -1728,7 +1751,6 @@ fn parse_episode<'a>(name: &'a [u8]) -> Option<ParsedEpisode<'a>> {
         prefix,
         sep,
         key,
-        key_len: key_len as usize,
         season: parse_u32_ascii(season_digits),
         season_digits_len: season_digits.len(),
         episode: parse_u32_ascii(ep_digits),
@@ -1832,11 +1854,11 @@ pub(crate) fn write_season_name_from_episodes(names: &[&[u8]], out: &mut OutCurs
         return 0;
     }
 
-    let first_key = &episodes[0].key[..episodes[0].key_len];
+    let first_key = episodes[0].key.as_slice();
     if episodes
         .iter()
         .skip(1)
-        .any(|ep| &ep.key[..ep.key_len] != first_key)
+        .any(|ep| ep.key.as_slice() != first_key)
     {
         return 0;
     }
