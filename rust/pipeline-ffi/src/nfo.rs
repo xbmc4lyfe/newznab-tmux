@@ -894,6 +894,4170 @@ pub unsafe extern "C" fn nntmux_nfo_validate_content(
     validate_nfo_content(src)
 }
 
+// ============================================================================
+// NfoNameExtractor & FileNameExtractor Accelerators
+// ============================================================================
+
+#[inline]
+fn is_php_trim_byte(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x00 | 0x0B)
+}
+
+#[inline]
+fn php_trim(mut s: &[u8]) -> &[u8] {
+    while let Some(&first) = s.first() {
+        if is_php_trim_byte(first) {
+            s = &s[1..];
+        } else {
+            break;
+        }
+    }
+    while let Some(&last) = s.last() {
+        if is_php_trim_byte(last) {
+            s = &s[..s.len() - 1];
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+/// Checks whether `src` consists solely of printable ASCII (`0x20..=0x7E`),
+/// standard whitespace (`\t`, `\n`, `\r`), and valid 3-byte UTF-8 box-drawing/block
+/// characters (`0xE2 0x94..=0x96 0x80..=0xBF`).
+#[inline]
+fn is_supported_nfo_bytes(src: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < src.len() {
+        let b = src[i];
+        if b < 0x80 {
+            if (0x20..=0x7E).contains(&b) || matches!(b, b'\t' | b'\n' | b'\r') {
+                i += 1;
+            } else {
+                return false;
+            }
+        } else if b == 0xE2
+            && i + 2 < src.len()
+            && (0x94..=0x96).contains(&src[i + 1])
+            && (0x80..=0xBF).contains(&src[i + 2])
+        {
+            i += 3;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+#[inline]
+fn is_predb_t_byte(b: u8) -> bool {
+    is_word_byte(b) || matches!(b, b'.' | b'\'' | b'(' | b')' | b'[' | b']' | b'-')
+}
+
+#[inline]
+fn is_predb_s_byte(b: u8) -> bool {
+    is_pcre_space(b) || matches!(b, b'.' | b'_' | b'-')
+}
+
+#[inline]
+fn is_predb_u_byte(b: u8) -> bool {
+    is_predb_t_byte(b) || is_pcre_space(b)
+}
+
+/// Evaluates `preg_match(ReleaseUpdateService::PREDB_REGEX, input)` in O(N) time.
+#[inline]
+fn matches_predb_regex(bytes: &[u8]) -> bool {
+    let n = bytes.len();
+    let mut i = 0usize;
+    while i < n {
+        if !is_predb_t_byte(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let mut u_end = i + 1;
+        let mut first_s = usize::MAX;
+        while u_end < n && is_predb_u_byte(bytes[u_end]) {
+            if first_s == usize::MAX && is_predb_s_byte(bytes[u_end]) {
+                first_s = u_end;
+            }
+            u_end += 1;
+        }
+        if u_end - i >= 5 && first_s != usize::MAX {
+            let min_d = (i + 3).max(first_s + 2);
+            if u_end >= min_d + 2 {
+                let mut d = u_end - 2;
+                loop {
+                    if matches!(bytes[d], b'-' | b'.')
+                        && is_word_byte(bytes[d + 1])
+                        && is_predb_t_byte(bytes[d - 1])
+                    {
+                        return true;
+                    }
+                    if d <= min_d {
+                        break;
+                    }
+                    d -= 1;
+                }
+            }
+        }
+        i = u_end;
+    }
+    false
+}
+
+/// Iterates all `preg_match_all(ReleaseUpdateService::PREDB_REGEX, identity)` matches in O(N) time.
+fn for_each_predb_regex_match<'a>(identity: &'a [u8], mut f: impl FnMut(&'a [u8]) -> bool) {
+    let n = identity.len();
+    let mut i = 0usize;
+    while i < n {
+        if !is_predb_t_byte(identity[i]) {
+            i += 1;
+            continue;
+        }
+        let mut u_end = i + 1;
+        while u_end < n && is_predb_u_byte(identity[u_end]) {
+            u_end += 1;
+        }
+        while i < u_end {
+            if !is_predb_t_byte(identity[i]) {
+                i += 1;
+                continue;
+            }
+            if u_end - i < 5 {
+                i = u_end;
+                break;
+            }
+            let mut first_s = usize::MAX;
+            for k in (i + 1)..u_end {
+                if is_predb_s_byte(identity[k]) {
+                    first_s = k;
+                    break;
+                }
+            }
+            if first_s == usize::MAX {
+                i = u_end;
+                break;
+            }
+            let min_d = (i + 3).max(first_s + 2);
+            let mut matched = false;
+            if u_end >= min_d + 2 {
+                let mut d = u_end - 2;
+                loop {
+                    if matches!(identity[d], b'-' | b'.')
+                        && is_word_byte(identity[d + 1])
+                        && is_predb_t_byte(identity[d - 1])
+                    {
+                        let mut end = d + 2;
+                        while end < u_end && is_word_byte(identity[end]) {
+                            end += 1;
+                        }
+                        if !f(&identity[i..end]) {
+                            return;
+                        }
+                        i = end;
+                        matched = true;
+                        break;
+                    }
+                    if d <= min_d {
+                        break;
+                    }
+                    d -= 1;
+                }
+            }
+            if !matched {
+                i = u_end;
+                break;
+            }
+        }
+    }
+}
+
+/// Matches `/^[ \t]*(?:Filename|File[ \t]+Name|Complete[ \t]+Name|Release(?:[ \t]+Name)?)[ \t]*[:=][ \t]*([^\r\n]+)$/i`
+/// on a single line and returns `trim($fields[1])`.
+#[inline]
+fn extract_literal_name_field(line: &[u8]) -> Option<&[u8]> {
+    let mut p = 0usize;
+    while p < line.len() && matches!(line[p], b' ' | b'\t') {
+        p += 1;
+    }
+    let rem = &line[p..];
+    let after_label = if rem.len() >= 8 && rem[..8].eq_ignore_ascii_case(b"filename") {
+        p + 8
+    } else if rem.len() >= 4 && rem[..4].eq_ignore_ascii_case(b"file") {
+        let mut q = p + 4;
+        while q < line.len() && matches!(line[q], b' ' | b'\t') {
+            q += 1;
+        }
+        if q == p + 4 || line.len() - q < 4 || !line[q..q + 4].eq_ignore_ascii_case(b"name") {
+            return None;
+        }
+        q + 4
+    } else if rem.len() >= 8 && rem[..8].eq_ignore_ascii_case(b"complete") {
+        let mut q = p + 8;
+        while q < line.len() && matches!(line[q], b' ' | b'\t') {
+            q += 1;
+        }
+        if q == p + 8 || line.len() - q < 4 || !line[q..q + 4].eq_ignore_ascii_case(b"name") {
+            return None;
+        }
+        q + 4
+    } else if rem.len() >= 7 && rem[..7].eq_ignore_ascii_case(b"release") {
+        let mut q = p + 7;
+        let ws_start = q;
+        while q < line.len() && matches!(line[q], b' ' | b'\t') {
+            q += 1;
+        }
+        if q > ws_start && line.len() - q >= 4 && line[q..q + 4].eq_ignore_ascii_case(b"name") {
+            let mut r = q + 4;
+            while r < line.len() && matches!(line[r], b' ' | b'\t') {
+                r += 1;
+            }
+            if r < line.len() && matches!(line[r], b':' | b'=') {
+                q + 4
+            } else {
+                p + 7
+            }
+        } else {
+            p + 7
+        }
+    } else {
+        return None;
+    };
+
+    let mut q = after_label;
+    while q < line.len() && matches!(line[q], b' ' | b'\t') {
+        q += 1;
+    }
+    if q >= line.len() || !matches!(line[q], b':' | b'=') {
+        return None;
+    }
+    q += 1;
+    // `[^\r\n]+$` requires at least 1 byte after `[:=]`
+    if q >= line.len() {
+        return None;
+    }
+    Some(php_trim(&line[q..]))
+}
+
+/// Evaluates `FileNameCleaner::looksLikeSceneRelease` on an ASCII title that does not contain `__NZBSPLIT__`.
+#[inline]
+fn looks_like_scene_release_ascii(title: &[u8]) -> bool {
+    let base = if let Some(dot) = title.iter().rposition(|&b| b == b'.') {
+        let ext = &title[dot + 1..];
+        if (2..=4).contains(&ext.len()) && ext.iter().all(|b| b.is_ascii_alphanumeric()) {
+            &title[..dot]
+        } else {
+            title
+        }
+    } else {
+        title
+    };
+
+    let Some(dash) = base.iter().rposition(|&b| b == b'-') else {
+        return false;
+    };
+    let group = &base[dash + 1..];
+    if !(2..=15).contains(&group.len()) || !group.iter().all(|b| b.is_ascii_alphanumeric()) {
+        return false;
+    }
+    if !base.iter().any(|&b| matches!(b, b'.' | b'_' | b'-')) {
+        return false;
+    }
+
+    const SCENE_TAGS: &[&[u8]] = &[
+        b"720p",
+        b"1080p",
+        b"2160p",
+        b"4k",
+        b"x264",
+        b"x265",
+        b"hevc",
+        b"xvid",
+        b"divx",
+        b"bluray",
+        b"bdrip",
+        b"dvdrip",
+        b"hdtv",
+        b"webrip",
+        b"web-dl",
+        b"webdl",
+        b"aac",
+        b"ac3",
+        b"dts",
+        b"flac",
+        b"mp3",
+        b"proper",
+        b"repack",
+        b"internal",
+        b"retail",
+        b"pal",
+        b"ntsc",
+        b"multi",
+        b"dual",
+    ];
+    for &tag in SCENE_TAGS {
+        if find_ascii_ci(base, tag).is_some() {
+            return true;
+        }
+    }
+
+    // Check `/s\d{1,2}e\d{1,3}/i`
+    for i in 0..base.len() {
+        if matches!(base[i], b's' | b'S') {
+            let mut p = i + 1;
+            while p < base.len() && base[p].is_ascii_digit() {
+                p += 1;
+            }
+            if (1..=2).contains(&(p - (i + 1))) && p < base.len() && matches!(base[p], b'e' | b'E')
+            {
+                let e_start = p + 1;
+                if e_start < base.len() && base[e_start].is_ascii_digit() {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Check `/[._-](19|20)\d{2}[._-]/i`
+    if base.len() >= 6 {
+        for i in 0..=base.len() - 6 {
+            if matches!(base[i], b'.' | b'_' | b'-')
+                && (&base[i + 1..i + 3] == b"19" || &base[i + 1..i + 3] == b"20")
+                && base[i + 3].is_ascii_digit()
+                && base[i + 4].is_ascii_digit()
+                && matches!(base[i + 5], b'.' | b'_' | b'-')
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Checks `/(:?^|[._-])(480p|576p|720p|1080[pi]|2160p|4320p|[48]k|web[._-]?dl|webrip|bluray|bdrip|brrip|dvdrip|hdtv|sdtv|x264|x265|h[._]?26[45]|hevc|avc|xvid|divx|aac|ac3|eac3|ddp?[0-9](?:[._][0-9])?|dts(?:[._-]?hd)?|flac|mp3|truehd|pal|ntsc)(?=$|[._-])/i`
+fn stem_has_technical_token(stem: &[u8]) -> bool {
+    let is_sep = |b: u8| matches!(b, b'.' | b'_' | b'-');
+    let is_end = |pos: usize| pos == stem.len() || is_sep(stem[pos]);
+
+    for i in 0..stem.len() {
+        if i > 0 && !is_sep(stem[i - 1]) {
+            continue;
+        }
+        let rem = &stem[i..];
+        for &word in &[
+            &b"480p"[..],
+            b"576p",
+            b"720p",
+            b"1080p",
+            b"1080i",
+            b"2160p",
+            b"4320p",
+            b"4k",
+            b"8k",
+            b"webdl",
+            b"webrip",
+            b"bluray",
+            b"bdrip",
+            b"brrip",
+            b"dvdrip",
+            b"hdtv",
+            b"sdtv",
+            b"x264",
+            b"x265",
+            b"h264",
+            b"h265",
+            b"hevc",
+            b"avc",
+            b"xvid",
+            b"divx",
+            b"aac",
+            b"ac3",
+            b"eac3",
+            b"dtshd",
+            b"dts",
+            b"flac",
+            b"mp3",
+            b"truehd",
+            b"pal",
+            b"ntsc",
+        ] {
+            if rem.len() >= word.len()
+                && rem[..word.len()].eq_ignore_ascii_case(word)
+                && is_end(i + word.len())
+            {
+                return true;
+            }
+        }
+        // `web[._-]dl`
+        if rem.len() >= 6
+            && rem[..3].eq_ignore_ascii_case(b"web")
+            && is_sep(rem[3])
+            && rem[4..6].eq_ignore_ascii_case(b"dl")
+            && is_end(i + 6)
+        {
+            return true;
+        }
+        // `h[._]26[45]`
+        if rem.len() >= 5
+            && matches!(rem[0], b'h' | b'H')
+            && matches!(rem[1], b'.' | b'_')
+            && &rem[2..4] == b"26"
+            && matches!(rem[4], b'4' | b'5')
+            && is_end(i + 5)
+        {
+            return true;
+        }
+        // `dts[._-]hd`
+        if rem.len() >= 6
+            && rem[..3].eq_ignore_ascii_case(b"dts")
+            && is_sep(rem[3])
+            && rem[4..6].eq_ignore_ascii_case(b"hd")
+            && is_end(i + 6)
+        {
+            return true;
+        }
+        // `ddp?[0-9](?:[._][0-9])?`
+        if rem.len() >= 3 && rem[..2].eq_ignore_ascii_case(b"dd") {
+            let mut p = 2usize;
+            if p < rem.len() && matches!(rem[p], b'p' | b'P') {
+                p += 1;
+            }
+            if p < rem.len() && rem[p].is_ascii_digit() {
+                p += 1;
+                if is_end(i + p) {
+                    return true;
+                }
+                if p + 1 < rem.len() && matches!(rem[p], b'.' | b'_') && rem[p + 1].is_ascii_digit()
+                {
+                    if is_end(i + p + 2) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Evaluates `FileNameCleaner::isLiteralTechnicalSceneTitle` for ASCII input.
+fn is_literal_technical_scene_title_ascii(title: &[u8]) -> Option<bool> {
+    if title.is_empty() || title.len() > 255 {
+        return Some(false);
+    }
+    if title.iter().any(|&b| !(0x20..=0x7E).contains(&b)) {
+        return None;
+    }
+    if crate::cleaning::nzbsplit_literal_payload_span(title).is_some()
+        || find_ascii_ci(title, b"__nzbsplit__").is_some()
+    {
+        return None;
+    }
+    let Some(dash_pos) = title.iter().rposition(|&b| b == b'-') else {
+        return Some(false);
+    };
+    let stem = &title[..dash_pos];
+    let group = &title[dash_pos + 1..];
+    if !(2..=15).contains(&group.len()) || !group.iter().all(|b| b.is_ascii_alphanumeric()) {
+        return Some(false);
+    }
+    if stem.is_empty()
+        || !stem[0].is_ascii_alphanumeric()
+        || !stem
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Some(false);
+    }
+
+    // Reject `/[._-](?:sample|proof|thumbs?|part\d+|vol\d+(?:[+-]\d+)?)\z/i`
+    if group.eq_ignore_ascii_case(b"sample")
+        || group.eq_ignore_ascii_case(b"proof")
+        || group.eq_ignore_ascii_case(b"thumb")
+        || group.eq_ignore_ascii_case(b"thumbs")
+        || (group.len() >= 5
+            && group[..4].eq_ignore_ascii_case(b"part")
+            && group[4..].iter().all(|b| b.is_ascii_digit()))
+        || (group.len() >= 4
+            && group[..3].eq_ignore_ascii_case(b"vol")
+            && group[3..].iter().all(|b| b.is_ascii_digit()))
+    {
+        return Some(false);
+    }
+    if group.iter().all(|b| b.is_ascii_digit()) {
+        // Check if `stem` ends with `[._-]vol\d+` (so `title` ends with `[._-]vol\d+-\d+`)
+        let mut p = stem.len();
+        while p > 0 && stem[p - 1].is_ascii_digit() {
+            p -= 1;
+        }
+        if p < stem.len()
+            && p >= 4
+            && matches!(stem[p - 4], b'.' | b'_' | b'-')
+            && stem[p - 3..p].eq_ignore_ascii_case(b"vol")
+        {
+            return Some(false);
+        }
+    }
+
+    if !stem_has_technical_token(stem) || !looks_like_scene_release_ascii(title) {
+        return Some(false);
+    }
+
+    crate::cleaning::is_plausible_release_title(title)
+}
+
+/// Core implementation of `NfoNameExtractor::predbCandidates(string $text)`.
+/// Returns:
+/// - `>= 0`: NUL-delimited candidate titles written to `out` (`complete = true`)
+/// - `-2`: declined to PHP fallback
+/// - `-4`: overflow (`> 100` unique candidates -> `['titles' => [], 'complete' => false]`)
+/// - `<= -16`: `out` buffer too small (`-(required_len as isize)`)
+pub(crate) fn nfo_predb_candidates_into(src: &[u8], out: &mut OutCursor<'_>) -> isize {
+    if src.is_empty() {
+        return 0;
+    }
+    if !is_supported_nfo_bytes(src) {
+        return -2;
+    }
+
+    let mut stack_ident = std::mem::MaybeUninit::<[u8; 16384]>::uninit();
+    let mut heap_ident: Vec<u8> = Vec::new();
+    let ident_slice: &[u8] = if src.len() <= 16384 {
+        let ptr = stack_ident.as_mut_ptr().cast::<u8>();
+        let mut cur = unsafe { OutCursor::new(ptr, 16384) };
+        nfo_identity_text_into(src, &mut cur);
+        unsafe { slice::from_raw_parts(ptr, cur.pos) }
+    } else {
+        heap_ident.resize(src.len(), 0);
+        let mut cur = unsafe { OutCursor::new(heap_ident.as_mut_ptr(), heap_ident.len()) };
+        nfo_identity_text_into(src, &mut cur);
+        &heap_ident[..cur.pos]
+    };
+
+    struct CandidateSet<'i> {
+        titles: [&'i [u8]; 100],
+        len: usize,
+        overflow: bool,
+    }
+
+    impl<'i> CandidateSet<'i> {
+        #[inline]
+        fn insert(&mut self, cand: &'i [u8]) -> bool {
+            if cand.is_empty() || cand.len() > 255 {
+                return true;
+            }
+            if cand.iter().any(|&b| b < 0x20 || b == 0x7F) {
+                return true;
+            }
+            for existing in self.titles.iter_mut().take(self.len) {
+                if existing.eq_ignore_ascii_case(cand) {
+                    *existing = cand;
+                    return true;
+                }
+            }
+            if self.len >= 100 {
+                self.overflow = true;
+                return false;
+            }
+            self.titles[self.len] = cand;
+            self.len += 1;
+            true
+        }
+    }
+
+    let mut cands = CandidateSet {
+        titles: [&[]; 100],
+        len: 0,
+        overflow: false,
+    };
+
+    // 1. `literalNameFields($identity)` -> `cleanForMatching($field)`
+    for line in ident_slice.split(|&b| b == b'\n') {
+        if let Some(field) = extract_literal_name_field(line) {
+            let span = crate::filename::clean_for_matching_span(field, false);
+            if span == -2 {
+                return -2;
+            }
+            if span >= 0 {
+                let start = (span >> 32) as usize;
+                let len = (span & 0xFFFF_FFFF) as usize;
+                let cleaned = &field[start..start + len];
+                if !cands.insert(cleaned) {
+                    return -4;
+                }
+            }
+        }
+    }
+
+    // 2. `preg_match_all(ReleaseUpdateService::PREDB_REGEX, $identity, $matches)`
+    for_each_predb_regex_match(ident_slice, |matched| {
+        let trimmed = php_trim(matched);
+        cands.insert(trimmed)
+    });
+
+    if cands.overflow {
+        return -4;
+    }
+    if cands.len == 0 {
+        return 0;
+    }
+
+    for (idx, &title) in cands.titles.iter().take(cands.len).enumerate() {
+        if idx > 0 {
+            out.push(0);
+        }
+        out.extend(title);
+    }
+
+    finish_cursor_min_ref(out, 16)
+}
+
+#[inline]
+fn is_pcre_dot_to_underscore_or_space_ci(b: u8) -> bool {
+    b == b' ' || (0x2E..=0x5F).contains(&b) || b.is_ascii_lowercase()
+}
+
+#[inline]
+fn is_sep_dot_dash_under_space(b: u8) -> bool {
+    matches!(b, b'.' | b'-' | b'_' | b' ')
+}
+
+#[inline]
+fn is_year_19_20(s: &[u8], pos: usize) -> bool {
+    pos + 4 <= s.len()
+        && (&s[pos..pos + 2] == b"19" || &s[pos..pos + 2] == b"20")
+        && s[pos + 2].is_ascii_digit()
+        && s[pos + 3].is_ascii_digit()
+}
+
+#[inline]
+fn has_nfo_end_delim(line: &[u8], pos: usize, has_trailing_newline: bool) -> bool {
+    if pos == line.len() {
+        has_trailing_newline
+    } else if is_pcre_space(line[pos]) {
+        if pos + 1 < line.len() {
+            is_pcre_space(line[pos + 1])
+        } else {
+            has_trailing_newline
+        }
+    } else {
+        false
+    }
+}
+
+#[inline]
+fn write_result_pair(out: &mut OutCursor<'_>, new_name: &[u8], method: &[u8]) {
+    out.extend(new_name);
+    out.push(0);
+    out.extend(method);
+}
+
+#[inline]
+fn write_replaced_result_pair(
+    out: &mut OutCursor<'_>,
+    haystack: &[u8],
+    needle: &[u8],
+    replacement: &[u8],
+    method: &[u8],
+) {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        out.extend(haystack);
+    } else {
+        let mut i = 0usize;
+        while i + needle.len() <= haystack.len() {
+            if &haystack[i..i + needle.len()] == needle {
+                out.extend(replacement);
+                i += needle.len();
+            } else {
+                out.push(haystack[i]);
+                i += 1;
+            }
+        }
+        if i < haystack.len() {
+            out.extend(&haystack[i..]);
+        }
+    }
+    out.push(0);
+    out.extend(method);
+}
+
+/// Evaluates `NfoNameExtractor::checkForTv` on `identity`.
+fn check_for_tv_into(identity: &[u8], out: &mut OutCursor<'_>) -> bool {
+    if identity.len() < 6
+        || !(0..identity.len() - 1)
+            .any(|k| matches!(identity[k], b's' | b'S') && identity[k + 1].is_ascii_digit())
+    {
+        return false;
+    }
+    // 1. Generic TV 1: `/:\s*.*[\\\\\/]([A-Z0-9].+?S\d+[.-_ ]?[ED]\d+.+?)\.\w{2,}\s+/i`
+    let mut pos = 0usize;
+    let mut carry_colon_ws = false;
+    while pos < identity.len() {
+        let line_start = pos;
+        while pos < identity.len() && identity[pos] != b'\n' {
+            pos += 1;
+        }
+        let line = &identity[line_start..pos];
+        let has_nl = pos < identity.len();
+        if has_nl {
+            pos += 1;
+        }
+
+        let earliest_start = if carry_colon_ws {
+            Some(0usize)
+        } else {
+            line.iter().position(|&b| b == b':').map(|c| c + 1)
+        };
+
+        if let Some(start_pos) = earliest_start {
+            for slash_pos in (start_pos..line.len()).rev() {
+                if !matches!(line[slash_pos], b'\\' | b'/') {
+                    continue;
+                }
+                let g1_start = slash_pos + 1;
+                if g1_start >= line.len() || !line[g1_start].is_ascii_alphanumeric() {
+                    continue;
+                }
+                for s_pos in (g1_start + 1)..line.len() {
+                    if !matches!(line[s_pos], b's' | b'S') {
+                        continue;
+                    }
+                    let mut d1_end = s_pos + 1;
+                    while d1_end < line.len() && line[d1_end].is_ascii_digit() {
+                        d1_end += 1;
+                    }
+                    for d1_len in (1..=(d1_end - (s_pos + 1))).rev() {
+                        let after_s = s_pos + 1 + d1_len;
+                        for sep_len in [1usize, 0usize] {
+                            if sep_len == 1
+                                && (after_s >= line.len()
+                                    || !is_pcre_dot_to_underscore_or_space_ci(line[after_s]))
+                            {
+                                continue;
+                            }
+                            let ed_pos = after_s + sep_len;
+                            if ed_pos >= line.len()
+                                || !matches!(line[ed_pos], b'e' | b'E' | b'd' | b'D')
+                            {
+                                continue;
+                            }
+                            let mut d2_end = ed_pos + 1;
+                            while d2_end < line.len() && line[d2_end].is_ascii_digit() {
+                                d2_end += 1;
+                            }
+                            for d2_len in (1..=(d2_end - (ed_pos + 1))).rev() {
+                                let sed_end = ed_pos + 1 + d2_len;
+                                for dot_pos in (sed_end + 1)..line.len() {
+                                    if line[dot_pos] != b'.' {
+                                        continue;
+                                    }
+                                    let mut w_end = dot_pos + 1;
+                                    while w_end < line.len() && is_word_byte(line[w_end]) {
+                                        w_end += 1;
+                                    }
+                                    if w_end - (dot_pos + 1) >= 2
+                                        && ((w_end < line.len() && is_pcre_space(line[w_end]))
+                                            || (w_end == line.len() && has_nl))
+                                    {
+                                        write_result_pair(
+                                            out,
+                                            &line[g1_start..dot_pos],
+                                            b"Generic TV 1",
+                                        );
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if has_nl {
+            if let Some(last_colon) = line.iter().rposition(|&b| b == b':') {
+                carry_colon_ws = line[last_colon + 1..].iter().all(|&b| is_pcre_space(b));
+            } else if carry_colon_ws {
+                carry_colon_ws = line.iter().all(|&b| is_pcre_space(b));
+            }
+        } else {
+            carry_colon_ws = false;
+        }
+    }
+
+    // 2. Generic TV 2: `/(?:(\:\s{1,}))(.+?S\d{1,3}[.-_ ]?[ED]\d{1,3}.+?)(\s{2,}|\r|\n)/i`
+    for colon_pos in 0..identity.len() {
+        if identity[colon_pos] != b':' {
+            continue;
+        }
+        let mut ws_end = colon_pos + 1;
+        while ws_end < identity.len() && is_pcre_space(identity[ws_end]) {
+            ws_end += 1;
+        }
+        if ws_end == colon_pos + 1 {
+            continue;
+        }
+        let mut ws_line_start = ws_end;
+        while ws_line_start > colon_pos + 1 && identity[ws_line_start - 1] != b'\n' {
+            ws_line_start -= 1;
+        }
+        let min_g2 = ws_line_start.max(colon_pos + 2);
+        let mut line_end = ws_end;
+        while line_end < identity.len() && identity[line_end] != b'\n' {
+            line_end += 1;
+        }
+        let full_line = &identity[min_g2..line_end];
+        if full_line.len() < 6
+            || !(1..full_line.len() - 1)
+                .any(|k| matches!(full_line[k], b's' | b'S') && full_line[k + 1].is_ascii_digit())
+        {
+            continue;
+        }
+        let has_nl = line_end < identity.len();
+        for g2_start in (min_g2..=ws_end).rev() {
+            let line = &identity[g2_start..line_end];
+            if line.len() < 6 {
+                continue;
+            }
+            for s_pos in 1..line.len() {
+                if !matches!(line[s_pos], b's' | b'S') {
+                    continue;
+                }
+                let mut d1_end = s_pos + 1;
+                while d1_end < line.len()
+                    && line[d1_end].is_ascii_digit()
+                    && d1_end - (s_pos + 1) < 3
+                {
+                    d1_end += 1;
+                }
+                for d1_len in (1..=(d1_end - (s_pos + 1))).rev() {
+                    let after_s = s_pos + 1 + d1_len;
+                    for sep_len in [1usize, 0usize] {
+                        if sep_len == 1
+                            && (after_s >= line.len()
+                                || !is_pcre_dot_to_underscore_or_space_ci(line[after_s]))
+                        {
+                            continue;
+                        }
+                        let ed_pos = after_s + sep_len;
+                        if ed_pos >= line.len()
+                            || !matches!(line[ed_pos], b'e' | b'E' | b'd' | b'D')
+                        {
+                            continue;
+                        }
+                        let mut d2_end = ed_pos + 1;
+                        while d2_end < line.len()
+                            && line[d2_end].is_ascii_digit()
+                            && d2_end - (ed_pos + 1) < 3
+                        {
+                            d2_end += 1;
+                        }
+                        for d2_len in (1..=(d2_end - (ed_pos + 1))).rev() {
+                            let sed_end = ed_pos + 1 + d2_len;
+                            for g2_end in (sed_end + 1)..=line.len() {
+                                if has_nfo_end_delim(line, g2_end, has_nl) {
+                                    write_result_pair(out, &line[..g2_end], b"Generic TV 2");
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+#[inline]
+fn try_movie_source_tag(line: &[u8], pos: usize, mut f: impl FnMut(usize) -> bool) -> bool {
+    let rem = &line[pos..];
+    // `(BDRip|bluray|DVD(R|Rip)?|XVID)`
+    if rem.len() >= 5 && rem[..5].eq_ignore_ascii_case(b"bdrip") && f(pos + 5) {
+        return true;
+    }
+    if rem.len() >= 6 && rem[..6].eq_ignore_ascii_case(b"bluray") && f(pos + 6) {
+        return true;
+    }
+    if rem.len() >= 3 && rem[..3].eq_ignore_ascii_case(b"dvd") {
+        if rem.len() >= 4 && matches!(rem[3], b'r' | b'R') && f(pos + 4) {
+            return true;
+        }
+        if rem.len() >= 6 && rem[3..6].eq_ignore_ascii_case(b"rip") && f(pos + 6) {
+            return true;
+        }
+        if f(pos + 3) {
+            return true;
+        }
+    }
+    if rem.len() >= 4 && rem[..4].eq_ignore_ascii_case(b"xvid") && f(pos + 4) {
+        return true;
+    }
+    false
+}
+
+/// Evaluates `NfoNameExtractor::checkForMovie` on `identity`.
+fn check_for_movie_into(identity: &[u8], out: &mut OutCursor<'_>) -> bool {
+    let has_year_and_source = identity.len() >= 10
+        && (0..=identity.len() - 4).any(|k| is_year_19_20(identity, k))
+        && (find_ascii_ci(identity, b"bdrip").is_some()
+            || find_ascii_ci(identity, b"bluray").is_some()
+            || find_ascii_ci(identity, b"dvd").is_some()
+            || find_ascii_ci(identity, b"xvid").is_some());
+
+    // 1. Generic Movies 1: `/(?:((?!Source\s)\:\s{1,}))(.+?(19|20)\d\d.+?(BDRip|bluray|DVD(R|Rip)?|XVID).+?)(\s{2,}|\r|\n)/i`
+    if has_year_and_source {
+        for colon_pos in 0..identity.len() {
+            if identity[colon_pos] != b':' {
+                continue;
+            }
+            let mut ws_end = colon_pos + 1;
+            while ws_end < identity.len() && is_pcre_space(identity[ws_end]) {
+                ws_end += 1;
+            }
+            if ws_end == colon_pos + 1 {
+                continue;
+            }
+            let mut ws_line_start = ws_end;
+            while ws_line_start > colon_pos + 1 && identity[ws_line_start - 1] != b'\n' {
+                ws_line_start -= 1;
+            }
+            let min_g2 = ws_line_start.max(colon_pos + 2);
+            let mut line_end = ws_end;
+            while line_end < identity.len() && identity[line_end] != b'\n' {
+                line_end += 1;
+            }
+            let full_line = &identity[min_g2..line_end];
+            if full_line.len() < 10
+                || !(0..=full_line.len() - 4).any(|k| is_year_19_20(full_line, k))
+            {
+                continue;
+            }
+            let has_nl = line_end < identity.len();
+            for g2_start in (min_g2..=ws_end).rev() {
+                let line = &identity[g2_start..line_end];
+                if line.len() < 10 {
+                    continue;
+                }
+                for y_pos in 1..line.len() {
+                    if !is_year_19_20(line, y_pos) {
+                        continue;
+                    }
+                    let y_end = y_pos + 4;
+                    for m_pos in (y_end + 1)..line.len() {
+                        let mut matched_end = None;
+                        try_movie_source_tag(line, m_pos, |m_end| {
+                            for g2_end in (m_end + 1)..=line.len() {
+                                if has_nfo_end_delim(line, g2_end, has_nl) {
+                                    matched_end = Some(g2_end);
+                                    return true;
+                                }
+                            }
+                            false
+                        });
+                        if let Some(g2_end) = matched_end {
+                            write_result_pair(out, &line[..g2_end], b"Generic Movies 1");
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Generic Movies 2: `/(?:(\s{2,}))((?!Source).+?[\.\-_ ](19|20)\d\d.+?(BDRip|bluray|DVD(R|Rip)?|XVID).+?)(\s{2,}|\r|\n)/i`
+        let mut i = 0usize;
+        while i < identity.len() {
+            if !is_pcre_space(identity[i]) {
+                i += 1;
+                continue;
+            }
+            let ws_start = i;
+            while i < identity.len() && is_pcre_space(identity[i]) {
+                i += 1;
+            }
+            let ws_end = i;
+            if ws_end - ws_start < 2 {
+                continue;
+            }
+            let mut ws_line_start = ws_end;
+            while ws_line_start > ws_start && identity[ws_line_start - 1] != b'\n' {
+                ws_line_start -= 1;
+            }
+            let min_g2 = ws_line_start.max(ws_start + 2);
+            let mut line_end = ws_end;
+            while line_end < identity.len() && identity[line_end] != b'\n' {
+                line_end += 1;
+            }
+            let full_line = &identity[min_g2..line_end];
+            if full_line.len() < 11
+                || !(0..=full_line.len() - 4).any(|k| is_year_19_20(full_line, k))
+            {
+                continue;
+            }
+            let has_nl = line_end < identity.len();
+            for g2_start in (min_g2..=ws_end).rev() {
+                let line = &identity[g2_start..line_end];
+                if line.len() < 11 || (line.len() >= 6 && line[..6].eq_ignore_ascii_case(b"source"))
+                {
+                    continue;
+                }
+                for sep_pos in 1..line.len() {
+                    if !is_sep_dot_dash_under_space(line[sep_pos])
+                        || !is_year_19_20(line, sep_pos + 1)
+                    {
+                        continue;
+                    }
+                    let y_end = sep_pos + 5;
+                    for m_pos in (y_end + 1)..line.len() {
+                        let mut matched_end = None;
+                        try_movie_source_tag(line, m_pos, |m_end| {
+                            for g2_end in (m_end + 1)..=line.len() {
+                                if has_nfo_end_delim(line, g2_end, has_nl) {
+                                    matched_end = Some(g2_end);
+                                    return true;
+                                }
+                            }
+                            false
+                        });
+                        if let Some(g2_end) = matched_end {
+                            write_result_pair(out, &line[..g2_end], b"Generic Movies 2");
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Generic Movies 3: `/(?:(\s{2,}))(.+?[\.\-_ ](NTSC|MULTi).+?(MULTi|DVDR)[\.\-_ ].+?)(\s{2,}|\r|\n)/i`
+    if find_ascii_ci(identity, b"ntsc").is_none() && find_ascii_ci(identity, b"multi").is_none() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < identity.len() {
+        if !is_pcre_space(identity[i]) {
+            i += 1;
+            continue;
+        }
+        let ws_start = i;
+        while i < identity.len() && is_pcre_space(identity[i]) {
+            i += 1;
+        }
+        let ws_end = i;
+        if ws_end - ws_start < 2 {
+            continue;
+        }
+        let mut ws_line_start = ws_end;
+        while ws_line_start > ws_start && identity[ws_line_start - 1] != b'\n' {
+            ws_line_start -= 1;
+        }
+        let min_g2 = ws_line_start.max(ws_start + 2);
+        let mut line_end = ws_end;
+        while line_end < identity.len() && identity[line_end] != b'\n' {
+            line_end += 1;
+        }
+        let full_line = &identity[min_g2..line_end];
+        if full_line.len() < 12
+            || (find_ascii_ci(full_line, b"ntsc").is_none()
+                && find_ascii_ci(full_line, b"multi").is_none())
+        {
+            continue;
+        }
+        let has_nl = line_end < identity.len();
+        for g2_start in (min_g2..=ws_end).rev() {
+            let line = &identity[g2_start..line_end];
+            if line.len() < 12 {
+                continue;
+            }
+            for sep1 in 1..line.len() {
+                if !is_sep_dot_dash_under_space(line[sep1]) {
+                    continue;
+                }
+                let rem1 = &line[sep1 + 1..];
+                let t1_len = if rem1.len() >= 4 && rem1[..4].eq_ignore_ascii_case(b"ntsc") {
+                    4
+                } else if rem1.len() >= 5 && rem1[..5].eq_ignore_ascii_case(b"multi") {
+                    5
+                } else {
+                    continue;
+                };
+                let t1_end = sep1 + 1 + t1_len;
+                for t2_pos in (t1_end + 1)..line.len() {
+                    let rem2 = &line[t2_pos..];
+                    for &t2_word in &[&b"multi"[..], b"dvdr"] {
+                        if rem2.len() > t2_word.len()
+                            && rem2[..t2_word.len()].eq_ignore_ascii_case(t2_word)
+                            && is_sep_dot_dash_under_space(rem2[t2_word.len()])
+                        {
+                            let after_sep2 = t2_pos + t2_word.len() + 1;
+                            for g2_end in (after_sep2 + 1)..=line.len() {
+                                if has_nfo_end_delim(line, g2_end, has_nl) {
+                                    write_result_pair(out, &line[..g2_end], b"Generic Movies 3");
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Evaluates `NfoNameExtractor::checkForMusic` on `identity`.
+fn check_for_music_into(identity: &[u8], out: &mut OutCursor<'_>) -> bool {
+    if find_ascii_ci(identity, b"-fm-").is_none() {
+        return false;
+    }
+    // `/(?:\s{2,})(.+?-FM-\d{2}-\d{2})/i`
+    let mut i = 0usize;
+    while i < identity.len() {
+        if !is_pcre_space(identity[i]) {
+            i += 1;
+            continue;
+        }
+        let ws_start = i;
+        while i < identity.len() && is_pcre_space(identity[i]) {
+            i += 1;
+        }
+        let ws_end = i;
+        if ws_end - ws_start < 2 {
+            continue;
+        }
+        let mut ws_line_start = ws_end;
+        while ws_line_start > ws_start && identity[ws_line_start - 1] != b'\n' {
+            ws_line_start -= 1;
+        }
+        let min_g1 = ws_line_start.max(ws_start + 2);
+        let mut line_end = ws_end;
+        while line_end < identity.len() && identity[line_end] != b'\n' {
+            line_end += 1;
+        }
+        let full_line = &identity[min_g1..line_end];
+        if full_line.len() < 10 || find_ascii_ci(full_line, b"-fm-").is_none() {
+            continue;
+        }
+        for g1_start in (min_g1..=ws_end).rev() {
+            let line = &identity[g1_start..line_end];
+            if line.len() < 10 {
+                continue;
+            }
+            for fm_pos in 1..=(line.len() - 9) {
+                if line[fm_pos..fm_pos + 4].eq_ignore_ascii_case(b"-fm-")
+                    && line[fm_pos + 4].is_ascii_digit()
+                    && line[fm_pos + 5].is_ascii_digit()
+                    && line[fm_pos + 6] == b'-'
+                    && line[fm_pos + 7].is_ascii_digit()
+                    && line[fm_pos + 8].is_ascii_digit()
+                {
+                    let matched = &line[..fm_pos + 9];
+                    write_replaced_result_pair(
+                        out,
+                        matched,
+                        b"-FM-",
+                        b"-FM-Radio-MP3-",
+                        b"Music FM RADIO",
+                    );
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[inline]
+fn is_wb_at(line: &[u8], pos: usize) -> bool {
+    let left = pos > 0 && is_word_byte(line[pos - 1]);
+    let right = pos < line.len() && is_word_byte(line[pos]);
+    left != right
+}
+
+#[inline]
+fn is_ty_char(b: u8) -> bool {
+    (0x20..=0x7E).contains(&b) && b != b':' && b != b'\\'
+}
+
+#[inline]
+fn is_ig_char(b: u8) -> bool {
+    (0x20..=0x7E).contains(&b) && b != b'\\'
+}
+
+fn find_title_year_match(identity: &[u8]) -> Option<&[u8]> {
+    // `/(\w[\-\w`~!@#$%^&*()_+={}|"<>?\[\]\\;\',.\/ ]+\s?\((19|20)\d\d\))/i`
+    if find_ascii_ci(identity, b"(19").is_none() && find_ascii_ci(identity, b"(20").is_none() {
+        return None;
+    }
+    let n = identity.len();
+    let mut i = 0usize;
+    while i < n {
+        if !is_word_byte(identity[i]) {
+            i += 1;
+            continue;
+        }
+        let mut run_end = i + 1;
+        while run_end < n && is_ty_char(identity[run_end]) {
+            run_end += 1;
+        }
+        let check_end = (run_end + 2).min(n);
+        if check_end > i + 2 {
+            let span = &identity[i + 2..check_end];
+            let has_paren = unsafe { !memchr(span.as_ptr(), b'(' as i32, span.len()).is_null() };
+            if has_paren {
+                // Try `is_ty_char+` stopping at `p` from `run_end` down to `i + 2`
+                for p in ((i + 2)..=run_end).rev() {
+                    // Try `\s?` with 1 byte, then 0 bytes
+                    for ws_len in [1usize, 0usize] {
+                        if ws_len == 1 && (p >= n || !is_pcre_space(identity[p])) {
+                            continue;
+                        }
+                        let paren_pos = p + ws_len;
+                        if paren_pos + 6 <= n
+                            && identity[paren_pos] == b'('
+                            && is_year_19_20(identity, paren_pos + 1)
+                            && identity[paren_pos + 5] == b')'
+                        {
+                            return Some(&identity[i..paren_pos + 6]);
+                        }
+                    }
+                }
+            }
+        }
+        i = run_end;
+    }
+    None
+}
+
+fn extract_language_from_nfo<'a>(metadata: &'a [u8]) -> Option<&'a [u8]> {
+    const LANG_KEYWORDS: &[&[u8]] = &[b"idiomas", b"lang", b"language", b"langue", b"sprache"];
+    const LANG_NAMES: &[&[u8]] = &[
+        b"brazilian",
+        b"chinese",
+        b"croatian",
+        b"danish",
+        b"de",
+        b"deutsch",
+        b"dutch",
+        b"estonian",
+        b"es",
+        b"english",
+        b"englisch",
+        b"finnish",
+        b"flemish",
+        b"francais",
+        b"french",
+        b"fr",
+        b"german",
+        b"greek",
+        b"hebrew",
+        b"icelandic",
+        b"italian",
+        b"japenese",
+        b"japan",
+        b"japanese",
+        b"korean",
+        b"latin",
+        b"nordic",
+        b"norwegian",
+        b"polish",
+        b"portuguese",
+        b"russian",
+        b"serbian",
+        b"slovenian",
+        b"swedish",
+        b"spanisch",
+        b"spanish",
+        b"thai",
+        b"turkish",
+    ];
+
+    for line in metadata.split(|&b| b == b'\n') {
+        if line.len() < 4 {
+            continue;
+        }
+        'line_scan: for p in 0..=line.len() - 4 {
+            let b0 = line[p].to_ascii_lowercase();
+            if !matches!(b0, b'i' | b'l' | b's') {
+                continue;
+            }
+            let b1 = line[p + 1].to_ascii_lowercase();
+            if !matches!((b0, b1), (b'i', b'd') | (b'l', b'a') | (b's', b'p')) {
+                continue;
+            }
+            for &kw in LANG_KEYWORDS {
+                if line.len() - p >= kw.len() && line[p..p + kw.len()].eq_ignore_ascii_case(kw) {
+                    for q in (p + kw.len())..line.len() {
+                        if !is_wb_at(line, q) {
+                            continue;
+                        }
+                        let q_lo = line[q].to_ascii_lowercase();
+                        for &lang in LANG_NAMES {
+                            if lang[0] == q_lo
+                                && line.len() - q >= lang.len()
+                                && line[q + 1..q + lang.len()].eq_ignore_ascii_case(&lang[1..])
+                                && is_wb_at(line, q + lang.len())
+                            {
+                                let captured = &line[q..q + lang.len()];
+                                return Some(match captured {
+                                    b"DE" => b"GERMAN",
+                                    b"Englisch" => b"ENGLISH",
+                                    b"FR" => b"FRENCH",
+                                    b"ES" => b"SPANISH",
+                                    _ => captured,
+                                });
+                            }
+                        }
+                    }
+                    break 'line_scan;
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_resolution_from_nfo<'a>(metadata: &'a [u8]) -> Option<&'a [u8]> {
+    // 1. `/(frame size|(video )?res(olution)?|video).*?(?P<res>(272|336|480|494|528|608|\(?640|688|704|720x480|810|816|820|1 ?080|1280( \@)?|1 ?920(x1080)?))/i`
+    const RES1_KW: &[&[u8]] = &[
+        b"frame size",
+        b"video resolution",
+        b"video res",
+        b"resolution",
+        b"res",
+        b"video",
+    ];
+    const RES1_VALS: &[&[u8]] = &[
+        b"272",
+        b"336",
+        b"480",
+        b"494",
+        b"528",
+        b"608",
+        b"(640",
+        b"640",
+        b"688",
+        b"704",
+        b"720x480",
+        b"810",
+        b"816",
+        b"820",
+        b"1 080",
+        b"1080",
+        b"1280 @",
+        b"1280",
+        b"1 920x1080",
+        b"1 920",
+        b"1920x1080",
+        b"1920",
+    ];
+
+    for line in metadata.split(|&b| b == b'\n') {
+        if line.len() < 3 {
+            continue;
+        }
+        'line_scan: for p in 0..=line.len() - 3 {
+            let b0 = line[p].to_ascii_lowercase();
+            if !matches!(b0, b'f' | b'v' | b'r') {
+                continue;
+            }
+            let b1 = line[p + 1].to_ascii_lowercase();
+            if !matches!((b0, b1), (b'f', b'r') | (b'v', b'i') | (b'r', b'e')) {
+                continue;
+            }
+            for &kw in RES1_KW {
+                if line.len() - p >= kw.len() && line[p..p + kw.len()].eq_ignore_ascii_case(kw) {
+                    for q in (p + kw.len())..line.len() {
+                        let bq = line[q];
+                        if !matches!(bq, b'(' | b'1'..=b'8') {
+                            continue;
+                        }
+                        for &val in RES1_VALS {
+                            if val[0] == bq
+                                && line.len() - q >= val.len()
+                                && line[q + 1..q + val.len()].eq_ignore_ascii_case(&val[1..])
+                            {
+                                let captured = &line[q..q + val.len()];
+                                return Some(match captured {
+                                    b"272" | b"336" | b"480" | b"494" | b"608" | b"640"
+                                    | b"(640" | b"688" | b"704" | b"720x480" => b"480p",
+                                    b"1280x720" | b"1280" | b"1280 @" => b"720p",
+                                    b"810" | b"816" | b"820" | b"1920" | b"1 920" | b"1080"
+                                    | b"1 080" | b"1920x1080" => b"1080p",
+                                    b"2160" => b"2160p",
+                                    _ => captured,
+                                });
+                            }
+                        }
+                    }
+                    break 'line_scan;
+                }
+            }
+        }
+    }
+
+    // 2. `/(largeur|width).*?(?P<res>(\(?640|688|704|720|1280( \@)?|1 ?920))/i`
+    const RES2_KW: &[&[u8]] = &[b"largeur", b"width"];
+    const RES2_VALS: &[&[u8]] = &[
+        b"(640", b"640", b"688", b"704", b"720", b"1280 @", b"1280", b"1 920", b"1920",
+    ];
+
+    for line in metadata.split(|&b| b == b'\n') {
+        if line.len() < 5 {
+            continue;
+        }
+        'line_scan: for p in 0..=line.len() - 5 {
+            let b0 = line[p].to_ascii_lowercase();
+            if !matches!(b0, b'l' | b'w') {
+                continue;
+            }
+            let b1 = line[p + 1].to_ascii_lowercase();
+            if !matches!((b0, b1), (b'l', b'a') | (b'w', b'i')) {
+                continue;
+            }
+            for &kw in RES2_KW {
+                if line.len() - p >= kw.len() && line[p..p + kw.len()].eq_ignore_ascii_case(kw) {
+                    for q in (p + kw.len())..line.len() {
+                        let bq = line[q];
+                        if !matches!(bq, b'(' | b'1' | b'6' | b'7') {
+                            continue;
+                        }
+                        for &val in RES2_VALS {
+                            if val[0] == bq
+                                && line.len() - q >= val.len()
+                                && line[q + 1..q + val.len()].eq_ignore_ascii_case(&val[1..])
+                            {
+                                let captured = &line[q..q + val.len()];
+                                return Some(match captured {
+                                    b"640" | b"(640" | b"688" | b"704" | b"720" => b"480p",
+                                    b"1280 @" | b"1280" => b"720p",
+                                    b"1920" | b"1 920" => b"1080p",
+                                    b"2160" => b"2160p",
+                                    _ => captured,
+                                });
+                            }
+                        }
+                    }
+                    break 'line_scan;
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_source_from_nfo<'a>(metadata: &'a [u8]) -> Option<&'a [u8]> {
+    // 1. `/source.*?\b(?P<source>BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-DL)\b/i`
+    const SRC_VALS: &[&[u8]] = &[
+        b"bd-25",
+        b"bd-50",
+        b"bd-rip",
+        b"bd25",
+        b"bd50",
+        b"bdrip",
+        b"bd",
+        b"blu-ray 3d",
+        b"blu-ray3d",
+        b"blu-ray ",
+        b"blu-ray",
+        b"bluray 3d",
+        b"bluray3d",
+        b"bluray ",
+        b"bluray",
+        b"brrip",
+        b"camrip",
+        b"cam",
+        b"dbrip",
+        b"dtv",
+        b"dvd-5",
+        b"dvd-9",
+        b"dvd-rip",
+        b"dvd-r",
+        b"dvd-screener",
+        b"dvd-scr",
+        b"dvd5",
+        b"dvd9",
+        b"dvdrip",
+        b"dvdr",
+        b"dvdscreener",
+        b"dvdscr",
+        b"dvd",
+        b"hdrip",
+        b"hdtvrip",
+        b"hdtv",
+        b"hd",
+        b"hrip",
+        b"htvrip",
+        b"htv",
+        b"h",
+        b"pdrip",
+        b"pdtvrip",
+        b"pdtv",
+        b"pd",
+        b"prip",
+        b"ptvrip",
+        b"ptv",
+        b"p",
+        b"sdrip",
+        b"sdtvrip",
+        b"sdtv",
+        b"sd",
+        b"srip",
+        b"stvrip",
+        b"stv",
+        b"s",
+        b"ntsc",
+        b"pal",
+        b"r5",
+        b"ripped ",
+        b"svcd",
+        b"vcd",
+        b"screener",
+        b"scr",
+        b"satrip",
+        b"sat",
+        b"ts",
+        b"vhsrip",
+        b"vhs",
+        b"vod",
+        b"web-dl",
+    ];
+
+    for line in metadata.split(|&b| b == b'\n') {
+        if line.len() < 6 {
+            continue;
+        }
+        for p in 0..=line.len() - 6 {
+            if matches!(line[p], b's' | b'S')
+                && matches!(line[p + 1], b'o' | b'O')
+                && line[p + 2..p + 6].eq_ignore_ascii_case(b"urce")
+            {
+                for q in (p + 6)..line.len() {
+                    if !is_wb_at(line, q) {
+                        continue;
+                    }
+                    let q_lo = line[q].to_ascii_lowercase();
+                    for &val in SRC_VALS {
+                        if val[0] == q_lo
+                            && line.len() - q >= val.len()
+                            && line[q + 1..q + val.len()].eq_ignore_ascii_case(&val[1..])
+                            && is_wb_at(line, q + val.len())
+                        {
+                            let captured = &line[q..q + val.len()];
+                            return Some(match captured {
+                                b"BD" => b"Bluray.x264",
+                                b"CAMRIP" => b"CAM",
+                                b"DBrip" => b"BDRIP",
+                                b"DVD R1" | b"NTSC" | b"PAL" | b"VOD" => b"DVD",
+                                b"HD" => b"HDTV",
+                                b"Ripped " => b"DVDRIP",
+                                _ => captured,
+                            });
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // 2. `/(codec( (name|code))?|(original )?format|res(olution)|video( (codec|format|res))?|tv system|type|writing library).*?\b(?P<video>AVC|AVI|DBrip|DIVX|\(Divx|DVD|[HX][._ -]?264|MPEG-4 Visual|NTSC|PAL|WMV|XVID)\b/i`
+    const VID_KW: &[&[u8]] = &[
+        b"codec name",
+        b"codec code",
+        b"codec",
+        b"original format",
+        b"format",
+        b"resolution",
+        b"video codec",
+        b"video format",
+        b"video res",
+        b"video",
+        b"tv system",
+        b"type",
+        b"writing library",
+    ];
+    const VID_VALS: &[&[u8]] = &[
+        b"avc",
+        b"avi",
+        b"dbrip",
+        b"divx",
+        b"(divx",
+        b"dvd",
+        b"h.264",
+        b"h_264",
+        b"h 264",
+        b"h-264",
+        b"h264",
+        b"x.264",
+        b"x_264",
+        b"x 264",
+        b"x-264",
+        b"x264",
+        b"mpeg-4 visual",
+        b"ntsc",
+        b"pal",
+        b"wmv",
+        b"xvid",
+    ];
+
+    for line in metadata.split(|&b| b == b'\n') {
+        if line.len() < 4 {
+            continue;
+        }
+        'line_scan: for p in 0..=line.len() - 4 {
+            let b0 = line[p].to_ascii_lowercase();
+            if !matches!(b0, b'c' | b'o' | b'f' | b'r' | b'v' | b't' | b'w') {
+                continue;
+            }
+            let b1 = line[p + 1].to_ascii_lowercase();
+            if !matches!(
+                (b0, b1),
+                (b'c', b'o')
+                    | (b'o', b'r')
+                    | (b'f', b'o')
+                    | (b'r', b'e')
+                    | (b'v', b'i')
+                    | (b't', b'v')
+                    | (b't', b'y')
+                    | (b'w', b'r')
+            ) {
+                continue;
+            }
+            for &kw in VID_KW {
+                if line.len() - p >= kw.len() && line[p..p + kw.len()].eq_ignore_ascii_case(kw) {
+                    for q in (p + kw.len())..line.len() {
+                        if !is_wb_at(line, q) {
+                            continue;
+                        }
+                        let q_lo = line[q].to_ascii_lowercase();
+                        for &val in VID_VALS {
+                            if val[0] == q_lo
+                                && line.len() - q >= val.len()
+                                && line[q + 1..q + val.len()].eq_ignore_ascii_case(&val[1..])
+                                && is_wb_at(line, q + val.len())
+                            {
+                                let captured = &line[q..q + val.len()];
+                                return Some(match captured {
+                                    b"AVI" => b"DVDRIP",
+                                    b"DBrip" => b"BDRIP",
+                                    b"(Divx" => b"DIVX",
+                                    b"h264" | b"h-264" | b"h.264" => b"H264",
+                                    b"MPEG-4 Visual" | b"x264" | b"x-264" | b"x.264" => b"x264",
+                                    b"NTSC" | b"PAL" => b"DVD",
+                                    _ => captured,
+                                });
+                            }
+                        }
+                    }
+                    break 'line_scan;
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn match_audio_token_at(line: &[u8], q: usize) -> Option<&[u8]> {
+    // `\b(?P<audio>0x0055 MPEG-1 Layer 3|AAC( LC)?|AC-?3|\(AC3|DD5(.1)?|(A_)?DTS-?(HD)?(-?MA)?|Dolby(\s?TrueHD)?|TrueHD|FLAC|MP3)\b`
+    if !is_wb_at(line, q)
+        || !matches!(
+            line[q].to_ascii_lowercase(),
+            b'0' | b'a' | b'(' | b'd' | b't' | b'f' | b'm'
+        )
+    {
+        return None;
+    }
+    let rem = &line[q..];
+    for &lit in &[
+        &b"0x0055 mpeg-1 layer 3"[..],
+        b"aac lc",
+        b"aac",
+        b"ac-3",
+        b"ac3",
+        b"(ac3",
+    ] {
+        if rem.len() >= lit.len()
+            && rem[..lit.len()].eq_ignore_ascii_case(lit)
+            && is_wb_at(line, q + lit.len())
+        {
+            return Some(&rem[..lit.len()]);
+        }
+    }
+    // `DD5(.1)?`
+    if rem.len() >= 3 && rem[..3].eq_ignore_ascii_case(b"dd5") {
+        if rem.len() >= 5 && rem[4] == b'1' && is_wb_at(line, q + 5) {
+            return Some(&rem[..5]);
+        }
+        if is_wb_at(line, q + 3) {
+            return Some(&rem[..3]);
+        }
+    }
+    // `(A_)?DTS-?(HD)?(-?MA)?`
+    for &dts_val in &[
+        &b"a_dts-hd-ma"[..],
+        b"a_dts-hdma",
+        b"a_dts-hd",
+        b"a_dts-ma",
+        b"a_dts-",
+        b"a_dtshd-ma",
+        b"a_dtshdma",
+        b"a_dtshd",
+        b"a_dtsma",
+        b"a_dts",
+        b"dts-hd-ma",
+        b"dts-hdma",
+        b"dts-hd",
+        b"dts-ma",
+        b"dts-",
+        b"dtshd-ma",
+        b"dtshdma",
+        b"dtshd",
+        b"dtsma",
+        b"dts",
+    ] {
+        if rem.len() >= dts_val.len()
+            && rem[..dts_val.len()].eq_ignore_ascii_case(dts_val)
+            && is_wb_at(line, q + dts_val.len())
+        {
+            return Some(&rem[..dts_val.len()]);
+        }
+    }
+    // `Dolby(\s?TrueHD)?`
+    if rem.len() >= 5 && rem[..5].eq_ignore_ascii_case(b"dolby") {
+        if rem.len() >= 12
+            && is_pcre_space(rem[5])
+            && rem[6..12].eq_ignore_ascii_case(b"truehd")
+            && is_wb_at(line, q + 12)
+        {
+            return Some(&rem[..12]);
+        }
+        if rem.len() >= 11 && rem[5..11].eq_ignore_ascii_case(b"truehd") && is_wb_at(line, q + 11) {
+            return Some(&rem[..11]);
+        }
+        if is_wb_at(line, q + 5) {
+            return Some(&rem[..5]);
+        }
+    }
+    for &lit in &[&b"truehd"[..], b"flac", b"mp3"] {
+        if rem.len() >= lit.len()
+            && rem[..lit.len()].eq_ignore_ascii_case(lit)
+            && is_wb_at(line, q + lit.len())
+        {
+            return Some(&rem[..lit.len()]);
+        }
+    }
+    None
+}
+
+fn extract_audio_from_nfo<'a>(metadata: &'a [u8]) -> Option<&'a [u8]> {
+    const AUD_KW: &[&[u8]] = &[
+        b"audio format",
+        b"audio",
+        b"codec name",
+        b"codec",
+        b"format",
+    ];
+    for line in metadata.split(|&b| b == b'\n') {
+        if line.len() < 5 {
+            continue;
+        }
+        'line_scan: for p in 0..=line.len() - 5 {
+            let b0 = line[p].to_ascii_lowercase();
+            if !matches!(b0, b'a' | b'c' | b'f') {
+                continue;
+            }
+            let b1 = line[p + 1].to_ascii_lowercase();
+            if !matches!((b0, b1), (b'a', b'u') | (b'c', b'o') | (b'f', b'o')) {
+                continue;
+            }
+            for &kw in AUD_KW {
+                if line.len() - p >= kw.len() && line[p..p + kw.len()].eq_ignore_ascii_case(kw) {
+                    for q in (p + kw.len())..line.len() {
+                        if let Some(captured) = match_audio_token_at(line, q) {
+                            return Some(match captured {
+                                b"0x0055 MPEG-1 Layer 3" => b"MP3",
+                                b"AC-3" | b"(AC3" => b"AC3",
+                                b"AAC LC" => b"AAC",
+                                b"A_DTS" | b"DTS-HD" | b"DTSHD" => b"DTS",
+                                _ => captured,
+                            });
+                        }
+                    }
+                    break 'line_scan;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Evaluates `NfoNameExtractor::checkForTitleYear`.
+fn check_for_title_year_into(identity: &[u8], metadata: &[u8], out: &mut OutCursor<'_>) -> bool {
+    // Skip PDFs and audiobooks: `/\.pdf|Audio ?Book/i`
+    if find_ascii_ci(identity, b".pdf").is_some()
+        || find_ascii_ci(identity, b"audiobook").is_some()
+        || find_ascii_ci(identity, b"audio book").is_some()
+    {
+        return false;
+    }
+
+    let Some(base_title) = find_title_year_match(identity) else {
+        return false;
+    };
+
+    out.extend(base_title);
+    if let Some(lang) = extract_language_from_nfo(metadata) {
+        out.push(b'.');
+        out.extend(lang);
+    }
+    if let Some(res) = extract_resolution_from_nfo(metadata) {
+        out.push(b'.');
+        out.extend(res);
+    }
+    if let Some(src) = extract_source_from_nfo(metadata) {
+        out.push(b'.');
+        out.extend(src);
+    }
+    if let Some(aud) = extract_audio_from_nfo(metadata) {
+        out.push(b'.');
+        out.extend(aud);
+    }
+    out.extend(b"-NoGroup");
+    out.push(0);
+    out.extend(b"Title (Year)");
+    true
+}
+
+#[inline]
+fn is_game_prefix_char(b: u8) -> bool {
+    is_word_byte(b)
+        || matches!(
+            b,
+            b'.' | b'+'
+                | b'&'
+                | b'*'
+                | b'/'
+                | b'('
+                | b')'
+                | b'\''
+                | b','
+                | b';'
+                | b':'
+                | b' '
+                | b'-'
+        )
+}
+
+#[inline]
+fn is_game_suffix_char(b: u8) -> bool {
+    is_word_byte(b) || matches!(b, b'-' | b'.' | b'\'' | b',' | b';' | b'&' | b' ')
+}
+
+/// Evaluates `NfoNameExtractor::checkForGame` on `identity`.
+fn check_for_game_into(identity: &[u8], out: &mut OutCursor<'_>) -> bool {
+    let has_c = find_ascii_ci(identity, b"(c)").is_some();
+    let has_iso = find_ascii_ci(identity, b"*iso*").is_some();
+    if !has_c && !has_iso {
+        return false;
+    }
+    const GAME_GROUPS: &[&[u8]] = &[
+        b"alias",
+        b"bat-team",
+        b"fairlight",
+        b"game type",
+        b"glamoury",
+        b"hi2u",
+        b"itwins",
+        b"jaguar",
+        b"largeiso",
+        b"mediumiso",
+        b"maze",
+        b"nerv",
+        b"prophet",
+        b"profit",
+        b"procyon",
+        b"reloaded",
+        b"revolver",
+        b"rogue",
+        b"vitality",
+    ];
+    if !GAME_GROUPS
+        .iter()
+        .any(|&grp| find_ascii_ci(identity, grp).is_some())
+    {
+        return false;
+    }
+
+    // 1. (c) pattern: `/\w[\w.+&*\/\()\',;: -]+\(c\)[\-\w.\',;& ]+\w/i`
+    if has_c {
+        let mut i = 0usize;
+        while i < identity.len() {
+            if !is_word_byte(identity[i]) {
+                i += 1;
+                continue;
+            }
+            let mut p_end = i + 1;
+            while p_end < identity.len() && is_game_prefix_char(identity[p_end]) {
+                p_end += 1;
+            }
+            // Look for rightmost `(c)` at `c_pos` in `(i + 2)..=(p_end.saturating_sub(3))`
+            if p_end >= i + 5 {
+                for c_pos in ((i + 2)..=(p_end - 3)).rev() {
+                    if identity[c_pos..c_pos + 3].eq_ignore_ascii_case(b"(c)") {
+                        let s_start = c_pos + 3;
+                        let mut s_end = s_start;
+                        while s_end < identity.len() && is_game_suffix_char(identity[s_end]) {
+                            s_end += 1;
+                        }
+                        if s_end >= s_start + 2 {
+                            for w_end in ((s_start + 1)..s_end).rev() {
+                                if is_word_byte(identity[w_end]) {
+                                    let matched = &identity[i..=w_end];
+                                    // `str_replace(['(c)', '(C)'], '(GAMES) (c)', $result[0])`
+                                    let mut k = 0usize;
+                                    while k < matched.len() {
+                                        if k + 3 <= matched.len()
+                                            && matched[k..k + 3].eq_ignore_ascii_case(b"(c)")
+                                        {
+                                            out.extend(b"(GAMES) (c)");
+                                            k += 3;
+                                        } else {
+                                            out.push(matched[k]);
+                                            k += 1;
+                                        }
+                                    }
+                                    out.push(0);
+                                    out.extend(b"PC Games (c)");
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            i = p_end;
+        }
+    }
+
+    // 2. *ISO* pattern: `/\w[\w.+&*\/()\',;: -]+\*ISO\*/i`
+    if has_iso {
+        let mut i = 0usize;
+        while i < identity.len() {
+            if !is_word_byte(identity[i]) {
+                i += 1;
+                continue;
+            }
+            let mut p_end = i + 1;
+            while p_end < identity.len() && is_game_prefix_char(identity[p_end]) {
+                p_end += 1;
+            }
+            if p_end >= i + 7 {
+                for iso_pos in ((i + 2)..=(p_end - 5)).rev() {
+                    if identity[iso_pos..iso_pos + 5].eq_ignore_ascii_case(b"*iso*") {
+                        let matched = &identity[i..iso_pos + 5];
+                        write_replaced_result_pair(
+                            out,
+                            matched,
+                            b"*ISO*",
+                            b"*ISO* (PC GAMES)",
+                            b"PC Games *ISO*",
+                        );
+                        return true;
+                    }
+                }
+            }
+            i = p_end;
+        }
+    }
+
+    false
+}
+
+/// Evaluates `NfoNameExtractor::checkForIguana` on `identity`.
+/// Returns `Some(true)` on match, `Some(false)` on no match, or `None` when declined to PHP.
+fn check_for_iguana_into(identity: &[u8], out: &mut OutCursor<'_>) -> Option<bool> {
+    if find_ascii_ci(identity, b"iguana").is_none() {
+        return Some(false);
+    }
+    // Check `/Supplier.+?IGUANA/i` on any line
+    let mut has_supplier_iguana = false;
+    for line in identity.split(|&b| b == b'\n') {
+        if let Some(sup_pos) = find_ascii_ci(line, b"supplier") {
+            if sup_pos + 9 <= line.len() && find_ascii_ci(&line[sup_pos + 9..], b"iguana").is_some()
+            {
+                has_supplier_iguana = true;
+                break;
+            }
+        }
+    }
+    if !has_supplier_iguana {
+        return Some(false);
+    }
+
+    let mut release_name: Vec<u8> = Vec::new();
+
+    // 1. `/\w[\-\w`~!@#$%^&*()+={}|:"<>?\[\]\\;\',.\/ ]+\s\((19|20)\d\d\)/i`
+    let n = identity.len();
+    let mut i = 0usize;
+    while i < n {
+        if !is_word_byte(identity[i]) {
+            i += 1;
+            continue;
+        }
+        let mut run_end = i + 1;
+        while run_end < n && is_ig_char(identity[run_end]) {
+            run_end += 1;
+        }
+        let mut found_ty = None;
+        for p in ((i + 2)..=run_end).rev() {
+            if p < n
+                && is_pcre_space(identity[p])
+                && p + 7 <= n
+                && identity[p + 1] == b'('
+                && is_year_19_20(identity, p + 2)
+                && identity[p + 6] == b')'
+            {
+                found_ty = Some(&identity[i..p + 7]);
+                break;
+            }
+        }
+        if let Some(matched) = found_ty {
+            release_name.extend_from_slice(matched);
+            break;
+        }
+        i = run_end;
+    }
+
+    // 2. `/\s\[\*\] (English|Dutch|French|German|Spanish)\b/i`
+    for pos in 0..n {
+        if is_pcre_space(identity[pos]) && pos + 5 <= n && &identity[pos + 1..pos + 5] == b"[*] " {
+            let q = pos + 5;
+            let mut matched_lang = None;
+            for &lang in &[&b"english"[..], b"dutch", b"french", b"german", b"spanish"] {
+                if n - q >= lang.len()
+                    && identity[q..q + lang.len()].eq_ignore_ascii_case(lang)
+                    && is_wb_at(identity, q + lang.len())
+                {
+                    matched_lang = Some(&identity[q..q + lang.len()]);
+                    break;
+                }
+            }
+            if let Some(lang) = matched_lang {
+                release_name.push(b'.');
+                release_name.extend_from_slice(lang);
+                break;
+            }
+        }
+    }
+
+    // 3. `/\s\[\*\] (DT?S [2567][._ -][0-2]( MONO)?)\b/i`
+    for pos in 0..n {
+        if is_pcre_space(identity[pos]) && pos + 5 <= n && &identity[pos + 1..pos + 5] == b"[*] " {
+            let q = pos + 5;
+            let rem = &identity[q..];
+            let dts_len = if rem.len() >= 4 && rem[..4].eq_ignore_ascii_case(b"dts ") {
+                4
+            } else if rem.len() >= 3 && rem[..3].eq_ignore_ascii_case(b"ds ") {
+                3
+            } else {
+                0
+            };
+            if dts_len > 0 && rem.len() >= dts_len + 3 {
+                let c1 = rem[dts_len];
+                let sep = rem[dts_len + 1];
+                let c2 = rem[dts_len + 2];
+                if matches!(c1, b'2' | b'5' | b'6' | b'7')
+                    && matches!(sep, b'.' | b'_' | b' ' | b'-')
+                    && matches!(c2, b'0'..=b'2')
+                {
+                    let after_ch = q + dts_len + 3;
+                    if n - after_ch >= 5
+                        && identity[after_ch..after_ch + 5].eq_ignore_ascii_case(b" mono")
+                        && is_wb_at(identity, after_ch + 5)
+                    {
+                        release_name.push(b'.');
+                        release_name.extend_from_slice(&identity[after_ch..after_ch + 5]);
+                        break;
+                    } else if is_wb_at(identity, after_ch) {
+                        // In PHP, `$result[2]` is undefined when `( MONO)?` is absent; decline to PHP.
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. `/Format.+(DVD([59R])?|[HX][._ -]?264)\b/i`
+    for line in identity.split(|&b| b == b'\n') {
+        if let Some(fmt_pos) = find_ascii_ci(line, b"format") {
+            let min_q = fmt_pos + 7;
+            let mut matched_fmt = None;
+            if line.len() > min_q {
+                for q in (min_q..line.len()).rev() {
+                    let rem = &line[q..];
+                    for &pat in &[
+                        &b"dvd5"[..],
+                        b"dvd9",
+                        b"dvdr",
+                        b"dvd",
+                        b"h.264",
+                        b"h_264",
+                        b"h 264",
+                        b"h-264",
+                        b"h264",
+                        b"x.264",
+                        b"x_264",
+                        b"x 264",
+                        b"x-264",
+                        b"x264",
+                    ] {
+                        if rem.len() >= pat.len()
+                            && rem[..pat.len()].eq_ignore_ascii_case(pat)
+                            && is_wb_at(line, q + pat.len())
+                        {
+                            matched_fmt = Some(&rem[..pat.len()]);
+                            break;
+                        }
+                    }
+                    if matched_fmt.is_some() {
+                        break;
+                    }
+                }
+            }
+            if let Some(fmt) = matched_fmt {
+                release_name.push(b'.');
+                release_name.extend_from_slice(fmt);
+                break;
+            }
+        }
+    }
+
+    // 5. `/\[(640x.+|1280x.+|1920x.+)\] Resolution\b/i`
+    for line in identity.split(|&b| b == b'\n') {
+        let mut found_res = None;
+        for b_pos in 0..line.len() {
+            if line[b_pos] != b'[' {
+                continue;
+            }
+            let inner = &line[b_pos + 1..];
+            let pfx_ok = (inner.len() >= 5 && inner[..4].eq_ignore_ascii_case(b"640x"))
+                || (inner.len() >= 6 && inner[..5].eq_ignore_ascii_case(b"1280x"))
+                || (inner.len() >= 6 && inner[..5].eq_ignore_ascii_case(b"1920x"));
+            if !pfx_ok {
+                continue;
+            }
+            let min_close = b_pos
+                + 1
+                + if inner[..4].eq_ignore_ascii_case(b"640x") {
+                    5
+                } else {
+                    6
+                };
+            for close_pos in (min_close..line.len()).rev() {
+                if line[close_pos] == b']'
+                    && line.len() - close_pos >= 12
+                    && line[close_pos + 1..close_pos + 12].eq_ignore_ascii_case(b" resolution")
+                    && is_wb_at(line, close_pos + 12)
+                {
+                    found_res = Some(&line[b_pos + 1..close_pos]);
+                    break;
+                }
+            }
+            if found_res.is_some() {
+                break;
+            }
+        }
+        if let Some(res) = found_res {
+            let mapped = match res {
+                b"640x.+" => &b"480p"[..],
+                b"1280x.+" => &b"720p"[..],
+                b"1920x.+" => &b"1080p"[..],
+                _ => res,
+            };
+            release_name.push(b'.');
+            release_name.extend_from_slice(mapped);
+            break;
+        }
+    }
+
+    if !release_name.is_empty() {
+        release_name.extend_from_slice(b".IGUANA");
+        write_result_pair(out, &release_name, b"IGUANA");
+        return Some(true);
+    }
+
+    Some(false)
+}
+
+/// Evaluates `NfoNameExtractor` pattern matching into `out`.
+/// - `mode == 0`: `extractFromNfo` (all 7 stages)
+/// - `mode == 1`: `checkForTv`
+/// - `mode == 2`: `checkForMovie`
+/// - `mode == 3`: `checkForMusic`
+/// - `mode == 4`: `checkForTitleYear`
+/// - `mode == 5`: `checkForGame`
+/// - `mode == 6`: `checkForIguana`
+pub(crate) fn nfo_extract_pattern_mode_into(
+    src: &[u8],
+    mode: u32,
+    out: &mut OutCursor<'_>,
+) -> isize {
+    if src.is_empty() {
+        return 0;
+    }
+    if !is_supported_nfo_bytes(src) {
+        return -2;
+    }
+
+    let mut stack_ident = std::mem::MaybeUninit::<[u8; 16384]>::uninit();
+    let mut heap_ident: Vec<u8> = Vec::new();
+    let ident_slice: &[u8] = if src.len() <= 16384 {
+        let ptr = stack_ident.as_mut_ptr().cast::<u8>();
+        let mut cur = unsafe { OutCursor::new(ptr, 16384) };
+        nfo_identity_text_into(src, &mut cur);
+        unsafe { slice::from_raw_parts(ptr, cur.pos) }
+    } else {
+        heap_ident.resize(src.len(), 0);
+        let mut cur = unsafe { OutCursor::new(heap_ident.as_mut_ptr(), heap_ident.len()) };
+        nfo_identity_text_into(src, &mut cur);
+        &heap_ident[..cur.pos]
+    };
+
+    if mode == 0 {
+        for line in ident_slice.split(|&b| b == b'\n') {
+            if let Some(field) = extract_literal_name_field(line) {
+                let span = crate::filename::clean_for_matching_span(field, false);
+                if span == -2 {
+                    return -2;
+                }
+                if span >= 0 {
+                    let start = (span >> 32) as usize;
+                    let len = (span & 0xFFFF_FFFF) as usize;
+                    let title = &field[start..start + len];
+                    match is_literal_technical_scene_title_ascii(title) {
+                        Some(true) => {
+                            write_result_pair(out, title, b"Complete literal NFO field");
+                            return finish_cursor_min_ref(out, 16);
+                        }
+                        Some(false) => {}
+                        None => return -2,
+                    }
+                }
+            }
+        }
+    }
+
+    if (mode == 0 || mode == 1) && check_for_tv_into(ident_slice, out) {
+        return finish_cursor_min_ref(out, 16);
+    }
+    if (mode == 0 || mode == 2) && check_for_movie_into(ident_slice, out) {
+        return finish_cursor_min_ref(out, 16);
+    }
+    if (mode == 0 || mode == 3) && check_for_music_into(ident_slice, out) {
+        return finish_cursor_min_ref(out, 16);
+    }
+    if (mode == 0 || mode == 4) && check_for_title_year_into(ident_slice, src, out) {
+        return finish_cursor_min_ref(out, 16);
+    }
+    if (mode == 0 || mode == 5) && check_for_game_into(ident_slice, out) {
+        return finish_cursor_min_ref(out, 16);
+    }
+    if mode == 0 || mode == 6 {
+        match check_for_iguana_into(ident_slice, out) {
+            Some(true) => return finish_cursor_min_ref(out, 16),
+            Some(false) => {}
+            None => return -2,
+        }
+    }
+
+    0
+}
+
+#[inline]
+fn finish_cursor_min_ref(out: &OutCursor<'_>, min_neg: usize) -> isize {
+    if out.pos == 0 {
+        0
+    } else if out.pos <= out.buf.len() {
+        out.pos as isize
+    } else {
+        -(out.pos.max(min_neg) as isize)
+    }
+}
+
+// ============================================================================
+// FileNameExtractor::extractFromFile
+// ============================================================================
+
+#[inline]
+fn matches_literal_basename_ext(basename: &[u8]) -> bool {
+    let Some(dot_pos) = basename.iter().rposition(|&b| b == b'.') else {
+        return false;
+    };
+    let ext = &basename[dot_pos + 1..];
+    if ext.is_empty() || ext.len() > 8 {
+        return false;
+    }
+    if (3..=5).contains(&ext.len())
+        && matches!(ext[0], b'r' | b'R')
+        && ext[1..].iter().all(|b| b.is_ascii_digit())
+    {
+        return true;
+    }
+    if ext.len() == 3
+        && matches!(ext[0], b'z' | b'Z')
+        && ext[1..].iter().all(|b| b.is_ascii_digit())
+    {
+        return true;
+    }
+    if ext.len() == 3 && ext.iter().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    let mut lower = [0u8; 8];
+    for (i, &b) in ext.iter().enumerate() {
+        lower[i] = b.to_ascii_lowercase();
+    }
+    matches!(
+        &lower[..ext.len()],
+        b"mkv"
+            | b"avi"
+            | b"mp4"
+            | b"m4v"
+            | b"wmv"
+            | b"mpg"
+            | b"mpeg"
+            | b"mov"
+            | b"ts"
+            | b"m2ts"
+            | b"vob"
+            | b"divx"
+            | b"flv"
+            | b"webm"
+            | b"ogv"
+            | b"3gp"
+            | b"asf"
+            | b"rm"
+            | b"rmvb"
+            | b"f4v"
+            | b"mp3"
+            | b"flac"
+            | b"m4a"
+            | b"aac"
+            | b"ogg"
+            | b"wav"
+            | b"wma"
+            | b"ape"
+            | b"opus"
+            | b"mka"
+            | b"ac3"
+            | b"dts"
+            | b"eac3"
+            | b"truehd"
+            | b"mpc"
+            | b"shn"
+            | b"tak"
+            | b"tta"
+            | b"wv"
+            | b"rar"
+            | b"zip"
+            | b"7z"
+            | b"par"
+            | b"par2"
+            | b"tar"
+            | b"gz"
+            | b"bz2"
+            | b"xz"
+            | b"lz"
+            | b"lzma"
+            | b"zst"
+            | b"tgz"
+            | b"lz4"
+            | b"rev"
+            | b"enc"
+    )
+}
+
+/// Enumerates candidate start indices of Group 4 after `^(\\\\|\/)?(.+(\\\\|\/))*` in PCRE backtracking order.
+fn for_each_path_prefix_end(filename: &[u8], mut f: impl FnMut(usize) -> bool) -> bool {
+    let is_slash = |b: u8| matches!(b, b'\\' | b'/');
+    if filename.is_empty() {
+        return false;
+    }
+    let first_is_slash = is_slash(filename[0]);
+    if first_is_slash {
+        for idx in (2..filename.len()).rev() {
+            if is_slash(filename[idx]) && f(idx + 1) {
+                return true;
+            }
+        }
+        if f(1) {
+            return true;
+        }
+        if filename.len() > 1 && is_slash(filename[1]) && f(2) {
+            return true;
+        }
+        f(0)
+    } else {
+        for idx in (1..filename.len()).rev() {
+            if is_slash(filename[idx]) && f(idx + 1) {
+                return true;
+            }
+        }
+        f(0)
+    }
+}
+
+#[inline]
+fn first_dot_with_tail(s: &[u8], min_dot: usize) -> Option<usize> {
+    if s.len() < 2 || min_dot >= s.len() - 1 {
+        return None;
+    }
+    for i in min_dot..s.len() - 1 {
+        if s[i] == b'.' {
+            return Some(i);
+        }
+    }
+    None
+}
+
+#[inline]
+fn last_dot_with_tail(s: &[u8], min_dot: usize) -> Option<usize> {
+    if s.len() < 2 || min_dot >= s.len() - 1 {
+        return None;
+    }
+    for i in (min_dot..s.len() - 1).rev() {
+        if s[i] == b'.' {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Matches `(?:720p|1080p|2160p|4K|HDTV|WEB-?DL|WEB-?RIP|BluRay|AMZN|HMAX|NF|DSNP)` at `s[pos..]`.
+#[inline]
+fn match_file_tv_quality_at(s: &[u8], pos: usize) -> Option<usize> {
+    let rem = &s[pos..];
+    for &tok in &[
+        &b"720p"[..],
+        b"1080p",
+        b"2160p",
+        b"4k",
+        b"hdtv",
+        b"web-dl",
+        b"webdl",
+        b"web-rip",
+        b"webrip",
+        b"bluray",
+        b"amzn",
+        b"hmax",
+        b"nf",
+        b"dsnp",
+    ] {
+        if rem.len() >= tok.len() && rem[..tok.len()].eq_ignore_ascii_case(tok) {
+            return Some(pos + tok.len());
+        }
+    }
+    None
+}
+
+/// Matches `(HDR10?\+?|DV|Dolby[\.\-_ ]?Vision)` at `s[pos..]`.
+#[inline]
+fn match_file_hdr_token_at(s: &[u8], pos: usize) -> Option<usize> {
+    let rem = &s[pos..];
+    if rem.len() >= 3 && rem[..3].eq_ignore_ascii_case(b"hdr") {
+        let mut len = 3usize;
+        if rem.len() >= 4 && rem[3] == b'1' {
+            len = 4;
+            if rem.len() >= 5 && rem[4] == b'0' {
+                len = 5;
+            }
+        }
+        if rem.len() > len && rem[len] == b'+' {
+            len += 1;
+        }
+        return Some(pos + len);
+    }
+    if rem.len() >= 2 && rem[..2].eq_ignore_ascii_case(b"dv") {
+        return Some(pos + 2);
+    }
+    if rem.len() >= 11 && rem[..5].eq_ignore_ascii_case(b"dolby") {
+        if matches!(rem[5], b'.' | b'-' | b'_' | b' ')
+            && rem.len() >= 12
+            && rem[6..12].eq_ignore_ascii_case(b"vision")
+        {
+            return Some(pos + 12);
+        }
+        if rem[5..11].eq_ignore_ascii_case(b"vision") {
+            return Some(pos + 11);
+        }
+    }
+    None
+}
+
+/// Matches `(HEVC|x265|H\.?265)` at `s[pos..]`.
+#[inline]
+fn match_file_hevc_codec_at(s: &[u8], pos: usize) -> Option<usize> {
+    let rem = &s[pos..];
+    if rem.len() >= 4
+        && (rem[..4].eq_ignore_ascii_case(b"hevc")
+            || rem[..4].eq_ignore_ascii_case(b"x265")
+            || rem[..4].eq_ignore_ascii_case(b"h265"))
+    {
+        return Some(pos + 4);
+    }
+    if rem.len() >= 5 && rem[..5].eq_ignore_ascii_case(b"h.265") {
+        return Some(pos + 5);
+    }
+    None
+}
+
+/// Matches `(x264|x265|HEVC|H\.?264|H\.?265|AVC)` at `s[pos..]`.
+#[inline]
+fn match_file_hd_codec_at(s: &[u8], pos: usize) -> Option<usize> {
+    let rem = &s[pos..];
+    if rem.len() >= 4
+        && (rem[..4].eq_ignore_ascii_case(b"x264")
+            || rem[..4].eq_ignore_ascii_case(b"x265")
+            || rem[..4].eq_ignore_ascii_case(b"hevc")
+            || rem[..4].eq_ignore_ascii_case(b"h264")
+            || rem[..4].eq_ignore_ascii_case(b"h265"))
+    {
+        return Some(pos + 4);
+    }
+    if rem.len() >= 5
+        && (rem[..5].eq_ignore_ascii_case(b"h.264") || rem[..5].eq_ignore_ascii_case(b"h.265"))
+    {
+        return Some(pos + 5);
+    }
+    if rem.len() >= 3 && rem[..3].eq_ignore_ascii_case(b"avc") {
+        return Some(pos + 3);
+    }
+    None
+}
+
+/// Evaluates `FileNameCleaner::cleanForTitleMatch` on an ASCII filename without `__NZBSPLIT__`.
+fn clean_for_title_match_slice(filename: &[u8]) -> &[u8] {
+    let mut end = filename.len();
+    // 1. `/\.(mkv|avi|mp4|m4v|wmv|mpg|mpeg|mov|ts|m2ts|vob|divx|flv|nfo|sfv|nzb|srr|srs|rar|r\d{2,4}|zip|7z|par2?|vol\d+[\+\-]\d+|\d{3})$/i`
+    if let Some(dot) = filename[..end].iter().rposition(|&b| b == b'.') {
+        let ext = &filename[dot + 1..end];
+        let mut matched = false;
+        if (3..=5).contains(&ext.len())
+            && matches!(ext[0], b'r' | b'R')
+            && ext[1..].iter().all(|b| b.is_ascii_digit())
+        {
+            matched = true;
+        } else if ext.len() == 3 && ext.iter().all(|b| b.is_ascii_digit()) {
+            matched = true;
+        } else if ext.len() >= 6 && ext[..3].eq_ignore_ascii_case(b"vol") {
+            let mut p = 3usize;
+            while p < ext.len() && ext[p].is_ascii_digit() {
+                p += 1;
+            }
+            if p > 3 && p < ext.len() && matches!(ext[p], b'+' | b'-') {
+                p += 1;
+                let d2 = p;
+                while p < ext.len() && ext[p].is_ascii_digit() {
+                    p += 1;
+                }
+                if p > d2 && p == ext.len() {
+                    matched = true;
+                }
+            }
+        } else if !ext.is_empty() && ext.len() <= 4 {
+            let mut lower = [0u8; 4];
+            for (i, &b) in ext.iter().enumerate() {
+                lower[i] = b.to_ascii_lowercase();
+            }
+            matched = matches!(
+                &lower[..ext.len()],
+                b"mkv"
+                    | b"avi"
+                    | b"mp4"
+                    | b"m4v"
+                    | b"wmv"
+                    | b"mpg"
+                    | b"mpeg"
+                    | b"mov"
+                    | b"ts"
+                    | b"m2ts"
+                    | b"vob"
+                    | b"divx"
+                    | b"flv"
+                    | b"nfo"
+                    | b"sfv"
+                    | b"nzb"
+                    | b"srr"
+                    | b"srs"
+                    | b"rar"
+                    | b"zip"
+                    | b"7z"
+                    | b"par"
+                    | b"par2"
+            );
+        }
+        if matched {
+            end = dot;
+        }
+    }
+
+    // 2. `/[\.\-_]?(part|vol|cd|dvd|disc|disk)\d+$/i`
+    {
+        let s = &filename[..end];
+        let mut p = s.len();
+        while p > 0 && s[p - 1].is_ascii_digit() {
+            p -= 1;
+        }
+        if p < s.len() {
+            let head = &s[..p];
+            for &word in &[&b"part"[..], b"vol", b"cd", b"dvd", b"disc", b"disk"] {
+                if head.len() >= word.len()
+                    && head[head.len() - word.len()..].eq_ignore_ascii_case(word)
+                {
+                    let mut w_start = head.len() - word.len();
+                    if w_start > 0 && matches!(head[w_start - 1], b'.' | b'-' | b'_') {
+                        w_start -= 1;
+                    }
+                    end = w_start;
+                    break;
+                }
+            }
+        }
+    }
+
+    // 3. `/[\.\-_](sample|proof|subs?)$/i`
+    {
+        let s = &filename[..end];
+        for &word in &[&b"sample"[..], b"proof", b"subs", b"sub"] {
+            if s.len() > word.len()
+                && matches!(s[s.len() - word.len() - 1], b'.' | b'-' | b'_')
+                && s[s.len() - word.len()..].eq_ignore_ascii_case(word)
+            {
+                end = s.len() - word.len() - 1;
+                break;
+            }
+        }
+    }
+
+    // 4. `trim($clean, " \t\n\r\0\x0B.-_")`
+    let mut start = 0usize;
+    while start < end
+        && (is_php_trim_byte(filename[start]) || matches!(filename[start], b'.' | b'-' | b'_'))
+    {
+        start += 1;
+    }
+    while end > start
+        && (is_php_trim_byte(filename[end - 1]) || matches!(filename[end - 1], b'.' | b'-' | b'_'))
+    {
+        end -= 1;
+    }
+    &filename[start..end]
+}
+
+#[inline]
+fn php_basename_norm_slashes(path: &[u8]) -> &[u8] {
+    if path.is_empty() {
+        return b"";
+    }
+    let mut end = path.len();
+    while end > 0 && matches!(path[end - 1], b'/' | b'\\') {
+        end -= 1;
+    }
+    if end == 0 {
+        return &path[..1];
+    }
+    if let Some(pos) = path[..end].iter().rposition(|&b| matches!(b, b'/' | b'\\')) {
+        &path[pos + 1..end]
+    } else {
+        &path[..end]
+    }
+}
+
+#[inline]
+fn php_parent_basename_norm_slashes(path: &[u8]) -> &[u8] {
+    if path.is_empty() {
+        return b"";
+    }
+    let mut end = path.len();
+    while end > 0 && matches!(path[end - 1], b'/' | b'\\') {
+        end -= 1;
+    }
+    if end == 0 {
+        return b"/";
+    }
+    let Some(slash) = path[..end].iter().rposition(|&b| matches!(b, b'/' | b'\\')) else {
+        return b".";
+    };
+    let mut dir_end = slash;
+    while dir_end > 0 && matches!(path[dir_end - 1], b'/' | b'\\') {
+        dir_end -= 1;
+    }
+    if dir_end == 0 {
+        return b"/";
+    }
+    php_basename_norm_slashes(&path[..dir_end])
+}
+
+fn normalize_candidate_title_ascii(title: &[u8], out: &mut Vec<u8>) {
+    let mut t = php_trim(title);
+    // 1. `/\.(mkv|avi|mp4|m4v|mpg|mpeg|wmv|flv|mov|ts|vob|iso|divx)$/i`
+    if let Some(dot) = t.iter().rposition(|&b| b == b'.') {
+        let ext = &t[dot + 1..];
+        if (2..=4).contains(&ext.len()) {
+            let mut lower = [0u8; 4];
+            for (i, &b) in ext.iter().enumerate() {
+                lower[i] = b.to_ascii_lowercase();
+            }
+            if matches!(
+                &lower[..ext.len()],
+                b"mkv"
+                    | b"avi"
+                    | b"mp4"
+                    | b"m4v"
+                    | b"mpg"
+                    | b"mpeg"
+                    | b"wmv"
+                    | b"flv"
+                    | b"mov"
+                    | b"ts"
+                    | b"vob"
+                    | b"iso"
+                    | b"divx"
+            ) {
+                t = &t[..dot];
+            }
+        }
+    }
+    // 2. `/\.(par2?|nfo|sfv|nzb|rar|zip|7z|gz|tar|bz2|xz|r\d{2,3}|\d{3}|pkg|exe|msi|jpe?g|png|gif|bmp|pdf|epub|mobi|azw3?|djvu|cbr|cbz|fb2|lit|prc|opf|txt|log)$/i`
+    if let Some(dot) = t.iter().rposition(|&b| b == b'.') {
+        let ext = &t[dot + 1..];
+        let mut matched = false;
+        if (3..=4).contains(&ext.len())
+            && matches!(ext[0], b'r' | b'R')
+            && ext[1..].iter().all(|b| b.is_ascii_digit())
+        {
+            matched = true;
+        } else if ext.len() == 3 && ext.iter().all(|b| b.is_ascii_digit()) {
+            matched = true;
+        } else if !ext.is_empty() && ext.len() <= 4 {
+            let mut lower = [0u8; 4];
+            for (i, &b) in ext.iter().enumerate() {
+                lower[i] = b.to_ascii_lowercase();
+            }
+            matched = matches!(
+                &lower[..ext.len()],
+                b"par"
+                    | b"par2"
+                    | b"nfo"
+                    | b"sfv"
+                    | b"nzb"
+                    | b"rar"
+                    | b"zip"
+                    | b"7z"
+                    | b"gz"
+                    | b"tar"
+                    | b"bz2"
+                    | b"xz"
+                    | b"pkg"
+                    | b"exe"
+                    | b"msi"
+                    | b"jpg"
+                    | b"jpeg"
+                    | b"png"
+                    | b"gif"
+                    | b"bmp"
+                    | b"pdf"
+                    | b"epub"
+                    | b"mobi"
+                    | b"azw"
+                    | b"azw3"
+                    | b"djvu"
+                    | b"cbr"
+                    | b"cbz"
+                    | b"fb2"
+                    | b"lit"
+                    | b"prc"
+                    | b"opf"
+                    | b"txt"
+                    | b"log"
+            );
+        }
+        if matched {
+            t = &t[..dot];
+        }
+    }
+    // 3. `/[.\-_ ](?:part|vol|r)\d+(?:\+\d+)?$/i`
+    {
+        let mut p = t.len();
+        while p > 0 && t[p - 1].is_ascii_digit() {
+            p -= 1;
+        }
+        if p < t.len() {
+            if p > 0 && t[p - 1] == b'+' {
+                let plus = p - 1;
+                p = plus;
+                while p > 0 && t[p - 1].is_ascii_digit() {
+                    p -= 1;
+                }
+                if p == plus {
+                    p = t.len();
+                }
+            }
+            if p < t.len() {
+                let head = &t[..p];
+                for &word in &[&b"part"[..], b"vol", b"r"] {
+                    if head.len() > word.len()
+                        && matches!(head[head.len() - word.len() - 1], b'.' | b'-' | b'_' | b' ')
+                        && head[head.len() - word.len()..].eq_ignore_ascii_case(word)
+                    {
+                        t = &head[..head.len() - word.len() - 1];
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // 4. Collapse `/[\s_]+/` -> `' '` and `trim($t, " .-_\t\r\n")`
+    out.clear();
+    let mut in_space = false;
+    for &b in t {
+        if is_pcre_space(b) || b == b'_' {
+            if !in_space {
+                out.push(b' ');
+                in_space = true;
+            }
+        } else {
+            in_space = false;
+            out.push(b);
+        }
+    }
+    while out
+        .last()
+        .is_some_and(|&b| matches!(b, b' ' | b'.' | b'-' | b'_' | b'\t' | b'\r' | b'\n'))
+    {
+        out.pop();
+    }
+    let mut lead = 0usize;
+    while lead < out.len() && matches!(out[lead], b' ' | b'.' | b'-' | b'_' | b'\t' | b'\r' | b'\n')
+    {
+        lead += 1;
+    }
+    if lead > 0 {
+        out.drain(..lead);
+    }
+}
+
+#[inline]
+fn candidate_has_real_title_prefix_before_year(candidate: &[u8]) -> bool {
+    // `/^(.+?)[ ._(\[](?:19|20)\d{2}(?=$|[ ._)\]-])/u`
+    // and `/[A-Za-z]{3}/` on `preg_replace('/^(?:\[[^\]]+\]\s*)+/', '', $result[1])`
+    if candidate.len() < 6 {
+        return false;
+    }
+    let mut r1: Option<&[u8]> = None;
+    for sep_pos in 1..=candidate.len() - 5 {
+        if matches!(candidate[sep_pos], b' ' | b'.' | b'_' | b'(' | b'[')
+            && (&candidate[sep_pos + 1..sep_pos + 3] == b"19"
+                || &candidate[sep_pos + 1..sep_pos + 3] == b"20")
+            && candidate[sep_pos + 3].is_ascii_digit()
+            && candidate[sep_pos + 4].is_ascii_digit()
+            && (sep_pos + 5 == candidate.len()
+                || matches!(
+                    candidate[sep_pos + 5],
+                    b' ' | b'.' | b'_' | b')' | b']' | b'-'
+                ))
+        {
+            r1 = Some(&candidate[..sep_pos]);
+            break;
+        }
+    }
+    let Some(mut prefix) = r1 else {
+        return false;
+    };
+    while prefix.starts_with(b"[") {
+        let Some(rel_close) = prefix[1..].iter().position(|&b| b == b']') else {
+            break;
+        };
+        if rel_close == 0 {
+            break;
+        }
+        let mut p = 1 + rel_close + 1;
+        while p < prefix.len() && is_pcre_space(prefix[p]) {
+            p += 1;
+        }
+        prefix = &prefix[p..];
+    }
+    prefix.windows(3).any(|w| {
+        w[0].is_ascii_alphabetic() && w[1].is_ascii_alphabetic() && w[2].is_ascii_alphabetic()
+    })
+}
+
+#[inline]
+fn candidate_has_bounded_resolution(candidate: &[u8]) -> bool {
+    // `/(?<![a-z0-9])(?:720p|1080p|2160p)(?![a-z0-9])/i`
+    for i in 0..candidate.len() {
+        if i > 0 && candidate[i - 1].is_ascii_alphanumeric() {
+            continue;
+        }
+        let rem = &candidate[i..];
+        for &tok in &[&b"720p"[..], b"1080p", b"2160p"] {
+            if rem.len() >= tok.len()
+                && rem[..tok.len()].eq_ignore_ascii_case(tok)
+                && (i + tok.len() == candidate.len()
+                    || !candidate[i + tok.len()].is_ascii_alphanumeric())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[inline]
+fn candidate_has_bounded_source(candidate: &[u8]) -> bool {
+    // `/(?<![a-z0-9])(?:HDTV(?:Light)?|BluRay|BDRip|WEB[- .]?DL|WEBRip|BD)(?![a-z0-9])/i`
+    for i in 0..candidate.len() {
+        if i > 0 && candidate[i - 1].is_ascii_alphanumeric() {
+            continue;
+        }
+        let rem = &candidate[i..];
+        for &tok in &[
+            &b"hdtvlight"[..],
+            b"hdtv",
+            b"bluray",
+            b"bdrip",
+            b"web-dl",
+            b"web.dl",
+            b"web dl",
+            b"webdl",
+            b"webrip",
+            b"bd",
+        ] {
+            if rem.len() >= tok.len()
+                && rem[..tok.len()].eq_ignore_ascii_case(tok)
+                && (i + tok.len() == candidate.len()
+                    || !candidate[i + tok.len()].is_ascii_alphanumeric())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[inline]
+fn candidate_has_bounded_codec(candidate: &[u8]) -> bool {
+    // `/(?<![a-z0-9])(?:x264|x265|HEVC|H[ .]?264|H[ .]?265|XviD)(?![a-z0-9])/i`
+    for i in 0..candidate.len() {
+        if i > 0 && candidate[i - 1].is_ascii_alphanumeric() {
+            continue;
+        }
+        let rem = &candidate[i..];
+        for &tok in &[
+            &b"x264"[..],
+            b"x265",
+            b"hevc",
+            b"h.264",
+            b"h 264",
+            b"h264",
+            b"h.265",
+            b"h 265",
+            b"h265",
+            b"xvid",
+        ] {
+            if rem.len() >= tok.len()
+                && rem[..tok.len()].eq_ignore_ascii_case(tok)
+                && (i + tok.len() == candidate.len()
+                    || !candidate[i + tok.len()].is_ascii_alphanumeric())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Evaluates `FileNameExtractor::extractFromFile(string $filename)` into `out`.
+/// Returns:
+/// - `> 0`: bytes written to `out` (`newName\0method`)
+/// - `0`: no match (`null`)
+/// - `-2`: declined to PHP fallback
+/// - `<= -16`: `-(required_len as isize)` when `out` capacity was exceeded
+pub(crate) fn filename_extract_candidate_into(filename: &[u8], out: &mut OutCursor<'_>) -> isize {
+    if filename.is_empty() {
+        return 0;
+    }
+    if filename.iter().any(|&b| !(0x20..=0x7E).contains(&b)) {
+        return -2;
+    }
+
+    // 1. `NZBSPLIT wrapper`
+    if find_ascii_ci(filename, b"__nzbsplit__").is_some() {
+        if filename.windows(12).any(|w| w == b"__NZBSPLIT__") {
+            let mut unwrapped = Vec::new();
+            match crate::cleaning::nzbsplit_unwrap_vec(filename, &mut unwrapped) {
+                Some(true) => match crate::cleaning::is_plausible_release_title(&unwrapped) {
+                    Some(true) => {
+                        write_result_pair(out, &unwrapped, b"NZBSPLIT wrapper");
+                        return finish_cursor_min_ref(out, 16);
+                    }
+                    Some(false) => return 0,
+                    None => return -2,
+                },
+                Some(false) => return 0,
+                None => return -2,
+            }
+        }
+        return -2;
+    }
+
+    // 2. `Complete literal basename`
+    let basename = crate::cleaning::extract_filename_from_path(filename);
+    let Some(stripped_len) = crate::filename::strip_known_file_suffixes_len(basename, true) else {
+        return -2;
+    };
+    let literal_title = &basename[..stripped_len];
+    if literal_title.len() != basename.len() && matches_literal_basename_ext(basename) {
+        match is_literal_technical_scene_title_ascii(literal_title) {
+            Some(true) => {
+                write_result_pair(out, literal_title, b"Complete literal basename");
+                return finish_cursor_min_ref(out, 16);
+            }
+            Some(false) => {}
+            None => return -2,
+        }
+    }
+
+    // 3. `Scene release with group`: `/^(.+?(x264|x265|HEVC|XviD|H\.?264|H\.?265)\-[A-Za-z0-9]+)\\\\/i`
+    if filename.contains(&b'\\') {
+        for c_pos in 1..filename.len() {
+            let rem = &filename[c_pos..];
+            for &codec in &[
+                &b"x264"[..],
+                b"x265",
+                b"hevc",
+                b"xvid",
+                b"h.264",
+                b"h264",
+                b"h.265",
+                b"h265",
+            ] {
+                if rem.len() > codec.len() + 2
+                    && rem[..codec.len()].eq_ignore_ascii_case(codec)
+                    && rem[codec.len()] == b'-'
+                {
+                    let grp_start = c_pos + codec.len() + 1;
+                    let mut p = grp_start;
+                    while p < filename.len() && filename[p].is_ascii_alphanumeric() {
+                        p += 1;
+                    }
+                    if p > grp_start && p < filename.len() && filename[p] == b'\\' {
+                        write_result_pair(out, &filename[..p], b"Scene release with group");
+                        return finish_cursor_min_ref(out, 16);
+                    }
+                }
+            }
+        }
+
+        // 4. `TVP`: `/^(.+?(x264|XviD)\-TVP)\\\\/i`
+        if filename.len() >= 10 {
+            for c_pos in 1..=filename.len() - 9 {
+                if filename[c_pos..c_pos + 9].eq_ignore_ascii_case(b"x264-tvp\\")
+                    || filename[c_pos..c_pos + 9].eq_ignore_ascii_case(b"xvid-tvp\\")
+                {
+                    write_result_pair(out, &filename[..c_pos + 8], b"TVP");
+                    return finish_cursor_min_ref(out, 16);
+                }
+            }
+        }
+    }
+
+    // 5. `TV SxxExx with quality`:
+    // `/^(\\\\|\/)?(.+(\\\\|\/))*(.+?S\d{1,3}[.-_ ]?E\d{1,3}(?:[.-_ ]?E\d{1,3})?[.-_ ].+?(?:720p|1080p|2160p|4K|HDTV|WEB-?DL|WEB-?RIP|BluRay|AMZN|HMAX|NF|DSNP).+?)\.(.+)$/iu`
+    if for_each_path_prefix_end(filename, |g4_start| {
+        let s = &filename[g4_start..];
+        if s.len() < 10 {
+            return false;
+        }
+        for s_pos in 1..s.len() {
+            if !matches!(s[s_pos], b's' | b'S') {
+                continue;
+            }
+            let d1_start = s_pos + 1;
+            let mut d1_max = d1_start;
+            while d1_max < s.len() && s[d1_max].is_ascii_digit() && d1_max - d1_start < 3 {
+                d1_max += 1;
+            }
+            for d1_end in (d1_start + 1..=d1_max).rev() {
+                for sep1 in [1usize, 0] {
+                    if sep1 == 1
+                        && (d1_end >= s.len() || !is_pcre_dot_to_underscore_or_space_ci(s[d1_end]))
+                    {
+                        continue;
+                    }
+                    let e1_pos = d1_end + sep1;
+                    if e1_pos >= s.len() || !matches!(s[e1_pos], b'e' | b'E') {
+                        continue;
+                    }
+                    let e1_start = e1_pos + 1;
+                    let mut e1_max = e1_start;
+                    while e1_max < s.len() && s[e1_max].is_ascii_digit() && e1_max - e1_start < 3 {
+                        e1_max += 1;
+                    }
+                    for e1_end in (e1_start + 1..=e1_max).rev() {
+                        // Try optional `(?:[.-_ ]?E\d{1,3})?` greedy (present first, then absent)
+                        let mut after_ep_candidates = [usize::MAX; 8];
+                        let mut cand_len = 0usize;
+                        for sep2 in [1usize, 0] {
+                            if sep2 == 1
+                                && (e1_end >= s.len()
+                                    || !is_pcre_dot_to_underscore_or_space_ci(s[e1_end]))
+                            {
+                                continue;
+                            }
+                            let e2_pos = e1_end + sep2;
+                            if e2_pos < s.len() && matches!(s[e2_pos], b'e' | b'E') {
+                                let e2_start = e2_pos + 1;
+                                let mut e2_max = e2_start;
+                                while e2_max < s.len()
+                                    && s[e2_max].is_ascii_digit()
+                                    && e2_max - e2_start < 3
+                                {
+                                    e2_max += 1;
+                                }
+                                for e2_end in (e2_start + 1..=e2_max).rev() {
+                                    if cand_len < after_ep_candidates.len() {
+                                        after_ep_candidates[cand_len] = e2_end;
+                                        cand_len += 1;
+                                    }
+                                }
+                            }
+                        }
+                        after_ep_candidates[cand_len] = e1_end;
+                        cand_len += 1;
+
+                        for &ep_end in &after_ep_candidates[..cand_len] {
+                            if ep_end >= s.len()
+                                || !is_pcre_dot_to_underscore_or_space_ci(s[ep_end])
+                            {
+                                continue;
+                            }
+                            let after_sep = ep_end + 1;
+                            for q_pos in (after_sep + 1)..s.len() {
+                                if let Some(q_end) = match_file_tv_quality_at(s, q_pos) {
+                                    if let Some(dot_pos) = first_dot_with_tail(s, q_end + 1) {
+                                        write_result_pair(
+                                            out,
+                                            &s[..dot_pos],
+                                            b"TV SxxExx with quality",
+                                        );
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }) {
+        return finish_cursor_min_ref(out, 16);
+    }
+
+    // 6. `Generic TV`:
+    // `/^(\\\\|\/)?(.+(\\\\|\/))*(.+?S\d{1,3}[.-_ ]?[ED]\d{1,3}.+)\.(.+)$/iu`
+    if for_each_path_prefix_end(filename, |g4_start| {
+        let s = &filename[g4_start..];
+        let Some(last_dot) = last_dot_with_tail(s, 5) else {
+            return false;
+        };
+        for s_pos in 1..last_dot {
+            if !matches!(s[s_pos], b's' | b'S') {
+                continue;
+            }
+            let d1_start = s_pos + 1;
+            let mut d1_max = d1_start;
+            while d1_max < last_dot && s[d1_max].is_ascii_digit() && d1_max - d1_start < 3 {
+                d1_max += 1;
+            }
+            for d1_end in (d1_start + 1..=d1_max).rev() {
+                for sep in [1usize, 0] {
+                    if sep == 1
+                        && (d1_end >= last_dot || !is_pcre_dot_to_underscore_or_space_ci(s[d1_end]))
+                    {
+                        continue;
+                    }
+                    let ed_pos = d1_end + sep;
+                    if ed_pos >= last_dot || !matches!(s[ed_pos], b'e' | b'E' | b'd' | b'D') {
+                        continue;
+                    }
+                    let d2_start = ed_pos + 1;
+                    let mut d2_max = d2_start;
+                    while d2_max < last_dot && s[d2_max].is_ascii_digit() && d2_max - d2_start < 3 {
+                        d2_max += 1;
+                    }
+                    for d2_end in (d2_start + 1..=d2_max).rev() {
+                        if let Some(dot_pos) = last_dot_with_tail(s, d2_end + 1) {
+                            write_result_pair(out, &s[..dot_pos], b"Generic TV");
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }) {
+        return finish_cursor_min_ref(out, 16);
+    }
+
+    // 7. `4K/UHD Movie`:
+    // `/^(\\\\|\/)?(.+(\\\\|\/))*(.+?[\.\-_ ](19|20)\d\d[\.\-_ ].+?(2160p|4K|UHD).+?(HDR10?\+?|DV|Dolby[\.\-_ ]?Vision)?.+?(HEVC|x265|H\.?265).+?)\.(.+)$/iu`
+    if for_each_path_prefix_end(filename, |g4_start| {
+        let s = &filename[g4_start..];
+        if s.len() < 16 {
+            return false;
+        }
+        for sep_pos in 1..s.len() - 6 {
+            if !matches!(s[sep_pos], b'.' | b'-' | b'_' | b' ')
+                || !(&s[sep_pos + 1..sep_pos + 3] == b"19" || &s[sep_pos + 1..sep_pos + 3] == b"20")
+                || !s[sep_pos + 3].is_ascii_digit()
+                || !s[sep_pos + 4].is_ascii_digit()
+                || !matches!(s[sep_pos + 5], b'.' | b'-' | b'_' | b' ')
+            {
+                continue;
+            }
+            let after_yr = sep_pos + 6;
+            for u_pos in (after_yr + 1)..s.len() {
+                let rem = &s[u_pos..];
+                let u_len = if rem.len() >= 5 && rem[..5].eq_ignore_ascii_case(b"2160p") {
+                    5
+                } else if rem.len() >= 3 && rem[..3].eq_ignore_ascii_case(b"uhd") {
+                    3
+                } else if rem.len() >= 2 && rem[..2].eq_ignore_ascii_case(b"4k") {
+                    2
+                } else {
+                    continue;
+                };
+                let u_end = u_pos + u_len;
+                for p in (u_end + 1)..s.len() {
+                    if let Some(hdr_end) = match_file_hdr_token_at(s, p) {
+                        for c_pos in (hdr_end + 1)..s.len() {
+                            if let Some(c_end) = match_file_hevc_codec_at(s, c_pos) {
+                                if let Some(dot_pos) = first_dot_with_tail(s, c_end + 1) {
+                                    write_result_pair(out, &s[..dot_pos], b"4K/UHD Movie");
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                for c_pos in (u_end + 2)..s.len() {
+                    if let Some(c_end) = match_file_hevc_codec_at(s, c_pos) {
+                        if let Some(dot_pos) = first_dot_with_tail(s, c_end + 1) {
+                            write_result_pair(out, &s[..dot_pos], b"4K/UHD Movie");
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }) {
+        return finish_cursor_min_ref(out, 16);
+    }
+
+    // 8. `HD Movie modern codec`:
+    // `/^(\\\\|\/)?(.+(\\\\|\/))*(.+?[\.\-_ ](19|20)\d\d[\.\-_ ].+?(720p|1080p).+?(BluRay|WEB-?DL|WEB-?RIP|BDRip|REMUX).+?(x264|x265|HEVC|H\.?264|H\.?265|AVC).+?)\.(.+)$/iu`
+    if for_each_path_prefix_end(filename, |g4_start| {
+        let s = &filename[g4_start..];
+        if s.len() < 18 {
+            return false;
+        }
+        for sep_pos in 1..s.len() - 6 {
+            if !matches!(s[sep_pos], b'.' | b'-' | b'_' | b' ')
+                || !(&s[sep_pos + 1..sep_pos + 3] == b"19" || &s[sep_pos + 1..sep_pos + 3] == b"20")
+                || !s[sep_pos + 3].is_ascii_digit()
+                || !s[sep_pos + 4].is_ascii_digit()
+                || !matches!(s[sep_pos + 5], b'.' | b'-' | b'_' | b' ')
+            {
+                continue;
+            }
+            let after_yr = sep_pos + 6;
+            for r_pos in (after_yr + 1)..s.len() {
+                let rem = &s[r_pos..];
+                let r_len = if rem.len() >= 5 && rem[..5].eq_ignore_ascii_case(b"1080p") {
+                    5
+                } else if rem.len() >= 4 && rem[..4].eq_ignore_ascii_case(b"720p") {
+                    4
+                } else {
+                    continue;
+                };
+                let r_end = r_pos + r_len;
+                for src_pos in (r_end + 1)..s.len() {
+                    let srem = &s[src_pos..];
+                    let mut matched_src_len = 0usize;
+                    for &tok in &[
+                        &b"bluray"[..],
+                        b"web-dl",
+                        b"webdl",
+                        b"web-rip",
+                        b"webrip",
+                        b"bdrip",
+                        b"remux",
+                    ] {
+                        if srem.len() >= tok.len() && srem[..tok.len()].eq_ignore_ascii_case(tok) {
+                            matched_src_len = tok.len();
+                            break;
+                        }
+                    }
+                    if matched_src_len == 0 {
+                        continue;
+                    }
+                    let src_end = src_pos + matched_src_len;
+                    for c_pos in (src_end + 1)..s.len() {
+                        if let Some(c_end) = match_file_hd_codec_at(s, c_pos) {
+                            if let Some(dot_pos) = first_dot_with_tail(s, c_end + 1) {
+                                write_result_pair(out, &s[..dot_pos], b"HD Movie modern codec");
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }) {
+        return finish_cursor_min_ref(out, 16);
+    }
+
+    // 9. `Generic movie 1`:
+    // `/^(\\\\|\/)?(.+(\\\\|\/))*(.+?([\.\-_ ]\d{4}[\.\-_ ].+?(BDRip|bluray|DVDRip|XVID|WEB-?DL|HDTV)).+)\.(.+)$/iu`
+    if for_each_path_prefix_end(filename, |g4_start| {
+        let s = &filename[g4_start..];
+        let Some(last_dot) = last_dot_with_tail(s, 10) else {
+            return false;
+        };
+        for sep_pos in 1..last_dot.saturating_sub(6) {
+            if !matches!(s[sep_pos], b'.' | b'-' | b'_' | b' ')
+                || !s[sep_pos + 1].is_ascii_digit()
+                || !s[sep_pos + 2].is_ascii_digit()
+                || !s[sep_pos + 3].is_ascii_digit()
+                || !s[sep_pos + 4].is_ascii_digit()
+                || !matches!(s[sep_pos + 5], b'.' | b'-' | b'_' | b' ')
+            {
+                continue;
+            }
+            let after_yr = sep_pos + 6;
+            for src_pos in (after_yr + 1)..last_dot {
+                let srem = &s[src_pos..];
+                for &tok in &[
+                    &b"bdrip"[..],
+                    b"bluray",
+                    b"dvdrip",
+                    b"xvid",
+                    b"web-dl",
+                    b"webdl",
+                    b"hdtv",
+                ] {
+                    if srem.len() >= tok.len() && srem[..tok.len()].eq_ignore_ascii_case(tok) {
+                        if let Some(dot_pos) = last_dot_with_tail(s, src_pos + tok.len() + 1) {
+                            write_result_pair(out, &s[..dot_pos], b"Generic movie 1");
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }) {
+        return finish_cursor_min_ref(out, 16);
+    }
+
+    // 10. `Generic movie 2`:
+    // `/^([a-z0-9\.\-_]+(19|20)\d\d[a-z0-9\.\-_]+[\.\-_ ](720p|1080p|2160p|4K|BDRip|bluray|DVDRip|x264|x265|XviD|HEVC)[a-z0-9\.\-_]+)\.[a-z]{2,}$/i`
+    if let Some(last_dot) = filename.iter().rposition(|&b| b == b'.') {
+        let stem = &filename[..last_dot];
+        let ext = &filename[last_dot + 1..];
+        if ext.len() >= 2 && ext.iter().all(|b| b.is_ascii_alphabetic()) && stem.len() >= 10 {
+            let is_m2_char = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_');
+            let mut matched_m2 = false;
+            for yr_pos in (1..=stem.len() - 6).rev() {
+                if !(&stem[yr_pos..yr_pos + 2] == b"19" || &stem[yr_pos..yr_pos + 2] == b"20")
+                    || !stem[yr_pos + 2].is_ascii_digit()
+                    || !stem[yr_pos + 3].is_ascii_digit()
+                    || !stem[..yr_pos].iter().all(|&b| is_m2_char(b))
+                {
+                    continue;
+                }
+                for sep_pos in (yr_pos + 5..stem.len()).rev() {
+                    if !matches!(stem[sep_pos], b'.' | b'-' | b'_' | b' ')
+                        || !stem[yr_pos + 4..sep_pos].iter().all(|&b| is_m2_char(b))
+                    {
+                        continue;
+                    }
+                    let rem = &stem[sep_pos + 1..];
+                    for &tok in &[
+                        &b"720p"[..],
+                        b"1080p",
+                        b"2160p",
+                        b"4k",
+                        b"bdrip",
+                        b"bluray",
+                        b"dvdrip",
+                        b"x264",
+                        b"x265",
+                        b"xvid",
+                        b"hevc",
+                    ] {
+                        if rem.len() > tok.len()
+                            && rem[..tok.len()].eq_ignore_ascii_case(tok)
+                            && rem[tok.len()..].iter().all(|&b| is_m2_char(b))
+                        {
+                            matched_m2 = true;
+                            break;
+                        }
+                    }
+                    if matched_m2 {
+                        break;
+                    }
+                }
+                if matched_m2 {
+                    break;
+                }
+            }
+            if matched_m2 {
+                write_result_pair(out, stem, b"Generic movie 2");
+                return finish_cursor_min_ref(out, 16);
+            }
+        }
+    }
+
+    // 11. `Streaming service release`:
+    // `/^([A-Za-z0-9\.\-_]+[\.\-_ ](AMZN|ATVP|DSNP|HMAX|HULU|iT|NF|PMTP|PCOK|ROKU|STAN|TVNZ|VUDU)[\.\-_ ].+?(WEB-?DL|WEB-?RIP).+?)\.(.+)$/i`
+    {
+        let mut max_prefix = 0usize;
+        while max_prefix < filename.len()
+            && (filename[max_prefix].is_ascii_alphanumeric()
+                || matches!(filename[max_prefix], b'.' | b'-' | b'_'))
+        {
+            max_prefix += 1;
+        }
+        for sep1_pos in (1..=max_prefix.min(filename.len().saturating_sub(10))).rev() {
+            if !matches!(filename[sep1_pos], b'.' | b'-' | b'_' | b' ') {
+                continue;
+            }
+            let rem = &filename[sep1_pos + 1..];
+            for &svc in &[
+                &b"amzn"[..],
+                b"atvp",
+                b"dsnp",
+                b"hmax",
+                b"hulu",
+                b"it",
+                b"nf",
+                b"pmtp",
+                b"pcok",
+                b"roku",
+                b"stan",
+                b"tvnz",
+                b"vudu",
+            ] {
+                if rem.len() > svc.len() + 1
+                    && rem[..svc.len()].eq_ignore_ascii_case(svc)
+                    && matches!(rem[svc.len()], b'.' | b'-' | b'_' | b' ')
+                {
+                    let after_svc = sep1_pos + 1 + svc.len() + 1;
+                    for w_pos in (after_svc + 1)..filename.len() {
+                        let wrem = &filename[w_pos..];
+                        for &wtok in &[&b"web-dl"[..], b"webdl", b"web-rip", b"webrip"] {
+                            if wrem.len() >= wtok.len()
+                                && wrem[..wtok.len()].eq_ignore_ascii_case(wtok)
+                            {
+                                if let Some(dot_pos) =
+                                    first_dot_with_tail(filename, w_pos + wtok.len() + 1)
+                                {
+                                    write_result_pair(
+                                        out,
+                                        &filename[..dot_pos],
+                                        b"Streaming service release",
+                                    );
+                                    return finish_cursor_min_ref(out, 16);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 12. `Generic music` & 13. `music groups`
+    if filename.contains(&b'\\') {
+        // `/(.+?([\.\-_ ](CD|FM)|[\.\-_ ]\dCD|CDR|FLAC|SAT|WEB).+?(19|20)\d\d.+?)\\\\.+/i`
+        for tok_pos in 1..filename.len() {
+            let rem = &filename[tok_pos..];
+            let mut lens = [0usize; 3];
+            let mut lcount = 0usize;
+            if rem.len() >= 3
+                && matches!(rem[0], b'.' | b'-' | b'_' | b' ')
+                && (rem[1..3].eq_ignore_ascii_case(b"cd") || rem[1..3].eq_ignore_ascii_case(b"fm"))
+            {
+                lens[lcount] = 3;
+                lcount += 1;
+            }
+            if rem.len() >= 4
+                && matches!(rem[0], b'.' | b'-' | b'_' | b' ')
+                && rem[1].is_ascii_digit()
+                && rem[2..4].eq_ignore_ascii_case(b"cd")
+            {
+                lens[lcount] = 4;
+                lcount += 1;
+            }
+            for &word in &[&b"cdr"[..], b"flac", b"sat", b"web"] {
+                if rem.len() >= word.len() && rem[..word.len()].eq_ignore_ascii_case(word) {
+                    lens[lcount] = word.len();
+                    lcount += 1;
+                    break;
+                }
+            }
+            for &tlen in &lens[..lcount] {
+                let after_tok = tok_pos + tlen;
+                for yr_pos in (after_tok + 1)..filename.len().saturating_sub(4) {
+                    if (&filename[yr_pos..yr_pos + 2] == b"19"
+                        || &filename[yr_pos..yr_pos + 2] == b"20")
+                        && filename[yr_pos + 2].is_ascii_digit()
+                        && filename[yr_pos + 3].is_ascii_digit()
+                    {
+                        for bs_pos in (yr_pos + 5)..filename.len() - 1 {
+                            if filename[bs_pos] == b'\\' {
+                                write_result_pair(out, &filename[..bs_pos], b"Generic music");
+                                return finish_cursor_min_ref(out, 16);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // `/^(.+?(19|20)\d\d\-([a-z0-9]{3}|[a-z]{2,}|C4))\\\\/i`
+        if filename.len() >= 9 {
+            for yr_pos in 1..=filename.len() - 8 {
+                if (&filename[yr_pos..yr_pos + 2] == b"19"
+                    || &filename[yr_pos..yr_pos + 2] == b"20")
+                    && filename[yr_pos + 2].is_ascii_digit()
+                    && filename[yr_pos + 3].is_ascii_digit()
+                    && filename[yr_pos + 4] == b'-'
+                {
+                    let grp_start = yr_pos + 5;
+                    let mut p = grp_start;
+                    while p < filename.len() && filename[p].is_ascii_alphanumeric() {
+                        p += 1;
+                    }
+                    if p < filename.len() && filename[p] == b'\\' {
+                        let grp = &filename[grp_start..p];
+                        if grp.len() == 3
+                            || (grp.len() >= 2 && grp.iter().all(|b| b.is_ascii_alphabetic()))
+                            || grp.eq_ignore_ascii_case(b"c4")
+                        {
+                            write_result_pair(out, &filename[..p], b"music groups");
+                            return finish_cursor_min_ref(out, 16);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 14. `Music with codec`:
+    // `/^(.+?[\.\-_ ](FLAC|MP3|AAC|OGG)[\.\-_ ].+?[\.\-_ ]\d{4}[\.\-_ ].+?\-[A-Za-z0-9]+)[\\\\\/.]/i`
+    if filename.len() >= 16 {
+        for sep1 in 1..filename.len() - 12 {
+            if !matches!(filename[sep1], b'.' | b'-' | b'_' | b' ') {
+                continue;
+            }
+            let rem = &filename[sep1 + 1..];
+            let mut clen = 0usize;
+            for &codec in &[&b"flac"[..], b"mp3", b"aac", b"ogg"] {
+                if rem.len() > codec.len()
+                    && rem[..codec.len()].eq_ignore_ascii_case(codec)
+                    && matches!(rem[codec.len()], b'.' | b'-' | b'_' | b' ')
+                {
+                    clen = codec.len();
+                    break;
+                }
+            }
+            if clen == 0 {
+                continue;
+            }
+            let after_codec = sep1 + 1 + clen + 1;
+            for sep2 in (after_codec + 1)..filename.len().saturating_sub(8) {
+                if !matches!(filename[sep2], b'.' | b'-' | b'_' | b' ')
+                    || !filename[sep2 + 1].is_ascii_digit()
+                    || !filename[sep2 + 2].is_ascii_digit()
+                    || !filename[sep2 + 3].is_ascii_digit()
+                    || !filename[sep2 + 4].is_ascii_digit()
+                    || !matches!(filename[sep2 + 5], b'.' | b'-' | b'_' | b' ')
+                {
+                    continue;
+                }
+                let after_yr = sep2 + 6;
+                for dash in (after_yr + 1)..filename.len() - 2 {
+                    if filename[dash] != b'-' {
+                        continue;
+                    }
+                    let mut p = dash + 1;
+                    while p < filename.len() && filename[p].is_ascii_alphanumeric() {
+                        p += 1;
+                    }
+                    for end_p in ((dash + 2)..=p).rev() {
+                        if end_p < filename.len() && matches!(filename[end_p], b'\\' | b'/' | b'.')
+                        {
+                            write_result_pair(out, &filename[..end_p], b"Music with codec");
+                            return finish_cursor_min_ref(out, 16);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 15, 16, 17: Movie (year) avi / iso / mkv/mp4
+    if filename.contains(&b'\\') && filename.len() >= 13 {
+        let check_paren_year = |pos: usize| -> bool {
+            pos + 6 <= filename.len()
+                && filename[pos] == b'('
+                && (&filename[pos + 1..pos + 3] == b"19" || &filename[pos + 1..pos + 3] == b"20")
+                && filename[pos + 3].is_ascii_digit()
+                && filename[pos + 4].is_ascii_digit()
+                && filename[pos + 5] == b')'
+        };
+        let paren_pos = filename.len() - 10;
+        if check_paren_year(paren_pos) {
+            let ext = &filename[filename.len() - 4..];
+            if ext.eq_ignore_ascii_case(b".avi") {
+                if let Some(bs) = filename[1..paren_pos].iter().rposition(|&b| b == b'\\') {
+                    let r1 = &filename[1 + bs + 1..];
+                    let mut new_name = Vec::with_capacity(r1.len() + 20);
+                    let mut i = 0usize;
+                    while i < r1.len() {
+                        if i + 4 <= r1.len() && &r1[i..i + 4] == b".avi" {
+                            new_name.extend_from_slice(b" DVDRip XVID NoGroup");
+                            i += 4;
+                        } else {
+                            new_name.push(r1[i]);
+                            i += 1;
+                        }
+                    }
+                    write_result_pair(out, &new_name, b"Movie (year) avi");
+                    return finish_cursor_min_ref(out, 16);
+                }
+            } else if ext.eq_ignore_ascii_case(b".iso") {
+                if let Some(bs) = filename[1..paren_pos].iter().rposition(|&b| b == b'\\') {
+                    let r1 = &filename[1 + bs + 1..];
+                    let mut new_name = Vec::with_capacity(r1.len() + 12);
+                    let mut i = 0usize;
+                    while i < r1.len() {
+                        if i + 4 <= r1.len() && &r1[i..i + 4] == b".iso" {
+                            new_name.extend_from_slice(b" DVD NoGroup");
+                            i += 4;
+                        } else {
+                            new_name.push(r1[i]);
+                            i += 1;
+                        }
+                    }
+                    write_result_pair(out, &new_name, b"Movie (year) iso");
+                    return finish_cursor_min_ref(out, 16);
+                }
+            } else if ext.eq_ignore_ascii_case(b".mkv")
+                || ext.eq_ignore_ascii_case(b".mp4")
+                || ext.eq_ignore_ascii_case(b".m4v")
+            {
+                if let Some(bs) = filename[1..paren_pos].iter().rposition(|&b| b == b'\\') {
+                    let r1 = &filename[1 + bs + 1..filename.len() - 4];
+                    let mut new_name = Vec::with_capacity(r1.len() + 19);
+                    new_name.extend_from_slice(r1);
+                    new_name.extend_from_slice(b" BDRip x264 NoGroup");
+                    write_result_pair(out, &new_name, b"Movie (year) mkv/mp4");
+                    return finish_cursor_min_ref(out, 16);
+                }
+            }
+        }
+    }
+
+    // 18. `RAR archive path` & 19. `Scene RAR release`
+    if let Some(first_slash) = filename.iter().position(|&b| matches!(b, b'\\' | b'/')) {
+        if let Some(dot_pos) = filename.iter().rposition(|&b| b == b'.') {
+            if dot_pos > first_slash + 1 {
+                let ext = &filename[dot_pos + 1..];
+                let is_rar_or_r = ext.eq_ignore_ascii_case(b"rar")
+                    || ((3..=5).contains(&ext.len())
+                        && matches!(ext[0], b'r' | b'R')
+                        && ext[1..].iter().all(|b| b.is_ascii_digit()));
+                let is_rar_zip_7z = is_rar_or_r
+                    || ext.eq_ignore_ascii_case(b"zip")
+                    || ext.eq_ignore_ascii_case(b"7z");
+                let g1 = &filename[..first_slash];
+                if is_rar_zip_7z
+                    && g1.len() >= 4
+                    && g1[0].is_ascii_alphanumeric()
+                    && g1[1] != b' '
+                    && g1[g1.len() - 1] != b' '
+                    && g1
+                        .iter()
+                        .all(|&b| is_word_byte(b) || matches!(b, b'.' | b'-' | b' '))
+                    && !g1.windows(2).any(|w| w == b"  ")
+                    && g1[2..g1.len() - 1]
+                        .iter()
+                        .any(|&b| matches!(b, b'.' | b'-' | b'_' | b' '))
+                {
+                    write_result_pair(out, g1, b"RAR archive path");
+                    return finish_cursor_min_ref(out, 16);
+                }
+                if is_rar_or_r && g1.len() >= 4 && g1[0].is_ascii_alphanumeric() {
+                    if let Some(dash) = g1.iter().rposition(|&b| b == b'-') {
+                        if dash >= 2
+                            && dash + 1 < g1.len()
+                            && g1[1..dash]
+                                .iter()
+                                .all(|&b| is_word_byte(b) || matches!(b, b'.' | b'-'))
+                            && g1[dash + 1..].iter().all(|b| b.is_ascii_alphanumeric())
+                        {
+                            write_result_pair(out, g1, b"Scene RAR release");
+                            return finish_cursor_min_ref(out, 16);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 20–28: Rare scene/group-specific patterns (`IMAGESET`, `VIDEOOT-`, `SDPORN`, `R&C`, `NhaNc3`, `tvp-`, `hdtv-lol`, `-XVID-DL.avi`, ` - s\d{2}[ex]\d{2} - `)
+    if find_ascii_ci(filename, b"imageset").is_some()
+        || filename.starts_with(b"VIDEOOT-")
+        || find_ascii_ci(filename, b"sdporn").is_some()
+        || find_ascii_ci(filename, b"mpeg2-r&c").is_some()
+        || find_ascii_ci(filename, b"nhanc3").is_some()
+        || find_ascii_ci(filename, b"tvp-").is_some()
+        || find_ascii_ci(filename, b".hdtv-lol.").is_some()
+        || find_ascii_ci(filename, b"-xvid-dl.avi").is_some()
+        || find_ascii_ci(filename, b" - s").is_some()
+        || find_ascii_ci(filename, b").nds").is_some()
+        || find_ascii_ci(filename, b".3ds").is_some()
+        || find_ascii_ci(filename, b"audiobook").is_some()
+    {
+        return -2;
+    }
+
+    // 31. `Nintendo Switch`: `/^(.+?)\[[\w]+\]\.(?:nsp|xci|nsz)$/i`
+    if filename.len() >= 8 {
+        let ext = &filename[filename.len() - 4..];
+        if ext.eq_ignore_ascii_case(b".nsp")
+            || ext.eq_ignore_ascii_case(b".xci")
+            || ext.eq_ignore_ascii_case(b".nsz")
+        {
+            let before_ext = &filename[..filename.len() - 4];
+            if before_ext.ends_with(b"]") {
+                if let Some(open_b) = before_ext.iter().rposition(|&b| b == b'[') {
+                    if open_b >= 1
+                        && open_b + 1 < before_ext.len() - 1
+                        && before_ext[open_b + 1..before_ext.len() - 1]
+                            .iter()
+                            .all(|&b| is_word_byte(b))
+                    {
+                        let r1 = php_trim(&before_ext[..open_b]);
+                        let mut new_name = Vec::with_capacity(r1.len() + 7);
+                        new_name.extend_from_slice(r1);
+                        new_name.extend_from_slice(b" Switch");
+                        write_result_pair(out, &new_name, b"Nintendo Switch");
+                        return finish_cursor_min_ref(out, 16);
+                    }
+                }
+            }
+        }
+    }
+
+    // 32. `Console game release`:
+    // `/^(.+?[\.\-_ ](PS[345P]|PSV|XBOX360|XBOXONE|NSW)[\.\-_ ].+?\-[A-Za-z0-9]+)[\\\\\/.]/i`
+    for sep1 in 1..filename.len().saturating_sub(6) {
+        if !matches!(filename[sep1], b'.' | b'-' | b'_' | b' ') {
+            continue;
+        }
+        let rem = &filename[sep1 + 1..];
+        let mut clen = 0usize;
+        for &plat in &[
+            &b"ps3"[..],
+            b"ps4",
+            b"ps5",
+            b"psp",
+            b"psv",
+            b"xbox360",
+            b"xboxone",
+            b"nsw",
+        ] {
+            if rem.len() > plat.len()
+                && rem[..plat.len()].eq_ignore_ascii_case(plat)
+                && matches!(rem[plat.len()], b'.' | b'-' | b'_' | b' ')
+            {
+                clen = plat.len();
+                break;
+            }
+        }
+        if clen == 0 {
+            continue;
+        }
+        let after_plat = sep1 + 1 + clen + 1;
+        for dash in (after_plat + 1)..filename.len().saturating_sub(2) {
+            if filename[dash] != b'-' {
+                continue;
+            }
+            let mut p = dash + 1;
+            while p < filename.len() && filename[p].is_ascii_alphanumeric() {
+                p += 1;
+            }
+            for end_p in ((dash + 2)..=p).rev() {
+                if end_p < filename.len() && matches!(filename[end_p], b'\\' | b'/' | b'.') {
+                    write_result_pair(out, &filename[..end_p], b"Console game release");
+                    return finish_cursor_min_ref(out, 16);
+                }
+            }
+        }
+    }
+
+    // 33. `EBook`: `/\w.+?\.(epub|mobi|azw3?|opf|fb2|prc|djvu|cb[rz])/i`
+    if let Some(w_start) = filename.iter().position(|&b| is_word_byte(b)) {
+        for dot in (w_start + 2)..filename.len() {
+            if filename[dot] != b'.' {
+                continue;
+            }
+            let rem = &filename[dot + 1..];
+            for &eb in &[
+                &b"epub"[..],
+                b"mobi",
+                b"azw3",
+                b"azw",
+                b"opf",
+                b"fb2",
+                b"prc",
+                b"djvu",
+                b"cbr",
+                b"cbz",
+            ] {
+                if rem.len() >= eb.len() && rem[..eb.len()].eq_ignore_ascii_case(eb) {
+                    let r0 = &filename[w_start..dot + 1 + eb.len()];
+                    let r1 = &filename[dot + 1..dot + 1 + eb.len()];
+                    let mut needle = Vec::with_capacity(1 + r1.len());
+                    needle.push(b'.');
+                    needle.extend_from_slice(r1);
+                    let mut repl = Vec::with_capacity(3 + r1.len());
+                    repl.extend_from_slice(b" (");
+                    repl.extend_from_slice(r1);
+                    repl.push(b')');
+                    let mut new_res = Vec::with_capacity(r0.len() + 3);
+                    let mut i = 0usize;
+                    while i < r0.len() {
+                        if i + needle.len() <= r0.len()
+                            && &r0[i..i + needle.len()] == needle.as_slice()
+                        {
+                            new_res.extend_from_slice(&repl);
+                            i += needle.len();
+                        } else {
+                            new_res.push(r0[i]);
+                            i += 1;
+                        }
+                    }
+                    write_result_pair(out, &new_res, b"EBook");
+                    return finish_cursor_min_ref(out, 16);
+                }
+            }
+        }
+    }
+
+    // 35. `Cleaned scene name`:
+    // `if (preg_match('/^([A-Za-z0-9][\w.\-]+\-[A-Za-z0-9]{2,15})$/i', $cleanedFilename, $result) && preg_match(self::PREDB_REGEX, $cleanedFilename))`
+    let cleaned_filename = clean_for_title_match_slice(filename);
+    if cleaned_filename.len() >= 5 && cleaned_filename[0].is_ascii_alphanumeric() {
+        if let Some(dash) = cleaned_filename.iter().rposition(|&b| b == b'-') {
+            let grp = &cleaned_filename[dash + 1..];
+            if dash >= 2
+                && (2..=15).contains(&grp.len())
+                && grp.iter().all(|b| b.is_ascii_alphanumeric())
+                && cleaned_filename[1..dash]
+                    .iter()
+                    .all(|&b| is_word_byte(b) || matches!(b, b'.' | b'-'))
+                && matches_predb_regex(cleaned_filename)
+            {
+                write_result_pair(out, cleaned_filename, b"Cleaned scene name");
+                return finish_cursor_min_ref(out, 16);
+            }
+        }
+    }
+
+    // 36. `Technical video basename` & 37. `Matching video parent basename`
+    let norm_basename = php_basename_norm_slashes(filename);
+    let Some(cand_len) = crate::filename::strip_known_file_suffixes_len(norm_basename, true) else {
+        return -2;
+    };
+    let candidate = &norm_basename[..cand_len];
+    let candidate_chars_ok = !candidate.is_empty()
+        && candidate.iter().all(|&b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b' ' | b'.'
+                        | b'_'
+                        | b'('
+                        | b')'
+                        | b'['
+                        | b']'
+                        | b'@'
+                        | b'+'
+                        | b','
+                        | b'!'
+                        | b'\''
+                        | b'&'
+                        | b'-'
+                )
+        });
+
+    if candidate.len() != norm_basename.len() && candidate_chars_ok {
+        let has_tech_ext = if let Some(dot) = norm_basename.iter().rposition(|&b| b == b'.') {
+            let ext = &norm_basename[dot + 1..];
+            if (3..=5).contains(&ext.len())
+                && matches!(ext[0], b'r' | b'R')
+                && ext[1..].iter().all(|b| b.is_ascii_digit())
+            {
+                true
+            } else if !ext.is_empty() && ext.len() <= 4 {
+                let mut lower = [0u8; 4];
+                for (i, &b) in ext.iter().enumerate() {
+                    lower[i] = b.to_ascii_lowercase();
+                }
+                matches!(
+                    &lower[..ext.len()],
+                    b"mkv"
+                        | b"avi"
+                        | b"mp4"
+                        | b"m4v"
+                        | b"ts"
+                        | b"m2ts"
+                        | b"rar"
+                        | b"7z"
+                        | b"par2"
+                        | b"nfo"
+                        | b"sfv"
+                        | b"md5"
+                        | b"sha1"
+                )
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if has_tech_ext
+            && candidate_has_real_title_prefix_before_year(candidate)
+            && candidate_has_bounded_resolution(candidate)
+            && candidate_has_bounded_source(candidate)
+            && candidate_has_bounded_codec(candidate)
+        {
+            let mut norm_title = Vec::with_capacity(candidate.len());
+            normalize_candidate_title_ascii(candidate, &mut norm_title);
+            match crate::cleaning::is_plausible_release_title(&norm_title) {
+                Some(true) => {
+                    write_result_pair(out, candidate, b"Technical video basename");
+                    return finish_cursor_min_ref(out, 16);
+                }
+                Some(false) => {}
+                None => return -2,
+            }
+        }
+    }
+
+    let parent = php_parent_basename_norm_slashes(filename);
+    if parent == candidate && candidate_chars_ok && norm_basename.len() >= 5 {
+        let ext = &norm_basename[norm_basename.len() - 4..];
+        let is_video4 = ext.eq_ignore_ascii_case(b".mkv")
+            || ext.eq_ignore_ascii_case(b".avi")
+            || ext.eq_ignore_ascii_case(b".mp4")
+            || ext.eq_ignore_ascii_case(b".m4v");
+        if is_video4
+            && candidate_has_real_title_prefix_before_year(candidate)
+            && candidate_has_bounded_resolution(candidate)
+        {
+            let mut norm_title = Vec::with_capacity(candidate.len());
+            normalize_candidate_title_ascii(candidate, &mut norm_title);
+            match crate::cleaning::is_plausible_release_title(&norm_title) {
+                Some(true) => {
+                    write_result_pair(out, candidate, b"Matching video parent basename");
+                    return finish_cursor_min_ref(out, 16);
+                }
+                Some(false) => {}
+                None => return -2,
+            }
+        }
+    }
+
+    // 38. `Folder name`:
+    // `if (preg_match('/\w+[\-\w.\',;& ]+$/i', $filename, $result) && preg_match(self::PREDB_REGEX, $filename))`
+    {
+        let is_folder_tail =
+            |b: u8| is_word_byte(b) || matches!(b, b'-' | b'.' | b'\'' | b',' | b';' | b'&' | b' ');
+        let mut run_start = filename.len();
+        while run_start > 0 && is_folder_tail(filename[run_start - 1]) {
+            run_start -= 1;
+        }
+        while run_start < filename.len() && !is_word_byte(filename[run_start]) {
+            run_start += 1;
+        }
+        if run_start + 1 < filename.len() && matches_predb_regex(filename) {
+            write_result_pair(out, &filename[run_start..], b"Folder name");
+            return finish_cursor_min_ref(out, 16);
+        }
+    }
+
+    0
+}
+
+// ============================================================================
+// C ABI Exports: NfoNameExtractor & FileNameExtractor
+// ============================================================================
+
+/// Extracts PreDB query candidate titles from `text[..text_len]` into `out_buf` as NUL-separated strings.
+/// Returns:
+/// - `>= 0`: total bytes written to `out_buf` (`complete = true`, `0` means `titles = []`)
+/// - `-1`: invalid pointer arguments
+/// - `-2`: declined to PHP fallback
+/// - `-4`: candidate overflow (`> 100` unique candidates -> `['titles' => [], 'complete' => false]`)
+/// - `<= -16`: `-(required_len as isize)` when `out_cap` is too small
+///
+/// # Safety
+///
+/// `text` must be valid for reads of `text_len` bytes when non-null and `text_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nfo_predb_candidates(
+    text: *const u8,
+    text_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if text_len == 0 {
+        return 0;
+    }
+    if text.is_null() || (out_buf.is_null() && out_cap > 0) {
+        return -1;
+    }
+    let src = unsafe { slice::from_raw_parts(text, text_len) };
+    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+    nfo_predb_candidates_into(src, &mut cursor)
+}
+
+/// Evaluates `NfoNameExtractor::extractFromNfo` pattern matching on `text[..text_len]`, writing `newName\0method` into `out_buf`.
+/// Returns:
+/// - `> 0`: bytes written to `out_buf`
+/// - `0`: no match (`null`)
+/// - `-1`: invalid pointer arguments
+/// - `-2`: declined to PHP fallback
+/// - `<= -16`: `-(required_len as isize)` when `out_cap` is too small
+///
+/// # Safety
+///
+/// `text` must be valid for reads of `text_len` bytes when non-null and `text_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nfo_extract_pattern_match(
+    text: *const u8,
+    text_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if text_len == 0 {
+        return 0;
+    }
+    if text.is_null() || (out_buf.is_null() && out_cap > 0) {
+        return -1;
+    }
+    let src = unsafe { slice::from_raw_parts(text, text_len) };
+    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+    nfo_extract_pattern_mode_into(src, 0, &mut cursor)
+}
+
+/// Evaluates `NfoNameExtractor` pattern matching for a specific `mode` (`0` = `extractFromNfo`, `1..=6` = individual `checkFor*` methods).
+///
+/// # Safety
+///
+/// `text` must be valid for reads of `text_len` bytes when non-null and `text_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nfo_extract_pattern_mode(
+    text: *const u8,
+    text_len: usize,
+    mode: u32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if text_len == 0 {
+        return 0;
+    }
+    if text.is_null() || (out_buf.is_null() && out_cap > 0) {
+        return -1;
+    }
+    let src = unsafe { slice::from_raw_parts(text, text_len) };
+    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+    nfo_extract_pattern_mode_into(src, mode, &mut cursor)
+}
+
+/// Evaluates `FileNameExtractor::extractFromFile` on `filename[..filename_len]`, writing `newName\0method` into `out_buf`.
+/// Returns:
+/// - `> 0`: bytes written to `out_buf`
+/// - `0`: no match (`null`)
+/// - `-1`: invalid pointer arguments
+/// - `-2`: declined to PHP fallback
+/// - `<= -16`: `-(required_len as isize)` when `out_cap` is too small
+///
+/// # Safety
+///
+/// `filename` must be valid for reads of `filename_len` bytes when non-null and `filename_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_filename_extract_candidate(
+    filename: *const u8,
+    filename_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if filename_len == 0 {
+        return 0;
+    }
+    if filename.is_null() || (out_buf.is_null() && out_cap > 0) {
+        return -1;
+    }
+    let src = unsafe { slice::from_raw_parts(filename, filename_len) };
+    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+    filename_extract_candidate_into(src, &mut cursor)
+}
+
+/// Alias for `nntmux_filename_extract_candidate`.
+///
+/// # Safety
+///
+/// Same safety requirements as [`nntmux_filename_extract_candidate`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_file_extract_candidate(
+    filename: *const u8,
+    filename_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    unsafe { nntmux_filename_extract_candidate(filename, filename_len, out_buf, out_cap) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -937,5 +5101,56 @@ mod tests {
 
         let sfv = b"; Generated by QuickSFV v2.36\r\ntest.rar 12345678\r\n";
         assert!(matches_non_nfo_header(sfv));
+    }
+
+    #[test]
+    fn test_nfo_predb_candidates_and_pattern_match() {
+        let nfo = b"Source: Fake.Show.S01E01.1080p.WEB-DL.x264-FAKE\r\nRelease Name: Real.Show.S01E01.1080p.WEB-DL.DDP5.1.H.264-REAL\r\n";
+        let mut buf = [0u8; 512];
+        let mut out = unsafe { OutCursor::new(buf.as_mut_ptr(), buf.len()) };
+        let len = nfo_predb_candidates_into(nfo, &mut out);
+        assert!(len > 0);
+        let cands: Vec<&str> = buf[..len as usize]
+            .split(|&b| b == 0)
+            .map(|s| std::str::from_utf8(s).unwrap())
+            .collect();
+        assert_eq!(
+            cands,
+            vec!["Real.Show.S01E01.1080p.WEB-DL.DDP5.1.H.264-REAL"]
+        );
+
+        let mut out2 = unsafe { OutCursor::new(buf.as_mut_ptr(), buf.len()) };
+        let len2 = nfo_extract_pattern_mode_into(nfo, 0, &mut out2);
+        assert!(len2 > 0);
+        assert_eq!(
+            &buf[..len2 as usize],
+            b"Real.Show.S01E01.1080p.WEB-DL.DDP5.1.H.264-REAL\0Complete literal NFO field"
+        );
+    }
+
+    #[test]
+    fn test_filename_extract_candidate() {
+        let mut buf = [0u8; 512];
+        let mut out = unsafe { OutCursor::new(buf.as_mut_ptr(), buf.len()) };
+        let len = filename_extract_candidate_into(
+            b"The.West.Wing.S07E01.The.Ticket.1080p.BluRay.10bit.EAC3.2.0.x265-iVy.mkv",
+            &mut out,
+        );
+        assert!(len > 0);
+        assert_eq!(
+            &buf[..len as usize],
+            b"The.West.Wing.S07E01.The.Ticket.1080p.BluRay.10bit.EAC3.2.0.x265-iVy\0Complete literal basename"
+        );
+
+        let mut out2 = unsafe { OutCursor::new(buf.as_mut_ptr(), buf.len()) };
+        let len2 = filename_extract_candidate_into(
+            b"Ordinary World (2016) 1080p\\Ordinary World (2016) 1080p.mkv",
+            &mut out2,
+        );
+        assert!(len2 > 0);
+        assert_eq!(
+            &buf[..len2 as usize],
+            b"Ordinary World (2016) 1080p\0Matching video parent basename"
+        );
     }
 }

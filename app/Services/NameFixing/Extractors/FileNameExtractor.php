@@ -6,6 +6,7 @@ namespace App\Services\NameFixing\Extractors;
 
 use App\Services\NameFixing\Data\NameFixResult;
 use App\Services\NameFixing\FileNameCleaner;
+use App\Support\RustPipelineLibrary;
 
 /**
  * Extracts release names from file names and paths.
@@ -22,15 +23,79 @@ class FileNameExtractor
 
     protected FileNameCleaner $cleaner;
 
-    public function __construct(?FileNameCleaner $cleaner = null)
+    private ?string $libraryPath = null;
+
+    public function __construct(?FileNameCleaner $cleaner = null, ?string $libraryPath = null)
     {
         $this->cleaner = $cleaner ?? new FileNameCleaner;
+        $this->libraryPath = $libraryPath;
     }
 
     /**
      * Extract a release name from a filename.
      */
     public function extractFromFile(string $filename): ?NameFixResult
+    {
+        if ($filename === '') {
+            return null;
+        }
+
+        if (get_class($this) === self::class && get_class($this->cleaner) === FileNameCleaner::class) {
+            [$handled, $result] = $this->extractFromFileRust($filename);
+            if ($handled) {
+                return $result;
+            }
+        }
+
+        return $this->extractFromFilePhp($filename);
+    }
+
+    /**
+     * @return array{0: bool, 1: ?NameFixResult}
+     */
+    private function extractFromFileRust(string $filename): array
+    {
+        $ffi = RustPipelineLibrary::resolveDomain('nfo_extractors', NfoNameExtractor::FFI_CDEF, $this->libraryPath);
+        if ($ffi === null) {
+            return [false, null];
+        }
+
+        try {
+            $len = strlen($filename);
+            $cap = 0;
+            $buf = RustPipelineLibrary::obtainScratch($ffi, max(512, min(16384, $len + 64)), $cap);
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_filename_extract_candidate($filename, $len, $buf, $cap);
+            if ($written <= -16) {
+                $buf = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_filename_extract_candidate($filename, $len, $buf, $cap);
+            }
+            if ($written === 0) {
+                return [true, null];
+            }
+            if ($written > 0) {
+                $raw = \FFI::string($buf, $written);
+                $nul = strpos($raw, "\0");
+                if ($nul !== false) {
+                    return [
+                        true,
+                        NameFixResult::fromMatch(
+                            substr($raw, 0, $nul),
+                            substr($raw, $nul + 1),
+                            'File',
+                        ),
+                    ];
+                }
+            }
+        } catch (\Throwable) {
+            return [false, null];
+        }
+
+        return [false, null];
+    }
+
+    public function extractFromFilePhp(string $filename): ?NameFixResult
     {
         $result = [];
         $cleanedFilename = $this->cleaner->cleanForTitleMatch($filename);
