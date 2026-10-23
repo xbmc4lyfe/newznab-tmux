@@ -221,6 +221,16 @@ class RustNameCheckersParityTest extends TestCase
         }
     }
 
+    public function test_long_nested_near_misses_remain_native_and_preserve_results(): void
+    {
+        foreach ([10, 50, 150] as $repeats) {
+            self::assertParity('movie', 'Title.'.str_repeat('2023.1080p.', $repeats).'BluRay!');
+            self::assertParity('tv', 'Title.'.str_repeat('S01E01.2023.', $repeats).'!');
+            self::assertParity('tv', 'Title.'.str_repeat('S01E01.', $repeats).'NOSOURCE');
+        }
+        self::assertParity('app', 'App.Name.v1.2.3.Multilingual1|GROUP');
+    }
+
     public function test_unqualified_candidate_keeps_php_as_the_default(): void
     {
         foreach ([new TvNameChecker, new MovieNameChecker, new GameNameChecker, new AppNameChecker] as $checker) {

@@ -189,6 +189,18 @@ impl Class {
         self.0[(b / 64) as usize] & (1 << (b % 64)) != 0
     }
 
+    fn union(self, other: Self) -> Self {
+        Self(std::array::from_fn(|i| self.0[i] | other.0[i]))
+    }
+
+    fn title() -> Self {
+        let mut c = Self::word();
+        for &b in b"-.' ,;&" {
+            c.insert(b);
+        }
+        c
+    }
+
     fn word() -> Self {
         let mut c = Self::default();
         for b in b'0'..=b'9' {
@@ -215,7 +227,22 @@ enum Expr {
 
 // Necessary literal bigrams provide a cheap, lossless rejection filter. The
 // input is scanned once for all patterns; optional expressions add no constraint.
-fn requirements(expr: &Expr) -> Vec<Vec<usize>> {
+type Bloom = [u64; 4];
+
+#[inline]
+fn bigram(a: u8, b: u8) -> Bloom {
+    let hash = ((a as usize * 31) ^ b as usize) & 255;
+    let mut mask = [0; 4];
+    mask[hash >> 6] = 1 << (hash & 63);
+    mask
+}
+
+#[inline]
+fn intersects(a: Bloom, b: Bloom) -> bool {
+    (a[0] & b[0]) | (a[1] & b[1]) | (a[2] & b[2]) | (a[3] & b[3]) != 0
+}
+
+fn requirements(expr: &Expr) -> Vec<Bloom> {
     fn literal(expr: &Expr) -> Option<u8> {
         let Expr::Byte(c) = expr else {
             return None;
@@ -230,26 +257,29 @@ fn requirements(expr: &Expr) -> Vec<Vec<usize>> {
     }
     match expr {
         Expr::Sequence(seq) => {
-            let mut result: Vec<Vec<usize>> = seq.iter().flat_map(requirements).collect();
+            let mut result: Vec<Bloom> = seq.iter().flat_map(requirements).collect();
             for pair in seq.windows(2) {
                 if let (Some(a), Some(b)) = (literal(&pair[0]), literal(&pair[1])) {
-                    result.push(vec![usize::from(a) * 128 + usize::from(b)]);
+                    result.push(bigram(a, b));
                 }
             }
             result
         }
         Expr::Alt(alts) if alts.len() == 1 => requirements(&alts[0]),
         Expr::Alt(alts) => {
-            let mut union = Vec::new();
+            let mut union = [0; 4];
             for alt in alts {
                 let rs = requirements(alt);
-                let Some(best) = rs.into_iter().min_by_key(Vec::len) else {
+                let Some(best) = rs
+                    .into_iter()
+                    .min_by_key(|mask| mask.iter().map(|word| word.count_ones()).sum::<u32>())
+                else {
                     return Vec::new();
                 };
-                union.extend(best);
+                for i in 0..4 {
+                    union[i] |= best[i];
+                }
             }
-            union.sort_unstable();
-            union.dedup();
             vec![union]
         }
         Expr::Repeat(e, min, _) if *min > 0 => requirements(e),
@@ -392,6 +422,7 @@ impl Parser<'_> {
 enum Op {
     Byte(Class, usize),
     Repeat(Class, usize, usize, usize),
+    TailRepeat(Class, usize, Class),
     Split(usize, usize),
     Before(usize),
     After(usize),
@@ -417,6 +448,28 @@ fn compile(expr: &Expr, next: usize, ops: &mut Vec<Op>) -> usize {
         Expr::Byte(c) => Op::Byte(*c, next),
         Expr::Repeat(e, min, max) => {
             if let Expr::Byte(c) = **e {
+                if *max == usize::MAX {
+                    if let Op::Byte(end_c, 0) = ops[next] {
+                        // Normalize the minimum before sharing tail failures:
+                        // a shorter suffix can fail only because of its minimum.
+                        ops.push(Op::TailRepeat(c, 0, end_c));
+                        let mut entry = ops.len() - 1;
+                        for _ in 0..*min {
+                            ops.push(Op::Byte(c, entry));
+                            entry = ops.len() - 1;
+                        }
+                        return entry;
+                    }
+                    // Normalize unbounded repeats so every scanned position is
+                    // the same zero-minimum state and can share failure memo.
+                    ops.push(Op::Repeat(c, 0, *max, next));
+                    let mut entry = ops.len() - 1;
+                    for _ in 0..*min {
+                        ops.push(Op::Byte(c, entry));
+                        entry = ops.len() - 1;
+                    }
+                    return entry;
+                }
                 Op::Repeat(c, *min, *max, next)
             } else {
                 // Every repeated group in this pattern set is optional.
@@ -433,6 +486,113 @@ fn compile(expr: &Expr, next: usize, ops: &mut Vec<Op>) -> usize {
     ops.len() - 1
 }
 
+#[derive(Clone, Copy)]
+struct Lookahead {
+    first0: Class,
+    first1: Class,
+    min_rem: usize,
+}
+
+impl Lookahead {
+    #[inline]
+    fn matches(self, input: &[u8], pos: usize) -> bool {
+        input.len() - pos >= self.min_rem
+            && (self.min_rem == 0 || self.first0.contains(input[pos]))
+            && (self.min_rem < 2 || self.first1.contains(input[pos + 1]))
+    }
+}
+
+// A state is marked on entry. Edges other than a repeat's implicit consuming
+// loop point backwards, so revisiting a state means its search already failed.
+struct Memo {
+    bits: Vec<u64>,
+    stride: usize,
+}
+
+impl Memo {
+    fn new(ops: usize, len: usize) -> Self {
+        Self {
+            bits: vec![0; (ops * (len + 1)).div_ceil(64)],
+            stride: len + 1,
+        }
+    }
+
+    #[inline]
+    fn visit(&mut self, pc: usize, pos: usize) -> bool {
+        let bit = pc * self.stride + pos;
+        let word = &mut self.bits[bit >> 6];
+        let mask = 1 << (bit & 63);
+        let seen = *word & mask != 0;
+        *word |= mask;
+        seen
+    }
+    // Claim an implicit zero-minimum repeat's consecutive states in whole
+    // words, stopping before the first suffix that already failed.
+    fn claim_repeat(&mut self, pc: usize, pos: usize, end: usize) -> usize {
+        let base = pc * self.stride;
+        let mut bit = base + pos + 1;
+        let last = base + end;
+        while bit <= last {
+            let word = &mut self.bits[bit >> 6];
+            let high = last.min(bit | 63);
+            let mask = (u64::MAX << (bit & 63)) & (u64::MAX >> (63 - (high & 63)));
+            let seen = *word & mask;
+            if seen != 0 {
+                let first = (bit & !63) + seen.trailing_zeros() as usize;
+                *word |= mask & ((1u64 << (first & 63)).wrapping_sub(1));
+                return first - base - 1;
+            }
+            *word |= mask;
+            bit = high + 1;
+        }
+        end
+    }
+}
+
+// Most repeats share the title alphabet. Cache its runs across patterns;
+// source and tail repeats then reuse the scan done by the first title repeat.
+struct Subject<'a> {
+    input: &'a [u8],
+    title_runs: [Option<(usize, usize)>; 2],
+    last_digit: Option<usize>,
+}
+
+impl Subject<'_> {
+    fn repeat_end(
+        &mut self,
+        c: Class,
+        pos: usize,
+        limit: usize,
+        memo: &mut Memo,
+        pc: usize,
+        unbounded: bool,
+    ) -> usize {
+        // Short names cost less to scan than to look up in the run cache.
+        let cache = self.input.len() >= 128 && c.0 == Class::title().0 && unbounded;
+        if cache {
+            for &(start, end) in self.title_runs.iter().flatten() {
+                if pos >= start && pos <= end {
+                    return memo.claim_repeat(pc, pos, end.min(limit));
+                }
+            }
+        }
+        let mut end = pos;
+        while end < limit && c.contains(self.input[end]) {
+            end += 1;
+            if unbounded && memo.visit(pc, end) {
+                // Revisited suffixes have already failed. Check during the
+                // scan, including non-title classes such as OUTLAWS' dot.
+                return end - 1;
+            }
+        }
+        if cache && (end < limit || limit == self.input.len()) {
+            self.title_runs[1] = self.title_runs[0];
+            self.title_runs[0] = Some((pos, end));
+        }
+        end
+    }
+}
+
 struct Pattern {
     name: &'static str,
     ops: Vec<Op>,
@@ -440,8 +600,10 @@ struct Pattern {
     // All but SPORTS and OUTLAWS/ALIAS start with a word plus a greedy
     // title class. Later word starts in the same run cannot add a match.
     title: Option<Class>,
-    first: Vec<(Class, bool)>,
-    required: Vec<Vec<usize>>,
+    first: Vec<Lookahead>,
+    required: Vec<Bloom>,
+    union_mask: Bloom,
+    needs_digit: bool,
 }
 
 impl Pattern {
@@ -451,46 +613,102 @@ impl Pattern {
             pos: 0,
         }
         .parse();
-        let required = requirements(&expr);
-        let mut ops = vec![Op::Accept];
-        let entry = compile(&expr, 0, &mut ops);
-        let title = match ops[entry] {
-            Op::Byte(_, next) => match ops[next] {
-                Op::Repeat(c, _, _, _) => Some(c),
+        fn needs_digit(expr: &Expr) -> bool {
+            match expr {
+                Expr::Byte(c) => (0..=127u8)
+                    .filter(|&b| c.contains(b))
+                    .all(|b| b.is_ascii_digit()),
+                Expr::Sequence(seq) => seq.iter().any(needs_digit),
+                Expr::Alt(alts) => alts.iter().all(needs_digit),
+                Expr::Repeat(e, min, _) => *min > 0 && needs_digit(e),
+                _ => false,
+            }
+        }
+        let needs_digit = needs_digit(&expr);
+        let mut union_mask = [0; 4];
+        let required = requirements(&expr)
+            .into_iter()
+            .filter(|mask| {
+                if mask.iter().map(|word| word.count_ones()).sum::<u32>() == 1 {
+                    for i in 0..4 {
+                        union_mask[i] |= mask[i];
+                    }
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        let top = match &expr {
+            Expr::Alt(alts) if alts.len() == 1 => &alts[0],
+            _ => &expr,
+        };
+        let title = match top {
+            Expr::Sequence(seq) => match seq.get(1) {
+                Some(Expr::Repeat(e, _, _)) => match **e {
+                    Expr::Byte(c) => Some(c),
+                    _ => None,
+                },
                 _ => None,
             },
             _ => None,
         };
-        // Every edge points to an earlier instruction, so FIRST sets can be
-        // computed in one pass. Skip impossible greedy backtracking positions.
-        let mut first: Vec<(Class, bool)> = Vec::with_capacity(ops.len());
+        let mut ops = vec![Op::Accept];
+        let entry = compile(&expr, 0, &mut ops);
+        let mut first: Vec<Lookahead> = Vec::with_capacity(ops.len());
         for op in &ops {
-            let (mut c, nullable) = match *op {
-                Op::Accept => (Class::default(), true),
-                Op::Byte(c, _) => (c, false),
-                Op::Repeat(c, min, _, next) => {
-                    let mut c = c;
-                    if min == 0 {
-                        for (dst, src) in c.0.iter_mut().zip(first[next].0.0) {
-                            *dst |= src;
-                        }
+            let mut look = match *op {
+                Op::Accept => Lookahead {
+                    first0: Class::default(),
+                    first1: Class::default(),
+                    min_rem: 0,
+                },
+                Op::Byte(c, next) => Lookahead {
+                    first0: c,
+                    first1: first[next].first0,
+                    min_rem: 1 + first[next].min_rem,
+                },
+                Op::TailRepeat(c, min, end_c) => Lookahead {
+                    first0: if min > 0 { c } else { c.union(end_c) },
+                    first1: if min > 1 { c } else { c.union(end_c) },
+                    min_rem: min + 1,
+                },
+                Op::Repeat(c, min, max, next) => {
+                    let rest = first[next];
+                    Lookahead {
+                        first0: if min > 0 { c } else { c.union(rest.first0) },
+                        first1: if min > 1 {
+                            c
+                        } else {
+                            let second = if max > 1 {
+                                c.union(rest.first0)
+                            } else {
+                                rest.first0
+                            };
+                            if min == 0 {
+                                second.union(rest.first1)
+                            } else {
+                                second
+                            }
+                        },
+                        min_rem: min + rest.min_rem,
                     }
-                    (c, min == 0 && first[next].1)
                 }
-                Op::Split(a, b) => {
-                    let mut c = first[a].0;
-                    for (dst, src) in c.0.iter_mut().zip(first[b].0.0) {
-                        *dst |= src;
-                    }
-                    (c, first[a].1 || first[b].1)
-                }
+                Op::Split(a, b) => Lookahead {
+                    first0: first[a].first0.union(first[b].first0),
+                    first1: first[a].first1.union(first[b].first1),
+                    min_rem: first[a].min_rem.min(first[b].min_rem),
+                },
                 Op::Before(next) | Op::After(next) | Op::End(next) => first[next],
             };
-            // A nullable continuation can accept without looking at a byte.
-            if nullable {
-                c = Class([u64::MAX; 4]);
+            // Nullable prefixes must never reject a valid short continuation.
+            if look.min_rem == 0 {
+                look.first0 = Class([u64::MAX; 4]);
             }
-            first.push((c, nullable));
+            if look.min_rem < 2 {
+                look.first1 = Class([u64::MAX; 4]);
+            }
+            first.push(look);
         }
         Self {
             name,
@@ -499,6 +717,8 @@ impl Pattern {
             title,
             first,
             required,
+            union_mask,
+            needs_digit,
         }
     }
 
@@ -506,10 +726,15 @@ impl Pattern {
         &self,
         mut pc: usize,
         mut pos: usize,
-        input: &[u8],
+        subject: &mut Subject<'_>,
         budget: &mut usize,
+        memo: &mut Memo,
     ) -> Result<Option<usize>, ()> {
+        let input = subject.input;
         loop {
+            if memo.visit(pc, pos) {
+                return Ok(None);
+            }
             if *budget == 0 {
                 return Err(());
             }
@@ -523,30 +748,47 @@ impl Pattern {
                     pc = next;
                 }
                 Op::Repeat(c, min, max, next) => {
-                    let mut end = pos;
                     let limit = input.len().min(pos.saturating_add(max));
-                    while end < limit && c.contains(input[end]) {
-                        end += 1;
-                    }
+                    let end = subject.repeat_end(c, pos, limit, memo, pc, max == usize::MAX);
                     if end - pos < min {
                         return Ok(None);
                     }
-                    let (first, nullable) = self.first[next];
+                    let look = self.first[next];
                     for candidate in (pos + min..=end).rev() {
-                        if !nullable
-                            && (candidate == input.len() || !first.contains(input[candidate]))
-                        {
+                        if !look.matches(input, candidate) {
                             continue;
                         }
-                        if let Some(end) = self.run(next, candidate, input, budget)? {
+                        if let Some(end) = self.run(next, candidate, subject, budget, memo)? {
                             return Ok(Some(end));
                         }
                     }
                     return Ok(None);
                 }
+                Op::TailRepeat(c, min, end_c) => {
+                    let mut end = subject.repeat_end(c, pos, input.len(), memo, pc, true);
+                    if end - pos < min {
+                        return Ok(None);
+                    }
+                    if end < input.len() && end_c.contains(input[end]) {
+                        return Ok(Some(end + 1));
+                    }
+                    // The final byte is separate from the repeat's minimum.
+                    while end > pos + min {
+                        if end_c.contains(input[end - 1]) {
+                            return Ok(Some(end));
+                        }
+                        end -= 1;
+                    }
+                    return Ok(None);
+                }
                 Op::Split(first, second) => {
-                    if let Some(end) = self.run(first, pos, input, budget)? {
-                        return Ok(Some(end));
+                    if self.first[first].matches(input, pos) {
+                        if let Some(end) = self.run(first, pos, subject, budget, memo)? {
+                            return Ok(Some(end));
+                        }
+                    }
+                    if !self.first[second].matches(input, pos) {
+                        return Ok(None);
                     }
                     pc = second;
                 }
@@ -573,14 +815,38 @@ impl Pattern {
         }
     }
 
+    #[cfg(test)]
     fn find<'a>(&self, input: &'a [u8], budget: &mut usize) -> Result<Option<&'a [u8]>, ()> {
+        let mut subject = Subject {
+            input,
+            title_runs: [None; 2],
+            last_digit: input.iter().rposition(u8::is_ascii_digit),
+        };
+        self.find_in(&mut subject, budget)
+    }
+
+    fn find_in<'a>(
+        &self,
+        subject: &mut Subject<'a>,
+        budget: &mut usize,
+    ) -> Result<Option<&'a [u8]>, ()> {
+        let input = subject.input;
+        let last_start = if self.needs_digit {
+            let Some(last_digit) = subject.last_digit else {
+                return Ok(None);
+            };
+            last_digit
+        } else {
+            input.len()
+        };
+        let mut memo = Memo::new(self.ops.len(), input.len());
         let mut start = 0;
-        while start < input.len() {
+        while start < input.len() && start <= last_start {
             if !Class::word().contains(input[start]) {
                 start += 1;
                 continue;
             }
-            if let Some(end) = self.run(self.entry, start, input, budget)? {
+            if let Some(end) = self.run(self.entry, start, subject, budget, &mut memo)? {
                 return Ok(Some(&input[start..end]));
             }
             start += 1;
@@ -610,32 +876,53 @@ unsafe fn check(
     } else {
         unsafe { slice::from_raw_parts(input, input_len) }
     };
-    if std::str::from_utf8(input).is_err() {
-        return -1;
-    }
     // PHP's byte-mode PCRE can use locale-specific character tables. Decline
     // non-ASCII, and bounded-work exhaustion, rather than guessing their result.
-    if !input.is_ascii() || input_len > 4096 {
+    if !input.is_ascii() {
+        return if std::str::from_utf8(input).is_err() {
+            -1
+        } else {
+            -2
+        };
+    }
+    if input_len > 4096 {
         return -2;
     }
     let patterns =
         compiled.get_or_init(|| source.iter().map(|&(n, r)| Pattern::new(n, r)).collect());
-    let mut pairs = [0u64; 256];
-    for pair in input.windows(2) {
-        let id = usize::from(pair[0].to_ascii_lowercase()) * 128
-            + usize::from(pair[1].to_ascii_lowercase());
-        pairs[id / 64] |= 1 << (id % 64);
+    let mut bloom = [0u64; 4];
+    let mut last_digit = None;
+    for (pos, pair) in input.windows(2).enumerate() {
+        if pair[0].is_ascii_digit() {
+            last_digit = Some(pos);
+        }
+        let hash = ((pair[0].to_ascii_lowercase() as usize * 31)
+            ^ pair[1].to_ascii_lowercase() as usize)
+            & 255;
+        bloom[hash >> 6] |= 1u64 << (hash & 63);
     }
+    if input.last().is_some_and(u8::is_ascii_digit) {
+        last_digit = Some(input.len() - 1);
+    }
+    let mut subject = Subject {
+        input,
+        title_runs: [None; 2],
+        last_digit,
+    };
     let mut budget = 100_000;
     for pattern in patterns {
-        if pattern.required.iter().any(|constraint| {
-            !constraint
+        if (bloom[0] & pattern.union_mask[0]) != pattern.union_mask[0]
+            || (bloom[1] & pattern.union_mask[1]) != pattern.union_mask[1]
+            || (bloom[2] & pattern.union_mask[2]) != pattern.union_mask[2]
+            || (bloom[3] & pattern.union_mask[3]) != pattern.union_mask[3]
+            || pattern
+                .required
                 .iter()
-                .any(|&id| pairs[id / 64] & (1 << (id % 64)) != 0)
-        }) {
+                .any(|&mask| !intersects(bloom, mask))
+        {
             continue;
         }
-        match pattern.find(input, &mut budget) {
+        match pattern.find_in(&mut subject, &mut budget) {
             Ok(Some(matched)) => {
                 let len = pattern.name.len() + 1 + matched.len();
                 if out_buf.is_null() || out_cap < len {
@@ -700,6 +987,133 @@ mod tests {
     fn fixed_patterns_compile() {
         for &(name, regex) in TV.iter().chain(MOVIE).chain(GAME).chain(APP) {
             Pattern::new(name, regex);
+        }
+    }
+
+    #[test]
+    fn nested_repeats_have_linear_work() {
+        let pattern = Pattern::new(
+            "stress",
+            r#"\w[\-\w.',;& ]+(19|20)\d\d[\-\w.',;& ]+(480|720|1080|2160)[ip]?[\-\w.',;& ]+(BluRay|BDRip|DVDRip|HDTV|WEB-?DL|WEB-?RIP)[\-\w.',;& ]+\w"#,
+        );
+        let input = format!("Title.{}BluRay!", "2023.1080p.".repeat(150));
+        let mut budget = 100_000;
+        assert_eq!(pattern.find(input.as_bytes(), &mut budget), Ok(None));
+    }
+
+    #[test]
+    fn tail_repeat_preserves_minimum_and_greedy_span() {
+        let pattern = Pattern::new("tail", r#"\w[.a]+\w"#);
+        for (input, expected) in [
+            ("X.a!", Some("X.a")),
+            ("Xa!", None),
+            ("X..z!", Some("X..z")),
+            ("X.aa..a!", Some("X.aa..a")),
+        ] {
+            assert_eq!(
+                pattern.find(input.as_bytes(), &mut 100_000).unwrap(),
+                expected.map(str::as_bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn optimized_states_match_exhaustive_reference_backtracking() {
+        fn reference(expr: &Expr, input: &[u8], pos: usize) -> Vec<usize> {
+            match expr {
+                Expr::Byte(c) => {
+                    if pos < input.len() && c.contains(input[pos]) {
+                        vec![pos + 1]
+                    } else {
+                        vec![]
+                    }
+                }
+                Expr::Sequence(seq) => seq.iter().fold(vec![pos], |positions, e| {
+                    positions
+                        .into_iter()
+                        .flat_map(|p| reference(e, input, p))
+                        .collect()
+                }),
+                Expr::Alt(alts) => alts.iter().flat_map(|e| reference(e, input, pos)).collect(),
+                Expr::Repeat(e, min, max) => {
+                    let mut layers = vec![vec![pos]];
+                    for _ in 0..(*max).min(input.len() + 1) {
+                        let next: Vec<_> = layers
+                            .last()
+                            .unwrap()
+                            .iter()
+                            .flat_map(|&p| reference(e, input, p))
+                            .collect();
+                        if next.is_empty() {
+                            break;
+                        }
+                        layers.push(next);
+                    }
+                    layers
+                        .into_iter()
+                        .enumerate()
+                        .rev()
+                        .filter(|(n, _)| n >= min)
+                        .flat_map(|(_, positions)| positions)
+                        .collect()
+                }
+                Expr::Before if pos == 0 || !input[pos - 1].is_ascii_digit() => vec![pos],
+                Expr::After if pos == input.len() || !input[pos].is_ascii_digit() => vec![pos],
+                Expr::End
+                    if pos == input.len() || (pos + 1 == input.len() && input[pos] == b'\n') =>
+                {
+                    vec![pos]
+                }
+                _ => vec![],
+            }
+        }
+        for regex in [
+            r#"\w[.a1]+\w"#,
+            r#"\w[.a1]+(a)?[.a1]+\w"#,
+            r#"\w[.a1]+(aa|a1|a)[.a1]+(a|1)[.a1]+\w"#,
+            r#"\w[.a1]*(a|a1)?[.a1]+\w"#,
+            r#"\w[.a1]+a?1?[.a1]+\w"#,
+            r#"\w[.a1]+a{1,3}[.a1]+\w"#,
+            r#"\w[.a1]+(?<!\d)1(?!\d)[.a1]+\w"#,
+            r#"\w[.a1]+(a|1)[.a1]+$"#,
+        ] {
+            let expr = Parser {
+                bytes: regex.as_bytes(),
+                pos: 0,
+            }
+            .parse();
+            let pattern = Pattern::new("reference", regex);
+            for len in 0..=6u32 {
+                for mut code in 0..5usize.pow(len) {
+                    let mut input = vec![0; len as usize];
+                    for byte in &mut input {
+                        *byte = b"a1.!\n"[code % 5];
+                        code /= 5;
+                    }
+                    let expected = (0..input.len()).find_map(|start| {
+                        reference(&expr, &input, start)
+                            .first()
+                            .map(|&end| (start, end))
+                    });
+                    let mut subject = Subject {
+                        input: &input,
+                        title_runs: [None; 2],
+                        last_digit: input.iter().rposition(u8::is_ascii_digit),
+                    };
+                    let mut memo = Memo::new(pattern.ops.len(), input.len());
+                    let mut actual = None;
+                    for start in 0..input.len() {
+                        if let Some(end) = pattern
+                            .run(pattern.entry, start, &mut subject, &mut 100_000, &mut memo)
+                            .unwrap()
+                        {
+                            actual = Some((start, end));
+                            break;
+                        }
+                    }
+                    assert_eq!(actual, expected, "{regex} {input:?}");
+                }
+            }
         }
     }
 
