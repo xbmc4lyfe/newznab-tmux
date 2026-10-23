@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace App\Services\Predb\Feeds\Sources;
 
 use App\Services\Predb\Feeds\PredbFeedEntry;
+use App\Support\RustPipelineLibrary;
 use Carbon\CarbonImmutable;
+use FFI;
 use RuntimeException;
 use SimpleXMLElement;
 use Throwable;
@@ -22,6 +24,12 @@ use Throwable;
 final class RssFeedSource extends BoundedHttpFeedSource
 {
     private const MAXIMUM_ITEMS = 5000;
+
+    private const NATIVE_CDEF = <<<'C'
+        ssize_t nntmux_predb_xml_rss(const char *xml, size_t len, uint32_t flags, size_t page_size, char *out_buf, size_t out_cap);
+        C;
+
+    private static FFI|false|null $native = null;
 
     public function __construct(
         private readonly string $sourceKey,
@@ -71,6 +79,10 @@ final class RssFeedSource extends BoundedHttpFeedSource
     {
         if (strlen($xml) > $this->maximumBodyBytes) {
             throw $this->bodyLimitException();
+        }
+        $output = $this->nativeItems($xml);
+        if ($output !== null) {
+            return $this->entriesFromNative($output);
         }
         if (preg_match('/<!(?:DOCTYPE|ENTITY)\b/i', $xml) === 1) {
             throw new RuntimeException($this->sourceLabel.' returned an invalid RSS document.');
@@ -128,6 +140,63 @@ final class RssFeedSource extends BoundedHttpFeedSource
             if (count($entries) >= $this->pageSize) {
                 break;
             }
+        }
+
+        return $entries;
+    }
+
+    /**
+     * Rust item output, or null when PHP must parse the document (library missing, or any
+     * document outside the reproduced XML subset, including every invalid one).
+     */
+    private function nativeItems(string $xml): ?string
+    {
+        $ffi = self::$native ??= RustPipelineLibrary::resolveDomain('predb_xml_catalogues', self::NATIVE_CDEF) ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        $flags = ($this->spacedTitles ? 1 : 0) | ($this->stripDisplaySizeSuffix ? 2 : 0) | ($this->mapCategory ? 4 : 0);
+        $length = strlen($xml);
+        $capacity = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, $length + 64, $capacity);
+        if ($scratch === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_predb_xml_rss($xml, $length, $flags, $this->pageSize, $scratch, $capacity);
+        if (is_int($written) && $written < -1) {
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_predb_xml_rss($xml, $length, $flags, $this->pageSize, $scratch, $capacity);
+        }
+
+        return is_int($written) && $written > 0 ? FFI::string($scratch, $written) : null;
+    }
+
+    /**
+     * @return list<PredbFeedEntry>
+     */
+    private function entriesFromNative(string $output): array
+    {
+        $parts = explode("\0", substr($output, 1));
+        $entries = [];
+        for ($index = 0, $last = count($parts) - 1; $index < $last; $index += 3) {
+            $category = $parts[$index + 1];
+            $date = $parts[$index + 2];
+            // "\x01" marks an exact RFC 2822 date that Rust already converted to UTC wall time.
+            $publishedAt = $date !== '' && $date[0] === "\x01"
+                ? new CarbonImmutable(substr($date, 1), 'UTC')
+                : $this->parseDate($date);
+            $entries[] = new PredbFeedEntry(
+                title: $parts[$index],
+                source: $this->sourceLabel,
+                category: $category !== '' ? $category : null,
+                predate: $this->publicationDatesOnly ? null : $publishedAt,
+                listedAt: $this->publicationDatesOnly ? $publishedAt : null,
+            );
         }
 
         return $entries;
