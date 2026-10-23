@@ -1195,6 +1195,122 @@ class VerifiedCollectionPolicyTest extends ReleaseVerificationCandidatesTest
             'A promotion backlog cannot keep its inventory indefinitely.');
     }
 
+    public function test_partial_promotion_and_allowance_skip_uploads_past_their_partial_attempt_window(): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $this->limits();
+        config(['release_verification.partial_after_hours' => 4]);
+        $expiry = (int) config('release_verification.expiry_hours');
+        $row = static fn (string $name, int $uniqueHoursAgo, string $dueAt): array => [
+            'identity' => sha1($name),
+            'source_identity' => sha1($name),
+            'groups_id' => 1,
+            'manifest_path' => hash('sha256', $name).'.json.gz',
+            'manifest_bytes' => 0,
+            'manifest_hash' => hash('sha256', $name),
+            'status' => 'waiting_upload',
+            'version' => 1,
+            'last_unique_at' => now()->subHours($uniqueHoursAgo)->format('Y-m-d H:i:s'),
+            'next_attempt_at' => $dueAt,
+        ];
+        DB::table('release_verification_candidates')->insert([
+            $row('overdue-ancient', $expiry + 10, now()->subHours($expiry + 10)->format('Y-m-d H:i:s')),
+            $row('overdue-retried', $expiry + 5, now()->subMinutes(2)->format('Y-m-d H:i:s')),
+            $row('owed', $expiry + 1, now()->subMinute()->format('Y-m-d H:i:s')),
+        ]);
+        $repository = app(CandidateRepository::class);
+        $candidates = DB::table('release_verification_candidates')->orderBy('id')->get()->keyBy('source_identity');
+
+        $this->assertFalse($repository->partialAllowed($candidates[sha1('overdue-ancient')]));
+        $this->assertFalse($repository->partialAllowed($candidates[sha1('overdue-retried')]));
+        $this->assertTrue($repository->partialAllowed($candidates[sha1('owed')]));
+
+        $this->assertSame(1, $repository->promotePartial(1));
+        $this->assertSame(
+            [
+                sha1('overdue-ancient') => 'waiting_upload',
+                sha1('overdue-retried') => 'waiting_upload',
+                sha1('owed') => 'ready',
+            ],
+            DB::table('release_verification_candidates')->orderBy('id')->pluck('status', 'source_identity')->all()
+        );
+    }
+
+    /** @return array<string, array{int, int}> */
+    public static function expiryCursorPrefixes(): array
+    {
+        return ['one page' => [1000, 1], 'past the per-pass page cap' => [10000, 2]];
+    }
+
+    #[DataProvider('expiryCursorPrefixes')]
+    public function test_candidate_expiry_pages_past_terminal_and_owed_prefixes_across_passes(int $prefix, int $passes): void
+    {
+        $this->publicationSchema(partialColumns: true);
+        $this->limits();
+        config(['release_verification.partial_after_hours' => 4]);
+        $expiry = (int) config('release_verification.expiry_hours');
+        $terminalAt = now()->subHours($expiry + 10)->format('Y-m-d H:i:s');
+        $owedAt = now()->subHours($expiry + 1)->format('Y-m-d H:i:s');
+        $overdueAt = now()->subHours($expiry + 5)->format('Y-m-d H:i:s');
+        $rows = [];
+        for ($n = 1; $n <= $prefix; $n++) {
+            $isOwed = $n === $prefix;
+            $rows[] = [
+                'identity' => sha1('prefix-'.$n),
+                'source_identity' => sha1('prefix-'.$n),
+                'groups_id' => 1,
+                'manifest_path' => '',
+                'manifest_bytes' => 0,
+                'manifest_hash' => hash('sha256', 'prefix-'.$n),
+                'status' => $isOwed ? 'waiting_upload' : 'expired',
+                'version' => 1,
+                'last_unique_at' => $isOwed ? $owedAt : $terminalAt,
+                'next_attempt_at' => $isOwed ? $owedAt : $terminalAt,
+            ];
+        }
+        $rows[] = [
+            'identity' => sha1('overdue-tail'),
+            'source_identity' => sha1('overdue-tail'),
+            'groups_id' => 1,
+            'manifest_path' => '',
+            'manifest_bytes' => 0,
+            'manifest_hash' => hash('sha256', 'overdue-tail'),
+            'status' => 'waiting_upload',
+            'version' => 1,
+            'last_unique_at' => $overdueAt,
+            'next_attempt_at' => $overdueAt,
+        ];
+        foreach (array_chunk($rows, 500) as $chunk) {
+            DB::table('release_verification_candidates')->insert($chunk);
+        }
+
+        for ($pass = 1; $pass <= $passes; $pass++) {
+            app(CandidateRepository::class)->expire();
+        }
+
+        $this->assertSame('expired', DB::table('release_verification_candidates')->where('source_identity', sha1('overdue-tail'))->value('status'));
+        $this->assertSame('waiting_upload', DB::table('release_verification_candidates')->where('source_identity', sha1('prefix-'.$prefix))->value('status'));
+
+        $this->travel(4)->hours();
+        $this->limits();
+        app(CandidateRepository::class)->expire();
+
+        $this->assertSame('expired', DB::table('release_verification_candidates')->where('source_identity', sha1('prefix-'.$prefix))->value('status'),
+            'After wrapping at the end of the table, the previously owed candidate expires on the next sweep.');
+
+        // A revived candidate row at the start of the table is visited and expired once due, even when the cursor starts mid-table.
+        $revivedHash = hex2bin(sha1('prefix-1'));
+        $revivedCollection = $this->collectionForPolicy('movie.mkv', 3, $revivedHash !== false ? $revivedHash : null);
+        app(CandidateRepository::class)->archive($revivedCollection);
+        $this->assertSame('waiting_upload', DB::table('release_verification_candidates')->where('source_identity', sha1('prefix-1'))->value('status'));
+
+        $this->travel($expiry + 5)->hours();
+        $this->limits();
+        app(CandidateRepository::class)->expire();
+
+        $this->assertSame('expired', DB::table('release_verification_candidates')->where('source_identity', sha1('prefix-1'))->value('status'));
+    }
+
     public function test_the_settle_sweep_pages_through_held_releases_across_passes(): void
     {
         $this->publicationSchema(partialColumns: true);
