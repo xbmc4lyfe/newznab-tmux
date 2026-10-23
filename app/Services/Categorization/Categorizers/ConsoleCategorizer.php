@@ -7,10 +7,73 @@ namespace App\Services\Categorization\Categorizers;
 use App\Models\Category;
 use App\Services\Categorization\CategorizationResult;
 use App\Services\Categorization\ReleaseContext;
+use App\Support\RustPipelineLibrary;
+use FFI;
+use Throwable;
 
 class ConsoleCategorizer extends AbstractCategorizer
 {
     protected int $priority = 35;
+
+    /**
+     * Native (Rust FFI) bindings. Rule ids returned by the library index {@see self::NATIVE_RULES}.
+     */
+    private const string NATIVE_CDEF = <<<'CDEF'
+        int64_t nntmux_categorize_console(const char *name, size_t name_len, uint32_t flags);
+CDEF;
+
+    /** @var array<int, string> */
+    private const array NATIVE_RULES = [
+        0 => 'ps4',
+        1 => 'ps3',
+        2 => 'psvita',
+        3 => 'psp',
+        4 => 'xboxone',
+        5 => 'xbox360',
+        6 => 'xbox',
+        7 => 'wiiu',
+        8 => 'wii',
+        9 => '3ds',
+        10 => 'nds',
+        11 => 'retro_console',
+    ];
+
+    /** Returned by the library instead of a result when `shouldSkip` is true. */
+    private const int NATIVE_SKIP = 1 << 62;
+
+    /** Resolved library handle: null until first use, false when the library is unavailable. */
+    private static FFI|false|null $nativeFfi = null;
+
+    private static ?CategorizationResult $nativeNoMatch = null;
+
+    /** Native result computed by `shouldSkip()` for the context that `categorize()` receives next. */
+    private ?ReleaseContext $nativeContext = null;
+
+    private int $nativePacked = 0;
+
+    private static function resolveNative(): FFI|false
+    {
+        return self::$nativeFfi = RustPipelineLibrary::resolveDomain('categorizers', self::NATIVE_CDEF) ?? false;
+    }
+
+    /**
+     * Run the native categorizer without the skip check; null when the library is unavailable or declines.
+     */
+    private function nativeCall(ReleaseContext $context): ?int
+    {
+        $ffi = self::$nativeFfi ?? self::resolveNative();
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $packed = $ffi->nntmux_categorize_console($context->releaseName, \strlen($context->releaseName), ($context->categorizeForeign ? 1 : 0) | ($context->catWebDL ? 2 : 0));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return \is_int($packed) && $packed >= 0 ? $packed : null;
+    }
 
     public function getName(): string
     {
@@ -18,6 +81,38 @@ class ConsoleCategorizer extends AbstractCategorizer
     }
 
     public function shouldSkip(ReleaseContext $context): bool
+    {
+        // One native call decides the skip and, when processing continues, the categorization
+        // that the pipe requests next for the same (immutable) context.
+        $ffi = self::$nativeFfi ?? self::resolveNative();
+        if ($ffi !== false) {
+            try {
+                // @phpstan-ignore method.notFound
+                $packed = $ffi->nntmux_categorize_console($context->releaseName, \strlen($context->releaseName), (($context->categorizeForeign ? 1 : 0) | ($context->catWebDL ? 2 : 0)) | 4);
+            } catch (Throwable) {
+                $packed = -1;
+            }
+            if (\is_int($packed) && $packed >= 0) {
+                if ($packed === self::NATIVE_SKIP) {
+                    $this->nativeContext = null;
+
+                    return true;
+                }
+                $this->nativeContext = $context;
+                $this->nativePacked = $packed;
+
+                return false;
+            }
+        }
+        $this->nativeContext = null;
+
+        return $this->shouldSkipPhp($context);
+    }
+
+    /**
+     * Pure-PHP skip check (fallback when the native library is unavailable).
+     */
+    public function shouldSkipPhp(ReleaseContext $context): bool
     {
         if ($context->hasAdultMarkers()) {
             return true;
@@ -31,6 +126,30 @@ class ConsoleCategorizer extends AbstractCategorizer
     }
 
     public function categorize(ReleaseContext $context): CategorizationResult
+    {
+        if ($this->nativeContext === $context) {
+            $packed = $this->nativePacked;
+            $this->nativeContext = null;
+        } else {
+            $packed = $this->nativeCall($context);
+        }
+        if ($packed !== null) {
+            if ($packed === 0) {
+                return self::$nativeNoMatch ??= CategorizationResult::noMatch();
+            }
+            $rule = self::NATIVE_RULES[$packed >> 32] ?? null;
+            if ($rule !== null) {
+                return new CategorizationResult($packed & 0xFFFF, (($packed >> 16) & 0xFFFF) / 1000, $rule);
+            }
+        }
+
+        return $this->categorizePhp($context);
+    }
+
+    /**
+     * Pure-PHP categorization (fallback when the native library is unavailable).
+     */
+    public function categorizePhp(ReleaseContext $context): CategorizationResult
     {
         $name = $context->releaseName;
         if ($result = $this->checkPS4($name)) {
