@@ -208,6 +208,85 @@ final class RustPipelineLibrary
         return \count($lines) === $count ? $lines : null;
     }
 
+    /**
+     * Compute a single binary identity MD5 hex hash via Rust FFI, or null when declined/unavailable.
+     */
+    public static function binaryIdentityHash(string $subject, string $poster, int $fileNumber, ?string $libraryPath = null): ?string
+    {
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+        $scratch = self::ensureScratch($ffi, 64);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_binary_identity_hash(
+            $subject,
+            \strlen($subject),
+            $poster,
+            \strlen($poster),
+            $fileNumber,
+            $scratch
+        );
+
+        return $written === 32 ? FFI::string($scratch, 32) : null;
+    }
+
+    /**
+     * Batch compute binary identity MD5 hex hashes for `count` pairs of `(first, second)` strings.
+     *
+     * @param  list<string>  $flatPairs
+     * @return list<string>|null 32-char hex string per record (or '' when declined to PHP fallback), or null
+     */
+    public static function binaryIdentityHashesBatch(array $flatPairs, int $count, ?string $libraryPath = null, bool &$allResolved = false): ?array
+    {
+        $allResolved = false;
+        if ($count === 0) {
+            $allResolved = true;
+
+            return [];
+        }
+        $ffi = self::resolve($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+
+        $joined = implode("\0", $flatPairs);
+        $needed = $count * 33 + 64;
+        $scratch = self::ensureScratch($ffi, $needed);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_binary_identity_hash_batch_nul($joined, \strlen($joined), $count, $scratch, self::$scratchCap);
+        if (! \is_int($written)) {
+            return null;
+        }
+        if ($written < -1) {
+            $scratch = self::ensureScratch($ffi, -$written);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_binary_identity_hash_batch_nul($joined, \strlen($joined), $count, $scratch, self::$scratchCap);
+        }
+        if (! \is_int($written) || $written < 0) {
+            return null;
+        }
+        if ($written === 0) {
+            return array_fill(0, $count, '');
+        }
+
+        $allResolved = $written === ($count * 33 - 1);
+        $lines = explode("\n", FFI::string($scratch, $written));
+
+        return \count($lines) === $count ? $lines : null;
+    }
+
     public static function resolve(?string $libraryPath = null): ?FFI
     {
         if (! \in_array(PHP_OS_FAMILY, ['Linux', 'Darwin'], true) || ! \extension_loaded('FFI')) {
@@ -242,6 +321,8 @@ final class RustPipelineLibrary
                     ssize_t nntmux_xref_extract_groups(const char *input, size_t input_len, char *out_buf, size_t out_cap);
                     ssize_t nntmux_xref_diff_tokens(const char *existing, size_t existing_len, const char *incoming, size_t incoming_len, char *out_buf, size_t out_cap);
                     ssize_t nntmux_xref_extract_batch_nul(const char *input, size_t input_len, uint32_t mode, char *out_buf, size_t out_cap);
+                    ssize_t nntmux_binary_identity_hash(const char *subject, size_t subject_len, const char *poster, size_t poster_len, int64_t file_number, char *out_hex32);
+                    ssize_t nntmux_binary_identity_hash_batch_nul(const char *input, size_t input_len, size_t count, char *out_buf, size_t out_cap);
                     C, $resolved);
 
                 // @phpstan-ignore method.notFound

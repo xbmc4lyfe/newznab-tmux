@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Binaries;
 
+use App\Support\RustPipelineLibrary;
 use App\Support\SqlError;
 use App\Support\Utf8;
 use Illuminate\Support\Facades\DB;
@@ -104,11 +105,13 @@ final class BinaryHandler
         $resolved = [];
         $pending = [];
         $indexesByArticleKey = [];
+        $hashesByIndex = \count($records) > 1 ? $this->identityHashesBatch($records) : null;
+
         foreach ($records as $index => $record) {
             $header = $record['header'];
             $collectionId = (int) $record['collection_id'];
             $fileNumber = (int) $record['file_number'];
-            $hash = $this->identityHash($header, $fileNumber);
+            $hash = $hashesByIndex[$index] ?? $this->identityHash($header, $fileNumber);
             $articleKey = $this->binaryLookupKey($hash, $collectionId);
 
             if (isset($this->articles[$articleKey])) {
@@ -508,8 +511,77 @@ final class BinaryHandler
         return $this->lastException;
     }
 
+    /**
+     * Compute binary identity hashes for a batch of header records.
+     *
+     * @param  array<int, array{header: array<string, mixed>, collection_id?: int, file_number: int}>  $records
+     * @return array<int, string>
+     */
+    public function identityHashesBatch(array $records, bool $useNative = true): array
+    {
+        if ($records === []) {
+            return [];
+        }
+
+        if ($useNative) {
+            $flatPairs = [];
+            foreach ($records as $record) {
+                $fileNumber = (int) $record['file_number'];
+                if ($fileNumber > 0) {
+                    $flatPairs[] = $fileNumber."\0\x01";
+                } else {
+                    $header = $record['header'];
+                    $flatPairs[] = ($header['matches'][1] ?? '')."\0".($header['From'] ?? '');
+                }
+            }
+            $allResolved = false;
+            $nativeHashes = RustPipelineLibrary::binaryIdentityHashesBatch($flatPairs, \count($records), null, $allResolved);
+            if ($nativeHashes !== null) {
+                if ($allResolved && array_is_list($records)) {
+                    return $nativeHashes;
+                }
+                $result = [];
+                $pos = 0;
+                foreach ($records as $index => $record) {
+                    $hash = $nativeHashes[$pos++];
+                    if ($hash === '') {
+                        $hash = $this->identityHashPhp($record['header'], (int) $record['file_number']);
+                    }
+                    $result[$index] = $hash;
+                }
+
+                return $result;
+            }
+        }
+
+        $result = [];
+        foreach ($records as $index => $record) {
+            $result[$index] = $this->identityHashPhp($record['header'], (int) $record['file_number']);
+        }
+
+        return $result;
+    }
+
     /** @param array<string, mixed> $header */
-    private function identityHash(array $header, int $fileNumber): string
+    public function identityHash(array $header, int $fileNumber, bool $useNative = true): string
+    {
+        if ($fileNumber > 0) {
+            return md5('file:'.$fileNumber);
+        }
+        if ($useNative) {
+            $subject = (string) ($header['matches'][1] ?? '');
+            $poster = (string) ($header['From'] ?? '');
+            $native = RustPipelineLibrary::binaryIdentityHash($subject, $poster, 0);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->identityHashPhp($header, $fileNumber);
+    }
+
+    /** @param array<string, mixed> $header */
+    public function identityHashPhp(array $header, int $fileNumber): string
     {
         if ($fileNumber > 0) {
             return md5('file:'.$fileNumber);
