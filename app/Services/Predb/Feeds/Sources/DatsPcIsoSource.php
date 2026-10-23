@@ -6,6 +6,8 @@ namespace App\Services\Predb\Feeds\Sources;
 
 use App\Services\Predb\Feeds\Contracts\CompleteCatalogueSource;
 use App\Services\Predb\Feeds\PredbFeedEntry;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use RuntimeException;
 use SimpleXMLElement;
 
@@ -18,6 +20,12 @@ use SimpleXMLElement;
  */
 final class DatsPcIsoSource extends BoundedHttpFeedSource implements CompleteCatalogueSource
 {
+    private const NATIVE_CDEF = <<<'C'
+        ssize_t nntmux_predb_xml_dats_pciso(const char *xml, size_t len, size_t max_records, char *out_buf, size_t out_cap);
+        C;
+
+    private static FFI|false|null $native = null;
+
     /** @var list<PredbFeedEntry>|null */
     private ?array $entries = null;
 
@@ -76,6 +84,17 @@ final class DatsPcIsoSource extends BoundedHttpFeedSource implements CompleteCat
         $this->entries = null;
         $this->acceptedCount = 0;
         $this->rejections = [];
+        $output = strlen($xml) <= $this->maximumBodyBytes ? $this->nativeExport($xml) : null;
+        if ($output !== null) {
+            $parts = explode("\0", substr($output, 1));
+            $unsupported = (int) array_shift($parts);
+            $entries = [];
+            foreach ($parts as $title) {
+                $entries[] = new PredbFeedEntry(title: $title, source: 'dats.site');
+            }
+
+            return $this->publish($entries, $unsupported);
+        }
         if (strlen($xml) > $this->maximumBodyBytes || ! mb_check_encoding($xml, 'UTF-8')
             || str_contains($xml, "\0") || preg_match('/<!(?:DOCTYPE|ENTITY)\b/i', $xml) === 1) {
             throw new RuntimeException('DATS_PCISO_1998 returned an invalid, oversized or entity-declaring export.');
@@ -163,11 +182,51 @@ final class DatsPcIsoSource extends BoundedHttpFeedSource implements CompleteCat
             $titles[mb_strtolower($title, 'UTF-8')] = true;
             $entries[] = new PredbFeedEntry(title: $title, source: 'dats.site');
         }
+
+        return $this->publish($entries, $unsupported);
+    }
+
+    /**
+     * @param  list<PredbFeedEntry>  $entries
+     * @return list<PredbFeedEntry>
+     */
+    private function publish(array $entries, int $unsupported): array
+    {
         $this->entries = $entries;
         $this->acceptedCount = count($entries);
         $this->rejections = $unsupported > 0 ? ['archive_file_metadata' => $unsupported] : [];
 
         return $entries;
+    }
+
+    /**
+     * Rust export output, or null when PHP must parse the export (library missing, or any export
+     * outside the reproduced XML subset, including every invalid one).
+     */
+    private function nativeExport(string $xml): ?string
+    {
+        $ffi = self::$native ??= RustPipelineLibrary::resolveDomain('predb_xml_catalogues', self::NATIVE_CDEF) ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        $length = strlen($xml);
+        $capacity = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, $length + 64, $capacity);
+        if ($scratch === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_predb_xml_dats_pciso($xml, $length, $this->maximumRecords, $scratch, $capacity);
+        if (is_int($written) && $written < -1) {
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_predb_xml_dats_pciso($xml, $length, $this->maximumRecords, $scratch, $capacity);
+        }
+
+        return is_int($written) && $written > 0 ? FFI::string($scratch, $written) : null;
     }
 
     private function validateHeader(SimpleXMLElement $header): void

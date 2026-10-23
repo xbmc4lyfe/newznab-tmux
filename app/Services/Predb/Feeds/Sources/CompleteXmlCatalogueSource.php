@@ -6,6 +6,8 @@ namespace App\Services\Predb\Feeds\Sources;
 
 use App\Services\Predb\Feeds\Contracts\CompleteCatalogueSource;
 use App\Services\Predb\Feeds\PredbFeedEntry;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
 use SimpleXMLElement;
@@ -16,6 +18,12 @@ use SimpleXMLElement;
  */
 abstract class CompleteXmlCatalogueSource extends BoundedHttpFeedSource implements CompleteCatalogueSource
 {
+    private const NATIVE_CDEF = <<<'C'
+        ssize_t nntmux_predb_xml_complete_catalogue(const char *xml, size_t len, size_t max_records, char *out_buf, size_t out_cap);
+        C;
+
+    private static FFI|false|null $native = null;
+
     /** @var list<PredbFeedEntry>|null */
     private ?array $entries = null;
 
@@ -87,6 +95,10 @@ abstract class CompleteXmlCatalogueSource extends BoundedHttpFeedSource implemen
         $this->acceptedCount = 0;
         $this->boundaryNormalizedCount = 0;
         $this->entries = null;
+        $output = strlen($xml) <= $this->maximumBodyBytes ? $this->nativeCatalogue($xml) : null;
+        if ($output !== null) {
+            return $this->entriesFromNative($output);
+        }
         if (strlen($xml) > $this->maximumBodyBytes || str_contains($xml, "\0")
             || preg_match('//u', $xml) !== 1 || preg_match('/<!(?:DOCTYPE|ENTITY)\b/i', $xml)
         ) {
@@ -154,6 +166,65 @@ abstract class CompleteXmlCatalogueSource extends BoundedHttpFeedSource implemen
             $entries[] = $entry;
             $boundaryNormalized += (int) $normalizedIds[$id];
         }
+
+        return $this->publish($entries, $rejections, $total, $boundaryNormalized);
+    }
+
+    /**
+     * Rust catalogue output, or null when PHP must parse the export (library missing, or any
+     * export outside the reproduced XML subset, including every invalid one).
+     */
+    private function nativeCatalogue(string $xml): ?string
+    {
+        $ffi = self::$native ??= RustPipelineLibrary::resolveDomain('predb_xml_catalogues', self::NATIVE_CDEF) ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        $length = strlen($xml);
+        $capacity = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, $length + 256, $capacity);
+        if ($scratch === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_predb_xml_complete_catalogue($xml, $length, $this->maximumRecords, $scratch, $capacity);
+        if (is_int($written) && $written < -1) {
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_predb_xml_complete_catalogue($xml, $length, $this->maximumRecords, $scratch, $capacity);
+        }
+
+        return is_int($written) && $written > 0 ? FFI::string($scratch, $written) : null;
+    }
+
+    /** @return list<PredbFeedEntry> */
+    private function entriesFromNative(string $output): array
+    {
+        $parts = explode("\0", substr($output, 1));
+        $rejections = [];
+        $offset = 3;
+        for ($reason = 0, $reasons = (int) $parts[2]; $reason < $reasons; $reason++, $offset += 2) {
+            $rejections[$parts[$offset]] = (int) $parts[$offset + 1];
+        }
+        $entries = [];
+        $label = $this->sourceLabel();
+        for ($count = count($parts); $offset < $count; $offset++) {
+            $entries[] = new PredbFeedEntry(title: $parts[$offset], source: $label);
+        }
+
+        return $this->publish($entries, $rejections, (int) $parts[0], (int) $parts[1]);
+    }
+
+    /**
+     * @param  list<PredbFeedEntry>  $entries
+     * @param  array<string, int>  $rejections
+     * @return list<PredbFeedEntry>
+     */
+    private function publish(array $entries, array $rejections, int $total, int $boundaryNormalized): array
+    {
         $this->rejections = $rejections;
         if ($rejections !== []) {
             Log::warning(strtoupper($this->key()).' export omitted ambiguous, nonliteral or duplicate catalogue records.', [
