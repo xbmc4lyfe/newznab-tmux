@@ -121,12 +121,7 @@ class TvNameChecker extends AbstractNameChecker
                     if ($written > 0) {
                         [$patternName, $matched] = explode("\0", FFI::string($buf, $written), 2);
 
-                        return NameFixResult::fromMatch(
-                            newName: $matched,
-                            method: $this->formatMethod($patternName),
-                            checkerName: $this->getName(),
-                            confidence: in_array($patternName, ['STREAMING_4K_HDR', 'STREAMING_HD'], true) ? 0.95 : (in_array($patternName, ['DAILY_SHOW', 'SPORTS', 'COMPLETE_SEASON', 'ANIME'], true) ? 0.80 : 0.85),
-                        );
+                        return $this->fromNativeMatch($patternName, $matched);
                     }
                 }
             } catch (\Throwable) {
@@ -135,6 +130,17 @@ class TvNameChecker extends AbstractNameChecker
         }
 
         return $this->checkPhp($release, $textstring);
+    }
+
+    /** Build the same result for individual and fused native matches. */
+    public function fromNativeMatch(string $patternName, string $matched): NameFixResult
+    {
+        return NameFixResult::fromMatch(
+            newName: $matched,
+            method: $this->formatMethod($patternName),
+            checkerName: $this->getName(),
+            confidence: in_array($patternName, ['STREAMING_4K_HDR', 'STREAMING_HD'], true) ? 0.95 : (in_array($patternName, ['DAILY_SHOW', 'SPORTS', 'COMPLETE_SEASON', 'ANIME'], true) ? 0.80 : 0.85),
+        );
     }
 
     /**

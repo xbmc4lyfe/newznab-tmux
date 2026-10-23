@@ -8,6 +8,8 @@ use App\Services\NameFixing\Checkers\AppNameChecker;
 use App\Services\NameFixing\Checkers\GameNameChecker;
 use App\Services\NameFixing\Checkers\MovieNameChecker;
 use App\Services\NameFixing\Checkers\TvNameChecker;
+use App\Services\NameFixing\Data\NameFixResult;
+use App\Services\NameFixing\NameCheckerService;
 use App\Services\NameFixing\Patterns\AppPatterns;
 use App\Services\NameFixing\Patterns\GamePatterns;
 use App\Services\NameFixing\Patterns\MoviePatterns;
@@ -146,6 +148,124 @@ class RustNameCheckersParityTest extends TestCase
         self::assertSame($expected, $raw, $domain.' '.bin2hex($input));
     }
 
+    private static function serviceFfi(): FFI
+    {
+        $cdef = (new \ReflectionClass(NameCheckerService::class))->getConstant('FFI_CDEF');
+        self::assertIsString($cdef);
+        $ffi = RustPipelineLibrary::resolveDomain('name_checker_service', $cdef);
+        self::assertNotNull($ffi, 'Build the release library with the fused exports.');
+
+        return $ffi;
+    }
+
+    #[DataProvider('cases')]
+    public function test_fused_service_preserves_results_and_wire_order(string $domain, string $input, bool $nativeRequired): void
+    {
+        $ffi = self::serviceFfi();
+        $release = (object) [];
+        $php = new NameCheckerService(useRust: false);
+        $rust = new NameCheckerService(useRust: true);
+        self::assertEquals($php->check($release, $input), $rust->check($release, $input));
+        self::assertEquals($php->checkAll($release, $input), $rust->checkAll($release, $input));
+        $missing = new NameCheckerService('/nonexistent/name-checkers.so', useRust: true);
+        self::assertEquals($php->check($release, $input), $missing->check($release, $input));
+        self::assertEquals($php->checkAll($release, $input), $missing->checkAll($release, $input));
+        $records = [];
+        foreach (array_keys(self::patterns()) as $idx => $checker) {
+            [$rc, $raw] = self::native($checker, $input);
+            if ($rc < 0) {
+                $nativeRequired = false;
+            } elseif ($rc > 0) {
+                $records[] = chr($idx)."\0".$raw;
+            }
+        }
+        foreach (['first', 'collect'] as $mode) {
+            $buf = $ffi->new('char[32768]');
+            $symbol = 'nntmux_name_check_all_'.$mode;
+            $written = $ffi->$symbol($input, strlen($input), $buf, 32768);
+            if (! $nativeRequired) {
+                // First may match before a later checker exhausts its budget.
+                if ($mode === 'collect') {
+                    self::assertLessThan(0, $written);
+                }
+
+                continue;
+            }
+            self::assertGreaterThanOrEqual(0, $written);
+            $expected = $mode === 'first' ? ($records[0] ?? '') : implode("\0", $records);
+            self::assertSame($expected, $written > 0 ? FFI::string($buf, $written) : '');
+        }
+    }
+
+    public function test_fused_capacity_errors_do_not_write_partial_records(): void
+    {
+        $ffi = self::serviceFfi();
+        $input = 'Show.S01E01.1080p.NF.WEB-DL-GROUP!Game.Name-OUTLAWS!Adobe.Photoshop.2024.v25.0-GROUP';
+        foreach (['first', 'collect'] as $mode) {
+            $symbol = 'nntmux_name_check_all_'.$mode;
+            $buf = $ffi->new('char[32768]');
+            $size = $ffi->$symbol($input, strlen($input), $buf, 32768);
+            self::assertGreaterThan(0, $size);
+            $raw = FFI::string($buf, $size);
+            self::assertSame($size, $ffi->$symbol($input, strlen($input), $buf, $size));
+            self::assertSame($raw, FFI::string($buf, $size));
+            FFI::memset($buf, 127, 32768);
+            self::assertSame(-3, $ffi->$symbol($input, strlen($input), $buf, $size - 1));
+            self::assertSame(str_repeat(chr(127), 32768), FFI::string($buf, 32768));
+            self::assertSame(-3, $ffi->$symbol($input, strlen($input), null, 0));
+            self::assertSame(-1, $ffi->$symbol(null, 1, null, 0));
+            self::assertSame(0, $ffi->$symbol(null, 0, null, 0));
+        }
+    }
+
+    public function test_fused_overlapping_checkers_and_binary_matches(): void
+    {
+        $release = (object) [];
+        $php = new NameCheckerService(useRust: false);
+        $rust = new NameCheckerService(useRust: true);
+        $input = implode('!', [self::fixtures()['tv']['STREAMING_HD'], self::fixtures()['movie']['UHD_HDR'], self::fixtures()['game']['OUTLAWS'], self::fixtures()['app']['ADOBE']]);
+        self::assertSame(['TV', 'Movie', 'Game', 'App'], $rust->checkAll($release, $input)->pluck('checkerName')->all());
+        self::assertEquals($php->check($release, $input), $rust->check($release, $input));
+        self::assertEquals($php->checkAll($release, $input), $rust->checkAll($release, $input));
+        $input = "Game.Na\0me-OUTLAWS!Adobe.Photoshop.2024.v25.0-GROUP";
+        self::assertEquals($php->check($release, $input), $rust->check($release, $input));
+        self::assertEquals($php->checkAll($release, $input), $rust->checkAll($release, $input));
+        $ffi = self::serviceFfi();
+        $buf = $ffi->new('char[32768]');
+        self::assertSame(-2, $ffi->nntmux_name_check_all_collect($input, strlen($input), $buf, 32768));
+    }
+
+    public function test_custom_registries_and_subclasses_keep_the_php_dispatch(): void
+    {
+        $release = (object) [];
+        $custom = new class extends TvNameChecker
+        {
+            public function getPriority(): int
+            {
+                return 0;
+            }
+
+            public function check(object $release, string $textstring): ?NameFixResult
+            {
+                return NameFixResult::fromMatch('custom', 'custom', 'custom');
+            }
+        };
+        $service = new NameCheckerService(useRust: true);
+        $service->addChecker($custom);
+        self::assertSame('custom', $service->check($release, 'no match')->newName);
+        self::assertSame('custom', $service->checkAll($release, 'no match')->first()->newName);
+        $service = new NameCheckerService(useRust: true);
+        $service->getCheckers()->splice(0, 4, [$custom]);
+        self::assertSame('custom', $service->check($release, 'no match')->newName);
+        self::assertSame('custom', $service->checkAll($release, 'no match')->first()->newName);
+        $service = new class(useRust: true) extends NameCheckerService
+        {
+            protected function registerDefaultCheckers(): void {}
+        };
+        self::assertNull($service->check($release, self::fixtures()['tv']['STREAMING_HD']));
+        self::assertCount(0, $service->checkAll($release, self::fixtures()['tv']['STREAMING_HD']));
+    }
+
     public function test_every_declared_pattern_has_a_positive_fixture_and_identical_rust_expression(): void
     {
         $source = file_get_contents(__DIR__.'/../../rust/pipeline-ffi/src/name_checkers.rs');
@@ -220,6 +340,10 @@ class RustNameCheckersParityTest extends TestCase
                     $input = substr_replace($input, $alphabet[$random(strlen($alphabet))], $pos, $random(2));
                 }
                 self::assertParity($domain, $input);
+                $php = new NameCheckerService(useRust: false);
+                $rust = new NameCheckerService(useRust: true);
+                self::assertEquals($php->check((object) [], $input), $rust->check((object) [], $input));
+                self::assertEquals($php->checkAll((object) [], $input), $rust->checkAll((object) [], $input));
             }
         }
     }
@@ -232,6 +356,19 @@ class RustNameCheckersParityTest extends TestCase
             self::assertParity('tv', 'Title.'.str_repeat('S01E01.', $repeats).'NOSOURCE');
         }
         self::assertParity('app', 'App.Name.v1.2.3.Multilingual1|GROUP');
+    }
+
+    public function test_qualified_fused_service_defaults_to_rust(): void
+    {
+        $service = new NameCheckerService;
+        self::assertTrue((new \ReflectionProperty($service, 'useRust'))->getValue($service));
+        $php = new NameCheckerService(useRust: false);
+        foreach (self::fixtures() as $fixtures) {
+            foreach ($fixtures as $input) {
+                self::assertEquals($php->check((object) [], $input), $service->check((object) [], $input));
+                self::assertEquals($php->checkAll((object) [], $input), $service->checkAll((object) [], $input));
+            }
+        }
     }
 
     public function test_unqualified_candidate_keeps_php_as_the_default(): void

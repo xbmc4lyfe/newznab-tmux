@@ -114,14 +114,7 @@ class AppNameChecker extends AbstractNameChecker
                     if ($written > 0) {
                         [$patternName, $matched] = explode("\0", FFI::string($buf, $written), 2);
 
-                        return NameFixResult::fromMatch(
-                            newName: $matched,
-                            method: $this->formatMethod($patternName),
-                            checkerName: $this->getName(),
-                            confidence: match ($patternName) {
-                                'WITH_KEYGEN' => 0.90, 'ADOBE', 'MICROSOFT' => 0.85, 'WITH_VERSION' => 0.70, default => 0.80
-                            },
-                        );
+                        return $this->fromNativeMatch($patternName, $matched);
                     }
                 }
             } catch (\Throwable) {
@@ -130,6 +123,19 @@ class AppNameChecker extends AbstractNameChecker
         }
 
         return $this->checkPhp($release, $textstring);
+    }
+
+    /** Build the same result for individual and fused native matches. */
+    public function fromNativeMatch(string $patternName, string $matched): NameFixResult
+    {
+        return NameFixResult::fromMatch(
+            newName: $matched,
+            method: $this->formatMethod($patternName),
+            checkerName: $this->getName(),
+            confidence: match ($patternName) {
+                'WITH_KEYGEN' => 0.90, 'ADOBE', 'MICROSOFT' => 0.85, 'WITH_VERSION' => 0.70, default => 0.80
+            },
+        );
     }
 
     /**

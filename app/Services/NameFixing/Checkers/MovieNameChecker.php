@@ -120,12 +120,7 @@ class MovieNameChecker extends AbstractNameChecker
                     if ($written > 0) {
                         [$patternName, $matched] = explode("\0", FFI::string($buf, $written), 2);
 
-                        return NameFixResult::fromMatch(
-                            newName: $matched,
-                            method: $this->formatMethod($patternName),
-                            checkerName: $this->getName(),
-                            confidence: in_array($patternName, ['UHD_HDR', 'UHD_REMUX', 'STREAMING_4K'], true) ? 0.95 : ($patternName === 'GENERIC' ? 0.70 : 0.85),
-                        );
+                        return $this->fromNativeMatch($patternName, $matched);
                     }
                 }
             } catch (\Throwable) {
@@ -134,6 +129,17 @@ class MovieNameChecker extends AbstractNameChecker
         }
 
         return $this->checkPhp($release, $textstring);
+    }
+
+    /** Build the same result for individual and fused native matches. */
+    public function fromNativeMatch(string $patternName, string $matched): NameFixResult
+    {
+        return NameFixResult::fromMatch(
+            newName: $matched,
+            method: $this->formatMethod($patternName),
+            checkerName: $this->getName(),
+            confidence: in_array($patternName, ['UHD_HDR', 'UHD_REMUX', 'STREAMING_4K'], true) ? 0.95 : ($patternName === 'GENERIC' ? 0.70 : 0.85),
+        );
     }
 
     /**

@@ -117,18 +117,8 @@ class GameNameChecker extends AbstractNameChecker
                     }
                     if ($written > 0) {
                         [$patternName, $matched] = explode("\0", FFI::string($buf, $written), 2);
-                        if ($patternName === 'OUTLAWS') {
-                            $matched = str_replace('OUTLAWS', 'PC GAME OUTLAWS', $matched);
-                        } elseif ($patternName === 'ALIAS') {
-                            $matched = str_replace('-ALiAS', ' PC GAME ALiAS', $matched);
-                        }
 
-                        return NameFixResult::fromMatch(
-                            newName: $matched,
-                            method: $this->formatMethod($patternName),
-                            checkerName: $this->getName(),
-                            confidence: in_array($patternName, ['MODERN_CONSOLE', 'REGION_CONSOLE', 'CONSOLE_SCENE_GROUP'], true) ? 0.90 : 0.85,
-                        );
+                        return $this->fromNativeMatch($patternName, $matched);
                     }
                 }
             } catch (\Throwable) {
@@ -137,6 +127,23 @@ class GameNameChecker extends AbstractNameChecker
         }
 
         return $this->checkPhp($release, $textstring);
+    }
+
+    /** Build the same result for individual and fused native matches. */
+    public function fromNativeMatch(string $patternName, string $matched): NameFixResult
+    {
+        if ($patternName === 'OUTLAWS') {
+            $matched = str_replace('OUTLAWS', 'PC GAME OUTLAWS', $matched);
+        } elseif ($patternName === 'ALIAS') {
+            $matched = str_replace('-ALiAS', ' PC GAME ALiAS', $matched);
+        }
+
+        return NameFixResult::fromMatch(
+            newName: $matched,
+            method: $this->formatMethod($patternName),
+            checkerName: $this->getName(),
+            confidence: in_array($patternName, ['MODERN_CONSOLE', 'REGION_CONSOLE', 'CONSOLE_SCENE_GROUP'], true) ? 0.90 : 0.85,
+        );
     }
 
     /**

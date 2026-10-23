@@ -623,7 +623,7 @@ impl Memo {
 // source and tail repeats then reuse the scan done by the first title repeat.
 struct Subject<'a> {
     input: &'a [u8],
-    title_runs: [Option<(usize, usize)>; 2],
+    title_runs: [Option<(usize, usize)>; 4],
     last_digit: Option<usize>,
 }
 
@@ -657,7 +657,7 @@ impl Subject<'_> {
             }
         }
         if cache && (end < limit || limit == self.input.len()) {
-            self.title_runs[1] = self.title_runs[0];
+            self.title_runs.rotate_right(1);
             self.title_runs[0] = Some((pos, end));
         }
         end
@@ -885,7 +885,7 @@ impl Pattern {
     fn find<'a>(&self, input: &'a [u8], budget: &mut usize) -> Result<Option<&'a [u8]>, ()> {
         let mut subject = Subject {
             input,
-            title_runs: [None; 2],
+            title_runs: [None; 4],
             last_digit: input.iter().rposition(u8::is_ascii_digit),
         };
         self.find_in(&mut subject, budget)
@@ -926,57 +926,73 @@ impl Pattern {
     }
 }
 
-unsafe fn check(
+// The same compiled patterns serve both individual and fused entry points.
+fn patterns(index: usize) -> &'static [Pattern] {
+    static COMPILED: OnceLock<[Vec<Pattern>; 4]> = OnceLock::new();
+    &COMPILED.get_or_init(|| {
+        [TV, MOVIE, GAME, APP].map(|source| {
+            source
+                .iter()
+                .map(|&(name, regex)| Pattern::new(name, regex))
+                .collect()
+        })
+    })[index]
+}
+
+unsafe fn prepare<'a>(
     input: *const u8,
     input_len: usize,
-    out_buf: *mut u8,
-    out_cap: usize,
-    source: &'static [(&'static str, &'static str)],
-    compiled: &'static OnceLock<Vec<Pattern>>,
-) -> isize {
+) -> Result<(Subject<'a>, [u64; 4]), isize> {
     if (input.is_null() && input_len != 0) || input_len > isize::MAX as usize {
-        return -1;
+        return Err(-1);
     }
     let input = if input_len == 0 {
         &[]
     } else {
         unsafe { slice::from_raw_parts(input, input_len) }
     };
-    // PHP's byte-mode PCRE can use locale-specific character tables. Decline
-    // non-ASCII, and bounded-work exhaustion, rather than guessing their result.
-    if !input.is_ascii() {
-        return if std::str::from_utf8(input).is_err() {
-            -1
-        } else {
-            -2
-        };
-    }
-    if input_len > 4096 {
-        return -2;
-    }
-    let patterns =
-        compiled.get_or_init(|| source.iter().map(|&(n, r)| Pattern::new(n, r)).collect());
     let mut bloom = [0u64; 4];
     let mut last_digit = None;
-    for (pos, pair) in input.windows(2).enumerate() {
-        if pair[0].is_ascii_digit() {
+    // One shared pass validates ASCII, locates the last digit, and builds the
+    // case-insensitive bigram bloom used by every checker.
+    for (pos, &byte) in input.iter().enumerate() {
+        if !byte.is_ascii() {
+            return Err(if std::str::from_utf8(input).is_err() {
+                -1
+            } else {
+                -2
+            });
+        }
+        if byte.is_ascii_digit() {
             last_digit = Some(pos);
         }
-        let hash = ((pair[0].to_ascii_lowercase() as usize * 31)
-            ^ pair[1].to_ascii_lowercase() as usize)
-            & 255;
-        bloom[hash >> 6] |= 1u64 << (hash & 63);
+        if pos > 0 {
+            let hash = ((input[pos - 1].to_ascii_lowercase() as usize * 31)
+                ^ byte.to_ascii_lowercase() as usize)
+                & 255;
+            bloom[hash >> 6] |= 1u64 << (hash & 63);
+        }
     }
-    if input.last().is_some_and(u8::is_ascii_digit) {
-        last_digit = Some(input.len() - 1);
+    if input_len > 4096 {
+        return Err(-2);
     }
-    let mut subject = Subject {
-        input,
-        title_runs: [None; 2],
-        last_digit,
-    };
-    let mut budget = 100_000;
-    for pattern in patterns {
+    Ok((
+        Subject {
+            input,
+            title_runs: [None; 4],
+            last_digit,
+        },
+        bloom,
+    ))
+}
+
+fn first_match<'a>(
+    index: usize,
+    subject: &mut Subject<'a>,
+    bloom: [u64; 4],
+    budget: &mut usize,
+) -> Result<Option<(&'static str, &'a [u8])>, isize> {
+    for pattern in patterns(index) {
         if (bloom[0] & pattern.union_mask[0]) != pattern.union_mask[0]
             || (bloom[1] & pattern.union_mask[1]) != pattern.union_mask[1]
             || (bloom[2] & pattern.union_mask[2]) != pattern.union_mask[2]
@@ -988,38 +1004,116 @@ unsafe fn check(
         {
             continue;
         }
-        match pattern.find_in(&mut subject, &mut budget) {
-            Ok(Some(matched)) => {
-                let len = pattern.name.len() + 1 + matched.len();
-                if out_buf.is_null() || out_cap < len {
-                    return -3;
-                }
-                // No partial writes on failure. The caller owns distinct input
-                // and output allocations for the duration of this call.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        pattern.name.as_ptr(),
-                        out_buf,
-                        pattern.name.len(),
-                    );
-                    *out_buf.add(pattern.name.len()) = 0;
-                    std::ptr::copy_nonoverlapping(
-                        matched.as_ptr(),
-                        out_buf.add(pattern.name.len() + 1),
-                        matched.len(),
-                    );
-                }
-                return len as isize;
-            }
-            Ok(None) => {}
-            Err(()) => return -2,
+        if let Some(matched) = pattern.find_in(subject, budget).map_err(|()| -2isize)? {
+            return Ok(Some((pattern.name, matched)));
         }
     }
-    0
+    Ok(None)
+}
+
+unsafe fn check(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+    index: usize,
+) -> isize {
+    let (mut subject, bloom) = match unsafe { prepare(input, input_len) } {
+        Ok(prepared) => prepared,
+        Err(code) => return code,
+    };
+    match first_match(index, &mut subject, bloom, &mut 100_000) {
+        Ok(Some((name, matched))) => {
+            let len = name.len() + 1 + matched.len();
+            if out_buf.is_null() || out_cap < len {
+                return -3;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(name.as_ptr(), out_buf, name.len());
+                *out_buf.add(name.len()) = 0;
+                std::ptr::copy_nonoverlapping(
+                    matched.as_ptr(),
+                    out_buf.add(name.len() + 1),
+                    matched.len(),
+                );
+            }
+            len as isize
+        }
+        Ok(None) => 0,
+        Err(code) => code,
+    }
+}
+
+unsafe fn check_all(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+    collect: bool,
+) -> isize {
+    let (mut subject, bloom) = match unsafe { prepare(input, input_len) } {
+        Ok(prepared) => prepared,
+        Err(code) => return code,
+    };
+    let mut matches = [None; 4];
+    let mut len = 0;
+    for (index, slot) in matches.iter_mut().enumerate() {
+        // Keep the individual checker's bounded-work allowance. A decline in
+        // any checker declines the whole call, with no partial output.
+        match first_match(index, &mut subject, bloom, &mut 100_000) {
+            Ok(Some((name, matched))) => {
+                // NUL-delimited collected records cannot represent an embedded
+                // NUL consumed by OUTLAWS/ALIAS' dot repeat. PHP retains it.
+                if collect && matched.contains(&0) {
+                    return -2;
+                }
+
+                if len > 0 {
+                    len += 1;
+                } // record separator
+                len += 2 + name.len() + 1 + matched.len();
+                *slot = Some((name, matched));
+                if !collect {
+                    break;
+                }
+            }
+            Ok(None) => {}
+            Err(code) => return code,
+        }
+    }
+    if len == 0 {
+        return 0;
+    }
+    if out_buf.is_null() || out_cap < len {
+        return -3;
+    }
+    let mut offset = 0;
+    for (index, (name, matched)) in matches
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, m)| m.map(|m| (i, m)))
+    {
+        unsafe {
+            if offset > 0 {
+                *out_buf.add(offset) = 0;
+                offset += 1;
+            }
+            *out_buf.add(offset) = index as u8;
+            *out_buf.add(offset + 1) = 0;
+            offset += 2;
+            std::ptr::copy_nonoverlapping(name.as_ptr(), out_buf.add(offset), name.len());
+            offset += name.len();
+            *out_buf.add(offset) = 0;
+            offset += 1;
+            std::ptr::copy_nonoverlapping(matched.as_ptr(), out_buf.add(offset), matched.len());
+            offset += matched.len();
+        }
+    }
+    len as isize
 }
 
 macro_rules! export_checker {
-    ($function:ident, $source:ident) => {
+    ($function:ident, $index:expr) => {
         /// Returns `PatternName\0MatchedText`, zero for no match, or -1 invalid
         /// input, -2 decline to PHP, -3 insufficient output capacity.
         ///
@@ -1034,20 +1128,116 @@ macro_rules! export_checker {
             out_buf: *mut u8,
             out_cap: usize,
         ) -> isize {
-            static COMPILED: OnceLock<Vec<Pattern>> = OnceLock::new();
-            unsafe { check(input, input_len, out_buf, out_cap, $source, &COMPILED) }
+            unsafe { check(input, input_len, out_buf, out_cap, $index) }
         }
     };
 }
+export_checker!(nntmux_name_check_tv, 0);
+export_checker!(nntmux_name_check_movie, 1);
+export_checker!(nntmux_name_check_game, 2);
+export_checker!(nntmux_name_check_app, 3);
 
-export_checker!(nntmux_name_check_tv, TV);
-export_checker!(nntmux_name_check_movie, MOVIE);
-export_checker!(nntmux_name_check_game, GAME);
-export_checker!(nntmux_name_check_app, APP);
+/// Returns the first `CheckerIdx\0PatternName\0MatchedText` in TV/Movie/Game/App
+/// order, zero if none, or -1 invalid input, -2 decline, -3 insufficient capacity.
+/// CheckerIdx is a raw byte (0 through 3), not an ASCII digit.
+///
+/// # Safety
+/// Input must be readable for `input_len` bytes and output writable for
+/// `out_cap` bytes, with no overlap. Null input requires zero length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_name_check_all_first(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    unsafe { check_all(input, input_len, out_buf, out_cap, false) }
+}
+
+/// Returns up to four records as in `nntmux_name_check_all_first`, separated by
+/// NUL, without a trailing NUL. Errors never write partial records.
+///
+/// # Safety
+/// Input must be readable for `input_len` bytes and output writable for
+/// `out_cap` bytes, with no overlap. Null input requires zero length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_name_check_all_collect(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    unsafe { check_all(input, input_len, out_buf, out_cap, true) }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fused_records_preserve_checker_order_and_atomic_output() {
+        let input = b"Show.S01E01.1080p.NF.WEB-DL-GROUP!Movie.2023.2160p.HDR10.BluRay.HEVC-GROUP!Game.Name-OUTLAWS!Adobe.Photoshop.2024.v25.0-GROUP";
+        let mut expected = Vec::new();
+        let mut buf = [0x7f; 2048];
+        for index in 0..4 {
+            let len = unsafe {
+                check(
+                    input.as_ptr(),
+                    input.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    index,
+                )
+            };
+            assert!(len > 0);
+            if index > 0 {
+                expected.push(0);
+            }
+            expected.extend_from_slice(&[index as u8, 0]);
+            expected.extend_from_slice(&buf[..len as usize]);
+        }
+        let len = unsafe {
+            nntmux_name_check_all_collect(
+                input.as_ptr(),
+                input.len(),
+                buf.as_mut_ptr(),
+                expected.len(),
+            )
+        };
+        assert_eq!(len as usize, expected.len());
+        assert_eq!(&buf[..len as usize], expected);
+        buf.fill(0x7f);
+        assert_eq!(
+            unsafe {
+                nntmux_name_check_all_collect(
+                    input.as_ptr(),
+                    input.len(),
+                    buf.as_mut_ptr(),
+                    expected.len() - 1,
+                )
+            },
+            -3
+        );
+        assert!(buf.iter().all(|&b| b == 0x7f));
+        let len = unsafe {
+            nntmux_name_check_all_first(input.as_ptr(), input.len(), buf.as_mut_ptr(), buf.len())
+        };
+        assert_eq!(&buf[..len as usize], &expected[..len as usize]);
+        let binary = b"Game.Na\0me-OUTLAWS";
+        buf.fill(0x7f);
+        assert_eq!(
+            unsafe {
+                nntmux_name_check_all_collect(
+                    binary.as_ptr(),
+                    binary.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            },
+            -2
+        );
+        assert!(buf.iter().all(|&b| b == 0x7f));
+    }
 
     #[test]
     fn fixed_patterns_compile() {
@@ -1233,7 +1423,7 @@ mod tests {
                     });
                     let mut subject = Subject {
                         input: &input,
-                        title_runs: [None; 2],
+                        title_runs: [None; 4],
                         last_digit: input.iter().rposition(u8::is_ascii_digit),
                     };
                     let mut memo = Memo::new(pattern.repeat_count, input.len());
