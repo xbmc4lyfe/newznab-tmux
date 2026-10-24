@@ -5150,6 +5150,2515 @@ pub unsafe extern "C" fn nntmux_file_extract_candidate(
     unsafe { nntmux_filename_extract_candidate(filename, filename_len, out_buf, out_cap) }
 }
 
+// ============================================================================
+// Wave 4 Slice 4: NzbFingerprintAnalyzer Accelerators
+// ============================================================================
+
+const CRC32_SLICE8_TABLE: [[u32; 256]; 8] = {
+    let mut table = [[0u32; 256]; 8];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            crc = if (crc & 1) != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+            j += 1;
+        }
+        table[0][i] = crc;
+        i += 1;
+    }
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = table[0][i];
+        let mut k = 1usize;
+        while k < 8 {
+            crc = (crc >> 8) ^ table[0][(crc & 0xFF) as usize];
+            table[k][i] = crc;
+            k += 1;
+        }
+        i += 1;
+    }
+    table
+};
+
+#[inline]
+pub fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    let (chunks, rem) = data.as_chunks::<8>();
+    for chunk in chunks {
+        let lo = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) ^ crc;
+        let hi = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        crc = CRC32_SLICE8_TABLE[7][(lo & 0xFF) as usize]
+            ^ CRC32_SLICE8_TABLE[6][((lo >> 8) & 0xFF) as usize]
+            ^ CRC32_SLICE8_TABLE[5][((lo >> 16) & 0xFF) as usize]
+            ^ CRC32_SLICE8_TABLE[4][(lo >> 24) as usize]
+            ^ CRC32_SLICE8_TABLE[3][(hi & 0xFF) as usize]
+            ^ CRC32_SLICE8_TABLE[2][((hi >> 8) & 0xFF) as usize]
+            ^ CRC32_SLICE8_TABLE[1][((hi >> 16) & 0xFF) as usize]
+            ^ CRC32_SLICE8_TABLE[0][(hi >> 24) as usize];
+    }
+    for &b in rem {
+        crc = (crc >> 8) ^ CRC32_SLICE8_TABLE[0][((crc as u8) ^ b) as usize];
+    }
+    !crc
+}
+
+#[cfg(target_arch = "aarch64")]
+const SHA256_K_AARCH64: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,sha2")]
+unsafe fn sha256_compress_blocks_aarch64(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
+    use std::arch::aarch64::{
+        uint32x4_t, vaddq_u32, vld1q_u8, vld1q_u32, vreinterpretq_u32_u8, vrev32q_u8,
+        vsha256h2q_u32, vsha256hq_u32, vsha256su0q_u32, vsha256su1q_u32, vst1q_u32,
+    };
+
+    let mut abcd: uint32x4_t = unsafe { vld1q_u32(state.as_ptr()) };
+    let mut efgh: uint32x4_t = unsafe { vld1q_u32(state.as_ptr().add(4)) };
+
+    for block in blocks {
+        let abcd_save = abcd;
+        let efgh_save = efgh;
+
+        let mut s0 = vreinterpretq_u32_u8(vrev32q_u8(unsafe { vld1q_u8(block.as_ptr()) }));
+        let mut s1 = vreinterpretq_u32_u8(vrev32q_u8(unsafe { vld1q_u8(block.as_ptr().add(16)) }));
+        let mut s2 = vreinterpretq_u32_u8(vrev32q_u8(unsafe { vld1q_u8(block.as_ptr().add(32)) }));
+        let mut s3 = vreinterpretq_u32_u8(vrev32q_u8(unsafe { vld1q_u8(block.as_ptr().add(48)) }));
+
+        macro_rules! round4 {
+            ($k_offset:expr, $w0:ident, $w1:ident, $w2:ident, $w3:ident, update) => {{
+                let k = unsafe { vld1q_u32(SHA256_K_AARCH64.as_ptr().add($k_offset)) };
+                let wk = vaddq_u32($w0, k);
+                let tmp = abcd;
+                abcd = vsha256hq_u32(abcd, efgh, wk);
+                efgh = vsha256h2q_u32(efgh, tmp, wk);
+                $w0 = vsha256su1q_u32(vsha256su0q_u32($w0, $w1), $w2, $w3);
+            }};
+            ($k_offset:expr, $w0:ident) => {{
+                let k = unsafe { vld1q_u32(SHA256_K_AARCH64.as_ptr().add($k_offset)) };
+                let wk = vaddq_u32($w0, k);
+                let tmp = abcd;
+                abcd = vsha256hq_u32(abcd, efgh, wk);
+                efgh = vsha256h2q_u32(efgh, tmp, wk);
+            }};
+        }
+
+        round4!(0, s0, s1, s2, s3, update);
+        round4!(4, s1, s2, s3, s0, update);
+        round4!(8, s2, s3, s0, s1, update);
+        round4!(12, s3, s0, s1, s2, update);
+        round4!(16, s0, s1, s2, s3, update);
+        round4!(20, s1, s2, s3, s0, update);
+        round4!(24, s2, s3, s0, s1, update);
+        round4!(28, s3, s0, s1, s2, update);
+        round4!(32, s0, s1, s2, s3, update);
+        round4!(36, s1, s2, s3, s0, update);
+        round4!(40, s2, s3, s0, s1, update);
+        round4!(44, s3, s0, s1, s2, update);
+        round4!(48, s0);
+        round4!(52, s1);
+        round4!(56, s2);
+        round4!(60, s3);
+
+        abcd = vaddq_u32(abcd, abcd_save);
+        efgh = vaddq_u32(efgh, efgh_save);
+    }
+
+    unsafe {
+        vst1q_u32(state.as_mut_ptr(), abcd);
+        vst1q_u32(state.as_mut_ptr().add(4), efgh);
+    }
+}
+
+#[inline]
+pub fn sha256_fast_hex(data: &[u8]) -> [u8; 64] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("sha2") {
+            let mut state: [u32; 8] = [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ];
+            let (blocks, remainder) = data.as_chunks::<64>();
+            if !blocks.is_empty() {
+                unsafe { sha256_compress_blocks_aarch64(&mut state, blocks) };
+            }
+            let bit_len = (data.len() as u64).wrapping_mul(8);
+            let mut tail = [0u8; 64];
+            tail[..remainder.len()].copy_from_slice(remainder);
+            tail[remainder.len()] = 0x80;
+            if remainder.len() >= 56 {
+                unsafe { sha256_compress_blocks_aarch64(&mut state, std::slice::from_ref(&tail)) };
+                tail.fill(0);
+            }
+            tail[56..64].copy_from_slice(&bit_len.to_be_bytes());
+            unsafe { sha256_compress_blocks_aarch64(&mut state, std::slice::from_ref(&tail)) };
+
+            let mut hex = [0u8; 64];
+            for (i, &word) in state.iter().enumerate() {
+                for (j, &byte) in word.to_be_bytes().iter().enumerate() {
+                    let idx = (i * 4 + j) * 2;
+                    hex[idx] = crate::HEX_LOWER[(byte >> 4) as usize];
+                    hex[idx + 1] = crate::HEX_LOWER[(byte & 0x0f) as usize];
+                }
+            }
+            return hex;
+        }
+    }
+    crate::predb::sha256_hex_slice(data)
+}
+
+/// Matches `NzbFingerprintAnalyzer::fileKind(string $subject)`:
+/// - `2` => `"par2"` (`/\.par2\b/i`)
+/// - `1` => `"rar"` (`/\.(?:part\d+\.rar|rar|r\d{2,})\b/i`)
+/// - `0` => `"other"`
+pub fn nzb_file_kind_code(subject: &[u8]) -> u8 {
+    let n = subject.len();
+    let mut has_rar = false;
+    let mut i = 0usize;
+    while i < n {
+        if subject[i] == b'.' {
+            let rest = &subject[i + 1..];
+            if rest.len() >= 4
+                && rest[..4].eq_ignore_ascii_case(b"par2")
+                && rest.get(4).is_none_or(|&b| !is_word_byte(b))
+            {
+                return 2;
+            }
+            if !has_rar {
+                if rest.len() >= 3
+                    && rest[..3].eq_ignore_ascii_case(b"rar")
+                    && rest.get(3).is_none_or(|&b| !is_word_byte(b))
+                {
+                    has_rar = true;
+                } else if rest.len() >= 3 && matches!(rest[0], b'r' | b'R') {
+                    let mut d = 1usize;
+                    while d < rest.len() && rest[d].is_ascii_digit() {
+                        d += 1;
+                    }
+                    if d >= 3 && rest.get(d).is_none_or(|&b| !is_word_byte(b)) {
+                        has_rar = true;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    if has_rar { 1 } else { 0 }
+}
+
+/// Matches `NzbFingerprintAnalyzer::formatHint(string $subject)`:
+/// `/\.([a-z0-9]{1,8})\b/i`
+pub fn nzb_format_hint_slice(subject: &[u8], out_hint: &mut [u8; 8]) -> usize {
+    let n = subject.len();
+    let mut i = 0usize;
+    while i < n {
+        if subject[i] == b'.' {
+            let start = i + 1;
+            let mut end = start;
+            while end < n && subject[end].is_ascii_alphanumeric() {
+                end += 1;
+            }
+            let len = end - start;
+            if (1..=8).contains(&len) && subject.get(end) != Some(&b'_') {
+                for (dst, &src) in out_hint[..len].iter_mut().zip(&subject[start..end]) {
+                    *dst = src.to_ascii_lowercase();
+                }
+                return len;
+            }
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    0
+}
+
+/// Matches `NzbFingerprintAnalyzer::detectFormatSignatures(string $bytes)`:
+/// Returns a 7-bit bitmask of matched format signatures:
+/// - bit 0 (`1`): `RAR 5`
+/// - bit 1 (`2`): `RAR 4`
+/// - bit 2 (`4`): `7-Zip`
+/// - bit 3 (`8`): `ZIP`
+/// - bit 4 (`16`): `gzip`
+/// - bit 5 (`32`): `XZ`
+/// - bit 6 (`64`): `ISO 9660 descriptor` (offset 32769)
+#[inline]
+pub fn detect_format_signatures_mask(bytes: &[u8]) -> u32 {
+    let mut mask = 0u32;
+    if bytes.starts_with(b"Rar!\x1A\x07\x01\x00") {
+        mask |= 1;
+    }
+    if bytes.starts_with(b"Rar!\x1A\x07\x00") {
+        mask |= 2;
+    }
+    if bytes.starts_with(b"7z\xBC\xAF\x27\x1C") {
+        mask |= 4;
+    }
+    if bytes.starts_with(b"PK\x03\x04") {
+        mask |= 8;
+    }
+    if bytes.starts_with(b"\x1F\x8B\x08") {
+        mask |= 16;
+    }
+    if bytes.starts_with(b"\xFD7zXZ\x00") {
+        mask |= 32;
+    }
+    if bytes.get(32_769..32_774) == Some(b"CD001") {
+        mask |= 64;
+    }
+    mask
+}
+
+#[inline]
+fn nzb_metadata_number(raw: &[u8]) -> Option<i64> {
+    if raw.is_empty() || !raw.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut val = 0i64;
+    for &b in raw {
+        val = val.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+    }
+    Some(val)
+}
+
+#[inline]
+fn write_usize_decimal(out: &mut OutCursor<'_>, n: usize) {
+    write_u64_decimal(out, n as u64);
+}
+
+#[inline]
+fn write_u64_decimal(out: &mut OutCursor<'_>, mut n: u64) {
+    if n == 0 {
+        out.push(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut pos = buf.len();
+    while n > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    out.extend(&buf[pos..]);
+}
+
+#[inline]
+fn is_nzb_xml_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+#[inline]
+fn skip_nzb_xml_ws(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && is_nzb_xml_ws(bytes[pos]) {
+        pos += 1;
+    }
+    pos
+}
+
+fn skip_nzb_xml_ws_and_comments(bytes: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        pos = skip_nzb_xml_ws(bytes, pos);
+        if bytes.get(pos..pos + 4) == Some(b"<!--") {
+            pos += 4;
+            let mut found = false;
+            while pos + 2 <= bytes.len() {
+                if &bytes[pos..pos + 2] == b"--" {
+                    if bytes.get(pos + 2) == Some(&b'>') {
+                        pos += 3;
+                        found = true;
+                        break;
+                    }
+                    return None;
+                }
+                pos += 1;
+            }
+            if !found {
+                return None;
+            }
+        } else {
+            return Some(pos);
+        }
+    }
+}
+
+fn unescape_nzb_xml_utf8(raw: &[u8], is_attr: bool, dst: &mut Vec<u8>) -> bool {
+    if std::str::from_utf8(raw).is_err()
+        || raw.iter().any(|&b| {
+            (b < 0x20 && !matches!(b, b'\t' | b'\r' | b'\n'))
+                || (is_attr && matches!(b, b'\t' | b'\r' | b'\n'))
+        })
+        || (!is_attr && php_trim(raw).contains(&b'\r'))
+        || (!is_attr && raw.windows(3).any(|w| w == b"]]>"))
+    {
+        return false;
+    }
+    if !raw.iter().any(|&b| b == b'&' || b == b'<') {
+        dst.extend_from_slice(raw);
+        return true;
+    }
+    let mut i = 0usize;
+    let n = raw.len();
+    while i < n {
+        let b = raw[i];
+        if b == b'<' {
+            return false;
+        }
+        if b != b'&' {
+            dst.push(b);
+            i += 1;
+            continue;
+        }
+        let rest = &raw[i + 1..];
+        let Some(semi) = rest.iter().take(12).position(|&c| c == b';') else {
+            return false;
+        };
+        let ent = &rest[..semi];
+        match ent {
+            b"amp" => dst.push(b'&'),
+            b"lt" => dst.push(b'<'),
+            b"gt" => dst.push(b'>'),
+            b"quot" => dst.push(b'"'),
+            b"apos" => dst.push(b'\''),
+            _ if ent.starts_with(b"#x") || ent.starts_with(b"#X") => {
+                let hex_digits = &ent[2..];
+                if hex_digits.is_empty()
+                    || hex_digits.len() > 6
+                    || !hex_digits.iter().all(u8::is_ascii_hexdigit)
+                {
+                    return false;
+                }
+                let Ok(s) = std::str::from_utf8(hex_digits) else {
+                    return false;
+                };
+                let Ok(code) = u32::from_str_radix(s, 16) else {
+                    return false;
+                };
+                if code < 0x20 || code == 0x7F {
+                    return false;
+                }
+                let Some(ch) = char::from_u32(code) else {
+                    return false;
+                };
+                let mut u8_buf = [0u8; 4];
+                dst.extend_from_slice(ch.encode_utf8(&mut u8_buf).as_bytes());
+            }
+            _ if ent.starts_with(b"#") => {
+                let dec_digits = &ent[1..];
+                if dec_digits.is_empty()
+                    || dec_digits.len() > 7
+                    || !dec_digits.iter().all(u8::is_ascii_digit)
+                {
+                    return false;
+                }
+                let Ok(s) = std::str::from_utf8(dec_digits) else {
+                    return false;
+                };
+                let Ok(code) = s.parse::<u32>() else {
+                    return false;
+                };
+                if code < 0x20 || code == 0x7F {
+                    return false;
+                }
+                let Some(ch) = char::from_u32(code) else {
+                    return false;
+                };
+                let mut u8_buf = [0u8; 4];
+                dst.extend_from_slice(ch.encode_utf8(&mut u8_buf).as_bytes());
+            }
+            _ => return false,
+        }
+        i += 1 + semi + 1;
+    }
+    true
+}
+
+#[inline]
+fn match_nzb_tag_exact(bytes: &[u8], pos: usize, tag_exact: &[u8]) -> Option<usize> {
+    let end = pos + tag_exact.len();
+    if bytes.get(pos..end) != Some(tag_exact) {
+        return None;
+    }
+    let next = bytes.get(end).copied()?;
+    if is_nzb_xml_ws(next) || next == b'>' || next == b'/' {
+        Some(end)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn expect_nzb_closing_tag(bytes: &[u8], pos: usize, close_exact: &[u8]) -> Option<usize> {
+    let end = pos + close_exact.len();
+    if bytes.get(pos..end) != Some(close_exact) {
+        return None;
+    }
+    let after_ws = skip_nzb_xml_ws(bytes, end);
+    if bytes.get(after_ws) == Some(&b'>') {
+        Some(after_ws + 1)
+    } else {
+        None
+    }
+}
+
+fn parse_nzb_xml_attributes<F>(
+    bytes: &[u8],
+    mut pos: usize,
+    allow_xmlns: bool,
+    mut on_attr: F,
+) -> Option<(usize, bool)>
+where
+    F: FnMut(&[u8], &[u8]) -> bool,
+{
+    let mut seen_names: [&[u8]; 12] = [&[]; 12];
+    let mut seen_count = 0usize;
+
+    loop {
+        let prev_pos = pos;
+        pos = skip_nzb_xml_ws(bytes, pos);
+        let b = *bytes.get(pos)?;
+        if b == b'>' {
+            return Some((pos + 1, false));
+        }
+        if b == b'/' {
+            if bytes.get(pos + 1) == Some(&b'>') {
+                return Some((pos + 2, true));
+            }
+            return None;
+        }
+        if seen_count > 0 && pos == prev_pos {
+            return None;
+        }
+        if !b.is_ascii_alphabetic() && b != b'_' {
+            return None;
+        }
+        let name_start = pos;
+        pos += 1;
+        while pos < bytes.len() {
+            let c = bytes[pos];
+            if c == b':' {
+                return None;
+            }
+            if c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.') {
+                pos += 1;
+            } else {
+                break;
+            }
+        }
+        let attr_name = &bytes[name_start..pos];
+        if !allow_xmlns && attr_name == b"xmlns" {
+            return None;
+        }
+        if seen_count >= seen_names.len() || seen_names[..seen_count].contains(&attr_name) {
+            return None;
+        }
+        seen_names[seen_count] = attr_name;
+        seen_count += 1;
+
+        pos = skip_nzb_xml_ws(bytes, pos);
+        if bytes.get(pos) != Some(&b'=') {
+            return None;
+        }
+        pos = skip_nzb_xml_ws(bytes, pos + 1);
+        let quote = *bytes.get(pos)?;
+        if quote != b'"' && quote != b'\'' {
+            return None;
+        }
+        pos += 1;
+        let val_start = pos;
+        while pos < bytes.len() && bytes[pos] != quote {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            return None;
+        }
+        let attr_val = &bytes[val_start..pos];
+        pos += 1;
+        if !on_attr(attr_name, attr_val) {
+            return None;
+        }
+    }
+}
+
+fn parse_nzb_xml_decl(bytes: &[u8], mut pos: usize) -> Option<usize> {
+    if bytes.get(pos..pos + 5) != Some(b"<?xml") {
+        return Some(pos);
+    }
+    let after_kw = pos + 5;
+    if !bytes.get(after_kw).copied().is_some_and(is_nzb_xml_ws) {
+        return None;
+    }
+    pos = after_kw;
+    let mut seen_version = false;
+    let mut seen_encoding = false;
+    let mut seen_standalone = false;
+
+    loop {
+        let prev = pos;
+        pos = skip_nzb_xml_ws(bytes, pos);
+        if bytes.get(pos..pos + 2) == Some(b"?>") {
+            return if seen_version { Some(pos + 2) } else { None };
+        }
+        if pos == prev {
+            return None;
+        }
+        let name_start = pos;
+        while pos < bytes.len() && bytes[pos].is_ascii_alphabetic() {
+            pos += 1;
+        }
+        let name = &bytes[name_start..pos];
+        pos = skip_nzb_xml_ws(bytes, pos);
+        if bytes.get(pos) != Some(&b'=') {
+            return None;
+        }
+        pos = skip_nzb_xml_ws(bytes, pos + 1);
+        let quote = *bytes.get(pos)?;
+        if quote != b'"' && quote != b'\'' {
+            return None;
+        }
+        pos += 1;
+        let val_start = pos;
+        while pos < bytes.len() && bytes[pos] != quote {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            return None;
+        }
+        let val = &bytes[val_start..pos];
+        pos += 1;
+
+        match name {
+            b"version" => {
+                if seen_version || seen_encoding || seen_standalone || val != b"1.0" {
+                    return None;
+                }
+                seen_version = true;
+            }
+            b"encoding" => {
+                if !seen_version
+                    || seen_encoding
+                    || seen_standalone
+                    || !val.eq_ignore_ascii_case(b"utf-8")
+                {
+                    return None;
+                }
+                seen_encoding = true;
+            }
+            b"standalone" => {
+                if !seen_version || seen_standalone || (val != b"yes" && val != b"no") {
+                    return None;
+                }
+                seen_standalone = true;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Matches the standard external DOCTYPE stripped by `NzbFingerprintAnalyzer::analyzeManifest`:
+/// `/<!DOCTYPE\s+nzb\s+PUBLIC\s+(["\'])-\/\/newzBin\/\/DTD NZB 1\.1\/\/EN\1\s+(["\'])http:\/\/www\.newzbin\.com\/DTD\/nzb\/nzb-1\.1\.dtd\2\s*>/i`
+fn match_standard_nzb_doctype(bytes: &[u8], mut pos: usize) -> Option<usize> {
+    if bytes.len() - pos < 90 || !bytes[pos..pos + 9].eq_ignore_ascii_case(b"<!doctype") {
+        return None;
+    }
+    pos += 9;
+    let ws1 = pos;
+    while pos < bytes.len() && is_pcre_space(bytes[pos]) {
+        pos += 1;
+    }
+    if pos == ws1 || bytes.len() - pos < 3 || !bytes[pos..pos + 3].eq_ignore_ascii_case(b"nzb") {
+        return None;
+    }
+    pos += 3;
+    let ws2 = pos;
+    while pos < bytes.len() && is_pcre_space(bytes[pos]) {
+        pos += 1;
+    }
+    if pos == ws2 || bytes.len() - pos < 6 || !bytes[pos..pos + 6].eq_ignore_ascii_case(b"public") {
+        return None;
+    }
+    pos += 6;
+    let ws3 = pos;
+    while pos < bytes.len() && is_pcre_space(bytes[pos]) {
+        pos += 1;
+    }
+    if pos == ws3 {
+        return None;
+    }
+    let q1 = *bytes.get(pos)?;
+    if q1 != b'"' && q1 != b'\'' {
+        return None;
+    }
+    pos += 1;
+    const PUB_ID: &[u8] = b"-//newzbin//dtd nzb 1.1//en";
+    if bytes.len() - pos < PUB_ID.len() + 1
+        || !bytes[pos..pos + PUB_ID.len()].eq_ignore_ascii_case(PUB_ID)
+    {
+        return None;
+    }
+    pos += PUB_ID.len();
+    if bytes.get(pos) != Some(&q1) {
+        return None;
+    }
+    pos += 1;
+    let ws4 = pos;
+    while pos < bytes.len() && is_pcre_space(bytes[pos]) {
+        pos += 1;
+    }
+    if pos == ws4 {
+        return None;
+    }
+    let q2 = *bytes.get(pos)?;
+    if q2 != b'"' && q2 != b'\'' {
+        return None;
+    }
+    pos += 1;
+    const SYS_ID: &[u8] = b"http://www.newzbin.com/dtd/nzb/nzb-1.1.dtd";
+    if bytes.len() - pos < SYS_ID.len() + 1
+        || !bytes[pos..pos + SYS_ID.len()].eq_ignore_ascii_case(SYS_ID)
+    {
+        return None;
+    }
+    pos += SYS_ID.len();
+    if bytes.get(pos) != Some(&q2) {
+        return None;
+    }
+    pos += 1;
+    while pos < bytes.len() && is_pcre_space(bytes[pos]) {
+        pos += 1;
+    }
+    if bytes.get(pos) == Some(&b'>') {
+        Some(pos + 1)
+    } else {
+        None
+    }
+}
+
+struct ParsedManifestSegment {
+    number: i64,
+    bytes: Option<i64>,
+    src_num_range: (usize, usize),
+    src_bytes_range: (usize, usize),
+    msg_id_range: (usize, usize),
+}
+
+struct ParsedManifestFile {
+    kind_code: u8,
+    format_hint: [u8; 8],
+    format_hint_len: usize,
+    subject: Vec<u8>,
+    poster: Vec<u8>,
+    date: Option<i64>,
+    source_date: Vec<u8>,
+    groups: Vec<(usize, usize)>,
+    group_arena: Vec<u8>,
+    source_segment_record_count: usize,
+    invalid_segment_record_count: usize,
+    invalid_segment_metadata_count: usize,
+    duplicate_message_id_count: usize,
+    duplicate_segment_number_count: usize,
+    segment_number_sequence_valid: bool,
+    advertised_bytes: Option<i64>,
+    advertised_bytes_overflow: bool,
+    segments: Vec<ParsedManifestSegment>,
+    seg_arena: Vec<u8>,
+}
+
+pub(crate) fn nzb_analyze_manifest_into(bytes: &[u8], out: &mut OutCursor<'_>) -> isize {
+    if bytes.is_empty() || bytes.len() > 33_554_432 {
+        return -1;
+    }
+    if find_ascii_ci(bytes, b"<!entity").is_some() {
+        return -1;
+    }
+
+    let mut pos = 0usize;
+    if bytes.starts_with(b"\xEF\xBB\xBF") {
+        pos = 3;
+    }
+    if std::str::from_utf8(&bytes[pos..]).is_err() {
+        return -1;
+    }
+    for &b in &bytes[pos..] {
+        if (b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r')) || b == 0x7F {
+            return -1;
+        }
+    }
+
+    let Some(after_decl) = parse_nzb_xml_decl(bytes, pos) else {
+        return -1;
+    };
+    pos = after_decl;
+
+    let mut doctype_span: Option<(usize, usize)> = None;
+    loop {
+        let Some(next_pos) = skip_nzb_xml_ws_and_comments(bytes, pos) else {
+            return -1;
+        };
+        pos = next_pos;
+        if bytes.get(pos..pos + 9).is_some_and(|s| s.eq_ignore_ascii_case(b"<!doctype")) {
+            if doctype_span.is_some() {
+                return -1;
+            }
+            let Some(after_dt) = match_standard_nzb_doctype(bytes, pos) else {
+                return -1;
+            };
+            doctype_span = Some((pos, after_dt));
+            pos = after_dt;
+        } else {
+            break;
+        }
+    }
+
+    match doctype_span {
+        Some((dt_start, dt_end)) => {
+            if find_ascii_ci(&bytes[..dt_start], b"<!doctype").is_some()
+                || find_ascii_ci(&bytes[dt_end..], b"<!doctype").is_some()
+            {
+                return -1;
+            }
+        }
+        None => {
+            if find_ascii_ci(bytes, b"<!doctype").is_some() {
+                return -1;
+            }
+        }
+    }
+
+    let Some(nzb_attr_start) = match_nzb_tag_exact(bytes, pos, b"<nzb") else {
+        return -1;
+    };
+    let mut tmp_attr = Vec::with_capacity(128);
+    let Some((after_nzb_open, nzb_self_closing)) =
+        parse_nzb_xml_attributes(bytes, nzb_attr_start, true, |_k, v| {
+            tmp_attr.clear();
+            unescape_nzb_xml_utf8(v, true, &mut tmp_attr)
+        })
+    else {
+        return -1;
+    };
+    if nzb_self_closing {
+        return -1;
+    }
+    pos = after_nzb_open;
+
+    let mut meta_groups: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+    let mut files: Vec<ParsedManifestFile> = Vec::new();
+    let mut total_file_count = [0usize; 3]; // 0 = other, 1 = rar, 2 = par2
+    let mut total_seg_count = [0usize; 3];
+    let mut total_adv_bytes: [Option<i64>; 3] = [Some(0), Some(0), Some(0)];
+    let mut total_adv_overflow = [false; 3];
+
+    let mut attr_buf1 = Vec::with_capacity(256);
+    let mut attr_buf2 = Vec::with_capacity(256);
+    let mut attr_buf3 = Vec::with_capacity(64);
+    let mut text_buf = Vec::with_capacity(256);
+
+    loop {
+        let Some(next_pos) = skip_nzb_xml_ws_and_comments(bytes, pos) else {
+            return -1;
+        };
+        pos = next_pos;
+
+        if let Some(after_nzb_close) = expect_nzb_closing_tag(bytes, pos, b"</nzb") {
+            let Some(end_pos) = skip_nzb_xml_ws_and_comments(bytes, after_nzb_close) else {
+                return -1;
+            };
+            if end_pos != bytes.len() {
+                return -1;
+            }
+            break;
+        }
+
+        if let Some(head_attr_start) = match_nzb_tag_exact(bytes, pos, b"<head") {
+            let Some((after_head_open, head_self_closing)) =
+                parse_nzb_xml_attributes(bytes, head_attr_start, false, |_k, v| {
+                    tmp_attr.clear();
+                    unescape_nzb_xml_utf8(v, true, &mut tmp_attr)
+                })
+            else {
+                return -1;
+            };
+            pos = after_head_open;
+            if !head_self_closing {
+                loop {
+                    let Some(p) = skip_nzb_xml_ws_and_comments(bytes, pos) else {
+                        return -1;
+                    };
+                    pos = p;
+                    if let Some(after_head_close) = expect_nzb_closing_tag(bytes, pos, b"</head") {
+                        pos = after_head_close;
+                        break;
+                    }
+                    let Some(meta_attr_start) = match_nzb_tag_exact(bytes, pos, b"<meta") else {
+                        return -1;
+                    };
+                    attr_buf1.clear();
+                    let Some((after_meta_open, meta_self_closing)) =
+                        parse_nzb_xml_attributes(bytes, meta_attr_start, false, |k, v| {
+                            if k == b"type" {
+                                attr_buf1.clear();
+                                unescape_nzb_xml_utf8(v, true, &mut attr_buf1)
+                            } else {
+                                tmp_attr.clear();
+                                unescape_nzb_xml_utf8(v, true, &mut tmp_attr)
+                            }
+                        })
+                    else {
+                        return -1;
+                    };
+                    pos = after_meta_open;
+                    text_buf.clear();
+                    if !meta_self_closing {
+                        let text_start = pos;
+                        while pos < bytes.len() && bytes[pos] != b'<' {
+                            pos += 1;
+                        }
+                        if !unescape_nzb_xml_utf8(&bytes[text_start..pos], false, &mut text_buf) {
+                            return -1;
+                        }
+                        let Some(after_meta_close) = expect_nzb_closing_tag(bytes, pos, b"</meta")
+                        else {
+                            return -1;
+                        };
+                        pos = after_meta_close;
+                    }
+                    let trimmed_type = php_trim(&attr_buf1);
+                    if !trimmed_type.is_empty() {
+                        let trimmed_val = php_trim(&text_buf).to_vec();
+                        if let Some(existing) = meta_groups
+                            .iter_mut()
+                            .find(|(t, _)| t.as_slice() == trimmed_type)
+                        {
+                            existing.1.push(trimmed_val);
+                        } else {
+                            meta_groups.push((trimmed_type.to_vec(), vec![trimmed_val]));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        let Some(file_attr_start) = match_nzb_tag_exact(bytes, pos, b"<file") else {
+            return -1;
+        };
+        attr_buf1.clear(); // subject
+        attr_buf2.clear(); // poster
+        attr_buf3.clear(); // date
+        let Some((after_file_open, file_self_closing)) =
+            parse_nzb_xml_attributes(bytes, file_attr_start, false, |k, v| match k {
+                b"subject" => {
+                    attr_buf1.clear();
+                    unescape_nzb_xml_utf8(v, true, &mut attr_buf1)
+                }
+                b"poster" => {
+                    attr_buf2.clear();
+                    unescape_nzb_xml_utf8(v, true, &mut attr_buf2)
+                }
+                b"date" => {
+                    attr_buf3.clear();
+                    unescape_nzb_xml_utf8(v, true, &mut attr_buf3)
+                }
+                _ => {
+                    tmp_attr.clear();
+                    unescape_nzb_xml_utf8(v, true, &mut tmp_attr)
+                }
+            })
+        else {
+            return -1;
+        };
+        pos = after_file_open;
+
+        let subject_trimmed = php_trim(&attr_buf1).to_vec();
+        let kind_code = nzb_file_kind_code(&subject_trimmed);
+        let mut format_hint = [0u8; 8];
+        let format_hint_len = nzb_format_hint_slice(&subject_trimmed, &mut format_hint);
+        let poster_vec = attr_buf2.clone();
+        let source_date_vec = attr_buf3.clone();
+        let date_parsed = nzb_metadata_number(php_trim(&attr_buf3));
+
+        let mut group_arena = Vec::with_capacity(128);
+        let mut groups: Vec<(usize, usize)> = Vec::new();
+        let mut seg_arena = Vec::with_capacity(1024);
+        let mut segments: Vec<ParsedManifestSegment> = Vec::new();
+        let mut source_segment_record_count = 0usize;
+        let mut invalid_segment_record_count = 0usize;
+        let mut invalid_segment_metadata_count = 0usize;
+        let mut advertised_bytes: Option<i64> = Some(0);
+        let mut advertised_bytes_overflow = false;
+
+        if !file_self_closing {
+            loop {
+                let Some(p) = skip_nzb_xml_ws_and_comments(bytes, pos) else {
+                    return -1;
+                };
+                pos = p;
+                if let Some(after_file_close) = expect_nzb_closing_tag(bytes, pos, b"</file") {
+                    pos = after_file_close;
+                    break;
+                }
+                if let Some(groups_attr_start) = match_nzb_tag_exact(bytes, pos, b"<groups") {
+                    let Some((after_groups_open, groups_self_closing)) =
+                        parse_nzb_xml_attributes(bytes, groups_attr_start, false, |_k, v| {
+                            tmp_attr.clear();
+                            unescape_nzb_xml_utf8(v, true, &mut tmp_attr)
+                        })
+                    else {
+                        return -1;
+                    };
+                    pos = after_groups_open;
+                    if !groups_self_closing {
+                        loop {
+                            let Some(gp) = skip_nzb_xml_ws_and_comments(bytes, pos) else {
+                                return -1;
+                            };
+                            pos = gp;
+                            if let Some(after_groups_close) =
+                                expect_nzb_closing_tag(bytes, pos, b"</groups")
+                            {
+                                pos = after_groups_close;
+                                break;
+                            }
+                            let Some(group_attr_start) = match_nzb_tag_exact(bytes, pos, b"<group")
+                            else {
+                                return -1;
+                            };
+                            let Some((after_group_open, group_self_closing)) =
+                                parse_nzb_xml_attributes(bytes, group_attr_start, false, |_k, v| {
+                                    tmp_attr.clear();
+                                    unescape_nzb_xml_utf8(v, true, &mut tmp_attr)
+                                })
+                            else {
+                                return -1;
+                            };
+                            pos = after_group_open;
+                            text_buf.clear();
+                            if !group_self_closing {
+                                let text_start = pos;
+                                while pos < bytes.len() && bytes[pos] != b'<' {
+                                    pos += 1;
+                                }
+                                if !unescape_nzb_xml_utf8(
+                                    &bytes[text_start..pos],
+                                    false,
+                                    &mut text_buf,
+                                ) {
+                                    return -1;
+                                }
+                                let Some(after_group_close) =
+                                    expect_nzb_closing_tag(bytes, pos, b"</group")
+                                else {
+                                    return -1;
+                                };
+                                pos = after_group_close;
+                            }
+                            let g_trimmed = php_trim(&text_buf);
+                            let gs = group_arena.len();
+                            group_arena.extend_from_slice(g_trimmed);
+                            groups.push((gs, group_arena.len()));
+                        }
+                    }
+                } else if let Some(segs_attr_start) = match_nzb_tag_exact(bytes, pos, b"<segments")
+                {
+                    let Some((after_segs_open, segs_self_closing)) =
+                        parse_nzb_xml_attributes(bytes, segs_attr_start, false, |_k, v| {
+                            tmp_attr.clear();
+                            unescape_nzb_xml_utf8(v, true, &mut tmp_attr)
+                        })
+                    else {
+                        return -1;
+                    };
+                    pos = after_segs_open;
+                    if !segs_self_closing {
+                        loop {
+                            let Some(sp) = skip_nzb_xml_ws_and_comments(bytes, pos) else {
+                                return -1;
+                            };
+                            pos = sp;
+                            if let Some(after_segs_close) =
+                                expect_nzb_closing_tag(bytes, pos, b"</segments")
+                            {
+                                pos = after_segs_close;
+                                break;
+                            }
+                            let Some(seg_attr_start) = match_nzb_tag_exact(bytes, pos, b"<segment")
+                            else {
+                                return -1;
+                            };
+                            attr_buf1.clear(); // number
+                            attr_buf2.clear(); // bytes
+                            let Some((after_seg_open, seg_self_closing)) =
+                                parse_nzb_xml_attributes(
+                                    bytes,
+                                    seg_attr_start,
+                                    false,
+                                    |k, v| match k {
+                                        b"number" => {
+                                            attr_buf1.clear();
+                                            unescape_nzb_xml_utf8(v, true, &mut attr_buf1)
+                                        }
+                                        b"bytes" => {
+                                            attr_buf2.clear();
+                                            unescape_nzb_xml_utf8(v, true, &mut attr_buf2)
+                                        }
+                                        _ => {
+                                            tmp_attr.clear();
+                                            unescape_nzb_xml_utf8(v, true, &mut tmp_attr)
+                                        }
+                                    },
+                                )
+                            else {
+                                return -1;
+                            };
+                            pos = after_seg_open;
+                            text_buf.clear();
+                            if !seg_self_closing {
+                                let text_start = pos;
+                                while pos < bytes.len() && bytes[pos] != b'<' {
+                                    pos += 1;
+                                }
+                                if !unescape_nzb_xml_utf8(
+                                    &bytes[text_start..pos],
+                                    false,
+                                    &mut text_buf,
+                                ) {
+                                    return -1;
+                                }
+                                let Some(after_seg_close) =
+                                    expect_nzb_closing_tag(bytes, pos, b"</segment")
+                                else {
+                                    return -1;
+                                };
+                                pos = after_seg_close;
+                            }
+
+                            source_segment_record_count += 1;
+                            let msg_trimmed = php_trim(&text_buf);
+                            let mut msg_stripped = msg_trimmed;
+                            while let Some(&first) = msg_stripped.first() {
+                                if first == b'<' || first == b'>' {
+                                    msg_stripped = &msg_stripped[1..];
+                                } else {
+                                    break;
+                                }
+                            }
+                            while let Some(&last) = msg_stripped.last() {
+                                if last == b'<' || last == b'>' {
+                                    msg_stripped = &msg_stripped[..msg_stripped.len() - 1];
+                                } else {
+                                    break;
+                                }
+                            }
+                            if msg_trimmed.is_empty()
+                                || msg_stripped.is_empty()
+                                || !msg_stripped
+                                    .iter()
+                                    .all(|&b| b > 0x20 && b != b'<' && b != b'>' && b != 0x7F)
+                            {
+                                invalid_segment_record_count += 1;
+                                continue;
+                            }
+
+                            let seg_num_trimmed = php_trim(&attr_buf1);
+                            let seg_bytes_trimmed = php_trim(&attr_buf2);
+                            let parsed_num = nzb_metadata_number(seg_num_trimmed);
+                            let parsed_bytes = nzb_metadata_number(seg_bytes_trimmed);
+                            if parsed_num.is_none_or(|n| n < 1) || parsed_bytes.is_none() {
+                                invalid_segment_metadata_count += 1;
+                            }
+                            let bytes_is_digits = !seg_bytes_trimmed.is_empty()
+                                && seg_bytes_trimmed.iter().all(|b| b.is_ascii_digit());
+                            if (parsed_bytes.is_none() && bytes_is_digits)
+                                || (advertised_bytes.is_some()
+                                    && parsed_bytes.is_some()
+                                    && parsed_bytes.unwrap()
+                                        > i64::MAX - advertised_bytes.unwrap())
+                            {
+                                advertised_bytes_overflow = true;
+                            }
+                            advertised_bytes = match (advertised_bytes, parsed_bytes) {
+                                (Some(a), Some(b)) => a.checked_add(b),
+                                _ => None,
+                            };
+
+                            let ns = seg_arena.len();
+                            seg_arena.extend_from_slice(seg_num_trimmed);
+                            let ne = seg_arena.len();
+                            seg_arena.extend_from_slice(seg_bytes_trimmed);
+                            let be = seg_arena.len();
+                            seg_arena.extend_from_slice(msg_stripped);
+                            let me = seg_arena.len();
+
+                            segments.push(ParsedManifestSegment {
+                                number: parsed_num.unwrap_or(0),
+                                bytes: parsed_bytes,
+                                src_num_range: (ns, ne),
+                                src_bytes_range: (ne, be),
+                                msg_id_range: (be, me),
+                            });
+                        }
+                    }
+                } else {
+                    return -1;
+                }
+            }
+        }
+
+        if segments.len() > 1 {
+            segments.sort_by_key(|s| s.number);
+        }
+
+        let segment_number_sequence_valid = !segments.is_empty()
+            && segments
+                .iter()
+                .enumerate()
+                .all(|(idx, s)| s.number == (idx as i64) + 1);
+
+        let duplicate_segment_number_count = segments
+            .windows(2)
+            .filter(|w| w[0].number == w[1].number)
+            .count();
+
+        let duplicate_message_id_count = if segments.len() <= 1 {
+            0
+        } else {
+            let mut msg_slices: Vec<&[u8]> = segments
+                .iter()
+                .map(|s| &seg_arena[s.msg_id_range.0..s.msg_id_range.1])
+                .collect();
+            msg_slices.sort_unstable();
+            msg_slices.windows(2).filter(|w| w[0] == w[1]).count()
+        };
+
+        let k_idx = kind_code as usize;
+        total_file_count[k_idx] += 1;
+        total_seg_count[k_idx] += segments.len();
+        if advertised_bytes_overflow
+            || (total_adv_bytes[k_idx].is_some()
+                && advertised_bytes.is_some()
+                && advertised_bytes.unwrap() > i64::MAX - total_adv_bytes[k_idx].unwrap())
+        {
+            total_adv_overflow[k_idx] = true;
+        }
+        total_adv_bytes[k_idx] = match (total_adv_bytes[k_idx], advertised_bytes) {
+            (Some(a), Some(b)) => a.checked_add(b),
+            _ => None,
+        };
+
+        files.push(ParsedManifestFile {
+            kind_code,
+            format_hint,
+            format_hint_len,
+            subject: subject_trimmed,
+            poster: poster_vec,
+            date: date_parsed,
+            source_date: source_date_vec,
+            groups,
+            group_arena,
+            source_segment_record_count,
+            invalid_segment_record_count,
+            invalid_segment_metadata_count,
+            duplicate_message_id_count,
+            duplicate_segment_number_count,
+            segment_number_sequence_valid,
+            advertised_bytes,
+            advertised_bytes_overflow,
+            segments,
+            seg_arena,
+        });
+    }
+
+    if files.is_empty() {
+        return -1;
+    }
+
+    // Emit NUL-separated manifest wire format:
+    // meta_group_count \0 (type \0 val_count \0 val_0 \0 ...)*
+    // file_count \0
+    // rar_fc \0 rar_sc \0 rar_ab \0 rar_abo \0
+    // par2_fc \0 par2_sc \0 par2_ab \0 par2_abo \0
+    // other_fc \0 other_sc \0 other_ab \0 other_abo \0
+    // advertised_byte_totals_valid \0
+    // For each file:
+    //   kind \0 format_hint \0 subject \0 poster \0 date \0 source_date \0
+    //   group_count \0 (group \0)*
+    //   seg_count \0 src_seg_count \0 inv_seg_count \0 inv_meta_count \0
+    //   dup_msgid_count \0 dup_segnum_count \0 seq_valid \0 adv_bytes \0 adv_overflow \0
+    //   For each segment:
+    //     number \0 bytes \0 source_number \0 source_bytes \0 messageid (NUL-separated)
+    write_usize_decimal(out, meta_groups.len());
+    for (m_type, m_vals) in &meta_groups {
+        out.push(0);
+        out.extend(m_type);
+        out.push(0);
+        write_usize_decimal(out, m_vals.len());
+        for v in m_vals {
+            out.push(0);
+            out.extend(v);
+        }
+    }
+
+    out.push(0);
+    write_usize_decimal(out, files.len());
+
+    // Totals in exact order: rar (1), par2 (2), other (0)
+    for &k_idx in &[1usize, 2, 0] {
+        out.push(0);
+        write_usize_decimal(out, total_file_count[k_idx]);
+        out.push(0);
+        write_usize_decimal(out, total_seg_count[k_idx]);
+        out.push(0);
+        if let Some(ab) = total_adv_bytes[k_idx] {
+            write_u64_decimal(out, ab as u64);
+        }
+        out.push(0);
+        out.push(if total_adv_overflow[k_idx] { b'1' } else { b'0' });
+    }
+
+    let adv_totals_valid =
+        total_adv_bytes[0].is_some() && total_adv_bytes[1].is_some() && total_adv_bytes[2].is_some();
+    out.push(0);
+    out.push(if adv_totals_valid { b'1' } else { b'0' });
+
+    for f in &files {
+        out.push(0);
+        match f.kind_code {
+            2 => out.extend(b"par2"),
+            1 => out.extend(b"rar"),
+            _ => out.extend(b"other"),
+        }
+        out.push(0);
+        if f.format_hint_len == 0 {
+            out.extend(b"unknown");
+        } else {
+            out.extend(&f.format_hint[..f.format_hint_len]);
+        }
+        out.push(0);
+        out.extend(&f.subject);
+        out.push(0);
+        out.extend(&f.poster);
+        out.push(0);
+        if let Some(d) = f.date {
+            write_u64_decimal(out, d as u64);
+        }
+        out.push(0);
+        out.extend(&f.source_date);
+        out.push(0);
+        write_usize_decimal(out, f.groups.len());
+        for &(gs, ge) in &f.groups {
+            out.push(0);
+            out.extend(&f.group_arena[gs..ge]);
+        }
+        out.push(0);
+        write_usize_decimal(out, f.segments.len());
+        out.push(0);
+        write_usize_decimal(out, f.source_segment_record_count);
+        out.push(0);
+        write_usize_decimal(out, f.invalid_segment_record_count);
+        out.push(0);
+        write_usize_decimal(out, f.invalid_segment_metadata_count);
+        out.push(0);
+        write_usize_decimal(out, f.duplicate_message_id_count);
+        out.push(0);
+        write_usize_decimal(out, f.duplicate_segment_number_count);
+        out.push(0);
+        out.push(if f.segment_number_sequence_valid {
+            b'1'
+        } else {
+            b'0'
+        });
+        out.push(0);
+        if let Some(ab) = f.advertised_bytes {
+            write_u64_decimal(out, ab as u64);
+        }
+        out.push(0);
+        out.push(if f.advertised_bytes_overflow {
+            b'1'
+        } else {
+            b'0'
+        });
+        for seg in &f.segments {
+            out.push(0);
+            write_u64_decimal(out, seg.number as u64);
+            out.push(0);
+            if let Some(bval) = seg.bytes {
+                write_u64_decimal(out, bval as u64);
+            }
+            out.push(0);
+            out.extend(&f.seg_arena[seg.src_num_range.0..seg.src_num_range.1]);
+            out.push(0);
+            out.extend(&f.seg_arena[seg.src_bytes_range.0..seg.src_bytes_range.1]);
+            out.push(0);
+            out.extend(&f.seg_arena[seg.msg_id_range.0..seg.msg_id_range.1]);
+        }
+    }
+
+    finish_cursor_min_ref(out, 16)
+}
+
+pub(crate) fn nzb_unfold_headers_into(
+    input: &[u8],
+    count: usize,
+    out: &mut OutCursor<'_>,
+) -> isize {
+    if count == 0 {
+        return 0;
+    }
+    let mut raw_header_bytes = 0usize;
+    let mut ordered_names: Vec<&[u8]> = Vec::with_capacity(count);
+    let mut values: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(count);
+    let mut previous_idx: Option<usize> = None;
+    let mut seen_lines = 0usize;
+
+    for raw_line in input.split(|&b| b == 0) {
+        seen_lines += 1;
+        raw_header_bytes += if raw_line.ends_with(b"\n") {
+            raw_line.len()
+        } else {
+            raw_line.len() + 2
+        };
+        let mut content = raw_line;
+        while let Some(&last) = content.last() {
+            if last == b'\r' || last == b'\n' {
+                content = &content[..content.len() - 1];
+            } else {
+                break;
+            }
+        }
+        if matches!(content.first(), Some(b' ' | b'\t')) {
+            if let Some(prev_idx) = previous_idx {
+                let prev_val = &mut values[prev_idx].1;
+                while let Some(&last) = prev_val.last() {
+                    if is_php_trim_byte(last) {
+                        prev_val.pop();
+                    } else {
+                        break;
+                    }
+                }
+                prev_val.push(b' ');
+                prev_val.extend_from_slice(php_trim(content));
+            }
+            continue;
+        }
+        let Some(colon) = content.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        let name_trimmed = php_trim(&content[..colon]);
+        if name_trimmed.is_empty() {
+            continue;
+        }
+        let mut norm_name = Vec::with_capacity(name_trimmed.len());
+        for &b in name_trimmed {
+            norm_name.push(b.to_ascii_lowercase());
+        }
+        ordered_names.push(name_trimmed);
+        let val_trimmed = php_trim(&content[colon + 1..]);
+        if let Some(idx) = values
+            .iter()
+            .position(|(k, _)| k.as_slice() == norm_name.as_slice())
+        {
+            previous_idx = Some(idx);
+            values[idx].1.extend_from_slice(b", ");
+            values[idx].1.extend_from_slice(val_trimmed);
+        } else {
+            let idx = values.len();
+            previous_idx = Some(idx);
+            values.push((norm_name, val_trimmed.to_vec()));
+        }
+    }
+
+    if seen_lines != count {
+        return -1;
+    }
+
+    let mut software: Vec<(&[u8], &[u8], &[u8])> = Vec::with_capacity(3);
+    for &hdr_name in &[&b"user-agent"[..], b"x-newsreader", b"x-poster"] {
+        let val: &[u8] = values
+            .iter()
+            .find(|(k, _)| k.as_slice() == hdr_name)
+            .map(|(_, v)| v.as_slice())
+            .unwrap_or(&[]);
+        if val.is_empty() {
+            continue;
+        }
+        for &(cand, cand_lower) in &[
+            (&b"Nyuu"[..], &b"nyuu"[..]),
+            (&b"ngPost"[..], &b"ngpost"[..]),
+            (&b"Postie"[..], &b"postie"[..]),
+        ] {
+            if find_ascii_ci(val, cand_lower).is_some() {
+                if let Some(entry) = software.iter_mut().find(|(c, _, _)| *c == cand) {
+                    *entry = (cand, hdr_name, val);
+                } else {
+                    software.push((cand, hdr_name, val));
+                }
+            }
+        }
+    }
+
+    write_usize_decimal(out, raw_header_bytes);
+    out.push(0);
+    write_usize_decimal(out, ordered_names.len());
+    for &name in &ordered_names {
+        out.push(0);
+        out.extend(name);
+    }
+    out.push(0);
+    write_usize_decimal(out, values.len());
+    for (k, v) in &values {
+        out.push(0);
+        out.extend(k);
+        out.push(0);
+        out.extend(v);
+    }
+    out.push(0);
+    write_usize_decimal(out, software.len());
+    for &(cand, hdr, val) in &software {
+        out.push(0);
+        out.extend(cand);
+        out.push(0);
+        out.extend(hdr);
+        out.push(0);
+        out.extend(val);
+    }
+
+    finish_cursor_min_ref(out, 16)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum YencControlKind {
+    Ybegin,
+    Ypart,
+    Yend,
+}
+
+fn check_fallback_yenc_control_line(
+    kind: YencControlKind,
+    line_raw: &[u8],
+    counts: &mut [usize; 3],
+) -> bool {
+    let k_idx = match kind {
+        YencControlKind::Ybegin => 0,
+        YencControlKind::Ypart => 1,
+        YencControlKind::Yend => 2,
+    };
+    counts[k_idx] += 1;
+    if counts[k_idx] > 1 || line_raw.len() > 16_384 {
+        return true;
+    }
+    if (kind == YencControlKind::Ypart && (counts[0] != 1 || counts[2] != 0))
+        || (kind == YencControlKind::Yend && counts[0] != 1)
+    {
+        return true;
+    }
+    let kw_len = match kind {
+        YencControlKind::Ybegin => 6,
+        YencControlKind::Ypart => 5,
+        YencControlKind::Yend => 4,
+    };
+    let mut line = if line_raw.len() > kw_len + 1 {
+        &line_raw[kw_len + 1..]
+    } else {
+        &[]
+    };
+    while line.ends_with(b"\r") {
+        line = &line[..line.len() - 1];
+    }
+
+    let critical: &[&[u8]] = match kind {
+        YencControlKind::Ybegin => &[b"name", b"line", b"size", b"part", b"total"],
+        YencControlKind::Ypart => &[b"begin", b"end"],
+        YencControlKind::Yend => &[b"size", b"part", b"total", b"pcrc32", b"crc32"],
+    };
+
+    let mut seen_critical: Vec<([u8; 8], usize, &[u8])> = Vec::with_capacity(6);
+    let mut pos = 0usize;
+    let mut field_count = 0usize;
+    while pos < line.len() {
+        let k_start = if pos == 0 && line[0].is_ascii_alphabetic() {
+            0
+        } else if matches!(line[pos], b' ' | b'\t')
+            && line.get(pos + 1).is_some_and(|b| b.is_ascii_alphabetic())
+        {
+            pos + 1
+        } else {
+            pos += 1;
+            continue;
+        };
+        let mut k_end = k_start + 1;
+        while k_end < line.len()
+            && (line[k_end].is_ascii_alphanumeric() || matches!(line[k_end], b'_' | b'-'))
+        {
+            k_end += 1;
+        }
+        if line.get(k_end) != Some(&b'=') {
+            pos = k_end;
+            continue;
+        }
+        field_count += 1;
+        let k_len = k_end - k_start;
+        if field_count > 64 || k_len > 128 {
+            return true;
+        }
+        let v_start = k_end + 1;
+        let mut v_end = v_start;
+        while v_end < line.len() && !matches!(line[v_end], b' ' | b'\t') {
+            v_end += 1;
+        }
+        let val = &line[v_start..v_end];
+
+        if k_len <= 8 {
+            let mut key_lower = [0u8; 8];
+            for (dst, &src) in key_lower[..k_len].iter_mut().zip(&line[k_start..k_end]) {
+                *dst = src.to_ascii_lowercase();
+            }
+            let name = &key_lower[..k_len];
+            if kind == YencControlKind::Ybegin && name == b"name" {
+                break;
+            }
+            if critical.contains(&name) {
+                if let Some(&(_, _, prev_val)) = seen_critical
+                    .iter()
+                    .find(|&&(k, kl, _)| &k[..kl] == name)
+                {
+                    if prev_val != val {
+                        return true;
+                    }
+                } else {
+                    seen_critical.push((key_lower, k_len, val));
+                }
+            }
+        }
+        pos = v_end;
+    }
+
+    false
+}
+
+fn find_yenc_control_line(text: &[u8], control_lower: &[u8], offset: usize) -> Option<usize> {
+    let clen = control_lower.len();
+    if offset == 0
+        && text.len() >= clen
+        && text[..clen].eq_ignore_ascii_case(control_lower)
+        && text
+            .get(clen)
+            .is_none_or(|&b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+    {
+        return Some(0);
+    }
+    let mut search_from = offset.saturating_sub(1);
+    while search_from + 1 + clen <= text.len() {
+        let rem = &text[search_from..];
+        let nl_rel = unsafe {
+            let p = memchr(rem.as_ptr(), b'\n' as i32, rem.len());
+            if p.is_null() {
+                return None;
+            }
+            p.offset_from_unsigned(rem.as_ptr())
+        };
+        let pos = search_from + nl_rel + 1;
+        let after = pos + clen;
+        if after <= text.len()
+            && text[pos..after].eq_ignore_ascii_case(control_lower)
+            && text
+                .get(after)
+                .is_none_or(|&b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            return Some(pos);
+        }
+        search_from = pos;
+    }
+    None
+}
+
+fn parse_yenc_frame_fields(mut line: &[u8], with_name: bool) -> Vec<(Vec<u8>, Vec<u8>)> {
+    while line.ends_with(b"\r") {
+        line = &line[..line.len() - 1];
+    }
+    let mut fields: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(8);
+    let mut pos = 0usize;
+    while pos < line.len() {
+        let k_start = if pos == 0 && line[0].is_ascii_alphabetic() {
+            0
+        } else if matches!(line[pos], b' ' | b'\t')
+            && line.get(pos + 1).is_some_and(|b| b.is_ascii_alphabetic())
+        {
+            pos + 1
+        } else {
+            pos += 1;
+            continue;
+        };
+        let mut k_end = k_start + 1;
+        while k_end < line.len()
+            && (line[k_end].is_ascii_alphanumeric() || matches!(line[k_end], b'_' | b'-'))
+        {
+            k_end += 1;
+        }
+        if line.get(k_end) != Some(&b'=') {
+            pos = k_end;
+            continue;
+        }
+        let raw_key = &line[k_start..k_end];
+        let mut key_lower = Vec::with_capacity(raw_key.len());
+        for &b in raw_key {
+            key_lower.push(b.to_ascii_lowercase());
+        }
+        let v_start = k_end + 1;
+        if with_name && key_lower == b"name" {
+            let val = line[v_start..].to_vec();
+            if let Some(existing) = fields.iter_mut().find(|(k, _)| k == &key_lower) {
+                existing.1 = val;
+            } else {
+                fields.push((key_lower, val));
+            }
+            break;
+        }
+        let mut v_end = v_start;
+        while v_end < line.len() && !matches!(line[v_end], b' ' | b'\t') {
+            v_end += 1;
+        }
+        let val = line[v_start..v_end].to_vec();
+        if let Some(existing) = fields.iter_mut().find(|(k, _)| k == &key_lower) {
+            existing.1 = val;
+        } else {
+            fields.push((key_lower, val));
+        }
+        pos = v_end;
+    }
+    fields
+}
+
+struct ParsedYencFrame {
+    header: Vec<(Vec<u8>, Vec<u8>)>,
+    part: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+    trailer: Vec<(Vec<u8>, Vec<u8>)>,
+    payload_offset: usize,
+    payload_length: usize,
+}
+
+fn parse_yenc_article_frame(text: &[u8]) -> Option<ParsedYencFrame> {
+    let mut offset = 0usize;
+    while let Some(begin) = find_yenc_control_line(text, b"=ybegin", offset) {
+        let rem = &text[begin..];
+        let line_end_rel = unsafe {
+            let p = memchr(rem.as_ptr(), b'\n' as i32, rem.len());
+            if p.is_null() {
+                return None;
+            }
+            p.offset_from_unsigned(rem.as_ptr())
+        };
+        let line_end = begin + line_end_rel;
+        let header = parse_yenc_frame_fields(&text[begin + 7..line_end], true);
+        offset = line_end + 1;
+        let has_line = header.iter().any(|(k, _)| k == b"line");
+        let has_size = header.iter().any(|(k, _)| k == b"size");
+        let has_name = header.iter().any(|(k, _)| k == b"name");
+        if !has_line || !has_size || !has_name {
+            continue;
+        }
+
+        let mut part = None;
+        if text.len() >= offset + 7
+            && text[offset..offset + 6].eq_ignore_ascii_case(b"=ypart")
+            && matches!(text[offset + 6], b' ' | b'\t')
+        {
+            let prem = &text[offset..];
+            let part_end_rel = unsafe {
+                let p = memchr(prem.as_ptr(), b'\n' as i32, prem.len());
+                if p.is_null() {
+                    return None;
+                }
+                p.offset_from_unsigned(prem.as_ptr())
+            };
+            let part_end = offset + part_end_rel;
+            part = Some(parse_yenc_frame_fields(&text[offset + 6..part_end], false));
+            offset = part_end + 1;
+        }
+
+        let end = find_yenc_control_line(text, b"=yend", offset)?;
+        if let Some(next_begin) = find_yenc_control_line(text, b"=ybegin", offset) {
+            if next_begin < end {
+                offset = next_begin;
+                continue;
+            }
+        }
+
+        let trem = &text[end..];
+        let trailer_end = unsafe {
+            let p = memchr(trem.as_ptr(), b'\n' as i32, trem.len());
+            if p.is_null() {
+                text.len()
+            } else {
+                end + p.offset_from_unsigned(trem.as_ptr())
+            }
+        };
+        let trailer = parse_yenc_frame_fields(&text[end + 5..trailer_end], false);
+
+        return Some(ParsedYencFrame {
+            header,
+            part,
+            trailer,
+            payload_offset: offset,
+            payload_length: end - offset,
+        });
+    }
+    None
+}
+
+pub(crate) fn nzb_analyze_article_body_into(
+    body: &[u8],
+    flags: u32,
+    out: &mut OutCursor<'_>,
+) -> isize {
+    // Reserve 76-byte binary header (19 * u32 LE)
+    for _ in 0..76 {
+        out.push(0);
+    }
+
+    let body_len = body.len();
+    let need_body_meta = (flags & 1) != 0;
+    let need_framing_check = (flags & 2) != 0;
+    let need_frame = (flags & 4) != 0;
+    let need_decode = (flags & 8) != 0;
+
+    let mut crlf_count = 0usize;
+    let mut lf_count = 0usize;
+    let mut bare_cr_count = 0usize;
+    let mut nul_count = 0usize;
+    let mut last_lf: Option<usize> = None;
+
+    let mut framing_incomplete = body_len > 2_000_000;
+    let mut framing_counts = [0usize; 3];
+    let mut control_lines: Vec<(usize, usize)> = Vec::new();
+
+    if need_body_meta {
+        let mut nul_off = 0usize;
+        while nul_off < body_len {
+            let rem = &body[nul_off..];
+            let p = unsafe { memchr(rem.as_ptr(), 0, rem.len()) };
+            if p.is_null() {
+                break;
+            }
+            nul_count += 1;
+            let rel = unsafe { p.offset_from_unsigned(rem.as_ptr()) };
+            nul_off += rel + 1;
+        }
+    }
+
+    if need_body_meta || need_framing_check || need_frame {
+        let mut offset = 0usize;
+        while offset < body_len {
+            let rem = &body[offset..];
+            let nl_rel = unsafe {
+                let p = memchr(rem.as_ptr(), b'\n' as i32, rem.len());
+                if p.is_null() {
+                    None
+                } else {
+                    Some(p.offset_from_unsigned(rem.as_ptr()))
+                }
+            };
+            let end = match nl_rel {
+                Some(rel) => {
+                    let e = offset + rel;
+                    lf_count += 1;
+                    last_lf = Some(e);
+                    if e > offset && body[e - 1] == b'\r' {
+                        crlf_count += 1;
+                    }
+                    e
+                }
+                None => body_len,
+            };
+            let line_raw = &body[offset..end];
+            if need_body_meta {
+                let check_slice = if end < body_len && end > offset && body[end - 1] == b'\r' {
+                    &body[offset..end - 1]
+                } else {
+                    line_raw
+                };
+                if !check_slice.is_empty() {
+                    let mut cr_off = 0usize;
+                    while cr_off < check_slice.len() {
+                        let sub = &check_slice[cr_off..];
+                        let p = unsafe { memchr(sub.as_ptr(), b'\r' as i32, sub.len()) };
+                        if p.is_null() {
+                            break;
+                        }
+                        bare_cr_count += 1;
+                        let rel = unsafe { p.offset_from_unsigned(sub.as_ptr()) };
+                        cr_off += rel + 1;
+                    }
+                }
+            }
+
+            if (need_framing_check || need_frame)
+                && line_raw.first() == Some(&b'=')
+                && line_raw.get(1).is_some_and(|&b| b == b'y' || b == b'Y')
+            {
+                let ctrl_kind_and_len = if line_raw.len() >= 7
+                    && line_raw[..7].eq_ignore_ascii_case(b"=ybegin")
+                {
+                    Some((YencControlKind::Ybegin, 7usize))
+                } else if line_raw.len() >= 6 && line_raw[..6].eq_ignore_ascii_case(b"=ypart") {
+                    Some((YencControlKind::Ypart, 6usize))
+                } else if line_raw.len() >= 5 && line_raw[..5].eq_ignore_ascii_case(b"=yend") {
+                    Some((YencControlKind::Yend, 5usize))
+                } else {
+                    None
+                };
+
+                if let Some((kind, kw_len)) = ctrl_kind_and_len {
+                    if need_frame {
+                        let cr_pos = line_raw
+                            .iter()
+                            .position(|&b| b == b'\r')
+                            .unwrap_or(line_raw.len());
+                        control_lines.push((offset, offset + cr_pos));
+                    }
+                    if need_framing_check
+                        && !framing_incomplete
+                        && line_raw
+                            .get(kw_len)
+                            .is_none_or(|&b| matches!(b, b' ' | b'\t' | b'\r'))
+                    {
+                        if check_fallback_yenc_control_line(kind, line_raw, &mut framing_counts) {
+                            framing_incomplete = true;
+                        }
+                    }
+                }
+            }
+
+            offset = match nl_rel {
+                Some(_) => end + 1,
+                None => body_len,
+            };
+        }
+    }
+
+    if need_framing_check && (framing_counts[0] != 1 || framing_counts[2] != 1) {
+        framing_incomplete = true;
+    }
+
+    let bare_lf_count = lf_count - crlf_count;
+    let final_line_terminated = body.is_empty() || body.ends_with(b"\r\n");
+    let unterminated_tail_byte_count = match last_lf {
+        Some(idx) => body_len - idx - 1,
+        None => body_len,
+    };
+    let observed_lf_delimited_line_count =
+        lf_count + usize::from(!body.is_empty() && !body.ends_with(b"\n"));
+    let body_status: u32 = if body.is_empty() {
+        0 // empty
+    } else if bare_lf_count > 0 || bare_cr_count > 0 {
+        2 // non_crlf_line_endings
+    } else if !final_line_terminated {
+        3 // unterminated_final_line
+    } else {
+        1 // complete_crlf
+    };
+
+    let mut flags_out = 0u32;
+    if final_line_terminated {
+        flags_out |= 1;
+    }
+    if framing_incomplete {
+        flags_out |= 2;
+    }
+
+    let mut payload_offset = 0u32;
+    let mut payload_length = 0u32;
+    let mut escape_sequence_count = 0u32;
+    let mut payload_line_count = 0u32;
+    let mut payload_line_min = 0u32;
+    let mut payload_line_max = 0u32;
+    let mut format_signatures_mask = 0u32;
+    let mut decoded_crc32 = 0u32;
+    let mut meta_section_len = 0u32;
+    let mut decoded_bytes_len = 0u32;
+
+    if need_frame {
+        let meta_start = out.pos;
+        let body_sha256 = sha256_fast_hex(body);
+        out.extend(&body_sha256);
+
+        if let Some(frame) = parse_yenc_article_frame(body) {
+            flags_out |= 4; // has_frame
+            if frame.part.is_some() {
+                flags_out |= 8; // has_part
+            }
+            payload_offset = frame.payload_offset as u32;
+            payload_length = frame.payload_length as u32;
+
+            let payload =
+                &body[frame.payload_offset..frame.payload_offset + frame.payload_length];
+            let payload_sha256 = sha256_fast_hex(payload);
+            out.push(b'\n');
+            out.extend(&payload_sha256);
+            out.push(b'\n');
+            let decoded_sha_pos = out.pos;
+            if need_decode {
+                out.extend(&[b'0'; 64]);
+            }
+
+            // Emit `\n`-separated frame fields + control lines
+            out.push(b'\n');
+            write_usize_decimal(out, frame.header.len());
+            for (k, v) in &frame.header {
+                out.push(b'\n');
+                out.extend(k);
+                out.push(b'\n');
+                out.extend(v);
+            }
+            if let Some(part_fields) = &frame.part {
+                out.push(b'\n');
+                write_usize_decimal(out, part_fields.len());
+                for (k, v) in part_fields {
+                    out.push(b'\n');
+                    out.extend(k);
+                    out.push(b'\n');
+                    out.extend(v);
+                }
+            }
+            out.push(b'\n');
+            write_usize_decimal(out, frame.trailer.len());
+            for (k, v) in &frame.trailer {
+                out.push(b'\n');
+                out.extend(k);
+                out.push(b'\n');
+                out.extend(v);
+            }
+            out.push(b'\n');
+            write_usize_decimal(out, control_lines.len());
+            for &(cs, ce) in &control_lines {
+                out.push(b'\n');
+                out.extend(&body[cs..ce]);
+            }
+            meta_section_len = (out.pos - meta_start) as u32;
+
+            let mut trailing_eq = 0usize;
+            for &b in payload.iter().rev() {
+                if b == b'=' {
+                    trailing_eq += 1;
+                } else if b != b'\r' && b != b'\n' {
+                    break;
+                }
+            }
+            if (trailing_eq & 1) == 0 {
+                flags_out |= 16; // payload_escape_state_valid
+            }
+
+            let mut trimmed_payload = payload;
+            while let Some(&last) = trimmed_payload.last() {
+                if last == b'\r' || last == b'\n' {
+                    trimmed_payload = &trimmed_payload[..trimmed_payload.len() - 1];
+                } else {
+                    break;
+                }
+            }
+            let mut p_min = u32::MAX;
+            let mut p_max = 0u32;
+            let mut p_off = 0usize;
+            while p_off < trimmed_payload.len() {
+                let rem = &trimmed_payload[p_off..];
+                let nl_rel = unsafe {
+                    let p = memchr(rem.as_ptr(), b'\n' as i32, rem.len());
+                    if p.is_null() {
+                        None
+                    } else {
+                        Some(p.offset_from_unsigned(rem.as_ptr()))
+                    }
+                };
+                match nl_rel {
+                    Some(rel) => {
+                        let line_len = if rel > 0 && rem[rel - 1] == b'\r' {
+                            rel - 1
+                        } else {
+                            rel
+                        } as u32;
+                        payload_line_count += 1;
+                        p_min = p_min.min(line_len);
+                        p_max = p_max.max(line_len);
+                        p_off += rel + 1;
+                    }
+                    None => break,
+                }
+            }
+            let tail_len = (trimmed_payload.len() - p_off) as u32;
+            payload_line_count += 1;
+            p_min = p_min.min(tail_len);
+            p_max = p_max.max(tail_len);
+            payload_line_min = p_min;
+            payload_line_max = p_max;
+
+            let decoded_start = out.pos;
+            if need_decode {
+                flags_out |= 32; // has_decoded_bytes
+                let mut escaped = false;
+                if out.pos.saturating_add(payload.len()) <= out.buf.len() {
+                    let mut write_pos = out.pos;
+                    let mut i = 0usize;
+                    let plen = payload.len();
+                    while i < plen {
+                        if !escaped {
+                            while i + 16 <= plen {
+                                let chunk = &payload[i..i + 16];
+                                if chunk
+                                    .iter()
+                                    .all(|&b| b != b'\r' && b != b'\n' && b != b'=')
+                                {
+                                    let dst = &mut out.buf[write_pos..write_pos + 16];
+                                    for k in 0..16 {
+                                        dst[k] = chunk[k].wrapping_sub(42);
+                                    }
+                                    write_pos += 16;
+                                    i += 16;
+                                } else {
+                                    break;
+                                }
+                            }
+                            while i < plen {
+                                let b = payload[i];
+                                if b != b'\r' && b != b'\n' && b != b'=' {
+                                    out.buf[write_pos] = b.wrapping_sub(42);
+                                    write_pos += 1;
+                                    i += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            if i >= plen {
+                                break;
+                            }
+                        }
+                        let b = payload[i];
+                        i += 1;
+                        if b == b'\r' || b == b'\n' {
+                            continue;
+                        }
+                        if b == b'=' {
+                            escape_sequence_count += 1;
+                        }
+                        if escaped {
+                            out.buf[write_pos] = b.wrapping_sub(106);
+                            write_pos += 1;
+                            escaped = false;
+                        } else if b == b'=' {
+                            escaped = true;
+                        } else {
+                            out.buf[write_pos] = b.wrapping_sub(42);
+                            write_pos += 1;
+                        }
+                    }
+                    out.pos = write_pos;
+                } else {
+                    for &b in payload {
+                        if b == b'\r' || b == b'\n' {
+                            continue;
+                        }
+                        if b == b'=' {
+                            escape_sequence_count += 1;
+                        }
+                        if escaped {
+                            out.push(b.wrapping_sub(106));
+                            escaped = false;
+                        } else if b == b'=' {
+                            escaped = true;
+                        } else {
+                            out.push(b.wrapping_sub(42));
+                        }
+                    }
+                }
+                decoded_bytes_len = (out.pos - decoded_start) as u32;
+                if out.pos <= out.buf.len() {
+                    let decoded_slice = &out.buf[decoded_start..out.pos];
+                    decoded_crc32 = crc32_ieee(decoded_slice);
+                    let prefix_end = decoded_slice.len().min(65_536);
+                    format_signatures_mask =
+                        detect_format_signatures_mask(&decoded_slice[..prefix_end]);
+                    let decoded_sha256 = sha256_fast_hex(decoded_slice);
+                    if decoded_sha_pos + 64 <= out.buf.len() {
+                        out.buf[decoded_sha_pos..decoded_sha_pos + 64]
+                            .copy_from_slice(&decoded_sha256);
+                    }
+                }
+            } else {
+                for &b in payload {
+                    if b == b'=' {
+                        escape_sequence_count += 1;
+                    }
+                }
+            }
+        } else {
+            meta_section_len = (out.pos - meta_start) as u32;
+        }
+    }
+
+    if out.buf.len() >= 76 {
+        let words: [u32; 19] = [
+            body_status,
+            crlf_count as u32,
+            lf_count as u32,
+            bare_lf_count as u32,
+            bare_cr_count as u32,
+            nul_count as u32,
+            observed_lf_delimited_line_count as u32,
+            unterminated_tail_byte_count as u32,
+            flags_out,
+            payload_offset,
+            payload_length,
+            escape_sequence_count,
+            payload_line_count,
+            payload_line_min,
+            payload_line_max,
+            format_signatures_mask,
+            decoded_crc32,
+            meta_section_len,
+            decoded_bytes_len,
+        ];
+        for (idx, w) in words.iter().enumerate() {
+            out.buf[idx * 4..idx * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+    }
+
+    if out.pos <= out.buf.len() {
+        out.pos as isize
+    } else {
+        -(out.pos.max(80) as isize)
+    }
+}
+
+pub(crate) fn nzb_select_article_samples_into(
+    input: &[u8],
+    file_count: usize,
+    max_samples: usize,
+    out: &mut OutCursor<'_>,
+) -> isize {
+    let maximum_samples = max_samples.clamp(1, 128);
+    let mut tokens = input.split(|&b| b == 0);
+    let mut seen_keys: Vec<(usize, &[u8])> = Vec::with_capacity(maximum_samples * 2);
+    let mut samples: Vec<(&[u8], &[u8], &[u8], &[u8], &[u8], &[u8], &[u8])> =
+        Vec::with_capacity(maximum_samples);
+    let mut omitted_count = 0usize;
+
+    for _ in 0..file_count {
+        let Some(file_idx_raw) = tokens.next() else {
+            return -1;
+        };
+        let Some(file_idx_num) = nzb_metadata_number(file_idx_raw) else {
+            return -1;
+        };
+        let file_idx = file_idx_num as usize;
+        let Some(kind) = tokens.next() else {
+            return -1;
+        };
+        let Some(subject) = tokens.next() else {
+            return -1;
+        };
+        let Some(seg_count_raw) = tokens.next() else {
+            return -1;
+        };
+        let Some(seg_count_i64) = nzb_metadata_number(seg_count_raw) else {
+            return -1;
+        };
+        let seg_count = seg_count_i64 as usize;
+
+        if seg_count == 0 {
+            continue;
+        }
+
+        if kind == b"par2" {
+            for _ in 0..seg_count {
+                let Some(seg_num) = tokens.next() else {
+                    return -1;
+                };
+                let Some(seg_bytes) = tokens.next() else {
+                    return -1;
+                };
+                let Some(msg_id) = tokens.next() else {
+                    return -1;
+                };
+                if msg_id.is_empty() || seen_keys.contains(&(file_idx, msg_id)) {
+                    continue;
+                }
+                seen_keys.push((file_idx, msg_id));
+                if samples.len() >= maximum_samples {
+                    omitted_count += 1;
+                } else {
+                    samples.push((
+                        file_idx_raw,
+                        kind,
+                        subject,
+                        seg_num,
+                        msg_id,
+                        seg_bytes,
+                        b"all_par2_segments",
+                    ));
+                }
+            }
+        } else {
+            let last = seg_count - 1;
+            let mid = if last > 1 { Some(last / 2) } else { None };
+            let mut first_seg = None;
+            let mut mid_seg = None;
+            let mut last_seg = None;
+            for s_idx in 0..seg_count {
+                let Some(seg_num) = tokens.next() else {
+                    return -1;
+                };
+                let Some(seg_bytes) = tokens.next() else {
+                    return -1;
+                };
+                let Some(msg_id) = tokens.next() else {
+                    return -1;
+                };
+                if s_idx == 0 {
+                    first_seg = Some((seg_num, seg_bytes, msg_id));
+                }
+                if mid == Some(s_idx) {
+                    mid_seg = Some((seg_num, seg_bytes, msg_id));
+                }
+                if last > 0 && s_idx == last {
+                    last_seg = Some((seg_num, seg_bytes, msg_id));
+                }
+            }
+
+            let mut candidates: [(Option<(&[u8], &[u8], &[u8])>, &[u8]); 3] = [
+                (first_seg, b"first"),
+                (mid_seg, b"middle"),
+                (last_seg, b"last"),
+            ];
+            for (cand_opt, role) in &mut candidates {
+                let Some((seg_num, seg_bytes, msg_id)) = *cand_opt else {
+                    continue;
+                };
+                if msg_id.is_empty() || seen_keys.contains(&(file_idx, msg_id)) {
+                    continue;
+                }
+                seen_keys.push((file_idx, msg_id));
+                if samples.len() >= maximum_samples {
+                    omitted_count += 1;
+                } else {
+                    samples.push((file_idx_raw, kind, subject, seg_num, msg_id, seg_bytes, role));
+                }
+            }
+        }
+    }
+
+    write_usize_decimal(out, omitted_count);
+    out.push(0);
+    write_usize_decimal(out, samples.len());
+    for &(f_idx, kind, subj, s_num, m_id, s_bytes, role) in &samples {
+        out.push(0);
+        out.extend(f_idx);
+        out.push(0);
+        out.extend(kind);
+        out.push(0);
+        out.extend(subj);
+        out.push(0);
+        out.extend(s_num);
+        out.push(0);
+        out.extend(m_id);
+        out.push(0);
+        out.extend(s_bytes);
+        out.push(0);
+        out.extend(role);
+    }
+
+    finish_cursor_min_ref(out, 16)
+}
+
+/// Classifies an NZB file subject into `0` (`"other"`), `1` (`"rar"`), or `2` (`"par2"`).
+///
+/// # Safety
+///
+/// `subject` must be valid for reads of `subject_len` bytes when non-null and `subject_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_file_kind(subject: *const u8, subject_len: usize) -> i32 {
+    if subject.is_null() && subject_len > 0 {
+        return -1;
+    }
+    let bytes = if subject_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(subject, subject_len) }
+    };
+    i32::from(nzb_file_kind_code(bytes))
+}
+
+/// Extracts `NzbFingerprintAnalyzer::formatHint` into `out_buf`.
+/// Returns `1..=8` on match, `0` when `"unknown"`, `-1` on null pointers, or `-8` if `out_cap < 8`.
+///
+/// # Safety
+///
+/// `subject` must be valid for reads of `subject_len` bytes when non-null and `subject_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_format_hint(
+    subject: *const u8,
+    subject_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if (subject.is_null() && subject_len > 0) || (out_buf.is_null() && out_cap > 0) {
+        return -1;
+    }
+    if out_cap < 8 {
+        return -8;
+    }
+    let bytes = if subject_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(subject, subject_len) }
+    };
+    let mut hint = [0u8; 8];
+    let len = nzb_format_hint_slice(bytes, &mut hint);
+    if len > 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(hint.as_ptr(), out_buf, len);
+        }
+    }
+    len as isize
+}
+
+/// Detects format signatures on a decoded article prefix (`NzbFingerprintAnalyzer::detectFormatSignatures`).
+///
+/// # Safety
+///
+/// `bytes` must be valid for reads of `len` bytes when non-null and `len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_detect_format_signatures(
+    bytes: *const u8,
+    len: usize,
+) -> i32 {
+    if bytes.is_null() && len > 0 {
+        return -1;
+    }
+    let slice = if len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(bytes, len) }
+    };
+    detect_format_signatures_mask(slice) as i32
+}
+
+/// Single-pass NZB XML manifest analyzer (`NzbFingerprintAnalyzer::analyzeManifest`).
+///
+/// # Safety
+///
+/// `xml` must be valid for reads of `xml_len` bytes when non-null and `xml_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_analyze_manifest(
+    xml: *const u8,
+    xml_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if xml_len == 0 || xml.is_null() || (out_buf.is_null() && out_cap > 0) {
+        return -1;
+    }
+    let src = unsafe { slice::from_raw_parts(xml, xml_len) };
+    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+    nzb_analyze_manifest_into(src, &mut cursor)
+}
+
+/// Unfolds RFC 5322 article headers and detects uploader software candidates.
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_unfold_headers(
+    input: *const u8,
+    input_len: usize,
+    count: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if count == 0 {
+        return 0;
+    }
+    if (input.is_null() && input_len > 0) || (out_buf.is_null() && out_cap > 0) {
+        return -1;
+    }
+    let src = if input_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(input, input_len) }
+    };
+    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+    nzb_unfold_headers_into(src, count, &mut cursor)
+}
+
+/// Analyzes NNTP article body framing, yEnc control lines, payload line statistics, and optional yEnc payload decoding.
+///
+/// # Safety
+///
+/// `body` must be valid for reads of `body_len` bytes when non-null and `body_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_analyze_article_body(
+    body: *const u8,
+    body_len: usize,
+    flags: u32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if (body.is_null() && body_len > 0) || (out_buf.is_null() && out_cap > 0) {
+        return -1;
+    }
+    let src = if body_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(body, body_len) }
+    };
+    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+    nzb_analyze_article_body_into(src, flags, &mut cursor)
+}
+
+/// Selects bounded article samples from packed NZB manifest file records (`NzbFingerprintAnalyzer::selectArticleSamples`).
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_select_article_samples(
+    input: *const u8,
+    input_len: usize,
+    file_count: usize,
+    max_samples: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if (input.is_null() && input_len > 0) || (out_buf.is_null() && out_cap > 0) {
+        return -1;
+    }
+    let src = if input_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(input, input_len) }
+    };
+    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+    nzb_select_article_samples_into(src, file_count, max_samples, &mut cursor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5244,5 +7753,105 @@ mod tests {
             &buf[..len2 as usize],
             b"Ordinary World (2016) 1080p\0Matching video parent basename"
         );
+    }
+
+    #[test]
+    fn test_nzb_file_kind_and_format_hint() {
+        assert_eq!(
+            nzb_file_kind_code(b"\"Release.vol01+02.PAR2\" yEnc (1/1)"),
+            2
+        );
+        assert_eq!(nzb_file_kind_code(b"\"Release.part01.rar\" yEnc (1/5)"), 1);
+        assert_eq!(nzb_file_kind_code(b"\"Release.r00\" yEnc (1/5)"), 1);
+        assert_eq!(nzb_file_kind_code(b"\"Release.s99\" yEnc (1/5)"), 0);
+        assert_eq!(nzb_file_kind_code(b"\"Release.001\" yEnc (1/5)"), 0);
+        assert_eq!(nzb_file_kind_code(b"\"Release.nfo\" yEnc (1/1)"), 0);
+
+        let mut h1 = [0u8; 8];
+        let l1 = nzb_format_hint_slice(b"\"Release.7z.001\" yEnc (1/1)", &mut h1);
+        assert_eq!(&h1[..l1], b"7z");
+        let mut h2 = [0u8; 8];
+        let l2 = nzb_format_hint_slice(b"\"Release_r12.RAR\" yEnc (1/1)", &mut h2);
+        assert_eq!(&h2[..l2], b"rar");
+        let mut h3 = [0u8; 8];
+        let l3 = nzb_format_hint_slice(b"no extension at all", &mut h3);
+        assert_eq!(l3, 0);
+    }
+
+    #[test]
+    fn test_nzb_detect_format_signatures() {
+        assert_eq!(detect_format_signatures_mask(b"Rar!\x1a\x07\x01\x00extra"), 1);
+        assert_eq!(detect_format_signatures_mask(b"Rar!\x1a\x07\x00"), 2);
+        assert_eq!(detect_format_signatures_mask(b"7z\xbc\xaf\x27\x1c"), 4);
+        assert_eq!(detect_format_signatures_mask(b"PK\x03\x04"), 8);
+        assert_eq!(detect_format_signatures_mask(b"\x1f\x8b\x08"), 16);
+        assert_eq!(detect_format_signatures_mask(b"\xfd7zXZ\x00"), 32);
+        let mut iso = vec![0u8; 0x8006];
+        iso[0x8001..0x8006].copy_from_slice(b"CD001");
+        assert_eq!(detect_format_signatures_mask(&iso), 64);
+    }
+
+    #[test]
+    fn test_nzb_analyze_manifest_and_samples() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nzb PUBLIC "-//newzBin//DTD NZB 1.1//EN" "http://www.newzbin.com/DTD/nzb/nzb-1.1.dtd">
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <head>
+    <meta type="title">Example &amp; Release</meta>
+    <meta type="category">TV &gt; HD</meta>
+  </head>
+  <file poster="poster@example.com" date="1700000000" subject="&quot;Example.part01.rar&quot; yEnc (1/2)">
+    <groups>
+      <group>alt.binaries.test</group>
+    </groups>
+    <segments>
+      <segment bytes="200" number="2">&lt;seg2@example.com&gt;</segment>
+      <segment bytes="100" number="1">seg1@example.com</segment>
+    </segments>
+  </file>
+</nzb>"#;
+        let mut buf = vec![0u8; 4096];
+        let mut out = unsafe { OutCursor::new(buf.as_mut_ptr(), buf.len()) };
+        let written = nzb_analyze_manifest_into(xml, &mut out);
+        assert!(written > 0);
+        let tokens: Vec<&str> = buf[..written as usize]
+            .split(|&b| b == 0)
+            .map(|s| std::str::from_utf8(s).unwrap())
+            .collect();
+        assert_eq!(tokens[0], "2"); // 2 meta types
+        assert_eq!(tokens[1], "title");
+        assert_eq!(tokens[2], "1");
+        assert_eq!(tokens[3], "Example & Release");
+    }
+
+    #[test]
+    fn test_nzb_unfold_headers_and_article_body() {
+        let headers = b"Subject: \"Example.rar\"\0\t yEnc (1/1)\0X-Newsreader: Nyuu/0.4.1\0From: tester@example.com";
+        let mut buf = vec![0u8; 2048];
+        let mut out = unsafe { OutCursor::new(buf.as_mut_ptr(), buf.len()) };
+        let written = nzb_unfold_headers_into(headers, 4, &mut out);
+        assert!(written > 0);
+
+        let body = b"=ybegin line=128 size=4 name=test.bin\r\n*+,-\r\n=yend size=4 crc32=9b0d08f1\r\n";
+        let mut body_buf = vec![0u8; 2048];
+        let mut body_out = unsafe { OutCursor::new(body_buf.as_mut_ptr(), body_buf.len()) };
+        let body_written = nzb_analyze_article_body_into(body, 0x0F, &mut body_out);
+        assert!(body_written >= 76);
+        let body_status = u32::from_le_bytes(body_buf[0..4].try_into().unwrap());
+        assert_eq!(body_status, 1); // complete_crlf
+        let decoded_len = u32::from_le_bytes(body_buf[72..76].try_into().unwrap()) as usize;
+        assert_eq!(decoded_len, 4);
+        let meta_len = u32::from_le_bytes(body_buf[68..72].try_into().unwrap()) as usize;
+        assert_eq!(&body_buf[76 + meta_len..76 + meta_len + 4], &[0, 1, 2, 3]);
+
+        for len in [0usize, 1, 3, 55, 56, 63, 64, 65, 128, 1024] {
+            let sample: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
+            assert_eq!(
+                sha256_fast_hex(&sample),
+                crate::predb::sha256_hex_slice(&sample),
+                "sha256 mismatch at len={len}"
+            );
+        }
+        assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
     }
 }

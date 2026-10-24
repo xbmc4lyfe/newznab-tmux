@@ -6,17 +6,51 @@ namespace App\Services\Releases\Fingerprint;
 
 use App\Services\Yenc\ArticleFrame;
 use App\Services\YencService;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use RuntimeException;
 
 final class NzbFingerprintAnalyzer
 {
     public const MAX_ARTICLE_SAMPLES = 128;
 
+    private const string FFI_CDEF = <<<'C'
+        int32_t nntmux_nzb_file_kind(const char *subject, size_t subject_len);
+        ssize_t nntmux_nzb_format_hint(const char *subject, size_t subject_len, char *out_buf, size_t out_cap);
+        int32_t nntmux_nzb_detect_format_signatures(const char *bytes, size_t len);
+        ssize_t nntmux_nzb_analyze_manifest(const char *xml, size_t xml_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_nzb_unfold_headers(const char *input, size_t input_len, size_t count, char *out_buf, size_t out_cap);
+        ssize_t nntmux_nzb_analyze_article_body(const char *body, size_t body_len, uint32_t flags, char *out_buf, size_t out_cap);
+        ssize_t nntmux_nzb_select_article_samples(const char *input, size_t input_len, size_t file_count, size_t max_samples, char *out_buf, size_t out_cap);
+        C;
+
+    private static bool $useRustFfi = true;
+
     public function __construct(private readonly YencService $yenc) {}
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+
+        return RustPipelineLibrary::resolveDomain('nzb_fingerprint_manifest', self::FFI_CDEF);
+    }
 
     /** @return array<string, mixed> */
     public function analyzeManifest(string $xml): array
     {
+        if (strlen($xml) <= 33_554_432) {
+            $native = self::analyzeManifestNative($xml);
+            if ($native !== null) {
+                return $native;
+            }
+        }
         if (strlen($xml) > 33_554_432 || str_contains(strtoupper($xml), '<!ENTITY')) {
             throw new RuntimeException('NZB exceeds the metadata parser budget or contains an entity declaration.');
         }
@@ -249,17 +283,29 @@ final class NzbFingerprintAnalyzer
                 : trim($value);
         }
 
-        $frame = ArticleFrame::parse($rawBody);
+        $joinedHeaders = implode('', $rawHeaders);
         $yencFramingMetadata = (new NativeMetadataParser)->parseYencFraming($rawBody);
-        $nntpHeaderMetadata = (new NativeMetadataParser)->parseNntpHeaders(implode('', $rawHeaders));
-        $nntpBodyMetadata = (new NativeMetadataParser)->parseNntpBody($rawBody)
-            ?? self::fallbackNntpBodyMetadata($rawBody);
+        $nntpHeaderMetadata = (new NativeMetadataParser)->parseNntpHeaders($joinedHeaders);
+        $nntpBodyMetadata = (new NativeMetadataParser)->parseNntpBody($rawBody);
         $nntpLinesBodyRelationship = (new NativeMetadataParser)->compareNntpLinesToBody(
-            implode('', $rawHeaders),
+            $joinedHeaders,
             $rawBody,
         );
+
+        $useRustYencDecode = $this->yenc::class === YencService::class && $this->yenc->decoderName() === 'PHP';
+        $bodyFlags = 4
+            | ($nntpBodyMetadata === null ? 1 : 0)
+            | ($yencFramingMetadata === null ? 2 : 0)
+            | ($useRustYencDecode ? 8 : 0);
+        $nativeBody = self::analyzeArticleBodyNative($rawBody, $bodyFlags);
+
+        if ($nntpBodyMetadata === null) {
+            $nntpBodyMetadata = $nativeBody['nntp_body_metadata'] ?? self::fallbackNntpBodyMetadata($rawBody);
+        }
         $conflictingYencFields = [];
-        $framingEvidenceIncomplete = self::yencFramingEvidenceIncomplete($yencFramingMetadata, $rawBody);
+        $framingEvidenceIncomplete = ($yencFramingMetadata === null && $nativeBody !== null)
+            ? $nativeBody['framing_incomplete']
+            : self::yencFramingEvidenceIncomplete($yencFramingMetadata, $rawBody);
         $framingLines = is_array($yencFramingMetadata['lines'] ?? null) ? $yencFramingMetadata['lines'] : [];
         foreach ($framingLines as $controlLine) {
             if (! is_array($controlLine) || ! is_string($controlLine['kind'] ?? null)) {
@@ -283,18 +329,64 @@ final class NzbFingerprintAnalyzer
         $decodedPrefix = null;
         $formatMetadata = null;
         $decodedBytes = null;
-        if ($frame !== null) {
-            $decoded = $this->yenc->decodeWithFrame($rawBody);
-            $payload = substr($rawBody, $frame->payloadOffset, $frame->payloadLength);
-            $payloadEscapeStateValid = self::payloadEscapeStateValid($payload);
-            $decodedBytes = $payloadEscapeStateValid ? $decoded[0] : null;
-            $payloadHash = hash('sha256', $payload);
-            $decodedHash = hash('sha256', $decoded[0]);
-            $decodedSize = strlen($decoded[0]);
-            $decodedPrefix = substr($decoded[0], 0, 65_536);
-            $formatMetadata = (new NativeMetadataParser)->parseFormats($decoded[0]) ?? [
+        $hasFrame = $nativeBody !== null ? $nativeBody['has_frame'] : (($frame = ArticleFrame::parse($rawBody)) !== null);
+        if ($hasFrame) {
+            if ($nativeBody !== null) {
+                $frameHeader = $nativeBody['header'];
+                $framePart = $nativeBody['part'];
+                $frameTrailer = $nativeBody['trailer'];
+                $payloadEscapeStateValid = $nativeBody['payload_escape_state_valid'];
+                $payloadHash = $nativeBody['payload_sha256'] !== ''
+                    ? $nativeBody['payload_sha256']
+                    : hash('sha256', substr($rawBody, $nativeBody['payload_offset'], $nativeBody['payload_length']));
+                if ($nativeBody['has_decoded_bytes']) {
+                    $decodedData = $nativeBody['decoded_bytes'];
+                    $decodedHash = $nativeBody['decoded_sha256'] !== ''
+                        ? $nativeBody['decoded_sha256']
+                        : hash('sha256', $decodedData);
+                    $observedCrc = $nativeBody['decoded_crc32'];
+                    $fallbackSignatures = self::formatSignaturesFromMask($nativeBody['format_signatures_mask']);
+                } else {
+                    $decoded = $this->yenc->decodeWithFrame($rawBody);
+                    $decodedData = $decoded[0];
+                    $decodedHash = hash('sha256', $decodedData);
+                    $observedCrc = hash('crc32b', $decodedData);
+                    $fallbackSignatures = null;
+                }
+                $payloadLineCount = $nativeBody['payload_line_count'];
+                $payloadLineMin = $nativeBody['payload_line_min'];
+                $payloadLineMax = $nativeBody['payload_line_max'];
+                $controlLines = $nativeBody['control_lines'];
+                $escapeSequenceCount = $nativeBody['escape_sequence_count'];
+            } else {
+                $frameHeader = $frame->header;
+                $framePart = $frame->part;
+                $frameTrailer = $frame->trailer;
+                $decoded = $this->yenc->decodeWithFrame($rawBody);
+                $decodedData = $decoded[0];
+                $payload = substr($rawBody, $frame->payloadOffset, $frame->payloadLength);
+                $payloadEscapeStateValid = self::payloadEscapeStateValid($payload);
+                $payloadHash = hash('sha256', $payload);
+                $decodedHash = hash('sha256', $decodedData);
+                $observedCrc = hash('crc32b', $decodedData);
+                $fallbackSignatures = null;
+                foreach (preg_split('/\r?\n/', rtrim($payload, "\r\n")) ?: [] as $line) {
+                    $payloadLineLengths[] = strlen($line);
+                }
+                $payloadLineCount = count($payloadLineLengths);
+                $payloadLineMin = $payloadLineLengths === [] ? null : min($payloadLineLengths);
+                $payloadLineMax = $payloadLineLengths === [] ? null : max($payloadLineLengths);
+                $controlLines = [];
+                preg_match_all('/^(?:=ybegin|=ypart|=yend)[^\r\n]*/mi', $rawBody, $controlMatches);
+                $controlLines = $controlMatches[0] ?? [];
+                $escapeSequenceCount = substr_count($payload, '=');
+            }
+            $decodedBytes = $payloadEscapeStateValid ? $decodedData : null;
+            $decodedSize = strlen($decodedData);
+            $decodedPrefix = substr($decodedData, 0, 65_536);
+            $formatMetadata = (new NativeMetadataParser)->parseFormats($decodedData) ?? [
                 'parser_engine' => 'php-signature-fallback',
-                'signatures' => self::detectFormatSignatures($decodedPrefix),
+                'signatures' => $fallbackSignatures ?? self::detectFormatSignatures($decodedPrefix),
                 'headers' => [],
             ];
             if (extension_loaded('fileinfo')) {
@@ -303,38 +395,35 @@ final class NzbFingerprintAnalyzer
                 $formatMetadata['mime_type'] = (new \finfo(FILEINFO_MIME_TYPE))->buffer($decodedPrefix) ?: null;
                 $formatMetadata['magic_basis'] = 'first 65536 decoded bytes; heuristic identification only';
             }
-            foreach (preg_split('/\r?\n/', rtrim($payload, "\r\n")) ?: [] as $line) {
-                $payloadLineLengths[] = strlen($line);
-            }
             $rangeFieldsConflict = $framingEvidenceIncomplete || in_array('ypart.begin', $conflictingYencFields, true)
                 || in_array('ypart.end', $conflictingYencFields, true);
             $headerSizeConflict = $framingEvidenceIncomplete || in_array('ybegin.size', $conflictingYencFields, true);
             $trailerSizeConflict = $framingEvidenceIncomplete || in_array('yend.size', $conflictingYencFields, true);
-            $rangeStart = ! $framingEvidenceIncomplete && ! in_array('ypart.begin', $conflictingYencFields, true) && isset($frame->part['begin'])
-                ? self::metadataNumber($frame->part['begin']) : null;
-            $rangeEnd = ! $framingEvidenceIncomplete && ! in_array('ypart.end', $conflictingYencFields, true) && isset($frame->part['end'])
-                ? self::metadataNumber($frame->part['end']) : null;
-            $headerExpectedDecodedSize = ! $headerSizeConflict && isset($frame->header['size'])
-                ? self::metadataNumber($frame->header['size']) : null;
-            $hasRangeField = isset($frame->part['begin']) || isset($frame->part['end']);
+            $rangeStart = ! $framingEvidenceIncomplete && ! in_array('ypart.begin', $conflictingYencFields, true) && isset($framePart['begin'])
+                ? self::metadataNumber($framePart['begin']) : null;
+            $rangeEnd = ! $framingEvidenceIncomplete && ! in_array('ypart.end', $conflictingYencFields, true) && isset($framePart['end'])
+                ? self::metadataNumber($framePart['end']) : null;
+            $headerExpectedDecodedSize = ! $headerSizeConflict && isset($frameHeader['size'])
+                ? self::metadataNumber($frameHeader['size']) : null;
+            $hasRangeField = isset($framePart['begin']) || isset($framePart['end']);
             $rangeIsValid = ! $hasRangeField || $rangeFieldsConflict || $headerSizeConflict ? null : ($rangeStart !== null && $rangeEnd !== null
                 && $rangeStart >= 1 && $rangeEnd >= $rangeStart
-                && (! isset($frame->header['size']) || ($headerExpectedDecodedSize !== null
+                && (! isset($frameHeader['size']) || ($headerExpectedDecodedSize !== null
                     && $rangeEnd <= $headerExpectedDecodedSize)));
             $ypartExpectedDecodedSize = $rangeIsValid === true ? $rangeEnd - $rangeStart + 1 : null;
-            $trailerExpectedDecodedSize = ! $trailerSizeConflict && isset($frame->trailer['size'])
-                ? self::metadataNumber($frame->trailer['size']) : null;
-            $trailerSizeIsDecimal = $trailerSizeConflict ? null : (! isset($frame->trailer['size']) || ctype_digit($frame->trailer['size']));
+            $trailerExpectedDecodedSize = ! $trailerSizeConflict && isset($frameTrailer['size'])
+                ? self::metadataNumber($frameTrailer['size']) : null;
+            $trailerSizeIsDecimal = $trailerSizeConflict ? null : (! isset($frameTrailer['size']) || ctype_digit($frameTrailer['size']));
             $trailerNumericFieldsValid = array_intersect(
                 ['yend.size', 'yend.part', 'yend.total'],
                 $conflictingYencFields,
             ) === [];
             $trailerNumericFieldsRangeValid = true;
             foreach (['size', 'part', 'total'] as $numericField) {
-                if (! isset($frame->trailer[$numericField])) {
+                if (! isset($frameTrailer[$numericField])) {
                     continue;
                 }
-                $number = self::metadataNumber($frame->trailer[$numericField]);
+                $number = self::metadataNumber($frameTrailer[$numericField]);
                 if ($number === null) {
                     $trailerNumericFieldsRangeValid = false;
                 }
@@ -342,16 +431,16 @@ final class NzbFingerprintAnalyzer
                     $trailerNumericFieldsValid = false;
                 }
             }
-            $trailerPartNumber = isset($frame->trailer['part'])
-                ? self::metadataNumber($frame->trailer['part']) : null;
-            $trailerTotalNumber = isset($frame->trailer['total'])
-                ? self::metadataNumber($frame->trailer['total']) : null;
-            $headerPartNumber = isset($frame->header['part'])
-                ? self::metadataNumber($frame->header['part']) : null;
-            $headerTotalNumber = isset($frame->header['total'])
-                ? self::metadataNumber($frame->header['total']) : null;
+            $trailerPartNumber = isset($frameTrailer['part'])
+                ? self::metadataNumber($frameTrailer['part']) : null;
+            $trailerTotalNumber = isset($frameTrailer['total'])
+                ? self::metadataNumber($frameTrailer['total']) : null;
+            $headerPartNumber = isset($frameHeader['part'])
+                ? self::metadataNumber($frameHeader['part']) : null;
+            $headerTotalNumber = isset($frameHeader['total'])
+                ? self::metadataNumber($frameHeader['total']) : null;
             $trailerPartMatchesHeader = null;
-            if (isset($frame->trailer['part'], $frame->header['part'])
+            if (isset($frameTrailer['part'], $frameHeader['part'])
                 && ! $framingEvidenceIncomplete
                 && ! in_array('yend.part', $conflictingYencFields, true)
                 && ! in_array('ybegin.part', $conflictingYencFields, true)) {
@@ -359,7 +448,7 @@ final class NzbFingerprintAnalyzer
                     ? $trailerPartNumber === $headerPartNumber : false;
             }
             $trailerTotalMatchesHeader = null;
-            if (isset($frame->trailer['total'], $frame->header['total'])
+            if (isset($frameTrailer['total'], $frameHeader['total'])
                 && ! $framingEvidenceIncomplete
                 && ! in_array('yend.total', $conflictingYencFields, true)
                 && ! in_array('ybegin.total', $conflictingYencFields, true)) {
@@ -372,10 +461,10 @@ final class NzbFingerprintAnalyzer
             ) === [];
             $headerNumericFieldsRangeValid = true;
             foreach (['line', 'size', 'part', 'total'] as $numericField) {
-                if (! isset($frame->header[$numericField])) {
+                if (! isset($frameHeader[$numericField])) {
                     continue;
                 }
-                $number = self::metadataNumber($frame->header[$numericField]);
+                $number = self::metadataNumber($frameHeader[$numericField]);
                 if ($number === null) {
                     $headerNumericFieldsRangeValid = false;
                 }
@@ -383,9 +472,9 @@ final class NzbFingerprintAnalyzer
                     $headerNumericFieldsValid = false;
                 }
             }
-            $multipart = isset($frame->header['part']) || isset($frame->trailer['part']) || $frame->part !== null;
-            if (($multipart && ($frame->part === null || ! isset($frame->header['part'])))
-                || (isset($frame->header['part'], $frame->header['total'])
+            $multipart = isset($frameHeader['part']) || isset($frameTrailer['part']) || $framePart !== null;
+            if (($multipart && ($framePart === null || ! isset($frameHeader['part'])))
+                || (isset($frameHeader['part'], $frameHeader['total'])
                     && $headerPartNumber !== null && $headerTotalNumber !== null
                     && $headerPartNumber > $headerTotalNumber)) {
                 $headerNumericFieldsValid = false;
@@ -399,12 +488,12 @@ final class NzbFingerprintAnalyzer
             // Decoding and the separate observed CRC comparison retain their compatibility rules.
             $multipartPcrc32Status = ! $multipart ? 'not-required-single-part'
                 : (($framingEvidenceIncomplete || in_array('yend.pcrc32', $conflictingYencFields, true)) ? 'ambiguous'
-                    : (! isset($frame->trailer['pcrc32']) ? 'missing'
-                        : (preg_match('/\A[0-9a-f]{8}\z/i', $frame->trailer['pcrc32']) === 1 ? 'present-hex' : 'malformed')));
-            $multipartRequiredFieldsMissing = $multipart && ($frame->part === null
-                || ! isset($frame->header['part'], $frame->header['size'], $frame->trailer['part'], $frame->trailer['size'])
+                    : (! isset($frameTrailer['pcrc32']) ? 'missing'
+                        : (preg_match('/\A[0-9a-f]{8}\z/i', $frameTrailer['pcrc32']) === 1 ? 'present-hex' : 'malformed')));
+            $multipartRequiredFieldsMissing = $multipart && ($framePart === null
+                || ! isset($frameHeader['part'], $frameHeader['size'], $frameTrailer['part'], $frameTrailer['size'])
                 || $multipartPcrc32Status === 'missing');
-            $multipartStructureValid = ! $multipartStructureAmbiguous && (! $multipart || ($frame->part !== null
+            $multipartStructureValid = ! $multipartStructureAmbiguous && (! $multipart || ($framePart !== null
                 && ! $multipartRequiredFieldsMissing && $multipartPcrc32Status === 'present-hex'
                 && $headerPartNumber !== null && $headerPartNumber >= 1
                 && $rangeIsValid === true && $headerNumericFieldsValid && $trailerNumericFieldsValid
@@ -415,9 +504,9 @@ final class NzbFingerprintAnalyzer
                         : ($multipartRequiredFieldsMissing ? 'incomplete'
                             : ($multipartStructureValid ? 'complete' : 'invalid'))));
             $expectedDecodedSize = $multipart ? $ypartExpectedDecodedSize : $headerExpectedDecodedSize;
-            $crcField = $multipart ? 'pcrc32' : (isset($frame->trailer['crc32']) ? 'crc32' : 'pcrc32');
+            $crcField = $multipart ? 'pcrc32' : (isset($frameTrailer['crc32']) ? 'crc32' : 'pcrc32');
             $crcFieldConflict = $framingEvidenceIncomplete || in_array('yend.'.$crcField, $conflictingYencFields, true);
-            $expectedCrc = $crcFieldConflict ? null : ($frame->trailer[$crcField] ?? null);
+            $expectedCrc = $crcFieldConflict ? null : ($frameTrailer[$crcField] ?? null);
             $criticalYencFields = [
                 'ybegin.name', 'ybegin.line', 'ybegin.size', 'ybegin.part', 'ybegin.total',
                 'ypart.begin', 'ypart.end', 'yend.size', 'yend.part', 'yend.total', 'yend.pcrc32', 'yend.crc32',
@@ -425,22 +514,18 @@ final class NzbFingerprintAnalyzer
             $integrityChecksAmbiguous = $framingEvidenceIncomplete || array_intersect($criticalYencFields, $conflictingYencFields) !== [];
             $allDeclaredCrc32FieldsAreHex = true;
             foreach (['pcrc32', 'crc32'] as $declaredCrcField) {
-                if (isset($frame->trailer[$declaredCrcField])
-                    && (! is_string($frame->trailer[$declaredCrcField])
-                        || preg_match('/\A[0-9a-f]{1,8}\z/i', $frame->trailer[$declaredCrcField]) !== 1)) {
+                if (isset($frameTrailer[$declaredCrcField])
+                    && (! is_string($frameTrailer[$declaredCrcField])
+                        || preg_match('/\A[0-9a-f]{1,8}\z/i', $frameTrailer[$declaredCrcField]) !== 1)) {
                     $allDeclaredCrc32FieldsAreHex = false;
                 }
             }
-            $observedCrc = hash('crc32b', $decoded[0]);
             $expectedCrcIsHex = is_string($expectedCrc) && preg_match('/\A[0-9a-f]{1,8}\z/i', $expectedCrc) === 1;
             $observedDeclaredCrcMatches = $expectedCrcIsHex
                 ? strcasecmp(str_pad($expectedCrc, 8, '0', STR_PAD_LEFT), $observedCrc) === 0 : null;
             $knownHeaderFields = ['line', 'size', 'part', 'total', 'name'];
             $knownPartFields = ['begin', 'end'];
             $knownTrailerFields = ['size', 'part', 'total', 'pcrc32', 'crc32'];
-            $controlLines = [];
-            preg_match_all('/^(?:=ybegin|=ypart|=yend)[^\r\n]*/mi', $rawBody, $controlMatches);
-            $controlLines = $controlMatches[0] ?? [];
             $par2PrefixLength = min($headerExpectedDecodedSize ?? 16_384, 16_384);
             $prefixCoverageIsValid = $multipartStructureValid && ! $integrityChecksAmbiguous && $payloadEscapeStateValid && $par2PrefixLength > 0
                 && (! $multipart || $observedDeclaredCrcMatches === true)
@@ -450,13 +535,13 @@ final class NzbFingerprintAnalyzer
                     : $rangeIsValid === true && $rangeStart === 1 && $rangeEnd >= $par2PrefixLength
                         && $decodedSize === $ypartExpectedDecodedSize);
             $par2PrefixMd5Candidate = $prefixCoverageIsValid
-                ? hash('md5', substr($decoded[0], 0, $par2PrefixLength)) : null;
+                ? hash('md5', substr($decodedData, 0, $par2PrefixLength)) : null;
             $yenc = [
                 'payload_escape_state_valid' => $payloadEscapeStateValid,
                 'payload_integrity_status' => $payloadEscapeStateValid ? 'escape_state_valid' : 'invalid_unmatched_escape',
-                'name' => $frame->header['name'] ?? null,
+                'name' => $frameHeader['name'] ?? null,
                 'file_size' => $headerExpectedDecodedSize,
-                'line_length' => isset($frame->header['line']) ? self::metadataNumber($frame->header['line']) : null,
+                'line_length' => isset($frameHeader['line']) ? self::metadataNumber($frameHeader['line']) : null,
                 'part' => $headerPartNumber,
                 'multipart' => $multipart,
                 'multipart_structure_status' => $multipartStructureStatus,
@@ -483,26 +568,26 @@ final class NzbFingerprintAnalyzer
                 'decoded_size_matches_header_size' => $headerExpectedDecodedSize === null ? null
                     : ($multipart ? ($rangeEnd !== null && $rangeEnd <= $headerExpectedDecodedSize) : $decodedSize === $headerExpectedDecodedSize),
                 'trailer_size_is_decimal' => $trailerSizeIsDecimal,
-                'pcrc32' => $frame->trailer['pcrc32'] ?? null,
-                'crc32' => $frame->trailer['crc32'] ?? null,
-                'header_fields' => $frame->header,
-                'part_fields' => $frame->part,
-                'trailer_fields' => $frame->trailer,
+                'pcrc32' => $frameTrailer['pcrc32'] ?? null,
+                'crc32' => $frameTrailer['crc32'] ?? null,
+                'header_fields' => $frameHeader,
+                'part_fields' => $framePart,
+                'trailer_fields' => $frameTrailer,
                 'decoded_segment_size' => $decodedSize,
                 'decoded_segment_sha256' => $decodedHash,
                 'par2_first_16k_md5_candidate' => $par2PrefixMd5Candidate,
                 'encoded_payload_sha256' => $payloadHash,
-                'payload_line_count' => count($payloadLineLengths),
-                'payload_line_length_min' => $payloadLineLengths === [] ? null : min($payloadLineLengths),
-                'payload_line_length_max' => $payloadLineLengths === [] ? null : max($payloadLineLengths),
+                'payload_line_count' => $payloadLineCount,
+                'payload_line_length_min' => $payloadLineMin,
+                'payload_line_length_max' => $payloadLineMax,
                 'decoded_prefix_format_signatures' => $formatMetadata['signatures'] ?? [],
                 'raw_control_lines' => $controlLines,
-                'header_field_order' => array_keys($frame->header),
-                'part_field_order' => array_keys($frame->part ?? []),
-                'trailer_field_order' => array_keys($frame->trailer),
-                'unknown_header_fields' => array_diff_key($frame->header, array_flip($knownHeaderFields)),
-                'unknown_part_fields' => array_diff_key($frame->part ?? [], array_flip($knownPartFields)),
-                'unknown_trailer_fields' => array_diff_key($frame->trailer, array_flip($knownTrailerFields)),
+                'header_field_order' => array_keys($frameHeader),
+                'part_field_order' => array_keys($framePart ?? []),
+                'trailer_field_order' => array_keys($frameTrailer),
+                'unknown_header_fields' => array_diff_key($frameHeader, array_flip($knownHeaderFields)),
+                'unknown_part_fields' => array_diff_key($framePart ?? [], array_flip($knownPartFields)),
+                'unknown_trailer_fields' => array_diff_key($frameTrailer, array_flip($knownTrailerFields)),
                 'expected_decoded_segment_size' => $expectedDecodedSize,
                 'decoded_size_matches_yenc' => $expectedDecodedSize === null ? null : $expectedDecodedSize === $decodedSize,
                 'decoded_size_matches_ypart_range' => $ypartExpectedDecodedSize === null ? null : $ypartExpectedDecodedSize === $decodedSize,
@@ -518,7 +603,7 @@ final class NzbFingerprintAnalyzer
                 'all_declared_crc32_fields_are_hex' => $allDeclaredCrc32FieldsAreHex,
                 'declared_crc32_matches' => $multipartStructureValid && $observedDeclaredCrcMatches !== null
                     ? $payloadEscapeStateValid && $observedDeclaredCrcMatches : null,
-                'escape_sequence_count' => substr_count($payload, '='),
+                'escape_sequence_count' => $escapeSequenceCount,
             ];
         }
 
@@ -563,7 +648,9 @@ final class NzbFingerprintAnalyzer
                 'yenc' => $yenc,
                 'yenc_framing_metadata' => $yencFramingMetadata,
                 'decoded_format_metadata' => $formatMetadata,
-                'article_body_sha256' => hash('sha256', $rawBody),
+                'article_body_sha256' => ($nativeBody !== null && $nativeBody['body_sha256'] !== '')
+                    ? $nativeBody['body_sha256']
+                    : hash('sha256', $rawBody),
                 'uploader_software_candidates' => $software,
             ],
             'decoded_bytes' => $decodedBytes,
@@ -638,6 +725,25 @@ final class NzbFingerprintAnalyzer
         return 'other';
     }
 
+    public static function fileKindNative(string $subject): ?string
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $code = $ffi->nntmux_nzb_file_kind($subject, strlen($subject));
+        if (! is_int($code) || $code < 0) {
+            return null;
+        }
+
+        return match ($code) {
+            2 => 'par2',
+            1 => 'rar',
+            default => 'other',
+        };
+    }
+
     public static function formatHint(string $subject): string
     {
         if (preg_match('/\.([a-z0-9]{1,8})\b/i', $subject, $matches) !== 1) {
@@ -647,9 +753,34 @@ final class NzbFingerprintAnalyzer
         return strtolower($matches[1]);
     }
 
+    public static function formatHintNative(string $subject): ?string
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, 16, $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_nzb_format_hint($subject, strlen($subject), $scratch, $cap);
+        if (! is_int($written) || $written < 0) {
+            return null;
+        }
+
+        return $written === 0 ? 'unknown' : FFI::string($scratch, $written);
+    }
+
     /** @return array<string, mixed> */
     private static function fallbackNntpBodyMetadata(string $body): array
     {
+        $native = self::analyzeArticleBodyNative($body, 1);
+        if ($native !== null) {
+            return $native['nntp_body_metadata'];
+        }
+
         $crlfLineBreakCount = substr_count($body, "\r\n");
         $lfLineBreakCount = substr_count($body, "\n");
         preg_match_all('/(?<!\r)\n/', $body, $bareLfMatches);
@@ -716,6 +847,10 @@ final class NzbFingerprintAnalyzer
         if (strlen($body) > 2_000_000) {
             return true;
         }
+        $native = self::analyzeArticleBodyNative($body, 2);
+        if ($native !== null) {
+            return $native['framing_incomplete'];
+        }
         $counts = ['ybegin' => 0, 'ypart' => 0, 'yend' => 0];
         $critical = [
             'ybegin' => ['name', 'line', 'size', 'part', 'total'],
@@ -769,6 +904,15 @@ final class NzbFingerprintAnalyzer
     /** @return list<array{name: string, offset: int, basis: string}> */
     private static function detectFormatSignatures(string $bytes): array
     {
+        $ffi = self::ffi();
+        if ($ffi !== null) {
+            // @phpstan-ignore method.notFound
+            $mask = $ffi->nntmux_nzb_detect_format_signatures($bytes, strlen($bytes));
+            if (is_int($mask) && $mask >= 0) {
+                return self::formatSignaturesFromMask($mask);
+            }
+        }
+
         $signatures = [];
         foreach ([
             ['name' => 'RAR 5', 'signature' => "Rar!\x1A\x07\x01\x00", 'offset' => 0],
@@ -787,5 +931,520 @@ final class NzbFingerprintAnalyzer
         }
 
         return $signatures;
+    }
+
+    /** @return list<array{name: string, offset: int, basis: string}> */
+    private static function formatSignaturesFromMask(int $mask): array
+    {
+        if ($mask === 0) {
+            return [];
+        }
+        $signatures = [];
+        foreach ([
+            [1, 'RAR 5', 0],
+            [2, 'RAR 4', 0],
+            [4, '7-Zip', 0],
+            [8, 'ZIP', 0],
+            [16, 'gzip', 0],
+            [32, 'XZ', 0],
+            [64, 'ISO 9660 descriptor', 32_769],
+        ] as [$bit, $name, $offset]) {
+            if (($mask & $bit) !== 0) {
+                $signatures[] = ['name' => $name, 'offset' => $offset, 'basis' => 'decoded first-segment prefix signature'];
+            }
+        }
+
+        return $signatures;
+    }
+
+    /** @return array<string, mixed>|null */
+    private static function analyzeManifestNative(string $xml): ?array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $xmlLen = strlen($xml);
+        if ($xmlLen === 0) {
+            return null;
+        }
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max($xmlLen * 2, 16_384), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_nzb_analyze_manifest($xml, $xmlLen, $scratch, $cap);
+        if (! is_int($written) || $written === -1) {
+            return null;
+        }
+        if ($written < -1) {
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_nzb_analyze_manifest($xml, $xmlLen, $scratch, $cap);
+            if (! is_int($written) || $written <= 0) {
+                return null;
+            }
+        }
+        if ($written <= 0) {
+            return null;
+        }
+
+        $tokens = explode("\0", FFI::string($scratch, $written));
+        $pos = 0;
+        $metaGroupCount = (int) ($tokens[$pos++] ?? 0);
+        $meta = [];
+        for ($m = 0; $m < $metaGroupCount; $m++) {
+            $type = $tokens[$pos++] ?? '';
+            $valCount = (int) ($tokens[$pos++] ?? 0);
+            $vals = [];
+            for ($v = 0; $v < $valCount; $v++) {
+                $vals[] = $tokens[$pos++] ?? '';
+            }
+            $meta[$type] = $vals;
+        }
+
+        $fileCount = (int) ($tokens[$pos++] ?? 0);
+        $totals = [];
+        foreach (['rar', 'par2', 'other'] as $kindKey) {
+            $fc = (int) ($tokens[$pos++] ?? 0);
+            $sc = (int) ($tokens[$pos++] ?? 0);
+            $abStr = $tokens[$pos++] ?? '';
+            $abo = ($tokens[$pos++] ?? '0') === '1';
+            $totals[$kindKey] = [
+                'file_count' => $fc,
+                'segment_count' => $sc,
+                'advertised_bytes' => $abStr === '' ? null : (int) $abStr,
+                'advertised_bytes_overflow' => $abo,
+            ];
+        }
+        $advertisedByteTotalsValid = ($tokens[$pos++] ?? '0') === '1';
+
+        $files = [];
+        for ($fileIndex = 0; $fileIndex < $fileCount; $fileIndex++) {
+            $kind = $tokens[$pos++] ?? 'other';
+            $formatHint = $tokens[$pos++] ?? 'unknown';
+            $subject = $tokens[$pos++] ?? '';
+            $poster = $tokens[$pos++] ?? '';
+            $dateStr = $tokens[$pos++] ?? '';
+            $sourceDate = $tokens[$pos++] ?? '';
+            $groupCount = (int) ($tokens[$pos++] ?? 0);
+            $groups = [];
+            for ($g = 0; $g < $groupCount; $g++) {
+                $groups[] = $tokens[$pos++] ?? '';
+            }
+            $segCount = (int) ($tokens[$pos++] ?? 0);
+            $sourceSegCount = (int) ($tokens[$pos++] ?? 0);
+            $invalidSegCount = (int) ($tokens[$pos++] ?? 0);
+            $invalidMetaCount = (int) ($tokens[$pos++] ?? 0);
+            $dupMsgIdCount = (int) ($tokens[$pos++] ?? 0);
+            $dupSegNumCount = (int) ($tokens[$pos++] ?? 0);
+            $seqValid = ($tokens[$pos++] ?? '0') === '1';
+            $advBytesStr = $tokens[$pos++] ?? '';
+            $advOverflow = ($tokens[$pos++] ?? '0') === '1';
+            $segments = [];
+            for ($s = 0; $s < $segCount; $s++) {
+                $num = (int) ($tokens[$pos++] ?? 0);
+                $bytesStr = $tokens[$pos++] ?? '';
+                $srcNum = $tokens[$pos++] ?? '';
+                $srcBytes = $tokens[$pos++] ?? '';
+                $msgId = $tokens[$pos++] ?? '';
+                $segments[] = [
+                    'number' => $num,
+                    'bytes' => $bytesStr === '' ? null : (int) $bytesStr,
+                    'source_number' => $srcNum,
+                    'source_bytes' => $srcBytes,
+                    'messageid' => $msgId,
+                ];
+            }
+            $files[] = [
+                'index' => $fileIndex,
+                'kind' => $kind,
+                'format_hint' => $formatHint,
+                'subject' => $subject,
+                'poster' => $poster,
+                'date' => $dateStr === '' ? null : (int) $dateStr,
+                'source_date' => $sourceDate,
+                'groups' => $groups,
+                'segment_count' => $segCount,
+                'source_segment_record_count' => $sourceSegCount,
+                'invalid_segment_record_count' => $invalidSegCount,
+                'invalid_segment_metadata_count' => $invalidMetaCount,
+                'duplicate_message_id_count' => $dupMsgIdCount,
+                'duplicate_segment_number_count' => $dupSegNumCount,
+                'segment_number_sequence_valid' => $seqValid,
+                'advertised_bytes' => $advBytesStr === '' ? null : (int) $advBytesStr,
+                'advertised_bytes_overflow' => $advOverflow,
+                'segments' => $segments,
+            ];
+        }
+
+        $par2ToRarPercent = is_int($totals['rar']['advertised_bytes']) && $totals['rar']['advertised_bytes'] > 0
+            && is_int($totals['par2']['advertised_bytes'])
+            ? round($totals['par2']['advertised_bytes'] / $totals['rar']['advertised_bytes'] * 100, 3)
+            : null;
+
+        return [
+            'file_count' => $fileCount,
+            'files' => $files,
+            'totals' => $totals,
+            'advertised_byte_totals_valid' => $advertisedByteTotalsValid,
+            'nzb_meta_values' => $meta,
+            'par2_to_rar_advertised_percent' => $par2ToRarPercent,
+            'par2_to_rar_percent_basis' => 'NZB advertised segment bytes; includes article and yEnc overhead and is not the PAR2 recovery percentage.',
+        ];
+    }
+
+    /**
+     * @param  list<string>  $rawHeaders
+     * @return array{raw_header_bytes_including_crlf: int, ordered_names: list<string>, headers: array<string, string>, uploader_software_candidates: array<string, array{header: string, value: string}>}|null
+     */
+    public static function unfoldHeadersNative(array $rawHeaders): ?array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $count = count($rawHeaders);
+        $packed = implode("\0", $rawHeaders);
+        $packedLen = strlen($packed);
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max($packedLen * 2 + 512, 4096), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_nzb_unfold_headers($packed, $packedLen, $count, $scratch, $cap);
+        if (! is_int($written) || $written === -1) {
+            return null;
+        }
+        if ($written < -1) {
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_nzb_unfold_headers($packed, $packedLen, $count, $scratch, $cap);
+            if (! is_int($written) || $written <= 0) {
+                return null;
+            }
+        }
+        if ($written <= 0) {
+            return null;
+        }
+
+        $tokens = explode("\0", FFI::string($scratch, $written));
+        $rawHeaderBytes = (int) $tokens[0];
+        $orderedCount = (int) ($tokens[1] ?? 0);
+        $pos = 2;
+        $orderedNames = [];
+        for ($i = 0; $i < $orderedCount; $i++) {
+            $orderedNames[] = $tokens[$pos++] ?? '';
+        }
+        $valueCount = (int) ($tokens[$pos++] ?? 0);
+        $values = [];
+        for ($i = 0; $i < $valueCount; $i++) {
+            $k = $tokens[$pos++] ?? '';
+            $v = $tokens[$pos++] ?? '';
+            $values[$k] = $v;
+        }
+        $swCount = (int) ($tokens[$pos++] ?? 0);
+        $software = [];
+        for ($i = 0; $i < $swCount; $i++) {
+            $cand = $tokens[$pos++] ?? '';
+            $hdr = $tokens[$pos++] ?? '';
+            $val = $tokens[$pos++] ?? '';
+            $software[$cand] = ['header' => $hdr, 'value' => $val];
+        }
+
+        return [
+            'raw_header_bytes_including_crlf' => $rawHeaderBytes,
+            'ordered_names' => $orderedNames,
+            'headers' => $values,
+            'uploader_software_candidates' => $software,
+        ];
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $files
+     *
+     * @param-out int $omittedSampleCount
+     *
+     * @return list<array{file_index: int, kind: string, subject: string, segment_number: int, messageid: string, segment_bytes: int|null, sample_role: string}>|null
+     */
+    public static function selectArticleSamplesNative(array $files, int $maximumSamples = self::MAX_ARTICLE_SAMPLES, ?int &$omittedSampleCount = null): ?array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $omittedSampleCount = 0;
+        $maximumSamples = max(1, min(self::MAX_ARTICLE_SAMPLES, $maximumSamples));
+        if ($files === []) {
+            return [];
+        }
+        $parts = [];
+        $fileCount = 0;
+        foreach ($files as $file) {
+            $segments = $file['segments'] ?? [];
+            if (! is_array($segments)) {
+                $segments = [];
+            }
+            $parts[] = (string) (int) ($file['index'] ?? 0);
+            $parts[] = (string) ($file['kind'] ?? 'other');
+            $parts[] = (string) ($file['subject'] ?? '');
+            $parts[] = (string) count($segments);
+            foreach ($segments as $segment) {
+                $parts[] = (string) (int) ($segment['number'] ?? 0);
+                $parts[] = is_int($segment['bytes'] ?? null) ? (string) $segment['bytes'] : '';
+                $parts[] = (string) ($segment['messageid'] ?? '');
+            }
+            $fileCount++;
+        }
+        $packed = implode("\0", $parts);
+        $packedLen = strlen($packed);
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max($packedLen + 1024, 16_384), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_nzb_select_article_samples($packed, $packedLen, $fileCount, $maximumSamples, $scratch, $cap);
+        if (! is_int($written) || $written === -1) {
+            return null;
+        }
+        if ($written < -1) {
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_nzb_select_article_samples($packed, $packedLen, $fileCount, $maximumSamples, $scratch, $cap);
+            if (! is_int($written) || $written <= 0) {
+                return null;
+            }
+        }
+        if ($written <= 0) {
+            return null;
+        }
+
+        $tokens = explode("\0", FFI::string($scratch, $written));
+        $omittedSampleCount = (int) $tokens[0];
+        $sampleCount = (int) ($tokens[1] ?? 0);
+        $pos = 2;
+        $samples = [];
+        for ($i = 0; $i < $sampleCount; $i++) {
+            $fileIndex = (int) ($tokens[$pos++] ?? 0);
+            $kind = $tokens[$pos++] ?? 'other';
+            $subject = $tokens[$pos++] ?? '';
+            $segNumber = (int) ($tokens[$pos++] ?? 0);
+            $msgId = $tokens[$pos++] ?? '';
+            $bytesStr = $tokens[$pos++] ?? '';
+            $role = $tokens[$pos++] ?? 'first';
+            $samples[] = [
+                'file_index' => $fileIndex,
+                'kind' => $kind,
+                'subject' => $subject,
+                'segment_number' => $segNumber,
+                'messageid' => $msgId,
+                'segment_bytes' => $bytesStr === '' ? null : (int) $bytesStr,
+                'sample_role' => $role,
+            ];
+        }
+
+        return $samples;
+    }
+
+    /**
+     * @return array{
+     *     nntp_body_metadata: array<string, mixed>,
+     *     framing_incomplete: bool,
+     *     has_frame: bool,
+     *     has_part: bool,
+     *     payload_escape_state_valid: bool,
+     *     has_decoded_bytes: bool,
+     *     payload_offset: int,
+     *     payload_length: int,
+     *     escape_sequence_count: int,
+     *     payload_line_count: int,
+     *     payload_line_min: int|null,
+     *     payload_line_max: int|null,
+     *     format_signatures_mask: int,
+     *     decoded_crc32: string,
+     *     body_sha256: string,
+     *     payload_sha256: string,
+     *     decoded_sha256: string,
+     *     header: array<string, string>,
+     *     part: array<string, string>|null,
+     *     trailer: array<string, string>,
+     *     control_lines: list<string>,
+     *     decoded_bytes: string
+     * }|null
+     */
+    private static function analyzeArticleBodyNative(string $body, int $flags): ?array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $bodyLen = strlen($body);
+        $cap = 0;
+        $minScratch = ($flags & 12) !== 0 ? max($bodyLen + 4096, 8192) : 256;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, $minScratch, $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_nzb_analyze_article_body($body, $bodyLen, $flags, $scratch, $cap);
+        if (! is_int($written) || $written === -1) {
+            return null;
+        }
+        if ($written < -1) {
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_nzb_analyze_article_body($body, $bodyLen, $flags, $scratch, $cap);
+            if (! is_int($written) || $written < 76) {
+                return null;
+            }
+        }
+        if ($written < 76) {
+            return null;
+        }
+
+        /** @var array<int, int>|false $hdr */
+        $hdr = unpack('V19', FFI::string($scratch, 76));
+        if ($hdr === false) {
+            return null;
+        }
+
+        $bodyStatusCode = $hdr[1];
+        $crlfCount = $hdr[2];
+        $lfCount = $hdr[3];
+        $bareLfCount = $hdr[4];
+        $bareCrCount = $hdr[5];
+        $nulCount = $hdr[6];
+        $observedLfLineCount = $hdr[7];
+        $unterminatedTailCount = $hdr[8];
+        $flagsOut = $hdr[9];
+        $payloadOffset = $hdr[10];
+        $payloadLength = $hdr[11];
+        $escapeSeqCount = $hdr[12];
+        $payloadLineCount = $hdr[13];
+        $payloadLineMin = $hdr[14];
+        $payloadLineMax = $hdr[15];
+        $formatMask = $hdr[16];
+        $decodedCrc32 = sprintf('%08x', $hdr[17]);
+        $metaLen = $hdr[18];
+        $decodedLen = $hdr[19];
+
+        $finalLineTerminated = ($flagsOut & 1) !== 0;
+        $framingIncomplete = ($flagsOut & 2) !== 0;
+        $hasFrame = ($flagsOut & 4) !== 0;
+        $hasPart = ($flagsOut & 8) !== 0;
+        $payloadEscapeStateValid = ($flagsOut & 16) !== 0;
+        $hasDecodedBytes = ($flagsOut & 32) !== 0;
+
+        $completeCrlfFraming = $bareLfCount === 0 && $bareCrCount === 0 && $finalLineTerminated;
+        $status = match ($bodyStatusCode) {
+            0 => 'empty',
+            2 => 'non_crlf_line_endings',
+            3 => 'unterminated_final_line',
+            default => 'complete_crlf',
+        };
+        $nntpBodyMetadata = [
+            'parser_engine' => 'php-fallback',
+            'schema_version' => 1,
+            'status' => $status,
+            'body_octets_after_dot_unstuffing' => $bodyLen,
+            'crlf_line_break_count' => $crlfCount,
+            'lf_line_break_count' => $lfCount,
+            'bare_lf_count' => $bareLfCount,
+            'bare_cr_count' => $bareCrCount,
+            'nul_byte_count' => $nulCount,
+            'body_line_count' => $completeCrlfFraming ? $crlfCount : null,
+            'observed_lf_delimited_line_count' => $observedLfLineCount,
+            'unterminated_tail_byte_count' => $unterminatedTailCount,
+            'final_line_terminated' => $finalLineTerminated,
+            'measurement_basis' => 'Raw NNTP BODY octets after one dot-unstuffing pass; excludes the NNTP dot terminator.',
+        ];
+
+        $bodySha256 = '';
+        $payloadSha256 = '';
+        $decodedSha256 = '';
+        $header = [];
+        $part = null;
+        $trailer = [];
+        $controlLines = [];
+        $decodedBytes = '';
+
+        if ($metaLen > 0) {
+            $metaStr = FFI::string(FFI::addr($scratch[76]), $metaLen);
+            $metaTokens = explode("\n", $metaStr);
+            $bodySha256 = $metaTokens[0];
+            if ($hasFrame) {
+                $payloadSha256 = $metaTokens[1] ?? '';
+                $decodedSha256 = $metaTokens[2] ?? '';
+                $hdrCount = (int) ($metaTokens[3] ?? 0);
+                $mPos = 4;
+                for ($i = 0; $i < $hdrCount; $i++) {
+                    $k = $metaTokens[$mPos++] ?? '';
+                    $v = $metaTokens[$mPos++] ?? '';
+                    $header[$k] = $v;
+                }
+                if ($hasPart) {
+                    $partCount = (int) ($metaTokens[$mPos++] ?? 0);
+                    $part = [];
+                    for ($i = 0; $i < $partCount; $i++) {
+                        $k = $metaTokens[$mPos++] ?? '';
+                        $v = $metaTokens[$mPos++] ?? '';
+                        $part[$k] = $v;
+                    }
+                }
+                $trailerCount = (int) ($metaTokens[$mPos++] ?? 0);
+                for ($i = 0; $i < $trailerCount; $i++) {
+                    $k = $metaTokens[$mPos++] ?? '';
+                    $v = $metaTokens[$mPos++] ?? '';
+                    $trailer[$k] = $v;
+                }
+                $ctrlCount = (int) ($metaTokens[$mPos++] ?? 0);
+                for ($i = 0; $i < $ctrlCount; $i++) {
+                    $controlLines[] = $metaTokens[$mPos++] ?? '';
+                }
+                if ($hasDecodedBytes && $decodedLen > 0) {
+                    $decodedBytes = FFI::string(FFI::addr($scratch[76 + $metaLen]), $decodedLen);
+                }
+            }
+        }
+
+        return [
+            'nntp_body_metadata' => $nntpBodyMetadata,
+            'framing_incomplete' => $framingIncomplete,
+            'has_frame' => $hasFrame,
+            'has_part' => $hasPart,
+            'payload_escape_state_valid' => $payloadEscapeStateValid,
+            'has_decoded_bytes' => $hasDecodedBytes,
+            'payload_offset' => $payloadOffset,
+            'payload_length' => $payloadLength,
+            'escape_sequence_count' => $escapeSeqCount,
+            'payload_line_count' => $payloadLineCount,
+            'payload_line_min' => $payloadLineCount === 0 ? null : $payloadLineMin,
+            'payload_line_max' => $payloadLineCount === 0 ? null : $payloadLineMax,
+            'format_signatures_mask' => $formatMask,
+            'decoded_crc32' => $decodedCrc32,
+            'body_sha256' => $bodySha256,
+            'payload_sha256' => $payloadSha256,
+            'decoded_sha256' => $decodedSha256,
+            'header' => $header,
+            'part' => $part,
+            'trailer' => $trailer,
+            'control_lines' => $controlLines,
+            'decoded_bytes' => $decodedBytes,
+        ];
     }
 }
