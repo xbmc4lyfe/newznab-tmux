@@ -9,6 +9,8 @@ use App\Models\Release;
 use App\Services\Nzb\NzbService;
 use App\Services\ReleaseImageService;
 use App\Support\ReleaseSearchIndexSync;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
@@ -20,6 +22,10 @@ use Throwable;
  */
 class ReleaseManagementService
 {
+    public static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
     public function __construct() {}
 
     /**
@@ -236,20 +242,95 @@ class ReleaseManagementService
         }
 
         if ($postFrom !== '') {
-            $dateParts = explode('/', $postFrom);
-            if (\count($dateParts) === 3) {
-                $query->where('r.postdate', '>', $dateParts[2].'-'.$dateParts[1].'-'.$dateParts[0].'00:00:00');
+            $fromBound = $this->formatExportDateBound($postFrom, false);
+            if ($fromBound !== null) {
+                $query->where('r.postdate', '>', $fromBound);
             }
         }
 
         if ($postTo !== '') {
-            $dateParts = explode('/', $postTo);
-            if (\count($dateParts) === 3) {
-                $query->where('r.postdate', '<', $dateParts[2].'-'.$dateParts[1].'-'.$dateParts[0].'23:59:59');
+            $toBound = $this->formatExportDateBound($postTo, true);
+            if ($toBound !== null) {
+                $query->where('r.postdate', '<', $toBound);
             }
         }
 
         return $query->get();
+    }
+
+    public function formatExportDateBound(string $date, bool $isEndOfDay = false): ?string
+    {
+        return self::$useRustFfi
+            ? $this->formatExportDateBoundNative($date, $isEndOfDay)
+            : $this->formatExportDateBoundPhp($date, $isEndOfDay);
+    }
+
+    public function formatExportDateBoundPhp(string $date, bool $isEndOfDay = false): ?string
+    {
+        if ($date === '') {
+            return null;
+        }
+
+        $dateParts = explode('/', $date);
+        if (\count($dateParts) !== 3) {
+            return null;
+        }
+
+        return $dateParts[2].'-'.$dateParts[1].'-'.$dateParts[0].($isEndOfDay ? '23:59:59' : '00:00:00');
+    }
+
+    public function formatExportDateBoundNative(string $date, bool $isEndOfDay = false): ?string
+    {
+        if ($date === '') {
+            return null;
+        }
+
+        $ffi = self::mediaFfi();
+        if ($ffi === null) {
+            return $this->formatExportDateBoundPhp($date, $isEndOfDay);
+        }
+
+        $len = \strlen($date);
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(64, $len + 16), $cap);
+        if ($scratch === null) {
+            return $this->formatExportDateBoundPhp($date, $isEndOfDay);
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_release_management_export_date($date, $len, $isEndOfDay ? 1 : 0, $scratch, $cap);
+        if (! \is_int($written) || $written === -1) {
+            return $this->formatExportDateBoundPhp($date, $isEndOfDay);
+        }
+        if ($written < -1) {
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+            if ($scratch === null) {
+                return $this->formatExportDateBoundPhp($date, $isEndOfDay);
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_release_management_export_date($date, $len, $isEndOfDay ? 1 : 0, $scratch, $cap);
+            if (! \is_int($written) || $written < 0) {
+                return $this->formatExportDateBoundPhp($date, $isEndOfDay);
+            }
+        }
+
+        return $written === 0 ? null : FFI::string($scratch, $written);
+    }
+
+    public static function setUseRustFfi(bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi;
+    }
+
+    public static function mediaFfi(): ?FFI
+    {
+        if (self::$ffi !== null) {
+            return self::$ffi === false ? null : self::$ffi;
+        }
+
+        self::$ffi = RustPipelineLibrary::resolveDomain('media', ReleaseImageService::FFI_CDEF) ?? false;
+
+        return self::$ffi === false ? null : self::$ffi;
     }
 
     /**
