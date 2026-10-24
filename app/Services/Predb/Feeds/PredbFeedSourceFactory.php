@@ -25,19 +25,109 @@ use App\Services\Predb\Feeds\Sources\SeriousAboutSoundSource;
 use App\Services\Predb\Feeds\Sources\SrrdbSource;
 use App\Services\Predb\Feeds\Sources\ThreeDsDbSource;
 use App\Services\Predb\Feeds\Sources\XrelSource;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use InvalidArgumentException;
+use Throwable;
 
 /**
  * Builds configured PreDB feed sources from config/predb_feeds.php.
  */
 class PredbFeedSourceFactory
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_wave21_feed_keys(const char *input, size_t len, char *out, size_t cap);
+        ssize_t nntmux_wave21_feed_key_index(const char *input, size_t len);
+        C;
+
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function enableRustFfi(): void
+    {
+        self::$useRustFfi = true;
+    }
+
+    public static function disableRustFfi(): void
+    {
+        self::$useRustFfi = false;
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = false;
+        self::$ffi = null;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
     /**
      * @return list<string>
      */
     public function availableKeys(): array
     {
+        return (self::$useRustFfi ? $this->availableKeysNative() : null) ?? $this->availableKeysPhp();
+    }
+
+    /** @return list<string>|null */
+    public function availableKeysNative(): ?array
+    {
+        try {
+            self::$ffi ??= RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) ?? false;
+            if (self::$ffi === false) {
+                return null;
+            }
+            $capacity = 1024;
+            $buffer = self::$ffi->new("char[{$capacity}]");
+            // @phpstan-ignore method.notFound
+            $written = self::$ffi->nntmux_wave21_feed_keys('', 0, $buffer, $capacity);
+            if (! is_int($written) || $written <= 0 || $written > $capacity) {
+                return null;
+            }
+
+            return explode("\0", FFI::string($buffer, $written));
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** @return list<string> */
+    public function availableKeysPhp(): array
+    {
         return ['predb_club', 'predb_net', 'predb_me', 'predb_org', 'predatabase', 'srrdb', 'xrel', 'xrel_p2p', 'scnsrc_me', 'eztv', 'predb_ovh', 'apibay', 'nfodb', 'one_techno', 'one_gabba', 'ddlvalley', 'hdencode', 'hdencode_tv', 'mp3scene', 'nima4k', 'gload', 'hdworld', 'g4u', 'nswdb', '3dsdb', 'gabber', 'movieblog', 'scnlog', 'knaben', 'crowdnfo', 'seriousaboutsound', 'dats_pciso_1998', 'nzedb_archive', 'scene_archive_sql'];
+    }
+
+    public function isAvailableKey(string $key): bool
+    {
+        return (self::$useRustFfi ? $this->isAvailableKeyNative($key) : null) ?? $this->isAvailableKeyPhp($key);
+    }
+
+    public function isAvailableKeyNative(string $key): ?bool
+    {
+        try {
+            self::$ffi ??= RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) ?? false;
+            if (self::$ffi === false) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $index = self::$ffi->nntmux_wave21_feed_key_index($key, strlen($key));
+            if ($index === -2) {
+                return false;
+            }
+
+            return is_int($index) && $index >= 0 && $index < 34 ? true : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public function isAvailableKeyPhp(string $key): bool
+    {
+        return in_array($key, $this->availableKeysPhp(), true);
     }
 
     /**
@@ -58,6 +148,10 @@ class PredbFeedSourceFactory
         $timeout = max(1, (int) config('predb_feeds.timeout', 15));
         $userAgent = (string) config('predb_feeds.user_agent', 'NNTmux-PreDB-Importer/1.0');
         $maximumBodyBytes = max(1, (int) config('predb_feeds.max_body_bytes', 1048576));
+
+        if (! $this->isAvailableKey($key)) {
+            throw new InvalidArgumentException("Unknown PreDB feed source [{$key}]. Available: ".implode(', ', $this->availableKeys()));
+        }
 
         return match ($key) {
             'predb_club' => new PredbClubSource($endpoint, $pageSize, $timeout, $userAgent),
