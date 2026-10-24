@@ -18838,3 +18838,1371 @@ pub mod search_content_watchlist_controllers {
         }
     }
 }
+/// Wave 28.5 profile, security, privacy and invitation controller helpers:
+/// `ProfileController` alternate profile lookup parameters, theme/color-scheme whitelists,
+/// `excluded_categories` numeric classification and cache keys,
+/// `PasswordSecurityController` profile-referer detection, trusted-device cookie JSON and
+/// 2FA setup cancel eligibility, `ProfileSecurityController` 2FA disable response state,
+/// `PrivacyCenterController` GDPR request payloads, export download authorization and
+/// filenames, and `InvitationController` available invites, invitation row plans and
+/// preview role lookup. No dependencies.
+///
+/// Every export returns DECLINE for an invalid flag, kind or pointer range and writes
+/// nothing on a negative or DECLINE result; a negative non-DECLINE result from an export
+/// with an output buffer is the required capacity. Strings are compared as exact bytes,
+/// like PHP `===`.
+pub mod profile_security_privacy_invite_controllers {
+    use std::mem::{align_of, size_of};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: i32 = i32::MIN;
+    /// `nntmux_password_security_trusted_cookie`: the token is not valid UTF-8, so PHP
+    /// `json_encode()` returns false.
+    pub const JSON_INVALID_UTF8: i32 = i32::MIN + 1;
+    /// `nntmux_invitation_role_index`: no role key matches.
+    pub const NOT_FOUND: i32 = -1;
+    const MAX_INPUT: usize = 1 << 20;
+    const MAX_ITEMS: usize = 1 << 16;
+
+    /// Alternate profile lookup modes.
+    pub const LOOKUP_NONE: i32 = 0;
+    pub const LOOKUP_BY_ID: i32 = 1;
+    pub const LOOKUP_BY_NAME: i32 = 2;
+
+    /// Theme whitelist kinds.
+    pub const THEME_PREFERENCE: u32 = 0;
+    pub const COLOR_SCHEME: u32 = 1;
+    const THEME_PREFERENCES: &[&[u8]] = &[b"light", b"dark", b"system"];
+    const COLOR_SCHEMES: &[&[u8]] = &[
+        b"blue", b"indigo", b"cyan", b"teal", b"emerald", b"violet", b"pink", b"rose", b"red",
+        b"orange", b"amber",
+    ];
+
+    /// `excluded_categories` string classification.
+    pub const NUMERIC_DROP: u8 = 0;
+    pub const NUMERIC_INT: u8 = 1;
+    /// Numeric, but a float form or an out-of-range integer: PHP `intval()` converts it.
+    pub const NUMERIC_DEFER: u8 = 2;
+
+    /// Cache key kinds.
+    pub const CACHE_COMPOSER_USER: u32 = 0;
+    pub const CACHE_CATEGORY_EXCLUSIONS: u32 = 1;
+    const CACHE_PREFIXES: &[&[u8]] = &[b"composer_user_", b"user_category_exclusions_"];
+
+    /// 2FA disable outcomes.
+    pub const DISABLE_PASSWORD_MISMATCH: i32 = 0;
+    pub const DISABLE_SUCCESS: i32 = 1;
+    pub const DISABLE_MISSING: i32 = 2;
+    const DISABLE_MESSAGES: [&[u8]; 3] = [
+        b"Your password does not match. Please try again.",
+        b"2FA has been successfully disabled.",
+        b"No 2FA configuration found for this user.",
+    ];
+
+    /// GDPR request kinds.
+    pub const GDPR_EXPORT: u32 = 0;
+    pub const GDPR_ERASURE: u32 = 1;
+    const REQUESTED_BY: &[u8] = b"self_service";
+    const EXPORT_PREFIX: &[u8] = b"gdpr-export-";
+    const EXPORT_SUFFIX: &[u8] = b".json";
+
+    /// Invitation row plan bits.
+    pub const ROW_SET_USED_BY_USER: i32 = 1;
+    pub const ROW_SET_USED_AT: i32 = 2;
+
+    /// PHP numeric-string whitespace.
+    const NUMERIC_WHITESPACE: &[u8] = b" \t\n\r\x0b\x0c";
+
+    fn range_ok(address: usize, length: usize) -> bool {
+        length <= isize::MAX as usize && address.checked_add(length).is_some()
+    }
+
+    fn aligned<T>(pointer: *const T, count: usize) -> bool {
+        let Some(length) = size_of::<T>().checked_mul(count) else {
+            return false;
+        };
+        !pointer.is_null()
+            && (pointer as usize).is_multiple_of(align_of::<T>())
+            && range_ok(pointer as usize, length)
+    }
+
+    /// A zero-count buffer may be any pointer; otherwise it must be aligned and in range.
+    fn buffer_ok<T>(pointer: *const T, count: usize) -> bool {
+        count == 0 || aligned(pointer, count)
+    }
+
+    fn flag(value: u8) -> Option<bool> {
+        match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    unsafe fn bytes<'a>(pointer: *const u8, length: usize) -> Option<&'a [u8]> {
+        if length > MAX_INPUT || !range_ok(pointer as usize, length) {
+            return None;
+        }
+        if length == 0 {
+            return Some(&[]);
+        }
+        if pointer.is_null() {
+            return None;
+        }
+        // u8 alignment is one; the range was checked above.
+        Some(unsafe { slice::from_raw_parts(pointer, length) })
+    }
+
+    /// Splits `payload` into `count` items of `lens`; the lengths must sum to the payload.
+    unsafe fn packed<'a>(
+        payload: *const u8,
+        payload_len: usize,
+        lens: *const usize,
+        count: usize,
+    ) -> Option<Vec<&'a [u8]>> {
+        if count > MAX_ITEMS || !buffer_ok(lens, count) {
+            return None;
+        }
+        let payload = unsafe { bytes(payload, payload_len) }?;
+        let lens: &[usize] = if count == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(lens, count) }
+        };
+        let mut items = Vec::with_capacity(count);
+        let mut offset = 0usize;
+        for &len in lens {
+            let end = offset.checked_add(len)?;
+            items.push(payload.get(offset..end)?);
+            offset = end;
+        }
+        (offset == payload.len()).then_some(items)
+    }
+
+    /// Copies `payload` into `out` and returns its length, or a negative capacity.
+    unsafe fn write_bytes(payload: &[u8], out: *mut u8, cap: usize) -> i32 {
+        if payload.len() > i32::MAX as usize {
+            return DECLINE;
+        }
+        if cap < payload.len() {
+            return -(payload.len() as i32);
+        }
+        if !payload.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), out, payload.len()) };
+        }
+        payload.len() as i32
+    }
+
+    /// Copies `parts` into `out` and their lengths into `out_lens`; the caller validated
+    /// `out_lens` for `parts.len()` values. Returns the total, or a negative capacity.
+    unsafe fn write_parts(parts: &[&[u8]], out_lens: *mut usize, out: *mut u8, cap: usize) -> i32 {
+        let mut total = 0usize;
+        for part in parts {
+            let Some(next) = total.checked_add(part.len()) else {
+                return DECLINE;
+            };
+            total = next;
+        }
+        if total > i32::MAX as usize {
+            return DECLINE;
+        }
+        if cap < total {
+            return -(total as i32);
+        }
+        // Copy first: the inputs may alias the outputs.
+        let payload = parts.concat();
+        let lens: Vec<usize> = parts.iter().map(|part| part.len()).collect();
+        unsafe {
+            if total != 0 {
+                std::ptr::copy_nonoverlapping(payload.as_ptr(), out, total);
+            }
+            std::ptr::copy_nonoverlapping(lens.as_ptr(), out_lens, lens.len());
+        }
+        total as i32
+    }
+
+    fn with_decimal(prefix: &[u8], value: i64, suffix: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(prefix.len() + 20 + suffix.len());
+        payload.extend_from_slice(prefix);
+        payload.extend_from_slice(value.to_string().as_bytes());
+        payload.extend_from_slice(suffix);
+        payload
+    }
+
+    /// PHP `(int)` of a `/^\d+$/` match: ASCII digits with an optional final newline,
+    /// saturating at `PHP_INT_MAX`.
+    fn profile_id(input: &[u8]) -> Option<i64> {
+        let digits = input.strip_suffix(b"\n").unwrap_or(input);
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(digits.iter().fold(0i64, |acc, digit| {
+            acc.saturating_mul(10)
+                .saturating_add(i64::from(digit - b'0'))
+        }))
+    }
+
+    fn digit_run(value: &[u8]) -> usize {
+        value.iter().take_while(|b| b.is_ascii_digit()).count()
+    }
+
+    /// PHP `is_numeric()` for a string, with the exact `intval()` result when the string
+    /// is a whitespace-padded integer that fits in an `int`.
+    fn classify_numeric(value: &[u8]) -> (u8, i64) {
+        let start = value
+            .iter()
+            .position(|b| !NUMERIC_WHITESPACE.contains(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !NUMERIC_WHITESPACE.contains(b))
+            .map_or(start, |index| index + 1);
+        let trimmed = &value[start..end.max(start)];
+        let (negative, body) = match trimmed.first() {
+            Some(b'-') => (true, &trimmed[1..]),
+            Some(b'+') => (false, &trimmed[1..]),
+            _ => (false, trimmed),
+        };
+        if body.is_empty() {
+            return (NUMERIC_DROP, 0);
+        }
+        if body.iter().all(u8::is_ascii_digit) {
+            let parsed = body.iter().try_fold(0i64, |acc, digit| {
+                let digit = i64::from(digit - b'0');
+                let scaled = acc.checked_mul(10)?;
+                if negative {
+                    scaled.checked_sub(digit)
+                } else {
+                    scaled.checked_add(digit)
+                }
+            });
+            return match parsed {
+                Some(value) => (NUMERIC_INT, value),
+                None => (NUMERIC_DEFER, 0),
+            };
+        }
+        let whole = digit_run(body);
+        let mut rest = &body[whole..];
+        let mut fraction = 0;
+        if let Some(after) = rest.strip_prefix(b".") {
+            fraction = digit_run(after);
+            rest = &after[fraction..];
+        }
+        if whole + fraction == 0 {
+            return (NUMERIC_DROP, 0);
+        }
+        if let Some(after) = rest.strip_prefix(b"e").or_else(|| rest.strip_prefix(b"E")) {
+            let after = after
+                .strip_prefix(b"+")
+                .or_else(|| after.strip_prefix(b"-"))
+                .unwrap_or(after);
+            let exponent = digit_run(after);
+            if exponent == 0 {
+                return (NUMERIC_DROP, 0);
+            }
+            rest = &after[exponent..];
+        }
+        if rest.is_empty() {
+            (NUMERIC_DEFER, 0)
+        } else {
+            (NUMERIC_DROP, 0)
+        }
+    }
+
+    /// PHP `json_encode()` string escaping with `JSON_UNESCAPED_SLASHES`.
+    fn json_escape_into(out: &mut Vec<u8>, value: &str) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let unit = |out: &mut Vec<u8>, code: u16| {
+            out.extend_from_slice(b"\\u");
+            for shift in [12, 8, 4, 0] {
+                out.push(HEX[usize::from((code >> shift) & 0xf)]);
+            }
+        };
+        for ch in value.chars() {
+            match ch {
+                '"' => out.extend_from_slice(b"\\\""),
+                '\\' => out.extend_from_slice(b"\\\\"),
+                '\u{8}' => out.extend_from_slice(b"\\b"),
+                '\u{c}' => out.extend_from_slice(b"\\f"),
+                '\n' => out.extend_from_slice(b"\\n"),
+                '\r' => out.extend_from_slice(b"\\r"),
+                '\t' => out.extend_from_slice(b"\\t"),
+                c if (c as u32) < 0x20 => unit(out, c as u16),
+                c if c.is_ascii() => out.push(c as u8),
+                c => {
+                    let mut buffer = [0u16; 2];
+                    for code in c.encode_utf16(&mut buffer) {
+                        unit(out, *code);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `ProfileController::profileLookupParameters()`: `id` (digits with an optional
+    /// final newline) takes precedence over a non-empty `name`. Writes the parsed id into
+    /// `out_id` only for LOOKUP_BY_ID.
+    ///
+    /// # Safety
+    /// `id`/`name` must be readable for their lengths and `out_id` an aligned writable
+    /// `int64_t`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_profile_lookup_params(
+        id: *const u8,
+        id_len: usize,
+        name: *const u8,
+        name_len: usize,
+        out_id: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !aligned(out_id as *const i64, 1) {
+                return DECLINE;
+            }
+            let (Some(id), Some(name)) = (unsafe { bytes(id, id_len) }, unsafe {
+                bytes(name, name_len)
+            }) else {
+                return DECLINE;
+            };
+            if let Some(value) = profile_id(id) {
+                unsafe { out_id.write(value) };
+                LOOKUP_BY_ID
+            } else if !name.is_empty() {
+                LOOKUP_BY_NAME
+            } else {
+                LOOKUP_NONE
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ProfileController::isAllowedThemeValue()`: 1 when `value` is in the kind's
+    /// whitelist (0 = theme preference, 1 = color scheme).
+    ///
+    /// # Safety
+    /// `value` must be readable for `value_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_profile_theme_allowed(
+        kind: u32,
+        value: *const u8,
+        value_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let allowed = match kind {
+                THEME_PREFERENCE => THEME_PREFERENCES,
+                COLOR_SCHEME => COLOR_SCHEMES,
+                _ => return DECLINE,
+            };
+            let Some(value) = (unsafe { bytes(value, value_len) }) else {
+                return DECLINE;
+            };
+            i32::from(allowed.contains(&value))
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ProfileController::excludedCategoryIds()`: classifies `count` packed strings like
+    /// PHP `is_numeric()` into `out_kinds` (0 drop, 1 integer in `out_values`, 2 numeric
+    /// but converted by PHP) and returns `count`.
+    ///
+    /// # Safety
+    /// `payload` must be readable for `payload_len` bytes, `lens` readable for `count`
+    /// aligned `size_t` values summing to `payload_len`, and `out_kinds`/`out_values`
+    /// writable for `out_cap` aligned values.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_profile_numeric_classify(
+        payload: *const u8,
+        payload_len: usize,
+        lens: *const usize,
+        count: usize,
+        out_kinds: *mut u8,
+        out_values: *mut i64,
+        out_cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !buffer_ok(out_kinds as *const u8, out_cap)
+                || !buffer_ok(out_values as *const i64, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some(items) = (unsafe { packed(payload, payload_len, lens, count) }) else {
+                return DECLINE;
+            };
+            // count <= MAX_ITEMS, so it fits in i32.
+            if out_cap < items.len() {
+                return -(items.len() as i32);
+            }
+            let (kinds, values): (Vec<u8>, Vec<i64>) =
+                items.iter().map(|item| classify_numeric(item)).unzip();
+            if !kinds.is_empty() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(kinds.as_ptr(), out_kinds, kinds.len());
+                    std::ptr::copy_nonoverlapping(values.as_ptr(), out_values, values.len());
+                }
+            }
+            items.len() as i32
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ProfileController::cacheKey()`: writes `composer_user_{id}` (kind 0) or
+    /// `user_category_exclusions_{id}` (kind 1) into `out`.
+    ///
+    /// # Safety
+    /// `out` must be writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_profile_cache_key(
+        kind: u32,
+        user_id: i64,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(prefix) = CACHE_PREFIXES.get(kind as usize) else {
+                return DECLINE;
+            };
+            if !buffer_ok(out as *const u8, cap) {
+                return DECLINE;
+            }
+            unsafe { write_bytes(&with_decimal(prefix, user_id, b""), out, cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `PasswordSecurityController::isProfileReferer()`: 1 when `from_profile` is set or
+    /// a present referer contains `profileedit`.
+    ///
+    /// # Safety
+    /// `referer` must be readable for `referer_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_password_security_profile_referer(
+        from_profile: u8,
+        has_referer: u8,
+        referer: *const u8,
+        referer_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let (Some(from_profile), Some(has_referer)) = (flag(from_profile), flag(has_referer))
+            else {
+                return DECLINE;
+            };
+            let Some(referer) = (unsafe { bytes(referer, referer_len) }) else {
+                return DECLINE;
+            };
+            let needle: &[u8] = b"profileedit";
+            i32::from(
+                from_profile || (has_referer && referer.windows(needle.len()).any(|w| w == needle)),
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `PasswordSecurityController::trustedDeviceCookiePayload()`: writes the PHP
+    /// `json_encode(['user_id', 'token', 'expires_at'], JSON_UNESCAPED_SLASHES)` payload
+    /// into `out`, or returns JSON_INVALID_UTF8 for a token that is not valid UTF-8.
+    ///
+    /// # Safety
+    /// `token` must be readable for `token_len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_password_security_trusted_cookie(
+        user_id: i64,
+        token: *const u8,
+        token_len: usize,
+        expires_at: i64,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !buffer_ok(out as *const u8, cap) {
+                return DECLINE;
+            }
+            let Some(token) = (unsafe { bytes(token, token_len) }) else {
+                return DECLINE;
+            };
+            let Ok(token) = std::str::from_utf8(token) else {
+                return JSON_INVALID_UTF8;
+            };
+            let mut payload = with_decimal(b"{\"user_id\":", user_id, b",\"token\":\"");
+            json_escape_into(&mut payload, token);
+            payload.extend_from_slice(b"\",\"expires_at\":");
+            payload.extend_from_slice(expires_at.to_string().as_bytes());
+            payload.push(b'}');
+            unsafe { write_bytes(&payload, out, cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `PasswordSecurityController::canCancelSetup()`: 1 when a 2FA record exists and is
+    /// not yet enabled.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_password_security_can_cancel(exists: u8, enabled: u8) -> i32 {
+        catch_unwind(|| match (flag(exists), flag(enabled)) {
+            (Some(exists), Some(enabled)) => i32::from(exists && !enabled),
+            _ => DECLINE,
+        })
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ProfileSecurityController::disable2faResponseState()`: writes
+    /// `[outcome, success, json]` into `out_meta` and the flash key and message into `out`
+    /// (lengths in `out_lens`).
+    ///
+    /// # Safety
+    /// `out_meta` must be an aligned writable `int32_t[3]`, `out_lens` an aligned writable
+    /// `size_t[2]` and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_profile_security_disable2fa_state(
+        password_matches: u8,
+        has_password_security: u8,
+        wants_json: u8,
+        out_meta: *mut i32,
+        out_lens: *mut usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let (Some(matches), Some(has_security), Some(json)) = (
+                flag(password_matches),
+                flag(has_password_security),
+                flag(wants_json),
+            ) else {
+                return DECLINE;
+            };
+            if !aligned(out_meta as *const i32, 3)
+                || !aligned(out_lens as *const usize, 2)
+                || !buffer_ok(out as *const u8, cap)
+            {
+                return DECLINE;
+            }
+            let outcome = if !matches {
+                DISABLE_PASSWORD_MISMATCH
+            } else if has_security {
+                DISABLE_SUCCESS
+            } else {
+                DISABLE_MISSING
+            };
+            let success = outcome == DISABLE_SUCCESS;
+            let key: &[u8] = if success {
+                b"success_2fa"
+            } else {
+                b"error_2fa"
+            };
+            let written = unsafe {
+                write_parts(
+                    &[key, DISABLE_MESSAGES[outcome as usize]],
+                    out_lens,
+                    out,
+                    cap,
+                )
+            };
+            if written >= 0 {
+                unsafe {
+                    out_meta.write(outcome);
+                    out_meta.add(1).write(i32::from(success));
+                    out_meta.add(2).write(i32::from(json));
+                }
+            }
+            written
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `PrivacyCenterController::gdprRequestPayload()`: writes `requested_by` and, for an
+    /// erasure (kind 1), the confirmation into `out` (lengths in `out_lens`). An export
+    /// (kind 0) carries `ip_recorded`, which must be 0 or 1 and is 0 for an erasure.
+    ///
+    /// # Safety
+    /// `confirmation` must be readable for its length, `out_lens` an aligned writable
+    /// `size_t[2]` and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_privacy_center_request_payload(
+        kind: u32,
+        ip_recorded: u8,
+        confirmation: *const u8,
+        confirmation_len: usize,
+        out_lens: *mut usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(ip_recorded) = flag(ip_recorded) else {
+                return DECLINE;
+            };
+            if kind > GDPR_ERASURE || (kind == GDPR_ERASURE && ip_recorded) {
+                return DECLINE;
+            }
+            if !aligned(out_lens as *const usize, 2) || !buffer_ok(out as *const u8, cap) {
+                return DECLINE;
+            }
+            let Some(confirmation) = (unsafe { bytes(confirmation, confirmation_len) }) else {
+                return DECLINE;
+            };
+            let confirmation = if kind == GDPR_ERASURE {
+                confirmation
+            } else {
+                &[][..]
+            };
+            unsafe { write_parts(&[REQUESTED_BY, confirmation], out_lens, out, cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `PrivacyCenterController::canDownloadExport()`: 1 when the request owner is the user
+    /// and the export is downloadable.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_privacy_center_can_download(
+        owner_id: i64,
+        user_id: i64,
+        downloadable: u8,
+    ) -> i32 {
+        catch_unwind(|| match flag(downloadable) {
+            Some(downloadable) => i32::from(owner_id == user_id && downloadable),
+            None => DECLINE,
+        })
+        .unwrap_or(DECLINE)
+    }
+
+    /// `PrivacyCenterController::exportDownloadFilename()`: writes
+    /// `gdpr-export-{id}.json` into `out`.
+    ///
+    /// # Safety
+    /// `out` must be writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_privacy_center_export_filename(
+        user_id: i64,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !buffer_ok(out as *const u8, cap) {
+                return DECLINE;
+            }
+            unsafe {
+                write_bytes(
+                    &with_decimal(EXPORT_PREFIX, user_id, EXPORT_SUFFIX),
+                    out,
+                    cap,
+                )
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `InvitationController::availableInvites()`: writes `total - active_pending` into
+    /// `out_available` and returns 1 when it is positive; DECLINE when the difference
+    /// overflows (PHP promotes it to float).
+    ///
+    /// # Safety
+    /// `out_available` must be an aligned writable `int64_t`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_invitation_available(
+        total: i64,
+        active_pending: i64,
+        out_available: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !aligned(out_available as *const i64, 1) {
+                return DECLINE;
+            }
+            let Some(available) = total.checked_sub(active_pending) else {
+                return DECLINE;
+            };
+            unsafe { out_available.write(available) };
+            i32::from(available > 0)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `InvitationController::normalizeInvitationRow()`: bit 0 adds `used_by_user`,
+    /// bit 1 sets `used_at`; `created_at`/`expires_at` are always replaced.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_invitation_row_plan(has_used_by: u8, has_used_at: u8) -> i32 {
+        catch_unwind(|| match (flag(has_used_by), flag(has_used_at)) {
+            (Some(used_by), Some(used_at)) => {
+                (if used_by { ROW_SET_USED_BY_USER } else { 0 })
+                    | (if used_at { ROW_SET_USED_AT } else { 0 })
+            }
+            _ => DECLINE,
+        })
+        .unwrap_or(DECLINE)
+    }
+
+    /// `InvitationController::previewRoleName()`: index of the role key whose PHP key
+    /// string equals `role`, or NOT_FOUND. PHP canonicalizes integer-like string keys, so
+    /// byte equality of the key strings is PHP array key equality.
+    ///
+    /// # Safety
+    /// `role` must be readable for `role_len` bytes, `keys` for `keys_len` bytes and
+    /// `key_lens` for `count` aligned `size_t` values summing to `keys_len`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_invitation_role_index(
+        role: *const u8,
+        role_len: usize,
+        keys: *const u8,
+        keys_len: usize,
+        key_lens: *const usize,
+        count: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(role) = (unsafe { bytes(role, role_len) }) else {
+                return DECLINE;
+            };
+            let Some(keys) = (unsafe { packed(keys, keys_len, key_lens, count) }) else {
+                return DECLINE;
+            };
+            // count <= MAX_ITEMS, so the index fits in i32.
+            keys.iter()
+                .position(|key| *key == role)
+                .map_or(NOT_FOUND, |index| index as i32)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn lookup(id: &[u8], name: &[u8]) -> (i32, i64) {
+            let mut out = 77i64;
+            let rc = unsafe {
+                nntmux_profile_lookup_params(
+                    id.as_ptr(),
+                    id.len(),
+                    name.as_ptr(),
+                    name.len(),
+                    &mut out,
+                )
+            };
+            (rc, out)
+        }
+
+        #[test]
+        fn wave28_5_profile_lookup_params() {
+            assert_eq!(lookup(b"42", b"bob"), (LOOKUP_BY_ID, 42));
+            assert_eq!(lookup(b"007", b""), (LOOKUP_BY_ID, 7));
+            assert_eq!(lookup(b"42\n", b""), (LOOKUP_BY_ID, 42));
+            assert_eq!(lookup(b"0", b""), (LOOKUP_BY_ID, 0));
+            assert_eq!(
+                lookup(b"99999999999999999999", b""),
+                (LOOKUP_BY_ID, i64::MAX)
+            );
+            assert_eq!(
+                lookup(b"9223372036854775807", b""),
+                (LOOKUP_BY_ID, i64::MAX)
+            );
+            for bad in [
+                &b""[..],
+                b"\n",
+                b"-1",
+                b"+1",
+                b" 1",
+                b"1 ",
+                b"1\n\n",
+                b"1.0",
+                b"\xd9\xa1",
+                b"1a",
+            ] {
+                assert_eq!(lookup(bad, b"bob"), (LOOKUP_BY_NAME, 77), "{bad:?}");
+                assert_eq!(lookup(bad, b""), (LOOKUP_NONE, 77), "{bad:?}");
+            }
+            assert_eq!(lookup(b"x", b"0"), (LOOKUP_BY_NAME, 77));
+            let mut out = [7i64; 2];
+            let bad = unsafe { (out.as_mut_ptr() as *mut u8).add(1) } as *mut i64;
+            let call = |id: *const u8, il, o: *mut i64| unsafe {
+                nntmux_profile_lookup_params(id, il, b"n".as_ptr(), 1, o)
+            };
+            assert_eq!(call(b"1".as_ptr(), 1, std::ptr::null_mut()), DECLINE);
+            assert_eq!(call(b"1".as_ptr(), 1, bad), DECLINE);
+            assert_eq!(call(std::ptr::null(), 1, out.as_mut_ptr()), DECLINE);
+            assert_eq!(call(b"1".as_ptr(), usize::MAX, out.as_mut_ptr()), DECLINE);
+            assert_eq!(
+                call(b"1".as_ptr(), MAX_INPUT + 1, out.as_mut_ptr()),
+                DECLINE
+            );
+            assert_eq!(call(usize::MAX as *const u8, 2, out.as_mut_ptr()), DECLINE);
+            assert_eq!(out, [7; 2]);
+            assert_eq!(call(std::ptr::null(), 0, out.as_mut_ptr()), LOOKUP_BY_NAME);
+        }
+
+        #[test]
+        fn wave28_5_profile_theme_allowed() {
+            let allowed = |kind, value: &[u8]| unsafe {
+                nntmux_profile_theme_allowed(kind, value.as_ptr(), value.len())
+            };
+            for value in THEME_PREFERENCES {
+                assert_eq!(allowed(THEME_PREFERENCE, value), 1);
+                assert_eq!(allowed(COLOR_SCHEME, value), 0);
+            }
+            for value in COLOR_SCHEMES {
+                assert_eq!(allowed(COLOR_SCHEME, value), 1);
+                assert_eq!(allowed(THEME_PREFERENCE, value), 0);
+            }
+            for value in [&b""[..], b"Light", b"dark ", b"system\0", b"purple"] {
+                assert_eq!(allowed(THEME_PREFERENCE, value), 0);
+                assert_eq!(allowed(COLOR_SCHEME, value), 0);
+            }
+            assert_eq!(allowed(2, b"dark"), DECLINE);
+            assert_eq!(
+                unsafe { nntmux_profile_theme_allowed(0, std::ptr::null(), 4) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_profile_theme_allowed(0, b"x".as_ptr(), usize::MAX) },
+                DECLINE
+            );
+        }
+
+        fn classify(items: &[&[u8]], cap: usize) -> (i32, Vec<u8>, Vec<i64>) {
+            let payload = items.concat();
+            let lens: Vec<usize> = items.iter().map(|item| item.len()).collect();
+            let mut kinds = vec![9u8; cap.max(1)];
+            let mut values = vec![77i64; cap.max(1)];
+            let rc = unsafe {
+                nntmux_profile_numeric_classify(
+                    payload.as_ptr(),
+                    payload.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                    kinds.as_mut_ptr(),
+                    values.as_mut_ptr(),
+                    cap,
+                )
+            };
+            (rc, kinds, values)
+        }
+
+        #[test]
+        fn wave28_5_profile_numeric_classification() {
+            let cases: &[(&[u8], u8, i64)] = &[
+                (b"5010", NUMERIC_INT, 5010),
+                (b"-7", NUMERIC_INT, -7),
+                (b"+7", NUMERIC_INT, 7),
+                (b"007", NUMERIC_INT, 7),
+                (b"-0", NUMERIC_INT, 0),
+                (b" \t\n\r\x0b\x0c12 \x0c", NUMERIC_INT, 12),
+                (b"-9223372036854775808", NUMERIC_INT, i64::MIN),
+                (b"9223372036854775807", NUMERIC_INT, i64::MAX),
+                (b"9223372036854775808", NUMERIC_DEFER, 0),
+                (b"1.5", NUMERIC_DEFER, 0),
+                (b"1.", NUMERIC_DEFER, 0),
+                (b".5", NUMERIC_DEFER, 0),
+                (b"1e3", NUMERIC_DEFER, 0),
+                (b"-1.e-3", NUMERIC_DEFER, 0),
+                (b" .5E+2 ", NUMERIC_DEFER, 0),
+                (b"", NUMERIC_DROP, 0),
+                (b" ", NUMERIC_DROP, 0),
+                (b"-", NUMERIC_DROP, 0),
+                (b".", NUMERIC_DROP, 0),
+                (b"1e", NUMERIC_DROP, 0),
+                (b"1e+", NUMERIC_DROP, 0),
+                (b"e5", NUMERIC_DROP, 0),
+                (b"0x1A", NUMERIC_DROP, 0),
+                (b"1_000", NUMERIC_DROP, 0),
+                (b"1 2", NUMERIC_DROP, 0),
+                (b"\x001", NUMERIC_DROP, 0),
+                (b"1\x00", NUMERIC_DROP, 0),
+                (b"--1", NUMERIC_DROP, 0),
+                (b"- 1", NUMERIC_DROP, 0),
+                (b"INF", NUMERIC_DROP, 0),
+                (b"1e5.5", NUMERIC_DROP, 0),
+            ];
+            let items: Vec<&[u8]> = cases.iter().map(|case| case.0).collect();
+            let (rc, kinds, values) = classify(&items, items.len());
+            assert_eq!(rc, items.len() as i32);
+            for (index, (input, kind, value)) in cases.iter().enumerate() {
+                assert_eq!(kinds[index], *kind, "{input:?}");
+                if *kind == NUMERIC_INT {
+                    assert_eq!(values[index], *value, "{input:?}");
+                }
+            }
+            let (rc, kinds, values) = classify(&items, 2);
+            assert_eq!(rc, -(items.len() as i32));
+            assert_eq!((kinds, values), (vec![9; 2], vec![77; 2]));
+            let (rc, _, _) = classify(&[], 0);
+            assert_eq!(rc, 0);
+        }
+
+        #[test]
+        fn wave28_5_profile_numeric_pointer_contract() {
+            let payload = b"12";
+            let lens = [1usize, 1];
+            let mut kinds = [9u8; 4];
+            let mut values = [77i64; 4];
+            let mut raw = [0u64; 4];
+            let bad_lens = unsafe { (raw.as_mut_ptr() as *mut u8).add(1) } as *const usize;
+            let bad_values = unsafe { (raw.as_mut_ptr() as *mut u8).add(1) } as *mut i64;
+            let call = |p: *const u8, pl, l: *const usize, c, k: *mut u8, v: *mut i64, cap| unsafe {
+                nntmux_profile_numeric_classify(p, pl, l, c, k, v, cap)
+            };
+            let (k, v) = (kinds.as_mut_ptr(), values.as_mut_ptr());
+            assert_eq!(
+                call(payload.as_ptr(), 3, lens.as_ptr(), 2, k, v, 4),
+                DECLINE
+            );
+            assert_eq!(
+                call(payload.as_ptr(), 1, lens.as_ptr(), 2, k, v, 4),
+                DECLINE
+            );
+            assert_eq!(
+                call(payload.as_ptr(), 2, [usize::MAX, 3].as_ptr(), 2, k, v, 4),
+                DECLINE
+            );
+            assert_eq!(
+                call(std::ptr::null(), 2, lens.as_ptr(), 2, k, v, 4),
+                DECLINE
+            );
+            assert_eq!(
+                call(payload.as_ptr(), 2, std::ptr::null(), 2, k, v, 4),
+                DECLINE
+            );
+            assert_eq!(call(payload.as_ptr(), 2, bad_lens, 2, k, v, 4), DECLINE);
+            assert_eq!(
+                call(payload.as_ptr(), 2, lens.as_ptr(), MAX_ITEMS + 1, k, v, 4),
+                DECLINE
+            );
+            assert_eq!(
+                call(
+                    payload.as_ptr(),
+                    2,
+                    lens.as_ptr(),
+                    2,
+                    std::ptr::null_mut(),
+                    v,
+                    4
+                ),
+                DECLINE
+            );
+            assert_eq!(
+                call(
+                    payload.as_ptr(),
+                    2,
+                    lens.as_ptr(),
+                    2,
+                    k,
+                    std::ptr::null_mut(),
+                    4
+                ),
+                DECLINE
+            );
+            assert_eq!(
+                call(payload.as_ptr(), 2, lens.as_ptr(), 2, k, bad_values, 4),
+                DECLINE
+            );
+            assert_eq!(
+                call(payload.as_ptr(), 2, lens.as_ptr(), 2, k, v, usize::MAX),
+                DECLINE
+            );
+            assert_eq!(kinds, [9; 4]);
+            assert_eq!(values, [77; 4]);
+            assert_eq!(raw, [0; 4]);
+            assert_eq!(
+                call(
+                    payload.as_ptr(),
+                    2,
+                    lens.as_ptr(),
+                    2,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0
+                ),
+                -2
+            );
+            assert_eq!(call(payload.as_ptr(), 2, lens.as_ptr(), 2, k, v, 2), 2);
+            assert_eq!((&kinds[..2], &values[..2]), (&[1u8, 1][..], &[1i64, 2][..]));
+        }
+
+        #[test]
+        fn wave28_5_profile_cache_key() {
+            let key = |kind, id, cap: usize| {
+                let mut out = vec![0x5au8; cap.max(1)];
+                let rc = unsafe { nntmux_profile_cache_key(kind, id, out.as_mut_ptr(), cap) };
+                (rc, out)
+            };
+            let (rc, out) = key(CACHE_COMPOSER_USER, 42, 64);
+            assert_eq!(&out[..rc as usize], b"composer_user_42");
+            let (rc, out) = key(CACHE_CATEGORY_EXCLUSIONS, i64::MIN, 64);
+            assert_eq!(
+                &out[..rc as usize],
+                b"user_category_exclusions_-9223372036854775808"
+            );
+            let (rc, out) = key(CACHE_COMPOSER_USER, 42, 4);
+            assert_eq!((rc, out), (-16, vec![0x5a; 4]));
+            assert_eq!(key(2, 42, 64).0, DECLINE);
+            assert_eq!(
+                unsafe { nntmux_profile_cache_key(0, 1, std::ptr::null_mut(), 64) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_profile_cache_key(0, 1, std::ptr::null_mut(), 0) },
+                -15
+            );
+            let mut out = [0u8; 4];
+            assert_eq!(
+                unsafe { nntmux_profile_cache_key(0, 1, out.as_mut_ptr(), usize::MAX) },
+                DECLINE
+            );
+        }
+
+        #[test]
+        fn wave28_5_password_security_referer_and_cancel() {
+            let referer = |from, has, value: &[u8]| unsafe {
+                nntmux_password_security_profile_referer(from, has, value.as_ptr(), value.len())
+            };
+            assert_eq!(referer(1, 0, b""), 1);
+            assert_eq!(referer(0, 1, b"https://x/profileedit#security"), 1);
+            assert_eq!(referer(0, 1, b"profileedit"), 1);
+            assert_eq!(referer(0, 1, b"https://x/profileEdit"), 0);
+            assert_eq!(referer(0, 1, b"profileedi"), 0);
+            assert_eq!(referer(0, 0, b"profileedit"), 0);
+            assert_eq!(referer(0, 1, b""), 0);
+            assert_eq!(referer(2, 0, b""), DECLINE);
+            assert_eq!(referer(0, 2, b""), DECLINE);
+            assert_eq!(
+                unsafe { nntmux_password_security_profile_referer(0, 1, std::ptr::null(), 3) },
+                DECLINE
+            );
+            for (exists, enabled, expected) in [(0, 0, 0), (0, 1, 0), (1, 0, 1), (1, 1, 0)] {
+                assert_eq!(
+                    nntmux_password_security_can_cancel(exists, enabled),
+                    expected
+                );
+            }
+            assert_eq!(nntmux_password_security_can_cancel(2, 0), DECLINE);
+            assert_eq!(nntmux_password_security_can_cancel(0, 2), DECLINE);
+        }
+
+        fn cookie(user_id: i64, token: &[u8], expires: i64, cap: usize) -> (i32, Vec<u8>) {
+            let mut out = vec![0x5au8; cap.max(1)];
+            let rc = unsafe {
+                nntmux_password_security_trusted_cookie(
+                    user_id,
+                    token.as_ptr(),
+                    token.len(),
+                    expires,
+                    out.as_mut_ptr(),
+                    cap,
+                )
+            };
+            (rc, out)
+        }
+
+        #[test]
+        fn wave28_5_password_security_trusted_cookie() {
+            let (rc, out) = cookie(7, b"abcXYZ09", 1_700_000_000, 128);
+            assert_eq!(
+                &out[..rc as usize],
+                br#"{"user_id":7,"token":"abcXYZ09","expires_at":1700000000}"#
+            );
+            let token =
+                b"a/\"\\\x08\x0c\n\r\t\x01\x7f<&'\xc3\xa9\xe2\x82\xac\xf0\x9f\x98\x80\xe2\x80\xa8";
+            let (rc, out) = cookie(-1, token, i64::MIN, 256);
+            let mut expected = br#"{"user_id":-1,"token":"a/\"\\\b\f\n\r\t\u0001"#.to_vec();
+            expected.extend_from_slice(b"\x7f<&'");
+            expected.extend_from_slice(
+                br#"\u00e9\u20ac\ud83d\ude00\u2028","expires_at":-9223372036854775808}"#,
+            );
+            assert_eq!(&out[..rc as usize], &expected[..]);
+            let (rc, out) = cookie(1, b"\xff", 1, 64);
+            assert_eq!((rc, out), (JSON_INVALID_UTF8, vec![0x5a; 64]));
+            let (rc, _) = cookie(1, b"\xed\xa0\x80", 1, 64);
+            assert_eq!(rc, JSON_INVALID_UTF8);
+            let (rc, out) = cookie(1, b"t", 1, 8);
+            assert_eq!((rc, out), (-40, vec![0x5a; 8]));
+            let mut out = [0u8; 8];
+            let call = |t: *const u8, tl, o: *mut u8, cap| unsafe {
+                nntmux_password_security_trusted_cookie(1, t, tl, 1, o, cap)
+            };
+            assert_eq!(call(std::ptr::null(), 1, out.as_mut_ptr(), 8), DECLINE);
+            assert_eq!(
+                call(b"t".as_ptr(), usize::MAX, out.as_mut_ptr(), 8),
+                DECLINE
+            );
+            assert_eq!(call(b"t".as_ptr(), 1, std::ptr::null_mut(), 8), DECLINE);
+            assert_eq!(
+                call(b"t".as_ptr(), 1, out.as_mut_ptr(), usize::MAX),
+                DECLINE
+            );
+            assert_eq!(call(b"t".as_ptr(), 1, std::ptr::null_mut(), 0), -40);
+            assert_eq!(out, [0; 8]);
+        }
+
+        #[test]
+        fn wave28_5_profile_security_disable2fa_state() {
+            let state = |matches, has, json, cap: usize| {
+                let mut meta = [7i32; 3];
+                let mut lens = [7usize; 2];
+                let mut out = vec![0x5au8; cap.max(1)];
+                let rc = unsafe {
+                    nntmux_profile_security_disable2fa_state(
+                        matches,
+                        has,
+                        json,
+                        meta.as_mut_ptr(),
+                        lens.as_mut_ptr(),
+                        out.as_mut_ptr(),
+                        cap,
+                    )
+                };
+                (rc, meta, lens, out)
+            };
+            for has in [0, 1] {
+                for json in [0, 1] {
+                    let (rc, meta, lens, out) = state(0, has, json, 128);
+                    assert_eq!(meta, [DISABLE_PASSWORD_MISMATCH, 0, i32::from(json)]);
+                    assert_eq!(lens, [9, DISABLE_MESSAGES[0].len()]);
+                    assert_eq!(&out[..9], b"error_2fa");
+                    assert_eq!(&out[9..rc as usize], DISABLE_MESSAGES[0]);
+                }
+            }
+            let (rc, meta, lens, out) = state(1, 1, 0, 128);
+            assert_eq!(meta, [DISABLE_SUCCESS, 1, 0]);
+            assert_eq!(
+                &out[..rc as usize],
+                b"success_2fa2FA has been successfully disabled."
+            );
+            assert_eq!(lens, [11, 35]);
+            let (_, meta, _, out) = state(1, 0, 1, 128);
+            assert_eq!(meta, [DISABLE_MISSING, 0, 1]);
+            assert_eq!(&out[9..50], DISABLE_MESSAGES[2]);
+            let (rc, meta, lens, out) = state(1, 1, 1, 10);
+            assert_eq!((rc, meta, lens), (-46, [7; 3], [7; 2]));
+            assert!(out.iter().all(|b| *b == 0x5a));
+            for (m, h, j) in [(2, 0, 0), (0, 2, 0), (0, 0, 2)] {
+                assert_eq!(state(m, h, j, 128).0, DECLINE);
+            }
+            let mut meta = [7i32; 4];
+            let mut lens = [7usize; 3];
+            let mut out = [0u8; 128];
+            let bad_meta = unsafe { (meta.as_mut_ptr() as *mut u8).add(1) } as *mut i32;
+            let bad_lens = unsafe { (lens.as_mut_ptr() as *mut u8).add(1) } as *mut usize;
+            let call = |m: *mut i32, l: *mut usize, o: *mut u8, cap| unsafe {
+                nntmux_profile_security_disable2fa_state(1, 1, 0, m, l, o, cap)
+            };
+            let (m, l, o) = (meta.as_mut_ptr(), lens.as_mut_ptr(), out.as_mut_ptr());
+            assert_eq!(call(std::ptr::null_mut(), l, o, 128), DECLINE);
+            assert_eq!(call(bad_meta, l, o, 128), DECLINE);
+            assert_eq!(call(m, std::ptr::null_mut(), o, 128), DECLINE);
+            assert_eq!(call(m, bad_lens, o, 128), DECLINE);
+            assert_eq!(call(m, l, std::ptr::null_mut(), 128), DECLINE);
+            assert_eq!(call(m, l, o, usize::MAX), DECLINE);
+            assert_eq!(call(m, l, std::ptr::null_mut(), 0), -46);
+            assert_eq!(meta, [7; 4]);
+            assert_eq!(lens, [7; 3]);
+            assert_eq!(out, [0; 128]);
+        }
+
+        #[test]
+        fn wave28_5_privacy_center_payload_download_and_filename() {
+            let payload = |kind, ip, confirmation: &[u8], cap: usize| {
+                let mut lens = [7usize; 2];
+                let mut out = vec![0x5au8; cap.max(1)];
+                let rc = unsafe {
+                    nntmux_privacy_center_request_payload(
+                        kind,
+                        ip,
+                        confirmation.as_ptr(),
+                        confirmation.len(),
+                        lens.as_mut_ptr(),
+                        out.as_mut_ptr(),
+                        cap,
+                    )
+                };
+                (rc, lens, out)
+            };
+            let (rc, lens, out) = payload(GDPR_EXPORT, 1, b"ignored", 64);
+            assert_eq!((rc, lens), (12, [12, 0]));
+            assert_eq!(&out[..12], b"self_service");
+            let (rc, lens, out) = payload(GDPR_ERASURE, 0, b"ERASE", 64);
+            assert_eq!((rc, lens), (17, [12, 5]));
+            assert_eq!(&out[..17], b"self_serviceERASE");
+            let (rc, lens, out) = payload(GDPR_ERASURE, 0, b"ERASE", 16);
+            assert_eq!((rc, lens), (-17, [7; 2]));
+            assert!(out.iter().all(|b| *b == 0x5a));
+            for (kind, ip) in [(2, 0), (u32::MAX, 0), (0, 2), (1, 1)] {
+                assert_eq!(payload(kind, ip, b"", 64).0, DECLINE);
+            }
+            let mut lens = [7usize; 3];
+            let bad_lens = unsafe { (lens.as_mut_ptr() as *mut u8).add(1) } as *mut usize;
+            let mut out = [0u8; 64];
+            let call = |c: *const u8, cl, l: *mut usize, o: *mut u8, cap| unsafe {
+                nntmux_privacy_center_request_payload(1, 0, c, cl, l, o, cap)
+            };
+            let (l, o) = (lens.as_mut_ptr(), out.as_mut_ptr());
+            assert_eq!(call(std::ptr::null(), 1, l, o, 64), DECLINE);
+            assert_eq!(call(b"E".as_ptr(), usize::MAX, l, o, 64), DECLINE);
+            assert_eq!(call(b"E".as_ptr(), 1, std::ptr::null_mut(), o, 64), DECLINE);
+            assert_eq!(call(b"E".as_ptr(), 1, bad_lens, o, 64), DECLINE);
+            assert_eq!(call(b"E".as_ptr(), 1, l, std::ptr::null_mut(), 64), DECLINE);
+            assert_eq!(call(b"E".as_ptr(), 1, l, o, usize::MAX), DECLINE);
+            assert_eq!(lens, [7; 3]);
+            assert_eq!(out, [0; 64]);
+            assert_eq!(call(b"E".as_ptr(), 1, l, std::ptr::null_mut(), 0), -13);
+
+            for (owner, user, downloadable, expected) in [
+                (1, 1, 1, 1),
+                (1, 1, 0, 0),
+                (1, 2, 1, 0),
+                (i64::MIN, i64::MIN, 1, 1),
+            ] {
+                assert_eq!(
+                    nntmux_privacy_center_can_download(owner, user, downloadable),
+                    expected
+                );
+            }
+            assert_eq!(nntmux_privacy_center_can_download(1, 1, 2), DECLINE);
+
+            let mut name = [0x5au8; 64];
+            let rc = unsafe { nntmux_privacy_center_export_filename(42, name.as_mut_ptr(), 64) };
+            assert_eq!(&name[..rc as usize], b"gdpr-export-42.json");
+            let rc = unsafe { nntmux_privacy_center_export_filename(-5, name.as_mut_ptr(), 64) };
+            assert_eq!(&name[..rc as usize], b"gdpr-export--5.json");
+            let mut small = [0x5au8; 4];
+            assert_eq!(
+                unsafe { nntmux_privacy_center_export_filename(42, small.as_mut_ptr(), 4) },
+                -19
+            );
+            assert_eq!(small, [0x5a; 4]);
+            assert_eq!(
+                unsafe { nntmux_privacy_center_export_filename(42, std::ptr::null_mut(), 64) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_privacy_center_export_filename(42, name.as_mut_ptr(), usize::MAX) },
+                DECLINE
+            );
+        }
+
+        #[test]
+        fn wave28_5_invitation_available_and_row_plan() {
+            let available = |total, pending| {
+                let mut out = 77i64;
+                let rc = unsafe { nntmux_invitation_available(total, pending, &mut out) };
+                (rc, out)
+            };
+            assert_eq!(available(5, 2), (1, 3));
+            assert_eq!(available(2, 2), (0, 0));
+            assert_eq!(available(1, 3), (0, -2));
+            assert_eq!(available(i64::MIN, 1), (DECLINE, 77));
+            assert_eq!(available(i64::MAX, -1), (DECLINE, 77));
+            let mut raw = [0i64; 2];
+            let bad = unsafe { (raw.as_mut_ptr() as *mut u8).add(1) } as *mut i64;
+            assert_eq!(unsafe { nntmux_invitation_available(1, 0, bad) }, DECLINE);
+            assert_eq!(
+                unsafe { nntmux_invitation_available(1, 0, std::ptr::null_mut()) },
+                DECLINE
+            );
+            assert_eq!(raw, [0; 2]);
+            assert_eq!(nntmux_invitation_row_plan(0, 0), 0);
+            assert_eq!(nntmux_invitation_row_plan(1, 0), ROW_SET_USED_BY_USER);
+            assert_eq!(nntmux_invitation_row_plan(0, 1), ROW_SET_USED_AT);
+            assert_eq!(nntmux_invitation_row_plan(1, 1), 3);
+            assert_eq!(nntmux_invitation_row_plan(2, 0), DECLINE);
+            assert_eq!(nntmux_invitation_row_plan(0, 2), DECLINE);
+        }
+
+        #[test]
+        fn wave28_5_invitation_role_index() {
+            let keys: [&[u8]; 4] = [b"1", b"2", b"02", b"admin"];
+            let payload = keys.concat();
+            let lens: Vec<usize> = keys.iter().map(|key| key.len()).collect();
+            let index = |role: &[u8]| unsafe {
+                nntmux_invitation_role_index(
+                    role.as_ptr(),
+                    role.len(),
+                    payload.as_ptr(),
+                    payload.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                )
+            };
+            assert_eq!(index(b"1"), 0);
+            assert_eq!(index(b"2"), 1);
+            assert_eq!(index(b"02"), 2);
+            assert_eq!(index(b"admin"), 3);
+            assert_eq!(index(b"3"), NOT_FOUND);
+            assert_eq!(index(b""), NOT_FOUND);
+            assert_eq!(index(b" 1"), NOT_FOUND);
+            assert_eq!(
+                unsafe {
+                    nntmux_invitation_role_index(
+                        b"1".as_ptr(),
+                        1,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                    )
+                },
+                NOT_FOUND
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_invitation_role_index(
+                        std::ptr::null(),
+                        1,
+                        payload.as_ptr(),
+                        payload.len(),
+                        lens.as_ptr(),
+                        4,
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_invitation_role_index(
+                        b"1".as_ptr(),
+                        1,
+                        payload.as_ptr(),
+                        payload.len() - 1,
+                        lens.as_ptr(),
+                        4,
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_invitation_role_index(
+                        b"1".as_ptr(),
+                        1,
+                        payload.as_ptr(),
+                        payload.len(),
+                        std::ptr::null(),
+                        4,
+                    )
+                },
+                DECLINE
+            );
+            let raw = [0u64; 4];
+            let bad = unsafe { (raw.as_ptr() as *const u8).add(1) } as *const usize;
+            assert_eq!(
+                unsafe {
+                    nntmux_invitation_role_index(
+                        b"1".as_ptr(),
+                        1,
+                        payload.as_ptr(),
+                        payload.len(),
+                        bad,
+                        1,
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_invitation_role_index(
+                        b"1".as_ptr(),
+                        usize::MAX,
+                        payload.as_ptr(),
+                        payload.len(),
+                        lens.as_ptr(),
+                        4,
+                    )
+                },
+                DECLINE
+            );
+        }
+    }
+}
