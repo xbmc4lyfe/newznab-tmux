@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace App\Services\Binaries;
 
 use App\Models\MissedPart;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
@@ -13,6 +15,19 @@ use Illuminate\Support\Facades\Log;
  */
 final class MissedPartHandler
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_missed_range_expand(int64_t first, int64_t last, size_t max_items, char *out, size_t cap);
+        ssize_t nntmux_missed_range_chunks(int64_t first, int64_t last, int64_t chunk, size_t max_chunks, char *out, size_t cap);
+        C;
+
+    /** Larger ranges stay on the PHP path rather than allocating an equally large FFI buffer. */
+    private const int NATIVE_MAX_RANGE_ITEMS = 1000000;
+
+    // PHP remains the production default: FFI marshaling stays below the 1.5x gate.
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
     private int $partRepairLimit;
 
     private int $partRepairMaxTries;
@@ -24,6 +39,157 @@ final class MissedPartHandler
         $this->partRepairLimit = $partRepairLimit;
         $this->partRepairMaxTries = $partRepairMaxTries;
         $this->chunkSize = max(50, min(1000, $chunkSize));
+    }
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
+    /**
+     * Every article number in an inclusive range; empty when the bounds are reversed.
+     *
+     * @return list<int>
+     */
+    public static function expandRange(int $first, int $last): array
+    {
+        return (self::$useRustFfi ? self::expandRangeNative($first, $last) : null) ?? self::expandRangePhp($first, $last);
+    }
+
+    /**
+     * @return list<int>
+     */
+    public static function expandRangePhp(int $first, int $last): array
+    {
+        return $last < $first ? [] : range($first, $last);
+    }
+
+    /**
+     * @return list<int>|null Null when Rust is unavailable or the range is too large.
+     */
+    public static function expandRangeNative(int $first, int $last): ?array
+    {
+        if ($last < $first) {
+            return [];
+        }
+        if (self::spanOverflows($first, $last)) {
+            return null;
+        }
+        $span = $last - $first;
+        if ($span >= self::NATIVE_MAX_RANGE_ITEMS) {
+            return null;
+        }
+
+        return self::packedInts(fn (FFI $ffi, FFI\CData $out, int $cap): int => $ffi->nntmux_missed_range_expand($first, $last, self::NATIVE_MAX_RANGE_ITEMS, $out, $cap), ($span + 1) * 8); // @phpstan-ignore method.notFound
+    }
+
+    /**
+     * Inclusive [start, end] bounds of each statement that covers a range in chunks.
+     *
+     * @return list<array{0: int, 1: int}>
+     */
+    public static function rangeChunks(int $first, int $last, int $chunkSize): array
+    {
+        return (self::$useRustFfi ? self::rangeChunksNative($first, $last, $chunkSize) : null) ?? self::rangeChunksPhp($first, $last, $chunkSize);
+    }
+
+    /**
+     * @return list<array{0: int, 1: int}>
+     */
+    public static function rangeChunksPhp(int $first, int $last, int $chunkSize): array
+    {
+        if ($last < $first) {
+            return [];
+        }
+        $chunkSize = max(1, $chunkSize);
+        $chunks = [];
+        $start = $first;
+        while (true) {
+            // Stepping from the end keeps PHP_INT_MAX bounds from overflowing.
+            $end = $last - $start < $chunkSize ? $last : $start + $chunkSize - 1;
+            $chunks[] = [$start, $end];
+            if ($end === $last) {
+                return $chunks;
+            }
+            $start = $end + 1;
+        }
+    }
+
+    /**
+     * @return list<array{0: int, 1: int}>|null
+     */
+    public static function rangeChunksNative(int $first, int $last, int $chunkSize): ?array
+    {
+        if ($last < $first) {
+            return [];
+        }
+        $chunkSize = max(1, $chunkSize);
+        if (self::spanOverflows($first, $last)) {
+            return null;
+        }
+        $span = $last - $first;
+        if (intdiv($span, $chunkSize) >= self::NATIVE_MAX_RANGE_ITEMS) {
+            return null;
+        }
+        $count = intdiv($span, $chunkSize) + 1;
+        $flat = self::packedInts(fn (FFI $ffi, FFI\CData $out, int $cap): int => $ffi->nntmux_missed_range_chunks($first, $last, $chunkSize, self::NATIVE_MAX_RANGE_ITEMS, $out, $cap), $count * 16); // @phpstan-ignore method.notFound
+        if ($flat === null || \count($flat) % 2 !== 0) {
+            return null;
+        }
+
+        /** @var list<array{0: int, 1: int}> */
+        return array_chunk($flat, 2);
+    }
+
+    /** Whether `$last - $first` exceeds PHP_INT_MAX for ordered bounds. */
+    private static function spanOverflows(int $first, int $last): bool
+    {
+        return $first < 0 && $last > PHP_INT_MAX + $first;
+    }
+
+    /**
+     * @param  \Closure(FFI, FFI\CData, int): int  $call
+     * @return list<int>|null
+     */
+    private static function packedInts(\Closure $call, int $bytes): ?array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, max(16, $bytes), $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            $written = $call($ffi, $scratch, $cap);
+            if ($written < 0 || $written % 8 !== 0) {
+                return null;
+            }
+            if ($written === 0) {
+                return [];
+            }
+            $values = unpack('q*', FFI::string($scratch, $written));
+
+            return $values === false ? null : array_values($values);
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
     /**
@@ -60,7 +226,7 @@ final class MissedPartHandler
             return;
         }
 
-        $this->addMissingParts(range($first, $last), $groupId);
+        $this->addMissingParts(self::expandRange($first, $last), $groupId);
     }
 
     /** Preserve never-attempted work without consuming retries on an existing obligation. */
@@ -69,22 +235,20 @@ final class MissedPartHandler
         if ($last < $first) {
             return;
         }
-        $rows = [];
-        $bindings = [];
         $conflict = DB::getDriverName() === 'sqlite'
             ? ' ON CONFLICT(numberid, groups_id) DO NOTHING'
             : ' ON DUPLICATE KEY UPDATE numberid = VALUES(numberid)';
-        for ($number = $first; $number <= $last; $number++) {
-            $rows[] = '(?, ?, 0)';
-            array_push($bindings, $number, $groupId);
-            if (\count($rows) === $this->chunkSize || $number === $last) {
-                DB::statement('INSERT INTO missed_parts (numberid, groups_id, attempts) VALUES '.implode(',', $rows).$conflict, $bindings);
-                $rows = [];
-                $bindings = [];
+        foreach (self::rangeChunks($first, $last, $this->chunkSize) as [$start, $end]) {
+            $rows = [];
+            $bindings = [];
+            for ($number = $start; ; $number++) {
+                $rows[] = '(?, ?, 0)';
+                array_push($bindings, $number, $groupId);
+                if ($number === $end) {
+                    break;
+                }
             }
-            if ($number === $last) {
-                break;
-            }
+            DB::statement('INSERT INTO missed_parts (numberid, groups_id, attempts) VALUES '.implode(',', $rows).$conflict, $bindings);
         }
     }
 
