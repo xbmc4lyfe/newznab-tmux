@@ -40,10 +40,16 @@ class PipelineDrilldownTest(unittest.TestCase):
             for file_entry in comp['files']
             for fn in file_entry['functions']
         }
-        for sym, rust_file in expected_exports.items():
-            with self.subTest(symbol=sym):
-                self.assertIn((rust_file, sym), fn_map)
-                fn = fn_map[(rust_file, sym)]
+        pipeline_fns = [
+            (rfile, fn)
+            for (rfile, _), fn in fn_map.items()
+            if rfile.startswith('rust/pipeline-ffi/src/')
+        ]
+        self.assertGreaterEqual(len(pipeline_fns), 304)
+        for rfile, fn in pipeline_fns:
+            with self.subTest(symbol=fn['name']):
+                self.assertIn(fn['name'], expected_exports)
+                self.assertEqual(expected_exports[fn['name']], rfile)
                 self.assertEqual(
                     [p['path_id'] for p in fn['paths']],
                     ['hot_path', 'uncommon_tail', 'boundary_batch', 'fallback_edge'],

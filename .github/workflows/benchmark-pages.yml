@@ -150,7 +150,7 @@ jobs:
           cp rust/pipeline-ffi/target/release/libnntmux_pipeline.so storage/app/nntmux-native/
           cp docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so storage/app/nntmux-native/
           php -d ffi.enable=true -d memory_limit=1G scripts/benchmark-pipeline-modules.php --pairs=20 --output=github-pages/docs/data/rust-module-benchmarks.json
-          python3 -B scripts/benchmark_pipeline_drilldown.py --check --root .
+          python3 -B scripts/benchmark_pipeline_drilldown.py --check --strict-exports --root .
       - name: Preserve the reviewed historical reports
         run: |
           if [[ -f github-pages/deployment/prepare-benchmarks.sh ]]; then

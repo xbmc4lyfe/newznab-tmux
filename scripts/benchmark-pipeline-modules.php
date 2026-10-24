@@ -11,6 +11,7 @@ declare(strict_types=1);
  *   4. fallback_edge  (non-matching / UTF-8 / malformed early-exit & fallback path)
  */
 
+use FFI\CData;
 use Random\Engine\Mt19937;
 use Random\Randomizer;
 
@@ -19,7 +20,11 @@ $outputPath = $root.'/github-pages/docs/data/rust-module-benchmarks.json';
 $pairsPerCell = 25;
 $warmupCalls = 6;
 
-foreach (array_slice($argv, 1) as $arg) {
+$cliArgs = isset($_SERVER['argv']) && is_array($_SERVER['argv']) ? $_SERVER['argv'] : [];
+foreach (array_slice($cliArgs, 1) as $arg) {
+    if (! is_string($arg)) {
+        continue;
+    }
     if (str_starts_with($arg, '--output=')) {
         $candidate = substr($arg, strlen('--output='));
         $outputPath = str_starts_with($candidate, '/') ? $candidate : $root.'/'.$candidate;
@@ -327,6 +332,7 @@ function componentForRustFile(string $rustFile): array
  *   - fallback_edge
  *
  * @param  array{ret: string, params: string, full: string, callers: list<string>, caller_methods: list<string>}  $meta
+ * @param  array<string, CData>  $buffers
  * @return array<string, array{label: string, workload: string, php: Closure(): mixed, rust: Closure(): mixed}>
  */
 function buildPipelineSymbolPaths(
@@ -763,11 +769,23 @@ if ($yencLibPath !== null && extension_loaded('ffi')) {
     $yencCdef = <<<'C'
         uint32_t nntmux_yenc_payload_kernel_v1(void);
         int32_t nntmux_yenc_supports_split_escapes(void);
-        int32_t nntmux_yenc_decode_span_v1(const void* src, size_t source_length, size_t payload_offset, size_t payload_length, void* dest, size_t destination_capacity, uint32_t* crc32_output);
+        size_t nntmux_yenc_decode_span_v1(const void* src, size_t source_length, size_t payload_offset, size_t payload_length, void* dest, size_t destination_capacity, uint32_t* crc32_output);
         int32_t nntmux_per_article_obfuscation_v2(const char* subject_ptr, size_t subject_len, const char* from_ptr, size_t from_len, int64_t total_parts);
         C;
     $yencFfi = FFI::cdef($yencCdef, $yencLibPath);
     $yencCrcBuf = $yencFfi->new('uint32_t');
+}
+
+function invokeYencDecodeSpan(
+    FFI $ffi,
+    string $sym,
+    string $payload,
+    int $payloadLen,
+    CData $dest,
+    int $cap,
+    CData $crcAddr
+): int {
+    return (int) $ffi->$sym($payload, $payloadLen, 0, $payloadLen, $dest, $cap, $crcAddr);
 }
 
 // Collect all functions grouped by (rust_file)
@@ -960,10 +978,10 @@ foreach ($extraCrateDirs as $crateDir) {
                 };
 
                 $rustFn = ($yencFfi !== null && $yencDestBuf !== null && $yencCrcBuf !== null)
-                    ? static fn (): int => $yencFfi->nntmux_yenc_decode_span_v1(
+                    ? static fn (): int => invokeYencDecodeSpan(
+                        $yencFfi,
+                        'nntmux_yenc_decode_span_v1',
                         $payload,
-                        $payloadLen,
-                        0,
                         $payloadLen,
                         $yencDestBuf,
                         32768,

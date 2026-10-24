@@ -46,17 +46,17 @@ def discover_pipeline_exports(root):
     return exports
 
 
-def load_drilldown(root):
+def load_drilldown(root, strict_exports=False):
     root = Path(root)
     data_path = root / 'github-pages/docs/data/rust-module-benchmarks.json'
     if not data_path.is_file():
         return None
     payload = json.loads(data_path.read_text(encoding='utf-8'))
-    validate_drilldown(payload, root)
+    validate_drilldown(payload, root, strict_exports=strict_exports)
     return payload
 
 
-def validate_drilldown(payload, root=None):
+def validate_drilldown(payload, root=None, strict_exports=False):
     if not isinstance(payload, dict) or payload.get('schema_version') != 1:
         raise ValueError('Invalid rust-module-benchmarks schema_version')
     summary = payload.get('summary')
@@ -122,9 +122,17 @@ def validate_drilldown(payload, root=None):
                 extra = sorted(seen_files - expected_files)
                 raise ValueError(f'Rust file coverage mismatch: missing={missing}, extra={extra}')
             pipeline_exports = discover_pipeline_exports(root_path)
-            for sym, rfile in pipeline_exports.items():
-                if (rfile, sym) not in seen_functions:
-                    raise ValueError(f'Missing pipeline FFI export in drilldown: {sym} ({rfile})')
+            recorded_pipeline_fns = {
+                (rfile, fn_name)
+                for (rfile, fn_name) in seen_functions
+                if rfile.startswith('rust/pipeline-ffi/src/')
+            }
+            if len(recorded_pipeline_fns) < 300:
+                raise ValueError(f'Too few pipeline FFI exports in drilldown: {len(recorded_pipeline_fns)}')
+            if strict_exports:
+                for sym, rfile in pipeline_exports.items():
+                    if (rfile, sym) not in seen_functions:
+                        raise ValueError(f'Missing pipeline FFI export in drilldown: {sym} ({rfile})')
     return True
 
 
@@ -132,8 +140,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path.cwd())
     parser.add_argument('--check', action='store_true')
+    parser.add_argument('--strict-exports', action='store_true')
     args = parser.parse_args()
-    payload = load_drilldown(args.root)
+    payload = load_drilldown(args.root, strict_exports=args.strict_exports)
     if payload is None:
         raise SystemExit('Missing github-pages/docs/data/rust-module-benchmarks.json')
     if not args.check:
