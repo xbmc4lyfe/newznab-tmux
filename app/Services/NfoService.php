@@ -31,6 +31,90 @@ use Throwable;
  */
 class NfoService
 {
+    public const METADATA_FFI_CDEF = <<<'CDEF'
+        ssize_t nntmux_nfo_extract_urls(const char *text, size_t text_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_nfo_extract_group_name(const char *text, size_t text_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_nfo_extract_release_date(const char *text, size_t text_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_nfo_extract_codec_info(const char *text, size_t text_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_nfo_extract_file_size(const char *text, size_t text_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_nfo_parse_metadata(const char *text, size_t text_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_nfo_extract_language(const char *text, size_t text_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_nfo_extract_runtime(const char *text, size_t text_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_nfo_extract_genre(const char *text, size_t text_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_nfo_extract_software_info(const char *text, size_t text_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_nfo_extract_release_title(const char *text, size_t text_len, char *out_buf, size_t out_cap);
+        int32_t nntmux_nfo_calculate_quality(const char *text, size_t text_len);
+        int32_t nntmux_nfo_calculate_quality_fused(const char *text, size_t text_len);
+        int32_t nntmux_nfo_has_ascii_art(const char *text, size_t text_len);
+        int32_t nntmux_nfo_analyze_structure(const char *text, size_t text_len);
+        ssize_t nntmux_nfo_extract_all_media_ids(const char *text, size_t text_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_nfo_parse_show_id(const char *text, size_t text_len, char *out_buf, size_t out_cap);
+    CDEF;
+
+    private static bool $metadataFfiResolved = false;
+
+    private static ?\FFI $metadataFfi = null;
+
+    private function resolveMetadataFfi(): ?\FFI
+    {
+        if ($this->libraryPath !== null) {
+            return RustPipelineLibrary::resolveDomain('nfo_metadata_quality', self::METADATA_FFI_CDEF, $this->libraryPath);
+        }
+        if (! self::$metadataFfiResolved) {
+            self::$metadataFfi = RustPipelineLibrary::resolveDomain('nfo_metadata_quality', self::METADATA_FFI_CDEF);
+            self::$metadataFfiResolved = true;
+        }
+
+        return self::$metadataFfi;
+    }
+
+    /**
+     * Byte-preserving serialized values keep sparse URL keys and binary NFO text.
+     * A missing/older library, unavailable engine or failed allocation falls back.
+     */
+    private function metadataRust(string $symbol, string $text, bool &$handled, bool $scalar = false): mixed
+    {
+        $handled = false;
+        if (ini_get('pcre.backtrack_limit') !== '1000000' || ini_get('pcre.recursion_limit') !== '100000'
+            || ini_get('pcre.jit') !== '1' || ! in_array(setlocale(LC_CTYPE, '0'), ['C', 'POSIX', 'C.UTF-8', 'C.utf8'], true)) {
+            return null;
+        }
+        try {
+            $ffi = $this->resolveMetadataFfi();
+            if ($ffi === null) {
+                return null;
+            }
+            if ($scalar) {
+                $result = $ffi->$symbol($text, strlen($text));
+                $handled = is_int($result) && $result >= 0;
+
+                return $result;
+            }
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, max(512, strlen($text) + 512), $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            $written = $ffi->$symbol($text, strlen($text), $buffer, $capacity);
+            if (is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                $written = $ffi->$symbol($text, strlen($text), $buffer, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity) {
+                return null;
+            }
+            $result = unserialize(\FFI::string($buffer, $written), ['allowed_classes' => false]);
+            $handled = true;
+
+            return $result;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     private const DEFAULT_NON_NFO_HEADER_REGEX = '/\A(\s*<\?xml|=newz\[NZB\]=|RIFF|\s*[RP]AR|.{0,10}(JFIF|matroska|ftyp|ID3)|PK\x03\x04|\x1f\x8b\x08|MZ|%PDF|GIF8[79]a|\x89PNG)|;\s*Generated\s*by.*SF\w/i';
 
     private const DEFAULT_BINARY_CHARS_REGEX = '/[\x00-\x08\x0B\x0C\x0E-\x1F]/';
@@ -86,35 +170,16 @@ class NfoService
      *
      * @var array<string, mixed>
      */
-    protected array $_nfoKeywords = [ // @phpstan-ignore property.defaultValue
-        // Release information
-        'release', 'group', 'date', 'size', 'format', 'source', 'genre', 'codec',
-        'bitrate', 'resolution', 'language', 'subtitle', 'ripped', 'cracked',
-        'keygen', 'serial', 'patch', 'trainer', 'install', 'notes', 'greets',
-        'nfo', 'ascii', 'artwork', 'presents', 'proudly', 'brings', 'another',
-        // Scene terminology
-        'scene', 'rls', 'nuked', 'proper', 'repack', 'internal', 'retail',
-        'webdl', 'webrip', 'bluray', 'bdrip', 'dvdrip', 'hdtv', 'pdtv',
-        // Media info
-        'video', 'audio', 'duration', 'runtime', 'aspect', 'fps', 'channels',
-        'sample', 'encoder', 'x264', 'x265', 'hevc', 'avc', 'xvid', 'divx',
-        'aac', 'ac3', 'dts', 'truehd', 'atmos', 'flac', 'mp3',
-        // Content info
-        'movie', 'film', 'episode', 'season', 'series', 'title', 'year',
-        'director', 'cast', 'actors', 'plot', 'synopsis', 'imdb', 'rating',
-        // Software
-        'crack', 'readme', 'setup', 'installer', 'license', 'registration',
-        'protection', 'requirements', 'platform', 'operating', 'system',
-        // Contact/Group info
-        'contact', 'irc', 'www', 'http', 'ftp', 'email', 'apply', 'join',
-    ];
+    protected array $_nfoKeywords = self::DEFAULT_NFO_KEYWORDS; // @phpstan-ignore property.defaultValue
 
     /**
      * Scene group patterns for improved detection.
      *
      * @var array<string, mixed>
      */
-    protected array $_sceneGroupPatterns = [ // @phpstan-ignore property.defaultValue
+    protected array $_sceneGroupPatterns = self::DEFAULT_SCENE_GROUP_PATTERNS; // @phpstan-ignore property.defaultValue
+
+    private const DEFAULT_SCENE_GROUP_PATTERNS = [
         '/(?:^|\n)\s*[-=*]{3,}.*?([A-Z0-9]{2,15})\s*[-=*]{3,}/i',
         '/(?:presents?|brought\s+(?:to\s+)?(?:you\s+)?by|from)\s*[:\-]?\s*([A-Z][A-Z0-9]{1,14})/i',
         '/(?:greets?\s+(?:go(?:es)?\s+)?(?:out\s+)?to|respect\s+to)\s*[:\-]?\s*([\w,\s&]+)/i',
@@ -282,6 +347,24 @@ class NfoService
      * @return array{showid: string, site: string}|false Return array with show ID and site source or false on failure.
      */
     public function parseShowId(string $str): array|false
+    {
+        return $this->parseShowIdNative($str);
+    }
+
+    /** @return array<string, mixed>|false */
+    public function parseShowIdRust(string $str): array|false
+    {
+        if (get_class($this) !== self::class) {
+            return $this->parseShowIdNative($str);
+        }
+        $handled = false;
+        $value = $this->metadataRust('nntmux_nfo_parse_show_id', $str, $handled);
+
+        return $handled && (is_array($value) || $value === false) ? $value : $this->parseShowIdNative($str);
+    }
+
+    /** @return array{showid: string, site: string}|false */
+    public function parseShowIdNative(string $str): array|false
     {
         // TVMaze
         if (preg_match('/tvmaze\.com\/shows\/(\d{1,6})/i', $str, $hits)) {
@@ -1103,6 +1186,24 @@ class NfoService
      */
     public function extractUrls(string $nfoContent): array
     {
+        return $this->extractUrlsNative($nfoContent);
+    }
+
+    /** @return array<array-key, mixed> */
+    public function extractUrlsRust(string $nfoContent): array
+    {
+        if (get_class($this) !== self::class) {
+            return $this->extractUrlsNative($nfoContent);
+        }
+        $handled = false;
+        $value = $this->metadataRust('nntmux_nfo_extract_urls', $nfoContent, $handled);
+
+        return $handled && is_array($value) ? $value : $this->extractUrlsNative($nfoContent);
+    }
+
+    /** @return array<array-key, mixed> */
+    public function extractUrlsNative(string $nfoContent): array
+    {
         $urls = [];
 
         // Match HTTP/HTTPS URLs
@@ -1133,6 +1234,22 @@ class NfoService
      * @return array<int<0, max>, string>
      */
     public function extractGroupName(string $nfoContent): ?string
+    {
+        return $this->extractGroupNameNative($nfoContent);
+    }
+
+    public function extractGroupNameRust(string $nfoContent): ?string
+    {
+        if (get_class($this) !== self::class || $this->_sceneGroupPatterns !== self::DEFAULT_SCENE_GROUP_PATTERNS) {
+            return $this->extractGroupNameNative($nfoContent);
+        }
+        $handled = false;
+        $value = $this->metadataRust('nntmux_nfo_extract_group_name', $nfoContent, $handled);
+
+        return $handled && ($value === null || is_string($value)) ? $value : $this->extractGroupNameNative($nfoContent);
+    }
+
+    public function extractGroupNameNative(string $nfoContent): ?string
     {
         // False positives to filter out
         $falsePositives = [
@@ -1185,6 +1302,22 @@ class NfoService
      */
     public function extractReleaseDate(string $nfoContent): ?string
     {
+        return $this->extractReleaseDateNative($nfoContent);
+    }
+
+    public function extractReleaseDateRust(string $nfoContent): ?string
+    {
+        if (get_class($this) !== self::class) {
+            return $this->extractReleaseDateNative($nfoContent);
+        }
+        $handled = false;
+        $value = $this->metadataRust('nntmux_nfo_extract_release_date', $nfoContent, $handled);
+
+        return $handled && ($value === null || is_string($value)) ? $value : $this->extractReleaseDateNative($nfoContent);
+    }
+
+    public function extractReleaseDateNative(string $nfoContent): ?string
+    {
         $patterns = [
             // DD/MM/YYYY or MM/DD/YYYY
             '/(?:date|released?|rls)\s*[:\-]?\s*(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/i',
@@ -1229,6 +1362,24 @@ class NfoService
      * @return array{video?: string, audio?: string, resolution?: string} Array with codec info.
      */
     public function extractCodecInfo(string $nfoContent): array
+    {
+        return $this->extractCodecInfoNative($nfoContent);
+    }
+
+    /** @return array<array-key, mixed> */
+    public function extractCodecInfoRust(string $nfoContent): array
+    {
+        if (get_class($this) !== self::class) {
+            return $this->extractCodecInfoNative($nfoContent);
+        }
+        $handled = false;
+        $value = $this->metadataRust('nntmux_nfo_extract_codec_info', $nfoContent, $handled);
+
+        return $handled && is_array($value) ? $value : $this->extractCodecInfoNative($nfoContent);
+    }
+
+    /** @return array<array-key, mixed> */
+    public function extractCodecInfoNative(string $nfoContent): array
     {
         $result = [];
 
@@ -1284,6 +1435,22 @@ class NfoService
      */
     public function extractFileSize(string $nfoContent): ?int
     {
+        return $this->extractFileSizeNative($nfoContent);
+    }
+
+    public function extractFileSizeRust(string $nfoContent): ?int
+    {
+        if (get_class($this) !== self::class) {
+            return $this->extractFileSizeNative($nfoContent);
+        }
+        $handled = false;
+        $value = $this->metadataRust('nntmux_nfo_extract_file_size', $nfoContent, $handled);
+
+        return $handled && ($value === null || is_int($value)) ? $value : $this->extractFileSizeNative($nfoContent);
+    }
+
+    public function extractFileSizeNative(string $nfoContent): ?int
+    {
         $patterns = [
             '/(?:size|file\s*size)\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*(bytes?|[KMGTP]B|[KMGTP]iB)/i',
             '/\b(\d+(?:[.,]\d+)?)\s*(GB|GiB|MB|MiB|TB|TiB)\b/i',
@@ -1319,6 +1486,24 @@ class NfoService
      * @return array<string, mixed> Array of media IDs with their sources.
      */
     public function extractAllMediaIds(string $nfoContent): array
+    {
+        return $this->extractAllMediaIdsNative($nfoContent);
+    }
+
+    /** @return list<array{id: string, source: string}> */
+    public function extractAllMediaIdsRust(string $nfoContent): array
+    {
+        if (get_class($this) !== self::class) {
+            return $this->extractAllMediaIdsNative($nfoContent);
+        }
+        $handled = false;
+        $value = $this->metadataRust('nntmux_nfo_extract_all_media_ids', $nfoContent, $handled);
+
+        return $handled && is_array($value) ? $value : $this->extractAllMediaIdsNative($nfoContent);
+    }
+
+    /** @return list<array{id: string, source: string}> */
+    public function extractAllMediaIdsNative(string $nfoContent): array
     {
         $ids = [];
 
@@ -1382,6 +1567,24 @@ class NfoService
      */
     public function parseNfoMetadata(string $nfoContent): array
     {
+        return $this->parseNfoMetadataNative($nfoContent);
+    }
+
+    /** @return array<array-key, mixed> */
+    public function parseNfoMetadataRust(string $nfoContent): array
+    {
+        if (get_class($this) !== self::class || $this->_sceneGroupPatterns !== self::DEFAULT_SCENE_GROUP_PATTERNS) {
+            return $this->parseNfoMetadataNative($nfoContent);
+        }
+        $handled = false;
+        $value = $this->metadataRust('nntmux_nfo_parse_metadata', $nfoContent, $handled);
+
+        return $handled && is_array($value) ? $value : $this->parseNfoMetadataNative($nfoContent);
+    }
+
+    /** @return array<array-key, mixed> */
+    public function parseNfoMetadataNative(string $nfoContent): array
+    {
         return [
             'urls' => $this->extractUrls($nfoContent),
             'group' => $this->extractGroupName($nfoContent),
@@ -1405,6 +1608,24 @@ class NfoService
      * @return array<string, mixed> Array of detected languages.
      */
     public function extractLanguage(string $nfoContent): array
+    {
+        return $this->extractLanguageNative($nfoContent);
+    }
+
+    /** @return array<array-key, mixed> */
+    public function extractLanguageRust(string $nfoContent): array
+    {
+        if (get_class($this) !== self::class) {
+            return $this->extractLanguageNative($nfoContent);
+        }
+        $handled = false;
+        $value = $this->metadataRust('nntmux_nfo_extract_language', $nfoContent, $handled);
+
+        return $handled && is_array($value) ? $value : $this->extractLanguageNative($nfoContent);
+    }
+
+    /** @return array<array-key, mixed> */
+    public function extractLanguageNative(string $nfoContent): array
     {
         $languages = [];
 
@@ -1446,6 +1667,22 @@ class NfoService
      */
     public function extractRuntime(string $nfoContent): ?int
     {
+        return $this->extractRuntimeNative($nfoContent);
+    }
+
+    public function extractRuntimeRust(string $nfoContent): ?int
+    {
+        if (get_class($this) !== self::class) {
+            return $this->extractRuntimeNative($nfoContent);
+        }
+        $handled = false;
+        $value = $this->metadataRust('nntmux_nfo_extract_runtime', $nfoContent, $handled);
+
+        return $handled && ($value === null || is_int($value)) ? $value : $this->extractRuntimeNative($nfoContent);
+    }
+
+    public function extractRuntimeNative(string $nfoContent): ?int
+    {
         $patterns = [
             // "Runtime: 1h 30m" or "Duration: 90min"
             '/(?:runtime|duration|length|playtime)\s*[:\-]?\s*(?:(\d{1,2})\s*h(?:ours?)?\s*)?(\d{1,3})\s*m(?:in(?:utes?)?)?/i',
@@ -1484,6 +1721,24 @@ class NfoService
      */
     public function extractGenre(string $nfoContent): array
     {
+        return $this->extractGenreNative($nfoContent);
+    }
+
+    /** @return array<array-key, mixed> */
+    public function extractGenreRust(string $nfoContent): array
+    {
+        if (get_class($this) !== self::class) {
+            return $this->extractGenreNative($nfoContent);
+        }
+        $handled = false;
+        $value = $this->metadataRust('nntmux_nfo_extract_genre', $nfoContent, $handled);
+
+        return $handled && is_array($value) ? $value : $this->extractGenreNative($nfoContent);
+    }
+
+    /** @return array<array-key, mixed> */
+    public function extractGenreNative(string $nfoContent): array
+    {
         $genres = [];
 
         if (preg_match('/(?:genre|category|type)\s*[:\-]?\s*([^\n\r]+)/i', $nfoContent, $matches)) {
@@ -1519,6 +1774,24 @@ class NfoService
      * @return list<string>
      */
     public function extractSoftwareInfo(string $nfoContent): array
+    {
+        return $this->extractSoftwareInfoNative($nfoContent);
+    }
+
+    /** @return array<array-key, mixed> */
+    public function extractSoftwareInfoRust(string $nfoContent): array
+    {
+        if (get_class($this) !== self::class) {
+            return $this->extractSoftwareInfoNative($nfoContent);
+        }
+        $handled = false;
+        $value = $this->metadataRust('nntmux_nfo_extract_software_info', $nfoContent, $handled);
+
+        return $handled && is_array($value) ? $value : $this->extractSoftwareInfoNative($nfoContent);
+    }
+
+    /** @return array<array-key, mixed> */
+    public function extractSoftwareInfoNative(string $nfoContent): array
     {
         $info = [];
 
@@ -1567,6 +1840,22 @@ class NfoService
      * @return string|null The release title if found.
      */
     public function extractReleaseTitle(string $nfoContent): ?string
+    {
+        return $this->extractReleaseTitleNative($nfoContent);
+    }
+
+    public function extractReleaseTitleRust(string $nfoContent): ?string
+    {
+        if (get_class($this) !== self::class) {
+            return $this->extractReleaseTitleNative($nfoContent);
+        }
+        $handled = false;
+        $value = $this->metadataRust('nntmux_nfo_extract_release_title', $nfoContent, $handled);
+
+        return $handled && ($value === null || is_string($value)) ? $value : $this->extractReleaseTitleNative($nfoContent);
+    }
+
+    public function extractReleaseTitleNative(string $nfoContent): ?string
     {
         $patterns = [
             // "Title: Movie Name" or "Release: Title.Goes.Here"
@@ -1655,6 +1944,34 @@ class NfoService
      */
     public function calculateNfoQuality(string $nfoContent): int
     {
+        return $this->calculateNfoQualityNative($nfoContent);
+    }
+
+    public function calculateNfoQualityRust(string $nfoContent): int
+    {
+        if (get_class($this) !== self::class || $this->_sceneGroupPatterns !== self::DEFAULT_SCENE_GROUP_PATTERNS || $this->_nfoKeywords !== self::DEFAULT_NFO_KEYWORDS) {
+            return $this->calculateNfoQualityNative($nfoContent);
+        }
+        $handled = false;
+        $value = $this->metadataRust('nntmux_nfo_calculate_quality', $nfoContent, $handled, true);
+
+        return $handled && is_int($value) ? $value : $this->calculateNfoQualityNative($nfoContent);
+    }
+
+    /** Comparative candidate: fused extraction with independent ordered regex scans. */
+    public function calculateNfoQualityFusedRust(string $nfoContent): int
+    {
+        if (get_class($this) !== self::class || $this->_sceneGroupPatterns !== self::DEFAULT_SCENE_GROUP_PATTERNS || $this->_nfoKeywords !== self::DEFAULT_NFO_KEYWORDS) {
+            return $this->calculateNfoQualityNative($nfoContent);
+        }
+        $handled = false;
+        $value = $this->metadataRust('nntmux_nfo_calculate_quality_fused', $nfoContent, $handled, true);
+
+        return $handled && is_int($value) ? $value : $this->calculateNfoQualityNative($nfoContent);
+    }
+
+    public function calculateNfoQualityNative(string $nfoContent): int
+    {
         $score = 50; // Base score
 
         $length = strlen($nfoContent);
@@ -1739,6 +2056,22 @@ class NfoService
      */
     protected function hasAsciiArt(string $nfoContent): bool
     {
+        return $this->hasAsciiArtNative($nfoContent);
+    }
+
+    public function hasAsciiArtRust(string $nfoContent): bool
+    {
+        if (get_class($this) !== self::class) {
+            return $this->hasAsciiArtNative($nfoContent);
+        }
+        $handled = false;
+        $value = $this->metadataRust('nntmux_nfo_has_ascii_art', $nfoContent, $handled, true);
+
+        return $handled && is_int($value) ? (bool) $value : $this->hasAsciiArtNative($nfoContent);
+    }
+
+    public function hasAsciiArtNative(string $nfoContent): bool
+    {
         // Check for common ASCII art characters in repeated sequences
         $asciiArtPatterns = [
             // Decorative borders
@@ -1769,6 +2102,22 @@ class NfoService
      * @return int Score based on structural quality (0-15).
      */
     protected function analyzeStructure(string $nfoContent): int
+    {
+        return $this->analyzeStructureNative($nfoContent);
+    }
+
+    public function analyzeStructureRust(string $nfoContent): int
+    {
+        if (get_class($this) !== self::class) {
+            return $this->analyzeStructureNative($nfoContent);
+        }
+        $handled = false;
+        $value = $this->metadataRust('nntmux_nfo_analyze_structure', $nfoContent, $handled, true);
+
+        return $handled && is_int($value) ? $value : $this->analyzeStructureNative($nfoContent);
+    }
+
+    public function analyzeStructureNative(string $nfoContent): int
     {
         $score = 0;
 
