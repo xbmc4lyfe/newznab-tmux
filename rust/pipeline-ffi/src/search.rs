@@ -17159,3 +17159,613 @@ pub mod signup_role_queue_enum_composer {
         }
     }
 }
+/// Wave 26.5 search-sync observer dirty checks, user excluded-category pair
+/// normalization and registration status history attribute construction. No dependencies.
+///
+/// Observer kinds: 0 = `CategoryObserver` (`title`, `root_categories_id`),
+/// 1 = `RootCategoryObserver` (`title`), 2 = `UsenetGroupObserver` (`name`). Dirty keys
+/// are compared as exact bytes, like PHP `array_key_exists`. Every export returns
+/// DECLINE for an invalid kind, mask or pointer range and writes nothing on a negative
+/// or DECLINE result; a negative non-DECLINE result is the required capacity.
+pub mod search_sync_observers_history {
+    use std::collections::HashSet;
+    use std::mem::{align_of, size_of};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: i32 = i32::MIN;
+    const MAX_INPUT: usize = 1 << 20;
+    const MAX_IDS: usize = 1 << 20;
+    const LINEAR_DEDUP_LIMIT: usize = 32;
+
+    /// `changed_by`, `old_status`, `new_status`, `registration_period_id`.
+    pub const HISTORY_SLOTS: usize = 4;
+    const HISTORY_MASK: u32 = (1 << HISTORY_SLOTS) - 1;
+
+    const CATEGORY_FIELDS: &[&[u8]] = &[b"title", b"root_categories_id"];
+    const ROOT_CATEGORY_FIELDS: &[&[u8]] = &[b"title"];
+    const USENET_GROUP_FIELDS: &[&[u8]] = &[b"name"];
+
+    fn fields(kind: u32) -> Option<&'static [&'static [u8]]> {
+        match kind {
+            0 => Some(CATEGORY_FIELDS),
+            1 => Some(ROOT_CATEGORY_FIELDS),
+            2 => Some(USENET_GROUP_FIELDS),
+            _ => None,
+        }
+    }
+
+    fn range_ok(address: usize, length: usize) -> bool {
+        length <= isize::MAX as usize && address.checked_add(length).is_some()
+    }
+
+    fn aligned<T>(pointer: *const T, count: usize) -> bool {
+        let Some(length) = size_of::<T>().checked_mul(count) else {
+            return false;
+        };
+        !pointer.is_null()
+            && (pointer as usize).is_multiple_of(align_of::<T>())
+            && range_ok(pointer as usize, length)
+    }
+
+    /// A zero-capacity output may be any pointer; otherwise it must be aligned and in range.
+    fn output_ok<T>(pointer: *mut T, capacity: usize) -> bool {
+        capacity == 0 || aligned(pointer as *const T, capacity)
+    }
+
+    unsafe fn bytes<'a>(pointer: *const u8, length: usize) -> Option<&'a [u8]> {
+        if length > MAX_INPUT || !range_ok(pointer as usize, length) {
+            return None;
+        }
+        if length == 0 {
+            return Some(&[]);
+        }
+        if pointer.is_null() {
+            return None;
+        }
+        // u8 alignment is one; the range was checked above.
+        Some(unsafe { slice::from_raw_parts(pointer, length) })
+    }
+
+    unsafe fn elements<'a, T>(pointer: *const T, count: usize, max: usize) -> Option<&'a [T]> {
+        if count > max {
+            return None;
+        }
+        if count == 0 {
+            return Some(&[]);
+        }
+        if !aligned(pointer, count) {
+            return None;
+        }
+        // Null, alignment and byte range were checked above.
+        Some(unsafe { slice::from_raw_parts(pointer, count) })
+    }
+
+    /// `1` when a packed dirty key names a reindex field, `0` otherwise.
+    unsafe fn reindex_required(
+        kind: u32,
+        keys: *const u8,
+        keys_len: usize,
+        lens: *const usize,
+        count: usize,
+    ) -> i32 {
+        let Some(fields) = fields(kind) else {
+            return DECLINE;
+        };
+        let Some(keys) = (unsafe { bytes(keys, keys_len) }) else {
+            return DECLINE;
+        };
+        let Some(lens) = (unsafe { elements(lens, count, MAX_INPUT) }) else {
+            return DECLINE;
+        };
+        let mut offset = 0usize;
+        let mut hit = false;
+        for &len in lens {
+            let Some(end) = offset.checked_add(len) else {
+                return DECLINE;
+            };
+            if end > keys.len() {
+                return DECLINE;
+            }
+            hit = hit || fields.contains(&&keys[offset..end]);
+            offset = end;
+        }
+        if offset != keys.len() {
+            return DECLINE;
+        }
+        i32::from(hit)
+    }
+
+    /// First occurrence of each id, in input order.
+    fn unique_ids(ids: &[i64]) -> Vec<i64> {
+        let mut unique = Vec::with_capacity(ids.len());
+        if ids.len() <= LINEAR_DEDUP_LIMIT {
+            for id in ids {
+                if !unique.contains(id) {
+                    unique.push(*id);
+                }
+            }
+        } else {
+            let mut seen = HashSet::with_capacity(ids.len());
+            unique.extend(ids.iter().copied().filter(|id| seen.insert(*id)));
+        }
+        unique
+    }
+
+    /// Dirty-attribute reindex check for `CategoryObserver`, `RootCategoryObserver` and
+    /// `UsenetGroupObserver`: `keys` holds the concatenated dirty attribute names and
+    /// `lens` their byte lengths, which must cover `keys` exactly.
+    ///
+    /// # Safety
+    /// `keys` must be readable for `keys_len` bytes and `lens` for `count` aligned
+    /// `size_t` values.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_search_sync_reindex_required(
+        kind: u32,
+        keys: *const u8,
+        keys_len: usize,
+        lens: *const usize,
+        count: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| unsafe {
+            reindex_required(kind, keys, keys_len, lens, count)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `UserExcludedCategory::normalizeExclusionPairs()`: writes the distinct category
+    /// ids in first-occurrence order and returns their count. `out` may alias `ids`.
+    ///
+    /// # Safety
+    /// `ids` must be readable for `count` aligned `int64_t` values and `out` writable
+    /// for `cap` aligned `int64_t` values.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_user_excluded_category_pairs(
+        ids: *const i64,
+        count: usize,
+        out: *mut i64,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !output_ok(out, cap) {
+                return DECLINE;
+            }
+            let Some(ids) = (unsafe { elements(ids, count, MAX_IDS) }) else {
+                return DECLINE;
+            };
+            // Collected before writing, so `out` may alias the input.
+            let unique = unique_ids(ids);
+            if cap < unique.len() {
+                return -(unique.len() as i32);
+            }
+            if !unique.is_empty() {
+                unsafe { std::ptr::copy_nonoverlapping(unique.as_ptr(), out, unique.len()) };
+            }
+            unique.len() as i32
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `RegistrationStatusHistory::recordAttributes()`: copies the action and description
+    /// bytes into `out` (returning their total length) and writes `out_lens = [action,
+    /// description]`, `out_mask = present_mask` and `out_ints` with each absent slot as 0.
+    /// Bit `i` of `present_mask` marks `ints[i]` as non-null.
+    ///
+    /// # Safety
+    /// `action`/`description` must be readable for their lengths, `ints` an aligned
+    /// readable `int64_t[4]`, `out_ints` an aligned writable `int64_t[4]`, `out_mask` an
+    /// aligned writable `uint32_t`, `out_lens` an aligned writable `size_t[2]`, and `out`
+    /// writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_registration_history_attributes(
+        action: *const u8,
+        action_len: usize,
+        description: *const u8,
+        description_len: usize,
+        ints: *const i64,
+        present_mask: u32,
+        out_ints: *mut i64,
+        out_mask: *mut u32,
+        out_lens: *mut usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if present_mask & !HISTORY_MASK != 0 {
+                return DECLINE;
+            }
+            if !aligned(out_ints as *const i64, HISTORY_SLOTS)
+                || !aligned(out_mask as *const u32, 1)
+                || !aligned(out_lens as *const usize, 2)
+                || !output_ok(out, cap)
+            {
+                return DECLINE;
+            }
+            let (Some(action), Some(description)) =
+                (unsafe { bytes(action, action_len) }, unsafe {
+                    bytes(description, description_len)
+                })
+            else {
+                return DECLINE;
+            };
+            if !aligned(ints, HISTORY_SLOTS) {
+                return DECLINE;
+            }
+            let Some(total) = action.len().checked_add(description.len()) else {
+                return DECLINE;
+            };
+            if total > i32::MAX as usize {
+                return DECLINE;
+            }
+            if cap < total {
+                return -(total as i32);
+            }
+            // Copy first: the inputs may alias the outputs.
+            let mut payload = Vec::with_capacity(total);
+            payload.extend_from_slice(action);
+            payload.extend_from_slice(description);
+            let lens = [action.len(), description.len()];
+            let mut values = [0i64; HISTORY_SLOTS];
+            for (slot, value) in values.iter_mut().enumerate() {
+                if present_mask & (1 << slot) != 0 {
+                    *value = unsafe { ints.add(slot).read() };
+                }
+            }
+            unsafe {
+                if total != 0 {
+                    std::ptr::copy_nonoverlapping(payload.as_ptr(), out, total);
+                }
+                std::ptr::copy_nonoverlapping(values.as_ptr(), out_ints, HISTORY_SLOTS);
+                out_mask.write(present_mask);
+                std::ptr::copy_nonoverlapping(lens.as_ptr(), out_lens, 2);
+            }
+            total as i32
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn pack(keys: &[&[u8]]) -> (Vec<u8>, Vec<usize>) {
+            let mut packed = Vec::new();
+            let mut lens = Vec::new();
+            for key in keys {
+                packed.extend_from_slice(key);
+                lens.push(key.len());
+            }
+            (packed, lens)
+        }
+
+        fn reindex(kind: u32, keys: &[&[u8]]) -> i32 {
+            let (packed, lens) = pack(keys);
+            unsafe {
+                nntmux_search_sync_reindex_required(
+                    kind,
+                    packed.as_ptr(),
+                    packed.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                )
+            }
+        }
+
+        #[test]
+        fn wave26_5_reindex_field_matrix() {
+            for kind in 0..=2 {
+                assert_eq!(reindex(kind, &[]), 0);
+                assert_eq!(reindex(kind, &[b"updated_at"]), 0);
+                assert_eq!(reindex(kind, &[b"", b"Title", b"title ", b"name\0"]), 0);
+                for field in fields(kind).unwrap() {
+                    assert_eq!(reindex(kind, &[field]), 1);
+                    assert_eq!(reindex(kind, &[b"updated_at", field, b""]), 1);
+                }
+            }
+            assert_eq!(reindex(0, &[b"root_categories_id"]), 1);
+            assert_eq!(reindex(1, &[b"root_categories_id"]), 0);
+            assert_eq!(reindex(0, &[b"name"]), 0);
+            assert_eq!(reindex(2, &[b"title"]), 0);
+            assert_eq!(reindex(3, &[b"title"]), DECLINE);
+            assert_eq!(reindex(u32::MAX, &[]), DECLINE);
+        }
+
+        #[test]
+        fn wave26_5_reindex_pointer_contract() {
+            let keys = b"titlename";
+            let lens = [5usize, 4];
+            let call = |keys: *const u8, keys_len, lens: *const usize, count| unsafe {
+                nntmux_search_sync_reindex_required(0, keys, keys_len, lens, count)
+            };
+            assert_eq!(call(keys.as_ptr(), 9, lens.as_ptr(), 2), 1);
+            assert_eq!(call(std::ptr::null(), 0, std::ptr::null(), 0), 0);
+            assert_eq!(call(std::ptr::null(), 9, lens.as_ptr(), 2), DECLINE);
+            assert_eq!(call(keys.as_ptr(), 9, std::ptr::null(), 2), DECLINE);
+            assert_eq!(call(keys.as_ptr(), 8, lens.as_ptr(), 2), DECLINE);
+            assert_eq!(call(keys.as_ptr(), 9, lens.as_ptr(), 1), DECLINE);
+            assert_eq!(call(keys.as_ptr(), usize::MAX, lens.as_ptr(), 2), DECLINE);
+            assert_eq!(call(usize::MAX as *const u8, 2, lens.as_ptr(), 1), DECLINE);
+            assert_eq!(call(keys.as_ptr(), 9, lens.as_ptr(), usize::MAX), DECLINE);
+            let raw = [0u64; 3];
+            let misaligned = unsafe { (raw.as_ptr() as *const u8).add(1) } as *const usize;
+            assert_eq!(call(keys.as_ptr(), 0, misaligned, 1), DECLINE);
+            assert_eq!(
+                call(keys.as_ptr(), 0, (usize::MAX - 7) as *const usize, 1),
+                DECLINE
+            );
+            let overflow = [usize::MAX, 2];
+            assert_eq!(call(keys.as_ptr(), 1, overflow.as_ptr(), 2), DECLINE);
+        }
+
+        fn pairs(ids: &[i64], cap: usize) -> (i32, Vec<i64>) {
+            let mut out = vec![-99i64; cap.max(1)];
+            let rc = unsafe {
+                nntmux_user_excluded_category_pairs(ids.as_ptr(), ids.len(), out.as_mut_ptr(), cap)
+            };
+            (rc, out)
+        }
+
+        #[test]
+        fn wave26_5_excluded_category_pairs() {
+            assert_eq!(pairs(&[], 0), (0, vec![-99]));
+            let (rc, out) = pairs(&[5, 3, 5, 0, -1, 3, i64::MIN, i64::MAX, 0], 9);
+            assert_eq!(rc, 6);
+            assert_eq!(&out[..6], &[5, 3, 0, -1, i64::MIN, i64::MAX]);
+            assert!(out[6..].iter().all(|v| *v == -99));
+            let (rc, out) = pairs(&[1, 2, 2, 3], 2);
+            assert_eq!(rc, -3);
+            assert!(out.iter().all(|v| *v == -99));
+            assert_eq!(pairs(&[4, 4, 4], 1).0, 1);
+            let (rc, _) = pairs(&[1, 2], 0);
+            assert_eq!(rc, -2);
+            let large: Vec<i64> = (0..500).map(|i| (i * 7919) % 97).collect();
+            let (rc, out) = pairs(&large, large.len());
+            assert_eq!(rc, 97);
+            let mut expected = Vec::new();
+            for id in &large {
+                if !expected.contains(id) {
+                    expected.push(*id);
+                }
+            }
+            assert_eq!(&out[..97], expected.as_slice());
+        }
+
+        #[test]
+        fn wave26_5_excluded_category_pointer_contract_and_aliasing() {
+            let ids = [1i64, 2];
+            let mut out = [-99i64; 4];
+            let call = |ids: *const i64, count, out: *mut i64, cap| unsafe {
+                nntmux_user_excluded_category_pairs(ids, count, out, cap)
+            };
+            assert_eq!(call(std::ptr::null(), 2, out.as_mut_ptr(), 4), DECLINE);
+            assert_eq!(call(std::ptr::null(), 0, std::ptr::null_mut(), 0), 0);
+            assert_eq!(call(ids.as_ptr(), 2, std::ptr::null_mut(), 4), DECLINE);
+            assert_eq!(call(ids.as_ptr(), usize::MAX, out.as_mut_ptr(), 4), DECLINE);
+            assert_eq!(call(ids.as_ptr(), 2, out.as_mut_ptr(), usize::MAX), DECLINE);
+            assert_eq!(
+                call((usize::MAX - 7) as *const i64, 2, out.as_mut_ptr(), 4),
+                DECLINE
+            );
+            let raw = [0u64; 3];
+            let misaligned = unsafe { (raw.as_ptr() as *const u8).add(1) } as *const i64;
+            assert_eq!(call(misaligned, 1, out.as_mut_ptr(), 4), DECLINE);
+            let mut raw_out = [0u64; 3];
+            let bad_out = unsafe { (raw_out.as_mut_ptr() as *mut u8).add(1) } as *mut i64;
+            assert_eq!(call(ids.as_ptr(), 2, bad_out, 2), DECLINE);
+            assert_eq!(raw_out, [0; 3]);
+            assert_eq!(out, [-99; 4]);
+            let mut alias = [9i64, 8, 9, 7, 8];
+            let rc = call(alias.as_ptr(), 5, alias.as_mut_ptr(), 5);
+            assert_eq!(rc, 3);
+            assert_eq!(alias, [9, 8, 7, 7, 8]);
+        }
+
+        #[allow(clippy::type_complexity)]
+        fn history(
+            action: &[u8],
+            description: &[u8],
+            ints: [i64; 4],
+            mask: u32,
+            cap: usize,
+        ) -> (i32, [i64; 4], u32, [usize; 2], Vec<u8>) {
+            let mut out_ints = [7i64; 4];
+            let mut out_mask = 7u32;
+            let mut out_lens = [7usize; 2];
+            let mut out = vec![0x5a; cap.max(1)];
+            let rc = unsafe {
+                nntmux_registration_history_attributes(
+                    action.as_ptr(),
+                    action.len(),
+                    description.as_ptr(),
+                    description.len(),
+                    ints.as_ptr(),
+                    mask,
+                    out_ints.as_mut_ptr(),
+                    &mut out_mask,
+                    out_lens.as_mut_ptr(),
+                    out.as_mut_ptr(),
+                    cap,
+                )
+            };
+            (rc, out_ints, out_mask, out_lens, out)
+        }
+
+        #[test]
+        fn wave26_5_history_attribute_matrix() {
+            let ints = [11, i64::MIN, i64::MAX, -4];
+            for mask in 0..=HISTORY_MASK {
+                let (rc, values, out_mask, lens, out) =
+                    history(b"period_created", b"Created \xff\0", ints, mask, 32);
+                assert_eq!(rc, 24);
+                assert_eq!(out_mask, mask);
+                assert_eq!(lens, [14, 10]);
+                assert_eq!(&out[..24], b"period_createdCreated \xff\0");
+                for slot in 0..HISTORY_SLOTS {
+                    let expected = if mask & (1 << slot) != 0 {
+                        ints[slot]
+                    } else {
+                        0
+                    };
+                    assert_eq!(values[slot], expected);
+                }
+            }
+            let (rc, values, out_mask, lens, _) = history(b"", b"", [1; 4], 0, 0);
+            assert_eq!((rc, values, out_mask, lens), (0, [0; 4], 0, [0, 0]));
+            let (rc, values, out_mask, lens, out) = history(b"abc", b"de", ints, 15, 4);
+            assert_eq!((rc, values, out_mask, lens), (-5, [7; 4], 7, [7; 2]));
+            assert!(out.iter().all(|b| *b == 0x5a));
+            for bad in [16, 17, u32::MAX] {
+                let (rc, values, out_mask, lens, out) = history(b"abc", b"de", ints, bad, 8);
+                assert_eq!((rc, values, out_mask, lens), (DECLINE, [7; 4], 7, [7; 2]));
+                assert!(out.iter().all(|b| *b == 0x5a));
+            }
+        }
+
+        #[test]
+        fn wave26_5_history_pointer_contract_and_aliasing() {
+            let ints = [1i64, 2, 3, 4];
+            let mut out_ints = [7i64; 5];
+            let mut out_mask = [7u32; 2];
+            let mut out_lens = [7usize; 3];
+            let mut out = [0x5au8; 16];
+            let bad_ints = unsafe { (out_ints.as_mut_ptr() as *mut u8).add(1) } as *mut i64;
+            let bad_mask = unsafe { (out_mask.as_mut_ptr() as *mut u8).add(1) } as *mut u32;
+            let bad_lens = unsafe { (out_lens.as_mut_ptr() as *mut u8).add(1) } as *mut usize;
+            let raw = [0u64; 5];
+            let misaligned_in = unsafe { (raw.as_ptr() as *const u8).add(1) } as *const i64;
+            let oi = out_ints.as_mut_ptr();
+            let om = out_mask.as_mut_ptr();
+            let ol = out_lens.as_mut_ptr();
+            let o = out.as_mut_ptr();
+            let a = b"ab".as_ptr();
+            let d = b"cd".as_ptr();
+            type Case = (
+                *const u8,
+                usize,
+                *const u8,
+                usize,
+                *const i64,
+                *mut i64,
+                *mut u32,
+                *mut usize,
+                *mut u8,
+                usize,
+            );
+            let cases: [Case; 14] = [
+                (std::ptr::null(), 2, d, 2, ints.as_ptr(), oi, om, ol, o, 16),
+                (a, 2, std::ptr::null(), 2, ints.as_ptr(), oi, om, ol, o, 16),
+                (a, usize::MAX, d, 2, ints.as_ptr(), oi, om, ol, o, 16),
+                (
+                    usize::MAX as *const u8,
+                    2,
+                    d,
+                    2,
+                    ints.as_ptr(),
+                    oi,
+                    om,
+                    ol,
+                    o,
+                    16,
+                ),
+                (a, 2, d, 2, std::ptr::null(), oi, om, ol, o, 16),
+                (a, 2, d, 2, misaligned_in, oi, om, ol, o, 16),
+                (
+                    a,
+                    2,
+                    d,
+                    2,
+                    (usize::MAX - 7) as *const i64,
+                    oi,
+                    om,
+                    ol,
+                    o,
+                    16,
+                ),
+                (
+                    a,
+                    2,
+                    d,
+                    2,
+                    ints.as_ptr(),
+                    std::ptr::null_mut(),
+                    om,
+                    ol,
+                    o,
+                    16,
+                ),
+                (a, 2, d, 2, ints.as_ptr(), bad_ints, om, ol, o, 16),
+                (a, 2, d, 2, ints.as_ptr(), oi, bad_mask, ol, o, 16),
+                (a, 2, d, 2, ints.as_ptr(), oi, om, bad_lens, o, 16),
+                (
+                    a,
+                    2,
+                    d,
+                    2,
+                    ints.as_ptr(),
+                    oi,
+                    om,
+                    (usize::MAX - 7) as *mut usize,
+                    o,
+                    16,
+                ),
+                (
+                    a,
+                    2,
+                    d,
+                    2,
+                    ints.as_ptr(),
+                    oi,
+                    om,
+                    ol,
+                    std::ptr::null_mut(),
+                    16,
+                ),
+                (a, 2, d, 2, ints.as_ptr(), oi, om, ol, o, usize::MAX),
+            ];
+            for (action, al, description, dl, ints_ptr, oi, om, ol, o, cap) in cases {
+                let rc = unsafe {
+                    nntmux_registration_history_attributes(
+                        action,
+                        al,
+                        description,
+                        dl,
+                        ints_ptr,
+                        15,
+                        oi,
+                        om,
+                        ol,
+                        o,
+                        cap,
+                    )
+                };
+                assert_eq!(rc, DECLINE);
+            }
+            assert_eq!(out_ints, [7; 5]);
+            assert_eq!(out_mask, [7; 2]);
+            assert_eq!(out_lens, [7; 3]);
+            assert_eq!(out, [0x5a; 16]);
+            let mut alias = *b"actiondescXXXXXX";
+            let rc = unsafe {
+                nntmux_registration_history_attributes(
+                    alias.as_ptr().add(6),
+                    4,
+                    alias.as_ptr(),
+                    6,
+                    ints.as_ptr(),
+                    5,
+                    out_ints.as_mut_ptr(),
+                    out_mask.as_mut_ptr(),
+                    out_lens.as_mut_ptr(),
+                    alias.as_mut_ptr(),
+                    alias.len(),
+                )
+            };
+            assert_eq!(rc, 10);
+            assert_eq!(&alias, b"descactionXXXXXX");
+            assert_eq!(&out_ints[..4], &[1, 0, 3, 0]);
+            assert_eq!(out_mask[0], 5);
+            assert_eq!(&out_lens[..2], &[4, 6]);
+        }
+    }
+}
