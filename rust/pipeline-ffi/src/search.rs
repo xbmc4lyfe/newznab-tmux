@@ -20206,3 +20206,1399 @@ pub mod profile_security_privacy_invite_controllers {
         }
     }
 }
+/// Wave 29.5 API v1, API help and Manticore/media index command helpers:
+/// `ApiController` `t` alias normalization, QUERY-safe functions, `sort` and `maxage`
+/// validation and TV season/episode airdates, `ApiHelpController` v1/v2 view metadata,
+/// `InspectManticore` version extraction, table-name safety and rebuild status,
+/// `CreateManticoreIndexes` `--index` selection, unknown logical indexes, default index
+/// names and create error classification, and `CreateMediaIndexes` media schema/mapping
+/// JSON and driver selection. No dependencies.
+///
+/// Every export returns DECLINE for an invalid kind or pointer range and writes nothing on
+/// a negative result; a negative result other than a documented sentinel from an export
+/// with an output buffer is the required capacity. Strings are compared as exact bytes,
+/// like PHP `===`.
+pub mod apiv1_manticore_media_index_commands {
+    use std::mem::{align_of, size_of};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: i32 = i32::MIN;
+    /// `nntmux_api_function_alias`: the `t` value is not a known API function.
+    pub const UNKNOWN_FUNCTION: i32 = i32::MIN + 1;
+    /// `nntmux_api_sort_normalize`: the trimmed sort is empty.
+    pub const SORT_EMPTY: i32 = i32::MIN + 1;
+    /// `nntmux_api_sort_normalize`: the sort is not `{field}_{asc|desc}`.
+    pub const SORT_INVALID: i32 = i32::MIN + 2;
+    const MAX_INPUT: usize = 1 << 20;
+    const MAX_ITEMS: usize = 1 << 16;
+
+    const FUNCTION_ALIASES: &[(&[u8], &[u8])] = &[
+        (b"d", b"d"),
+        (b"details", b"d"),
+        (b"g", b"g"),
+        (b"get", b"g"),
+        (b"s", b"s"),
+        (b"search", b"s"),
+        (b"c", b"c"),
+        (b"caps", b"c"),
+        (b"tv", b"tv"),
+        (b"tvsearch", b"tv"),
+        (b"m", b"m"),
+        (b"movie", b"m"),
+        (b"music", b"music"),
+        (b"audio", b"music"),
+        (b"b", b"book"),
+        (b"book", b"book"),
+        (b"anime", b"anime"),
+        (b"gn", b"n"),
+        (b"n", b"n"),
+        (b"nfo", b"n"),
+        (b"info", b"n"),
+        (b"nzbadd", b"nzbAdd"),
+    ];
+    const QUERY_SAFE_FUNCTIONS: &[&[u8]] = &[
+        b"s", b"tv", b"m", b"music", b"book", b"anime", b"d", b"c", b"n",
+    ];
+    const SORT_FIELDS: &[&[u8]] = &[b"cat", b"name", b"size", b"files", b"stats", b"posted"];
+    /// PHP `trim()` default characters.
+    const TRIM_WHITESPACE: &[u8] = b" \t\n\r\0\x0b";
+    /// PHP numeric-string whitespace.
+    const NUMERIC_WHITESPACE: &[u8] = b" \t\n\r\x0b\x0c";
+
+    /// `maxage` outcomes.
+    pub const MAX_AGE_OK: i32 = 0;
+    pub const MAX_AGE_EMPTY: i32 = 1;
+    pub const MAX_AGE_NOT_NUMERIC: i32 = 2;
+    /// Numeric, but a float form or a long integer: PHP `(int)` converts it.
+    pub const MAX_AGE_DEFER: i32 = 3;
+    /// Integers this long may exceed `int64_t`; PHP converts them.
+    const MAX_EXACT_DIGITS: usize = 18;
+
+    /// API help versions.
+    pub const HELP_V1: u32 = 1;
+    pub const HELP_V2: u32 = 2;
+    const HELP_KEYWORDS: &[u8] = b"view,nzb,api,details,help,json,rss,atom";
+    const HELP_METADATA: [[&[u8]; 4]; 2] = [
+        [
+            b"Api Help",
+            b"Api Help Topics",
+            HELP_KEYWORDS,
+            b"View description of the site Nzb Api.",
+        ],
+        [
+            b"Api V2 Help",
+            b"Api V2 Help Topics",
+            HELP_KEYWORDS,
+            b"View description of the site Nzb version 2 Api.",
+        ],
+    ];
+
+    const UNKNOWN_VERSION: &[u8] = b"unknown";
+    const DEFAULT_INDEX_SUFFIX: &[u8] = b"_rt";
+
+    /// Manticore create error kinds.
+    pub const CREATE_ERROR_ALREADY_EXISTS: i32 = 0;
+    pub const CREATE_ERROR_DATA_DIR: i32 = 1;
+    pub const CREATE_ERROR_GENERIC: i32 = 2;
+
+    /// Media schema kinds.
+    pub const MEDIA_SCHEMA_MANTICORE: u32 = 0;
+    pub const MEDIA_SCHEMA_ELASTICSEARCH: u32 = 1;
+
+    /// Media index drivers.
+    pub const DRIVER_MANTICORE: i32 = 0;
+    pub const DRIVER_ELASTICSEARCH: i32 = 1;
+    pub const DRIVER_UNSUPPORTED: i32 = 2;
+
+    /// A media column: name, Manticore type, Elasticsearch type and whether the
+    /// Elasticsearch field sets the `standard` analyzer.
+    type Column = (&'static str, &'static str, &'static str, bool);
+
+    const MOVIE_COLUMNS: &[Column] = &[
+        ("imdbid", "string", "keyword", false),
+        ("tmdbid", "integer", "integer", false),
+        ("traktid", "integer", "integer", false),
+        ("title", "text", "text", true),
+        ("year", "text", "keyword", false),
+        ("genre", "text", "text", false),
+        ("actors", "text", "text", false),
+        ("director", "text", "text", false),
+        ("rating", "text", "keyword", false),
+        ("plot", "text", "text", false),
+    ];
+    const TVSHOW_COLUMNS: &[Column] = &[
+        ("title", "text", "text", true),
+        ("tvdb", "integer", "integer", false),
+        ("trakt", "integer", "integer", false),
+        ("tvmaze", "integer", "integer", false),
+        ("tvrage", "integer", "integer", false),
+        ("imdb", "string", "keyword", false),
+        ("tmdb", "integer", "integer", false),
+        ("started", "text", "keyword", false),
+        ("type", "integer", "integer", false),
+    ];
+
+    fn range_ok(address: usize, length: usize) -> bool {
+        length <= isize::MAX as usize && address.checked_add(length).is_some()
+    }
+
+    fn aligned<T>(pointer: *const T, count: usize) -> bool {
+        let Some(length) = size_of::<T>().checked_mul(count) else {
+            return false;
+        };
+        !pointer.is_null()
+            && (pointer as usize).is_multiple_of(align_of::<T>())
+            && range_ok(pointer as usize, length)
+    }
+
+    /// A zero-count buffer may be any pointer; otherwise it must be aligned and in range.
+    fn buffer_ok<T>(pointer: *const T, count: usize) -> bool {
+        count == 0 || aligned(pointer, count)
+    }
+
+    unsafe fn bytes<'a>(pointer: *const u8, length: usize) -> Option<&'a [u8]> {
+        if length > MAX_INPUT || !range_ok(pointer as usize, length) {
+            return None;
+        }
+        if length == 0 {
+            return Some(&[]);
+        }
+        if pointer.is_null() {
+            return None;
+        }
+        // u8 alignment is one; the range was checked above.
+        Some(unsafe { slice::from_raw_parts(pointer, length) })
+    }
+
+    /// Splits `payload` into `count` items of `lens`; the lengths must sum to the payload.
+    unsafe fn packed<'a>(
+        payload: *const u8,
+        payload_len: usize,
+        lens: *const usize,
+        count: usize,
+    ) -> Option<Vec<&'a [u8]>> {
+        if count > MAX_ITEMS || !buffer_ok(lens, count) {
+            return None;
+        }
+        let payload = unsafe { bytes(payload, payload_len) }?;
+        let lens: &[usize] = if count == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(lens, count) }
+        };
+        let mut items = Vec::with_capacity(count);
+        let mut offset = 0usize;
+        for &len in lens {
+            let end = offset.checked_add(len)?;
+            items.push(payload.get(offset..end)?);
+            offset = end;
+        }
+        (offset == payload.len()).then_some(items)
+    }
+
+    /// Copies `payload` into `out` and returns its length, or a negative capacity.
+    unsafe fn write_bytes(payload: &[u8], out: *mut u8, cap: usize) -> i32 {
+        if payload.len() > i32::MAX as usize {
+            return DECLINE;
+        }
+        if cap < payload.len() {
+            return -(payload.len() as i32);
+        }
+        if !payload.is_empty() {
+            // Inputs may alias `out`; `payload` is always an owned copy or a constant.
+            unsafe { std::ptr::copy(payload.as_ptr(), out, payload.len()) };
+        }
+        payload.len() as i32
+    }
+
+    /// Copies `parts` into `out` and their lengths into `out_lens`; the caller validated
+    /// `out_lens` for `parts.len()` values. Returns the total, or a negative capacity.
+    unsafe fn write_parts(parts: &[&[u8]], out_lens: *mut usize, out: *mut u8, cap: usize) -> i32 {
+        let mut total = 0usize;
+        for part in parts {
+            let Some(next) = total.checked_add(part.len()) else {
+                return DECLINE;
+            };
+            total = next;
+        }
+        if total > i32::MAX as usize {
+            return DECLINE;
+        }
+        if cap < total {
+            return -(total as i32);
+        }
+        let payload = parts.concat();
+        let lens: Vec<usize> = parts.iter().map(|part| part.len()).collect();
+        unsafe {
+            if total != 0 {
+                std::ptr::copy_nonoverlapping(payload.as_ptr(), out, total);
+            }
+            std::ptr::copy_nonoverlapping(lens.as_ptr(), out_lens, lens.len());
+        }
+        total as i32
+    }
+
+    /// Writes `indices` into `out` (validated by the caller for `cap` values) and returns
+    /// their count, or the negative required capacity.
+    unsafe fn write_indices(indices: &[usize], out: *mut usize, cap: usize) -> i32 {
+        // indices.len() <= MAX_ITEMS, so it fits in i32.
+        if cap < indices.len() {
+            return -(indices.len() as i32);
+        }
+        if !indices.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(indices.as_ptr(), out, indices.len()) };
+        }
+        indices.len() as i32
+    }
+
+    fn trim<'a>(value: &'a [u8], set: &[u8]) -> &'a [u8] {
+        let start = value
+            .iter()
+            .position(|b| !set.contains(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !set.contains(b))
+            .map_or(start, |index| index + 1);
+        &value[start..end.max(start)]
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    /// PCRE `$` without `D` also matches before one final newline.
+    fn before_final_newline(value: &[u8]) -> &[u8] {
+        value.strip_suffix(b"\n").unwrap_or(value)
+    }
+
+    fn digit_run(value: &[u8]) -> usize {
+        value.iter().take_while(|b| b.is_ascii_digit()).count()
+    }
+
+    /// `strtolower(trim($sort))` matched against `/^(cat|name|...)_(asc|desc)$/`.
+    fn normalize_sort(raw: &[u8]) -> Result<Vec<u8>, i32> {
+        let sort = trim(raw, TRIM_WHITESPACE).to_ascii_lowercase();
+        if sort.is_empty() {
+            return Err(SORT_EMPTY);
+        }
+        let body = before_final_newline(&sort);
+        let valid = SORT_FIELDS.iter().any(|field| {
+            body.strip_prefix(*field)
+                .and_then(|rest| rest.strip_prefix(b"_"))
+                .is_some_and(|dir| dir == b"asc" || dir == b"desc")
+        });
+        if valid { Ok(sort) } else { Err(SORT_INVALID) }
+    }
+
+    /// `maxage`: blank like Laravel `filled()`, then PHP `is_numeric()` with the exact
+    /// `(int)` result for short whitespace-padded integers.
+    fn max_age(value: &[u8]) -> (i32, i64) {
+        if trim(value, TRIM_WHITESPACE).is_empty() {
+            return (MAX_AGE_EMPTY, 0);
+        }
+        let trimmed = trim(value, NUMERIC_WHITESPACE);
+        let (negative, body) = match trimmed.first() {
+            Some(b'-') => (true, &trimmed[1..]),
+            Some(b'+') => (false, &trimmed[1..]),
+            _ => (false, trimmed),
+        };
+        if body.is_empty() {
+            return (MAX_AGE_NOT_NUMERIC, 0);
+        }
+        if body.iter().all(u8::is_ascii_digit) {
+            if body.len() > MAX_EXACT_DIGITS {
+                return (MAX_AGE_DEFER, 0);
+            }
+            let magnitude = body
+                .iter()
+                .fold(0i64, |acc, digit| acc * 10 + i64::from(digit - b'0'));
+            return (MAX_AGE_OK, if negative { -magnitude } else { magnitude });
+        }
+        let whole = digit_run(body);
+        let mut rest = &body[whole..];
+        let mut fraction = 0;
+        if let Some(after) = rest.strip_prefix(b".") {
+            fraction = digit_run(after);
+            rest = &after[fraction..];
+        }
+        if whole + fraction == 0 {
+            return (MAX_AGE_NOT_NUMERIC, 0);
+        }
+        if let Some(after) = rest.strip_prefix(b"e").or_else(|| rest.strip_prefix(b"E")) {
+            let after = after
+                .strip_prefix(b"+")
+                .or_else(|| after.strip_prefix(b"-"))
+                .unwrap_or(after);
+            let exponent = digit_run(after);
+            if exponent == 0 {
+                return (MAX_AGE_NOT_NUMERIC, 0);
+            }
+            rest = &after[exponent..];
+        }
+        if rest.is_empty() {
+            (MAX_AGE_DEFER, 0)
+        } else {
+            (MAX_AGE_NOT_NUMERIC, 0)
+        }
+    }
+
+    /// `#^(19|20)\d{2}$#` on the season and `/` in the episode give
+    /// `str_replace('/', '-', "{year}-{episode}")`; otherwise empty.
+    fn tv_air_date(series: &[u8], episode: &[u8]) -> Vec<u8> {
+        let year = before_final_newline(series);
+        let is_year = year.len() == 4
+            && (year.starts_with(b"19") || year.starts_with(b"20"))
+            && year[2..].iter().all(u8::is_ascii_digit);
+        if !is_year || !episode.contains(&b'/') {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(5 + episode.len());
+        out.extend_from_slice(year);
+        out.push(b'-');
+        out.extend(episode.iter().map(|&b| if b == b'/' { b'-' } else { b }));
+        out
+    }
+
+    /// First `/\d+\.\d+(?:\.\d+)?/` match, or `unknown`.
+    fn extract_version(input: &[u8]) -> &[u8] {
+        let mut index = 0;
+        while index < input.len() {
+            if !input[index].is_ascii_digit() {
+                index += 1;
+                continue;
+            }
+            let start = index;
+            let major_end = start + digit_run(&input[start..]);
+            if input.get(major_end) == Some(&b'.') {
+                let minor_end = major_end + 1 + digit_run(&input[major_end + 1..]);
+                if minor_end > major_end + 1 {
+                    let mut end = minor_end;
+                    if input.get(minor_end) == Some(&b'.') {
+                        let patch_end = minor_end + 1 + digit_run(&input[minor_end + 1..]);
+                        if patch_end > minor_end + 1 {
+                            end = patch_end;
+                        }
+                    }
+                    return &input[start..end];
+                }
+            }
+            // A later start inside this digit run reaches the same separator and fails.
+            index = major_end;
+        }
+        UNKNOWN_VERSION
+    }
+
+    /// `/^[a-zA-Z0-9_]+$/`.
+    fn table_name_safe(name: &[u8]) -> bool {
+        let body = before_final_newline(name);
+        !body.is_empty() && body.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+    }
+
+    fn json_columns(out: &mut Vec<u8>, columns: &[Column], elasticsearch: bool) {
+        out.push(b'{');
+        for (index, (name, manticore, elastic, analyzed)) in columns.iter().enumerate() {
+            if index > 0 {
+                out.push(b',');
+            }
+            let kind = if elasticsearch { elastic } else { manticore };
+            out.extend_from_slice(format!("\"{name}\":{{\"type\":\"{kind}\"").as_bytes());
+            if elasticsearch && *analyzed {
+                out.extend_from_slice(b",\"analyzer\":\"standard\"");
+            }
+            out.push(b'}');
+        }
+        out.push(b'}');
+    }
+
+    /// `CreateMediaIndexes` schemas as PHP `json_encode()` of the PHP arrays.
+    fn media_schema(kind: u32) -> Option<Vec<u8>> {
+        let mut out = Vec::with_capacity(1024);
+        let tables: [(&[u8], &[Column]); 2] = match kind {
+            MEDIA_SCHEMA_MANTICORE => [
+                (b"movies_rt", MOVIE_COLUMNS),
+                (b"tvshows_rt", TVSHOW_COLUMNS),
+            ],
+            MEDIA_SCHEMA_ELASTICSEARCH => {
+                [(b"movies", MOVIE_COLUMNS), (b"tvshows", TVSHOW_COLUMNS)]
+            }
+            _ => return None,
+        };
+        out.push(b'{');
+        for (index, (name, columns)) in tables.into_iter().enumerate() {
+            if index > 0 {
+                out.push(b',');
+            }
+            out.push(b'"');
+            out.extend_from_slice(name);
+            out.extend_from_slice(b"\":");
+            if kind == MEDIA_SCHEMA_MANTICORE {
+                out.extend_from_slice(
+                    b"{\"settings\":{\"min_prefix_len\":0,\"min_infix_len\":2},\"columns\":",
+                );
+                json_columns(&mut out, columns, false);
+                out.push(b'}');
+            } else {
+                out.extend_from_slice(b"{\"mappings\":{\"properties\":");
+                json_columns(&mut out, columns, true);
+                out.extend_from_slice(
+                    b"},\"settings\":{\"number_of_shards\":1,\"number_of_replicas\":0}}",
+                );
+            }
+        }
+        out.push(b'}');
+        Some(out)
+    }
+
+    /// `ApiController::apiFunctionName()`: writes the canonical function for a `t` alias
+    /// into `out` and returns its length, or UNKNOWN_FUNCTION.
+    ///
+    /// # Safety
+    /// `t` must be readable for `t_len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_api_function_alias(
+        t: *const u8,
+        t_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !buffer_ok(out as *const u8, cap) {
+                return DECLINE;
+            }
+            let Some(t) = (unsafe { bytes(t, t_len) }) else {
+                return DECLINE;
+            };
+            match FUNCTION_ALIASES.iter().find(|(alias, _)| *alias == t) {
+                Some((_, canonical)) => unsafe { write_bytes(canonical, out, cap) },
+                None => UNKNOWN_FUNCTION,
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ApiController::isQuerySafeFunction()`: 1 when the canonical function may be served
+    /// over HTTP QUERY.
+    ///
+    /// # Safety
+    /// `function` must be readable for `function_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_api_query_safe_function(
+        function: *const u8,
+        function_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            match unsafe { bytes(function, function_len) } {
+                Some(function) => i32::from(QUERY_SAFE_FUNCTIONS.contains(&function)),
+                None => DECLINE,
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ApiController::normalizeSortValue()`: writes the trimmed lowercase sort into `out`
+    /// and returns its length, or SORT_EMPTY / SORT_INVALID.
+    ///
+    /// # Safety
+    /// `sort` must be readable for `sort_len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_api_sort_normalize(
+        sort: *const u8,
+        sort_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !buffer_ok(out as *const u8, cap) {
+                return DECLINE;
+            }
+            let Some(sort) = (unsafe { bytes(sort, sort_len) }) else {
+                return DECLINE;
+            };
+            match normalize_sort(sort) {
+                Ok(sort) => unsafe { write_bytes(&sort, out, cap) },
+                Err(code) => code,
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ApiController::maxAgeValue()` for a present string: returns MAX_AGE_OK (value in
+    /// `out_value`), MAX_AGE_EMPTY, MAX_AGE_NOT_NUMERIC or MAX_AGE_DEFER.
+    ///
+    /// # Safety
+    /// `value` must be readable for `value_len` bytes and `out_value` an aligned writable
+    /// `int64_t`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_api_max_age(
+        value: *const u8,
+        value_len: usize,
+        out_value: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !aligned(out_value as *const i64, 1) {
+                return DECLINE;
+            }
+            let Some(value) = (unsafe { bytes(value, value_len) }) else {
+                return DECLINE;
+            };
+            let (status, parsed) = max_age(value);
+            if status == MAX_AGE_OK {
+                unsafe { out_value.write(parsed) };
+            }
+            status
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ApiController::tvAirDate()`: writes the `YYYY-MM-DD` style airdate into `out` and
+    /// returns its length (0 when the season is not a year or the episode has no `/`).
+    ///
+    /// # Safety
+    /// `series`/`episode` must be readable for their lengths and `out` writable for `cap`
+    /// bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_api_tv_air_date(
+        series: *const u8,
+        series_len: usize,
+        episode: *const u8,
+        episode_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !buffer_ok(out as *const u8, cap) {
+                return DECLINE;
+            }
+            let (Some(series), Some(episode)) = (unsafe { bytes(series, series_len) }, unsafe {
+                bytes(episode, episode_len)
+            }) else {
+                return DECLINE;
+            };
+            unsafe { write_bytes(&tv_air_date(series, episode), out, cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ApiHelpController::helpViewMetadata()`: writes title, meta title, keywords and
+    /// description for API version 1 or 2 into `out` (lengths in `out_lens`).
+    ///
+    /// # Safety
+    /// `out_lens` must be an aligned writable `size_t[4]` and `out` writable for `cap`
+    /// bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_api_help_metadata(
+        version: u32,
+        out_lens: *mut usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let parts = match version {
+                HELP_V1 => &HELP_METADATA[0],
+                HELP_V2 => &HELP_METADATA[1],
+                _ => return DECLINE,
+            };
+            if !aligned(out_lens as *const usize, 4) || !buffer_ok(out as *const u8, cap) {
+                return DECLINE;
+            }
+            unsafe { write_parts(parts, out_lens, out, cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `InspectManticore::extractVersion()`: writes the first `\d+\.\d+(?:\.\d+)?` match
+    /// of the JSON-encoded response, or `unknown`, into `out`.
+    ///
+    /// # Safety
+    /// `input` must be readable for `input_len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_manticore_extract_version(
+        input: *const u8,
+        input_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !buffer_ok(out as *const u8, cap) {
+                return DECLINE;
+            }
+            let Some(input) = (unsafe { bytes(input, input_len) }) else {
+                return DECLINE;
+            };
+            let version = extract_version(input).to_vec();
+            unsafe { write_bytes(&version, out, cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `InspectManticore::isSafeTableName()`: 1 for `/^[a-zA-Z0-9_]+$/`.
+    ///
+    /// # Safety
+    /// `name` must be readable for `name_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_manticore_table_name_safe(
+        name: *const u8,
+        name_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            match unsafe { bytes(name, name_len) } {
+                Some(name) => i32::from(table_name_safe(name)),
+                None => DECLINE,
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `InspectManticore::tableNeedsRebuild()`: 1 when any missing column, incompatible
+    /// column or missing setting is reported.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_manticore_needs_rebuild(
+        missing: usize,
+        incompatible: usize,
+        missing_settings: usize,
+    ) -> i32 {
+        catch_unwind(|| i32::from(missing != 0 || incompatible != 0 || missing_settings != 0))
+            .unwrap_or(DECLINE)
+    }
+
+    /// `CreateManticoreIndexes::selectedIndexes()`: writes the positions of the `--index`
+    /// values PHP `array_filter()` keeps (not `""` or `"0"`) into `out_indices` and
+    /// returns their count.
+    ///
+    /// # Safety
+    /// `payload` must be readable for `payload_len` bytes, `lens` readable for `count`
+    /// aligned `size_t` values summing to `payload_len`, and `out_indices` writable for
+    /// `out_cap` aligned `size_t` values.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_manticore_selected_indexes(
+        payload: *const u8,
+        payload_len: usize,
+        lens: *const usize,
+        count: usize,
+        out_indices: *mut usize,
+        out_cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !buffer_ok(out_indices as *const usize, out_cap) {
+                return DECLINE;
+            }
+            let Some(items) = (unsafe { packed(payload, payload_len, lens, count) }) else {
+                return DECLINE;
+            };
+            let kept: Vec<usize> = items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| !item.is_empty() && **item != b"0")
+                .map(|(index, _)| index)
+                .collect();
+            unsafe { write_indices(&kept, out_indices, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `CreateManticoreIndexes::unknownIndexes()`: writes the positions of selected names
+    /// that are not known logical indexes (PHP `array_diff()`) into `out_indices` and
+    /// returns their count.
+    ///
+    /// # Safety
+    /// Each payload must be readable for its length, each `lens` readable for its count of
+    /// aligned `size_t` values summing to that payload length, and `out_indices` writable
+    /// for `out_cap` aligned `size_t` values.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_manticore_unknown_indexes(
+        selected: *const u8,
+        selected_len: usize,
+        selected_lens: *const usize,
+        selected_count: usize,
+        known: *const u8,
+        known_len: usize,
+        known_lens: *const usize,
+        known_count: usize,
+        out_indices: *mut usize,
+        out_cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !buffer_ok(out_indices as *const usize, out_cap) {
+                return DECLINE;
+            }
+            let (Some(selected), Some(known)) = (
+                unsafe { packed(selected, selected_len, selected_lens, selected_count) },
+                unsafe { packed(known, known_len, known_lens, known_count) },
+            ) else {
+                return DECLINE;
+            };
+            let unknown: Vec<usize> = selected
+                .iter()
+                .enumerate()
+                .filter(|(_, name)| !known.contains(name))
+                .map(|(index, _)| index)
+                .collect();
+            unsafe { write_indices(&unknown, out_indices, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `CreateManticoreIndexes::resolveIndexName()` without a configured name: writes
+    /// `{logical}_rt` into `out`.
+    ///
+    /// # Safety
+    /// `logical` must be readable for `logical_len` bytes and `out` writable for `cap`
+    /// bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_manticore_default_index_name(
+        logical: *const u8,
+        logical_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !buffer_ok(out as *const u8, cap) {
+                return DECLINE;
+            }
+            let Some(logical) = (unsafe { bytes(logical, logical_len) }) else {
+                return DECLINE;
+            };
+            unsafe { write_bytes(&[logical, DEFAULT_INDEX_SUFFIX].concat(), out, cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `CreateManticoreIndexes::createErrorKind()`: CREATE_ERROR_ALREADY_EXISTS when the
+    /// message contains `already exists`, CREATE_ERROR_DATA_DIR for `data_dir`, otherwise
+    /// CREATE_ERROR_GENERIC.
+    ///
+    /// # Safety
+    /// `message` must be readable for `message_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_manticore_create_error_kind(
+        message: *const u8,
+        message_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(message) = (unsafe { bytes(message, message_len) }) else {
+                return DECLINE;
+            };
+            if contains(message, b"already exists") {
+                CREATE_ERROR_ALREADY_EXISTS
+            } else if contains(message, b"data_dir") {
+                CREATE_ERROR_DATA_DIR
+            } else {
+                CREATE_ERROR_GENERIC
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `CreateMediaIndexes::manticoreMediaSchemas()` (kind 0) or
+    /// `elasticsearchMediaMappings()` (kind 1): writes the PHP `json_encode()` of the
+    /// schema array into `out`.
+    ///
+    /// # Safety
+    /// `out` must be writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_media_index_schema(kind: u32, out: *mut u8, cap: usize) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(schema) = media_schema(kind) else {
+                return DECLINE;
+            };
+            if !buffer_ok(out as *const u8, cap) {
+                return DECLINE;
+            }
+            unsafe { write_bytes(&schema, out, cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `CreateMediaIndexes::mediaDriver()`: DRIVER_MANTICORE, DRIVER_ELASTICSEARCH or
+    /// DRIVER_UNSUPPORTED.
+    ///
+    /// # Safety
+    /// `driver` must be readable for `driver_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_media_driver_kind(driver: *const u8, driver_len: usize) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            match unsafe { bytes(driver, driver_len) } {
+                Some(b"manticore") => DRIVER_MANTICORE,
+                Some(b"elasticsearch") => DRIVER_ELASTICSEARCH,
+                Some(_) => DRIVER_UNSUPPORTED,
+                None => DECLINE,
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn misaligned<T>(raw: &mut [u64]) -> *mut T {
+            unsafe { (raw.as_mut_ptr() as *mut u8).add(1) as *mut T }
+        }
+
+        fn string_call(
+            call: unsafe extern "C" fn(*const u8, usize, *mut u8, usize) -> i32,
+            input: &[u8],
+            cap: usize,
+        ) -> (i32, Vec<u8>) {
+            let mut out = vec![0x5au8; cap.max(1)];
+            let rc = unsafe { call(input.as_ptr(), input.len(), out.as_mut_ptr(), cap) };
+            if rc >= 0 {
+                out.truncate(rc as usize);
+            }
+            (rc, out)
+        }
+
+        fn assert_string_contract(
+            call: unsafe extern "C" fn(*const u8, usize, *mut u8, usize) -> i32,
+        ) {
+            let mut out = [0x5au8; 8];
+            let o = out.as_mut_ptr();
+            assert_eq!(unsafe { call(std::ptr::null(), 1, o, 8) }, DECLINE);
+            assert_eq!(unsafe { call(b"x".as_ptr(), usize::MAX, o, 8) }, DECLINE);
+            assert_eq!(unsafe { call(b"x".as_ptr(), MAX_INPUT + 1, o, 8) }, DECLINE);
+            assert_eq!(
+                unsafe { call(b"x".as_ptr(), 1, std::ptr::null_mut(), 8) },
+                DECLINE
+            );
+            assert_eq!(unsafe { call(b"x".as_ptr(), 1, o, usize::MAX) }, DECLINE);
+            assert_eq!(out, [0x5a; 8]);
+        }
+
+        #[test]
+        fn wave29_5_api_function_alias() {
+            for (alias, canonical) in FUNCTION_ALIASES {
+                assert_eq!(
+                    string_call(nntmux_api_function_alias, alias, 16),
+                    (canonical.len() as i32, canonical.to_vec())
+                );
+            }
+            for unknown in [&b""[..], b"D", b"details ", b"nzbAdd", b"r", b"t\0"] {
+                assert_eq!(
+                    string_call(nntmux_api_function_alias, unknown, 16).0,
+                    UNKNOWN_FUNCTION
+                );
+            }
+            let (rc, out) = string_call(nntmux_api_function_alias, b"nzbadd", 3);
+            assert_eq!(rc, -6);
+            assert_eq!(out, [0x5a; 3]);
+            assert_eq!(
+                unsafe { nntmux_api_function_alias(b"c".as_ptr(), 1, std::ptr::null_mut(), 0) },
+                -1
+            );
+            assert_string_contract(nntmux_api_function_alias);
+        }
+
+        #[test]
+        fn wave29_5_api_query_safe_function() {
+            let safe = |f: &[u8]| unsafe { nntmux_api_query_safe_function(f.as_ptr(), f.len()) };
+            for function in QUERY_SAFE_FUNCTIONS {
+                assert_eq!(safe(function), 1);
+            }
+            for function in [&b"g"[..], b"nzbAdd", b"r", b"", b"S", b"search"] {
+                assert_eq!(safe(function), 0);
+            }
+            assert_eq!(
+                unsafe { nntmux_api_query_safe_function(std::ptr::null(), 1) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_api_query_safe_function(b"s".as_ptr(), usize::MAX) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_api_query_safe_function(std::ptr::null(), 0) },
+                0
+            );
+        }
+
+        #[test]
+        fn wave29_5_api_sort_normalize() {
+            for (raw, expected) in [
+                (&b"posted_desc"[..], &b"posted_desc"[..]),
+                (b" NAME_ASC\n", b"name_asc"),
+                (b"\0\x0bStats_Desc\t\r", b"stats_desc"),
+                (b"cat_asc", b"cat_asc"),
+                (b"files_desc", b"files_desc"),
+                (b"size_asc", b"size_asc"),
+            ] {
+                assert_eq!(
+                    string_call(nntmux_api_sort_normalize, raw, 16),
+                    (expected.len() as i32, expected.to_vec())
+                );
+            }
+            for empty in [&b""[..], b"   ", b"\n\t\0\x0b\r"] {
+                assert_eq!(
+                    string_call(nntmux_api_sort_normalize, empty, 16).0,
+                    SORT_EMPTY
+                );
+            }
+            for invalid in [
+                &b"posted"[..],
+                b"posted_up",
+                b"date_desc",
+                b"posted_desc_",
+                b"\x0cposted_desc",
+                b"posted desc",
+                b"posted_d\xc3\xa9sc",
+            ] {
+                assert_eq!(
+                    string_call(nntmux_api_sort_normalize, invalid, 16).0,
+                    SORT_INVALID
+                );
+            }
+            let (rc, out) = string_call(nntmux_api_sort_normalize, b"POSTED_DESC", 4);
+            assert_eq!(rc, -11);
+            assert_eq!(out, [0x5a; 4]);
+            assert_string_contract(nntmux_api_sort_normalize);
+        }
+
+        #[test]
+        fn wave29_5_api_max_age() {
+            let call = |value: &[u8]| {
+                let mut out = 77i64;
+                let rc = unsafe { nntmux_api_max_age(value.as_ptr(), value.len(), &mut out) };
+                (rc, out)
+            };
+            assert_eq!(call(b"7"), (MAX_AGE_OK, 7));
+            assert_eq!(call(b" +12 \n"), (MAX_AGE_OK, 12));
+            assert_eq!(call(b"-0"), (MAX_AGE_OK, 0));
+            assert_eq!(call(b"-30"), (MAX_AGE_OK, -30));
+            assert_eq!(
+                call(b"999999999999999999"),
+                (MAX_AGE_OK, 999_999_999_999_999_999)
+            );
+            assert_eq!(call(b"9999999999999999999"), (MAX_AGE_DEFER, 77));
+            for defer in [&b"1.5"[..], b".5", b"5.", b"1e3", b" -2.5E-1 "] {
+                assert_eq!(call(defer), (MAX_AGE_DEFER, 77));
+            }
+            for empty in [&b""[..], b" ", b"\0\n", b"\x0b"] {
+                assert_eq!(call(empty), (MAX_AGE_EMPTY, 77));
+            }
+            for bad in [
+                &b"\x0c"[..],
+                b"abc",
+                b"1a",
+                b"0x1A",
+                b"1e",
+                b".",
+                b"-",
+                b"1 2",
+                b"e5",
+            ] {
+                assert_eq!(call(bad), (MAX_AGE_NOT_NUMERIC, 77));
+            }
+            let mut raw = [0u64; 2];
+            let bad = misaligned::<i64>(&mut raw);
+            assert_eq!(
+                unsafe { nntmux_api_max_age(b"1".as_ptr(), 1, bad) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_api_max_age(b"1".as_ptr(), 1, std::ptr::null_mut()) },
+                DECLINE
+            );
+            let mut out = 5i64;
+            assert_eq!(
+                unsafe { nntmux_api_max_age(std::ptr::null(), 1, &mut out) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_api_max_age(b"1".as_ptr(), usize::MAX, &mut out) },
+                DECLINE
+            );
+            assert_eq!(out, 5);
+            assert_eq!(raw, [0; 2]);
+        }
+
+        #[test]
+        fn wave29_5_api_tv_air_date() {
+            let call = |series: &[u8], episode: &[u8], cap: usize| {
+                let mut out = vec![0x5au8; cap.max(1)];
+                let rc = unsafe {
+                    nntmux_api_tv_air_date(
+                        series.as_ptr(),
+                        series.len(),
+                        episode.as_ptr(),
+                        episode.len(),
+                        out.as_mut_ptr(),
+                        cap,
+                    )
+                };
+                if rc >= 0 {
+                    out.truncate(rc as usize);
+                }
+                (rc, out)
+            };
+            assert_eq!(call(b"2024", b"10/31", 32), (10, b"2024-10-31".to_vec()));
+            assert_eq!(call(b"1999\n", b"1/2/3", 32), (10, b"1999-1-2-3".to_vec()));
+            assert_eq!(call(b"2024", b"/", 32), (6, b"2024--".to_vec()));
+            for (series, episode) in [
+                (&b"2024"[..], &b"10"[..]),
+                (b"2124", b"10/31"),
+                (b"1899", b"10/31"),
+                (b"202", b"10/31"),
+                (b"20245", b"10/31"),
+                (b" 2024", b"10/31"),
+                (b"2024\n\n", b"10/31"),
+                (b"", b""),
+            ] {
+                assert_eq!(call(series, episode, 32), (0, Vec::new()));
+            }
+            let (rc, out) = call(b"2024", b"10/31", 4);
+            assert_eq!(rc, -10);
+            assert_eq!(out, [0x5a; 4]);
+            let mut out = [0x5au8; 16];
+            let o = out.as_mut_ptr();
+            let raw = |s: *const u8, sl, e: *const u8, el, o: *mut u8, cap| unsafe {
+                nntmux_api_tv_air_date(s, sl, e, el, o, cap)
+            };
+            assert_eq!(raw(std::ptr::null(), 4, b"1/2".as_ptr(), 3, o, 16), DECLINE);
+            assert_eq!(
+                raw(b"2024".as_ptr(), 4, std::ptr::null(), 3, o, 16),
+                DECLINE
+            );
+            assert_eq!(
+                raw(b"2024".as_ptr(), usize::MAX, b"1/2".as_ptr(), 3, o, 16),
+                DECLINE
+            );
+            assert_eq!(
+                raw(
+                    b"2024".as_ptr(),
+                    4,
+                    b"1/2".as_ptr(),
+                    3,
+                    std::ptr::null_mut(),
+                    16
+                ),
+                DECLINE
+            );
+            assert_eq!(
+                raw(b"2024".as_ptr(), 4, b"1/2".as_ptr(), 3, o, usize::MAX),
+                DECLINE
+            );
+            assert_eq!(out, [0x5a; 16]);
+            assert_eq!(
+                raw(
+                    b"2024".as_ptr(),
+                    4,
+                    b"12".as_ptr(),
+                    2,
+                    std::ptr::null_mut(),
+                    0
+                ),
+                0
+            );
+        }
+
+        #[test]
+        fn wave29_5_api_help_metadata() {
+            for (version, parts) in [(HELP_V1, HELP_METADATA[0]), (HELP_V2, HELP_METADATA[1])] {
+                let mut lens = [7usize; 4];
+                let mut out = [0u8; 256];
+                let rc = unsafe {
+                    nntmux_api_help_metadata(version, lens.as_mut_ptr(), out.as_mut_ptr(), 256)
+                };
+                assert_eq!(&out[..rc as usize], parts.concat().as_slice());
+                assert_eq!(lens, parts.map(<[u8]>::len));
+            }
+            let mut lens = [7usize; 5];
+            let mut out = [0x5au8; 8];
+            let (l, o) = (lens.as_mut_ptr(), out.as_mut_ptr());
+            assert_eq!(unsafe { nntmux_api_help_metadata(1, l, o, 8) }, -99);
+            for version in [0, 3, u32::MAX] {
+                assert_eq!(
+                    unsafe { nntmux_api_help_metadata(version, l, o, 8) },
+                    DECLINE
+                );
+            }
+            let mut raw = [0u64; 6];
+            let bad = misaligned::<usize>(&mut raw);
+            assert_eq!(unsafe { nntmux_api_help_metadata(1, bad, o, 8) }, DECLINE);
+            assert_eq!(
+                unsafe { nntmux_api_help_metadata(1, std::ptr::null_mut(), o, 8) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_api_help_metadata(1, l, std::ptr::null_mut(), 8) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_api_help_metadata(1, l, o, usize::MAX) },
+                DECLINE
+            );
+            assert_eq!(lens, [7; 5]);
+            assert_eq!(out, [0x5a; 8]);
+            assert_eq!(raw, [0; 6]);
+        }
+
+        #[test]
+        fn wave29_5_manticore_extract_version() {
+            for (input, expected) in [
+                (
+                    &br#"[{"version":"6.3.6 1d8b2b3e5@24070216 dev"}]"#[..],
+                    &b"6.3.6"[..],
+                ),
+                (br#"{"version":"13.11"}"#, b"13.11"),
+                (b"v1.2.3.4", b"1.2.3"),
+                (b"1.x 2.5", b"2.5"),
+                (b"12..3 4.5.", b"4.5"),
+                (b"1.2.x", b"1.2"),
+                (b"no version", b"unknown"),
+                (b"", b"unknown"),
+                (b"7.", b"unknown"),
+            ] {
+                assert_eq!(
+                    string_call(nntmux_manticore_extract_version, input, 32),
+                    (expected.len() as i32, expected.to_vec())
+                );
+            }
+            let (rc, out) = string_call(nntmux_manticore_extract_version, b"x", 3);
+            assert_eq!(rc, -7);
+            assert_eq!(out, [0x5a; 3]);
+            assert_string_contract(nntmux_manticore_extract_version);
+        }
+
+        #[test]
+        fn wave29_5_manticore_table_name_and_rebuild() {
+            let safe = |n: &[u8]| unsafe { nntmux_manticore_table_name_safe(n.as_ptr(), n.len()) };
+            for name in [&b"releases_rt"[..], b"A1_b2", b"_", b"0", b"releases_rt\n"] {
+                assert_eq!(safe(name), 1);
+            }
+            for name in [
+                &b""[..],
+                b"\n",
+                b"releases-rt",
+                b"rel eases",
+                b"a\n\n",
+                b"a;b",
+                b"\xc3\xa9",
+            ] {
+                assert_eq!(safe(name), 0);
+            }
+            assert_eq!(
+                unsafe { nntmux_manticore_table_name_safe(std::ptr::null(), 1) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_manticore_table_name_safe(b"a".as_ptr(), usize::MAX) },
+                DECLINE
+            );
+            assert_eq!(nntmux_manticore_needs_rebuild(0, 0, 0), 0);
+            assert_eq!(nntmux_manticore_needs_rebuild(1, 0, 0), 1);
+            assert_eq!(nntmux_manticore_needs_rebuild(0, usize::MAX, 0), 1);
+            assert_eq!(nntmux_manticore_needs_rebuild(0, 0, 2), 1);
+        }
+
+        fn pack(items: &[&[u8]]) -> (Vec<u8>, Vec<usize>) {
+            (
+                items.concat(),
+                items.iter().map(|item| item.len()).collect(),
+            )
+        }
+
+        #[test]
+        fn wave29_5_manticore_selected_and_unknown_indexes() {
+            let (payload, lens) = pack(&[b"releases", b"", b"0", b"predb", b"00", b" "]);
+            let mut out = [99usize; 8];
+            let rc = unsafe {
+                nntmux_manticore_selected_indexes(
+                    payload.as_ptr(),
+                    payload.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                    out.as_mut_ptr(),
+                    8,
+                )
+            };
+            assert_eq!((rc, &out[..4]), (4, &[0, 3, 4, 5][..]));
+            let mut small = [99usize; 2];
+            let rc = unsafe {
+                nntmux_manticore_selected_indexes(
+                    payload.as_ptr(),
+                    payload.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                    small.as_mut_ptr(),
+                    2,
+                )
+            };
+            assert_eq!((rc, small), (-4, [99; 2]));
+            let empty = unsafe {
+                nntmux_manticore_selected_indexes(
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(empty, 0);
+            let mut raw = [0u64; 4];
+            let bad = misaligned::<usize>(&mut raw);
+            let select = |p: *const u8, pl, l: *const usize, c, o: *mut usize, cap| unsafe {
+                nntmux_manticore_selected_indexes(p, pl, l, c, o, cap)
+            };
+            let (p, l, o) = (payload.as_ptr(), lens.as_ptr(), out.as_mut_ptr());
+            assert_eq!(select(p, payload.len() - 1, l, 6, o, 8), DECLINE);
+            assert_eq!(select(p, payload.len(), std::ptr::null(), 6, o, 8), DECLINE);
+            assert_eq!(select(p, payload.len(), bad, 1, o, 8), DECLINE);
+            assert_eq!(
+                select(p, payload.len(), l, 6, std::ptr::null_mut(), 8),
+                DECLINE
+            );
+            assert_eq!(select(p, payload.len(), l, 6, bad, 1), DECLINE);
+            assert_eq!(select(p, payload.len(), l, 6, o, usize::MAX), DECLINE);
+            assert_eq!(
+                select(std::ptr::null(), 1, [1usize].as_ptr(), 1, o, 8),
+                DECLINE
+            );
+            assert_eq!(select(p, payload.len(), l, MAX_ITEMS + 1, o, 8), DECLINE);
+            let overflow = [usize::MAX, 2];
+            assert_eq!(
+                select(p, payload.len(), overflow.as_ptr(), 2, o, 8),
+                DECLINE
+            );
+            assert_eq!(raw, [0; 4]);
+
+            let (selected, selected_lens) = pack(&[b"releases", b"bogus", b"predb", b"Releases"]);
+            let (known, known_lens) = pack(&[b"releases", b"predb"]);
+            let unknown = |sl: usize, kl: usize, out: *mut usize, cap| unsafe {
+                nntmux_manticore_unknown_indexes(
+                    selected.as_ptr(),
+                    selected.len(),
+                    selected_lens.as_ptr(),
+                    sl,
+                    known.as_ptr(),
+                    known.len(),
+                    known_lens.as_ptr(),
+                    kl,
+                    out,
+                    cap,
+                )
+            };
+            let mut out = [99usize; 4];
+            assert_eq!(unknown(4, 2, out.as_mut_ptr(), 4), 2);
+            assert_eq!(&out[..2], &[1, 3]);
+            let mut small = [99usize; 1];
+            assert_eq!(unknown(4, 2, small.as_mut_ptr(), 1), -2);
+            assert_eq!(small, [99]);
+            assert_eq!(unknown(4, 1, out.as_mut_ptr(), 4), DECLINE);
+            assert_eq!(unknown(3, 2, out.as_mut_ptr(), 4), DECLINE);
+            assert_eq!(unknown(4, 2, std::ptr::null_mut(), 4), DECLINE);
+            assert_eq!(unknown(4, 2, out.as_mut_ptr(), usize::MAX), DECLINE);
+            let none = unsafe {
+                nntmux_manticore_unknown_indexes(
+                    selected.as_ptr(),
+                    8,
+                    selected_lens.as_ptr(),
+                    1,
+                    known.as_ptr(),
+                    known.len(),
+                    known_lens.as_ptr(),
+                    2,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(none, 0);
+        }
+
+        #[test]
+        fn wave29_5_manticore_default_name_and_error_kind() {
+            assert_eq!(
+                string_call(nntmux_manticore_default_index_name, b"releases", 32),
+                (11, b"releases_rt".to_vec())
+            );
+            assert_eq!(
+                string_call(nntmux_manticore_default_index_name, b"", 32),
+                (3, b"_rt".to_vec())
+            );
+            let (rc, out) = string_call(nntmux_manticore_default_index_name, b"predb", 4);
+            assert_eq!((rc, out), (-8, vec![0x5a; 4]));
+            assert_string_contract(nntmux_manticore_default_index_name);
+
+            let kind =
+                |m: &[u8]| unsafe { nntmux_manticore_create_error_kind(m.as_ptr(), m.len()) };
+            assert_eq!(
+                kind(b"table 'x' already exists"),
+                CREATE_ERROR_ALREADY_EXISTS
+            );
+            assert_eq!(
+                kind(b"data_dir missing; already exists"),
+                CREATE_ERROR_ALREADY_EXISTS
+            );
+            assert_eq!(kind(b"please set data_dir"), CREATE_ERROR_DATA_DIR);
+            assert_eq!(kind(b"Already Exists"), CREATE_ERROR_GENERIC);
+            assert_eq!(kind(b""), CREATE_ERROR_GENERIC);
+            assert_eq!(
+                unsafe { nntmux_manticore_create_error_kind(std::ptr::null(), 1) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_manticore_create_error_kind(b"x".as_ptr(), usize::MAX) },
+                DECLINE
+            );
+        }
+
+        #[test]
+        fn wave29_5_media_schema_and_driver() {
+            let schema = |kind: u32, cap: usize| {
+                let mut out = vec![0x5au8; cap.max(1)];
+                let rc = unsafe { nntmux_media_index_schema(kind, out.as_mut_ptr(), cap) };
+                if rc >= 0 {
+                    out.truncate(rc as usize);
+                }
+                (rc, out)
+            };
+            let (rc, manticore) = schema(MEDIA_SCHEMA_MANTICORE, 4096);
+            assert!(rc > 0);
+            assert!(manticore.starts_with(
+                br#"{"movies_rt":{"settings":{"min_prefix_len":0,"min_infix_len":2},"columns":{"imdbid":{"type":"string"},"#
+            ));
+            assert!(
+                manticore.ends_with(br#""started":{"type":"text"},"type":{"type":"integer"}}}}"#)
+            );
+            let (rc, elastic) = schema(MEDIA_SCHEMA_ELASTICSEARCH, 4096);
+            assert!(rc > 0);
+            assert!(elastic.starts_with(
+                br#"{"movies":{"mappings":{"properties":{"imdbid":{"type":"keyword"},"tmdbid":{"type":"integer"},"traktid":{"type":"integer"},"title":{"type":"text","analyzer":"standard"},"#
+            ));
+            assert!(elastic.ends_with(
+                br#""type":{"type":"integer"}}},"settings":{"number_of_shards":1,"number_of_replicas":0}}}"#
+            ));
+            let (rc, out) = schema(MEDIA_SCHEMA_MANTICORE, 16);
+            assert_eq!(rc, -(manticore.len() as i32));
+            assert_eq!(out, vec![0x5a; 16]);
+            assert_eq!(schema(2, 4096).0, DECLINE);
+            assert_eq!(
+                unsafe { nntmux_media_index_schema(0, std::ptr::null_mut(), 4096) },
+                DECLINE
+            );
+            let mut out = [0u8; 4];
+            assert_eq!(
+                unsafe { nntmux_media_index_schema(0, out.as_mut_ptr(), usize::MAX) },
+                DECLINE
+            );
+
+            let driver = |d: &[u8]| unsafe { nntmux_media_driver_kind(d.as_ptr(), d.len()) };
+            assert_eq!(driver(b"manticore"), DRIVER_MANTICORE);
+            assert_eq!(driver(b"elasticsearch"), DRIVER_ELASTICSEARCH);
+            for other in [&b""[..], b"Manticore", b"manticore ", b"meilisearch"] {
+                assert_eq!(driver(other), DRIVER_UNSUPPORTED);
+            }
+            assert_eq!(
+                unsafe { nntmux_media_driver_kind(std::ptr::null(), 1) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_media_driver_kind(b"x".as_ptr(), usize::MAX) },
+                DECLINE
+            );
+        }
+    }
+}
