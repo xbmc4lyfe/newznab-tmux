@@ -6,7 +6,10 @@ namespace App\Services;
 
 use App\Enums\ImageAssetProfile;
 use App\Support\Data\ImageProcessingResult;
+use App\Support\RustPipelineLibrary;
 use Closure;
+use FFI;
+use FFI\CData;
 use GuzzleHttp\Psr7\Uri;
 use GuzzleHttp\Psr7\UriResolver;
 use Illuminate\Http\UploadedFile;
@@ -25,6 +28,25 @@ use Throwable;
  */
 class ReleaseImageService
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_release_image_is_valid_basename(const char *input, size_t input_len);
+        ssize_t nntmux_release_image_redact_url(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        int64_t nntmux_release_image_scale_dimensions(int64_t width, int64_t height, int64_t max_width, int64_t max_height, const char *format, size_t format_len, int32_t *out_format);
+        int32_t nntmux_release_duplicate_resolve_reason(int64_t dup_predb_id, int64_t predb_id, const char *dup_search_name, size_t dup_search_name_len, const char *search_name, size_t search_name_len);
+        int32_t nntmux_release_duplicate_size_bounds(int64_t filesize, double tolerance, int64_t *out_low, int64_t *out_high);
+        ssize_t nntmux_release_management_export_date(const char *input, size_t input_len, uint32_t is_end_of_day, char *out_buf, size_t out_cap);
+        int32_t nntmux_categorization_result_is_successful(int64_t category_id, double confidence, const char *matched_by, size_t matched_by_len);
+        int32_t nntmux_categorization_result_is_protected_misc(int64_t category_id, const char *matched_by, size_t matched_by_len);
+        int32_t nntmux_categorization_result_should_override(int64_t self_category_id, double self_confidence, const char *self_matched_by, size_t self_matched_by_len, int64_t other_category_id, double other_confidence, const char *other_matched_by, size_t other_matched_by_len);
+        ssize_t nntmux_api_release_cache_normalize_json(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        C;
+
+    public static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    private static ?CData $formatOut = null;
+
     /** Path to save ogg audio samples. */
     public string $audSavePath;
 
@@ -393,8 +415,31 @@ class ReleaseImageService
         ?int $maxWidth,
         ?int $maxHeight,
     ): LaravelImage {
-        if ($maxWidth === null || $maxHeight === null) {
-            return $image;
+        $dimensions = $this->scaleDimensions($width, $height, $maxWidth, $maxHeight);
+        if ($dimensions !== null) {
+            return $image->resize($dimensions[0], $dimensions[1]);
+        }
+
+        return $image;
+    }
+
+    /**
+     * @return array{0: int, 1: int}|null
+     */
+    public function scaleDimensions(int $width, int $height, ?int $maxWidth, ?int $maxHeight): ?array
+    {
+        return self::$useRustFfi
+            ? $this->scaleDimensionsNative($width, $height, $maxWidth, $maxHeight)
+            : $this->scaleDimensionsPhp($width, $height, $maxWidth, $maxHeight);
+    }
+
+    /**
+     * @return array{0: int, 1: int}|null
+     */
+    public function scaleDimensionsPhp(int $width, int $height, ?int $maxWidth, ?int $maxHeight): ?array
+    {
+        if ($maxWidth === null || $maxHeight === null || $width <= 0 || $height <= 0 || $maxWidth <= 0 || $maxHeight <= 0) {
+            return null;
         }
 
         $ratio = min($maxHeight / $height, $maxWidth / $width, 1);
@@ -402,10 +447,36 @@ class ReleaseImageService
         $newHeight = (int) floor($ratio * $height);
 
         if ($ratio < 1 && $newWidth > 10 && $newHeight > 10) {
-            return $image->resize($newWidth, $newHeight);
+            return [$newWidth, $newHeight];
         }
 
-        return $image;
+        return null;
+    }
+
+    /**
+     * @return array{0: int, 1: int}|null
+     */
+    public function scaleDimensionsNative(int $width, int $height, ?int $maxWidth, ?int $maxHeight): ?array
+    {
+        if ($maxWidth === null || $maxHeight === null || $width <= 0 || $height <= 0 || $maxWidth <= 0 || $maxHeight <= 0) {
+            return null;
+        }
+
+        $ffi = self::mediaFfi();
+        if ($ffi === null) {
+            return $this->scaleDimensionsPhp($width, $height, $maxWidth, $maxHeight);
+        }
+
+        // @phpstan-ignore method.notFound
+        $packed = $ffi->nntmux_release_image_scale_dimensions($width, $height, $maxWidth, $maxHeight, null, 0, null);
+        if (! \is_int($packed) || $packed < 0) {
+            return $this->scaleDimensionsPhp($width, $height, $maxWidth, $maxHeight);
+        }
+        if ($packed === 0) {
+            return null;
+        }
+
+        return [$packed >> 32, $packed & 0xFFFFFFFF];
     }
 
     private function encode(LaravelImage $image): string
@@ -420,9 +491,40 @@ class ReleaseImageService
 
     private function outputFormat(): string
     {
-        $format = strtolower((string) config('image.output_format', 'webp'));
+        return $this->resolveOutputFormat((string) config('image.output_format', 'webp'));
+    }
 
-        return in_array($format, ['jpg', 'jpeg'], true) ? 'jpg' : 'webp';
+    public function resolveOutputFormat(string $format): string
+    {
+        return self::$useRustFfi
+            ? $this->resolveOutputFormatNative($format)
+            : $this->resolveOutputFormatPhp($format);
+    }
+
+    public function resolveOutputFormatPhp(string $format): string
+    {
+        $normalized = strtolower($format);
+
+        return in_array($normalized, ['jpg', 'jpeg'], true) ? 'jpg' : 'webp';
+    }
+
+    public function resolveOutputFormatNative(string $format): string
+    {
+        $ffi = self::mediaFfi();
+        if ($ffi === null) {
+            return $this->resolveOutputFormatPhp($format);
+        }
+
+        $outBuf = self::$formatOut ??= $ffi->new('int32_t');
+
+        // @phpstan-ignore method.notFound
+        $res = $ffi->nntmux_release_image_scale_dimensions(0, 0, 0, 0, $format, \strlen($format), FFI::addr($outBuf));
+        if (! \is_int($res) || $res < 0) {
+            return $this->resolveOutputFormatPhp($format);
+        }
+
+        // @phpstan-ignore property.notFound
+        return $outBuf->cdata === 1 ? 'jpg' : 'webp';
     }
 
     private function maxSourceBytes(): int
@@ -435,9 +537,36 @@ class ReleaseImageService
         return max(1, (int) config('image.max_source_pixels', 40_000_000));
     }
 
-    private function isValidBasename(string $basename): bool
+    public function isValidBasename(string $basename): bool
+    {
+        return self::$useRustFfi
+            ? $this->isValidBasenameNative($basename)
+            : $this->isValidBasenamePhp($basename);
+    }
+
+    public function isValidBasenamePhp(string $basename): bool
     {
         return preg_match('/\A[A-Za-z0-9][A-Za-z0-9_-]*\z/D', $basename) === 1;
+    }
+
+    public function isValidBasenameNative(string $basename): bool
+    {
+        if ($basename === '') {
+            return false;
+        }
+
+        $ffi = self::mediaFfi();
+        if ($ffi === null) {
+            return $this->isValidBasenamePhp($basename);
+        }
+
+        // @phpstan-ignore method.notFound
+        $res = $ffi->nntmux_release_image_is_valid_basename($basename, \strlen($basename));
+        if (! \is_int($res) || $res < 0) {
+            return $this->isValidBasenamePhp($basename);
+        }
+
+        return $res === 1;
     }
 
     private function assertSafeRemoteUrl(string $url): void
@@ -493,7 +622,14 @@ class ReleaseImageService
         return array_values(array_unique($addresses));
     }
 
-    private function redactedUrl(string $url): string
+    public function redactedUrl(string $url): string
+    {
+        return self::$useRustFfi
+            ? $this->redactedUrlNative($url)
+            : $this->redactedUrlPhp($url);
+    }
+
+    public function redactedUrlPhp(string $url): string
     {
         $parts = parse_url($url);
         if (! is_array($parts) || ! isset($parts['scheme'], $parts['host'])) {
@@ -503,5 +639,59 @@ class ReleaseImageService
         $port = isset($parts['port']) ? ':'.$parts['port'] : '';
 
         return strtolower($parts['scheme']).'://'.$parts['host'].$port.($parts['path'] ?? '/');
+    }
+
+    public function redactedUrlNative(string $url): string
+    {
+        if ($url === '') {
+            return '[invalid-url]';
+        }
+
+        $ffi = self::mediaFfi();
+        if ($ffi === null) {
+            return $this->redactedUrlPhp($url);
+        }
+
+        $len = \strlen($url);
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $len + 32), $cap);
+        if ($scratch === null) {
+            return $this->redactedUrlPhp($url);
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_release_image_redact_url($url, $len, $scratch, $cap);
+        if (! \is_int($written) || $written === -1) {
+            return $this->redactedUrlPhp($url);
+        }
+        if ($written < -1) {
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+            if ($scratch === null) {
+                return $this->redactedUrlPhp($url);
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_release_image_redact_url($url, $len, $scratch, $cap);
+            if (! \is_int($written) || $written <= 0) {
+                return $this->redactedUrlPhp($url);
+            }
+        }
+
+        return $written === 0 ? '[invalid-url]' : FFI::string($scratch, $written);
+    }
+
+    public static function setUseRustFfi(bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi;
+    }
+
+    public static function mediaFfi(): ?FFI
+    {
+        if (self::$ffi !== null) {
+            return self::$ffi === false ? null : self::$ffi;
+        }
+
+        self::$ffi = RustPipelineLibrary::resolveDomain('media', self::FFI_CDEF) ?? false;
+
+        return self::$ffi === false ? null : self::$ffi;
     }
 }
