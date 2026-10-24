@@ -12103,3 +12103,852 @@ mod wave19_tests {
         );
     }
 }
+
+// Wave 20 `DegradeWhenRedisUnreachable`, `DecorateHttpQueryResponses`,
+// `EnforceSessionToken`, `ForceJsonOnAPI` and `AllowRemoteVerificationPublication`
+// candidates. Every export catches panics (-1), rejects null or misaligned pointers,
+// and bounds slice lengths by `isize::MAX` before building slices; -1 sends the PHP
+// adapter back to its own path.
+
+/// Validates a packed name list: `names` holds `names_len` bytes split by the `count`
+/// aligned `size_t` lengths in `lens`, which must sum to `names_len`.
+unsafe fn w20_names<'a>(
+    names: *const u8,
+    names_len: usize,
+    lens: *const usize,
+    count: usize,
+) -> Option<Vec<&'a [u8]>> {
+    let names = unsafe { w14_input(names, names_len) }?;
+    if count > isize::MAX as usize / std::mem::size_of::<usize>() {
+        return None;
+    }
+    let lens: &[usize] = if count == 0 {
+        &[]
+    } else {
+        if lens.is_null() || !lens.is_aligned() {
+            return None;
+        }
+        unsafe { slice::from_raw_parts(lens, count) }
+    };
+    let mut out = Vec::with_capacity(count);
+    let mut offset = 0usize;
+    for &len in lens {
+        let end = offset.checked_add(len).filter(|&e| e <= names.len())?;
+        out.push(&names[offset..end]);
+        offset = end;
+    }
+    (offset == names.len()).then_some(out)
+}
+
+/// `$request->is('api/*')`: `Str::is()` compiles `#^api/.*\z#su`, so the decoded path
+/// must start with `api/` and be valid UTF-8 (`preg_match()` fails otherwise).
+fn w20_is_api_path(path: &[u8]) -> bool {
+    path.starts_with(b"api/") && std::str::from_utf8(path).is_ok()
+}
+
+/// `DegradeWhenRedisUnreachable::streamRemote()`.
+fn w20_stream_remote(scheme: &[u8], host: &[u8], port: i64) -> Vec<u8> {
+    let port = port.to_string();
+    let mut out = Vec::with_capacity(host.len() + port.len() + 9);
+    if matches!(scheme, b"tls" | b"ssl" | b"rediss") {
+        out.extend_from_slice(b"ssl://");
+        out.extend_from_slice(host);
+    } else {
+        out.extend_from_slice(b"tcp://");
+        if host.contains(&b':') && !host.starts_with(b"[") {
+            out.push(b'[');
+            out.extend_from_slice(host);
+            out.push(b']');
+        } else {
+            out.extend_from_slice(host);
+        }
+    }
+    out.push(b':');
+    out.extend_from_slice(port.as_bytes());
+    out
+}
+
+/// `DegradeWhenRedisUnreachable::failoverChainContainsRedis()`: 1 when the store config
+/// is an array whose `driver` is exactly the string `failover` and one of its `stores`
+/// (already cast to strings, packed by `lens`) lowercases to `redis`; 0 otherwise; -1
+/// for invalid input.
+/// # Safety
+/// `driver` holds `driver_len` bytes, `names` `names_len` bytes, and `lens` `count`
+/// aligned `size_t` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_redis_failover_contains_redis(
+    is_array: i32,
+    driver: *const u8,
+    driver_len: usize,
+    driver_is_string: i32,
+    names: *const u8,
+    names_len: usize,
+    lens: *const usize,
+    count: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !(0..=1).contains(&is_array) || !(0..=1).contains(&driver_is_string) {
+            return -1;
+        }
+        let Some(driver) = (unsafe { w14_input(driver, driver_len) }) else {
+            return -1;
+        };
+        let Some(names) = (unsafe { w20_names(names, names_len, lens, count) }) else {
+            return -1;
+        };
+        if is_array == 0 || driver_is_string == 0 || driver != b"failover" {
+            return 0;
+        }
+        i32::from(names.iter().any(|n| n.eq_ignore_ascii_case(b"redis")))
+    }))
+    .unwrap_or(-1)
+}
+
+/// `DegradeWhenRedisUnreachable::shouldProbeRedis()`: 1 when `cache.default` is `redis`
+/// or `failover_redis_file`, its failover chain contains Redis, or `session.driver` is
+/// exactly the string `redis`; 0 otherwise; -1 for invalid input.
+/// # Safety
+/// `cache_default` and `session_driver` hold their lengths in bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_redis_should_probe(
+    cache_default: *const u8,
+    cache_default_len: usize,
+    failover_contains_redis: i32,
+    session_driver: *const u8,
+    session_driver_len: usize,
+    session_is_string: i32,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !(0..=1).contains(&failover_contains_redis) || !(0..=1).contains(&session_is_string) {
+            return -1;
+        }
+        let (Some(cache), Some(session)) = (unsafe {
+            (
+                w14_input(cache_default, cache_default_len),
+                w14_input(session_driver, session_driver_len),
+            )
+        }) else {
+            return -1;
+        };
+        i32::from(
+            cache == b"redis"
+                || cache == b"failover_redis_file"
+                || failover_contains_redis == 1
+                || (session_is_string == 1 && session == b"redis"),
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+/// `DegradeWhenRedisUnreachable::streamRemote()`: `ssl://host:port` for the `tls`,
+/// `ssl` and `rediss` schemes, otherwise `tcp://host:port` with unbracketed IPv6 hosts
+/// wrapped in `[]`. Returns the bytes written, -1 for invalid input, or
+/// `-(required + 3)`.
+/// # Safety
+/// `scheme`/`host` hold their lengths in bytes and `out` `cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_redis_stream_remote(
+    scheme: *const u8,
+    scheme_len: usize,
+    host: *const u8,
+    host_len: usize,
+    port: i64,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (Some(scheme), Some(host)) =
+            (unsafe { (w14_input(scheme, scheme_len), w14_input(host, host_len)) })
+        else {
+            return -1;
+        };
+        w14_output(&w20_stream_remote(scheme, host, port), out, cap)
+    }))
+    .unwrap_or(-1)
+}
+
+/// `DegradeWhenRedisUnreachable::redisTcpTarget()` after the adapter has run
+/// `parse_url()` (`use_url = 1`, parts as parsed) or cast `host`/`port` (`use_url = 0`).
+/// The URL branch needs a non-empty host, defaults the port to 6379 and lowercases the
+/// scheme (default `tcp`); the host branch defaults to `127.0.0.1:6379` and skips empty
+/// hosts and Unix socket paths. Returns the remote's length, 0 when there is no TCP
+/// target, -1 for invalid input, or `-(required + 3)`.
+/// # Safety
+/// `host`/`scheme` hold their lengths in bytes and `out` `cap` writable bytes.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_redis_tcp_target(
+    use_url: i32,
+    host: *const u8,
+    host_len: usize,
+    has_host: i32,
+    port: i64,
+    has_port: i32,
+    scheme: *const u8,
+    scheme_len: usize,
+    has_scheme: i32,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if [use_url, has_host, has_port, has_scheme]
+            .iter()
+            .any(|f| !(0..=1).contains(f))
+        {
+            return -1;
+        }
+        let (Some(host), Some(scheme)) =
+            (unsafe { (w14_input(host, host_len), w14_input(scheme, scheme_len)) })
+        else {
+            return -1;
+        };
+        let port = if has_port == 1 { port } else { 6379 };
+        let remote = if use_url == 1 {
+            if has_host == 0 || host.is_empty() {
+                return 0;
+            }
+            let scheme = if has_scheme == 1 {
+                scheme.to_ascii_lowercase()
+            } else {
+                b"tcp".to_vec()
+            };
+            w20_stream_remote(&scheme, host, port)
+        } else {
+            let host: &[u8] = if has_host == 1 { host } else { b"127.0.0.1" };
+            if host.is_empty() || host.starts_with(b"/") {
+                return 0;
+            }
+            w20_stream_remote(b"tcp", host, port)
+        };
+        w14_output(&remote, out, cap)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Header flags returned by [`nntmux_http_query_header_flags`].
+const W20_QUERY_CACHE_CONTROL: i32 = 1;
+const W20_QUERY_ACCEPT_QUERY: i32 = 2;
+
+/// `DecorateHttpQueryResponses::handle()`: bit 1 sets `Cache-Control: private,
+/// no-store` (method is `QUERY`, case-insensitively, and the decoded path matches
+/// `api/*`); bit 2 sets `Accept-Query` (a matched route lists `QUERY` exactly, as the
+/// strict `in_array()` does). Route methods are packed by `lens`. Returns the mask or
+/// -1 for invalid input.
+/// # Safety
+/// `method`, `path` and `methods` hold their lengths in bytes; `lens` holds `count`
+/// aligned `size_t` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_http_query_header_flags(
+    method: *const u8,
+    method_len: usize,
+    path: *const u8,
+    path_len: usize,
+    has_route: i32,
+    methods: *const u8,
+    methods_len: usize,
+    lens: *const usize,
+    count: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !(0..=1).contains(&has_route) {
+            return -1;
+        }
+        let (Some(method), Some(path)) =
+            (unsafe { (w14_input(method, method_len), w14_input(path, path_len)) })
+        else {
+            return -1;
+        };
+        let Some(methods) = (unsafe { w20_names(methods, methods_len, lens, count) }) else {
+            return -1;
+        };
+        let mut flags = 0;
+        if method.eq_ignore_ascii_case(b"QUERY") && w20_is_api_path(path) {
+            flags |= W20_QUERY_CACHE_CONTROL;
+        }
+        if has_route == 1 && methods.iter().any(|m| *m == b"QUERY") {
+            flags |= W20_QUERY_ACCEPT_QUERY;
+        }
+        flags
+    }))
+    .unwrap_or(-1)
+}
+
+/// `hash_equals()`: unequal lengths fail fast; equal lengths compare in constant time.
+fn w20_hash_equals(known: &[u8], user: &[u8]) -> bool {
+    if known.len() != user.len() {
+        return false;
+    }
+    let diff = known
+        .iter()
+        .zip(user)
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+    std::hint::black_box(diff) == 0
+}
+
+/// Actions returned by [`nntmux_session_token_action`].
+const W20_SESSION_ALLOW: i32 = 0;
+const W20_SESSION_SEED: i32 = 1;
+const W20_SESSION_REJECT: i32 = 2;
+
+/// `EnforceSessionToken::handle()`: 0 allow (no user token, or the tokens match per
+/// `hash_equals()`), 1 seed the empty session token, 2 log out; -1 for invalid input.
+/// # Safety
+/// `user_token`/`session_token` hold their lengths in bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_session_token_action(
+    user_token: *const u8,
+    user_token_len: usize,
+    session_token: *const u8,
+    session_token_len: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (Some(user), Some(session)) = (unsafe {
+            (
+                w14_input(user_token, user_token_len),
+                w14_input(session_token, session_token_len),
+            )
+        }) else {
+            return -1;
+        };
+        if user.is_empty() {
+            W20_SESSION_ALLOW
+        } else if session.is_empty() {
+            W20_SESSION_SEED
+        } else if w20_hash_equals(user, session) {
+            W20_SESSION_ALLOW
+        } else {
+            W20_SESSION_REJECT
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+const W20_JSON_ACCEPT_PREFIX: &[u8] = b"application/json,";
+
+/// `ForceJsonOnAPI::handle()`: on `api/*` paths whose `Accept` header (absent when
+/// `has_accept = 0`) contains neither `/json` nor `+json`, writes
+/// `application/json,` . accept. Returns the bytes written, 0 when the header stays
+/// unchanged, -1 for invalid input, or `-(required + 3)`.
+/// # Safety
+/// `path`/`accept` hold their lengths in bytes and `out` `cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_force_json_accept(
+    path: *const u8,
+    path_len: usize,
+    accept: *const u8,
+    accept_len: usize,
+    has_accept: i32,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !(0..=1).contains(&has_accept) {
+            return -1;
+        }
+        let (Some(path), Some(accept)) =
+            (unsafe { (w14_input(path, path_len), w14_input(accept, accept_len)) })
+        else {
+            return -1;
+        };
+        let has_json = has_accept == 1
+            && (accept.windows(5).any(|w| w == b"/json")
+                || accept.windows(5).any(|w| w == b"+json"));
+        if !w20_is_api_path(path) || has_json {
+            return 0;
+        }
+        let mut header = Vec::with_capacity(W20_JSON_ACCEPT_PREFIX.len() + accept.len());
+        header.extend_from_slice(W20_JSON_ACCEPT_PREFIX);
+        header.extend_from_slice(accept);
+        w14_output(&header, out, cap)
+    }))
+    .unwrap_or(-1)
+}
+
+/// `AllowRemoteVerificationPublication::handle()` network list: splits on `,`, trims
+/// each entry with PHP `trim()` and drops falsy entries (`""` and `"0"`). Writes the
+/// entries joined by NUL and returns the bytes written (0 for an empty list), -1 for
+/// invalid input or an input containing NUL, or `-(required + 3)`.
+/// # Safety
+/// `input` holds `input_len` bytes and `out` `cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_verification_networks_parse(
+    input: *const u8,
+    input_len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(input) = (unsafe { w14_input(input, input_len) }) else {
+            return -1;
+        };
+        if input.contains(&0) {
+            return -1;
+        }
+        let joined = input
+            .split(|&b| b == b',')
+            .map(w19_php_trim)
+            .filter(|e| !e.is_empty() && *e != b"0")
+            .collect::<Vec<_>>()
+            .join(&0u8);
+        w14_output(&joined, out, cap)
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave20_tests {
+    use super::*;
+
+    fn buf_call(f: impl Fn(*mut u8, usize) -> isize) -> Result<Vec<u8>, isize> {
+        let mut out = vec![0u8; 256];
+        let n = f(out.as_mut_ptr(), out.len());
+        if n < 0 {
+            return Err(n);
+        }
+        out.truncate(n as usize);
+        Ok(out)
+    }
+
+    fn packed(names: &[&[u8]]) -> (Vec<u8>, Vec<usize>) {
+        (names.concat(), names.iter().map(|n| n.len()).collect())
+    }
+
+    fn failover(is_array: i32, driver: Option<&[u8]>, stores: &[&[u8]]) -> i32 {
+        let d = driver.unwrap_or(b"");
+        let (names, lens) = packed(stores);
+        unsafe {
+            nntmux_redis_failover_contains_redis(
+                is_array,
+                d.as_ptr(),
+                d.len(),
+                i32::from(driver.is_some()),
+                names.as_ptr(),
+                names.len(),
+                lens.as_ptr(),
+                lens.len(),
+            )
+        }
+    }
+
+    #[test]
+    fn failover_chain_detection() {
+        assert_eq!(failover(1, Some(b"failover"), &[b"redis", b"file"]), 1);
+        assert_eq!(failover(1, Some(b"failover"), &[b"database", b"ReDiS"]), 1);
+        assert_eq!(failover(1, Some(b"failover"), &[b"file", b" redis"]), 0);
+        assert_eq!(failover(1, Some(b"failover"), &[]), 0);
+        assert_eq!(failover(1, Some(b"Failover"), &[b"redis"]), 0);
+        assert_eq!(failover(1, None, &[b"redis"]), 0);
+        assert_eq!(failover(0, Some(b"failover"), &[b"redis"]), 0);
+        assert_eq!(failover(2, Some(b"failover"), &[b"redis"]), -1);
+        // Lengths must cover exactly the packed bytes.
+        let lens = [3usize];
+        assert_eq!(
+            unsafe {
+                nntmux_redis_failover_contains_redis(
+                    1,
+                    b"failover".as_ptr(),
+                    8,
+                    1,
+                    b"redis".as_ptr(),
+                    5,
+                    lens.as_ptr(),
+                    1,
+                )
+            },
+            -1
+        );
+        let lens = [usize::MAX, 6];
+        assert_eq!(
+            unsafe {
+                nntmux_redis_failover_contains_redis(
+                    1,
+                    b"failover".as_ptr(),
+                    8,
+                    1,
+                    b"redis".as_ptr(),
+                    5,
+                    lens.as_ptr(),
+                    2,
+                )
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn should_probe_decision() {
+        let probe = |cache: &[u8], chain: i32, session: Option<&[u8]>| {
+            let s = session.unwrap_or(b"");
+            unsafe {
+                nntmux_redis_should_probe(
+                    cache.as_ptr(),
+                    cache.len(),
+                    chain,
+                    s.as_ptr(),
+                    s.len(),
+                    i32::from(session.is_some()),
+                )
+            }
+        };
+        assert_eq!(probe(b"redis", 0, None), 1);
+        assert_eq!(probe(b"failover_redis_file", 0, Some(b"file")), 1);
+        assert_eq!(probe(b"file", 1, None), 1);
+        assert_eq!(probe(b"file", 0, Some(b"redis")), 1);
+        assert_eq!(probe(b"file", 0, Some(b"Redis")), 0);
+        assert_eq!(probe(b"REDIS", 0, Some(b"database")), 0);
+        assert_eq!(probe(b"", 0, None), 0);
+        assert_eq!(probe(b"redis", 2, None), -1);
+    }
+
+    #[test]
+    fn stream_remote_and_tcp_target() {
+        let remote = |scheme: &[u8], host: &[u8], port: i64| {
+            buf_call(|o, c| unsafe {
+                nntmux_redis_stream_remote(
+                    scheme.as_ptr(),
+                    scheme.len(),
+                    host.as_ptr(),
+                    host.len(),
+                    port,
+                    o,
+                    c,
+                )
+            })
+            .unwrap()
+        };
+        assert_eq!(remote(b"tcp", b"redis", 6379), b"tcp://redis:6379");
+        assert_eq!(
+            remote(b"rediss", b"cache.example", 6380),
+            b"ssl://cache.example:6380"
+        );
+        assert_eq!(remote(b"tls", b"::1", 1), b"ssl://::1:1");
+        assert_eq!(remote(b"tcp", b"::1", 6379), b"tcp://[::1]:6379");
+        assert_eq!(remote(b"redis", b"[::1]", -5), b"tcp://[::1]:-5");
+        assert_eq!(remote(b"TLS", b"h", 0), b"tcp://h:0");
+
+        let target =
+            |use_url: i32, host: Option<&[u8]>, port: Option<i64>, scheme: Option<&[u8]>| {
+                let (h, s) = (host.unwrap_or(b""), scheme.unwrap_or(b""));
+                buf_call(|o, c| unsafe {
+                    nntmux_redis_tcp_target(
+                        use_url,
+                        h.as_ptr(),
+                        h.len(),
+                        i32::from(host.is_some()),
+                        port.unwrap_or(0),
+                        i32::from(port.is_some()),
+                        s.as_ptr(),
+                        s.len(),
+                        i32::from(scheme.is_some()),
+                        o,
+                        c,
+                    )
+                })
+            };
+        assert_eq!(target(1, Some(b"r"), None, None).unwrap(), b"tcp://r:6379");
+        assert_eq!(
+            target(1, Some(b"r"), Some(1), Some(b"REDISS")).unwrap(),
+            b"ssl://r:1"
+        );
+        assert_eq!(target(1, Some(b""), None, None).unwrap(), b"");
+        assert_eq!(target(1, None, None, Some(b"tcp")).unwrap(), b"");
+        assert_eq!(
+            target(0, None, None, None).unwrap(),
+            b"tcp://127.0.0.1:6379"
+        );
+        assert_eq!(
+            target(0, Some(b"fe80::1"), Some(7000), None).unwrap(),
+            b"tcp://[fe80::1]:7000"
+        );
+        assert_eq!(
+            target(0, Some(b"/tmp/redis.sock"), None, None).unwrap(),
+            b""
+        );
+        assert_eq!(target(0, Some(b""), None, None).unwrap(), b"");
+        assert_eq!(target(2, None, None, None), Err(-1));
+        let mut small = [0u8; 4];
+        assert_eq!(
+            unsafe {
+                nntmux_redis_tcp_target(
+                    0,
+                    std::ptr::null(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    0,
+                    small.as_mut_ptr(),
+                    4,
+                )
+            },
+            -("tcp://127.0.0.1:6379".len() as isize + 3)
+        );
+    }
+
+    #[test]
+    fn query_header_flags() {
+        let flags = |method: &[u8], path: &[u8], route: Option<&[&[u8]]>| {
+            let (names, lens) = packed(route.unwrap_or(&[]));
+            unsafe {
+                nntmux_http_query_header_flags(
+                    method.as_ptr(),
+                    method.len(),
+                    path.as_ptr(),
+                    path.len(),
+                    i32::from(route.is_some()),
+                    names.as_ptr(),
+                    names.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                )
+            }
+        };
+        assert_eq!(
+            flags(
+                b"QUERY",
+                b"api/v2/search",
+                Some(&[b"GET", b"HEAD", b"QUERY"])
+            ),
+            3
+        );
+        assert_eq!(flags(b"query", b"api/x", None), 1);
+        assert_eq!(flags(b"QUERY", b"api", None), 0);
+        assert_eq!(flags(b"QUERY", b"API/x", None), 0);
+        assert_eq!(flags(b"QUERY", b"api/\xff", None), 0);
+        assert_eq!(flags(b"QUERY", b"api/\n", None), 1);
+        assert_eq!(flags(b"GET", b"api/x", Some(&[b"GET", b"query"])), 0);
+        assert_eq!(flags(b"GET", b"browse", Some(&[b"QUERY"])), 2);
+        assert_eq!(flags(b"GET", b"browse", Some(&[])), 0);
+        assert_eq!(
+            unsafe {
+                nntmux_http_query_header_flags(
+                    b"GET".as_ptr(),
+                    3,
+                    b"/".as_ptr(),
+                    1,
+                    3,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                )
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn session_token_state_machine() {
+        let action = |user: &[u8], session: &[u8]| unsafe {
+            nntmux_session_token_action(user.as_ptr(), user.len(), session.as_ptr(), session.len())
+        };
+        assert_eq!(action(b"", b""), 0);
+        assert_eq!(action(b"", b"abc"), 0);
+        assert_eq!(action(b"abc", b""), 1);
+        assert_eq!(action(b"abc", b"abc"), 0);
+        assert_eq!(action(b"abc", b"abd"), 2);
+        assert_eq!(action(b"abc", b"abcd"), 2);
+        assert_eq!(action(b"0", b"0"), 0);
+        assert_eq!(
+            unsafe { nntmux_session_token_action(std::ptr::null(), 1, b"a".as_ptr(), 1) },
+            -1
+        );
+    }
+
+    #[test]
+    fn force_json_accept_header() {
+        let force = |path: &[u8], accept: Option<&[u8]>| {
+            let a = accept.unwrap_or(b"");
+            buf_call(|o, c| unsafe {
+                nntmux_force_json_accept(
+                    path.as_ptr(),
+                    path.len(),
+                    a.as_ptr(),
+                    a.len(),
+                    i32::from(accept.is_some()),
+                    o,
+                    c,
+                )
+            })
+        };
+        assert_eq!(
+            force(b"api/v1/api", Some(b"text/html")).unwrap(),
+            b"application/json,text/html"
+        );
+        assert_eq!(force(b"api/v1/api", None).unwrap(), b"application/json,");
+        assert_eq!(
+            force(b"api/v1/api", Some(b"")).unwrap(),
+            b"application/json,"
+        );
+        assert_eq!(
+            force(b"api/v1/api", Some(b"application/json")).unwrap(),
+            b""
+        );
+        assert_eq!(
+            force(b"api/v1/api", Some(b"application/vnd.api+json")).unwrap(),
+            b""
+        );
+        assert_eq!(
+            force(b"api/v1/api", Some(b"application/JSON")).unwrap(),
+            b"application/json,application/JSON"
+        );
+        assert_eq!(force(b"browse", Some(b"text/html")).unwrap(), b"");
+        assert_eq!(force(b"api/\xc3", Some(b"text/html")).unwrap(), b"");
+        assert_eq!(
+            force(b"api/x", Some(b"*/*")).unwrap(),
+            b"application/json,*/*"
+        );
+        assert_eq!(
+            force(b"api/x", Some(b"")),
+            Ok(b"application/json,".to_vec())
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_force_json_accept(
+                    b"api/x".as_ptr(),
+                    5,
+                    std::ptr::null(),
+                    0,
+                    2,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn verification_network_list() {
+        let parse = |input: &[u8]| {
+            buf_call(|o, c| unsafe {
+                nntmux_verification_networks_parse(input.as_ptr(), input.len(), o, c)
+            })
+        };
+        assert_eq!(parse(b"").unwrap(), b"");
+        assert_eq!(parse(b" , ,0,").unwrap(), b"");
+        assert_eq!(
+            parse(b"10.0.0.0/8, 192.168.0.0/16 ,\t::1\n").unwrap(),
+            b"10.0.0.0/8\x00192.168.0.0/16\x00::1"
+        );
+        assert_eq!(parse(b"00, 0.0.0.0/0").unwrap(), b"00\x000.0.0.0/0");
+        assert_eq!(parse(b"a\x00b"), Err(-1));
+        assert_eq!(
+            unsafe {
+                nntmux_verification_networks_parse(std::ptr::null(), 2, std::ptr::null_mut(), 0)
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn rejects_misaligned_and_oversized_buffers() {
+        let names = b"redisfile";
+        let mut raw = [0u8; 64];
+        let misaligned = unsafe { raw.as_mut_ptr().add(1) } as *const usize;
+        assert_eq!(
+            unsafe {
+                nntmux_redis_failover_contains_redis(
+                    1,
+                    b"failover".as_ptr(),
+                    8,
+                    1,
+                    names.as_ptr(),
+                    9,
+                    misaligned,
+                    2,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_http_query_header_flags(
+                    b"GET".as_ptr(),
+                    3,
+                    b"/".as_ptr(),
+                    1,
+                    1,
+                    names.as_ptr(),
+                    9,
+                    misaligned,
+                    2,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_http_query_header_flags(
+                    b"GET".as_ptr(),
+                    3,
+                    b"/".as_ptr(),
+                    1,
+                    1,
+                    names.as_ptr(),
+                    9,
+                    std::ptr::null(),
+                    2,
+                )
+            },
+            -1
+        );
+        let lens = [5usize, 4];
+        assert_eq!(
+            unsafe {
+                nntmux_redis_failover_contains_redis(
+                    1,
+                    b"failover".as_ptr(),
+                    8,
+                    1,
+                    names.as_ptr(),
+                    9,
+                    lens.as_ptr(),
+                    usize::MAX,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_session_token_action(
+                    b"a".as_ptr(),
+                    isize::MAX as usize + 1,
+                    b"a".as_ptr(),
+                    1,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_verification_networks_parse(
+                    b"a".as_ptr(),
+                    usize::MAX,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            },
+            -1
+        );
+        let mut out = [0u8; 8];
+        assert_eq!(
+            unsafe {
+                nntmux_redis_stream_remote(
+                    b"tcp".as_ptr(),
+                    3,
+                    b"h".as_ptr(),
+                    1,
+                    1,
+                    out.as_mut_ptr(),
+                    usize::MAX,
+                )
+            },
+            -1
+        );
+    }
+}
