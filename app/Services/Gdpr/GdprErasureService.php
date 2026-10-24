@@ -7,19 +7,90 @@ namespace App\Services\Gdpr;
 use App\Models\GdprRequest;
 use App\Models\User;
 use App\Services\AdminDashboardSnapshotService;
+use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
+use Throwable;
 
 class GdprErasureService
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_gdpr_erasure_anonymous_identity_nul(int64_t user_id, char *out_buf, size_t out_cap);
+        ssize_t nntmux_gdpr_erasure_event_name(uint8_t force_delete, char *out_buf, size_t out_cap);
+        ssize_t nntmux_gdpr_erasure_audit_subject_json(const char *username_ptr, size_t username_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_gdpr_erasure_filter_metadata_keys_nul(const char *keys_nul_ptr, size_t keys_nul_len, size_t key_count, uint8_t *out_keep_mask, size_t out_mask_cap, int32_t *out_has_gdpr_minimized);
+        C;
+
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    private static ?CData $int32Slot = null;
+
+    private static ?CData $maskBuf = null;
+
+    private static int $maskCap = 0;
+
+    private static ?FFI $slotOwner = null;
+
     public function __construct(
         private readonly GdprDataInventory $inventory = new GdprDataInventory,
         private readonly GdprAuditService $audit = new GdprAuditService,
         private readonly GdprNotificationService $notifications = new GdprNotificationService,
     ) {}
+
+    public static function enableRustFfi(): void
+    {
+        self::setUseRustFfi(true);
+    }
+
+    public static function disableRustFfi(): void
+    {
+        self::setUseRustFfi(false);
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::setUseRustFfi(null);
+    }
+
+    public static function setUseRustFfi(?bool $use = true): void
+    {
+        self::$useRustFfi = $use ?? false;
+        if ($use === null) {
+            self::$ffi = null;
+        }
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    public static function setFfiForTesting(FFI|false|null $override = null): void
+    {
+        self::$ffi = $override;
+    }
+
+    public static function categorizeFfi(bool $reset = false, FFI|false|null $override = null): ?FFI
+    {
+        if ($reset) {
+            self::$ffi = $override;
+            if ($override !== null) {
+                return self::$ffi === false ? null : self::$ffi;
+            }
+        }
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('categorize', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
 
     public function eraseForAccountDeletion(User $user, ?User $actor = null, ?GdprRequest $request = null, bool $forceDelete = false): void
     {
@@ -30,7 +101,7 @@ class GdprErasureService
                 'username' => (string) $freshUser->username,
                 'email' => (string) $freshUser->email,
             ];
-            $anonymous = $this->anonymousIdentity((int) $freshUser->id);
+            $anonymous = self::anonymousIdentity((int) $freshUser->id);
 
             $this->deleteErasableRecords((int) $freshUser->id);
             $this->anonymizeCommunityRecords((int) $freshUser->id, $anonymous['username']);
@@ -40,7 +111,7 @@ class GdprErasureService
             $this->anonymizeUser($freshUser, $anonymous);
 
             $this->audit->record(
-                event: $forceDelete ? 'erasure_force_delete' : 'erasure_soft_delete',
+                event: self::resolveErasureEventName($forceDelete),
                 description: 'GDPR erasure workflow completed; retained payment and audit records were anonymized/minimized.',
                 subject: $freshUser,
                 actor: $actor,
@@ -86,13 +157,266 @@ class GdprErasureService
     /**
      * @return array{username: string, email: string, name: string}
      */
-    private function anonymousIdentity(int $userId): array
+    public static function anonymousIdentity(int $userId): array
+    {
+        return self::$useRustFfi
+            ? self::anonymousIdentityNative($userId)
+            : self::anonymousIdentityPhp($userId);
+    }
+
+    /**
+     * @return array{username: string, email: string, name: string}
+     */
+    public static function anonymousIdentityPhp(int $userId): array
     {
         return [
             'username' => 'deleted_user_'.$userId,
             'email' => 'deleted-user-'.$userId.'@deleted.invalid',
             'name' => 'Deleted user '.$userId,
         ];
+    }
+
+    /**
+     * @return array{username: string, email: string, name: string}
+     */
+    public static function anonymousIdentityNative(int $userId): array
+    {
+        $ffi = self::categorizeFfi();
+        if ($ffi === null) {
+            return self::anonymousIdentityPhp($userId);
+        }
+
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, 128, $cap);
+        if ($scratch === null) {
+            return self::anonymousIdentityPhp($userId);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_gdpr_erasure_anonymous_identity_nul($userId, $scratch, $cap);
+            if (\is_int($written) && $written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return self::anonymousIdentityPhp($userId);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_gdpr_erasure_anonymous_identity_nul($userId, $scratch, $cap);
+            }
+            if (\is_int($written) && $written > 0 && $written <= $cap) {
+                $parts = explode("\0", FFI::string($scratch, $written));
+                if (\count($parts) === 3) {
+                    return [
+                        'username' => $parts[0],
+                        'email' => $parts[1],
+                        'name' => $parts[2],
+                    ];
+                }
+            }
+        } catch (Throwable) {
+            // Fall through to PHP fallback.
+        }
+
+        return self::anonymousIdentityPhp($userId);
+    }
+
+    public static function resolveErasureEventName(bool $forceDelete): string
+    {
+        return self::$useRustFfi
+            ? self::resolveErasureEventNameNative($forceDelete)
+            : self::resolveErasureEventNamePhp($forceDelete);
+    }
+
+    public static function resolveErasureEventNamePhp(bool $forceDelete): string
+    {
+        return $forceDelete ? 'erasure_force_delete' : 'erasure_soft_delete';
+    }
+
+    public static function resolveErasureEventNameNative(bool $forceDelete): string
+    {
+        $ffi = self::categorizeFfi();
+        if ($ffi === null) {
+            return self::resolveErasureEventNamePhp($forceDelete);
+        }
+
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, 32, $cap);
+        if ($scratch === null) {
+            return self::resolveErasureEventNamePhp($forceDelete);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_gdpr_erasure_event_name($forceDelete ? 1 : 0, $scratch, $cap);
+            if (\is_int($written) && $written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return self::resolveErasureEventNamePhp($forceDelete);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_gdpr_erasure_event_name($forceDelete ? 1 : 0, $scratch, $cap);
+            }
+            if (\is_int($written) && $written > 0 && $written <= $cap) {
+                return FFI::string($scratch, $written);
+            }
+        } catch (Throwable) {
+            // Fall through to PHP fallback.
+        }
+
+        return self::resolveErasureEventNamePhp($forceDelete);
+    }
+
+    public static function formatAuditSubjectMetadataJson(string $anonymousUsername): string
+    {
+        return self::$useRustFfi
+            ? self::formatAuditSubjectMetadataJsonNative($anonymousUsername)
+            : self::formatAuditSubjectMetadataJsonPhp($anonymousUsername);
+    }
+
+    public static function formatAuditSubjectMetadataJsonPhp(string $anonymousUsername): string
+    {
+        return (string) json_encode(['subject' => $anonymousUsername], JSON_UNESCAPED_SLASHES);
+    }
+
+    public static function formatAuditSubjectMetadataJsonNative(string $anonymousUsername): string
+    {
+        $ffi = self::categorizeFfi();
+        if ($ffi === null) {
+            return self::formatAuditSubjectMetadataJsonPhp($anonymousUsername);
+        }
+
+        $len = \strlen($anonymousUsername);
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(64, $len * 2 + 24), $cap);
+        if ($scratch === null) {
+            return self::formatAuditSubjectMetadataJsonPhp($anonymousUsername);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_gdpr_erasure_audit_subject_json($anonymousUsername, $len, $scratch, $cap);
+            if (\is_int($written) && $written < -2) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return self::formatAuditSubjectMetadataJsonPhp($anonymousUsername);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_gdpr_erasure_audit_subject_json($anonymousUsername, $len, $scratch, $cap);
+            }
+            if (\is_int($written) && $written > 0 && $written <= $cap) {
+                return FFI::string($scratch, $written);
+            }
+        } catch (Throwable) {
+            // Fall through to PHP fallback.
+        }
+
+        return self::formatAuditSubjectMetadataJsonPhp($anonymousUsername);
+    }
+
+    /**
+     * @return array<int|string, mixed>
+     */
+    public static function sanitizeMetadata(mixed $metadata): array
+    {
+        return self::$useRustFfi
+            ? self::sanitizeMetadataNative($metadata)
+            : self::sanitizeMetadataPhp($metadata);
+    }
+
+    /**
+     * @return array<int|string, mixed>
+     */
+    public static function sanitizeMetadataPhp(mixed $metadata): array
+    {
+        if (is_string($metadata)) {
+            $decoded = json_decode($metadata, true);
+            $metadata = is_array($decoded) ? $decoded : [];
+        }
+
+        if (! is_array($metadata)) {
+            $metadata = [];
+        }
+
+        unset($metadata['email'], $metadata['ip_address'], $metadata['host']);
+        $metadata['gdpr_minimized'] = true;
+
+        return $metadata;
+    }
+
+    /**
+     * @return array<int|string, mixed>
+     */
+    public static function sanitizeMetadataNative(mixed $metadata): array
+    {
+        $ffi = self::categorizeFfi();
+        if ($ffi === null) {
+            return self::sanitizeMetadataPhp($metadata);
+        }
+
+        $parsed = $metadata;
+        if (is_string($parsed)) {
+            $decoded = json_decode($parsed, true);
+            $parsed = is_array($decoded) ? $decoded : [];
+        }
+        if (! is_array($parsed)) {
+            $parsed = [];
+        }
+
+        $keyCount = \count($parsed);
+        if (! self::ensureMaskSlots($ffi, max(8, $keyCount)) || self::$int32Slot === null || self::$maskBuf === null) {
+            return self::sanitizeMetadataPhp($metadata);
+        }
+
+        $strKeys = [];
+        $rawKeys = [];
+        $values = [];
+        foreach ($parsed as $k => $v) {
+            $sk = (string) $k;
+            if (str_contains($sk, "\0")) {
+                return self::sanitizeMetadataPhp($metadata);
+            }
+            $strKeys[] = $sk;
+            $rawKeys[] = $k;
+            $values[] = $v;
+        }
+
+        $joined = implode("\0", $strKeys);
+
+        try {
+            // @phpstan-ignore method.notFound
+            $kept = $ffi->nntmux_gdpr_erasure_filter_metadata_keys_nul(
+                $joined,
+                \strlen($joined),
+                $keyCount,
+                self::$maskBuf,
+                self::$maskCap,
+                self::$int32Slot,
+            );
+            if (! \is_int($kept) || $kept < 0) {
+                return self::sanitizeMetadataPhp($metadata);
+            }
+
+            $result = [];
+            for ($i = 0; $i < $keyCount; $i++) {
+                /** @var int $code */
+                $code = self::$maskBuf[$i];
+                if ($code === 1) {
+                    $result[$rawKeys[$i]] = $values[$i];
+                } elseif ($code === 2) {
+                    $result['gdpr_minimized'] = true;
+                }
+            }
+
+            /** @var int $hasGdpr */
+            $hasGdpr = self::$int32Slot[0];
+            if ($hasGdpr === 0) {
+                $result['gdpr_minimized'] = true;
+            }
+
+            return $result;
+        } catch (Throwable) {
+            return self::sanitizeMetadataPhp($metadata);
+        }
     }
 
     /**
@@ -252,7 +576,7 @@ class GdprErasureService
                 ->orderBy('id')
                 ->chunkById(100, function ($activities) use ($anonymous): void {
                     foreach ($activities as $activity) {
-                        $metadata = $this->sanitizeMetadata($activity->metadata ?? null);
+                        $metadata = self::sanitizeMetadata($activity->metadata ?? null);
                         $updates = ['username' => $anonymous['username']];
                         if (Schema::hasColumn('user_activities', 'metadata')) {
                             $updates['metadata'] = json_encode($metadata, JSON_UNESCAPED_SLASHES);
@@ -265,28 +589,8 @@ class GdprErasureService
         if (Schema::hasTable('gdpr_audit_logs') && Schema::hasColumn('gdpr_audit_logs', 'metadata')) {
             DB::table('gdpr_audit_logs')
                 ->where('user_id', $original['id'])
-                ->update(['metadata' => json_encode(['subject' => $anonymous['username']], JSON_UNESCAPED_SLASHES)]);
+                ->update(['metadata' => self::formatAuditSubjectMetadataJson($anonymous['username'])]);
         }
-    }
-
-    /**
-     * @return array<string, mixed>
-     */
-    private function sanitizeMetadata(mixed $metadata): array
-    {
-        if (is_string($metadata)) {
-            $decoded = json_decode($metadata, true);
-            $metadata = is_array($decoded) ? $decoded : [];
-        }
-
-        if (! is_array($metadata)) {
-            $metadata = [];
-        }
-
-        unset($metadata['email'], $metadata['ip_address'], $metadata['host']);
-        $metadata['gdpr_minimized'] = true;
-
-        return $metadata;
     }
 
     /**
@@ -304,5 +608,22 @@ class GdprErasureService
             static fn (string $column): bool => Schema::hasColumn($table, $column),
             ARRAY_FILTER_USE_KEY
         );
+    }
+
+    private static function ensureMaskSlots(FFI $ffi, int $neededCap): bool
+    {
+        if (self::$slotOwner !== $ffi || self::$int32Slot === null || self::$maskBuf === null || self::$maskCap < $neededCap) {
+            try {
+                $allocCap = max(32, $neededCap);
+                self::$int32Slot = $ffi->new('int32_t[1]');
+                self::$maskBuf = $ffi->new("uint8_t[{$allocCap}]");
+                self::$maskCap = $allocCap;
+                self::$slotOwner = $ffi;
+            } catch (Throwable) {
+                return false;
+            }
+        }
+
+        return true;
     }
 }
