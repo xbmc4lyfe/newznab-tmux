@@ -11382,3 +11382,724 @@ mod wave18_tests {
         assert_eq!(n, -1);
     }
 }
+
+// Wave 19 `SearchFailureTracker`, `ApiUserResolver`, `DateRangeFilter`,
+// `ThrottleApiRequestsByToken` and `NoCacheForAuthenticatedUsers` candidates. Every
+// export catches panics (-1), rejects null or misaligned pointers, and bounds slice
+// lengths by `isize::MAX` before building slices; -1 sends the PHP adapter back to
+// its own path.
+
+unsafe fn w19_out<'a, T>(ptr: *mut T) -> Option<&'a mut T> {
+    if ptr.is_null() || !ptr.is_aligned() {
+        return None;
+    }
+    Some(unsafe { &mut *ptr })
+}
+
+/// PHP `trim()` default characters: space, `\t`, `\n`, `\r`, NUL and `\v`.
+fn w19_php_trim(bytes: &[u8]) -> &[u8] {
+    let is_ws = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+    let start = bytes.iter().position(|b| !is_ws(b)).unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !is_ws(b))
+        .map_or(start, |i| i + 1);
+    &bytes[start..end]
+}
+
+/// `SearchFailureTracker::record()`: writes `count + 1` to `out` and returns 0, or -1
+/// for a negative count, an overflowing increment or an invalid `out` pointer.
+/// # Safety
+/// `out` is one aligned, writable `int64_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_search_failure_next(count: i64, out: *mut i64) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(out) = (unsafe { w19_out(out) }) else {
+            return -1;
+        };
+        if count < 0 {
+            return -1;
+        }
+        match count.checked_add(1) {
+            Some(next) => {
+                *out = next;
+                0
+            }
+            None => -1,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// `SearchFailureTracker::failedSince()`: 1 when a failure was recorded after the
+/// `baseline` snapshot (`count !== baseline`), 0 otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_search_failure_since(count: i64, baseline: i64) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        i32::from(count != baseline)
+    }))
+    .unwrap_or(-1)
+}
+
+/// `SearchFailureTracker::reachedThreshold()`: 1 when `threshold > 0` and
+/// `count >= threshold`, 0 otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_search_failure_reached(count: i64, threshold: i64) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        i32::from(threshold > 0 && count >= threshold)
+    }))
+    .unwrap_or(-1)
+}
+
+const W19_API_USER_PREFIX: &[u8] = b"api_user:";
+const W19_API_USER_KEY_LEN: usize = W19_API_USER_PREFIX.len() + 32;
+
+/// `ApiUserResolver::cacheKey()`: writes `api_user:` . md5(token) (41 bytes). Returns
+/// the bytes written, -1 for invalid input, or `-(41 + 3)` when `cap` is too small.
+/// # Safety
+/// `token` holds `token_len` bytes and `out` `cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_api_user_cache_key(
+    token: *const u8,
+    token_len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(token) = (unsafe { w14_input(token, token_len) }) else {
+            return -1;
+        };
+        let mut key = [0u8; W19_API_USER_KEY_LEN];
+        key[..W19_API_USER_PREFIX.len()].copy_from_slice(W19_API_USER_PREFIX);
+        key[W19_API_USER_PREFIX.len()..].copy_from_slice(&crate::md5_hex_slice(token));
+        w14_output(&key, out, cap)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Request-input kinds for [`nntmux_api_token_classify`].
+const W19_INPUT_NULL: i32 = 0;
+const W19_INPUT_STRING: i32 = 1;
+const W19_INPUT_OTHER: i32 = 2;
+
+/// `ApiUserResolver::resolveCredentials()`: `$apiToken ?? $apikey` must be a
+/// non-empty string; it resolves through v2 when `api_token` is `filled()` (its
+/// trimmed value is non-empty) and v1 otherwise. Kinds: 0 null, 1 string, 2 any other
+/// non-null value. Writes the chosen source to `out_source` (0 `api_token`,
+/// 1 `apikey`, -1 none) and returns 0 (no token), 1 (v1), 2 (v2) or -1 for invalid
+/// input.
+/// # Safety
+/// `api_token`/`apikey` hold their lengths in bytes; `out_source` is one aligned
+/// `int32_t`.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_api_token_classify(
+    api_token: *const u8,
+    api_token_len: usize,
+    api_token_kind: i32,
+    apikey: *const u8,
+    apikey_len: usize,
+    apikey_kind: i32,
+    out_source: *mut i32,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let kinds = W19_INPUT_NULL..=W19_INPUT_OTHER;
+        if !kinds.contains(&api_token_kind) || !kinds.contains(&apikey_kind) {
+            return -1;
+        }
+        let (Some(api_token), Some(apikey), Some(source)) = (
+            unsafe { w14_input(api_token, api_token_len) },
+            unsafe { w14_input(apikey, apikey_len) },
+            unsafe { w19_out(out_source) },
+        ) else {
+            return -1;
+        };
+        let (from, kind, value) = if api_token_kind != W19_INPUT_NULL {
+            (0, api_token_kind, api_token)
+        } else {
+            (1, apikey_kind, apikey)
+        };
+        if kind != W19_INPUT_STRING || value.is_empty() {
+            *source = -1;
+            return 0;
+        }
+        *source = from;
+        if from == 0 && !w19_php_trim(value).is_empty() {
+            2
+        } else {
+            1
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+const W19_RATE_LIMIT_PREFIX: &[u8] = b"api-rate-limit:user:";
+
+/// `ThrottleApiRequestsByToken::rateLimitKey()`: writes `api-rate-limit:user:{id}`.
+/// Returns the bytes written, -1 for invalid input, or `-(required + 3)`.
+/// # Safety
+/// `out` holds `cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_throttle_rate_limit_key(
+    user_id: i64,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut key = Vec::with_capacity(W19_RATE_LIMIT_PREFIX.len() + 20);
+        key.extend_from_slice(W19_RATE_LIMIT_PREFIX);
+        key.extend_from_slice(user_id.to_string().as_bytes());
+        w14_output(&key, out, cap)
+    }))
+    .unwrap_or(-1)
+}
+
+/// `ThrottleApiRequestsByToken::maxAttempts()` for an integer or null rate limit:
+/// `max(1, rate_limit ?: default)`. Returns the limit (>= 1) or -1 when `is_null`
+/// is not 0/1.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_throttle_max_attempts(rate_limit: i64, is_null: i32, default: i64) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !(0..=1).contains(&is_null) {
+            return -1;
+        }
+        let limit = if is_null == 1 || rate_limit == 0 {
+            default
+        } else {
+            rate_limit
+        };
+        limit.max(1)
+    }))
+    .unwrap_or(-1)
+}
+
+/// `ThrottleApiRequestsByToken::remainingAttempts()`: `max(0, max - attempts)`, or -1
+/// when the subtraction overflows (PHP would switch to a float).
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_throttle_remaining(max_attempts: i64, attempts: i64) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        max_attempts.checked_sub(attempts).map_or(-1, |r| r.max(0))
+    }))
+    .unwrap_or(-1)
+}
+
+/// `ThrottleApiRequestsByToken::retryAfter()`: `max(1, available_in)`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_throttle_retry_after(available_in: i64) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| available_in.max(1))).unwrap_or(-1)
+}
+
+/// `ThrottleApiRequestsByToken::errorHeader()`: writes `API ERROR [{code}] {message}`.
+/// Returns the bytes written, -1 for invalid input, or `-(required + 3)`.
+/// # Safety
+/// `message` holds `message_len` bytes and `out` `cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_throttle_error_header(
+    code: i64,
+    message: *const u8,
+    message_len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(message) = (unsafe { w14_input(message, message_len) }) else {
+            return -1;
+        };
+        let mut header = Vec::with_capacity(message.len() + 32);
+        header.extend_from_slice(b"API ERROR [");
+        header.extend_from_slice(code.to_string().as_bytes());
+        header.extend_from_slice(b"] ");
+        header.extend_from_slice(message);
+        w14_output(&header, out, cap)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Session-backed auth-flow routes kept out of CDN/browser caches.
+const W19_NO_CACHE_ROUTES: [&[u8]; 10] = [
+    b"login",
+    b"login.post",
+    b"register",
+    b"register.post",
+    b"logout",
+    b"forgottenpassword",
+    b"password.request",
+    b"2fa.verify",
+    b"2fa.post",
+    b"2faVerify",
+];
+
+/// `NoCacheForAuthenticatedUsers::shouldPreventCachingFor()`: 1 when the user is
+/// authenticated or the named route is an auth-flow route (`routeIs()` with literal
+/// patterns is an exact, case-sensitive match), 0 otherwise, -1 for invalid input.
+/// # Safety
+/// `route_name` holds `route_name_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nocache_should_prevent(
+    authenticated: i32,
+    route_name: *const u8,
+    route_name_len: usize,
+    has_route_name: i32,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !(0..=1).contains(&authenticated) || !(0..=1).contains(&has_route_name) {
+            return -1;
+        }
+        let Some(name) = (unsafe { w14_input(route_name, route_name_len) }) else {
+            return -1;
+        };
+        if authenticated == 1 {
+            return 1;
+        }
+        i32::from(has_route_name == 1 && W19_NO_CACHE_ROUTES.contains(&name))
+    }))
+    .unwrap_or(-1)
+}
+
+/// `NoCacheForAuthenticatedUsers::mergeVary()`: splits the existing `Vary` value on
+/// `,`, trims each entry, drops falsy entries (`""` and `"0"`, as `array_filter()`
+/// does), appends `Cookie` and (with a bearer token) `Authorization` when missing, and
+/// joins with `", "`. Returns the bytes written, -1 for invalid input, or
+/// `-(required + 3)`.
+/// # Safety
+/// `existing` holds `existing_len` bytes and `out` `cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nocache_merge_vary(
+    existing: *const u8,
+    existing_len: usize,
+    has_bearer: i32,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !(0..=1).contains(&has_bearer) {
+            return -1;
+        }
+        let Some(existing) = (unsafe { w14_input(existing, existing_len) }) else {
+            return -1;
+        };
+        let mut entries: Vec<&[u8]> = existing
+            .split(|&b| b == b',')
+            .map(w19_php_trim)
+            .filter(|e| !e.is_empty() && *e != b"0")
+            .collect();
+        if !entries.contains(&b"Cookie".as_slice()) {
+            entries.push(b"Cookie");
+        }
+        if has_bearer == 1 && !entries.contains(&b"Authorization".as_slice()) {
+            entries.push(b"Authorization");
+        }
+        let vary = entries.join(b", ".as_slice());
+        w14_output(&vary, out, cap)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Window modes written by [`nntmux_date_range_plan`].
+const W19_RANGE_EXPLICIT: i64 = 0;
+const W19_RANGE_DAYS: i64 = 1;
+const W19_RANGE_YEAR: i64 = 2;
+const W19_RANGE_ALL: i64 = 3;
+
+/// `DateRangeFilter::resolvePlan()`: explicit `start_date`/`end_date` win, then the
+/// `period` preset (strict `match`, so a non-string period uses the default), else
+/// the default window. Writes `[mode, days]` (mode 0 explicit, 1 `subDays(days)`,
+/// 2 `subYear()`, 3 all time) and returns 0, -1 for invalid input, or -5 when
+/// `out_cap < 2`.
+/// # Safety
+/// `period` holds `period_len` bytes; `out` holds `out_cap` aligned `int64_t`.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_date_range_plan(
+    has_start: i32,
+    has_end: i32,
+    has_period: i32,
+    period: *const u8,
+    period_len: usize,
+    period_is_string: i32,
+    default_days: i64,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if [has_start, has_end, has_period, period_is_string]
+            .iter()
+            .any(|flag| !(0..=1).contains(flag))
+        {
+            return -1;
+        }
+        let (Some(period), Some(out)) = (unsafe { w14_input(period, period_len) }, unsafe {
+            w15_slice_mut(out, out_cap)
+        }) else {
+            return -1;
+        };
+        if out_cap < 2 {
+            return i32::try_from(w18_short(2)).unwrap_or(-1);
+        }
+        let plan = if has_start == 1 && has_end == 1 {
+            [W19_RANGE_EXPLICIT, 0]
+        } else if has_period == 1 && period_is_string == 1 {
+            match period {
+                b"7days" => [W19_RANGE_DAYS, 7],
+                b"30days" => [W19_RANGE_DAYS, 30],
+                b"90days" => [W19_RANGE_DAYS, 90],
+                b"year" => [W19_RANGE_YEAR, 0],
+                b"all" => [W19_RANGE_ALL, 0],
+                _ => [W19_RANGE_DAYS, default_days],
+            }
+        } else {
+            [W19_RANGE_DAYS, default_days]
+        };
+        out[..2].copy_from_slice(&plan);
+        0
+    }))
+    .unwrap_or(-1)
+}
+
+fn w19_digits(bytes: &[u8]) -> Option<i64> {
+    bytes.iter().try_fold(0i64, |acc, &b| {
+        b.is_ascii_digit().then(|| acc * 10 + i64::from(b - b'0'))
+    })
+}
+
+/// `DateRangeFilter::parseDate()` fast path: strict `YYYY-MM-DD` or
+/// `YYYY-MM-DD HH:MM:SS` with a 1000-9999 year and an in-range calendar date/time.
+/// Writes `[year, month, day, hour, minute, second]` and returns 1, returns 0 for any
+/// other value (PHP keeps `Carbon::parse()`, including its overflow and relative
+/// formats), -1 for invalid input, or -9 when `out_cap < 6`.
+/// # Safety
+/// `value` holds `value_len` bytes; `out` holds `out_cap` aligned `int64_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_date_range_parse_ymd(
+    value: *const u8,
+    value_len: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (Some(value), Some(out)) = (unsafe { w14_input(value, value_len) }, unsafe {
+            w15_slice_mut(out, out_cap)
+        }) else {
+            return -1;
+        };
+        if out_cap < 6 {
+            return i32::try_from(w18_short(6)).unwrap_or(-1);
+        }
+        if (value.len() != 10 && value.len() != 19) || value[4] != b'-' || value[7] != b'-' {
+            return 0;
+        }
+        let (Some(year), Some(month), Some(day)) = (
+            w19_digits(&value[0..4]),
+            w19_digits(&value[5..7]),
+            w19_digits(&value[8..10]),
+        ) else {
+            return 0;
+        };
+        let (mut hour, mut minute, mut second) = (0, 0, 0);
+        if value.len() == 19 {
+            if value[10] != b' ' || value[13] != b':' || value[16] != b':' {
+                return 0;
+            }
+            let (Some(h), Some(i), Some(s)) = (
+                w19_digits(&value[11..13]),
+                w19_digits(&value[14..16]),
+                w19_digits(&value[17..19]),
+            ) else {
+                return 0;
+            };
+            (hour, minute, second) = (h, i, s);
+        }
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let days_in_month = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => return 0,
+        };
+        if !(1000..=9999).contains(&year)
+            || !(1..=days_in_month).contains(&day)
+            || hour > 23
+            || minute > 59
+            || second > 59
+        {
+            return 0;
+        }
+        out[..6].copy_from_slice(&[year, month, day, hour, minute, second]);
+        1
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave19_tests {
+    use super::*;
+
+    fn buf_call(f: impl Fn(*mut u8, usize) -> isize) -> Result<Vec<u8>, isize> {
+        let mut out = vec![0u8; 256];
+        let n = f(out.as_mut_ptr(), out.len());
+        if n < 0 {
+            return Err(n);
+        }
+        out.truncate(n as usize);
+        Ok(out)
+    }
+
+    #[test]
+    fn search_failure_counters() {
+        let mut next = 0i64;
+        assert_eq!(unsafe { nntmux_search_failure_next(4, &mut next) }, 0);
+        assert_eq!(next, 5);
+        assert_eq!(
+            unsafe { nntmux_search_failure_next(i64::MAX, &mut next) },
+            -1
+        );
+        assert_eq!(unsafe { nntmux_search_failure_next(-1, &mut next) }, -1);
+        assert_eq!(
+            unsafe { nntmux_search_failure_next(0, std::ptr::null_mut()) },
+            -1
+        );
+        assert_eq!(nntmux_search_failure_since(3, 3), 0);
+        assert_eq!(nntmux_search_failure_since(4, 3), 1);
+        assert_eq!(nntmux_search_failure_reached(2, 2), 1);
+        assert_eq!(nntmux_search_failure_reached(1, 2), 0);
+        assert_eq!(nntmux_search_failure_reached(5, 0), 0);
+        assert_eq!(nntmux_search_failure_reached(0, -3), 0);
+    }
+
+    #[test]
+    fn api_user_cache_key_and_classification() {
+        let key = buf_call(|o, c| unsafe { nntmux_api_user_cache_key(b"abc".as_ptr(), 3, o, c) });
+        assert_eq!(key.unwrap(), b"api_user:900150983cd24fb0d6963f7d28e17f72");
+        let empty =
+            buf_call(|o, c| unsafe { nntmux_api_user_cache_key(std::ptr::null(), 0, o, c) });
+        assert_eq!(empty.unwrap(), b"api_user:d41d8cd98f00b204e9800998ecf8427e");
+        let mut small = [0u8; 8];
+        assert_eq!(
+            unsafe { nntmux_api_user_cache_key(b"a".as_ptr(), 1, small.as_mut_ptr(), 8) },
+            -44
+        );
+        assert_eq!(
+            unsafe { nntmux_api_user_cache_key(std::ptr::null(), 1, small.as_mut_ptr(), 8) },
+            -1
+        );
+
+        let classify = |api: Option<&[u8]>, api_kind: i32, key: Option<&[u8]>, key_kind: i32| {
+            let (a, k) = (api.unwrap_or(b""), key.unwrap_or(b""));
+            let mut source = 9i32;
+            let r = unsafe {
+                nntmux_api_token_classify(
+                    a.as_ptr(),
+                    a.len(),
+                    api_kind,
+                    k.as_ptr(),
+                    k.len(),
+                    key_kind,
+                    &mut source,
+                )
+            };
+            (r, source)
+        };
+        assert_eq!(classify(Some(b"tok"), 1, Some(b"key"), 1), (2, 0));
+        assert_eq!(classify(Some(b" \t"), 1, Some(b"key"), 1), (1, 0));
+        assert_eq!(classify(Some(b""), 1, Some(b"key"), 1), (0, -1));
+        assert_eq!(classify(None, 2, Some(b"key"), 1), (0, -1));
+        assert_eq!(classify(None, 0, Some(b"key"), 1), (1, 1));
+        assert_eq!(classify(None, 0, Some(b""), 1), (0, -1));
+        assert_eq!(classify(None, 0, None, 2), (0, -1));
+        assert_eq!(classify(None, 0, None, 0), (0, -1));
+        assert_eq!(classify(None, 3, None, 0), (-1, 9));
+        // Misaligned `int32_t` output pointers are rejected.
+        let mut raw = [0u8; 16];
+        let misaligned = unsafe { raw.as_mut_ptr().add(1) } as *mut i32;
+        assert_eq!(
+            unsafe {
+                nntmux_api_token_classify(b"t".as_ptr(), 1, 1, std::ptr::null(), 0, 0, misaligned)
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_api_token_classify(
+                    b"t".as_ptr(),
+                    usize::MAX,
+                    1,
+                    std::ptr::null(),
+                    0,
+                    0,
+                    &mut 0,
+                )
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn throttle_helpers() {
+        let key = buf_call(|o, c| unsafe { nntmux_throttle_rate_limit_key(42, o, c) });
+        assert_eq!(key.unwrap(), b"api-rate-limit:user:42");
+        let key = buf_call(|o, c| unsafe { nntmux_throttle_rate_limit_key(i64::MIN, o, c) });
+        assert_eq!(key.unwrap(), b"api-rate-limit:user:-9223372036854775808");
+        assert_eq!(
+            unsafe { nntmux_throttle_rate_limit_key(1, std::ptr::null_mut(), 4) },
+            -1
+        );
+        assert_eq!(nntmux_throttle_max_attempts(0, 1, 60), 60);
+        assert_eq!(nntmux_throttle_max_attempts(0, 0, 60), 60);
+        assert_eq!(nntmux_throttle_max_attempts(-5, 0, 60), 1);
+        assert_eq!(nntmux_throttle_max_attempts(250, 0, 60), 250);
+        assert_eq!(nntmux_throttle_max_attempts(250, 2, 60), -1);
+        assert_eq!(nntmux_throttle_remaining(60, 3), 57);
+        assert_eq!(nntmux_throttle_remaining(60, 99), 0);
+        assert_eq!(nntmux_throttle_remaining(i64::MIN, 1), -1);
+        assert_eq!(nntmux_throttle_retry_after(0), 1);
+        assert_eq!(nntmux_throttle_retry_after(37), 37);
+        let header = buf_call(|o, c| unsafe {
+            nntmux_throttle_error_header(500, b"Request limit reached".as_ptr(), 21, o, c)
+        });
+        assert_eq!(header.unwrap(), b"API ERROR [500] Request limit reached");
+        let mut small = [0u8; 4];
+        assert_eq!(
+            unsafe { nntmux_throttle_error_header(5, std::ptr::null(), 0, small.as_mut_ptr(), 4) },
+            -(b"API ERROR [5] ".len() as isize + 3)
+        );
+    }
+
+    #[test]
+    fn no_cache_eligibility_and_vary() {
+        let prevent = |auth: i32, name: Option<&[u8]>| {
+            let n = name.unwrap_or(b"");
+            unsafe {
+                nntmux_nocache_should_prevent(auth, n.as_ptr(), n.len(), i32::from(name.is_some()))
+            }
+        };
+        assert_eq!(prevent(1, None), 1);
+        assert_eq!(prevent(0, None), 0);
+        assert_eq!(prevent(0, Some(b"2fa.verify")), 1);
+        assert_eq!(prevent(0, Some(b"Login")), 0);
+        assert_eq!(prevent(0, Some(b"home")), 0);
+        assert_eq!(prevent(2, None), -1);
+
+        let merge = |existing: &[u8], bearer: i32| {
+            buf_call(|o, c| unsafe {
+                nntmux_nocache_merge_vary(existing.as_ptr(), existing.len(), bearer, o, c)
+            })
+        };
+        assert_eq!(merge(b"", 0).unwrap(), b"Cookie");
+        assert_eq!(merge(b"", 1).unwrap(), b"Cookie, Authorization");
+        assert_eq!(
+            merge(b" Accept-Encoding ,0,, Cookie\x0b", 1).unwrap(),
+            b"Accept-Encoding, Cookie, Authorization"
+        );
+        assert_eq!(
+            merge(b"cookie,Authorization", 1).unwrap(),
+            b"cookie, Authorization, Cookie"
+        );
+        assert_eq!(merge(b"", 3), Err(-1));
+    }
+
+    #[test]
+    fn date_range_plan_and_parse() {
+        let plan = |s: i32, e: i32, p: i32, period: &[u8], is_str: i32| {
+            let mut out = [9i64; 2];
+            let r = unsafe {
+                nntmux_date_range_plan(
+                    s,
+                    e,
+                    p,
+                    period.as_ptr(),
+                    period.len(),
+                    is_str,
+                    30,
+                    out.as_mut_ptr(),
+                    2,
+                )
+            };
+            (r, out)
+        };
+        assert_eq!(plan(1, 1, 1, b"all", 1), (0, [0, 0]));
+        assert_eq!(plan(1, 0, 1, b"7days", 1), (0, [1, 7]));
+        assert_eq!(plan(0, 0, 1, b"year", 1), (0, [2, 0]));
+        assert_eq!(plan(0, 0, 1, b"all", 1), (0, [3, 0]));
+        assert_eq!(plan(0, 0, 1, b"ALL", 1), (0, [1, 30]));
+        assert_eq!(plan(0, 0, 1, b"", 0), (0, [1, 30]));
+        assert_eq!(plan(0, 0, 0, b"", 0), (0, [1, 30]));
+        assert_eq!(plan(0, 0, 2, b"", 0).0, -1);
+        let mut short = [0i64; 1];
+        assert_eq!(
+            unsafe {
+                nntmux_date_range_plan(0, 0, 0, std::ptr::null(), 0, 0, 30, short.as_mut_ptr(), 1)
+            },
+            -5
+        );
+
+        let parse = |value: &[u8]| {
+            let mut out = [0i64; 6];
+            let r = unsafe {
+                nntmux_date_range_parse_ymd(value.as_ptr(), value.len(), out.as_mut_ptr(), 6)
+            };
+            (r, out)
+        };
+        assert_eq!(parse(b"2026-10-24"), (1, [2026, 10, 24, 0, 0, 0]));
+        assert_eq!(
+            parse(b"2024-02-29 23:59:59"),
+            (1, [2024, 2, 29, 23, 59, 59])
+        );
+        assert_eq!(parse(b"2026-02-29").0, 0);
+        assert_eq!(parse(b"1900-02-29").0, 0);
+        assert_eq!(parse(b"2000-02-29").0, 1);
+        assert_eq!(parse(b"2026-13-01").0, 0);
+        assert_eq!(parse(b"2026-01-05 24:00:00").0, 0);
+        assert_eq!(parse(b"2026-01-05T10:00:00").0, 0);
+        assert_eq!(parse(b"0999-01-01").0, 0);
+        assert_eq!(parse(b"2026-1-05").0, 0);
+        assert_eq!(parse(b"+026-01-05").0, 0);
+        assert_eq!(parse(b"yesterday").0, 0);
+        assert_eq!(parse(b"").0, 0);
+    }
+
+    #[test]
+    fn date_range_rejects_misaligned_and_oversized_buffers() {
+        let mut raw = [0u8; 128];
+        let misaligned = unsafe { raw.as_mut_ptr().add(1) } as *mut i64;
+        assert_eq!(
+            unsafe { nntmux_date_range_plan(0, 0, 0, std::ptr::null(), 0, 0, 30, misaligned, 2) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_date_range_parse_ymd(b"2026-01-01".as_ptr(), 10, misaligned, 6) },
+            -1
+        );
+        let mut next_raw = [0u8; 16];
+        let misaligned_next = unsafe { next_raw.as_mut_ptr().add(3) } as *mut i64;
+        assert_eq!(
+            unsafe { nntmux_search_failure_next(1, misaligned_next) },
+            -1
+        );
+        let mut out = [0i64; 6];
+        assert_eq!(
+            unsafe {
+                nntmux_date_range_parse_ymd(b"2026".as_ptr(), usize::MAX, out.as_mut_ptr(), 6)
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_date_range_parse_ymd(b"2026".as_ptr(), 4, out.as_mut_ptr(), usize::MAX)
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_nocache_merge_vary(
+                    b"a".as_ptr(),
+                    isize::MAX as usize + 1,
+                    0,
+                    out.as_mut_ptr().cast(),
+                    8,
+                )
+            },
+            -1
+        );
+    }
+}
