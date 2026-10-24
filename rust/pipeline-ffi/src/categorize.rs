@@ -15338,3 +15338,849 @@ pub mod probes_collectors_inactivity_and_gdpr_erasure {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 23 Slice 23.5: AdminContentRequest, RegistrationPeriodRequest,
+// StoreIncidentRequest, UpdateRegistrationStatusRequest, and
+// ContactContactURequest pure-CPU helpers
+// ---------------------------------------------------------------------------
+
+pub mod admin_incident_content_requests {
+    use std::mem::size_of;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = (isize::MAX as usize) / 8;
+
+    #[inline]
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || !ptr.is_aligned()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_buf.is_aligned()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    #[inline]
+    fn valid_mut_ptr<T>(ptr: *mut T) -> bool {
+        !ptr.is_null()
+            && ptr.is_aligned()
+            && (ptr as usize).checked_add(size_of::<T>()).is_some()
+    }
+
+    #[inline]
+    fn valid_mut_slice<T>(ptr: *mut T, len: usize) -> bool {
+        if ptr.is_null() || !ptr.is_aligned() {
+            return false;
+        }
+        let Some(byte_len) = len.checked_mul(size_of::<T>()) else {
+            return false;
+        };
+        byte_len <= isize::MAX as usize && (ptr as usize).checked_add(byte_len).is_some()
+    }
+
+    #[inline]
+    fn valid_const_slice<T>(ptr: *const T, len: usize) -> bool {
+        if ptr.is_null() || !ptr.is_aligned() {
+            return false;
+        }
+        let Some(byte_len) = len.checked_mul(size_of::<T>()) else {
+            return false;
+        };
+        byte_len <= isize::MAX as usize && (ptr as usize).checked_add(byte_len).is_some()
+    }
+
+    #[inline]
+    unsafe fn write_bytes(out_buf: *mut u8, out_cap: usize, bytes: &[u8]) -> isize {
+        if !valid_out_buf(out_buf, out_cap) {
+            return DECLINE;
+        }
+        let needed = bytes.len();
+        if needed > isize::MAX as usize {
+            return DECLINE;
+        }
+        if needed > out_cap {
+            let neg = -(needed as isize);
+            return if neg == -1 { -2 } else { neg };
+        }
+        if needed > 0 {
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, needed) };
+            dst.copy_from_slice(bytes);
+        }
+        needed as isize
+    }
+
+    #[inline]
+    fn is_php_trim_byte(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B)
+    }
+
+    #[inline]
+    fn is_ascii_space_no_nul(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C)
+    }
+
+    #[inline]
+    fn php_trim_bytes(bytes: &[u8]) -> &[u8] {
+        let mut start = 0usize;
+        let mut end = bytes.len();
+        while start < end && is_php_trim_byte(bytes[start]) {
+            start += 1;
+        }
+        while end > start && is_php_trim_byte(bytes[end - 1]) {
+            end -= 1;
+        }
+        &bytes[start..end]
+    }
+
+    #[inline]
+    fn format_i64_dec(v: i64, buf: &mut [u8; 24]) -> &[u8] {
+        let mut n = v.unsigned_abs();
+        let mut i = buf.len();
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        if v < 0 {
+            i -= 1;
+            buf[i] = b'-';
+        }
+        &buf[i..]
+    }
+
+    /// Classifies a string for PHP `is_numeric($period) ? (int) $period : null`:
+    /// - `Ok(Some(val))`: canonical ASCII signed/unsigned decimal integer fitting `i64`.
+    /// - `Ok(None)`: definitely non-numeric string (empty, whitespace-only, or contains non-digit/non-float characters without numeric prefix).
+    /// - `Err(())`: decimal/scientific/overflow string that should decline to PHP `is_numeric()`.
+    #[inline]
+    fn classify_numeric_int_string(bytes: &[u8]) -> Result<Option<i64>, ()> {
+        if bytes.contains(&0) {
+            return Ok(None);
+        }
+        let mut start = 0usize;
+        let mut end = bytes.len();
+        while start < end && is_ascii_space_no_nul(bytes[start]) {
+            start += 1;
+        }
+        while end > start && is_ascii_space_no_nul(bytes[end - 1]) {
+            end -= 1;
+        }
+        let trimmed = &bytes[start..end];
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let (neg, digits) = match trimmed[0] {
+            b'+' => (false, &trimmed[1..]),
+            b'-' => (true, &trimmed[1..]),
+            _ => (false, trimmed),
+        };
+        if digits.is_empty() {
+            return Ok(None);
+        }
+        if digits.iter().all(u8::is_ascii_digit) {
+            let mut val: i64 = 0;
+            if neg {
+                for &b in digits {
+                    val = val.checked_mul(10).ok_or(())?.checked_sub(i64::from(b - b'0')).ok_or(())?;
+                }
+            } else {
+                for &b in digits {
+                    val = val.checked_mul(10).ok_or(())?.checked_add(i64::from(b - b'0')).ok_or(())?;
+                }
+            }
+            return Ok(Some(val));
+        }
+        if digits
+            .iter()
+            .all(|&b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-'))
+        {
+            return Err(());
+        }
+        Ok(None)
+    }
+
+    #[inline]
+    fn split_exact_nul_segments(bytes: &[u8], expected_count: usize) -> Option<Vec<&[u8]>> {
+        if expected_count == 0 {
+            return bytes.is_empty().then_some(Vec::new());
+        }
+        let parts: Vec<&[u8]> = bytes.split(|&b| b == 0).collect();
+        (parts.len() == expected_count).then_some(parts)
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. AdminContentRequest helpers
+    // -------------------------------------------------------------------------
+
+    /// Trims the 5 string fields (`action`, `title`, `url`, `metadescription`, `metakeywords`)
+    /// selected by `string_mask` (`0..=31`) using PHP default `trim()`, writing trimmed byte
+    /// lengths into `out_lens[0..5]` and concatenated bytes into `out_buf`.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_content_normalize_inputs(
+        string_mask: u32,
+        action_ptr: *const u8,
+        action_len: usize,
+        title_ptr: *const u8,
+        title_len: usize,
+        url_ptr: *const u8,
+        url_len: usize,
+        desc_ptr: *const u8,
+        desc_len: usize,
+        kw_ptr: *const u8,
+        kw_len: usize,
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if string_mask >= 32
+                || !valid_mut_slice(out_lens, 5)
+                || !valid_out_buf(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some(s0) = (unsafe { valid_slice(action_ptr, action_len) }) else {
+                return DECLINE;
+            };
+            let Some(s1) = (unsafe { valid_slice(title_ptr, title_len) }) else {
+                return DECLINE;
+            };
+            let Some(s2) = (unsafe { valid_slice(url_ptr, url_len) }) else {
+                return DECLINE;
+            };
+            let Some(s3) = (unsafe { valid_slice(desc_ptr, desc_len) }) else {
+                return DECLINE;
+            };
+            let Some(s4) = (unsafe { valid_slice(kw_ptr, kw_len) }) else {
+                return DECLINE;
+            };
+
+            let raw = [s0, s1, s2, s3, s4];
+            let mut trimmed: [&[u8]; 5] = [&[]; 5];
+            let mut needed = 0usize;
+            for i in 0..5 {
+                if (string_mask & (1 << i)) != 0 {
+                    let t = php_trim_bytes(raw[i]);
+                    let Some(next) = needed.checked_add(t.len()) else {
+                        return DECLINE;
+                    };
+                    if next > isize::MAX as usize {
+                        return DECLINE;
+                    }
+                    needed = next;
+                    trimmed[i] = t;
+                }
+            }
+
+            if needed > out_cap {
+                let neg = -(needed as isize);
+                return if neg == -1 { -2 } else { neg };
+            }
+
+            let lens_out = unsafe { slice::from_raw_parts_mut(out_lens, 5) };
+            let mut offset = 0usize;
+            for i in 0..5 {
+                let part = trimmed[i];
+                lens_out[i] = part.len();
+                if !part.is_empty() {
+                    let dst =
+                        unsafe { slice::from_raw_parts_mut(out_buf.add(offset), part.len()) };
+                    dst.copy_from_slice(part);
+                    offset += part.len();
+                }
+            }
+            needed as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Evaluates `AdminContentRequest::isSubmitAction($method, $action)`
+    /// (`strcasecmp($method, 'POST') === 0 && $action === 'submit'`).
+    /// Returns `1` when true, `0` when false, or `-1` on invalid arguments.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_content_is_submit_action(
+        method_ptr: *const u8,
+        method_len: usize,
+        action_is_str: u32,
+        action_ptr: *const u8,
+        action_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if action_is_str > 1 {
+                return -1;
+            }
+            let Some(method) = (unsafe { valid_slice(method_ptr, method_len) }) else {
+                return -1;
+            };
+            let Some(action) = (unsafe { valid_slice(action_ptr, action_len) }) else {
+                return -1;
+            };
+            i32::from(
+                method.eq_ignore_ascii_case(b"POST")
+                    && action_is_str == 1
+                    && action == b"submit",
+            )
+        }))
+        .unwrap_or(-1)
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. RegistrationPeriodRequest helpers
+    // -------------------------------------------------------------------------
+
+    /// Resolves the route `period` parameter ID (`?int`) for `RegistrationPeriodRequest`.
+    /// `kind`: `0` = null/non-numeric, `1` = integer (`int_val`), `2` = string (`str_ptr[..str_len]`).
+    /// Writes `out_has_id` (`0` or `1`) and `out_id`, returning `1` on success, `-2` when declined to PHP,
+    /// or `-1` on invalid/unaligned pointers.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_registration_period_resolve_route_id(
+        kind: i32,
+        int_val: i64,
+        str_ptr: *const u8,
+        str_len: usize,
+        out_has_id: *mut i32,
+        out_id: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_ptr(out_has_id) || !valid_mut_ptr(out_id) {
+                return -1;
+            }
+            let Some(str_bytes) = (unsafe { valid_slice(str_ptr, str_len) }) else {
+                return -1;
+            };
+            let (has_id, id_val) = match kind {
+                0 => (0i32, 0i64),
+                1 => (1i32, int_val),
+                2 => match classify_numeric_int_string(str_bytes) {
+                    Ok(Some(v)) => (1i32, v),
+                    Ok(None) => (0i32, 0i64),
+                    Err(()) => return -2,
+                },
+                _ => return -1,
+            };
+            unsafe {
+                *out_has_id = has_id;
+                *out_id = id_val;
+            }
+            1
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Evaluates whether existing period `[start_a, end_a]` overlaps candidate period `[start_b, end_b]`
+    /// under `RegistrationPeriodRequest`'s 3-branch overlap query predicate.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_registration_period_intervals_overlap(
+        start_a: i64,
+        end_a: i64,
+        start_b: i64,
+        end_b: i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let overlaps = (start_a >= start_b && start_a <= end_b)
+                || (end_a >= start_b && end_a <= end_b)
+                || (start_a <= start_b && end_a >= end_b);
+            i32::from(overlaps)
+        }))
+        .unwrap_or(-1)
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. StoreIncidentRequest helpers
+    // -------------------------------------------------------------------------
+
+    /// Sanitizes NUL-delimited `impact` and `status` enum value lists (trimming PHP whitespace,
+    /// dropping empty values, and deduplicating in first-seen order) and builds `in:` constraint
+    /// rule strings for `StoreIncidentRequest`.
+    /// Writes `[impact_count, status_count, impact_vals_len, status_vals_len, impact_rule_len, status_rule_len, title_max, service_status_ids_min]`
+    /// into `out_meta[0..8]` and the 4 concatenated byte sections into `out_buf`.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_store_incident_validation_spec(
+        impact_ptr: *const u8,
+        impact_len: usize,
+        impact_count: usize,
+        status_ptr: *const u8,
+        status_len: usize,
+        status_count: usize,
+        out_meta: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_meta, 8) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(impact_raw) = (unsafe { valid_slice(impact_ptr, impact_len) }) else {
+                return DECLINE;
+            };
+            let Some(status_raw) = (unsafe { valid_slice(status_ptr, status_len) }) else {
+                return DECLINE;
+            };
+            let Some(impact_parts) = split_exact_nul_segments(impact_raw, impact_count) else {
+                return DECLINE;
+            };
+            let Some(status_parts) = split_exact_nul_segments(status_raw, status_count) else {
+                return DECLINE;
+            };
+
+            let mut clean_impact: Vec<&[u8]> = Vec::with_capacity(impact_parts.len());
+            for part in impact_parts {
+                let t = php_trim_bytes(part);
+                if !t.is_empty() && !clean_impact.contains(&t) {
+                    clean_impact.push(t);
+                }
+            }
+
+            let mut clean_status: Vec<&[u8]> = Vec::with_capacity(status_parts.len());
+            for part in status_parts {
+                let t = php_trim_bytes(part);
+                if !t.is_empty() && !clean_status.contains(&t) {
+                    clean_status.push(t);
+                }
+            }
+
+            let mut buf = Vec::with_capacity(128);
+            for (i, item) in clean_impact.iter().enumerate() {
+                if i > 0 {
+                    buf.push(0);
+                }
+                buf.extend_from_slice(item);
+            }
+            let impact_vals_len = buf.len();
+
+            for (i, item) in clean_status.iter().enumerate() {
+                if i > 0 {
+                    buf.push(0);
+                }
+                buf.extend_from_slice(item);
+            }
+            let status_vals_len = buf.len() - impact_vals_len;
+
+            let rule1_start = buf.len();
+            buf.extend_from_slice(b"in:");
+            for (i, item) in clean_impact.iter().enumerate() {
+                if i > 0 {
+                    buf.push(b',');
+                }
+                buf.extend_from_slice(item);
+            }
+            let impact_rule_len = buf.len() - rule1_start;
+
+            let rule2_start = buf.len();
+            buf.extend_from_slice(b"in:");
+            for (i, item) in clean_status.iter().enumerate() {
+                if i > 0 {
+                    buf.push(b',');
+                }
+                buf.extend_from_slice(item);
+            }
+            let status_rule_len = buf.len() - rule2_start;
+
+            let written = unsafe { write_bytes(out_buf, out_cap, &buf) };
+            if written >= 0 {
+                let meta = unsafe { slice::from_raw_parts_mut(out_meta, 8) };
+                meta[0] = clean_impact.len();
+                meta[1] = clean_status.len();
+                meta[2] = impact_vals_len;
+                meta[3] = status_vals_len;
+                meta[4] = impact_rule_len;
+                meta[5] = status_rule_len;
+                meta[6] = 255;
+                meta[7] = 1;
+            }
+            written
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. UpdateRegistrationStatusRequest helpers
+    // -------------------------------------------------------------------------
+
+    /// Formats `'in:' . implode(',', $statusValues)` for `UpdateRegistrationStatusRequest`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_update_registration_status_in_rule(
+        values_ptr: *const i64,
+        values_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_const_slice(values_ptr, values_len) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let values: &[i64] = if values_len == 0 {
+                &[]
+            } else {
+                unsafe { slice::from_raw_parts(values_ptr, values_len) }
+            };
+
+            let mut buf = Vec::with_capacity(3 + values.len() * 4);
+            buf.extend_from_slice(b"in:");
+            let mut dec = [0u8; 24];
+            for (i, &val) in values.iter().enumerate() {
+                if i > 0 {
+                    buf.push(b',');
+                }
+                buf.extend_from_slice(format_i64_dec(val, &mut dec));
+            }
+
+            unsafe { write_bytes(out_buf, out_cap, &buf) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. ContactContactURequest helpers
+    // -------------------------------------------------------------------------
+
+    /// Builds NUL-separated `key\0value` rule pairs for `ContactContactURequest::rules()`,
+    /// merging extra CAPTCHA rules when `captcha_enabled == 1`.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_contact_request_build_rules(
+        captcha_enabled: u32,
+        extra_keys_ptr: *const u8,
+        extra_keys_len: usize,
+        extra_vals_ptr: *const u8,
+        extra_vals_len: usize,
+        extra_count: usize,
+        out_pair_count: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if captcha_enabled > 1
+                || !valid_mut_ptr(out_pair_count)
+                || !valid_out_buf(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some(extra_keys_raw) = (unsafe { valid_slice(extra_keys_ptr, extra_keys_len) })
+            else {
+                return DECLINE;
+            };
+            let Some(extra_vals_raw) = (unsafe { valid_slice(extra_vals_ptr, extra_vals_len) })
+            else {
+                return DECLINE;
+            };
+
+            let mut pairs: Vec<(&[u8], &[u8])> = vec![
+                (b"username", b"required|string|max:255"),
+                (b"useremail", b"required|email|max:255"),
+                (b"comment", b"required|string|min:10"),
+            ];
+
+            if captcha_enabled == 1 && extra_count > 0 {
+                let Some(keys) = split_exact_nul_segments(extra_keys_raw, extra_count) else {
+                    return DECLINE;
+                };
+                let Some(vals) = split_exact_nul_segments(extra_vals_raw, extra_count) else {
+                    return DECLINE;
+                };
+                for (k, v) in keys.into_iter().zip(vals.into_iter()) {
+                    if k.is_empty() {
+                        return DECLINE;
+                    }
+                    if let Some(existing) = pairs.iter_mut().find(|(ek, _)| *ek == k) {
+                        existing.1 = v;
+                    } else {
+                        pairs.push((k, v));
+                    }
+                }
+            } else if extra_count > 0 {
+                if split_exact_nul_segments(extra_keys_raw, extra_count).is_none()
+                    || split_exact_nul_segments(extra_vals_raw, extra_count).is_none()
+                {
+                    return DECLINE;
+                }
+            } else if !extra_keys_raw.is_empty() || !extra_vals_raw.is_empty() {
+                return DECLINE;
+            }
+
+            let mut buf = Vec::with_capacity(160);
+            for (i, (k, v)) in pairs.iter().enumerate() {
+                if i > 0 {
+                    buf.push(0);
+                }
+                buf.extend_from_slice(k);
+                buf.push(0);
+                buf.extend_from_slice(v);
+            }
+
+            let written = unsafe { write_bytes(out_buf, out_cap, &buf) };
+            if written >= 0 {
+                unsafe {
+                    *out_pair_count = pairs.len();
+                }
+            }
+            written
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Writes NUL-separated `key\0message` pairs for `ContactContactURequest::messages()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_contact_request_validation_messages(
+        out_pair_count: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_ptr(out_pair_count) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            const PAYLOAD: &[u8] = concat!(
+                "username.required\0Please enter your name.\0",
+                "useremail.required\0Please enter your email address.\0",
+                "useremail.email\0Please enter a valid email address.\0",
+                "comment.required\0Please enter your message.\0",
+                "comment.min\0Your message must be at least 10 characters long."
+            )
+            .as_bytes();
+
+            let written = unsafe { write_bytes(out_buf, out_cap, PAYLOAD) };
+            if written >= 0 {
+                unsafe {
+                    *out_pair_count = 5;
+                }
+            }
+            written
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn admin_content_and_registration_period_helpers() {
+            let mut lens = [0usize; 5];
+            let mut buf = [0u8; 256];
+            let n = unsafe {
+                nntmux_admin_content_normalize_inputs(
+                    0b11111,
+                    b"  submit ".as_ptr(),
+                    9,
+                    b" Welcome \n".as_ptr(),
+                    10,
+                    b"\t/home\t".as_ptr(),
+                    7,
+                    b" Desc ".as_ptr(),
+                    6,
+                    b" kw1, kw2 ".as_ptr(),
+                    10,
+                    lens.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(n > 0);
+            assert_eq!(lens, [6, 7, 5, 4, 8]);
+            assert_eq!(&buf[..n as usize], b"submitWelcome/homeDesckw1, kw2");
+
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_content_is_submit_action(
+                        b"post".as_ptr(),
+                        4,
+                        1,
+                        b"submit".as_ptr(),
+                        6,
+                    )
+                },
+                1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_content_is_submit_action(
+                        b"GET".as_ptr(),
+                        3,
+                        1,
+                        b"submit".as_ptr(),
+                        6,
+                    )
+                },
+                0
+            );
+
+            let mut has_id = -1i32;
+            let mut id_val = -1i64;
+            assert_eq!(
+                unsafe {
+                    nntmux_registration_period_resolve_route_id(
+                        2,
+                        0,
+                        b" 42 ".as_ptr(),
+                        4,
+                        &mut has_id,
+                        &mut id_val,
+                    )
+                },
+                1
+            );
+            assert_eq!((has_id, id_val), (1, 42));
+
+            assert_eq!(
+                unsafe { nntmux_registration_period_intervals_overlap(100, 200, 150, 250) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_registration_period_intervals_overlap(100, 200, 201, 300) },
+                0
+            );
+        }
+
+        #[test]
+        fn incident_registration_status_and_contact_helpers() {
+            let mut meta = [0usize; 8];
+            let mut buf = [0u8; 512];
+            let impact = b"none\0minor\0major\0critical";
+            let status = b"investigating\0identified\0monitoring\0resolved";
+            let n = unsafe {
+                nntmux_store_incident_validation_spec(
+                    impact.as_ptr(),
+                    impact.len(),
+                    4,
+                    status.as_ptr(),
+                    status.len(),
+                    4,
+                    meta.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(n > 0);
+            assert_eq!((meta[0], meta[1], meta[6], meta[7]), (4, 4, 255, 1));
+
+            let vals = [0i64, 1, 2];
+            let rn = unsafe {
+                nntmux_update_registration_status_in_rule(
+                    vals.as_ptr(),
+                    vals.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..rn as usize], b"in:0,1,2");
+
+            let mut pair_count = 0usize;
+            let cn = unsafe {
+                nntmux_contact_request_build_rules(
+                    1,
+                    b"g-recaptcha-response".as_ptr(),
+                    20,
+                    b"required|captcha".as_ptr(),
+                    16,
+                    1,
+                    &mut pair_count,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(cn > 0);
+            assert_eq!(pair_count, 4);
+
+            let mn = unsafe {
+                nntmux_contact_request_validation_messages(
+                    &mut pair_count,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(mn > 0);
+            assert_eq!(pair_count, 5);
+        }
+
+        #[test]
+        fn wave23_slice5_rejects_null_unaligned_and_undersized_buffers() {
+            let mut raw = [0u8; 128];
+            let unaligned_usize = unsafe { raw.as_mut_ptr().add(1).cast::<usize>() };
+            let unaligned_i32 = unsafe { raw.as_mut_ptr().add(1).cast::<i32>() };
+            let unaligned_i64 = unsafe { raw.as_mut_ptr().add(1).cast::<i64>() };
+            let unaligned_const_i64 = unsafe { raw.as_ptr().add(1).cast::<i64>() };
+            let mut small = [b'Z'; 4];
+            let mut pair_count = 777usize;
+
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_content_normalize_inputs(
+                        1,
+                        b"a".as_ptr(),
+                        1,
+                        b"".as_ptr(),
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        unaligned_usize,
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_registration_period_resolve_route_id(
+                        1,
+                        42,
+                        b"".as_ptr(),
+                        0,
+                        unaligned_i32,
+                        unaligned_i64,
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_update_registration_status_in_rule(
+                        unaligned_const_i64,
+                        1,
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                DECLINE
+            );
+            let short = unsafe {
+                nntmux_contact_request_validation_messages(
+                    &mut pair_count,
+                    small.as_mut_ptr(),
+                    small.len(),
+                )
+            };
+            assert!(short < -1);
+            assert_eq!(pair_count, 777);
+            assert_eq!(&small, &[b'Z'; 4]);
+        }
+    }
+}
+
