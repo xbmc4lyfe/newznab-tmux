@@ -7,6 +7,7 @@ namespace App\Console\Commands;
 use App\Enums\TmuxPaneRole;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
+use App\Services\Runners\BaseRunner;
 use App\Services\Tmux\TmuxCommand;
 use App\Services\Tmux\TmuxPaneManager;
 use App\Services\Tmux\TmuxSessionManager;
@@ -17,6 +18,18 @@ use Throwable;
 
 class TmuxDrain extends Command
 {
+    private static ?bool $useRustFfi = null;
+
+    public static function setUseRustFfi(?bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
     protected $signature = 'tmux:drain
                             {--session= : Tmux session name}
                             {--timeout=90 : Maximum seconds to wait for active processing workers}
@@ -205,7 +218,19 @@ class TmuxDrain extends Command
 
     protected function monitorRecoveryTimeout(): int
     {
+        return (self::usesRustFfi() ? $this->monitorRecoveryTimeoutNative() : null) ?? $this->monitorRecoveryTimeoutPhp();
+    }
+
+    public function monitorRecoveryTimeoutPhp(): int
+    {
         return 15;
+    }
+
+    public function monitorRecoveryTimeoutNative(): ?int
+    {
+        $value = BaseRunner::runnerTransformNative(14, []);
+
+        return $value !== null ? (int) $value : null;
     }
 
     private function setDrainFlag(TmuxSessionManager $session, bool $draining): void

@@ -159,6 +159,26 @@ class ReleasesRunner extends BaseRunner
 
     protected function workerFollowUp(string|int $key, float $startedAt): ?array
     {
+        return self::usesRustFfi() ? $this->workerFollowUpNative($key, $startedAt) : $this->workerFollowUpPhp($key, $startedAt);
+    }
+
+    /** @return array{command: list<string>, not_before: float}|null */
+    public function workerFollowUpNative(string|int $key, float $startedAt): ?array
+    {
+        if ($this->rollingInterval === 0) {
+            return null;
+        }
+        $deadline = self::followUpDeadlineNative($startedAt, $this->rollingInterval);
+        if ($deadline === null) {
+            return $this->workerFollowUpPhp($key, $startedAt);
+        }
+
+        return ['command' => $this->buildDnrCommand('releases  '.$key), 'not_before' => $deadline];
+    }
+
+    /** @return array{command: list<string>, not_before: float}|null */
+    public function workerFollowUpPhp(string|int $key, float $startedAt): ?array
+    {
         if ($this->rollingInterval === 0) {
             return null;
         }
