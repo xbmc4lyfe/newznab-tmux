@@ -10301,3 +10301,1088 @@ pub mod candidate_inventory {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// ReleaseFingerprintCollector reconciliation accelerators.
+//
+// Inputs arrive as PHP `serialize()` documents or flat scalars; structured results leave as
+// `serialize()` output so PHP rebuilds them in its C runtime. Every export returns `-1` when
+// PHP must evaluate the input itself (types or values whose PHP semantics are not reproduced
+// here), and a negative length below `-1` when `out_cap` is too small for the result.
+// ---------------------------------------------------------------------------
+
+pub mod release_fingerprint_reconcile {
+    use std::collections::HashMap;
+    use std::slice;
+
+    use super::{
+        OutCursor, PhpKey, PhpNode, PhpSerParser, PhpSerWriter, PhpVal, opt_int, opt_is_false,
+        opt_is_true, opt_str, par2_declared_yenc_crc32_valid,
+    };
+
+    const FALLBACK: isize = -1;
+
+    /// Timestamps beyond this magnitude (about 34,800 years) are formatted by PHP.
+    const MAX_TIMESTAMP_MAGNITUDE: i64 = 1 << 40;
+
+    pub const RANGE_VALID_CRC: i64 = 0;
+    pub const RANGE_VALID_NO_CRC: i64 = 1;
+    pub const RANGE_IDENTITY_UNVERIFIED: i64 = 2;
+    pub const RANGE_UNMATCHED_ESCAPE: i64 = 3;
+    pub const RANGE_UNAVAILABLE: i64 = 4;
+    pub const RANGE_SIZE_MISMATCH: i64 = 5;
+    pub const RANGE_INTEGRITY_MISMATCH: i64 = 6;
+
+    #[inline]
+    unsafe fn bytes<'a>(data: *const u8, length: usize) -> Option<&'a [u8]> {
+        if length == 0 {
+            return Some(&[]);
+        }
+        if data.is_null() || length > isize::MAX as usize {
+            return None;
+        }
+        Some(unsafe { slice::from_raw_parts(data, length) })
+    }
+
+    #[inline]
+    unsafe fn emit(out_buf: *mut u8, out_cap: usize, data: &[u8]) -> isize {
+        let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+        out.extend(data);
+        out.finish()
+    }
+
+    #[inline]
+    fn crc_hex(s: &[u8]) -> bool {
+        (1..=8).contains(&s.len()) && s.iter().all(u8::is_ascii_hexdigit)
+    }
+
+    #[inline]
+    fn md5_hex(s: &[u8]) -> bool {
+        s.len() == 32 && s.iter().all(u8::is_ascii_hexdigit)
+    }
+
+    #[inline]
+    fn list_item<'n, 'a>(list: &'n PhpNode<'a>, index: usize) -> Option<&'n PhpNode<'a>> {
+        match list.items().get(index) {
+            Some((PhpKey::Int(i), node)) if *i == index as i64 => Some(node),
+            _ => None,
+        }
+    }
+
+    /// `$node ?? null` for a list slot: `None` for a missing slot or `null`.
+    #[inline]
+    fn present<'n, 'a>(node: Option<&'n PhpNode<'a>>) -> Option<&'n PhpNode<'a>> {
+        node.filter(|n| !matches!(n.val, PhpVal::Null))
+    }
+
+    // ---- ReleaseFingerprintCollector::decodedFileRange ------------------------
+
+    /// Computes the outcome of `decodedFileRange()` once the body response identity is known.
+    /// `fields` is `[$yenc, part_matches, total_matches, trailer_part_matches,
+    /// trailer_total_matches]`; `decoded_size` is `-1` when no decoded bytes exist.
+    /// Returns `(code, start, end_exclusive, file_size)`.
+    fn decoded_file_range(
+        fields: &PhpNode<'_>,
+        decoded_size: i64,
+        identity_verified: bool,
+    ) -> Option<[i64; 4]> {
+        if fields.items().len() != 5 {
+            return None;
+        }
+        let at = |i: usize| list_item(fields, i);
+        let yenc = at(0)?;
+        if !identity_verified {
+            return Some([RANGE_IDENTITY_UNVERIFIED, 0, 0, 0]);
+        }
+        if yenc.is_arr() && opt_is_false(yenc.get(b"payload_escape_state_valid")) {
+            return Some([RANGE_UNMATCHED_ESCAPE, 0, 0, 0]);
+        }
+        if !yenc.is_arr() || decoded_size < 0 {
+            return Some([RANGE_UNAVAILABLE, 0, 0, 0]);
+        }
+        let file_size = opt_int(yenc.get(b"file_size"));
+        let multipart = opt_is_true(yenc.get(b"multipart"));
+        let begin = opt_int(yenc.get(b"begin"));
+        let end = opt_int(yenc.get(b"end"));
+        let range_valid = if multipart {
+            opt_is_true(yenc.get(b"ypart_range_valid"))
+                && matches!((begin, end), (Some(b), Some(e)) if b >= 1 && e >= b && decoded_size == e - b + 1)
+        } else {
+            file_size == Some(decoded_size)
+                && !opt_is_false(yenc.get(b"decoded_size_matches_yend_size"))
+        };
+        let Some(file_size) = file_size.filter(|&s| range_valid && s >= 0) else {
+            return Some([RANGE_SIZE_MISMATCH, 0, 0, 0]);
+        };
+
+        let part_matches = opt_is_true(at(1));
+        let total_matches = !opt_is_false(at(2)) && !opt_is_false(at(3)) && !opt_is_false(at(4));
+        let size_matches = opt_is_true(yenc.get(b"header_numeric_fields_valid"))
+            && opt_is_true(yenc.get(b"trailer_numeric_fields_valid"))
+            && opt_is_true(yenc.get(b"trailer_size_is_decimal"))
+            && opt_is_true(yenc.get(b"decoded_size_matches_yenc"))
+            && opt_is_true(yenc.get(b"decoded_size_matches_yend_size"));
+        let crc_syntax_valid = opt_is_true(yenc.get(b"all_declared_crc32_fields_are_hex"));
+        let observed = opt_str(yenc.get(b"observed_decoded_crc32"));
+        let mut crc_values_match = observed.is_some();
+        let has_part = yenc.coalesce(b"part").is_some();
+        let segment_fields: &[&[u8]] = if has_part {
+            &[b"pcrc32"]
+        } else {
+            &[b"pcrc32", b"crc32"]
+        };
+        for field in segment_fields {
+            let Some(declared) = yenc.coalesce(field) else {
+                continue;
+            };
+            let matched = match (declared.as_str(), observed) {
+                (Some(d), Some(o)) if crc_hex(d) => {
+                    let pad = 8usize.saturating_sub(d.len());
+                    o.len() == pad + d.len()
+                        && o[..pad].iter().all(|&b| b == b'0')
+                        && o[pad..].eq_ignore_ascii_case(d)
+                }
+                _ => false,
+            };
+            if !matched {
+                crc_values_match = false;
+            }
+        }
+        let crc_valid = par2_declared_yenc_crc32_valid(yenc)
+            && opt_is_true(yenc.get(b"declared_crc32_matches"))
+            && (multipart || crc_values_match);
+        let basis = opt_str(yenc.coalesce(b"segment_crc32_basis"));
+        let crc_declared = !matches!(basis, Some(b"missing-pcrc32" | b"missing-crc32"));
+        let integrity_valid = size_matches
+            && total_matches
+            && crc_syntax_valid
+            && (!multipart || (part_matches && crc_valid))
+            && (multipart || !crc_declared || crc_valid)
+            && (multipart || !has_part);
+        if !integrity_valid {
+            return Some([RANGE_INTEGRITY_MISMATCH, 0, 0, 0]);
+        }
+        let (start, end) = if multipart {
+            (begin? - 1, end?)
+        } else {
+            (0, decoded_size)
+        };
+        let code = if crc_valid {
+            RANGE_VALID_CRC
+        } else {
+            RANGE_VALID_NO_CRC
+        };
+        Some([code, start, end, file_size])
+    }
+
+    /// `ReleaseFingerprintCollector::decodedFileRange` over
+    /// `serialize([$yenc, part_matches, total_matches, trailer_part_matches, trailer_total_matches])`.
+    ///
+    /// `out` receives `[code, start, end_exclusive, file_size]` (codes are the `RANGE_*`
+    /// constants). Returns `0`, or `-1` when PHP must compute the range.
+    ///
+    /// # Safety
+    ///
+    /// `data` must be valid for `length` bytes and `out` for four `int64_t` values.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_release_fp_decoded_file_range_packed(
+        data: *const u8,
+        length: usize,
+        decoded_size: i64,
+        identity_verified: i32,
+        out: *mut i64,
+    ) -> i32 {
+        if out.is_null() {
+            return -1;
+        }
+        let Some(data) = (unsafe { bytes(data, length) }) else {
+            return -1;
+        };
+        let Some(doc) = PhpSerParser::parse_document(data) else {
+            return -1;
+        };
+        let Some(result) = decoded_file_range(&doc, decoded_size, identity_verified != 0) else {
+            return -1;
+        };
+        unsafe { slice::from_raw_parts_mut(out, 4) }.copy_from_slice(&result);
+        0
+    }
+
+    // ---- ReleaseFingerprintCollector::matchPar2SourcesToNzbFiles --------------
+
+    const MATCHED: &[u8] = b"matched_prefix_and_length";
+    const STATUSES: [&[u8]; 7] = [
+        MATCHED,
+        b"ambiguous",
+        b"unmatched",
+        b"contradictory_length",
+        b"insufficient_prefix",
+        b"length_unavailable",
+        b"integrity_conflict",
+    ];
+    const COUNT_KEYS: [&[u8]; 7] = [
+        b"matched_prefix_and_length_count",
+        b"ambiguous_count",
+        b"unmatched_count",
+        b"contradictory_length_count",
+        b"insufficient_prefix_count",
+        b"length_unavailable_count",
+        b"integrity_conflict_count",
+    ];
+    const YENC_CONFLICTS: [(&[u8], &[u8]); 11] = [
+        (b"payload_escape_state_valid", b"unmatched_yenc_escape"),
+        (
+            b"header_numeric_fields_valid",
+            b"invalid_yenc_numeric_fields",
+        ),
+        (
+            b"trailer_numeric_fields_valid",
+            b"invalid_yend_numeric_fields",
+        ),
+        (
+            b"decoded_size_matches_header_size",
+            b"decoded_size_header_size_mismatch",
+        ),
+        (
+            b"decoded_size_matches_ypart_range",
+            b"decoded_size_ypart_range_mismatch",
+        ),
+        (
+            b"decoded_size_matches_yend_size",
+            b"decoded_size_yend_size_mismatch",
+        ),
+        (b"trailer_size_is_decimal", b"invalid_yend_size"),
+        (
+            b"all_declared_crc32_fields_are_hex",
+            b"invalid_declared_crc32_field",
+        ),
+        (b"declared_crc32_matches", b"declared_crc32_mismatch"),
+        (b"trailer_part_matches_header", b"yend_part_header_mismatch"),
+        (
+            b"trailer_total_matches_header",
+            b"yend_total_header_mismatch",
+        ),
+    ];
+    const NZB_CONFLICTS: [&[u8]; 4] = [
+        b"yenc_part_number_nzb_mismatch",
+        b"yenc_total_parts_nzb_mismatch",
+        b"yend_part_number_nzb_mismatch",
+        b"yend_total_parts_nzb_mismatch",
+    ];
+
+    /// `(string) $value` for the scalar shapes PHP converts without a warning; `None` requests
+    /// the PHP fallback (floats and arrays).
+    fn php_string_cast(node: Option<&PhpNode<'_>>) -> Option<Vec<u8>> {
+        let Some(node) = node else {
+            return Some(Vec::new());
+        };
+        match node.val {
+            PhpVal::Null | PhpVal::Bool(false) => Some(Vec::new()),
+            PhpVal::Bool(true) => Some(b"1".to_vec()),
+            PhpVal::Int(i) => Some(i.to_string().into_bytes()),
+            PhpVal::Str(s) => Some(s.to_vec()),
+            PhpVal::Float | PhpVal::Arr(_) => None,
+        }
+    }
+
+    /// `strtolower((string) ($value ?? ''))` when it is a 32-digit hex digest. Floats cast to
+    /// a string with a `.` or exponent and so never qualify; arrays request the PHP fallback.
+    fn lower_md5(node: Option<&PhpNode<'_>>) -> Option<Option<Vec<u8>>> {
+        let Some(node) = node else {
+            return Some(None);
+        };
+        match node.val {
+            PhpVal::Str(s) if md5_hex(s) => Some(Some(s.to_ascii_lowercase())),
+            PhpVal::Arr(_) => None,
+            _ => Some(None),
+        }
+    }
+
+    /// A value `json_encode()` maps one-to-one onto its serialized form.
+    fn json_key_safe(node: Option<&PhpNode<'_>>) -> bool {
+        match node.map(|n| &n.val) {
+            None | Some(PhpVal::Null | PhpVal::Bool(_) | PhpVal::Int(_)) => true,
+            Some(PhpVal::Str(s)) => std::str::from_utf8(s).is_ok(),
+            _ => false,
+        }
+    }
+
+    #[inline]
+    fn raw_or_null<'a>(node: Option<&PhpNode<'a>>) -> &'a [u8] {
+        node.map_or(b"N;", |n| n.raw)
+    }
+
+    struct Match<'n, 'a> {
+        status: usize,
+        prefix_and_length_status: usize,
+        conflicts: Vec<&'static [u8]>,
+        file_index: i64,
+        kind: &'a [u8],
+        subject: &'a [u8],
+        signatures: Vec<(&'a [u8], Option<&'a [u8]>)>,
+        message_id: Vec<u8>,
+        prefix: Option<Vec<u8>>,
+        length: Option<i64>,
+        sources: Vec<&'n PhpNode<'a>>,
+        providers: Vec<(&'a [u8], &'a [u8])>,
+    }
+
+    /// `matchPar2SourcesToNzbFiles()` without the `basis` entry. `doc` is
+    /// `[$sourceFiles, $eligible]`, where each eligible observation (first sample of
+    /// segment 1, integer file index, not PAR2) is `[file_index, kind, nzb_subject,
+    /// message_id, server, provider_label, body_identity_verified, yenc, signatures,
+    /// part_matches, total_matches, trailer_part_matches, trailer_total_matches]`.
+    fn match_par2_sources(doc: &PhpNode<'_>, w: &mut PhpSerWriter) -> Option<()> {
+        if doc.items().len() != 2 {
+            return None;
+        }
+        let source_files = list_item(doc, 0)?;
+        let observations = list_item(doc, 1)?;
+        if !source_files.is_arr() || !observations.is_arr() {
+            return None;
+        }
+        let mut by_prefix: HashMap<Vec<u8>, Vec<&PhpNode<'_>>> = HashMap::new();
+        for (_, source) in source_files.items() {
+            if !source.is_arr() {
+                return None;
+            }
+            if let Some(prefix) = lower_md5(source.coalesce(b"md5_first_16k"))? {
+                by_prefix.entry(prefix).or_default().push(source);
+            }
+        }
+
+        let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut matches: Vec<Match<'_, '_>> = Vec::new();
+        for (_, observation) in observations.items() {
+            if observation.items().len() != 13 {
+                return None;
+            }
+            let at = |i: usize| present(list_item(observation, i));
+            let file_index = opt_int(at(0))?;
+            let yenc = at(7).filter(|n| n.is_arr());
+            let mut conflicts: Vec<&'static [u8]> = Vec::new();
+            if !opt_is_true(at(6)) {
+                conflicts.push(b"article_response_identity_unverified");
+            }
+            if let Some(yenc) = yenc {
+                for (field, conflict) in YENC_CONFLICTS {
+                    if opt_is_false(yenc.get(field)) {
+                        conflicts.push(conflict);
+                    }
+                }
+            }
+            for (slot, conflict) in NZB_CONFLICTS.iter().enumerate() {
+                if opt_is_false(at(9 + slot)) {
+                    conflicts.push(conflict);
+                }
+            }
+            let prefix = match yenc {
+                Some(y) => lower_md5(y.coalesce(b"par2_first_16k_md5_candidate"))?,
+                None => None,
+            };
+            let empty = Vec::new();
+            let candidates = prefix
+                .as_ref()
+                .and_then(|p| by_prefix.get(p))
+                .unwrap_or(&empty);
+            let length = yenc.and_then(|y| opt_int(y.get(b"file_size")));
+            let source_length = |s: &PhpNode<'_>| opt_int(s.get(b"file_length"));
+            let exact: Vec<&PhpNode<'_>> = candidates
+                .iter()
+                .copied()
+                .filter(|s| length.is_some() && source_length(s) == length)
+                .collect();
+            let unknown = candidates
+                .iter()
+                .filter(|s| source_length(s).is_none())
+                .count();
+            let status = if prefix.is_none() {
+                4
+            } else if candidates.is_empty() {
+                2
+            } else if length.is_none() || (unknown > 0 && exact.len() == 1) {
+                5
+            } else if exact.len() == 1 {
+                0
+            } else if exact.len() > 1 {
+                1
+            } else if unknown > 0 {
+                5
+            } else {
+                3
+            };
+            let prefix_and_length_status = status;
+            let status = if conflicts.is_empty() { status } else { 6 };
+
+            let message_id = php_string_cast(at(3))?;
+            if message_id.is_empty() {
+                continue;
+            }
+            let sources = if prefix_and_length_status == 0 {
+                exact
+            } else {
+                candidates.clone()
+            };
+            let mut candidate_ids: Vec<Vec<u8>> = Vec::with_capacity(sources.len());
+            for source in &sources {
+                let mut id = php_string_cast(source.coalesce(b"recovery_set_id"))?;
+                id.push(b':');
+                id.extend(php_string_cast(source.coalesce(b"file_id"))?.to_ascii_lowercase());
+                candidate_ids.push(id);
+            }
+            // Every ID contains ':' and so is never numeric: PHP sort() compares bytes.
+            candidate_ids.sort_unstable();
+
+            let mut key = file_index.to_string().into_bytes();
+            key.push(0);
+            key.extend_from_slice(&message_id);
+            key.push(0);
+            match length {
+                Some(l) => key.extend(l.to_string().into_bytes()),
+                None => key.extend_from_slice(b"length-unknown"),
+            }
+            key.push(0);
+            key.extend_from_slice(prefix.as_deref().unwrap_or(b"insufficient-prefix"));
+            key.push(0);
+            key.extend_from_slice(STATUSES[status]);
+            key.push(0);
+            key.extend(conflicts.join(&b","[..]));
+            key.push(0);
+            key.extend(candidate_ids.join(&b","[..]));
+
+            let server = at(4);
+            let label = at(5);
+            if !json_key_safe(server) || !json_key_safe(label) {
+                return None;
+            }
+            let provider = (raw_or_null(server), raw_or_null(label));
+            let slot = match index.get(&key) {
+                Some(&slot) => slot,
+                None => {
+                    let mut signatures = Vec::new();
+                    if let Some(list) = at(8).filter(|n| n.is_arr()) {
+                        for (_, signature) in list.items() {
+                            if !signature.is_arr() || opt_int(signature.get(b"offset")) != Some(0) {
+                                continue;
+                            }
+                            let Some(format) = opt_str(signature.get(b"format")) else {
+                                continue;
+                            };
+                            signatures.push((format, opt_str(signature.get(b"basis"))));
+                        }
+                    }
+                    matches.push(Match {
+                        status,
+                        prefix_and_length_status,
+                        conflicts,
+                        file_index,
+                        kind: raw_or_null(at(1)),
+                        subject: raw_or_null(at(2)),
+                        signatures,
+                        message_id,
+                        prefix,
+                        length,
+                        sources,
+                        providers: Vec::new(),
+                    });
+                    index.insert(key, matches.len() - 1);
+                    matches.len() - 1
+                }
+            };
+            if !matches[slot].providers.contains(&provider) {
+                matches[slot].providers.push(provider);
+            }
+        }
+
+        w.arr_open(COUNT_KEYS.len() + 1);
+        for (status, count_key) in COUNT_KEYS.iter().enumerate() {
+            w.key(count_key);
+            w.int(matches.iter().filter(|m| m.status == status).count() as i64);
+        }
+        w.key(b"matches");
+        w.arr_open(matches.len());
+        for (i, m) in matches.iter().enumerate() {
+            w.idx(i);
+            w.arr_open(13);
+            w.key(b"relationship");
+            w.str(b"par2_source_file_to_nzb_file");
+            w.key(b"status");
+            w.str(STATUSES[m.status]);
+            w.key(b"prefix_and_length_status");
+            w.str(STATUSES[m.prefix_and_length_status]);
+            w.key(b"integrity_conflicts");
+            w.arr_open(m.conflicts.len());
+            for (j, conflict) in m.conflicts.iter().enumerate() {
+                w.idx(j);
+                w.str(conflict);
+            }
+            w.arr_close();
+            w.key(b"nzb_file_index");
+            w.int(m.file_index);
+            w.key(b"nzb_file_kind");
+            w.raw(m.kind);
+            w.key(b"nzb_subject");
+            w.raw(m.subject);
+            w.key(b"decoded_format_signatures_at_offset_zero");
+            w.arr_open(m.signatures.len());
+            for (j, (format, basis)) in m.signatures.iter().enumerate() {
+                w.idx(j);
+                w.arr_open(2);
+                w.key(b"format");
+                w.str(format);
+                w.key(b"basis");
+                w.opt_str(*basis);
+                w.arr_close();
+            }
+            w.arr_close();
+            w.key(b"message_id");
+            w.str(&m.message_id);
+            w.key(b"observed_first_16k_md5");
+            w.opt_str(m.prefix.as_deref());
+            w.key(b"observed_yenc_file_length");
+            w.opt_int(m.length);
+            w.key(b"candidate_source_files");
+            w.arr_open(m.sources.len());
+            for (j, source) in m.sources.iter().enumerate() {
+                w.idx(j);
+                w.arr_open(4);
+                for field in [
+                    &b"recovery_set_id"[..],
+                    b"file_id",
+                    b"filename",
+                    b"file_length",
+                ] {
+                    w.key(field);
+                    w.raw(raw_or_null(source.get(field)));
+                }
+                w.arr_close();
+            }
+            w.arr_close();
+            w.key(b"provider_observations");
+            w.arr_open(m.providers.len());
+            for (j, (server, label)) in m.providers.iter().enumerate() {
+                w.idx(j);
+                w.arr_open(2);
+                w.key(b"server");
+                w.raw(server);
+                w.key(b"provider_label");
+                w.raw(label);
+                w.arr_close();
+            }
+            w.arr_close();
+            w.arr_close();
+        }
+        w.arr_close();
+        w.arr_close();
+        Some(())
+    }
+
+    /// `ReleaseFingerprintCollector::matchPar2SourcesToNzbFiles` (all entries but `basis`) as
+    /// PHP `serialize()` output; see [`match_par2_sources`] for the input document.
+    ///
+    /// # Safety
+    ///
+    /// `data` must be valid for `length` bytes and `out_buf` for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_release_fp_match_par2_sources_packed(
+        data: *const u8,
+        length: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        let Some(data) = (unsafe { bytes(data, length) }) else {
+            return FALLBACK;
+        };
+        let Some(doc) = PhpSerParser::parse_document(data) else {
+            return FALLBACK;
+        };
+        let mut w = PhpSerWriter::new();
+        if match_par2_sources(&doc, &mut w).is_none() {
+            return FALLBACK;
+        }
+        unsafe { emit(out_buf, out_cap, &w.buf) }
+    }
+
+    // ---- ReleaseFingerprintCollector::mapIfscPreviewToSource ------------------
+
+    const MAX_IFSC_PREVIEW_HEX_BYTES: usize = 8192;
+
+    fn map_ifsc_preview(
+        hex: &[u8],
+        file_length: Option<i64>,
+        block_size: Option<i64>,
+        maximum_slices: i64,
+        w: &mut PhpSerWriter,
+    ) {
+        if maximum_slices < 1
+            || hex.is_empty()
+            || hex.len() > MAX_IFSC_PREVIEW_HEX_BYTES
+            || !hex.len().is_multiple_of(40)
+            || !hex.iter().all(u8::is_ascii_hexdigit)
+        {
+            w.arr_open(0);
+            w.arr_close();
+            return;
+        }
+        let layout = match (file_length, block_size) {
+            (Some(length), Some(block)) if block > 0 => {
+                let expected = length / block + i64::from(length % block != 0);
+                Some((length, block, expected))
+            }
+            _ => None,
+        };
+        let count = (hex.len() / 40).min(usize::try_from(maximum_slices).unwrap_or(usize::MAX));
+        w.arr_open(count);
+        for (index, record) in hex.as_chunks::<40>().0.iter().take(count).enumerate() {
+            let index = index as i64;
+            let mut range: Option<Option<[i64; 4]>> = None;
+            if let Some((length, block, expected)) = layout
+                && index <= i64::MAX / block
+            {
+                let start = index * block;
+                range = Some((start < length && index < expected).then(|| {
+                    let bytes = block.min(length - start);
+                    [start, start + bytes, bytes, block - bytes]
+                }));
+            }
+            let crc_hex = &record[32..40];
+            let mut crc = [0u8; 4];
+            for (i, pair) in crc_hex.as_chunks::<2>().0.iter().enumerate() {
+                let nibble = |b: u8| (b as char).to_digit(16).unwrap_or(0) as u8;
+                crc[i] = (nibble(pair[0]) << 4) | nibble(pair[1]);
+            }
+            w.idx(index as usize);
+            w.arr_open(9);
+            w.key(b"slice_index");
+            w.int(index);
+            w.key(b"md5");
+            w.str(&record[..32]);
+            w.key(b"crc32");
+            w.int(i64::from(u32::from_le_bytes(crc)));
+            w.key(b"crc32_little_endian_hex");
+            w.str(crc_hex);
+            let values = range.flatten();
+            for (slot, key) in [
+                &b"source_byte_start"[..],
+                b"source_byte_end_exclusive",
+                b"source_bytes_in_slice",
+                b"zero_padding_bytes",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                w.key(key);
+                w.opt_int(values.map(|v| v[slot]));
+            }
+            w.key(b"source_range_valid");
+            match range {
+                None => w.null(),
+                Some(valid) => w.bool(valid.is_some()),
+            }
+            w.arr_close();
+        }
+        w.arr_close();
+    }
+
+    /// `ReleaseFingerprintCollector::mapIfscPreviewToSource` as PHP `serialize()` output.
+    /// `flags` bit 0 marks `file_length` present and bit 1 `block_size` present.
+    ///
+    /// # Safety
+    ///
+    /// `hex` must be valid for `hex_len` bytes and `out_buf` for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_release_fp_map_ifsc_preview(
+        hex: *const u8,
+        hex_len: usize,
+        file_length: i64,
+        block_size: i64,
+        maximum_slices: i64,
+        flags: u32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        let Some(hex) = (unsafe { bytes(hex, hex_len) }) else {
+            return FALLBACK;
+        };
+        let mut w = PhpSerWriter::new();
+        map_ifsc_preview(
+            hex,
+            (flags & 1 != 0).then_some(file_length),
+            (flags & 2 != 0).then_some(block_size),
+            maximum_slices,
+            &mut w,
+        );
+        unsafe { emit(out_buf, out_cap, &w.buf) }
+    }
+
+    // ---- ReleaseFingerprintCollector::timestampSummary ------------------------
+
+    /// `gmdate(DATE_ATOM, $timestamp)` (proleptic Gregorian, `Y` padded to four digits).
+    fn atom_utc(timestamp: i64, out: &mut Vec<u8>) {
+        let days = timestamp.div_euclid(86_400);
+        let second_of_day = timestamp.rem_euclid(86_400);
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = yoe + era * 400 + i64::from(month <= 2);
+        if year < 0 {
+            out.push(b'-');
+        }
+        let digits = year.unsigned_abs().to_string();
+        out.extend(std::iter::repeat_n(
+            b'0',
+            4usize.saturating_sub(digits.len()),
+        ));
+        out.extend_from_slice(digits.as_bytes());
+        let two = |out: &mut Vec<u8>, sep: u8, v: i64| {
+            out.push(sep);
+            out.push(b'0' + (v / 10) as u8);
+            out.push(b'0' + (v % 10) as u8);
+        };
+        two(out, b'-', month);
+        two(out, b'-', day);
+        two(out, b'T', second_of_day / 3600);
+        two(out, b':', second_of_day / 60 % 60);
+        two(out, b':', second_of_day % 60);
+        out.extend_from_slice(b"+00:00");
+    }
+
+    /// The non-empty `timestampSummary()` fields: writes `first_utc` then `last_utc` to
+    /// `out_buf` and `[strlen(first_utc), seconds]` to `meta`. Returns the bytes written,
+    /// `-1` when PHP must summarize (empty input or out-of-range timestamps), or the negated
+    /// required size.
+    ///
+    /// # Safety
+    ///
+    /// `values` must be valid for `count` `int64_t`, `meta` for two `int64_t` and `out_buf`
+    /// for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_release_fp_timestamp_summary_packed(
+        values: *const i64,
+        count: usize,
+        meta: *mut i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if values.is_null() || count == 0 || meta.is_null() || count > isize::MAX as usize / 8 {
+            return FALLBACK;
+        }
+        let values = unsafe { slice::from_raw_parts(values, count) };
+        let (mut first, mut last) = (i64::MAX, i64::MIN);
+        for &value in values {
+            first = first.min(value);
+            last = last.max(value);
+        }
+        if first < -MAX_TIMESTAMP_MAGNITUDE || last > MAX_TIMESTAMP_MAGNITUDE {
+            return FALLBACK;
+        }
+        let mut text = Vec::with_capacity(52);
+        atom_utc(first, &mut text);
+        let first_len = text.len() as i64;
+        atom_utc(last, &mut text);
+        let meta = unsafe { slice::from_raw_parts_mut(meta, 2) };
+        meta[0] = first_len;
+        meta[1] = (last - first).max(0);
+        unsafe { emit(out_buf, out_cap, &text) }
+    }
+
+    // ---- ReleaseFingerprintCollector::parseOverview ---------------------------
+
+    #[inline]
+    fn php_trim(s: &[u8]) -> &[u8] {
+        let ws = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B);
+        let start = s.iter().position(|b| !ws(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|b| !ws(b)).map_or(start, |e| e + 1);
+        &s[start..end]
+    }
+
+    #[inline]
+    fn rtrim_colon(s: &[u8]) -> &[u8] {
+        let end = s.iter().rposition(|&b| b != b':').map_or(0, |e| e + 1);
+        &s[..end]
+    }
+
+    #[inline]
+    fn name_token(s: &[u8]) -> bool {
+        !s.is_empty() && s.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'-')
+    }
+
+    /// The `parseOverview()` key for one `LIST OVERVIEW.FMT` field: whether it gains a `:`
+    /// prefix, and the bytes that are lowercased after it.
+    fn overview_key(field: &[u8]) -> (bool, &[u8]) {
+        let field = php_trim(field);
+        if field.first() == Some(&b':') && name_token(&field[1..]) {
+            return (false, field);
+        }
+        if field.eq_ignore_ascii_case(b"bytes:") || field.eq_ignore_ascii_case(b"lines:") {
+            return (true, &field[..5]);
+        }
+        if field.len() > 5
+            && field[field.len() - 5..].eq_ignore_ascii_case(b":full")
+            && name_token(&field[..field.len() - 5])
+        {
+            return (false, &field[..field.len() - 5]);
+        }
+        (false, rtrim_colon(field))
+    }
+
+    /// `article_number` and the `parseOverview()` keys of the fields that have a value (the
+    /// first `min(format_count, tab count)` fields), joined by tabs, so PHP can
+    /// `array_combine()` them with the row values. `None` requests the PHP fallback: a field
+    /// containing NUL, or a key that is empty, repeats, contains a tab or is `article_number`.
+    #[cfg(test)]
+    fn overview_keys(row: &[u8], format: &[u8], format_count: usize) -> Option<Vec<u8>> {
+        let mut out = Vec::with_capacity(format.len() + format_count + 16);
+        overview_keys_into(row, format, format_count, &mut out).then_some(out)
+    }
+
+    /// [`overview_keys`] appended to `out` (which must start empty); `false` requests the
+    /// PHP fallback.
+    fn overview_keys_into(
+        row: &[u8],
+        format: &[u8],
+        format_count: usize,
+        out: &mut Vec<u8>,
+    ) -> bool {
+        const ARTICLE_NUMBER: &[u8] = b"article_number";
+        const INLINE_KEYS: usize = 64;
+        let value_count = row.iter().filter(|&&b| b == b'\t').count();
+        out.extend_from_slice(ARTICLE_NUMBER);
+        let mut inline = [(0usize, 0usize); INLINE_KEYS];
+        let mut spilled: Vec<(usize, usize)> = Vec::new();
+        let mut keys = 0usize;
+        let mut fields = 0usize;
+        for field in format.split(|&b| b == 0) {
+            fields += 1;
+            if fields > value_count {
+                continue;
+            }
+            let (colon, body) = overview_key(field);
+            if (!colon && body.is_empty()) || body.contains(&b'\t') {
+                return false;
+            }
+            out.push(b'\t');
+            let start = out.len();
+            if colon {
+                out.push(b':');
+            }
+            out.extend(body.iter().map(u8::to_ascii_lowercase));
+            let end = out.len();
+            let key = &out[start..end];
+            let seen = if keys <= INLINE_KEYS {
+                &inline[..keys]
+            } else {
+                &spilled[..]
+            };
+            // An integer-like key has exactly one decimal spelling, so byte equality matches
+            // PHP's key identity.
+            if key == ARTICLE_NUMBER || seen.iter().any(|&(s, e)| out[s..e] == *key) {
+                return false;
+            }
+            if keys < INLINE_KEYS {
+                inline[keys] = (start, end);
+            } else {
+                if keys == INLINE_KEYS {
+                    spilled.extend_from_slice(&inline);
+                }
+                spilled.push((start, end));
+            }
+            keys += 1;
+        }
+        fields == format_count
+    }
+
+    /// `ReleaseFingerprintCollector::parseOverview` keys for a non-null row and non-empty
+    /// format list (see [`overview_keys`]). `format` is `implode("\0", $format)` and
+    /// `format_count` its element count. Returns the key bytes written, `-1` when PHP must
+    /// parse, or the negated required size.
+    ///
+    /// # Safety
+    ///
+    /// `row` and `format` must be valid for their lengths and `out_buf` for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_release_fp_parse_overview(
+        row: *const u8,
+        row_len: usize,
+        format: *const u8,
+        format_len: usize,
+        format_count: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        let (Some(row), Some(format), Ok(format_count)) = (
+            unsafe { bytes(row, row_len) },
+            unsafe { bytes(format, format_len) },
+            usize::try_from(format_count),
+        ) else {
+            return FALLBACK;
+        };
+        if format_count == 0 {
+            return FALLBACK;
+        }
+        thread_local! {
+            static KEYS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        KEYS.with_borrow_mut(|keys| {
+            keys.clear();
+            if overview_keys_into(row, format, format_count, keys) {
+                unsafe { emit(out_buf, out_cap, keys) }
+            } else {
+                FALLBACK
+            }
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn atom(ts: i64) -> String {
+            let mut out = Vec::new();
+            atom_utc(ts, &mut out);
+            String::from_utf8(out).unwrap()
+        }
+
+        #[test]
+        fn formats_gmdate_atom() {
+            assert_eq!(atom(0), "1970-01-01T00:00:00+00:00");
+            assert_eq!(atom(1_700_000_000), "2023-11-14T22:13:20+00:00");
+            assert_eq!(atom(-1), "1969-12-31T23:59:59+00:00");
+            assert_eq!(atom(951_782_400), "2000-02-29T00:00:00+00:00");
+            assert_eq!(atom(-62_135_596_800), "0001-01-01T00:00:00+00:00");
+            assert_eq!(atom(-62_167_219_200), "0000-01-01T00:00:00+00:00");
+            assert_eq!(atom(-62_198_755_200), "-0001-01-01T00:00:00+00:00");
+            assert_eq!(atom(253_402_300_800), "10000-01-01T00:00:00+00:00");
+        }
+
+        #[test]
+        fn summarizes_timestamps() {
+            let values = [1_700_000_100_i64, 1_700_000_000, 1_700_000_050];
+            let mut meta = [0i64; 2];
+            let mut out = [0u8; 64];
+            let n = unsafe {
+                nntmux_release_fp_timestamp_summary_packed(
+                    values.as_ptr(),
+                    values.len(),
+                    meta.as_mut_ptr(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(n, 50);
+            assert_eq!(meta, [25, 100]);
+            assert_eq!(&out[..25], b"2023-11-14T22:13:20+00:00");
+            let short = unsafe {
+                nntmux_release_fp_timestamp_summary_packed(
+                    values.as_ptr(),
+                    values.len(),
+                    meta.as_mut_ptr(),
+                    out.as_mut_ptr(),
+                    10,
+                )
+            };
+            assert_eq!(short, -50);
+            let huge = [i64::MAX];
+            let fallback = unsafe {
+                nntmux_release_fp_timestamp_summary_packed(
+                    huge.as_ptr(),
+                    1,
+                    meta.as_mut_ptr(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(fallback, FALLBACK);
+        }
+
+        #[test]
+        fn derives_overview_keys() {
+            let key = |f: &[u8]| {
+                let (colon, body) = overview_key(f);
+                let mut key = if colon { vec![b':'] } else { Vec::new() };
+                key.extend(body.to_ascii_lowercase());
+                key
+            };
+            assert_eq!(key(b" Subject: "), b"subject");
+            assert_eq!(key(b":bytes"), b":bytes");
+            assert_eq!(key(b"Bytes:"), b":bytes");
+            assert_eq!(key(b"LINES:"), b":lines");
+            assert_eq!(key(b"Xref:full"), b"xref");
+            assert_eq!(key(b"Bytes::"), b"bytes");
+            assert_eq!(key(b"::"), b"");
+            assert_eq!(key(b"x y:full"), b"x y:full");
+        }
+
+        #[test]
+        fn lists_overview_keys() {
+            assert_eq!(
+                overview_keys(b"7\tSubj\tme", b"Subject:\0From:\0Date:", 3).unwrap(),
+                b"article_number\tsubject\tfrom"
+            );
+            assert_eq!(overview_keys(b"7", b"a\0b", 2).unwrap(), b"article_number");
+            assert!(overview_keys(b"7", b"a\0b", 3).is_none());
+            assert!(overview_keys(b"7\tx\ty", b"5:\0Article_Number:", 2).is_none());
+            assert!(overview_keys(b"7\tx\ty", b"From:\0from", 2).is_none());
+            assert!(overview_keys(b"7\tx", b"::\0from", 2).is_none());
+            assert_eq!(
+                overview_keys(b"7\tx", b"From:\0from", 2).unwrap(),
+                b"article_number\tfrom"
+            );
+            let row = "\t".repeat(80);
+            let unique: Vec<String> = (0..80).map(|i| format!("f{i}:")).collect();
+            let keys = overview_keys(row.as_bytes(), unique.join("\0").as_bytes(), 80).unwrap();
+            assert_eq!(keys.split(|&b| b == b'\t').count(), 81);
+            let mut repeated = unique.clone();
+            repeated[75] = "F70".to_string();
+            assert!(overview_keys(row.as_bytes(), repeated.join("\0").as_bytes(), 80).is_none());
+            repeated = unique.clone();
+            repeated[40] = "f3".to_string();
+            assert!(overview_keys(row.as_bytes(), repeated.join("\0").as_bytes(), 80).is_none());
+        }
+
+        #[test]
+        fn maps_ifsc_preview_ranges() {
+            let record = "00112233445566778899aabbccddeeff78563412";
+            let hex = record.repeat(3);
+            let mut w = PhpSerWriter::new();
+            map_ifsc_preview(hex.as_bytes(), Some(250), Some(100), 2, &mut w);
+            let doc = PhpSerParser::parse_document(&w.buf).unwrap();
+            assert_eq!(doc.items().len(), 2);
+            let second = list_item(&doc, 1).unwrap();
+            assert_eq!(opt_int(second.get(b"crc32")), Some(0x1234_5678));
+            assert_eq!(opt_int(second.get(b"source_byte_start")), Some(100));
+            let mut w = PhpSerWriter::new();
+            map_ifsc_preview(hex.as_bytes(), Some(150), Some(100), 3, &mut w);
+            let doc = PhpSerParser::parse_document(&w.buf).unwrap();
+            let third = list_item(&doc, 2).unwrap();
+            assert!(opt_is_false(third.get(b"source_range_valid")));
+            assert_eq!(third.get(b"source_byte_start").unwrap().raw, b"N;");
+            let mut w = PhpSerWriter::new();
+            map_ifsc_preview(b"zz", None, None, 3, &mut w);
+            assert_eq!(w.buf, b"a:0:{}");
+        }
+
+        #[test]
+        fn decodes_single_part_range() {
+            let doc = b"a:5:{i:0;a:9:{s:9:\"file_size\";i:10;s:27:\"header_numeric_fields_valid\";b:1;s:28:\"trailer_numeric_fields_valid\";b:1;s:23:\"trailer_size_is_decimal\";b:1;s:25:\"decoded_size_matches_yenc\";b:1;s:30:\"decoded_size_matches_yend_size\";b:1;s:33:\"all_declared_crc32_fields_are_hex\";b:1;s:19:\"segment_crc32_basis\";s:13:\"missing-crc32\";s:9:\"multipart\";b:0;}i:1;N;i:2;N;i:3;N;i:4;N;}";
+            let node = PhpSerParser::parse_document(doc).unwrap();
+            assert_eq!(
+                decoded_file_range(&node, 10, true),
+                Some([RANGE_VALID_NO_CRC, 0, 10, 10])
+            );
+            assert_eq!(
+                decoded_file_range(&node, 9, true),
+                Some([RANGE_SIZE_MISMATCH, 0, 0, 0])
+            );
+            assert_eq!(
+                decoded_file_range(&node, 10, false),
+                Some([RANGE_IDENTITY_UNVERIFIED, 0, 0, 0])
+            );
+        }
+    }
+}

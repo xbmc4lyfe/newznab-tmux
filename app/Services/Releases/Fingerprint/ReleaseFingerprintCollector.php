@@ -10,6 +10,9 @@ use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
 use App\Services\Nzb\NzbSourceGuard;
 use App\Services\YencService;
+use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
 use Throwable;
 
 final class ReleaseFingerprintCollector
@@ -39,6 +42,42 @@ final class ReleaseFingerprintCollector
     private const MAX_RELEASE_IFSC_RECORDS = 20_000;
 
     private const MAX_RELEASE_IFSC_PREVIEW_RECORDS = 4096;
+
+    private const string PAR2_SOURCE_MATCH_BASIS = 'Compare PAR2 FileDesc md5_first_16k with the first 16384 decoded bytes from NZB segment 1 for every non-PAR2 file, regardless of its recognized format signature; multipart yEnc samples must declare a valid range beginning at byte 1. A unique prefix-hash and whole-file length match is labeled matched_prefix_and_length only when available yEnc part numbering, numeric fields, size fields, and declared CRC checks have no contradiction; this does not verify the remaining file bytes. Format signatures are supporting byte-pattern observations, not proof of file type.';
+
+    private const string FFI_CDEF = <<<'C'
+        int32_t nntmux_release_fp_decoded_file_range_packed(const char *data, size_t length, int64_t decoded_size, int32_t identity_verified, int64_t *out);
+        ssize_t nntmux_release_fp_match_par2_sources_packed(const char *data, size_t length, char *out_buf, size_t out_cap);
+        ssize_t nntmux_release_fp_map_ifsc_preview(const char *hex, size_t hex_len, int64_t file_length, int64_t block_size, int64_t maximum_slices, uint32_t flags, char *out_buf, size_t out_cap);
+        ssize_t nntmux_release_fp_timestamp_summary_packed(const char *values, size_t count, int64_t *meta, char *out_buf, size_t out_cap);
+        ssize_t nntmux_release_fp_parse_overview(const char *row, size_t row_len, const char *format, size_t format_len, int64_t format_count, char *out_buf, size_t out_cap);
+        C;
+
+    /** decodedFileRange() results by nntmux_release_fp_decoded_file_range_packed() code. */
+    private const array DECODED_RANGE_OUTCOMES = [
+        2 => ['mapping_status' => 'invalid', 'integrity_status' => 'article_response_identity_unverified'],
+        3 => ['mapping_status' => 'invalid', 'integrity_status' => 'invalid_unmatched_escape'],
+        4 => ['mapping_status' => 'unavailable', 'integrity_status' => 'unavailable'],
+        5 => ['mapping_status' => 'invalid', 'integrity_status' => 'range_or_size_mismatch'],
+        6 => ['mapping_status' => 'invalid', 'integrity_status' => 'yenc_integrity_mismatch'],
+    ];
+
+    /**
+     * Rust summarizes from this many timestamps; below it the FFI round trip costs more than
+     * sort() and gmdate() (see tests/Unit/RustReleaseFingerprintReconcileParityTest.php).
+     */
+    private const int TIMESTAMP_SUMMARY_RUST_MINIMUM = 40;
+
+    /** Two DATE_ATOM strings for timestamps within the Rust range (|t| <= 2^40) need 52 bytes. */
+    private const int TIMESTAMP_TEXT_BYTES = 64;
+
+    private static FFI|false|null $ffi = null;
+
+    private static ?CData $int64Out = null;
+
+    private static ?CData $timestampText = null;
+
+    private static bool $useRustFfi = true;
 
     private readonly FingerprintProviderBreaker $breaker;
 
@@ -2054,7 +2093,7 @@ final class ReleaseFingerprintCollector
         unset($match);
 
         return [
-            'basis' => 'Compare PAR2 FileDesc md5_first_16k with the first 16384 decoded bytes from NZB segment 1 for every non-PAR2 file, regardless of its recognized format signature; multipart yEnc samples must declare a valid range beginning at byte 1. A unique prefix-hash and whole-file length match is labeled matched_prefix_and_length only when available yEnc part numbering, numeric fields, size fields, and declared CRC checks have no contradiction; this does not verify the remaining file bytes. Format signatures are supporting byte-pattern observations, not proof of file type.',
+            'basis' => self::PAR2_SOURCE_MATCH_BASIS,
             'matched_prefix_and_length_count' => count(array_filter($matches, static fn (array $match): bool => $match['status'] === 'matched_prefix_and_length')),
             'ambiguous_count' => count(array_filter($matches, static fn (array $match): bool => $match['status'] === 'ambiguous')),
             'unmatched_count' => count(array_filter($matches, static fn (array $match): bool => $match['status'] === 'unmatched')),
@@ -2597,6 +2636,10 @@ final class ReleaseFingerprintCollector
         if ($timestamps === []) {
             return ['available' => false, 'valid_timestamp_count' => 0, 'observations' => $observations, 'expected_samples' => $expected];
         }
+        if (self::$useRustFfi && count($timestamps) >= self::TIMESTAMP_SUMMARY_RUST_MINIMUM
+            && ($summary = self::timestampSummaryNative($timestamps, $observations, $expected)) !== null) {
+            return $summary;
+        }
         $values = array_values($timestamps);
         sort($values);
 
@@ -2972,5 +3015,272 @@ final class ReleaseFingerprintCollector
         unset($candidate);
 
         return array_values($candidates);
+    }
+
+    public static function setUseRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    /**
+     * Rust decodedFileRange() for parity tests and benchmarks (not adopted: marshaling the yEnc
+     * record loses to PHP); null when PHP must map the range.
+     *
+     * @param  array<string, mixed>  $metadata
+     * @return array<string, mixed>|null
+     */
+    public static function decodedFileRangeNative(array $metadata, ?string $decodedBytes): ?array
+    {
+        $ffi = self::ffi();
+        $out = self::$int64Out;
+        if ($ffi === null || $out === null) {
+            return null;
+        }
+        $packed = serialize([
+            $metadata['yenc'] ?? null,
+            $metadata['yenc_nzb_part_number_matches'] ?? null,
+            $metadata['yenc_nzb_total_parts_matches'] ?? null,
+            $metadata['yenc_nzb_trailer_part_number_matches'] ?? null,
+            $metadata['yenc_nzb_trailer_total_parts_matches'] ?? null,
+        ]);
+        try {
+            // @phpstan-ignore method.notFound
+            if ($ffi->nntmux_release_fp_decoded_file_range_packed($packed, strlen($packed),
+                is_string($decodedBytes) ? strlen($decodedBytes) : -1,
+                Par2MetadataParser::bodyResponseIdentityVerified($metadata) ? 1 : 0, $out) !== 0) {
+                return null;
+            }
+        } catch (Throwable) {
+            return null;
+        }
+        $code = (int) $out[0];
+        if ($code > 1) {
+            return self::DECODED_RANGE_OUTCOMES[$code] ?? null;
+        }
+
+        return [
+            'mapping_status' => 'valid',
+            'start_offset' => (int) $out[1],
+            'end_offset_exclusive' => (int) $out[2],
+            'file_size' => (int) $out[3],
+            'integrity_status' => $code === 0 ? 'yenc_crc_valid' : 'yenc_crc_not_declared',
+        ];
+    }
+
+    /**
+     * Rust matchPar2SourcesToNzbFiles() for parity tests and benchmarks (not adopted: slower than
+     * PHP once marshaling is included). PHP selects the
+     * eligible first-segment observations and forwards only the fields the match reads; null
+     * when PHP must match.
+     *
+     * @param  list<array<string, mixed>>  $sourceFiles
+     * @param  list<array<string, mixed>>  $observations
+     * @return array<string, mixed>|null
+     */
+    public static function matchPar2SourcesToNzbFilesNative(array $sourceFiles, array $observations): ?array
+    {
+        $eligible = [];
+        foreach ($observations as $observation) {
+            if (! is_array($observation)) {
+                return null;
+            }
+            if (($observation['sample_role'] ?? null) !== 'first' || ($observation['segment_number'] ?? null) !== 1
+                || ! is_int($observation['file_index'] ?? null) || ($observation['kind'] ?? null) === 'par2') {
+                continue;
+            }
+            $metadata = $observation['metadata'] ?? [];
+            if (! is_array($metadata)) {
+                return null;
+            }
+            $eligible[] = [
+                $observation['file_index'],
+                $observation['kind'] ?? null,
+                $observation['nzb_subject'] ?? null,
+                $observation['message_id'] ?? null,
+                $observation['server'] ?? null,
+                $observation['provider_label'] ?? null,
+                Par2MetadataParser::bodyResponseIdentityVerified($metadata),
+                $metadata['yenc'] ?? null,
+                $metadata['decoded_format_metadata']['signatures'] ?? null,
+                $metadata['yenc_nzb_part_number_matches'] ?? null,
+                $metadata['yenc_nzb_total_parts_matches'] ?? null,
+                $metadata['yenc_nzb_trailer_part_number_matches'] ?? null,
+                $metadata['yenc_nzb_trailer_total_parts_matches'] ?? null,
+            ];
+        }
+        $decoded = self::serializedCall(
+            'nntmux_release_fp_match_par2_sources_packed',
+            [serialize([$sourceFiles, $eligible])],
+            16_384,
+        );
+
+        return is_array($decoded) && is_array($decoded['matches'] ?? null)
+            ? ['basis' => self::PAR2_SOURCE_MATCH_BASIS] + $decoded : null;
+    }
+
+    /**
+     * Rust mapIfscPreviewToSource() for parity tests and benchmarks (not adopted: unserialize()
+     * of the slices loses to PHP); null when PHP must map.
+     *
+     * @return list<array<string, int|string|bool|null>>|null
+     */
+    public static function mapIfscPreviewToSourceNative(?string $previewHex, ?int $fileLength, ?int $blockSize, int $maximumSlices): ?array
+    {
+        if ($previewHex === null) {
+            return [];
+        }
+        $decoded = self::serializedCall('nntmux_release_fp_map_ifsc_preview', [
+            $previewHex, $fileLength ?? 0, $blockSize ?? 0, $maximumSlices,
+            ($fileLength !== null ? 1 : 0) | ($blockSize !== null ? 2 : 0),
+        ], 4096);
+
+        /** @var list<array<string, int|string|bool|null>>|null */
+        return is_array($decoded) && array_is_list($decoded) ? $decoded : null;
+    }
+
+    /**
+     * Rust timestampSummary(), used by timestampSummary() from TIMESTAMP_SUMMARY_RUST_MINIMUM
+     * timestamps; null when PHP must summarize (empty input or timestamps beyond +/-2^40).
+     *
+     * @param  array<string, int>  $timestamps
+     * @return array<string, mixed>|null
+     */
+    public static function timestampSummaryNative(array $timestamps, int $observations, int $expected): ?array
+    {
+        $count = count($timestamps);
+        if ($count === 0 || self::ffi() === null || ($ffi = self::$ffi) === false || self::$timestampText === null || self::$int64Out === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_release_fp_timestamp_summary_packed(pack('q*', ...array_values($timestamps)), $count, self::$int64Out, self::$timestampText, self::TIMESTAMP_TEXT_BYTES);
+            if (! is_int($written) || $written <= 0) {
+                return null;
+            }
+            $text = FFI::string(self::$timestampText, $written);
+            $firstLength = (int) self::$int64Out[0];
+            $seconds = (int) self::$int64Out[1];
+        } catch (Throwable) {
+            return null;
+        }
+
+        return [
+            'available' => true,
+            'first_utc' => substr($text, 0, $firstLength),
+            'last_utc' => substr($text, $firstLength),
+            'seconds' => $seconds,
+            'valid_timestamp_count' => $count,
+            'observations' => $observations,
+            'expected_samples' => $expected,
+            'complete' => $observations >= $expected && $count >= $expected,
+        ];
+    }
+
+    /**
+     * Rust parseOverview() for parity tests and benchmarks (not adopted: below 1.5x for the common
+     * 8-field format). Rust derives the field keys and PHP combines them with the row values.
+     * Null when PHP must parse (a non-list format, a field containing NUL, or an
+     * empty, repeated or article_number key).
+     *
+     * @param  list<string>  $format
+     * @return array<string, string>|null
+     */
+    public static function parseOverviewNative(?string $row, array $format): ?array
+    {
+        if ($row === null || $format === []) {
+            return [];
+        }
+        $ffi = self::ffi();
+        if ($ffi === null || ! array_is_list($format)) {
+            return null;
+        }
+        $joined = implode("\0", $format);
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, 1024, $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_release_fp_parse_overview($row, strlen($row), $joined, strlen($joined), count($format), $scratch, $cap);
+            if (is_int($written) && $written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_release_fp_parse_overview($row, strlen($row), $joined, strlen($joined), count($format), $scratch, $cap);
+            }
+            if (! is_int($written) || $written <= 0) {
+                return null;
+            }
+            $keys = explode("\t", FFI::string($scratch, $written));
+        } catch (Throwable) {
+            return null;
+        }
+        $values = explode("\t", $row);
+
+        return array_combine($keys, count($values) === count($keys) ? $values : array_slice($values, 0, count($keys)));
+    }
+
+    /**
+     * Calls an export taking `(inputs..., char *out_buf, size_t out_cap)` and unserializes its
+     * output. String inputs are passed with their byte length; null when PHP must evaluate.
+     *
+     * @param  list<string|int>  $inputs
+     */
+    private static function serializedCall(string $function, array $inputs, int $initialBytes): mixed
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $arguments = [];
+        foreach ($inputs as $input) {
+            $arguments[] = $input;
+            if (is_string($input)) {
+                $arguments[] = strlen($input);
+            }
+        }
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, $initialBytes, $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        try {
+            $written = $ffi->{$function}(...$arguments, ...[$scratch, $cap]);
+            if (is_int($written) && $written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                $written = $ffi->{$function}(...$arguments, ...[$scratch, $cap]);
+            }
+            if (! is_int($written) || $written <= 0) {
+                return null;
+            }
+            $decoded = unserialize(FFI::string($scratch, $written), ['allowed_classes' => false]);
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $decoded === false ? null : $decoded;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('release_fingerprint_reconcile', self::FFI_CDEF) ?? false;
+            if (self::$ffi !== false) {
+                try {
+                    self::$int64Out = self::$ffi->new('int64_t[4]');
+                    self::$timestampText = self::$ffi->new('char['.self::TIMESTAMP_TEXT_BYTES.']');
+                } catch (Throwable) {
+                    self::$ffi = false;
+                }
+            }
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
     }
 }
