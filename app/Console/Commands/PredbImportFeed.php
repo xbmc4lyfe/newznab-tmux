@@ -10,7 +10,9 @@ use App\Services\Predb\Feeds\FeedRateLimitedException;
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use App\Services\Predb\Feeds\PredbFeedImporter;
 use App\Services\Predb\Feeds\PredbFeedSourceFactory;
+use App\Support\RustPipelineLibrary;
 use Carbon\CarbonImmutable;
+use FFI;
 use Illuminate\Console\Command;
 use Illuminate\Http\Client\RequestException;
 use Illuminate\Support\Facades\Log;
@@ -20,6 +22,22 @@ use Throwable;
 
 class PredbImportFeed extends Command
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_predb_import_parse_since(const char *value, size_t value_len, int64_t *amount);
+        int64_t nntmux_predb_import_rate_limit_wait(const char *retry_after, size_t retry_after_len, const char *reset_at, size_t reset_at_len, int64_t default_seconds, int64_t now, uint8_t has_now);
+        C;
+
+    /**
+     * Both option helpers stay on PHP: Carbon construction dominates parseSince() and the
+     * single-call FFI overhead outweighs rateLimitWaitSeconds() (see
+     * RustPredbFeedsAndStreamParityTest for the paired benchmark evidence).
+     */
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    private static ?FFI\CData $sinceAmount = null;
+
     /**
      * @var string
      */
@@ -190,11 +208,72 @@ class PredbImportFeed extends Command
         }
     }
 
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        self::$ffi ??= RustPipelineLibrary::resolveDomain('predb', self::FFI_CDEF) ?? false;
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
     /**
      * Seconds to wait before retrying a throttled request: Retry-After (delta-seconds or HTTP-date),
      * else an epoch X-RateLimit-Reset (xREL), else $default. The server's delay is never shortened.
      */
     private function rateLimitWaitSeconds(?string $retryAfter, ?string $resetAt, int $default): int
+    {
+        if (self::$useRustFfi) {
+            $supported = false;
+            $native = self::rateLimitWaitSecondsNative($retryAfter, $resetAt, $default, $supported);
+            if ($supported && $native !== null) {
+                return $native;
+            }
+        }
+
+        return self::rateLimitWaitSecondsPhp($retryAfter, $resetAt, $default);
+    }
+
+    /**
+     * Rust rateLimitWaitSeconds(); $supported is false for HTTP-dates other than a
+     * weekday-consistent IMF-fixdate and for overlong numbers.
+     */
+    public static function rateLimitWaitSecondsNative(?string $retryAfter, ?string $resetAt, int $default, bool &$supported = false): ?int
+    {
+        $supported = false;
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $retryAfter = (string) $retryAfter;
+        $resetAt = (string) $resetAt;
+        try {
+            // @phpstan-ignore method.notFound
+            $wait = $ffi->nntmux_predb_import_rate_limit_wait($retryAfter, strlen($retryAfter), $resetAt, strlen($resetAt), $default, 0, 0);
+            if ($wait === -2) {
+                // @phpstan-ignore method.notFound
+                $wait = $ffi->nntmux_predb_import_rate_limit_wait($retryAfter, strlen($retryAfter), $resetAt, strlen($resetAt), $default, CarbonImmutable::now()->getTimestamp(), 1);
+            }
+        } catch (Throwable) {
+            return null;
+        }
+        if (! is_int($wait) || $wait < 0) {
+            return null;
+        }
+        $supported = true;
+
+        return $wait;
+    }
+
+    public static function rateLimitWaitSecondsPhp(?string $retryAfter, ?string $resetAt, int $default): int
     {
         $retryAfter = trim((string) $retryAfter);
 
@@ -232,6 +311,66 @@ class PredbImportFeed extends Command
      * @return CarbonImmutable|false|null null when not given, false when invalid
      */
     private function parseSince(mixed $value): CarbonImmutable|false|null
+    {
+        if (self::$useRustFfi) {
+            $supported = false;
+            $native = self::parseSinceNative($value, $supported);
+            if ($supported) {
+                return $native;
+            }
+        }
+
+        return self::parseSincePhp($value);
+    }
+
+    /**
+     * Rust parseSince(); $supported is false for non-string values, non-ASCII text and overlong
+     * offsets.
+     */
+    public static function parseSinceNative(mixed $value, bool &$supported = false): CarbonImmutable|false|null
+    {
+        $supported = false;
+        if ($value === null) {
+            $supported = true;
+
+            return null;
+        }
+        $ffi = self::ffi();
+        if ($ffi === null || ! is_string($value)) {
+            return null;
+        }
+        try {
+            self::$sinceAmount ??= $ffi->new('int64_t');
+            // @phpstan-ignore method.notFound
+            $kind = $ffi->nntmux_predb_import_parse_since($value, strlen($value), FFI::addr(self::$sinceAmount));
+            // @phpstan-ignore property.notFound
+            $amount = self::$sinceAmount->cdata;
+        } catch (Throwable) {
+            return null;
+        }
+        if (! is_int($amount)) {
+            return null;
+        }
+        $result = match ($kind) {
+            0 => null,
+            1 => false,
+            2 => CarbonImmutable::now()->subDays($amount),
+            3 => CarbonImmutable::now()->subHours($amount),
+            4 => CarbonImmutable::createFromTimestamp($amount, 'UTC'),
+            default => -1,
+        };
+        if ($result === -1) {
+            return null;
+        }
+        $supported = true;
+
+        return $result;
+    }
+
+    /**
+     * @return CarbonImmutable|false|null null when not given, false when invalid
+     */
+    public static function parseSincePhp(mixed $value): CarbonImmutable|false|null
     {
         if ($value === null || $value === '') {
             return null;

@@ -3926,3 +3926,1652 @@ mod tests {
         assert_eq!(console_replace_platform_index(b"Atari"), None);
     }
 }
+
+// =============================================================================================
+// PreDB feed entries, importer changes, stream envelopes, import-feed options, IRC supervisor
+// =============================================================================================
+//
+// Counterparts of `PredbFeedEntry::sizeFromMegabytes`/`filesFromCount`,
+// `PredbFeedImporter::changesFor`, `PredbStreamListener::entries`,
+// `PredbImportFeed::parseSince`/`rateLimitWaitSeconds` and `IrcScraperCommand::restartDelay`.
+// Every entry point declines (`-1`) inputs outside the subset whose PHP semantics are reproduced
+// exactly, so callers fall back to PHP, and maps a panic to the same decline.
+
+const FEED_PRE_NONUKE: i64 = 0;
+
+/// Runs an FFI body, mapping a panic to `fallback`.
+#[inline]
+fn feed_ffi_guard<T>(fallback: T, body: impl FnOnce() -> T) -> T {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or(fallback)
+}
+
+/// Borrows `len` bytes at `ptr`: an empty slice for a zero length, `None` for a null pointer
+/// with a non-zero length or a length no allocation can have.
+#[inline]
+unsafe fn feed_ffi_input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+    if len == 0 {
+        return Some(&[]);
+    }
+    if ptr.is_null() || len > isize::MAX as usize {
+        return None;
+    }
+    Some(unsafe { slice::from_raw_parts(ptr, len) })
+}
+
+/// Copies `body` to the caller buffer: its length, `0` for an empty body, or `-(needed)` (at
+/// least `-2`, since `-1` is a decline) when `out_cap` is too small.
+unsafe fn feed_ffi_output(body: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+    if body.is_empty() {
+        return 0;
+    }
+    if body.len() > isize::MAX as usize {
+        return -1;
+    }
+    if out_buf.is_null() || out_cap < body.len() {
+        return -(body.len().max(2) as isize);
+    }
+    unsafe { std::ptr::copy_nonoverlapping(body.as_ptr(), out_buf, body.len()) };
+    body.len() as isize
+}
+
+#[inline]
+fn feed_push_i64(out: &mut Vec<u8>, v: i64) {
+    let mut buf = [0u8; 20];
+    let mut n = v.unsigned_abs();
+    let mut at = buf.len();
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    if v < 0 {
+        out.push(b'-');
+    }
+    out.extend_from_slice(&buf[at..]);
+}
+
+/// PHP `trim()` with its default character list.
+#[inline]
+fn feed_php_trim(s: &[u8]) -> &[u8] {
+    let is_trim = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+    let start = s.iter().position(|b| !is_trim(b)).unwrap_or(s.len());
+    let end = s.iter().rposition(|b| !is_trim(b)).map_or(start, |e| e + 1);
+    &s[start..end]
+}
+
+/// A run of 1..=18 ASCII digits (so it fits an `i64`), as `ctype_digit()` plus `(int)` accept.
+fn feed_digits_i64(s: &[u8]) -> Option<i64> {
+    if s.is_empty() || s.len() > 18 || !s.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(
+        s.iter()
+            .fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0')),
+    )
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date.
+fn feed_days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn feed_days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        _ => 28,
+    }
+}
+
+// --- PredbFeedEntry ---------------------------------------------------------------------------
+
+/// `PredbFeedEntry::sizeFromMegabytes()`: `Ok(false)` for null, `Err` for values that are near a
+/// `number_format()` rounding tie, large or not finite (PHP formats those).
+fn feed_size_from_megabytes(mb: f64, out: &mut Vec<u8>) -> Result<bool, ()> {
+    if !mb.is_finite() {
+        return Err(());
+    }
+    if mb <= 0.0 {
+        return Ok(false);
+    }
+    let (value, unit): (f64, &[u8]) = if mb < 1.0 {
+        (mb * 1024.0, b"KB")
+    } else {
+        (mb, b"MB")
+    };
+    let scaled = value * 100.0;
+    let frac = scaled - scaled.floor();
+    if value >= 1e6 || (frac - 0.5).abs() <= 1e-6 {
+        return Err(());
+    }
+    // rtrim(rtrim(number_format($value, 2, '.', ''), '0'), '.')
+    let cents = scaled.round() as i64;
+    feed_push_i64(out, cents / 100);
+    let fraction = cents % 100;
+    if fraction != 0 {
+        out.push(b'.');
+        out.push(b'0' + (fraction / 10) as u8);
+        if fraction % 10 != 0 {
+            out.push(b'0' + (fraction % 10) as u8);
+        }
+    }
+    out.extend_from_slice(unit);
+    Ok(true)
+}
+
+/// `(int) $string` for the integer-prefix strings PHP converts without a float step; `None` for
+/// float-like or overlong numbers.
+fn feed_php_string_int(s: &[u8]) -> Option<i64> {
+    let mut p = 0;
+    while p < s.len() && matches!(s[p], b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) {
+        p += 1;
+    }
+    let negative = match s.get(p) {
+        Some(b'-') => {
+            p += 1;
+            true
+        }
+        Some(b'+') => {
+            p += 1;
+            false
+        }
+        _ => false,
+    };
+    let start = p;
+    while p < s.len() && s[p].is_ascii_digit() {
+        p += 1;
+    }
+    if matches!(s.get(p), Some(b'.' | b'e' | b'E')) {
+        return None;
+    }
+    if p == start {
+        return Some(0);
+    }
+    let value = feed_digits_i64(&s[start..p])?;
+    Some(if negative { -value } else { value })
+}
+
+/// Formats a size given in megabytes like `PredbFeedEntry::sizeFromMegabytes()`.
+///
+/// Returns the bytes written, `0` for null (unknown size), `-1` to decline (PHP formats near-tie,
+/// large or non-finite values) and `< -1` (`-needed`) when `out_cap` is too small.
+///
+/// # Safety
+/// `out_buf` must be writable for `out_cap` bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_predb_feed_entry_format_size_mb(
+    megabytes: f64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    feed_ffi_guard(-1, || {
+        let mut body = Vec::with_capacity(16);
+        match feed_size_from_megabytes(megabytes, &mut body) {
+            Ok(true) => unsafe { feed_ffi_output(&body, out_buf, out_cap) },
+            Ok(false) => 0,
+            Err(()) => -1,
+        }
+    })
+}
+
+/// Normalises a file count like `PredbFeedEntry::filesFromCount()`: `count` when `is_string` is
+/// `0`, else the PHP `(int)` cast of `text[..text_len]`.
+///
+/// Returns the bytes written, `0` for null (unknown count), `-1` to decline (float-like or overlong
+/// numeric strings, invalid pointers) and `< -1` (`-needed`) when `out_cap` is too small.
+///
+/// # Safety
+/// `text` must be readable for `text_len` bytes and `out_buf` writable for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_predb_feed_entry_format_files(
+    count: i64,
+    text: *const u8,
+    text_len: usize,
+    is_string: u8,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    feed_ffi_guard(-1, || {
+        let value = match is_string {
+            0 => count,
+            1 => {
+                let Some(s) = (unsafe { feed_ffi_input(text, text_len) }) else {
+                    return -1;
+                };
+                let Some(v) = feed_php_string_int(s) else {
+                    return -1;
+                };
+                v
+            }
+            _ => return -1,
+        };
+        if value <= 0 {
+            return 0;
+        }
+        let mut body = Vec::with_capacity(20);
+        feed_push_i64(&mut body, value);
+        unsafe { feed_ffi_output(&body, out_buf, out_cap) }
+    })
+}
+
+// --- PredbFeedImporter::changesFor -----------------------------------------------------------
+
+/// The leading `chars` code points of valid UTF-8 (`mb_substr($s, 0, $chars)`).
+fn feed_mb_prefix(s: &[u8], chars: usize) -> &[u8] {
+    let mut count = 0;
+    for (i, &b) in s.iter().enumerate() {
+        if b & 0xc0 != 0x80 {
+            if count == chars {
+                return &s[..i];
+            }
+            count += 1;
+        }
+    }
+    s
+}
+
+/// Appends a JSON string literal of valid UTF-8 bytes.
+fn feed_json_string(out: &mut Vec<u8>, s: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push(b'"');
+    let mut run = 0;
+    for (i, &b) in s.iter().enumerate() {
+        if b == b'"' || b == b'\\' || b < 0x20 {
+            out.extend_from_slice(&s[run..i]);
+            match b {
+                b'"' => out.extend_from_slice(b"\\\""),
+                b'\\' => out.extend_from_slice(b"\\\\"),
+                _ => out.extend_from_slice(&[
+                    b'\\',
+                    b'u',
+                    b'0',
+                    b'0',
+                    HEX[usize::from(b >> 4)],
+                    HEX[usize::from(b & 15)],
+                ]),
+            }
+            run = i + 1;
+        }
+    }
+    out.extend_from_slice(&s[run..]);
+    out.push(b'"');
+}
+
+/// Appends `"key":` with the separating comma when the object already has members.
+fn feed_json_key(out: &mut Vec<u8>, key: &[u8]) {
+    out.push(if out.is_empty() { b'{' } else { b',' });
+    out.push(b'"');
+    out.extend_from_slice(key);
+    out.extend_from_slice(b"\":");
+}
+
+fn feed_json_nullable(out: &mut Vec<u8>, s: Option<&[u8]>) -> Result<(), ()> {
+    match s {
+        None => out.extend_from_slice(b"null"),
+        Some(v) => {
+            std::str::from_utf8(v).map_err(|_| ())?;
+            feed_json_string(out, v);
+        }
+    }
+    Ok(())
+}
+
+struct FeedChangeInputs<'a> {
+    existing_category: Option<&'a [u8]>,
+    existing_size: Option<&'a [u8]>,
+    existing_files: Option<&'a [u8]>,
+    existing_nukereason: Option<&'a [u8]>,
+    entry_category: Option<&'a [u8]>,
+    entry_size: Option<&'a [u8]>,
+    entry_files: Option<&'a [u8]>,
+    entry_predate: Option<&'a [u8]>,
+    entry_nukereason: Option<&'a [u8]>,
+    existing_predate_null: bool,
+    existing_nuked: i64,
+    entry_nuked: i64,
+}
+
+/// `PredbFeedImporter::changesFor()` as a JSON object in PHP insertion order (empty when there
+/// are no changes); `Err` when a string that must be cut or emitted is not valid UTF-8.
+fn feed_changes_for(i: &FeedChangeInputs<'_>, out: &mut Vec<u8>) -> Result<(), ()> {
+    type Fill<'a> = (&'static [u8], Option<&'a [u8]>, Option<&'a [u8]>, usize);
+    let fills: [Fill<'_>; 3] = [
+        (b"category", i.existing_category, i.entry_category, 255),
+        (b"size", i.existing_size, i.entry_size, 50),
+        (b"files", i.existing_files, i.entry_files, 50),
+    ];
+    for (key, existing, entry, chars) in fills {
+        if let Some(value) = entry
+            && existing.is_none_or(<[u8]>::is_empty)
+        {
+            std::str::from_utf8(value).map_err(|_| ())?;
+            feed_json_key(out, key);
+            feed_json_string(out, feed_mb_prefix(value, chars));
+        }
+    }
+    if i.existing_predate_null
+        && let Some(predate) = i.entry_predate
+    {
+        std::str::from_utf8(predate).map_err(|_| ())?;
+        feed_json_key(out, b"predate");
+        feed_json_string(out, predate);
+    }
+
+    let reason = match i.entry_nukereason {
+        Some(r) => {
+            std::str::from_utf8(r).map_err(|_| ())?;
+            Some(feed_mb_prefix(r, 255))
+        }
+        None => None,
+    };
+    if i.entry_nuked != FEED_PRE_NONUKE && i.existing_nuked != i.entry_nuked {
+        feed_json_key(out, b"nuked");
+        feed_push_i64(out, i.entry_nuked);
+        feed_json_key(out, b"nuked_from");
+        feed_push_i64(out, i.existing_nuked);
+        feed_json_key(out, b"nukereason");
+        feed_json_nullable(out, reason.or(i.existing_nukereason))?;
+    } else if i.entry_nuked != FEED_PRE_NONUKE
+        && let Some(r) = reason
+        && r != i.existing_nukereason.unwrap_or(b"")
+    {
+        feed_json_key(out, b"nukereason");
+        feed_json_string(out, r);
+        feed_json_key(out, b"nuked_status");
+        feed_push_i64(out, i.entry_nuked);
+        feed_json_key(out, b"nukereason_from");
+        feed_json_nullable(out, i.existing_nukereason)?;
+    }
+    if !out.is_empty() {
+        out.push(b'}');
+    }
+    Ok(())
+}
+
+/// Computes `PredbFeedImporter::changesFor()` as a JSON object (keys in PHP insertion order).
+///
+/// Strings are `(pointer, length)` pairs; bit `n` of `present_mask` marks string `n` as non-null
+/// (0 existing category, 1 existing size, 2 existing files, 3 existing nuke reason, 4 entry
+/// category, 5 entry size, 6 entry files, 7 entry predate as `Y-m-d H:i:s`, 8 entry nuke reason).
+///
+/// Returns the JSON length, `0` when there are no changes, `-1` to decline (invalid pointers or
+/// UTF-8 that `mb_substr`/JSON cannot reproduce) and `< -1` (`-needed`) when `out_cap` is too
+/// small.
+///
+/// # Safety
+/// Every present string pointer must be readable for its length and `out_buf` writable for
+/// `out_cap` bytes.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_predb_feed_importer_changes_for_json(
+    existing_category: *const u8,
+    existing_category_len: usize,
+    existing_size: *const u8,
+    existing_size_len: usize,
+    existing_files: *const u8,
+    existing_files_len: usize,
+    existing_nukereason: *const u8,
+    existing_nukereason_len: usize,
+    entry_category: *const u8,
+    entry_category_len: usize,
+    entry_size: *const u8,
+    entry_size_len: usize,
+    entry_files: *const u8,
+    entry_files_len: usize,
+    entry_predate: *const u8,
+    entry_predate_len: usize,
+    entry_nukereason: *const u8,
+    entry_nukereason_len: usize,
+    present_mask: u32,
+    existing_predate_null: u8,
+    existing_nuked: i64,
+    entry_nuked: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    feed_ffi_guard(-1, || {
+        if present_mask >> 9 != 0 || existing_predate_null > 1 {
+            return -1;
+        }
+        let pairs = [
+            (existing_category, existing_category_len),
+            (existing_size, existing_size_len),
+            (existing_files, existing_files_len),
+            (existing_nukereason, existing_nukereason_len),
+            (entry_category, entry_category_len),
+            (entry_size, entry_size_len),
+            (entry_files, entry_files_len),
+            (entry_predate, entry_predate_len),
+            (entry_nukereason, entry_nukereason_len),
+        ];
+        let mut strings: [Option<&[u8]>; 9] = [None; 9];
+        for (n, (ptr, len)) in pairs.into_iter().enumerate() {
+            if present_mask & (1 << n) != 0 {
+                let Some(s) = (unsafe { feed_ffi_input(ptr, len) }) else {
+                    return -1;
+                };
+                strings[n] = Some(s);
+            }
+        }
+        let inputs = FeedChangeInputs {
+            existing_category: strings[0],
+            existing_size: strings[1],
+            existing_files: strings[2],
+            existing_nukereason: strings[3],
+            entry_category: strings[4],
+            entry_size: strings[5],
+            entry_files: strings[6],
+            entry_predate: strings[7],
+            entry_nukereason: strings[8],
+            existing_predate_null: existing_predate_null == 1,
+            existing_nuked,
+            entry_nuked,
+        };
+        let mut body = Vec::with_capacity(128);
+        if feed_changes_for(&inputs, &mut body).is_err() {
+            return -1;
+        }
+        unsafe { feed_ffi_output(&body, out_buf, out_cap) }
+    })
+}
+
+// --- PredbStreamListener::entries -------------------------------------------------------------
+//
+// One pass validates the message with `json_decode($message, true)` acceptance (RFC 8259 grammar,
+// UTF-8, escapes, unpaired surrogates, depth) while capturing the last occurrence of every member
+// `entries()` and `parseRows()` read; the captured values are then converted with PHP's casts.
+
+const STREAM_PREDB_CLUB: u32 = 0;
+const STREAM_PREDB_NET: u32 = 1;
+/// Below `json_decode`'s default depth of 512, so deeper documents always decline.
+const STREAM_MAX_DEPTH: usize = 500;
+const STREAM_REC_SEP: u8 = 0x1e;
+const STREAM_FIELD_SEP: u8 = 0x1f;
+
+const STREAM_PRE_UNNUKED: u8 = 1;
+const STREAM_PRE_NUKED: u8 = 2;
+const STREAM_PRE_MODNUKE: u8 = 3;
+const STREAM_PRE_RENUKED: u8 = 4;
+const STREAM_PRE_OLDNUKE: u8 = 5;
+
+/// `Malformed`: `json_decode` fails (the message yields no entries). `Unsupported`: PHP decides.
+#[derive(Debug, PartialEq)]
+enum StreamFail {
+    Malformed,
+    Unsupported,
+}
+
+type StreamResult<T> = Result<T, StreamFail>;
+
+/// A validated JSON value: spans index the message; strings keep their raw (escaped) content.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SVal {
+    Null,
+    Bool(bool),
+    Num(usize, usize),
+    Str(usize, usize),
+    Arr { empty: bool },
+    Obj { empty: bool },
+}
+
+#[derive(Default)]
+struct NukeCapture {
+    kind: Option<SVal>,
+    reason: Option<SVal>,
+}
+
+/// The members of one row object (`parseRows()` reads each with `?? null`).
+#[derive(Default)]
+struct RowCapture {
+    title: Option<SVal>,
+    category: Option<SVal>,
+    size: Option<SVal>,
+    files: Option<SVal>,
+    time: Option<SVal>,
+    status: Option<SVal>,
+    reason: Option<SVal>,
+    nuke: Option<SVal>,
+    nuke_members: NukeCapture,
+}
+
+struct StreamParser<'a> {
+    s: &'a [u8],
+    p: usize,
+}
+
+#[inline]
+fn stream_hex4(s: &[u8], at: usize) -> Option<u32> {
+    let h = s.get(at..at + 4)?;
+    h.iter().try_fold(0u32, |acc, &b| {
+        let d = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => return None,
+        };
+        Some(acc << 4 | u32::from(d))
+    })
+}
+
+impl<'a> StreamParser<'a> {
+    #[inline]
+    fn ws(&mut self) {
+        while self.p < self.s.len() && matches!(self.s[self.p], b' ' | b'\t' | b'\n' | b'\r') {
+            self.p += 1;
+        }
+    }
+
+    #[inline]
+    fn peek(&self) -> Option<u8> {
+        self.s.get(self.p).copied()
+    }
+
+    /// Validates the string opening at `p` (the message is already valid UTF-8) and returns the
+    /// raw content span.
+    fn string(&mut self) -> StreamResult<(usize, usize)> {
+        let s = self.s;
+        let start = self.p + 1;
+        let mut p = start;
+        loop {
+            while p < s.len() && !matches!(s[p], b'"' | b'\\' | 0..=0x1f) {
+                p += 1;
+            }
+            match s.get(p) {
+                Some(b'"') => {
+                    self.p = p + 1;
+                    return Ok((start, p));
+                }
+                Some(b'\\') => match s.get(p + 1) {
+                    Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => p += 2,
+                    Some(b'u') => {
+                        let cp = stream_hex4(s, p + 2).ok_or(StreamFail::Malformed)?;
+                        p += 6;
+                        if (0xd800..0xdc00).contains(&cp) {
+                            let low = (s.get(p) == Some(&b'\\') && s.get(p + 1) == Some(&b'u'))
+                                .then(|| stream_hex4(s, p + 2))
+                                .flatten();
+                            match low {
+                                Some(l) if (0xdc00..0xe000).contains(&l) => p += 6,
+                                _ => return Err(StreamFail::Malformed),
+                            }
+                        } else if (0xdc00..0xe000).contains(&cp) {
+                            return Err(StreamFail::Malformed);
+                        }
+                    }
+                    _ => return Err(StreamFail::Malformed),
+                },
+                _ => return Err(StreamFail::Malformed),
+            }
+        }
+    }
+
+    fn number(&mut self) -> StreamResult<(usize, usize)> {
+        let s = self.s;
+        let start = self.p;
+        let mut p = start;
+        let digits = |p: &mut usize| {
+            let from = *p;
+            while *p < s.len() && s[*p].is_ascii_digit() {
+                *p += 1;
+            }
+            *p > from
+        };
+        if s.get(p) == Some(&b'-') {
+            p += 1;
+        }
+        match s.get(p) {
+            Some(b'0') => p += 1,
+            Some(b'1'..=b'9') => {
+                digits(&mut p);
+            }
+            _ => return Err(StreamFail::Malformed),
+        }
+        if s.get(p) == Some(&b'.') {
+            p += 1;
+            if !digits(&mut p) {
+                return Err(StreamFail::Malformed);
+            }
+        }
+        if matches!(s.get(p), Some(b'e' | b'E')) {
+            p += 1;
+            if matches!(s.get(p), Some(b'+' | b'-')) {
+                p += 1;
+            }
+            if !digits(&mut p) {
+                return Err(StreamFail::Malformed);
+            }
+        }
+        self.p = p;
+        Ok((start, p))
+    }
+
+    fn literal(&mut self, word: &[u8]) -> StreamResult<()> {
+        if self.s[self.p..].starts_with(word) {
+            self.p += word.len();
+            Ok(())
+        } else {
+            Err(StreamFail::Malformed)
+        }
+    }
+
+    /// The decoded key at `p`, borrowed unless it contains escapes.
+    fn key(&mut self) -> StreamResult<Cow<'a, [u8]>> {
+        if self.peek() != Some(b'"') {
+            return Err(StreamFail::Malformed);
+        }
+        let (a, b) = self.string()?;
+        let s = self.s;
+        Ok(stream_decode(&s[a..b]))
+    }
+
+    /// Parses an object at `p` (depth already counted), handing each member's decoded key to
+    /// `member`, which must consume the value.
+    fn object(
+        &mut self,
+        depth: usize,
+        mut member: impl FnMut(&mut Self, &[u8], usize) -> StreamResult<()>,
+    ) -> StreamResult<bool> {
+        self.p += 1;
+        self.ws();
+        if self.peek() == Some(b'}') {
+            self.p += 1;
+            return Ok(true);
+        }
+        loop {
+            let key = self.key()?;
+            self.ws();
+            if self.peek() != Some(b':') {
+                return Err(StreamFail::Malformed);
+            }
+            self.p += 1;
+            self.ws();
+            member(self, &key, depth)?;
+            self.ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.p += 1;
+                    self.ws();
+                }
+                Some(b'}') => {
+                    self.p += 1;
+                    return Ok(false);
+                }
+                _ => return Err(StreamFail::Malformed),
+            }
+        }
+    }
+
+    /// Validates any value at `p`; `depth` counts the containers enclosing it.
+    fn value(&mut self, depth: usize) -> StreamResult<SVal> {
+        match self.peek().ok_or(StreamFail::Malformed)? {
+            b'{' => {
+                let depth = stream_enter(depth)?;
+                let empty = self.object(depth, |p, _, d| p.value(d).map(drop))?;
+                Ok(SVal::Obj { empty })
+            }
+            b'[' => {
+                let depth = stream_enter(depth)?;
+                self.p += 1;
+                self.ws();
+                if self.peek() == Some(b']') {
+                    self.p += 1;
+                    return Ok(SVal::Arr { empty: true });
+                }
+                loop {
+                    self.value(depth)?;
+                    self.ws();
+                    match self.peek() {
+                        Some(b',') => {
+                            self.p += 1;
+                            self.ws();
+                        }
+                        Some(b']') => {
+                            self.p += 1;
+                            return Ok(SVal::Arr { empty: false });
+                        }
+                        _ => return Err(StreamFail::Malformed),
+                    }
+                }
+            }
+            b'"' => self.string().map(|(a, b)| SVal::Str(a, b)),
+            b't' => self.literal(b"true").map(|()| SVal::Bool(true)),
+            b'f' => self.literal(b"false").map(|()| SVal::Bool(false)),
+            b'n' => self.literal(b"null").map(|()| SVal::Null),
+            _ => self.number().map(|(a, b)| SVal::Num(a, b)),
+        }
+    }
+
+    /// A row value: an object's captured members, or `None` for any other value (a list has no
+    /// title member, so `parseRows()` skips it).
+    fn row(&mut self, depth: usize, format: u32) -> StreamResult<Option<RowCapture>> {
+        if self.peek() != Some(b'{') {
+            return self.value(depth).map(|_| None);
+        }
+        let depth = stream_enter(depth)?;
+        let mut row = RowCapture::default();
+        self.object(depth, |p, key, d| {
+            let slot = match (format, key) {
+                (STREAM_PREDB_CLUB, b"name") | (STREAM_PREDB_NET, b"release") => &mut row.title,
+                (STREAM_PREDB_CLUB, b"cat") | (STREAM_PREDB_NET, b"section") => &mut row.category,
+                (_, b"size") => &mut row.size,
+                (_, b"files") => &mut row.files,
+                (STREAM_PREDB_CLUB, b"preAt") | (STREAM_PREDB_NET, b"pretime") => &mut row.time,
+                (STREAM_PREDB_NET, b"status") => &mut row.status,
+                (STREAM_PREDB_NET, b"reason") => &mut row.reason,
+                (STREAM_PREDB_CLUB, b"nuke") => {
+                    row.nuke_members = NukeCapture::default();
+                    if p.peek() == Some(b'{') {
+                        let inner = stream_enter(d)?;
+                        let nuke = &mut row.nuke_members;
+                        let empty = p.object(inner, |q, k, dd| {
+                            let v = q.value(dd)?;
+                            match k {
+                                b"type" => nuke.kind = Some(v),
+                                b"reason" => nuke.reason = Some(v),
+                                _ => {}
+                            }
+                            Ok(())
+                        })?;
+                        row.nuke = Some(SVal::Obj { empty });
+                    } else {
+                        row.nuke = Some(p.value(d)?);
+                    }
+                    return Ok(());
+                }
+                _ => return p.value(d).map(drop),
+            };
+            *slot = Some(p.value(d)?);
+            Ok(())
+        })?;
+        Ok(Some(row))
+    }
+}
+
+#[inline]
+fn stream_enter(depth: usize) -> StreamResult<usize> {
+    if depth >= STREAM_MAX_DEPTH {
+        Err(StreamFail::Unsupported)
+    } else {
+        Ok(depth + 1)
+    }
+}
+
+/// Decodes the raw content of a validated JSON string.
+fn stream_decode(raw: &[u8]) -> Cow<'_, [u8]> {
+    if !raw.contains(&b'\\') {
+        return Cow::Borrowed(raw);
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] != b'\\' {
+            out.push(raw[i]);
+            i += 1;
+            continue;
+        }
+        let byte = match raw[i + 1] {
+            b'b' => 0x08,
+            b'f' => 0x0c,
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b't' => b'\t',
+            b'u' => {
+                let mut cp = stream_hex4(raw, i + 2).unwrap_or(0xfffd);
+                i += 6;
+                if (0xd800..0xdc00).contains(&cp) {
+                    let low = stream_hex4(raw, i + 2).unwrap_or(0xdc00);
+                    cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
+                    i += 6;
+                }
+                let mut buf = [0u8; 4];
+                let c = char::from_u32(cp).unwrap_or('\u{fffd}');
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                continue;
+            }
+            other => other,
+        };
+        out.push(byte);
+        i += 2;
+    }
+    Cow::Owned(out)
+}
+
+/// Whether the message is valid JSON: an object whose captures are returned, or another value.
+fn stream_parse(s: &[u8], format: u32) -> StreamResult<(Option<SVal>, Option<RowCapture>)> {
+    if std::str::from_utf8(s).is_err() {
+        return Err(StreamFail::Malformed);
+    }
+    let mut parser = StreamParser { s, p: 0 };
+    parser.ws();
+    let mut action = None;
+    let mut row = None;
+    if parser.peek() == Some(b'{') {
+        let depth = stream_enter(0)?;
+        let row_key: &[u8] = if format == STREAM_PREDB_CLUB {
+            b"row"
+        } else {
+            b"message"
+        };
+        parser.object(depth, |p, key, d| {
+            if key == row_key {
+                row = p.row(d, format)?;
+            } else if format == STREAM_PREDB_CLUB && key == b"action" {
+                action = Some(p.value(d)?);
+            } else {
+                p.value(d)?;
+            }
+            Ok(())
+        })?;
+    } else {
+        parser.value(0)?;
+    }
+    parser.ws();
+    if parser.p != s.len() {
+        return Err(StreamFail::Malformed);
+    }
+    Ok((action, row))
+}
+
+/// A PHP number: `int` or `float`.
+#[derive(Clone, Copy)]
+enum SNum {
+    I(i64),
+    F(f64),
+}
+
+fn stream_plain_integer(s: &[u8]) -> Option<i64> {
+    let digits = s.strip_prefix(b"-").unwrap_or(s);
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(s).ok()?.parse().ok()
+}
+
+/// PHP 8 `is_numeric()` of a string and its number: optional surrounding whitespace, a sign,
+/// decimal digits with an optional fraction and exponent. Integer forms that overflow become
+/// floats, as in PHP.
+fn stream_numeric_string(text: &[u8]) -> Option<SNum> {
+    let is_ws = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+    let start = text.iter().position(|b| !is_ws(b))?;
+    let end = text.iter().rposition(|b| !is_ws(b))? + 1;
+    let t = &text[start..end];
+    let mut p = usize::from(matches!(t.first(), Some(b'+' | b'-')));
+    let int_digits = t[p..].iter().take_while(|b| b.is_ascii_digit()).count();
+    p += int_digits;
+    let mut float = false;
+    let mut frac_digits = 0;
+    if t.get(p) == Some(&b'.') {
+        float = true;
+        p += 1;
+        frac_digits = t[p..].iter().take_while(|b| b.is_ascii_digit()).count();
+        p += frac_digits;
+    }
+    if int_digits + frac_digits == 0 {
+        return None;
+    }
+    if matches!(t.get(p), Some(b'e' | b'E')) {
+        float = true;
+        p += 1;
+        if matches!(t.get(p), Some(b'+' | b'-')) {
+            p += 1;
+        }
+        let exp_digits = t[p..].iter().take_while(|b| b.is_ascii_digit()).count();
+        if exp_digits == 0 {
+            return None;
+        }
+        p += exp_digits;
+    }
+    if p != t.len() {
+        return None;
+    }
+    let number = std::str::from_utf8(t).ok()?;
+    if !float && let Ok(i) = number.parse::<i64>() {
+        return Some(SNum::I(i));
+    }
+    number.parse::<f64>().ok().map(SNum::F)
+}
+
+/// `is_numeric($v) ? <number> : null`; `Err` for JSON numbers Rust cannot parse.
+fn stream_numeric(s: &[u8], v: Option<SVal>) -> Result<Option<SNum>, ()> {
+    match v {
+        Some(SVal::Num(a, b)) => {
+            let raw = &s[a..b];
+            if !raw.iter().any(|b| matches!(b, b'.' | b'e' | b'E'))
+                && let Some(i) = stream_plain_integer(raw)
+            {
+                return Ok(Some(SNum::I(i)));
+            }
+            let f: f64 = std::str::from_utf8(raw)
+                .ok()
+                .and_then(|t| t.parse().ok())
+                .ok_or(())?;
+            Ok(Some(SNum::F(f)))
+        }
+        Some(SVal::Str(a, b)) => Ok(stream_numeric_string(&stream_decode(&s[a..b]))),
+        _ => Ok(None),
+    }
+}
+
+/// `(int) $numeric`; `Err` for floats PHP cannot narrow exactly.
+fn stream_num_int(n: SNum) -> Result<i64, ()> {
+    match n {
+        SNum::I(i) => Ok(i),
+        SNum::F(f) if f.is_finite() && f > -9.2e18 && f < 9.2e18 => Ok(f.trunc() as i64),
+        SNum::F(_) => Err(()),
+    }
+}
+
+/// `(int) ($v ?? 0)`.
+fn stream_int_cast(s: &[u8], v: Option<SVal>) -> Result<i64, ()> {
+    match v {
+        None | Some(SVal::Null) | Some(SVal::Bool(false)) => Ok(0),
+        Some(SVal::Bool(true)) => Ok(1),
+        Some(SVal::Arr { empty } | SVal::Obj { empty }) => Ok(i64::from(!empty)),
+        Some(SVal::Num(..)) => stream_num_int(stream_numeric(s, v)?.ok_or(())?),
+        // (int) "12abc" is 12; float-like prefixes decline.
+        Some(SVal::Str(a, b)) => feed_php_string_int(&stream_decode(&s[a..b])).ok_or(()),
+    }
+}
+
+/// `is_string($v) && $v !== ''` → the decoded string.
+fn stream_nonempty_string(s: &[u8], v: Option<SVal>) -> Option<Cow<'_, [u8]>> {
+    match v {
+        Some(SVal::Str(a, b)) if b > a => Some(stream_decode(&s[a..b])),
+        _ => None,
+    }
+}
+
+fn stream_push_field(out: &mut Vec<u8>, bytes: &[u8]) -> Option<()> {
+    if bytes
+        .iter()
+        .any(|&b| b == STREAM_REC_SEP || b == STREAM_FIELD_SEP)
+    {
+        return None;
+    }
+    out.push(STREAM_FIELD_SEP);
+    out.extend_from_slice(bytes);
+    Some(())
+}
+
+/// Appends one entry record; `None` declines (values PHP converts in ways not reproduced here).
+fn stream_record(s: &[u8], row: &RowCapture, format: u32, out: &mut Vec<u8>) -> Option<bool> {
+    let Some(SVal::Str(a, b)) = row.title else {
+        return Some(false);
+    };
+    let decoded = stream_decode(&s[a..b]);
+    let title = feed_php_trim(&decoded);
+    if title.is_empty() {
+        return Some(false);
+    }
+    let (nuked, reason) = if format == STREAM_PREDB_CLUB {
+        match row.nuke {
+            Some(SVal::Obj { .. } | SVal::Arr { .. }) => {
+                let kind = match row.nuke_members.kind {
+                    None | Some(SVal::Null) => Cow::Borrowed(&b"nuke"[..]),
+                    Some(SVal::Str(x, y)) => stream_decode(&s[x..y]),
+                    // (string) of an array warns; other scalars never equal a keyword.
+                    Some(SVal::Arr { .. } | SVal::Obj { .. }) => return None,
+                    Some(_) => Cow::Borrowed(&b""[..]),
+                };
+                let nuked = match kind.to_ascii_lowercase().as_slice() {
+                    b"unnuke" | b"undelpre" => STREAM_PRE_UNNUKED,
+                    b"modnuke" => STREAM_PRE_MODNUKE,
+                    b"renuke" => STREAM_PRE_RENUKED,
+                    b"oldnuke" => STREAM_PRE_OLDNUKE,
+                    _ => STREAM_PRE_NUKED,
+                };
+                (nuked, stream_nonempty_string(s, row.nuke_members.reason))
+            }
+            _ => (0, None),
+        }
+    } else {
+        let status = stream_int_cast(s, row.status).ok()?;
+        let nuked = match status {
+            0 => 0,
+            2 | 4 => STREAM_PRE_UNNUKED,
+            _ => STREAM_PRE_NUKED,
+        };
+        let reason = if status == 0 {
+            None
+        } else {
+            stream_nonempty_string(s, row.reason)
+        };
+        (nuked, reason)
+    };
+
+    stream_push_field(out, title)?;
+    stream_push_field(
+        out,
+        stream_nonempty_string(s, row.category)
+            .as_deref()
+            .unwrap_or(b""),
+    )?;
+    out.push(STREAM_FIELD_SEP);
+    if let Some(n) = stream_numeric(s, row.size).ok()? {
+        let mb = match n {
+            SNum::I(i) => i as f64,
+            SNum::F(f) => f,
+        };
+        match feed_size_from_megabytes(mb, out) {
+            Ok(_) => {}
+            // Near a rounding tie: "~<float>" lets PHP format the value itself.
+            Err(()) if mb.is_finite() => {
+                out.push(b'~');
+                out.extend_from_slice(format!("{mb:?}").as_bytes());
+            }
+            Err(()) => return None,
+        }
+    }
+    out.push(STREAM_FIELD_SEP);
+    if let Some(n) = stream_numeric(s, row.files).ok()? {
+        let count = stream_num_int(n).ok()?;
+        if count > 0 {
+            feed_push_i64(out, count);
+        }
+    }
+    out.push(STREAM_FIELD_SEP);
+    if let Some(n) = stream_numeric(s, row.time).ok()? {
+        feed_push_i64(out, stream_num_int(n).ok()?);
+    }
+    out.push(STREAM_FIELD_SEP);
+    out.push(b'0' + nuked);
+    stream_push_field(out, reason.as_deref().unwrap_or(b""))?;
+    Some(true)
+}
+
+/// `PredbStreamListener::entries()`: `Ok` with the records (possibly none), `Err` to decline.
+fn stream_entries(s: &[u8], format: u32, out: &mut Vec<u8>) -> Result<(), ()> {
+    if format != STREAM_PREDB_CLUB && format != STREAM_PREDB_NET {
+        return Err(());
+    }
+    out.push(b'K');
+    let (action, row) = match stream_parse(s, format) {
+        Ok(captures) => captures,
+        Err(StreamFail::Malformed) => return Ok(()),
+        Err(StreamFail::Unsupported) => return Err(()),
+    };
+    if format == STREAM_PREDB_CLUB {
+        let Some(SVal::Str(a, b)) = action else {
+            return Ok(());
+        };
+        let action = stream_decode(&s[a..b]);
+        if &action[..] != b"insert" && &action[..] != b"update" {
+            return Ok(());
+        }
+    }
+    if let Some(row) = row {
+        stream_record(s, &row, format, out).ok_or(())?;
+    }
+    Ok(())
+}
+
+/// Extracts the PRE rows of one predb.club (`format` 0: `{"action":"insert"|"update","row":{..}}`)
+/// or predb.net (`format` 1: `{"message":{..}}`) WebSocket message, matching
+/// `PredbStreamListener::entries()` (`json_decode` plus `PredbClubSource`/`PredbNetSource::parseRows`).
+///
+/// The output is `K` followed by seven `0x1F`-prefixed fields per row (title, category, size,
+/// files, Unix time, nuke status, reason); a size starting with `~` is a megabyte value near a
+/// rounding tie that PHP formats. Invalid JSON and messages without a row yield just `K`.
+///
+/// Returns the bytes written (at least `1`), `-1` to decline (PHP decodes the message) and
+/// `< -1` (`-needed`) when `out_cap` is too small.
+///
+/// # Safety
+/// `message` must be readable for `message_len` bytes and `out_buf` writable for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_predb_stream_extract_entries_json(
+    message: *const u8,
+    message_len: usize,
+    format: u32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    feed_ffi_guard(-1, || {
+        let Some(s) = (unsafe { feed_ffi_input(message, message_len) }) else {
+            return -1;
+        };
+        let mut body = Vec::with_capacity(s.len() + 16);
+        if stream_entries(s, format, &mut body).is_err() {
+            return -1;
+        }
+        unsafe { feed_ffi_output(&body, out_buf, out_cap) }
+    })
+}
+
+// --- PredbImportFeed --------------------------------------------------------------------------
+
+const SINCE_NULL: i32 = 0;
+const SINCE_INVALID: i32 = 1;
+const SINCE_DAYS: i32 = 2;
+const SINCE_HOURS: i32 = 3;
+const SINCE_DATE: i32 = 4;
+
+/// `PredbImportFeed::parseSince()` for a string option: `(kind, amount)`, `None` to decline.
+fn import_parse_since(value: &[u8]) -> Option<(i32, i64)> {
+    if value.is_empty() {
+        return Some((SINCE_NULL, 0));
+    }
+    let v = feed_php_trim(value);
+    // PCRE character classes depend on the locale tables outside ASCII.
+    if !v.is_ascii() {
+        return None;
+    }
+    // /^(\d+)\s*([dh])$/i
+    let digits = v.iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits > 0 && v.len() > digits {
+        let unit = v[v.len() - 1].to_ascii_lowercase();
+        let gap = &v[digits..v.len() - 1];
+        if matches!(unit, b'd' | b'h')
+            && gap
+                .iter()
+                .all(|b| matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
+        {
+            let amount = feed_digits_i64(&v[..digits])?;
+            return Some((
+                if unit == b'd' {
+                    SINCE_DAYS
+                } else {
+                    SINCE_HOURS
+                },
+                amount,
+            ));
+        }
+    }
+    // /^\d{4}-\d{2}-\d{2}$/ and a date that createFromFormat('!Y-m-d') does not normalise.
+    let shape = v.len() == 10
+        && v[4] == b'-'
+        && v[7] == b'-'
+        && v.iter()
+            .enumerate()
+            .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit());
+    if !shape {
+        return Some((SINCE_INVALID, 0));
+    }
+    let num = |r: std::ops::Range<usize>| feed_digits_i64(&v[r]).unwrap_or(-1);
+    let (y, m, d) = (num(0..4), num(5..7), num(8..10));
+    if !(1..=12).contains(&m) || d < 1 || d > feed_days_in_month(y, m) {
+        return Some((SINCE_INVALID, 0));
+    }
+    Some((SINCE_DATE, feed_days_from_civil(y, m, d) * 86_400))
+}
+
+/// Parses the `--since` option like `PredbImportFeed::parseSince()`.
+///
+/// Returns `0` for null (`value` null or empty), `1` for invalid (PHP `false`), `2`/`3` for a
+/// day/hour offset written to `*amount`, `4` for a UTC date whose midnight Unix time is written to
+/// `*amount`, and `-1` to decline.
+///
+/// # Safety
+/// `value` must be readable for `value_len` bytes and `amount` writable when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_predb_import_parse_since(
+    value: *const u8,
+    value_len: usize,
+    amount: *mut i64,
+) -> i32 {
+    feed_ffi_guard(-1, || {
+        if amount.is_null() {
+            return -1;
+        }
+        let Some(s) = (unsafe { feed_ffi_input(value, value_len) }) else {
+            return -1;
+        };
+        match import_parse_since(s) {
+            Some((kind, n)) => {
+                unsafe { *amount = n };
+                kind
+            }
+            None => -1,
+        }
+    })
+}
+
+/// An IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) whose weekday matches its date, as Unix
+/// time. Other forms decline: Carbon's parser moves dates to a mismatched weekday and accepts
+/// many layouts this reader does not reproduce.
+fn import_http_date(s: &[u8]) -> Option<i64> {
+    const DAYS: [&[u8; 3]; 7] = [b"Sun", b"Mon", b"Tue", b"Wed", b"Thu", b"Fri", b"Sat"];
+    const MONTHS: [&[u8; 3]; 12] = [
+        b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov",
+        b"Dec",
+    ];
+    if s.len() != 29
+        || &s[3..5] != b", "
+        || s[7] != b' '
+        || s[11] != b' '
+        || s[16] != b' '
+        || s[19] != b':'
+        || s[22] != b':'
+        || &s[25..] != b" GMT"
+    {
+        return None;
+    }
+    let weekday = DAYS.iter().position(|d| &s[0..3] == *d)? as i64;
+    let month = MONTHS.iter().position(|m| &s[8..11] == *m)? as i64 + 1;
+    let day = feed_digits_i64(&s[5..7])?;
+    let year = feed_digits_i64(&s[12..16])?;
+    let (h, mi, sec) = (
+        feed_digits_i64(&s[17..19])?,
+        feed_digits_i64(&s[20..22])?,
+        feed_digits_i64(&s[23..25])?,
+    );
+    if !(1970..=9999).contains(&year)
+        || day < 1
+        || day > feed_days_in_month(year, month)
+        || h > 23
+        || mi > 59
+        || sec > 59
+    {
+        return None;
+    }
+    let days = feed_days_from_civil(year, month, day);
+    if (days + 4).rem_euclid(7) != weekday {
+        return None;
+    }
+    Some(days * 86_400 + h * 3600 + mi * 60 + sec)
+}
+
+const RATE_LIMIT_DECLINE: i64 = -1;
+const RATE_LIMIT_NEEDS_NOW: i64 = -2;
+
+fn import_rate_limit_wait(
+    retry_after: &[u8],
+    reset_at: &[u8],
+    default: i64,
+    now: Option<i64>,
+) -> i64 {
+    let retry_after = feed_php_trim(retry_after);
+    if !retry_after.is_empty() {
+        if retry_after.iter().all(u8::is_ascii_digit) {
+            return feed_digits_i64(retry_after).unwrap_or(RATE_LIMIT_DECLINE);
+        }
+        let Some(at) = import_http_date(retry_after) else {
+            return RATE_LIMIT_DECLINE;
+        };
+        return now.map_or(RATE_LIMIT_NEEDS_NOW, |n| (at - n).max(0));
+    }
+    let reset_at = feed_php_trim(reset_at);
+    if !reset_at.is_empty() && reset_at.iter().all(u8::is_ascii_digit) {
+        let Some(reset) = feed_digits_i64(reset_at) else {
+            return RATE_LIMIT_DECLINE;
+        };
+        return now.map_or(RATE_LIMIT_NEEDS_NOW, |n| (reset - n).max(0));
+    }
+    default.max(0)
+}
+
+/// Seconds to wait before retrying a throttled request, matching
+/// `PredbImportFeed::rateLimitWaitSeconds()` (null headers are passed as empty strings).
+///
+/// `now` is the current Unix time when `has_now` is `1`. Returns the wait (`>= 0`), `-2` when the
+/// answer depends on the current time and `has_now` is `0`, and `-1` to decline (HTTP-dates other
+/// than a weekday-consistent IMF-fixdate, overlong numbers, invalid pointers).
+///
+/// # Safety
+/// `retry_after` and `reset_at` must be readable for their lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_predb_import_rate_limit_wait(
+    retry_after: *const u8,
+    retry_after_len: usize,
+    reset_at: *const u8,
+    reset_at_len: usize,
+    default_seconds: i64,
+    now: i64,
+    has_now: u8,
+) -> i64 {
+    feed_ffi_guard(RATE_LIMIT_DECLINE, || {
+        let (Some(retry_after), Some(reset_at)) = (unsafe {
+            (
+                feed_ffi_input(retry_after, retry_after_len),
+                feed_ffi_input(reset_at, reset_at_len),
+            )
+        }) else {
+            return RATE_LIMIT_DECLINE;
+        };
+        let now = match has_now {
+            0 => None,
+            1 => Some(now),
+            _ => return RATE_LIMIT_DECLINE,
+        };
+        import_rate_limit_wait(retry_after, reset_at, default_seconds, now)
+    })
+}
+
+// --- IrcScraperCommand ------------------------------------------------------------------------
+
+const IRC_RESTART_DELAY: i64 = 30;
+const IRC_MAX_RESTART_DELAY: i64 = 3600;
+
+/// `IrcScraperCommand::restartDelay()`: `min(3600, 30 * 2 ** clamp($failures - 1, 0, 16))`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_irc_scraper_restart_delay(failures: i64) -> i64 {
+    feed_ffi_guard(-1, || {
+        let exponent = (i128::from(failures) - 1).clamp(0, 16) as u32;
+        (IRC_RESTART_DELAY << exponent).min(IRC_MAX_RESTART_DELAY)
+    })
+}
+
+#[cfg(test)]
+mod feed_stream_tests {
+    use super::*;
+
+    fn size(mb: f64) -> Result<Option<String>, ()> {
+        let mut out = Vec::new();
+        feed_size_from_megabytes(mb, &mut out)
+            .map(|some| some.then(|| String::from_utf8(out).unwrap()))
+    }
+
+    #[test]
+    fn size_from_megabytes_matches_php_examples() {
+        assert_eq!(size(0.0), Ok(None));
+        assert_eq!(size(-3.0), Ok(None));
+        assert_eq!(size(1.0), Ok(Some("1MB".into())));
+        assert_eq!(size(700.5), Ok(Some("700.5MB".into())));
+        assert_eq!(size(4482.27), Ok(Some("4482.27MB".into())));
+        assert_eq!(size(0.5), Ok(Some("512KB".into())));
+        assert_eq!(size(0.0123), Ok(Some("12.6KB".into())));
+        assert_eq!(size(10.0), Ok(Some("10MB".into())));
+        assert_eq!(size(1.005), Err(()));
+        assert_eq!(size(2e6), Err(()));
+        assert_eq!(size(f64::NAN), Err(()));
+        assert_eq!(size(f64::INFINITY), Err(()));
+    }
+
+    fn files(count: i64, text: Option<&str>) -> isize {
+        let mut buf = [0u8; 32];
+        let (ptr, len, is_string) = match text {
+            Some(t) => (t.as_ptr(), t.len(), 1),
+            None => (std::ptr::null(), 0, 0),
+        };
+        unsafe {
+            nntmux_predb_feed_entry_format_files(
+                count,
+                ptr,
+                len,
+                is_string,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        }
+    }
+
+    #[test]
+    fn files_from_count_casts_like_php() {
+        assert_eq!(files(12, None), 2);
+        assert_eq!(files(0, None), 0);
+        assert_eq!(files(-4, None), 0);
+        assert_eq!(files(0, Some(" 12abc")), 2);
+        assert_eq!(files(0, Some("0x1A")), 0);
+        assert_eq!(files(0, Some("1e3")), -1);
+        assert_eq!(files(0, Some("1.9")), -1);
+        assert_eq!(files(0, Some("99999999999999999999")), -1);
+        let mut tiny = [0u8; 1];
+        assert_eq!(
+            unsafe {
+                nntmux_predb_feed_entry_format_files(
+                    123,
+                    std::ptr::null(),
+                    0,
+                    0,
+                    tiny.as_mut_ptr(),
+                    1,
+                )
+            },
+            -3
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_predb_feed_entry_format_files(
+                    1,
+                    std::ptr::null(),
+                    4,
+                    1,
+                    tiny.as_mut_ptr(),
+                    1,
+                )
+            },
+            -1
+        );
+    }
+
+    fn changes(i: &FeedChangeInputs<'_>) -> Result<String, ()> {
+        let mut out = Vec::new();
+        feed_changes_for(i, &mut out).map(|()| String::from_utf8(out).unwrap())
+    }
+
+    fn inputs<'a>() -> FeedChangeInputs<'a> {
+        FeedChangeInputs {
+            existing_category: None,
+            existing_size: Some(b""),
+            existing_files: Some(b"12"),
+            existing_nukereason: None,
+            entry_category: Some(b"TV-X264"),
+            entry_size: Some(b"700MB"),
+            entry_files: Some(b"40"),
+            entry_predate: Some(b"2026-10-24 12:00:00"),
+            entry_nukereason: None,
+            existing_predate_null: true,
+            existing_nuked: 0,
+            entry_nuked: 0,
+        }
+    }
+
+    #[test]
+    fn changes_for_fills_and_nukes_in_php_order() {
+        assert_eq!(
+            changes(&inputs()).unwrap(),
+            r#"{"category":"TV-X264","size":"700MB","predate":"2026-10-24 12:00:00"}"#
+        );
+        let mut nuke = inputs();
+        nuke.existing_category = Some(b"TV");
+        nuke.existing_size = Some(b"1MB");
+        nuke.existing_predate_null = false;
+        nuke.entry_nuked = 2;
+        nuke.existing_nukereason = Some(b"old \"reason\"");
+        assert_eq!(
+            changes(&nuke).unwrap(),
+            r#"{"nuked":2,"nuked_from":0,"nukereason":"old \"reason\""}"#
+        );
+        nuke.existing_nuked = 2;
+        nuke.entry_nukereason = Some("dupe\u{1}é".as_bytes());
+        assert_eq!(
+            changes(&nuke).unwrap(),
+            r#"{"nukereason":"dupe\u0001é","nuked_status":2,"nukereason_from":"old \"reason\""}"#
+        );
+        nuke.existing_nukereason = Some("dupe\u{1}é".as_bytes());
+        assert_eq!(changes(&nuke).unwrap(), "");
+        nuke.entry_nukereason = Some(b"\xff");
+        assert_eq!(changes(&nuke), Err(()));
+        let long = "é".repeat(300);
+        let mut cut = inputs();
+        cut.entry_category = Some(long.as_bytes());
+        let json = changes(&cut).unwrap();
+        assert!(json.starts_with(&format!(r#"{{"category":"{}""#, "é".repeat(255))));
+    }
+
+    fn stream(message: &str, format: u32) -> Option<String> {
+        let mut buf = vec![0u8; 4096];
+        let n = unsafe {
+            nntmux_predb_stream_extract_entries_json(
+                message.as_ptr(),
+                message.len(),
+                format,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        (n >= 1).then(|| String::from_utf8(buf[..n as usize].to_vec()).unwrap())
+    }
+
+    #[test]
+    fn stream_envelopes_yield_rows_like_php() {
+        assert_eq!(
+            stream(r#"{"action":"insert","row":{"name":" A.B-GRP ","cat":"TV","size":700.5,"files":40,"preAt":1700000000,"nuke":null}}"#, 0).as_deref(),
+            Some("K\x1fA.B-GRP\x1fTV\x1f700.5MB\x1f40\x1f1700000000\x1f0\x1f")
+        );
+        assert_eq!(
+            stream(r#"{"action":"delete","row":{"name":"A"}}"#, 0).as_deref(),
+            Some("K")
+        );
+        assert_eq!(stream(r#"{"hb":1}"#, 0).as_deref(), Some("K"));
+        assert_eq!(stream("", 0).as_deref(), Some("K"));
+        assert_eq!(stream("[1,2]", 1).as_deref(), Some("K"));
+        assert_eq!(
+            stream(r#"{"action":"insert","row":[1]}"#, 0).as_deref(),
+            Some("K")
+        );
+        // Invalid JSON around a well-formed row yields nothing, as json_decode() fails.
+        assert_eq!(
+            stream(
+                "{\"action\":\"insert\",\"row\":{\"name\":\"A\"},\"x\":01}",
+                0
+            )
+            .as_deref(),
+            Some("K")
+        );
+        assert_eq!(
+            stream(r#"{"action":"insert","row":{"name":"A"}} x"#, 0).as_deref(),
+            Some("K")
+        );
+        let lone = format!(
+            "{{\"action\":\"insert\",\"row\":{{\"name\":\"A{0}ud800\"}}}}",
+            '\\'
+        );
+        assert_eq!(stream(&lone, 0).as_deref(), Some("K"));
+        // Escaped keys and values decode like json_decode().
+        let escaped = format!(
+            "{{\"act{0}u0069on\":\"ins{0}u0065rt\",\"row\":{{\"name\":\"A{0}u00e9{0}ud83d{0}ude00\"}}}}",
+            '\\'
+        );
+        assert_eq!(
+            stream(&escaped, 0).as_deref(),
+            Some("K\x1fA\u{e9}\u{1f600}\x1f\x1f\x1f\x1f\x1f0\x1f")
+        );
+        let deep = format!(
+            "{{\"message\":{{\"release\":\"A\"}},\"x\":{}{}}}",
+            "[".repeat(600),
+            "]".repeat(600)
+        );
+        assert_eq!(stream(&deep, 1), None);
+        assert_eq!(
+            stream(r#"{"action":"update","row":{"name":"A","size":1.005,"nuke":{"type":"MODNUKE","reason":"r"}}}"#, 0).as_deref(),
+            Some("K\x1fA\x1f\x1f~1.005\x1f\x1f\x1f3\x1fr")
+        );
+        assert_eq!(
+            stream(r#"{"message":{"release":"X-GRP","section":"MP3","pretime":"1700000000","status":1,"reason":"bad"}}"#, 1).as_deref(),
+            Some("K\x1fX-GRP\x1fMP3\x1f\x1f\x1f1700000000\x1f2\x1fbad")
+        );
+        assert_eq!(stream(r#"{"message":"text"}"#, 1).as_deref(), Some("K"));
+        assert_eq!(stream(r#"{"message":{}}"#, 2), None);
+        let mut tiny = [0u8; 4];
+        let msg = r#"{"message":{"release":"X-GRP"}}"#;
+        assert!(
+            unsafe {
+                nntmux_predb_stream_extract_entries_json(
+                    msg.as_ptr(),
+                    msg.len(),
+                    1,
+                    tiny.as_mut_ptr(),
+                    4,
+                )
+            } < -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_predb_stream_extract_entries_json(
+                    std::ptr::null(),
+                    3,
+                    1,
+                    tiny.as_mut_ptr(),
+                    4,
+                )
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn parse_since_matches_php_forms() {
+        assert_eq!(import_parse_since(b""), Some((SINCE_NULL, 0)));
+        assert_eq!(import_parse_since(b" 14d "), Some((SINCE_DAYS, 14)));
+        assert_eq!(import_parse_since(b"36 H"), Some((SINCE_HOURS, 36)));
+        assert_eq!(import_parse_since(b"14\x0bd"), Some((SINCE_DAYS, 14)));
+        assert_eq!(import_parse_since(b"14w"), Some((SINCE_INVALID, 0)));
+        assert_eq!(import_parse_since(b"d"), Some((SINCE_INVALID, 0)));
+        assert_eq!(
+            import_parse_since(b"2026-09-25"),
+            Some((SINCE_DATE, 1_790_294_400))
+        );
+        assert_eq!(
+            import_parse_since(b"0000-02-29"),
+            Some((SINCE_DATE, -62_162_121_600))
+        );
+        assert_eq!(import_parse_since(b"1900-02-29"), Some((SINCE_INVALID, 0)));
+        assert_eq!(import_parse_since(b"2026-13-01"), Some((SINCE_INVALID, 0)));
+        assert_eq!(import_parse_since("14d\u{a0}".as_bytes()), None);
+        assert_eq!(import_parse_since(b"9999999999999999999d"), None);
+    }
+
+    #[test]
+    fn rate_limit_wait_matches_php_rules() {
+        assert_eq!(import_rate_limit_wait(b" 120 ", b"", 60, None), 120);
+        assert_eq!(import_rate_limit_wait(b"", b"", -5, None), 0);
+        assert_eq!(
+            import_rate_limit_wait(b"", b"1000", 60, None),
+            RATE_LIMIT_NEEDS_NOW
+        );
+        assert_eq!(import_rate_limit_wait(b"", b"1000", 60, Some(400)), 600);
+        assert_eq!(import_rate_limit_wait(b"", b"1000", 60, Some(4000)), 0);
+        assert_eq!(import_rate_limit_wait(b"", b"soon", 60, None), 60);
+        let date = b"Sun, 06 Nov 1994 08:49:37 GMT";
+        assert_eq!(
+            import_rate_limit_wait(date, b"", 60, Some(784_111_000)),
+            777
+        );
+        assert_eq!(
+            import_rate_limit_wait(b"Mon, 06 Nov 1994 08:49:37 GMT", b"", 60, Some(0)),
+            RATE_LIMIT_DECLINE
+        );
+        assert_eq!(
+            import_rate_limit_wait(b"tomorrow", b"", 60, Some(0)),
+            RATE_LIMIT_DECLINE
+        );
+        assert_eq!(
+            import_rate_limit_wait(b"9999999999999999999", b"", 60, None),
+            RATE_LIMIT_DECLINE
+        );
+    }
+
+    #[test]
+    fn restart_delay_caps_exponential_backoff() {
+        let expected = [
+            (i64::MIN, 30),
+            (-3, 30),
+            (0, 30),
+            (1, 30),
+            (2, 60),
+            (5, 480),
+            (7, 1920),
+            (8, 3600),
+            (17, 3600),
+            (i64::MAX, 3600),
+        ];
+        for (failures, delay) in expected {
+            assert_eq!(
+                nntmux_irc_scraper_restart_delay(failures),
+                delay,
+                "{failures}"
+            );
+        }
+    }
+}

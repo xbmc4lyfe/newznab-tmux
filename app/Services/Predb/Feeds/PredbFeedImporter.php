@@ -8,6 +8,8 @@ use App\Facades\Search;
 use App\Models\Predb;
 use App\Services\Predb\PredbIdentityWriter;
 use App\Support\PredbSearchDocument;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Database\Connection;
 use Illuminate\Database\QueryException;
 use Illuminate\Database\UniqueConstraintViolationException;
@@ -15,6 +17,7 @@ use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
+use Throwable;
 
 /**
  * Upserts feed entries into the predb table by title, mirroring the IRC scraper:
@@ -23,6 +26,18 @@ use RuntimeException;
  */
 class PredbFeedImporter
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_predb_feed_importer_changes_for_json(const char *existing_category, size_t existing_category_len, const char *existing_size, size_t existing_size_len, const char *existing_files, size_t existing_files_len, const char *existing_nukereason, size_t existing_nukereason_len, const char *entry_category, size_t entry_category_len, const char *entry_size, size_t entry_size_len, const char *entry_files, size_t entry_files_len, const char *entry_predate, size_t entry_predate_len, const char *entry_nukereason, size_t entry_nukereason_len, uint32_t present_mask, uint8_t existing_predate_null, int64_t existing_nuked, int64_t entry_nuked, char *out_buf, size_t out_cap);
+        C;
+
+    /**
+     * changesFor() stays on PHP: Eloquent attribute reads dominate and FFI plus JSON decoding
+     * cannot recover 1.5x (see RustPredbFeedsAndStreamParityTest for the benchmark evidence).
+     */
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
     /**
      * Dry runs record what they would have written, so later pages and overlapping feeds in the
      * same run are counted as updates/skips rather than as more inserts.
@@ -367,12 +382,126 @@ class PredbFeedImporter
         }
     }
 
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        self::$ffi ??= RustPipelineLibrary::resolveDomain('predb', self::FFI_CDEF) ?? false;
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
     /**
      * Only fill details the row is missing, and record nuke status changes.
      *
      * @return array<string, mixed>
      */
     private function changesFor(Predb $existing, PredbFeedEntry $entry): array
+    {
+        if (self::$useRustFfi) {
+            $supported = false;
+            $native = $this->changesForNative($existing, $entry, $supported);
+            if ($supported && $native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->changesForPhp($existing, $entry);
+    }
+
+    /**
+     * Rust changesFor(); $supported is false for non-string attributes, invalid UTF-8 or an
+     * unavailable library.
+     *
+     * @return array<string, mixed>|null
+     */
+    public function changesForNative(Predb $existing, PredbFeedEntry $entry, bool &$supported = false): ?array
+    {
+        $supported = false;
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $strings = [
+            $existing->category,
+            $existing->size,
+            $existing->files,
+            $existing->nukereason,
+            $entry->category,
+            $entry->size,
+            $entry->files,
+            $entry->predate?->format('Y-m-d H:i:s'),
+            $entry->nukeReason,
+        ];
+        $mask = 0;
+        foreach ($strings as $bit => $value) {
+            if ($value === null) {
+                continue;
+            }
+            if (! is_string($value)) {
+                return null;
+            }
+            $mask |= 1 << $bit;
+        }
+        [$existingCategory, $existingSize, $existingFiles, $existingReason, $category, $size, $files, $predate, $reason] = $strings;
+        $call = static fn (FFI\CData $scratch, int $capacity): mixed => $ffi->nntmux_predb_feed_importer_changes_for_json( // @phpstan-ignore method.notFound
+            $existingCategory, $existingCategory === null ? 0 : strlen($existingCategory),
+            $existingSize, $existingSize === null ? 0 : strlen($existingSize),
+            $existingFiles, $existingFiles === null ? 0 : strlen($existingFiles),
+            $existingReason, $existingReason === null ? 0 : strlen($existingReason),
+            $category, $category === null ? 0 : strlen($category),
+            $size, $size === null ? 0 : strlen($size),
+            $files, $files === null ? 0 : strlen($files),
+            $predate, $predate === null ? 0 : strlen($predate),
+            $reason, $reason === null ? 0 : strlen($reason),
+            $mask,
+            $existing->predate === null ? 1 : 0,
+            (int) $existing->nuked,
+            $entry->nuked,
+            $scratch,
+            $capacity,
+        );
+        try {
+            $capacity = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, 4096, $capacity);
+            $written = $scratch === null ? null : $call($scratch, $capacity);
+            if (is_int($written) && $written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                $written = $scratch === null ? null : $call($scratch, $capacity);
+            }
+        } catch (Throwable) {
+            return null;
+        }
+        if (! is_int($written) || $written < 0 || $scratch === null) {
+            return null;
+        }
+        if ($written === 0) {
+            $supported = true;
+
+            return [];
+        }
+        $changes = json_decode(FFI::string($scratch, $written), true);
+        if (! is_array($changes)) {
+            return null;
+        }
+        $supported = true;
+
+        /** @var array<string, mixed> $changes */
+        return $changes;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function changesForPhp(Predb $existing, PredbFeedEntry $entry): array
     {
         $changes = [];
 
