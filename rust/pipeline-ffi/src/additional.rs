@@ -17089,3 +17089,678 @@ mod wave23_dashboard_activity_observer_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 24 Slice 24.6: UserDownload, UserRequest, UserMovie, UserSerie, and
+// UsersRelease pure-CPU helpers
+// ---------------------------------------------------------------------------
+
+#[inline]
+unsafe fn add24_valid_i64_slice<'a>(
+    ptr: *const i64,
+    len: usize,
+    max_len: usize,
+) -> Option<&'a [i64]> {
+    if ptr.is_null()
+        || !ptr.is_aligned()
+        || len > max_len
+        || len > (isize::MAX as usize) / std::mem::size_of::<i64>()
+    {
+        return None;
+    }
+    let byte_len = len.checked_mul(std::mem::size_of::<i64>())?;
+    if (ptr as usize).checked_add(byte_len).is_none() {
+        return None;
+    }
+    if len == 0 {
+        return Some(&[]);
+    }
+    Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+
+#[inline]
+fn add24_valid_i64_out(out_ptr: *mut i64, out_cap: usize, max_len: usize) -> bool {
+    if out_ptr.is_null()
+        || !out_ptr.is_aligned()
+        || out_cap > max_len
+        || out_cap > (isize::MAX as usize) / std::mem::size_of::<i64>()
+    {
+        return false;
+    }
+    let Some(byte_len) = out_cap.checked_mul(std::mem::size_of::<i64>()) else {
+        return false;
+    };
+    (out_ptr as usize).checked_add(byte_len).is_some()
+}
+
+#[inline]
+fn add24_split_nul_exact<'a>(bytes: &'a [u8], expected_count: usize) -> Option<Vec<&'a [u8]>> {
+    if expected_count == 0 {
+        return if bytes.is_empty() {
+            Some(Vec::new())
+        } else {
+            None
+        };
+    }
+    let parts: Vec<&'a [u8]> = bytes.split(|&b| b == 0).collect();
+    if parts.len() != expected_count {
+        return None;
+    }
+    Some(parts)
+}
+
+#[inline]
+fn add24_trim_php_ascii(bytes: &[u8]) -> &[u8] {
+    let is_ws = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C);
+    let Some(start) = bytes.iter().position(|&b| !is_ws(b)) else {
+        return &[];
+    };
+    let end = bytes.iter().rposition(|&b| !is_ws(b)).map_or(start, |i| i + 1);
+    &bytes[start..end]
+}
+
+unsafe fn add24_aggregate_hourly_buckets_nul(
+    hour_keys_ptr: *const u8,
+    hour_keys_len: usize,
+    hour_keys_count: usize,
+    event_keys_ptr: *const u8,
+    event_keys_len: usize,
+    event_keys_count: usize,
+    out_counts: *mut i64,
+    out_cap: usize,
+) -> isize {
+    if hour_keys_count > ADD23_MAX_SEG_LEN
+        || event_keys_count > ADD23_MAX_SEG_LEN
+        || !add24_valid_i64_out(out_counts, out_cap, ADD23_MAX_SEG_LEN)
+    {
+        return -1;
+    }
+    let (Some(hour_bytes), Some(event_bytes)) = (
+        unsafe { add23_valid_slice(hour_keys_ptr, hour_keys_len, ADD23_MAX_SEG_LEN) },
+        unsafe { add23_valid_slice(event_keys_ptr, event_keys_len, ADD23_MAX_SEG_LEN) },
+    ) else {
+        return -1;
+    };
+    let (Some(hour_parts), Some(event_parts)) = (
+        add24_split_nul_exact(hour_bytes, hour_keys_count),
+        add24_split_nul_exact(event_bytes, event_keys_count),
+    ) else {
+        return -1;
+    };
+
+    let mut unique_keys: Vec<&[u8]> = Vec::with_capacity(hour_parts.len());
+    for key in hour_parts {
+        if !unique_keys.contains(&key) {
+            unique_keys.push(key);
+        }
+    }
+
+    let needed = unique_keys.len();
+    if needed > out_cap {
+        return -(needed.max(2) as isize);
+    }
+
+    let mut counts = vec![0i64; needed];
+    for ev in event_parts {
+        if let Some(pos) = unique_keys.iter().position(|&k| k == ev) {
+            counts[pos] = counts[pos].saturating_add(1);
+        }
+    }
+
+    for (i, &c) in counts.iter().enumerate() {
+        unsafe {
+            *out_counts.add(i) = c;
+        }
+    }
+    needed as isize
+}
+
+/// Aggregates 24-hour download bucket counts for `UserDownload::aggregateHourlyBuckets()`.
+///
+/// `hour_keys_ptr[..hour_keys_len]` contains `hour_keys_count` NUL-separated bucket keys,
+/// and `event_keys_ptr[..event_keys_len]` contains `event_keys_count` NUL-separated event
+/// hour keys. Writes the count for each unique bucket key (in first-seen order) into
+/// `out_counts[..unique_count]`.
+///
+/// Returns `unique_count` (`>= 0`), `-(needed as isize)` (`<= -2`) when `out_cap` is too
+/// small, or `-1` on invalid arguments.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_user_download_aggregate_hourly_buckets_nul(
+    hour_keys_ptr: *const u8,
+    hour_keys_len: usize,
+    hour_keys_count: usize,
+    event_keys_ptr: *const u8,
+    event_keys_len: usize,
+    event_keys_count: usize,
+    out_counts: *mut i64,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        add24_aggregate_hourly_buckets_nul(
+            hour_keys_ptr,
+            hour_keys_len,
+            hour_keys_count,
+            event_keys_ptr,
+            event_keys_len,
+            event_keys_count,
+            out_counts,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+/// Expands `user_id` and `release_ids_ptr[..release_ids_len]` into interleaved
+/// `[user_id, release_id]` `i64` pairs in `out_pairs` for
+/// `UserDownload::buildDownloadBatchRows()`.
+///
+/// Returns `release_ids_len as isize` (`>= 0`), `-(needed_i64s as isize)` (`<= -2`) when
+/// `out_pairs_cap < release_ids_len * 2`, or `-1` on null/unaligned pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_user_download_normalize_batch_ids(
+    user_id: i64,
+    release_ids_ptr: *const i64,
+    release_ids_len: usize,
+    out_pairs: *mut i64,
+    out_pairs_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !add24_valid_i64_out(out_pairs, out_pairs_cap, ADD23_MAX_SEG_LEN) {
+            return -1;
+        }
+        let Some(release_ids) =
+            (unsafe { add24_valid_i64_slice(release_ids_ptr, release_ids_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        let Some(needed_i64s) = release_ids.len().checked_mul(2) else {
+            return -1;
+        };
+        if needed_i64s > isize::MAX as usize {
+            return -1;
+        }
+        if needed_i64s > out_pairs_cap {
+            return -(needed_i64s.max(2) as isize);
+        }
+        for (i, &rel_id) in release_ids.iter().enumerate() {
+            unsafe {
+                *out_pairs.add(i * 2) = user_id;
+                *out_pairs.add(i * 2 + 1) = rel_id;
+            }
+        }
+        release_ids.len() as isize
+    }))
+    .unwrap_or(-1)
+}
+
+/// Aggregates 24-hour API request bucket counts for `UserRequest::aggregateHourlyRequestBuckets()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_user_request_aggregate_hourly_buckets_nul(
+    hour_keys_ptr: *const u8,
+    hour_keys_len: usize,
+    hour_keys_count: usize,
+    event_keys_ptr: *const u8,
+    event_keys_len: usize,
+    event_keys_count: usize,
+    out_counts: *mut i64,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        add24_aggregate_hourly_buckets_nul(
+            hour_keys_ptr,
+            hour_keys_len,
+            hour_keys_count,
+            event_keys_ptr,
+            event_keys_len,
+            event_keys_count,
+            out_counts,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+/// Classifies whether `$tokenOrUserId` in `UserRequest::addApiRequest()` is a direct integer
+/// user ID (`value_kind == 1` -> `1`) vs an API token string or non-int (`value_kind == 0` -> `0`).
+/// Returns `-1` when `value_kind > 1`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_user_request_is_direct_user_id(
+    value_kind: u8,
+    _int_val: i64,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match value_kind {
+        0 => 0,
+        1 => 1,
+        _ => -1,
+    }))
+    .unwrap_or(-1)
+}
+
+unsafe fn add24_serialize_category_ids_nul(
+    cats_ptr: *const u8,
+    cats_len: usize,
+    cats_count: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if cats_count > ADD23_MAX_SEG_LEN || !add23_valid_out_buf(out_buf, out_cap) {
+        return -1;
+    }
+    let Some(cats_bytes) = (unsafe { add23_valid_slice(cats_ptr, cats_len, ADD23_MAX_SEG_LEN) })
+    else {
+        return -1;
+    };
+    let Some(parts) = add24_split_nul_exact(cats_bytes, cats_count) else {
+        return -1;
+    };
+    if parts.is_empty() {
+        return unsafe { add23_write_slices(out_buf, out_cap, &[b"NULL"], 2) };
+    }
+
+    let mut needed = 0usize;
+    for (idx, part) in parts.iter().enumerate() {
+        if idx > 0 {
+            needed = match needed.checked_add(1) {
+                Some(n) => n,
+                None => return -1,
+            };
+        }
+        needed = match needed.checked_add(part.len()) {
+            Some(n) => n,
+            None => return -1,
+        };
+    }
+    if needed > isize::MAX as usize {
+        return -1;
+    }
+    if needed > out_cap {
+        return -(needed.max(2) as isize);
+    }
+
+    let mut offset = 0usize;
+    for (idx, part) in parts.iter().enumerate() {
+        if idx > 0 {
+            unsafe {
+                *out_buf.add(offset) = b'|';
+            }
+            offset += 1;
+        }
+        if !part.is_empty() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(part.as_ptr(), out_buf.add(offset), part.len());
+            }
+            offset += part.len();
+        }
+    }
+    needed as isize
+}
+
+/// Serializes category IDs as pipe-delimited string (`!empty($catID) ? implode('|', $catID) : 'NULL'`)
+/// for `UserMovie::serializeCategoryIds()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_user_movie_serialize_category_ids_nul(
+    cats_ptr: *const u8,
+    cats_len: usize,
+    cats_count: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        add24_serialize_category_ids_nul(cats_ptr, cats_len, cats_count, out_buf, out_cap)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Serializes TV series category IDs as pipe-delimited string (`!empty($catID) ? implode('|', $catID) : 'NULL'`)
+/// for `UserSerie::serializeSeriesCategoryIds()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_user_serie_serialize_category_ids_nul(
+    cats_ptr: *const u8,
+    cats_len: usize,
+    cats_count: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        add24_serialize_category_ids_nul(cats_ptr, cats_len, cats_count, out_buf, out_cap)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Trims, filters out PHP-falsy strings (`""` and `"0"`), and deduplicates cart GUIDs in
+/// first-seen order for `UsersRelease::normalizeCartGuids()`.
+///
+/// Writes NUL-separated normalized GUIDs into `out_buf` and stores the normalized GUID count
+/// into `*out_count`.
+/// Returns written byte length (`>= 0`), `-(needed as isize)` (`<= -2`) when `out_cap` is too
+/// small, or `-1` on invalid arguments.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_users_release_normalize_cart_guids_nul(
+    guids_ptr: *const u8,
+    guids_len: usize,
+    guids_count: usize,
+    out_count: *mut usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if guids_count > ADD23_MAX_SEG_LEN
+            || out_count.is_null()
+            || !out_count.is_aligned()
+            || !add23_valid_out_buf(out_buf, out_cap)
+        {
+            return -1;
+        }
+        let Some(guids_bytes) =
+            (unsafe { add23_valid_slice(guids_ptr, guids_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        let Some(parts) = add24_split_nul_exact(guids_bytes, guids_count) else {
+            return -1;
+        };
+
+        let mut unique: Vec<&[u8]> = Vec::with_capacity(parts.len());
+        for raw in parts {
+            let trimmed = add24_trim_php_ascii(raw);
+            if trimmed.is_empty() || trimmed == b"0" {
+                continue;
+            }
+            if !unique.contains(&trimmed) {
+                unique.push(trimmed);
+            }
+        }
+
+        if unique.is_empty() {
+            unsafe {
+                *out_count = 0;
+            }
+            return 0;
+        }
+
+        let mut needed = 0usize;
+        for (idx, item) in unique.iter().enumerate() {
+            if idx > 0 {
+                needed = match needed.checked_add(1) {
+                    Some(n) => n,
+                    None => return -1,
+                };
+            }
+            needed = match needed.checked_add(item.len()) {
+                Some(n) => n,
+                None => return -1,
+            };
+        }
+        if needed > isize::MAX as usize {
+            return -1;
+        }
+        if needed > out_cap {
+            return -(needed.max(2) as isize);
+        }
+
+        let mut offset = 0usize;
+        for (idx, item) in unique.iter().enumerate() {
+            if idx > 0 {
+                unsafe {
+                    *out_buf.add(offset) = 0;
+                }
+                offset += 1;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(item.as_ptr(), out_buf.add(offset), item.len());
+            }
+            offset += item.len();
+        }
+        unsafe {
+            *out_count = unique.len();
+        }
+        needed as isize
+    }))
+    .unwrap_or(-1)
+}
+
+/// Deduplicates `release_ids_ptr[..release_ids_len]` in first-seen order for
+/// `UsersRelease::deduplicateReleaseIds()`.
+///
+/// Returns the number of unique IDs written (`>= 0`), `-(needed as isize)` (`<= -2`) when
+/// `out_cap` is too small, or `-1` on null/unaligned pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_users_release_deduplicate_release_ids(
+    release_ids_ptr: *const i64,
+    release_ids_len: usize,
+    out_ids: *mut i64,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !add24_valid_i64_out(out_ids, out_cap, ADD23_MAX_SEG_LEN) {
+            return -1;
+        }
+        let Some(release_ids) =
+            (unsafe { add24_valid_i64_slice(release_ids_ptr, release_ids_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+
+        let mut unique: Vec<i64> = Vec::with_capacity(release_ids.len());
+        for &id in release_ids {
+            if !unique.contains(&id) {
+                unique.push(id);
+            }
+        }
+
+        let needed = unique.len();
+        if needed > out_cap {
+            return -(needed.max(2) as isize);
+        }
+        for (i, &id) in unique.iter().enumerate() {
+            unsafe {
+                *out_ids.add(i) = id;
+            }
+        }
+        needed as isize
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave24_user_watchlist_cart_activity_tests {
+    use super::*;
+
+    #[test]
+    fn hourly_bucket_aggregation_and_batch_pairs_match_php_contracts() {
+        let hour_keys = b"00:00\001:00\002:00";
+        let event_keys = b"01:00\099:00\001:00\000:00";
+        let mut counts = [0i64; 4];
+
+        let n = unsafe {
+            nntmux_user_download_aggregate_hourly_buckets_nul(
+                hour_keys.as_ptr(),
+                hour_keys.len(),
+                3,
+                event_keys.as_ptr(),
+                event_keys.len(),
+                4,
+                counts.as_mut_ptr(),
+                counts.len(),
+            )
+        };
+        assert_eq!(n, 3);
+        assert_eq!(&counts[..3], &[1, 2, 0]);
+
+        let n_req = unsafe {
+            nntmux_user_request_aggregate_hourly_buckets_nul(
+                hour_keys.as_ptr(),
+                hour_keys.len(),
+                3,
+                b"".as_ptr(),
+                0,
+                0,
+                counts.as_mut_ptr(),
+                counts.len(),
+            )
+        };
+        assert_eq!(n_req, 3);
+        assert_eq!(&counts[..3], &[0, 0, 0]);
+
+        let rel_ids = [101i64, 202, 303];
+        let mut pairs = [0i64; 6];
+        let pair_rows = unsafe {
+            nntmux_user_download_normalize_batch_ids(
+                77,
+                rel_ids.as_ptr(),
+                rel_ids.len(),
+                pairs.as_mut_ptr(),
+                pairs.len(),
+            )
+        };
+        assert_eq!(pair_rows, 3);
+        assert_eq!(pairs, [77, 101, 77, 202, 77, 303]);
+
+        assert_eq!(unsafe { nntmux_user_request_is_direct_user_id(1, 42) }, 1);
+        assert_eq!(unsafe { nntmux_user_request_is_direct_user_id(0, 0) }, 0);
+        assert_eq!(unsafe { nntmux_user_request_is_direct_user_id(2, 0) }, -1);
+    }
+
+    #[test]
+    fn category_serialization_cart_guid_normalization_and_release_dedup_match_php() {
+        let mut buf = [0u8; 64];
+
+        let n_empty = unsafe {
+            nntmux_user_movie_serialize_category_ids_nul(
+                b"".as_ptr(),
+                0,
+                0,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(n_empty, 4);
+        assert_eq!(&buf[..4], b"NULL");
+
+        let cats = b"2030\02040\02050";
+        let n_cats = unsafe {
+            nntmux_user_serie_serialize_category_ids_nul(
+                cats.as_ptr(),
+                cats.len(),
+                3,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(n_cats, 14);
+        assert_eq!(&buf[..14], b"2030|2040|2050");
+
+        let guids = b"  abc \0\0   \00\0def\0abc\0\tdef\n";
+        let mut out_count = 0usize;
+        let written = unsafe {
+            nntmux_users_release_normalize_cart_guids_nul(
+                guids.as_ptr(),
+                guids.len(),
+                7,
+                &mut out_count,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(out_count, 2);
+        assert_eq!(written, 7);
+        assert_eq!(&buf[..7], b"abc\0def");
+
+        let ids = [10i64, 20, 10, 30, 20, 40];
+        let mut out_ids = [0i64; 6];
+        let uniq = unsafe {
+            nntmux_users_release_deduplicate_release_ids(
+                ids.as_ptr(),
+                ids.len(),
+                out_ids.as_mut_ptr(),
+                out_ids.len(),
+            )
+        };
+        assert_eq!(uniq, 4);
+        assert_eq!(&out_ids[..4], &[10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn wave24_slice6_entrypoints_reject_null_unaligned_and_undersized_buffers() {
+        let mut raw = [0xA5u8; 64];
+        let unaligned_i64 = unsafe { raw.as_mut_ptr().add(1).cast::<i64>() };
+        let unaligned_usize = unsafe { raw.as_mut_ptr().add(1).cast::<usize>() };
+
+        assert_eq!(
+            unsafe {
+                nntmux_user_download_aggregate_hourly_buckets_nul(
+                    b"00:00".as_ptr(),
+                    5,
+                    1,
+                    b"".as_ptr(),
+                    0,
+                    0,
+                    unaligned_i64,
+                    4,
+                )
+            },
+            -1
+        );
+
+        let mut small_i64 = [99i64; 1];
+        assert_eq!(
+            unsafe {
+                nntmux_user_download_aggregate_hourly_buckets_nul(
+                    b"00:00\001:00".as_ptr(),
+                    11,
+                    2,
+                    b"".as_ptr(),
+                    0,
+                    0,
+                    small_i64.as_mut_ptr(),
+                    1,
+                )
+            },
+            -2
+        );
+        assert_eq!(small_i64[0], 99);
+
+        let mut small_u8 = [0x5Au8; 3];
+        assert_eq!(
+            unsafe {
+                nntmux_user_movie_serialize_category_ids_nul(
+                    b"".as_ptr(),
+                    0,
+                    0,
+                    small_u8.as_mut_ptr(),
+                    3,
+                )
+            },
+            -4
+        );
+        assert_eq!(small_u8, [0x5Au8; 3]);
+
+        assert_eq!(
+            unsafe {
+                nntmux_users_release_normalize_cart_guids_nul(
+                    b"abc".as_ptr(),
+                    3,
+                    1,
+                    unaligned_usize,
+                    raw.as_mut_ptr(),
+                    32,
+                )
+            },
+            -1
+        );
+
+        let ids = [1i64, 2, 3];
+        assert_eq!(
+            unsafe {
+                nntmux_users_release_deduplicate_release_ids(
+                    ids.as_ptr(),
+                    ids.len(),
+                    small_i64.as_mut_ptr(),
+                    1,
+                )
+            },
+            -3
+        );
+        assert_eq!(small_i64[0], 99);
+    }
+}
