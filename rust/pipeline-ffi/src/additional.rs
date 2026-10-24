@@ -7135,3 +7135,942 @@ mod wave10_release_file_manager_audio_tag_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 11: PartHandler, HeaderStorageService & Par2CandidateProgress FFI
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn is_pcre2_ascii_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C)
+}
+
+#[inline]
+fn is_file_counter_start(b: u8) -> bool {
+    matches!(b, b'[' | b'(') || is_pcre2_ascii_space(b)
+}
+
+#[inline]
+fn is_file_counter_end(b: u8) -> bool {
+    matches!(b, b']' | b')' | b'[' | b'$' | b':') || is_pcre2_ascii_space(b)
+}
+
+#[inline]
+pub(crate) fn part_validation_error_code(part_number: i64, msg_id: &[u8]) -> i32 {
+    if part_number <= 0 {
+        return 1;
+    }
+    let trimmed = trim_php(msg_id);
+    if trimmed.is_empty()
+        || trimmed.len() > 255
+        || !trimmed.iter().all(|&b| (0x20..=0x7E).contains(&b))
+    {
+        return 2;
+    }
+    0
+}
+
+#[inline]
+pub(crate) fn part_should_prefer_tuple(
+    cand_has_msg: bool,
+    cand_size: i64,
+    cand_num: i64,
+    curr_has_msg: bool,
+    curr_size: i64,
+    curr_num: i64,
+) -> bool {
+    if cand_has_msg != curr_has_msg {
+        return cand_has_msg;
+    }
+    if cand_size != curr_size {
+        return cand_size > curr_size;
+    }
+    cand_num < curr_num
+}
+
+/// Validates a part header (`PartHandler::validationError`):
+/// - `-1`: invalid pointer
+/// - `0`: valid (`null`)
+/// - `1`: `'Invalid part number'` (`part_number <= 0`)
+/// - `2`: `'Invalid message ID'` (empty after PHP trim, `> 255` bytes, or outside `0x20..=0x7E`)
+///
+/// # Safety
+///
+/// `msg_id_ptr` must be valid for reads of `msg_id_len` bytes when non-null and `msg_id_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_part_validation_error(
+    part_number: i64,
+    msg_id_ptr: *const u8,
+    msg_id_len: usize,
+) -> i32 {
+    if msg_id_ptr.is_null() && msg_id_len > 0 {
+        return -1;
+    }
+    let msg_id = if msg_id_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(msg_id_ptr, msg_id_len) }
+    };
+    part_validation_error_code(part_number, msg_id)
+}
+
+/// Compares two duplicate part rows (`PartHandler::shouldPrefer`):
+/// - `-1`: invalid pointer
+/// - `1`: candidate is preferred
+/// - `0`: current is kept
+///
+/// # Safety
+///
+/// `cand_msg_ptr` and `curr_msg_ptr` must be valid for reads of their respective lengths when non-null.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_part_should_prefer(
+    cand_msg_ptr: *const u8,
+    cand_msg_len: usize,
+    cand_size: i64,
+    cand_num: i64,
+    curr_msg_ptr: *const u8,
+    curr_msg_len: usize,
+    curr_size: i64,
+    curr_num: i64,
+) -> i32 {
+    if (cand_msg_ptr.is_null() && cand_msg_len > 0) || (curr_msg_ptr.is_null() && curr_msg_len > 0)
+    {
+        return -1;
+    }
+    let cand_msg = if cand_msg_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(cand_msg_ptr, cand_msg_len) }
+    };
+    let curr_msg = if curr_msg_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(curr_msg_ptr, curr_msg_len) }
+    };
+    let cand_has_msg = !trim_php(cand_msg).is_empty();
+    let curr_has_msg = !trim_php(curr_msg).is_empty();
+    i32::from(part_should_prefer_tuple(
+        cand_has_msg,
+        cand_size,
+        cand_num,
+        curr_has_msg,
+        curr_size,
+        curr_num,
+    ))
+}
+
+#[derive(Clone, Copy)]
+struct PartWinner {
+    index: u32,
+    binaries_id: i64,
+    partnumber: i64,
+    has_msg: bool,
+    size: i64,
+    number: i64,
+}
+
+/// Batch deduplicates `count` encoded part records by `(binaries_id, partnumber)` using
+/// `PartHandler::shouldPrefer`, optionally sorting the winning entries by `(binaries_id ASC, partnumber ASC)`
+/// when `sort_by_pk != 0`.
+///
+/// Input format per record:
+/// `[binaries_id: i64 NE][partnumber: i64 NE][size: i64 NE][number: i64 NE][msg_len: u32 NE][msg_bytes: msg_len]`
+///
+/// Output format:
+/// `winners.len()` `u32` (native-endian) 0-based input indices (`winners.len() * 4` bytes).
+///
+/// # Safety
+///
+/// `input_ptr` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_ptr` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_part_deduplicate(
+    input_ptr: *const u8,
+    input_len: usize,
+    count: usize,
+    sort_by_pk: u32,
+    out_ptr: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if (input_ptr.is_null() && input_len > 0) || (out_ptr.is_null() && out_cap > 0) {
+        return -1;
+    }
+    if count == 0 {
+        return if input_len == 0 { 0 } else { -1 };
+    }
+    if count > (u32::MAX as usize) {
+        return -1;
+    }
+    let data = if input_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(input_ptr, input_len) }
+    };
+
+    let mut winners: Vec<PartWinner> = Vec::with_capacity(count);
+    // Open-addressed hash table keyed by (binaries_id, partnumber) -> (winners_idx + 1).
+    let table_cap = (count.saturating_mul(2)).next_power_of_two().max(16);
+    let table_mask = table_cap - 1;
+    let mut table_keys: Vec<(i64, i64)> = vec![(0, 0); table_cap];
+    let mut table_vals: Vec<u32> = vec![0; table_cap];
+    let mut off = 0usize;
+
+    for idx in 0..count {
+        if off + 36 > data.len() {
+            return -1;
+        }
+        let binaries_id = i64::from_ne_bytes(data[off..off + 8].try_into().unwrap());
+        let partnumber = i64::from_ne_bytes(data[off + 8..off + 16].try_into().unwrap());
+        let size = i64::from_ne_bytes(data[off + 16..off + 24].try_into().unwrap());
+        let number = i64::from_ne_bytes(data[off + 24..off + 32].try_into().unwrap());
+        let msg_len = u32::from_ne_bytes(data[off + 32..off + 36].try_into().unwrap()) as usize;
+        off += 36;
+        if off + msg_len > data.len() {
+            return -1;
+        }
+        let has_msg = !trim_php(&data[off..off + msg_len]).is_empty();
+        off += msg_len;
+
+        let h = ((binaries_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            ^ ((partnumber as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+        let mut slot = ((h ^ (h >> 32)) as usize) & table_mask;
+        loop {
+            let entry = table_vals[slot];
+            if entry == 0 {
+                table_keys[slot] = (binaries_id, partnumber);
+                table_vals[slot] = (winners.len() + 1) as u32;
+                winners.push(PartWinner {
+                    index: idx as u32,
+                    binaries_id,
+                    partnumber,
+                    has_msg,
+                    size,
+                    number,
+                });
+                break;
+            }
+            if table_keys[slot] == (binaries_id, partnumber) {
+                let pos = (entry - 1) as usize;
+                let current = winners[pos];
+                if part_should_prefer_tuple(
+                    has_msg,
+                    size,
+                    number,
+                    current.has_msg,
+                    current.size,
+                    current.number,
+                ) {
+                    winners[pos] = PartWinner {
+                        index: idx as u32,
+                        binaries_id,
+                        partnumber,
+                        has_msg,
+                        size,
+                        number,
+                    };
+                }
+                break;
+            }
+            slot = (slot + 1) & table_mask;
+        }
+    }
+
+    if off != data.len() {
+        return -1;
+    }
+
+    if sort_by_pk != 0 {
+        winners.sort_by_key(|w| (w.binaries_id, w.partnumber));
+    }
+
+    let needed = winners.len() * 4;
+    if needed > out_cap {
+        return -(needed.max(4) as isize);
+    }
+    let out = unsafe { slice::from_raw_parts_mut(out_ptr, needed) };
+    for (i, w) in winners.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&w.index.to_ne_bytes());
+    }
+    needed as isize
+}
+
+/// Stably sorts `count` `(binaries_id: i64 NE, partnumber: i64 NE)` pairs (`16 * count` bytes)
+/// by `(binaries_id ASC, partnumber ASC)` and writes `count` `u32` (native-endian) 0-based indices
+/// to `out_ptr`.
+///
+/// # Safety
+///
+/// `input_ptr` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_ptr` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_part_sort_primary_key(
+    input_ptr: *const u8,
+    input_len: usize,
+    count: usize,
+    out_ptr: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if (input_ptr.is_null() && input_len > 0) || (out_ptr.is_null() && out_cap > 0) {
+        return -1;
+    }
+    if count == 0 {
+        return if input_len == 0 { 0 } else { -1 };
+    }
+    if count > (u32::MAX as usize) || input_len != count.saturating_mul(16) {
+        return -1;
+    }
+    let needed = count * 4;
+    if needed > out_cap {
+        return -(needed.max(4) as isize);
+    }
+    let data = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+    let mut items: Vec<(i64, i64, u32)> = Vec::with_capacity(count);
+    for idx in 0..count {
+        let base = idx * 16;
+        let bid = i64::from_ne_bytes(data[base..base + 8].try_into().unwrap());
+        let pnum = i64::from_ne_bytes(data[base + 8..base + 16].try_into().unwrap());
+        items.push((bid, pnum, idx as u32));
+    }
+    items.sort_by_key(|&(bid, pnum, _)| (bid, pnum));
+
+    let out = unsafe { slice::from_raw_parts_mut(out_ptr, needed) };
+    for (i, &(_, _, idx)) in items.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&idx.to_ne_bytes());
+    }
+    needed as isize
+}
+
+/// Matches `HeaderParser::FILE_COUNTER_PATTERN`:
+/// `'/[[(\s](\d{1,5})(\/|[\s_]of[\s_]|-)(\d{1,5})[])[\s$:]/i'`
+/// Returns `(start, d1_len, sep_len, d2_len, file_number, total_files)`.
+pub(crate) fn match_header_file_counter(
+    s: &[u8],
+) -> Option<(usize, usize, usize, usize, u32, u32)> {
+    if s.len() < 5 {
+        return None;
+    }
+    let mut i = 0usize;
+    let last_possible_start = s.len() - 5;
+    while i <= last_possible_start {
+        let d1_start = i + 1;
+        if !s[d1_start].is_ascii_digit() {
+            i += if is_file_counter_start(s[d1_start]) { 1 } else { 2 };
+            continue;
+        }
+        if !is_file_counter_start(s[i]) {
+            i += 1;
+            continue;
+        }
+        let mut d1_end = d1_start + 1;
+        while d1_end < s.len() && d1_end - d1_start < 6 && s[d1_end].is_ascii_digit() {
+            d1_end += 1;
+        }
+        let d1_len = d1_end - d1_start;
+        if d1_len > 5 || d1_end >= s.len() {
+            // None of s[d1_start..d1_end] can be is_file_counter_start since all are digits.
+            i = d1_end;
+            continue;
+        }
+        let sep_len = if s[d1_end] == b'/' || s[d1_end] == b'-' {
+            1usize
+        } else if d1_end + 4 <= s.len()
+            && (is_pcre2_ascii_space(s[d1_end]) || s[d1_end] == b'_')
+            && s[d1_end + 1].eq_ignore_ascii_case(&b'o')
+            && s[d1_end + 2].eq_ignore_ascii_case(&b'f')
+            && (is_pcre2_ascii_space(s[d1_end + 3]) || s[d1_end + 3] == b'_')
+        {
+            4usize
+        } else {
+            i = d1_end;
+            continue;
+        };
+        let d2_start = d1_end + sep_len;
+        if d2_start >= s.len() || !s[d2_start].is_ascii_digit() {
+            i = d1_end;
+            continue;
+        }
+        let mut d2_end = d2_start + 1;
+        while d2_end < s.len() && d2_end - d2_start < 6 && s[d2_end].is_ascii_digit() {
+            d2_end += 1;
+        }
+        let d2_len = d2_end - d2_start;
+        if d2_len > 5 || d2_end >= s.len() || !is_file_counter_end(s[d2_end]) {
+            i = d1_end;
+            continue;
+        }
+        let mut file_num = 0u32;
+        for &b in &s[d1_start..d1_end] {
+            file_num = file_num * 10 + u32::from(b - b'0');
+        }
+        let mut total_files = 0u32;
+        for &b in &s[d2_start..d2_end] {
+            total_files = total_files * 10 + u32::from(b - b'0');
+        }
+        return Some((i, d1_len, sep_len, d2_len, file_num, total_files));
+    }
+    None
+}
+
+/// Extracts `(file_number, total_files)` from a subject string (`HeaderStorageService::extractFileNumberAndTotal`):
+/// - `-1`: invalid pointer
+/// - `0`: no match (`[0, 0]`)
+/// - `> 0`: `(1 << 40) | ((total_files as i64) << 20) | (file_number as i64)`
+///
+/// # Safety
+///
+/// `subject_ptr` must be valid for reads of `subject_len` bytes when non-null and `subject_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_header_extract_file_numbers(
+    subject_ptr: *const u8,
+    subject_len: usize,
+) -> i64 {
+    if subject_ptr.is_null() && subject_len > 0 {
+        return -1;
+    }
+    let s = if subject_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(subject_ptr, subject_len) }
+    };
+    match match_header_file_counter(s) {
+        Some((_, _, _, _, file_num, total_files)) => {
+            (1i64 << 40) | (i64::from(total_files) << 20) | i64::from(file_num)
+        }
+        None => 0,
+    }
+}
+
+/// Extracts the exact PCRE capture spans for `HeaderStorageService::getFileCount`:
+/// - `-1`: invalid pointer
+/// - `-2`: match offset exceeds `u32::MAX` (decline to PHP)
+/// - `0`: no match (`[1 => 0, 3 => 0]`)
+/// - `> 0`: `(1 << 48) | ((d2_len as i64) << 38) | ((sep_len as i64) << 35) | ((d1_len as i64) << 32) | (start as i64)`
+///
+/// # Safety
+///
+/// `subject_ptr` must be valid for reads of `subject_len` bytes when non-null and `subject_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_header_get_file_count_span(
+    subject_ptr: *const u8,
+    subject_len: usize,
+) -> i64 {
+    if subject_ptr.is_null() && subject_len > 0 {
+        return -1;
+    }
+    let s = if subject_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(subject_ptr, subject_len) }
+    };
+    match match_header_file_counter(s) {
+        Some((start, d1_len, sep_len, d2_len, _, _)) => {
+            if start > u32::MAX as usize {
+                return -2;
+            }
+            (1i64 << 48)
+                | ((d2_len as i64) << 38)
+                | ((sep_len as i64) << 35)
+                | ((d1_len as i64) << 32)
+                | (start as i64)
+        }
+        None => 0,
+    }
+}
+
+/// Batch extracts `(file_number: u32 NE, total_files: u32 NE)` pairs for `count` NUL-separated subjects.
+///
+/// # Safety
+///
+/// `input_ptr` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_ptr` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_header_extract_file_numbers_batch_nul(
+    input_ptr: *const u8,
+    input_len: usize,
+    count: usize,
+    out_ptr: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if (input_ptr.is_null() && input_len > 0) || (out_ptr.is_null() && out_cap > 0) {
+        return -1;
+    }
+    if count == 0 {
+        return if input_len == 0 { 0 } else { -1 };
+    }
+    let needed = match count.checked_mul(8) {
+        Some(n) => n,
+        None => return -1,
+    };
+    let data = if input_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(input_ptr, input_len) }
+    };
+    if needed > out_cap {
+        if data.iter().filter(|&&b| b == 0).count() + 1 != count {
+            return -1;
+        }
+        return -(needed.max(4) as isize);
+    }
+    let out = unsafe { slice::from_raw_parts_mut(out_ptr, needed) };
+    let mut seen = 0usize;
+    for seg in data.split(|&b| b == 0) {
+        if seen >= count {
+            return -1;
+        }
+        let (file_num, total_files) = match match_header_file_counter(seg) {
+            Some((_, _, _, _, f, t)) => (f, t),
+            None => (0u32, 0u32),
+        };
+        let base = seen * 8;
+        out[base..base + 4].copy_from_slice(&file_num.to_ne_bytes());
+        out[base + 4..base + 8].copy_from_slice(&total_files.to_ne_bytes());
+        seen += 1;
+    }
+    if seen != count {
+        return -1;
+    }
+    needed as isize
+}
+
+#[inline]
+fn is_lower_hex_64(s: &[u8]) -> bool {
+    s.len() == 64
+        && s.iter()
+            .all(|&b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+static B64_DECODE_TABLE: [u8; 256] = {
+    let mut t = [0xFFu8; 256];
+    let mut c = b'A';
+    while c <= b'Z' {
+        t[c as usize] = c - b'A';
+        c += 1;
+    }
+    c = b'a';
+    while c <= b'z' {
+        t[c as usize] = c - b'a' + 26;
+        c += 1;
+    }
+    c = b'0';
+    while c <= b'9' {
+        t[c as usize] = c - b'0' + 52;
+        c += 1;
+    }
+    t[b'+' as usize] = 62;
+    t[b'/' as usize] = 63;
+    t
+};
+
+static FORBIDDEN_PAR2_BYTE: [u8; 256] = {
+    let mut t = [0u8; 256];
+    t[0] = 1;
+    t[b'\n' as usize] = 1;
+    t[b'\r' as usize] = 1;
+    t
+};
+
+#[inline]
+fn b64_sextet(b: u8) -> u8 {
+    B64_DECODE_TABLE[b as usize]
+}
+
+#[inline]
+fn is_forbidden_par2_filename_byte(b: u8) -> bool {
+    FORBIDDEN_PAR2_BYTE[b as usize] != 0
+}
+
+/// Validates that `b64` is the canonical `base64_encode` of a `1..=65536` byte string
+/// containing no `\0`, `\n`, or `\r` bytes.
+pub(crate) fn is_valid_par2_identity_base64(b64: &[u8]) -> bool {
+    if b64.is_empty() || b64.len() > 87384 || !b64.len().is_multiple_of(4) {
+        return false;
+    }
+    let num_quads = b64.len() / 4;
+    let (quads, _) = b64[..(num_quads - 1) * 4].as_chunks::<4>();
+    for &[q0, q1, q2, q3] in quads {
+        let v0 = B64_DECODE_TABLE[q0 as usize];
+        let v1 = B64_DECODE_TABLE[q1 as usize];
+        let v2 = B64_DECODE_TABLE[q2 as usize];
+        let v3 = B64_DECODE_TABLE[q3 as usize];
+        let b0 = (v0 << 2) | (v1 >> 4);
+        let b1 = (v1 << 4) | (v2 >> 2);
+        let b2 = (v2 << 6) | v3;
+        if (((v0 | v1 | v2 | v3) & 0xC0)
+            | FORBIDDEN_PAR2_BYTE[b0 as usize]
+            | FORBIDDEN_PAR2_BYTE[b1 as usize]
+            | FORBIDDEN_PAR2_BYTE[b2 as usize])
+            != 0
+        {
+            return false;
+        }
+    }
+
+    let q = &b64[(num_quads - 1) * 4..];
+    let v0 = b64_sextet(q[0]);
+    let v1 = b64_sextet(q[1]);
+    if ((v0 | v1) & 0xC0) != 0 {
+        return false;
+    }
+    let b0 = (v0 << 2) | (v1 >> 4);
+    if is_forbidden_par2_filename_byte(b0) {
+        return false;
+    }
+
+    let decoded_len = if q[2] == b'=' {
+        if q[3] != b'=' || (v1 & 0x0F) != 0 {
+            return false;
+        }
+        (num_quads - 1) * 3 + 1
+    } else if q[3] == b'=' {
+        let v2 = b64_sextet(q[2]);
+        if (v2 & 0xC0) != 0 || (v2 & 0x03) != 0 {
+            return false;
+        }
+        let b1 = (v1 << 4) | (v2 >> 2);
+        if is_forbidden_par2_filename_byte(b1) {
+            return false;
+        }
+        (num_quads - 1) * 3 + 2
+    } else {
+        let v2 = b64_sextet(q[2]);
+        let v3 = b64_sextet(q[3]);
+        if ((v2 | v3) & 0xC0) != 0 {
+            return false;
+        }
+        let b1 = (v1 << 4) | (v2 >> 2);
+        let b2 = (v2 << 6) | v3;
+        if is_forbidden_par2_filename_byte(b1) || is_forbidden_par2_filename_byte(b2) {
+            return false;
+        }
+        num_quads * 3
+    };
+
+    (1..=65536).contains(&decoded_len)
+}
+
+/// Validates `Par2CandidateProgress::validateArguments`:
+/// - `-1`: invalid pointer
+/// - `1`: valid
+/// - `0`: invalid
+///
+/// # Safety
+///
+/// `manifest_ptr` and `candidate_ptr` must be valid for reads of their respective lengths when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_par2_checkpoint_validate_arguments(
+    release_id: i64,
+    manifest_ptr: *const u8,
+    manifest_len: usize,
+    candidate_ptr: *const u8,
+    candidate_len: usize,
+    segment_count: i64,
+    max_state_bytes: i64,
+) -> i32 {
+    if (manifest_ptr.is_null() && manifest_len > 0)
+        || (candidate_ptr.is_null() && candidate_len > 0)
+    {
+        return -1;
+    }
+    if release_id < 1
+        || !(1..=1_000_000).contains(&segment_count)
+        || !(1..=4_294_967_295).contains(&max_state_bytes)
+        || manifest_len != 64
+        || candidate_len != 64
+    {
+        return 0;
+    }
+    let manifest = unsafe { slice::from_raw_parts(manifest_ptr, 64) };
+    let candidate = unsafe { slice::from_raw_parts(candidate_ptr, 64) };
+    i32::from(is_lower_hex_64(manifest) && is_lower_hex_64(candidate))
+}
+
+/// Validates `Par2CandidateProgress::validateCursor` over `retries_count` native-endian `i64` retry segments:
+/// - `-1`: invalid pointer or byte length
+/// - `0`: valid
+/// - `1`: `'Invalid PAR2 article cursor or retry list.'`
+/// - `2`: `'Invalid or duplicate PAR2 retry segment.'`
+///
+/// # Safety
+///
+/// `retries_ptr` must be valid for reads of `retries_len` bytes when non-null and `retries_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_par2_checkpoint_validate_cursor(
+    next_segment: i64,
+    segment_count: i64,
+    retries_ptr: *const u8,
+    retries_len: usize,
+    retries_count: usize,
+) -> i32 {
+    if retries_ptr.is_null() && retries_len > 0 {
+        return -1;
+    }
+    if next_segment < 0
+        || next_segment > segment_count
+        || (retries_count as i128) > i128::from(next_segment)
+    {
+        return 1;
+    }
+    if retries_len != retries_count.saturating_mul(8) {
+        return -1;
+    }
+    if retries_count == 0 {
+        return 0;
+    }
+    let data = unsafe { slice::from_raw_parts(retries_ptr, retries_len) };
+    if retries_count <= 32 {
+        let mut seen = [0i64; 32];
+        for i in 0..retries_count {
+            let val = i64::from_ne_bytes(data[i * 8..i * 8 + 8].try_into().unwrap());
+            if val < 0 || val >= next_segment || seen[..i].contains(&val) {
+                return 2;
+            }
+            seen[i] = val;
+        }
+    } else {
+        let mut seen = std::collections::HashSet::with_capacity(retries_count);
+        for i in 0..retries_count {
+            let val = i64::from_ne_bytes(data[i * 8..i * 8 + 8].try_into().unwrap());
+            if val < 0 || val >= next_segment || !seen.insert(val) {
+                return 2;
+            }
+        }
+    }
+    0
+}
+
+/// Validates `Par2CandidateProgress::validateBlock`:
+/// - `-1`: invalid pointer
+/// - `1`: valid
+/// - `0`: invalid
+///
+/// # Safety
+///
+/// `ptr` must be valid for reads of `len` bytes when non-null and `len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_par2_checkpoint_validate_block(
+    ptr: *const u8,
+    len: usize,
+    is_null: u32,
+) -> i32 {
+    if ptr.is_null() && len > 0 {
+        return -1;
+    }
+    if is_null != 0 {
+        return 1;
+    }
+    if len == 0 || len > 64 {
+        return 0;
+    }
+    let s = unsafe { slice::from_raw_parts(ptr, len) };
+    if !s[0].is_ascii_lowercase() {
+        return 0;
+    }
+    i32::from(
+        s[1..]
+            .iter()
+            .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+    )
+}
+
+/// Validates `Par2CandidateProgress::canonicalIdentity`:
+/// - `-1`: invalid pointer
+/// - `0`: valid
+/// - `1`: `'Invalid decoded article offset.'`
+/// - `2`: `'Invalid article continuity identity.'`
+/// - `3`: `'Invalid article filename encoding.'`
+///
+/// # Safety
+///
+/// `b64_ptr` must be valid for reads of `b64_len` bytes when non-null and `b64_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_par2_checkpoint_validate_identity(
+    b64_ptr: *const u8,
+    b64_len: usize,
+    size: i64,
+    has_part: u32,
+    part: i64,
+    decoded_offset: i64,
+    tombstone: u32,
+) -> i32 {
+    if b64_ptr.is_null() && b64_len > 0 {
+        return -1;
+    }
+    if decoded_offset < 0 {
+        return 1;
+    }
+    if tombstone != 0
+        || b64_len > 87384
+        || size < 1
+        || decoded_offset > size
+        || (has_part != 0 && !(1..=1_000_000).contains(&part))
+    {
+        return 2;
+    }
+    let b64 = if b64_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(b64_ptr, b64_len) }
+    };
+    if !is_valid_par2_identity_base64(b64) {
+        return 3;
+    }
+    0
+}
+
+/// Parses and validates a decimal integer string for `Par2CandidateProgress::storedInteger`:
+/// - `-1`: invalid pointer
+/// - `-2`: invalid stored integer or exceeds `maximum`
+/// - `>= 0`: parsed integer in `0..=maximum`
+///
+/// # Safety
+///
+/// `ptr` must be valid for reads of `len` bytes when non-null and `len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_par2_checkpoint_stored_integer(
+    ptr: *const u8,
+    len: usize,
+    maximum: i64,
+) -> i64 {
+    if ptr.is_null() && len > 0 {
+        return -1;
+    }
+    if maximum < 0 || len == 0 || len > 19 {
+        return -2;
+    }
+    let s = unsafe { slice::from_raw_parts(ptr, len) };
+    if s == b"0" {
+        return 0;
+    }
+    if !matches!(s[0], b'1'..=b'9') {
+        return -2;
+    }
+    let mut acc = u64::from(s[0] - b'0');
+    for &b in &s[1..] {
+        if !b.is_ascii_digit() {
+            return -2;
+        }
+        acc = match acc
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(u64::from(b - b'0')))
+        {
+            Some(v) => v,
+            None => return -2,
+        };
+    }
+    if acc > maximum as u64 {
+        return -2;
+    }
+    acc as i64
+}
+
+#[cfg(test)]
+mod wave11_binaries_part_handler_par2_checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn part_validation_and_preference() {
+        assert_eq!(part_validation_error_code(0, b"<msg@example>"), 1);
+        assert_eq!(part_validation_error_code(-5, b"<msg@example>"), 1);
+        assert_eq!(part_validation_error_code(1, b"   \t\n "), 2);
+        assert_eq!(part_validation_error_code(1, "café@example".as_bytes()), 2);
+        assert_eq!(part_validation_error_code(1, &[b'a'; 256]), 2);
+        assert_eq!(part_validation_error_code(1, &[b'a'; 255]), 0);
+        assert_eq!(part_validation_error_code(1, b"  <valid@example>  "), 0);
+
+        // Non-empty messageid wins over empty messageid
+        assert!(part_should_prefer_tuple(true, 10, 999, false, 1000, 1));
+        assert!(!part_should_prefer_tuple(false, 1000, 1, true, 10, 999));
+        // Larger size wins when both have messageid
+        assert!(part_should_prefer_tuple(true, 200, 901, true, 100, 900));
+        assert!(!part_should_prefer_tuple(true, 100, 900, true, 200, 901));
+        // Smaller article number wins on equal size
+        assert!(part_should_prefer_tuple(true, 200, 899, true, 200, 900));
+        assert!(!part_should_prefer_tuple(true, 200, 900, true, 200, 900));
+    }
+
+    #[test]
+    fn part_deduplicate_and_sort_ffi() {
+        let rows: &[(i64, i64, i64, i64, &[u8])] = &[
+            (20, 2, 100, 500, b"<m1>"),
+            (10, 1, 100, 501, b"<m2>"),
+            (20, 2, 200, 502, b"<m3>"), // larger size -> wins for (20, 2) at index 2
+            (10, 1, 100, 499, b"<m4>"), // smaller number -> wins for (10, 1) at index 3
+            (10, 1, 999, 100, b"   "),  // empty trimmed messageid -> loses
+        ];
+        let mut buf = Vec::new();
+        for &(bid, pnum, size, num, msg) in rows {
+            buf.extend_from_slice(&bid.to_ne_bytes());
+            buf.extend_from_slice(&pnum.to_ne_bytes());
+            buf.extend_from_slice(&size.to_ne_bytes());
+            buf.extend_from_slice(&num.to_ne_bytes());
+            buf.extend_from_slice(&(msg.len() as u32).to_ne_bytes());
+            buf.extend_from_slice(msg);
+        }
+
+        let mut out = [0u8; 32];
+        let written_unsorted = unsafe {
+            nntmux_part_deduplicate(buf.as_ptr(), buf.len(), rows.len(), 0, out.as_mut_ptr(), out.len())
+        };
+        assert_eq!(written_unsorted, 8);
+        let idx0 = u32::from_ne_bytes(out[0..4].try_into().unwrap());
+        let idx1 = u32::from_ne_bytes(out[4..8].try_into().unwrap());
+        assert_eq!((idx0, idx1), (2, 3));
+
+        let written_sorted = unsafe {
+            nntmux_part_deduplicate(buf.as_ptr(), buf.len(), rows.len(), 1, out.as_mut_ptr(), out.len())
+        };
+        assert_eq!(written_sorted, 8);
+        let s0 = u32::from_ne_bytes(out[0..4].try_into().unwrap());
+        let s1 = u32::from_ne_bytes(out[4..8].try_into().unwrap());
+        assert_eq!((s0, s1), (3, 2));
+    }
+
+    #[test]
+    fn header_file_counter_matching() {
+        assert_eq!(
+            match_header_file_counter(b"Release.Name [03/62] \"file.rar\" yEnc"),
+            Some((13, 2, 1, 2, 3, 62))
+        );
+        assert_eq!(
+            match_header_file_counter(b"Release (3 of 62) file.rar"),
+            Some((8, 1, 4, 2, 3, 62))
+        );
+        assert_eq!(
+            match_header_file_counter(b"[1/2$"),
+            Some((0, 1, 1, 1, 1, 2))
+        );
+        assert_eq!(match_header_file_counter(b"[1/2"), None);
+        assert_eq!(match_header_file_counter(b"[123456/7]"), None);
+    }
+
+    #[test]
+    fn par2_checkpoint_validators() {
+        assert!(is_valid_par2_identity_base64(b"ZmlsZS5wYXIy")); // "file.par2"
+        assert!(!is_valid_par2_identity_base64(b"eA")); // unpadded
+        assert!(!is_valid_par2_identity_base64(b"eB==")); // non-canonical padding bits
+        assert!(!is_valid_par2_identity_base64(b"AA==")); // decodes to "\0"
+        assert!(!is_valid_par2_identity_base64(b"Cg==")); // decodes to "\n"
+        assert!(!is_valid_par2_identity_base64(b"DQ==")); // decodes to "\r"
+
+        let zero = b"0";
+        assert_eq!(
+            unsafe { nntmux_par2_checkpoint_stored_integer(zero.as_ptr(), zero.len(), 100) },
+            0
+        );
+        let lead_zero = b"01";
+        assert_eq!(
+            unsafe { nntmux_par2_checkpoint_stored_integer(lead_zero.as_ptr(), lead_zero.len(), 100) },
+            -2
+        );
+        let overflow = b"9223372036854775808";
+        assert_eq!(
+            unsafe {
+                nntmux_par2_checkpoint_stored_integer(overflow.as_ptr(), overflow.len(), i64::MAX)
+            },
+            -2
+        );
+    }
+}
+

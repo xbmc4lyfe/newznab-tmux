@@ -6,11 +6,14 @@ namespace App\Services\Binaries;
 
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Tmux\CollectionDowntimeCompensator;
+use App\Support\RustPipelineLibrary;
 use App\Support\SqlError;
+use FFI;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
+use Throwable;
 
 /**
  * Orchestrates the header storage process.
@@ -20,6 +23,35 @@ use Illuminate\Support\Facades\Schema;
  */
 final class HeaderStorageService
 {
+    public const string FFI_CDEF = <<<'C'
+        int64_t nntmux_header_extract_file_numbers(const char *subject_ptr, size_t subject_len);
+        int64_t nntmux_header_get_file_count_span(const char *subject_ptr, size_t subject_len);
+        ssize_t nntmux_header_extract_file_numbers_batch_nul(const char *input_ptr, size_t input_len, size_t count, char *out_ptr, size_t out_cap);
+        C;
+
+    private static FFI|false|null $ffi = null;
+
+    private static bool $useRustFfi = true;
+
+    public static function setUseRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    private static function resolveFfi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
     private const int LOCK_RETRY_MAX = 10;
 
     /** @var array<int, true> */
@@ -36,7 +68,7 @@ final class HeaderStorageService
     /** @var array<int, int|string> Article numbers that failed to insert */
     private array $failedInserts = [];
 
-    private ?\Throwable $lastStorageException = null;
+    private ?Throwable $lastStorageException = null;
 
     public function __construct(
         ?CollectionHandler $collectionHandler = null,
@@ -162,7 +194,7 @@ final class HeaderStorageService
      *
      * @return array{driver_code?: int, constraint?: string}
      */
-    private function constraintContext(\Throwable $exception): array
+    private function constraintContext(Throwable $exception): array
     {
         if (! $exception instanceof QueryException) {
             return [];
@@ -234,7 +266,7 @@ final class HeaderStorageService
             if (! $transaction->hasErrors()) {
                 $this->invalidateVerificationCandidates();
             }
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             $this->lastStorageException = $e;
             $transaction->markError();
         }
@@ -262,7 +294,7 @@ final class HeaderStorageService
         return true;
     }
 
-    private function isTransientLockError(?\Throwable $exception): bool
+    private function isTransientLockError(?Throwable $exception): bool
     {
         return $exception !== null && SqlError::isTransientLock($exception);
     }
@@ -271,7 +303,7 @@ final class HeaderStorageService
      * Lock conflicts, and a collection or binary deleted by the releases or cleanup pass after this
      * attempt resolved its id. A fresh attempt re-resolves (or recreates) the parent row.
      */
-    private function isRetryableStorageError(?\Throwable $exception): bool
+    private function isRetryableStorageError(?Throwable $exception): bool
     {
         return $this->isTransientLockError($exception) || $this->isMissingParentRow($exception);
     }
@@ -279,7 +311,7 @@ final class HeaderStorageService
     /**
      * MySQL/MariaDB 1452: a child row's foreign key names a parent row that no longer exists.
      */
-    private function isMissingParentRow(?\Throwable $exception): bool
+    private function isMissingParentRow(?Throwable $exception): bool
     {
         return $exception instanceof QueryException && (int) ($exception->errorInfo[1] ?? 0) === 1452;
     }
@@ -383,11 +415,195 @@ final class HeaderStorageService
      * @param  array<string, mixed>  $header
      * @return array{0: int, 1: int}
      */
-    private function extractFileNumberAndTotal(array $header): array
+    public function extractFileNumberAndTotal(array $header): array
     {
-        $fileCount = $this->getFileCount($header['matches'][1]);
+        return $this->extractFileNumberAndTotalPhp($header);
+    }
+
+    /**
+     * @param  array<string, mixed>  $header
+     * @return array{0: int, 1: int}
+     */
+    public function extractFileNumberAndTotalPhp(array $header): array
+    {
+        $fileCount = $this->getFileCountPhp((string) ($header['matches'][1] ?? ''));
 
         return [(int) $fileCount[1], (int) $fileCount[3]];
+    }
+
+    /**
+     * @param  array<string, mixed>  $header
+     * @return array{0: int, 1: int}|null
+     */
+    public function extractFileNumberAndTotalNative(array $header): ?array
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        $ffi = self::$ffi ?? self::resolveFfi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+
+        $subject = (string) ($header['matches'][1] ?? '');
+
+        try {
+            // @phpstan-ignore method.notFound
+            $packed = $ffi->nntmux_header_extract_file_numbers($subject, \strlen($subject));
+            if (! \is_int($packed) || $packed < 0) {
+                return null;
+            }
+            if ($packed === 0) {
+                return [0, 0];
+            }
+
+            return [$packed & 0xFFFFF, ($packed >> 20) & 0xFFFFF];
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch extract `[fileNumbersByIndex, totalFilesByIndex]` for a header chunk.
+     *
+     * @param  array<int, array<string, mixed>>  $headers
+     * @return array{0: array<int, int>, 1: array<int, int>}
+     */
+    public function extractFileNumbersAndTotalsBatch(array $headers): array
+    {
+        return $this->extractFileNumbersAndTotalsBatchPhp($headers);
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $headers
+     * @return array{0: array<int, int>, 1: array<int, int>}
+     */
+    public function extractFileNumbersAndTotalsBatchPhp(array $headers): array
+    {
+        $fileNumbersByIndex = [];
+        $totalFilesByIndex = [];
+        foreach ($headers as $index => $header) {
+            [$fileNumber, $totalFiles] = $this->extractFileNumberAndTotalPhp($header);
+            $fileNumbersByIndex[$index] = $fileNumber;
+            $totalFilesByIndex[$index] = $totalFiles;
+        }
+
+        return [$fileNumbersByIndex, $totalFilesByIndex];
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $headers
+     * @return array{0: array<int, int>, 1: array<int, int>}|null
+     */
+    public function extractFileNumbersAndTotalsBatchNative(array $headers): ?array
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        $count = \count($headers);
+        if ($count === 0) {
+            return [[], []];
+        }
+        $ffi = self::$ffi ?? self::resolveFfi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+
+        $isList = array_is_list($headers);
+        $subjects = [];
+        $indices = [];
+        if ($isList) {
+            foreach ($headers as $header) {
+                $subj = (string) ($header['matches'][1] ?? '');
+                if (\str_contains($subj, "\0")) {
+                    return $this->extractFileNumbersAndTotalsBatchFallbackNative($headers);
+                }
+                $subjects[] = $subj;
+            }
+        } else {
+            foreach ($headers as $index => $header) {
+                $subj = (string) ($header['matches'][1] ?? '');
+                if (\str_contains($subj, "\0")) {
+                    return $this->extractFileNumbersAndTotalsBatchFallbackNative($headers);
+                }
+                $subjects[] = $subj;
+                $indices[] = $index;
+            }
+        }
+
+        $joined = \implode("\0", $subjects);
+        $needed = $count * 8;
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $needed), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_header_extract_file_numbers_batch_nul($joined, \strlen($joined), $count, $scratch, $cap);
+            if (! \is_int($written) || $written === -1) {
+                return null;
+            }
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_header_extract_file_numbers_batch_nul($joined, \strlen($joined), $count, $scratch, $cap);
+                if (! \is_int($written) || $written < 0) {
+                    return null;
+                }
+            }
+            if ($written !== $needed) {
+                return null;
+            }
+
+            /** @var array<int, int>|false $values */
+            $values = \unpack('L*', FFI::string($scratch, $written));
+            if ($values === false) {
+                return null;
+            }
+
+            $fileNumbersByIndex = [];
+            $totalFilesByIndex = [];
+            if ($isList) {
+                for ($pos = 0; $pos < $count; $pos++) {
+                    $fileNumbersByIndex[$pos] = $values[$pos * 2 + 1];
+                    $totalFilesByIndex[$pos] = $values[$pos * 2 + 2];
+                }
+            } else {
+                foreach ($indices as $pos => $index) {
+                    $fileNumbersByIndex[$index] = $values[$pos * 2 + 1];
+                    $totalFilesByIndex[$index] = $values[$pos * 2 + 2];
+                }
+            }
+
+            return [$fileNumbersByIndex, $totalFilesByIndex];
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $headers
+     * @return array{0: array<int, int>, 1: array<int, int>}|null
+     */
+    private function extractFileNumbersAndTotalsBatchFallbackNative(array $headers): ?array
+    {
+        $fileNumbersByIndex = [];
+        $totalFilesByIndex = [];
+        foreach ($headers as $index => $header) {
+            $pair = $this->extractFileNumberAndTotalNative($header);
+            if ($pair === null) {
+                return null;
+            }
+            $fileNumbersByIndex[$index] = $pair[0];
+            $totalFilesByIndex[$index] = $pair[1];
+        }
+
+        return [$fileNumbersByIndex, $totalFilesByIndex];
     }
 
     /** @param  array<string, mixed>  $header */
@@ -402,13 +618,61 @@ final class HeaderStorageService
     /**
      * @return array<int, int|string>
      */
-    private function getFileCount(string $subject): array
+    public function getFileCount(string $subject): array
+    {
+        return $this->getFileCountPhp($subject);
+    }
+
+    /**
+     * @return array<int, int|string>
+     */
+    public function getFileCountPhp(string $subject): array
     {
         if (! preg_match(HeaderParser::FILE_COUNTER_PATTERN, $subject, $fileCount)) {
             $fileCount[1] = $fileCount[3] = 0;
         }
 
         return $fileCount;
+    }
+
+    /**
+     * @return array<int, int|string>|null
+     */
+    public function getFileCountNative(string $subject): ?array
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        $ffi = self::$ffi ?? self::resolveFfi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $packed = $ffi->nntmux_header_get_file_count_span($subject, \strlen($subject));
+            if (! \is_int($packed) || $packed < 0) {
+                return null;
+            }
+            if ($packed === 0) {
+                return [3 => 0, 1 => 0];
+            }
+
+            $start = $packed & 0xFFFFFFFF;
+            $d1Len = ($packed >> 32) & 0x7;
+            $sepLen = ($packed >> 35) & 0x7;
+            $d2Len = ($packed >> 38) & 0x7;
+            $fullLen = 1 + $d1Len + $sepLen + $d2Len + 1;
+
+            return [
+                0 => \substr($subject, $start, $fullLen),
+                1 => \substr($subject, $start + 1, $d1Len),
+                2 => \substr($subject, $start + 1 + $d1Len, $sepLen),
+                3 => \substr($subject, $start + 1 + $d1Len + $sepLen, $d2Len),
+            ];
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     /**
@@ -419,7 +683,7 @@ final class HeaderStorageService
     {
         try {
             app(CollectionDowntimeCompensator::class)->noteIngestion();
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::debug('Unable to record ingestion activity: '.$e->getMessage());
         }
     }
