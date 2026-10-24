@@ -5,10 +5,13 @@ declare(strict_types=1);
 namespace App\Models;
 
 use App\Services\UserStatsService;
+use App\Support\RustPipelineLibrary;
 use Carbon\Carbon;
+use FFI;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 class UserActivityStat extends Model
 {
@@ -19,6 +22,151 @@ class UserActivityStat extends Model
     protected $casts = [
         'stat_date' => 'date',
     ];
+
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_user_activity_hourly_label(int64_t hour_local, int64_t now_local, const char *time_hm_ptr, size_t time_hm_len, const char *day_hm_ptr, size_t day_hm_len, const char *month_day_hm_ptr, size_t month_day_hm_len, char *out_buf, size_t out_cap);
+        C;
+
+    private const int SECONDS_PER_DAY = 86400;
+
+    /**
+     * PHP stays the production default: the Rust helper misses the 1.5x mean/p99 gate
+     * (see RustUserStatsInvitationParityTest for the paired benchmark evidence).
+     */
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(bool $use = true): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function enableRustFfi(): void
+    {
+        self::setUseRustFfi(true);
+    }
+
+    public static function disableRustFfi(): void
+    {
+        self::setUseRustFfi(false);
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = false;
+        self::$ffi = null;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    public static function setFfiForTesting(FFI|false|null $override = null): void
+    {
+        self::$ffi = $override;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('metadata', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
+    /**
+     * Format the relative chart label for an hourly bucket.
+     *
+     * `$hourTs` and `$nowTs` are wall-clock seconds (Unix timestamp plus UTC offset), so whole
+     * days compare as calendar dates in the display timezone: today `H:i`, yesterday
+     * `Yesterday H:i`, under seven days ago `D H:i`, otherwise `M d H:i`.
+     */
+    public static function formatHourlyStatLabel(int $hourTs, int $nowTs, string $timeHm, string $dayHm, string $monthDayHm): string
+    {
+        return self::$useRustFfi
+            ? self::formatHourlyStatLabelNative($hourTs, $nowTs, $timeHm, $dayHm, $monthDayHm)
+            : self::formatHourlyStatLabelPhp($hourTs, $nowTs, $timeHm, $dayHm, $monthDayHm);
+    }
+
+    public static function formatHourlyStatLabelNative(int $hourTs, int $nowTs, string $timeHm, string $dayHm, string $monthDayHm): string
+    {
+        if (($ffi = self::ffi()) === null) {
+            return self::formatHourlyStatLabelPhp($hourTs, $nowTs, $timeHm, $dayHm, $monthDayHm);
+        }
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch(
+                $ffi,
+                max(64, 10 + max(\strlen($timeHm), \strlen($dayHm), \strlen($monthDayHm))),
+                $capacity,
+            );
+            if ($buffer === null) {
+                return self::formatHourlyStatLabelPhp($hourTs, $nowTs, $timeHm, $dayHm, $monthDayHm);
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_user_activity_hourly_label(
+                $hourTs,
+                $nowTs,
+                $timeHm,
+                \strlen($timeHm),
+                $dayHm,
+                \strlen($dayHm),
+                $monthDayHm,
+                \strlen($monthDayHm),
+                $buffer,
+                $capacity,
+            );
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return self::formatHourlyStatLabelPhp($hourTs, $nowTs, $timeHm, $dayHm, $monthDayHm);
+            }
+
+            return $written === 0 ? '' : FFI::string($buffer, $written);
+        } catch (Throwable) {
+            return self::formatHourlyStatLabelPhp($hourTs, $nowTs, $timeHm, $dayHm, $monthDayHm);
+        }
+    }
+
+    public static function formatHourlyStatLabelPhp(int $hourTs, int $nowTs, string $timeHm, string $dayHm, string $monthDayHm): string
+    {
+        $hourDay = self::floorDay($hourTs);
+        $nowDay = self::floorDay($nowTs);
+
+        if ($hourDay === $nowDay) {
+            return $timeHm;
+        }
+        if ($hourDay === $nowDay - 1) {
+            return 'Yesterday '.$timeHm;
+        }
+        if ($nowTs - $hourTs < 7 * self::SECONDS_PER_DAY) {
+            return $dayHm;
+        }
+
+        return $monthDayHm;
+    }
+
+    private static function floorDay(int $wallSeconds): int
+    {
+        $day = intdiv($wallSeconds, self::SECONDS_PER_DAY);
+
+        return $wallSeconds % self::SECONDS_PER_DAY < 0 ? $day - 1 : $day;
+    }
+
+    /**
+     * Relative chart label for an hourly bucket compared with the current time.
+     */
+    private static function hourlyLabel(Carbon $time, Carbon $now): string
+    {
+        return self::formatHourlyStatLabel(
+            $time->getTimestamp() + $time->getOffset(),
+            $now->getTimestamp() + $now->getOffset(),
+            $time->format('H:i'),
+            $time->format('D H:i'),
+            $time->format('M d H:i'),
+        );
+    }
 
     /**
      * Collect and store user activity stats for a specific date
@@ -215,16 +363,7 @@ class UserActivityStat extends Model
             $stat = $stats->get($hourKey);
 
             // Format label based on how recent the hour is
-            $now = Carbon::now();
-            if ($time->isToday()) {
-                $label = $time->format('H:i');
-            } elseif ($time->isYesterday()) {
-                $label = 'Yesterday '.$time->format('H:i');
-            } elseif ($time->diffInDays($now) < 7) {
-                $label = $time->format('D H:i');
-            } else {
-                $label = $time->format('M d H:i');
-            }
+            $label = self::hourlyLabel($time, Carbon::now());
 
             $result[] = [
                 'time' => $label,
@@ -259,16 +398,7 @@ class UserActivityStat extends Model
             $stat = $stats->get($hourKey);
 
             // Format label based on how recent the hour is
-            $now = Carbon::now();
-            if ($time->isToday()) {
-                $label = $time->format('H:i');
-            } elseif ($time->isYesterday()) {
-                $label = 'Yesterday '.$time->format('H:i');
-            } elseif ($time->diffInDays($now) < 7) {
-                $label = $time->format('D H:i');
-            } else {
-                $label = $time->format('M d H:i');
-            }
+            $label = self::hourlyLabel($time, Carbon::now());
 
             $result[] = [
                 'time' => $label,

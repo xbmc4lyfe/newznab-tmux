@@ -7,12 +7,143 @@ namespace App\Services;
 use App\Mail\InvitationMail;
 use App\Models\Invitation;
 use App\Models\User;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\ValidationException;
+use Throwable;
 
 class InvitationService
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_invitation_availability(int64_t total_invites, int64_t active_invitations, int64_t *out_available);
+        C;
+
+    /**
+     * PHP stays the production default: the Rust helper misses the 1.5x mean/p99 gate
+     * (see RustUserStatsInvitationParityTest for the paired benchmark evidence).
+     */
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(bool $use = true): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function enableRustFfi(): void
+    {
+        self::setUseRustFfi(true);
+    }
+
+    public static function disableRustFfi(): void
+    {
+        self::setUseRustFfi(false);
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = false;
+        self::$ffi = null;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    public static function setFfiForTesting(FFI|false|null $override = null): void
+    {
+        self::$ffi = $override;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('metadata', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
+    /**
+     * Calculate a user's invitation quota breakdown: available invites are the total allowance
+     * minus active pending invitations, and another invite may be sent while any remain.
+     *
+     * @return array{total_invites: int, active_pending: int, used_invitations: int, expired_invitations: int, cancelled_invitations: int, calculated_available: int, can_send_invite: bool}
+     */
+    public static function calculateInviteAvailability(
+        int $totalInvites,
+        int $activeInvitations,
+        int $usedInvitations,
+        int $expiredInvitations,
+        int $cancelledInvitations,
+    ): array {
+        return self::$useRustFfi
+            ? self::calculateInviteAvailabilityNative($totalInvites, $activeInvitations, $usedInvitations, $expiredInvitations, $cancelledInvitations)
+            : self::calculateInviteAvailabilityPhp($totalInvites, $activeInvitations, $usedInvitations, $expiredInvitations, $cancelledInvitations);
+    }
+
+    /**
+     * @return array{total_invites: int, active_pending: int, used_invitations: int, expired_invitations: int, cancelled_invitations: int, calculated_available: int, can_send_invite: bool}
+     */
+    public static function calculateInviteAvailabilityNative(
+        int $totalInvites,
+        int $activeInvitations,
+        int $usedInvitations,
+        int $expiredInvitations,
+        int $cancelledInvitations,
+    ): array {
+        if (($ffi = self::ffi()) === null) {
+            return self::calculateInviteAvailabilityPhp($totalInvites, $activeInvitations, $usedInvitations, $expiredInvitations, $cancelledInvitations);
+        }
+        try {
+            $available = $ffi->new('int64_t[1]');
+            // @phpstan-ignore method.notFound
+            $rc = $ffi->nntmux_invitation_availability($totalInvites, $activeInvitations, $available);
+            if ($rc !== 0 && $rc !== 1) {
+                return self::calculateInviteAvailabilityPhp($totalInvites, $activeInvitations, $usedInvitations, $expiredInvitations, $cancelledInvitations);
+            }
+
+            return [
+                'total_invites' => $totalInvites,
+                'active_pending' => $activeInvitations,
+                'used_invitations' => $usedInvitations,
+                'expired_invitations' => $expiredInvitations,
+                'cancelled_invitations' => $cancelledInvitations,
+                'calculated_available' => (int) $available[0],
+                'can_send_invite' => $rc === 1,
+            ];
+        } catch (Throwable) {
+            return self::calculateInviteAvailabilityPhp($totalInvites, $activeInvitations, $usedInvitations, $expiredInvitations, $cancelledInvitations);
+        }
+    }
+
+    /**
+     * @return array{total_invites: int, active_pending: int, used_invitations: int, expired_invitations: int, cancelled_invitations: int, calculated_available: int, can_send_invite: bool}
+     */
+    public static function calculateInviteAvailabilityPhp(
+        int $totalInvites,
+        int $activeInvitations,
+        int $usedInvitations,
+        int $expiredInvitations,
+        int $cancelledInvitations,
+    ): array {
+        $availableInvites = $totalInvites - $activeInvitations;
+
+        return [
+            'total_invites' => $totalInvites,
+            'active_pending' => $activeInvitations,
+            'used_invitations' => $usedInvitations,
+            'expired_invitations' => $expiredInvitations,
+            'cancelled_invitations' => $cancelledInvitations,
+            'calculated_available' => $availableInvites,
+            'can_send_invite' => $availableInvites > 0,
+        ];
+    }
+
     /**
      * Create and send an invitation
      *
@@ -53,7 +184,7 @@ class InvitationService
         }
 
         // Check if there's already a valid invitation for this email
-        $existingInvitation = Invitation::where('email', strtolower(trim($email)))
+        $existingInvitation = Invitation::where('email', Invitation::normalizeEmail($email))
             ->valid()
             ->first();
 
@@ -195,7 +326,8 @@ class InvitationService
 
         $sentCount = Invitation::where('invited_by', $userId)->count();
 
-        return $sentCount < $maxInvitations;
+        // The configured cap is the allowance and every sent invitation consumes it.
+        return self::calculateInviteAvailability($maxInvitations, $sentCount, 0, 0, 0)['can_send_invite'];
     }
 
     /**
@@ -234,7 +366,7 @@ class InvitationService
             return [];
         }
 
-        $totalInvites = $user->invites;
+        $totalInvites = (int) $user->invites;
 
         $activeInvitations = Invitation::where('invited_by', $userId)
             ->where('is_active', true)
@@ -256,18 +388,15 @@ class InvitationService
             ->where('used_at', null)
             ->count();
 
-        $availableInvites = $totalInvites - $activeInvitations;
-
         return [
             'user_id' => $userId,
             'username' => $user->username,
-            'total_invites' => $totalInvites,
-            'active_pending' => $activeInvitations,
-            'used_invitations' => $usedInvitations,
-            'expired_invitations' => $expiredInvitations,
-            'cancelled_invitations' => $cancelledInvitations,
-            'calculated_available' => $availableInvites,
-            'can_send_invite' => $availableInvites > 0,
-        ];
+        ] + self::calculateInviteAvailability(
+            $totalInvites,
+            $activeInvitations,
+            $usedInvitations,
+            $expiredInvitations,
+            $cancelledInvitations,
+        );
     }
 }

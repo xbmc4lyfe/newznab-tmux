@@ -8,11 +8,191 @@ use App\Models\User;
 use App\Models\UserActivityStat;
 use App\Models\UserDownload;
 use App\Models\UserRequest;
+use App\Support\RustPipelineLibrary;
 use Carbon\Carbon;
+use FFI;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 class UserStatsService
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_user_stats_minute_bucket_expression(const char *driver_ptr, size_t driver_len, char *out_buf, size_t out_cap);
+        int32_t nntmux_user_stats_summary_totals(int64_t total_users, int64_t today_closed_downloads, int64_t week_closed_downloads, int64_t today_closed_api_hits, int64_t week_closed_api_hits, int64_t downloads_current_hour, int64_t api_hits_current_hour, int64_t *out_totals);
+        C;
+
+    /**
+     * PHP stays the production default: the Rust helpers miss the 1.5x mean/p99 gate
+     * (see RustUserStatsInvitationParityTest for the paired benchmark evidence).
+     */
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(bool $use = true): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function enableRustFfi(): void
+    {
+        self::setUseRustFfi(true);
+    }
+
+    public static function disableRustFfi(): void
+    {
+        self::setUseRustFfi(false);
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = false;
+        self::$ffi = null;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    public static function setFfiForTesting(FFI|false|null $override = null): void
+    {
+        self::$ffi = $override;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('metadata', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
+    /**
+     * Resolve the SQL expression that buckets `timestamp` to its minute for a database driver.
+     */
+    public static function resolveMinuteBucketExpression(string $driver): string
+    {
+        return self::$useRustFfi
+            ? self::resolveMinuteBucketExpressionNative($driver)
+            : self::resolveMinuteBucketExpressionPhp($driver);
+    }
+
+    public static function resolveMinuteBucketExpressionNative(string $driver): string
+    {
+        if (($ffi = self::ffi()) === null) {
+            return self::resolveMinuteBucketExpressionPhp($driver);
+        }
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, 64, $capacity);
+            if ($buffer === null) {
+                return self::resolveMinuteBucketExpressionPhp($driver);
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_user_stats_minute_bucket_expression($driver, \strlen($driver), $buffer, $capacity);
+            if (! \is_int($written) || $written <= 0 || $written > $capacity) {
+                return self::resolveMinuteBucketExpressionPhp($driver);
+            }
+
+            return FFI::string($buffer, $written);
+        } catch (Throwable) {
+            return self::resolveMinuteBucketExpressionPhp($driver);
+        }
+    }
+
+    public static function resolveMinuteBucketExpressionPhp(string $driver): string
+    {
+        return $driver === 'sqlite'
+            ? "strftime('%Y-%m-%d %H:%M:00', timestamp)"
+            : 'DATE_FORMAT(timestamp, "%Y-%m-%d %H:%i:00")';
+    }
+
+    /**
+     * Combine closed-hour aggregates with the live current hour into the headline summary tiles.
+     *
+     * @return array{total_users: int, downloads_today: int, downloads_week: int, api_hits_today: int, api_hits_week: int}
+     */
+    public static function computeSummaryTotals(
+        int $totalUsers,
+        int $todayClosedDownloads,
+        int $weekClosedDownloads,
+        int $todayClosedApiHits,
+        int $weekClosedApiHits,
+        int $downloadsCurrentHour,
+        int $apiHitsCurrentHour,
+    ): array {
+        return self::$useRustFfi
+            ? self::computeSummaryTotalsNative($totalUsers, $todayClosedDownloads, $weekClosedDownloads, $todayClosedApiHits, $weekClosedApiHits, $downloadsCurrentHour, $apiHitsCurrentHour)
+            : self::computeSummaryTotalsPhp($totalUsers, $todayClosedDownloads, $weekClosedDownloads, $todayClosedApiHits, $weekClosedApiHits, $downloadsCurrentHour, $apiHitsCurrentHour);
+    }
+
+    /**
+     * @return array{total_users: int, downloads_today: int, downloads_week: int, api_hits_today: int, api_hits_week: int}
+     */
+    public static function computeSummaryTotalsNative(
+        int $totalUsers,
+        int $todayClosedDownloads,
+        int $weekClosedDownloads,
+        int $todayClosedApiHits,
+        int $weekClosedApiHits,
+        int $downloadsCurrentHour,
+        int $apiHitsCurrentHour,
+    ): array {
+        if (($ffi = self::ffi()) === null) {
+            return self::computeSummaryTotalsPhp($totalUsers, $todayClosedDownloads, $weekClosedDownloads, $todayClosedApiHits, $weekClosedApiHits, $downloadsCurrentHour, $apiHitsCurrentHour);
+        }
+        try {
+            $out = $ffi->new('int64_t[5]');
+            // @phpstan-ignore method.notFound
+            $rc = $ffi->nntmux_user_stats_summary_totals(
+                $totalUsers,
+                $todayClosedDownloads,
+                $weekClosedDownloads,
+                $todayClosedApiHits,
+                $weekClosedApiHits,
+                $downloadsCurrentHour,
+                $apiHitsCurrentHour,
+                $out,
+            );
+            if ($rc !== 1) {
+                return self::computeSummaryTotalsPhp($totalUsers, $todayClosedDownloads, $weekClosedDownloads, $todayClosedApiHits, $weekClosedApiHits, $downloadsCurrentHour, $apiHitsCurrentHour);
+            }
+
+            return [
+                'total_users' => (int) $out[0],
+                'downloads_today' => (int) $out[1],
+                'downloads_week' => (int) $out[2],
+                'api_hits_today' => (int) $out[3],
+                'api_hits_week' => (int) $out[4],
+            ];
+        } catch (Throwable) {
+            return self::computeSummaryTotalsPhp($totalUsers, $todayClosedDownloads, $weekClosedDownloads, $todayClosedApiHits, $weekClosedApiHits, $downloadsCurrentHour, $apiHitsCurrentHour);
+        }
+    }
+
+    /**
+     * @return array{total_users: int, downloads_today: int, downloads_week: int, api_hits_today: int, api_hits_week: int}
+     */
+    public static function computeSummaryTotalsPhp(
+        int $totalUsers,
+        int $todayClosedDownloads,
+        int $weekClosedDownloads,
+        int $todayClosedApiHits,
+        int $weekClosedApiHits,
+        int $downloadsCurrentHour,
+        int $apiHitsCurrentHour,
+    ): array {
+        return [
+            'total_users' => $totalUsers,
+            'downloads_today' => $todayClosedDownloads + $downloadsCurrentHour,
+            'downloads_week' => $weekClosedDownloads + $downloadsCurrentHour,
+            'api_hits_today' => $todayClosedApiHits + $apiHitsCurrentHour,
+            'api_hits_week' => $weekClosedApiHits + $apiHitsCurrentHour,
+        ];
+    }
+
     /**
      * Get user statistics by role
      *
@@ -215,6 +395,18 @@ class UserStatsService
             ->where('timestamp', '>=', $currentHourStart)
             ->count();
 
+        if (self::$useRustFfi) {
+            return self::computeSummaryTotals(
+                User::whereNull('deleted_at')->count(),
+                (int) ($todayClosed->downloads ?? 0),
+                (int) ($weekClosed->downloads ?? 0),
+                (int) ($todayClosed->api_hits ?? 0),
+                (int) ($weekClosed->api_hits ?? 0),
+                $downloadsCurrentHour,
+                $apiHitsCurrentHour,
+            );
+        }
+
         $downloadsToday = (int) ($todayClosed->downloads ?? 0) + $downloadsCurrentHour;
         $apiHitsToday = (int) ($todayClosed->api_hits ?? 0) + $apiHitsCurrentHour;
 
@@ -293,8 +485,6 @@ class UserStatsService
 
     private function minuteBucketExpression(): string
     {
-        return DB::connection()->getDriverName() === 'sqlite'
-            ? "strftime('%Y-%m-%d %H:%M:00', timestamp)"
-            : 'DATE_FORMAT(timestamp, "%Y-%m-%d %H:%i:00")';
+        return self::resolveMinuteBucketExpression(DB::connection()->getDriverName());
     }
 }

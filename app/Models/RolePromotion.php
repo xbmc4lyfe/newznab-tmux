@@ -4,11 +4,15 @@ declare(strict_types=1);
 
 namespace App\Models;
 
+use App\Support\RustPipelineLibrary;
+use DateTimeInterface;
+use FFI;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Support\Carbon;
 use Spatie\Permission\Models\Role;
+use Throwable;
 
 /**
  * App\Models\RolePromotion
@@ -27,6 +31,19 @@ use Spatie\Permission\Models\Role;
  */
 class RolePromotion extends Model // @phpstan-ignore missingType.iterableValue
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_role_promotion_active_window(int32_t is_active, int32_t has_start, int64_t start_us, int32_t has_end, int64_t end_us, int64_t now_us);
+        ssize_t nntmux_role_promotion_system_roles(char *out_buf, size_t out_cap);
+        C;
+
+    /**
+     * PHP stays the production default: the Rust helpers miss the 1.5x mean/p99 gate
+     * (see RustUserStatsInvitationParityTest for the paired benchmark evidence).
+     */
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
     protected $fillable = [
         'name',
         'description',
@@ -44,6 +61,151 @@ class RolePromotion extends Model // @phpstan-ignore missingType.iterableValue
         'additional_days' => 'integer',
         'applicable_roles' => 'array',
     ];
+
+    public static function setUseRustFfi(bool $use = true): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function enableRustFfi(): void
+    {
+        self::setUseRustFfi(true);
+    }
+
+    public static function disableRustFfi(): void
+    {
+        self::setUseRustFfi(false);
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = false;
+        self::$ffi = null;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    public static function setFfiForTesting(FFI|false|null $override = null): void
+    {
+        self::$ffi = $override;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('metadata', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
+    /**
+     * Evaluate whether a promotion is active at `$nowTs`.
+     *
+     * Timestamps are microseconds since the Unix epoch so comparisons match Carbon's
+     * microsecond-precision `lt()` / `gt()`; a null bound leaves that side of the window open.
+     */
+    public static function evaluatePromotionActiveWindow(bool $isActive, ?int $startTs, ?int $endTs, int $nowTs): bool
+    {
+        return self::$useRustFfi
+            ? self::evaluatePromotionActiveWindowNative($isActive, $startTs, $endTs, $nowTs)
+            : self::evaluatePromotionActiveWindowPhp($isActive, $startTs, $endTs, $nowTs);
+    }
+
+    public static function evaluatePromotionActiveWindowNative(bool $isActive, ?int $startTs, ?int $endTs, int $nowTs): bool
+    {
+        if (($ffi = self::ffi()) === null) {
+            return self::evaluatePromotionActiveWindowPhp($isActive, $startTs, $endTs, $nowTs);
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $rc = $ffi->nntmux_role_promotion_active_window(
+                (int) $isActive,
+                (int) ($startTs !== null),
+                $startTs ?? 0,
+                (int) ($endTs !== null),
+                $endTs ?? 0,
+                $nowTs,
+            );
+
+            return match ($rc) {
+                1 => true,
+                0 => false,
+                default => self::evaluatePromotionActiveWindowPhp($isActive, $startTs, $endTs, $nowTs),
+            };
+        } catch (Throwable) {
+            return self::evaluatePromotionActiveWindowPhp($isActive, $startTs, $endTs, $nowTs);
+        }
+    }
+
+    public static function evaluatePromotionActiveWindowPhp(bool $isActive, ?int $startTs, ?int $endTs, int $nowTs): bool
+    {
+        if (! $isActive) {
+            return false;
+        }
+
+        if ($startTs !== null && $nowTs < $startTs) {
+            return false;
+        }
+
+        if ($endTs !== null && $nowTs > $endTs) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * System role names excluded from custom promotion roles.
+     *
+     * @return list<string>
+     */
+    public static function systemRoleNames(): array
+    {
+        return self::$useRustFfi ? self::systemRoleNamesNative() : self::systemRoleNamesPhp();
+    }
+
+    /**
+     * @return list<string>
+     */
+    public static function systemRoleNamesNative(): array
+    {
+        if (($ffi = self::ffi()) === null) {
+            return self::systemRoleNamesPhp();
+        }
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, 64, $capacity);
+            if ($buffer === null) {
+                return self::systemRoleNamesPhp();
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_role_promotion_system_roles($buffer, $capacity);
+            if (! \is_int($written) || $written <= 0 || $written > $capacity) {
+                return self::systemRoleNamesPhp();
+            }
+
+            return explode("\n", FFI::string($buffer, $written));
+        } catch (Throwable) {
+            return self::systemRoleNamesPhp();
+        }
+    }
+
+    /**
+     * @return list<string>
+     */
+    public static function systemRoleNamesPhp(): array
+    {
+        return ['Admin', 'User', 'Moderator', 'Disabled', 'Friend'];
+    }
+
+    private static function toMicroTimestamp(DateTimeInterface $date): int
+    {
+        return $date->getTimestamp() * 1_000_000 + (int) $date->format('u');
+    }
 
     /**
      * Get the statistics for this promotion
@@ -90,9 +252,7 @@ class RolePromotion extends Model // @phpstan-ignore missingType.iterableValue
      */
     public static function getCustomRoles(): mixed
     {
-        $systemRoles = ['Admin', 'User', 'Moderator', 'Disabled', 'Friend'];
-
-        return Role::whereNotIn('name', $systemRoles)->get();
+        return Role::whereNotIn('name', self::systemRoleNames())->get();
     }
 
     /**
@@ -104,17 +264,12 @@ class RolePromotion extends Model // @phpstan-ignore missingType.iterableValue
             return false;
         }
 
-        $now = Carbon::now();
-
-        if ($this->start_date && $now->lt($this->start_date)) {
-            return false;
-        }
-
-        if ($this->end_date && $now->gt($this->end_date)) {
-            return false;
-        }
-
-        return true;
+        return self::evaluatePromotionActiveWindow(
+            true,
+            $this->start_date ? self::toMicroTimestamp($this->start_date) : null,
+            $this->end_date ? self::toMicroTimestamp($this->end_date) : null,
+            self::toMicroTimestamp(Carbon::now()),
+        );
     }
 
     /**
