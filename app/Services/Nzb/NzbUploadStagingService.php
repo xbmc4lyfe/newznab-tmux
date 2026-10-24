@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace App\Services\Nzb;
 
 use App\Exceptions\NzbUploadException;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Log;
@@ -18,6 +20,34 @@ final class NzbUploadStagingService
     public const STAGING_DIRECTORY = '.staging';
 
     private const MAX_NFO_SIZE = 65535;
+
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_upload_staging_filename(const char *name, size_t name_len, const char *extension, size_t extension_len);
+        int32_t nntmux_upload_staging_prefix(const char *data, size_t data_len, uint32_t kind);
+        C;
+
+    private static FFI|false|null $ffi = null;
+
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    private static function resolveFfi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
 
     private NzbUploadManifestService $manifests;
 
@@ -158,6 +188,29 @@ final class NzbUploadStagingService
         }
 
         $filename = $file->getClientOriginalName();
+        $basename = self::$useRustFfi
+            ? (self::validateFilenameNative($filename, $expectedExtension) ?? self::validateFilenamePhp($filename, $expectedExtension))
+            : self::validateFilenamePhp($filename, $expectedExtension);
+
+        try {
+            $content = $file->getContent();
+        } catch (\Throwable) {
+            throw new NzbUploadException("Failed to read {$expectedExtension} upload", 400);
+        }
+
+        if ($expectedExtension === 'nzb' && ! self::xmlPayload($content)) {
+            throw new NzbUploadException('Invalid NZB payload', 400);
+        }
+        if ($expectedExtension === 'nfo' && ($content === '' || strlen($content) > self::MAX_NFO_SIZE)) {
+            throw new NzbUploadException('NFO upload must not be empty or exceed 65535 bytes', 400);
+        }
+
+        return [$filename, $basename, $content];
+    }
+
+    /** Validate without rewriting the filename; return the original pathinfo basename. */
+    public static function validateFilenamePhp(string $filename, string $expectedExtension): string
+    {
         if ($filename === ''
             || $filename === '.'
             || $filename === '..'
@@ -173,20 +226,98 @@ final class NzbUploadStagingService
             throw new NzbUploadException("The {$expectedExtension} field must contain a .{$expectedExtension} file", 400);
         }
 
-        try {
-            $content = $file->getContent();
-        } catch (\Throwable) {
-            throw new NzbUploadException("Failed to read {$expectedExtension} upload", 400);
+        return $basename;
+    }
+
+    public static function validateFilenameNative(string $filename, string $expectedExtension): ?string
+    {
+        $ffi = self::$useRustFfi ? self::resolveFfi() : null;
+        if ($ffi === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $status = $ffi->nntmux_upload_staging_filename($filename, strlen($filename), $expectedExtension, strlen($expectedExtension));
+        if ($status < 0) {
+            return null;
+        }
+        if ($status === 1) {
+            throw new NzbUploadException("Unsafe {$expectedExtension} filename", 400);
+        }
+        if ($status === 2) {
+            throw new NzbUploadException("The {$expectedExtension} field must contain a .{$expectedExtension} file", 400);
         }
 
-        if ($expectedExtension === 'nzb' && ! isValidNewznabNzb($content)) {
-            throw new NzbUploadException('Invalid NZB payload', 400);
+        return (string) pathinfo($filename, PATHINFO_FILENAME);
+    }
+
+    public static function hasGzipMagicPhp(string $content): bool
+    {
+        return str_starts_with($content, "\x1f\x8b");
+    }
+
+    public static function hasGzipMagicNative(string $content): ?bool
+    {
+        return self::prefixNative($content, 0);
+    }
+
+    public static function hasUtf8BomPhp(string $content): bool
+    {
+        return str_starts_with($content, "\xef\xbb\xbf");
+    }
+
+    public static function hasUtf8BomNative(string $content): ?bool
+    {
+        return self::prefixNative($content, 1);
+    }
+
+    private static function prefixNative(string $content, int $kind): ?bool
+    {
+        $ffi = self::$useRustFfi ? self::resolveFfi() : null;
+        if ($ffi === null) {
+            return null;
         }
-        if ($expectedExtension === 'nfo' && ($content === '' || strlen($content) > self::MAX_NFO_SIZE)) {
-            throw new NzbUploadException('NFO upload must not be empty or exceed 65535 bytes', 400);
+        // @phpstan-ignore method.notFound
+        $status = $ffi->nntmux_upload_staging_prefix($content, strlen($content), $kind);
+
+        return $status < 0 ? null : $status === 1;
+    }
+
+    private static function xmlPayload(string $content): bool
+    {
+        return self::$useRustFfi
+            ? (self::xmlPayloadNative($content) ?? self::xmlPayloadPhp($content))
+            : self::xmlPayloadPhp($content);
+    }
+
+    public static function xmlPayloadPhp(string $content): bool
+    {
+        return isValidNewznabNzb($content);
+    }
+
+    /** Prefix preflight only: libxml retains namespace, encoding and XML semantics. */
+    public static function xmlPayloadNative(string $content): ?bool
+    {
+        if (! self::$useRustFfi || self::resolveFfi() === null) {
+            return null;
+        }
+        // Match PHP empty(), including its special string "0" case, before libxml state changes.
+        if ($content === '' || $content === '0') {
+            return false;
+        }
+        $gzip = self::hasGzipMagicNative($content) ?? self::hasGzipMagicPhp($content);
+        $bomOnly = strlen($content) === 3
+            && (self::hasUtf8BomNative($content) ?? self::hasUtf8BomPhp($content));
+        if ($gzip || $bomOnly) {
+            // These prefixes cannot form an XML document. Preserve the original helper's
+            // global libxml error-mode and clearing side effects on parser rejection.
+            libxml_use_internal_errors(true);
+            libxml_clear_errors();
+
+            return false;
         }
 
-        return [$filename, $basename, $content];
+        // Do not strip BOMs or inflate gzip: staging preserves the exact uploaded bytes.
+        return self::xmlPayloadPhp($content);
     }
 
     /**

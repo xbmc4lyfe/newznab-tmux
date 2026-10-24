@@ -5,10 +5,24 @@ declare(strict_types=1);
 namespace App\Services\Releases\Verification;
 
 use App\Services\YencService;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Throwable;
 
 final class SpotCheckVerifier
 {
+    private const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_verification_sample_plan(const char *data, size_t length, const char *identity, size_t identity_length, int64_t maximum_articles, int64_t maximum_header_bytes, int64_t article_limit, char *out_buf, size_t out_cap);
+        int nntmux_spot_article_dimensions(int64_t part, int64_t number, int64_t size, int64_t offset, int64_t length, int64_t header_bytes, int64_t total);
+        C;
+
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
     /** @param array<string, mixed> $options */
     public function __construct(private readonly ArticleSource $source, private readonly array $options,
         private readonly ?YencService $decoder = null, private readonly ?SpotCheckPlanner $planner = null) {}
@@ -101,13 +115,8 @@ final class SpotCheckVerifier
             }
             $article = VerifiedArticle::decode($raw, $this->decoder);
             $isPar2Packet = $article->offset === 0 && str_starts_with($article->bytes, "PAR2\0PKT");
-            if ($article->part !== $segment['number'] || $article->size < 1
-                // OVER reports article octets, including encoding/headers, rather
-                // than decoded payload length. It must at least cover the payload.
-                || strlen($article->bytes) > $segment['bytes']
-                || $article->offset + strlen($article->bytes) > $article->size
-                || ($article->part === 1 && $article->offset !== 0)
-                || ($article->part === $segment['totalparts'] && $article->offset + strlen($article->bytes) !== $article->size)
+            if (! (self::$useRustFfi ? self::articleDimensionsMatchNative($article, $segment)
+                : self::articleDimensionsMatchPhp($article, $segment))
                 || ! $this->matchesHeaderFilename($manifest, $segment['file_key'], $article->name, $isPar2Packet)
                 || ($article->totalParts !== null && $article->totalParts !== $segment['totalparts'])) {
                 return self::deterministic('Spot-check article identity differs from its header.');
@@ -176,11 +185,115 @@ final class SpotCheckVerifier
      */
     public function sample(array $manifest): array
     {
+        if (self::$useRustFfi && $this->planner === null) {
+            return $this->sampleNative($manifest);
+        }
+
+        return $this->samplePhp($manifest);
+    }
+
+    /** @param array<string, mixed> $manifest
+     * @return list<array{file_key:string,totalparts:int,totalparts_inferred:bool,number:int,messageid:string,bytes:int}>
+     */
+    public function samplePhp(array $manifest): array
+    {
         $articleLimit = max(0, min(16, (int) ($this->options['spot_check_articles'] ?? 1)));
         $byteLimit = max(0, min(1048576, (int) ($this->options['spot_check_bytes'] ?? 1048576)));
         $articleByteLimit = max(0, min($byteLimit, (int) ($this->options['spot_check_article_bytes'] ?? 1048576)));
 
         return ($this->planner ?? new SpotCheckPlanner)->select($manifest, $articleLimit, $byteLimit, $articleByteLimit);
+    }
+
+    /** @param array<string, mixed> $manifest
+     * @return list<array{file_key:string,totalparts:int,totalparts_inferred:bool,number:int,messageid:string,bytes:int}>
+     */
+    public function sampleNative(array $manifest): array
+    {
+        // An injected planner retains ownership of selection, including its hooks.
+        if ($this->planner !== null || ! is_array($manifest['files'] ?? null) || ! is_string($manifest['identity'] ?? '')) {
+            return $this->samplePhp($manifest);
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+        if ($ffi === null) {
+            return $this->samplePhp($manifest);
+        }
+        $articleLimit = max(0, min(16, (int) ($this->options['spot_check_articles'] ?? 1)));
+        $byteLimit = max(0, min(1048576, (int) ($this->options['spot_check_bytes'] ?? 1048576)));
+        $articleByteLimit = max(0, min($byteLimit, (int) ($this->options['spot_check_article_bytes'] ?? 1048576)));
+        $files = [];
+        foreach ($manifest['files'] as $file) {
+            if (! is_array($file) || ! is_string($file['key'] ?? null) || ! is_int($file['totalparts'] ?? 0)
+                || ! is_bool($file['totalparts_inferred'] ?? false) || ! is_array($file['segments'] ?? null)) {
+                return $this->samplePhp($manifest);
+            }
+            $segments = [];
+            foreach ($file['segments'] as $segment) {
+                if (! is_array($segment) || ! is_string($segment['messageid'] ?? null)
+                    || ! is_int($segment['number'] ?? null) || ! is_int($segment['bytes'] ?? null)) {
+                    return $this->samplePhp($manifest);
+                }
+                $segments[] = ['messageid' => $segment['messageid'], 'number' => $segment['number'], 'bytes' => $segment['bytes']];
+            }
+            $files[] = ['key' => $file['key'], 'totalparts' => $file['totalparts'] ?? 0,
+                'totalparts_inferred' => $file['totalparts_inferred'] ?? false, 'segments' => $segments];
+        }
+        $input = serialize($files);
+        $identity = $manifest['identity'] ?? '';
+        $capacity = 0;
+        $out = RustPipelineLibrary::obtainScratch($ffi, 1024, $capacity);
+        if ($out === null) {
+            return $this->samplePhp($manifest);
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_verification_sample_plan($input, strlen($input), $identity, strlen($identity),
+            $articleLimit, $byteLimit, $articleByteLimit, $out, $capacity);
+        if (! is_int($written) || $written < 0 || $written % 64 !== 0) {
+            return $this->samplePhp($manifest);
+        }
+        if ($written === 0) {
+            return [];
+        }
+        $cells = unpack('q*', FFI::string($out, $written));
+        if ($cells === false) {
+            return $this->samplePhp($manifest);
+        }
+        $sample = [];
+        for ($cell = 1, $end = count($cells); $cell < $end; $cell += 8) {
+            $sample[] = ['file_key' => substr($input, $cells[$cell], $cells[$cell + 1]), 'totalparts' => $cells[$cell + 2],
+                'totalparts_inferred' => $cells[$cell + 3] === 1, 'number' => $cells[$cell + 4],
+                'messageid' => substr($input, $cells[$cell + 5], $cells[$cell + 6]), 'bytes' => $cells[$cell + 7]];
+        }
+
+        return $sample;
+    }
+
+    /** @param array{number:int,bytes:int,totalparts:int} $segment */
+    public static function articleDimensionsMatchPhp(VerifiedArticle $article, array $segment): bool
+    {
+        // OVER octets include headers and encoding; they must cover decoded bytes.
+        return $article->part === $segment['number'] && $article->size >= 1
+            && strlen($article->bytes) <= $segment['bytes']
+            && $article->offset + strlen($article->bytes) <= $article->size
+            && ($article->part !== 1 || $article->offset === 0)
+            && ($article->part !== $segment['totalparts'] || $article->offset + strlen($article->bytes) === $article->size);
+    }
+
+    /** @param array{number:int,bytes:int,totalparts:int} $segment */
+    public static function articleDimensionsMatchNative(VerifiedArticle $article, array $segment): bool
+    {
+        $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+        if ($ffi === null || $article->offset > PHP_INT_MAX - strlen($article->bytes)) {
+            return self::articleDimensionsMatchPhp($article, $segment);
+        }
+        // @phpstan-ignore method.notFound
+        $status = $ffi->nntmux_spot_article_dimensions($article->part, $segment['number'], $article->size, $article->offset,
+            strlen($article->bytes), $segment['bytes'], $segment['totalparts']);
+
+        return match ($status) {
+            0 => false,
+            1 => true,
+            default => self::articleDimensionsMatchPhp($article, $segment),
+        };
     }
 
     /**

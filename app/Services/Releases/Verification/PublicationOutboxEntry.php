@@ -4,12 +4,35 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
+
 /**
  * One verified candidate waiting in the per-host publication outbox. It holds exactly what the
  * primary needs: the claim (fenced by its lease token), the reason and the sampled evidence.
  */
 final readonly class PublicationOutboxEntry
 {
+    private const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_verification_outbox_normalize(const char *, size_t, char *, size_t);
+        C;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::useRustFfi($enabled);
+    }
+
+    private static function useRustFfi(?bool $enabled = null): bool
+    {
+        // Readonly classes cannot declare static properties.
+        static $useRustFfi = false;
+        if ($enabled !== null) {
+            $useRustFfi = $enabled;
+        }
+
+        return $useRustFfi;
+    }
+
     /**
      * @param  array{id: int, version: int, manifest_hash: string, lease_token: string}  $claim
      * @param  array{articles: int, bytes: int, sampled_files: int, verified_file_names: list<string>, identity_hints: list<string>}  $evidence
@@ -83,6 +106,51 @@ final readonly class PublicationOutboxEntry
 
     /** The decoded entry, or null when the document is not a valid one. */
     public static function decode(string $name, string $path, string $json, int $modifiedAt): ?self
+    {
+        // The PHP path remains admitted until paired caller benchmarks qualify Rust.
+        return self::decodeNative($name, $path, $json, $modifiedAt) ?? self::decodePhp($name, $path, $json, $modifiedAt);
+    }
+
+    /** The decoded entry, or null when invalid or the native candidate declines. */
+    public static function decodeNative(string $name, string $path, string $json, int $modifiedAt): ?self
+    {
+        if (! self::useRustFfi() || ($ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF)) === null) {
+            return null;
+        }
+        // Keep PHP's JSON parser, duplicate-key handling and integer/float classification.
+        $data = json_decode($json, true);
+        if (! is_array($data)) {
+            return null;
+        }
+        $input = serialize($data);
+        $capacity = 0;
+        $buffer = RustPipelineLibrary::obtainScratch($ffi, strlen($input) + 512, $capacity);
+        if ($buffer === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_verification_outbox_normalize($input, strlen($input), $buffer, $capacity);
+        if ($written < -1) {
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_verification_outbox_normalize($input, strlen($input), $buffer, $capacity);
+        }
+        if ($written <= 0 || $written > $capacity) {
+            return null;
+        }
+        $row = unserialize(FFI::string($buffer, $written), ['allowed_classes' => false]);
+        if (! is_array($row) || count($row) !== 8) {
+            return null;
+        }
+
+        return new self($name, $path, $row[0], $row[1], $row[2], $row[3], $row[4], $row[5], $modifiedAt, $row[6], $row[7]);
+    }
+
+    /** The original decoder, including its PHP scalar conversions and warnings. */
+    public static function decodePhp(string $name, string $path, string $json, int $modifiedAt): ?self
     {
         $data = json_decode($json, true);
         if (! is_array($data) || ! is_array($data['claim'] ?? null) || ! is_array($data['evidence'] ?? null)) {
