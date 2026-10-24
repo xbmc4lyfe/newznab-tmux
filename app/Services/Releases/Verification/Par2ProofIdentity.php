@@ -6,7 +6,14 @@ namespace App\Services\Releases\Verification;
 
 use dariusiii\rarinfo\Par2Info;
 
-/** Only complete, unambiguous equivalent metadata can share a successful source proof. */
+/**
+ * Only complete, unambiguous equivalent metadata can share a successful source proof.
+ *
+ * Retains PHP under the < 1.5x FFI bailout rule: `nntmux_par2_proof_identity` in
+ * `rust/pipeline-ffi/src/metadata.rs` is hash-identical but must marshal every duplicated
+ * packet through `serialize()`, while PHP serializes only the deduplicated canonical set
+ * (measured 0.47x-0.78x mean).
+ */
 final class Par2ProofIdentity
 {
     /** @param list<array<string, mixed>> $packets */
