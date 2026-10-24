@@ -9285,3 +9285,608 @@ fn regex_release_sha1_hex(data: &[u8]) -> [u8; 40] {
     }
     hex
 }
+
+#[cfg(test)]
+mod wave13_maintenance_verification_tests {
+    use super::*;
+
+    fn frames(values: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for value in values {
+            out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            out.extend_from_slice(value);
+        }
+        out
+    }
+
+    #[test]
+    fn whitespace_and_criteria_keep_php_trim_boundaries() {
+        assert_eq!(
+            maintenance_verification_transform(b"\0 \ta\x0c\x0b b\r\n", 0),
+            Ok(b"a b".to_vec())
+        );
+        assert_eq!(
+            maintenance_verification_transform(b"\x0c x\x0c", 0),
+            Ok(b" x ".to_vec())
+        );
+        assert_eq!(maintenance_verification_transform(b"\xff", 0), Err(-1));
+        assert_eq!(
+            maintenance_verification_transform(b"\0 column\t= equals =\"' x '\"", 1),
+            Ok(frames(&[b"column", b"equals", b" x "]))
+        );
+        assert_eq!(maintenance_verification_transform(b"a=b=c=d", 1), Err(-3));
+        assert_eq!(
+            maintenance_verification_transform(b"==", 1),
+            Ok(frames(&[b"", b"", b""]))
+        );
+    }
+
+    #[test]
+    fn byte_format_and_integer_limits() {
+        for (input, expected) in [
+            (b"-1".as_slice(), b"-1 B".as_slice()),
+            (b"1023", b"1023 B"),
+            (b"1024", b"1.00 KiB"),
+            (b"1536", b"1.50 KiB"),
+            (b"1099511627776", b"1.00 TiB"),
+            (b"9223372036854775807", b"8388608.00 TiB"),
+        ] {
+            assert_eq!(
+                maintenance_verification_transform(input, 2),
+                Ok(expected.to_vec())
+            );
+        }
+        assert_eq!(
+            maintenance_verification_transform(b"9223372036854775808", 2),
+            Err(-1)
+        );
+        for (input, expected) in [
+            (b" -1 \n".as_slice(), b"-1".as_slice()),
+            (b"+002K", b"2048"),
+            (b"-2m", b"-2097152"),
+            (b"8G", b"8589934592"),
+            (b"-9223372036854775808", b"-9223372036854775808"),
+        ] {
+            assert_eq!(
+                maintenance_verification_transform(input, 11),
+                Ok(expected.to_vec())
+            );
+        }
+        for input in [
+            b"".as_slice(),
+            b"1.5G",
+            b"1e3",
+            b"2MB",
+            b"9223372036854775807k",
+            b"9223372036854775808",
+            b"k",
+        ] {
+            assert_eq!(maintenance_verification_transform(input, 11), Err(-1));
+        }
+    }
+
+    #[test]
+    fn list_operations_preserve_left_order_duplicates_and_strict_bytes() {
+        let members = [
+            b"intersect".as_slice(),
+            b"4",
+            b"b",
+            b"a",
+            b"b",
+            b"01",
+            b"b",
+            b"1",
+        ];
+        assert_eq!(
+            maintenance_verification_transform(&frames(&members), 3),
+            Ok(frames(&[b"b", b"b"]))
+        );
+        let mut diff = members;
+        diff[0] = b"diff";
+        assert_eq!(
+            maintenance_verification_transform(&frames(&diff), 3),
+            Ok(frames(&[b"a", b"01"]))
+        );
+        assert_eq!(
+            maintenance_verification_transform(
+                &frames(&[b"4", b"php", b"js", b"php", b"PHP", b"php", b"js"]),
+                8
+            ),
+            Ok(frames(&[b"php", b"js"]))
+        );
+    }
+
+    #[test]
+    fn path_classification_and_stems_match_literal_and_pcre_suffixes() {
+        assert_eq!(
+            maintenance_verification_transform(
+                &frames(&[
+                    b"resources/views/x.blade.php",
+                    b"app/Mcp/A.php",
+                    b"tests/FooTest.php",
+                    b"config/nntmux-mcp.php",
+                    b"vite.config.js",
+                    b"foo.PHP",
+                    b"tests/fixture.txt",
+                    b"outside/ExampleTest.php"
+                ]),
+                4
+            ),
+            Ok(vec![2, 5, 9, 5, 2, 0, 0, 1])
+        );
+        assert_eq!(
+            maintenance_verification_transform(
+                &frames(&[
+                    b"tests/FooTest.php",
+                    b"other/Foo.php",
+                    b"x/ZeroTest.php\n",
+                    b"x/Test.php",
+                    b"x/0.php",
+                    b"bar/Baz.php///",
+                    b"Foo.php\r\n",
+                    b"a\\BTest.php"
+                ]),
+                5
+            ),
+            Ok(frames(&[
+                b"Foo",
+                b"Zero\n",
+                b"Baz",
+                b"Foo.php\r\n",
+                b"a\\B"
+            ]))
+        );
+        assert_eq!(
+            maintenance_verification_transform(&frames(&[b"/vendor/bin///", b"phpunit"]), 6),
+            Ok(b"/vendor/bin/phpunit".to_vec())
+        );
+    }
+
+    #[test]
+    fn filter_accepts_one_final_newline_and_workspace_prefers_group() {
+        for input in [b"Foo\\Bar::test-a_1.php".as_slice(), b"x\n"] {
+            assert_eq!(
+                maintenance_verification_transform(input, 7),
+                Ok(b"1".to_vec())
+            );
+        }
+        for input in [b"".as_slice(), b"\n", b"x\n\n", b"x y", b"x\r\n", b"\xff"] {
+            assert_eq!(
+                maintenance_verification_transform(input, 7),
+                Ok(b"0".to_vec())
+            );
+        }
+        assert_eq!(
+            maintenance_verification_transform(&frames(&[b"/tmp", b"a", b"12", b"abc"]), 9),
+            Ok(
+                b"/tmp/12/ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad/"
+                    .to_vec()
+            )
+        );
+        assert_eq!(
+            maintenance_verification_transform(&frames(&[b"C:\\tmp\\", b"0", b"", b""]), 9),
+            Ok(b"C:\\tmp\\0/".to_vec())
+        );
+    }
+
+    #[test]
+    fn meminfo_first_valid_unanchored_capture_and_overflow_fallback() {
+        assert_eq!(
+            maintenance_verification_transform(
+                b"xMemTotal:no MemTotal:\x0c 000123 kB\nMemAvailable:\n42\nMemTotal: 999",
+                10
+            ),
+            Ok(frames(&[b"123", b"42"]))
+        );
+        assert_eq!(
+            maintenance_verification_transform(b"MemTotal: 42", 10),
+            Err(-3)
+        );
+        assert_eq!(
+            maintenance_verification_transform(b"MemTotal: 0\nMemAvailable: 1", 10),
+            Err(-1)
+        );
+        assert_eq!(
+            maintenance_verification_transform(
+                b"MemTotal: 9223372036854775808\nMemAvailable: 1",
+                10
+            ),
+            Err(-1)
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_frames_limits_and_unknown_modes() {
+        for mode in [3, 4, 5, 6, 8, 9] {
+            assert_eq!(
+                maintenance_verification_transform(b"\x01\0\0\0", mode),
+                Err(-1)
+            );
+            assert_eq!(
+                maintenance_verification_transform(&vec![0; 4 * 4097], mode),
+                Err(-1)
+            );
+        }
+        assert_eq!(
+            maintenance_verification_transform(&frames(&[b"diff", b"9", b"x"]), 3),
+            Err(-1)
+        );
+        assert_eq!(
+            maintenance_verification_transform(&frames(&[b"9000000000000000000000"]), 8),
+            Err(-1)
+        );
+        assert_eq!(maintenance_verification_transform(b"", 12), Err(-1));
+        assert_eq!(
+            maintenance_verification_transform(&vec![b'a'; 1_048_577], 0),
+            Err(-1)
+        );
+    }
+
+    #[test]
+    fn ffi_sentinels_null_pointers_and_capacity_do_not_write() {
+        unsafe {
+            let mut out = [b'!'; 32];
+            assert_eq!(
+                nntmux_maintenance_verification(std::ptr::null(), 1, 0, out.as_mut_ptr(), 32),
+                -1
+            );
+            assert_eq!(
+                nntmux_maintenance_verification(b"abc".as_ptr(), 3, 0, std::ptr::null_mut(), 1),
+                -1
+            );
+            assert_eq!(
+                nntmux_maintenance_verification(b"abc".as_ptr(), 3, 0, out.as_mut_ptr(), 2),
+                -6
+            );
+            assert_eq!(
+                nntmux_maintenance_verification(b"bad".as_ptr(), 3, 1, out.as_mut_ptr(), 32),
+                -3
+            );
+            assert_eq!(out, [b'!'; 32]);
+            assert_eq!(
+                nntmux_maintenance_verification(std::ptr::null(), 0, 0, std::ptr::null_mut(), 0),
+                0
+            );
+            assert_eq!(
+                nntmux_maintenance_verification(b"abc".as_ptr(), 3, 0, out.as_mut_ptr(), 32),
+                3
+            );
+            assert_eq!(&out[..4], b"abc!");
+        }
+    }
+}
+
+// Wave 13 transports are bounded independently of the caller's output buffer.
+const MAINTENANCE_VERIFICATION_MAX_INPUT: usize = 1_048_576;
+const MAINTENANCE_VERIFICATION_MAX_FRAMES: usize = 4096;
+
+fn maintenance_verification_frames(input: &[u8]) -> Result<Vec<&[u8]>, isize> {
+    // Check the frame count before allocating the shared frame decoder's vector.
+    let mut remaining = input;
+    let mut count = 0;
+    while !remaining.is_empty() {
+        count += 1;
+        if count > MAINTENANCE_VERIFICATION_MAX_FRAMES {
+            return Err(-1);
+        }
+        let header = remaining.get(..4).ok_or(-1isize)?;
+        let len = u32::from_le_bytes(header.try_into().map_err(|_| -1isize)?) as usize;
+        remaining = remaining
+            .get(4..)
+            .and_then(|v| v.get(len..))
+            .ok_or(-1isize)?;
+    }
+    regex_release_frames(input).ok_or(-1)
+}
+
+fn maintenance_verification_push_frame(output: &mut Vec<u8>, value: &[u8]) {
+    // Every source frame is bounded by the 1 MiB aggregate input limit.
+    output.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    output.extend_from_slice(value);
+}
+
+fn maintenance_verification_integer(input: &[u8]) -> Result<i64, isize> {
+    let digits = if matches!(input.first(), Some(b'+' | b'-')) {
+        &input[1..]
+    } else {
+        input
+    };
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return Err(-1);
+    }
+    std::str::from_utf8(input)
+        .map_err(|_| -1isize)?
+        .parse()
+        .map_err(|_| -1)
+}
+
+fn maintenance_verification_count(input: &[u8]) -> Result<usize, isize> {
+    if input.is_empty() || !input.iter().all(u8::is_ascii_digit) {
+        return Err(-1);
+    }
+    std::str::from_utf8(input)
+        .map_err(|_| -1isize)?
+        .parse()
+        .map_err(|_| -1)
+}
+
+fn maintenance_verification_meminfo_capture<'a>(
+    input: &'a [u8],
+    prefix: &[u8],
+) -> Option<&'a [u8]> {
+    for (start, _) in input
+        .windows(prefix.len())
+        .enumerate()
+        .filter(|(_, v)| *v == prefix)
+    {
+        let rest = &input[start + prefix.len()..];
+        let spaces = rest.iter().take_while(|b| is_pcre_space(**b)).count();
+        if spaces == 0 {
+            continue;
+        }
+        let digits = rest[spaces..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if digits != 0 {
+            return Some(&rest[spaces..spaces + digits]);
+        }
+    }
+    None
+}
+
+fn maintenance_verification_transform(input: &[u8], mode: u32) -> Result<Vec<u8>, isize> {
+    if input.len() > MAINTENANCE_VERIFICATION_MAX_INPUT {
+        return Err(-1);
+    }
+    let mut output = Vec::new();
+    match mode {
+        0 => {
+            if !input.is_ascii() {
+                return Err(-1);
+            }
+            let mut in_space = false;
+            for &byte in php_trim_ascii(input) {
+                if is_pcre_space(byte) {
+                    if !in_space {
+                        output.push(b' ');
+                    }
+                    in_space = true;
+                } else {
+                    output.push(byte);
+                    in_space = false;
+                }
+            }
+        }
+        1 => {
+            let mut parts = input.split(|&b| b == b'=');
+            let column = parts.next().ok_or(-3isize)?;
+            let modifier = parts.next().ok_or(-3isize)?;
+            let value = parts.next().ok_or(-3isize)?;
+            if parts.next().is_some() {
+                return Err(-3);
+            }
+            maintenance_verification_push_frame(&mut output, php_trim_ascii(column));
+            maintenance_verification_push_frame(&mut output, php_trim_ascii(modifier));
+            // PHP's explicit quote charlist does not trim whitespace.
+            let start = value
+                .iter()
+                .take_while(|&&b| matches!(b, b'\'' | b'"'))
+                .count();
+            let end = value[start..]
+                .iter()
+                .rposition(|&b| !matches!(b, b'\'' | b'"'))
+                .map_or(start, |p| start + p + 1);
+            maintenance_verification_push_frame(&mut output, &value[start..end]);
+        }
+        2 => {
+            let bytes = maintenance_verification_integer(input)?;
+            let mut value = bytes as f64;
+            let units = ["B", "KiB", "MiB", "GiB", "TiB"];
+            let mut unit = 0;
+            while value >= 1024.0 && unit < units.len() - 1 {
+                value /= 1024.0;
+                unit += 1;
+            }
+            output = if unit == 0 {
+                format!("{bytes} B").into_bytes()
+            } else {
+                format!("{value:.2} {}", units[unit]).into_bytes()
+            };
+        }
+        3 | 8 => {
+            let values = maintenance_verification_frames(input)?;
+            let offset = if mode == 3 { 2 } else { 1 };
+            if values.len() < offset {
+                return Err(-1);
+            }
+            let intersect = if mode == 3 {
+                match values[0] {
+                    b"intersect" => true,
+                    b"diff" => false,
+                    _ => return Err(-1),
+                }
+            } else {
+                true
+            };
+            let count = maintenance_verification_count(values[offset - 1])?;
+            if count > values.len() - offset {
+                return Err(-1);
+            }
+            let left = &values[offset..offset + count];
+            let right: std::collections::HashSet<&[u8]> =
+                values[offset + count..].iter().copied().collect();
+            let mut seen = std::collections::HashSet::new();
+            for &value in left {
+                if right.contains(value) == intersect && (mode == 3 || seen.insert(value)) {
+                    maintenance_verification_push_frame(&mut output, value);
+                }
+            }
+        }
+        4 => {
+            for path in maintenance_verification_frames(input)? {
+                let php = path.ends_with(b".php") && !path.ends_with(b".blade.php");
+                let frontend = [
+                    b"resources/views/".as_slice(),
+                    b"resources/js/",
+                    b"resources/css/",
+                ]
+                .iter()
+                .any(|prefix| path.starts_with(prefix))
+                    || matches!(path, b"package.json" | b"vite.config.js");
+                let mcp = path.starts_with(b"app/Mcp/")
+                    || path.starts_with(b"app/Services/Mcp/")
+                    || matches!(path, b"config/nntmux-mcp.php" | b"routes/ai.php");
+                let tests = path.starts_with(b"tests/") && path.ends_with(b"Test.php");
+                output.push(
+                    u8::from(php)
+                        | (u8::from(frontend) << 1)
+                        | (u8::from(mcp) << 2)
+                        | (u8::from(tests) << 3),
+                );
+            }
+        }
+        5 => {
+            let mut seen = std::collections::HashSet::new();
+            for path in maintenance_verification_frames(input)? {
+                // basename is locale-sensitive for multibyte bytes on PHP.
+                if !path.is_ascii() {
+                    return Err(-1);
+                }
+                let end = path.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1);
+                let basename = path[..end]
+                    .rsplit(|&b| b == b'/')
+                    .next()
+                    .unwrap_or_default();
+                let suffix_end = basename.len() - usize::from(basename.ends_with(b"\n"));
+                let before_newline = &basename[..suffix_end];
+                let strip = if before_newline.ends_with(b"Test.php") {
+                    8
+                } else if before_newline.ends_with(b".php") {
+                    4
+                } else {
+                    0
+                };
+                let stem = if strip != 0 {
+                    [&basename[..suffix_end - strip], &basename[suffix_end..]].concat()
+                } else {
+                    basename.to_vec()
+                };
+                if !stem.is_empty() && stem != b"0" && seen.insert(stem.clone()) {
+                    maintenance_verification_push_frame(&mut output, &stem);
+                }
+            }
+        }
+        6 => {
+            let values = maintenance_verification_frames(input)?;
+            if values.len() != 2 {
+                return Err(-1);
+            }
+            let end = values[0]
+                .iter()
+                .rposition(|&b| b != b'/')
+                .map_or(0, |i| i + 1);
+            output.extend_from_slice(&values[0][..end]);
+            output.push(b'/');
+            output.extend_from_slice(values[1]);
+        }
+        7 => {
+            let input = input.strip_suffix(b"\n").unwrap_or(input);
+            let valid = !input.is_empty()
+                && input.iter().all(|b| {
+                    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-' | b'\\')
+                });
+            output.push(if valid { b'1' } else { b'0' });
+        }
+        9 => {
+            let values = maintenance_verification_frames(input)?;
+            if values.len() != 4 {
+                return Err(-1);
+            }
+            output.extend_from_slice(values[0]);
+            if !matches!(output.last(), Some(b'/' | b'\\')) {
+                output.push(b'/');
+            }
+            let namespace = if values[2].is_empty() {
+                values[1]
+            } else {
+                values[2]
+            };
+            if !namespace.is_empty() {
+                output.extend_from_slice(namespace);
+                output.push(b'/');
+            }
+            if !values[3].is_empty() {
+                output.extend_from_slice(&crate::predb::sha256_hex_slice(values[3]));
+                output.push(b'/');
+            }
+        }
+        10 => {
+            if !input.is_ascii() {
+                return Err(-1);
+            }
+            let total = maintenance_verification_meminfo_capture(input, b"MemTotal:");
+            let available = maintenance_verification_meminfo_capture(input, b"MemAvailable:");
+            let (Some(total), Some(available)) = (total, available) else {
+                return Err(-3);
+            };
+            let total = maintenance_verification_integer(total)?;
+            let available = maintenance_verification_integer(available)?;
+            if total == 0 {
+                return Err(-1);
+            }
+            maintenance_verification_push_frame(&mut output, total.to_string().as_bytes());
+            maintenance_verification_push_frame(&mut output, available.to_string().as_bytes());
+        }
+        11 => {
+            let input = php_trim_ascii(input);
+            let (integer, multiplier) = match input.last() {
+                Some(b'k' | b'K') => (&input[..input.len() - 1], 1024i64),
+                Some(b'm' | b'M') => (&input[..input.len() - 1], 1024i64.pow(2)),
+                Some(b'g' | b'G') => (&input[..input.len() - 1], 1024i64.pow(3)),
+                _ => (input, 1),
+            };
+            let value = maintenance_verification_integer(integer)?
+                .checked_mul(multiplier)
+                .ok_or(-1isize)?;
+            output.extend_from_slice(value.to_string().as_bytes());
+        }
+        _ => return Err(-1),
+    }
+    Ok(output)
+}
+
+/// Maintenance and verification byte transforms. Returns bytes written, -1 to
+/// request PHP fallback, -3 for malformed criteria or missing meminfo fields,
+/// or -(required+3) for insufficient capacity. Errors never modify output.
+/// Modes 0..11 cover whitespace, criteria, byte formatting, index comparison,
+/// path classification, test stems, vendor binary paths, test filters, targeted
+/// checks, workspace paths, meminfo fields, and PHP memory limits respectively.
+/// Lists use u32 little-endian byte lengths; input is limited to 1 MiB and 4096
+/// frames. Locale-sensitive or numerically unsupported inputs request fallback.
+///
+/// # Safety
+/// Pointers must cover their stated lengths. Null pointers require zero lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_maintenance_verification(
+    input: *const u8,
+    len: usize,
+    mode: u32,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    if len > MAINTENANCE_VERIFICATION_MAX_INPUT
+        || cap > isize::MAX as usize
+        || out.is_null() && cap != 0
+    {
+        return -1;
+    }
+    let Some(input) = (unsafe { wave9_input(input, len) }) else {
+        return -1;
+    };
+    let output = match maintenance_verification_transform(input, mode) {
+        Ok(output) => output,
+        Err(code) => return code,
+    };
+    unsafe { wave9_write_output(&output, out, cap) }
+}

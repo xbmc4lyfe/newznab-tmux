@@ -4,16 +4,100 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Console\Attributes\Description;
 use Illuminate\Console\Attributes\Signature;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Throwable;
 
 #[Signature('releases:optimize-preflight {--json : Output machine-readable JSON}')]
 #[Description('Read-only safety and data-volume report for the releases normalization migration')]
 class ReleasesOptimizePreflight extends Command
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_maintenance_verification(const char *input, size_t len, uint32_t mode, char *out, size_t cap);
+        C;
+
+    // Single-call candidates remain opt-in until both performance gates pass.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi && RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) !== null;
+    }
+
+    private static function transformNative(int $mode, string $input): string|false|null
+    {
+        if (! self::$useRustFfi || strlen($input) > 1_048_576) {
+            return null;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF);
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, strlen($input) * 4 + 256), $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_maintenance_verification($input, strlen($input), $mode, $scratch, $cap);
+            if ($written === -3) {
+                return false;
+            }
+            if (! is_int($written) || $written < 0 || $written > $cap) {
+                return null;
+            }
+
+            return $written === 0 ? '' : FFI::string($scratch, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** @param list<string> $values */
+    private static function encodeFrames(array $values): string
+    {
+        $input = '';
+        foreach ($values as $value) {
+            $input .= pack('V', strlen($value)).$value;
+        }
+
+        return $input;
+    }
+
+    /** @return list<string>|null */
+    private static function decodeFrames(string $output): ?array
+    {
+        $values = [];
+        $offset = 0;
+        $size = strlen($output);
+        while ($offset < $size) {
+            if ($size - $offset < 4) {
+                return null;
+            }
+            $header = unpack('Vlength', substr($output, $offset, 4));
+            $length = $header['length'];
+            $offset += 4;
+            if ($length > $size - $offset) {
+                return null;
+            }
+            $values[] = substr($output, $offset, $length);
+            $offset += $length;
+        }
+
+        return $values;
+    }
+
     /** @var list<string> */
     private const array REMOVED_INDEXES = [
         'ix_releases_adddate_only',
@@ -84,8 +168,8 @@ class ReleasesOptimizePreflight extends Command
             'discarded_data' => $this->discardedDataCounts(),
             'indexes' => [
                 'present' => $indexes,
-                'scheduled_for_removal' => array_values(array_intersect(self::REMOVED_INDEXES, $indexes)),
-                'already_present_replacements' => array_values(array_intersect(self::NEW_INDEXES, $indexes)),
+                'scheduled_for_removal' => self::indexDiff(self::REMOVED_INDEXES, $indexes, true),
+                'already_present_replacements' => self::indexDiff(self::NEW_INDEXES, $indexes, true),
             ],
             'blockers' => $blockers,
         ];
@@ -359,7 +443,7 @@ class ReleasesOptimizePreflight extends Command
 
         $removal = $indexes['scheduled_for_removal'] ?? [];
         $existing = $indexes['already_present_replacements'] ?? [];
-        $missing = array_values(array_diff(self::NEW_INDEXES, $existing));
+        $missing = self::indexDiff(self::NEW_INDEXES, $existing);
 
         $this->table(['Index change', 'Names'], [
             ['Dropped', $removal === [] ? 'none' : implode(', ', $removal)],
@@ -368,7 +452,22 @@ class ReleasesOptimizePreflight extends Command
         ]);
     }
 
-    private static function formatBytes(int $bytes): string
+    public static function formatBytes(int $bytes): string
+    {
+        return (self::$useRustFfi ? self::formatBytesNative($bytes) : null) ?? self::formatBytesPhp($bytes);
+    }
+
+    public static function formatBytesNative(int $bytes): ?string
+    {
+        if (localeconv()['decimal_point'] !== '.') {
+            return null;
+        }
+        $output = self::transformNative(2, (string) $bytes);
+
+        return is_string($output) ? $output : null;
+    }
+
+    public static function formatBytesPhp(int $bytes): string
     {
         $units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
         $value = (float) $bytes;
@@ -381,5 +480,34 @@ class ReleasesOptimizePreflight extends Command
         return $unit === 0
             ? $bytes.' B'
             : sprintf('%.2f %s', $value, $units[$unit]);
+    }
+
+    /** @param list<string> $left
+     * @param  list<string>  $right
+     * @return list<string>
+     */
+    public static function indexDiff(array $left, array $right, bool $intersect = false): array
+    {
+        return (self::$useRustFfi ? self::indexDiffNative($left, $right, $intersect) : null) ?? self::indexDiffPhp($left, $right, $intersect);
+    }
+
+    /** @param list<string> $left
+     * @param  list<string>  $right
+     * @return list<string>
+     */
+    public static function indexDiffPhp(array $left, array $right, bool $intersect = false): array
+    {
+        return array_values($intersect ? array_intersect($left, $right) : array_diff($left, $right));
+    }
+
+    /** @param list<string> $left
+     * @param  list<string>  $right
+     * @return list<string>|null
+     */
+    public static function indexDiffNative(array $left, array $right, bool $intersect = false): ?array
+    {
+        $output = self::transformNative(3, self::encodeFrames([$intersect ? 'intersect' : 'diff', (string) count($left), ...array_values($left), ...array_values($right)]));
+
+        return is_string($output) ? self::decodeFrames($output) : null;
     }
 }

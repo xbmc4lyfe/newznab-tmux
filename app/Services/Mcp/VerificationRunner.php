@@ -4,14 +4,98 @@ declare(strict_types=1);
 
 namespace App\Services\Mcp;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\Log;
 use InvalidArgumentException;
 use RecursiveDirectoryIterator;
 use RecursiveIteratorIterator;
 use SplFileInfo;
+use Throwable;
 
 class VerificationRunner
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_maintenance_verification(const char *input, size_t len, uint32_t mode, char *out, size_t cap);
+        C;
+
+    // Single-call candidates remain opt-in until both performance gates pass.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi && RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) !== null;
+    }
+
+    private static function transformNative(int $mode, string $input): string|false|null
+    {
+        if (! self::$useRustFfi || strlen($input) > 1_048_576) {
+            return null;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF);
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, strlen($input) * 4 + 256), $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_maintenance_verification($input, strlen($input), $mode, $scratch, $cap);
+            if ($written === -3) {
+                return false;
+            }
+            if (! is_int($written) || $written < 0 || $written > $cap) {
+                return null;
+            }
+
+            return $written === 0 ? '' : FFI::string($scratch, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** @param list<string> $values */
+    private static function encodeFrames(array $values): string
+    {
+        $input = '';
+        foreach ($values as $value) {
+            $input .= pack('V', strlen($value)).$value;
+        }
+
+        return $input;
+    }
+
+    /** @return list<string>|null */
+    private static function decodeFrames(string $output): ?array
+    {
+        $values = [];
+        $offset = 0;
+        $size = strlen($output);
+        while ($offset < $size) {
+            if ($size - $offset < 4) {
+                return null;
+            }
+            $header = unpack('Vlength', substr($output, $offset, 4));
+            $length = $header['length'];
+            $offset += 4;
+            if ($length > $size - $offset) {
+                return null;
+            }
+            $values[] = substr($output, $offset, $length);
+            $offset += $length;
+        }
+
+        return $values;
+    }
+
     public function __construct(
         private readonly ProjectPathGuard $paths,
         private readonly ProcessRunner $processes,
@@ -32,7 +116,7 @@ class VerificationRunner
             throw new InvalidArgumentException('test_path must identify a PHPUnit Test.php file under tests/.');
         }
 
-        if ($filter !== null && preg_match('/^[A-Za-z0-9_.:\-\\\\]+$/', $filter) !== 1) {
+        if ($filter !== null && ! self::validFilter($filter)) {
             throw new InvalidArgumentException('filter may only contain a PHPUnit test name or class/method selector.');
         }
 
@@ -70,11 +154,11 @@ class VerificationRunner
     private function runTargeted(array $paths, ?string $testPath, ?string $filter): array
     {
         $plan = $this->planner->plan($paths);
-        $checks = array_values(array_unique(array_column($plan['checks'], 'name')));
+        $plannedChecks = array_column($plan['checks'], 'name');
         $allowedChecks = (array) config('nntmux-mcp.check_profiles.targeted', [
             'phpunit', 'pint', 'phpstan', 'php-lint', 'frontend', 'composer', 'diff',
         ]);
-        $checks = array_values(array_filter($checks, fn (string $plannedCheck): bool => in_array($plannedCheck, $allowedChecks, true)));
+        $checks = (self::$useRustFfi ? self::targetedChecksNative($plannedChecks, $allowedChecks) : null) ?? self::targetedChecksPhp($plannedChecks, $allowedChecks);
         $results = [];
 
         foreach ($checks as $plannedCheck) {
@@ -222,7 +306,7 @@ class VerificationRunner
     {
         $directory = $this->executable('vendor_bin', 'vendor/bin/');
 
-        return rtrim($directory, '/').'/'.$binary;
+        return (self::$useRustFfi ? self::vendorBinaryNative($directory, $binary) : null) ?? self::vendorBinaryPhp($directory, $binary);
     }
 
     /**
@@ -257,5 +341,58 @@ class VerificationRunner
         }
 
         return array_values(array_unique($files));
+    }
+
+    public static function vendorBinaryPhp(string $directory, string $binary): string
+    {
+        return rtrim($directory, '/').'/'.$binary;
+    }
+
+    public static function vendorBinaryNative(string $directory, string $binary): ?string
+    {
+        $output = self::transformNative(6, self::encodeFrames([$directory, $binary]));
+
+        return is_string($output) ? $output : null;
+    }
+
+    public static function validFilter(string $filter): bool
+    {
+        return (self::$useRustFfi ? self::validFilterNative($filter) : null) ?? self::validFilterPhp($filter);
+    }
+
+    public static function validFilterPhp(string $filter): bool
+    {
+        return preg_match('/^[A-Za-z0-9_.:\-\\\\]+$/', $filter) === 1;
+    }
+
+    public static function validFilterNative(string $filter): ?bool
+    {
+        if ((int) ini_get('pcre.backtrack_limit') < strlen($filter) + 1) {
+            return null;
+        }
+        $output = self::transformNative(7, $filter);
+
+        return is_string($output) ? $output === '1' : null;
+    }
+
+    /** @param list<string> $planned
+     * @param  array<mixed>  $allowed
+     * @return list<string>
+     */
+    public static function targetedChecksPhp(array $planned, array $allowed): array
+    {
+        return array_values(array_filter(array_values(array_unique($planned)), static fn (string $check): bool => in_array($check, $allowed, true)));
+    }
+
+    /** @param list<string> $planned
+     * @param  array<mixed>  $allowed
+     * @return list<string>|null
+     */
+    public static function targetedChecksNative(array $planned, array $allowed): ?array
+    {
+        $allowed = array_values(array_filter($allowed, is_string(...)));
+        $output = self::transformNative(8, self::encodeFrames([(string) count($planned), ...$planned, ...$allowed]));
+
+        return is_string($output) ? self::decodeFrames($output) : null;
     }
 }

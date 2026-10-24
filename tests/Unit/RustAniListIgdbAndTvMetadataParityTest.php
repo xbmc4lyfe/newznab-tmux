@@ -413,6 +413,7 @@ class RustAniListIgdbAndTvMetadataParityTest extends TestCase
 
     public function test_non_c_locale_falls_back_cleanly_and_restores_pcre_tables(): void
     {
+        $startupAsciiTables = preg_match('/^\s$/', "\xa0") === 0;
         $previous = setlocale(LC_CTYPE, '0');
         $switched = setlocale(LC_CTYPE, 'en_US.ISO8859-1', 'en_US.UTF-8', 'de_DE.UTF-8', 'fr_FR.UTF-8');
         try {
@@ -431,6 +432,9 @@ class RustAniListIgdbAndTvMetadataParityTest extends TestCase
             setlocale(LC_CTYPE, 'C');
             if (\is_string($previous) && $previous !== '') {
                 setlocale(LC_CTYPE, $previous);
+            }
+            if ($startupAsciiTables) {
+                setlocale(LC_CTYPE, 'C');
             }
         }
     }
