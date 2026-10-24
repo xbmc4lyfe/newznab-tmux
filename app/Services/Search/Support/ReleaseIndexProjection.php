@@ -5,8 +5,11 @@ declare(strict_types=1);
 namespace App\Services\Search\Support;
 
 use App\Support\ReleaseSearchIndexDocument;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 /**
  * Single database projection used to build complete release search documents.
@@ -17,24 +20,7 @@ final class ReleaseIndexProjection
     {
         $isSqlite = DB::connection()->getDriverName() === 'sqlite';
         $mediaInfo = self::mediaInfoQuery();
-        $filename = $isSqlite
-            ? "COALESCE((SELECT GROUP_CONCAT(rf.name, ' ') FROM release_files rf WHERE rf.releases_id = r.id), '')"
-            : "COALESCE((SELECT GROUP_CONCAT(rf.name SEPARATOR ' ') FROM release_files rf WHERE rf.releases_id = r.id), '')";
-        $audioFormat = $isSqlite
-            ? "COALESCE((SELECT GROUP_CONCAT(ad.audioformat, ' ') FROM audio_data ad WHERE ad.releases_id = r.id), '')"
-            : "COALESCE((SELECT GROUP_CONCAT(ad.audioformat SEPARATOR ' ') FROM audio_data ad WHERE ad.releases_id = r.id), '')";
-        $audioChannels = $isSqlite
-            ? "COALESCE((SELECT GROUP_CONCAT(ad.audiochannels, ' ') FROM audio_data ad WHERE ad.releases_id = r.id), '')"
-            : "COALESCE((SELECT GROUP_CONCAT(ad.audiochannels SEPARATOR ' ') FROM audio_data ad WHERE ad.releases_id = r.id), '')";
-        $audioLanguage = $isSqlite
-            ? "COALESCE((SELECT GROUP_CONCAT(ad.audiolanguage, ' ') FROM audio_data ad WHERE ad.releases_id = r.id), '')"
-            : "COALESCE((SELECT GROUP_CONCAT(ad.audiolanguage SEPARATOR ' ') FROM audio_data ad WHERE ad.releases_id = r.id), '')";
-        $subtitleLanguage = $isSqlite
-            ? "COALESCE((SELECT GROUP_CONCAT(rs.subslanguage, ' ') FROM release_subtitles rs WHERE rs.releases_id = r.id), '')"
-            : "COALESCE((SELECT GROUP_CONCAT(rs.subslanguage SEPARATOR ' ') FROM release_subtitles rs WHERE rs.releases_id = r.id), '')";
-        $categoryName = $isSqlite
-            ? "cp.title || ' > ' || c.title"
-            : "CONCAT(cp.title, ' > ', c.title)";
+        [$filename, $audioFormat, $audioChannels, $audioLanguage, $subtitleLanguage, $categoryName] = self::aggregateExpressions($isSqlite);
 
         return DB::table('releases as r')
             ->leftJoin('usenet_groups as g', 'g.id', '=', 'r.groups_id')
@@ -89,6 +75,65 @@ final class ReleaseIndexProjection
                 DB::raw("{$subtitleLanguage} AS media_subtitle_language"),
                 DB::raw('CASE WHEN mdi.releases_id IS NOT NULL OR vd.releases_id IS NOT NULL OR EXISTS (SELECT 1 FROM audio_data ad WHERE ad.releases_id = r.id) OR EXISTS (SELECT 1 FROM release_subtitles rs WHERE rs.releases_id = r.id) THEN 1 ELSE 0 END AS has_media_info'),
             ]);
+    }
+
+    /**
+     * Driver-specific aggregate SQL: filename, audio format, channels and language,
+     * subtitle language and category name. Rust is opt-in (slower in the benchmark).
+     *
+     * @return list<string>
+     */
+    public static function aggregateExpressions(bool $isSqlite, bool $useRustFfi = false): array
+    {
+        return ($useRustFfi ? self::aggregateExpressionsNative($isSqlite) : null) ?? self::aggregateExpressionsPhp($isSqlite);
+    }
+
+    /** @return list<string> */
+    public static function aggregateExpressionsPhp(bool $isSqlite): array
+    {
+        return $isSqlite
+            ? [
+                "COALESCE((SELECT GROUP_CONCAT(rf.name, ' ') FROM release_files rf WHERE rf.releases_id = r.id), '')",
+                "COALESCE((SELECT GROUP_CONCAT(ad.audioformat, ' ') FROM audio_data ad WHERE ad.releases_id = r.id), '')",
+                "COALESCE((SELECT GROUP_CONCAT(ad.audiochannels, ' ') FROM audio_data ad WHERE ad.releases_id = r.id), '')",
+                "COALESCE((SELECT GROUP_CONCAT(ad.audiolanguage, ' ') FROM audio_data ad WHERE ad.releases_id = r.id), '')",
+                "COALESCE((SELECT GROUP_CONCAT(rs.subslanguage, ' ') FROM release_subtitles rs WHERE rs.releases_id = r.id), '')",
+                "cp.title || ' > ' || c.title",
+            ]
+            : [
+                "COALESCE((SELECT GROUP_CONCAT(rf.name SEPARATOR ' ') FROM release_files rf WHERE rf.releases_id = r.id), '')",
+                "COALESCE((SELECT GROUP_CONCAT(ad.audioformat SEPARATOR ' ') FROM audio_data ad WHERE ad.releases_id = r.id), '')",
+                "COALESCE((SELECT GROUP_CONCAT(ad.audiochannels SEPARATOR ' ') FROM audio_data ad WHERE ad.releases_id = r.id), '')",
+                "COALESCE((SELECT GROUP_CONCAT(ad.audiolanguage SEPARATOR ' ') FROM audio_data ad WHERE ad.releases_id = r.id), '')",
+                "COALESCE((SELECT GROUP_CONCAT(rs.subslanguage SEPARATOR ' ') FROM release_subtitles rs WHERE rs.releases_id = r.id), '')",
+                "CONCAT(cp.title, ' > ', c.title)",
+            ];
+    }
+
+    /** @return list<string>|null */
+    public static function aggregateExpressionsNative(bool $isSqlite): ?array
+    {
+        static $ffi;
+        $ffi ??= RustPipelineLibrary::resolveDomain('search', 'ssize_t nntmux_search_projection_aggregates(uint32_t sqlite, char *out, size_t cap);') ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, 1024, $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            $written = $ffi->nntmux_search_projection_aggregates($isSqlite ? 1 : 0, $scratch, $cap);
+            if (! is_int($written) || $written <= 0 || $written > $cap) {
+                return null;
+            }
+            $parts = explode("\0", FFI::string($scratch, $written));
+
+            return count($parts) === 6 ? $parts : null;
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     private static function mediaInfoQuery(): Builder
