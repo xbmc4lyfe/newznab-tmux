@@ -10,14 +10,39 @@ use App\Models\Collection;
 use App\Models\Release;
 use App\Services\AdditionalProcessing\AdditionalCandidateQuery;
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
+use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 /**
  * Service for monitoring tmux operations and collecting statistics
  */
 class TmuxMonitorService
 {
+    public const string FFI_CDEF = <<<'C'
+        int64_t nntmux_tmux_monitor_increment_run_count(int64_t iterations);
+        ssize_t nntmux_tmux_monitor_update_diffs_nul(const int64_t *now_vals, const int64_t *start_vals, size_t count, char *out_buf, size_t out_cap);
+        ssize_t nntmux_tmux_monitor_calc_processing_stats(int64_t work, int64_t process_sum, int64_t tv, int64_t movies, int64_t audio, int64_t books, int64_t console, int64_t pc, int64_t xxx, int64_t misc, int64_t nfo, int64_t processnfo, int64_t predb_matched, int64_t predb, int64_t renamed, int64_t processrenames, int64_t *total_work_out, char *out_buf, size_t out_cap);
+        int32_t nntmux_tmux_monitor_should_run_pane(const char *pane, size_t pane_len, int64_t binaries_run, int64_t backfill, int64_t releases_run, int64_t fix_names, const char *fix_crap_opt, size_t fix_crap_opt_len, const char *fix_crap, size_t fix_crap_len, int64_t post, int64_t post_non, int64_t post_amazon, int64_t processtvrage, int64_t processanime, int64_t processmovies, int64_t processbooks, int64_t processmusic, int64_t processgames, int64_t run_ircscraper, int64_t work_available, int64_t processnfo, int64_t processrenames, int64_t count_processtv, int64_t count_processanime, int64_t count_processmovies, int64_t count_processbooks, int64_t count_processmusic, int64_t count_processconsole, int64_t count_processgames, uint8_t kill_pp, uint8_t kill_coll);
+        C;
+
+    private static bool $useRustFfi = false;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
+    private static ?CData $totalWorkOut = null;
+
+    private static ?CData $nowDiffBuf = null;
+
+    private static ?CData $startDiffBuf = null;
+
+    private static int $diffBufCap = 0;
+
     private const int PROC1_CACHE_TTL_SECONDS = 60;
 
     protected Tmux $tmux;
@@ -48,6 +73,26 @@ class TmuxMonitorService
             'monitor_path_a' => config('nntmux_settings.covers_path'),
             'monitor_path_b' => config('nntmux.tmp_unrar_path'),
         ]);
+    }
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (! self::$ffiResolved) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('irc', self::FFI_CDEF);
+            self::$ffiResolved = true;
+        }
+
+        return self::$ffi;
     }
 
     /**
@@ -429,14 +474,12 @@ class TmuxMonitorService
         $this->runVar['counts']['diff'] = array_replace($this->defaultDiffValues(), $this->runVar['counts']['diff'] ?? []);
         $this->runVar['counts']['percent'] = array_replace($this->defaultPercentValues(), $this->runVar['counts']['percent'] ?? []);
 
-        // Calculate total work
-        $this->runVar['counts']['now']['total_work'] = (int) $this->runVar['counts']['now']['work'];
-
-        foreach ($this->runVar['counts']['now'] as $key => $value) {
-            if (str_starts_with($key, 'process')) {
-                $this->runVar['counts']['now']['total_work'] += $value;
-            }
-        }
+        $stats = $this->calculateProcessingStats(
+            $this->runVar['counts']['now'],
+            $this->runVar['counts']['percent'],
+        );
+        $this->runVar['counts']['now'] = $stats['now'];
+        $this->runVar['counts']['percent'] = $stats['percent'];
 
         // Set initial start values on first iteration
         if ($this->iterations === 1) {
@@ -444,50 +487,446 @@ class TmuxMonitorService
         }
 
         // Calculate diffs
-        foreach ($this->runVar['counts']['now'] as $key => $value) {
-            $startValue = (int) ($this->runVar['counts']['start'][$key] ?? 0);
-            $this->runVar['counts']['diff'][$key] = number_format((int) $value - $startValue);
+        $this->runVar['counts']['diff'] = array_replace(
+            $this->runVar['counts']['diff'],
+            $this->updateDiffs($this->runVar['counts']['now'], $this->runVar['counts']['start']),
+        );
+    }
+
+    /**
+     * Compute formatted diffs (`number_format(now - start)`) for all keys in `$now`.
+     *
+     * @param  array<string, int|float|string>  $now
+     * @param  array<string, int|float|string>  $start
+     * @return array<string, string>
+     */
+    public function updateDiffs(array $now, array $start): array
+    {
+        if (self::$useRustFfi) {
+            $native = $this->updateDiffsNative($now, $start);
+            if ($native !== null) {
+                return $native;
+            }
         }
 
-        // Calculate percentages for category counts (as % of total categorized releases)
+        return $this->updateDiffsPhp($now, $start);
+    }
+
+    /**
+     * @param  array<string, int|float|string>  $now
+     * @param  array<string, int|float|string>  $start
+     * @return array<string, string>|null
+     */
+    public function updateDiffsNative(array $now, array $start): ?array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        $count = count($now);
+        if ($count === 0) {
+            return [];
+        }
+
+        try {
+            if (self::$nowDiffBuf === null || self::$startDiffBuf === null || self::$diffBufCap < $count) {
+                $cap = max(64, $count);
+                self::$nowDiffBuf = $ffi->new("int64_t[{$cap}]");
+                self::$startDiffBuf = $ffi->new("int64_t[{$cap}]");
+                self::$diffBufCap = $cap;
+            }
+
+            $keys = [];
+            $idx = 0;
+            foreach ($now as $key => $value) {
+                $keys[] = (string) $key;
+                self::$nowDiffBuf[$idx] = (int) $value;
+                self::$startDiffBuf[$idx] = (int) ($start[$key] ?? 0);
+                $idx++;
+            }
+
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $count * 16), $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $rc = (int) $ffi->nntmux_tmux_monitor_update_diffs_nul(
+                self::$nowDiffBuf,
+                self::$startDiffBuf,
+                $count,
+                $scratch,
+                $cap,
+            );
+            if ($rc <= -2) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$rc, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $rc = (int) $ffi->nntmux_tmux_monitor_update_diffs_nul(
+                    self::$nowDiffBuf,
+                    self::$startDiffBuf,
+                    $count,
+                    $scratch,
+                    $cap,
+                );
+            }
+            if ($rc < 0) {
+                return null;
+            }
+
+            $parts = explode("\0", FFI::string($scratch, $rc));
+            if (count($parts) !== $count) {
+                return null;
+            }
+
+            return array_combine($keys, $parts);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  array<string, int|float|string>  $now
+     * @param  array<string, int|float|string>  $start
+     * @return array<string, string>
+     */
+    public function updateDiffsPhp(array $now, array $start): array
+    {
+        $diffs = [];
+        foreach ($now as $key => $value) {
+            $startValue = (int) ($start[$key] ?? 0);
+            $diffs[(string) $key] = number_format((int) $value - $startValue);
+        }
+
+        return $diffs;
+    }
+
+    /**
+     * Compute `total_work` and category/PP percentages for `counts.now` and `counts.percent`.
+     *
+     * @param  array<string, int|float|string>  $now
+     * @param  array<string, int|string>  $percentDefaults
+     * @return array{now: array<string, int|float|string>, percent: array<string, int|string>}
+     */
+    public function calculateProcessingStats(array $now, array $percentDefaults = []): array
+    {
+        if (self::$useRustFfi) {
+            $native = $this->calculateProcessingStatsNative($now, $percentDefaults);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->calculateProcessingStatsPhp($now, $percentDefaults);
+    }
+
+    /**
+     * @param  array<string, int|float|string>  $now
+     * @param  array<string, int|string>  $percentDefaults
+     * @return array{now: array<string, int|float|string>, percent: array<string, int|string>}|null
+     */
+    public function calculateProcessingStatsNative(array $now, array $percentDefaults = []): ?array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        $processSum = 0;
+        foreach ($now as $key => $value) {
+            if (str_starts_with((string) $key, 'process')) {
+                $processSum += (int) $value;
+            }
+        }
+
+        try {
+            if (self::$totalWorkOut === null) {
+                self::$totalWorkOut = $ffi->new('int64_t');
+            }
+
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, 128, $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $rc = (int) $ffi->nntmux_tmux_monitor_calc_processing_stats(
+                (int) ($now['work'] ?? 0),
+                $processSum,
+                (int) ($now['tv'] ?? 0),
+                (int) ($now['movies'] ?? 0),
+                (int) ($now['audio'] ?? 0),
+                (int) ($now['books'] ?? 0),
+                (int) ($now['console'] ?? 0),
+                (int) ($now['pc'] ?? 0),
+                (int) ($now['xxx'] ?? 0),
+                (int) ($now['misc'] ?? 0),
+                (int) ($now['nfo'] ?? 0),
+                (int) ($now['processnfo'] ?? 0),
+                (int) ($now['predb_matched'] ?? 0),
+                (int) ($now['predb'] ?? 1),
+                (int) ($now['renamed'] ?? 0),
+                (int) ($now['processrenames'] ?? 0),
+                FFI::addr(self::$totalWorkOut),
+                $scratch,
+                $cap,
+            );
+            if ($rc <= -10) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$rc, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $rc = (int) $ffi->nntmux_tmux_monitor_calc_processing_stats(
+                    (int) ($now['work'] ?? 0),
+                    $processSum,
+                    (int) ($now['tv'] ?? 0),
+                    (int) ($now['movies'] ?? 0),
+                    (int) ($now['audio'] ?? 0),
+                    (int) ($now['books'] ?? 0),
+                    (int) ($now['console'] ?? 0),
+                    (int) ($now['pc'] ?? 0),
+                    (int) ($now['xxx'] ?? 0),
+                    (int) ($now['misc'] ?? 0),
+                    (int) ($now['nfo'] ?? 0),
+                    (int) ($now['processnfo'] ?? 0),
+                    (int) ($now['predb_matched'] ?? 0),
+                    (int) ($now['predb'] ?? 1),
+                    (int) ($now['renamed'] ?? 0),
+                    (int) ($now['processrenames'] ?? 0),
+                    FFI::addr(self::$totalWorkOut),
+                    $scratch,
+                    $cap,
+                );
+            }
+            if ($rc < 10) {
+                return null;
+            }
+
+            $tokens = explode("\0", FFI::string($scratch, $rc));
+            if (count($tokens) !== 11) {
+                return null;
+            }
+
+            // @phpstan-ignore property.notFound
+            $now['total_work'] = (int) self::$totalWorkOut->cdata;
+            $percent = array_replace($this->defaultPercentValues(), $percentDefaults);
+            $keys = ['tv', 'movies', 'audio', 'books', 'console', 'pc', 'xxx', 'misc', 'nfo', 'predb_matched', 'renamed'];
+            foreach ($keys as $idx => $key) {
+                $percent[$key] = $tokens[$idx] === '' ? 0 : $tokens[$idx];
+            }
+
+            return [
+                'now' => $now,
+                'percent' => $percent,
+            ];
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  array<string, int|float|string>  $now
+     * @param  array<string, int|string>  $percentDefaults
+     * @return array{now: array<string, int|float|string>, percent: array<string, int|string>}
+     */
+    public function calculateProcessingStatsPhp(array $now, array $percentDefaults = []): array
+    {
+        $now['total_work'] = (int) ($now['work'] ?? 0);
+
+        foreach ($now as $key => $value) {
+            if (str_starts_with((string) $key, 'process')) {
+                $now['total_work'] += (int) $value;
+            }
+        }
+
+        $percent = array_replace($this->defaultPercentValues(), $percentDefaults);
         $categoryKeys = ['tv', 'movies', 'audio', 'books', 'console', 'pc', 'xxx', 'misc'];
 
-        // Sum all category counts to get the true total
         $totalCategorized = 0;
         foreach ($categoryKeys as $key) {
-            $totalCategorized += (int) ($this->runVar['counts']['now'][$key] ?? 0);
+            $totalCategorized += (int) ($now[$key] ?? 0);
         }
 
         foreach ($categoryKeys as $key) {
-            $value = (int) ($this->runVar['counts']['now'][$key] ?? 0);
-            $this->runVar['counts']['percent'][$key] = $totalCategorized > 0
+            $value = (int) ($now[$key] ?? 0);
+            $percent[$key] = $totalCategorized > 0
                 ? sprintf('%02d', (int) floor(($value / $totalCategorized) * 100))
                 : 0;
         }
 
-        // Calculate percentages for PP Lists (matched / total for each type)
         // NFO: nfo / (nfo + processnfo) * 100
-        $nfoMatched = $this->runVar['counts']['now']['nfo'] ?? 0;
-        $nfoUnmatched = $this->runVar['counts']['now']['processnfo'] ?? 0;
+        $nfoMatched = (int) ($now['nfo'] ?? 0);
+        $nfoUnmatched = (int) ($now['processnfo'] ?? 0);
         $nfoTotal = $nfoMatched + $nfoUnmatched;
-        $this->runVar['counts']['percent']['nfo'] = $nfoTotal > 0
+        $percent['nfo'] = $nfoTotal > 0
             ? sprintf('%02d', floor(($nfoMatched / $nfoTotal) * 100))
             : 0;
 
         // PreDB: predb_matched / predb * 100
-        $predbMatched = $this->runVar['counts']['now']['predb_matched'] ?? 0;
-        $predbTotal = $this->runVar['counts']['now']['predb'] ?? 1;
-        $this->runVar['counts']['percent']['predb_matched'] = $predbTotal > 0
+        $predbMatched = (int) ($now['predb_matched'] ?? 0);
+        $predbTotal = (int) ($now['predb'] ?? 1);
+        $percent['predb_matched'] = $predbTotal > 0
             ? sprintf('%02d', floor(($predbMatched / $predbTotal) * 100))
             : 0;
 
         // Renames: renamed / (renamed + processrenames) * 100
-        $renamed = $this->runVar['counts']['now']['renamed'] ?? 0;
-        $processrenames = $this->runVar['counts']['now']['processrenames'] ?? 0;
+        $renamed = (int) ($now['renamed'] ?? 0);
+        $processrenames = (int) ($now['processrenames'] ?? 0);
         $renameTotal = $renamed + $processrenames;
-        $this->runVar['counts']['percent']['renamed'] = $renameTotal > 0
+        $percent['renamed'] = $renameTotal > 0
             ? sprintf('%02d', floor(($renamed / $renameTotal) * 100))
             : 0;
+
+        return [
+            'now' => $now,
+            'percent' => $percent,
+        ];
+    }
+
+    /**
+     * Evaluate whether a pane task should run based on monitor settings, work counts, and killswitches.
+     *
+     * @param  array<string, mixed>|null  $settings
+     * @param  array<string, mixed>|null  $countsNow
+     * @param  array<string, mixed>|null  $killswitch
+     */
+    public function shouldRunPane(
+        string $pane,
+        ?array $settings = null,
+        ?array $countsNow = null,
+        ?array $killswitch = null,
+    ): bool {
+        $resolvedSettings = $settings ?? ($this->runVar['settings'] ?? []);
+        $resolvedCounts = $countsNow ?? ($this->runVar['counts']['now'] ?? []);
+        $resolvedKillswitch = $killswitch ?? ($this->runVar['killswitch'] ?? []);
+
+        if (self::$useRustFfi) {
+            $native = $this->shouldRunPaneNative($pane, $resolvedSettings, $resolvedCounts, $resolvedKillswitch);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->shouldRunPanePhp($pane, $resolvedSettings, $resolvedCounts, $resolvedKillswitch);
+    }
+
+    /**
+     * @param  array<string, mixed>  $settings
+     * @param  array<string, mixed>  $countsNow
+     * @param  array<string, mixed>  $killswitch
+     */
+    public function shouldRunPaneNative(
+        string $pane,
+        array $settings = [],
+        array $countsNow = [],
+        array $killswitch = [],
+    ): ?bool {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        $fixCrapOpt = (string) ($settings['fix_crap_opt'] ?? '');
+        $fixCrapRaw = $settings['fix_crap'] ?? '';
+        $fixCrap = is_array($fixCrapRaw) ? implode(',', array_map('strval', $fixCrapRaw)) : (string) $fixCrapRaw;
+
+        try {
+            // @phpstan-ignore method.notFound
+            $rc = (int) $ffi->nntmux_tmux_monitor_should_run_pane(
+                $pane,
+                strlen($pane),
+                (int) ($settings['binaries_run'] ?? 0),
+                (int) ($settings['backfill'] ?? 0),
+                (int) ($settings['releases_run'] ?? 0),
+                (int) ($settings['fix_names'] ?? 0),
+                $fixCrapOpt,
+                strlen($fixCrapOpt),
+                $fixCrap,
+                strlen($fixCrap),
+                (int) ($settings['post'] ?? 0),
+                (int) ($settings['post_non'] ?? 0),
+                (int) ($settings['post_amazon'] ?? 0),
+                (int) ($settings['processtvrage'] ?? 0),
+                (int) ($settings['processanime'] ?? 0),
+                (int) ($settings['processmovies'] ?? 0),
+                (int) ($settings['processbooks'] ?? 0),
+                (int) ($settings['processmusic'] ?? 0),
+                (int) ($settings['processgames'] ?? 0),
+                (int) ($settings['run_ircscraper'] ?? 0),
+                (int) ($countsNow['work_available'] ?? 0),
+                (int) ($countsNow['processnfo'] ?? 0),
+                (int) ($countsNow['processrenames'] ?? 0),
+                (int) ($countsNow['processtv'] ?? 0),
+                (int) ($countsNow['processanime'] ?? 0),
+                (int) ($countsNow['processmovies'] ?? 0),
+                (int) ($countsNow['processbooks'] ?? 0),
+                (int) ($countsNow['processmusic'] ?? 0),
+                (int) ($countsNow['processconsole'] ?? 0),
+                (int) ($countsNow['processgames'] ?? 0),
+                ! empty($killswitch['pp']) ? 1 : 0,
+                ! empty($killswitch['coll']) ? 1 : 0,
+            );
+            if ($rc < 0) {
+                return null;
+            }
+
+            return $rc === 1;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $settings
+     * @param  array<string, mixed>  $countsNow
+     * @param  array<string, mixed>  $killswitch
+     */
+    public function shouldRunPanePhp(
+        string $pane,
+        array $settings = [],
+        array $countsNow = [],
+        array $killswitch = [],
+    ): bool {
+        $killPp = ! empty($killswitch['pp']);
+        $killColl = ! empty($killswitch['coll']);
+
+        return match ($pane) {
+            'binaries' => (int) ($settings['binaries_run'] ?? 0) === 1 && ! $killPp,
+            'backfill' => in_array((int) ($settings['backfill'] ?? 0), [1, 4], true) && ! $killColl && ! $killPp,
+            'releases' => (int) ($settings['releases_run'] ?? 0) !== 0,
+            'sequential' => true,
+            'fixnames' => (int) ($settings['fix_names'] ?? 0) === 1 && (int) ($countsNow['processrenames'] ?? 0) > 0,
+            'removecrap' => match ((string) ($settings['fix_crap_opt'] ?? '')) {
+                'All' => true,
+                'Custom' => array_filter(
+                    array_map('trim', explode(',', is_array($settings['fix_crap'] ?? null) ? implode(',', $settings['fix_crap']) : (string) ($settings['fix_crap'] ?? ''))),
+                    static fn (string $v): bool => $v !== '' && $v !== '0',
+                ) !== [],
+                default => false,
+            },
+            'ppadditional' => match ((int) ($settings['post'] ?? 0)) {
+                1 => (int) ($countsNow['work_available'] ?? 0) > 0,
+                2 => (int) ($countsNow['processnfo'] ?? 0) > 0,
+                3 => (int) ($countsNow['work_available'] ?? 0) > 0 || (int) ($countsNow['processnfo'] ?? 0) > 0,
+                default => false,
+            },
+            'tv', 'nonamazon' => (int) ($settings['post_non'] ?? 0) > 0
+                && (((int) ($settings['processtvrage'] ?? 0) > 0 && (int) ($countsNow['processtv'] ?? 0) > 0)
+                    || ((int) ($settings['processanime'] ?? 0) > 0 && (int) ($countsNow['processanime'] ?? 0) > 0)),
+            'movies' => (int) ($settings['post_non'] ?? 0) > 0
+                && (int) ($settings['processmovies'] ?? 0) > 0
+                && (int) ($countsNow['processmovies'] ?? 0) > 0,
+            'amazon' => (int) ($settings['post_amazon'] ?? 0) > 0
+                && (((int) ($settings['processbooks'] ?? 0) > 0 && (int) ($countsNow['processbooks'] ?? 0) > 0)
+                    || ((int) ($settings['processmusic'] ?? 0) > 0 && (int) ($countsNow['processmusic'] ?? 0) > 0)
+                    || ((int) ($settings['processgames'] ?? 0) > 0 && ((int) ($countsNow['processconsole'] ?? 0) > 0 || (int) ($countsNow['processgames'] ?? 0) > 0))),
+            'scraper' => (int) ($settings['run_ircscraper'] ?? 0) === 1,
+            default => false,
+        };
     }
 
     /**
@@ -622,8 +1061,48 @@ class TmuxMonitorService
      */
     public function incrementIteration(): void
     {
-        $this->iterations++;
+        $this->iterations = $this->incrementRunCount($this->iterations);
         $this->runVar['counts']['iterations'] = $this->iterations;
+    }
+
+    /**
+     * Increment a monitor run iteration count (`$iterations + 1`).
+     */
+    public function incrementRunCount(int $iterations): int
+    {
+        if (self::$useRustFfi) {
+            $native = $this->incrementRunCountNative($iterations);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->incrementRunCountPhp($iterations);
+    }
+
+    public function incrementRunCountNative(int $iterations): ?int
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $rc = (int) $ffi->nntmux_tmux_monitor_increment_run_count($iterations);
+            if ($rc < 0) {
+                return null;
+            }
+
+            return $rc;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public function incrementRunCountPhp(int $iterations): int
+    {
+        return $iterations + 1;
     }
 
     /**

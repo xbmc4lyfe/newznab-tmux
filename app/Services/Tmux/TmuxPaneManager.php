@@ -5,16 +5,32 @@ declare(strict_types=1);
 namespace App\Services\Tmux;
 
 use App\Enums\TmuxPaneRole;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Contracts\Process\InvokedProcess;
 use Illuminate\Contracts\Process\ProcessResult;
 use Illuminate\Support\Facades\Process;
 use RuntimeException;
+use Throwable;
 
 /**
  * Service for managing individual tmux panes
  */
 class TmuxPaneManager
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_tmux_pane_get_names(int32_t sequential, uint8_t include_irc, char *out_buf, size_t out_cap);
+        ssize_t nntmux_tmux_pane_build_respawn_argv_nul(const char *base_args, size_t base_args_len, size_t base_count, uint8_t kill_flag, const char *target, size_t target_len, const char *directory, size_t directory_len, const char *env_pairs, size_t env_pairs_len, size_t env_pair_count, const char *worker_args, size_t worker_args_len, size_t worker_count, char *out_buf, size_t out_cap);
+        ssize_t nntmux_tmux_pane_build_log_tee_suffix(const char *path, size_t path_len, const char *pane, size_t pane_len, const char *date, size_t date_len, uint8_t write_logs, char *out_buf, size_t out_cap);
+        ssize_t nntmux_tmux_pane_get_sequential_command(const char *php_bin, size_t php_bin_len, const char *artisan, size_t artisan_len, int32_t niceness, const char *subcommand, size_t subcommand_len, const char *log_suffix, size_t log_suffix_len, char *out_buf, size_t out_cap);
+        C;
+
+    private static bool $useRustFfi = false;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
     private const ROLE_OPTION = '@nntmux_role';
 
     /**
@@ -63,6 +79,307 @@ class TmuxPaneManager
     {
         $this->sessionName = $sessionName;
         $this->sessionManager = new TmuxSessionManager($sessionName);
+    }
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (! self::$ffiResolved) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('irc', self::FFI_CDEF);
+            self::$ffiResolved = true;
+        }
+
+        return self::$ffi;
+    }
+
+    /**
+     * @return list<string>
+     */
+    public function getPaneNames(int $sequential, bool $runIrcScraper = true): array
+    {
+        if (self::$useRustFfi) {
+            $native = self::getPaneNamesNative($sequential, $runIrcScraper);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->getPaneNamesPhp($sequential, $runIrcScraper);
+    }
+
+    /**
+     * @return list<string>|null
+     */
+    public static function getPaneNamesNative(int $sequential, bool $runIrcScraper = true): ?array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, 256, $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tmux_pane_get_names($sequential, $runIrcScraper ? 1 : 0, $scratch, $cap);
+            if (! is_int($written) || $written === -1) {
+                return null;
+            }
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_tmux_pane_get_names($sequential, $runIrcScraper ? 1 : 0, $scratch, $cap);
+                if (! is_int($written) || $written <= 0) {
+                    return null;
+                }
+            }
+
+            return explode("\n", FFI::string($scratch, $written));
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @return list<string>
+     */
+    public function getPaneNamesPhp(int $sequential, bool $runIrcScraper = true): array
+    {
+        $names = match ($sequential) {
+            1 => [
+                'monitor',
+                'releases',
+                'fix_names',
+                'remove_crap',
+                'post_additional',
+                'post_movies',
+                'post_tv',
+                'post_metadata',
+            ],
+            2 => [
+                'monitor',
+                'sequential',
+                'fix_names',
+                'post_metadata',
+            ],
+            default => [
+                'monitor',
+                'binaries',
+                'backfill',
+                'releases',
+                'fix_names',
+                'remove_crap',
+                'post_additional',
+                'post_movies',
+                'post_tv',
+                'post_metadata',
+            ],
+        };
+
+        if ($runIrcScraper) {
+            $names[] = 'irc_scraper';
+        }
+
+        return $names;
+    }
+
+    public function buildLogTeeSuffix(string $path, string $pane, string $date, bool $writeLogs = true): string
+    {
+        if (self::$useRustFfi) {
+            $supported = false;
+            $native = self::buildLogTeeSuffixNative($path, $pane, $date, $writeLogs, $supported);
+            if ($supported && $native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->buildLogTeeSuffixPhp($path, $pane, $date, $writeLogs);
+    }
+
+    public static function buildLogTeeSuffixNative(
+        string $path,
+        string $pane,
+        string $date,
+        bool $writeLogs = true,
+        bool &$supported = false,
+    ): ?string {
+        $supported = false;
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $pathLen = strlen($path);
+        $paneLen = strlen($pane);
+        $dateLen = strlen($date);
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(128, $pathLen + $paneLen + $dateLen + 32), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tmux_pane_build_log_tee_suffix(
+                $path,
+                $pathLen,
+                $pane,
+                $paneLen,
+                $date,
+                $dateLen,
+                $writeLogs ? 1 : 0,
+                $scratch,
+                $cap,
+            );
+            if (! is_int($written) || $written === -1) {
+                return null;
+            }
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_tmux_pane_build_log_tee_suffix(
+                    $path,
+                    $pathLen,
+                    $pane,
+                    $paneLen,
+                    $date,
+                    $dateLen,
+                    $writeLogs ? 1 : 0,
+                    $scratch,
+                    $cap,
+                );
+                if (! is_int($written) || $written < 0) {
+                    return null;
+                }
+            }
+            $supported = true;
+
+            return $written === 0 ? '' : FFI::string($scratch, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public function buildLogTeeSuffixPhp(string $path, string $pane, string $date, bool $writeLogs = true): string
+    {
+        if (! $writeLogs) {
+            return '';
+        }
+
+        return "2>&1 | tee -a {$path}/{$pane}-{$date}.log";
+    }
+
+    public function getSequentialCommand(
+        string $phpBinary = PHP_BINARY,
+        ?string $artisan = null,
+        int $niceness = 2,
+        string $subcommand = 'multiprocessing:update-per-group',
+        string $logSuffix = '',
+    ): string {
+        $resolvedArtisan = $artisan ?? base_path('artisan');
+        if (self::$useRustFfi) {
+            $native = self::getSequentialCommandNative($phpBinary, $resolvedArtisan, $niceness, $subcommand, $logSuffix);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->getSequentialCommandPhp($phpBinary, $resolvedArtisan, $niceness, $subcommand, $logSuffix);
+    }
+
+    public static function getSequentialCommandNative(
+        string $phpBinary,
+        string $artisan,
+        int $niceness = 2,
+        string $subcommand = 'multiprocessing:update-per-group',
+        string $logSuffix = '',
+    ): ?string {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $phpLen = strlen($phpBinary);
+        $artLen = strlen($artisan);
+        $subLen = strlen($subcommand);
+        $logLen = strlen($logSuffix);
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, ($phpLen + $artLen) * 2 + $subLen + $logLen + 64), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tmux_pane_get_sequential_command(
+                $phpBinary,
+                $phpLen,
+                $artisan,
+                $artLen,
+                $niceness,
+                $subcommand,
+                $subLen,
+                $logSuffix,
+                $logLen,
+                $scratch,
+                $cap,
+            );
+            if (! is_int($written) || $written === -1) {
+                return null;
+            }
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_tmux_pane_get_sequential_command(
+                    $phpBinary,
+                    $phpLen,
+                    $artisan,
+                    $artLen,
+                    $niceness,
+                    $subcommand,
+                    $subLen,
+                    $logSuffix,
+                    $logLen,
+                    $scratch,
+                    $cap,
+                );
+                if (! is_int($written) || $written <= 0) {
+                    return null;
+                }
+            }
+
+            return FFI::string($scratch, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public function getSequentialCommandPhp(
+        string $phpBinary,
+        string $artisan,
+        int $niceness = 2,
+        string $subcommand = 'multiprocessing:update-per-group',
+        string $logSuffix = '',
+    ): string {
+        $cmd = "nice -n{$niceness} ".escapeshellarg($phpBinary).' '.escapeshellarg($artisan)." {$subcommand}";
+
+        return $logSuffix !== '' ? "{$cmd} {$logSuffix}" : $cmd;
     }
 
     /**
@@ -144,25 +461,192 @@ class TmuxPaneManager
      */
     public function respawnPane(string $target, string|array $command, bool $kill = false, ?string $directory = null, array $environment = []): bool
     {
-        $arguments = TmuxCommand::arguments(['respawn-pane']);
-        if ($kill) {
-            $arguments[] = '-k';
-        }
-        array_push($arguments, '-t', $this->target($target), '-c', $directory ?? base_path());
-        foreach ($environment as $name => $value) {
-            array_push($arguments, '-e', $name.'='.$value);
-        }
-        $workerArguments = is_array($command) ? $command : [$command];
-        // tmux treats a trailing semicolon in an argv item as a command separator.
-        $workerArguments = array_map(static fn (string $argument): string => str_ends_with($argument, ';')
-            ? substr($argument, 0, -1).'\\;' : $argument, $workerArguments);
-        array_push($arguments, ...$workerArguments);
+        $arguments = $this->buildRespawnCommand($target, $command, $kill, $directory, $environment);
 
         $result = Process::timeout(10)->run(
             $arguments
         );
 
         return $this->recordResult($result);
+    }
+
+    /**
+     * @param  string|list<string>  $command
+     * @param  array<string, string>  $environment
+     * @return list<string>
+     */
+    public function buildRespawnCommand(string $target, string|array $command, bool $kill = false, ?string $directory = null, array $environment = []): array
+    {
+        $baseArguments = TmuxCommand::arguments(['respawn-pane']);
+        $resolvedTarget = $this->target($target);
+        $resolvedDirectory = $directory ?? base_path();
+        $workerArguments = is_array($command) ? array_values($command) : [$command];
+
+        if (self::$useRustFfi) {
+            $native = self::buildRespawnCommandNative(
+                $baseArguments,
+                $kill,
+                $resolvedTarget,
+                $resolvedDirectory,
+                $environment,
+                $workerArguments,
+            );
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->buildRespawnCommandPhp(
+            $baseArguments,
+            $kill,
+            $resolvedTarget,
+            $resolvedDirectory,
+            $environment,
+            $workerArguments,
+        );
+    }
+
+    /**
+     * @param  list<string>  $baseArguments
+     * @param  array<string, string>  $environment
+     * @param  list<string>  $workerArguments
+     * @return list<string>|null
+     */
+    public static function buildRespawnCommandNative(
+        array $baseArguments,
+        bool $kill,
+        string $target,
+        string $directory,
+        array $environment,
+        array $workerArguments,
+    ): ?array {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $baseCount = count($baseArguments);
+        $workerCount = count($workerArguments);
+        if ($baseCount === 0 || $workerCount === 0) {
+            return null;
+        }
+        $baseJoined = implode("\0", $baseArguments);
+        if (substr_count($baseJoined, "\0") !== $baseCount - 1) {
+            return null;
+        }
+        $workerJoined = implode("\0", $workerArguments);
+        if (substr_count($workerJoined, "\0") !== $workerCount - 1) {
+            return null;
+        }
+
+        $envFlat = [];
+        foreach ($environment as $name => $value) {
+            $envFlat[] = (string) $name;
+            $envFlat[] = (string) $value;
+        }
+        $envPairCount = count($environment);
+        $envJoined = $envPairCount === 0 ? '' : implode("\0", $envFlat);
+        if ($envPairCount > 0 && substr_count($envJoined, "\0") !== $envPairCount * 2 - 1) {
+            return null;
+        }
+
+        $baseLen = strlen($baseJoined);
+        $targetLen = strlen($target);
+        $dirLen = strlen($directory);
+        $envLen = strlen($envJoined);
+        $workerLen = strlen($workerJoined);
+        $minBytes = max(256, $baseLen + $targetLen + $dirLen + $envLen + $workerLen + $envPairCount * 4 + $workerCount * 2 + 32);
+
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, $minBytes, $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tmux_pane_build_respawn_argv_nul(
+                $baseJoined,
+                $baseLen,
+                $baseCount,
+                $kill ? 1 : 0,
+                $target,
+                $targetLen,
+                $directory,
+                $dirLen,
+                $envJoined,
+                $envLen,
+                $envPairCount,
+                $workerJoined,
+                $workerLen,
+                $workerCount,
+                $scratch,
+                $cap,
+            );
+            if (! is_int($written) || $written === -1) {
+                return null;
+            }
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_tmux_pane_build_respawn_argv_nul(
+                    $baseJoined,
+                    $baseLen,
+                    $baseCount,
+                    $kill ? 1 : 0,
+                    $target,
+                    $targetLen,
+                    $directory,
+                    $dirLen,
+                    $envJoined,
+                    $envLen,
+                    $envPairCount,
+                    $workerJoined,
+                    $workerLen,
+                    $workerCount,
+                    $scratch,
+                    $cap,
+                );
+                if (! is_int($written) || $written <= 0) {
+                    return null;
+                }
+            }
+
+            return explode("\0", FFI::string($scratch, $written));
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  list<string>  $baseArguments
+     * @param  array<string, string>  $environment
+     * @param  list<string>  $workerArguments
+     * @return list<string>
+     */
+    public function buildRespawnCommandPhp(
+        array $baseArguments,
+        bool $kill,
+        string $target,
+        string $directory,
+        array $environment,
+        array $workerArguments,
+    ): array {
+        $arguments = $baseArguments;
+        if ($kill) {
+            $arguments[] = '-k';
+        }
+        array_push($arguments, '-t', $target, '-c', $directory);
+        foreach ($environment as $name => $value) {
+            array_push($arguments, '-e', $name.'='.$value);
+        }
+        // tmux treats a trailing semicolon in an argv item as a command separator.
+        $escapedWorkers = array_map(static fn (string $argument): string => str_ends_with($argument, ';')
+            ? substr($argument, 0, -1).'\\;' : $argument, $workerArguments);
+        array_push($arguments, ...$escapedWorkers);
+
+        return $arguments;
     }
 
     public function heartbeat(): bool
