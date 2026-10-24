@@ -23,14 +23,7 @@ class RedisMonitorService
         ssize_t nntmux_redis_format_bytes(int64_t bytes, char *out_buf, size_t out_cap);
         C;
 
-    private const array DB_KEY_MAP = [
-        'db0' => true, 'db1' => true, 'db2' => true, 'db3' => true,
-        'db4' => true, 'db5' => true, 'db6' => true, 'db7' => true,
-        'db8' => true, 'db9' => true, 'db10' => true, 'db11' => true,
-        'db12' => true, 'db13' => true, 'db14' => true, 'db15' => true,
-    ];
-
-    private static bool $useRustFfi = true;
+    private static bool $useRustFfi = false;
 
     private static ?FFI $ffi = null;
 
@@ -286,100 +279,44 @@ class RedisMonitorService
             return $this->parseRedisInfoPhp($info);
         }
 
-        $dbs = null;
-        if (isset($info['redis_version']) && ! is_array(end($info))) {
-            $flatInfo = $info;
-        } elseif ($info !== [] && is_array(reset($info)) && is_array(end($info))) {
-            try {
-                if (isset($info['Keyspace']) && is_array($info['Keyspace'])) {
-                    $ks = $info['Keyspace'];
-                    $copy = $info;
-                    unset($copy['Keyspace']);
-                    /** @var array<int, array<string, mixed>> $sections */
-                    $sections = array_values($copy);
-                    $flatInfo = $sections === [] ? [] : array_replace(...$sections);
-                    $dbs = array_intersect_key($ks, self::DB_KEY_MAP) + array_intersect_key($flatInfo, self::DB_KEY_MAP);
-                } else {
-                    /** @var array<int, array<string, mixed>> $sections */
-                    $sections = array_values($info);
-                    $flatInfo = array_replace(...$sections);
-                }
-            } catch (\TypeError) {
-                $dbs = null;
-                $flatInfo = [];
-                foreach ($info as $k => $v) {
-                    if (is_array($v)) {
-                        $flatInfo = $v + $flatInfo;
-                    } else {
-                        $flatInfo[$k] = $v;
-                    }
-                }
-            }
-        } else {
-            $flatInfo = $info;
-            foreach ($info as $value) {
-                if (is_array($value)) {
-                    $flatInfo = [];
-                    foreach ($info as $k => $v) {
-                        if (is_array($v)) {
-                            $flatInfo = $v + $flatInfo;
-                        } else {
-                            $flatInfo[$k] = $v;
-                        }
-                    }
-                    break;
-                }
+        $flatInfo = [];
+        foreach ($info as $key => $value) {
+            if (is_array($value)) {
+                $flatInfo = array_merge($flatInfo, $value);
+            } else {
+                $flatInfo[$key] = $value;
             }
         }
 
         $hits = (int) ($flatInfo['keyspace_hits'] ?? 0);
         $misses = (int) ($flatInfo['keyspace_misses'] ?? 0);
         $totalOps = $hits + $misses;
-        $hitRate = $totalOps > 0 ? round(($hits * 100) / $totalOps, 2) : 0;
+        $hitRate = $totalOps > 0
+            ? (self::hitRateNative($hits, $misses) ?? round(($hits * 100) / $totalOps, 2))
+            : 0;
 
-        $dbs ??= array_intersect_key($flatInfo, self::DB_KEY_MAP);
         $dbKeys = 0;
-        if ($dbs !== []) {
-            $allStrings = is_string(reset($dbs)) && is_string(end($dbs)) && (count($dbs) <= 2 || is_string(next($dbs)));
-            if ($allStrings) {
-                $ffi = self::$ffiResolved ? self::$ffi : self::ffi();
-                $nativeSum = null;
-                if ($ffi !== null) {
-                    $joined = implode("\0", $dbs);
-                    // @phpstan-ignore method.notFound
-                    $sum = $ffi->nntmux_redis_sum_db_keys_nul($joined, strlen($joined), count($dbs));
-                    if (is_int($sum) && $sum >= 0) {
-                        $nativeSum = $sum;
-                    }
+        $stringSpecs = [];
+        for ($i = 0; $i <= 15; $i++) {
+            $dbKey = "db{$i}";
+            if (isset($flatInfo[$dbKey])) {
+                $dbValue = $flatInfo[$dbKey];
+                if (is_array($dbValue)) {
+                    $dbKeys += (int) ($dbValue['keys'] ?? 0);
+                } elseif (is_string($dbValue)) {
+                    $stringSpecs[] = $dbValue;
                 }
-                if ($nativeSum !== null) {
-                    $dbKeys = $nativeSum;
-                } else {
-                    foreach ($dbs as $spec) {
-                        if (preg_match('/keys=(\d+)/', $spec, $matches)) {
-                            $dbKeys += (int) $matches[1];
-                        }
-                    }
-                }
+            }
+        }
+
+        if ($stringSpecs !== []) {
+            $nativeSum = self::sumDbKeysNative($stringSpecs);
+            if ($nativeSum !== null) {
+                $dbKeys += $nativeSum;
             } else {
-                $stringSpecs = [];
-                foreach ($dbs as $dbValue) {
-                    if (is_string($dbValue)) {
-                        $stringSpecs[] = $dbValue;
-                    } elseif (is_array($dbValue)) {
-                        $dbKeys += (int) ($dbValue['keys'] ?? 0);
-                    }
-                }
-                if ($stringSpecs !== []) {
-                    $nativeSum = self::sumDbKeysNative($stringSpecs);
-                    if ($nativeSum !== null) {
-                        $dbKeys += $nativeSum;
-                    } else {
-                        foreach ($stringSpecs as $spec) {
-                            if (preg_match('/keys=(\d+)/', $spec, $matches)) {
-                                $dbKeys += (int) $matches[1];
-                            }
-                        }
+                foreach ($stringSpecs as $spec) {
+                    if (preg_match('/keys=(\d+)/', $spec, $matches)) {
+                        $dbKeys += (int) $matches[1];
                     }
                 }
             }

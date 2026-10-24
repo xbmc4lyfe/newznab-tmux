@@ -35,8 +35,8 @@ use ReflectionProperty;
  * | SystemMetricsService::parseMeminfo (uncommon) | 207.6 ns (244.1 ns)    | 286.8 ns (332.7 ns)     | 1.38x / 1.36x        | PHP (<1.5x)     |
  * | SystemMetricsService::parseCpuInfo (common8)  | 423.0 ns (582.7 ns)    | 856.1 ns (930.3 ns)     | 2.02x / 1.60x        | Rust FFI        |
  * | SystemMetricsService::parseCpuInfo (uncom64)  | 785.4 ns (1277.6 ns)   | 4777.8 ns (5875.9 ns)   | 6.08x / 4.60x        | Rust FFI        |
- * | RedisMonitorService::parseRedisInfo (common)  | 1241.7 ns (1877.0 ns)  | 1875.9 ns (3175.4 ns)   | 1.51x / 1.69x        | Rust FFI        |
- * | RedisMonitorService::parseRedisInfo (uncom16) | 1890.0 ns (2610.0 ns)  | 3035.3 ns (5198.9 ns)   | 1.61x / 1.99x        | Rust FFI        |
+ * | RedisMonitorService::parseRedisInfo (common)  | 1627.5 ns (2104.2 ns)  | 1497.4 ns (1847.6 ns)   | 0.92x / 0.88x        | PHP (<1.5x)     |
+ * | RedisMonitorService::parseRedisInfo (uncom16) | 1881.9 ns (2599.2 ns)  | 2637.0 ns (3010.4 ns)   | 1.40x / 1.16x        | PHP (<1.5x)     |
  * | RedisMonitorService::formatBytes (common)     | 221.8 ns (352.9 ns)    | 130.3 ns (277.3 ns)     | 0.59x / 0.79x        | PHP (<1.5x)     |
  * | RedisMonitorService::formatBytes (uncommon)   | 210.6 ns (374.3 ns)    | 126.0 ns (327.1 ns)     | 0.60x / 0.87x        | PHP (<1.5x)     |
  */
@@ -63,7 +63,7 @@ final class RustTmuxSocketMetricsParserParityTest extends TestCase
         parent::setUp();
         Tmux::setUseRustFfi(true);
         SystemMetricsService::setUseRustFfi(true);
-        RedisMonitorService::setUseRustFfi(true);
+        RedisMonitorService::setUseRustFfi(false);
 
         $ffi = RustPipelineLibrary::resolveDomain('irc', self::CDEF);
         if ($ffi === null) {
@@ -76,7 +76,7 @@ final class RustTmuxSocketMetricsParserParityTest extends TestCase
     {
         Tmux::setUseRustFfi(true);
         SystemMetricsService::setUseRustFfi(true);
-        RedisMonitorService::setUseRustFfi(true);
+        RedisMonitorService::setUseRustFfi(false);
         parent::tearDown();
     }
 
@@ -398,6 +398,8 @@ final class RustTmuxSocketMetricsParserParityTest extends TestCase
 
     public function test_redis_monitor_service_parse_info_and_format_bytes_parity(): void
     {
+        self::assertFalse(RedisMonitorService::usesRustFfi());
+
         /** @var RedisMonitorService $redis */
         $redis = (new ReflectionClass(RedisMonitorService::class))->newInstanceWithoutConstructor();
         (new ReflectionProperty(RedisMonitorService::class, 'host'))->setValue($redis, '127.0.0.1');
@@ -432,6 +434,37 @@ final class RustTmuxSocketMetricsParserParityTest extends TestCase
                 'keyspace_misses' => 6789,
                 'db0' => "keys=100\0keys=999", // Embedded NUL falls back to PHP regex -> 100
                 'db1' => 'keys=200,expires=0',
+            ],
+            // Regression 1: top-level redis_version, middle Keyspace array section, trailing scalar key
+            [
+                'redis_version' => '7.2.5',
+                'Keyspace' => [
+                    'db0' => 'keys=42,expires=1,avg_ttl=100',
+                    'db1' => 'keys=58,expires=2,avg_ttl=200',
+                ],
+                'role' => 'replica',
+            ],
+            // Regression 2: Keyspace containing a non-DB key and a later section overriding db0
+            [
+                'Server' => ['redis_version' => '7.2.5'],
+                'Keyspace' => [
+                    'role' => 'slave',
+                    'db0' => 'keys=10,expires=0,avg_ttl=0',
+                    'db1' => 'keys=20,expires=0,avg_ttl=0',
+                ],
+                'Override' => [
+                    'db0' => 'keys=90,expires=0,avg_ttl=0',
+                ],
+            ],
+            // Regression 3: 4+ DB entries mixing string and interior array values
+            [
+                'Keyspace' => [
+                    'db0' => 'keys=10,expires=1,avg_ttl=100',
+                    'db1' => ['keys' => 25, 'expires' => 2],
+                    'db2' => ['keys' => 35, 'expires' => 3],
+                    'db3' => 'keys=40,expires=4,avg_ttl=400',
+                    'db4' => 'keys=50,expires=5,avg_ttl=500',
+                ],
             ],
         ];
 
