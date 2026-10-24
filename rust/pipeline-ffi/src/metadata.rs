@@ -8240,3 +8240,2064 @@ mod par2_metadata_proof_tests {
         assert_eq!(samples.items().len(), 4);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Release verification: CandidateHeaderInventory assessment and SpotCheckPlanner selection.
+//
+// PHP passes `serialize($manifest['files'])` (C-speed marshaling that keeps every PHP scalar
+// type), so the PHP `is_int`/`is_string`/`(int)` semantics are reproduced exactly. Any shape
+// whose PHP behavior is not reproduced (objects, references, float or string casts, warnings,
+// non-transitive numeric-string digest comparisons) returns `-1` so the caller runs PHP.
+// ---------------------------------------------------------------------------
+
+pub mod candidate_inventory {
+    use std::borrow::Cow;
+    use std::cmp::Ordering;
+    use std::collections::{HashMap, HashSet};
+    use std::hash::{BuildHasher, Hasher};
+    use std::slice;
+    use std::sync::OnceLock;
+
+    const FALLBACK: i32 = -1;
+    const MAX_DEPTH: usize = 500;
+
+    pub const MODE_ASSESS: u32 = 1;
+    pub const MODE_COMPLETENESS: u32 = 2;
+    pub const MODE_BYTES: u32 = 4;
+
+    pub const STATUS_READY: i64 = 0;
+    pub const STATUS_WAITING_FILES: i64 = 1;
+    pub const STATUS_WAITING_ARTICLES: i64 = 2;
+    /// `STATUS_REJECTED + i` is `CandidateHeaderInventory::REJECTION_REASONS[i]`.
+    pub const STATUS_REJECTED: i64 = 10;
+    pub const STATUS_FALLBACK: i64 = -1;
+
+    const REJECT_CONFLICT: i64 = STATUS_REJECTED;
+    const REJECT_NO_FILES: i64 = STATUS_REJECTED + 1;
+    const REJECT_FILE_IDENTITY: i64 = STATUS_REJECTED + 2;
+    const REJECT_ARTICLE_COUNT: i64 = STATUS_REJECTED + 3;
+    const REJECT_ARTICLE_REFERENCE: i64 = STATUS_REJECTED + 4;
+
+    // ---- seeded fast hasher (PHP's own arrays use unseeded DJBX33A) ------------------------
+
+    #[derive(Clone, Copy)]
+    struct Seeded(u64);
+
+    impl Seeded {
+        fn new() -> Self {
+            static SEED: OnceLock<u64> = OnceLock::new();
+            Self(*SEED.get_or_init(|| {
+                let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+                hasher.write_u64(0x6e6e_746d_7578);
+                hasher.finish() | 1
+            }))
+        }
+    }
+
+    impl BuildHasher for Seeded {
+        type Hasher = FoldHasher;
+
+        #[inline]
+        fn build_hasher(&self) -> FoldHasher {
+            FoldHasher(self.0)
+        }
+    }
+
+    struct FoldHasher(u64);
+
+    #[inline(always)]
+    fn fold_mul(a: u64, b: u64) -> u64 {
+        let product = u128::from(a).wrapping_mul(u128::from(b));
+        (product as u64) ^ ((product >> 64) as u64)
+    }
+
+    impl Hasher for FoldHasher {
+        #[inline]
+        fn write(&mut self, bytes: &[u8]) {
+            const K: u64 = 0x9E37_79B9_7F4A_7C15;
+            let mut h = self.0;
+            let (chunks, rest) = bytes.as_chunks::<8>();
+            for chunk in chunks {
+                h = fold_mul(h ^ u64::from_le_bytes(*chunk), K);
+            }
+            if !rest.is_empty() {
+                let mut tail = [0u8; 8];
+                tail[..rest.len()].copy_from_slice(rest);
+                h = fold_mul(h ^ u64::from_le_bytes(tail), K);
+            }
+            self.0 = fold_mul(h ^ bytes.len() as u64, K ^ self.0.rotate_left(29));
+        }
+
+        #[inline]
+        fn write_usize(&mut self, value: usize) {
+            self.0 = fold_mul(self.0 ^ value as u64, 0xA076_1D64_78BD_642F);
+        }
+
+        #[inline]
+        fn finish(&self) -> u64 {
+            self.0
+        }
+    }
+
+    // ---- SHA-256 with ARMv8 / SHA-NI acceleration ------------------------------------------
+
+    const K256: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    const H256: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+
+    type CompressFn = unsafe fn(&mut [u32; 8], &[[u8; 64]]);
+
+    fn compress_soft(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
+        for block in blocks {
+            let mut w = [0u32; 64];
+            for (i, chunk) in block.as_chunks::<4>().0.iter().enumerate() {
+                w[i] = u32::from_be_bytes(*chunk);
+            }
+            for i in 16..64 {
+                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+                w[i] = w[i - 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(w[i - 7])
+                    .wrapping_add(s1);
+            }
+            let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+            for i in 0..64 {
+                let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+                let ch = (e & f) ^ ((!e) & g);
+                let t1 = h
+                    .wrapping_add(s1)
+                    .wrapping_add(ch)
+                    .wrapping_add(K256[i])
+                    .wrapping_add(w[i]);
+                let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+                let maj = (a & b) ^ (a & c) ^ (b & c);
+                let t2 = s0.wrapping_add(maj);
+                h = g;
+                g = f;
+                f = e;
+                e = d.wrapping_add(t1);
+                d = c;
+                c = b;
+                b = a;
+                a = t1.wrapping_add(t2);
+            }
+            for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+                *slot = slot.wrapping_add(value);
+            }
+        }
+    }
+
+    unsafe fn compress_soft_entry(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
+        compress_soft(state, blocks);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "sha2")]
+    unsafe fn compress_arm(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
+        use std::arch::aarch64::*;
+        unsafe {
+            let mut abcd = vld1q_u32(state.as_ptr());
+            let mut efgh = vld1q_u32(state.as_ptr().add(4));
+            for block in blocks {
+                let abcd_saved = abcd;
+                let efgh_saved = efgh;
+                let p = block.as_ptr();
+                let mut m = [
+                    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p))),
+                    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p.add(16)))),
+                    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p.add(32)))),
+                    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p.add(48)))),
+                ];
+                for group in 0..16 {
+                    let lane = group & 3;
+                    let wk = vaddq_u32(m[lane], vld1q_u32(K256.as_ptr().add(group * 4)));
+                    let abcd_prev = abcd;
+                    abcd = vsha256hq_u32(abcd, efgh, wk);
+                    efgh = vsha256h2q_u32(efgh, abcd_prev, wk);
+                    if group < 12 {
+                        m[lane] = vsha256su1q_u32(
+                            vsha256su0q_u32(m[lane], m[(lane + 1) & 3]),
+                            m[(lane + 2) & 3],
+                            m[(lane + 3) & 3],
+                        );
+                    }
+                }
+                abcd = vaddq_u32(abcd, abcd_saved);
+                efgh = vaddq_u32(efgh, efgh_saved);
+            }
+            vst1q_u32(state.as_mut_ptr(), abcd);
+            vst1q_u32(state.as_mut_ptr().add(4), efgh);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
+    unsafe fn compress_x86(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
+        use std::arch::x86_64::*;
+        unsafe {
+            let mask = _mm_set_epi64x(
+                0x0C0D_0E0F_0809_0A0B_u64 as i64,
+                0x0405_0607_0001_0203_u64 as i64,
+            );
+            let state_ptr = state.as_ptr().cast::<__m128i>();
+            let dcba = _mm_loadu_si128(state_ptr);
+            let efgh = _mm_loadu_si128(state_ptr.add(1));
+            let cdab = _mm_shuffle_epi32(dcba, 0xB1);
+            let efgh = _mm_shuffle_epi32(efgh, 0x1B);
+            let mut abef = _mm_alignr_epi8(cdab, efgh, 8);
+            let mut cdgh = _mm_blend_epi16(efgh, cdab, 0xF0);
+            for block in blocks {
+                let abef_saved = abef;
+                let cdgh_saved = cdgh;
+                let data = block.as_ptr().cast::<__m128i>();
+                let mut w = [
+                    _mm_shuffle_epi8(_mm_loadu_si128(data), mask),
+                    _mm_shuffle_epi8(_mm_loadu_si128(data.add(1)), mask),
+                    _mm_shuffle_epi8(_mm_loadu_si128(data.add(2)), mask),
+                    _mm_shuffle_epi8(_mm_loadu_si128(data.add(3)), mask),
+                ];
+                for group in 0..16 {
+                    let lane = group & 3;
+                    if group >= 4 {
+                        let t1 = _mm_sha256msg1_epu32(w[lane], w[(lane + 1) & 3]);
+                        let t2 = _mm_alignr_epi8(w[(lane + 3) & 3], w[(lane + 2) & 3], 4);
+                        w[lane] = _mm_sha256msg2_epu32(_mm_add_epi32(t1, t2), w[(lane + 3) & 3]);
+                    }
+                    let k = _mm_loadu_si128(K256.as_ptr().add(group * 4).cast::<__m128i>());
+                    let wk = _mm_add_epi32(w[lane], k);
+                    cdgh = _mm_sha256rnds2_epu32(cdgh, abef, wk);
+                    abef = _mm_sha256rnds2_epu32(abef, cdgh, _mm_shuffle_epi32(wk, 0x0E));
+                }
+                abef = _mm_add_epi32(abef, abef_saved);
+                cdgh = _mm_add_epi32(cdgh, cdgh_saved);
+            }
+            let feba = _mm_shuffle_epi32(abef, 0x1B);
+            let dchg = _mm_shuffle_epi32(cdgh, 0xB1);
+            let dcba = _mm_blend_epi16(feba, dchg, 0xF0);
+            let hgef = _mm_alignr_epi8(dchg, feba, 8);
+            let out = state.as_mut_ptr().cast::<__m128i>();
+            _mm_storeu_si128(out, dcba);
+            _mm_storeu_si128(out.add(1), hgef);
+        }
+    }
+
+    fn sha256_with(compress: CompressFn, data: &[u8]) -> [u8; 32] {
+        let mut state = H256;
+        let (blocks, rest) = data.as_chunks::<64>();
+        unsafe { compress(&mut state, blocks) };
+        let mut tail = [[0u8; 64]; 2];
+        let flat = tail.as_flattened_mut();
+        flat[..rest.len()].copy_from_slice(rest);
+        flat[rest.len()] = 0x80;
+        let used = if rest.len() < 56 { 1 } else { 2 };
+        let bits = (data.len() as u64).wrapping_mul(8).to_be_bytes();
+        flat[used * 64 - 8..used * 64].copy_from_slice(&bits);
+        unsafe { compress(&mut state, &tail[..used]) };
+        let mut digest = [0u8; 32];
+        for (out, word) in digest.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+            *out = word.to_be_bytes();
+        }
+        digest
+    }
+
+    fn accelerated() -> Option<CompressFn> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            if std::arch::is_aarch64_feature_detected!("sha2") {
+                return Some(compress_arm as CompressFn);
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("sha")
+                && is_x86_feature_detected!("sse2")
+                && is_x86_feature_detected!("ssse3")
+                && is_x86_feature_detected!("sse4.1")
+            {
+                return Some(compress_x86 as CompressFn);
+            }
+        }
+        None
+    }
+
+    /// The accelerated compressor is adopted only after it reproduces the portable digest.
+    fn compressor() -> CompressFn {
+        static SELECTED: OnceLock<CompressFn> = OnceLock::new();
+        *SELECTED.get_or_init(|| {
+            if let Some(fast) = accelerated() {
+                let probe: Vec<u8> = (0..300u32)
+                    .map(|i| (i.wrapping_mul(31) ^ 0x5a) as u8)
+                    .collect();
+                let agrees = (0..probe.len()).step_by(7).all(|len| {
+                    sha256_with(fast, &probe[..len])
+                        == sha256_with(compress_soft_entry, &probe[..len])
+                });
+                if agrees {
+                    return fast;
+                }
+            }
+            compress_soft_entry as CompressFn
+        })
+    }
+
+    #[inline]
+    pub fn sha256(data: &[u8]) -> [u8; 32] {
+        sha256_with(compressor(), data)
+    }
+
+    /// Whether the lowercase hex digest is a PHP numeric string (`[0-9]+` or `[0-9]+e[0-9]+`),
+    /// which makes PHP's `<=>` compare it numerically against another numeric digest.
+    #[inline]
+    fn php_numeric_hex(digest: &[u8; 32]) -> bool {
+        let mut exponent = false;
+        for (index, byte) in digest.iter().enumerate() {
+            for (offset, nibble) in [byte >> 4, byte & 15].into_iter().enumerate() {
+                if nibble < 10 {
+                    continue;
+                }
+                let position = index * 2 + offset;
+                if nibble == 14 && !exponent && position > 0 && position < 63 {
+                    exponent = true;
+                    continue;
+                }
+                return false;
+            }
+        }
+        true
+    }
+
+    // ---- streaming PHP serialize() reader ---------------------------------------------------
+
+    enum Tok<'a> {
+        Null,
+        Bool(bool),
+        Int(i64),
+        Float,
+        Str(&'a [u8], usize),
+        Arr(usize),
+    }
+
+    enum Key<'a> {
+        Int,
+        Str(&'a [u8]),
+    }
+
+    struct Ser<'a> {
+        s: &'a [u8],
+        p: usize,
+    }
+
+    impl<'a> Ser<'a> {
+        #[inline]
+        fn byte(&mut self) -> Option<u8> {
+            let byte = *self.s.get(self.p)?;
+            self.p += 1;
+            Some(byte)
+        }
+
+        #[inline]
+        fn expect(&mut self, wanted: u8) -> Option<()> {
+            (self.byte()? == wanted).then_some(())
+        }
+
+        #[inline]
+        fn length(&mut self, term: u8) -> Option<usize> {
+            let mut value: usize = 0;
+            let mut digits = 0;
+            loop {
+                let byte = self.byte()?;
+                if byte == term && digits > 0 {
+                    return Some(value);
+                }
+                if !byte.is_ascii_digit() || digits >= 18 {
+                    return None;
+                }
+                value = value * 10 + usize::from(byte - b'0');
+                digits += 1;
+            }
+        }
+
+        #[inline]
+        fn int(&mut self) -> Option<i64> {
+            let negative = self.s.get(self.p) == Some(&b'-');
+            if negative {
+                self.p += 1;
+            }
+            let mut value: i64 = 0;
+            let mut digits = 0;
+            loop {
+                let byte = self.byte()?;
+                if byte == b';' && digits > 0 {
+                    return Some(value);
+                }
+                if !byte.is_ascii_digit() {
+                    return None;
+                }
+                let digit = i64::from(byte - b'0');
+                value = value.checked_mul(10)?;
+                value = if negative {
+                    value.checked_sub(digit)?
+                } else {
+                    value.checked_add(digit)?
+                };
+                digits += 1;
+            }
+        }
+
+        #[inline]
+        fn string_body(&mut self) -> Option<(&'a [u8], usize)> {
+            let length = self.length(b':')?;
+            self.expect(b'"')?;
+            let start = self.p;
+            let end = start.checked_add(length)?;
+            if self.s.get(end..end + 2)? != b"\";" {
+                return None;
+            }
+            self.p = end + 2;
+            Some((&self.s[start..end], start))
+        }
+
+        /// One value; arrays return their entry count with the reader positioned at the first key.
+        #[inline]
+        fn value(&mut self) -> Option<Tok<'a>> {
+            match self.byte()? {
+                b'N' => {
+                    self.expect(b';')?;
+                    Some(Tok::Null)
+                }
+                b'b' => {
+                    self.expect(b':')?;
+                    let value = self.byte()?;
+                    self.expect(b';')?;
+                    match value {
+                        b'0' => Some(Tok::Bool(false)),
+                        b'1' => Some(Tok::Bool(true)),
+                        _ => None,
+                    }
+                }
+                b'i' => {
+                    self.expect(b':')?;
+                    Some(Tok::Int(self.int()?))
+                }
+                b'd' => {
+                    self.expect(b':')?;
+                    let end = self.s[self.p..].iter().position(|&b| b == b';')?;
+                    self.p += end + 1;
+                    Some(Tok::Float)
+                }
+                b's' => {
+                    self.expect(b':')?;
+                    let (body, offset) = self.string_body()?;
+                    Some(Tok::Str(body, offset))
+                }
+                b'a' => {
+                    self.expect(b':')?;
+                    let count = self.length(b':')?;
+                    self.expect(b'{')?;
+                    Some(Tok::Arr(count))
+                }
+                // Objects, enums and references keep PHP semantics (and hooks) in PHP.
+                _ => None,
+            }
+        }
+
+        #[inline]
+        fn key(&mut self) -> Option<Key<'a>> {
+            match self.byte()? {
+                b'i' => {
+                    self.expect(b':')?;
+                    self.int()?;
+                    Some(Key::Int)
+                }
+                b's' => {
+                    self.expect(b':')?;
+                    Some(Key::Str(self.string_body()?.0))
+                }
+                _ => None,
+            }
+        }
+
+        #[inline]
+        fn close(&mut self) -> Option<()> {
+            self.expect(b'}')
+        }
+
+        fn skip_entries(&mut self, count: usize, depth: usize) -> Option<()> {
+            if depth >= MAX_DEPTH {
+                return None;
+            }
+            for _ in 0..count {
+                self.key()?;
+                if let Tok::Arr(inner) = self.value()? {
+                    self.skip_entries(inner, depth + 1)?;
+                }
+            }
+            self.close()
+        }
+
+        /// A captured value; nested arrays are skipped and reduced to their emptiness.
+        #[inline]
+        fn val(&mut self, depth: usize) -> Option<Val<'a>> {
+            Some(match self.value()? {
+                Tok::Null => Val::Null,
+                Tok::Bool(value) => Val::Bool(value),
+                Tok::Int(value) => Val::Int(value),
+                Tok::Float => Val::Float,
+                Tok::Str(body, offset) => Val::Str(Cow::Borrowed(body), offset),
+                Tok::Arr(count) => {
+                    self.skip_entries(count, depth + 1)?;
+                    Val::Arr(count > 0)
+                }
+            })
+        }
+    }
+
+    // ---- shared PHP value model --------------------------------------------------------------
+
+    #[derive(Clone, Default)]
+    enum Val<'a> {
+        #[default]
+        Missing,
+        Null,
+        Bool(bool),
+        Int(i64),
+        Float,
+        Str(Cow<'a, [u8]>, usize),
+        Arr(bool),
+    }
+
+    impl<'a> Val<'a> {
+        /// `(int) ($value ?? 0)` for the types whose cast is reproduced; `None` keeps PHP.
+        #[inline]
+        fn int_cast(&self) -> Option<i64> {
+            match self {
+                Val::Missing | Val::Null => Some(0),
+                Val::Bool(value) | Val::Arr(value) => Some(i64::from(*value)),
+                Val::Int(value) => Some(*value),
+                Val::Float | Val::Str(..) => None,
+            }
+        }
+    }
+
+    /// `trim($id, '<>')` followed by `/\A[^\s<>\x00-\x1f\x7f]+\z/D` (non-UTF PCRE `\s`).
+    #[inline]
+    fn trimmed_message_id(id: &[u8]) -> Option<(usize, usize)> {
+        let mut start = 0;
+        let mut end = id.len();
+        while start < end && matches!(id[start], b'<' | b'>') {
+            start += 1;
+        }
+        while end > start && matches!(id[end - 1], b'<' | b'>') {
+            end -= 1;
+        }
+        if start == end {
+            return None;
+        }
+        message_id_body_valid(&id[start..end]).then_some((start, end))
+    }
+
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+
+    /// Nonzero when any byte of `v` is below `n` (`n <= 0x80`; exact for presence).
+    #[inline(always)]
+    fn swar_less(v: u64, n: u64) -> u64 {
+        v.wrapping_sub(ONES * n) & !v & HIGHS
+    }
+
+    #[inline(always)]
+    fn swar_eq(v: u64, byte: u64) -> u64 {
+        swar_less(v ^ (ONES * byte), 1)
+    }
+
+    /// No byte is whitespace/control (`<= 0x20`), `<`, `>` or DEL.
+    #[inline]
+    fn message_id_body_valid(body: &[u8]) -> bool {
+        let (words, rest) = body.as_chunks::<8>();
+        let mut bad = 0u64;
+        for word in words {
+            let v = u64::from_le_bytes(*word);
+            bad |= swar_less(v, 0x21) | swar_eq(v, 0x3c) | swar_eq(v, 0x3e) | swar_eq(v, 0x7f);
+        }
+        bad == 0
+            && rest
+                .iter()
+                .all(|&b| b > 0x20 && b != b'<' && b != b'>' && b != 0x7f)
+    }
+
+    #[inline]
+    fn sub_cow<'a>(value: &Cow<'a, [u8]>, start: usize, end: usize) -> Cow<'a, [u8]> {
+        match value {
+            Cow::Borrowed(bytes) => Cow::Borrowed(&bytes[start..end]),
+            Cow::Owned(bytes) => Cow::Owned(bytes[start..end].to_vec()),
+        }
+    }
+
+    #[derive(Default)]
+    struct SegRec<'a> {
+        is_arr: bool,
+        number: Val<'a>,
+        bytes: Val<'a>,
+        messageid: Val<'a>,
+    }
+
+    #[derive(Default)]
+    struct FileRec<'a> {
+        is_arr: bool,
+        key: Val<'a>,
+        totalparts: Val<'a>,
+        segments: Val<'a>,
+        segment_count: usize,
+    }
+
+    /// Order-independent single pass over files: segments are checked as they stream and the
+    /// file-level checks that PHP runs first are applied when the file closes. Because PHP stops
+    /// at the first defective file, the first file with any defect decides the rejection reason.
+    struct Assessor<'a> {
+        mode: u32,
+        status: Option<i64>,
+        keys: HashSet<Cow<'a, [u8]>, Seeded>,
+        ids: HashSet<Cow<'a, [u8]>, Seeded>,
+        numbers: Vec<i64>,
+        missing_parts: bool,
+        segment_defect: bool,
+        found: i64,
+        expected: i64,
+        files_found: i64,
+        completeness_ok: bool,
+        bytes: i64,
+        bytes_ok: bool,
+    }
+
+    impl<'a> Assessor<'a> {
+        fn new(mode: u32, status: Option<i64>) -> Self {
+            Self {
+                mode,
+                status,
+                keys: HashSet::with_hasher(Seeded::new()),
+                ids: HashSet::with_hasher(Seeded::new()),
+                numbers: Vec::new(),
+                missing_parts: false,
+                segment_defect: false,
+                found: 0,
+                expected: 0,
+                files_found: 0,
+                completeness_ok: true,
+                bytes: 0,
+                bytes_ok: true,
+            }
+        }
+
+        #[inline]
+        fn assessing(&self) -> bool {
+            self.mode & MODE_ASSESS != 0 && self.status.is_none()
+        }
+
+        /// Only assessment requested and already decided: the remaining input is irrelevant.
+        #[inline]
+        fn done(&self) -> bool {
+            self.mode & (MODE_COMPLETENESS | MODE_BYTES) == 0 && !self.assessing()
+        }
+
+        #[inline]
+        fn segment(&mut self, segment: SegRec<'a>) {
+            if self.mode & MODE_BYTES != 0 && self.bytes_ok && segment.is_arr {
+                match segment.bytes.int_cast() {
+                    Some(value) => match self.bytes.checked_add(value.max(0)) {
+                        Some(sum) => self.bytes = sum,
+                        None => self.bytes_ok = false,
+                    },
+                    None => self.bytes_ok = false,
+                }
+            }
+            if !self.assessing() || self.segment_defect {
+                return;
+            }
+            let valid = segment.is_arr
+                && matches!(segment.number, Val::Int(n) if n >= 1)
+                && matches!(segment.bytes, Val::Int(b) if b >= 1);
+            let Val::Str(id, _) = &segment.messageid else {
+                self.segment_defect = true;
+                return;
+            };
+            let trimmed = trimmed_message_id(id);
+            match (valid, trimmed) {
+                (true, Some((start, end))) => {
+                    if let Val::Int(number) = segment.number {
+                        self.numbers.push(number);
+                    }
+                    if !self.ids.insert(sub_cow(id, start, end)) {
+                        self.segment_defect = true;
+                    }
+                }
+                _ => self.segment_defect = true,
+            }
+        }
+
+        fn end_file(&mut self, file: FileRec<'a>) {
+            let segments_array = matches!(file.segments, Val::Arr(_));
+            let count = if segments_array {
+                file.segment_count as i64
+            } else {
+                0
+            };
+            if self.mode & MODE_COMPLETENESS != 0 && self.completeness_ok {
+                let total = if file.is_arr {
+                    file.totalparts.int_cast()
+                } else {
+                    Some(0)
+                };
+                match total.and_then(|t| self.expected.checked_add(count.max(t))) {
+                    Some(expected) => {
+                        self.expected = expected;
+                        self.found += count;
+                        self.files_found += i64::from(count > 0);
+                    }
+                    None => self.completeness_ok = false,
+                }
+            }
+            if self.mode & MODE_BYTES != 0 && (!file.is_arr || !segments_array) {
+                self.bytes_ok = false;
+            }
+            if self.assessing() {
+                self.status = self.file_status(file, count);
+            }
+            self.numbers.clear();
+            self.segment_defect = false;
+        }
+
+        fn file_status(&mut self, file: FileRec<'a>, count: i64) -> Option<i64> {
+            let key = match file.key {
+                Val::Str(key, _)
+                    if file.is_arr && !key.is_empty() && matches!(file.segments, Val::Arr(_)) =>
+                {
+                    key
+                }
+                _ => return Some(REJECT_FILE_IDENTITY),
+            };
+            if !self.keys.insert(key) {
+                return Some(REJECT_FILE_IDENTITY);
+            }
+            let Some(total) = file.totalparts.int_cast() else {
+                return Some(STATUS_FALLBACK);
+            };
+            if total < 1 || count > total {
+                return Some(REJECT_ARTICLE_COUNT);
+            }
+            self.missing_parts |= count < total;
+            if self.segment_defect || self.numbers.iter().any(|&n| n > total) {
+                return Some(REJECT_ARTICLE_REFERENCE);
+            }
+            self.numbers.sort_unstable();
+            if self.numbers.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Some(REJECT_ARTICLE_REFERENCE);
+            }
+            None
+        }
+
+        fn finish(&mut self, file_count: usize, expected_files: Option<i64>, out: &mut [i64; 8]) {
+            let file_count = file_count as i64;
+            if self.mode & MODE_ASSESS != 0 && self.status.is_none() {
+                self.status = Some(match expected_files {
+                    None => STATUS_FALLBACK,
+                    Some(expected) if expected.max(0) > file_count => STATUS_WAITING_FILES,
+                    Some(_) if self.missing_parts => STATUS_WAITING_ARTICLES,
+                    Some(_) => STATUS_READY,
+                });
+            }
+            let completeness_ok = self.completeness_ok && expected_files.is_some();
+            *out = [
+                self.status.unwrap_or(STATUS_FALLBACK),
+                self.found,
+                self.expected,
+                self.files_found,
+                expected_files.map_or(0, |expected| expected.max(file_count)),
+                self.bytes,
+                i64::from(self.mode & MODE_COMPLETENESS != 0 && completeness_ok),
+                i64::from(self.mode & MODE_BYTES != 0 && self.bytes_ok),
+            ];
+        }
+    }
+
+    // ---- serialize() walkers -----------------------------------------------------------------
+
+    fn assess_serialized<'a>(
+        ser: &mut Ser<'a>,
+        assessor: &mut Assessor<'a>,
+    ) -> Option<Option<usize>> {
+        let Tok::Arr(file_count) = ser.value()? else {
+            return None;
+        };
+        if file_count == 0 && assessor.assessing() {
+            assessor.status = Some(REJECT_NO_FILES);
+        }
+        for _ in 0..file_count {
+            if assessor.done() {
+                return Some(None);
+            }
+            ser.key()?;
+            let mut file = FileRec::default();
+            if let Tok::Arr(fields) = ser.value()? {
+                file.is_arr = true;
+                for _ in 0..fields {
+                    match ser.key()? {
+                        Key::Str(b"key") => file.key = ser.val(1)?,
+                        Key::Str(b"totalparts") => file.totalparts = ser.val(1)?,
+                        Key::Str(b"segments") => match ser.value()? {
+                            Tok::Arr(count) => {
+                                file.segments = Val::Arr(count > 0);
+                                file.segment_count = count;
+                                if assessor.assessing() {
+                                    assessor.ids.reserve(count);
+                                }
+                                for _ in 0..count {
+                                    ser.key()?;
+                                    let mut segment = SegRec::default();
+                                    if let Tok::Arr(entries) = ser.value()? {
+                                        segment.is_arr = true;
+                                        for _ in 0..entries {
+                                            match ser.key()? {
+                                                Key::Str(b"number") => {
+                                                    segment.number = ser.val(3)?
+                                                }
+                                                Key::Str(b"bytes") => segment.bytes = ser.val(3)?,
+                                                Key::Str(b"messageid") => {
+                                                    segment.messageid = ser.val(3)?
+                                                }
+                                                _ => {
+                                                    if let Tok::Arr(inner) = ser.value()? {
+                                                        ser.skip_entries(inner, 4)?;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        ser.close()?;
+                                    }
+                                    assessor.segment(segment);
+                                }
+                                ser.close()?;
+                            }
+                            Tok::Null => file.segments = Val::Null,
+                            _ => file.segments = Val::Float,
+                        },
+                        _ => {
+                            if let Tok::Arr(inner) = ser.value()? {
+                                ser.skip_entries(inner, 2)?;
+                            }
+                        }
+                    }
+                }
+                ser.close()?;
+            }
+            assessor.end_file(file);
+        }
+        ser.close()?;
+        (ser.p == ser.s.len()).then_some(Some(file_count))
+    }
+
+    #[inline]
+    unsafe fn input<'a>(data: *const u8, length: usize) -> Option<&'a [u8]> {
+        if data.is_null() || length == 0 || length > isize::MAX as usize {
+            return None;
+        }
+        Some(unsafe { slice::from_raw_parts(data, length) })
+    }
+
+    /// Assesses `serialize($manifest['files'])` for `CandidateHeaderInventory`.
+    ///
+    /// `out` receives eight `int64_t`: status (`0` ready, `1` waiting for files, `2` waiting for
+    /// articles, `10 + i` rejection reason `i`, `-1` PHP must assess), the four completeness
+    /// counts, bytes, and whether completeness and bytes were reproduced. Returns `0` on success
+    /// and `-1` when the input must be evaluated by PHP.
+    ///
+    /// # Safety
+    ///
+    /// `data` must be valid for `length` bytes and `out` for eight `int64_t` values.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_candidate_header_assess_packed(
+        data: *const u8,
+        length: usize,
+        conflict: i32,
+        expected_files: i64,
+        mode: u32,
+        out: *mut i64,
+    ) -> i32 {
+        let Some(data) = (unsafe { input(data, length) }) else {
+            return FALLBACK;
+        };
+        if out.is_null() {
+            return FALLBACK;
+        }
+        let mut assessor = Assessor::new(mode, (conflict != 0).then_some(REJECT_CONFLICT));
+        let mut ser = Ser { s: data, p: 0 };
+        let mut result = [0i64; 8];
+        match assess_serialized(&mut ser, &mut assessor) {
+            None => return FALLBACK,
+            Some(file_count) => {
+                assessor.finish(file_count.unwrap_or(0), Some(expected_files), &mut result)
+            }
+        }
+        unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, 8) };
+        0
+    }
+
+    /// A message-ID key stored in [`IdChunks`]; it dereferences into a boxed chunk that stays
+    /// alive (and unmoved) until the set is cleared.
+    #[derive(Clone, Copy)]
+    struct ChunkKey {
+        ptr: *const u8,
+        len: usize,
+    }
+
+    impl ChunkKey {
+        #[inline]
+        fn bytes(&self) -> &[u8] {
+            unsafe { slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+
+    impl PartialEq for ChunkKey {
+        #[inline]
+        fn eq(&self, other: &Self) -> bool {
+            self.bytes() == other.bytes()
+        }
+    }
+
+    impl Eq for ChunkKey {}
+
+    impl std::hash::Hash for ChunkKey {
+        #[inline]
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.bytes().hash(state);
+        }
+    }
+
+    /// Trimmed message IDs seen by the current `CandidateHeaderInventory` assessment on this
+    /// thread (PHP runs one assessment at a time per thread).
+    struct IdChunks {
+        keys: HashSet<ChunkKey, Seeded>,
+        chunks: Vec<Box<[u8]>>,
+    }
+
+    impl IdChunks {
+        fn clear(&mut self) {
+            // Keys first: they point into the chunks.
+            if self.keys.capacity() > 1 << 16 {
+                self.keys = HashSet::with_hasher(Seeded::new());
+            } else {
+                self.keys.clear();
+            }
+            self.chunks.clear();
+            self.chunks.shrink_to(64);
+        }
+
+        /// Validates one chunk in order; see [`nntmux_candidate_header_ids_feed`].
+        fn feed(&mut self, data: &[u8], expected: usize) -> i64 {
+            let chunk: Box<[u8]> = data.into();
+            self.keys.reserve(expected);
+            let base = chunk.as_ptr();
+            let bytes: &[u8] = &chunk;
+            let mut index = 0usize;
+            let mut start = 0usize;
+            let mut result = None;
+            loop {
+                let end =
+                    crate::find_nul(&bytes[start..]).map_or(bytes.len(), |offset| start + offset);
+                let id = &bytes[start..end];
+                match trimmed_message_id(id) {
+                    Some((from, to))
+                        if self.keys.insert(ChunkKey {
+                            ptr: unsafe { base.add(start + from) },
+                            len: to - from,
+                        }) => {}
+                    // NUL is itself invalid, so an ID containing NUL (which shifts the pieces) can
+                    // only turn a valid manifest invalid, never the reverse.
+                    _ => {
+                        result = Some(index.min(expected - 1) as i64);
+                        break;
+                    }
+                }
+                index += 1;
+                if end == bytes.len() {
+                    break;
+                }
+                start = end + 1;
+            }
+            self.chunks.push(chunk);
+            result.unwrap_or(if index == expected {
+                expected as i64
+            } else {
+                -1
+            })
+        }
+    }
+
+    thread_local! {
+        static ID_CHUNKS: std::cell::RefCell<IdChunks> = std::cell::RefCell::new(IdChunks {
+            keys: HashSet::with_hasher(Seeded::new()),
+            chunks: Vec::new(),
+        });
+    }
+
+    /// Starts a message-ID uniqueness scope for one assessment on the calling thread, reserving
+    /// room for `capacity` IDs (capped) so feeding never rehashes the set.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_candidate_header_ids_begin(capacity: usize) {
+        ID_CHUNKS.with(|cell| {
+            let mut chunks = cell.borrow_mut();
+            chunks.clear();
+            chunks.keys.reserve(capacity.min(1 << 22));
+        });
+    }
+
+    /// Validates the next `implode("\0", $messageIds)` chunk in order as
+    /// `CandidateHeaderInventory` does: `trim($id, '<>')` must match `/\A[^\s<>\x00-\x1f\x7f]+\z/D`
+    /// and be unique within the scope opened by [`nntmux_candidate_header_ids_begin`]. Returns
+    /// `count` when all are valid, an index below `count` when some ID is invalid or repeated
+    /// (exact unless an ID contains NUL), or `-1` when valid pieces do not number exactly `count`
+    /// and PHP must validate.
+    ///
+    /// # Safety
+    ///
+    /// `data` must be valid for `length` bytes (it may be null when `length` is zero).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_candidate_header_ids_feed(
+        data: *const u8,
+        length: usize,
+        count: i64,
+    ) -> i64 {
+        let Ok(expected) = usize::try_from(count) else {
+            return -1;
+        };
+        if expected == 0 {
+            return if length == 0 { 0 } else { -1 };
+        }
+        let data: &[u8] = if length == 0 {
+            &[]
+        } else if data.is_null() || length > isize::MAX as usize {
+            return -1;
+        } else {
+            unsafe { slice::from_raw_parts(data, length) }
+        };
+        ID_CHUNKS.with(|cell| cell.borrow_mut().feed(data, expected))
+    }
+
+    /// One-shot [`nntmux_candidate_header_ids_feed`] over a complete ID list.
+    ///
+    /// # Safety
+    ///
+    /// `data` must be valid for `length` bytes (it may be null when `length` is zero).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_candidate_header_message_ids(
+        data: *const u8,
+        length: usize,
+        count: i64,
+    ) -> i64 {
+        nntmux_candidate_header_ids_begin(usize::try_from(count).unwrap_or(0));
+        let result = unsafe { nntmux_candidate_header_ids_feed(data, length, count) };
+        nntmux_candidate_header_ids_begin(0);
+        result
+    }
+
+    // ---- json_decode($json, true) walker ---------------------------------------------------
+
+    struct Json<'a> {
+        s: &'a [u8],
+        p: usize,
+    }
+
+    enum JTok<'a> {
+        Null,
+        Bool(bool),
+        Int(i64),
+        Float,
+        Str(Cow<'a, [u8]>),
+        Arr,
+        Obj,
+    }
+
+    impl<'a> Json<'a> {
+        #[inline]
+        fn ws(&mut self) {
+            while let Some(b' ' | b'\t' | b'\n' | b'\r') = self.s.get(self.p) {
+                self.p += 1;
+            }
+        }
+
+        #[inline]
+        fn peek(&mut self) -> Option<u8> {
+            self.ws();
+            self.s.get(self.p).copied()
+        }
+
+        #[inline]
+        fn eat(&mut self, wanted: u8) -> bool {
+            if self.peek() == Some(wanted) {
+                self.p += 1;
+                true
+            } else {
+                false
+            }
+        }
+
+        fn hex4(&mut self) -> Option<u32> {
+            let digits = self.s.get(self.p..self.p + 4)?;
+            let mut value = 0u32;
+            for &digit in digits {
+                value = value * 16 + (digit as char).to_digit(16)?;
+            }
+            self.p += 4;
+            Some(value)
+        }
+
+        /// A string after its opening quote, validated like PHP's scanner (UTF-8, UTF-16 pairs).
+        fn string(&mut self) -> Option<Cow<'a, [u8]>> {
+            let start = self.p;
+            let mut owned: Option<Vec<u8>> = None;
+            let mut run = start;
+            loop {
+                let byte = *self.s.get(self.p)?;
+                match byte {
+                    b'"' => {
+                        let tail = &self.s[run..self.p];
+                        std::str::from_utf8(tail).ok()?;
+                        self.p += 1;
+                        return Some(match owned {
+                            None => Cow::Borrowed(tail),
+                            Some(mut buffer) => {
+                                buffer.extend_from_slice(tail);
+                                Cow::Owned(buffer)
+                            }
+                        });
+                    }
+                    b'\\' => {
+                        let chunk = &self.s[run..self.p];
+                        std::str::from_utf8(chunk).ok()?;
+                        let buffer = owned.get_or_insert_with(Vec::new);
+                        buffer.extend_from_slice(chunk);
+                        self.p += 1;
+                        let escape = *self.s.get(self.p)?;
+                        self.p += 1;
+                        match escape {
+                            b'"' | b'\\' | b'/' => buffer.push(escape),
+                            b'b' => buffer.push(0x08),
+                            b'f' => buffer.push(0x0c),
+                            b'n' => buffer.push(b'\n'),
+                            b'r' => buffer.push(b'\r'),
+                            b't' => buffer.push(b'\t'),
+                            b'u' => {
+                                let mut code = self.hex4()?;
+                                if (0xD800..0xDC00).contains(&code) {
+                                    if self.s.get(self.p..self.p + 2)? != b"\\u" {
+                                        return None;
+                                    }
+                                    self.p += 2;
+                                    let low = self.hex4()?;
+                                    if !(0xDC00..0xE000).contains(&low) {
+                                        return None;
+                                    }
+                                    code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                                } else if (0xDC00..0xE000).contains(&code) {
+                                    return None;
+                                }
+                                let ch = char::from_u32(code)?;
+                                let mut utf8 = [0u8; 4];
+                                buffer.extend_from_slice(ch.encode_utf8(&mut utf8).as_bytes());
+                            }
+                            _ => return None,
+                        }
+                        run = self.p;
+                    }
+                    0x00..=0x1f => return None,
+                    _ => self.p += 1,
+                }
+            }
+        }
+
+        fn number(&mut self) -> Option<JTok<'a>> {
+            let start = self.p;
+            if self.s.get(self.p) == Some(&b'-') {
+                self.p += 1;
+            }
+            match self.s.get(self.p)? {
+                b'0' => self.p += 1,
+                b'1'..=b'9' => {
+                    while self.s.get(self.p).is_some_and(u8::is_ascii_digit) {
+                        self.p += 1;
+                    }
+                }
+                _ => return None,
+            }
+            let mut float = false;
+            if self.s.get(self.p) == Some(&b'.') {
+                float = true;
+                self.p += 1;
+                if !self.s.get(self.p).is_some_and(u8::is_ascii_digit) {
+                    return None;
+                }
+                while self.s.get(self.p).is_some_and(u8::is_ascii_digit) {
+                    self.p += 1;
+                }
+            }
+            if let Some(b'e' | b'E') = self.s.get(self.p) {
+                float = true;
+                self.p += 1;
+                if let Some(b'+' | b'-') = self.s.get(self.p) {
+                    self.p += 1;
+                }
+                if !self.s.get(self.p).is_some_and(u8::is_ascii_digit) {
+                    return None;
+                }
+                while self.s.get(self.p).is_some_and(u8::is_ascii_digit) {
+                    self.p += 1;
+                }
+            }
+            if float {
+                return Some(JTok::Float);
+            }
+            // json_decode turns integers outside the PHP int range into floats.
+            let text = std::str::from_utf8(&self.s[start..self.p]).ok()?;
+            Some(text.parse::<i64>().map_or(JTok::Float, JTok::Int))
+        }
+
+        fn literal(&mut self, word: &[u8]) -> Option<()> {
+            (self.s.get(self.p..self.p + word.len())? == word).then(|| self.p += word.len())
+        }
+
+        /// One value; containers return with the reader after the opening bracket.
+        fn value(&mut self) -> Option<JTok<'a>> {
+            match self.peek()? {
+                b'{' => {
+                    self.p += 1;
+                    Some(JTok::Obj)
+                }
+                b'[' => {
+                    self.p += 1;
+                    Some(JTok::Arr)
+                }
+                b'"' => {
+                    self.p += 1;
+                    Some(JTok::Str(self.string()?))
+                }
+                b't' => self.literal(b"true").map(|()| JTok::Bool(true)),
+                b'f' => self.literal(b"false").map(|()| JTok::Bool(false)),
+                b'n' => self.literal(b"null").map(|()| JTok::Null),
+                _ => self.number(),
+            }
+        }
+
+        /// Advances to the next element: `Some(true)` if one follows, `Some(false)` at the end.
+        fn next(&mut self, close: u8, first: &mut bool) -> Option<bool> {
+            if *first {
+                *first = false;
+                if self.eat(close) {
+                    return Some(false);
+                }
+                return Some(true);
+            }
+            if self.eat(b',') {
+                return Some(true);
+            }
+            self.eat(close).then_some(false)
+        }
+
+        fn object_key(&mut self) -> Option<Cow<'a, [u8]>> {
+            if !self.eat(b'"') {
+                return None;
+            }
+            let key = self.string()?;
+            self.eat(b':').then_some(key)
+        }
+
+        /// Skips a container body; returns whether it had any element.
+        fn skip_container(&mut self, object: bool, depth: usize) -> Option<bool> {
+            if depth >= MAX_DEPTH {
+                return None;
+            }
+            let close = if object { b'}' } else { b']' };
+            let mut first = true;
+            let mut any = false;
+            while self.next(close, &mut first)? {
+                any = true;
+                if object {
+                    self.object_key()?;
+                }
+                self.skip_value_tok(depth)?;
+            }
+            Some(any)
+        }
+
+        fn skip_value_tok(&mut self, depth: usize) -> Option<()> {
+            match self.value()? {
+                JTok::Obj => self.skip_container(true, depth + 1).map(|_| ()),
+                JTok::Arr => self.skip_container(false, depth + 1).map(|_| ()),
+                _ => Some(()),
+            }
+        }
+
+        fn val(&mut self, depth: usize) -> Option<Val<'a>> {
+            Some(match self.value()? {
+                JTok::Null => Val::Null,
+                JTok::Bool(value) => Val::Bool(value),
+                JTok::Int(value) => Val::Int(value),
+                JTok::Float => Val::Float,
+                JTok::Str(body) => Val::Str(body, 0),
+                JTok::Arr => Val::Arr(self.skip_container(false, depth + 1)?),
+                JTok::Obj => Val::Arr(self.skip_container(true, depth + 1)?),
+            })
+        }
+    }
+
+    /// Fields of interest in one JSON object; a repeated field (PHP keeps the last) falls back.
+    fn json_fields<'a>(
+        json: &mut Json<'a>,
+        depth: usize,
+        mut field: impl FnMut(&mut Json<'a>, &[u8]) -> Option<bool>,
+    ) -> Option<()> {
+        let mut first = true;
+        while json.next(b'}', &mut first)? {
+            let key = json.object_key()?;
+            if !field(json, &key)? {
+                json.skip_value_tok(depth)?;
+            }
+        }
+        Some(())
+    }
+
+    fn assess_json_files<'a>(json: &mut Json<'a>, assessor: &mut Assessor<'a>) -> Option<usize> {
+        let mut file_count = 0;
+        let mut first = true;
+        while json.next(b']', &mut first)? {
+            file_count += 1;
+            let mut file = FileRec::default();
+            match json.value()? {
+                JTok::Obj => {
+                    file.is_arr = true;
+                    let mut seen = [false; 3];
+                    json_fields(json, 2, |json, key| {
+                        let slot = match key {
+                            b"key" => 0,
+                            b"totalparts" => 1,
+                            b"segments" => 2,
+                            _ => return Some(false),
+                        };
+                        if std::mem::replace(&mut seen[slot], true) {
+                            return None;
+                        }
+                        match slot {
+                            0 => file.key = json.val(2)?,
+                            1 => file.totalparts = json.val(2)?,
+                            _ => match json.value()? {
+                                JTok::Arr => {
+                                    let mut count = 0;
+                                    let mut first_segment = true;
+                                    while json.next(b']', &mut first_segment)? {
+                                        count += 1;
+                                        let mut segment = SegRec::default();
+                                        match json.value()? {
+                                            JTok::Obj => {
+                                                segment.is_arr = true;
+                                                let mut seen = [false; 3];
+                                                json_fields(json, 4, |json, key| {
+                                                    let slot = match key {
+                                                        b"number" => 0,
+                                                        b"bytes" => 1,
+                                                        b"messageid" => 2,
+                                                        _ => return Some(false),
+                                                    };
+                                                    if std::mem::replace(&mut seen[slot], true) {
+                                                        return None;
+                                                    }
+                                                    let value = json.val(4)?;
+                                                    match slot {
+                                                        0 => segment.number = value,
+                                                        1 => segment.bytes = value,
+                                                        _ => segment.messageid = value,
+                                                    }
+                                                    Some(true)
+                                                })?;
+                                            }
+                                            JTok::Arr => {
+                                                segment.is_arr = true;
+                                                json.skip_container(false, 4)?;
+                                            }
+                                            _ => {}
+                                        }
+                                        assessor.segment(segment);
+                                    }
+                                    file.segments = Val::Arr(count > 0);
+                                    file.segment_count = count;
+                                }
+                                // A keyed segment map can collapse duplicate keys: PHP decides.
+                                JTok::Obj => {
+                                    if json.skip_container(true, 3)? {
+                                        return None;
+                                    }
+                                    file.segments = Val::Arr(false);
+                                }
+                                JTok::Null => file.segments = Val::Null,
+                                _ => file.segments = Val::Float,
+                            },
+                        }
+                        Some(true)
+                    })?;
+                }
+                JTok::Arr => {
+                    file.is_arr = true;
+                    json.skip_container(false, 2)?;
+                }
+                _ => {}
+            }
+            assessor.end_file(file);
+        }
+        Some(file_count)
+    }
+
+    /// Assesses a whole manifest JSON document exactly as
+    /// `CandidateHeaderInventory::assessment(json_decode($json, true))` (plus `completeness()` and
+    /// `bytes()`), writing the same eight values as the packed variant. Invalid JSON, non-object
+    /// documents, keyed file maps and repeated fields of interest return `-1`.
+    ///
+    /// # Safety
+    ///
+    /// `data` must be valid for `length` bytes and `out` for eight `int64_t` values.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_candidate_header_assess_json(
+        data: *const u8,
+        length: usize,
+        mode: u32,
+        out: *mut i64,
+    ) -> i32 {
+        let Some(data) = (unsafe { input(data, length) }) else {
+            return FALLBACK;
+        };
+        if out.is_null() {
+            return FALLBACK;
+        }
+        let mut json = Json { s: data, p: 0 };
+        // The whole document is walked: json_decode() rejects invalid input anywhere in it.
+        let mut assessor = Assessor::new(mode, None);
+        let mut conflict = false;
+        let mut expected = Val::Missing;
+        let mut files: Option<Option<usize>> = None;
+        let mut seen = [false; 3];
+        let parsed = (|| -> Option<()> {
+            if !matches!(json.value()?, JTok::Obj) {
+                return None;
+            }
+            json_fields(&mut json, 1, |json, key| {
+                let slot = match key {
+                    b"conflict" => 0,
+                    b"expected_files" => 1,
+                    b"files" => 2,
+                    _ => return Some(false),
+                };
+                if std::mem::replace(&mut seen[slot], true) {
+                    return None;
+                }
+                match slot {
+                    0 => conflict = matches!(json.val(1)?, Val::Bool(true)),
+                    1 => expected = json.val(1)?,
+                    _ => match json.value()? {
+                        JTok::Arr => files = Some(Some(assess_json_files(json, &mut assessor)?)),
+                        JTok::Obj => {
+                            if json.skip_container(true, 2)? {
+                                return None;
+                            }
+                            files = Some(Some(0));
+                        }
+                        _ => files = Some(None),
+                    },
+                }
+                Some(true)
+            })?;
+            json.ws();
+            (json.p == json.s.len()).then_some(())
+        })();
+        if parsed.is_none() {
+            return FALLBACK;
+        }
+        let mut result = [0i64; 8];
+        let file_count = files.flatten().unwrap_or(0);
+        if files.flatten().is_none() {
+            // bytes() iterates a missing or scalar `files` with warnings, and completeness()
+            // counts a scalar one; only a missing inventory counts as empty there.
+            assessor.bytes_ok = false;
+            if files.is_some() {
+                assessor.completeness_ok = false;
+            }
+        }
+        let status = if conflict {
+            Some(REJECT_CONFLICT)
+        } else if file_count == 0 {
+            Some(REJECT_NO_FILES)
+        } else {
+            assessor.status
+        };
+        assessor.status = status;
+        assessor.finish(file_count, expected.int_cast(), &mut result);
+        if mode & MODE_ASSESS == 0 {
+            result[0] = STATUS_FALLBACK;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, 8) };
+        0
+    }
+
+    // ---- SpotCheckPlanner::select ------------------------------------------------------------
+
+    struct Candidate<'a> {
+        number: i64,
+        bytes: i64,
+        messageid: &'a [u8],
+        offset: usize,
+        rank: [u8; 32],
+        terminal_rank: u8,
+        index: usize,
+    }
+
+    struct PlanFile<'a> {
+        key: &'a [u8],
+        key_offset: usize,
+        first_seen: usize,
+        totalparts: i64,
+        inferred: bool,
+        candidates: Vec<Candidate<'a>>,
+        rank: [u8; 32],
+    }
+
+    #[inline]
+    fn eligible_int(value: &Val<'_>) -> Option<Option<i64>> {
+        match value {
+            Val::Int(value) => Some(Some(*value)),
+            // is_numeric() plus (int) on strings and floats stays in PHP.
+            Val::Float | Val::Str(..) => None,
+            _ => Some(None),
+        }
+    }
+
+    fn collect_plan_files<'a>(ser: &mut Ser<'a>, article_limit: i64) -> Option<Vec<PlanFile<'a>>> {
+        let Tok::Arr(file_count) = ser.value()? else {
+            return None;
+        };
+        let mut files: Vec<PlanFile<'a>> = Vec::new();
+        let mut by_key: HashMap<&'a [u8], usize, Seeded> = HashMap::with_hasher(Seeded::new());
+        for _ in 0..file_count {
+            ser.key()?;
+            let Tok::Arr(fields) = ser.value()? else {
+                continue;
+            };
+            let mut key: Option<(&'a [u8], usize)> = None;
+            let mut totalparts = Val::Missing;
+            let mut inferred = false;
+            let mut segments_array = false;
+            let mut candidates: Vec<Candidate<'a>> = Vec::new();
+            for _ in 0..fields {
+                match ser.key()? {
+                    Key::Str(b"key") => {
+                        key = match ser.val(1)? {
+                            Val::Str(Cow::Borrowed(body), offset) => Some((body, offset)),
+                            _ => None,
+                        }
+                    }
+                    Key::Str(b"totalparts") => totalparts = ser.val(1)?,
+                    Key::Str(b"totalparts_inferred") => {
+                        inferred = matches!(ser.val(1)?, Val::Bool(true))
+                    }
+                    Key::Str(b"segments") => match ser.value()? {
+                        Tok::Arr(count) => {
+                            segments_array = true;
+                            for _ in 0..count {
+                                ser.key()?;
+                                let Tok::Arr(entries) = ser.value()? else {
+                                    continue;
+                                };
+                                let (mut number, mut bytes) = (Val::Missing, Val::Missing);
+                                let mut messageid: Option<(&'a [u8], usize)> = None;
+                                for _ in 0..entries {
+                                    match ser.key()? {
+                                        Key::Str(b"number") => number = ser.val(3)?,
+                                        Key::Str(b"bytes") => bytes = ser.val(3)?,
+                                        Key::Str(b"messageid") => {
+                                            messageid = match ser.val(3)? {
+                                                Val::Str(Cow::Borrowed(body), offset)
+                                                    if !body.is_empty() =>
+                                                {
+                                                    Some((body, offset))
+                                                }
+                                                _ => None,
+                                            }
+                                        }
+                                        _ => {
+                                            if let Tok::Arr(inner) = ser.value()? {
+                                                ser.skip_entries(inner, 4)?;
+                                            }
+                                        }
+                                    }
+                                }
+                                ser.close()?;
+                                let Some((messageid, offset)) = messageid else {
+                                    continue;
+                                };
+                                let (Some(number), Some(bytes)) =
+                                    (eligible_int(&number)?, eligible_int(&bytes)?)
+                                else {
+                                    continue;
+                                };
+                                if number < 1 || bytes < 1 || bytes > article_limit {
+                                    continue;
+                                }
+                                candidates.push(Candidate {
+                                    number,
+                                    bytes,
+                                    messageid,
+                                    offset,
+                                    rank: [0; 32],
+                                    terminal_rank: 0,
+                                    index: candidates.len(),
+                                });
+                            }
+                            ser.close()?;
+                        }
+                        _ => segments_array = false,
+                    },
+                    _ => {
+                        if let Tok::Arr(inner) = ser.value()? {
+                            ser.skip_entries(inner, 2)?;
+                        }
+                    }
+                }
+            }
+            ser.close()?;
+            let Some((key, key_offset)) = key else {
+                continue;
+            };
+            if !segments_array || candidates.is_empty() {
+                continue;
+            }
+            let totalparts = totalparts.int_cast()?.max(0);
+            let file = PlanFile {
+                key,
+                key_offset,
+                first_seen: files.len(),
+                totalparts,
+                inferred,
+                candidates,
+                rank: [0; 32],
+            };
+            // `$files[$file['key']] = $segments` keeps the last file under its first position.
+            match by_key.get(key) {
+                Some(&slot) => {
+                    let first_seen = files[slot].first_seen;
+                    files[slot] = PlanFile { first_seen, ..file };
+                }
+                None => {
+                    by_key.insert(key, files.len());
+                    files.push(file);
+                }
+            }
+        }
+        ser.close()?;
+        (ser.p == ser.s.len()).then_some(files)
+    }
+
+    #[inline]
+    fn identity_rank(prefix: &mut Vec<u8>, base: usize, value: &[u8]) -> [u8; 32] {
+        prefix.truncate(base);
+        prefix.extend_from_slice(value);
+        sha256(prefix)
+    }
+
+    /// Returns the selected rows or `None` when PHP must plan.
+    fn plan<'a>(
+        files: &mut [PlanFile<'a>],
+        identity: &[u8],
+        maximum_articles: i64,
+        maximum_header_bytes: i64,
+    ) -> Option<Vec<(usize, usize)>> {
+        let mut prefix = Vec::with_capacity(identity.len() + 128);
+        prefix.extend_from_slice(identity);
+        prefix.push(0);
+        let base = prefix.len();
+        let keep = usize::try_from(maximum_articles).unwrap_or(usize::MAX);
+        let mut numeric_files = 0;
+        for file in files.iter_mut() {
+            let mut numeric = 0;
+            for candidate in &mut file.candidates {
+                candidate.rank = identity_rank(&mut prefix, base, candidate.messageid);
+                numeric += usize::from(php_numeric_hex(&candidate.rank));
+                candidate.terminal_rank =
+                    u8::from(file.inferred && candidate.number != file.totalparts);
+            }
+            // Two numeric digests compare numerically in PHP, breaking string order transitivity.
+            if numeric > 1 {
+                return None;
+            }
+            let order = |a: &Candidate<'_>, b: &Candidate<'_>| -> Ordering {
+                a.terminal_rank
+                    .cmp(&b.terminal_rank)
+                    .then_with(|| a.rank.cmp(&b.rank))
+                    .then_with(|| a.index.cmp(&b.index))
+            };
+            if file.candidates.len() > keep {
+                file.candidates.select_nth_unstable_by(keep - 1, order);
+                file.candidates.truncate(keep);
+            }
+            file.candidates.sort_unstable_by(order);
+            file.rank = identity_rank(&mut prefix, base, file.key);
+            numeric_files += usize::from(php_numeric_hex(&file.rank));
+        }
+        if numeric_files > 1 {
+            return None;
+        }
+        let mut order: Vec<usize> = (0..files.len()).collect();
+        order.sort_unstable_by(|&a, &b| {
+            let (a, b) = (&files[a], &files[b]);
+            b.inferred
+                .cmp(&a.inferred)
+                .then_with(|| a.rank.cmp(&b.rank))
+                .then_with(|| a.first_seen.cmp(&b.first_seen))
+        });
+
+        let mut selected: Vec<(usize, usize)> = Vec::new();
+        let mut seen: HashSet<&[u8], Seeded> = HashSet::with_hasher(Seeded::new());
+        let mut used: i64 = 0;
+        let mut round = 0;
+        while (selected.len() as i64) < maximum_articles {
+            let mut added = false;
+            for &slot in &order {
+                let Some(candidate) = files[slot].candidates.get(round) else {
+                    continue;
+                };
+                if seen.contains(candidate.messageid) {
+                    continue;
+                }
+                let next_used = used.checked_add(candidate.bytes)?;
+                if next_used > maximum_header_bytes {
+                    continue;
+                }
+                selected.push((slot, round));
+                seen.insert(candidate.messageid);
+                used = next_used;
+                added = true;
+                if selected.len() as i64 >= maximum_articles {
+                    break;
+                }
+            }
+            if !added {
+                break;
+            }
+            round += 1;
+        }
+        Some(selected)
+    }
+
+    /// Plans `SpotCheckPlanner::select()` over `serialize($manifest['files'])`.
+    ///
+    /// Each selected article is written as eight native-endian `int64_t`: key offset, key length,
+    /// totalparts, totalparts_inferred, number, message-ID offset, message-ID length and bytes
+    /// (offsets index `data`). Returns the bytes written, `-1` when PHP must plan, or the negated
+    /// required capacity when `out_cap` is too small.
+    ///
+    /// # Safety
+    ///
+    /// `data` must be valid for `length` bytes, `identity` for `identity_length` bytes and
+    /// `out_buf` for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_spot_check_plan_packed(
+        data: *const u8,
+        length: usize,
+        identity: *const u8,
+        identity_length: usize,
+        maximum_articles: i64,
+        maximum_header_bytes: i64,
+        article_limit: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if maximum_articles < 1 || maximum_header_bytes < 1 {
+            return 0;
+        }
+        let Some(data) = (unsafe { input(data, length) }) else {
+            return FALLBACK as isize;
+        };
+        let identity: &[u8] = if identity_length == 0 {
+            &[]
+        } else if identity.is_null() {
+            return FALLBACK as isize;
+        } else {
+            unsafe { slice::from_raw_parts(identity, identity_length) }
+        };
+        let mut ser = Ser { s: data, p: 0 };
+        let Some(mut files) = collect_plan_files(&mut ser, article_limit) else {
+            return FALLBACK as isize;
+        };
+        if files.is_empty() {
+            return 0;
+        }
+        let Some(selected) = plan(&mut files, identity, maximum_articles, maximum_header_bytes)
+        else {
+            return FALLBACK as isize;
+        };
+        let needed = selected.len() * 64;
+        if needed == 0 {
+            return 0;
+        }
+        if out_buf.is_null() || out_cap < needed {
+            return -(needed as isize);
+        }
+        let out = unsafe { slice::from_raw_parts_mut(out_buf, needed) };
+        for ((slot, round), row) in selected
+            .into_iter()
+            .zip(out.as_chunks_mut::<64>().0.iter_mut())
+        {
+            let file = &files[slot];
+            let candidate = &file.candidates[round];
+            let values = [
+                file.key_offset as i64,
+                file.key.len() as i64,
+                file.totalparts,
+                i64::from(file.inferred),
+                candidate.number,
+                candidate.offset as i64,
+                candidate.messageid.len() as i64,
+                candidate.bytes,
+            ];
+            for (cell, value) in row.as_chunks_mut::<8>().0.iter_mut().zip(values) {
+                *cell = value.to_ne_bytes();
+            }
+        }
+        needed as isize
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn hex(digest: &[u8; 32]) -> String {
+            digest.iter().map(|b| format!("{b:02x}")).collect()
+        }
+
+        #[test]
+        fn sha256_matches_vectors_and_portable_implementation() {
+            assert_eq!(
+                hex(&sha256(b"")),
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            );
+            assert_eq!(
+                hex(&sha256(b"abc")),
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            );
+            let data: Vec<u8> = (0..1000u32).map(|i| (i * 7 + 3) as u8).collect();
+            for len in 0..data.len() {
+                assert_eq!(
+                    sha256(&data[..len]),
+                    sha256_with(compress_soft_entry, &data[..len])
+                );
+            }
+            if let Some(fast) = accelerated() {
+                for len in [0, 55, 56, 63, 64, 65, 119, 120, 128, 999] {
+                    assert_eq!(
+                        sha256_with(fast, &data[..len]),
+                        sha256_with(compress_soft_entry, &data[..len])
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn numeric_hex_detection_matches_php_numeric_strings() {
+            let mut digest = [0x12u8; 32];
+            assert!(php_numeric_hex(&digest));
+            digest[5] = 0x1e;
+            assert!(php_numeric_hex(&digest));
+            digest[6] = 0xe1;
+            assert!(!php_numeric_hex(&digest));
+            let mut leading = [0x11u8; 32];
+            leading[0] = 0xe1;
+            assert!(!php_numeric_hex(&leading));
+            let mut trailing = [0x11u8; 32];
+            trailing[31] = 0x1e;
+            assert!(!php_numeric_hex(&trailing));
+            assert!(!php_numeric_hex(&[0xabu8; 32]));
+        }
+
+        fn assess_packed(data: &[u8], conflict: i32, expected: i64, mode: u32) -> Option<[i64; 8]> {
+            let mut out = [0i64; 8];
+            let rc = unsafe {
+                nntmux_candidate_header_assess_packed(
+                    data.as_ptr(),
+                    data.len(),
+                    conflict,
+                    expected,
+                    mode,
+                    out.as_mut_ptr(),
+                )
+            };
+            (rc == 0).then_some(out)
+        }
+
+        fn assess_json(data: &[u8], mode: u32) -> Option<[i64; 8]> {
+            let mut out = [0i64; 8];
+            let rc = unsafe {
+                nntmux_candidate_header_assess_json(
+                    data.as_ptr(),
+                    data.len(),
+                    mode,
+                    out.as_mut_ptr(),
+                )
+            };
+            (rc == 0).then_some(out)
+        }
+
+        const ALL: u32 = MODE_ASSESS | MODE_COMPLETENESS | MODE_BYTES;
+
+        #[test]
+        fn packed_assessment_reports_status_completeness_and_bytes() {
+            let ready = br#"a:1:{i:0;a:3:{s:3:"key";s:5:"movie";s:10:"totalparts";i:1;s:8:"segments";a:1:{i:0;a:3:{s:6:"number";i:1;s:9:"messageid";s:11:"<a@article>";s:5:"bytes";i:5;}}}}"#;
+            assert_eq!(
+                assess_packed(ready, 0, 1, ALL),
+                Some([0, 1, 1, 1, 1, 5, 1, 1])
+            );
+            assert_eq!(
+                assess_packed(ready, 0, 2, ALL),
+                Some([1, 1, 1, 1, 2, 5, 1, 1])
+            );
+            assert_eq!(
+                assess_packed(ready, 1, 1, MODE_ASSESS).map(|o| o[0]),
+                Some(REJECT_CONFLICT)
+            );
+            let missing = br#"a:1:{i:0;a:3:{s:3:"key";s:5:"movie";s:10:"totalparts";i:3;s:8:"segments";a:1:{i:0;a:3:{s:6:"number";i:1;s:9:"messageid";s:9:"a@article";s:5:"bytes";i:5;}}}}"#;
+            assert_eq!(
+                assess_packed(missing, 0, 1, ALL),
+                Some([2, 1, 3, 1, 1, 5, 1, 1])
+            );
+            let bad_id = br#"a:1:{i:0;a:3:{s:3:"key";s:5:"movie";s:10:"totalparts";i:1;s:8:"segments";a:1:{i:0;a:3:{s:6:"number";i:1;s:9:"messageid";s:5:"a b@c";s:5:"bytes";i:5;}}}}"#;
+            assert_eq!(
+                assess_packed(bad_id, 0, 1, MODE_ASSESS).map(|o| o[0]),
+                Some(REJECT_ARTICLE_REFERENCE)
+            );
+            let float_total = br#"a:1:{i:0;a:3:{s:3:"key";s:5:"movie";s:10:"totalparts";d:1.5;s:8:"segments";a:0:{}}}"#;
+            assert_eq!(
+                assess_packed(float_total, 0, 1, MODE_ASSESS).map(|o| o[0]),
+                Some(STATUS_FALLBACK)
+            );
+            assert_eq!(
+                assess_packed(br#"a:1:{i:0;O:8:"stdClass":0:{}}"#, 0, 1, ALL),
+                None
+            );
+            assert_eq!(
+                assess_packed(b"a:0:{}", 0, 0, MODE_ASSESS).map(|o| o[0]),
+                Some(REJECT_NO_FILES)
+            );
+        }
+
+        #[test]
+        fn json_assessment_matches_packed_and_rejects_ambiguous_documents() {
+            let doc = br#"{"expected_files":1,"files":[{"key":"movie","totalparts":1,"segments":[{"number":1,"messageid":"<a@article>","bytes":5}]}]}"#;
+            assert_eq!(assess_json(doc, ALL), Some([0, 1, 1, 1, 1, 5, 1, 1]));
+            let escaped = br#"{"expected_files":1,"files":[{"key":"movie","totalparts":1,"segments":[{"number":1,"messageid":"a@article","bytes":5}]}],"conflict":true}"#;
+            assert_eq!(
+                assess_json(escaped, MODE_ASSESS).map(|o| o[0]),
+                Some(REJECT_CONFLICT)
+            );
+            assert_eq!(
+                assess_json(br#"{"files":[],"files":[]}"#, MODE_ASSESS),
+                None
+            );
+            assert_eq!(
+                assess_json(br#"{"files":[{"key":"a","key":"b"}]}"#, MODE_ASSESS),
+                None
+            );
+            assert_eq!(assess_json(b"[1]", MODE_ASSESS), None);
+            assert_eq!(assess_json(b"{\"files\":[\"\xff\"]}", MODE_ASSESS), None);
+            assert_eq!(
+                assess_json(br#"{"files":{}}"#, MODE_ASSESS).map(|o| o[0]),
+                Some(REJECT_NO_FILES)
+            );
+        }
+
+        #[test]
+        fn message_id_validation_reports_the_first_invalid_or_repeated_id() {
+            let check = |data: &[u8], count: i64| unsafe {
+                nntmux_candidate_header_message_ids(data.as_ptr(), data.len(), count)
+            };
+            assert_eq!(check(b"<a@b>\0c@d\0<<e@f>>", 3), 3);
+            assert_eq!(check(b"<a@b>\0a@b", 2), 1);
+            assert_eq!(check(b"a@b\0c d", 2), 1);
+            assert_eq!(check(b"<>\0c@d", 2), 0);
+            assert_eq!(check(b"a<b\0c@d", 2), 0);
+            assert_eq!(check(b"a\x7fb", 1), 0);
+            assert_eq!(check(b"a\xffb", 1), 1);
+            assert_eq!(check(b"a\0b\0c", 2), -1);
+            assert_eq!(check(b"", 0), 0);
+            assert_eq!(check(b"", 1), 0);
+            assert_eq!(check(b"a", -1), -1);
+
+            let feed = |data: &[u8], count: i64| unsafe {
+                nntmux_candidate_header_ids_feed(data.as_ptr(), data.len(), count)
+            };
+            nntmux_candidate_header_ids_begin(4);
+            assert_eq!(feed(b"<a@b>\0c@d", 2), 2);
+            assert_eq!(feed(b"e@f\0<c@d>", 2), 1);
+            nntmux_candidate_header_ids_begin(0);
+            assert_eq!(feed(b"e@f\0<c@d>", 2), 2);
+        }
+
+        #[test]
+        fn spot_check_plan_prefers_inferred_terminal_articles() {
+            let data = br#"a:1:{i:0;a:4:{s:3:"key";s:5:"probe";s:10:"totalparts";i:2;s:19:"totalparts_inferred";b:1;s:8:"segments";a:2:{i:0;a:3:{s:6:"number";i:1;s:9:"messageid";s:6:"normal";s:5:"bytes";i:2;}i:1;a:3:{s:6:"number";i:2;s:9:"messageid";s:8:"terminal";s:5:"bytes";i:2;}}}}"#;
+            let mut out = [0u8; 128];
+            let written = unsafe {
+                nntmux_spot_check_plan_packed(
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    1,
+                    2,
+                    2,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(written, 64);
+            let cell = |i: usize| i64::from_ne_bytes(out[i * 8..i * 8 + 8].try_into().unwrap());
+            let key = &data[cell(0) as usize..(cell(0) + cell(1)) as usize];
+            let id = &data[cell(5) as usize..(cell(5) + cell(6)) as usize];
+            assert_eq!(
+                (key, cell(2), cell(3), cell(4), id, cell(7)),
+                (&b"probe"[..], 2, 1, 2, &b"terminal"[..], 2)
+            );
+            let short = unsafe {
+                nntmux_spot_check_plan_packed(
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    2,
+                    4,
+                    2,
+                    out.as_mut_ptr(),
+                    64,
+                )
+            };
+            assert_eq!(short, -128);
+        }
+    }
+}
