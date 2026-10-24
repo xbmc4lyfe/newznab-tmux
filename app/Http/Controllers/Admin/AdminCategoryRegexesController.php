@@ -59,23 +59,14 @@ class AdminCategoryRegexesController extends BasePageController
             'status' => 1,
         ];
 
-        $error = '';
         $meta_title = $title = 'Category Regex';
+
+        $state = self::validateForm($action, $request->all());
+        $error = $state['error'];
 
         switch ($action) {
             case 'submit':
-                if (empty($request->input('group_regex'))) {
-                    $error = 'Group regex must not be empty!';
-                    break;
-                }
-
-                if (empty($request->input('regex'))) {
-                    $error = 'Regex cannot be empty';
-                    break;
-                }
-
-                if (! is_numeric($request->input('ordinal')) || $request->input('ordinal') < 0) {
-                    $error = 'Ordinal must be a number, 0 or higher.';
+                if ($error !== '') {
                     break;
                 }
 
@@ -91,7 +82,7 @@ class AdminCategoryRegexesController extends BasePageController
             default:
                 if ($request->has('id')) {
                     $meta_title = $title = 'Category Regex Edit';
-                    $id = filter_var($request->input('id'), FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+                    $id = $state['id'];
                     if ($id === false) {
                         abort(404);
                     }
@@ -111,13 +102,9 @@ class AdminCategoryRegexesController extends BasePageController
             ->orderBy('c.id')
             ->get();
 
-        $category_ids = [];
-        $category_names = [];
-        foreach ($categories_db as $category_db) {
-            $category_ids[] = $category_db->id;
-            /** @phpstan-ignore property.notFound */
-            $category_names[] = $category_db->parent_title.' '.$category_db->title.': '.$category_db->id;
-        }
+        $labels = self::categoryLabels($categories_db->map(static fn (Category $category): array => ['id' => $category->id, 'parent_title' => $category->getAttribute('parent_title'), 'title' => $category->title])->all());
+        $category_ids = $labels['category_ids'];
+        $category_names = $labels['category_names'];
 
         $this->viewData = array_merge($this->viewData, [
             'error' => $error,
@@ -131,5 +118,89 @@ class AdminCategoryRegexesController extends BasePageController
         ]);
 
         return view('admin.regexes.category-edit', $this->viewData);
+    }
+
+    // PHP stays the default until every paired common/p99 benchmark clears 1.5x.
+    private static ?bool $useRustFfi = null;
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    /** @param array<string, mixed> $input
+     * @return array<string, mixed>
+     */
+    public static function validateForm(string $action, array $input): array
+    {
+        return self::usesRustFfi() ? self::validateFormNative($action, $input) : self::validateFormPhp($action, $input);
+    }
+
+    /** @param array<string, mixed> $input
+     * @return array<string, mixed>
+     */
+    public static function validateFormPhp(string $action, array $input): array
+    {
+        $error = '';
+        $id = null;
+        if ($action === 'submit') {
+            if (empty($input['group_regex'])) {
+                $error = 'Group regex must not be empty!';
+            } elseif (empty($input['regex'])) {
+                $error = 'Regex cannot be empty';
+            } else {
+                if (! is_numeric($input['ordinal'] ?? null) || $input['ordinal'] < 0) {
+                    $error = 'Ordinal must be a number, 0 or higher.';
+                }
+            }
+        } elseif (array_key_exists('id', $input)) {
+            $id = filter_var($input['id'], FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        }
+
+        return ['error' => $error, 'input' => $input, 'id' => $id];
+    }
+
+    /** @param array<string, mixed> $input
+     * @return array<string, mixed>
+     */
+    public static function validateFormNative(string $action, array $input): array
+    {
+        return AdminBlacklistController::wave28Native(2, ['action' => $action, 'input' => $input]) ?? self::validateFormPhp($action, $input);
+    }
+
+    /** @param list<array<string, mixed>> $categories
+     * @return array{category_ids: list<mixed>, category_names: list<string>}
+     */
+    public static function categoryLabels(array $categories): array
+    {
+        return self::usesRustFfi() ? self::categoryLabelsNative($categories) : self::categoryLabelsPhp($categories);
+    }
+
+    /** @param list<array<string, mixed>> $categories
+     * @return array{category_ids: list<mixed>, category_names: list<string>}
+     */
+    public static function categoryLabelsPhp(array $categories): array
+    {
+        $ids = [];
+        $names = [];
+        foreach ($categories as $category) {
+            $ids[] = $category['id'];
+            $names[] = $category['parent_title'].' '.$category['title'].': '.$category['id'];
+        }
+
+        return ['category_ids' => $ids, 'category_names' => $names];
+    }
+
+    /** @param list<array<string, mixed>> $categories
+     * @return array{category_ids: list<mixed>, category_names: list<string>}
+     */
+    public static function categoryLabelsNative(array $categories): array
+    {
+        return AdminBlacklistController::wave28Native(3, ['categories' => $categories]) ?? self::categoryLabelsPhp($categories);
     }
 }
