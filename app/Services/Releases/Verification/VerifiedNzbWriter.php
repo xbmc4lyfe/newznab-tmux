@@ -9,12 +9,22 @@ use App\Services\Nzb\NzbService;
 use App\Services\Nzb\NzbSourceGuard;
 use App\Services\Nzb\NzbSourceInstallation;
 use App\Support\NzbPasswordMetadata;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\DB;
 use RuntimeException;
 use XMLWriter;
 
 final class VerifiedNzbWriter
 {
+    private const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_verified_nzb_document(const char *meta, size_t meta_len, size_t group_count, size_t password_count,
+            int64_t inventory, uint32_t flags, const char *files, size_t files_len, size_t file_count, size_t segment_count,
+            char *out_buf, size_t out_cap);
+        C;
+
+    private static bool $useRustFfi = true;
+
     public function __construct(private readonly NzbService $nzb) {}
 
     /** @param array<string, mixed> $manifest */
@@ -94,6 +104,102 @@ final class VerifiedNzbWriter
 
     /** @param array<string, mixed> $manifest */
     public function document(array $manifest): string
+    {
+        return $this->documentNative($manifest) ?? $this->documentPhp($manifest);
+    }
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    /**
+     * Rust rendering of documentPhp(): the manifest is packed into two NUL-delimited buffers (see
+     * nntmux_verified_nzb_document). Null when the library is unavailable or the input needs PHP's
+     * exact XMLWriter or error behavior (control bytes, invalid UTF-8, unexpected types, unparsable date).
+     *
+     * @param  array<string, mixed>  $manifest
+     */
+    public function documentNative(array $manifest): ?string
+    {
+        if (! self::$useRustFfi || ! is_array($files = $manifest['files'] ?? null)) {
+            return null;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('verified_nzb_document', self::FFI_CDEF);
+        if ($ffi === null) {
+            return null;
+        }
+        $packed = '';
+        $fileCount = 0;
+        $segmentCount = 0;
+        foreach ($files as $file) {
+            if (! is_array($file) || ! is_array($segments = $file['segments'] ?? null)) {
+                return null;
+            }
+            if ($segments === []) {
+                continue;
+            }
+            $count = count($segments);
+            $packed .= $file['subject'].' (1/'.$file['totalparts'].")\0".$count."\0";
+            foreach ($segments as $segment) {
+                if (! is_string($messageId = $segment['messageid'])) {
+                    return null;
+                }
+                $packed .= $segment['number']."\0".$segment['bytes']."\0".$messageId."\0";
+            }
+            $fileCount++;
+            $segmentCount += $count;
+        }
+        $inventory = max((int) ($manifest['expected_files'] ?? 0), (int) ($manifest['verified_file_count'] ?? 0), $fileCount);
+        $passwords = array_key_exists('passwords', $manifest) ? $manifest['passwords'] : [];
+        if (! NzbPasswordMetadata::isValid($passwords)) {
+            throw new RuntimeException('Invalid verified NZB password metadata.');
+        }
+        $meta = "\0\0";
+        $groupCount = 0;
+        if ($fileCount > 0) {
+            if (! is_string($manifest['date'] ?? null) || ($date = strtotime($manifest['date'])) === false || ! is_array($manifest['groups'] ?? null)) {
+                return null;
+            }
+            $meta = (string) $manifest['fromname']."\0".$date."\0";
+            foreach ($manifest['groups'] as $group) {
+                if (! is_string($group)) {
+                    return null;
+                }
+                $meta .= $group."\0";
+                $groupCount++;
+            }
+        }
+        if ($passwords !== []) {
+            $meta .= implode("\0", $passwords)."\0";
+        }
+        $flags = ($manifest['verification_mode'] ?? null) === 'spot_check' ? 1 : 0;
+        $metaLength = strlen($meta);
+        $packedLength = strlen($packed);
+        $capacity = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, $packedLength + $metaLength + 64 * $segmentCount
+            + $fileCount * (192 + $metaLength) + 512, $capacity);
+        if ($scratch === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_verified_nzb_document($meta, $metaLength, $groupCount, count($passwords), $inventory, $flags,
+            $packed, $packedLength, $fileCount, $segmentCount, $scratch, $capacity);
+        if (is_int($written) && $written < -1) {
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_verified_nzb_document($meta, $metaLength, $groupCount, count($passwords), $inventory, $flags,
+                $packed, $packedLength, $fileCount, $segmentCount, $scratch, $capacity);
+        }
+
+        return is_int($written) && $written > 0 ? FFI::string($scratch, $written) : null;
+    }
+
+    /** @param array<string, mixed> $manifest */
+    public function documentPhp(array $manifest): string
     {
         $xml = new XMLWriter;
         $xml->openMemory();
