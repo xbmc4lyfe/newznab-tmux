@@ -1,6 +1,6 @@
 //! Byte-exact IRC string helpers. State, timestamps and database writes remain in PHP.
 use crate::OutCursor;
-use std::slice;
+use std::{ffi::c_char, slice};
 
 fn ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 11 | 12)
@@ -676,9 +676,424 @@ pub unsafe extern "C" fn nntmux_irc_parse_bot_message(
     }
 }
 
+// WebSocket status codes: -1 incomplete, -2 reserved length bit, -3 over limit,
+// -4 insufficient output capacity, -5 invalid arguments. Encode returns -1 on
+// invalid arguments, otherwise the frame length (negative if capacity is short).
+const WS_MAX_FRAME_BYTES: u64 = 4 * 1024 * 1024;
+
+/// XOR directly into caller memory, handling arbitrary alignment and binary data.
+unsafe fn ws_mask(payload: &[u8], mask: [u8; 4], out: *mut u8) {
+    let word = u32::from_ne_bytes(mask) as u64;
+    let repeated = word | (word << 32);
+    let mut pos = 0;
+    while payload.len() - pos >= 8 {
+        unsafe {
+            let value = std::ptr::read_unaligned(payload.as_ptr().add(pos).cast::<u64>());
+            std::ptr::write_unaligned(out.add(pos).cast::<u64>(), value ^ repeated);
+        }
+        pos += 8;
+    }
+    while pos < payload.len() {
+        unsafe { *out.add(pos) = payload[pos] ^ mask[pos & 3] };
+        pos += 1;
+    }
+}
+
+/// Encode a FIN client frame, including its four-byte mask. No heap allocations.
+/// # Safety
+/// Readable inputs and writable output must not overlap and have the stated sizes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_ws_encode_frame(
+    opcode: u8,
+    payload: *const c_char,
+    payload_len: usize,
+    mask: *const c_char,
+    mask_len: usize,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if (payload.is_null() && payload_len != 0)
+        || mask.is_null()
+        || mask_len != 4
+        || (out_buf.is_null() && out_cap != 0)
+        || payload_len > isize::MAX as usize - 14
+        || out_cap > isize::MAX as usize
+    {
+        return -1;
+    }
+    let header = if payload_len < 126 {
+        2
+    } else if payload_len < 65536 {
+        4
+    } else {
+        10
+    };
+    let needed = header + 4 + payload_len;
+    if out_cap < needed || out_buf.is_null() {
+        return -(needed as isize);
+    }
+    let data = if payload_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(payload.cast::<u8>(), payload_len) }
+    };
+    let mask = unsafe { std::ptr::read_unaligned(mask.cast::<[u8; 4]>()) };
+    let out = out_buf.cast::<u8>();
+    unsafe {
+        *out = 0x80 | opcode;
+        *out.add(1) = 0x80
+            | if header == 2 {
+                payload_len as u8
+            } else if header == 4 {
+                126
+            } else {
+                127
+            };
+        if header == 4 {
+            std::ptr::copy_nonoverlapping(
+                (payload_len as u16).to_be_bytes().as_ptr(),
+                out.add(2),
+                2,
+            );
+        } else if header == 10 {
+            std::ptr::copy_nonoverlapping(
+                (payload_len as u64).to_be_bytes().as_ptr(),
+                out.add(2),
+                8,
+            );
+        }
+        std::ptr::copy_nonoverlapping(mask.as_ptr(), out.add(header), 4);
+        ws_mask(data, mask, out.add(header + 4));
+    }
+    needed as isize
+}
+
+/// Decode the first frame, copying only its payload. Success returns payload length
+/// (including zero). Metadata is five u32s: FIN, opcode, consumed, length low/high.
+/// Oversize errors also populate length low/high; errors never copy a payload.
+/// # Safety
+/// Input/output must not overlap, meta_out must hold five aligned u32s, and all
+/// buffers must be accessible for their stated sizes. Null output with zero cap is valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_ws_decode_frame(
+    bytes: *const c_char,
+    bytes_len: usize,
+    meta_out: *mut u32,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if (bytes.is_null() && bytes_len != 0)
+        || meta_out.is_null()
+        || (out_buf.is_null() && out_cap != 0)
+        || bytes_len > isize::MAX as usize
+    {
+        return -5;
+    }
+    if bytes_len < 2 {
+        return -1;
+    }
+    let data = unsafe { slice::from_raw_parts(bytes.cast::<u8>(), bytes_len) };
+    let mut offset = 2;
+    let length = match data[1] & 0x7f {
+        126 => {
+            if data.len() < 4 {
+                return -1;
+            }
+            offset = 4;
+            u16::from_be_bytes([data[2], data[3]]) as u64
+        }
+        127 => {
+            if data.len() < 10 {
+                return -1;
+            }
+            if data[2] & 0x80 != 0 {
+                return -2;
+            }
+            offset = 10;
+            u64::from_be_bytes(data[2..10].try_into().unwrap())
+        }
+        n => n as u64,
+    };
+    unsafe {
+        *meta_out.add(3) = length as u32;
+        *meta_out.add(4) = (length >> 32) as u32;
+    }
+    if length > WS_MAX_FRAME_BYTES {
+        return -3;
+    }
+    let length = length as usize;
+    let masked = data[1] & 0x80 != 0;
+    let mask_offset = offset;
+    if masked {
+        offset += 4;
+    }
+    if data.len() < offset || data.len() - offset < length {
+        return -1;
+    }
+    unsafe {
+        *meta_out = u32::from(data[0] & 0x80 != 0);
+        *meta_out.add(1) = (data[0] & 0x0f) as u32;
+        *meta_out.add(2) = (offset + length) as u32;
+    }
+    if out_cap < length || (out_buf.is_null() && length != 0) {
+        return -4;
+    }
+    if length != 0 {
+        let payload = &data[offset..offset + length];
+        unsafe {
+            if masked {
+                ws_mask(
+                    payload,
+                    data[mask_offset..mask_offset + 4].try_into().unwrap(),
+                    out_buf.cast::<u8>(),
+                );
+            } else {
+                std::ptr::copy_nonoverlapping(payload.as_ptr(), out_buf.cast::<u8>(), length);
+            }
+        }
+    }
+    length as isize
+}
+
+/// Scene announce fields: type\0title\0section\0reason\0files\0size.
+/// 0 means no match, -1 requests PHP fallback; other negative values are required
+/// capacity. Formats are 0 corruptnet, 1 zenet, 2 predatabase, 3 ngp, 4 rizon, 5 relay.
+/// # Safety
+/// Input readable and output writable for stated sizes, without overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_irc_pre_announce_parse(
+    line: *const c_char,
+    line_len: usize,
+    format: i32,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if (line.is_null() && line_len != 0)
+        || (out_buf.is_null() && out_cap != 0)
+        || line_len > isize::MAX as usize / 2
+        || out_cap > isize::MAX as usize
+    {
+        return -1;
+    }
+    unsafe {
+        crate::predb_feeds::nntmux_predb_parse_irc_announce(
+            line.cast(),
+            line_len,
+            format,
+            out_buf.cast(),
+            out_cap,
+        )
+    }
+}
+
+/// NUL-separated input with a required trailing NUL (including an empty last line).
+/// One newline-terminated record per line; empty means no match, '?' means PHP fallback.
+/// CR/LF inputs cannot match, so record delimiters cannot appear in accepted fields.
+/// # Safety
+/// Input readable and output writable for stated sizes, without overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_irc_pre_announce_parse_batch_nul(
+    lines: *const c_char,
+    lines_len: usize,
+    format: i32,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if (lines.is_null() && lines_len != 0)
+        || (out_buf.is_null() && out_cap != 0)
+        || lines_len > isize::MAX as usize / 2
+        || out_cap > isize::MAX as usize
+    {
+        return -1;
+    }
+    if lines_len != 0 && unsafe { *lines.add(lines_len - 1) } != 0 {
+        return -1;
+    }
+    unsafe {
+        crate::predb_feeds::nntmux_predb_parse_irc_announce_batch_nul(
+            lines.cast(),
+            lines_len,
+            format,
+            out_buf.cast(),
+            out_cap,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn websocket_swar_boundaries_and_capacity_guards() {
+        let mask = [0, 0x81, 0xfe, 0x7f];
+        for len in 0..260 {
+            let payload: Vec<u8> = (0..len).map(|i| (i * 73) as u8).collect();
+            let mut frame = vec![0xa5u8; len + 20];
+            let mut out = vec![0xa5u8; len + 2];
+            let mut meta = [0u32; 5];
+            unsafe {
+                let written = nntmux_ws_encode_frame(
+                    2,
+                    payload.as_ptr().cast(),
+                    len,
+                    mask.as_ptr().cast(),
+                    4,
+                    frame.as_mut_ptr().add(1).cast(),
+                    len + 14,
+                );
+                assert!(written > 0);
+                let frame_end = 1 + written as usize;
+                assert_eq!(frame[0], 0xa5);
+                assert!(frame[frame_end..].iter().all(|&b| b == 0xa5));
+                let header = if len < 126 { 2 } else { 4 };
+                for i in 0..len {
+                    assert_eq!(frame[1 + header + 4 + i], payload[i] ^ mask[i & 3]);
+                }
+                assert_eq!(
+                    nntmux_ws_decode_frame(
+                        frame.as_ptr().add(1).cast(),
+                        written as usize,
+                        meta.as_mut_ptr(),
+                        out.as_mut_ptr().add(1).cast(),
+                        len
+                    ),
+                    len as isize
+                );
+                assert_eq!(&out[1..1 + len], &payload);
+                assert_eq!(out[0], 0xa5);
+                assert_eq!(out[len + 1], 0xa5);
+                assert_eq!(meta, [1, 2, written as u32, len as u32, 0]);
+                for end in 0..written as usize {
+                    assert_eq!(
+                        nntmux_ws_decode_frame(
+                            frame.as_ptr().add(1).cast(),
+                            end,
+                            meta.as_mut_ptr(),
+                            out.as_mut_ptr().cast(),
+                            out.len()
+                        ),
+                        -1
+                    );
+                }
+                assert_eq!(
+                    nntmux_ws_encode_frame(
+                        2,
+                        payload.as_ptr().cast(),
+                        len,
+                        mask.as_ptr().cast(),
+                        4,
+                        std::ptr::null_mut(),
+                        0
+                    ),
+                    -written
+                );
+                if len != 0 {
+                    out.fill(0xa5);
+                    assert_eq!(
+                        nntmux_ws_decode_frame(
+                            frame.as_ptr().add(1).cast(),
+                            written as usize,
+                            meta.as_mut_ptr(),
+                            out.as_mut_ptr().cast(),
+                            len - 1
+                        ),
+                        -4
+                    );
+                    assert!(out.iter().all(|&b| b == 0xa5));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn websocket_invalid_arguments_and_length_errors() {
+        let mut meta = [0u32; 5];
+        unsafe {
+            assert_eq!(
+                nntmux_ws_decode_frame(
+                    std::ptr::null(),
+                    0,
+                    meta.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    0
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_ws_decode_frame(
+                    std::ptr::null(),
+                    1,
+                    meta.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    0
+                ),
+                -5
+            );
+            let mut frame: [u8; 10] = [0x81, 127, 0x80, 0, 0, 0, 0, 0, 0, 0];
+            assert_eq!(
+                nntmux_ws_decode_frame(
+                    frame.as_ptr().cast(),
+                    10,
+                    meta.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    0
+                ),
+                -2
+            );
+            frame[2] = 0;
+            frame[7] = 0x40;
+            frame[9] = 1;
+            assert_eq!(
+                nntmux_ws_decode_frame(
+                    frame.as_ptr().cast(),
+                    10,
+                    meta.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    0
+                ),
+                -3
+            );
+            assert_eq!(meta[3], 4194305);
+            frame[9] = 0;
+            assert_eq!(
+                nntmux_ws_decode_frame(
+                    frame.as_ptr().cast(),
+                    10,
+                    meta.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    0
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_irc_pre_announce_parse(std::ptr::null(), 1, 0, std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                nntmux_irc_pre_announce_parse_batch_nul(
+                    b"x".as_ptr().cast(),
+                    1,
+                    0,
+                    std::ptr::null_mut(),
+                    0
+                ),
+                -1
+            );
+            let mut out = [0u8; 8];
+            assert_eq!(
+                nntmux_irc_pre_announce_parse_batch_nul(
+                    b"\0\0".as_ptr().cast(),
+                    2,
+                    0,
+                    out.as_mut_ptr().cast(),
+                    8
+                ),
+                2
+            );
+            assert_eq!(&out[..2], b"\n\n");
+        }
+    }
+
     #[test]
     fn unaligned_search_and_small_copies_stay_within_bounds() {
         let mut input = [0u8; 128];
