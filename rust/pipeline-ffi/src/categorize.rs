@@ -16184,3 +16184,625 @@ pub mod admin_incident_content_requests {
     }
 }
 
+/// Wave 24 Slice 24.3: forum policy authorization and `Forumpost` creation/delete routing.
+///
+/// Every export returns `1` (granted/valid), `0` (denied/invalid input value) or
+/// `DECLINED` (`-1`) for invalid arguments, so PHP can fall back to its native path.
+/// `nntmux_forumpost_build_post_attributes` returns `-(POST_ATTRIBUTE_FIELDS as i32)` when
+/// `out_cap` is too small and leaves the output untouched.
+pub mod forum_policy_and_post {
+    use std::mem::size_of;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINED: i32 = -1;
+    /// `forumid`, `parentid`, `users_id`, `locked`, `sticky`, `replies`.
+    pub const POST_ATTRIBUTE_FIELDS: usize = 6;
+    const FORUM_ID: i64 = 1;
+
+    const ID_KIND_NULL: u8 = 0;
+    const ID_KIND_INT: u8 = 1;
+    const ID_KIND_STRING: u8 = 2;
+
+    const CATEGORY_ADMIN_ACTIONS: [&[u8]; 10] = [
+        b"manageThreads",
+        b"deleteThreads",
+        b"restoreThreads",
+        b"enableThreads",
+        b"moveThreadsFrom",
+        b"moveThreadsTo",
+        b"lockThreads",
+        b"pinThreads",
+        b"delete",
+        b"edit",
+    ];
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum IdRef<'a> {
+        Null,
+        Int(i64),
+        Str(&'a [u8]),
+    }
+
+    #[inline]
+    unsafe fn valid_bytes<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null() || len > isize::MAX as usize || (ptr as usize).checked_add(len).is_none() {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_slice<T>(ptr: *mut T, len: usize) -> bool {
+        if ptr.is_null() || !ptr.is_aligned() {
+            return false;
+        }
+        let Some(byte_len) = len.checked_mul(size_of::<T>()) else {
+            return false;
+        };
+        byte_len <= isize::MAX as usize && (ptr as usize).checked_add(byte_len).is_some()
+    }
+
+    #[inline]
+    fn flag(value: u8) -> Option<bool> {
+        match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn verdict(granted: bool) -> i32 {
+        if granted { 1 } else { 0 }
+    }
+
+    /// `kind`: 0 = PHP `null`, 1 = int (`int_val`), 2 = string (`str_ptr`/`str_len`).
+    /// The string pointer is only read for kind 2.
+    #[inline]
+    unsafe fn decode_id<'a>(
+        kind: u8,
+        int_val: i64,
+        str_ptr: *const u8,
+        str_len: usize,
+    ) -> Option<IdRef<'a>> {
+        match kind {
+            ID_KIND_NULL => Some(IdRef::Null),
+            ID_KIND_INT => Some(IdRef::Int(int_val)),
+            ID_KIND_STRING => unsafe { valid_bytes(str_ptr, str_len) }.map(IdRef::Str),
+            _ => None,
+        }
+    }
+
+    /// Mirrors `CategoryPolicy::evaluateCategoryPermissionPhp()`; unknown actions are denied.
+    pub fn category_permission(action: &[u8], is_user_instance: bool, is_admin: bool) -> bool {
+        if action == b"view" {
+            return is_user_instance;
+        }
+        if CATEGORY_ADMIN_ACTIONS.contains(&action) {
+            return is_admin;
+        }
+        false
+    }
+
+    /// Mirrors `ForumPolicy::evaluateForumAdminCapabilityPhp()`.
+    pub fn forum_admin_capability(has_user: bool, has_admin_role: bool) -> bool {
+        has_user && has_admin_role
+    }
+
+    /// Mirrors PHP `$isAdmin || ($isUserInstance && $userId === $authorId)`.
+    pub fn author_can_modify(
+        is_user_instance: bool,
+        is_admin: bool,
+        user_id: &IdRef<'_>,
+        author_id: &IdRef<'_>,
+    ) -> bool {
+        is_admin || (is_user_instance && user_id == author_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn can_modify_raw(
+        is_user_instance: u8,
+        is_admin: u8,
+        user_kind: u8,
+        user_int: i64,
+        user_ptr: *const u8,
+        user_len: usize,
+        author_kind: u8,
+        author_int: i64,
+        author_ptr: *const u8,
+        author_len: usize,
+    ) -> i32 {
+        let (Some(is_user_instance), Some(is_admin)) = (flag(is_user_instance), flag(is_admin))
+        else {
+            return DECLINED;
+        };
+        let Some(user_id) = (unsafe { decode_id(user_kind, user_int, user_ptr, user_len) }) else {
+            return DECLINED;
+        };
+        let Some(author_id) =
+            (unsafe { decode_id(author_kind, author_int, author_ptr, author_len) })
+        else {
+            return DECLINED;
+        };
+        verdict(author_can_modify(
+            is_user_instance,
+            is_admin,
+            &user_id,
+            &author_id,
+        ))
+    }
+
+    /// Backs `CategoryPolicy::evaluateCategoryPermissionNative()`.
+    ///
+    /// # Safety
+    ///
+    /// `action_ptr` must be non-null and readable for `action_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_category_policy_evaluate_permission(
+        action_ptr: *const u8,
+        action_len: usize,
+        is_user_instance: u8,
+        is_admin: u8,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let (Some(is_user_instance), Some(is_admin)) = (flag(is_user_instance), flag(is_admin))
+            else {
+                return DECLINED;
+            };
+            let Some(action) = (unsafe { valid_bytes(action_ptr, action_len) }) else {
+                return DECLINED;
+            };
+            verdict(category_permission(action, is_user_instance, is_admin))
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Backs `ForumPolicy::evaluateForumAdminCapabilityNative()`.
+    ///
+    /// # Safety
+    ///
+    /// Takes scalars only; always safe to call.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_forum_policy_evaluate_admin_capability(
+        has_user: u8,
+        has_admin_role: u8,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let (Some(has_user), Some(has_admin_role)) = (flag(has_user), flag(has_admin_role))
+            else {
+                return DECLINED;
+            };
+            verdict(forum_admin_capability(has_user, has_admin_role))
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Backs `PostPolicy::canModifyPostNative()`.
+    ///
+    /// # Safety
+    ///
+    /// For id kind 2, the matching string pointer must be non-null and readable for its length.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_post_policy_can_modify(
+        is_user_instance: u8,
+        is_admin: u8,
+        user_kind: u8,
+        user_int: i64,
+        user_ptr: *const u8,
+        user_len: usize,
+        author_kind: u8,
+        author_int: i64,
+        author_ptr: *const u8,
+        author_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| unsafe {
+            can_modify_raw(
+                is_user_instance,
+                is_admin,
+                user_kind,
+                user_int,
+                user_ptr,
+                user_len,
+                author_kind,
+                author_int,
+                author_ptr,
+                author_len,
+            )
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Backs `ThreadPolicy::canModifyThreadNative()`.
+    ///
+    /// # Safety
+    ///
+    /// For id kind 2, the matching string pointer must be non-null and readable for its length.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_thread_policy_can_modify(
+        is_user_instance: u8,
+        is_admin: u8,
+        user_kind: u8,
+        user_int: i64,
+        user_ptr: *const u8,
+        user_len: usize,
+        author_kind: u8,
+        author_int: i64,
+        author_ptr: *const u8,
+        author_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| unsafe {
+            can_modify_raw(
+                is_user_instance,
+                is_admin,
+                user_kind,
+                user_int,
+                user_ptr,
+                user_len,
+                author_kind,
+                author_int,
+                author_ptr,
+                author_len,
+            )
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Backs `Forumpost::validateAndBuildPostAttributesNative()`.
+    ///
+    /// Writes `[forumid, parentid, users_id, locked, sticky, replies]` and returns `1`, returns
+    /// `0` without writing for an empty message, and returns `-6` without writing when
+    /// `out_cap < POST_ATTRIBUTE_FIELDS`.
+    ///
+    /// # Safety
+    ///
+    /// `message_ptr` must be readable for `message_len` bytes and `out_fields` must be an
+    /// aligned, writable `int64_t` array of at least `out_cap` elements.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_forumpost_build_post_attributes(
+        parent_id: i64,
+        user_id: i64,
+        message_ptr: *const u8,
+        message_len: usize,
+        locked: i64,
+        sticky: i64,
+        replies: i64,
+        out_fields: *mut i64,
+        out_cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(message) = (unsafe { valid_bytes(message_ptr, message_len) }) else {
+                return DECLINED;
+            };
+            if !valid_out_slice(out_fields, out_cap) {
+                return DECLINED;
+            }
+            if out_cap < POST_ATTRIBUTE_FIELDS {
+                return -(POST_ATTRIBUTE_FIELDS as i32);
+            }
+            if message.is_empty() {
+                return 0;
+            }
+            let out = unsafe { slice::from_raw_parts_mut(out_fields, POST_ATTRIBUTE_FIELDS) };
+            out.copy_from_slice(&[FORUM_ID, parent_id, user_id, locked, sticky, replies]);
+            1
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Backs `Forumpost::isRootTopicPostNative()`.
+    ///
+    /// # Safety
+    ///
+    /// Takes a scalar only; always safe to call.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_forumpost_is_root_topic(parent_id: i64) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| verdict(parent_id == 0))).unwrap_or(DECLINED)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        unsafe fn category(action: &[u8], is_user: u8, is_admin: u8) -> i32 {
+            unsafe {
+                nntmux_category_policy_evaluate_permission(
+                    action.as_ptr(),
+                    action.len(),
+                    is_user,
+                    is_admin,
+                )
+            }
+        }
+
+        unsafe fn post(
+            is_user: u8,
+            is_admin: u8,
+            user: (u8, i64, &[u8]),
+            author: (u8, i64, &[u8]),
+        ) -> i32 {
+            unsafe {
+                nntmux_post_policy_can_modify(
+                    is_user,
+                    is_admin,
+                    user.0,
+                    user.1,
+                    user.2.as_ptr(),
+                    user.2.len(),
+                    author.0,
+                    author.1,
+                    author.2.as_ptr(),
+                    author.2.len(),
+                )
+            }
+        }
+
+        unsafe fn thread(
+            is_user: u8,
+            is_admin: u8,
+            user: (u8, i64, &[u8]),
+            author: (u8, i64, &[u8]),
+        ) -> i32 {
+            unsafe {
+                nntmux_thread_policy_can_modify(
+                    is_user,
+                    is_admin,
+                    user.0,
+                    user.1,
+                    user.2.as_ptr(),
+                    user.2.len(),
+                    author.0,
+                    author.1,
+                    author.2.as_ptr(),
+                    author.2.len(),
+                )
+            }
+        }
+
+        #[test]
+        fn category_permission_truth_table() {
+            for action in CATEGORY_ADMIN_ACTIONS {
+                assert_eq!(unsafe { category(action, 1, 1) }, 1);
+                assert_eq!(unsafe { category(action, 1, 0) }, 0);
+                assert_eq!(unsafe { category(action, 0, 0) }, 0);
+            }
+            assert_eq!(unsafe { category(b"view", 1, 0) }, 1);
+            assert_eq!(unsafe { category(b"view", 0, 1) }, 0);
+            assert_eq!(unsafe { category(b"View", 1, 1) }, 0);
+            assert_eq!(unsafe { category(b"view\0", 1, 1) }, 0);
+            assert_eq!(unsafe { category(b"createThreads", 1, 1) }, 0);
+            assert_eq!(unsafe { category(b"", 1, 1) }, 0);
+            assert_eq!(unsafe { category(b"edit", 2, 1) }, DECLINED);
+            assert_eq!(unsafe { category(b"edit", 1, 9) }, DECLINED);
+            assert_eq!(
+                unsafe { nntmux_category_policy_evaluate_permission(ptr::null(), 0, 1, 1) },
+                DECLINED
+            );
+        }
+
+        #[test]
+        fn forum_admin_capability_truth_table() {
+            assert_eq!(
+                unsafe { nntmux_forum_policy_evaluate_admin_capability(1, 1) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_forum_policy_evaluate_admin_capability(1, 0) },
+                0
+            );
+            assert_eq!(
+                unsafe { nntmux_forum_policy_evaluate_admin_capability(0, 1) },
+                0
+            );
+            assert_eq!(
+                unsafe { nntmux_forum_policy_evaluate_admin_capability(0, 0) },
+                0
+            );
+            assert_eq!(
+                unsafe { nntmux_forum_policy_evaluate_admin_capability(2, 1) },
+                DECLINED
+            );
+        }
+
+        #[test]
+        fn author_modify_uses_php_strict_identity() {
+            let none: &[u8] = b"";
+            for f in [post, thread] {
+                assert_eq!(unsafe { f(0, 1, (0, 0, none), (1, 7, none)) }, 1);
+                assert_eq!(unsafe { f(1, 0, (1, 7, none), (1, 7, none)) }, 1);
+                assert_eq!(unsafe { f(1, 0, (1, 7, none), (1, 8, none)) }, 0);
+                assert_eq!(unsafe { f(1, 0, (1, 7, none), (2, 0, b"7")) }, 0);
+                assert_eq!(unsafe { f(1, 0, (2, 0, b"7"), (2, 0, b"7")) }, 1);
+                assert_eq!(unsafe { f(1, 0, (2, 0, b"7"), (2, 0, b"07")) }, 0);
+                assert_eq!(unsafe { f(1, 0, (0, 0, none), (0, 0, none)) }, 1);
+                assert_eq!(unsafe { f(0, 0, (0, 0, none), (0, 0, none)) }, 0);
+                assert_eq!(unsafe { f(1, 0, (0, 0, none), (1, 0, none)) }, 0);
+                assert_eq!(unsafe { f(1, 0, (3, 0, none), (1, 0, none)) }, DECLINED);
+                assert_eq!(unsafe { f(1, 2, (1, 0, none), (1, 0, none)) }, DECLINED);
+            }
+            assert_eq!(
+                unsafe {
+                    nntmux_post_policy_can_modify(1, 0, 2, 0, ptr::null(), 0, 1, 1, ptr::null(), 0)
+                },
+                DECLINED
+            );
+            // Non-string kinds never read the string pointer.
+            assert_eq!(
+                unsafe {
+                    nntmux_thread_policy_can_modify(
+                        1,
+                        0,
+                        1,
+                        5,
+                        ptr::null(),
+                        0,
+                        1,
+                        5,
+                        ptr::null(),
+                        0,
+                    )
+                },
+                1
+            );
+        }
+
+        #[test]
+        fn forumpost_build_attributes_and_root_topic() {
+            let mut out = [i64::MIN; POST_ATTRIBUTE_FIELDS];
+            let msg = b"hello";
+            let rc = unsafe {
+                nntmux_forumpost_build_post_attributes(
+                    4,
+                    9,
+                    msg.as_ptr(),
+                    msg.len(),
+                    1,
+                    0,
+                    3,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(rc, 1);
+            assert_eq!(out, [1, 4, 9, 1, 0, 3]);
+
+            let mut untouched = [i64::MIN; POST_ATTRIBUTE_FIELDS];
+            let rc = unsafe {
+                nntmux_forumpost_build_post_attributes(
+                    4,
+                    9,
+                    b"".as_ptr(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    untouched.as_mut_ptr(),
+                    untouched.len(),
+                )
+            };
+            assert_eq!(rc, 0);
+            assert_eq!(untouched, [i64::MIN; POST_ATTRIBUTE_FIELDS]);
+
+            assert_eq!(unsafe { nntmux_forumpost_is_root_topic(0) }, 1);
+            assert_eq!(unsafe { nntmux_forumpost_is_root_topic(1) }, 0);
+            assert_eq!(unsafe { nntmux_forumpost_is_root_topic(-1) }, 0);
+        }
+
+        #[test]
+        fn forumpost_rejects_null_unaligned_and_undersized_buffers() {
+            let msg = b"hello";
+            let mut small = [i64::MIN; 5];
+            assert_eq!(
+                unsafe {
+                    nntmux_forumpost_build_post_attributes(
+                        0,
+                        1,
+                        msg.as_ptr(),
+                        msg.len(),
+                        0,
+                        0,
+                        0,
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -(POST_ATTRIBUTE_FIELDS as i32)
+            );
+            assert_eq!(small, [i64::MIN; 5]);
+
+            let mut raw = [0u8; 64];
+            let unaligned = unsafe { raw.as_mut_ptr().add(1).cast::<i64>() };
+            assert_eq!(
+                unsafe {
+                    nntmux_forumpost_build_post_attributes(
+                        0,
+                        1,
+                        msg.as_ptr(),
+                        msg.len(),
+                        0,
+                        0,
+                        0,
+                        unaligned,
+                        6,
+                    )
+                },
+                DECLINED
+            );
+            assert_eq!(raw, [0u8; 64]);
+
+            let mut out = [0i64; POST_ATTRIBUTE_FIELDS];
+            assert_eq!(
+                unsafe {
+                    nntmux_forumpost_build_post_attributes(
+                        0,
+                        1,
+                        ptr::null(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        out.as_mut_ptr(),
+                        6,
+                    )
+                },
+                DECLINED
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_forumpost_build_post_attributes(
+                        0,
+                        1,
+                        msg.as_ptr(),
+                        msg.len(),
+                        0,
+                        0,
+                        0,
+                        ptr::null_mut(),
+                        6,
+                    )
+                },
+                DECLINED
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_forumpost_build_post_attributes(
+                        0,
+                        1,
+                        msg.as_ptr(),
+                        usize::MAX,
+                        0,
+                        0,
+                        0,
+                        out.as_mut_ptr(),
+                        6,
+                    )
+                },
+                DECLINED
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_forumpost_build_post_attributes(
+                        0,
+                        1,
+                        msg.as_ptr(),
+                        msg.len(),
+                        0,
+                        0,
+                        0,
+                        out.as_mut_ptr(),
+                        usize::MAX,
+                    )
+                },
+                DECLINED
+            );
+            assert_eq!(out, [0i64; POST_ATTRIBUTE_FIELDS]);
+        }
+    }
+}
