@@ -5,9 +5,12 @@ declare(strict_types=1);
 namespace App\Models;
 
 use App\Enums\UserRole;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Model;
+use Throwable;
 
 /**
  * App\Models\Content.
@@ -63,6 +66,25 @@ class Content extends Model
     public const ROLE_LOGGED_IN = 1;
 
     public const ROLE_ADMIN = 2;
+
+    // URL classifications returned by classifyUrl()
+    public const URL_EMPTY = 0;
+
+    public const URL_ABSOLUTE = 1;
+
+    public const URL_BARE_DOMAIN = 2;
+
+    public const URL_INTERNAL = 3;
+
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_content_label(int32_t kind, int32_t has_value, int64_t value, char *out, size_t cap);
+        int32_t nntmux_content_url_kind(const char *ptr, size_t len);
+        C;
+
+    // PHP remains the production default until benchmarks qualify Rust.
+    private static ?bool $useRustFfi = null;
+
+    private static FFI|false|null $ffi = null;
 
     /**
      * @var string
@@ -167,11 +189,7 @@ class Content extends Model
      */
     public function getContentTypeLabel(): string
     {
-        return match ($this->contenttype) {
-            self::TYPE_USEFUL => 'Useful Link',
-            self::TYPE_INDEX => 'Homepage',
-            default => 'Unknown',
-        };
+        return self::contentTypeLabelFor($this->contenttype);
     }
 
     /**
@@ -179,12 +197,7 @@ class Content extends Model
      */
     public function getRoleLabel(): string
     {
-        return match ($this->role) {
-            self::ROLE_EVERYONE => 'Everyone',
-            self::ROLE_LOGGED_IN => 'Logged in Users',
-            self::ROLE_ADMIN => 'Admins',
-            default => 'Unknown',
-        };
+        return self::roleLabelFor($this->role);
     }
 
     /**
@@ -215,20 +228,13 @@ class Content extends Model
             get: function (): ?string {
                 $url = $this->url;
 
-                if (empty($url)) {
-                    return null;
-                }
-
-                if (str_starts_with($url, 'http://') || str_starts_with($url, 'https://')) {
-                    return $url;
-                }
-
-                // Domain pattern without protocol (e.g. google.com, chatgpt.ai)
-                if (! str_starts_with($url, '/') && preg_match('/^[a-zA-Z0-9][a-zA-Z0-9-]*\.[a-zA-Z]{2,}/', $url)) {
-                    return 'https://'.$url;
-                }
-
-                return url($url);
+                return match (self::classifyUrl($url)) {
+                    self::URL_EMPTY => null,
+                    self::URL_ABSOLUTE => $url,
+                    // Domain pattern without protocol (e.g. google.com, chatgpt.ai)
+                    self::URL_BARE_DOMAIN => 'https://'.$url,
+                    default => url((string) $url),
+                };
             }
         );
     }
@@ -241,17 +247,154 @@ class Content extends Model
     protected function isExternalUrl(): Attribute
     {
         return Attribute::make(
-            get: function (): bool {
-                $url = $this->url;
-
-                if (empty($url)) {
-                    return false;
-                }
-
-                return str_starts_with($url, 'http://')
-                    || str_starts_with($url, 'https://')
-                    || (! str_starts_with($url, '/') && preg_match('/^[a-zA-Z0-9][a-zA-Z0-9-]*\.[a-zA-Z]{2,}/', $url));
-            }
+            get: fn (): bool => \in_array(self::classifyUrl($this->url), [self::URL_ABSOLUTE, self::URL_BARE_DOMAIN], true)
         );
+    }
+
+    public static function enableRustFfi(): void
+    {
+        self::$useRustFfi = true;
+    }
+
+    public static function disableRustFfi(): void
+    {
+        self::$useRustFfi = false;
+    }
+
+    /**
+     * Restore the production default and re-resolve the library on next use.
+     */
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = null;
+        self::$ffi = null;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    public static function setFfiForTesting(FFI|false|null $override = null): void
+    {
+        self::$ffi = $override;
+    }
+
+    /**
+     * Admin label for a content type.
+     */
+    public static function contentTypeLabelFor(?int $type): string
+    {
+        return self::usesRustFfi() ? self::contentTypeLabelForNative($type) : self::contentTypeLabelForPhp($type);
+    }
+
+    public static function contentTypeLabelForPhp(?int $type): string
+    {
+        return match ($type) {
+            self::TYPE_USEFUL => 'Useful Link',
+            self::TYPE_INDEX => 'Homepage',
+            default => 'Unknown',
+        };
+    }
+
+    public static function contentTypeLabelForNative(?int $type): string
+    {
+        return self::labelNative(0, $type) ?? self::contentTypeLabelForPhp($type);
+    }
+
+    /**
+     * Admin label for a content visibility role.
+     */
+    public static function roleLabelFor(?int $role): string
+    {
+        return self::usesRustFfi() ? self::roleLabelForNative($role) : self::roleLabelForPhp($role);
+    }
+
+    public static function roleLabelForPhp(?int $role): string
+    {
+        return match ($role) {
+            self::ROLE_EVERYONE => 'Everyone',
+            self::ROLE_LOGGED_IN => 'Logged in Users',
+            self::ROLE_ADMIN => 'Admins',
+            default => 'Unknown',
+        };
+    }
+
+    public static function roleLabelForNative(?int $role): string
+    {
+        return self::labelNative(1, $role) ?? self::roleLabelForPhp($role);
+    }
+
+    /**
+     * One of the URL_* classifications: empty, absolute http(s), a bare domain that gets
+     * `https://`, or an internal path resolved against the site URL.
+     */
+    public static function classifyUrl(?string $url): int
+    {
+        return self::usesRustFfi() ? self::classifyUrlNative($url) : self::classifyUrlPhp($url);
+    }
+
+    public static function classifyUrlPhp(?string $url): int
+    {
+        if (empty($url)) {
+            return self::URL_EMPTY;
+        }
+
+        if (str_starts_with($url, 'http://') || str_starts_with($url, 'https://')) {
+            return self::URL_ABSOLUTE;
+        }
+
+        if (! str_starts_with($url, '/') && preg_match('/^[a-zA-Z0-9][a-zA-Z0-9-]*\.[a-zA-Z]{2,}/', $url)) {
+            return self::URL_BARE_DOMAIN;
+        }
+
+        return self::URL_INTERNAL;
+    }
+
+    public static function classifyUrlNative(?string $url): int
+    {
+        if (($ffi = self::ffi()) === null) {
+            return self::classifyUrlPhp($url);
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $kind = $ffi->nntmux_content_url_kind($url, $url === null ? 0 : \strlen($url));
+        } catch (Throwable) {
+            return self::classifyUrlPhp($url);
+        }
+
+        return \is_int($kind) && $kind >= self::URL_EMPTY && $kind <= self::URL_INTERNAL ? $kind : self::classifyUrlPhp($url);
+    }
+
+    private static function labelNative(int $kind, ?int $value): ?string
+    {
+        if (($ffi = self::ffi()) === null) {
+            return null;
+        }
+        $capacity = 0;
+        $buffer = RustPipelineLibrary::obtainScratch($ffi, 32, $capacity);
+        if ($buffer === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_content_label($kind, $value === null ? 0 : 1, $value ?? 0, $buffer, $capacity);
+            if (! \is_int($written) || $written <= 0 || $written > $capacity) {
+                return null;
+            }
+
+            return FFI::string($buffer, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
     }
 }
