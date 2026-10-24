@@ -10,6 +10,8 @@ on:
       - '.github/workflows/release-presentation.yml'
       - 'scripts/*benchmark*'
       - 'docker/app/nzb-yenc-ffi/**'
+      - 'rust/pipeline-ffi/**'
+      - 'rust/fingerprint-worker/**'
       - 'tests/Unit/test_benchmark*'
       - 'tests/Unit/test_verify_benchmark_pages.py'
       - 'github-pages/docs/**'
@@ -19,6 +21,7 @@ on:
       - 'tests/Unit/test_docs_links.py'
       - '.github/workflows/native-utilities-performance.yml'
       - '.github/workflows/archive-sample-performance.yml'
+      - '.github/workflows/fingerprint-worker.yml'
       - 'scripts/benchmark_callers_summary.py'
       - 'scripts/benchmark-resource-limits.py'
       - 'tests/Unit/test_benchmark_callers_export.py'
@@ -26,8 +29,8 @@ on:
       - 'tests/Unit/test_benchmark_resource_limits.py'
       - '.gitattributes'
   workflow_run:
-    workflows: ['Paired native yEnc performance', 'Rust release presentation', 'Run tests', 'rust-clippy analyze', 'Native utility performance', 'Archive and sample planning performance']
-    types: [in_progress, completed]
+    workflows: ['Paired native yEnc performance', 'Rust release presentation', 'Run tests', 'rust-clippy analyze', 'Native utility performance', 'Archive and sample planning performance', 'Database Rust fingerprint worker']
+    types: [completed]
     branches: [master]
   workflow_dispatch:
 
@@ -37,10 +40,10 @@ permissions:
 env:
   PYTHONDONTWRITEBYTECODE: 1
 
-# Serialize collection as well as deployment. Old completion events refresh the
-# current master, and cannot publish an older rendered snapshot after a new one.
+# Distinct per-run concurrency groups with cancel-in-progress: false ensure a
+# new workflow run never cancels an in-progress or pending run.
 concurrency:
-  group: benchmark-pages-${{ github.event_name == 'pull_request' && github.ref || 'master' }}
+  group: benchmark-pages-${{ github.event_name == 'pull_request' && github.ref || 'master' }}-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -77,6 +80,8 @@ jobs:
           python3 -B tests/Unit/test_benchmark_rust_inventory.py
           python3 -B tests/Unit/test_benchmark_toolchain.py
           python3 -B scripts/benchmark_rust_inventory.py --check --root .
+          python3 -B scripts/benchmark_pipeline_drilldown.py --check --root .
+          python3 -B tests/Unit/test_benchmark_pipeline_drilldown.py
           python3 -B tests/Unit/test_benchmark_summary_export.py
           python3 -B tests/Unit/test_benchmark_callers_export.py
           python3 -B tests/Unit/test_benchmark_remaining_modules_export.py
@@ -123,6 +128,29 @@ jobs:
           persist-credentials: false
       - id: identity
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: ffi, mbstring
+          coverage: none
+      - name: Select the pinned Rust toolchain
+        env:
+          RUST_TOOLCHAIN: '1.98.0'
+          RUSTUP_TOOLCHAIN: '1.98.0'
+        shell: bash
+        run: source scripts/benchmark-rust-toolchain.sh
+      - name: Build native Rust libraries and benchmark all Rust modules
+        env:
+          RUST_TOOLCHAIN: '1.98.0'
+          RUSTUP_TOOLCHAIN: '1.98.0'
+        run: |
+          cargo build --release --locked --manifest-path rust/pipeline-ffi/Cargo.toml
+          cargo build --release --locked --manifest-path docker/app/nzb-yenc-ffi/Cargo.toml
+          mkdir -p storage/app/nntmux-native
+          cp rust/pipeline-ffi/target/release/libnntmux_pipeline.so storage/app/nntmux-native/
+          cp docker/app/nzb-yenc-ffi/target/release/libnzbyenc.so storage/app/nntmux-native/
+          php -d ffi.enable=true -d memory_limit=1G scripts/benchmark-pipeline-modules.php --pairs=20 --output=github-pages/docs/data/rust-module-benchmarks.json
+          python3 -B scripts/benchmark_pipeline_drilldown.py --check --root .
       - name: Preserve the reviewed historical reports
         run: |
           if [[ -f github-pages/deployment/prepare-benchmarks.sh ]]; then
@@ -151,6 +179,18 @@ jobs:
       - uses: actions/upload-pages-artifact@v4
         with:
           path: benchmark-site
+      - name: Wait for earlier Benchmark Pages runs before entering deploy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          for _ in $(seq 1 90); do
+            older=$(gh api "repos/xbmc4lyfe/newznab-tmux/actions/workflows/benchmark-pages.yml/runs?status=in_progress&per_page=100" --jq "[.workflow_runs[] | select(.id < ($CURRENT_RUN_ID | tonumber))] | length" || echo 0)
+            if [[ "${older:-0}" -eq 0 ]]; then
+              break
+            fi
+            sleep 10
+          done
 
   deploy:
     needs: build
