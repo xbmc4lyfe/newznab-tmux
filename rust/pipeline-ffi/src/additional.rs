@@ -17764,3 +17764,671 @@ mod wave24_user_watchlist_cart_activity_tests {
         assert_eq!(small_i64[0], 99);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 25 Slice 25.6: GdprRetentionService, GdprAuditService,
+// ReviewNntmuxChangePrompt, RolePromotionObserver, and UserServiceObserver
+// pure-CPU helpers
+// ---------------------------------------------------------------------------
+
+pub mod gdpr_retention_prompt_observer {
+    use super::{ADD23_MAX_SEG_LEN, add23_valid_out_buf, add23_valid_slice, add23_write_slices};
+
+    pub const POLICY_EXPORT_FILES: &[u8] = b"7 days after generation, then safe to purge.";
+    pub const POLICY_GDPR_REQUESTS: &[u8] = b"Retained as an accountability record.";
+    pub const POLICY_PAYMENTS: &[u8] = b"Retained for accounting, tax, fraud prevention, dispute handling, and legal obligations with direct account identifiers anonymized during erasure where practical.";
+    pub const POLICY_AUDIT: &[u8] =
+        b"Retained in anonymized or minimized form for security and administrative accountability.";
+    pub const POLICY_COOKIES: &[u8] = b"Essential cookies/storage only; no marketing or analytics cookies are set by GDPR functionality.";
+
+    pub const REVIEW_PROMPT_ASSISTANT: &[u8] = b"Review the selected NNTmux change as a repository specialist. Inspect scoped diffs and dependants, verify applicable AGENTS.md and .ai/rules guidance, identify behavior and failure-mode risks, check test adequacy, then run only the targeted allowlisted verification that the paths require. Report findings by severity with concrete file evidence, followed by verification results and residual risk.";
+    pub const REVIEW_PROMPT_DEFAULT_PATHS: &[u8] = b"Derive them from the current scoped diff.";
+
+    #[inline]
+    pub unsafe fn policy_strings_nul(out_buf: *mut u8, out_cap: usize) -> isize {
+        unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[
+                    POLICY_EXPORT_FILES,
+                    b"\0",
+                    POLICY_GDPR_REQUESTS,
+                    b"\0",
+                    POLICY_PAYMENTS,
+                    b"\0",
+                    POLICY_AUDIT,
+                    b"\0",
+                    POLICY_COOKIES,
+                ],
+                2,
+            )
+        }
+    }
+
+    #[inline]
+    pub unsafe fn resolve_purge_target(
+        has_disk: u8,
+        disk_ptr: *const u8,
+        disk_len: usize,
+        has_path: u8,
+        path_ptr: *const u8,
+        path_len: usize,
+        has_expires_at: u8,
+        expires_at_epoch: i64,
+        now_epoch: i64,
+        out_should_purge: *mut i32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if has_disk > 1
+            || has_path > 1
+            || has_expires_at > 1
+            || out_should_purge.is_null()
+            || !out_should_purge.is_aligned()
+        {
+            return -1;
+        }
+        let (Some(disk_in), Some(path_in)) = (
+            unsafe { add23_valid_slice(disk_ptr, disk_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(path_ptr, path_len, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+        if disk_in.contains(&0) || path_in.contains(&0) {
+            return -2;
+        }
+
+        let effective_disk: &[u8] = if has_disk == 1 && !disk_in.is_empty() && disk_in != b"0" {
+            disk_in
+        } else {
+            b"local"
+        };
+        let effective_path: &[u8] = if has_path == 1 { path_in } else { b"" };
+        let should_purge = i32::from(
+            has_path == 1
+                && !effective_path.is_empty()
+                && has_expires_at == 1
+                && expires_at_epoch < now_epoch,
+        );
+
+        let written = unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[effective_disk, b"\0", effective_path],
+                3,
+            )
+        };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_should_purge = should_purge;
+        }
+        written
+    }
+
+    #[inline]
+    pub unsafe fn normalize_audit_payload_nul(
+        event_ptr: *const u8,
+        event_len: usize,
+        desc_ptr: *const u8,
+        desc_len: usize,
+        has_subject_id: u8,
+        subject_id: i64,
+        has_actor_id: u8,
+        actor_id: i64,
+        has_request_id: u8,
+        request_id: i64,
+        metadata_count: usize,
+        out_scalars: *mut i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if has_subject_id > 1
+            || has_actor_id > 1
+            || has_request_id > 1
+            || metadata_count > ADD23_MAX_SEG_LEN
+            || out_scalars.is_null()
+            || !out_scalars.is_aligned()
+            || (out_scalars as usize)
+                .checked_add(4 * std::mem::size_of::<i64>())
+                .is_none()
+            || !add23_valid_out_buf(out_buf, out_cap)
+        {
+            return -1;
+        }
+        let (Some(event), Some(desc)) = (
+            unsafe { add23_valid_slice(event_ptr, event_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(desc_ptr, desc_len, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+        if event.contains(&0) || desc.contains(&0) {
+            return -2;
+        }
+
+        let written = unsafe { add23_write_slices(out_buf, out_cap, &[event, b"\0", desc], 3) };
+        if written < 0 {
+            return written;
+        }
+
+        let mut flags = 0i64;
+        if has_request_id == 1 {
+            flags |= 1;
+        }
+        if has_subject_id == 1 {
+            flags |= 2;
+        }
+        if has_actor_id == 1 {
+            flags |= 4;
+        }
+        if metadata_count > 0 {
+            flags |= 8;
+        }
+
+        unsafe {
+            *out_scalars.add(0) = flags;
+            *out_scalars.add(1) = if has_request_id == 1 { request_id } else { 0 };
+            *out_scalars.add(2) = if has_subject_id == 1 { subject_id } else { 0 };
+            *out_scalars.add(3) = if has_actor_id == 1 { actor_id } else { 0 };
+        }
+        written
+    }
+
+    #[inline]
+    pub unsafe fn format_review_prompt_messages_nul(
+        goal_ptr: *const u8,
+        goal_len: usize,
+        has_paths: u8,
+        paths_ptr: *const u8,
+        paths_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if has_paths > 1 {
+            return -1;
+        }
+        let (Some(goal), Some(paths_in)) = (
+            unsafe { add23_valid_slice(goal_ptr, goal_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(paths_ptr, paths_len, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+        if goal.contains(&0) || (has_paths == 1 && paths_in.contains(&0)) {
+            return -2;
+        }
+        let effective_paths: &[u8] = if has_paths == 1 {
+            paths_in
+        } else {
+            REVIEW_PROMPT_DEFAULT_PATHS
+        };
+        unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[
+                    REVIEW_PROMPT_ASSISTANT,
+                    b"\0Change goal:\n",
+                    goal,
+                    b"\n\nChanged paths:\n",
+                    effective_paths,
+                ],
+                3,
+            )
+        }
+    }
+
+    #[inline]
+    pub unsafe fn evaluate_role_promotion_expiry(
+        is_active: u8,
+        has_end_date: u8,
+        end_timestamp_us: i64,
+        now_timestamp_us: i64,
+        out_flags: *mut i32,
+    ) -> i32 {
+        if is_active > 1 || has_end_date > 1 || out_flags.is_null() || !out_flags.is_aligned() {
+            return -1;
+        }
+        let is_expired = has_end_date == 1 && now_timestamp_us > end_timestamp_us;
+        let next_is_active = if is_expired { false } else { is_active == 1 };
+        let should_disable_on_saving = is_expired;
+        let should_persist_quietly_on_retrieved = is_active == 1 && is_expired;
+
+        let mut mask = 0i32;
+        if is_expired {
+            mask |= 1;
+        }
+        if next_is_active {
+            mask |= 2;
+        }
+        if should_disable_on_saving {
+            mask |= 4;
+        }
+        if should_persist_quietly_on_retrieved {
+            mask |= 8;
+        }
+
+        unsafe {
+            *out_flags = mask;
+        }
+        1
+    }
+
+    #[inline]
+    pub unsafe fn evaluate_user_service_registration(
+        has_mail_from: u8,
+        mail_from_ptr: *const u8,
+        mail_from_len: usize,
+        has_install_lock: u8,
+        base_path_ptr: *const u8,
+        base_path_len: usize,
+        out_should_dispatch: *mut i32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if has_mail_from > 1
+            || has_install_lock > 1
+            || out_should_dispatch.is_null()
+            || !out_should_dispatch.is_aligned()
+        {
+            return -1;
+        }
+        let (Some(mail_from), Some(base_path)) = (
+            unsafe { add23_valid_slice(mail_from_ptr, mail_from_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(base_path_ptr, base_path_len, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+        if base_path.contains(&0) {
+            return -2;
+        }
+
+        let mail_from_non_empty =
+            has_mail_from == 1 && !mail_from.is_empty() && mail_from != b"0";
+        let should_dispatch = i32::from(mail_from_non_empty && has_install_lock == 1);
+
+        let written = unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[
+                    base_path,
+                    b"/_install/install.lock\0newreg\0welcomeemails",
+                ],
+                3,
+            )
+        };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_should_dispatch = should_dispatch;
+        }
+        written
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_gdpr_retention_policy_strings_nul(
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        gdpr_retention_prompt_observer::policy_strings_nul(out_buf, out_cap)
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_gdpr_retention_resolve_purge_target(
+    has_disk: u8,
+    disk_ptr: *const u8,
+    disk_len: usize,
+    has_path: u8,
+    path_ptr: *const u8,
+    path_len: usize,
+    has_expires_at: u8,
+    expires_at_epoch: i64,
+    now_epoch: i64,
+    out_should_purge: *mut i32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        gdpr_retention_prompt_observer::resolve_purge_target(
+            has_disk,
+            disk_ptr,
+            disk_len,
+            has_path,
+            path_ptr,
+            path_len,
+            has_expires_at,
+            expires_at_epoch,
+            now_epoch,
+            out_should_purge,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_gdpr_audit_normalize_payload_nul(
+    event_ptr: *const u8,
+    event_len: usize,
+    desc_ptr: *const u8,
+    desc_len: usize,
+    has_subject_id: u8,
+    subject_id: i64,
+    has_actor_id: u8,
+    actor_id: i64,
+    has_request_id: u8,
+    request_id: i64,
+    metadata_count: usize,
+    out_scalars: *mut i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        gdpr_retention_prompt_observer::normalize_audit_payload_nul(
+            event_ptr,
+            event_len,
+            desc_ptr,
+            desc_len,
+            has_subject_id,
+            subject_id,
+            has_actor_id,
+            actor_id,
+            has_request_id,
+            request_id,
+            metadata_count,
+            out_scalars,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_mcp_review_change_prompt_messages_nul(
+    goal_ptr: *const u8,
+    goal_len: usize,
+    has_paths: u8,
+    paths_ptr: *const u8,
+    paths_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        gdpr_retention_prompt_observer::format_review_prompt_messages_nul(
+            goal_ptr,
+            goal_len,
+            has_paths,
+            paths_ptr,
+            paths_len,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_role_promotion_observer_evaluate(
+    is_active: u8,
+    has_end_date: u8,
+    end_timestamp_us: i64,
+    now_timestamp_us: i64,
+    out_flags: *mut i32,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        gdpr_retention_prompt_observer::evaluate_role_promotion_expiry(
+            is_active,
+            has_end_date,
+            end_timestamp_us,
+            now_timestamp_us,
+            out_flags,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_user_service_observer_evaluate_registration(
+    has_mail_from: u8,
+    mail_from_ptr: *const u8,
+    mail_from_len: usize,
+    has_install_lock: u8,
+    base_path_ptr: *const u8,
+    base_path_len: usize,
+    out_should_dispatch: *mut i32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        gdpr_retention_prompt_observer::evaluate_user_service_registration(
+            has_mail_from,
+            mail_from_ptr,
+            mail_from_len,
+            has_install_lock,
+            base_path_ptr,
+            base_path_len,
+            out_should_dispatch,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave25_gdpr_retention_prompt_observer_tests {
+    use super::*;
+
+    #[test]
+    fn gdpr_retention_and_audit_helpers_match_php_contracts() {
+        let mut buf = [0u8; 512];
+        let written =
+            unsafe { nntmux_gdpr_retention_policy_strings_nul(buf.as_mut_ptr(), buf.len()) };
+        assert!(written > 0);
+        let parts: Vec<&[u8]> = buf[..written as usize].split(|&b| b == 0).collect();
+        assert_eq!(parts.len(), 5);
+        assert_eq!(parts[0], b"7 days after generation, then safe to purge.");
+
+        let mut should_purge = 0i32;
+        let t_written = unsafe {
+            nntmux_gdpr_retention_resolve_purge_target(
+                0,
+                b"".as_ptr(),
+                0,
+                1,
+                b"gdpr/export-1.zip".as_ptr(),
+                17,
+                1,
+                1000,
+                2000,
+                &mut should_purge,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(should_purge, 1);
+        assert_eq!(&buf[..t_written as usize], b"local\0gdpr/export-1.zip");
+
+        let mut scalars = [0i64; 4];
+        let a_written = unsafe {
+            nntmux_gdpr_audit_normalize_payload_nul(
+                b"erasure.completed".as_ptr(),
+                17,
+                b"Completed erasure".as_ptr(),
+                17,
+                1,
+                10,
+                0,
+                0,
+                1,
+                55,
+                2,
+                scalars.as_mut_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(a_written, 35);
+        assert_eq!(&buf[..35], b"erasure.completed\0Completed erasure");
+        assert_eq!(scalars, [1 | 2 | 8, 55, 10, 0]);
+    }
+
+    #[test]
+    fn review_prompt_and_observers_match_php_contracts() {
+        let mut buf = [0u8; 1024];
+        let p_written = unsafe {
+            nntmux_mcp_review_change_prompt_messages_nul(
+                b"Fix retention".as_ptr(),
+                13,
+                0,
+                b"".as_ptr(),
+                0,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(p_written > 0);
+        let prompt_parts: Vec<&[u8]> = buf[..p_written as usize].split(|&b| b == 0).collect();
+        assert_eq!(prompt_parts.len(), 2);
+        assert_eq!(
+            prompt_parts[1],
+            b"Change goal:\nFix retention\n\nChanged paths:\nDerive them from the current scoped diff."
+        );
+
+        let mut flags = 0i32;
+        assert_eq!(
+            unsafe { nntmux_role_promotion_observer_evaluate(1, 1, 1000, 2000, &mut flags) },
+            1
+        );
+        assert_eq!(flags, 1 | 4 | 8);
+
+        assert_eq!(
+            unsafe { nntmux_role_promotion_observer_evaluate(1, 1, 3000, 2000, &mut flags) },
+            1
+        );
+        assert_eq!(flags, 2);
+
+        let mut dispatch = 0i32;
+        let u_written = unsafe {
+            nntmux_user_service_observer_evaluate_registration(
+                1,
+                b"noreply@example.com".as_ptr(),
+                19,
+                1,
+                b"/var/www/nntmux".as_ptr(),
+                15,
+                &mut dispatch,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(dispatch, 1);
+        assert_eq!(
+            &buf[..u_written as usize],
+            b"/var/www/nntmux/_install/install.lock\0newreg\0welcomeemails"
+        );
+    }
+
+    #[test]
+    fn wave25_slice6_entrypoints_reject_null_unaligned_and_undersized_buffers() {
+        let mut raw = [0xA5u8; 64];
+        let unaligned_i32 = unsafe { raw.as_mut_ptr().add(1).cast::<i32>() };
+        let unaligned_i64 = unsafe { raw.as_mut_ptr().add(1).cast::<i64>() };
+
+        let mut small = [0x5Au8; 8];
+        assert!(
+            unsafe { nntmux_gdpr_retention_policy_strings_nul(small.as_mut_ptr(), small.len()) }
+                < -8
+        );
+        assert_eq!(small, [0x5Au8; 8]);
+
+        assert_eq!(
+            unsafe {
+                nntmux_gdpr_retention_resolve_purge_target(
+                    0,
+                    b"".as_ptr(),
+                    0,
+                    1,
+                    b"a".as_ptr(),
+                    1,
+                    1,
+                    10,
+                    20,
+                    unaligned_i32,
+                    raw.as_mut_ptr(),
+                    32,
+                )
+            },
+            -1
+        );
+
+        assert_eq!(
+            unsafe {
+                nntmux_gdpr_audit_normalize_payload_nul(
+                    b"ev".as_ptr(),
+                    2,
+                    b"desc".as_ptr(),
+                    4,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    unaligned_i64,
+                    raw.as_mut_ptr(),
+                    32,
+                )
+            },
+            -1
+        );
+
+        assert_eq!(
+            unsafe {
+                nntmux_mcp_review_change_prompt_messages_nul(
+                    b"bad\0goal".as_ptr(),
+                    8,
+                    0,
+                    b"".as_ptr(),
+                    0,
+                    raw.as_mut_ptr(),
+                    64,
+                )
+            },
+            -2
+        );
+
+        assert_eq!(
+            unsafe { nntmux_role_promotion_observer_evaluate(1, 1, 10, 20, unaligned_i32) },
+            -1
+        );
+
+        assert_eq!(
+            unsafe {
+                nntmux_user_service_observer_evaluate_registration(
+                    1,
+                    b"a@b.c".as_ptr(),
+                    5,
+                    1,
+                    b"/app".as_ptr(),
+                    4,
+                    unaligned_i32,
+                    raw.as_mut_ptr(),
+                    64,
+                )
+            },
+            -1
+        );
+    }
+}
