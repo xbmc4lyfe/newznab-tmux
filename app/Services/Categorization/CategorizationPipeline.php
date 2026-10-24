@@ -4,15 +4,19 @@ declare(strict_types=1);
 
 namespace App\Services\Categorization;
 
+use App\Models\Category;
 use App\Models\UsenetGroup;
 use App\Services\Categorization\Pipes\AbstractCategorizationPipe;
 use App\Services\Categorization\Pipes\CategorizationPassable;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\NameFixing\Extractors\ObfuscatedSubjectExtractor;
 use App\Services\NameFixing\NzbSplitUnwrapper;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Pipeline\Pipeline;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
+use Throwable;
 
 /**
  * Pipeline-based categorization service using Laravel Pipeline.
@@ -24,6 +28,14 @@ use Illuminate\Support\Facades\Log;
  */
 class CategorizationPipeline
 {
+    private const string NATIVE_CDEF = <<<'CDEF'
+        int64_t nntmux_categorize_pipeline(const char *name, size_t name_len, const char *group, size_t group_len, const char *poster, size_t poster_len, uint32_t flags);
+CDEF;
+
+    private static FFI|false|null $nativeFfi = null;
+
+    protected bool $defaultPipesUnmodified = false;
+
     /**
      * @var Collection<AbstractCategorizationPipe>
      */
@@ -57,10 +69,16 @@ class CategorizationPipeline
      */
     public function addCategorizer(AbstractCategorizationPipe $pipe): self
     {
+        $this->defaultPipesUnmodified = false;
         $this->pipes->push($pipe);
         $this->pipes = $this->pipes->sortBy(fn (AbstractCategorizationPipe $p) => $p->getPriority());
 
         return $this;
+    }
+
+    public function addPipe(AbstractCategorizationPipe $pipe): self
+    {
+        return $this->addCategorizer($pipe);
     }
 
     /**
@@ -102,6 +120,14 @@ class CategorizationPipeline
             catWebDL: $this->catWebDL,
         );
 
+        // Debug/logging need every intermediate result and Misc's full signal analysis.
+        if ($this->defaultPipesUnmodified && ! $debug && ! config('nntmux.categorization.log', false)) {
+            $category = $this->categorizeNative($context);
+            if ($category !== null) {
+                return ['categories_id' => $category];
+            }
+        }
+
         $passable = new CategorizationPassable($context, $debug);
 
         /** @var CategorizationPassable $result */
@@ -113,6 +139,27 @@ class CategorizationPipeline
         $this->logCategorization($result);
 
         return $result->toArray();
+    }
+
+    private function categorizeNative(ReleaseContext $context): ?int
+    {
+        $ffi = self::$nativeFfi ??= RustPipelineLibrary::resolveDomain('categorization-pipeline', self::NATIVE_CDEF) ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $packed = $ffi->nntmux_categorize_pipeline(
+                $context->releaseName, \strlen($context->releaseName),
+                $context->groupName, \strlen($context->groupName),
+                $context->poster, \strlen($context->poster),
+                ($context->categorizeForeign ? 1 : 0) | ($context->catWebDL ? 2 : 0)
+            );
+        } catch (Throwable) {
+            return null;
+        }
+
+        return \is_int($packed) && $packed >= 0 ? ($packed === 0 ? Category::OTHER_MISC : $packed & 0xFFFF) : null;
     }
 
     protected function logCategorization(CategorizationPassable $result): void
@@ -145,6 +192,9 @@ class CategorizationPipeline
      */
     public function getCategorizers(): Collection // @phpstan-ignore missingType.generics
     {
+        // Collection is mutable: after exposing it we cannot promise default pipe semantics.
+        $this->defaultPipesUnmodified = false;
+
         return $this->pipes;
     }
 
@@ -153,7 +203,7 @@ class CategorizationPipeline
      */
     public static function createDefault(): self
     {
-        return new self([
+        $pipeline = new self([
             new Pipes\MiscPipe,
             new Pipes\GroupNamePipe,
             new Pipes\XxxPipe,
@@ -165,5 +215,8 @@ class CategorizationPipeline
             new Pipes\ConsolePipe,
             new Pipes\MiscSafetyNetPipe,
         ]);
+        $pipeline->defaultPipesUnmodified = true;
+
+        return $pipeline;
     }
 }
