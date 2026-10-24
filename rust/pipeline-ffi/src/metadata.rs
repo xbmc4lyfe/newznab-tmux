@@ -20298,6 +20298,1200 @@ pub mod genre_resources_metadata_config {
     }
 }
 
+/// Wave 19 Slice 19.5: AnidbInfo, BookInfo, GamesInfo, MovieCollection, and IGDB\Client C-ABI helpers.
+///
+/// Every export wraps its body in `std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ...)).unwrap_or(-1)`,
+/// validates raw pointers for non-null and `.is_aligned()`, bounds all slice lengths with `<= isize::MAX as usize`
+/// before `std::slice::from_raw_parts*`, and returns `-1` on panic or decline so PHP callers fall back safely.
+pub mod anidb_book_games_igdb_movie {
+    use super::{OutCursor, PhpSerWriter};
+    use std::mem::size_of;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 4 << 20;
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT || len > isize::MAX as usize {
+            return None;
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_cap(out: *mut u8, cap: usize) -> bool {
+        (!out.is_null() || cap == 0) && cap <= isize::MAX as usize
+    }
+
+    #[inline]
+    fn finish_cursor(cursor: OutCursor<'_>) -> isize {
+        let res = cursor.finish();
+        if res == -1 { -2 } else { res }
+    }
+
+    #[inline]
+    fn is_ascii_space_no_nul(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0B' | b'\x0C')
+    }
+
+    #[inline]
+    fn parse_cast_int_bytes(bytes: &[u8]) -> Option<i64> {
+        if bytes.contains(&0) {
+            return None;
+        }
+        let mut start = 0;
+        let mut end = bytes.len();
+        while start < end && is_ascii_space_no_nul(bytes[start]) {
+            start += 1;
+        }
+        while end > start && is_ascii_space_no_nul(bytes[end - 1]) {
+            end -= 1;
+        }
+        let trimmed = &bytes[start..end];
+        if trimmed.is_empty() {
+            return Some(0);
+        }
+        let (neg, digits) = match trimmed.first()? {
+            b'+' => (false, &trimmed[1..]),
+            b'-' => (true, &trimmed[1..]),
+            _ => (false, trimmed),
+        };
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let mut val: i64 = 0;
+        if neg {
+            for &b in digits {
+                val = val.checked_mul(10)?.checked_sub(i64::from(b - b'0'))?;
+            }
+        } else {
+            for &b in digits {
+                val = val.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+            }
+        }
+        Some(val)
+    }
+
+    #[inline]
+    fn write_i64_dec(cursor: &mut OutCursor<'_>, v: i64) -> usize {
+        let before = cursor.pos;
+        if v < 0 {
+            cursor.push(b'-');
+        }
+        let mut n = v.unsigned_abs();
+        let mut tmp = [0u8; 20];
+        let mut i = tmp.len();
+        loop {
+            i -= 1;
+            tmp[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        cursor.extend(&tmp[i..]);
+        cursor.pos - before
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. AnidbInfo helpers
+    // -------------------------------------------------------------------------
+
+    /// Formats the three relative anime cover paths for `AnidbInfo`:
+    /// - `covers/anime/<anidbid>-cover.webp` (`*out_webp_len` bytes)
+    /// - `covers/anime/<anidbid>-cover.jpg` (`*out_legacy_len` bytes)
+    /// - `covers/anime/<anidbid>.jpg` (remaining bytes)
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_anidb_info_picture_paths(
+        anidbid_ptr: *const u8,
+        anidbid_len: usize,
+        out_webp_len: *mut usize,
+        out_legacy_len: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_webp_len.is_null()
+                || !out_webp_len.is_aligned()
+                || out_legacy_len.is_null()
+                || !out_legacy_len.is_aligned()
+                || !valid_out_cap(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some(anidbid) = (unsafe { input(anidbid_ptr, anidbid_len) }) else {
+                return DECLINE;
+            };
+            if anidbid.contains(&0) {
+                return DECLINE;
+            }
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(b"covers/anime/");
+            cursor.extend(anidbid);
+            cursor.extend(b"-cover.webp");
+            let webp_len = cursor.pos;
+
+            cursor.extend(b"covers/anime/");
+            cursor.extend(anidbid);
+            cursor.extend(b"-cover.jpg");
+            let legacy_len = cursor.pos - webp_len;
+
+            cursor.extend(b"covers/anime/");
+            cursor.extend(anidbid);
+            cursor.extend(b".jpg");
+
+            let written = finish_cursor(cursor);
+            if written >= 0 {
+                unsafe {
+                    *out_webp_len = webp_len;
+                    *out_legacy_len = legacy_len;
+                }
+            }
+            written
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Formats a provider anime URL for `AnidbInfo`:
+    /// `provider`:
+    /// - `0` = `https://anidb.net/anime/<id>`
+    /// - `1` = `https://anilist.co/anime/<id>`
+    /// - `2` = `https://myanimelist.net/anime/<id>`
+    /// Returns `0` when `has_id == 0` or `id` is empty / `"0"`, `> 0` bytes written, `< -1` on short buffer, or `-1` on decline.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_anidb_info_provider_url(
+        provider: i32,
+        id_ptr: *const u8,
+        id_len: usize,
+        has_id: u32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let prefix: &[u8] = match provider {
+                0 => b"https://anidb.net/anime/",
+                1 => b"https://anilist.co/anime/",
+                2 => b"https://myanimelist.net/anime/",
+                _ => return DECLINE,
+            };
+            let Some(id_bytes) = (unsafe { input(id_ptr, id_len) }) else {
+                return DECLINE;
+            };
+            if has_id == 0 || id_bytes.is_empty() || id_bytes == b"0" {
+                return 0;
+            }
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(prefix);
+            cursor.extend(id_bytes);
+            finish_cursor(cursor)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Builds the PHP-serialized `array<string, string>` returned by `AnidbInfo::getExternalLinks()`
+    /// and writes the number of present links (`0..=3`) into `*out_count`.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_anidb_info_external_links(
+        anidb_ptr: *const u8,
+        anidb_len: usize,
+        has_anidb: u32,
+        anilist_ptr: *const u8,
+        anilist_len: usize,
+        has_anilist: u32,
+        mal_ptr: *const u8,
+        mal_len: usize,
+        has_mal: u32,
+        out_count: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_count.is_null() || !out_count.is_aligned() || !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (Some(anidb), Some(anilist), Some(mal)) = (
+                unsafe { input(anidb_ptr, anidb_len) },
+                unsafe { input(anilist_ptr, anilist_len) },
+                unsafe { input(mal_ptr, mal_len) },
+            ) else {
+                return DECLINE;
+            };
+
+            let anidb_ok = has_anidb != 0 && !anidb.is_empty() && anidb != b"0";
+            let anilist_ok = has_anilist != 0 && !anilist.is_empty() && anilist != b"0";
+            let mal_ok = has_mal != 0 && !mal.is_empty() && mal != b"0";
+            let count = usize::from(anidb_ok) + usize::from(anilist_ok) + usize::from(mal_ok);
+
+            let mut w = PhpSerWriter::new();
+            w.arr_open(count);
+            if anidb_ok {
+                w.key(b"anidb");
+                let mut url = Vec::with_capacity(24 + anidb.len());
+                url.extend_from_slice(b"https://anidb.net/anime/");
+                url.extend_from_slice(anidb);
+                w.str(&url);
+            }
+            if anilist_ok {
+                w.key(b"anilist");
+                let mut url = Vec::with_capacity(25 + anilist.len());
+                url.extend_from_slice(b"https://anilist.co/anime/");
+                url.extend_from_slice(anilist);
+                w.str(&url);
+            }
+            if mal_ok {
+                w.key(b"myanimelist");
+                let mut url = Vec::with_capacity(30 + mal.len());
+                url.extend_from_slice(b"https://myanimelist.net/anime/");
+                url.extend_from_slice(mal);
+                w.str(&url);
+            }
+            w.arr_close();
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(&w.buf);
+            let written = finish_cursor(cursor);
+            if written >= 0 {
+                unsafe {
+                    *out_count = count;
+                }
+            }
+            written
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. BookInfo helpers
+    // -------------------------------------------------------------------------
+
+    /// Formats the book cover relative paths (`covers/book/<id>.webp` and `covers/book/<id>.jpg`)
+    /// when `(int) $id > 0`.
+    /// `id_kind`: `0` = null/false/empty, `1` = `int` (`id_int`), `2` = `string` (`id_ptr[..id_len]`).
+    /// Returns `0` when `(int) $id <= 0` (setting `*out_webp_len = 0`), `> 0` total bytes written, `< -1` on short buffer, or `-1` on decline.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_book_info_cover_paths(
+        id_kind: i32,
+        id_int: i64,
+        id_ptr: *const u8,
+        id_len: usize,
+        out_webp_len: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_webp_len.is_null()
+                || !out_webp_len.is_aligned()
+                || !valid_out_cap(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some(id_bytes) = (unsafe { input(id_ptr, id_len) }) else {
+                return DECLINE;
+            };
+
+            match id_kind {
+                0 => {
+                    unsafe {
+                        *out_webp_len = 0;
+                    }
+                    0
+                }
+                1 => {
+                    if id_int <= 0 {
+                        unsafe {
+                            *out_webp_len = 0;
+                        }
+                        return 0;
+                    }
+                    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+                    cursor.extend(b"covers/book/");
+                    write_i64_dec(&mut cursor, id_int);
+                    cursor.extend(b".webp");
+                    let webp_len = cursor.pos;
+
+                    cursor.extend(b"covers/book/");
+                    write_i64_dec(&mut cursor, id_int);
+                    cursor.extend(b".jpg");
+
+                    let written = finish_cursor(cursor);
+                    if written >= 0 {
+                        unsafe {
+                            *out_webp_len = webp_len;
+                        }
+                    }
+                    written
+                }
+                2 => {
+                    let Some(parsed) = parse_cast_int_bytes(id_bytes) else {
+                        return DECLINE;
+                    };
+                    if parsed <= 0 {
+                        unsafe {
+                            *out_webp_len = 0;
+                        }
+                        return 0;
+                    }
+                    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+                    cursor.extend(b"covers/book/");
+                    cursor.extend(id_bytes);
+                    cursor.extend(b".webp");
+                    let webp_len = cursor.pos;
+
+                    cursor.extend(b"covers/book/");
+                    cursor.extend(id_bytes);
+                    cursor.extend(b".jpg");
+
+                    let written = finish_cursor(cursor);
+                    if written >= 0 {
+                        unsafe {
+                            *out_webp_len = webp_len;
+                        }
+                    }
+                    written
+                }
+                _ => DECLINE,
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. GamesInfo helpers
+    // -------------------------------------------------------------------------
+
+    /// Formats the `.webp` and legacy `.jpg` candidate paths for `GamesInfo::getCoverPath()` (`is_backdrop == 0`)
+    /// or `GamesInfo::getBackdropPath()` (`is_backdrop != 0`).
+    /// Returns `0` when `enabled == 0` (setting `*out_webp_len = 0`), `> 0` total bytes written, `< -1` on short buffer, or `-1` on decline.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_games_info_image_paths(
+        covers_path_ptr: *const u8,
+        covers_path_len: usize,
+        id_ptr: *const u8,
+        id_len: usize,
+        enabled: u32,
+        is_backdrop: u32,
+        out_webp_len: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_webp_len.is_null()
+                || !out_webp_len.is_aligned()
+                || !valid_out_cap(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let (Some(covers_path), Some(id_bytes)) = (
+                unsafe { input(covers_path_ptr, covers_path_len) },
+                unsafe { input(id_ptr, id_len) },
+            ) else {
+                return DECLINE;
+            };
+            if enabled == 0 {
+                unsafe {
+                    *out_webp_len = 0;
+                }
+                return 0;
+            }
+            if covers_path.contains(&0) || id_bytes.contains(&0) {
+                return DECLINE;
+            }
+
+            let suffix_webp: &[u8] = if is_backdrop != 0 {
+                b"-backdrop.webp"
+            } else {
+                b".webp"
+            };
+            let suffix_jpg: &[u8] = if is_backdrop != 0 {
+                b"-backdrop.jpg"
+            } else {
+                b".jpg"
+            };
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(covers_path);
+            cursor.extend(b"/games/");
+            cursor.extend(id_bytes);
+            cursor.extend(suffix_webp);
+            let webp_len = cursor.pos;
+
+            cursor.extend(covers_path);
+            cursor.extend(b"/games/");
+            cursor.extend(id_bytes);
+            cursor.extend(suffix_jpg);
+
+            let written = finish_cursor(cursor);
+            if written >= 0 {
+                unsafe {
+                    *out_webp_len = webp_len;
+                }
+            }
+            written
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. MovieCollection helpers
+    // -------------------------------------------------------------------------
+
+    /// Resolves the 4 pagination metadata integers (`[total, per_page, current_page, last_page]`)
+    /// for `MovieCollection` into `out_meta[..4]`.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_movie_collection_resolve_meta(
+        has_total: u32,
+        total_val: i64,
+        has_per_page: u32,
+        per_page_val: i64,
+        has_current_page: u32,
+        current_page_val: i64,
+        has_last_page: u32,
+        last_page_val: i64,
+        collection_count: i64,
+        out_meta: *mut i64,
+        meta_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let max_elems = (isize::MAX as usize) / size_of::<i64>();
+            if out_meta.is_null()
+                || !out_meta.is_aligned()
+                || meta_cap < 4
+                || meta_cap > max_elems
+                || collection_count < 0
+            {
+                return DECLINE;
+            }
+            let resolved = [
+                if has_total != 0 {
+                    total_val
+                } else {
+                    collection_count
+                },
+                if has_per_page != 0 {
+                    per_page_val
+                } else {
+                    collection_count
+                },
+                if has_current_page != 0 {
+                    current_page_val
+                } else {
+                    1
+                },
+                if has_last_page != 0 {
+                    last_page_val
+                } else {
+                    1
+                },
+            ];
+            let slice_out = unsafe { slice::from_raw_parts_mut(out_meta, 4) };
+            slice_out.copy_from_slice(&resolved);
+            4
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Serializes the `meta` and `links` pagination envelope for `MovieCollection::toArray()`.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_movie_collection_build_envelope(
+        has_total: u32,
+        total_val: i64,
+        has_per_page: u32,
+        per_page_val: i64,
+        has_current_page: u32,
+        current_page_val: i64,
+        has_last_page: u32,
+        last_page_val: i64,
+        collection_count: i64,
+        has_first: u32,
+        first_ptr: *const u8,
+        first_len: usize,
+        has_last: u32,
+        last_ptr: *const u8,
+        last_len: usize,
+        has_prev: u32,
+        prev_ptr: *const u8,
+        prev_len: usize,
+        has_next: u32,
+        next_ptr: *const u8,
+        next_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) || collection_count < 0 {
+                return DECLINE;
+            }
+            let (Some(first_url), Some(last_url), Some(prev_url), Some(next_url)) = (
+                unsafe { input(first_ptr, first_len) },
+                unsafe { input(last_ptr, last_len) },
+                unsafe { input(prev_ptr, prev_len) },
+                unsafe { input(next_ptr, next_len) },
+            ) else {
+                return DECLINE;
+            };
+
+            let total = if has_total != 0 {
+                total_val
+            } else {
+                collection_count
+            };
+            let per_page = if has_per_page != 0 {
+                per_page_val
+            } else {
+                collection_count
+            };
+            let current_page = if has_current_page != 0 {
+                current_page_val
+            } else {
+                1
+            };
+            let last_page = if has_last_page != 0 {
+                last_page_val
+            } else {
+                1
+            };
+
+            let mut w = PhpSerWriter::new();
+            w.arr_open(2);
+            w.key(b"meta");
+            w.arr_open(4);
+            w.key(b"total");
+            w.int(total);
+            w.key(b"per_page");
+            w.int(per_page);
+            w.key(b"current_page");
+            w.int(current_page);
+            w.key(b"last_page");
+            w.int(last_page);
+            w.arr_close();
+
+            w.key(b"links");
+            w.arr_open(4);
+            w.key(b"first");
+            if has_first != 0 {
+                w.str(first_url);
+            } else {
+                w.null();
+            }
+            w.key(b"last");
+            if has_last != 0 {
+                w.str(last_url);
+            } else {
+                w.null();
+            }
+            w.key(b"prev");
+            if has_prev != 0 {
+                w.str(prev_url);
+            } else {
+                w.null();
+            }
+            w.key(b"next");
+            if has_next != 0 {
+                w.str(next_url);
+            } else {
+                w.null();
+            }
+            w.arr_close();
+            w.arr_close();
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(&w.buf);
+            finish_cursor(cursor)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. IGDB\Client helpers
+    // -------------------------------------------------------------------------
+
+    /// Computes `'igdb:query:' . md5($endpoint . '|' . $query)` (43 bytes).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_igdb_client_query_cache_key(
+        endpoint_ptr: *const u8,
+        endpoint_len: usize,
+        query_ptr: *const u8,
+        query_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (Some(endpoint), Some(query)) = (
+                unsafe { input(endpoint_ptr, endpoint_len) },
+                unsafe { input(query_ptr, query_len) },
+            ) else {
+                return DECLINE;
+            };
+
+            let mut md5_input = Vec::with_capacity(endpoint.len() + 1 + query.len());
+            md5_input.extend_from_slice(endpoint);
+            md5_input.push(b'|');
+            md5_input.extend_from_slice(query);
+            let digest = crate::md5_hex_slice(&md5_input);
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(b"igdb:query:");
+            cursor.extend(&digest);
+            finish_cursor(cursor)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Normalizes `rtrim($baseUrl, '/')` and `ltrim($endpoint, '/')` for `IGDB\Client::request()`,
+    /// writing `trimmed_base` followed by `trimmed_endpoint` into `out_buf` and storing `trimmed_base.len()`
+    /// into `*out_base_len`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_igdb_client_normalize_target(
+        base_ptr: *const u8,
+        base_len: usize,
+        endpoint_ptr: *const u8,
+        endpoint_len: usize,
+        out_base_len: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_base_len.is_null()
+                || !out_base_len.is_aligned()
+                || !valid_out_cap(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let (Some(base), Some(endpoint)) = (
+                unsafe { input(base_ptr, base_len) },
+                unsafe { input(endpoint_ptr, endpoint_len) },
+            ) else {
+                return DECLINE;
+            };
+
+            let mut b_end = base.len();
+            while b_end > 0 && base[b_end - 1] == b'/' {
+                b_end -= 1;
+            }
+            let trimmed_base = &base[..b_end];
+
+            let mut e_start = 0;
+            while e_start < endpoint.len() && endpoint[e_start] == b'/' {
+                e_start += 1;
+            }
+            let trimmed_endpoint = &endpoint[e_start..];
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(trimmed_base);
+            cursor.extend(trimmed_endpoint);
+            let written = finish_cursor(cursor);
+            if written >= 0 {
+                unsafe {
+                    *out_base_len = trimmed_base.len();
+                }
+            }
+            written
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Computes TTL values for `IGDB\Client`:
+    /// `kind`:
+    /// - `0` = `max(0, (int) $lifetime)` (`normalizeCacheLifetime`)
+    /// - `1` = `max(60, ((int) $expiresIn) - 60)` (`computeTokenTtl`)
+    /// `val_kind`: `0` = null/false (`0`), `1` = true (`1`), `2` = int (`val_int`), `3` = string (`val_ptr[..val_len]`).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_igdb_client_compute_ttl(
+        kind: i32,
+        val_kind: i32,
+        val_int: i64,
+        val_ptr: *const u8,
+        val_len: usize,
+        out_ttl: *mut i64,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_ttl.is_null() || !out_ttl.is_aligned() {
+                return DECLINE;
+            }
+            let Some(val_bytes) = (unsafe { input(val_ptr, val_len) }) else {
+                return DECLINE;
+            };
+            let parsed = match val_kind {
+                0 => 0i64,
+                1 => 1i64,
+                2 => val_int,
+                3 => {
+                    let Some(v) = parse_cast_int_bytes(val_bytes) else {
+                        return DECLINE;
+                    };
+                    v
+                }
+                _ => return DECLINE,
+            };
+
+            let ttl = match kind {
+                0 => parsed.max(0),
+                1 => {
+                    let Some(sub) = parsed.checked_sub(60) else {
+                        return DECLINE;
+                    };
+                    sub.max(60)
+                }
+                _ => return DECLINE,
+            };
+
+            unsafe {
+                *out_ttl = ttl;
+            }
+            1
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Serializes request headers (`mode == 0`) or Twitch OAuth token form payload (`mode == 1`)
+    /// for `IGDB\Client`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_igdb_client_build_auth_payload(
+        mode: i32,
+        client_id_ptr: *const u8,
+        client_id_len: usize,
+        secret_ptr: *const u8,
+        secret_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (Some(client_id), Some(secret)) = (
+                unsafe { input(client_id_ptr, client_id_len) },
+                unsafe { input(secret_ptr, secret_len) },
+            ) else {
+                return DECLINE;
+            };
+            if client_id.is_empty() {
+                return DECLINE;
+            }
+
+            let mut w = PhpSerWriter::new();
+            match mode {
+                0 => {
+                    w.arr_open(2);
+                    w.key(b"Accept");
+                    w.str(b"application/json");
+                    w.key(b"Client-ID");
+                    w.str(client_id);
+                    w.arr_close();
+                }
+                1 => {
+                    if secret.is_empty() {
+                        return DECLINE;
+                    }
+                    w.arr_open(3);
+                    w.key(b"client_id");
+                    w.str(client_id);
+                    w.key(b"client_secret");
+                    w.str(secret);
+                    w.key(b"grant_type");
+                    w.str(b"client_credentials");
+                    w.arr_close();
+                }
+                _ => return DECLINE,
+            }
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(&w.buf);
+            finish_cursor(cursor)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn anidb_book_games_paths_and_links() {
+            let mut buf = [0u8; 512];
+            let (mut webp_len, mut legacy_len) = (0usize, 0usize);
+
+            let n = unsafe {
+                nntmux_anidb_info_picture_paths(
+                    b"12345".as_ptr(),
+                    5,
+                    &mut webp_len,
+                    &mut legacy_len,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(n > 0);
+            assert_eq!(&buf[..webp_len], b"covers/anime/12345-cover.webp");
+            assert_eq!(
+                &buf[webp_len..webp_len + legacy_len],
+                b"covers/anime/12345-cover.jpg"
+            );
+            assert_eq!(
+                &buf[webp_len + legacy_len..n as usize],
+                b"covers/anime/12345.jpg"
+            );
+
+            // Provider URLs
+            let u0 = unsafe {
+                nntmux_anidb_info_provider_url(
+                    0,
+                    b"12345".as_ptr(),
+                    5,
+                    1,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..u0 as usize], b"https://anidb.net/anime/12345");
+            assert_eq!(
+                unsafe {
+                    nntmux_anidb_info_provider_url(0, b"0".as_ptr(), 1, 1, buf.as_mut_ptr(), 64)
+                },
+                0
+            );
+
+            // External links serialized map
+            let mut count = 0usize;
+            let ext_n = unsafe {
+                nntmux_anidb_info_external_links(
+                    b"123".as_ptr(),
+                    3,
+                    1,
+                    b"".as_ptr(),
+                    0,
+                    0,
+                    b"456".as_ptr(),
+                    3,
+                    1,
+                    &mut count,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(ext_n > 0);
+            assert_eq!(count, 2);
+
+            // BookInfo cover paths
+            let bk_n = unsafe {
+                nntmux_book_info_cover_paths(
+                    1,
+                    42,
+                    std::ptr::null(),
+                    0,
+                    &mut webp_len,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(bk_n > 0);
+            assert_eq!(&buf[..webp_len], b"covers/book/42.webp");
+            assert_eq!(&buf[webp_len..bk_n as usize], b"covers/book/42.jpg");
+            assert_eq!(
+                unsafe {
+                    nntmux_book_info_cover_paths(
+                        1,
+                        0,
+                        std::ptr::null(),
+                        0,
+                        &mut webp_len,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                0
+            );
+
+            // GamesInfo image paths
+            let gm_n = unsafe {
+                nntmux_games_info_image_paths(
+                    b"/var/covers".as_ptr(),
+                    11,
+                    b"99".as_ptr(),
+                    2,
+                    1,
+                    1,
+                    &mut webp_len,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(gm_n > 0);
+            assert_eq!(&buf[..webp_len], b"/var/covers/games/99-backdrop.webp");
+            assert_eq!(
+                &buf[webp_len..gm_n as usize],
+                b"/var/covers/games/99-backdrop.jpg"
+            );
+        }
+
+        #[test]
+        fn movie_collection_and_igdb_client_helpers() {
+            let mut buf = [0u8; 512];
+            let mut meta = [0i64; 4];
+
+            assert_eq!(
+                unsafe {
+                    nntmux_movie_collection_resolve_meta(
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        15,
+                        meta.as_mut_ptr(),
+                        meta.len(),
+                    )
+                },
+                4
+            );
+            assert_eq!(meta, [15, 15, 1, 1]);
+
+            let env_n = unsafe {
+                nntmux_movie_collection_build_envelope(
+                    1,
+                    100,
+                    1,
+                    25,
+                    1,
+                    2,
+                    1,
+                    4,
+                    25,
+                    1,
+                    b"http://localhost?page=1".as_ptr(),
+                    23,
+                    1,
+                    b"http://localhost?page=4".as_ptr(),
+                    23,
+                    1,
+                    b"http://localhost?page=1".as_ptr(),
+                    23,
+                    1,
+                    b"http://localhost?page=3".as_ptr(),
+                    23,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(env_n > 0);
+
+            let ck_n = unsafe {
+                nntmux_igdb_client_query_cache_key(
+                    b"games".as_ptr(),
+                    5,
+                    b"fields *; limit 10;".as_ptr(),
+                    19,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(ck_n, 43);
+            assert!(buf[..43].starts_with(b"igdb:query:"));
+
+            let mut base_len = 0usize;
+            let tgt_n = unsafe {
+                nntmux_igdb_client_normalize_target(
+                    b"https://api.igdb.com/v4///".as_ptr(),
+                    26,
+                    b"///games/platforms".as_ptr(),
+                    18,
+                    &mut base_len,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..base_len], b"https://api.igdb.com/v4");
+            assert_eq!(&buf[base_len..tgt_n as usize], b"games/platforms");
+
+            let mut ttl = -1i64;
+            assert_eq!(
+                unsafe {
+                    nntmux_igdb_client_compute_ttl(1, 2, 3600, std::ptr::null(), 0, &mut ttl)
+                },
+                1
+            );
+            assert_eq!(ttl, 3540);
+            assert_eq!(
+                unsafe { nntmux_igdb_client_compute_ttl(1, 2, 30, std::ptr::null(), 0, &mut ttl) },
+                1
+            );
+            assert_eq!(ttl, 60);
+            assert_eq!(
+                unsafe {
+                    nntmux_igdb_client_compute_ttl(0, 2, -50, std::ptr::null(), 0, &mut ttl)
+                },
+                1
+            );
+            assert_eq!(ttl, 0);
+
+            let hdr_n = unsafe {
+                nntmux_igdb_client_build_auth_payload(
+                    0,
+                    b"my-client".as_ptr(),
+                    9,
+                    std::ptr::null(),
+                    0,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(hdr_n > 0);
+        }
+
+        #[test]
+        fn unaligned_and_null_pointers_rejected() {
+            let mut raw = [0u64; 8];
+            let mut buf = [0u8; 128];
+            let unaligned_usize =
+                unsafe { (raw.as_mut_ptr() as *mut u8).add(1) as *mut usize };
+            let unaligned_i64 = unsafe { (raw.as_mut_ptr() as *mut u8).add(1) as *mut i64 };
+            let mut aligned_usize = 0usize;
+
+            assert_eq!(
+                unsafe {
+                    nntmux_anidb_info_picture_paths(
+                        b"1".as_ptr(),
+                        1,
+                        unaligned_usize,
+                        &mut aligned_usize,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_anidb_info_picture_paths(
+                        b"1".as_ptr(),
+                        1,
+                        &mut aligned_usize,
+                        unaligned_usize,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_anidb_info_external_links(
+                        b"1".as_ptr(),
+                        1,
+                        1,
+                        b"".as_ptr(),
+                        0,
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        0,
+                        unaligned_usize,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_book_info_cover_paths(
+                        1,
+                        5,
+                        std::ptr::null(),
+                        0,
+                        unaligned_usize,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_games_info_image_paths(
+                        b"/tmp".as_ptr(),
+                        4,
+                        b"5".as_ptr(),
+                        1,
+                        1,
+                        0,
+                        unaligned_usize,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_movie_collection_resolve_meta(
+                        1,
+                        10,
+                        1,
+                        10,
+                        1,
+                        1,
+                        1,
+                        1,
+                        10,
+                        unaligned_i64,
+                        4,
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_igdb_client_normalize_target(
+                        b"https://a".as_ptr(),
+                        9,
+                        b"/b".as_ptr(),
+                        2,
+                        unaligned_usize,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_igdb_client_compute_ttl(
+                        0,
+                        2,
+                        100,
+                        std::ptr::null(),
+                        0,
+                        unaligned_i64,
+                    )
+                },
+                DECLINE
+            );
+        }
+    }
+}
+
+
 
 
 
