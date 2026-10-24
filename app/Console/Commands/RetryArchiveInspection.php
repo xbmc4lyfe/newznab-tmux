@@ -6,12 +6,15 @@ namespace App\Console\Commands;
 
 use App\Models\Release;
 use App\Services\AdditionalProcessing\AdditionalCandidateQuery;
+use App\Support\ReleaseNameDisplay;
 use Illuminate\Console\Command;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Query\Builder as QueryBuilder;
 
 class RetryArchiveInspection extends Command
 {
+    public bool $useRustFfi = false;
+
     private const int CHUNK_SIZE = 1000;
 
     protected $signature = 'releases:retry-archive-inspection
@@ -94,6 +97,16 @@ class RetryArchiveInspection extends Command
     }
 
     private function archiveType(string $name): string
+    {
+        return $this->useRustFfi ? $this->archiveTypeNative($name) : $this->archiveTypePhp($name);
+    }
+
+    public function archiveTypeNative(string $name): string
+    {
+        return ReleaseNameDisplay::transformNative(4, $name) ?? $this->archiveTypePhp($name);
+    }
+
+    public function archiveTypePhp(string $name): string
     {
         return match (true) {
             preg_match('/\.7z(\.\d{3})?\b/i', $name) === 1 => '7z',

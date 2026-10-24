@@ -8769,3 +8769,519 @@ mod wave11_remover_tests {
         }
     }
 }
+
+// Wave 12: byte-preserving candidates. Non-ASCII PCRE inputs request PHP's
+// locale-aware fallback instead of guessing its character tables.
+fn regex_release_count(input: &[u8]) -> &[u8] {
+    for i in 0..input.len() {
+        if !matches!(input[i], b'[' | b'(') && !is_pcre_space(input[i]) {
+            continue;
+        }
+        let mut p = i + 1;
+        let start = p;
+        while p < input.len() && p - start < 5 && input[p].is_ascii_digit() {
+            p += 1;
+        }
+        if p == start {
+            continue;
+        }
+        if matches!(input.get(p), Some(b'/' | b'-')) {
+            p += 1;
+        } else if p + 3 < input.len()
+            && (is_pcre_space(input[p]) || input[p] == b'_')
+            && input[p + 1..p + 3].eq_ignore_ascii_case(b"of")
+            && (is_pcre_space(input[p + 3]) || input[p + 3] == b'_')
+        {
+            p += 4;
+        } else {
+            continue;
+        }
+        let start = p;
+        while p < input.len() && p - start < 5 && input[p].is_ascii_digit() {
+            p += 1;
+        }
+        if p > start
+            && input
+                .get(p)
+                .is_some_and(|b| matches!(b, b']' | b')' | b'$' | b':') || is_pcre_space(*b))
+        {
+            return &input[start..p];
+        }
+    }
+    b"0"
+}
+
+fn regex_release_display(input: &[u8]) -> &[u8] {
+    fn space(s: &[u8], p: &mut usize) {
+        while *p < s.len() && is_pcre_space(s[*p]) {
+            *p += 1;
+        }
+    }
+    fn digits(s: &[u8], p: &mut usize) -> bool {
+        let start = *p;
+        while *p < s.len() && s[*p].is_ascii_digit() {
+            *p += 1;
+        }
+        *p > start
+    }
+    fn take(s: &[u8], p: &mut usize, b: u8) -> bool {
+        if s.get(*p) == Some(&b) {
+            *p += 1;
+            true
+        } else {
+            false
+        }
+    }
+    let mut p = 0;
+    space(input, &mut p);
+    if !take(input, &mut p, b'[') {
+        return input;
+    }
+    space(input, &mut p);
+    if !digits(input, &mut p) {
+        return input;
+    }
+    space(input, &mut p);
+    if !take(input, &mut p, b'/') {
+        return input;
+    }
+    space(input, &mut p);
+    if !digits(input, &mut p) {
+        return input;
+    }
+    space(input, &mut p);
+    if !take(input, &mut p, b']') {
+        return input;
+    }
+    space(input, &mut p);
+    take(input, &mut p, b'-');
+    space(input, &mut p);
+    let Some(quote) = [b"\"".as_slice(), b"#34;", b"&#34;", b"&quot;"]
+        .into_iter()
+        .find(|q| {
+            input
+                .get(p..p + q.len())
+                .is_some_and(|s| s.eq_ignore_ascii_case(q))
+        })
+    else {
+        return input;
+    };
+    p += quote.len();
+    let start = p;
+    while p < input.len()
+        && !input
+            .get(p..p + quote.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(quote))
+        && !matches!(input[p], b'\r' | b'\n')
+    {
+        p += 1;
+    }
+    if p == start
+        || !input
+            .get(p..p + quote.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(quote))
+    {
+        return input;
+    }
+    let file = php_trim_ascii(&input[start..p]);
+    p += quote.len();
+    space(input, &mut p);
+    if p < input.len() {
+        take(input, &mut p, b'-');
+        space(input, &mut p);
+        if !input
+            .get(p..p + 4)
+            .is_some_and(|s| s.eq_ignore_ascii_case(b"yenc"))
+        {
+            return input;
+        }
+        p += 4;
+        let before = p;
+        space(input, &mut p);
+        if p > before && input.get(p) == Some(&b'(') {
+            p += 1;
+            if !digits(input, &mut p)
+                || !take(input, &mut p, b'/')
+                || !digits(input, &mut p)
+                || !take(input, &mut p, b')')
+            {
+                return input;
+            }
+        }
+        space(input, &mut p);
+    }
+    if p == input.len() && !file.is_empty() {
+        file
+    } else {
+        input
+    }
+}
+
+fn regex_release_archive(input: &[u8]) -> &'static [u8] {
+    // Priority is by archive family, not the first extension in the subject.
+    for family in 0..3 {
+        for i in 0..input.len() {
+            if input[i] != b'.' {
+                continue;
+            }
+            let s = &input[i + 1..];
+            let boundary = |n: usize| !s.get(n).is_some_and(|b| is_pcre_word(*b));
+            match family {
+                0 if s.len() >= 2 && s[..2].eq_ignore_ascii_case(b"7z") => {
+                    if boundary(2)
+                        || s.len() >= 6
+                            && s[2] == b'.'
+                            && s[3..6].iter().all(u8::is_ascii_digit)
+                            && boundary(6)
+                    {
+                        return b"7z";
+                    }
+                }
+                1 => {
+                    if s.len() >= 3 && s[..3].eq_ignore_ascii_case(b"rar") && boundary(3) {
+                        return b"rar";
+                    }
+                    if s.first().is_some_and(|b| b.eq_ignore_ascii_case(&b'r')) {
+                        for n in [4, 3] {
+                            if s.len() >= n && s[1..n].iter().all(u8::is_ascii_digit) && boundary(n)
+                            {
+                                return b"rar";
+                            }
+                        }
+                    }
+                    if s.len() >= 5 && s[..4].eq_ignore_ascii_case(b"part") {
+                        let n = 4 + s[4..].iter().take_while(|b| b.is_ascii_digit()).count();
+                        if n > 4 && boundary(n) {
+                            return b"rar";
+                        }
+                    }
+                }
+                2 if s.len() >= 3 && s[..3].eq_ignore_ascii_case(b"zip") => {
+                    if boundary(3)
+                        || s.get(3).is_some_and(|b| b.eq_ignore_ascii_case(&b'x')) && boundary(4)
+                    {
+                        return b"zip";
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    b"unknown"
+}
+
+fn regex_release_domain(input: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input
+            .get(i..i + 4)
+            .is_some_and(|s| s.eq_ignore_ascii_case(b"www."))
+        {
+            let end = i
+                + 4
+                + input[i + 4..]
+                    .iter()
+                    .take_while(|b| !is_pcre_space(**b))
+                    .count();
+            let mut matched = None;
+            for dot in (i + 5..end).rev() {
+                if input[dot] == b'.' {
+                    let n = input[dot + 1..end]
+                        .iter()
+                        .take(4)
+                        .take_while(|b| b.is_ascii_alphabetic())
+                        .count();
+                    if n >= 2 {
+                        matched = Some(dot + 1 + n);
+                        break;
+                    }
+                }
+            }
+            if let Some(end) = matched {
+                i = end;
+                continue;
+            }
+        }
+        output.push(input[i]);
+        i += 1;
+    }
+    output
+}
+
+fn regex_release_frames(mut input: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut values = Vec::new();
+    while !input.is_empty() {
+        let len = u32::from_le_bytes(input.get(..4)?.try_into().ok()?) as usize;
+        input = &input[4..];
+        values.push(input.get(..len)?);
+        input = &input[len..];
+    }
+    Some(values)
+}
+
+fn regex_release_transform(input: &[u8], mode: u32) -> Option<Vec<u8>> {
+    // Keep pathological subjects on PHP's PCRE path, including its resource
+    // failures. Batch limits apply per frame, not to the aggregate transport.
+    if (mode != 0 && mode != 8 && input.len() > 8192) || (mode == 3 && input.len() > 4096) {
+        return None;
+    }
+    // Conservative locale fallback. Raw framing bytes are not character data.
+    if matches!(mode, 0 | 1 | 3 | 4 | 5) && !input.is_ascii() {
+        return None;
+    }
+    Some(match mode {
+        0 => {
+            if input.is_empty() || input == b"0" {
+                Vec::new()
+            } else {
+                [b"%", input, b"%"].concat()
+            }
+        }
+        1 => regex_release_count(input).to_vec(),
+        2 => {
+            let values = regex_release_frames(input)?;
+            if values.len() != 4 || !values[0].is_ascii() {
+                return None;
+            }
+            let mut payload = [values[1], values[2], values[3]].concat();
+            payload.extend_from_slice(regex_release_count(values[0]));
+            regex_release_sha1_hex(&payload).to_vec()
+        }
+        3 => regex_release_display(input).to_vec(),
+        4 => regex_release_archive(input).to_vec(),
+        5 => regex_release_domain(input),
+        6 | 7 => {
+            let values = regex_release_frames(input)?;
+            let allowed: &[&[u8]] = &[
+                b"music", b"console", b"movie", b"game", b"tv", b"adult", b"book", b"misc",
+            ];
+            let mut result: Vec<Vec<u8>> = Vec::new();
+            for value in values {
+                if !value.is_ascii() || value.contains(&0) {
+                    return None;
+                }
+                if mode == 7 {
+                    if value != b"all" && !allowed.contains(&value) {
+                        result.push(value.to_vec());
+                    }
+                    continue;
+                }
+                for token in value
+                    .split(|b| is_pcre_space(*b) || *b == b',')
+                    .filter(|v| !v.is_empty())
+                {
+                    let value = php_trim_ascii(token.rsplit(|b| *b == b'=').next()?);
+                    let value: Vec<u8> = value.iter().map(u8::to_ascii_lowercase).collect();
+                    let singular = value.as_slice();
+                    let mut end = singular.len();
+                    while end > 0 && singular[end - 1] == b's' {
+                        end -= 1;
+                    }
+                    let normalized = if allowed.contains(&&singular[..end]) {
+                        &singular[..end]
+                    } else {
+                        &value
+                    };
+                    // Collection::unique uses loose numeric comparison. Decline numeric
+                    // tokens rather than reimplementing PHP float/coercion semantics.
+                    if normalized.iter().any(u8::is_ascii_digit) {
+                        return None;
+                    }
+                    if !normalized.is_empty()
+                        && normalized != b"0"
+                        && !result.iter().any(|v| v == normalized)
+                    {
+                        result.push(normalized.to_vec());
+                    }
+                }
+            }
+            // An empty invalid token cannot be represented by a NUL-separated result.
+            if mode == 7 && result.iter().any(Vec::is_empty) {
+                return None;
+            }
+            result.join(&0)
+        }
+        8 => {
+            let mut output = Vec::new();
+            for value in regex_release_frames(input)? {
+                if !value.is_ascii() || value.len() > 4096 {
+                    return None;
+                }
+                let value = regex_release_display(value);
+                output.extend_from_slice(&u32::try_from(value.len()).ok()?.to_le_bytes());
+                output.extend_from_slice(value);
+            }
+            output
+        }
+        _ => return None,
+    })
+}
+
+/// Returns bytes written, -1 to request PHP fallback, or -(required+3) for
+/// insufficient output capacity, without modifying the buffer on errors.
+/// Modes: 0 group LIKE payload, 1 collection count, 2 framed collection hash,
+/// 3 display wrapper, 4 archive family, 5 domain removal, 6 framed raw categories,
+/// 7 framed normalized categories, 8 framed display batch. Frames use u32 LE
+/// length plus bytes. Categories return NUL-separated tokens; display batches
+/// return length-prefixed frames. Unsupported locale-sensitive bytes decline.
+///
+/// # Safety
+/// Pointers must cover their stated lengths; output must not overlap input.
+/// Null pointers are accepted only for zero length/capacity.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_regex_release_cleaning(
+    input: *const u8,
+    len: usize,
+    mode: u32,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    if cap > isize::MAX as usize || out.is_null() && cap != 0 {
+        return -1;
+    }
+    let Some(input) = (unsafe { wave9_input(input, len) }) else {
+        return -1;
+    };
+    let Some(output) = regex_release_transform(input, mode) else {
+        return -1;
+    };
+    unsafe { wave9_write_output(&output, out, cap) }
+}
+
+#[cfg(test)]
+mod wave12_regex_release_tests {
+    use super::*;
+    #[test]
+    fn literal_contracts() {
+        assert_eq!(regex_release_count(b"title [1/00012]"), b"00012");
+        assert_eq!(regex_release_count(b"title (2_of_19)"), b"19");
+        assert_eq!(regex_release_count(b"title (2/123456)"), b"0");
+        assert_eq!(
+            regex_release_display(b"[1/12] - \"file.mkv\" yEnc (1/50)"),
+            b"file.mkv"
+        );
+        assert_eq!(regex_release_archive(b"a.zip b.RAR c.7z"), b"7z");
+        assert_eq!(regex_release_domain(b"a www.example.com z"), b"a  z");
+    }
+    #[test]
+    fn framed_categories_hash_and_batch_contracts() {
+        fn frames(values: &[&[u8]]) -> Vec<u8> {
+            let mut out = Vec::new();
+            for value in values {
+                out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                out.extend_from_slice(value);
+            }
+            out
+        }
+        assert_eq!(
+            regex_release_sha1_hex(b"abc").as_slice(),
+            b"a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert_eq!(
+            regex_release_transform(&frames(&[b"TV,Movies", b"category=tv unknown"]), 6).unwrap(),
+            b"tv\0movie\0unknown"
+        );
+        assert_eq!(
+            regex_release_transform(&frames(&[b"tv", b"all", b"bad", b"bad"]), 7).unwrap(),
+            b"bad\0bad"
+        );
+        assert!(regex_release_transform(&frames(&[b"00", b"0.0"]), 6).is_none());
+        assert!(regex_release_transform(&frames(&[b""]), 7).is_none());
+        assert_eq!(
+            regex_release_transform(&frames(&[b"[1/2] \"a\"", b"b"]), 8).unwrap(),
+            frames(&[b"a", b"b"])
+        );
+        assert!(regex_release_transform(&frames(&[b"short"]), 2).is_none());
+        for mode in [6, 7, 8] {
+            assert!(regex_release_transform(&[255, 255, 255, 255], mode).is_none());
+        }
+    }
+
+    #[test]
+    fn malformed_abi_and_short_buffers_never_write() {
+        unsafe {
+            let null = std::ptr::null();
+            let mut out = [b'!'; 2];
+            assert_eq!(
+                nntmux_regex_release_cleaning(null, 1, 3, out.as_mut_ptr(), 2),
+                -1
+            );
+            assert_eq!(
+                nntmux_regex_release_cleaning(null, 0, 4, out.as_mut_ptr(), 2),
+                -10
+            );
+            assert_eq!(
+                nntmux_regex_release_cleaning(null, 0, 8, std::ptr::null_mut(), 0),
+                0
+            );
+            assert_eq!(
+                nntmux_regex_release_cleaning(b"abc".as_ptr(), 3, 6, out.as_mut_ptr(), 2),
+                -1
+            );
+            assert_eq!(out, [b'!'; 2]);
+        }
+    }
+}
+
+fn regex_release_sha1_hex(data: &[u8]) -> [u8; 40] {
+    const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+    #[inline(always)]
+    fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
+        let mut w = [0u32; 80];
+        for (i, &chunk) in block.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes(chunk);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e] = *state;
+        for (i, &word) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5a827999),
+                20..=39 => (b ^ c ^ d, 0x6ed9eba1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1bbcdc),
+                _ => (b ^ c ^ d, 0xca62c1d6u32),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(word);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+        for (s, v) in state.iter_mut().zip([a, b, c, d, e]) {
+            *s = s.wrapping_add(v);
+        }
+    }
+
+    let mut state: [u32; 5] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
+    let (blocks, remainder) = data.as_chunks::<64>();
+    for block in blocks {
+        compress(&mut state, block);
+    }
+    let mut tail = [0u8; 64];
+    tail[..remainder.len()].copy_from_slice(remainder);
+    tail[remainder.len()] = 0x80;
+    if remainder.len() >= 56 {
+        compress(&mut state, &tail);
+        tail.fill(0);
+    }
+    tail[56..64].copy_from_slice(&((data.len() as u64).wrapping_mul(8)).to_be_bytes());
+    compress(&mut state, &tail);
+
+    let mut hex = [0u8; 40];
+    for (i, &word) in state.iter().enumerate() {
+        for (j, &byte) in word.to_be_bytes().iter().enumerate() {
+            let idx = (i * 4 + j) * 2;
+            hex[idx] = HEX_LOWER[(byte >> 4) as usize];
+            hex[idx + 1] = HEX_LOWER[(byte & 0x0f) as usize];
+        }
+    }
+    hex
+}
