@@ -410,20 +410,41 @@ function buildPipelineSymbolPaths(
                 } elseif (str_contains($part, 'uint8_t') && str_contains($part, '*')) {
                     $ffiArgs[] = $buffers['addrU8'];
                     $prevWasOutChar = false;
+                } elseif (str_contains($part, 'int8_t') && str_contains($part, '*')) {
+                    $ffiArgs[] = $buffers['addrI8'];
+                    $prevWasOutChar = false;
+                } elseif (str_contains($part, 'uint16_t') && str_contains($part, '*')) {
+                    $ffiArgs[] = $buffers['addrU16'];
+                    $prevWasOutChar = false;
+                } elseif (str_contains($part, 'int16_t') && str_contains($part, '*')) {
+                    $ffiArgs[] = $buffers['addrI16'];
+                    $prevWasOutChar = false;
                 } elseif (str_contains($part, 'uint32_t') && str_contains($part, '*')) {
                     $ffiArgs[] = $buffers['addrU32'];
                     $prevWasOutChar = false;
                 } elseif (str_contains($part, 'int32_t') && str_contains($part, '*')) {
                     $ffiArgs[] = $buffers['addrI32'];
                     $prevWasOutChar = false;
+                } elseif (str_contains($part, 'uint64_t') && str_contains($part, '*')) {
+                    $ffiArgs[] = $buffers['addrU64'];
+                    $prevWasOutChar = false;
                 } elseif (str_contains($part, 'int64_t') && str_contains($part, '*')) {
                     $ffiArgs[] = $buffers['addrI64'];
+                    $prevWasOutChar = false;
+                } elseif (str_contains($part, 'ssize_t') && str_contains($part, '*')) {
+                    $ffiArgs[] = $buffers['addrSsize'];
                     $prevWasOutChar = false;
                 } elseif (str_contains($part, 'size_t') && str_contains($part, '*')) {
                     $ffiArgs[] = $buffers['addrSize'];
                     $prevWasOutChar = false;
                 } elseif (str_contains($part, 'double') && str_contains($part, '*')) {
                     $ffiArgs[] = $buffers['addrF64'];
+                    $prevWasOutChar = false;
+                } elseif (str_contains($part, 'float') && str_contains($part, '*')) {
+                    $ffiArgs[] = $buffers['addrF32'];
+                    $prevWasOutChar = false;
+                } elseif (str_contains($part, 'bool') && str_contains($part, '*')) {
+                    $ffiArgs[] = $buffers['addrBool'];
                     $prevWasOutChar = false;
                 } elseif (str_starts_with($part, 'size_t')) {
                     if ($prevWasOutChar || str_contains($part, 'cap')) {
@@ -732,22 +753,37 @@ if ($pipelineLibPath !== null && $allPipelineCdefs !== [] && extension_loaded('f
     $pipelineFfi = FFI::cdef(implode("\n", $allPipelineCdefs)."\n", $pipelineLibPath);
     $outChar = $pipelineFfi->new('char[65536]');
     $outU8 = $pipelineFfi->new('uint8_t[65536]');
+    $outI8 = $pipelineFfi->new('int8_t[8192]');
+    $outU16 = $pipelineFfi->new('uint16_t[8192]');
+    $outI16 = $pipelineFfi->new('int16_t[8192]');
     $outU32 = $pipelineFfi->new('uint32_t[8192]');
     $outI32 = $pipelineFfi->new('int32_t[8192]');
+    $outU64 = $pipelineFfi->new('uint64_t[8192]');
     $outI64 = $pipelineFfi->new('int64_t[8192]');
+    $outSsize = $pipelineFfi->new('ssize_t[8192]');
     $outSize = $pipelineFfi->new('size_t[8192]');
     $outF64 = $pipelineFfi->new('double[8192]');
+    $outF32 = $pipelineFfi->new('float[8192]');
+    $outBool = $pipelineFfi->new('bool[8192]');
     for ($i = 0; $i < 16; $i++) {
         $outI64[$i] = ($i % 2 === 0) ? 1000 + $i : 1048576;
+        $outU64[$i] = ($i % 2 === 0) ? 1000 + $i : 1048576;
     }
     $buffers = [
         'outChar' => $outChar,
         'addrU8' => FFI::addr($outU8[0]),
+        'addrI8' => FFI::addr($outI8[0]),
+        'addrU16' => FFI::addr($outU16[0]),
+        'addrI16' => FFI::addr($outI16[0]),
         'addrU32' => FFI::addr($outU32[0]),
         'addrI32' => FFI::addr($outI32[0]),
+        'addrU64' => FFI::addr($outU64[0]),
         'addrI64' => FFI::addr($outI64[0]),
+        'addrSsize' => FFI::addr($outSsize[0]),
         'addrSize' => FFI::addr($outSize[0]),
         'addrF64' => FFI::addr($outF64[0]),
+        'addrF32' => FFI::addr($outF32[0]),
+        'addrBool' => FFI::addr($outBool[0]),
     ];
 }
 
