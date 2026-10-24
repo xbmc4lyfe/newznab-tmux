@@ -16300,3 +16300,792 @@ Excluded color 999999999999999999999 must be an integer from 0 through 255."
         );
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// Wave 23 Slice 23.6: UserActivity, UserActivityObserver, AnidbInfoObserver,
+// SteamAppObserver, and AdminDashboardSnapshotService pure-CPU helpers
+// ---------------------------------------------------------------------------
+
+const ADD23_MAX_SEG_LEN: usize = (isize::MAX as usize) / 8;
+
+#[inline]
+unsafe fn add23_valid_slice<'a>(
+    ptr: *const u8,
+    len: usize,
+    max_len: usize,
+) -> Option<&'a [u8]> {
+    if ptr.is_null()
+        || len > max_len
+        || len > isize::MAX as usize
+        || (ptr as usize).checked_add(len).is_none()
+    {
+        return None;
+    }
+    if len == 0 {
+        return Some(&[]);
+    }
+    Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+
+#[inline]
+fn add23_valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+    !out_buf.is_null()
+        && out_cap <= isize::MAX as usize
+        && (out_buf as usize).checked_add(out_cap).is_some()
+}
+
+#[inline]
+unsafe fn add23_write_slices(
+    out_buf: *mut u8,
+    out_cap: usize,
+    parts: &[&[u8]],
+    min_neg: usize,
+) -> isize {
+    if !add23_valid_out_buf(out_buf, out_cap) {
+        return -1;
+    }
+    let mut needed = 0usize;
+    for part in parts {
+        let Some(next) = needed.checked_add(part.len()) else {
+            return -1;
+        };
+        if next > isize::MAX as usize {
+            return -1;
+        }
+        needed = next;
+    }
+    if needed > out_cap {
+        return -(needed.max(min_neg) as isize);
+    }
+    let mut offset = 0usize;
+    for part in parts {
+        if !part.is_empty() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(part.as_ptr(), out_buf.add(offset), part.len());
+            }
+            offset += part.len();
+        }
+    }
+    needed as isize
+}
+
+/// Resolves the FontAwesome icon slug for `UserActivity::getIconAttribute()`:
+/// - `'registered'` -> `'user-plus'`
+/// - `'deleted'` -> `'user-times'`
+/// - `'role_updated'` -> `'user-shield'`
+/// - default -> `'info-circle'`
+///
+/// Returns written byte length (`> 0`), `-(needed as isize)` when `out_cap` is too small,
+/// or `-1` on invalid pointer/length arguments.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_user_activity_resolve_icon(
+    type_ptr: *const u8,
+    type_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(activity_type) =
+            (unsafe { add23_valid_slice(type_ptr, type_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        let icon: &[u8] = match activity_type {
+            b"registered" => b"user-plus",
+            b"deleted" => b"user-times",
+            b"role_updated" => b"user-shield",
+            _ => b"info-circle",
+        };
+        unsafe { add23_write_slices(out_buf, out_cap, &[icon], 2) }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Resolves the Tailwind color token for `UserActivity::getColorClassAttribute()`:
+/// - `'registered'` -> `'green'`
+/// - `'deleted'` -> `'red'`
+/// - `'role_updated'` -> `'blue'`
+/// - default -> `'gray'`
+///
+/// Returns written byte length (`> 0`), `-(needed as isize)` when `out_cap` is too small,
+/// or `-1` on invalid pointer/length arguments.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_user_activity_resolve_color_class(
+    type_ptr: *const u8,
+    type_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(activity_type) =
+            (unsafe { add23_valid_slice(type_ptr, type_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        let color: &[u8] = match activity_type {
+            b"registered" => b"green",
+            b"deleted" => b"red",
+            b"role_updated" => b"blue",
+            _ => b"gray",
+        };
+        unsafe { add23_write_slices(out_buf, out_cap, &[color], 2) }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Resolves the actor label (`'Self'`, authenticated username, or `'System'`) for
+/// `UserActivityObserver`:
+/// - When `check_self == 1 && has_auth_id == 1 && auth_id == target_user_id`: writes `"Self"`.
+/// - Otherwise when `has_auth_username == 1`: writes `auth_username`.
+/// - Otherwise: writes `"System"`.
+///
+/// Returns written byte length (`>= 0`), `-(needed as isize)` when `out_cap` is too small,
+/// or `-1` on invalid flags or pointer/length arguments.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_user_activity_observer_resolve_actor(
+    has_auth_username: u8,
+    auth_username_ptr: *const u8,
+    auth_username_len: usize,
+    has_auth_id: u8,
+    auth_id: i64,
+    target_user_id: i64,
+    check_self: u8,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if has_auth_username > 1 || has_auth_id > 1 || check_self > 1 {
+            return -1;
+        }
+        let Some(auth_username) = (unsafe {
+            add23_valid_slice(auth_username_ptr, auth_username_len, ADD23_MAX_SEG_LEN)
+        }) else {
+            return -1;
+        };
+        let label: &[u8] = if check_self == 1 && has_auth_id == 1 && auth_id == target_user_id {
+            b"Self"
+        } else if has_auth_username == 1 {
+            auth_username
+        } else {
+            b"System"
+        };
+        unsafe { add23_write_slices(out_buf, out_cap, &[label], 2) }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Formats the fallback role name for `UserActivityObserver::getRoleName()`:
+/// - `'None'` when `has_role_id == 0 || role_id == 0`
+/// - `"Role #{role_id}"` otherwise
+///
+/// Returns written byte length (`> 0`), `-(needed as isize)` when `out_cap` is too small,
+/// or `-1` on invalid flags or pointer/length arguments.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_user_activity_observer_fallback_role_name(
+    has_role_id: u8,
+    role_id: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if has_role_id > 1 {
+            return -1;
+        }
+        if has_role_id == 0 || role_id == 0 {
+            return unsafe { add23_write_slices(out_buf, out_cap, &[b"None"], 2) };
+        }
+        let id_str = role_id.to_string();
+        unsafe { add23_write_slices(out_buf, out_cap, &[b"Role #", id_str.as_bytes()], 2) }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Formats NUL-separated `activity_type\0description` and sets `*out_event_code` for
+/// `UserActivityObserver::buildActivityPayload()`:
+/// - `'created'` (`0`): `"registered\0New user registered: {username}"`
+/// - `'updated'` / `'role_updated'` (`1`): `"role_updated\0User role updated: {username} → {new_role_name}"`
+/// - `'deleted'` (`2`): `"deleted\0User deleted: {username}"`
+/// - `'restored'` (`3`): `"registered\0User restored: {username}"`
+/// - `'force_deleted'` (`4`): `"deleted\0User permanently deleted: {username}"`
+///
+/// Returns written byte length (`> 0`), `-2` on unknown event or embedded NUL in strings,
+/// `-(needed as isize)` (`< -2`) when `out_cap` is too small, or `-1` on invalid pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_user_activity_observer_format_event(
+    event_ptr: *const u8,
+    event_len: usize,
+    username_ptr: *const u8,
+    username_len: usize,
+    new_role_name_ptr: *const u8,
+    new_role_name_len: usize,
+    out_event_code: *mut i32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_event_code.is_null() || !out_event_code.is_aligned() {
+            return -1;
+        }
+        let (Some(event), Some(username), Some(new_role_name)) = (
+            unsafe { add23_valid_slice(event_ptr, event_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(username_ptr, username_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(new_role_name_ptr, new_role_name_len, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+        if username.contains(&0) || new_role_name.contains(&0) {
+            return -2;
+        }
+
+        let (code, written): (i32, isize) = match event {
+            b"created" => (
+                0,
+                unsafe {
+                    add23_write_slices(
+                        out_buf,
+                        out_cap,
+                        &[b"registered\0New user registered: ", username],
+                        3,
+                    )
+                },
+            ),
+            b"updated" | b"role_updated" => (
+                1,
+                unsafe {
+                    add23_write_slices(
+                        out_buf,
+                        out_cap,
+                        &[
+                            b"role_updated\0User role updated: ",
+                            username,
+                            " \u{2192} ".as_bytes(),
+                            new_role_name,
+                        ],
+                        3,
+                    )
+                },
+            ),
+            b"deleted" => (
+                2,
+                unsafe {
+                    add23_write_slices(out_buf, out_cap, &[b"deleted\0User deleted: ", username], 3)
+                },
+            ),
+            b"restored" => (
+                3,
+                unsafe {
+                    add23_write_slices(
+                        out_buf,
+                        out_cap,
+                        &[b"registered\0User restored: ", username],
+                        3,
+                    )
+                },
+            ),
+            b"force_deleted" => (
+                4,
+                unsafe {
+                    add23_write_slices(
+                        out_buf,
+                        out_cap,
+                        &[b"deleted\0User permanently deleted: ", username],
+                        3,
+                    )
+                },
+            ),
+            _ => return -2,
+        };
+
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_event_code = code;
+        }
+        written
+    }))
+    .unwrap_or(-1)
+}
+
+#[inline]
+fn add23_crc32_update(mut crc: u32, bytes: &[u8]) -> u32 {
+    for &b in bytes {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    crc
+}
+
+/// Validates and computes the unsigned CRC32 secondary search index document ID for an
+/// `AnidbTitle` row in `AnidbInfoObserver::normalizeAnidbTitleRow()`.
+///
+/// Writes:
+/// - `*out_doc_id`: unsigned IEEE CRC32 of `"{anidb_id}|{type}|{lang}|{title}"` widened to `i64`
+/// - `*out_valid`: `1` when `anidb_id > 0 && !title.is_empty()`, else `0`
+///
+/// Returns `1` on success, or `-1` on null/unaligned pointers or invalid slice lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_anidb_info_observer_normalize_title_row(
+    anidb_id: i64,
+    type_ptr: *const u8,
+    type_len: usize,
+    lang_ptr: *const u8,
+    lang_len: usize,
+    title_ptr: *const u8,
+    title_len: usize,
+    out_doc_id: *mut i64,
+    out_valid: *mut i32,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_doc_id.is_null()
+            || !out_doc_id.is_aligned()
+            || out_valid.is_null()
+            || !out_valid.is_aligned()
+        {
+            return -1;
+        }
+        let (Some(title_type), Some(lang), Some(title)) = (
+            unsafe { add23_valid_slice(type_ptr, type_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(lang_ptr, lang_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(title_ptr, title_len, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+
+        let id_str = anidb_id.to_string();
+        let mut crc = !0u32;
+        crc = add23_crc32_update(crc, id_str.as_bytes());
+        crc = add23_crc32_update(crc, b"|");
+        crc = add23_crc32_update(crc, title_type);
+        crc = add23_crc32_update(crc, b"|");
+        crc = add23_crc32_update(crc, lang);
+        crc = add23_crc32_update(crc, b"|");
+        crc = add23_crc32_update(crc, title);
+        let doc_id = i64::from(!crc);
+        let valid = i32::from(anidb_id > 0 && !title.is_empty());
+
+        unsafe {
+            *out_doc_id = doc_id;
+            *out_valid = valid;
+        }
+        1
+    }))
+    .unwrap_or(-1)
+}
+
+/// Extracts and validates a positive Steam app ID (`(int) ($rawId ?? 0) > 0`) for
+/// `SteamAppObserver::deleted()` and `SteamAppObserver::sync()`.
+///
+/// `kind`:
+/// - `0`: null / false (`*out_id = 0`, returns `0`)
+/// - `1`: integer `int_val` (`*out_id = int_val.max(0)`, returns `1` if `int_val > 0`, else `0`)
+/// - `2`: string `str_ptr[..str_len]` parsed with PHP `(int)` rules (`-2` if scientific/float notation)
+///
+/// Returns `1` when eligible (`*out_id > 0`), `0` when ineligible (`*out_id == 0`),
+/// `-2` when a string requires PHP float coercion, or `-1` on invalid arguments.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_steam_app_observer_resolve_id(
+    kind: u8,
+    int_val: i64,
+    str_ptr: *const u8,
+    str_len: usize,
+    out_id: *mut i64,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_id.is_null() || !out_id.is_aligned() {
+            return -1;
+        }
+        let Some(raw_str) = (unsafe { add23_valid_slice(str_ptr, str_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+
+        let parsed: i64 = match kind {
+            0 => 0,
+            1 => int_val,
+            2 => {
+                let trimmed_start = raw_str
+                    .iter()
+                    .position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C))
+                    .map_or(&[][..], |idx| &raw_str[idx..]);
+                let Some(val) = w22_php_int(trimmed_start) else {
+                    return -2;
+                };
+                val
+            }
+            _ => return -1,
+        };
+
+        if parsed > 0 {
+            unsafe {
+                *out_id = parsed;
+            }
+            1
+        } else {
+            unsafe {
+                *out_id = 0;
+            }
+            0
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Formats NUL-separated `icon_bg\0icon_color` Tailwind badge classes for
+/// `AdminDashboardSnapshotService::buildRecentActivity()`:
+/// - `icon_bg`: `"bg-{color}-100 dark:bg-{color}-900"`
+/// - `icon_color`: `"text-{color}-600 dark:text-{color}-400"`
+///
+/// Returns written byte length (`> 0`), `-2` when `color` contains a NUL byte,
+/// `-(needed as isize)` when `out_cap` is too small, or `-1` on invalid arguments.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_admin_dashboard_activity_badge_classes_nul(
+    color_ptr: *const u8,
+    color_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(color) = (unsafe { add23_valid_slice(color_ptr, color_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        if color.contains(&0) {
+            return -2;
+        }
+        unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[
+                    b"bg-",
+                    color,
+                    b"-100 dark:bg-",
+                    color,
+                    b"-900\0text-",
+                    color,
+                    b"-600 dark:text-",
+                    color,
+                    b"-400",
+                ],
+                3,
+            )
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Normalizes a recent payment row for `AdminDashboardSnapshotService::buildRecentPayments()`.
+/// Writes NUL-separated `username\0email\0item_description\0invoice_amount\0payment_method\0payment_status\0invoice_status\0order_id`
+/// into `out_buf` (defaulting `invoice_status` to `"Pending"` when `has_invoice_status == 0`)
+/// and stores `raw_id` in `*out_id`.
+///
+/// Returns written byte length (`>= 7`), `-2` if any input field contains a NUL byte,
+/// `-(needed as isize)` when `out_cap` is too small, or `-1` on invalid arguments.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_admin_dashboard_normalize_payment_row_nul(
+    raw_id: i64,
+    username_ptr: *const u8,
+    username_len: usize,
+    email_ptr: *const u8,
+    email_len: usize,
+    item_desc_ptr: *const u8,
+    item_desc_len: usize,
+    invoice_amount_ptr: *const u8,
+    invoice_amount_len: usize,
+    payment_method_ptr: *const u8,
+    payment_method_len: usize,
+    payment_status_ptr: *const u8,
+    payment_status_len: usize,
+    has_invoice_status: u8,
+    invoice_status_ptr: *const u8,
+    invoice_status_len: usize,
+    order_id_ptr: *const u8,
+    order_id_len: usize,
+    out_id: *mut i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if has_invoice_status > 1 || out_id.is_null() || !out_id.is_aligned() {
+            return -1;
+        }
+        let (
+            Some(username),
+            Some(email),
+            Some(item_desc),
+            Some(invoice_amount),
+            Some(payment_method),
+            Some(payment_status),
+            Some(invoice_status_in),
+            Some(order_id),
+        ) = (
+            unsafe { add23_valid_slice(username_ptr, username_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(email_ptr, email_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(item_desc_ptr, item_desc_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(invoice_amount_ptr, invoice_amount_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(payment_method_ptr, payment_method_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(payment_status_ptr, payment_status_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(invoice_status_ptr, invoice_status_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(order_id_ptr, order_id_len, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+
+        let invoice_status: &[u8] = if has_invoice_status == 1 {
+            invoice_status_in
+        } else {
+            b"Pending"
+        };
+
+        if username.contains(&0)
+            || email.contains(&0)
+            || item_desc.contains(&0)
+            || invoice_amount.contains(&0)
+            || payment_method.contains(&0)
+            || payment_status.contains(&0)
+            || invoice_status.contains(&0)
+            || order_id.contains(&0)
+        {
+            return -2;
+        }
+
+        let written = unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[
+                    username,
+                    b"\0",
+                    email,
+                    b"\0",
+                    item_desc,
+                    b"\0",
+                    invoice_amount,
+                    b"\0",
+                    payment_method,
+                    b"\0",
+                    payment_status,
+                    b"\0",
+                    invoice_status,
+                    b"\0",
+                    order_id,
+                ],
+                3,
+            )
+        };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_id = raw_id;
+        }
+        written
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave23_dashboard_activity_observer_tests {
+    use super::*;
+
+    #[test]
+    fn user_activity_and_observer_helpers_match_php_contracts() {
+        let mut buf = [0u8; 256];
+
+        let n = unsafe {
+            nntmux_user_activity_resolve_icon(b"registered".as_ptr(), 10, buf.as_mut_ptr(), buf.len())
+        } as usize;
+        assert_eq!(&buf[..n], b"user-plus");
+
+        let n = unsafe {
+            nntmux_user_activity_resolve_color_class(
+                b"role_updated".as_ptr(),
+                12,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        } as usize;
+        assert_eq!(&buf[..n], b"blue");
+
+        let n = unsafe {
+            nntmux_user_activity_observer_resolve_actor(
+                1,
+                b"alice".as_ptr(),
+                5,
+                1,
+                7,
+                7,
+                1,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        } as usize;
+        assert_eq!(&buf[..n], b"Self");
+
+        let n = unsafe {
+            nntmux_user_activity_observer_fallback_role_name(1, 5, buf.as_mut_ptr(), buf.len())
+        } as usize;
+        assert_eq!(&buf[..n], b"Role #5");
+
+        let mut code = -1i32;
+        let n = unsafe {
+            nntmux_user_activity_observer_format_event(
+                b"updated".as_ptr(),
+                7,
+                b"alice".as_ptr(),
+                5,
+                b"Admin".as_ptr(),
+                5,
+                &mut code,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        } as usize;
+        assert_eq!(code, 1);
+        assert_eq!(
+            &buf[..n],
+            "role_updated\0User role updated: alice \u{2192} Admin".as_bytes()
+        );
+    }
+
+    #[test]
+    fn anidb_steam_and_dashboard_snapshot_helpers_match_php_contracts() {
+        let mut doc_id = -1i64;
+        let mut valid = -1i32;
+        assert_eq!(
+            unsafe {
+                nntmux_anidb_info_observer_normalize_title_row(
+                    42,
+                    b"main".as_ptr(),
+                    4,
+                    b"en".as_ptr(),
+                    2,
+                    b"Cowboy Bebop".as_ptr(),
+                    12,
+                    &mut doc_id,
+                    &mut valid,
+                )
+            },
+            1
+        );
+        assert_eq!(valid, 1);
+        assert_eq!(
+            doc_id,
+            i64::from(!add23_crc32_update(!0u32, b"42|main|en|Cowboy Bebop"))
+        );
+
+        let mut steam_id = -1i64;
+        assert_eq!(
+            unsafe {
+                nntmux_steam_app_observer_resolve_id(2, 0, b"  570abc".as_ptr(), 8, &mut steam_id)
+            },
+            1
+        );
+        assert_eq!(steam_id, 570);
+
+        let mut buf = [0u8; 256];
+        let n = unsafe {
+            nntmux_admin_dashboard_activity_badge_classes_nul(
+                b"green".as_ptr(),
+                5,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        } as usize;
+        assert_eq!(
+            &buf[..n],
+            b"bg-green-100 dark:bg-green-900\0text-green-600 dark:text-green-400"
+        );
+
+        let mut pay_id = -1i64;
+        let n = unsafe {
+            nntmux_admin_dashboard_normalize_payment_row_nul(
+                99,
+                b"alice".as_ptr(),
+                5,
+                b"a@b.c".as_ptr(),
+                5,
+                b"VIP".as_ptr(),
+                3,
+                b"10.00".as_ptr(),
+                5,
+                b"BTC".as_ptr(),
+                3,
+                b"Settled".as_ptr(),
+                7,
+                0,
+                b"".as_ptr(),
+                0,
+                b"ord-1".as_ptr(),
+                5,
+                &mut pay_id,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        } as usize;
+        assert_eq!(pay_id, 99);
+        assert_eq!(
+            &buf[..n],
+            b"alice\0a@b.c\0VIP\010.00\0BTC\0Settled\0Pending\0ord-1"
+        );
+    }
+
+    #[test]
+    fn wave23_slice6_entrypoints_reject_null_unaligned_and_undersized_buffers() {
+        let mut raw = [0u8; 64];
+        let unaligned_i64 = unsafe { raw.as_mut_ptr().add(1).cast::<i64>() };
+        let unaligned_i32 = unsafe { raw.as_mut_ptr().add(1).cast::<i32>() };
+        let mut small = [7u8; 2];
+
+        assert_eq!(
+            unsafe { nntmux_user_activity_resolve_icon(b"registered".as_ptr(), 10, small.as_mut_ptr(), 2) },
+            -9
+        );
+        assert_eq!(small, [7u8; 2]);
+        assert_eq!(
+            unsafe { nntmux_user_activity_resolve_color_class(b"deleted".as_ptr(), 7, small.as_mut_ptr(), 2) },
+            -3
+        );
+        assert_eq!(small, [7u8; 2]);
+        assert_eq!(
+            unsafe {
+                nntmux_user_activity_observer_format_event(
+                    b"created".as_ptr(),
+                    7,
+                    b"u".as_ptr(),
+                    1,
+                    b"".as_ptr(),
+                    0,
+                    unaligned_i32,
+                    raw.as_mut_ptr(),
+                    32,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_anidb_info_observer_normalize_title_row(
+                    1,
+                    b"a".as_ptr(),
+                    1,
+                    b"b".as_ptr(),
+                    1,
+                    b"c".as_ptr(),
+                    1,
+                    unaligned_i64,
+                    &mut 0,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_steam_app_observer_resolve_id(1, 5, b"".as_ptr(), 0, unaligned_i64) },
+            -1
+        );
+    }
+}
