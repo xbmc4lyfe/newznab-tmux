@@ -4,19 +4,35 @@ declare(strict_types=1);
 
 namespace App\Services\Api\V1;
 
-final readonly class ReleaseItemPayloadBuilder
+use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
+use Throwable;
+
+final class ReleaseItemPayloadBuilder
 {
-    private string $serverUrl;
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_rfc2822_from_unix_utc(int64_t ts, char *out_buf, size_t out_cap);
+        ssize_t nntmux_release_item_rss_dates(const char *adddate_ptr, size_t adddate_len, const char *postdate_ptr, size_t postdate_len, char *out_buf, size_t out_cap);
+        C;
 
-    private mixed $token;
+    private static FFI|false|null $ffi = null;
 
-    private string $delParam;
+    private static ?CData $outBuf64 = null;
 
-    private bool $includeEnclosure;
+    private static bool $useRustFfi = true;
 
-    private bool $extended;
+    private readonly string $serverUrl;
 
-    private bool $isNewznab;
+    private readonly mixed $token;
+
+    private readonly string $delParam;
+
+    private readonly bool $includeEnclosure;
+
+    private readonly bool $extended;
+
+    private readonly bool $isNewznab;
 
     /**
      * @param  array<string, mixed>  $parameters
@@ -26,6 +42,7 @@ final readonly class ReleaseItemPayloadBuilder
         array $parameters,
         array $server,
         string $namespace = 'newznab',
+        private readonly bool $useNative = true,
     ) {
         $this->serverUrl = (string) ($server['server']['url'] ?? '');
         $this->token = $parameters['token'] ?? '';
@@ -33,6 +50,130 @@ final readonly class ReleaseItemPayloadBuilder
         $this->includeEnclosure = ! isset($parameters['dl']) || (int) $parameters['dl'] === 1;
         $this->extended = (int) ($parameters['extended'] ?? '') === 1;
         $this->isNewznab = $namespace === 'newznab';
+    }
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    /**
+     * Retains native PHP `date(DATE_RSS, $timestamp)` in production under the < 1.5x FFI threshold
+     * (`1.22x` p99 due to single-integer `FFI::string` allocation overhead); see `rfc2822FromUnixUtcNative`.
+     */
+    public static function rfc2822FromUnixUtc(int $timestamp): string
+    {
+        return date(DATE_RSS, $timestamp);
+    }
+
+    public static function rfc2822FromUnixUtcNative(int $timestamp): ?string
+    {
+        if (! self::$useRustFfi || \date_default_timezone_get() !== 'UTC') {
+            return null;
+        }
+        $ffi = self::$ffi ?? self::resolveFfi();
+        $buf = self::$outBuf64;
+        if ($ffi === null || $ffi === false || $buf === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_rfc2822_from_unix_utc($timestamp, $buf, 64);
+
+            return $written === 31 ? FFI::string($buf, 31) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public static function rfc2822FromUnixUtcPhp(int $timestamp): string
+    {
+        return date(DATE_RSS, $timestamp);
+    }
+
+    /**
+     * @return array{pubDate: string, usenetdate: string}|null
+     */
+    public static function rssDates(string $adddate, ?string $postdate = null): ?array
+    {
+        if (self::$useRustFfi && \date_default_timezone_get() === 'UTC') {
+            $native = self::rssDatesNative($adddate, $postdate ?? '');
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return self::rssDatesPhp($adddate, $postdate);
+    }
+
+    /**
+     * @return array{pubDate: string, usenetdate: string}|null
+     */
+    public static function rssDatesNative(string $adddate, string $postdate = ''): ?array
+    {
+        if (! self::$useRustFfi || \date_default_timezone_get() !== 'UTC') {
+            return null;
+        }
+        $addLen = \strlen($adddate);
+        if ($addLen === 0) {
+            return null;
+        }
+        $ffi = self::$ffi ?? self::resolveFfi();
+        $buf = self::$outBuf64;
+        if ($ffi === null || $ffi === false || $buf === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_release_item_rss_dates(
+                $adddate,
+                $addLen,
+                $postdate,
+                \strlen($postdate),
+                $buf,
+                64,
+            );
+            if ($written !== 63) {
+                return null;
+            }
+            if ($postdate === '' || $postdate === $adddate) {
+                $pub = FFI::string($buf, 31);
+
+                return ['pubDate' => $pub, 'usenetdate' => $pub];
+            }
+            $raw = FFI::string($buf, 63);
+
+            return [
+                'pubDate' => \substr($raw, 0, 31),
+                'usenetdate' => \substr($raw, 32, 31),
+            ];
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @return array{pubDate: string, usenetdate: string}|null
+     */
+    public static function rssDatesPhp(string $adddate, ?string $postdate = null): ?array
+    {
+        $addTs = strtotime($adddate);
+        if ($addTs === false) {
+            return null;
+        }
+        $pubDate = date(DATE_RSS, $addTs);
+        $postTs = ($postdate !== null && trim($postdate) !== '') ? strtotime($postdate) : false;
+        $usenetTs = $postTs !== false ? $postTs : $addTs;
+
+        return [
+            'pubDate' => $pubDate,
+            'usenetdate' => date(DATE_RSS, $usenetTs),
+        ];
     }
 
     /**
@@ -49,6 +190,69 @@ final readonly class ReleaseItemPayloadBuilder
      * }
      */
     public function build(mixed $release): array
+    {
+        if (! $this->useNative || ! self::$useRustFfi || \date_default_timezone_get() !== 'UTC') {
+            return $this->buildPhp($release);
+        }
+
+        $guid = (string) $this->value($release, 'guid');
+        $searchName = $this->value($release, 'searchname');
+        $downloadUrl = $this->serverUrl.'/getnzb?id='.$guid.'.nzb&r='.$this->token.$this->delParam;
+        $adddate = $this->value($release, 'adddate');
+        $postdate = $this->extended ? $this->value($release, 'postdate') : null;
+
+        $rssDates = (\is_string($adddate) && ($postdate === null || \is_string($postdate)))
+            ? self::rssDatesNative($adddate, \is_string($postdate) ? $postdate : '')
+            : null;
+
+        if ($rssDates !== null) {
+            $pubDate = $rssDates['pubDate'];
+            $precomputedUsenetDate = $rssDates['usenetdate'];
+        } else {
+            $onlyAdd = \is_string($adddate) ? self::rssDatesNative($adddate, '') : null;
+            $pubDate = $onlyAdd !== null
+                ? $onlyAdd['pubDate']
+                : date(DATE_RSS, strtotime((string) $adddate));
+            $precomputedUsenetDate = null;
+        }
+
+        $payload = [
+            'title' => $searchName,
+            'guid' => $this->serverUrl.'/details/'.$guid,
+            'link' => $downloadUrl,
+            'comments' => $this->serverUrl.'/details/'.$guid.'#comments',
+            'pubDate' => $pubDate,
+            'category' => $this->value($release, 'category_name'),
+            'description' => $searchName,
+        ];
+
+        if ($this->includeEnclosure) {
+            $payload['enclosure'] = [
+                'url' => $downloadUrl,
+                'length' => $this->value($release, 'size'),
+                'type' => 'application/x-nzb',
+            ];
+        }
+
+        $payload['attr'] = $this->attributes($release, $precomputedUsenetDate, true);
+
+        return $payload;
+    }
+
+    /**
+     * @return array{
+     *     title: mixed,
+     *     guid: string,
+     *     link: string,
+     *     comments: string,
+     *     pubDate: string,
+     *     category: mixed,
+     *     description: mixed,
+     *     enclosure?: array{url: string, length: mixed, type: string},
+     *     attr: array<string, mixed>
+     * }
+     */
+    public function buildPhp(mixed $release): array
     {
         $guid = (string) $this->value($release, 'guid');
         $searchName = $this->value($release, 'searchname');
@@ -72,7 +276,7 @@ final readonly class ReleaseItemPayloadBuilder
             ];
         }
 
-        $payload['attr'] = $this->attributes($release);
+        $payload['attr'] = $this->attributes($release, null, false);
 
         return $payload;
     }
@@ -80,7 +284,7 @@ final readonly class ReleaseItemPayloadBuilder
     /**
      * @return array<string, mixed>
      */
-    private function attributes(mixed $release): array
+    private function attributes(mixed $release, ?string $precomputedUsenetDate = null, bool $allowNative = true): array
     {
         $attributes = [
             'category' => $this->value($release, 'categories_id'),
@@ -131,10 +335,16 @@ final readonly class ReleaseItemPayloadBuilder
         $attributes['grabs'] = $this->value($release, 'grabs');
         $attributes['comments'] = $this->value($release, 'comments');
         $attributes['password'] = $this->value($release, 'passwordstatus');
-        $usenetTimestamp = $this->timestamp($this->value($release, 'postdate'))
-            ?? $this->timestamp($this->value($release, 'adddate'));
-        if ($usenetTimestamp !== null) {
-            $attributes['usenetdate'] = date(DATE_RSS, $usenetTimestamp);
+        if ($precomputedUsenetDate !== null) {
+            $attributes['usenetdate'] = $precomputedUsenetDate;
+        } else {
+            $usenetTimestamp = $this->timestamp($this->value($release, 'postdate'))
+                ?? $this->timestamp($this->value($release, 'adddate'));
+            if ($usenetTimestamp !== null) {
+                $attributes['usenetdate'] = $allowNative
+                    ? self::rfc2822FromUnixUtc($usenetTimestamp)
+                    : date(DATE_RSS, $usenetTimestamp);
+            }
         }
 
         $groupName = $this->value($release, 'group_name');
@@ -248,5 +458,28 @@ final readonly class ReleaseItemPayloadBuilder
         $timestamp = strtotime($value);
 
         return $timestamp === false ? null : $timestamp;
+    }
+
+    private static function resolveFfi(): ?FFI
+    {
+        if (self::$ffi !== null) {
+            return self::$ffi === false ? null : self::$ffi;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('release_item_payload_builder', self::FFI_CDEF);
+        if ($ffi === null) {
+            self::$ffi = false;
+
+            return null;
+        }
+        try {
+            self::$outBuf64 = $ffi->new('char[64]');
+            self::$ffi = $ffi;
+
+            return $ffi;
+        } catch (Throwable) {
+            self::$ffi = false;
+
+            return null;
+        }
     }
 }

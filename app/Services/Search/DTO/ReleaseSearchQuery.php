@@ -4,8 +4,24 @@ declare(strict_types=1);
 
 namespace App\Services\Search\DTO;
 
-final readonly class ReleaseSearchQuery
+use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
+use Throwable;
+
+final class ReleaseSearchQuery
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_search_normalize_media_unique_id(const char *input_ptr, size_t input_len, char *out_buf, size_t out_cap);
+        int32_t nntmux_search_normalize_range_bound(const char *input_ptr, size_t input_len, int64_t *out_val);
+        C;
+
+    private static FFI|false|null $ffi = null;
+
+    private static ?CData $outI64 = null;
+
+    private static bool $useRustFfi = true;
+
     /**
      * @param  array<string, mixed>|string|null  $phrases
      * @param  list<int>|null  $categoryIds
@@ -14,37 +30,47 @@ final readonly class ReleaseSearchQuery
      * @param  list<int>|null  $releaseIds
      */
     public function __construct(
-        public array|string|null $phrases = null,
-        public ?array $categoryIds = null,
-        public array $excludedCategoryIds = [],
-        public ?array $releaseIds = null,
-        public int $minSize = 0,
-        public int $maxSize = 0,
-        public int $maxAgeDays = -1,
-        public int $minDate = 0,
-        public int $maxDate = 0,
-        public ?int $groupId = null,
-        public bool $passwordAllowRar = false,
-        public ?int $passwordStatusMin = null,
-        public ?bool $hasMediaInfo = null,
-        public ?string $mediaUniqueId = null,
-        public int $minVideoWidth = 0,
-        public int $maxVideoWidth = 0,
-        public int $minVideoHeight = 0,
-        public int $maxVideoHeight = 0,
-        public string $sortField = 'postdate_ts',
-        public string $sortDirection = 'desc',
-        public bool $tryFuzzy = true,
-        public int $limit = 100,
-        public int $offset = 0,
-        public ?SearchCursor $cursor = null,
-        public bool $trackTotal = true,
-        public bool $includeDocuments = false,
-        public array $ranges = [],
-        public ?int $minId = null,
-        public ?int $maxId = null,
-        public bool $fuzzyOnly = false,
+        public readonly array|string|null $phrases = null,
+        public readonly ?array $categoryIds = null,
+        public readonly array $excludedCategoryIds = [],
+        public readonly ?array $releaseIds = null,
+        public readonly int $minSize = 0,
+        public readonly int $maxSize = 0,
+        public readonly int $maxAgeDays = -1,
+        public readonly int $minDate = 0,
+        public readonly int $maxDate = 0,
+        public readonly ?int $groupId = null,
+        public readonly bool $passwordAllowRar = false,
+        public readonly ?int $passwordStatusMin = null,
+        public readonly ?bool $hasMediaInfo = null,
+        public readonly ?string $mediaUniqueId = null,
+        public readonly int $minVideoWidth = 0,
+        public readonly int $maxVideoWidth = 0,
+        public readonly int $minVideoHeight = 0,
+        public readonly int $maxVideoHeight = 0,
+        public readonly string $sortField = 'postdate_ts',
+        public readonly string $sortDirection = 'desc',
+        public readonly bool $tryFuzzy = true,
+        public readonly int $limit = 100,
+        public readonly int $offset = 0,
+        public readonly ?SearchCursor $cursor = null,
+        public readonly bool $trackTotal = true,
+        public readonly bool $includeDocuments = false,
+        public readonly array $ranges = [],
+        public readonly ?int $minId = null,
+        public readonly ?int $maxId = null,
+        public readonly bool $fuzzyOnly = false,
     ) {}
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
 
     /** @param array<string, mixed> $criteria */
     public static function fromCriteria(array $criteria, int $limit, int $offset = 0, ?SearchCursor $cursor = null): self
@@ -155,6 +181,33 @@ final readonly class ReleaseSearchQuery
         return $normalized;
     }
 
+    /** @return array<string, array<string, int>> */
+    public static function normalizeRangesNative(mixed $ranges): array
+    {
+        if (! is_array($ranges)) {
+            return [];
+        }
+
+        $normalized = [];
+        foreach (['size', 'totalpart', 'grabs', 'comments', 'adddate_ts'] as $field) {
+            if (! is_array($ranges[$field] ?? null)) {
+                continue;
+            }
+            foreach (['min', 'max'] as $bound) {
+                $value = self::normalizeRangeBoundNative($ranges[$field][$bound] ?? null);
+                if ($value !== null) {
+                    $normalized[$field][$bound] = $value;
+                }
+            }
+        }
+
+        return $normalized;
+    }
+
+    /**
+     * Retains native PHP `filter_var` in production under the < 1.5x FFI threshold (`0.38x` mean,
+     * `0.67x` p99 due to single-scalar FFI boundary overhead); see `normalizeRangeBoundNative`.
+     */
     public static function normalizeRangeBound(mixed $value): ?int
     {
         if (! is_int($value) && ! is_string($value)) {
@@ -165,6 +218,37 @@ final readonly class ReleaseSearchQuery
         return $integer !== false && $integer >= 0 ? $integer : null;
     }
 
+    public static function normalizeRangeBoundNative(mixed $value): ?int
+    {
+        if (! self::$useRustFfi || (! \is_int($value) && ! \is_string($value))) {
+            return null;
+        }
+        if (\is_int($value)) {
+            return $value >= 0 ? $value : null;
+        }
+        if ($value === '') {
+            return null;
+        }
+        $ffi = self::resolveFfi();
+        $out = self::$outI64;
+        if ($ffi === null || $out === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $rc = $ffi->nntmux_search_normalize_range_bound($value, \strlen($value), FFI::addr($out));
+
+            // @phpstan-ignore property.notFound
+            return $rc === 1 ? (int) $out->cdata : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Retains native PHP `trim` in production under the < 1.5x FFI threshold (`0.33x` mean,
+     * `0.50x` p99 due to single-scalar `FFI::string` allocation overhead); see `normalizeMediaUniqueIdNative`.
+     */
     public static function normalizeMediaUniqueId(mixed $value): ?string
     {
         if (! is_scalar($value)) {
@@ -174,5 +258,68 @@ final readonly class ReleaseSearchQuery
         $mediaUniqueId = trim((string) $value);
 
         return $mediaUniqueId === '' || $mediaUniqueId === '-1' ? null : $mediaUniqueId;
+    }
+
+    public static function normalizeMediaUniqueIdNative(mixed $value): ?string
+    {
+        if (! self::$useRustFfi || ! \is_scalar($value)) {
+            return null;
+        }
+        $str = (string) $value;
+        $len = \strlen($str);
+        if ($len === 0) {
+            return null;
+        }
+        $ffi = self::resolveFfi();
+        if ($ffi === null) {
+            return null;
+        }
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(64, $len), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_search_normalize_media_unique_id($str, $len, $scratch, $cap);
+            if (! \is_int($written)) {
+                return null;
+            }
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_search_normalize_media_unique_id($str, $len, $scratch, $cap);
+            }
+
+            return \is_int($written) && $written > 0 ? FFI::string($scratch, $written) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function resolveFfi(): ?FFI
+    {
+        if (self::$ffi !== null) {
+            return self::$ffi === false ? null : self::$ffi;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('release_search_query', self::FFI_CDEF);
+        if ($ffi === null) {
+            self::$ffi = false;
+
+            return null;
+        }
+        try {
+            self::$outI64 = $ffi->new('int64_t');
+            self::$ffi = $ffi;
+
+            return $ffi;
+        } catch (Throwable) {
+            self::$ffi = false;
+
+            return null;
+        }
     }
 }

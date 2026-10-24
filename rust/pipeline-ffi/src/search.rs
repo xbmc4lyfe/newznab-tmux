@@ -2452,6 +2452,330 @@ pub unsafe extern "C" fn nntmux_datetime_to_unix_utc(input: *const u8, input_len
         + i64::from(sec)
 }
 
+const MIN_RFC2822_TS_UTC: i64 = -62_167_219_200; // 0000-01-01 00:00:00 UTC
+const MAX_RFC2822_TS_UTC: i64 = 253_402_300_799; // 9999-12-31 23:59:59 UTC
+
+const DOW_NAMES: [[u8; 3]; 7] = [
+    *b"Thu", *b"Fri", *b"Sat", *b"Sun", *b"Mon", *b"Tue", *b"Wed",
+];
+
+const MONTH_NAMES: [[u8; 3]; 12] = [
+    *b"Jan", *b"Feb", *b"Mar", *b"Apr", *b"May", *b"Jun", *b"Jul", *b"Aug", *b"Sep", *b"Oct",
+    *b"Nov", *b"Dec",
+];
+
+#[inline]
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = i64::from(yoe) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = y + i64::from(m <= 2);
+    (y, m, d)
+}
+
+#[inline]
+fn rfc2822_from_unix_utc_bytes(ts: i64) -> Option<[u8; 31]> {
+    if !(MIN_RFC2822_TS_UTC..=MAX_RFC2822_TS_UTC).contains(&ts) {
+        return None;
+    }
+    let days = ts.div_euclid(86_400);
+    let sod = ts.rem_euclid(86_400) as u32;
+    let dow = days.rem_euclid(7) as usize;
+    let (year, month, day) = civil_from_days(days);
+    if !(0..=9999).contains(&year) {
+        return None;
+    }
+    let y = year as u32;
+    let hour = sod / 3_600;
+    let rem = sod % 3_600;
+    let min = rem / 60;
+    let sec = rem % 60;
+
+    let dow_b = DOW_NAMES[dow];
+    let mon_b = MONTH_NAMES[(month - 1) as usize];
+
+    Some([
+        dow_b[0],
+        dow_b[1],
+        dow_b[2],
+        b',',
+        b' ',
+        b'0' + (day / 10) as u8,
+        b'0' + (day % 10) as u8,
+        b' ',
+        mon_b[0],
+        mon_b[1],
+        mon_b[2],
+        b' ',
+        b'0' + ((y / 1000) % 10) as u8,
+        b'0' + ((y / 100) % 10) as u8,
+        b'0' + ((y / 10) % 10) as u8,
+        b'0' + (y % 10) as u8,
+        b' ',
+        b'0' + (hour / 10) as u8,
+        b'0' + (hour % 10) as u8,
+        b':',
+        b'0' + (min / 10) as u8,
+        b'0' + (min % 10) as u8,
+        b':',
+        b'0' + (sec / 10) as u8,
+        b'0' + (sec % 10) as u8,
+        b' ',
+        b'+',
+        b'0',
+        b'0',
+        b'0',
+        b'0',
+    ])
+}
+
+#[inline]
+fn trim_filter_validate_int_ws(mut s: &[u8]) -> &[u8] {
+    while let Some(&b) = s.first() {
+        if matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B) {
+            s = &s[1..];
+        } else {
+            break;
+        }
+    }
+    while let Some(&b) = s.last() {
+        if matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B) {
+            s = &s[..s.len() - 1];
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+#[inline]
+fn parse_non_negative_filter_int(input: &[u8]) -> Option<i64> {
+    let s = trim_filter_validate_int_ws(input);
+    if s.is_empty() {
+        return None;
+    }
+    if s[0] == b'-' {
+        return if &s[1..] == b"0" { Some(0) } else { None };
+    }
+    let digits = if s[0] == b'+' { &s[1..] } else { s };
+    if digits.is_empty() {
+        return None;
+    }
+    if digits[0] == b'0' {
+        return if digits.len() == 1 { Some(0) } else { None };
+    }
+    if digits.len() > 19 {
+        return None;
+    }
+    let mut acc: i64 = 0;
+    for &b in digits {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        acc = acc.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+    }
+    Some(acc)
+}
+
+/// Accelerates `ApiInputCanonicalizer::listValue` for comma-separated strings:
+/// splits on `,`, trims PHP default ASCII whitespace (` \t\n\r\x0B\0`), filters empty items,
+/// and joins remaining items with `,`.
+///
+/// # Safety
+///
+/// `input_ptr` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_api_canonicalize_list_csv(
+    input_ptr: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input_len == 0 {
+        return 0;
+    }
+    if input_ptr.is_null() {
+        return -1;
+    }
+    let slice = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+    let mut cur = OutCursor::new(out_buf, out_cap);
+    let mut first = true;
+    for raw_item in slice.split(|&b| b == b',') {
+        let item = trim_php_default(raw_item);
+        if !item.is_empty() {
+            if !first {
+                cur.push_byte(b',');
+            }
+            first = false;
+            cur.push_slice(item);
+        }
+    }
+    cur.finish()
+}
+
+/// Accelerates `ReleaseSearchQuery::normalizeMediaUniqueId`:
+/// trims PHP default ASCII whitespace (` \t\n\r\x0B\0`) and returns `0` (`null`) for `""` or `"-1"`.
+///
+/// # Safety
+///
+/// `input_ptr` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_search_normalize_media_unique_id(
+    input_ptr: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input_len == 0 {
+        return 0;
+    }
+    if input_ptr.is_null() {
+        return -1;
+    }
+    let slice = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+    let trimmed = trim_php_default(slice);
+    if trimmed.is_empty() || trimmed == b"-1" {
+        return 0;
+    }
+    let mut cur = OutCursor::new(out_buf, out_cap);
+    cur.push_slice(trimmed);
+    cur.finish()
+}
+
+/// Accelerates `ReleaseSearchQuery::normalizeRangeBound` matching
+/// `filter_var($value, FILTER_VALIDATE_INT)` >= 0.
+/// Returns `1` and writes the non-negative `i64` to `*out_val` when valid, `0` when invalid/negative,
+/// or `-1` on null pointer arguments.
+///
+/// # Safety
+///
+/// `input_ptr` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_val` must be valid for writes of one `i64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_search_normalize_range_bound(
+    input_ptr: *const u8,
+    input_len: usize,
+    out_val: *mut i64,
+) -> i32 {
+    if out_val.is_null() || (input_len > 0 && input_ptr.is_null()) {
+        return -1;
+    }
+    if input_len == 0 {
+        return 0;
+    }
+    let slice = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+    match parse_non_negative_filter_int(slice) {
+        Some(val) => {
+            unsafe {
+                *out_val = val;
+            }
+            1
+        }
+        None => 0,
+    }
+}
+
+/// Formats a Unix timestamp `ts` into PHP `date(DATE_RSS, $ts)` (`"D, d M Y H:i:s +0000"`, 31 bytes)
+/// when the default timezone is UTC and year is in `0000..=9999`.
+/// Returns `31` on success, `-2` when outside `0000..=9999`, or `-31` when `out_cap < 31`.
+///
+/// # Safety
+///
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_rfc2822_from_unix_utc(
+    ts: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(rss) = rfc2822_from_unix_utc_bytes(ts) else {
+        return -2;
+    };
+    let mut cur = OutCursor::new(out_buf, out_cap);
+    cur.push_slice(&rss);
+    cur.finish()
+}
+
+/// Formats `adddate` (`pubDate`) and `postdate` (`usenetdate`, falling back to `adddate` when empty)
+/// into two `\n`-separated 31-byte `DATE_RSS` strings (`63` bytes total) when the default timezone
+/// is UTC, reusing `nntmux_datetime_to_unix_utc`.
+/// Returns `63` on success, `-2` when declined to PHP, `-1` on null pointers, or `-63` when `out_cap < 63`.
+///
+/// # Safety
+///
+/// `adddate_ptr` and `postdate_ptr` must be valid for reads of their lengths when length > 0.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_item_rss_dates(
+    adddate_ptr: *const u8,
+    adddate_len: usize,
+    postdate_ptr: *const u8,
+    postdate_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if (adddate_len > 0 && adddate_ptr.is_null()) || (postdate_len > 0 && postdate_ptr.is_null()) {
+        return -1;
+    }
+    if adddate_len == 0 {
+        return -2;
+    }
+    let add_slice = unsafe { slice::from_raw_parts(adddate_ptr, adddate_len) };
+    if add_slice.contains(&0) {
+        return -2;
+    }
+    let add_trimmed = trim_php_ws(add_slice);
+    if add_trimmed.is_empty() {
+        return -2;
+    }
+    let add_ts = unsafe { nntmux_datetime_to_unix_utc(adddate_ptr, adddate_len) };
+    if add_ts == i64::MIN {
+        return -2;
+    }
+    let Some(pub_rss) = rfc2822_from_unix_utc_bytes(add_ts) else {
+        return -2;
+    };
+
+    let post_slice = if postdate_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(postdate_ptr, postdate_len) }
+    };
+    if post_slice.contains(&0) {
+        return -2;
+    }
+    let post_trimmed = trim_php_default(post_slice);
+    let use_rss = if post_trimmed.is_empty() || post_trimmed == add_trimmed {
+        pub_rss
+    } else {
+        if trim_php_ws(post_trimmed).is_empty() {
+            return -2;
+        }
+        let post_ts = unsafe { nntmux_datetime_to_unix_utc(postdate_ptr, postdate_len) };
+        if post_ts == i64::MIN {
+            return -2;
+        }
+        let Some(r) = rfc2822_from_unix_utc_bytes(post_ts) else {
+            return -2;
+        };
+        r
+    };
+
+    let mut cur = OutCursor::new(out_buf, out_cap);
+    cur.push_slice(&pub_rss);
+    cur.push_byte(b'\n');
+    cur.push_slice(&use_rss);
+    cur.finish()
+}
+
 // ---------------------------------------------------------------------------
 // Verified NZB 1.0 document renderer (VerifiedNzbWriter::document parity).
 //
@@ -3787,5 +4111,103 @@ mod tests {
         };
         assert_eq!(s2, 5);
         assert_eq!(out_f64[0] as usize, 0);
+    }
+
+    #[test]
+    fn test_api_canonicalize_list_csv_and_search_normalizers() {
+        let mut buf = [0u8; 64];
+        let csv = b" 2000 , \t\n\r\0\x0B , 5030 , 0 , ";
+        let n = unsafe {
+            nntmux_api_canonicalize_list_csv(csv.as_ptr(), csv.len(), buf.as_mut_ptr(), buf.len())
+        };
+        assert_eq!(n, 11);
+        assert_eq!(&buf[..n as usize], b"2000,5030,0");
+
+        let empty_csv = b" , \t\n , ";
+        let n_empty = unsafe {
+            nntmux_api_canonicalize_list_csv(
+                empty_csv.as_ptr(),
+                empty_csv.len(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(n_empty, 0);
+
+        let neg_one = b"  -1 \n";
+        assert_eq!(
+            unsafe {
+                nntmux_search_normalize_media_unique_id(
+                    neg_one.as_ptr(),
+                    neg_one.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            },
+            0
+        );
+        let valid_uid = b" \t1234567890\r\n ";
+        let n_uid = unsafe {
+            nntmux_search_normalize_media_unique_id(
+                valid_uid.as_ptr(),
+                valid_uid.len(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(n_uid, 10);
+        assert_eq!(&buf[..10], b"1234567890");
+
+        let mut val: i64 = -1;
+        for (raw, expected) in [
+            (b"0" as &[u8], Some(0i64)),
+            (b"-0", Some(0)),
+            (b"+0", Some(0)),
+            (b" 42\n", Some(42)),
+            (b"+9223372036854775807", Some(i64::MAX)),
+            (b"00", None),
+            (b"01", None),
+            (b"-1", None),
+            (b"42\0", None),
+            (b"\x0c42", None),
+            (b"9223372036854775808", None),
+        ] {
+            let rc = unsafe {
+                nntmux_search_normalize_range_bound(raw.as_ptr(), raw.len(), &mut val)
+            };
+            match expected {
+                Some(exp) => {
+                    assert_eq!(rc, 1, "expected valid for {:?}", raw);
+                    assert_eq!(val, exp);
+                }
+                None => assert_eq!(rc, 0, "expected invalid for {:?}", raw),
+            }
+        }
+    }
+
+    #[test]
+    fn test_rfc2822_and_release_item_rss_dates() {
+        let mut buf = [0u8; 128];
+        let n = unsafe { nntmux_rfc2822_from_unix_utc(1_767_323_045, buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(n, 31);
+        assert_eq!(&buf[..31], b"Fri, 02 Jan 2026 03:04:05 +0000");
+
+        let add = b"2026-01-02 03:04:05";
+        let post = b"2024-02-29 23:59:59";
+        let n2 = unsafe {
+            nntmux_release_item_rss_dates(
+                add.as_ptr(),
+                add.len(),
+                post.as_ptr(),
+                post.len(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(n2, 63);
+        assert_eq!(
+            &buf[..63],
+            b"Fri, 02 Jan 2026 03:04:05 +0000\nThu, 29 Feb 2024 23:59:59 +0000"
+        );
     }
 }
