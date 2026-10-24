@@ -10646,3 +10646,1012 @@ pub unsafe extern "C" fn nntmux_additional_claim_index_matches_json(
 ) -> isize {
     unsafe { additional_json_ffi(ptr, len, out, cap, additional_claim_index) }
 }
+// ---------------------------------------------------------------------------
+// Wave 15 Slice 4: collection batch state, header storage helpers, missed-part
+// ranges, additional work plans, media source hints, console status labels and
+// PAR2 rename progress payloads. Every export returns -1 (or a defer status) so
+// the PHP caller falls back to its native implementation.
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn w15_input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+    if !additional_pointer_valid(ptr, len) {
+        return None;
+    }
+    if len == 0 {
+        return Some(&[]);
+    }
+    // SAFETY: the pointer is non-null, the range does not wrap, and the caller
+    // promises `len` readable bytes.
+    Some(unsafe { slice::from_raw_parts(ptr, len) })
+}
+
+#[inline]
+fn w15_write(out: *mut u8, cap: usize, bytes: &[u8]) -> isize {
+    if !additional_pointer_valid(out.cast_const(), cap) || bytes.len() > isize::MAX as usize {
+        return -1;
+    }
+    if bytes.len() > cap {
+        return -(bytes.len().max(2) as isize);
+    }
+    if !bytes.is_empty() {
+        // SAFETY: `out` was validated for `cap >= bytes.len()` writable bytes.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len()) };
+    }
+    bytes.len() as isize
+}
+
+#[inline]
+fn w15_read_i64(chunk: &[u8]) -> i64 {
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(chunk);
+    i64::from_le_bytes(raw)
+}
+
+pub(crate) fn w15_unique_i64(packed: &[u8]) -> Option<Vec<u8>> {
+    if !packed.len().is_multiple_of(8) {
+        return None;
+    }
+    let mut seen = std::collections::HashSet::with_capacity(packed.len() / 8);
+    let mut out = Vec::with_capacity(packed.len());
+    for chunk in packed.as_chunks::<8>().0 {
+        if seen.insert(i64::from_le_bytes(*chunk)) {
+            out.extend_from_slice(chunk);
+        }
+    }
+    Some(out)
+}
+
+pub(crate) fn w15_unique_records(packed: &[u8], width: usize) -> Option<Vec<u8>> {
+    if width == 0 || !packed.len().is_multiple_of(width) {
+        return None;
+    }
+    let mut seen: std::collections::HashSet<&[u8]> =
+        std::collections::HashSet::with_capacity(packed.len() / width);
+    let mut out = Vec::with_capacity(packed.len());
+    for chunk in packed.chunks_exact(width) {
+        if seen.insert(chunk) {
+            out.extend_from_slice(chunk);
+        }
+    }
+    Some(out)
+}
+
+/// `CollectionHandler::getAllIds`: order-preserving unique of packed little-endian i64 ids.
+///
+/// # Safety
+/// Non-null input/output pointers must be valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_collection_unique_ids(
+    ids: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(input) = w15_input(ids, len) else {
+            return -1;
+        };
+        match w15_unique_i64(input) {
+            Some(result) => w15_write(out, cap, &result),
+            None => -1,
+        }
+    })
+    .unwrap_or(-1)
+}
+
+/// `CollectionHandler::getBatchHashes`: order-preserving unique of fixed-width records.
+///
+/// # Safety
+/// Non-null input/output pointers must be valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_collection_unique_hashes(
+    packed: *const u8,
+    len: usize,
+    width: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(input) = w15_input(packed, len) else {
+            return -1;
+        };
+        match w15_unique_records(input, width) {
+            Some(result) => w15_write(out, cap, &result),
+            None => -1,
+        }
+    })
+    .unwrap_or(-1)
+}
+
+pub(crate) fn w15_hex_lower(bytes: &[u8]) -> Vec<u8> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize]);
+        out.push(HEX[(b & 0x0F) as usize]);
+    }
+    out
+}
+
+/// `HeaderStorageTransaction` batch noise marker: `bin2hex($bytes)`.
+///
+/// # Safety
+/// Non-null input/output pointers must be valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_header_batch_noise_hex(
+    bytes: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(input) = w15_input(bytes, len) else {
+            return -1;
+        };
+        if input.len() > (isize::MAX as usize) / 2 {
+            return -1;
+        }
+        w15_write(out, cap, &w15_hex_lower(input))
+    })
+    .unwrap_or(-1)
+}
+
+pub(crate) fn w15_cleanup_strategy(inserted: usize, all: usize, hashes: usize) -> i32 {
+    if inserted > 0 {
+        0
+    } else if all > 0 {
+        1
+    } else if hashes > 0 {
+        2
+    } else {
+        3
+    }
+}
+
+/// `HeaderStorageTransaction` rollback cleanup selector:
+/// 0 = inserted ids, 1 = all batch ids, 2 = collection hashes, 3 = noise marker.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_header_cleanup_strategy(
+    inserted: usize,
+    all: usize,
+    hashes: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| w15_cleanup_strategy(inserted, all, hashes)).unwrap_or(-1)
+}
+
+pub(crate) fn w15_range_count(first: i64, last: i64) -> u128 {
+    if last < first {
+        0
+    } else {
+        (i128::from(last) - i128::from(first) + 1) as u128
+    }
+}
+
+pub(crate) fn w15_range_expand(first: i64, last: i64, max_items: usize) -> Option<Vec<u8>> {
+    let count = w15_range_count(first, last);
+    if count > max_items as u128 || count > (isize::MAX as u128) / 8 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(count as usize * 8);
+    let mut number = first;
+    for step in 0..count as usize {
+        out.extend_from_slice(&number.to_le_bytes());
+        if step + 1 < count as usize {
+            number += 1;
+        }
+    }
+    Some(out)
+}
+
+pub(crate) fn w15_range_chunks(
+    first: i64,
+    last: i64,
+    chunk: i64,
+    max_chunks: usize,
+) -> Option<Vec<u8>> {
+    if chunk < 1 {
+        return None;
+    }
+    let count = w15_range_count(first, last);
+    if count == 0 {
+        return Some(Vec::new());
+    }
+    let chunks = count.div_ceil(chunk as u128);
+    if chunks > max_chunks as u128 || chunks > (isize::MAX as u128) / 16 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(chunks as usize * 16);
+    let mut start = i128::from(first);
+    let last_wide = i128::from(last);
+    loop {
+        let end = (start + i128::from(chunk) - 1).min(last_wide);
+        out.extend_from_slice(&(start as i64).to_le_bytes());
+        out.extend_from_slice(&(end as i64).to_le_bytes());
+        if end == last_wide {
+            break;
+        }
+        start = end + 1;
+    }
+    Some(out)
+}
+
+/// `MissedPartHandler::addMissingRange` expansion: inclusive range as packed i64, or -1
+/// when the range exceeds `max_items`.
+///
+/// # Safety
+/// A non-null `out` must be writable for `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_missed_range_expand(
+    first: i64,
+    last: i64,
+    max_items: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| match w15_range_expand(first, last, max_items) {
+        Some(result) => w15_write(out, cap, &result),
+        None => -1,
+    })
+    .unwrap_or(-1)
+}
+
+/// `MissedPartHandler::deferRange` statement bounds: packed i64 `[start, end]` pairs.
+///
+/// # Safety
+/// A non-null `out` must be writable for `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_missed_range_chunks(
+    first: i64,
+    last: i64,
+    chunk: i64,
+    max_chunks: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| match w15_range_chunks(first, last, chunk, max_chunks) {
+        Some(result) => w15_write(out, cap, &result),
+        None => -1,
+    })
+    .unwrap_or(-1)
+}
+
+pub(crate) fn w15_set_key(key: &[u8], source_index: i64) -> Vec<u8> {
+    if !key.is_empty() {
+        return key.to_vec();
+    }
+    let mut out = b"src:".to_vec();
+    out.extend_from_slice(source_index.to_string().as_bytes());
+    out
+}
+
+pub(crate) fn w15_archive_set_count(
+    keys: &[u8],
+    lens: &[u8],
+    indexes: &[u8],
+    count: usize,
+) -> Option<usize> {
+    if lens.len() != count.checked_mul(4)? || indexes.len() != count.checked_mul(8)? {
+        return None;
+    }
+    let mut seen: std::collections::HashSet<std::borrow::Cow<'_, [u8]>> =
+        std::collections::HashSet::with_capacity(count);
+    let mut offset = 0usize;
+    for i in 0..count {
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(&lens[i * 4..i * 4 + 4]);
+        let len = u32::from_le_bytes(raw) as usize;
+        let end = offset.checked_add(len)?;
+        if end > keys.len() {
+            return None;
+        }
+        let key = &keys[offset..end];
+        offset = end;
+        if key.is_empty() {
+            let index = w15_read_i64(&indexes[i * 8..i * 8 + 8]);
+            seen.insert(std::borrow::Cow::Owned(w15_set_key(key, index)));
+        } else {
+            seen.insert(std::borrow::Cow::Borrowed(key));
+        }
+    }
+    if offset != keys.len() {
+        return None;
+    }
+    Some(seen.len())
+}
+
+/// `AdditionalWorkPlan::setKeyOf`.
+///
+/// # Safety
+/// Non-null input/output pointers must be valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_workplan_set_key(
+    key: *const u8,
+    key_len: usize,
+    source_index: i64,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(input) = w15_input(key, key_len) else {
+            return -1;
+        };
+        w15_write(out, cap, &w15_set_key(input, source_index))
+    })
+    .unwrap_or(-1)
+}
+
+/// `AdditionalWorkPlan::archiveSetCount`: `keys` is every candidate's `setKey` concatenated,
+/// `lens` their u32 LE lengths and `indexes` their i64 LE source indexes.
+///
+/// # Safety
+/// Non-null input pointers must be valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_workplan_archive_set_count(
+    keys: *const u8,
+    keys_len: usize,
+    lens: *const u8,
+    lens_len: usize,
+    indexes: *const u8,
+    indexes_len: usize,
+    count: usize,
+) -> i64 {
+    std::panic::catch_unwind(|| {
+        let (Some(keys), Some(lens), Some(indexes)) = (
+            w15_input(keys, keys_len),
+            w15_input(lens, lens_len),
+            w15_input(indexes, indexes_len),
+        ) else {
+            return -1;
+        };
+        w15_archive_set_count(keys, lens, indexes, count).map_or(-1, |n| n as i64)
+    })
+    .unwrap_or(-1)
+}
+
+pub(crate) fn w15_candidate_order(flags: &[u8], mode: u32) -> Option<Vec<u8>> {
+    if flags.len() > u32::MAX as usize {
+        return None;
+    }
+    let mut out = Vec::with_capacity(flags.len() * 4);
+    match mode {
+        0 => (0..flags.len()).for_each(|i| out.extend_from_slice(&(i as u32).to_le_bytes())),
+        1 => (0..flags.len())
+            .rev()
+            .for_each(|i| out.extend_from_slice(&(i as u32).to_le_bytes())),
+        2 => {
+            for wanted in [true, false] {
+                for (i, &flag) in flags.iter().enumerate() {
+                    if (flag != 0) == wanted {
+                        out.extend_from_slice(&(i as u32).to_le_bytes());
+                    }
+                }
+            }
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
+/// `AdditionalWorkPlan` candidate ordering as u32 LE indexes. `flags[i] != 0` marks a
+/// likely first volume. Mode 0 = posted order, 1 = reversed, 2 = first volumes first (stable).
+///
+/// # Safety
+/// Non-null input/output pointers must be valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_workplan_candidate_order(
+    flags: *const u8,
+    count: usize,
+    mode: u32,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(input) = w15_input(flags, count) else {
+            return -1;
+        };
+        match w15_candidate_order(input, mode) {
+            Some(result) => w15_write(out, cap, &result),
+            None => -1,
+        }
+    })
+    .unwrap_or(-1)
+}
+
+/// PHP `$a / $b` for integers: exact quotients stay integral before widening.
+fn w15_php_int_div(a: i64, b: i64) -> Option<f64> {
+    if b == 0 {
+        return None;
+    }
+    if b == -1 && a == i64::MIN {
+        return Some(a as f64 / b as f64);
+    }
+    if a % b == 0 {
+        Some((a / b) as f64)
+    } else {
+        Some(a as f64 / b as f64)
+    }
+}
+
+/// Returns `(status, value)`: status 0 = null, 1 = value, -1 = defer to PHP.
+pub(crate) fn w15_available_fraction(
+    position: u32,
+    has_real: bool,
+    real: i64,
+    available: i64,
+) -> (i32, f64) {
+    match position {
+        0 => return (1, 1.0),
+        1 | 2 => {}
+        _ => return (-1, 0.0),
+    }
+    if !has_real || available <= 0 {
+        return (0, 0.0);
+    }
+    match w15_php_int_div(available, real) {
+        Some(fraction) => (1, if fraction < 1.0 { fraction } else { 1.0 }),
+        None => (-1, 0.0),
+    }
+}
+
+/// `MediaSourceHints::availableFraction`. Position 0 = complete, 1 = head, 2 = mid.
+/// `*status` receives 0 for null, 1 for a value and -1 when PHP must evaluate it.
+///
+/// # Safety
+/// `status` must be null or writable for one `int32_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_media_available_fraction(
+    position: u32,
+    has_real: u8,
+    real: i64,
+    available: i64,
+    status: *mut i32,
+) -> f64 {
+    if status.is_null() {
+        return f64::NAN;
+    }
+    let (code, value) = std::panic::catch_unwind(|| {
+        w15_available_fraction(position, has_real != 0, real, available)
+    })
+    .unwrap_or((-1, 0.0));
+    // SAFETY: `status` is non-null and the caller promises it is writable.
+    unsafe { status.write_unaligned(code) };
+    value
+}
+
+/// Returns 0 = complete (real size kept), 1 = head with real size, 2 = head without one.
+pub(crate) fn w15_head_hint(has_real: bool, real: i64, available: i64) -> i32 {
+    if has_real && real > 0 && available >= real {
+        0
+    } else if has_real && real > 0 {
+        1
+    } else {
+        2
+    }
+}
+
+/// `MediaSourceHints::head` evaluation; -1 for an invalid output pointer.
+///
+/// # Safety
+/// `real_out` must be null or writable for one `int64_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_media_head_hint(
+    has_real: u8,
+    real: i64,
+    available: i64,
+    real_out: *mut i64,
+) -> i32 {
+    if real_out.is_null() {
+        return -1;
+    }
+    let code =
+        std::panic::catch_unwind(|| w15_head_hint(has_real != 0, real, available)).unwrap_or(-1);
+    if code >= 0 {
+        // SAFETY: `real_out` is non-null and the caller promises it is writable.
+        unsafe { real_out.write_unaligned(if code == 2 { 0 } else { real }) };
+    }
+    code
+}
+
+/// `human_filesize($bytes, 1)` for integer input.
+pub(crate) fn w15_human_filesize_1(bytes: i64) -> String {
+    const UNITS: [&str; 9] = ["B", "kB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"];
+    let digits = bytes.to_string();
+    let factor = (digits.len() - 1) / 3;
+    let divisor = 1024i64.pow(factor as u32);
+    let value = w15_php_int_div(bytes, divisor).unwrap_or(0.0);
+    let fixed = format!("{value:.1}");
+    let parsed: f64 = fixed.parse().unwrap_or(value);
+    format!("{parsed}{}", UNITS.get(factor).copied().unwrap_or(""))
+}
+
+pub(crate) fn w15_console_status(kind: u32, a: i64, b: i64, text: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(48 + text.len());
+    match kind {
+        0 => {
+            out.extend_from_slice(b"\n[");
+            out.extend_from_slice(a.to_string().as_bytes());
+            out.extend_from_slice(b"][");
+            out.extend_from_slice(w15_human_filesize_1(b).as_bytes());
+            out.push(b']');
+        }
+        1 => {
+            out.extend_from_slice(b"fC");
+            out.extend_from_slice(a.to_string().as_bytes());
+        }
+        2 => {
+            out.extend_from_slice(b"(p2n:");
+            out.extend_from_slice(a.to_string().as_bytes());
+            out.push(b')');
+        }
+        3 => {
+            out.extend_from_slice(b"(src:");
+            out.extend_from_slice(text);
+            out.push(b')');
+        }
+        4 => {
+            out.extend_from_slice(b" Release ");
+            out.extend_from_slice(a.to_string().as_bytes());
+            out.extend_from_slice(b" timed out after ");
+            out.extend_from_slice(b.to_string().as_bytes());
+            out.push(b's');
+        }
+        5 => {
+            out.extend_from_slice(b" Release ");
+            out.extend_from_slice(a.to_string().as_bytes());
+            out.extend_from_slice(b" deleted after ");
+            out.extend_from_slice(b.to_string().as_bytes());
+            out.extend_from_slice(b" timeout(s)");
+        }
+        6 => {
+            out.extend_from_slice(b"Deleted broken release ID ");
+            out.extend_from_slice(a.to_string().as_bytes());
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
+/// `ConsoleOutputService` status labels. Kinds: 0 release start, 1 compressed failure,
+/// 2 PAR2 mapped, 3 media source, 4 timeout, 5 timeout deletion, 6 broken release deletion.
+///
+/// # Safety
+/// Non-null input/output pointers must be valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_console_status_format(
+    kind: u32,
+    a: i64,
+    b: i64,
+    text: *const u8,
+    text_len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(input) = w15_input(text, text_len) else {
+            return -1;
+        };
+        match w15_console_status(kind, a, b, input) {
+            Some(result) => w15_write(out, cap, &result),
+            None => -1,
+        }
+    })
+    .unwrap_or(-1)
+}
+
+#[inline]
+fn w15_json_ws(input: &[u8], mut pos: usize) -> usize {
+    while pos < input.len() && matches!(input[pos], b' ' | b'\t' | b'\n' | b'\r') {
+        pos += 1;
+    }
+    pos
+}
+
+/// Strict JSON integer at `pos`; `None` for floats, overflow or malformed numbers.
+fn w15_json_int(input: &[u8], pos: usize) -> Option<(i64, usize)> {
+    let mut i = pos;
+    let negative = input.get(i) == Some(&b'-');
+    if negative {
+        i += 1;
+    }
+    let digits_start = i;
+    match input.get(i) {
+        Some(b'0') => i += 1,
+        Some(b'1'..=b'9') => {
+            while matches!(input.get(i), Some(b'0'..=b'9')) {
+                i += 1;
+            }
+        }
+        _ => return None,
+    }
+    if matches!(input.get(i), Some(b'.' | b'e' | b'E' | b'0'..=b'9')) {
+        return None;
+    }
+    let mut value: i64 = 0;
+    for &digit in &input[digits_start..i] {
+        let d = i64::from(digit - b'0');
+        value = if negative {
+            value.checked_mul(10)?.checked_sub(d)?
+        } else {
+            value.checked_mul(10)?.checked_add(d)?
+        };
+    }
+    Some((value, i))
+}
+
+/// `Par2RenameProgress` retry payload: the integers `json_decode` keeps after the
+/// `is_int` filter, or `None` when PHP must decide (strings, floats, nesting, errors).
+pub(crate) fn w15_normalize_retry(input: &[u8], max_items: usize) -> Option<Vec<u8>> {
+    let mut pos = w15_json_ws(input, 0);
+    let mut out = Vec::new();
+    match input.get(pos) {
+        Some(b'[') => {
+            pos = w15_json_ws(input, pos + 1);
+            if input.get(pos) == Some(&b']') {
+                pos += 1;
+            } else {
+                loop {
+                    let (value, next) = w15_json_int(input, pos)?;
+                    if out.len() / 8 >= max_items {
+                        return None;
+                    }
+                    out.extend_from_slice(&value.to_le_bytes());
+                    pos = w15_json_ws(input, next);
+                    match input.get(pos) {
+                        Some(b',') => pos = w15_json_ws(input, pos + 1),
+                        Some(b']') => {
+                            pos += 1;
+                            break;
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+        }
+        Some(b'n') if input[pos..].starts_with(b"null") => pos += 4,
+        Some(b't') if input[pos..].starts_with(b"true") => pos += 4,
+        Some(b'f') if input[pos..].starts_with(b"false") => pos += 5,
+        Some(b'-' | b'0'..=b'9') => {
+            let (_, next) = w15_json_int(input, pos)?;
+            pos = next;
+        }
+        _ => return None,
+    }
+    if w15_json_ws(input, pos) != input.len() {
+        return None;
+    }
+    Some(out)
+}
+
+/// `Par2RenameProgress::get` retry normalization into packed i64, or -1 to defer to PHP.
+///
+/// # Safety
+/// Non-null input/output pointers must be valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_par2_progress_normalize_retry(
+    json: *const u8,
+    len: usize,
+    max_items: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(input) = w15_input(json, len) else {
+            return -1;
+        };
+        match w15_normalize_retry(input, max_items) {
+            Some(result) => w15_write(out, cap, &result),
+            None => -1,
+        }
+    })
+    .unwrap_or(-1)
+}
+
+pub(crate) fn w15_encode_retry(packed: &[u8]) -> Option<Vec<u8>> {
+    if !packed.len().is_multiple_of(8) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(2 + packed.len() / 8 * 8);
+    out.push(b'[');
+    for (i, chunk) in packed.as_chunks::<8>().0.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(i64::from_le_bytes(*chunk).to_string().as_bytes());
+    }
+    out.push(b']');
+    Some(out)
+}
+
+/// `Par2RenameProgress::save` retry payload: `json_encode` of packed i64 values.
+///
+/// # Safety
+/// Non-null input/output pointers must be valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_par2_progress_encode_retry(
+    packed: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(input) = w15_input(packed, len) else {
+            return -1;
+        };
+        match w15_encode_retry(input) {
+            Some(result) => w15_write(out, cap, &result),
+            None => -1,
+        }
+    })
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave15_binaries_collection_workplan_tests {
+    use super::*;
+
+    fn pack(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn unpack(bytes: &[u8]) -> Vec<i64> {
+        bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| i64::from_le_bytes(*c))
+            .collect()
+    }
+
+    #[test]
+    fn unique_ids_preserve_first_occurrence() {
+        let input = pack(&[5, 3, 5, -1, 3, 9]);
+        let mut out = [0u8; 64];
+        let written = unsafe {
+            nntmux_collection_unique_ids(input.as_ptr(), input.len(), out.as_mut_ptr(), out.len())
+        };
+        assert_eq!(unpack(&out[..written as usize]), vec![5, 3, -1, 9]);
+        assert_eq!(
+            unsafe { nntmux_collection_unique_ids(input.as_ptr(), 7, out.as_mut_ptr(), out.len()) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_collection_unique_ids(std::ptr::null(), 8, out.as_mut_ptr(), 8) },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_collection_unique_ids(input.as_ptr(), input.len(), out.as_mut_ptr(), 8)
+            },
+            -32
+        );
+        assert_eq!(
+            unsafe { nntmux_collection_unique_ids(std::ptr::null(), 0, std::ptr::null_mut(), 0) },
+            0
+        );
+    }
+
+    #[test]
+    fn unique_hashes_use_fixed_width_records() {
+        let input = b"aabbaaccbb";
+        let mut out = [0u8; 16];
+        let written = unsafe {
+            nntmux_collection_unique_hashes(
+                input.as_ptr(),
+                input.len(),
+                2,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(&out[..written as usize], b"aabbcc");
+        assert_eq!(
+            unsafe {
+                nntmux_collection_unique_hashes(
+                    input.as_ptr(),
+                    input.len(),
+                    0,
+                    out.as_mut_ptr(),
+                    16,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_collection_unique_hashes(
+                    input.as_ptr(),
+                    input.len(),
+                    3,
+                    out.as_mut_ptr(),
+                    16,
+                )
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn header_noise_and_cleanup_strategy() {
+        let mut out = [0u8; 16];
+        let bytes = [0x00u8, 0xAB, 0x7F, 0xFF];
+        let written = unsafe {
+            nntmux_header_batch_noise_hex(bytes.as_ptr(), bytes.len(), out.as_mut_ptr(), out.len())
+        };
+        assert_eq!(&out[..written as usize], b"00ab7fff");
+        assert_eq!(
+            unsafe {
+                nntmux_header_batch_noise_hex(bytes.as_ptr(), bytes.len(), out.as_mut_ptr(), 3)
+            },
+            -8
+        );
+        assert_eq!(nntmux_header_cleanup_strategy(1, 0, 0), 0);
+        assert_eq!(nntmux_header_cleanup_strategy(0, 4, 9), 1);
+        assert_eq!(nntmux_header_cleanup_strategy(0, 0, 9), 2);
+        assert_eq!(nntmux_header_cleanup_strategy(0, 0, 0), 3);
+    }
+
+    #[test]
+    fn range_expand_and_chunks_cover_bounds() {
+        assert_eq!(
+            unpack(&w15_range_expand(3, 6, 10).unwrap()),
+            vec![3, 4, 5, 6]
+        );
+        assert!(w15_range_expand(6, 3, 10).unwrap().is_empty());
+        assert!(w15_range_expand(0, 10, 10).is_none());
+        assert_eq!(
+            unpack(&w15_range_expand(i64::MAX - 1, i64::MAX, 4).unwrap()),
+            vec![i64::MAX - 1, i64::MAX]
+        );
+        assert!(w15_range_expand(i64::MIN, i64::MAX, usize::MAX).is_none());
+        assert_eq!(
+            unpack(&w15_range_chunks(1001, 1052, 50, 10).unwrap()),
+            vec![1001, 1050, 1051, 1052]
+        );
+        assert_eq!(
+            unpack(&w15_range_chunks(1, 100, 50, 10).unwrap()),
+            vec![1, 50, 51, 100]
+        );
+        assert_eq!(
+            unpack(&w15_range_chunks(i64::MAX - 2, i64::MAX, 2, 10).unwrap()),
+            vec![i64::MAX - 2, i64::MAX - 1, i64::MAX, i64::MAX]
+        );
+        assert!(w15_range_chunks(1, 0, 50, 10).unwrap().is_empty());
+        assert!(w15_range_chunks(1, 10, 0, 10).is_none());
+        assert!(w15_range_chunks(1, 1000, 1, 10).is_none());
+        let mut out = [0u8; 8];
+        assert_eq!(
+            unsafe { nntmux_missed_range_expand(1, 4, 100, out.as_mut_ptr(), out.len()) },
+            -32
+        );
+        assert_eq!(
+            unsafe { nntmux_missed_range_chunks(1, 4, 50, 10, std::ptr::null_mut(), 16) },
+            -1
+        );
+    }
+
+    #[test]
+    fn work_plan_keys_counts_and_order() {
+        assert_eq!(w15_set_key(b"", -4), b"src:-4");
+        assert_eq!(w15_set_key(b"rar:movie", 9), b"rar:movie");
+        let keys = b"rar:asrc:1";
+        let lens: Vec<u8> = [5u32, 0, 5, 0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let indexes = pack(&[0, 1, 2, 7]);
+        assert_eq!(w15_archive_set_count(keys, &lens, &indexes, 4), Some(3));
+        assert_eq!(w15_archive_set_count(keys, &lens, &indexes, 3), None);
+        assert_eq!(w15_archive_set_count(b"rar:", &lens, &indexes, 4), None);
+        let order = |flags: &[u8], mode| -> Vec<u32> {
+            w15_candidate_order(flags, mode)
+                .unwrap()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
+                .collect()
+        };
+        assert_eq!(order(&[0, 1, 0, 1], 0), vec![0, 1, 2, 3]);
+        assert_eq!(order(&[0, 1, 0, 1], 1), vec![3, 2, 1, 0]);
+        assert_eq!(order(&[0, 1, 0, 1], 2), vec![1, 3, 0, 2]);
+        assert!(w15_candidate_order(&[0], 3).is_none());
+        assert_eq!(
+            unsafe {
+                nntmux_workplan_archive_set_count(
+                    std::ptr::null(),
+                    4,
+                    lens.as_ptr(),
+                    16,
+                    indexes.as_ptr(),
+                    32,
+                    4,
+                )
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn media_hints_follow_php_arithmetic() {
+        assert_eq!(w15_available_fraction(0, false, 0, 0), (1, 1.0));
+        assert_eq!(w15_available_fraction(1, false, 0, 10).0, 0);
+        assert_eq!(w15_available_fraction(1, true, 10, 0).0, 0);
+        assert_eq!(w15_available_fraction(1, true, 10, 5), (1, 0.5));
+        assert_eq!(w15_available_fraction(2, true, 10, 50), (1, 1.0));
+        assert_eq!(w15_available_fraction(1, true, -4, 2), (1, -0.5));
+        assert_eq!(w15_available_fraction(1, true, 0, 5).0, -1);
+        assert_eq!(w15_available_fraction(9, true, 1, 5).0, -1);
+        let mut status = 7i32;
+        let value = unsafe { nntmux_media_available_fraction(1, 1, 4, 1, &mut status) };
+        assert_eq!((status, value), (1, 0.25));
+        assert!(
+            unsafe { nntmux_media_available_fraction(1, 1, 4, 1, std::ptr::null_mut()) }.is_nan()
+        );
+        let mut real = 0i64;
+        assert_eq!(unsafe { nntmux_media_head_hint(1, 100, 100, &mut real) }, 0);
+        assert_eq!(real, 100);
+        assert_eq!(unsafe { nntmux_media_head_hint(1, 100, 99, &mut real) }, 1);
+        assert_eq!(unsafe { nntmux_media_head_hint(1, 0, 99, &mut real) }, 2);
+        assert_eq!(
+            unsafe { nntmux_media_head_hint(0, 0, 0, std::ptr::null_mut()) },
+            -1
+        );
+    }
+
+    #[test]
+    fn console_labels_match_php_strings() {
+        assert_eq!(w15_human_filesize_1(0), "0B");
+        assert_eq!(w15_human_filesize_1(999), "999B");
+        assert_eq!(w15_human_filesize_1(1000), "1kB");
+        assert_eq!(w15_human_filesize_1(1536), "1.5kB");
+        assert_eq!(w15_human_filesize_1(734_003_200), "700MB");
+        assert_eq!(w15_human_filesize_1(-1000), "-1kB");
+        assert_eq!(
+            w15_console_status(0, 42, 1536, b"").unwrap(),
+            b"\n[42][1.5kB]"
+        );
+        assert_eq!(
+            w15_console_status(4, 7, 30, b"").unwrap(),
+            b" Release 7 timed out after 30s"
+        );
+        assert_eq!(w15_console_status(3, 0, 0, b"head").unwrap(), b"(src:head)");
+        assert!(w15_console_status(99, 0, 0, b"").is_none());
+    }
+
+    #[test]
+    fn retry_payloads_round_trip_and_defer() {
+        assert_eq!(
+            unpack(&w15_normalize_retry(b" [1, -0 ,30]\n", 10).unwrap()),
+            vec![1, 0, 30]
+        );
+        assert!(w15_normalize_retry(b"[]", 10).unwrap().is_empty());
+        assert!(w15_normalize_retry(b"null", 10).unwrap().is_empty());
+        assert!(w15_normalize_retry(b"5", 10).unwrap().is_empty());
+        for deferred in [
+            &b"[1.0]"[..],
+            b"[\"1\"]",
+            b"[01]",
+            b"[1,]",
+            b"[[1]]",
+            b"",
+            b"[1",
+            b"{\"a\":1}",
+            b"[99999999999999999999]",
+            b"[1] x",
+        ] {
+            assert!(
+                w15_normalize_retry(deferred, 10).is_none(),
+                "{:?}",
+                std::str::from_utf8(deferred)
+            );
+        }
+        assert!(w15_normalize_retry(b"[1,2,3]", 2).is_none());
+        assert_eq!(w15_encode_retry(&pack(&[])).unwrap(), b"[]");
+        assert_eq!(
+            w15_encode_retry(&pack(&[3, -1, i64::MIN])).unwrap(),
+            format!("[3,-1,{}]", i64::MIN).as_bytes()
+        );
+        assert!(w15_encode_retry(b"abc").is_none());
+    }
+}

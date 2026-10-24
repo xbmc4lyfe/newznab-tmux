@@ -8,15 +8,50 @@ use App\Enums\CollectionFileCheckStatus;
 use App\Models\Collection;
 use App\Services\CollectionsCleaningService;
 use App\Services\XrefService;
+use App\Support\RustPipelineLibrary;
 use App\Support\SqlError;
 use App\Support\Utf8;
+use FFI;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 /**
  * Handles collection record creation and retrieval during header storage.
  */
 final class CollectionHandler
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_collection_unique_ids(const char *ids, size_t len, char *out, size_t cap);
+        ssize_t nntmux_collection_unique_hashes(const char *packed, size_t len, size_t width, char *out, size_t cap);
+        C;
+
+    /** Raw SHA-1 width of every collectionhash key. */
+    private const int HASH_WIDTH = 20;
+
+    // PHP remains the production default: FFI marshaling stays below the 1.5x gate.
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
     /**
      * Hard upper bound on rows packed into a single SQL statement
      * (multi-row INSERT, IN(...) lookup, etc.). Keeps the generated SQL
@@ -40,7 +75,7 @@ final class CollectionHandler
     /** @var array<string, int> Cached collection IDs by collectionhash (populated by bulk prefetch) */
     private array $existingIdsByHash = [];
 
-    private ?\Throwable $lastException = null;
+    private ?Throwable $lastException = null;
 
     public function __construct(
         ?CollectionsCleaningService $collectionsCleaning = null,
@@ -128,7 +163,7 @@ final class CollectionHandler
 
                 return $collectionId;
             }
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             $this->lastException = $e;
             if (config('app.debug') === true) {
                 SqlError::logFailure('Collection insert failed', $e);
@@ -247,7 +282,7 @@ final class CollectionHandler
                 }
             }
             $this->insertCollectionGroups($groupNamesByCollectionKey);
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             $this->lastException = $e;
             if (config('app.debug') === true) {
                 SqlError::logFailure('Bulk collection insert failed', $e);
@@ -726,7 +761,7 @@ final class CollectionHandler
             }
 
             return true;
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             $this->lastException = $e;
             if (config('app.debug') === true) {
                 SqlError::logFailure('Collection aggregate refresh failed', $e);
@@ -746,7 +781,7 @@ final class CollectionHandler
         return array_keys($this->insertedCollectionIds);
     }
 
-    public function getLastException(): ?\Throwable
+    public function getLastException(): ?Throwable
     {
         return $this->lastException;
     }
@@ -758,7 +793,36 @@ final class CollectionHandler
      */
     public function getAllIds(): array
     {
+        return (self::$useRustFfi ? $this->getAllIdsNative() : null) ?? $this->getAllIdsPhp();
+    }
+
+    /**
+     * @return list<int>
+     */
+    public function getAllIdsPhp(): array
+    {
         return array_values(array_unique(array_map('intval', $this->collectionIds)));
+    }
+
+    /**
+     * @return list<int>|null Null when the Rust library is unavailable.
+     */
+    public function getAllIdsNative(): ?array
+    {
+        if ($this->collectionIds === []) {
+            return [];
+        }
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $packed = pack('q*', ...array_map('intval', array_values($this->collectionIds)));
+        $packed = self::callPacked($ffi, $packed, static fn (FFI $ffi, string $in, FFI\CData $out, int $cap): int => $ffi->nntmux_collection_unique_ids($in, \strlen($in), $out, $cap)); // @phpstan-ignore method.notFound
+        if ($packed === null) {
+            return null;
+        }
+
+        return $packed === '' ? [] : array_values(unpack('q*', $packed) ?: []);
     }
 
     /**
@@ -768,6 +832,61 @@ final class CollectionHandler
      */
     public function getBatchHashes(): array
     {
+        return (self::$useRustFfi ? $this->getBatchHashesNative() : null) ?? $this->getBatchHashesPhp();
+    }
+
+    /**
+     * @return list<string>
+     */
+    public function getBatchHashesPhp(): array
+    {
         return array_keys($this->batchCollectionHashes);
+    }
+
+    /**
+     * @return list<string>|null Null when Rust is unavailable or a key is not a raw SHA-1.
+     */
+    public function getBatchHashesNative(): ?array
+    {
+        if ($this->batchCollectionHashes === []) {
+            return [];
+        }
+        $keys = array_keys($this->batchCollectionHashes);
+        foreach ($keys as $key) {
+            if (! \is_string($key) || \strlen($key) !== self::HASH_WIDTH) {
+                return null;
+            }
+        }
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $packed = self::callPacked($ffi, implode('', $keys), static fn (FFI $ffi, string $in, FFI\CData $out, int $cap): int => $ffi->nntmux_collection_unique_hashes($in, \strlen($in), self::HASH_WIDTH, $out, $cap)); // @phpstan-ignore method.notFound
+
+        return $packed === null ? null : str_split($packed, self::HASH_WIDTH);
+    }
+
+    /**
+     * Run a packed-input export whose output never exceeds its input length.
+     *
+     * @param  \Closure(FFI, string, FFI\CData, int): int  $call
+     */
+    private static function callPacked(FFI $ffi, string $input, \Closure $call): ?string
+    {
+        try {
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, max(1, \strlen($input)), $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            $written = $call($ffi, $input, $scratch, $cap);
+            if ($written < 0) {
+                return null;
+            }
+
+            return $written === 0 ? '' : FFI::string($scratch, $written);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
