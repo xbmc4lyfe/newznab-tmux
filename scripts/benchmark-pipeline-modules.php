@@ -731,12 +731,12 @@ $buffers = [];
 if ($pipelineLibPath !== null && $allPipelineCdefs !== [] && extension_loaded('ffi')) {
     $pipelineFfi = FFI::cdef(implode("\n", $allPipelineCdefs)."\n", $pipelineLibPath);
     $outChar = $pipelineFfi->new('char[65536]');
-    $outU8 = $pipelineFfi->new('uint8_t[64]');
-    $outU32 = $pipelineFfi->new('uint32_t[64]');
-    $outI32 = $pipelineFfi->new('int32_t[64]');
-    $outI64 = $pipelineFfi->new('int64_t[256]');
-    $outSize = $pipelineFfi->new('size_t[64]');
-    $outF64 = $pipelineFfi->new('double[256]');
+    $outU8 = $pipelineFfi->new('uint8_t[65536]');
+    $outU32 = $pipelineFfi->new('uint32_t[8192]');
+    $outI32 = $pipelineFfi->new('int32_t[8192]');
+    $outI64 = $pipelineFfi->new('int64_t[8192]');
+    $outSize = $pipelineFfi->new('size_t[8192]');
+    $outF64 = $pipelineFfi->new('double[8192]');
     for ($i = 0; $i < 16; $i++) {
         $outI64[$i] = ($i % 2 === 0) ? 1000 + $i : 1048576;
     }
