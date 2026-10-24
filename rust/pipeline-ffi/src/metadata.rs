@@ -24787,3 +24787,723 @@ pub mod metadata_secondary_index_observers {
 
 
 
+/// Wave 23 Slice 23.3: UserStatsService, InvitationService, Invitation, RolePromotion, and
+/// UserActivityStat C-ABI helpers.
+///
+/// Every export wraps its body in `std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ...))`,
+/// validates raw pointers for non-null, `.is_aligned()`, `<= isize::MAX as usize`, and checked
+/// address addition, never writes partial output when capacity is insufficient (returning the
+/// negated required length, `-2` when only one byte is needed), and returns `-1` on panic,
+/// invalid input, or arithmetic overflow so PHP callers fall back to their native implementation.
+pub mod user_stats_invitation {
+    use std::mem::size_of;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 1 << 20;
+
+    const SQLITE_MINUTE_BUCKET: &[u8] = b"strftime('%Y-%m-%d %H:%M:00', timestamp)";
+    const MYSQL_MINUTE_BUCKET: &[u8] = b"DATE_FORMAT(timestamp, \"%Y-%m-%d %H:%i:00\")";
+    const SYSTEM_ROLE_NAMES: &[u8] = b"Admin\nUser\nModerator\nDisabled\nFriend";
+    const YESTERDAY_PREFIX: &[u8] = b"Yesterday ";
+
+    const SECONDS_PER_DAY: i64 = 86_400;
+    const SEVEN_DAYS: i64 = 7 * SECONDS_PER_DAY;
+
+    pub const INVITATION_STATE_VALID: i32 = 1;
+    pub const INVITATION_STATE_EXPIRED: i32 = 2;
+    pub const INVITATION_STATE_USED: i32 = 4;
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || !ptr.is_aligned()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_cap(out: *mut u8, cap: usize) -> bool {
+        !out.is_null()
+            && out.is_aligned()
+            && cap <= isize::MAX as usize
+            && (out as usize).checked_add(cap).is_some()
+    }
+
+    #[inline]
+    fn valid_mut_ptr<T>(ptr: *mut T, count: usize) -> bool {
+        let Some(bytes) = size_of::<T>().checked_mul(count) else {
+            return false;
+        };
+        !ptr.is_null()
+            && ptr.is_aligned()
+            && bytes <= isize::MAX as usize
+            && (ptr as usize).checked_add(bytes).is_some()
+    }
+
+    #[inline]
+    fn required(needed: usize) -> isize {
+        if needed > isize::MAX as usize {
+            return DECLINE;
+        }
+        let neg = -(needed as isize);
+        if neg == -1 { -2 } else { neg }
+    }
+
+    /// Writes `parts` back to back into `out_buf`, or nothing when `out_cap` is too small.
+    #[inline]
+    unsafe fn write_parts(out_buf: *mut u8, out_cap: usize, parts: &[&[u8]]) -> isize {
+        let mut needed: usize = 0;
+        for part in parts {
+            let Some(next) = needed.checked_add(part.len()) else {
+                return DECLINE;
+            };
+            needed = next;
+        }
+        if needed > isize::MAX as usize {
+            return DECLINE;
+        }
+        if needed == 0 {
+            return 0;
+        }
+        if needed > out_cap {
+            return required(needed);
+        }
+        let dst = unsafe { slice::from_raw_parts_mut(out_buf, needed) };
+        let mut offset = 0;
+        for part in parts {
+            dst[offset..offset + part.len()].copy_from_slice(part);
+            offset += part.len();
+        }
+        needed as isize
+    }
+
+    #[inline]
+    fn is_php_trim_byte(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\0' | b'\x0B')
+    }
+
+    /// PHP `trim()` with the default character list.
+    #[inline]
+    pub fn php_trim(bytes: &[u8]) -> &[u8] {
+        let mut start = 0;
+        let mut end = bytes.len();
+        while start < end && is_php_trim_byte(bytes[start]) {
+            start += 1;
+        }
+        while end > start && is_php_trim_byte(bytes[end - 1]) {
+            end -= 1;
+        }
+        &bytes[start..end]
+    }
+
+    /// `UserStatsService::resolveMinuteBucketExpression()`: SQLite uses `strftime`, every other
+    /// driver name (compared byte-for-byte) uses MySQL/MariaDB `DATE_FORMAT`.
+    #[inline]
+    pub fn minute_bucket_expression(driver: &[u8]) -> &'static [u8] {
+        if driver == b"sqlite" {
+            SQLITE_MINUTE_BUCKET
+        } else {
+            MYSQL_MINUTE_BUCKET
+        }
+    }
+
+    /// `UserStatsService::computeSummaryTotals()` output order: total users, downloads today,
+    /// downloads week, API hits today, API hits week. `None` on signed 64-bit overflow.
+    #[inline]
+    pub fn summary_totals(
+        total_users: i64,
+        today_closed_downloads: i64,
+        week_closed_downloads: i64,
+        today_closed_api_hits: i64,
+        week_closed_api_hits: i64,
+        downloads_current_hour: i64,
+        api_hits_current_hour: i64,
+    ) -> Option<[i64; 5]> {
+        Some([
+            total_users,
+            today_closed_downloads.checked_add(downloads_current_hour)?,
+            week_closed_downloads.checked_add(downloads_current_hour)?,
+            today_closed_api_hits.checked_add(api_hits_current_hour)?,
+            week_closed_api_hits.checked_add(api_hits_current_hour)?,
+        ])
+    }
+
+    /// `InvitationService::calculateInviteAvailability()`: available invites and whether one
+    /// more can be sent. `None` on signed 64-bit overflow.
+    #[inline]
+    pub fn invite_availability(total_invites: i64, active_invitations: i64) -> Option<(i64, bool)> {
+        let available = total_invites.checked_sub(active_invitations)?;
+        Some((available, available > 0))
+    }
+
+    /// `Invitation::evaluateInvitationState()` bitmask over microsecond timestamps.
+    #[inline]
+    pub fn invitation_state(
+        is_active: bool,
+        expires_at_us: i64,
+        now_us: i64,
+        has_used_at: bool,
+    ) -> i32 {
+        let mut state = 0;
+        if is_active && expires_at_us > now_us && !has_used_at {
+            state |= INVITATION_STATE_VALID;
+        }
+        if expires_at_us < now_us {
+            state |= INVITATION_STATE_EXPIRED;
+        }
+        if has_used_at {
+            state |= INVITATION_STATE_USED;
+        }
+        state
+    }
+
+    /// `RolePromotion::evaluatePromotionActiveWindow()` over microsecond timestamps.
+    #[inline]
+    pub fn promotion_active_window(
+        is_active: bool,
+        start_us: Option<i64>,
+        end_us: Option<i64>,
+        now_us: i64,
+    ) -> bool {
+        if !is_active {
+            return false;
+        }
+        if start_us.is_some_and(|start| now_us < start) {
+            return false;
+        }
+        if end_us.is_some_and(|end| now_us > end) {
+            return false;
+        }
+        true
+    }
+
+    /// Label variant chosen by `UserActivityStat::formatHourlyStatLabel()` from wall-clock
+    /// (timestamp plus UTC offset) seconds: 0 today, 1 yesterday, 2 within seven days, 3 older.
+    #[inline]
+    pub fn hourly_label_kind(hour_local: i64, now_local: i64) -> Option<u8> {
+        let hour_day = hour_local.div_euclid(SECONDS_PER_DAY);
+        let now_day = now_local.div_euclid(SECONDS_PER_DAY);
+        if hour_day == now_day {
+            return Some(0);
+        }
+        if Some(hour_day) == now_day.checked_sub(1) {
+            return Some(1);
+        }
+        if now_local.checked_sub(hour_local)? < SEVEN_DAYS {
+            return Some(2);
+        }
+        Some(3)
+    }
+
+    /// Writes the minute bucket SQL expression for `driver`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_user_stats_minute_bucket_expression(
+        driver_ptr: *const u8,
+        driver_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(driver) = (unsafe { input(driver_ptr, driver_len) }) else {
+                return DECLINE;
+            };
+            unsafe { write_parts(out_buf, out_cap, &[minute_bucket_expression(driver)]) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Writes five summary totals into `out_totals`; returns `1`, or `-1` on invalid pointer or overflow.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_user_stats_summary_totals(
+        total_users: i64,
+        today_closed_downloads: i64,
+        week_closed_downloads: i64,
+        today_closed_api_hits: i64,
+        week_closed_api_hits: i64,
+        downloads_current_hour: i64,
+        api_hits_current_hour: i64,
+        out_totals: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_ptr(out_totals, 5) {
+                return -1;
+            }
+            let Some(totals) = summary_totals(
+                total_users,
+                today_closed_downloads,
+                week_closed_downloads,
+                today_closed_api_hits,
+                week_closed_api_hits,
+                downloads_current_hour,
+                api_hits_current_hour,
+            ) else {
+                return -1;
+            };
+            let dst = unsafe { slice::from_raw_parts_mut(out_totals, 5) };
+            dst.copy_from_slice(&totals);
+            1
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Writes available invites to `out_available`; returns `1` when another invite may be sent,
+    /// `0` when not, or `-1` on invalid pointer or overflow.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_invitation_availability(
+        total_invites: i64,
+        active_invitations: i64,
+        out_available: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_ptr(out_available, 1) {
+                return -1;
+            }
+            let Some((available, can_send)) =
+                invite_availability(total_invites, active_invitations)
+            else {
+                return -1;
+            };
+            unsafe { out_available.write(available) };
+            i32::from(can_send)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Writes `strtolower(trim($email))` (ASCII-only lowering, default PHP trim set).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_invitation_normalize_email(
+        email_ptr: *const u8,
+        email_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(email) = (unsafe { input(email_ptr, email_len) }) else {
+                return DECLINE;
+            };
+            let trimmed = php_trim(email);
+            let needed = trimmed.len();
+            if needed == 0 {
+                return 0;
+            }
+            if needed > out_cap {
+                return required(needed);
+            }
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, needed) };
+            for (d, &s) in dst.iter_mut().zip(trimmed) {
+                *d = s.to_ascii_lowercase();
+            }
+            needed as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Returns the invitation state bitmask (1 valid, 2 expired, 4 used), or `-1` when a boolean
+    /// flag is not `0` or `1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_invitation_state(
+        is_active: i32,
+        expires_at_us: i64,
+        now_us: i64,
+        has_used_at: i32,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !matches!(is_active, 0 | 1) || !matches!(has_used_at, 0 | 1) {
+                return -1;
+            }
+            invitation_state(is_active == 1, expires_at_us, now_us, has_used_at == 1)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Returns `1` when the promotion window is active, `0` when not, or `-1` when a boolean flag
+    /// is not `0` or `1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_role_promotion_active_window(
+        is_active: i32,
+        has_start: i32,
+        start_us: i64,
+        has_end: i32,
+        end_us: i64,
+        now_us: i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !matches!(is_active, 0 | 1)
+                || !matches!(has_start, 0 | 1)
+                || !matches!(has_end, 0 | 1)
+            {
+                return -1;
+            }
+            i32::from(promotion_active_window(
+                is_active == 1,
+                (has_start == 1).then_some(start_us),
+                (has_end == 1).then_some(end_us),
+                now_us,
+            ))
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Writes the newline-separated system role names excluded from custom roles.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_role_promotion_system_roles(
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            unsafe { write_parts(out_buf, out_cap, &[SYSTEM_ROLE_NAMES]) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Writes the relative hourly chart label for wall-clock `hour_local` against `now_local`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_user_activity_hourly_label(
+        hour_local: i64,
+        now_local: i64,
+        time_hm_ptr: *const u8,
+        time_hm_len: usize,
+        day_hm_ptr: *const u8,
+        day_hm_len: usize,
+        month_day_hm_ptr: *const u8,
+        month_day_hm_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(time_hm) = (unsafe { input(time_hm_ptr, time_hm_len) }) else {
+                return DECLINE;
+            };
+            let Some(day_hm) = (unsafe { input(day_hm_ptr, day_hm_len) }) else {
+                return DECLINE;
+            };
+            let Some(month_day_hm) = (unsafe { input(month_day_hm_ptr, month_day_hm_len) }) else {
+                return DECLINE;
+            };
+            let Some(kind) = hourly_label_kind(hour_local, now_local) else {
+                return DECLINE;
+            };
+            let parts: &[&[u8]] = match kind {
+                0 => &[time_hm],
+                1 => &[YESTERDAY_PREFIX, time_hm],
+                2 => &[day_hm],
+                _ => &[month_day_hm],
+            };
+            unsafe { write_parts(out_buf, out_cap, parts) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn call_buf(f: impl Fn(*mut u8, usize) -> isize, cap: usize) -> (isize, Vec<u8>) {
+            let mut buf = vec![b'Z'; cap.max(1)];
+            let rc = f(buf.as_mut_ptr(), cap);
+            (rc, buf)
+        }
+
+        #[test]
+        fn minute_bucket_expression_by_driver() {
+            for (driver, expected) in [
+                (&b"sqlite"[..], SQLITE_MINUTE_BUCKET),
+                (b"mysql", MYSQL_MINUTE_BUCKET),
+                (b"mariadb", MYSQL_MINUTE_BUCKET),
+                (b"SQLite", MYSQL_MINUTE_BUCKET),
+                (b"", MYSQL_MINUTE_BUCKET),
+            ] {
+                let (rc, buf) = call_buf(
+                    |o, c| unsafe {
+                        nntmux_user_stats_minute_bucket_expression(
+                            driver.as_ptr(),
+                            driver.len(),
+                            o,
+                            c,
+                        )
+                    },
+                    128,
+                );
+                assert_eq!(rc, expected.len() as isize);
+                assert_eq!(&buf[..rc as usize], expected);
+            }
+            let (rc, buf) = call_buf(
+                |o, c| unsafe {
+                    nntmux_user_stats_minute_bucket_expression(b"sqlite".as_ptr(), 6, o, c)
+                },
+                4,
+            );
+            assert_eq!(rc, -(SQLITE_MINUTE_BUCKET.len() as isize));
+            assert_eq!(&buf[..4], b"ZZZZ");
+            let (rc, _) = call_buf(
+                |o, c| unsafe {
+                    nntmux_user_stats_minute_bucket_expression(std::ptr::null(), 6, o, c)
+                },
+                128,
+            );
+            assert_eq!(rc, DECLINE);
+            let rc = unsafe {
+                nntmux_user_stats_minute_bucket_expression(
+                    b"sqlite".as_ptr(),
+                    6,
+                    std::ptr::null_mut(),
+                    128,
+                )
+            };
+            assert_eq!(rc, DECLINE);
+            let rc = unsafe {
+                nntmux_user_stats_minute_bucket_expression(
+                    b"sqlite".as_ptr(),
+                    usize::MAX,
+                    b"x".as_ptr().cast_mut(),
+                    1,
+                )
+            };
+            assert_eq!(rc, DECLINE);
+        }
+
+        #[test]
+        fn summary_totals_contract() {
+            let mut out = [7i64; 5];
+            let rc =
+                unsafe { nntmux_user_stats_summary_totals(10, 1, 2, 3, 4, 5, 6, out.as_mut_ptr()) };
+            assert_eq!(rc, 1);
+            assert_eq!(out, [10, 6, 7, 9, 10]);
+            let mut out = [7i64; 5];
+            let rc = unsafe {
+                nntmux_user_stats_summary_totals(0, i64::MAX, 0, 0, 0, 1, 0, out.as_mut_ptr())
+            };
+            assert_eq!(rc, -1);
+            assert_eq!(out, [7; 5]);
+            let rc = unsafe {
+                nntmux_user_stats_summary_totals(0, 0, 0, 0, 0, 0, 0, std::ptr::null_mut())
+            };
+            assert_eq!(rc, -1);
+            let mut raw = [0u8; 64];
+            let misaligned = unsafe { raw.as_mut_ptr().add(1) }.cast::<i64>();
+            let rc = unsafe { nntmux_user_stats_summary_totals(0, 0, 0, 0, 0, 0, 0, misaligned) };
+            assert_eq!(rc, -1);
+            assert_eq!(raw, [0u8; 64]);
+        }
+
+        #[test]
+        fn invitation_availability_contract() {
+            let mut out = 99i64;
+            assert_eq!(unsafe { nntmux_invitation_availability(5, 2, &mut out) }, 1);
+            assert_eq!(out, 3);
+            assert_eq!(unsafe { nntmux_invitation_availability(2, 2, &mut out) }, 0);
+            assert_eq!(out, 0);
+            assert_eq!(unsafe { nntmux_invitation_availability(1, 4, &mut out) }, 0);
+            assert_eq!(out, -3);
+            out = 99;
+            assert_eq!(
+                unsafe { nntmux_invitation_availability(i64::MIN, 1, &mut out) },
+                -1
+            );
+            assert_eq!(out, 99);
+            assert_eq!(
+                unsafe { nntmux_invitation_availability(1, 0, std::ptr::null_mut()) },
+                -1
+            );
+            let mut raw = [0u8; 16];
+            let misaligned = unsafe { raw.as_mut_ptr().add(3) }.cast::<i64>();
+            assert_eq!(
+                unsafe { nntmux_invitation_availability(1, 0, misaligned) },
+                -1
+            );
+        }
+
+        #[test]
+        fn normalize_email_contract() {
+            for (input_bytes, expected) in [
+                (
+                    &b"  John.Doe@Example.COM \t\n"[..],
+                    &b"john.doe@example.com"[..],
+                ),
+                (b"\0\x0Bmixed@CASE.org\r", b"mixed@case.org"),
+                (b"\x0Cformfeed@X.io", b"\x0cformfeed@x.io"),
+                ("ÜSER@ÉXAMPLE.com".as_bytes(), "Üser@Éxample.com".as_bytes()),
+                (b"A", b"a"),
+            ] {
+                let (rc, buf) = call_buf(
+                    |o, c| unsafe {
+                        nntmux_invitation_normalize_email(
+                            input_bytes.as_ptr(),
+                            input_bytes.len(),
+                            o,
+                            c,
+                        )
+                    },
+                    64,
+                );
+                assert_eq!(rc, expected.len() as isize);
+                assert_eq!(&buf[..rc as usize], expected);
+            }
+            let (rc, _) = call_buf(
+                |o, c| unsafe { nntmux_invitation_normalize_email(b" \t".as_ptr(), 2, o, c) },
+                0,
+            );
+            assert_eq!(rc, 0);
+            let (rc, buf) = call_buf(
+                |o, c| unsafe { nntmux_invitation_normalize_email(b"A".as_ptr(), 1, o, c) },
+                0,
+            );
+            assert_eq!(rc, -2);
+            assert_eq!(buf[0], b'Z');
+            let (rc, buf) = call_buf(
+                |o, c| unsafe { nntmux_invitation_normalize_email(b"USER@HOST".as_ptr(), 9, o, c) },
+                3,
+            );
+            assert_eq!(rc, -9);
+            assert_eq!(&buf[..3], b"ZZZ");
+        }
+
+        #[test]
+        fn invitation_state_contract() {
+            assert_eq!(
+                unsafe { nntmux_invitation_state(1, 200, 100, 0) },
+                INVITATION_STATE_VALID
+            );
+            assert_eq!(unsafe { nntmux_invitation_state(1, 100, 100, 0) }, 0);
+            assert_eq!(
+                unsafe { nntmux_invitation_state(1, 99, 100, 0) },
+                INVITATION_STATE_EXPIRED
+            );
+            assert_eq!(unsafe { nntmux_invitation_state(0, 200, 100, 0) }, 0);
+            assert_eq!(
+                unsafe { nntmux_invitation_state(1, 99, 100, 1) },
+                INVITATION_STATE_EXPIRED | INVITATION_STATE_USED
+            );
+            assert_eq!(
+                unsafe { nntmux_invitation_state(1, 200, 100, 1) },
+                INVITATION_STATE_USED
+            );
+            assert_eq!(unsafe { nntmux_invitation_state(2, 200, 100, 0) }, -1);
+            assert_eq!(unsafe { nntmux_invitation_state(1, 200, 100, -1) }, -1);
+        }
+
+        #[test]
+        fn promotion_window_contract() {
+            assert_eq!(
+                unsafe { nntmux_role_promotion_active_window(1, 0, 0, 0, 0, 50) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_role_promotion_active_window(0, 0, 0, 0, 0, 50) },
+                0
+            );
+            assert_eq!(
+                unsafe { nntmux_role_promotion_active_window(1, 1, 51, 0, 0, 50) },
+                0
+            );
+            assert_eq!(
+                unsafe { nntmux_role_promotion_active_window(1, 1, 50, 1, 50, 50) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_role_promotion_active_window(1, 0, 0, 1, 49, 50) },
+                0
+            );
+            assert_eq!(
+                unsafe { nntmux_role_promotion_active_window(1, 0, 999, 0, -999, 50) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_role_promotion_active_window(1, 2, 0, 0, 0, 50) },
+                -1
+            );
+            assert_eq!(
+                unsafe { nntmux_role_promotion_active_window(1, 0, 0, 3, 0, 50) },
+                -1
+            );
+        }
+
+        #[test]
+        fn system_roles_contract() {
+            let (rc, buf) = call_buf(
+                |o, c| unsafe { nntmux_role_promotion_system_roles(o, c) },
+                64,
+            );
+            assert_eq!(rc, SYSTEM_ROLE_NAMES.len() as isize);
+            assert_eq!(&buf[..rc as usize], SYSTEM_ROLE_NAMES);
+            let (rc, buf) = call_buf(
+                |o, c| unsafe { nntmux_role_promotion_system_roles(o, c) },
+                5,
+            );
+            assert_eq!(rc, -(SYSTEM_ROLE_NAMES.len() as isize));
+            assert_eq!(&buf[..5], b"ZZZZZ");
+            assert_eq!(
+                unsafe { nntmux_role_promotion_system_roles(std::ptr::null_mut(), 64) },
+                DECLINE
+            );
+        }
+
+        #[test]
+        fn hourly_label_contract() {
+            let now = 1_700_000_000 - 1_700_000_000 % SECONDS_PER_DAY + 13 * 3600;
+            let label = |hour: i64, cap: usize| {
+                call_buf(
+                    |o, c| unsafe {
+                        nntmux_user_activity_hourly_label(
+                            hour,
+                            now,
+                            b"10:00".as_ptr(),
+                            5,
+                            b"Tue 10:00".as_ptr(),
+                            9,
+                            b"Nov 14 10:00".as_ptr(),
+                            12,
+                            o,
+                            c,
+                        )
+                    },
+                    cap,
+                )
+            };
+            let today = now - now % SECONDS_PER_DAY;
+            let (rc, buf) = label(today, 64);
+            assert_eq!(&buf[..rc as usize], b"10:00");
+            let (rc, buf) = label(today - 1, 64);
+            assert_eq!(&buf[..rc as usize], b"Yesterday 10:00");
+            let (rc, buf) = label(today - SECONDS_PER_DAY, 64);
+            assert_eq!(&buf[..rc as usize], b"Yesterday 10:00");
+            let (rc, buf) = label(today - SECONDS_PER_DAY - 1, 64);
+            assert_eq!(&buf[..rc as usize], b"Tue 10:00");
+            let (rc, buf) = label(now - SEVEN_DAYS + 1, 64);
+            assert_eq!(&buf[..rc as usize], b"Tue 10:00");
+            let (rc, buf) = label(now - SEVEN_DAYS, 64);
+            assert_eq!(&buf[..rc as usize], b"Nov 14 10:00");
+            let (rc, buf) = label(now + 3 * SECONDS_PER_DAY, 64);
+            assert_eq!(&buf[..rc as usize], b"Tue 10:00");
+            let (rc, buf) = label(today - 1, 8);
+            assert_eq!(rc, -15);
+            assert_eq!(&buf[..8], b"ZZZZZZZZ");
+            assert_eq!(hourly_label_kind(i64::MIN, i64::MAX), None);
+            assert_eq!(hourly_label_kind(-1, -1), Some(0));
+            assert_eq!(hourly_label_kind(-SECONDS_PER_DAY, -1), Some(0));
+            assert_eq!(hourly_label_kind(-SECONDS_PER_DAY - 1, -1), Some(1));
+        }
+    }
+}
