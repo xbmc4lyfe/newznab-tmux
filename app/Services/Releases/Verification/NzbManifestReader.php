@@ -6,15 +6,37 @@ namespace App\Services\Releases\Verification;
 
 use App\Exceptions\NzbPasswordMetadataRejected;
 use App\Services\Nzb\NzbXmlElements;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use RuntimeException;
 
 final class NzbManifestReader
 {
+    private const string FFI_CDEF = <<<'C'
+        int64_t nntmux_nzb_declared_file_count(const char *subject, size_t subject_len);
+        ssize_t nntmux_nzb_manifest_read_xml(const char *xml, size_t xml_len, char *out_buf, size_t out_cap);
+        C;
+
+    private static bool $useRustFfi = true;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
     /** @return array<string, mixed> */
     public function read(string $xml, object $release): array
     {
         if (strlen($xml) > 268435456) {
             throw new RuntimeException('NZB exceeds audit metadata budget.');
+        }
+        if (self::$useRustFfi) {
+            $native = self::readNative($xml, $release);
+            if ($native !== null) {
+                libxml_clear_errors();
+
+                return $native;
+            }
         }
         $previous = libxml_use_internal_errors(true);
         try {
@@ -108,6 +130,87 @@ final class NzbManifestReader
             libxml_clear_errors();
             libxml_use_internal_errors($previous);
         }
+    }
+
+    /**
+     * The Rust reader handles a conservative XML subset. A decline leaves all
+     * namespace, password, entity and malformed-input decisions to PHP.
+     *
+     * @return array<string, mixed>|null
+     */
+    public static function readNative(string $xml, object $release): ?array
+    {
+        $length = strlen($xml);
+        // Stay below libxml's default 10 MB lexical limits. Larger documents
+        // must pass PHP's own validation, even when their XML is well formed.
+        if ($length === 0 || $length > 8388608) {
+            return null;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('nzb_manifest_reader', self::FFI_CDEF);
+        if ($ffi === null) {
+            return null;
+        }
+        $capacity = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max($length, 4096), $capacity);
+        if ($scratch === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_nzb_manifest_read_xml($xml, $length, $scratch, $capacity);
+        if (! is_int($written) || $written === -1) {
+            return null;
+        }
+        if ($written < -1) {
+            if ($written < -536870912) {
+                return null;
+            }
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_nzb_manifest_read_xml($xml, $length, $scratch, $capacity);
+        }
+        if (! is_int($written) || $written <= 0 || $written > $capacity) {
+            return null;
+        }
+        $parsed = unserialize(FFI::string($scratch, $written), ['allowed_classes' => false]);
+        if (! is_array($parsed) || ! isset($parsed['expected_files'], $parsed['groups'], $parsed['files'])) {
+            return null;
+        }
+        $metadataSource = ($release->metadata_source ?? null) === 'import' ? 'import' : 'audit';
+        $manifest = ['subject' => $release->searchname, 'fromname' => $release->fromname, 'date' => $release->postdate,
+            'groups_id' => (int) $release->groups_id, 'regex_id' => 0, 'expected_files' => $parsed['expected_files'],
+            'groups' => $parsed['groups'], 'files' => $parsed['files'], 'metadata_source' => $metadataSource];
+        if (isset($parsed['conflict'])) {
+            $manifest['conflict'] = $parsed['conflict'];
+        }
+        if (isset($parsed['verification_mode'])) {
+            $manifest['verification_mode'] = $parsed['verification_mode'];
+        }
+        if ($metadataSource === 'import' && is_int($release->categories_id ?? null) && $release->categories_id > 0) {
+            $manifest['categories_id'] = $release->categories_id;
+        }
+        if ($metadataSource === 'import' && ($release->import_name_override ?? false) === true) {
+            $manifest['import_name_override'] = true;
+        }
+        if ($metadataSource === 'import' && is_string($release->original_subject ?? null)) {
+            $manifest['original_subject'] = $release->original_subject;
+        }
+
+        return $manifest;
+    }
+
+    public static function declaredFileCountNative(string $subject): ?int
+    {
+        $ffi = RustPipelineLibrary::resolveDomain('nzb_manifest_reader', self::FFI_CDEF);
+        if ($ffi === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $count = $ffi->nntmux_nzb_declared_file_count($subject, strlen($subject));
+
+        return is_int($count) && $count >= 0 ? $count : null;
     }
 
     /** @return array<string, mixed> */
@@ -221,6 +324,7 @@ final class NzbManifestReader
 
     public static function declaredFileCount(string $subject): int
     {
+        // Single-call FFI misses the 1.5x mean/p99 gate; retain PHP here.
         $outsideNames = preg_replace('/"[^"\r\n]*"|\'[^\'\r\n]*\'/', '', $subject) ?? '';
         $outsideNames = preg_replace('/\s*\(\d+\/\d+\)\s*$/', '', $outsideNames) ?? '';
         preg_match_all('/(?<!\S)[\[(](\d+)\/(\d+)[\])](?=\s|$)/', $outsideNames, $counts, PREG_SET_ORDER);
