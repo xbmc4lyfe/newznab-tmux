@@ -12529,3 +12529,772 @@ mod verification_manifest_tests {
         assert_eq!(verification_article_framing(invalid.as_bytes()), 1);
     }
 }
+
+// Wave 13: pure CPU verification helpers. PHP retains network, storage and
+// publication ownership, as well as fallbacks outside the supported ABI domain.
+/// # Safety
+/// Scalar-only entry point; all integers are PHP-width signed values.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_payload_article_identity(
+    part: i64,
+    number: i64,
+    total: i64,
+    observed: i64,
+    inferred: u8,
+    has_article_total: u8,
+    article_total: i64,
+    has_body_total: u8,
+    body_total: i64,
+    identity_matches: u8,
+) -> i32 {
+    if part != number {
+        return 1;
+    }
+    let mut total = total;
+    if has_article_total != 0 {
+        if has_body_total != 0 && article_total != body_total {
+            return 2;
+        }
+        if inferred == 0 && article_total != total {
+            return 3;
+        }
+        if inferred != 0 && article_total < observed {
+            return 4;
+        }
+        total = article_total;
+    }
+    if part > total {
+        return 5;
+    }
+    if identity_matches == 0 {
+        return 6;
+    }
+    0
+}
+
+fn payload_subject_name(subject: &[u8]) -> Option<&[u8]> {
+    let mut name = subject;
+    // PCRE searches past empty pairs and quote candidates containing CR/LF.
+    for (start, byte) in subject.iter().enumerate() {
+        if *byte != b'"' {
+            continue;
+        }
+        let rest = &subject[start + 1..];
+        let end = rest.iter().position(|b| matches!(b, b'"' | b'\r' | b'\n'));
+        if let Some(end) = end {
+            if end > 0 && rest[end] == b'"' {
+                name = &rest[..end];
+                break;
+            }
+        }
+    }
+    if name.is_empty()
+        || matches!(name[0], b'.' | b'-')
+        || name
+            .iter()
+            .any(|b| *b < 32 || matches!(b, 127 | b'/' | b'\\' | b'[' | b']'))
+        || name.windows(4).any(|w| w.eq_ignore_ascii_case(b"yenc"))
+    {
+        return None;
+    }
+    Some(name)
+}
+
+/// Returns 0 for an ambiguous identity, -1 for unsupported input, or the name.
+/// # Safety
+/// Input must be readable, output writable and disjoint for their supplied lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_payload_subject_name(
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    let Some(subject) = (unsafe { verification_input(input, len) }) else {
+        return -1;
+    };
+    if !subject.is_ascii()
+        || !(out.is_null() && cap == 0 || yenc_valid_range(out as usize, cap))
+        || yenc_ranges_overlap(input as usize, len, out as usize, cap)
+    {
+        return -1;
+    }
+    let Some(name) = payload_subject_name(subject) else {
+        return 0;
+    };
+    let mut cursor = unsafe { OutCursor::new(out, cap) };
+    cursor.extend(name);
+    cursor.finish()
+}
+
+/// # Safety
+/// Input must be readable for len bytes. High bytes defer basename locale rules to PHP.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_payload_par2_filename(input: *const u8, len: usize) -> i32 {
+    let Some(name) = (unsafe { verification_input(input, len) }) else {
+        return -1;
+    };
+    if !name.is_ascii() {
+        return -1;
+    }
+    i32::from(
+        !name.is_empty()
+            && name.len() <= 200
+            && !matches!(name[0], b'.' | b'-')
+            && !name
+                .iter()
+                .any(|b| *b < 32 || matches!(b, 127 | b'/' | b'\\')),
+    )
+}
+
+/// # Safety
+/// Scalar-only entry point. Overflow falls back before comparing PHP float semantics.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_spot_article_dimensions(
+    part: i64,
+    number: i64,
+    size: i64,
+    offset: i64,
+    length: i64,
+    header_bytes: i64,
+    total: i64,
+) -> i32 {
+    let Some(end) = offset.checked_add(length) else {
+        return -1;
+    };
+    i32::from(
+        part == number
+            && size >= 1
+            && length <= header_bytes
+            && end <= size
+            && (part != 1 || offset == 0)
+            && (part != total || end == size),
+    )
+}
+
+/// Reuse the established deterministic planner and strengthen its ABI pointer checks.
+/// # Safety
+/// Both inputs must be readable and output writable and disjoint for their supplied lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_verification_sample_plan(
+    input: *const u8,
+    len: usize,
+    identity: *const u8,
+    identity_len: usize,
+    maximum_articles: i64,
+    maximum_bytes: i64,
+    article_limit: i64,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    if !(yenc_valid_range(input as usize, len)
+        && yenc_valid_range(identity as usize, identity_len)
+        && (out.is_null() && cap == 0 || yenc_valid_range(out as usize, cap)))
+        || yenc_ranges_overlap(input as usize, len, out as usize, cap)
+        || yenc_ranges_overlap(identity as usize, identity_len, out as usize, cap)
+    {
+        return -1;
+    }
+    unsafe {
+        crate::metadata::candidate_inventory::nntmux_spot_check_plan_packed(
+            input,
+            len,
+            identity,
+            identity_len,
+            maximum_articles,
+            maximum_bytes,
+            article_limit,
+            out,
+            cap,
+        )
+    }
+}
+
+#[cfg(test)]
+mod wave13_payload_spot_tests {
+    use super::*;
+    #[test]
+    fn identity_reason_precedence_and_dimensions() {
+        assert_eq!(
+            nntmux_payload_article_identity(2, 1, 1, 3, 1, 1, 1, 1, 2, 0),
+            1
+        );
+        assert_eq!(
+            nntmux_payload_article_identity(1, 1, 1, 3, 1, 1, 1, 1, 2, 0),
+            2
+        );
+        assert_eq!(
+            nntmux_payload_article_identity(1, 1, 2, 3, 0, 1, 1, 0, 0, 0),
+            3
+        );
+        assert_eq!(
+            nntmux_payload_article_identity(1, 1, 2, 3, 1, 1, 1, 0, 0, 0),
+            4
+        );
+        assert_eq!(
+            nntmux_payload_article_identity(3, 3, 2, 2, 0, 0, 0, 0, 0, 0),
+            5
+        );
+        assert_eq!(
+            nntmux_payload_article_identity(1, 1, 1, 1, 0, 0, 0, 0, 0, 0),
+            6
+        );
+        assert_eq!(nntmux_spot_article_dimensions(1, 1, 3, 0, 3, 3, 1), 1);
+        assert_eq!(nntmux_spot_article_dimensions(1, 1, 4, 0, 3, 3, 1), 0);
+        assert_eq!(
+            nntmux_spot_article_dimensions(2, 2, i64::MAX, i64::MAX, 1, 1, 2),
+            -1
+        );
+    }
+    #[test]
+    fn subject_identity_and_pointer_contracts() {
+        assert_eq!(
+            payload_subject_name(b"[1/2] \"file.bin\" yEnc"),
+            Some(&b"file.bin"[..])
+        );
+        assert_eq!(payload_subject_name(b"\"\" \"f.bin\""), Some(&b" "[..]));
+        assert_eq!(payload_subject_name(b"\"../f.bin\""), None);
+        assert_eq!(payload_subject_name(b"f.yEnC"), None);
+        let mut out = [0u8; 32];
+        assert_eq!(
+            unsafe { nntmux_payload_subject_name(b"filename".as_ptr(), 8, out.as_mut_ptr(), 2) },
+            -8
+        );
+        assert_eq!(
+            unsafe { nntmux_payload_subject_name(std::ptr::null(), 1, out.as_mut_ptr(), 32) },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_verification_sample_plan(
+                    b"a:0:{}".as_ptr(),
+                    6,
+                    b"".as_ptr(),
+                    0,
+                    1,
+                    100,
+                    100,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            },
+            0
+        );
+    }
+}
+// Wave 13 staging candidates. Filename bytes are not rewritten; PHP keeps
+// pathinfo for returned basename and handles locale-dependent non-ASCII names.
+/// # Safety
+/// Both input buffers must be readable for their supplied byte lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_upload_staging_filename(
+    name: *const u8,
+    name_len: usize,
+    extension: *const u8,
+    extension_len: usize,
+) -> i32 {
+    let (Some(name), Some(extension)) = (unsafe {
+        (
+            verification_input(name, name_len),
+            verification_input(extension, extension_len),
+        )
+    }) else {
+        return -1;
+    };
+    if name.is_empty()
+        || name == b"."
+        || name == b".."
+        || name.iter().any(|b| matches!(b, 0 | b'/' | b'\\'))
+    {
+        return 1;
+    }
+    // PHP's pathinfo is locale-aware. Decline this case rather than assuming
+    // how the active locale handles non-ASCII or malformed multibyte bytes.
+    if !name.is_ascii() || !extension.is_ascii() {
+        return -1;
+    }
+    let (basename, actual_extension) = match name.iter().rposition(|b| *b == b'.') {
+        Some(dot) => (&name[..dot], &name[dot + 1..]),
+        None => (name, &b""[..]),
+    };
+    let blank = basename
+        .iter()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 11));
+    if blank
+        || actual_extension.len() != extension.len()
+        || !actual_extension
+            .iter()
+            .zip(extension)
+            .all(|(a, b)| a.to_ascii_lowercase() == *b)
+    {
+        2
+    } else {
+        0
+    }
+}
+
+/// Match only the existing bytes: no gzip inflation or BOM removal is implied.
+/// `kind`: 0 = two-byte gzip magic, 1 = UTF-8 BOM. Invalid kind returns -1.
+/// # Safety
+/// Input must be readable for `data_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_upload_staging_prefix(
+    data: *const u8,
+    data_len: usize,
+    kind: u32,
+) -> i32 {
+    let Some(data) = (unsafe { verification_input(data, data_len) }) else {
+        return -1;
+    };
+    match kind {
+        0 => i32::from(data.starts_with(b"\x1f\x8b")),
+        1 => i32::from(data.starts_with(b"\xef\xbb\xbf")),
+        _ => -1,
+    }
+}
+
+#[cfg(test)]
+mod upload_staging_tests {
+    use super::*;
+
+    fn filename(name: &[u8], extension: &[u8]) -> i32 {
+        unsafe {
+            nntmux_upload_staging_filename(
+                name.as_ptr(),
+                name.len(),
+                extension.as_ptr(),
+                extension.len(),
+            )
+        }
+    }
+
+    #[test]
+    fn filename_preserves_the_existing_validation_statuses() {
+        assert_eq!(filename(b"Release.NZB", b"nzb"), 0);
+        assert_eq!(filename(b"x..nzb", b"nzb"), 0);
+        assert_eq!(filename(b".nzb", b"nzb"), 2);
+        assert_eq!(filename(b" \t\r\n\x0b.nzb", b"nzb"), 2);
+        assert_eq!(filename(b"\x0c.nzb", b"nzb"), 0);
+        assert_eq!(filename(b"../x.nzb", b"nzb"), 1);
+        assert_eq!(filename(b"x\0.nzb", b"nzb"), 1);
+        assert_eq!(filename(b"", b"nzb"), 1);
+        assert_eq!(filename("é.nzb".as_bytes(), b"nzb"), -1);
+        assert_eq!(filename(b"x.nfo", b"nzb"), 2);
+    }
+
+    #[test]
+    fn prefixes_handle_truncation_and_invalid_arguments() {
+        let check = |data: &[u8], kind| unsafe {
+            nntmux_upload_staging_prefix(data.as_ptr(), data.len(), kind)
+        };
+        assert_eq!(check(b"\x1f\x8b", 0), 1);
+        assert_eq!(check(b"\x1f", 0), 0);
+        assert_eq!(check(b"\xef\xbb\xbf", 1), 1);
+        assert_eq!(check(b"\xef\xbb", 1), 0);
+        assert_eq!(check(b"", 1), 0);
+        assert_eq!(check(b"", 2), -1);
+        assert_eq!(
+            unsafe { nntmux_upload_staging_prefix(std::ptr::null(), 1, 0) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_upload_staging_prefix(usize::MAX as *const u8, 2, 0) },
+            -1
+        );
+    }
+}
+// Wave 13 Slice 2: outbox row normalization and bounded preparation diagnostics.
+// The parser accepts only the acyclic scalar/array subset emitted by PHP's
+// json_decode(..., true). PHP remains responsible for JSON parsing and warnings.
+#[derive(Clone, Debug)]
+enum VerificationOutboxValue {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(Vec<u8>),
+    Bytes(Vec<u8>),
+    Array(Vec<(VerificationOutboxValue, VerificationOutboxValue)>),
+}
+
+impl VerificationOutboxValue {
+    fn field(&self, name: &[u8]) -> Option<&Self> {
+        let Self::Array(entries) = self else {
+            return None;
+        };
+        entries.iter().rev().find_map(|(key, value)| match key {
+            Self::Bytes(bytes) if bytes == name => Some(value),
+            _ => None,
+        })
+    }
+    fn serialize(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Null => out.extend_from_slice(b"N;"),
+            Self::Bool(v) => out.extend_from_slice(if *v { b"b:1;" } else { b"b:0;" }),
+            Self::Int(v) => out.extend_from_slice(format!("i:{v};").as_bytes()),
+            Self::Float(bytes) => {
+                out.extend_from_slice(b"d:");
+                out.extend_from_slice(bytes);
+                out.push(b';');
+            }
+            Self::Bytes(bytes) => {
+                out.extend_from_slice(format!("s:{}:\"", bytes.len()).as_bytes());
+                out.extend_from_slice(bytes);
+                out.extend_from_slice(b"\";");
+            }
+            Self::Array(entries) => {
+                out.extend_from_slice(format!("a:{}:{{", entries.len()).as_bytes());
+                for (key, value) in entries {
+                    key.serialize(out);
+                    value.serialize(out);
+                }
+                out.push(b'}');
+            }
+        }
+    }
+}
+
+struct VerificationOutboxParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    remaining: usize,
+}
+impl<'a> VerificationOutboxParser<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let result = self.bytes.get(self.pos..end)?;
+        self.pos = end;
+        Some(result)
+    }
+    fn expect(&mut self, bytes: &[u8]) -> Option<()> {
+        (self.take(bytes.len())? == bytes).then_some(())
+    }
+    fn until(&mut self, delimiter: u8) -> Option<&'a [u8]> {
+        let n = self
+            .bytes
+            .get(self.pos..)?
+            .iter()
+            .position(|b| *b == delimiter)?;
+        let result = self.take(n)?;
+        self.pos += 1;
+        Some(result)
+    }
+    fn decimal(&mut self, delimiter: u8) -> Option<usize> {
+        let bytes = self.until(delimiter)?;
+        if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(bytes).ok()?.parse().ok()
+    }
+    fn value(&mut self, depth: usize) -> Option<VerificationOutboxValue> {
+        use VerificationOutboxValue as V;
+        if depth > 512 || self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        let kind = *self.take(1)?.first()?;
+        if kind == b'N' {
+            self.expect(b";")?;
+            return Some(V::Null);
+        }
+        self.expect(b":")?;
+        match kind {
+            b'b' => {
+                let v = self.take(1)?;
+                self.expect(b";")?;
+                match v {
+                    b"0" => Some(V::Bool(false)),
+                    b"1" => Some(V::Bool(true)),
+                    _ => None,
+                }
+            }
+            b'i' => Some(V::Int(
+                std::str::from_utf8(self.until(b';')?).ok()?.parse().ok()?,
+            )),
+            b'd' => {
+                let bytes = self.until(b';')?;
+                let text = std::str::from_utf8(bytes).ok()?;
+                let _value: f64 = match text {
+                    "NAN" => f64::NAN,
+                    "INF" => f64::INFINITY,
+                    "-INF" => f64::NEG_INFINITY,
+                    _ => text.parse().ok()?,
+                };
+                Some(V::Float(bytes.to_vec()))
+            }
+            b's' => {
+                let n = self.decimal(b':')?;
+                self.expect(b"\"")?;
+                let bytes = self.take(n)?.to_vec();
+                self.expect(b"\";")?;
+                Some(V::Bytes(bytes))
+            }
+            b'a' => {
+                let n = self.decimal(b':')?;
+                if n > self.remaining / 2 {
+                    return None;
+                }
+                self.expect(b"{")?;
+                let mut entries = Vec::with_capacity(n.min(1024));
+                for _ in 0..n {
+                    let key = self.value(depth + 1)?;
+                    if !matches!(key, V::Int(_) | V::Bytes(_)) {
+                        return None;
+                    }
+                    entries.push((key, self.value(depth + 1)?));
+                }
+                self.expect(b"}")?;
+                Some(V::Array(entries))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn verification_outbox_float(
+    value: Option<&VerificationOutboxValue>,
+) -> Option<VerificationOutboxValue> {
+    use VerificationOutboxValue as V;
+    let number = match value {
+        None | Some(V::Null) => 0.0,
+        Some(V::Bool(v)) => {
+            if *v {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        Some(V::Int(v)) => *v as f64,
+        Some(v @ V::Float(_)) => return Some(v.clone()),
+        _ => return None,
+    };
+    Some(V::Float(number.to_string().into_bytes()))
+}
+fn verification_outbox_count(
+    value: Option<&VerificationOutboxValue>,
+) -> Option<VerificationOutboxValue> {
+    use VerificationOutboxValue as V;
+    Some(V::Int(match value {
+        None | Some(V::Null) => 0,
+        Some(V::Int(v)) => (*v).max(0),
+        Some(V::Bool(v)) => i64::from(*v),
+        // Numeric string/float casts stay in PHP, including saturation/wrapping.
+        _ => return None,
+    }))
+}
+fn verification_outbox_names(value: &VerificationOutboxValue) -> Option<VerificationOutboxValue> {
+    use VerificationOutboxValue as V;
+    let V::Array(entries) = value else {
+        return None;
+    };
+    let mut names = Vec::with_capacity(entries.len());
+    for (index, (_, value)) in entries.iter().enumerate() {
+        let bytes = match value {
+            V::Bytes(bytes) => bytes.clone(),
+            V::Int(v) => v.to_string().into_bytes(),
+            V::Bool(true) => b"1".to_vec(),
+            V::Bool(false) | V::Null => Vec::new(),
+            // Array-to-string warnings and configured float precision belong to PHP.
+            _ => return None,
+        };
+        names.push((V::Int(index as i64), V::Bytes(bytes)));
+    }
+    Some(V::Array(names))
+}
+fn verification_outbox_normalize(input: &[u8]) -> Option<Vec<u8>> {
+    use VerificationOutboxValue as V;
+    let mut parser = VerificationOutboxParser {
+        bytes: input,
+        pos: 0,
+        remaining: input.len(),
+    };
+    let row = parser.value(0)?;
+    if parser.pos != input.len() {
+        return None;
+    }
+    let claim = row.field(b"claim")?;
+    let evidence = row.field(b"evidence")?;
+    let mut claim_entries = Vec::new();
+    for (name, integer) in [
+        (b"id".as_slice(), true),
+        (b"version", true),
+        (b"manifest_hash", false),
+        (b"lease_token", false),
+    ] {
+        let value = claim.field(name)?;
+        if integer && !matches!(value, V::Int(_)) || !integer && !matches!(value, V::Bytes(_)) {
+            return None;
+        }
+        claim_entries.push((V::Bytes(name.to_vec()), value.clone()));
+    }
+    let reason @ V::Bytes(_) = row.field(b"reason")? else {
+        return None;
+    };
+    let mut evidence_entries = Vec::new();
+    for name in [b"articles".as_slice(), b"bytes", b"sampled_files"] {
+        let value @ V::Int(_) = evidence.field(name)? else {
+            return None;
+        };
+        evidence_entries.push((V::Bytes(name.to_vec()), value.clone()));
+    }
+    for name in [b"verified_file_names".as_slice(), b"identity_hints"] {
+        evidence_entries.push((
+            V::Bytes(name.to_vec()),
+            verification_outbox_names(evidence.field(name)?)?,
+        ));
+    }
+    let enqueued = row.field(b"enqueued_at");
+    let heartbeat = row
+        .field(b"heartbeat_at")
+        .filter(|v| !matches!(v, V::Null))
+        .or(enqueued);
+    let values = [
+        V::Array(claim_entries),
+        reason.clone(),
+        V::Array(evidence_entries),
+        verification_outbox_float(enqueued)?,
+        verification_outbox_count(row.field(b"attempts"))?,
+        verification_outbox_float(row.field(b"not_before"))?,
+        verification_outbox_count(row.field(b"deferrals"))?,
+        verification_outbox_float(heartbeat)?,
+    ];
+    let output = V::Array(
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| (V::Int(i as i64), v))
+            .collect(),
+    );
+    let mut bytes = Vec::new();
+    output.serialize(&mut bytes);
+    Some(bytes)
+}
+
+/// # Safety
+/// Input must be readable and output writable for the supplied lengths, with no
+/// overlap. Null output is accepted only for zero capacity. -1 declines; another
+/// negative value is the required capacity; positive lengths contain PHP data.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_verification_outbox_normalize(
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    let Some(input_bytes) = (unsafe { verification_input(input, len) }) else {
+        return -1;
+    };
+    if !(out.is_null() && cap == 0 || yenc_valid_range(out as usize, cap))
+        || yenc_ranges_overlap(input as usize, len, out as usize, cap)
+    {
+        return -1;
+    }
+    let Some(bytes) = verification_outbox_normalize(input_bytes) else {
+        return -1;
+    };
+    let mut cursor = unsafe { OutCursor::new(out, cap) };
+    cursor.extend(&bytes);
+    cursor.finish()
+}
+
+/// Fixed 88-byte native-endian record: two i64 counters, total/max f64, seven
+/// i64 exclusive latency buckets. PHP's pack/unpack uses the same host ABI.
+/// # Safety
+/// Input must be readable and output writable, with no overlap. Null output is
+/// accepted only for zero capacity. Overflow declines before any output write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_verification_diagnostic_phase(
+    input: *const u8,
+    len: usize,
+    milliseconds: f64,
+    failed: u8,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    let Some(bytes) = (unsafe { verification_input(input, len) }) else {
+        return -1;
+    };
+    if len != 88
+        || failed > 1
+        || !(out.is_null() && cap == 0 || yenc_valid_range(out as usize, cap))
+        || yenc_ranges_overlap(input as usize, len, out as usize, cap)
+    {
+        return -1;
+    }
+    let mut result = [0u8; 88];
+    result.copy_from_slice(bytes);
+    let mut counts = [0i64; 9];
+    for (index, count) in counts.iter_mut().enumerate() {
+        let offset = if index < 2 {
+            index * 8
+        } else {
+            (index + 2) * 8
+        };
+        *count = i64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap());
+    }
+    let bucket = [0.1, 1.0, 10.0, 100.0, 1000.0, 10000.0]
+        .iter()
+        .position(|bound| milliseconds <= *bound)
+        .unwrap_or(6);
+    let Some(count) = counts[0].checked_add(1) else {
+        return -1;
+    };
+    counts[0] = count;
+    let Some(count) = counts[1].checked_add(i64::from(failed)) else {
+        return -1;
+    };
+    counts[1] = count;
+    let Some(count) = counts[bucket + 2].checked_add(1) else {
+        return -1;
+    };
+    counts[bucket + 2] = count;
+    for (index, count) in counts.iter().enumerate() {
+        let offset = if index < 2 {
+            index * 8
+        } else {
+            (index + 2) * 8
+        };
+        result[offset..offset + 8].copy_from_slice(&count.to_ne_bytes());
+    }
+    let total = f64::from_ne_bytes(bytes[16..24].try_into().unwrap()) + milliseconds;
+    let old_max = f64::from_ne_bytes(bytes[24..32].try_into().unwrap());
+    // PHP max keeps the first equal value, but selects the second for NaN.
+    let maximum = if old_max >= milliseconds {
+        old_max
+    } else {
+        milliseconds
+    };
+    result[16..24].copy_from_slice(&total.to_ne_bytes());
+    result[24..32].copy_from_slice(&maximum.to_ne_bytes());
+    let mut cursor = unsafe { OutCursor::new(out, cap) };
+    cursor.extend(&result);
+    cursor.finish()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_verification_diagnostic_size(files: u8, size: i64) -> i32 {
+    let bounds = match files {
+        0 => [4096, 65536, 1048576, 16777216],
+        1 => [1, 10, 100, 1000],
+        _ => return -1,
+    };
+    bounds.iter().position(|bound| size <= *bound).unwrap_or(4) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_verification_diagnostic_projection(
+    limit: i64,
+    inspected: i64,
+    finished: i64,
+    deadline: i64,
+    uninspected: i64,
+    exhausted: u8,
+    error: u8,
+) -> i32 {
+    if exhausted > 1 || error > 1 {
+        return -1;
+    }
+    i32::from(inspected >= limit)
+        | (i32::from(finished >= deadline) << 1)
+        | (i32::from(exhausted != 0 && uninspected == 0) << 2)
+        | (i32::from(error != 0) << 3)
+}
