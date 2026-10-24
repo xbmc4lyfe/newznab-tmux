@@ -19741,3 +19741,437 @@ pub unsafe extern "C" fn nntmux_w26_stat_aggregation_models(
     }))
     .unwrap_or(-1)
 }
+
+/// Pure byte-preserving controller value assembly; database/model/date work stays in PHP.
+pub mod wave27_browse_nfo_contact_status_controllers {
+    use super::*;
+    const MAX_BYTES: usize = 67_108_864;
+
+    fn joined(parts: &[&[u8]]) -> VerificationOutboxValue {
+        w16_string(&parts.concat())
+    }
+
+    fn thank_you(name: &[u8]) -> VerificationOutboxValue {
+        joined(&[
+            b"<h2 style='text-align:center;'>Thank you for getting in touch with ",
+            name,
+            b".</h2>",
+        ])
+    }
+
+    fn compute(
+        operation: u32,
+        args: &[VerificationOutboxValue],
+    ) -> Option<VerificationOutboxValue> {
+        use VerificationOutboxValue as V;
+        Some(match (operation, args) {
+            (
+                0,
+                [
+                    V::Bytes(id),
+                    parent @ (V::Null | V::Int(_)),
+                    child @ (V::Null | V::Int(_)),
+                ],
+            ) => {
+                let value = if id == b"All" { parent } else { child };
+                match value {
+                    V::Int(_) => value.clone(),
+                    _ => V::Int(-1),
+                }
+            }
+            (1, [V::Bytes(search)]) => {
+                let has_search = !search.is_empty() && search != b"0";
+                w16_map(vec![
+                    (
+                        "meta_title",
+                        if has_search {
+                            joined(&[b"Browse Groups - Search: ", search])
+                        } else {
+                            w16_string(b"Browse Groups")
+                        },
+                    ),
+                    (
+                        "meta_keywords",
+                        w16_string(b"browse,groups,description,details"),
+                    ),
+                    (
+                        "meta_description",
+                        if has_search {
+                            joined(&[b"Browse groups search results for ", search])
+                        } else {
+                            w16_string(b"Browse groups")
+                        },
+                    ),
+                ])
+            }
+            (2, [V::Bytes(name), V::Bool(modal)]) => {
+                let mut fields = vec![("modal", V::Bool(*modal))];
+                if !modal {
+                    fields.extend([
+                        ("meta_title", joined(&[b"View NFO - ", name])),
+                        (
+                            "meta_keywords",
+                            w16_string(b"view,nzb,nfo,description,details"),
+                        ),
+                        ("meta_description", joined(&[b"View NFO File for ", name])),
+                    ]);
+                }
+                w16_map(fields)
+            }
+            (3, [rows, V::Bytes(email), V::Bytes(name), V::Bytes(eol)]) => {
+                if !w19_list(rows) {
+                    return None;
+                }
+                let mut body = b"Values submitted from contact form: ".to_vec();
+                for (_, row) in w16_entries(rows)? {
+                    if !w19_list(row) {
+                        return None;
+                    }
+                    let entries = w16_entries(row)?;
+                    let [(_, V::Bytes(key)), (_, V::Bytes(value))] = entries else {
+                        return None;
+                    };
+                    if matches!(
+                        key.as_slice(),
+                        b"submit" | b"_token" | b"g-recaptcha-response" | b"cf-turnstile-response"
+                    ) {
+                        continue;
+                    }
+                    // Bound output while accumulating, before serialization/allocation expansion.
+                    let next = body
+                        .len()
+                        .checked_add(key.len())?
+                        .checked_add(3)?
+                        .checked_add(value.len())?
+                        .checked_add(eol.len())?;
+                    if next > MAX_BYTES {
+                        return None;
+                    }
+                    body.extend_from_slice(key);
+                    body.extend_from_slice(b" : ");
+                    body.extend_from_slice(value);
+                    body.extend_from_slice(eol);
+                }
+                w16_map(vec![
+                    ("mailBody", w16_string(&body)),
+                    ("send", V::Bool(!email.contains(&b'\n'))),
+                    ("msg", thank_you(name)),
+                ])
+            }
+            (4, [V::Bytes(email)]) => V::Bool(!email.contains(&b'\n')),
+            (5, [V::Bytes(name)]) => thank_you(name),
+            (6, [V::Null]) => w16_string(b"unknown"),
+            (6, [date @ V::Bytes(_)]) => date.clone(),
+            (7, []) => w16_map(vec![
+                ("meta_title", w16_string(b"Service status")),
+                (
+                    "meta_description",
+                    w16_string(b"Current status of site services, incidents, and uptime."),
+                ),
+                ("title", w16_string(b"Service status")),
+            ]),
+            _ => return None,
+        })
+    }
+
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> i32 {
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_BYTES
+            || capacity > MAX_BYTES
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let mut parser = VerificationOutboxParser {
+            bytes,
+            pos: 0,
+            remaining: 65_536,
+        };
+        let Some(value) = parser.value(480) else {
+            return -1;
+        };
+        if parser.pos != length || !w19_list(&value) || !w20_canonical(&value) {
+            return -1;
+        }
+        let mut canonical = Vec::new();
+        value.serialize(&mut canonical);
+        if canonical != bytes {
+            return -1;
+        }
+        let Some(entries) = w16_entries(&value) else {
+            return -1;
+        };
+        let args: Vec<_> = entries.iter().map(|(_, v)| v.clone()).collect();
+        let Some(result) = compute(operation, &args) else {
+            return -1;
+        };
+        let mut wire = Vec::new();
+        result.serialize(&mut wire);
+        if wire.len() > MAX_BYTES {
+            return -1;
+        }
+        let Ok(needed) = i32::try_from(wire.len()) else {
+            return -1;
+        };
+        if wire.len() > capacity {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(wire.as_ptr(), output, wire.len()) };
+        needed
+    }
+
+    #[cfg(test)]
+    mod w27_browse_nfo_contact_status_controllers_tests {
+        use super::*;
+        use VerificationOutboxValue as V;
+
+        fn parity(op: u32, args: Vec<V>, expected: V) {
+            let mut input = vec![0x5a];
+            w16_list(args).serialize(&mut input);
+            input.push(0x5a);
+            let mut wire = Vec::new();
+            expected.serialize(&mut wire);
+            let mut out = vec![0xa5; wire.len() + 3];
+            for cap in [0, 1, wire.len() - 1, wire.len(), wire.len() + 1] {
+                out.fill(0xa5);
+                let result = unsafe {
+                    nntmux_w27_browse_nfo_contact_status_controllers(
+                        op,
+                        input.as_ptr().add(1),
+                        input.len() - 2,
+                        out.as_mut_ptr().add(1),
+                        cap,
+                    )
+                };
+                if cap < wire.len() {
+                    assert_eq!(result, -(wire.len() as i32));
+                    assert!(out.iter().all(|b| *b == 0xa5));
+                } else {
+                    assert_eq!(result, wire.len() as i32);
+                    assert_eq!(&out[1..1 + wire.len()], &wire);
+                    assert_eq!(out[0], 0xa5);
+                    assert!(out[1 + wire.len()..].iter().all(|b| *b == 0xa5));
+                }
+            }
+            assert_eq!(input[0], 0x5a);
+            assert_eq!(input[input.len() - 1], 0x5a);
+        }
+
+        #[test]
+        fn w27_browse_nfo_contact_status_controllers_category_ids() {
+            for parent in [
+                V::Null,
+                V::Int(-1),
+                V::Int(0),
+                V::Int(i64::MAX),
+                V::Int(i64::MIN),
+            ] {
+                for child in [V::Null, V::Int(2040)] {
+                    parity(
+                        0,
+                        vec![w16_string(b"All"), parent.clone(), child.clone()],
+                        if matches!(parent, V::Null) {
+                            V::Int(-1)
+                        } else {
+                            parent.clone()
+                        },
+                    );
+                    parity(
+                        0,
+                        vec![w16_string(b"all"), parent.clone(), child.clone()],
+                        if matches!(child, V::Null) {
+                            V::Int(-1)
+                        } else {
+                            child.clone()
+                        },
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn w27_browse_nfo_contact_status_controllers_meta_and_binary_strings() {
+            for search in [b"".as_slice(), b"0", b"alt.binaries", b"a\0\xff"] {
+                let mut title = b"Browse Groups".to_vec();
+                let mut description = b"Browse groups".to_vec();
+                if !search.is_empty() && search != b"0" {
+                    title.extend_from_slice(b" - Search: ");
+                    title.extend_from_slice(search);
+                    description.extend_from_slice(b" search results for ");
+                    description.extend_from_slice(search);
+                }
+                parity(
+                    1,
+                    vec![w16_string(search)],
+                    w16_map(vec![
+                        ("meta_title", w16_string(&title)),
+                        (
+                            "meta_keywords",
+                            w16_string(b"browse,groups,description,details"),
+                        ),
+                        ("meta_description", w16_string(&description)),
+                    ]),
+                );
+                parity(
+                    2,
+                    vec![w16_string(search), V::Bool(true)],
+                    w16_map(vec![("modal", V::Bool(true))]),
+                );
+                let mut title = b"View NFO - ".to_vec();
+                title.extend_from_slice(search);
+                let mut description = b"View NFO File for ".to_vec();
+                description.extend_from_slice(search);
+                parity(
+                    2,
+                    vec![w16_string(search), V::Bool(false)],
+                    w16_map(vec![
+                        ("modal", V::Bool(false)),
+                        ("meta_title", w16_string(&title)),
+                        (
+                            "meta_keywords",
+                            w16_string(b"view,nzb,nfo,description,details"),
+                        ),
+                        ("meta_description", w16_string(&description)),
+                    ]),
+                );
+                parity(6, vec![w16_string(search)], w16_string(search));
+            }
+            parity(6, vec![V::Null], w16_string(b"unknown"));
+            parity(
+                7,
+                vec![],
+                w16_map(vec![
+                    ("meta_title", w16_string(b"Service status")),
+                    (
+                        "meta_description",
+                        w16_string(b"Current status of site services, incidents, and uptime."),
+                    ),
+                    ("title", w16_string(b"Service status")),
+                ]),
+            );
+        }
+
+        #[test]
+        fn w27_browse_nfo_contact_status_controllers_contact_filter_and_injection() {
+            for (email, send) in [
+                (b"a@example.org".as_slice(), true),
+                (b"a\rb", true),
+                (b"a\nb", false),
+                (b"a\r\nb", false),
+                (b"\0\xff", true),
+            ] {
+                parity(4, vec![w16_string(email)], V::Bool(send));
+            }
+            let rows = [
+                "submit",
+                "_token",
+                "g-recaptcha-response",
+                "cf-turnstile-response",
+                "message",
+                "0",
+            ]
+            .iter()
+            .map(|key| w16_list(vec![w16_string(key.as_bytes()), w16_string(b"a\0\xff")]))
+            .collect();
+            let html = w16_string(
+                b"<h2 style='text-align:center;'>Thank you for getting in touch with Index.</h2>",
+            );
+            parity(5, vec![w16_string(b"Index")], html.clone());
+            parity(3,vec![w16_list(rows),w16_string(b"a\nb"),w16_string(b"Index"),w16_string(b"\r\n")],
+                w16_map(vec![("mailBody",w16_string(b"Values submitted from contact form: message : a\0\xff\r\n0 : a\0\xff\r\n")),
+                    ("send",V::Bool(false)),("msg",html)]));
+        }
+
+        #[test]
+        fn w27_browse_nfo_contact_status_controllers_rejects_malformed_and_unsupported_wire_without_writes()
+         {
+            for (op, input) in [
+                (99,b"a:0:{}".as_slice()),(7,b"a:0:{}junk"),(7,b"a:00:{}"),
+                (7,b"a:1:{i:1;s:1:\"x\";}"),(4,b"a:1:{i:0;i:1;}"),
+                (6,b"a:1:{i:0;O:8:\"stdClass\":0:{}}"),
+                (0,b"a:3:{i:0;s:3:\"All\";i:1;i:+1;i:2;N;}"),
+                (0,b"a:3:{i:0;s:3:\"All\";i:1;i:9223372036854775808;i:2;N;}"),
+                (4,b"a:1:{i:0;R:1;}"),(4,b"a:1:{i:0;s:99999999999999999999:\"x\";}"),
+                (3,b"a:4:{i:0;a:1:{i:0;a:1:{i:0;s:1:\"k\";}}i:1;s:0:\"\";i:2;s:0:\"\";i:3;s:0:\"\";}"),
+            ] {
+                let mut out=[0xa5;1024];
+                assert_eq!(unsafe{nntmux_w27_browse_nfo_contact_status_controllers(op,input.as_ptr(),input.len(),out.as_mut_ptr(),out.len())},-1);
+                assert!(out.iter().all(|b|*b==0xa5));
+            }
+        }
+
+        #[test]
+        fn w27_browse_nfo_contact_status_controllers_validates_ranges_before_read_or_write() {
+            let input = b"a:0:{}";
+            let mut out = [0xa5; 256];
+            let run = |p, len, o, cap| unsafe {
+                nntmux_w27_browse_nfo_contact_status_controllers(7, p, len, o, cap)
+            };
+            for len in [0, 1] {
+                assert_eq!(run(std::ptr::null(), len, out.as_mut_ptr(), out.len()), -1);
+                assert_eq!(
+                    run(input.as_ptr(), input.len(), std::ptr::null_mut(), len),
+                    -1
+                );
+            }
+            assert_eq!(
+                run(input.as_ptr(), usize::MAX, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(usize::MAX as *const u8, 2, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), usize::MAX as *mut u8, 2),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), MAX_BYTES + 1, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), out.as_mut_ptr(), MAX_BYTES + 1),
+                -1
+            );
+            let p = out.as_mut_ptr();
+            assert_eq!(run(p, input.len(), p, out.len()), -1);
+            assert_eq!(run(unsafe { p.add(1) }, input.len(), p, out.len()), -1);
+            assert_eq!(run(p, input.len(), unsafe { p.add(1) }, out.len() - 1), -1);
+            assert!(out.iter().all(|b| *b == 0xa5));
+        }
+    }
+}
+
+/// Evaluate canonical PHP list arguments; -1 declines, -needed requests capacity without writing.
+///
+/// # Safety
+/// Callers supply live, disjoint allocations covering both declared ranges, with non-null
+/// pointers even for zero-length ranges. Range checks cannot establish allocation provenance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w27_browse_nfo_contact_status_controllers(
+    operation: u32,
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave27_browse_nfo_contact_status_controllers::evaluate(
+            operation, input, length, output, capacity,
+        )
+    }))
+    .unwrap_or(-1)
+}
