@@ -14541,3 +14541,809 @@ mod wave17_xml_verification_timing_tests {
         assert!(matches!(budget, Some(V::Int(16))));
     }
 }
+
+// Wave 18: bounded verification metadata and fingerprint value operations.
+fn w18_php_bool(value: &VerificationOutboxValue) -> Option<bool> {
+    use VerificationOutboxValue as V;
+    Some(match value {
+        V::Null => false,
+        V::Bool(value) => *value,
+        V::Int(value) => *value != 0,
+        V::Bytes(value) => !value.is_empty() && value != b"0",
+        V::Array(value) => !value.is_empty(),
+        V::Float(value) => match value.as_slice() {
+            // PHP 8.5 warns when NAN is coerced to bool; retain that warning.
+            b"NAN" => return None,
+            b"INF" | b"-INF" => true,
+            _ => std::str::from_utf8(value).ok()?.parse::<f64>().ok()? != 0.0,
+        },
+    })
+}
+
+fn w18_php_string(value: &VerificationOutboxValue) -> Option<Vec<u8>> {
+    use VerificationOutboxValue as V;
+    Some(match value {
+        V::Null | V::Bool(false) => Vec::new(),
+        V::Bool(true) => b"1".to_vec(),
+        V::Int(value) => value.to_string().into_bytes(),
+        V::Bytes(value) => value.clone(),
+        // PHP owns array-to-string warnings and precision-dependent float casts.
+        V::Float(_) | V::Array(_) => return None,
+    })
+}
+
+fn w18_php_int(value: &VerificationOutboxValue) -> Option<i64> {
+    use VerificationOutboxValue as V;
+    Some(match value {
+        V::Null => 0,
+        V::Bool(value) => i64::from(*value),
+        V::Int(value) => *value,
+        V::Array(value) => i64::from(!value.is_empty()),
+        V::Bytes(value) => {
+            let text = std::str::from_utf8(value)
+                .ok()?
+                .trim_matches(|c: char| c.is_ascii_whitespace());
+            if text.is_empty() {
+                0
+            } else {
+                text.parse().ok()?
+            }
+        }
+        // Numeric-prefix strings, float overflow and nonfinite casts fall back.
+        V::Float(_) => return None,
+    })
+}
+
+fn w18_category(value: &VerificationOutboxValue) -> Option<VerificationOutboxValue> {
+    use VerificationOutboxValue as V;
+    let number = match value {
+        V::Int(value) => Some(*value),
+        V::Bool(true) => Some(1),
+        V::Bytes(value) => {
+            // FILTER_VALIDATE_INT uses PHP trim characters except NUL,
+            // including vertical tab but excluding form feed.
+            let whitespace = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 11);
+            let start = value
+                .iter()
+                .position(|b| !whitespace(b))
+                .unwrap_or(value.len());
+            let end = value
+                .iter()
+                .rposition(|b| !whitespace(b))
+                .map(|i| i + 1)
+                .unwrap_or(start);
+            let value = &value[start..end];
+            let digits = value
+                .strip_prefix(b"+")
+                .or_else(|| value.strip_prefix(b"-"))
+                .unwrap_or(value);
+            if digits.is_empty()
+                || !digits.iter().all(u8::is_ascii_digit)
+                || (digits.len() > 1 && digits[0] == b'0')
+            {
+                None
+            } else {
+                std::str::from_utf8(value)
+                    .ok()
+                    .and_then(|v| v.parse::<i64>().ok())
+            }
+        }
+        V::Float(value) => {
+            let number = std::str::from_utf8(value).ok()?.parse::<f64>().ok()?;
+            // Only these float-to-string results are independent of PHP's ini
+            // precision. Other floats must use FILTER_VALIDATE_INT in PHP.
+            if number.fract() == 0.0 && (1.0..=9.0).contains(&number) {
+                Some(number as i64)
+            } else {
+                return None;
+            }
+        }
+        V::Null | V::Bool(false) | V::Array(_) => None,
+    };
+    Some(
+        number
+            .filter(|n| *n > 0)
+            .map(V::Int)
+            .unwrap_or(V::Bool(false)),
+    )
+}
+
+fn w18_search_name(name: &[u8], raw_name: &[u8], import: bool) -> Option<Vec<u8>> {
+    let chosen = if !name.is_empty() && (import || name != b"0") {
+        name
+    } else {
+        raw_name
+    };
+    std::str::from_utf8(chosen).ok()?;
+    Some(chosen.to_vec())
+}
+
+fn w18_compute(op: u32, args: &[VerificationOutboxValue]) -> Option<VerificationOutboxValue> {
+    use VerificationOutboxValue as V;
+    let arity = match op {
+        0 => 7,
+        1 | 4 | 9 | 10 | 11 => 3,
+        2 | 7 | 8 => 2,
+        3 | 5 => 1,
+        6 => 4,
+        _ => return None,
+    };
+    if args.len() != arity {
+        return None;
+    }
+    let bytes = |i: usize| w16_bytes(&args[i]);
+    let int = |i: usize| w16_int(&args[i]);
+    let boolean = |i: usize| w16_bool(&args[i]);
+    Some(match op {
+        0 => {
+            let subject = bytes(0)?;
+            let poster = bytes(1)?;
+            let collection =
+                matches!(&args[2], V::Null) || w16_bytes(&args[2]) == Some(b"collection");
+            let import = w16_bytes(&args[2]) == Some(b"import");
+            let display = if import {
+                w16_bytes(&args[3]).unwrap_or(subject)
+            } else {
+                subject
+            };
+            let raw_name = if collection {
+                std::str::from_utf8(subject)
+                    .ok()?
+                    .chars()
+                    .filter(|c| !matches!(c, '#' | '@' | '$' | '%' | '^' | '§' | '¨' | '©' | 'Ö'))
+                    .collect::<String>()
+                    .into_bytes()
+            } else {
+                std::str::from_utf8(display).ok()?;
+                display.to_vec()
+            };
+            let from = if collection {
+                let start = poster
+                    .iter()
+                    .position(|b| *b != b'\'')
+                    .unwrap_or(poster.len());
+                let end = poster
+                    .iter()
+                    .rposition(|b| *b != b'\'')
+                    .map(|i| i + 1)
+                    .unwrap_or(start);
+                &poster[start..end]
+            } else {
+                poster
+            };
+            std::str::from_utf8(from).ok()?;
+            let override_name = import && matches!(&args[4], V::Bool(true)) && !subject.is_empty();
+            let cleaned = &args[6];
+            let field = |key: &[u8]| cleaned.field(key).filter(|v| !matches!(v, V::Null));
+            let is_array = matches!(cleaned, V::Array(_));
+            let name = if override_name {
+                std::str::from_utf8(subject).ok()?;
+                subject.to_vec()
+            } else if is_array {
+                match field(b"cleansubject") {
+                    Some(value) => w18_php_string(value)?,
+                    None => raw_name.clone(),
+                }
+            } else {
+                w16_bytes(cleaned)
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or(&raw_name)
+                    .to_vec()
+            };
+            let proper = if is_array {
+                w18_php_bool(field(b"properlynamed").unwrap_or(&V::Bool(false)))?
+            } else {
+                true
+            };
+            let predb = if is_array {
+                w18_php_int(field(b"predb").unwrap_or(&V::Int(0)))?.max(0)
+            } else {
+                0
+            };
+            let naming_regex_id = if is_array {
+                w18_php_int(field(b"id").unwrap_or(&V::Int(0)))?
+            } else {
+                0
+            };
+            let explicit_category = if import {
+                w18_category(&args[5])?
+            } else {
+                V::Bool(false)
+            };
+            let search_name = w18_search_name(&name, &raw_name, import)?;
+            w16_map(vec![
+                ("collectionMetadata", V::Bool(collection)),
+                ("importMetadata", V::Bool(import)),
+                ("importNameOverride", V::Bool(override_name)),
+                ("rawName", V::Bytes(raw_name)),
+                ("from", w16_string(from)),
+                ("name", V::Bytes(name)),
+                ("proper", V::Bool(proper)),
+                ("predb", V::Int(predb)),
+                ("explicitCategory", explicit_category),
+                ("searchName", V::Bytes(search_name)),
+                ("naming_regex_id", V::Int(naming_regex_id)),
+            ])
+        }
+        1 => V::Bytes(w18_search_name(bytes(0)?, bytes(1)?, boolean(2)?)?),
+        2 => {
+            if !matches!(&args[1], V::Null | V::Int(_)) {
+                return None;
+            }
+            V::Bool(bytes(0)? == b"published" && !matches!(&args[1], V::Null))
+        }
+        3 => V::Bool(matches!(
+            w16_bytes(&args[0]),
+            Some(
+                b"published"
+                    | b"filtered"
+                    | b"metadata_review"
+                    | b"deferred"
+                    | b"stale"
+                    | b"paused"
+                    | b"retry"
+                    | b"invalid"
+                    | b"error"
+                    | b"unresolved"
+                    | b"transport"
+                    | b"no_release"
+            )
+        )),
+        4 => {
+            bytes(0)?;
+            if !matches!(&args[1], V::Null | V::Int(_))
+                || !matches!(&args[2], V::Null | V::Bytes(_))
+            {
+                return None;
+            }
+            w16_map(vec![
+                ("status", args[0].clone()),
+                ("release_id", args[1].clone()),
+                ("error", args[2].clone()),
+            ])
+        }
+        5 => V::Bool(matches!(bytes(0)?, b"complete" | b"repaired" | b"sampled")),
+        6 => {
+            int(0)?;
+            bytes(1)?;
+            int(2)?;
+            bytes(3)?;
+            w16_map(vec![
+                ("candidate_id", args[0].clone()),
+                ("identity", args[1].clone()),
+                ("version", args[2].clone()),
+                ("manifest_hash", args[3].clone()),
+            ])
+        }
+        7 => {
+            let mut key = int(0)?.to_string().into_bytes();
+            let generation = bytes(1)?;
+            if !generation.is_empty() {
+                key.push(b':');
+                key.extend_from_slice(generation);
+            }
+            V::Bytes(key)
+        }
+        8 => {
+            let compact = boolean(0)?;
+            bytes(1)?;
+            if compact { args[1].clone() } else { V::Null }
+        }
+        9 => {
+            let compact = boolean(0)?;
+            int(1)?;
+            int(2)?;
+            args[if compact { 1 } else { 2 }].clone()
+        }
+        10 => {
+            if !matches!(&args[1], V::Null | V::Bytes(_)) {
+                return None;
+            }
+            let schema = int(2)?;
+            V::Bool(
+                matches!(&args[0], V::Array(_))
+                    && w16_equal(args[0].field(b"format").unwrap_or(&V::Null), &args[1])
+                    && args[0].field(b"schema_version").and_then(w16_int) == Some(schema),
+            )
+        }
+        11 => {
+            let id = int(0)?;
+            let generation = bytes(1)?;
+            let token = bytes(2)?;
+            if !token.is_empty() {
+                w16_string(token)
+            } else {
+                let mut legacy = format!("legacy:{id}:").into_bytes();
+                legacy.extend_from_slice(generation);
+                w16_string(&sha256_fast_hex(&legacy)[..16])
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// PHP serialized list arguments and scalar/array result. -1 declines input;
+/// -required reports size queries and short buffers without writing.
+/// # Safety
+/// Caller must supply live readable input and writable output allocations for
+/// the stated ranges. Allocation ownership is not discoverable from pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w18_verification_metadata_fingerprint(
+    operation: u32,
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        // Check alignment, lengths, address ends and disjointness before making
+        // any slice. u8 alignment is one, so word-unaligned byte buffers work.
+        if input.is_null()
+            || !input.is_aligned()
+            || !output.is_aligned()
+            || length > 64 * 1024 * 1024
+            || length > isize::MAX as usize
+            || capacity > isize::MAX as usize
+            || (output.is_null() && capacity != 0)
+        {
+            return -1;
+        }
+        let Some(input_end) = (input as usize).checked_add(length) else {
+            return -1;
+        };
+        let Some(output_end) = (output as usize).checked_add(capacity) else {
+            return -1;
+        };
+        if length != 0
+            && capacity != 0
+            && (input as usize) < output_end
+            && (output as usize) < input_end
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let mut parser = VerificationOutboxParser {
+            bytes,
+            pos: 0,
+            remaining: 100_000,
+        };
+        // The shared parser stops above 512; starting at 488 permits 24 levels.
+        let Some(value) = parser.value(488) else {
+            return -1;
+        };
+        if parser.pos != length {
+            return -1;
+        }
+        let Some(entries) = w16_entries(&value) else {
+            return -1;
+        };
+        if entries
+            .iter()
+            .enumerate()
+            .any(|(i, (key, _))| !matches!(key, VerificationOutboxValue::Int(n) if *n == i as i64))
+        {
+            return -1;
+        }
+        let args: Vec<_> = entries.iter().map(|(_, value)| value.clone()).collect();
+        let Some(result) = w18_compute(operation, &args) else {
+            return -1;
+        };
+        let mut wire = Vec::new();
+        result.serialize(&mut wire);
+        let Ok(required) = isize::try_from(wire.len()) else {
+            return -1;
+        };
+        if wire.len() > capacity {
+            return -required;
+        }
+        // A result is always at least two bytes; capacity therefore guarantees
+        // nonnull output here. Short buffers and queries never write anything.
+        unsafe {
+            std::ptr::copy_nonoverlapping(wire.as_ptr(), output, wire.len());
+        }
+        required
+    })
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave18_verification_metadata_fingerprint_tests {
+    use super::*;
+    use VerificationOutboxValue as V;
+
+    fn assert_value(op: u32, args: &[V], expected: V) {
+        let actual = w18_compute(op, args).expect("supported operation");
+        assert!(
+            w16_equal(&actual, &expected),
+            "actual {actual:?}, expected {expected:?}"
+        );
+    }
+
+    #[test]
+    fn collection_metadata_preserves_cleaner_casts_and_zero_search_rule() {
+        let args = [
+            w16_string("#a@b$%^§¨©Ö".as_bytes()),
+            w16_string(b"'''poster''"),
+            V::Null,
+            V::Null,
+            V::Bool(false),
+            V::Int(7),
+            w16_map(vec![
+                ("cleansubject", V::Int(0)),
+                ("properlynamed", w16_string(b"0")),
+                ("predb", V::Int(-3)),
+                ("id", w16_string(b"12")),
+            ]),
+        ];
+        assert_value(
+            0,
+            &args,
+            w16_map(vec![
+                ("collectionMetadata", V::Bool(true)),
+                ("importMetadata", V::Bool(false)),
+                ("importNameOverride", V::Bool(false)),
+                ("rawName", w16_string(b"ab")),
+                ("from", w16_string(b"poster")),
+                ("name", w16_string(b"0")),
+                ("proper", V::Bool(false)),
+                ("predb", V::Int(0)),
+                ("explicitCategory", V::Bool(false)),
+                ("searchName", w16_string(b"ab")),
+                ("naming_regex_id", V::Int(12)),
+            ]),
+        );
+    }
+
+    #[test]
+    fn import_override_and_original_subject_are_independent() {
+        let args = [
+            w16_string(b"0"),
+            w16_string(b"'poster'"),
+            w16_string(b"import"),
+            w16_string(b"original#"),
+            V::Bool(true),
+            w16_string(b" +12 "),
+            V::Null,
+        ];
+        assert_value(
+            0,
+            &args,
+            w16_map(vec![
+                ("collectionMetadata", V::Bool(false)),
+                ("importMetadata", V::Bool(true)),
+                ("importNameOverride", V::Bool(true)),
+                ("rawName", w16_string(b"original#")),
+                ("from", w16_string(b"'poster'")),
+                ("name", w16_string(b"0")),
+                ("proper", V::Bool(true)),
+                ("predb", V::Int(0)),
+                ("explicitCategory", V::Int(12)),
+                ("searchName", w16_string(b"0")),
+                ("naming_regex_id", V::Int(0)),
+            ]),
+        );
+    }
+
+    #[test]
+    fn search_name_distinguishes_import_zero_and_declines_invalid_selected_utf8() {
+        assert_value(
+            1,
+            &[w16_string(b"0"), w16_string(b"raw"), V::Bool(false)],
+            w16_string(b"raw"),
+        );
+        assert_value(
+            1,
+            &[w16_string(b"0"), w16_string(b"raw"), V::Bool(true)],
+            w16_string(b"0"),
+        );
+        assert_value(
+            1,
+            &[w16_string(b""), w16_string(b"raw"), V::Bool(true)],
+            w16_string(b"raw"),
+        );
+        assert_value(
+            1,
+            &[w16_string(b"ok"), w16_string(&[255]), V::Bool(false)],
+            w16_string(b"ok"),
+        );
+        assert!(w18_compute(1, &[w16_string(&[255]), w16_string(b"raw"), V::Bool(true)]).is_none());
+    }
+
+    #[test]
+    fn publication_and_verdict_status_checks_remain_strict() {
+        for id in [0, -2, i64::MAX] {
+            assert_value(2, &[w16_string(b"published"), V::Int(id)], V::Bool(true));
+        }
+        assert_value(2, &[w16_string(b"published"), V::Null], V::Bool(false));
+        assert_value(2, &[w16_string(b"Published"), V::Int(1)], V::Bool(false));
+        for status in [
+            "published",
+            "filtered",
+            "metadata_review",
+            "deferred",
+            "stale",
+            "paused",
+            "retry",
+            "invalid",
+            "error",
+            "unresolved",
+            "transport",
+            "no_release",
+        ] {
+            assert_value(3, &[w16_string(status.as_bytes())], V::Bool(true));
+        }
+        assert_value(3, &[V::Int(1)], V::Bool(false));
+        assert_value(3, &[w16_string(b"future")], V::Bool(false));
+        assert_value(
+            4,
+            &[w16_string(b"future"), V::Int(-7), V::Null],
+            w16_map(vec![
+                ("status", w16_string(b"future")),
+                ("release_id", V::Int(-7)),
+                ("error", V::Null),
+            ]),
+        );
+        for verdict in ["complete", "repaired", "sampled"] {
+            assert_value(5, &[w16_string(verdict.as_bytes())], V::Bool(true));
+        }
+        assert_value(5, &[w16_string(b"Complete")], V::Bool(false));
+    }
+
+    #[test]
+    fn fingerprint_values_preserve_bytes_nulls_integer_extremes_and_strict_schema() {
+        assert_value(
+            6,
+            &[
+                V::Int(-1),
+                w16_string(&[255]),
+                V::Int(i64::MIN),
+                w16_string(b"hash"),
+            ],
+            w16_map(vec![
+                ("candidate_id", V::Int(-1)),
+                ("identity", w16_string(&[255])),
+                ("version", V::Int(i64::MIN)),
+                ("manifest_hash", w16_string(b"hash")),
+            ]),
+        );
+        assert_value(7, &[V::Int(-1), w16_string(b"g\0")], w16_string(b"-1:g\0"));
+        assert_value(7, &[V::Int(0), w16_string(b"")], w16_string(b"0"));
+        assert_value(8, &[V::Bool(false), w16_string(b"format")], V::Null);
+        assert_value(
+            8,
+            &[V::Bool(true), w16_string(b"format")],
+            w16_string(b"format"),
+        );
+        assert_value(9, &[V::Bool(true), V::Int(2), V::Int(3)], V::Int(2));
+        assert_value(9, &[V::Bool(false), V::Int(2), V::Int(3)], V::Int(3));
+        let meta = w16_map(vec![("schema_version", V::Int(3))]);
+        assert_value(10, &[meta.clone(), V::Null, V::Int(3)], V::Bool(true));
+        assert_value(10, &[meta, w16_string(b""), V::Int(3)], V::Bool(false));
+        assert_value(
+            10,
+            &[
+                w16_map(vec![("schema_version", w16_string(b"3"))]),
+                V::Null,
+                V::Int(3),
+            ],
+            V::Bool(false),
+        );
+        assert_value(
+            11,
+            &[V::Int(1), w16_string(b"gen"), w16_string(&[255])],
+            w16_string(&[255]),
+        );
+        assert_value(
+            11,
+            &[V::Int(1), w16_string(b"gen"), w16_string(b"")],
+            w16_string(&sha256_fast_hex(b"legacy:1:gen")[..16]),
+        );
+    }
+
+    #[test]
+    fn abi_checks_ranges_before_reading_and_never_partially_writes() {
+        let input = b"a:1:{i:0;s:8:\"complete\";}";
+        let mut output = [88_u8; 32];
+        unsafe {
+            let call = nntmux_w18_verification_metadata_fingerprint;
+            assert_eq!(
+                call(5, std::ptr::null(), 0, output.as_mut_ptr(), output.len()),
+                -1
+            );
+            assert_eq!(
+                call(5, std::ptr::null(), 1, output.as_mut_ptr(), output.len()),
+                -1
+            );
+            assert_eq!(
+                call(
+                    5,
+                    input.as_ptr(),
+                    usize::MAX,
+                    output.as_mut_ptr(),
+                    output.len()
+                ),
+                -1
+            );
+            assert_eq!(
+                call(
+                    5,
+                    input.as_ptr(),
+                    64 * 1024 * 1024 + 1,
+                    output.as_mut_ptr(),
+                    output.len()
+                ),
+                -1
+            );
+            assert_eq!(
+                call(
+                    5,
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr(),
+                    usize::MAX
+                ),
+                -1
+            );
+            assert_eq!(
+                call(
+                    5,
+                    usize::MAX as *const u8,
+                    1,
+                    output.as_mut_ptr(),
+                    output.len()
+                ),
+                -1
+            );
+            assert_eq!(
+                call(5, input.as_ptr(), input.len(), usize::MAX as *mut u8, 1),
+                -1
+            );
+            assert_eq!(
+                call(5, input.as_ptr(), input.len(), std::ptr::null_mut(), 1),
+                -1
+            );
+            assert_eq!(call(5, output.as_ptr(), 8, output.as_mut_ptr(), 8), -1);
+            assert_eq!(
+                call(5, output.as_ptr(), 8, output.as_mut_ptr().add(4), 8),
+                -1
+            );
+            assert_eq!(
+                call(5, output.as_ptr().add(4), 8, output.as_mut_ptr(), 8),
+                -1
+            );
+            assert_eq!(
+                call(5, input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -4
+            );
+            assert_eq!(
+                call(5, input.as_ptr(), input.len(), output.as_mut_ptr(), 3),
+                -4
+            );
+            assert_eq!(output, [88; 32]);
+            assert_eq!(
+                call(5, input.as_ptr(), input.len(), output.as_mut_ptr(), 4),
+                4
+            );
+            assert_eq!(&output[..4], b"b:1;");
+            assert_eq!(&output[4..], &[88; 28]);
+        }
+    }
+
+    #[test]
+    fn abi_accepts_byte_alignment_and_adjacent_disjoint_ranges() {
+        let input = b"a:1:{i:0;s:8:\"complete\";}";
+        let mut buffer = vec![88_u8; input.len() + 8];
+        buffer[1..=input.len()].copy_from_slice(input);
+        unsafe {
+            // Byte pointers at offsets of one need not have word alignment.
+            let result = nntmux_w18_verification_metadata_fingerprint(
+                5,
+                buffer.as_ptr().add(1),
+                input.len(),
+                buffer.as_mut_ptr().add(input.len() + 1),
+                4,
+            );
+            assert_eq!(result, 4);
+        }
+        assert_eq!(&buffer[input.len() + 1..input.len() + 5], b"b:1;");
+        assert_eq!(buffer[0], 88);
+    }
+
+    #[test]
+    fn abi_rejects_malformed_nonlist_wrong_arity_and_bounded_parser_inputs() {
+        let query = |op, input: &[u8]| unsafe {
+            nntmux_w18_verification_metadata_fingerprint(
+                op,
+                input.as_ptr(),
+                input.len(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        for input in [
+            b"N;".as_slice(),
+            b"a:0:{}",
+            b"a:0:{}junk",
+            b"a:1:{i:1;s:8:\"complete\";}",
+            b"a:1:{i:0;R:1;}",
+            b"a:1:{s:1:\"0\";s:8:\"complete\";}",
+            b"a:1:{i:0;O:1:\"X\":0:{}}",
+            b"a:999999999999999999999:{}",
+            b"a:1:{i:0;i:9223372036854775808;}",
+        ] {
+            assert_eq!(
+                query(5, input),
+                -1,
+                "wire {:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+        assert_eq!(query(99, b"a:0:{}"), -1);
+        let mut nested = V::Null;
+        for _ in 0..25 {
+            nested = w16_list(vec![nested]);
+        }
+        let mut wire = Vec::new();
+        nested.serialize(&mut wire);
+        assert_eq!(query(3, &wire), -1);
+        // The count fails the node budget before allocating or reading entries.
+        assert_eq!(query(3, b"a:50000:{}"), -1);
+        for op in 0..12 {
+            assert!(w18_compute(op, &[]).is_none());
+        }
+    }
+
+    #[test]
+    fn category_filters_decimal_syntax_and_numeric_boundaries() {
+        for (value, expected) in [
+            (V::Bool(true), V::Int(1)),
+            (V::Bool(false), V::Bool(false)),
+            (V::Float(b"3".to_vec()), V::Int(3)),
+            (V::Int(i64::MAX), V::Int(i64::MAX)),
+            (w16_string(b" +12 "), V::Int(12)),
+            (w16_string(b"01"), V::Bool(false)),
+            (w16_string(b"\x0b12\x0b"), V::Int(12)),
+            (w16_string(b"\x0c12\x0c"), V::Bool(false)),
+            (w16_string(b"1.0"), V::Bool(false)),
+            (w16_string(b"1e2"), V::Bool(false)),
+            (w16_string(b"0"), V::Bool(false)),
+            (w16_string(b"-1"), V::Bool(false)),
+            (w16_string(b"9223372036854775808"), V::Bool(false)),
+            (w16_string(b"9223372036854775807"), V::Int(i64::MAX)),
+        ] {
+            assert!(w16_equal(&w18_category(&value).unwrap(), &expected));
+        }
+        assert!(w18_category(&V::Float(b"100000000000000".to_vec())).is_none());
+    }
+
+    #[test]
+    fn nan_boolean_coercion_declines_to_preserve_php_warning() {
+        let args = vec![
+            w16_string(b"subject"),
+            w16_string(b"poster"),
+            V::Null,
+            V::Null,
+            V::Bool(false),
+            V::Null,
+            w16_map(vec![("properlynamed", V::Float(b"NAN".to_vec()))]),
+        ];
+        let mut wire = Vec::new();
+        w16_list(args).serialize(&mut wire);
+        let mut output = [88_u8; 1024];
+        let result = unsafe {
+            nntmux_w18_verification_metadata_fingerprint(
+                0,
+                wire.as_ptr(),
+                wire.len(),
+                output.as_mut_ptr(),
+                output.len(),
+            )
+        };
+        assert_eq!(result, -1);
+        assert_eq!(output, [88; 1024]);
+        for value in [b"INF".as_slice(), b"-INF"] {
+            assert_eq!(w18_php_bool(&V::Float(value.to_vec())), Some(true));
+        }
+    }
+
+}
