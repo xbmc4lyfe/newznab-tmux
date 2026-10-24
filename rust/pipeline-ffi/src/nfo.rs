@@ -21663,3 +21663,872 @@ pub unsafe extern "C" fn nntmux_w29_admin_settings_status_monitoring_payment(
     }))
     .unwrap_or(-1)
 }
+/// Wave 30.2: JSON-dispatched pure helpers for the NFO/NZB/manifest import and
+/// yEnc doctor console commands. PHP sends `json_encode($args)` (a JSON list)
+/// and decodes the JSON result; any input outside the strict grammar declines
+/// with -1 so PHP falls back to its own implementation.
+mod wave30_nfo_nzb_manifest_import_yenc_commands {
+    use super::{nfo_abi_range, yenc_ranges_overlap};
+    use std::slice;
+
+    pub(super) const MAX_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_DEPTH: usize = 32;
+    const MAX_NODES: usize = 1_000_000;
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub(super) enum J {
+        Null,
+        Bool(bool),
+        Int(i64),
+        /// Any non-integer JSON number. Kept only so callers can decline it.
+        Float,
+        Str(Vec<u8>),
+        Arr(Vec<J>),
+        Obj(Vec<(Vec<u8>, J)>),
+    }
+
+    impl J {
+        fn get(&self, key: &[u8]) -> Option<&J> {
+            match self {
+                J::Obj(entries) => entries.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+                _ => None,
+            }
+        }
+        fn str(&self) -> Option<&[u8]> {
+            match self {
+                J::Str(s) => Some(s),
+                _ => None,
+            }
+        }
+        fn int(&self) -> Option<i64> {
+            match self {
+                J::Int(i) => Some(*i),
+                _ => None,
+            }
+        }
+        fn bool(&self) -> Option<bool> {
+            match self {
+                J::Bool(b) => Some(*b),
+                _ => None,
+            }
+        }
+    }
+
+    struct Parser<'a> {
+        bytes: &'a [u8],
+        pos: usize,
+        nodes: usize,
+    }
+
+    impl Parser<'_> {
+        fn ws(&mut self) {
+            while matches!(self.bytes.get(self.pos), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+                self.pos += 1;
+            }
+        }
+
+        fn eat(&mut self, byte: u8) -> bool {
+            if self.bytes.get(self.pos) == Some(&byte) {
+                self.pos += 1;
+                true
+            } else {
+                false
+            }
+        }
+
+        fn literal(&mut self, text: &[u8], value: J) -> Option<J> {
+            if self.bytes.get(self.pos..self.pos + text.len()) == Some(text) {
+                self.pos += text.len();
+                Some(value)
+            } else {
+                None
+            }
+        }
+
+        fn value(&mut self, depth: usize) -> Option<J> {
+            if depth > MAX_DEPTH {
+                return None;
+            }
+            self.nodes = self.nodes.checked_add(1)?;
+            if self.nodes > MAX_NODES {
+                return None;
+            }
+            self.ws();
+            let value = match *self.bytes.get(self.pos)? {
+                b'n' => self.literal(b"null", J::Null)?,
+                b't' => self.literal(b"true", J::Bool(true))?,
+                b'f' => self.literal(b"false", J::Bool(false))?,
+                b'"' => J::Str(self.string()?),
+                b'[' => {
+                    self.pos += 1;
+                    let mut items = Vec::new();
+                    self.ws();
+                    if !self.eat(b']') {
+                        loop {
+                            items.push(self.value(depth + 1)?);
+                            self.ws();
+                            if self.eat(b']') {
+                                break;
+                            }
+                            if !self.eat(b',') {
+                                return None;
+                            }
+                        }
+                    }
+                    J::Arr(items)
+                }
+                b'{' => {
+                    self.pos += 1;
+                    let mut entries: Vec<(Vec<u8>, J)> = Vec::new();
+                    self.ws();
+                    if !self.eat(b'}') {
+                        loop {
+                            self.ws();
+                            if self.bytes.get(self.pos) != Some(&b'"') {
+                                return None;
+                            }
+                            let key = self.string()?;
+                            // PHP never emits duplicate keys; json_decode would keep the last.
+                            if entries.iter().any(|(k, _)| *k == key) {
+                                return None;
+                            }
+                            self.ws();
+                            if !self.eat(b':') {
+                                return None;
+                            }
+                            let item = self.value(depth + 1)?;
+                            entries.push((key, item));
+                            self.ws();
+                            if self.eat(b'}') {
+                                break;
+                            }
+                            if !self.eat(b',') {
+                                return None;
+                            }
+                        }
+                    }
+                    J::Obj(entries)
+                }
+                b'-' | b'0'..=b'9' => self.number()?,
+                _ => return None,
+            };
+            Some(value)
+        }
+
+        fn number(&mut self) -> Option<J> {
+            let start = self.pos;
+            self.eat(b'-');
+            match self.bytes.get(self.pos) {
+                Some(b'0') => self.pos += 1,
+                Some(b'1'..=b'9') => {
+                    while matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
+                        self.pos += 1;
+                    }
+                }
+                _ => return None,
+            }
+            let mut float = false;
+            if self.eat(b'.') {
+                float = true;
+                let digits = self.pos;
+                while matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+                if self.pos == digits {
+                    return None;
+                }
+            }
+            if matches!(self.bytes.get(self.pos), Some(b'e' | b'E')) {
+                float = true;
+                self.pos += 1;
+                if matches!(self.bytes.get(self.pos), Some(b'+' | b'-')) {
+                    self.pos += 1;
+                }
+                let digits = self.pos;
+                while matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+                if self.pos == digits {
+                    return None;
+                }
+            }
+            if float {
+                return Some(J::Float);
+            }
+            let text = std::str::from_utf8(&self.bytes[start..self.pos]).ok()?;
+            // Integers beyond i64 decode as floats in PHP; decline them.
+            Some(text.parse::<i64>().map_or(J::Float, J::Int))
+        }
+
+        fn hex4(&mut self) -> Option<u32> {
+            let digits = self.bytes.get(self.pos..self.pos + 4)?;
+            let mut value = 0u32;
+            for &digit in digits {
+                value = value * 16 + char::from(digit).to_digit(16)?;
+            }
+            self.pos += 4;
+            Some(value)
+        }
+
+        fn string(&mut self) -> Option<Vec<u8>> {
+            self.pos += 1;
+            let mut out = Vec::new();
+            loop {
+                let byte = *self.bytes.get(self.pos)?;
+                self.pos += 1;
+                match byte {
+                    b'"' => return Some(out),
+                    b'\\' => {
+                        let escape = *self.bytes.get(self.pos)?;
+                        self.pos += 1;
+                        let decoded = match escape {
+                            b'"' => b'"',
+                            b'\\' => b'\\',
+                            b'/' => b'/',
+                            b'b' => 0x08,
+                            b'f' => 0x0c,
+                            b'n' => b'\n',
+                            b'r' => b'\r',
+                            b't' => b'\t',
+                            b'u' => {
+                                let high = self.hex4()?;
+                                let code = if (0xd800..0xdc00).contains(&high) {
+                                    if !(self.eat(b'\\') && self.eat(b'u')) {
+                                        return None;
+                                    }
+                                    let low = self.hex4()?;
+                                    if !(0xdc00..0xe000).contains(&low) {
+                                        return None;
+                                    }
+                                    0x10000 + ((high - 0xd800) << 10) + (low - 0xdc00)
+                                } else {
+                                    high
+                                };
+                                let ch = char::from_u32(code)?;
+                                let mut buf = [0u8; 4];
+                                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                                continue;
+                            }
+                            _ => return None,
+                        };
+                        out.push(decoded);
+                    }
+                    0x00..=0x1f => return None,
+                    _ => out.push(byte),
+                }
+            }
+        }
+    }
+
+    pub(super) fn parse(bytes: &[u8]) -> Option<J> {
+        // json_encode() output is always valid UTF-8; reject anything else up front.
+        std::str::from_utf8(bytes).ok()?;
+        let mut parser = Parser {
+            bytes,
+            pos: 0,
+            nodes: 0,
+        };
+        let value = parser.value(0)?;
+        parser.ws();
+        (parser.pos == bytes.len()).then_some(value)
+    }
+
+    fn write_str(out: &mut Vec<u8>, value: &[u8]) {
+        out.push(b'"');
+        for &byte in value {
+            match byte {
+                b'"' => out.extend_from_slice(b"\\\""),
+                b'\\' => out.extend_from_slice(b"\\\\"),
+                0x00..=0x1f => {
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    out.extend_from_slice(b"\\u00");
+                    out.push(HEX[usize::from(byte >> 4)]);
+                    out.push(HEX[usize::from(byte & 0x0f)]);
+                }
+                _ => out.push(byte),
+            }
+        }
+        out.push(b'"');
+    }
+
+    pub(super) fn write(out: &mut Vec<u8>, value: &J) {
+        match value {
+            J::Null => out.extend_from_slice(b"null"),
+            J::Bool(true) => out.extend_from_slice(b"true"),
+            J::Bool(false) => out.extend_from_slice(b"false"),
+            J::Int(i) => out.extend_from_slice(i.to_string().as_bytes()),
+            // Results never contain floats; emitting null keeps the writer total.
+            J::Float => out.extend_from_slice(b"null"),
+            J::Str(s) => write_str(out, s),
+            J::Arr(items) => {
+                out.push(b'[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    write(out, item);
+                }
+                out.push(b']');
+            }
+            J::Obj(entries) => {
+                out.push(b'{');
+                for (i, (key, item)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    write_str(out, key);
+                    out.push(b':');
+                    write(out, item);
+                }
+                out.push(b'}');
+            }
+        }
+    }
+
+    fn s(text: impl AsRef<[u8]>) -> J {
+        J::Str(text.as_ref().to_vec())
+    }
+
+    /// `rtrim($folder, "/\\")`.
+    pub(super) fn normalize_folder_path(folder: &[u8]) -> &[u8] {
+        let end = folder
+            .iter()
+            .rposition(|b| !matches!(b, b'/' | b'\\'))
+            .map_or(0, |i| i + 1);
+        &folder[..end]
+    }
+
+    /// PHP 8 `(int) $string` restricted to inputs whose result is unambiguous:
+    /// no ASCII digit at all (0) or a whitespace-padded plain decimal integer.
+    fn php_plain_int_cast(value: &[u8]) -> Option<i64> {
+        if !value.iter().any(u8::is_ascii_digit) {
+            return Some(0);
+        }
+        let ws = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+        let start = value.iter().position(|b| !ws(b))?;
+        let end = value.iter().rposition(|b| !ws(b))? + 1;
+        let body = &value[start..end];
+        let digits = body
+            .strip_prefix(b"-")
+            .or_else(|| body.strip_prefix(b"+"))
+            .unwrap_or(body);
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(body).ok()?.parse::<i64>().ok()
+    }
+
+    /// `$source ? (int) $source : 1`.
+    pub(super) fn normalize_source_id(source: &J) -> Option<i64> {
+        Some(match source {
+            J::Null | J::Bool(_) | J::Int(0) => 1,
+            J::Int(i) => *i,
+            J::Str(text) if text.is_empty() || text == b"0" => 1,
+            J::Str(text) => php_plain_int_cast(text)?,
+            _ => return None,
+        })
+    }
+
+    pub(super) fn is_importable_nzb_filename(filename: &[u8], manifest: &[u8]) -> bool {
+        if filename == manifest {
+            return false;
+        }
+        let lower = filename.to_ascii_lowercase();
+        lower.ends_with(b".nzb") || lower.ends_with(b".nzb.gz")
+    }
+
+    pub(super) fn is_valid_release_guid(guid: &[u8]) -> bool {
+        (1..=40).contains(&guid.len())
+            && guid
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    }
+
+    pub(super) fn compute_chunk_limit(batch: i64, limit: i64, seen: i64) -> i64 {
+        if limit > 0 {
+            // PHP promotes an overflowing subtraction to float; min() then keeps $batch.
+            let remaining = (i128::from(limit) - i128::from(seen)).max(0);
+            i128::from(batch).min(remaining) as i64
+        } else {
+            batch
+        }
+    }
+
+    pub(super) fn resolve_active_decoder(mode: &[u8], ffi: bool, rapidyenc: bool) -> &'static str {
+        if !matches!(mode, b"auto" | b"php" | b"native") {
+            "unavailable"
+        } else if mode == b"php" {
+            "PHP"
+        } else if ffi && rapidyenc {
+            "RapidYenc"
+        } else if mode == b"native" {
+            "unavailable"
+        } else {
+            "PHP"
+        }
+    }
+
+    fn diagnostic_rows(report: &J) -> Option<J> {
+        let text = |key: &[u8]| report.get(key)?.str();
+        let flag = |key: &[u8]| report.get(key)?.bool();
+        let nullable = |key: &[u8]| match report.get(key)? {
+            J::Null => Some(None),
+            J::Str(value) => Some(Some(value.as_slice())),
+            _ => None,
+        };
+        let cat = |parts: &[&[u8]]| J::Str(parts.concat());
+        let row = |label: &str, value: J| J::Arr(vec![s(label), value]);
+        let library = text(b"library_path")?;
+        let ffi_enable = text(b"ffi_enable")?;
+        let native_error = nullable(b"native_error")?;
+        Some(J::Arr(vec![
+            row(
+                "PHP",
+                cat(&[
+                    text(b"php")?,
+                    b" (",
+                    text(b"os")?,
+                    b", ",
+                    text(b"sapi")?,
+                    if flag(b"thread_safe")? {
+                        b", ZTS"
+                    } else {
+                        b", NTS"
+                    },
+                    b")",
+                ]),
+            ),
+            row(
+                "FFI extension",
+                s(if flag(b"ffi_extension")? {
+                    "loaded"
+                } else {
+                    "missing"
+                }),
+            ),
+            row(
+                "ffi.enable",
+                s(if ffi_enable.is_empty() {
+                    b"(default)".as_slice()
+                } else {
+                    ffi_enable
+                }),
+            ),
+            row("YENC_DECODER", s(text(b"decoder_mode")?)),
+            row(
+                "Library",
+                s(if library.is_empty() {
+                    b"(unset)".as_slice()
+                } else {
+                    library
+                }),
+            ),
+            row(
+                "Library present",
+                s(if flag(b"library_present")? {
+                    "yes"
+                } else {
+                    "no"
+                }),
+            ),
+            row(
+                "Native self-check",
+                if flag(b"native_available")? {
+                    s("passed")
+                } else {
+                    cat(&[b"failed: ", native_error.unwrap_or(b"")])
+                },
+            ),
+            row(
+                "RapidYenc version",
+                s(nullable(b"rapidyenc_version")?.unwrap_or(b"n/a")),
+            ),
+            row(
+                "Hardware CRC32",
+                s(if flag(b"hardware_crc32")? {
+                    "yes"
+                } else {
+                    "no"
+                }),
+            ),
+            row("Active decoder", s(text(b"active_decoder")?)),
+        ]))
+    }
+
+    fn tally(outcomes: &J) -> Option<J> {
+        let items: Vec<&J> = match outcomes {
+            J::Arr(items) => items.iter().collect(),
+            J::Obj(entries) => entries.iter().map(|(_, v)| v).collect(),
+            _ => return None,
+        };
+        let (mut imported, mut failed, mut skipped) = (0i64, 0i64, 0i64);
+        let mut warnings = Vec::new();
+        for item in items {
+            let status = item.get(b"status")?.str()?;
+            let dirname = item.get(b"dirname")?.str()?;
+            let message = item.get(b"message")?.str()?;
+            match status {
+                b"imported" => imported += 1,
+                b"failed" => {
+                    failed += 1;
+                    warnings.push(J::Str([dirname, b": ", message].concat()));
+                }
+                _ => skipped += 1,
+            }
+        }
+        Some(J::Obj(vec![
+            (b"imported".to_vec(), J::Int(imported)),
+            (b"failed".to_vec(), J::Int(failed)),
+            (b"skipped".to_vec(), J::Int(skipped)),
+            (b"warnings".to_vec(), J::Arr(warnings)),
+        ]))
+    }
+
+    pub(super) fn compute(operation: u32, args: &[J]) -> Option<J> {
+        let int = |i: usize| args.get(i)?.int();
+        let text = |i: usize| args.get(i)?.str();
+        let arity = |n: usize| args.len() == n;
+        Some(match operation {
+            // ImportNfos::normalizeFolderPath / ImportNzbs::normalizeFolderPath
+            0 if arity(1) => s(normalize_folder_path(text(0)?)),
+            1 if arity(1) => tally(&args[0])?,
+            2 if arity(3) => s(format!(
+                "Processed {} NFOs, skipped {}, failed {}.",
+                int(0)?,
+                int(1)?,
+                int(2)?
+            )),
+            3 if arity(2) => J::Bool(is_importable_nzb_filename(text(0)?, text(1)?)),
+            4 if arity(1) => J::Int(normalize_source_id(&args[0])?),
+            5 if arity(3) => s(format!(
+                "Completed: {} imported, {} failed, {} skipped.",
+                int(0)?,
+                int(1)?,
+                int(2)?
+            )),
+            6 if arity(1) => {
+                let name = text(0)?;
+                J::Bool(!name.is_empty() && name.len() <= 120)
+            }
+            7 if arity(1) => J::Int(int(0)?.clamp(1, 10_000)),
+            8 if arity(1) => J::Bool(is_valid_release_guid(text(0)?)),
+            9 if arity(7) => {
+                let dry_run = args[0].bool()?;
+                let (processed, imported, already) = (int(1)?, int(2)?, int(3)?);
+                let (missing, unreadable, cursor) = (int(4)?, int(5)?, int(6)?);
+                let mut line = format!(
+                    "{}Imported {imported}; already stored {already}; resume after release {cursor}.",
+                    if dry_run { "Dry run: " } else { "" }
+                );
+                if missing != 0 || unreadable != 0 {
+                    line.push_str(&format!(
+                        " Skipped {missing} missing and {unreadable} unreadable of {processed} processed."
+                    ));
+                }
+                s(line)
+            }
+            10 if arity(3) => J::Obj(vec![
+                (b"batch".to_vec(), J::Int(int(0)?.max(1))),
+                (b"limit".to_vec(), J::Int(int(1)?.max(0))),
+                (b"cursor".to_vec(), J::Int(int(2)?.max(0))),
+            ]),
+            11 if arity(3) => J::Int(compute_chunk_limit(int(0)?, int(1)?, int(2)?)),
+            12 if arity(7) => s(format!(
+                "imported={} already={} missing={} invalid={} conflict={} unreferenced={} last_candidate_id={}",
+                int(0)?,
+                int(1)?,
+                int(2)?,
+                int(3)?,
+                int(4)?,
+                int(5)?,
+                int(6)?
+            )),
+            13 if arity(1) => J::Bool(matches!(text(0)?, b"auto" | b"php" | b"native")),
+            14 if arity(3) => s(resolve_active_decoder(
+                text(0)?,
+                args[1].bool()?,
+                args[2].bool()?,
+            )),
+            15 if arity(1) => diagnostic_rows(&args[0])?,
+            _ => return None,
+        })
+    }
+
+    /// # Safety
+    /// See [`super::nntmux_w30_nfo_nzb_manifest_import_yenc_commands`].
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> i64 {
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_BYTES
+            || capacity > MAX_BYTES
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let Some(J::Arr(args)) = parse(bytes) else {
+            return -1;
+        };
+        let Some(result) = compute(operation, &args) else {
+            return -1;
+        };
+        let mut wire = Vec::new();
+        write(&mut wire, &result);
+        if wire.is_empty() || wire.len() > MAX_BYTES {
+            return -1;
+        }
+        let needed = wire.len() as i64;
+        if wire.len() > capacity {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(wire.as_ptr(), output, wire.len()) };
+        needed
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn run(operation: u32, input: &str) -> Option<String> {
+            let mut out = vec![0xa5u8; 4096];
+            let written = unsafe {
+                evaluate(
+                    operation,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                assert_eq!(written, -1);
+                assert!(out.iter().all(|b| *b == 0xa5));
+                return None;
+            }
+            Some(String::from_utf8(out[..written as usize].to_vec()).unwrap())
+        }
+
+        #[test]
+        fn w30_2_folder_filename_guid_and_checkpoint_helpers() {
+            assert_eq!(run(0, r#"["/a/b//\\\\/"]"#).unwrap(), r#""/a/b""#);
+            assert_eq!(run(0, r#"["///"]"#).unwrap(), r#""""#);
+            assert_eq!(run(0, r#"["a\u0000/"]"#).unwrap(), r#""a\u0000""#);
+            assert_eq!(run(0, "[\"\u{e9}t\u{e9}/\"]").unwrap(), "\"\u{e9}t\u{e9}\"");
+            assert_eq!(run(0, r#"["\ud83d\ude00\\"]"#).unwrap(), "\"\u{1f600}\"");
+            assert_eq!(run(3, r#"["X.NZB.GZ","manifest.json"]"#).unwrap(), "true");
+            assert_eq!(run(3, r#"["x.nzb","x.nzb"]"#).unwrap(), "false");
+            assert_eq!(run(3, r#"["x.nzb.zip","manifest.json"]"#).unwrap(), "false");
+            assert_eq!(
+                run(3, r#"["manifest.json","manifest.json"]"#).unwrap(),
+                "false"
+            );
+            assert_eq!(run(8, r#"["abc-_09"]"#).unwrap(), "true");
+            assert_eq!(run(8, r#"["abc\n"]"#).unwrap(), "false");
+            assert_eq!(
+                run(8, &format!("[\"{}\"]", "a".repeat(41))).unwrap(),
+                "false"
+            );
+            assert_eq!(run(8, r#"[""]"#).unwrap(), "false");
+            assert_eq!(run(6, r#"[""]"#).unwrap(), "false");
+            assert_eq!(
+                run(6, &format!("[\"{}\"]", "\u{e9}".repeat(60))).unwrap(),
+                "true"
+            );
+            assert_eq!(
+                run(6, &format!("[\"{}\"]", "\u{e9}".repeat(61))).unwrap(),
+                "false"
+            );
+        }
+
+        #[test]
+        fn w30_2_numeric_helpers_cover_extremes() {
+            assert_eq!(run(7, "[-5]").unwrap(), "1");
+            assert_eq!(run(7, "[99999]").unwrap(), "10000");
+            assert_eq!(
+                run(10, "[-1,-2,-9223372036854775808]").unwrap(),
+                r#"{"batch":1,"limit":0,"cursor":0}"#
+            );
+            assert_eq!(run(11, "[10,5,2]").unwrap(), "3");
+            assert_eq!(run(11, "[10,0,2]").unwrap(), "10");
+            assert_eq!(run(11, "[10,5,9]").unwrap(), "0");
+            assert_eq!(
+                run(
+                    11,
+                    "[9223372036854775807,9223372036854775807,-9223372036854775808]"
+                )
+                .unwrap(),
+                "9223372036854775807"
+            );
+            for (source, expected) in [
+                ("null", "1"),
+                ("false", "1"),
+                ("true", "1"),
+                ("0", "1"),
+                ("-7", "-7"),
+                (r#""""#, "1"),
+                (r#""0""#, "1"),
+                (r#""00""#, "0"),
+                (r#"" 12\n""#, "12"),
+                (r#""abc""#, "0"),
+                (r#""-3""#, "-3"),
+            ] {
+                assert_eq!(
+                    run(4, &format!("[{source}]")).unwrap(),
+                    expected,
+                    "{source}"
+                );
+            }
+            for declined in [
+                "1.5",
+                r#""12abc""#,
+                r#""1e3""#,
+                r#""99999999999999999999""#,
+                "[]",
+                "{}",
+            ] {
+                assert_eq!(run(4, &format!("[{declined}]")), None, "{declined}");
+            }
+        }
+
+        #[test]
+        fn w30_2_formatting_tally_and_yenc() {
+            assert_eq!(
+                run(2, "[1,-2,3]").unwrap(),
+                r#""Processed 1 NFOs, skipped -2, failed 3.""#
+            );
+            assert_eq!(
+                run(5, "[1,2,3]").unwrap(),
+                r#""Completed: 1 imported, 2 failed, 3 skipped.""#
+            );
+            assert_eq!(
+                run(9, "[true,3,2,1,0,0,77]").unwrap(),
+                r#""Dry run: Imported 2; already stored 1; resume after release 77.""#
+            );
+            assert_eq!(
+                run(9, "[false,3,1,0,1,1,5]").unwrap(),
+                r#""Imported 1; already stored 0; resume after release 5. Skipped 1 missing and 1 unreadable of 3 processed.""#
+            );
+            assert_eq!(
+                run(12, "[1,2,3,4,5,6,-7]").unwrap(),
+                r#""imported=1 already=2 missing=3 invalid=4 conflict=5 unreferenced=6 last_candidate_id=-7""#
+            );
+            assert_eq!(
+                run(1, r#"[[{"dirname":"a","status":"imported","message":""},{"status":"failed","dirname":"b\"","message":"x\u0000"},{"dirname":"c","status":"weird","message":"m"}]]"#).unwrap(),
+                r#"{"imported":1,"failed":1,"skipped":1,"warnings":["b\": x\u0000"]}"#
+            );
+            assert_eq!(
+                run(1, "[[]]").unwrap(),
+                r#"{"imported":0,"failed":0,"skipped":0,"warnings":[]}"#
+            );
+            assert_eq!(
+                run(1, r#"[[{"dirname":"a","status":1,"message":""}]]"#),
+                None
+            );
+            assert_eq!(run(13, r#"["native"]"#).unwrap(), "true");
+            assert_eq!(run(13, r#"["Native"]"#).unwrap(), "false");
+            for (mode, ffi, rapid, expected) in [
+                ("typo", true, true, "unavailable"),
+                ("php", true, true, "PHP"),
+                ("auto", true, true, "RapidYenc"),
+                ("auto", false, true, "PHP"),
+                ("native", true, false, "unavailable"),
+                ("auto", true, false, "PHP"),
+            ] {
+                assert_eq!(
+                    run(14, &format!("[\"{mode}\",{ffi},{rapid}]")).unwrap(),
+                    format!("\"{expected}\"")
+                );
+            }
+            let report = r#"[{"php":"8.5.0","os":"Darwin","sapi":"cli","thread_safe":false,"ffi_extension":true,"ffi_enable":"","decoder_mode":"auto","library_path":"","library_present":false,"native_available":false,"native_error":null,"rapidyenc_version":null,"hardware_crc32":false,"active_decoder":"PHP"}]"#;
+            assert_eq!(
+                run(15, report).unwrap(),
+                r#"[["PHP","8.5.0 (Darwin, cli, NTS)"],["FFI extension","loaded"],["ffi.enable","(default)"],["YENC_DECODER","auto"],["Library","(unset)"],["Library present","no"],["Native self-check","failed: "],["RapidYenc version","n/a"],["Hardware CRC32","no"],["Active decoder","PHP"]]"#
+            );
+            assert_eq!(
+                run(
+                    15,
+                    &report.replace(r#""thread_safe":false"#, r#""thread_safe":0"#)
+                ),
+                None
+            );
+        }
+
+        #[test]
+        fn w30_2_rejects_malformed_json_arity_and_bad_ranges() {
+            for (op, bad) in [
+                (0, "[\"a\"] x"),
+                (0, "[\"a\""),
+                (0, "[\"\\ud800\"]"),
+                (0, "[\"\\x\"]"),
+                (0, "[\"a\u{1}\"]"),
+                (0, "{\"0\":\"a\"}"),
+                (0, "[1]"),
+                (0, "[\"a\",\"b\"]"),
+                (2, "[1,2]"),
+                (2, "[1,2,3.0]"),
+                (2, "[1,2,01]"),
+                (7, "[9223372036854775808]"),
+                (14, "[\"auto\",1,true]"),
+                (
+                    1,
+                    "[[{\"status\":\"a\",\"status\":\"b\",\"dirname\":\"\",\"message\":\"\"}]]",
+                ),
+                (16, "[]"),
+            ] {
+                assert_eq!(run(op, bad), None, "{op} {bad}");
+            }
+            let deep = format!("{}{}", "[".repeat(40), "]".repeat(40));
+            assert_eq!(run(1, &deep), None);
+            let input = b"[\"a\"]";
+            let mut out = [0x5au8; 8];
+            let call = |p: *const u8, len: usize, o: *mut u8, cap: usize| unsafe {
+                evaluate(0, p, len, o, cap)
+            };
+            assert_eq!(call(std::ptr::null(), 0, out.as_mut_ptr(), out.len()), -1);
+            assert_eq!(
+                call(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                call(input.as_ptr(), MAX_BYTES + 1, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(call(input.as_ptr(), input.len(), out.as_mut_ptr(), 2), -3);
+            assert!(out.iter().all(|b| *b == 0x5a));
+            assert_eq!(call(input.as_ptr(), input.len(), out.as_mut_ptr(), 3), 3);
+            assert_eq!(&out[..3], b"\"a\"");
+            let p = out.as_mut_ptr();
+            assert_eq!(call(p, 4, unsafe { p.add(2) }, 4), -1);
+        }
+    }
+}
+
+/// Evaluate one Wave 30.2 command helper. `input` is a `json_encode()`d argument
+/// list; the JSON result is copied to `output`. Returns the byte count written,
+/// the negated required capacity when `output` is too small (nothing written),
+/// or -1 when the input is malformed or outside the strict contract.
+///
+/// # Safety
+/// Both ranges must be live, disjoint readable/writable allocations. Pointers must
+/// be non-null even for zero lengths; arithmetic checks cannot prove provenance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w30_nfo_nzb_manifest_import_yenc_commands(
+    operation: u32,
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave30_nfo_nzb_manifest_import_yenc_commands::evaluate(
+            operation, input, length, output, capacity,
+        )
+    }))
+    .unwrap_or(-1)
+}
