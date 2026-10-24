@@ -6367,6 +6367,1721 @@ pub unsafe extern "C" fn nntmux_api_release_cache_normalize_json(
     .unwrap_or(-1)
 }
 
+// ============================================================================
+// Wave 16 Slice 6: TmuxMetricsSnapshot, GrafanaEmbedService, GrafanaJwtIssuer,
+// ContentSecurityPolicy, and MeasureApiPerformance helpers
+// ============================================================================
+
+const BASE64URL_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const HEX_UPPER_CHARS: &[u8; 16] = b"0123456789ABCDEF";
+const JWT_RS256_HEADER_B64: &[u8] = b"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9";
+
+#[inline]
+unsafe fn valid_slice_bounded<'a>(ptr: *const u8, len: usize, max_len: usize) -> Option<&'a [u8]> {
+    if len > max_len || len > isize::MAX as usize {
+        return None;
+    }
+    if len == 0 {
+        return Some(&[]);
+    }
+    if ptr.is_null() {
+        return None;
+    }
+    Some(unsafe { slice::from_raw_parts(ptr, len) })
+}
+
+#[inline]
+fn valid_out_cursor_checked(out_buf: *mut u8, out_cap: usize) -> Option<OutCursor> {
+    if out_cap > isize::MAX as usize || (out_buf.is_null() && out_cap > 0) {
+        return None;
+    }
+    Some(OutCursor::new(
+        out_buf,
+        if out_buf.is_null() { 0 } else { out_cap },
+    ))
+}
+
+#[inline]
+fn finish_out_cursor_checked(out: OutCursor) -> isize {
+    if out.len > isize::MAX as usize {
+        return -1;
+    }
+    out.finish()
+}
+
+#[inline]
+fn is_canonical_php_int_key(key: &[u8]) -> bool {
+    if key.is_empty() || key.len() > 20 {
+        return false;
+    }
+    if key == b"0" {
+        return true;
+    }
+    let digits = if key[0] == b'-' { &key[1..] } else { key };
+    if digits.is_empty() || digits[0] == b'0' || !digits.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    std::str::from_utf8(key)
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .is_some()
+}
+
+#[inline]
+fn trim_php_numeric_ws(mut s: &[u8]) -> &[u8] {
+    while let Some(&b) = s.first() {
+        if is_ascii_ws(b) {
+            s = &s[1..];
+        } else {
+            break;
+        }
+    }
+    while let Some(&b) = s.last() {
+        if is_ascii_ws(b) {
+            s = &s[..s.len() - 1];
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+enum ParsedSnapshotNum {
+    NotNumeric,
+    Decline,
+    Int(i64),
+    FloatToken(Vec<u8>),
+}
+
+fn classify_php_numeric_string(raw: &[u8]) -> ParsedSnapshotNum {
+    let trimmed = trim_php_numeric_ws(raw);
+    if trimmed.is_empty() {
+        return ParsedSnapshotNum::NotNumeric;
+    }
+    let (sign_neg, body) = match trimmed[0] {
+        b'+' => (false, &trimmed[1..]),
+        b'-' => (true, &trimmed[1..]),
+        _ => (false, trimmed),
+    };
+    if body.is_empty() {
+        return ParsedSnapshotNum::NotNumeric;
+    }
+
+    let mut i = 0usize;
+    let mut int_digits = 0usize;
+    while i < body.len() && body[i].is_ascii_digit() {
+        int_digits += 1;
+        i += 1;
+    }
+    let mut has_dot = false;
+    let mut frac_digits = 0usize;
+    if i < body.len() && body[i] == b'.' {
+        has_dot = true;
+        i += 1;
+        while i < body.len() && body[i].is_ascii_digit() {
+            frac_digits += 1;
+            i += 1;
+        }
+    }
+    if int_digits == 0 && frac_digits == 0 {
+        return ParsedSnapshotNum::NotNumeric;
+    }
+    let mut has_exp = false;
+    if i < body.len() && matches!(body[i], b'e' | b'E') {
+        has_exp = true;
+        i += 1;
+        if i < body.len() && matches!(body[i], b'+' | b'-') {
+            i += 1;
+        }
+        let exp_start = i;
+        while i < body.len() && body[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == exp_start {
+            return ParsedSnapshotNum::NotNumeric;
+        }
+    }
+    if i != body.len() {
+        return ParsedSnapshotNum::NotNumeric;
+    }
+
+    if !has_dot && !has_exp {
+        let mut parse_buf = Vec::with_capacity(body.len() + 1);
+        if sign_neg {
+            parse_buf.push(b'-');
+        }
+        parse_buf.extend_from_slice(body);
+        if let Ok(s) = std::str::from_utf8(&parse_buf) {
+            if let Ok(v) = s.parse::<i64>() {
+                return ParsedSnapshotNum::Int(v);
+            }
+        }
+        return ParsedSnapshotNum::Decline;
+    }
+
+    if has_exp || int_digits == 0 || frac_digits == 0 {
+        return ParsedSnapshotNum::Decline;
+    }
+    let mut parse_buf = Vec::with_capacity(body.len() + 1);
+    if sign_neg {
+        parse_buf.push(b'-');
+    }
+    parse_buf.extend_from_slice(body);
+    let Ok(s) = std::str::from_utf8(&parse_buf) else {
+        return ParsedSnapshotNum::Decline;
+    };
+    let Ok(f) = s.parse::<f64>() else {
+        return ParsedSnapshotNum::Decline;
+    };
+    if !f.is_finite() {
+        return ParsedSnapshotNum::Decline;
+    }
+    let mut formatted = format!("{f}").into_bytes();
+    if !formatted.contains(&b'.') && !formatted.contains(&b'e') && !formatted.contains(&b'E') {
+        formatted.extend_from_slice(b".0");
+    }
+    ParsedSnapshotNum::FloatToken(formatted)
+}
+
+impl<'a> ApiCacheJsonParser<'a> {
+    fn skip_any_value(&mut self, depth: usize) -> Option<()> {
+        if depth > 64 {
+            return None;
+        }
+        self.ws();
+        match *self.s.get(self.pos)? {
+            b'"' => {
+                self.parse_string()?;
+                Some(())
+            }
+            b't' => self.parse_literal(b"true"),
+            b'f' => self.parse_literal(b"false"),
+            b'n' => self.parse_literal(b"null"),
+            b'[' => {
+                self.pos += 1;
+                if self.eat(b']') {
+                    return Some(());
+                }
+                loop {
+                    self.skip_any_value(depth + 1)?;
+                    if self.eat(b']') {
+                        return Some(());
+                    }
+                    if !self.eat(b',') {
+                        return None;
+                    }
+                }
+            }
+            b'{' => {
+                self.pos += 1;
+                if self.eat(b'}') {
+                    return Some(());
+                }
+                loop {
+                    self.parse_string()?;
+                    if !self.eat(b':') {
+                        return None;
+                    }
+                    self.skip_any_value(depth + 1)?;
+                    if self.eat(b'}') {
+                        return Some(());
+                    }
+                    if !self.eat(b',') {
+                        return None;
+                    }
+                }
+            }
+            b'-' | b'0'..=b'9' => {
+                let _ = self.parse_raw_number_token()?;
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    fn parse_raw_number_token(&mut self) -> Option<(&'a [u8], bool)> {
+        self.ws();
+        let start = self.pos;
+        if self.s.get(self.pos) == Some(&b'-') {
+            self.pos += 1;
+        }
+        match *self.s.get(self.pos)? {
+            b'0' => {
+                self.pos += 1;
+                if self.s.get(self.pos).is_some_and(u8::is_ascii_digit) {
+                    return None;
+                }
+            }
+            b'1'..=b'9' => {
+                self.pos += 1;
+                while self.s.get(self.pos).is_some_and(u8::is_ascii_digit) {
+                    self.pos += 1;
+                }
+            }
+            _ => return None,
+        }
+        let mut is_float = false;
+        if self.s.get(self.pos) == Some(&b'.') {
+            is_float = true;
+            self.pos += 1;
+            let frac_start = self.pos;
+            while self.s.get(self.pos).is_some_and(u8::is_ascii_digit) {
+                self.pos += 1;
+            }
+            if self.pos == frac_start {
+                return None;
+            }
+        }
+        if self
+            .s
+            .get(self.pos)
+            .is_some_and(|b| matches!(b, b'e' | b'E'))
+        {
+            is_float = true;
+            self.pos += 1;
+            if self
+                .s
+                .get(self.pos)
+                .is_some_and(|b| matches!(b, b'+' | b'-'))
+            {
+                self.pos += 1;
+            }
+            let exp_start = self.pos;
+            while self.s.get(self.pos).is_some_and(u8::is_ascii_digit) {
+                self.pos += 1;
+            }
+            if self.pos == exp_start {
+                return None;
+            }
+        }
+        Some((&self.s[start..self.pos], is_float))
+    }
+
+    fn parse_php_int_cast(&mut self) -> Option<i64> {
+        self.ws();
+        match *self.s.get(self.pos)? {
+            b'n' => {
+                self.parse_literal(b"null")?;
+                Some(0)
+            }
+            b'f' => {
+                self.parse_literal(b"false")?;
+                Some(0)
+            }
+            b't' => {
+                self.parse_literal(b"true")?;
+                Some(1)
+            }
+            b'-' | b'0'..=b'9' => {
+                let (tok, is_float) = self.parse_raw_number_token()?;
+                if !is_float {
+                    std::str::from_utf8(tok).ok()?.parse::<i64>().ok()
+                } else {
+                    let f = std::str::from_utf8(tok).ok()?.parse::<f64>().ok()?;
+                    if !f.is_finite() || f <= (i64::MIN as f64) || f >= (i64::MAX as f64) {
+                        return None;
+                    }
+                    Some(f.trunc() as i64)
+                }
+            }
+            b'"' => {
+                let raw = self.parse_string()?;
+                match classify_php_numeric_string(&raw) {
+                    ParsedSnapshotNum::NotNumeric => Some(0),
+                    ParsedSnapshotNum::Int(v) => Some(v),
+                    ParsedSnapshotNum::FloatToken(_) | ParsedSnapshotNum::Decline => None,
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Computes tmux snapshot age in seconds (`max(0, now_ts - collected_at)`) and writes
+/// `1` to `*out_is_stale` when `age > max(0, max_age_seconds)` (`0` otherwise).
+/// Returns `-1` on null `out_is_stale` or integer overflow.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_snapshot_age_and_stale(
+    collected_at: i64,
+    now_ts: i64,
+    max_age_seconds: i64,
+    out_is_stale: *mut i32,
+) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_is_stale.is_null() {
+            return -1;
+        }
+        let age = if now_ts <= collected_at {
+            0i64
+        } else {
+            let Some(diff) = now_ts.checked_sub(collected_at) else {
+                return -1;
+            };
+            diff.max(0)
+        };
+        let threshold = max_age_seconds.max(0);
+        unsafe {
+            *out_is_stale = i32::from(age > threshold);
+        }
+        age
+    }))
+    .unwrap_or(-1)
+}
+
+/// Normalizes a JSON-encoded map of tmux snapshot metrics (`TmuxMetricsSnapshot::numericValues`),
+/// retaining only string-keyed numeric entries (`int`, `float`, or `is_numeric` string) and
+/// optionally coercing all outputs to JSON floats (`force_float != 0` for `query_timers`).
+/// Returns `-1` when declined to PHP fallback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_snapshot_normalize_numeric_json(
+    input: *const u8,
+    input_len: usize,
+    force_float: u32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if input.is_null() || input_len == 0 {
+            return -1;
+        }
+        let Some(s) = (unsafe { valid_slice_bounded(input, input_len, (isize::MAX as usize) / 4) })
+        else {
+            return -1;
+        };
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+        if std::str::from_utf8(s).is_err() {
+            return -1;
+        }
+
+        let mut parser = ApiCacheJsonParser { s, pos: 0 };
+        parser.ws();
+        match parser.s.get(parser.pos) {
+            Some(&b'[') => {
+                parser.skip_any_value(0);
+                parser.ws();
+                if parser.pos != parser.s.len() {
+                    return -1;
+                }
+                out.push_slice(b"[]");
+                return finish_out_cursor_checked(out);
+            }
+            Some(&b'{') => {
+                parser.pos += 1;
+            }
+            _ => return -1,
+        }
+
+        let mut kept: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        if !parser.eat(b'}') {
+            loop {
+                let Some(key) = parser.parse_string() else {
+                    return -1;
+                };
+                if !parser.eat(b':') {
+                    return -1;
+                }
+                if is_canonical_php_int_key(&key) {
+                    if parser.skip_any_value(1).is_none() {
+                        return -1;
+                    }
+                } else {
+                    parser.ws();
+                    match parser.s.get(parser.pos) {
+                        Some(&b'-') | Some(b'0'..=b'9') => {
+                            let Some((tok, is_float)) = parser.parse_raw_number_token() else {
+                                return -1;
+                            };
+                            if !is_float {
+                                let Some(n) = std::str::from_utf8(tok)
+                                    .ok()
+                                    .and_then(|t| t.parse::<i64>().ok())
+                                else {
+                                    return -1;
+                                };
+                                let mut vbuf = Vec::with_capacity(tok.len() + 2);
+                                vbuf.extend_from_slice(n.to_string().as_bytes());
+                                if force_float != 0 {
+                                    vbuf.extend_from_slice(b".0");
+                                }
+                                kept.push((key, vbuf));
+                            } else {
+                                kept.push((key, tok.to_vec()));
+                            }
+                        }
+                        Some(&b'"') => {
+                            let Some(raw_str) = parser.parse_string() else {
+                                return -1;
+                            };
+                            match classify_php_numeric_string(&raw_str) {
+                                ParsedSnapshotNum::NotNumeric => {}
+                                ParsedSnapshotNum::Decline => return -1,
+                                ParsedSnapshotNum::Int(n) => {
+                                    let mut vbuf = n.to_string().into_bytes();
+                                    if force_float != 0 {
+                                        vbuf.extend_from_slice(b".0");
+                                    }
+                                    kept.push((key, vbuf));
+                                }
+                                ParsedSnapshotNum::FloatToken(ftok) => {
+                                    kept.push((key, ftok));
+                                }
+                            }
+                        }
+                        Some(_) => {
+                            if parser.skip_any_value(1).is_none() {
+                                return -1;
+                            }
+                        }
+                        None => return -1,
+                    }
+                }
+                if parser.eat(b'}') {
+                    break;
+                }
+                if !parser.eat(b',') {
+                    return -1;
+                }
+            }
+        }
+        parser.ws();
+        if parser.pos != parser.s.len() {
+            return -1;
+        }
+
+        if kept.is_empty() {
+            out.push_slice(b"[]");
+            return finish_out_cursor_checked(out);
+        }
+
+        out.push_byte(b'{');
+        for (idx, (k, raw_num)) in kept.iter().enumerate() {
+            if idx > 0 {
+                out.push_byte(b',');
+            }
+            write_json_string(&mut out, k);
+            out.push_byte(b':');
+            out.push_slice(raw_num);
+        }
+        out.push_byte(b'}');
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Normalizes a JSON-encoded map of per-server NNTP connection counts
+/// (`TmuxMetricsSnapshot::connections`) into `{"server":{"active":int,"total":int}}`
+/// (or `[]` when empty). Returns `-1` when declined to PHP fallback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_snapshot_normalize_connections_json(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if input.is_null() || input_len == 0 {
+            return -1;
+        }
+        let Some(s) = (unsafe { valid_slice_bounded(input, input_len, (isize::MAX as usize) / 4) })
+        else {
+            return -1;
+        };
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+        if std::str::from_utf8(s).is_err() {
+            return -1;
+        }
+
+        let mut parser = ApiCacheJsonParser { s, pos: 0 };
+        parser.ws();
+        match parser.s.get(parser.pos) {
+            Some(&b'[') => {
+                if parser.skip_any_value(0).is_none() {
+                    return -1;
+                }
+                parser.ws();
+                if parser.pos != parser.s.len() {
+                    return -1;
+                }
+                out.push_slice(b"[]");
+                return finish_out_cursor_checked(out);
+            }
+            Some(&b'{') => {
+                parser.pos += 1;
+            }
+            _ => return -1,
+        }
+
+        let mut servers: Vec<(Vec<u8>, i64, i64)> = Vec::new();
+        if !parser.eat(b'}') {
+            loop {
+                let Some(server) = parser.parse_string() else {
+                    return -1;
+                };
+                if !parser.eat(b':') {
+                    return -1;
+                }
+                if is_canonical_php_int_key(&server) {
+                    if parser.skip_any_value(1).is_none() {
+                        return -1;
+                    }
+                } else {
+                    parser.ws();
+                    match parser.s.get(parser.pos) {
+                        Some(&b'[') => {
+                            if parser.skip_any_value(1).is_none() {
+                                return -1;
+                            }
+                            servers.push((server, 0, 0));
+                        }
+                        Some(&b'{') => {
+                            parser.pos += 1;
+                            let mut active = 0i64;
+                            let mut total = 0i64;
+                            if !parser.eat(b'}') {
+                                loop {
+                                    let Some(field) = parser.parse_string() else {
+                                        return -1;
+                                    };
+                                    if !parser.eat(b':') {
+                                        return -1;
+                                    }
+                                    if field == b"active" {
+                                        let Some(v) = parser.parse_php_int_cast() else {
+                                            return -1;
+                                        };
+                                        active = v;
+                                    } else if field == b"total" {
+                                        let Some(v) = parser.parse_php_int_cast() else {
+                                            return -1;
+                                        };
+                                        total = v;
+                                    } else if parser.skip_any_value(2).is_none() {
+                                        return -1;
+                                    }
+                                    if parser.eat(b'}') {
+                                        break;
+                                    }
+                                    if !parser.eat(b',') {
+                                        return -1;
+                                    }
+                                }
+                            }
+                            servers.push((server, active, total));
+                        }
+                        Some(_) => {
+                            if parser.skip_any_value(1).is_none() {
+                                return -1;
+                            }
+                        }
+                        None => return -1,
+                    }
+                }
+                if parser.eat(b'}') {
+                    break;
+                }
+                if !parser.eat(b',') {
+                    return -1;
+                }
+            }
+        }
+        parser.ws();
+        if parser.pos != parser.s.len() {
+            return -1;
+        }
+
+        if servers.is_empty() {
+            out.push_slice(b"[]");
+            return finish_out_cursor_checked(out);
+        }
+
+        out.push_byte(b'{');
+        for (idx, (server, active, total)) in servers.iter().enumerate() {
+            if idx > 0 {
+                out.push_byte(b',');
+            }
+            write_json_string(&mut out, server);
+            out.push_slice(b":{\"active\":");
+            write_i64_decimal(&mut out, *active);
+            out.push_slice(b",\"total\":");
+            write_i64_decimal(&mut out, *total);
+            out.push_byte(b'}');
+        }
+        out.push_byte(b'}');
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+#[inline]
+fn push_rawurlencoded(out: &mut OutCursor, bytes: &[u8]) {
+    for &b in bytes {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push_byte(b);
+        } else {
+            out.push_slice(&[
+                b'%',
+                HEX_UPPER_CHARS[(b >> 4) as usize],
+                HEX_UPPER_CHARS[(b & 0x0f) as usize],
+            ]);
+        }
+    }
+}
+
+#[inline]
+fn push_urlencoded_rfc1738(out: &mut OutCursor, bytes: &[u8]) {
+    for &b in bytes {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') {
+            out.push_byte(b);
+        } else if b == b' ' {
+            out.push_byte(b'+');
+        } else {
+            out.push_slice(&[
+                b'%',
+                HEX_UPPER_CHARS[(b >> 4) as usize],
+                HEX_UPPER_CHARS[(b & 0x0f) as usize],
+            ]);
+        }
+    }
+}
+
+#[inline]
+fn rtrim_slashes(mut s: &[u8]) -> &[u8] {
+    while s.last() == Some(&b'/') {
+        s = &s[..s.len() - 1];
+    }
+    s
+}
+
+/// Builds a Grafana dashboard (`/d/...`) or solo panel (`/d-solo/...`) embed URL
+/// matching `GrafanaEmbedService::dashboardUrl` and `GrafanaEmbedService::panelUrl`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_grafana_embed_url(
+    base_url: *const u8,
+    base_url_len: usize,
+    uid: *const u8,
+    uid_len: usize,
+    slug: *const u8,
+    slug_len: usize,
+    org_id: i64,
+    from_range: *const u8,
+    from_range_len: usize,
+    refresh: *const u8,
+    refresh_len: usize,
+    is_panel: u32,
+    kiosk: u32,
+    panel_id: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let max_seg = (isize::MAX as usize) / 16;
+        let (Some(base), Some(uid_s), Some(slug_s), Some(from_s), Some(refresh_s)) = (
+            unsafe { valid_slice_bounded(base_url, base_url_len, max_seg) },
+            unsafe { valid_slice_bounded(uid, uid_len, max_seg) },
+            unsafe { valid_slice_bounded(slug, slug_len, max_seg) },
+            unsafe { valid_slice_bounded(from_range, from_range_len, max_seg) },
+            unsafe { valid_slice_bounded(refresh, refresh_len, max_seg) },
+        ) else {
+            return -1;
+        };
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+
+        out.push_slice(rtrim_slashes(base));
+        out.push_slice(if is_panel != 0 { b"/d-solo/" } else { b"/d/" });
+        push_rawurlencoded(&mut out, uid_s);
+        out.push_byte(b'/');
+        push_rawurlencoded(&mut out, slug_s);
+        out.push_slice(b"?orgId=");
+        write_i64_decimal(&mut out, org_id);
+        out.push_slice(b"&from=");
+        push_urlencoded_rfc1738(&mut out, from_s);
+        out.push_slice(b"&to=now&refresh=");
+        push_urlencoded_rfc1738(&mut out, refresh_s);
+        if is_panel != 0 {
+            out.push_slice(b"&panelId=");
+            write_i64_decimal(&mut out, panel_id);
+        } else if kiosk != 0 {
+            out.push_slice(b"&kiosk");
+        }
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+#[derive(Clone, Copy)]
+struct ParsedUrlOrigin<'a> {
+    scheme: &'a [u8],
+    host: &'a [u8],
+    port: Option<u16>,
+    path: &'a [u8],
+}
+
+fn parse_simple_url_for_origin(bytes: &[u8]) -> Result<Option<ParsedUrlOrigin<'_>>, ()> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.iter().any(|&b| b <= 0x1f || b == 0x7f) {
+        return Err(());
+    }
+    let Some(colon_pos) = bytes
+        .iter()
+        .position(|&b| !(b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')))
+    else {
+        return Ok(None);
+    };
+    if colon_pos == 0
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes.get(colon_pos..colon_pos + 3) != Some(b"://")
+    {
+        if bytes[colon_pos] == b':' {
+            return Err(());
+        }
+        return Ok(None);
+    }
+
+    let scheme = &bytes[..colon_pos];
+    let after_scheme = colon_pos + 3;
+    let auth_end = bytes[after_scheme..]
+        .iter()
+        .position(|&b| matches!(b, b'/' | b'?' | b'#'))
+        .map_or(bytes.len(), |i| after_scheme + i);
+    let auth = &bytes[after_scheme..auth_end];
+    if auth.is_empty() {
+        return Ok(None);
+    }
+
+    let host_port = match auth.iter().rposition(|&b| b == b'@') {
+        Some(at) => &auth[at + 1..],
+        None => auth,
+    };
+    if host_port.is_empty() {
+        return Ok(None);
+    }
+
+    let (host, port_opt): (&[u8], Option<&[u8]>) = if host_port[0] == b'[' {
+        let Some(rel_close) = host_port[1..].iter().position(|&b| b == b']') else {
+            return Err(());
+        };
+        let close = 1 + rel_close;
+        if close == 1 {
+            return Err(());
+        }
+        let rest = &host_port[close + 1..];
+        if rest.is_empty() {
+            (&host_port[..=close], None)
+        } else if rest[0] == b':' {
+            (&host_port[..=close], Some(&rest[1..]))
+        } else {
+            return Err(());
+        }
+    } else if let Some(c) = host_port.iter().rposition(|&b| b == b':') {
+        (&host_port[..c], Some(&host_port[c + 1..]))
+    } else {
+        (host_port, None)
+    };
+
+    if host.is_empty() {
+        return Ok(None);
+    }
+
+    let parsed_port: Option<u16> = match port_opt {
+        None | Some(b"") => None,
+        Some(p) => {
+            if p.len() > 5 || !p.iter().all(u8::is_ascii_digit) {
+                return Err(());
+            }
+            let mut port_val = 0u32;
+            for &d in p {
+                port_val = port_val * 10 + u32::from(d - b'0');
+            }
+            if port_val == 0 || port_val > 65535 {
+                return Err(());
+            }
+            Some(port_val as u16)
+        }
+    };
+
+    let path: &[u8] = if auth_end < bytes.len() && bytes[auth_end] == b'/' {
+        let path_end = bytes[auth_end..]
+            .iter()
+            .position(|&b| matches!(b, b'?' | b'#'))
+            .map_or(bytes.len(), |i| auth_end + i);
+        &bytes[auth_end..path_end]
+    } else {
+        b""
+    };
+
+    Ok(Some(ParsedUrlOrigin {
+        scheme,
+        host,
+        port: parsed_port,
+        path,
+    }))
+}
+
+#[inline]
+fn origins_match_ignore_ascii_case(a: &ParsedUrlOrigin<'_>, b: &ParsedUrlOrigin<'_>) -> bool {
+    a.scheme.eq_ignore_ascii_case(b.scheme)
+        && a.host.eq_ignore_ascii_case(b.host)
+        && a.port == b.port
+}
+
+/// Computes `GrafanaEmbedService::frameOrigin($grafanaUrl, $appUrl)`:
+/// returns `0` when `null` (relative URL, missing scheme/host, or same origin as `app_url`),
+/// `> 0` bytes written when cross-origin, `-(required_len)` if `out_cap` is too small,
+/// or `-1` when declined to PHP `parse_url`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_grafana_frame_origin(
+    grafana_url: *const u8,
+    grafana_url_len: usize,
+    app_url: *const u8,
+    app_url_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let max_len = (isize::MAX as usize) / 4;
+        let (Some(g_bytes), Some(a_bytes)) = (
+            unsafe { valid_slice_bounded(grafana_url, grafana_url_len, max_len) },
+            unsafe { valid_slice_bounded(app_url, app_url_len, max_len) },
+        ) else {
+            return -1;
+        };
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+
+        let g_parsed = match parse_simple_url_for_origin(g_bytes) {
+            Ok(Some(p)) => p,
+            Ok(None) => return 0,
+            Err(()) => return -1,
+        };
+
+        if !a_bytes.is_empty() {
+            match parse_simple_url_for_origin(a_bytes) {
+                Ok(Some(a_parsed)) => {
+                    if origins_match_ignore_ascii_case(&g_parsed, &a_parsed) {
+                        return 0;
+                    }
+                }
+                Ok(None) => {}
+                Err(()) => return -1,
+            }
+        }
+
+        for &b in g_parsed.scheme {
+            out.push_byte(b.to_ascii_lowercase());
+        }
+        out.push_slice(b"://");
+        for &b in g_parsed.host {
+            out.push_byte(b.to_ascii_lowercase());
+        }
+        if let Some(port) = g_parsed.port {
+            out.push_byte(b':');
+            push_u16_decimal(&mut out, port);
+        }
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Computes `GrafanaEmbedService::cookiePath` for a given `base_url`:
+/// extracts `parse_url(rtrim(base_url, '/'), PHP_URL_PATH)` and formats `rtrim(path, '/') . '/'`.
+/// Returns `-1` when declined to PHP `parse_url`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_grafana_cookie_path(
+    base_url: *const u8,
+    base_url_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(raw) =
+            (unsafe { valid_slice_bounded(base_url, base_url_len, (isize::MAX as usize) / 4) })
+        else {
+            return -1;
+        };
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+
+        let trimmed_base = rtrim_slashes(raw);
+        if trimmed_base.is_empty() {
+            out.push_byte(b'/');
+            return finish_out_cursor_checked(out);
+        }
+        if trimmed_base
+            .iter()
+            .any(|&b| b <= 0x1f || b == 0x7f || b == b'?' || b == b'#')
+        {
+            return -1;
+        }
+
+        let path: &[u8] = if trimmed_base.starts_with(b"//") {
+            return -1;
+        } else if trimmed_base[0] == b'/' {
+            trimmed_base
+        } else if trimmed_base.contains(&b':') {
+            match parse_simple_url_for_origin(trimmed_base) {
+                Ok(Some(parsed)) => parsed.path,
+                Ok(None) | Err(()) => return -1,
+            }
+        } else {
+            trimmed_base
+        };
+
+        let clean_path = rtrim_slashes(path);
+        out.push_slice(clean_path);
+        out.push_byte(b'/');
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+#[inline]
+fn push_base64url_encoded(out: &mut OutCursor, bytes: &[u8]) {
+    let mut chunks = bytes.chunks_exact(3);
+    for chunk in &mut chunks {
+        let b0 = u32::from(chunk[0]);
+        let b1 = u32::from(chunk[1]);
+        let b2 = u32::from(chunk[2]);
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push_slice(&[
+            BASE64URL_ALPHABET[((n >> 18) & 0x3f) as usize],
+            BASE64URL_ALPHABET[((n >> 12) & 0x3f) as usize],
+            BASE64URL_ALPHABET[((n >> 6) & 0x3f) as usize],
+            BASE64URL_ALPHABET[(n & 0x3f) as usize],
+        ]);
+    }
+    let rem = chunks.remainder();
+    if rem.len() == 1 {
+        let b0 = u32::from(rem[0]);
+        out.push_slice(&[
+            BASE64URL_ALPHABET[((b0 >> 2) & 0x3f) as usize],
+            BASE64URL_ALPHABET[((b0 << 4) & 0x3f) as usize],
+        ]);
+    } else if rem.len() == 2 {
+        let b0 = u32::from(rem[0]);
+        let b1 = u32::from(rem[1]);
+        let n = (b0 << 8) | b1;
+        out.push_slice(&[
+            BASE64URL_ALPHABET[((n >> 10) & 0x3f) as usize],
+            BASE64URL_ALPHABET[((n >> 4) & 0x3f) as usize],
+            BASE64URL_ALPHABET[((n << 2) & 0x3f) as usize],
+        ]);
+    }
+}
+
+/// Encodes `input` using URL-safe base64 (`-`, `_`) without `=` padding,
+/// matching `GrafanaJwtIssuer::base64Url`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_grafana_jwt_base64url_encode(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(bytes) =
+            (unsafe { valid_slice_bounded(input, input_len, (isize::MAX as usize) / 2) })
+        else {
+            return -1;
+        };
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+        push_base64url_encoded(&mut out, bytes);
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+#[inline]
+fn push_vec_json_string_ascii(dst: &mut Vec<u8>, s: &[u8]) {
+    dst.push(b'"');
+    for &b in s {
+        match b {
+            b'"' => dst.extend_from_slice(b"\\\""),
+            b'\\' => dst.extend_from_slice(b"\\\\"),
+            0x08 => dst.extend_from_slice(b"\\b"),
+            0x09 => dst.extend_from_slice(b"\\t"),
+            0x0a => dst.extend_from_slice(b"\\n"),
+            0x0c => dst.extend_from_slice(b"\\f"),
+            0x0d => dst.extend_from_slice(b"\\r"),
+            0x00..=0x1f => {
+                let hex = crate::HEX_LOWER;
+                dst.extend_from_slice(&[
+                    b'\\',
+                    b'u',
+                    b'0',
+                    b'0',
+                    hex[(b >> 4) as usize],
+                    hex[(b & 0x0f) as usize],
+                ]);
+            }
+            _ => dst.push(b),
+        }
+    }
+    dst.push(b'"');
+}
+
+#[inline]
+fn push_vec_i64_decimal(dst: &mut Vec<u8>, n: i64) {
+    if n == 0 {
+        dst.push(b'0');
+        return;
+    }
+    let neg = n < 0;
+    let mut u = n.unsigned_abs();
+    let mut buf = [0u8; 20];
+    let mut pos = 20;
+    while u > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (u % 10) as u8;
+        u /= 10;
+    }
+    if neg {
+        dst.push(b'-');
+    }
+    dst.extend_from_slice(&buf[pos..]);
+}
+
+/// Formats the Grafana JWT claims JSON (`raw_claims_only != 0`) or the complete
+/// `<base64url(header)>.<base64url(claims)>` RS256 signing input (`raw_claims_only == 0`)
+/// for `GrafanaJwtIssuer`. Returns `-1` if any string contains non-ASCII bytes (`>= 0x80`)
+/// or if `now_ts - 30` overflows `i64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_grafana_jwt_signing_input(
+    username: *const u8,
+    username_len: usize,
+    email: *const u8,
+    email_len: usize,
+    role: *const u8,
+    role_len: usize,
+    issuer: *const u8,
+    issuer_len: usize,
+    audience: *const u8,
+    audience_len: usize,
+    now_ts: i64,
+    expires_at: i64,
+    jti: *const u8,
+    jti_len: usize,
+    raw_claims_only: u32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let max_seg = (isize::MAX as usize) / 16;
+        let (Some(user_s), Some(email_s), Some(role_s), Some(iss_s), Some(aud_s), Some(jti_s)) = (
+            unsafe { valid_slice_bounded(username, username_len, max_seg) },
+            unsafe { valid_slice_bounded(email, email_len, max_seg) },
+            unsafe { valid_slice_bounded(role, role_len, max_seg) },
+            unsafe { valid_slice_bounded(issuer, issuer_len, max_seg) },
+            unsafe { valid_slice_bounded(audience, audience_len, max_seg) },
+            unsafe { valid_slice_bounded(jti, jti_len, max_seg) },
+        ) else {
+            return -1;
+        };
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+        let Some(nbf) = now_ts.checked_sub(30) else {
+            return -1;
+        };
+
+        for slice_item in [user_s, email_s, role_s, iss_s, aud_s, jti_s] {
+            if slice_item.iter().any(|&b| b >= 0x80) {
+                return -1;
+            }
+        }
+
+        let mut claims_json = Vec::with_capacity(
+            128 + user_s.len() * 2
+                + email_s.len()
+                + role_s.len()
+                + iss_s.len()
+                + aud_s.len()
+                + jti_s.len(),
+        );
+        claims_json.extend_from_slice(b"{\"sub\":");
+        push_vec_json_string_ascii(&mut claims_json, user_s);
+        claims_json.extend_from_slice(b",\"email\":");
+        push_vec_json_string_ascii(&mut claims_json, email_s);
+        claims_json.extend_from_slice(b",\"name\":");
+        push_vec_json_string_ascii(&mut claims_json, user_s);
+        claims_json.extend_from_slice(b",\"role\":");
+        push_vec_json_string_ascii(&mut claims_json, role_s);
+        claims_json.extend_from_slice(b",\"iss\":");
+        push_vec_json_string_ascii(&mut claims_json, iss_s);
+        claims_json.extend_from_slice(b",\"aud\":");
+        push_vec_json_string_ascii(&mut claims_json, aud_s);
+        claims_json.extend_from_slice(b",\"iat\":");
+        push_vec_i64_decimal(&mut claims_json, now_ts);
+        claims_json.extend_from_slice(b",\"nbf\":");
+        push_vec_i64_decimal(&mut claims_json, nbf);
+        claims_json.extend_from_slice(b",\"exp\":");
+        push_vec_i64_decimal(&mut claims_json, expires_at);
+        claims_json.extend_from_slice(b",\"jti\":");
+        push_vec_json_string_ascii(&mut claims_json, jti_s);
+        claims_json.push(b'}');
+
+        if raw_claims_only != 0 {
+            out.push_slice(&claims_json);
+            return finish_out_cursor_checked(out);
+        }
+
+        out.push_slice(JWT_RS256_HEADER_B64);
+        out.push_byte(b'.');
+        push_base64url_encoded(&mut out, &claims_json);
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+const CSP_SCRIPT_HOSTS: &[u8] = b" https://challenges.cloudflare.com https://cdn.tiny.cloud https://cdn.jsdelivr.net/ https://static.cloudflareinsights.com/ https://cdnjs.cloudflare.com/ https://unpkg.com/ https://cdn.tailwindcss.com/ https://code.jquery.com https://apis.google.com https://www.google.com https://www.gstatic.com https://ajax.cloudflare.com";
+const CSP_STYLE_PREFIX: &[u8] = b"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.bunny.net https://cdn.jsdelivr.net/ https://cdnjs.cloudflare.com/ https://cdn.tiny.cloud";
+const CSP_STYLE_ELEM_PREFIX: &[u8] = b"; style-src-elem 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.bunny.net https://cdn.jsdelivr.net/ https://cdnjs.cloudflare.com/ https://cdn.tiny.cloud";
+const CSP_FONT_PREFIX: &[u8] = b"; font-src 'self' https://fonts.gstatic.com https://fonts.bunny.net https://cdnjs.cloudflare.com/ https://cdn.tiny.cloud data:";
+const CSP_IMG_PREFIX: &[u8] = b"; img-src 'self' data: https: blob:";
+const CSP_CONNECT_PREFIX: &[u8] =
+    b"; connect-src 'self' https://www.google.com https://cdn.tiny.cloud https://sp.tinymce.com";
+const CSP_FRAME_PREFIX: &[u8] = b"; frame-src 'self' https://www.google.com https://www.gstatic.com https://challenges.cloudflare.com https://cdn.tiny.cloud data: blob:";
+const CSP_CHILD_PREFIX: &[u8] =
+    b"; child-src 'self' https://www.google.com https://challenges.cloudflare.com https://cdn.tiny.cloud blob:";
+const CSP_TAIL: &[u8] =
+    b"; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'";
+
+/// Assembles the complete `Content-Security-Policy` header string for `ContentSecurityPolicy`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_csp_build_header(
+    nonce: *const u8,
+    nonce_len: usize,
+    vite_asset: *const u8,
+    vite_asset_len: usize,
+    vite_ws: *const u8,
+    vite_ws_len: usize,
+    grafana_origin: *const u8,
+    grafana_origin_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let max_seg = (isize::MAX as usize) / 16;
+        let (Some(nonce_s), Some(asset_s), Some(ws_s), Some(grafana_s)) = (
+            unsafe { valid_slice_bounded(nonce, nonce_len, max_seg) },
+            unsafe { valid_slice_bounded(vite_asset, vite_asset_len, max_seg) },
+            unsafe { valid_slice_bounded(vite_ws, vite_ws_len, max_seg) },
+            unsafe { valid_slice_bounded(grafana_origin, grafana_origin_len, max_seg) },
+        ) else {
+            return -1;
+        };
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+
+        let push_vite_asset = |cursor: &mut OutCursor| {
+            if !asset_s.is_empty() {
+                cursor.push_byte(b' ');
+                cursor.push_slice(asset_s);
+            }
+        };
+
+        out.push_slice(b"default-src 'self'; script-src 'self' 'nonce-");
+        out.push_slice(nonce_s);
+        out.push_slice(b"' 'unsafe-eval' 'strict-dynamic'");
+        out.push_slice(CSP_SCRIPT_HOSTS);
+        out.push_slice(b" blob:");
+        push_vite_asset(&mut out);
+
+        out.push_slice(b"; script-src-elem 'self' 'nonce-");
+        out.push_slice(nonce_s);
+        out.push_byte(b'\'');
+        out.push_slice(CSP_SCRIPT_HOSTS);
+        push_vite_asset(&mut out);
+
+        out.push_slice(b"; script-src-attr 'none'; ");
+        out.push_slice(CSP_STYLE_PREFIX);
+        push_vite_asset(&mut out);
+
+        out.push_slice(CSP_STYLE_ELEM_PREFIX);
+        push_vite_asset(&mut out);
+
+        out.push_slice(CSP_FONT_PREFIX);
+        push_vite_asset(&mut out);
+
+        out.push_slice(CSP_IMG_PREFIX);
+        push_vite_asset(&mut out);
+
+        out.push_slice(CSP_CONNECT_PREFIX);
+        if !asset_s.is_empty() && !ws_s.is_empty() {
+            out.push_byte(b' ');
+            out.push_slice(asset_s);
+            out.push_byte(b' ');
+            out.push_slice(ws_s);
+        }
+
+        out.push_slice(CSP_FRAME_PREFIX);
+        if !grafana_s.is_empty() {
+            out.push_byte(b' ');
+            out.push_slice(grafana_s);
+        }
+
+        out.push_slice(CSP_CHILD_PREFIX);
+        if !grafana_s.is_empty() {
+            out.push_byte(b' ');
+            out.push_slice(grafana_s);
+        }
+
+        out.push_slice(CSP_TAIL);
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Parses a raw Vite hot-file URL for `ContentSecurityPolicy::viteDevServerSources`:
+/// writes `{asset_origin}\t{websocket_origin}` when the URL uses `http` or `https` and a
+/// loopback host (`localhost`, `127.0.0.1`, `[::1]`), `0` when rejected, or `-1` when
+/// declined to PHP `parse_url`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_csp_parse_vite_hot_url(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(raw) =
+            (unsafe { valid_slice_bounded(input, input_len, (isize::MAX as usize) / 4) })
+        else {
+            return -1;
+        };
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+
+        let trimmed = trim_php_ws(raw);
+        if trimmed.is_empty() {
+            return 0;
+        }
+        let parsed = match parse_simple_url_for_origin(trimmed) {
+            Ok(Some(p)) => p,
+            Ok(None) => return 0,
+            Err(()) => return -1,
+        };
+
+        let is_https = if parsed.scheme == b"http" {
+            false
+        } else if parsed.scheme == b"https" {
+            true
+        } else {
+            return 0;
+        };
+
+        let url_host: &[u8] = if parsed.host == b"localhost"
+            || parsed.host == b"127.0.0.1"
+            || parsed.host == b"[::1]"
+        {
+            parsed.host
+        } else {
+            return 0;
+        };
+
+        out.push_slice(parsed.scheme);
+        out.push_slice(b"://");
+        out.push_slice(url_host);
+        if let Some(port) = parsed.port {
+            out.push_byte(b':');
+            push_u16_decimal(&mut out, port);
+        }
+        out.push_byte(b'\t');
+        out.push_slice(if is_https { b"wss://" } else { b"ws://" });
+        out.push_slice(url_host);
+        if let Some(port) = parsed.port {
+            out.push_byte(b':');
+            push_u16_decimal(&mut out, port);
+        }
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Computes elapsed milliseconds (`(finished_at_ns - started_at_ns) / 1_000_000`) and its
+/// 2-decimal rounded value (`round($durationMs, 2)`) for `MeasureApiPerformance`.
+/// Returns `0` on success or `-1` on null output pointers or integer overflow.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_api_perf_elapsed_ms(
+    started_at_ns: i64,
+    finished_at_ns: i64,
+    out_raw_ms: *mut f64,
+    out_rounded_ms: *mut f64,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_raw_ms.is_null() || out_rounded_ms.is_null() {
+            return -1;
+        }
+        let Some(diff) = finished_at_ns.checked_sub(started_at_ns) else {
+            return -1;
+        };
+        let raw_ms = (diff as f64) / 1_000_000.0;
+        let rounded_ms = if diff >= 0 {
+            let Some(shifted) = diff.checked_add(5_000) else {
+                return -1;
+            };
+            ((shifted / 10_000) as f64) / 100.0
+        } else {
+            let abs_diff = diff.unsigned_abs();
+            let Some(shifted) = abs_diff.checked_add(5_000) else {
+                return -1;
+            };
+            -(((shifted / 10_000) as f64) / 100.0)
+        };
+        unsafe {
+            *out_raw_ms = raw_ms;
+            *out_rounded_ms = rounded_ms;
+        }
+        0
+    }))
+    .unwrap_or(-1)
+}
+
+/// Formats the `Server-Timing` response header (`sprintf('app;dur=%.2f, db;dur=%.2f;desc="%d queries"', ...)`)
+/// for `MeasureApiPerformance`. Returns `-1` if `duration_ms` or `query_ms` is non-finite.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_api_perf_format_server_timing(
+    duration_ms: f64,
+    query_ms: f64,
+    query_count: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !duration_ms.is_finite() || !query_ms.is_finite() {
+            return -1;
+        }
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+        let app_dur = if duration_ms == 0.0 { 0.0 } else { duration_ms };
+        let db_dur = if query_ms == 0.0 { 0.0 } else { query_ms };
+        let formatted = format!(
+            "app;dur={app_dur:.2}, db;dur={db_dur:.2};desc=\"{query_count} queries\""
+        );
+        out.push_slice(formatted.as_bytes());
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Classifies API request latency against slow-request thresholds (`0` = normal, `1` = slow app,
+/// `2` = slow db, `3` = both) and optionally computes the clamped `1..1_000_000` sample threshold
+/// (`(int) (min(1.0, max(0.0, sample_rate)) * 1_000_000)`) into `*out_sample_threshold`.
+/// Returns `-1` when any duration/threshold parameter is non-finite.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_api_perf_classify_slow_request(
+    duration_ms: f64,
+    query_ms: f64,
+    slow_duration_threshold_ms: f64,
+    slow_query_threshold_ms: f64,
+    sample_rate: f64,
+    out_sample_threshold: *mut i64,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !out_sample_threshold.is_null() {
+            let clamped = if sample_rate.is_nan() {
+                0.0
+            } else {
+                sample_rate.clamp(0.0, 1.0)
+            };
+            unsafe {
+                *out_sample_threshold = (clamped * 1_000_000.0) as i64;
+            }
+        }
+        if !duration_ms.is_finite()
+            || !query_ms.is_finite()
+            || !slow_duration_threshold_ms.is_finite()
+            || !slow_query_threshold_ms.is_finite()
+        {
+            return -1;
+        }
+        let slow_app = slow_duration_threshold_ms > 0.0 && duration_ms >= slow_duration_threshold_ms;
+        let slow_db = slow_query_threshold_ms > 0.0 && query_ms >= slow_query_threshold_ms;
+        (i32::from(slow_app)) | (i32::from(slow_db) << 1)
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave16_slice6_tests {
+    use super::*;
+
+    #[test]
+    fn tmux_snapshot_age_and_json_normalizers() {
+        let mut stale = -1i32;
+        assert_eq!(
+            unsafe { nntmux_tmux_snapshot_age_and_stale(1_700_000_000, 1_700_000_120, 900, &mut stale) },
+            120
+        );
+        assert_eq!(stale, 0);
+        assert_eq!(
+            unsafe { nntmux_tmux_snapshot_age_and_stale(1_700_000_000, 1_700_001_000, 900, &mut stale) },
+            1000
+        );
+        assert_eq!(stale, 1);
+        assert_eq!(
+            unsafe { nntmux_tmux_snapshot_age_and_stale(1_700_000_500, 1_700_000_000, 900, &mut stale) },
+            0
+        );
+        assert_eq!(stale, 0);
+        assert_eq!(
+            unsafe { nntmux_tmux_snapshot_age_and_stale(0, 10, 5, std::ptr::null_mut()) },
+            -1
+        );
+
+        let mut buf = [0u8; 256];
+        let counts_json = br#"{"processnfo":12,"releases":"345","label":"not a number","0":99}"#;
+        let n = unsafe {
+            nntmux_tmux_snapshot_normalize_numeric_json(
+                counts_json.as_ptr(),
+                counts_json.len(),
+                0,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(&buf[..n as usize], br#"{"processnfo":12,"releases":345}"#);
+
+        let timers_json = br#"{"proc1_time":0.5,"proc2_time":2}"#;
+        let nt = unsafe {
+            nntmux_tmux_snapshot_normalize_numeric_json(
+                timers_json.as_ptr(),
+                timers_json.len(),
+                1,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(&buf[..nt as usize], br#"{"proc1_time":0.5,"proc2_time":2.0}"#);
+
+        let conn_json = br#"{"primary":{"active":4,"total":"20"},"empty":[],"bad":"x"}"#;
+        let nc = unsafe {
+            nntmux_tmux_snapshot_normalize_connections_json(
+                conn_json.as_ptr(),
+                conn_json.len(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(
+            &buf[..nc as usize],
+            br#"{"primary":{"active":4,"total":20},"empty":{"active":0,"total":0}}"#
+        );
+    }
+
+    #[test]
+    fn grafana_embed_urls_frame_origin_cookie_path_and_jwt() {
+        let mut buf = [0u8; 512];
+        let n1 = unsafe {
+            nntmux_grafana_embed_url(
+                b"/grafana/".as_ptr(),
+                9,
+                b"nntmux-host".as_ptr(),
+                11,
+                b"nntmux-host".as_ptr(),
+                11,
+                1,
+                b"now-6h".as_ptr(),
+                6,
+                b"1m".as_ptr(),
+                2,
+                0,
+                1,
+                0,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(
+            &buf[..n1 as usize],
+            b"/grafana/d/nntmux-host/nntmux-host?orgId=1&from=now-6h&to=now&refresh=1m&kiosk"
+        );
+
+        let n2 = unsafe {
+            nntmux_grafana_embed_url(
+                b"/grafana".as_ptr(),
+                8,
+                b"nntmux-processing".as_ptr(),
+                17,
+                b"nntmux-processing".as_ptr(),
+                17,
+                1,
+                b"now-6h".as_ptr(),
+                6,
+                b"1m".as_ptr(),
+                2,
+                1,
+                0,
+                2,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(
+            &buf[..n2 as usize],
+            b"/grafana/d-solo/nntmux-processing/nntmux-processing?orgId=1&from=now-6h&to=now&refresh=1m&panelId=2"
+        );
+
+        let n_origin = unsafe {
+            nntmux_grafana_frame_origin(
+                b"https://Grafana.Example:3000/grafana".as_ptr(),
+                36,
+                b"https://nntmux.example".as_ptr(),
+                22,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(&buf[..n_origin as usize], b"https://grafana.example:3000");
+
+        let n_same = unsafe {
+            nntmux_grafana_frame_origin(
+                b"https://nntmux.example/grafana".as_ptr(),
+                30,
+                b"https://nntmux.example".as_ptr(),
+                22,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(n_same, 0);
+
+        let n_cookie = unsafe {
+            nntmux_grafana_cookie_path(
+                b"https://grafana.example:3000/grafana/".as_ptr(),
+                37,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(&buf[..n_cookie as usize], b"/grafana/");
+
+        let n_b64 = unsafe {
+            nntmux_grafana_jwt_base64url_encode(
+                b"{\"alg\":\"RS256\",\"typ\":\"JWT\"}".as_ptr(),
+                27,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(&buf[..n_b64 as usize], JWT_RS256_HEADER_B64);
+
+        let n_jwt = unsafe {
+            nntmux_grafana_jwt_signing_input(
+                b"admin_user".as_ptr(),
+                10,
+                b"admin@example.test".as_ptr(),
+                18,
+                b"Viewer".as_ptr(),
+                6,
+                b"nntmux".as_ptr(),
+                6,
+                b"grafana".as_ptr(),
+                7,
+                1_700_000_000,
+                1_700_000_600,
+                b"00000000-0000-4000-8000-000000000001".as_ptr(),
+                36,
+                1,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(
+            &buf[..n_jwt as usize],
+            br#"{"sub":"admin_user","email":"admin@example.test","name":"admin_user","role":"Viewer","iss":"nntmux","aud":"grafana","iat":1700000000,"nbf":1699999970,"exp":1700000600,"jti":"00000000-0000-4000-8000-000000000001"}"#
+        );
+    }
+
+    #[test]
+    fn csp_header_vite_hot_url_and_api_performance_helpers() {
+        let mut buf = [0u8; 2048];
+        let nh = unsafe {
+            nntmux_csp_parse_vite_hot_url(
+                b"  http://localhost:5173 \n".as_ptr(),
+                25,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(
+            &buf[..nh as usize],
+            b"http://localhost:5173\tws://localhost:5173"
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_csp_parse_vite_hot_url(
+                    b"https://assets.example.com:5173".as_ptr(),
+                    31,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            },
+            0
+        );
+
+        let ncsp = unsafe {
+            nntmux_csp_build_header(
+                b"nonce123".as_ptr(),
+                8,
+                b"http://localhost:5173".as_ptr(),
+                21,
+                b"ws://localhost:5173".as_ptr(),
+                19,
+                b"https://grafana.example:3000".as_ptr(),
+                28,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        let csp_str = std::str::from_utf8(&buf[..ncsp as usize]).unwrap();
+        assert!(csp_str.contains("script-src 'self' 'nonce-nonce123'"));
+        assert!(csp_str.contains("https://sp.tinymce.com http://localhost:5173 ws://localhost:5173;"));
+        assert!(csp_str.contains("data: blob: https://grafana.example:3000;"));
+        assert!(csp_str.ends_with("frame-ancestors 'self'"));
+
+        let (mut raw_ms, mut rounded_ms) = (0.0f64, 0.0f64);
+        assert_eq!(
+            unsafe {
+                nntmux_api_perf_elapsed_ms(1_000_000_000, 1_012_345_678, &mut raw_ms, &mut rounded_ms)
+            },
+            0
+        );
+        assert!((raw_ms - 12.345678).abs() < 1e-9);
+        assert_eq!(rounded_ms, 12.35);
+
+        let nst = unsafe {
+            nntmux_api_perf_format_server_timing(12.345, 3.4, 5, buf.as_mut_ptr(), buf.len())
+        };
+        assert_eq!(
+            &buf[..nst as usize],
+            b"app;dur=12.35, db;dur=3.40;desc=\"5 queries\""
+        );
+
+        let mut threshold = 0i64;
+        let cls = unsafe {
+            nntmux_api_perf_classify_slow_request(600.0, 100.0, 500.0, 250.0, 0.01, &mut threshold)
+        };
+        assert_eq!(cls, 1);
+        assert_eq!(threshold, 10_000);
+    }
+}
+
 #[cfg(test)]
 mod wave14_slice5_tests {
     use super::*;
