@@ -17874,4 +17874,1065 @@ pub mod tv_book_series_lookup {
     }
 }
 
+/// Wave 17 Worker 5: TvPosterResolver, ParseInfoPipe, LocalDbPipe,
+/// IGDB\Models\BaseModel, and BookParseResult C-ABI helpers.
+///
+/// Every export validates raw pointers, input lengths, and output capacities
+/// before constructing slices, guards against integer overflow, and wraps its
+/// body in `std::panic::catch_unwind`, returning `-1` on panic or decline so
+/// the PHP caller falls back to its pure-PHP implementation.
+pub mod tv_igdb_book_metadata {
+    use super::{OutCursor, PhpNode, PhpSerParser, PhpVal};
+    use std::mem::size_of;
+    use std::panic::{UnwindSafe, catch_unwind};
+    use std::slice;
+    use std::str;
+
+    const DECLINE: isize = -1;
+    const DECLINE_I32: i32 = -1;
+    const MAX_INPUT: usize = 4 << 20;
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT || len > isize::MAX as usize {
+            return None;
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_cap(out: *mut u8, cap: usize) -> bool {
+        out.is_null() || cap <= isize::MAX as usize
+    }
+
+    #[inline]
+    fn guard<F: FnOnce() -> isize + UnwindSafe>(f: F) -> isize {
+        catch_unwind(f).unwrap_or(DECLINE)
+    }
+
+    #[inline]
+    fn guard_i32<F: FnOnce() -> i32 + UnwindSafe>(f: F) -> i32 {
+        catch_unwind(f).unwrap_or(DECLINE_I32)
+    }
+
+    #[inline]
+    fn is_php_trim_byte(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\0' | b'\x0B')
+    }
+
+    #[inline]
+    fn php_trim_bytes(bytes: &[u8]) -> &[u8] {
+        let mut start = 0;
+        let mut end = bytes.len();
+        while start < end && is_php_trim_byte(bytes[start]) {
+            start += 1;
+        }
+        while end > start && is_php_trim_byte(bytes[end - 1]) {
+            end -= 1;
+        }
+        &bytes[start..end]
+    }
+
+    #[inline]
+    fn parse_simple_int_bytes(bytes: &[u8]) -> Option<i64> {
+        if bytes.is_empty() {
+            return Some(0);
+        }
+        let trimmed = php_trim_bytes(bytes);
+        if trimmed.is_empty() {
+            return None;
+        }
+        let (neg, digits) = match trimmed.first()? {
+            b'+' => (false, &trimmed[1..]),
+            b'-' => (true, &trimmed[1..]),
+            _ => (false, trimmed),
+        };
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let nz = digits
+            .iter()
+            .position(|&b| b != b'0')
+            .unwrap_or(digits.len());
+        let sig = &digits[nz..];
+        if sig.is_empty() {
+            return Some(0);
+        }
+        if sig.len() > 18 {
+            return None;
+        }
+        let mut val: i64 = 0;
+        for &b in sig {
+            val = val.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+        }
+        Some(if neg { -val } else { val })
+    }
+
+    #[inline]
+    fn node_to_int(node: Option<&PhpNode<'_>>) -> Option<i64> {
+        let Some(n) = node else {
+            return Some(0);
+        };
+        match n.val {
+            PhpVal::Null => Some(0),
+            PhpVal::Int(i) => Some(i),
+            PhpVal::Bool(b) => Some(i64::from(b)),
+            PhpVal::Str(s) => parse_simple_int_bytes(s),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn node_is_empty(node: Option<&PhpNode<'_>>) -> Option<bool> {
+        let Some(n) = node else {
+            return Some(true);
+        };
+        match &n.val {
+            PhpVal::Null | PhpVal::Bool(false) | PhpVal::Int(0) => Some(true),
+            PhpVal::Bool(true) | PhpVal::Int(_) => Some(false),
+            PhpVal::Str(s) => Some(s.is_empty() || *s == b"0"),
+            PhpVal::Arr(items) => Some(items.is_empty()),
+            PhpVal::Float => None,
+        }
+    }
+
+    #[inline]
+    fn node_to_bool(node: Option<&PhpNode<'_>>) -> Option<bool> {
+        Some(!node_is_empty(node)?)
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. TvPosterResolver helpers
+    // -------------------------------------------------------------------------
+
+    #[inline]
+    fn extract_poster_str<'a>(node: Option<&'a PhpNode<'a>>) -> Option<&'a [u8]> {
+        let Some(n) = node else {
+            return Some(b"");
+        };
+        match &n.val {
+            PhpVal::Null | PhpVal::Bool(false) => Some(b""),
+            PhpVal::Str(s) => (!s.contains(&0)).then_some(*s),
+            PhpVal::Arr(_) => {
+                let orig = match n.coalesce(b"original") {
+                    None => b"" as &[u8],
+                    Some(PhpNode {
+                        val: PhpVal::Str(s),
+                        ..
+                    }) if !s.contains(&0) => s,
+                    _ => return None,
+                };
+                if !orig.is_empty() {
+                    return Some(orig);
+                }
+                match n.coalesce(b"medium") {
+                    None => Some(b""),
+                    Some(PhpNode {
+                        val: PhpVal::Str(s),
+                        ..
+                    }) if !s.contains(&0) => Some(s),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Extracts candidate poster URL (`poster` then `image`) and provider IDs
+    /// (`tmdb`, `tvdb`/`thetvdb`, `tvmaze`) from a serialized show array.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_poster_extract_show_meta(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        out_tmdb: *mut i64,
+        out_tvdb: *mut i64,
+        out_tvmaze: *mut i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        guard(|| {
+            if out_tmdb.is_null()
+                || out_tvdb.is_null()
+                || out_tvmaze.is_null()
+                || !valid_out_cap(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some(ser_bytes) = (unsafe { input(ser_ptr, ser_len) }) else {
+                return DECLINE;
+            };
+            let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+                return DECLINE;
+            };
+            if !doc.is_arr() {
+                return DECLINE;
+            }
+
+            let Some(poster_primary) = extract_poster_str(doc.get(b"poster")) else {
+                return DECLINE;
+            };
+            let poster = if !poster_primary.is_empty() {
+                poster_primary
+            } else {
+                let Some(poster_fallback) = extract_poster_str(doc.get(b"image")) else {
+                    return DECLINE;
+                };
+                poster_fallback
+            };
+
+            let Some(tmdb_id) = node_to_int(doc.get(b"tmdb")) else {
+                return DECLINE;
+            };
+            let Some(tvdb_primary) = node_to_int(doc.get(b"tvdb")) else {
+                return DECLINE;
+            };
+            let tvdb_id = if tvdb_primary != 0 {
+                tvdb_primary
+            } else {
+                let Some(thetvdb) = node_to_int(doc.get(b"thetvdb")) else {
+                    return DECLINE;
+                };
+                thetvdb
+            };
+            let Some(tvmaze_id) = node_to_int(doc.get(b"tvmaze")) else {
+                return DECLINE;
+            };
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(poster);
+            let written = cursor.finish();
+            if written >= 0 {
+                unsafe {
+                    *out_tmdb = tmdb_id;
+                    *out_tvdb = tvdb_id;
+                    *out_tvmaze = tvmaze_id;
+                }
+            }
+            written
+        })
+    }
+
+    /// Selects the highest-priority non-empty poster URL from `(provider_poster, tmdb_poster, fanart_poster)`.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_poster_select_url(
+        p1_ptr: *const u8,
+        p1_len: usize,
+        p2_ptr: *const u8,
+        p2_len: usize,
+        p3_ptr: *const u8,
+        p3_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            if !valid_out_cap(out, cap) {
+                return DECLINE;
+            }
+            let (Some(p1), Some(p2), Some(p3)) = (
+                unsafe { input(p1_ptr, p1_len) },
+                unsafe { input(p2_ptr, p2_len) },
+                unsafe { input(p3_ptr, p3_len) },
+            ) else {
+                return DECLINE;
+            };
+            let chosen = if !p1.is_empty() {
+                p1
+            } else if !p2.is_empty() {
+                p2
+            } else {
+                p3
+            };
+            let mut cursor = unsafe { OutCursor::new(out, cap) };
+            cursor.extend(chosen);
+            cursor.finish()
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. ParseInfoPipe helpers
+    // -------------------------------------------------------------------------
+
+    /// Validates raw `parseInfo()` output (`$info !== false && !empty($info['name']) && isset($info['season'], $info['episode'])`).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_parse_pipe_validate_info(
+        ser_ptr: *const u8,
+        ser_len: usize,
+    ) -> i32 {
+        guard_i32(|| {
+            let Some(ser_bytes) = (unsafe { input(ser_ptr, ser_len) }) else {
+                return DECLINE_I32;
+            };
+            let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+                return DECLINE_I32;
+            };
+            match &doc.val {
+                PhpVal::Bool(false) => 0,
+                PhpVal::Arr(_) => {
+                    let Some(name_empty) = node_is_empty(doc.get(b"name")) else {
+                        return DECLINE_I32;
+                    };
+                    if name_empty {
+                        return 0;
+                    }
+                    i32::from(doc.coalesce(b"season").is_some() && doc.coalesce(b"episode").is_some())
+                }
+                _ => DECLINE_I32,
+            }
+        })
+    }
+
+    /// Mirrors `ParseInfoPipe` transition check (`$parsed !== null`).
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_tv_parse_pipe_should_advance(has_parsed: u32) -> i32 {
+        guard_i32(|| i32::from(has_parsed != 0))
+    }
+
+    /// Formats `sprintf('  ✗ Parse failed: %s', mb_substr($searchName, 0, $maxLength))`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_parse_pipe_format_error(
+        search_ptr: *const u8,
+        search_len: usize,
+        max_chars: i64,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            if max_chars < 0 || !valid_out_cap(out, cap) {
+                return DECLINE;
+            }
+            let Some(search_bytes) = (unsafe { input(search_ptr, search_len) }) else {
+                return DECLINE;
+            };
+            let Ok(search_str) = str::from_utf8(search_bytes) else {
+                return DECLINE;
+            };
+            let max_len = max_chars as usize;
+            let prefix_end = if max_len == 0 {
+                0
+            } else {
+                search_str
+                    .char_indices()
+                    .nth(max_len)
+                    .map_or(search_str.len(), |(idx, _)| idx)
+            };
+            let mut cursor = unsafe { OutCursor::new(out, cap) };
+            cursor.extend("  ✗ Parse failed: ".as_bytes());
+            cursor.extend(&search_bytes[..prefix_end]);
+            cursor.finish()
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. LocalDbPipe helpers
+    // -------------------------------------------------------------------------
+
+    /// Mirrors `!$parsed->seasonPack && $parsed->hasEpisodeReference()`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_tv_local_pipe_should_lookup_episode(
+        season_pack: u32,
+        has_season: u32,
+        season: i64,
+        has_episode: u32,
+        episode: i64,
+        has_airdate: u32,
+    ) -> i32 {
+        guard_i32(|| {
+            if season_pack != 0 {
+                return 0;
+            }
+            let has_numbers = has_season != 0 && season >= 0 && has_episode != 0 && episode > 0;
+            i32::from(has_numbers || has_airdate != 0)
+        })
+    }
+
+    /// Checks whether a local video ID or site ID is present and positive (`> 0`).
+    /// `kind`: `0` = null/bool/other, `1` = int (`int_val`), `2` = string (`str_ptr[..str_len]`).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_local_pipe_has_valid_site_id(
+        kind: i32,
+        int_val: i64,
+        str_ptr: *const u8,
+        str_len: usize,
+    ) -> i32 {
+        guard_i32(|| match kind {
+            0 => 0,
+            1 => i32::from(int_val > 0),
+            2 => {
+                let Some(bytes) = (unsafe { input(str_ptr, str_len) }) else {
+                    return DECLINE_I32;
+                };
+                match parse_simple_int_bytes(bytes) {
+                    Some(v) => i32::from(v > 0),
+                    None => 0,
+                }
+            }
+            _ => DECLINE_I32,
+        })
+    }
+
+    /// Classifies the `LocalDbPipe` outcome:
+    /// `0` = `not_found` (`video_id <= 0`), `1` = `season_pack`, `2` = `matched` (`episode_id > 0`),
+    /// `3` = `episode_missing`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_tv_local_pipe_classify_outcome(
+        video_id: i64,
+        season_pack: u32,
+        episode_id: i64,
+    ) -> i32 {
+        guard_i32(|| {
+            if video_id <= 0 {
+                0
+            } else if season_pack != 0 {
+                1
+            } else if episode_id > 0 {
+                2
+            } else {
+                3
+            }
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. IGDB\Models\BaseModel helpers
+    // -------------------------------------------------------------------------
+
+    /// Normalizes an IGDB endpoint path: trims ASCII whitespace and `/` characters,
+    /// collapses duplicate internal slashes, and lowercases ASCII uppercase letters.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_igdb_model_normalize_endpoint(
+        ptr: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            if !valid_out_cap(out, cap) {
+                return DECLINE;
+            }
+            let Some(bytes) = (unsafe { input(ptr, len) }) else {
+                return DECLINE;
+            };
+            let mut start = 0;
+            let mut end = bytes.len();
+            while start < end && (is_php_trim_byte(bytes[start]) || bytes[start] == b'/') {
+                start += 1;
+            }
+            while end > start && (is_php_trim_byte(bytes[end - 1]) || bytes[end - 1] == b'/') {
+                end -= 1;
+            }
+            let mut cursor = unsafe { OutCursor::new(out, cap) };
+            let mut prev_slash = false;
+            for &b in &bytes[start..end] {
+                if b == b'/' {
+                    if !prev_slash {
+                        cursor.push(b'/');
+                        prev_slash = true;
+                    }
+                } else if !is_php_trim_byte(b) {
+                    cursor.push(b.to_ascii_lowercase());
+                    prev_slash = false;
+                }
+            }
+            cursor.finish()
+        })
+    }
+
+    /// Normalizes an IGDB attribute key to canonical `snake_case` lowercase ASCII.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_igdb_model_normalize_key(
+        ptr: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            if !valid_out_cap(out, cap) {
+                return DECLINE;
+            }
+            let Some(bytes) = (unsafe { input(ptr, len) }) else {
+                return DECLINE;
+            };
+            let trimmed = php_trim_bytes(bytes);
+            let mut buf = Vec::with_capacity(trimmed.len() + 8);
+            for (i, &b) in trimmed.iter().enumerate() {
+                if matches!(b, b'_' | b'-' | b'.') || is_php_trim_byte(b) {
+                    if !buf.is_empty() && buf.last() != Some(&b'_') {
+                        buf.push(b'_');
+                    }
+                    continue;
+                }
+                if b.is_ascii_uppercase() {
+                    let prev_lower_or_digit = i > 0
+                        && (trimmed[i - 1].is_ascii_lowercase() || trimmed[i - 1].is_ascii_digit());
+                    let prev_upper_next_lower = i > 0
+                        && trimmed[i - 1].is_ascii_uppercase()
+                        && trimmed
+                            .get(i + 1)
+                            .is_some_and(| next| next.is_ascii_lowercase());
+                    if (prev_lower_or_digit || prev_upper_next_lower)
+                        && !buf.is_empty()
+                        && buf.last() != Some(&b'_')
+                    {
+                        buf.push(b'_');
+                    }
+                    buf.push(b.to_ascii_lowercase());
+                } else {
+                    buf.push(b);
+                }
+            }
+            while buf.last() == Some(&b'_') {
+                buf.pop();
+            }
+            let mut cursor = unsafe { OutCursor::new(out, cap) };
+            cursor.extend(&buf);
+            cursor.finish()
+        })
+    }
+
+    #[inline]
+    fn extract_positive_id_from_node(node: &PhpNode<'_>, key: &[u8]) -> Option<Option<i64>> {
+        match &node.val {
+            PhpVal::Null | PhpVal::Bool(_) => Some(None),
+            PhpVal::Int(i) => Some((*i > 0).then_some(*i)),
+            PhpVal::Str(s) => Some(parse_simple_int_bytes(s).filter(|&v| v > 0)),
+            PhpVal::Arr(_) => match node.get(key) {
+                None => Some(None),
+                Some(inner) => match &inner.val {
+                    PhpVal::Null | PhpVal::Bool(_) => Some(None),
+                    PhpVal::Int(i) => Some((*i > 0).then_some(*i)),
+                    PhpVal::Str(s) => Some(parse_simple_int_bytes(s).filter(|&v| v > 0)),
+                    _ => None,
+                },
+            },
+            PhpVal::Float => None,
+        }
+    }
+
+    /// Extracts a single positive integer identifier (`> 0`) from serialized `$source` (`int`, `string`, or `array[$key]`).
+    /// Writes `*out_id` and returns `1` when present, `0` when absent/non-positive, or `-1` on decline.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_igdb_model_extract_id(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        key_ptr: *const u8,
+        key_len: usize,
+        out_id: *mut i64,
+    ) -> i32 {
+        guard_i32(|| {
+            if out_id.is_null() {
+                return DECLINE_I32;
+            }
+            let (Some(ser_bytes), Some(key_bytes)) = (
+                unsafe { input(ser_ptr, ser_len) },
+                unsafe { input(key_ptr, key_len) },
+            ) else {
+                return DECLINE_I32;
+            };
+            let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+                return DECLINE_I32;
+            };
+            let Some(maybe_id) = extract_positive_id_from_node(&doc, key_bytes) else {
+                return DECLINE_I32;
+            };
+            match maybe_id {
+                Some(id) => {
+                    unsafe {
+                        *out_id = id;
+                    }
+                    1
+                }
+                None => 0,
+            }
+        })
+    }
+
+    /// Extracts deduplicated positive integer IDs (`> 0`) in encounter order from a serialized PHP array.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_igdb_model_extract_ids(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        key_ptr: *const u8,
+        key_len: usize,
+        out_ids: *mut i64,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            let (Some(ser_bytes), Some(key_bytes)) = (
+                unsafe { input(ser_ptr, ser_len) },
+                unsafe { input(key_ptr, key_len) },
+            ) else {
+                return DECLINE;
+            };
+            let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+                return DECLINE;
+            };
+            let PhpVal::Arr(items) = &doc.val else {
+                return DECLINE;
+            };
+            let mut ids: Vec<i64> = Vec::with_capacity(items.len());
+            for (_, item) in items {
+                let Some(maybe_id) = extract_positive_id_from_node(item, key_bytes) else {
+                    return DECLINE;
+                };
+                if let Some(id) = maybe_id
+                    && !ids.contains(&id)
+                {
+                    ids.push(id);
+                }
+            }
+            let len = ids.len();
+            if len == 0 {
+                return 0;
+            }
+            let max_elems = (isize::MAX as usize) / size_of::<i64>();
+            if out_ids.is_null() || cap < len || len > max_elems || cap > max_elems {
+                return DECLINE;
+            }
+            let out_slice = unsafe { slice::from_raw_parts_mut(out_ids, len) };
+            out_slice.copy_from_slice(&ids);
+            len as isize
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. BookParseResult helpers
+    // -------------------------------------------------------------------------
+
+    #[inline]
+    fn extract_optional_non_empty_str<'a>(node: Option<&'a PhpNode<'a>>) -> Option<Option<&'a [u8]>> {
+        let Some(n) = node else {
+            return Some(None);
+        };
+        match &n.val {
+            PhpVal::Null | PhpVal::Bool(false) => Some(None),
+            PhpVal::Str(s) if !s.contains(&0) => {
+                if s.is_empty() {
+                    Some(None)
+                } else {
+                    Some(Some(*s))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn extract_required_str<'a>(node: Option<&'a PhpNode<'a>>) -> Option<&'a [u8]> {
+        let Some(n) = node else {
+            return Some(b"");
+        };
+        match &n.val {
+            PhpVal::Null | PhpVal::Bool(false) => Some(b""),
+            PhpVal::Str(s) if !s.contains(&0) => Some(*s),
+            _ => None,
+        }
+    }
+
+    /// Parses a PHP `serialize($data)` book array into `BookParseResult` fields.
+    /// Emits `<rawName>\0<title>\0<author>\0<isbn>\0<format>` (`>= 4` bytes on success)
+    /// and writes `*out_year` and `*out_flags`:
+    /// bit 0 (`1`) = `has_author`, bit 1 (`2`) = `has_isbn`, bit 2 (`4`) = `has_year`,
+    /// bit 3 (`8`) = `has_format`, bit 4 (`16`) = `is_junk`, bit 5 (`32`) = `is_magazine`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_book_parse_result_from_serialized(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        out_year: *mut i64,
+        out_flags: *mut i32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        guard(|| {
+            if out_year.is_null() || out_flags.is_null() || !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(ser_bytes) = (unsafe { input(ser_ptr, ser_len) }) else {
+                return DECLINE;
+            };
+            let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+                return DECLINE;
+            };
+            if !doc.is_arr() {
+                return DECLINE;
+            }
+
+            let raw_node = doc.coalesce(b"rawName").or_else(|| doc.coalesce(b"raw_name"));
+            let Some(raw_name) = extract_required_str(raw_node) else {
+                return DECLINE;
+            };
+            let Some(title) = extract_required_str(doc.coalesce(b"title")) else {
+                return DECLINE;
+            };
+            let Some(author_opt) = extract_optional_non_empty_str(doc.coalesce(b"author")) else {
+                return DECLINE;
+            };
+            let Some(isbn_opt) = extract_optional_non_empty_str(doc.coalesce(b"isbn")) else {
+                return DECLINE;
+            };
+            let Some(format_opt) = extract_optional_non_empty_str(doc.coalesce(b"format")) else {
+                return DECLINE;
+            };
+
+            let (has_year, year_val): (i32, i64) = match doc.coalesce(b"year") {
+                None => (0, 0),
+                Some(PhpNode {
+                    val: PhpVal::Int(i),
+                    ..
+                }) => (4, *i),
+                Some(PhpNode {
+                    val: PhpVal::Str(s),
+                    ..
+                }) => match parse_simple_int_bytes(s) {
+                    Some(i) => (4, i),
+                    None => (0, 0),
+                },
+                _ => return DECLINE,
+            };
+
+            let junk_node = doc.coalesce(b"isJunk").or_else(|| doc.coalesce(b"is_junk"));
+            let Some(is_junk) = node_to_bool(junk_node) else {
+                return DECLINE;
+            };
+            let mag_node = doc
+                .coalesce(b"isMagazine")
+                .or_else(|| doc.coalesce(b"is_magazine"));
+            let Some(is_magazine) = node_to_bool(mag_node) else {
+                return DECLINE;
+            };
+
+            let mut flags = has_year;
+            if author_opt.is_some() {
+                flags |= 1;
+            }
+            if isbn_opt.is_some() {
+                flags |= 2;
+            }
+            if format_opt.is_some() {
+                flags |= 8;
+            }
+            if is_junk {
+                flags |= 16;
+            }
+            if is_magazine {
+                flags |= 32;
+            }
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(raw_name);
+            cursor.push(0);
+            cursor.extend(title);
+            cursor.push(0);
+            cursor.extend(author_opt.unwrap_or(b""));
+            cursor.push(0);
+            cursor.extend(isbn_opt.unwrap_or(b""));
+            cursor.push(0);
+            cursor.extend(format_opt.unwrap_or(b""));
+            let written = cursor.finish();
+            if written >= 4 {
+                unsafe {
+                    *out_year = year_val;
+                    *out_flags = flags;
+                }
+            }
+            written
+        })
+    }
+
+    /// Computes `BookParseResult` inspection flags, completeness score (`0..=5`), and `searchQuery()`:
+    /// `*out_flags`:
+    /// - bit 0 (`1`) = `hasAuthor()`
+    /// - bit 1 (`2`) = `hasIsbn()`
+    /// - bit 2 (`4`) = `hasTitleAndAuthor()`
+    /// - bit 3 (`8`) = `isComplete()`
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_book_parse_result_inspect(
+        title_ptr: *const u8,
+        title_len: usize,
+        has_author: u32,
+        author_ptr: *const u8,
+        author_len: usize,
+        has_isbn: u32,
+        isbn_ptr: *const u8,
+        isbn_len: usize,
+        has_year: u32,
+        year: i64,
+        has_format: u32,
+        format_ptr: *const u8,
+        format_len: usize,
+        is_junk: u32,
+        out_flags: *mut i32,
+        out_completeness: *mut i32,
+        out_query: *mut u8,
+        query_cap: usize,
+    ) -> isize {
+        guard(|| {
+            if out_flags.is_null()
+                || out_completeness.is_null()
+                || !valid_out_cap(out_query, query_cap)
+            {
+                return DECLINE;
+            }
+            let (Some(title), Some(author), Some(isbn), Some(format)) = (
+                unsafe { input(title_ptr, title_len) },
+                unsafe { input(author_ptr, author_len) },
+                unsafe { input(isbn_ptr, isbn_len) },
+                unsafe { input(format_ptr, format_len) },
+            ) else {
+                return DECLINE;
+            };
+
+            let author_present = has_author != 0 && !author.is_empty();
+            let isbn_present = has_isbn != 0 && !isbn.is_empty();
+
+            let title_trimmed = php_trim_bytes(title);
+            let author_trimmed = if has_author != 0 {
+                php_trim_bytes(author)
+            } else {
+                b""
+            };
+            let isbn_trimmed = if has_isbn != 0 {
+                php_trim_bytes(isbn)
+            } else {
+                b""
+            };
+            let format_trimmed = if has_format != 0 {
+                php_trim_bytes(format)
+            } else {
+                b""
+            };
+
+            let has_non_empty_title = !title_trimmed.is_empty();
+            let has_non_empty_author = !author_trimmed.is_empty();
+            let has_non_empty_isbn = !isbn_trimmed.is_empty();
+            let has_valid_year = has_year != 0 && year > 0;
+            let has_non_empty_format = !format_trimmed.is_empty();
+
+            let has_title_and_author = has_non_empty_title && has_non_empty_author;
+            let is_complete = is_junk == 0
+                && has_non_empty_title
+                && (has_non_empty_author || has_non_empty_isbn);
+
+            let completeness = i32::from(has_non_empty_title)
+                + i32::from(has_non_empty_author)
+                + i32::from(has_non_empty_isbn)
+                + i32::from(has_valid_year)
+                + i32::from(has_non_empty_format);
+
+            let flags = i32::from(author_present)
+                | (i32::from(isbn_present) << 1)
+                | (i32::from(has_title_and_author) << 2)
+                | (i32::from(is_complete) << 3);
+
+            let mut cursor = unsafe { OutCursor::new(out_query, query_cap) };
+            let raw_author = if has_author != 0 { author } else { b"" };
+            let mut a_start = 0;
+            while a_start < raw_author.len() && is_php_trim_byte(raw_author[a_start]) {
+                a_start += 1;
+            }
+            let mut t_end = title.len();
+            while t_end > 0 && is_php_trim_byte(title[t_end - 1]) {
+                t_end -= 1;
+            }
+
+            if a_start < raw_author.len() && t_end > 0 {
+                cursor.extend(&raw_author[a_start..]);
+                cursor.push(b' ');
+                cursor.extend(&title[..t_end]);
+            } else if a_start < raw_author.len() {
+                cursor.extend(author_trimmed);
+            } else if t_end > 0 {
+                cursor.extend(title_trimmed);
+            }
+
+            let written = cursor.finish();
+            if written >= 0 {
+                unsafe {
+                    *out_flags = flags;
+                    *out_completeness = completeness;
+                }
+            }
+            written
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn tv_poster_extract_and_select() {
+            let ser = br#"a:4:{s:6:"poster";s:0:"";s:5:"image";a:2:{s:8:"original";s:28:"https://example.test/orig.jpg";s:6:"medium";s:27:"https://example.test/med.jpg";}s:4:"tmdb";i:95396;s:7:"thetvdb";s:6:"371980";}"#;
+            let ser_fixed = br#"a:4:{s:6:"poster";s:0:"";s:5:"image";a:2:{s:8:"original";s:29:"https://example.test/orig.jpg";s:6:"medium";s:28:"https://example.test/med.jpg";}s:4:"tmdb";i:95396;s:7:"thetvdb";s:6:"371980";}"#;
+            let _ = ser;
+            let (mut tmdb, mut tvdb, mut tvmaze) = (0i64, 0i64, 0i64);
+            let mut buf = [0u8; 128];
+            let n = unsafe {
+                nntmux_tv_poster_extract_show_meta(
+                    ser_fixed.as_ptr(),
+                    ser_fixed.len(),
+                    &mut tmdb,
+                    &mut tvdb,
+                    &mut tvmaze,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(n, 29);
+            assert_eq!(&buf[..n as usize], b"https://example.test/orig.jpg");
+            assert_eq!((tmdb, tvdb, tvmaze), (95396, 371980, 0));
+
+            let sel = unsafe {
+                nntmux_tv_poster_select_url(
+                    std::ptr::null(),
+                    0,
+                    b"https://tmdb.test/p.jpg".as_ptr(),
+                    23,
+                    b"https://fanart.test/f.jpg".as_ptr(),
+                    25,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..sel as usize], b"https://tmdb.test/p.jpg");
+        }
+
+        #[test]
+        fn parse_info_and_local_db_pipe_helpers() {
+            let ok_ser = br#"a:3:{s:4:"name";s:9:"Severance";s:6:"season";i:1;s:7:"episode";i:2;}"#;
+            let bad_ser = br#"b:0;"#;
+            assert_eq!(
+                unsafe { nntmux_tv_parse_pipe_validate_info(ok_ser.as_ptr(), ok_ser.len()) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_tv_parse_pipe_validate_info(bad_ser.as_ptr(), bad_ser.len()) },
+                0
+            );
+            assert_eq!(nntmux_tv_parse_pipe_should_advance(1), 1);
+            assert_eq!(nntmux_tv_parse_pipe_should_advance(0), 0);
+
+            let mut buf = [0u8; 128];
+            let msg_len = unsafe {
+                nntmux_tv_parse_pipe_format_error(
+                    b"Unparseable.Release.Name".as_ptr(),
+                    24,
+                    11,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(
+                &buf[..msg_len as usize],
+                "  ✗ Parse failed: Unparseable".as_bytes()
+            );
+
+            assert_eq!(
+                nntmux_tv_local_pipe_should_lookup_episode(0, 1, 0, 1, 5, 0),
+                1
+            );
+            assert_eq!(
+                nntmux_tv_local_pipe_should_lookup_episode(1, 1, 1, 1, 5, 0),
+                0
+            );
+            assert_eq!(
+                unsafe { nntmux_tv_local_pipe_has_valid_site_id(2, 0, b"42".as_ptr(), 2) },
+                1
+            );
+            assert_eq!(nntmux_tv_local_pipe_classify_outcome(15, 0, 99), 2);
+            assert_eq!(nntmux_tv_local_pipe_classify_outcome(15, 1, 0), 1);
+            assert_eq!(nntmux_tv_local_pipe_classify_outcome(15, 0, 0), 3);
+            assert_eq!(nntmux_tv_local_pipe_classify_outcome(0, 0, 0), 0);
+        }
+
+        #[test]
+        fn igdb_base_model_and_book_parse_result() {
+            let mut buf = [0u8; 128];
+            let ep = unsafe {
+                nntmux_igdb_model_normalize_endpoint(
+                    b" /Games//Platforms/ ".as_ptr(),
+                    20,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..ep as usize], b"games/platforms");
+
+            let key = unsafe {
+                nntmux_igdb_model_normalize_key(
+                    b" firstReleaseDate ".as_ptr(),
+                    18,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..key as usize], b"first_release_date");
+
+            let id_ser = br#"a:2:{s:2:"id";s:4:"1942";s:4:"name";s:4:"Halo";}"#;
+            let mut out_id = 0i64;
+            assert_eq!(
+                unsafe {
+                    nntmux_igdb_model_extract_id(
+                        id_ser.as_ptr(),
+                        id_ser.len(),
+                        b"id".as_ptr(),
+                        2,
+                        &mut out_id,
+                    )
+                },
+                1
+            );
+            assert_eq!(out_id, 1942);
+
+            let ids_ser = br#"a:4:{i:0;i:6;i:1;a:1:{s:2:"id";i:14;}i:2;i:6;i:3;i:0;}"#;
+            let mut ids = [0i64; 4];
+            let count = unsafe {
+                nntmux_igdb_model_extract_ids(
+                    ids_ser.as_ptr(),
+                    ids_ser.len(),
+                    b"id".as_ptr(),
+                    2,
+                    ids.as_mut_ptr(),
+                    4,
+                )
+            };
+            assert_eq!(count, 2);
+            assert_eq!(&ids[..2], &[6, 14]);
+
+            let (mut flags, mut comp) = (0i32, 0i32);
+            let qlen = unsafe {
+                nntmux_book_parse_result_inspect(
+                    b"Clean Code".as_ptr(),
+                    10,
+                    1,
+                    b"Robert C. Martin".as_ptr(),
+                    16,
+                    1,
+                    b"9780132350884".as_ptr(),
+                    13,
+                    1,
+                    2008,
+                    1,
+                    b"EPUB".as_ptr(),
+                    4,
+                    0,
+                    &mut flags,
+                    &mut comp,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..qlen as usize], b"Robert C. Martin Clean Code");
+            assert_eq!(flags, 15);
+            assert_eq!(comp, 5);
+        }
+    }
+}
+
+
 
