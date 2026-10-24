@@ -29313,3 +29313,1506 @@ pub mod admin_media_catalog_controllers {
         }
     }
 }
+
+
+pub mod admin_anidb_book_media_commands {
+    use std::mem::size_of;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const DECLINE: isize = -1;
+
+    const ANIDB_LIST_TITLE: &[u8] = b"AniDB List";
+    const ANIDB_EDIT_TITLE: &[u8] = b"AniDB Edit";
+    const ANIDB_REMOVE_TITLE: &[u8] = b"Remove AniDB ID from Releases";
+    const NA_BYTES: &[u8] = b"N/A";
+    const DEFAULT_TYPE_BYTES: &[u8] = b"Game";
+    const DEFAULT_CURRENCY_BYTES: &[u8] = b"USD";
+    const DEFAULT_RATING_BYTES: &[u8] = b"Unknown";
+
+    #[inline]
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || !ptr.is_aligned()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_buf.is_aligned()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    #[inline]
+    fn valid_mut_slice<T>(ptr: *mut T, count: usize) -> bool {
+        if ptr.is_null() || !ptr.is_aligned() {
+            return false;
+        }
+        let Some(byte_len) = count.checked_mul(size_of::<T>()) else {
+            return false;
+        };
+        byte_len <= isize::MAX as usize && (ptr as usize).checked_add(byte_len).is_some()
+    }
+
+    #[inline]
+    fn is_php_numeric_ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c')
+    }
+
+    #[inline]
+    fn trim_php_numeric_ws(mut slice: &[u8]) -> &[u8] {
+        while let Some((&first, rest)) = slice.split_first() {
+            if is_php_numeric_ws(first) {
+                slice = rest;
+            } else {
+                break;
+            }
+        }
+        while let Some((&last, rest)) = slice.split_last() {
+            if is_php_numeric_ws(last) {
+                slice = rest;
+            } else {
+                break;
+            }
+        }
+        slice
+    }
+
+    #[inline]
+    fn parse_ascii_u32(bytes: &[u8]) -> Option<u32> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let mut acc = 0u32;
+        for &b in bytes {
+            if !b.is_ascii_digit() {
+                return None;
+            }
+            acc = acc.checked_mul(10)?.checked_add(u32::from(b - b'0'))?;
+        }
+        Some(acc)
+    }
+
+    #[inline]
+    fn parse_signed_ascii_i64(bytes: &[u8]) -> Option<i64> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let digits = if let Some(rest) = bytes.strip_prefix(b"-") {
+            rest
+        } else if let Some(rest) = bytes.strip_prefix(b"+") {
+            rest
+        } else {
+            bytes
+        };
+        if digits.is_empty() || !digits.iter().all(|&b| b.is_ascii_digit()) {
+            return None;
+        }
+        let s = std::str::from_utf8(bytes).ok()?;
+        s.parse::<i64>().ok()
+    }
+
+    #[inline]
+    fn is_leap_year(year: u32) -> bool {
+        (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+    }
+
+    #[inline]
+    fn days_in_month(year: u32, month: u32) -> u32 {
+        match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => {
+                if is_leap_year(year) {
+                    29
+                } else {
+                    28
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    #[inline]
+    fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+        let y = year - i64::from(month <= 2);
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = (y - era * 400) as u32;
+        let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + (doe as i64) - 719_468
+    }
+
+    #[inline]
+    fn parse_iso_datetime_utc(input: &[u8]) -> Option<i64> {
+        let s = trim_php_numeric_ws(input);
+        if s.len() != 10 && s.len() != 19 {
+            return None;
+        }
+        if s[4] != b'-' || s[7] != b'-' {
+            return None;
+        }
+        let year = parse_ascii_u32(&s[0..4])?;
+        if !(1902..=2199).contains(&year) {
+            return None;
+        }
+        let month = parse_ascii_u32(&s[5..7])?;
+        if !(1..=12).contains(&month) {
+            return None;
+        }
+        let day = parse_ascii_u32(&s[8..10])?;
+        let max_day = days_in_month(year, month);
+        if day < 1 || day > max_day {
+            return None;
+        }
+
+        let (hour, min, sec) = if s.len() == 10 {
+            (0u32, 0u32, 0u32)
+        } else {
+            if !matches!(s[10], b' ' | b'T') || s[13] != b':' || s[16] != b':' {
+                return None;
+            }
+            let h = parse_ascii_u32(&s[11..13])?;
+            let m = parse_ascii_u32(&s[14..16])?;
+            let sec = parse_ascii_u32(&s[17..19])?;
+            if h > 23 || m > 59 || sec > 59 {
+                return None;
+            }
+            (h, m, sec)
+        };
+
+        let days = days_from_civil(i64::from(year), month, day);
+        Some(days * 86_400 + i64::from(hour) * 3_600 + i64::from(min) * 60 + i64::from(sec))
+    }
+
+    #[inline]
+    fn format_i64_thousands(val: i64) -> String {
+        let neg = val < 0;
+        let digits = val.unsigned_abs().to_string();
+        let bytes = digits.as_bytes();
+        let len = bytes.len();
+        let mut out = String::with_capacity(len + len / 3 + usize::from(neg));
+        if neg {
+            out.push('-');
+        }
+        for (i, &b) in bytes.iter().enumerate() {
+            if i > 0 && (len - i).is_multiple_of(3) {
+                out.push(',');
+            }
+            out.push(char::from(b));
+        }
+        out
+    }
+
+    #[inline]
+    fn format_usd_price(val: f64) -> Option<String> {
+        if !val.is_finite() || val.abs() > 1e14 {
+            return None;
+        }
+        let scaled = val * 100.0;
+        let rounded = scaled.round();
+        if (scaled - rounded).abs() > 0.499_999 && (scaled - rounded).abs() < 0.500_001 {
+            return None;
+        }
+        let cents = rounded as i64;
+        let neg = cents < 0;
+        let abs_cents = cents.unsigned_abs();
+        let dollars = abs_cents / 100;
+        let rem = abs_cents % 100;
+        if neg {
+            Some(format!("$-{dollars}.{rem:02}"))
+        } else {
+            Some(format!("${dollars}.{rem:02}"))
+        }
+    }
+
+    #[inline]
+    fn format_match_rate(processed: i64, matched: i64) -> Option<String> {
+        if processed < 0 || matched < 0 {
+            return None;
+        }
+        if processed == 0 {
+            return Some("0%".to_string());
+        }
+        let pct = (matched as f64 / processed as f64) * 100.0;
+        if !pct.is_finite() {
+            return None;
+        }
+        let scaled = pct * 100.0;
+        let rounded = scaled.round();
+        if (scaled - rounded).abs() > 0.499_999 && (scaled - rounded).abs() < 0.500_001 {
+            let exact_rem2 = ((matched as i128) * 20_000) % (processed as i128);
+            if exact_rem2 != 0 && exact_rem2 != (processed as i128) {
+                return None;
+            }
+        }
+        let bp = if ((matched as i128) * 20_000) % (processed as i128) == (processed as i128) {
+            (((matched as i128) * 20_000 + (processed as i128)) / (2 * (processed as i128)))
+                as i64
+        } else {
+            rounded as i64
+        };
+        let whole = bp / 100;
+        let frac = (bp % 100).unsigned_abs();
+        let s = if frac == 0 {
+            format!("{whole}%")
+        } else if frac.is_multiple_of(10) {
+            format!("{whole}.{}%", frac / 10)
+        } else {
+            format!("{whole}.{frac:02}%")
+        };
+        Some(s)
+    }
+
+    /// Normalizes the `animetitle` filter for `AdminAnidbController::index()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_anidb_normalize_search_filter(
+        filter_ptr: *const u8,
+        filter_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(filter) = (unsafe { valid_slice(filter_ptr, filter_len) }) else {
+                return DECLINE;
+            };
+            let required = filter.len();
+            if required == 0 {
+                return 0;
+            }
+            if required > out_cap {
+                return -(required as isize);
+            }
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, required) };
+            dst.copy_from_slice(filter);
+            required as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Resolves `(mode, title)` for `AdminAnidbController::index()`, `edit()`, and `destroy()`.
+    /// Writes `[mode_len, title_len]` to `out_lens` (`usize[2]`) and `mode || title` to `out_buf`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_anidb_resolve_action_and_title(
+        context_ptr: *const u8,
+        context_len: usize,
+        action_ptr: *const u8,
+        action_len: usize,
+        id: i64,
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_lens, 2) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(context) = (unsafe { valid_slice(context_ptr, context_len) }) else {
+                return DECLINE;
+            };
+            let Some(action) = (unsafe { valid_slice(action_ptr, action_len) }) else {
+                return DECLINE;
+            };
+
+            let (mode, title): (&[u8], &[u8]) = match context {
+                b"index" => (b"index", ANIDB_LIST_TITLE),
+                b"destroy" => {
+                    if id != 0 {
+                        (b"remove", ANIDB_REMOVE_TITLE)
+                    } else {
+                        (b"noop", ANIDB_REMOVE_TITLE)
+                    }
+                }
+                b"edit" => {
+                    if action == b"submit" {
+                        (b"submit", b"")
+                    } else if id != 0 {
+                        (b"view", ANIDB_EDIT_TITLE)
+                    } else {
+                        (b"redirect", b"")
+                    }
+                }
+                _ => return DECLINE,
+            };
+
+            let Some(required) = mode.len().checked_add(title.len()) else {
+                return DECLINE;
+            };
+            if required > isize::MAX as usize {
+                return DECLINE;
+            }
+
+            let lens = unsafe { slice::from_raw_parts_mut(out_lens, 2) };
+            lens[0] = mode.len();
+            lens[1] = title.len();
+
+            if required > out_cap {
+                return -(required as isize);
+            }
+
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, required) };
+            dst[..mode.len()].copy_from_slice(mode);
+            dst[mode.len()..required].copy_from_slice(title);
+            required as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Normalizes the `anidbid` scalar input for `AdminAnidbController::edit()` submit payload.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_anidb_normalize_update_id(
+        anidbid_ptr: *const u8,
+        anidbid_len: usize,
+        fallback_id: i64,
+        out_id: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_id, 1) {
+                return DECLINE as i32;
+            }
+            let Some(raw) = (unsafe { valid_slice(anidbid_ptr, anidbid_len) }) else {
+                return DECLINE as i32;
+            };
+            let trimmed = trim_php_numeric_ws(raw);
+            let resolved = if trimmed.is_empty() {
+                fallback_id
+            } else if let Some(parsed) = parse_signed_ascii_i64(trimmed) {
+                parsed
+            } else {
+                let digits = trimmed
+                    .strip_prefix(b"-")
+                    .or_else(|| trimmed.strip_prefix(b"+"))
+                    .unwrap_or(trimmed);
+                if !digits.is_empty() && digits.iter().all(|&b| b.is_ascii_digit()) {
+                    return DECLINE as i32;
+                }
+                fallback_id
+            };
+            unsafe {
+                *out_id = resolved;
+            }
+            0
+        }))
+        .unwrap_or(DECLINE as i32)
+    }
+
+    /// Normalizes `(publishdate, has_cover)` for `AdminBookController::edit()`.
+    /// Writes `[use_fallback_date, timestamp, has_cover]` into `out_scalars` (`i64[3]`).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_book_normalize_edit_fields(
+        publishdate_ptr: *const u8,
+        publishdate_len: usize,
+        is_utc: u32,
+        has_cover: i64,
+        out_scalars: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if is_utc > 1 || !valid_mut_slice(out_scalars, 3) {
+                return DECLINE as i32;
+            }
+            let Some(publishdate) = (unsafe { valid_slice(publishdate_ptr, publishdate_len) })
+            else {
+                return DECLINE as i32;
+            };
+
+            let (use_fallback_date, timestamp) = if publishdate.is_empty() || publishdate == b"0" {
+                (1i64, 0i64)
+            } else if is_utc == 1 {
+                let Some(ts) = parse_iso_datetime_utc(publishdate) else {
+                    return DECLINE as i32;
+                };
+                if ts == 0 {
+                    (1i64, 0i64)
+                } else {
+                    (0i64, ts)
+                }
+            } else {
+                return DECLINE as i32;
+            };
+
+            let scalars = unsafe { slice::from_raw_parts_mut(out_scalars, 3) };
+            scalars[0] = use_fallback_date;
+            scalars[1] = timestamp;
+            scalars[2] = i64::from(has_cover != 0);
+            0
+        }))
+        .unwrap_or(DECLINE as i32)
+    }
+
+    /// Formats the 8 basic info table values for `SteamLookupGame::displayGameDetails()`.
+    /// Writes the 8 value byte lengths to `out_lens` (`usize[8]`) and concatenated values to `out_buf`.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_steam_lookup_format_basic_info(
+        has_title: u32,
+        title_ptr: *const u8,
+        title_len: usize,
+        has_steamid: u32,
+        steamid_ptr: *const u8,
+        steamid_len: usize,
+        has_type: u32,
+        type_ptr: *const u8,
+        type_len: usize,
+        has_publisher: u32,
+        publisher_ptr: *const u8,
+        publisher_len: usize,
+        developers_ptr: *const u8,
+        developers_len: usize,
+        has_releasedate: u32,
+        releasedate_ptr: *const u8,
+        releasedate_len: usize,
+        has_genres: u32,
+        genres_ptr: *const u8,
+        genres_len: usize,
+        platforms_ptr: *const u8,
+        platforms_len: usize,
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if has_title > 1
+                || has_steamid > 1
+                || has_type > 1
+                || has_publisher > 1
+                || has_releasedate > 1
+                || has_genres > 1
+                || !valid_mut_slice(out_lens, 8)
+                || !valid_out_buf(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some(title) = (unsafe { valid_slice(title_ptr, title_len) }) else {
+                return DECLINE;
+            };
+            let Some(steamid) = (unsafe { valid_slice(steamid_ptr, steamid_len) }) else {
+                return DECLINE;
+            };
+            let Some(game_type) = (unsafe { valid_slice(type_ptr, type_len) }) else {
+                return DECLINE;
+            };
+            let Some(publisher) = (unsafe { valid_slice(publisher_ptr, publisher_len) }) else {
+                return DECLINE;
+            };
+            let Some(developers) = (unsafe { valid_slice(developers_ptr, developers_len) }) else {
+                return DECLINE;
+            };
+            let Some(releasedate) = (unsafe { valid_slice(releasedate_ptr, releasedate_len) })
+            else {
+                return DECLINE;
+            };
+            let Some(genres) = (unsafe { valid_slice(genres_ptr, genres_len) }) else {
+                return DECLINE;
+            };
+            let Some(platforms) = (unsafe { valid_slice(platforms_ptr, platforms_len) }) else {
+                return DECLINE;
+            };
+
+            let v_title = if has_title == 1 { title } else { NA_BYTES };
+            let v_steamid = if has_steamid == 1 { steamid } else { NA_BYTES };
+            let mut type_owned: Vec<u8> = Vec::new();
+            let v_type: &[u8] = if has_type == 1 {
+                if let Some((&first, rest)) = game_type.split_first() {
+                    if first.is_ascii_lowercase() {
+                        type_owned.reserve_exact(game_type.len());
+                        type_owned.push(first.to_ascii_uppercase());
+                        type_owned.extend_from_slice(rest);
+                        &type_owned
+                    } else {
+                        game_type
+                    }
+                } else {
+                    b""
+                }
+            } else {
+                DEFAULT_TYPE_BYTES
+            };
+            let v_publisher = if has_publisher == 1 {
+                publisher
+            } else {
+                NA_BYTES
+            };
+            let v_developers = if developers.is_empty() || developers == b"0" {
+                NA_BYTES
+            } else {
+                developers
+            };
+            let v_releasedate = if has_releasedate == 1 {
+                releasedate
+            } else {
+                NA_BYTES
+            };
+            let v_genres = if has_genres == 1 { genres } else { NA_BYTES };
+            let v_platforms = platforms;
+
+            let parts = [
+                v_title,
+                v_steamid,
+                v_type,
+                v_publisher,
+                v_developers,
+                v_releasedate,
+                v_genres,
+                v_platforms,
+            ];
+
+            let mut required = 0usize;
+            for part in parts {
+                let Some(next) = required.checked_add(part.len()) else {
+                    return DECLINE;
+                };
+                required = next;
+            }
+            if required > isize::MAX as usize {
+                return DECLINE;
+            }
+
+            let lens = unsafe { slice::from_raw_parts_mut(out_lens, 8) };
+            for (idx, part) in parts.iter().enumerate() {
+                lens[idx] = part.len();
+            }
+
+            if required > out_cap {
+                return -(required as isize);
+            }
+
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, required) };
+            let mut offset = 0usize;
+            for part in parts {
+                dst[offset..offset + part.len()].copy_from_slice(part);
+                offset += part.len();
+            }
+
+            required as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Formats the price and optional discount table values for `SteamLookupGame::displayGameDetails()`.
+    /// Writes `[currency_len, price_len, original_len, discount_len]` into `out_lens` (`usize[4]`).
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_steam_lookup_format_price_rows(
+        has_currency: u32,
+        currency_ptr: *const u8,
+        currency_len: usize,
+        has_final_formatted: u32,
+        final_formatted_ptr: *const u8,
+        final_formatted_len: usize,
+        final_price: f64,
+        initial_price: f64,
+        discount_percent: i64,
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if has_currency > 1
+                || has_final_formatted > 1
+                || !valid_mut_slice(out_lens, 4)
+                || !valid_out_buf(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some(currency) = (unsafe { valid_slice(currency_ptr, currency_len) }) else {
+                return DECLINE;
+            };
+            let Some(final_formatted) =
+                (unsafe { valid_slice(final_formatted_ptr, final_formatted_len) })
+            else {
+                return DECLINE;
+            };
+
+            let v_currency = if has_currency == 1 {
+                currency
+            } else {
+                DEFAULT_CURRENCY_BYTES
+            };
+
+            let price_owned: String;
+            let v_price: &[u8] = if has_final_formatted == 1 {
+                final_formatted
+            } else {
+                let Some(formatted) = format_usd_price(final_price) else {
+                    return DECLINE;
+                };
+                price_owned = formatted;
+                price_owned.as_bytes()
+            };
+
+            let (original_owned, discount_owned) = if discount_percent > 0 {
+                let Some(orig) = format_usd_price(initial_price) else {
+                    return DECLINE;
+                };
+                (orig, format!("{discount_percent}%"))
+            } else {
+                (String::new(), String::new())
+            };
+
+            let v_original = original_owned.as_bytes();
+            let v_discount = discount_owned.as_bytes();
+
+            let parts = [v_currency, v_price, v_original, v_discount];
+            let mut required = 0usize;
+            for part in parts {
+                let Some(next) = required.checked_add(part.len()) else {
+                    return DECLINE;
+                };
+                required = next;
+            }
+            if required > isize::MAX as usize {
+                return DECLINE;
+            }
+
+            let lens = unsafe { slice::from_raw_parts_mut(out_lens, 4) };
+            for (idx, part) in parts.iter().enumerate() {
+                lens[idx] = part.len();
+            }
+
+            if required > out_cap {
+                return -(required as isize);
+            }
+
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, required) };
+            let mut offset = 0usize;
+            for part in parts {
+                dst[offset..offset + part.len()].copy_from_slice(part);
+                offset += part.len();
+            }
+
+            required as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Formats the 4 review summary table values for `SteamLookupGame::handle()`.
+    /// Writes `[rating_len, positive_len, negative_len, total_len]` into `out_lens` (`usize[4]`).
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_steam_lookup_format_reviews_rows(
+        has_rating: u32,
+        rating_ptr: *const u8,
+        rating_len: usize,
+        total_positive: i64,
+        total_negative: i64,
+        total_reviews: i64,
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if has_rating > 1
+                || !valid_mut_slice(out_lens, 4)
+                || !valid_out_buf(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some(rating) = (unsafe { valid_slice(rating_ptr, rating_len) }) else {
+                return DECLINE;
+            };
+
+            let v_rating = if has_rating == 1 {
+                rating
+            } else {
+                DEFAULT_RATING_BYTES
+            };
+            let pos_str = format_i64_thousands(total_positive);
+            let neg_str = format_i64_thousands(total_negative);
+            let tot_str = format_i64_thousands(total_reviews);
+
+            let parts = [
+                v_rating,
+                pos_str.as_bytes(),
+                neg_str.as_bytes(),
+                tot_str.as_bytes(),
+            ];
+            let mut required = 0usize;
+            for part in parts {
+                let Some(next) = required.checked_add(part.len()) else {
+                    return DECLINE;
+                };
+                required = next;
+            }
+            if required > isize::MAX as usize {
+                return DECLINE;
+            }
+
+            let lens = unsafe { slice::from_raw_parts_mut(out_lens, 4) };
+            for (idx, part) in parts.iter().enumerate() {
+                lens[idx] = part.len();
+            }
+
+            if required > out_cap {
+                return -(required as isize);
+            }
+
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, required) };
+            let mut offset = 0usize;
+            for part in parts {
+                dst[offset..offset + part.len()].copy_from_slice(part);
+                offset += part.len();
+            }
+
+            required as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Computes `$limit > 0 ? min($limit, $totalCount) : $totalCount` for `ReprocessMissingEpisodes`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_reprocess_missing_episodes_process_count(
+        limit: i64,
+        total_count: i64,
+        out_count: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_count, 1) {
+                return DECLINE as i32;
+            }
+            let resolved = if limit > 0 {
+                limit.min(total_count)
+            } else {
+                total_count
+            };
+            unsafe {
+                *out_count = resolved;
+            }
+            0
+        }))
+        .unwrap_or(DECLINE as i32)
+    }
+
+    /// Truncates `search_name` to 55 Unicode characters with `...` suffix when longer than 55 chars
+    /// (`mb_substr($s, 0, 55).(mb_strlen($s) > 55 ? '...' : '')`).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_reprocess_missing_episodes_truncate_search_name(
+        search_name_ptr: *const u8,
+        search_name_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(raw) = (unsafe { valid_slice(search_name_ptr, search_name_len) }) else {
+                return DECLINE;
+            };
+            let Ok(text) = std::str::from_utf8(raw) else {
+                return DECLINE;
+            };
+
+            let mut char_iter = text.char_indices();
+            let prefix_end = char_iter.nth(55).map(|(idx, _)| idx);
+            let (prefix, suffix): (&[u8], &[u8]) = match prefix_end {
+                Some(idx) => (&raw[..idx], b"..."),
+                None => (raw, b""),
+            };
+
+            let Some(required) = prefix.len().checked_add(suffix.len()) else {
+                return DECLINE;
+            };
+            if required > isize::MAX as usize {
+                return DECLINE;
+            }
+            if required == 0 {
+                return 0;
+            }
+            if required > out_cap {
+                return -(required as isize);
+            }
+
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, required) };
+            dst[..prefix.len()].copy_from_slice(prefix);
+            dst[prefix.len()..required].copy_from_slice(suffix);
+            required as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Formats `[number_format($processed), number_format($matched), number_format($failed), $matchRate]`
+    /// for `ReprocessMissingEpisodes::handle()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_reprocess_missing_episodes_format_summary(
+        processed: i64,
+        matched: i64,
+        failed: i64,
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_lens, 4) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(rate_str) = format_match_rate(processed, matched) else {
+                return DECLINE;
+            };
+            let proc_str = format_i64_thousands(processed);
+            let match_str = format_i64_thousands(matched);
+            let fail_str = format_i64_thousands(failed);
+
+            let parts = [
+                proc_str.as_bytes(),
+                match_str.as_bytes(),
+                fail_str.as_bytes(),
+                rate_str.as_bytes(),
+            ];
+            let mut required = 0usize;
+            for part in parts {
+                let Some(next) = required.checked_add(part.len()) else {
+                    return DECLINE;
+                };
+                required = next;
+            }
+            if required > isize::MAX as usize {
+                return DECLINE;
+            }
+
+            let lens = unsafe { slice::from_raw_parts_mut(out_lens, 4) };
+            for (idx, part) in parts.iter().enumerate() {
+                lens[idx] = part.len();
+            }
+
+            if required > out_cap {
+                return -(required as isize);
+            }
+
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, required) };
+            let mut offset = 0usize;
+            for part in parts {
+                dst[offset..offset + part.len()].copy_from_slice(part);
+                offset += part.len();
+            }
+
+            required as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Evaluates `(should_requeue, should_rename)` for `RequeueFailedBooks::handle()` into
+    /// `out_flags` (`i64[2]`).
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_requeue_failed_books_evaluate_release(
+        has_bookinfo_id: u32,
+        bookinfo_id: i64,
+        current_searchname_ptr: *const u8,
+        current_searchname_len: usize,
+        has_normalized: u32,
+        normalized_ptr: *const u8,
+        normalized_len: usize,
+        out_flags: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if has_bookinfo_id > 1 || has_normalized > 1 || !valid_mut_slice(out_flags, 2) {
+                return DECLINE as i32;
+            }
+            let Some(current_searchname) =
+                (unsafe { valid_slice(current_searchname_ptr, current_searchname_len) })
+            else {
+                return DECLINE as i32;
+            };
+            let Some(normalized) = (unsafe { valid_slice(normalized_ptr, normalized_len) }) else {
+                return DECLINE as i32;
+            };
+
+            let effective_bookinfo_id = if has_bookinfo_id == 1 { bookinfo_id } else { 0 };
+            let should_requeue = effective_bookinfo_id == -2 || effective_bookinfo_id == -3;
+            let should_rename = has_normalized == 1 && normalized != current_searchname;
+
+            let flags = unsafe { slice::from_raw_parts_mut(out_flags, 2) };
+            flags[0] = i64::from(should_requeue);
+            flags[1] = i64::from(should_rename);
+            0
+        }))
+        .unwrap_or(DECLINE as i32)
+    }
+
+    /// Formats `[dry-run] #{release_id} searchname: "{old_name}" -> "{new_name}"` for
+    /// `RequeueFailedBooks::handle()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_requeue_failed_books_format_dry_run_rename(
+        release_id: i64,
+        old_name_ptr: *const u8,
+        old_name_len: usize,
+        new_name_ptr: *const u8,
+        new_name_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(old_name) = (unsafe { valid_slice(old_name_ptr, old_name_len) }) else {
+                return DECLINE;
+            };
+            let Some(new_name) = (unsafe { valid_slice(new_name_ptr, new_name_len) }) else {
+                return DECLINE;
+            };
+
+            let prefix = format!("[dry-run] #{release_id} searchname: \"");
+            let mid = b"\" -> \"";
+            let suffix = b"\"";
+
+            let Some(required) = prefix
+                .len()
+                .checked_add(old_name.len())
+                .and_then(|v| v.checked_add(mid.len()))
+                .and_then(|v| v.checked_add(new_name.len()))
+                .and_then(|v| v.checked_add(suffix.len()))
+            else {
+                return DECLINE;
+            };
+            if required > isize::MAX as usize {
+                return DECLINE;
+            }
+            if required > out_cap {
+                return -(required as isize);
+            }
+
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, required) };
+            let mut offset = 0usize;
+            dst[offset..offset + prefix.len()].copy_from_slice(prefix.as_bytes());
+            offset += prefix.len();
+            dst[offset..offset + old_name.len()].copy_from_slice(old_name);
+            offset += old_name.len();
+            dst[offset..offset + mid.len()].copy_from_slice(mid);
+            offset += mid.len();
+            dst[offset..offset + new_name.len()].copy_from_slice(new_name);
+            offset += new_name.len();
+            dst[offset..offset + suffix.len()].copy_from_slice(suffix);
+
+            required as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Formats the final dry-run or execution summary message for `RequeueFailedBooks::handle()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_requeue_failed_books_format_summary(
+        dry_run: u32,
+        total: i64,
+        queued: i64,
+        renamed: i64,
+        skipped: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if dry_run > 1 || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+
+            let formatted = if dry_run == 1 {
+                format!(
+                    "Dry run complete. Inspected: {total}, would apply updates: {queued}, would normalize names: {renamed}, skipped: {skipped}."
+                )
+            } else {
+                format!(
+                    "Requeued {queued} failed book release(s). Normalized {renamed} searchname value(s). Skipped: {skipped}."
+                )
+            };
+
+            let bytes = formatted.as_bytes();
+            let required = bytes.len();
+            if required > isize::MAX as usize {
+                return DECLINE;
+            }
+            if required > out_cap {
+                return -(required as isize);
+            }
+
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, required) };
+            dst.copy_from_slice(bytes);
+            required as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn admin_anidb_and_book_helpers_contract() {
+            let mut buf = [0u8; 128];
+            let rc_filter = unsafe {
+                nntmux_admin_anidb_normalize_search_filter(
+                    b"Cowboy Bebop".as_ptr(),
+                    12,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(rc_filter, 12);
+            assert_eq!(&buf[..12], b"Cowboy Bebop");
+
+            let mut lens2 = [0usize; 2];
+            let rc_edit = unsafe {
+                nntmux_admin_anidb_resolve_action_and_title(
+                    b"edit".as_ptr(),
+                    4,
+                    b"view".as_ptr(),
+                    4,
+                    42,
+                    lens2.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(rc_edit, 14);
+            assert_eq!(lens2, [4, 10]);
+            assert_eq!(&buf[..4], b"view");
+            assert_eq!(&buf[4..14], b"AniDB Edit");
+
+            let rc_destroy = unsafe {
+                nntmux_admin_anidb_resolve_action_and_title(
+                    b"destroy".as_ptr(),
+                    7,
+                    b"view".as_ptr(),
+                    4,
+                    99,
+                    lens2.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(lens2, [6, 29]);
+            assert_eq!(&buf[..6], b"remove");
+            assert_eq!(
+                &buf[6..rc_destroy as usize],
+                b"Remove AniDB ID from Releases"
+            );
+
+            let mut out_id = 0i64;
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_anidb_normalize_update_id(b" 1234 ".as_ptr(), 6, 7, &mut out_id)
+                },
+                0
+            );
+            assert_eq!(out_id, 1234);
+
+            let mut book_scalars = [0i64; 3];
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_book_normalize_edit_fields(
+                        b"2024-02-29".as_ptr(),
+                        10,
+                        1,
+                        1,
+                        book_scalars.as_mut_ptr(),
+                    )
+                },
+                0
+            );
+            assert_eq!(book_scalars, [0, 1_709_164_800, 1]);
+        }
+
+        #[test]
+        fn steam_reprocess_and_requeue_helpers_contract() {
+            let mut lens8 = [0usize; 8];
+            let mut buf = [0u8; 256];
+            let rc_basic = unsafe {
+                nntmux_steam_lookup_format_basic_info(
+                    1,
+                    b"Half-Life 2".as_ptr(),
+                    11,
+                    1,
+                    b"220".as_ptr(),
+                    3,
+                    1,
+                    b"game".as_ptr(),
+                    4,
+                    1,
+                    b"Valve".as_ptr(),
+                    5,
+                    b"Valve".as_ptr(),
+                    5,
+                    1,
+                    b"2004-11-16".as_ptr(),
+                    10,
+                    1,
+                    b"Action".as_ptr(),
+                    6,
+                    b"Windows, Mac, Linux".as_ptr(),
+                    19,
+                    lens8.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(rc_basic > 0);
+            assert_eq!(lens8, [11, 3, 4, 5, 5, 10, 6, 19]);
+            assert_eq!(&buf[14..18], b"Game");
+
+            let mut lens4 = [0usize; 4];
+            let rc_price = unsafe {
+                nntmux_steam_lookup_format_price_rows(
+                    1,
+                    b"USD".as_ptr(),
+                    3,
+                    0,
+                    b"".as_ptr(),
+                    0,
+                    29.99,
+                    59.99,
+                    50,
+                    lens4.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(rc_price, 18);
+            assert_eq!(lens4, [3, 6, 6, 3]);
+            assert_eq!(&buf[..18], b"USD$29.99$59.9950%");
+
+            let rc_rev = unsafe {
+                nntmux_steam_lookup_format_reviews_rows(
+                    1,
+                    b"Overwhelmingly Positive".as_ptr(),
+                    23,
+                    123456,
+                    1234,
+                    124690,
+                    lens4.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(rc_rev > 0);
+            assert_eq!(lens4, [23, 7, 5, 7]);
+
+            let mut proc_count = 0i64;
+            assert_eq!(
+                unsafe {
+                    nntmux_reprocess_missing_episodes_process_count(10, 25, &mut proc_count)
+                },
+                0
+            );
+            assert_eq!(proc_count, 10);
+
+            let long_name = "A".repeat(60);
+            let rc_trunc = unsafe {
+                nntmux_reprocess_missing_episodes_truncate_search_name(
+                    long_name.as_ptr(),
+                    long_name.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(rc_trunc, 58);
+            assert_eq!(&buf[55..58], b"...");
+
+            let rc_sum = unsafe {
+                nntmux_reprocess_missing_episodes_format_summary(
+                    3,
+                    2,
+                    1,
+                    lens4.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(rc_sum, 9);
+            assert_eq!(lens4, [1, 1, 1, 6]);
+            assert_eq!(&buf[3..9], b"66.67%");
+
+            let mut flags2 = [0i64; 2];
+            assert_eq!(
+                unsafe {
+                    nntmux_requeue_failed_books_evaluate_release(
+                        1,
+                        -3,
+                        b"N:/NZB/foo".as_ptr(),
+                        10,
+                        1,
+                        b"Clean Book Title".as_ptr(),
+                        16,
+                        flags2.as_mut_ptr(),
+                    )
+                },
+                0
+            );
+            assert_eq!(flags2, [1, 1]);
+
+            let rc_dry = unsafe {
+                nntmux_requeue_failed_books_format_dry_run_rename(
+                    42,
+                    b"old".as_ptr(),
+                    3,
+                    b"new".as_ptr(),
+                    3,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(
+                &buf[..rc_dry as usize],
+                b"[dry-run] #42 searchname: \"old\" -> \"new\""
+            );
+
+            let rc_req_sum = unsafe {
+                nntmux_requeue_failed_books_format_summary(
+                    0,
+                    10,
+                    7,
+                    3,
+                    3,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(
+                &buf[..rc_req_sum as usize],
+                b"Requeued 7 failed book release(s). Normalized 3 searchname value(s). Skipped: 3."
+            );
+        }
+
+        #[test]
+        fn abi_safety_null_unaligned_invalid_flags_and_undersized_buffers() {
+            let mut raw = [0u8; 64];
+            let unaligned_usize = unsafe { raw.as_mut_ptr().add(1) as *mut usize };
+            let unaligned_i64 = unsafe { raw.as_mut_ptr().add(1) as *mut i64 };
+            let mut small = [b'Z'; 4];
+            let mut lens2 = [0usize; 2];
+            let mut lens4 = [0usize; 4];
+            let mut lens8 = [0usize; 8];
+            let mut scalars3 = [0i64; 3];
+
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_anidb_normalize_search_filter(
+                        b"Cowboy".as_ptr(),
+                        6,
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -6
+            );
+            assert_eq!(small, [b'Z'; 4]);
+
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_anidb_resolve_action_and_title(
+                        b"index".as_ptr(),
+                        5,
+                        b"view".as_ptr(),
+                        4,
+                        0,
+                        unaligned_usize,
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_anidb_resolve_action_and_title(
+                        b"index".as_ptr(),
+                        5,
+                        b"view".as_ptr(),
+                        4,
+                        0,
+                        lens2.as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -15
+            );
+            assert_eq!(small, [b'Z'; 4]);
+
+            assert_eq!(
+                unsafe { nntmux_admin_anidb_normalize_update_id(b"1".as_ptr(), 1, 0, unaligned_i64) },
+                DECLINE as i32
+            );
+
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_book_normalize_edit_fields(
+                        b"2024-01-01".as_ptr(),
+                        10,
+                        2,
+                        1,
+                        scalars3.as_mut_ptr(),
+                    )
+                },
+                DECLINE as i32
+            );
+
+            assert_eq!(
+                unsafe {
+                    nntmux_steam_lookup_format_basic_info(
+                        1,
+                        b"Portal".as_ptr(),
+                        6,
+                        1,
+                        b"400".as_ptr(),
+                        3,
+                        1,
+                        b"game".as_ptr(),
+                        4,
+                        1,
+                        b"Valve".as_ptr(),
+                        5,
+                        b"Valve".as_ptr(),
+                        5,
+                        1,
+                        b"2007-10-10".as_ptr(),
+                        10,
+                        1,
+                        b"Puzzle".as_ptr(),
+                        6,
+                        b"Windows".as_ptr(),
+                        7,
+                        lens8.as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -46
+            );
+            assert_eq!(small, [b'Z'; 4]);
+
+            assert_eq!(
+                unsafe {
+                    nntmux_steam_lookup_format_price_rows(
+                        1,
+                        b"USD".as_ptr(),
+                        3,
+                        1,
+                        b"Free".as_ptr(),
+                        4,
+                        0.0,
+                        0.0,
+                        0,
+                        lens4.as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -7
+            );
+            assert_eq!(small, [b'Z'; 4]);
+
+            assert_eq!(
+                unsafe {
+                    nntmux_steam_lookup_format_reviews_rows(
+                        1,
+                        b"Positive".as_ptr(),
+                        8,
+                        10,
+                        1,
+                        11,
+                        lens4.as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -13
+            );
+            assert_eq!(small, [b'Z'; 4]);
+
+            assert_eq!(
+                unsafe { nntmux_reprocess_missing_episodes_process_count(5, 10, unaligned_i64) },
+                DECLINE as i32
+            );
+
+            assert_eq!(
+                unsafe {
+                    nntmux_reprocess_missing_episodes_truncate_search_name(
+                        b"Severance".as_ptr(),
+                        9,
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -9
+            );
+            assert_eq!(small, [b'Z'; 4]);
+
+            assert_eq!(
+                unsafe {
+                    nntmux_reprocess_missing_episodes_format_summary(
+                        10,
+                        5,
+                        5,
+                        lens4.as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -7
+            );
+            assert_eq!(small, [b'Z'; 4]);
+
+            assert_eq!(
+                unsafe {
+                    nntmux_requeue_failed_books_evaluate_release(
+                        2,
+                        -2,
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        b"b".as_ptr(),
+                        1,
+                        unaligned_i64,
+                    )
+                },
+                DECLINE as i32
+            );
+
+            assert_eq!(
+                unsafe {
+                    nntmux_requeue_failed_books_format_dry_run_rename(
+                        1,
+                        b"a".as_ptr(),
+                        1,
+                        b"b".as_ptr(),
+                        1,
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -35
+            );
+            assert_eq!(small, [b'Z'; 4]);
+
+            assert_eq!(
+                unsafe {
+                    nntmux_requeue_failed_books_format_summary(
+                        1,
+                        1,
+                        1,
+                        1,
+                        0,
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -93
+            );
+            assert_eq!(small, [b'Z'; 4]);
+        }
+    }
+}
