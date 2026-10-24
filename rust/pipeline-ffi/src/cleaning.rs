@@ -2110,9 +2110,533 @@ pub unsafe extern "C" fn nntmux_extract_obfuscated_subject(
     cur.finish()
 }
 
+// libc's bounded byte search is vectorized on supported Linux/macOS hosts.
+unsafe extern "C" {
+    fn memchr(input: *const u8, byte: std::ffi::c_int, len: usize) -> *const u8;
+    fn memmem(input: *const u8, len: usize, needle: *const u8, needle_len: usize) -> *const u8;
+}
+
+#[inline]
+fn header_find_byte(bytes: &[u8], byte: u8) -> Option<usize> {
+    let found = unsafe { memchr(bytes.as_ptr(), byte.into(), bytes.len()) };
+    if found.is_null() {
+        None
+    } else {
+        Some(unsafe { found.offset_from(bytes.as_ptr()) } as usize)
+    }
+}
+
+fn header_has_yenc(subject: &[u8]) -> bool {
+    for byte in [b'y', b'Y'] {
+        let mut remaining = subject;
+        while let Some(pos) = header_find_byte(remaining, byte) {
+            if remaining
+                .get(pos..pos + 4)
+                .is_some_and(|s| s.eq_ignore_ascii_case(b"yenc"))
+            {
+                return true;
+            }
+            remaining = &remaining[pos + 1..];
+        }
+    }
+    false
+}
+
+// HeaderParser's byte-oriented PCRE captures. A positive word packs name start (8 bits),
+// name length (16), whitespace length (8), part/total digit lengths (8 each), and
+// pattern type (1 = append yEnc, 2 = already present). Zero is no match; -1 declines.
+// Digits remain spans, preserving leading zeros and values beyond PHP_INT_MAX.
+fn header_subject(subject: &[u8]) -> i64 {
+    // Bound work and decline spans that cannot be represented. PHP retains PCRE limits/errors.
+    if subject.len() > 2048 {
+        return -1;
+    }
+    let prefix = subject.iter().take_while(|&&b| is_pcre_space(b)).count();
+    if prefix > 255 {
+        return -1;
+    }
+    for start in (0..=prefix).rev() {
+        if subject[start..].starts_with(b"Usenet Index Post") {
+            continue;
+        }
+        if start == subject.len() || subject[start] == b'\n' {
+            continue;
+        }
+        let mut search = start + 2;
+        while search < subject.len() {
+            let Some(relative) = header_find_byte(&subject[search..], b'(') else {
+                break;
+            };
+            let pos = search + relative;
+            search = pos + 1;
+            if !is_pcre_space(subject[pos - 1]) {
+                continue;
+            }
+            let mut name_end = pos - 1;
+            while name_end > start + 1 && is_pcre_space(subject[name_end - 1]) {
+                name_end -= 1;
+            }
+            if header_find_byte(&subject[start..name_end], b'\n').is_some() {
+                break;
+            }
+            if pos - name_end > 255 {
+                return -1;
+            }
+            let part_start = pos + 1;
+            let mut end = part_start;
+            while subject.get(end).is_some_and(u8::is_ascii_digit) {
+                end += 1;
+            }
+            let part_len = end - part_start;
+            if part_len > 0 && subject.get(end) == Some(&b'/') {
+                let total_start = end + 1;
+                end = total_start;
+                while subject.get(end).is_some_and(u8::is_ascii_digit) {
+                    end += 1;
+                }
+                let total_len = end - total_start;
+                if total_len > 0 && subject.get(end) == Some(&b')') {
+                    if part_len > 255 || total_len > 255 {
+                        return -1;
+                    }
+                    let kind = if header_has_yenc(subject) { 2i64 } else { 1i64 };
+                    return start as i64
+                        | ((name_end - start) as i64) << 8
+                        | ((pos - name_end) as i64) << 24
+                        | (part_len as i64) << 32
+                        | (total_len as i64) << 40
+                        | kind << 48;
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Packed captures for HeaderParser's subject pattern; zero for no match, -1 for PHP fallback.
+///
+/// # Safety
+/// `input` must be readable for `input_len` bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_header_parse_subject(input: *const u8, input_len: usize) -> i64 {
+    if input.is_null() {
+        return -1;
+    }
+    header_subject(unsafe { slice::from_raw_parts(input, input_len) })
+}
+
+/// Batch subject captures: input is repeated (u32 little-endian length, subject bytes).
+/// Output is one native-endian i64 packed result per record, without alignment requirements.
+/// Returns output bytes, -1 for malformed framing, or negative required capacity.
+///
+/// # Safety
+/// `input` must be readable for `input_len` bytes; `out_buf` writable for `out_cap` bytes.
+/// Input and output must not overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_header_parse_batch(
+    input: *const u8,
+    input_len: usize,
+    count: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> i64 {
+    let Some(needed) = count.checked_mul(8).filter(|&n| n <= i64::MAX as usize) else {
+        return -1;
+    };
+    if input.is_null() || out_buf.is_null() {
+        return -1;
+    }
+    if out_cap < needed {
+        return -(needed as i64);
+    }
+    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+    let mut pos = 0usize;
+    for index in 0..count {
+        if bytes.len().saturating_sub(pos) < 4 {
+            return -1;
+        }
+        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if len > bytes.len() - pos {
+            return -1;
+        }
+        let packed = header_subject(&bytes[pos..pos + len]);
+        unsafe { std::ptr::write_unaligned(out_buf.add(index * 8).cast::<i64>(), packed) };
+        pos += len;
+    }
+    if pos != bytes.len() {
+        -1
+    } else {
+        needed as i64
+    }
+}
+
+// Deliberately a small PCRE subset: ASCII literals with optional ^/$ anchors and
+// escaped punctuation. Backreferences, character classes, modifiers, Unicode,
+// alternations and every other PCRE construct are declined to preg_match.
+fn blacklist_literal(pattern: &[u8]) -> Option<(u8, Vec<u8>)> {
+    let mut flags = 0u8;
+    let mut pos = 0;
+    if pattern.first() == Some(&b'^') {
+        flags |= 1;
+        pos += 1;
+    }
+    let mut literal = Vec::with_capacity(pattern.len());
+    while pos < pattern.len() {
+        let b = pattern[pos];
+        if b == b'$' && pos + 1 == pattern.len() {
+            flags |= 2;
+        } else if b == b'\\' {
+            pos += 1;
+            let &escaped = pattern.get(pos)?;
+            if !escaped.is_ascii_punctuation() {
+                return None;
+            }
+            literal.push(escaped.to_ascii_lowercase());
+        } else if !b.is_ascii()
+            || matches!(
+                b,
+                b'.' | b'^'
+                    | b'$'
+                    | b'|'
+                    | b'('
+                    | b')'
+                    | b'['
+                    | b']'
+                    | b'{'
+                    | b'}'
+                    | b'*'
+                    | b'+'
+                    | b'?'
+                    | b'/'
+            )
+        {
+            return None;
+        } else {
+            literal.push(b.to_ascii_lowercase());
+        }
+        pos += 1;
+    }
+    Some((flags, literal))
+}
+
+/// Compile (field byte, u32 LE regex length, regex) records to literal matching records.
+/// Output records are (field byte, anchor flags byte, u16 LE literal length, literal).
+/// Returns -1 when any pattern needs PCRE; otherwise output length/negative required capacity.
+///
+/// # Safety
+/// `input` must be readable for `input_len` bytes, `out_buf` writable for `out_cap` bytes.
+/// Input and output must not overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_blacklist_compile(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> i64 {
+    if input.is_null() {
+        return -1;
+    }
+    let mut bytes = unsafe { slice::from_raw_parts(input, input_len) };
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+    while !bytes.is_empty() {
+        if bytes.len() < 5 || !(1..=3).contains(&bytes[0]) {
+            return -1;
+        }
+        let field = bytes[0];
+        let len = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
+        bytes = &bytes[5..];
+        if len > bytes.len() || len > u16::MAX as usize {
+            return -1;
+        }
+        let Some((flags, literal)) = blacklist_literal(&bytes[..len]) else {
+            return -1;
+        };
+        out.push(field);
+        out.push(flags);
+        out.extend(&(literal.len() as u16).to_le_bytes());
+        out.extend(&literal);
+        bytes = &bytes[len..];
+    }
+    out.finish() as i64
+}
+
+fn blacklist_contains(value: &[u8], literal: &[u8], flags: u8) -> bool {
+    if literal.len() > value.len() {
+        return false;
+    }
+    if flags & 1 != 0 {
+        return value.starts_with(literal)
+            && (flags & 2 == 0
+                || literal.len() == value.len()
+                || (literal.len() + 1 == value.len() && value.last() == Some(&b'\n')));
+    }
+    if flags & 2 != 0 {
+        return value.ends_with(literal)
+            || (value.last() == Some(&b'\n') && value[..value.len() - 1].ends_with(literal));
+    }
+    literal.is_empty()
+        || !unsafe { memmem(value.as_ptr(), value.len(), literal.as_ptr(), literal.len()) }
+            .is_null()
+}
+
+/// Return the first matched rule's 1-based ordinal, zero for none, -1 for invalid records.
+/// All fields are length-delimited, so embedded NUL/invalid UTF-8 remain ordinary bytes.
+///
+/// # Safety
+/// All input pointers must be readable for their corresponding lengths, and non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_blacklist_match(
+    rules: *const u8,
+    rules_len: usize,
+    subject: *const u8,
+    subject_len: usize,
+    poster: *const u8,
+    poster_len: usize,
+    message_id: *const u8,
+    message_id_len: usize,
+) -> i32 {
+    if rules.is_null() || subject.is_null() || poster.is_null() || message_id.is_null() {
+        return -1;
+    }
+    let mut rules = unsafe { slice::from_raw_parts(rules, rules_len) };
+    let fields = unsafe {
+        [
+            slice::from_raw_parts(subject, subject_len),
+            slice::from_raw_parts(poster, poster_len),
+            slice::from_raw_parts(message_id, message_id_len),
+        ]
+    };
+    let mut lowered: [Option<Vec<u8>>; 3] = [None, None, None];
+    // Probe each distinct literal byte at most once per field. Shared absent bytes
+    // reject entire rule families before libc scans a long or repetitive subject.
+    let mut byte_presence = [[0u8; 128]; 3];
+    let mut index = 0i32;
+    while !rules.is_empty() {
+        if rules.len() < 4 || !(1..=3).contains(&rules[0]) || rules[1] > 3 {
+            return -1;
+        }
+        let field = (rules[0] - 1) as usize;
+        let flags = rules[1];
+        let len = u16::from_le_bytes([rules[2], rules[3]]) as usize;
+        rules = &rules[4..];
+        if len > rules.len() || index == i32::MAX {
+            return -1;
+        }
+        index += 1;
+        let value = lowered[field].get_or_insert_with(|| fields[field].to_ascii_lowercase());
+        if flags == 0 && len > 0 {
+            let mut possible = true;
+            for &byte in &rules[..len] {
+                if byte >= 128 {
+                    return -1;
+                }
+                let presence = &mut byte_presence[field][byte as usize];
+                if *presence == 0 {
+                    *presence = if header_find_byte(value, byte).is_some() {
+                        1
+                    } else {
+                        2
+                    };
+                }
+                if *presence == 2 {
+                    possible = false;
+                    break;
+                }
+            }
+            if !possible {
+                rules = &rules[len..];
+                continue;
+            }
+        }
+        if blacklist_contains(value, &rules[..len], flags) {
+            return index;
+        }
+        rules = &rules[len..];
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_subject_packed_spans_and_binary_inputs() {
+        let packed = header_subject(b"\tfile\0name yEnc (001/999)");
+        assert_eq!(packed & 255, 1);
+        assert_eq!((packed >> 8) & 65535, 14);
+        assert_eq!((packed >> 24) & 255, 1);
+        assert_eq!((packed >> 32) & 255, 3);
+        assert_eq!((packed >> 40) & 255, 3);
+        assert_eq!(packed >> 48, 2);
+        assert_eq!(header_subject(b"Usenet Index Post file (1/2)"), 0);
+        assert!(header_subject(b" Usenet Index Post file (1/2)") > 0);
+        assert!(header_subject(b" \n(1/2)") > 0);
+        assert_eq!(header_subject(b"file\nother (1/2)"), 0);
+        assert_eq!(header_subject(&vec![b'x'; 2049]), -1);
+        assert_eq!(header_subject(b"file [1/2]"), 0);
+        assert_eq!(header_subject(b"file (1/2)") >> 48, 1);
+        assert_eq!(
+            unsafe { nntmux_header_parse_subject(std::ptr::null(), 0) },
+            -1
+        );
+    }
+
+    #[test]
+    fn header_batch_checks_lengths_and_unaligned_output() {
+        let mut input = Vec::new();
+        for subject in [
+            b"file (01/02)".as_slice(),
+            b"no counter",
+            b"a\0b yEnc (2/3)",
+        ] {
+            input.extend_from_slice(&(subject.len() as u32).to_le_bytes());
+            input.extend_from_slice(subject);
+        }
+        let mut output = [0u8; 25];
+        assert_eq!(
+            unsafe {
+                nntmux_header_parse_batch(
+                    input.as_ptr(),
+                    input.len(),
+                    3,
+                    output.as_mut_ptr().add(1),
+                    24,
+                )
+            },
+            24
+        );
+        assert_eq!(i64::from_ne_bytes(output[9..17].try_into().unwrap()), 0);
+        assert_eq!(
+            unsafe {
+                nntmux_header_parse_batch(input.as_ptr(), input.len(), 3, output.as_mut_ptr(), 8)
+            },
+            -24
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_header_parse_batch(
+                    input.as_ptr(),
+                    input.len() - 1,
+                    3,
+                    output.as_mut_ptr(),
+                    24,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_header_parse_batch(input.as_ptr(), input.len(), 2, output.as_mut_ptr(), 24)
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_header_parse_batch(
+                    input.as_ptr(),
+                    input.len(),
+                    usize::MAX,
+                    output.as_mut_ptr(),
+                    24,
+                )
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn blacklist_literal_subset_and_first_match() {
+        assert_eq!(blacklist_literal(br"^a\.b$"), Some((3, b"a.b".to_vec())));
+        for pattern in [
+            br"(a)\1".as_slice(),
+            br"\w+",
+            br"(?=x)",
+            br"a/b",
+            br"[ab]",
+            br"a|b",
+            br"a\",
+            b"\xff",
+        ] {
+            assert!(blacklist_literal(pattern).is_none());
+        }
+        assert!(blacklist_contains(b"needle\n", b"needle", 3));
+        assert!(!blacklist_contains(b"needle\r\n", b"needle", 3));
+        assert!(blacklist_contains(b"a\0b", b"\0", 0));
+        assert!(blacklist_contains(b"anything", b"", 0));
+        let mut input = Vec::new();
+        for (field, pattern) in [(1, "absent"), (2, "^poster$"), (3, "id")] {
+            input.push(field);
+            input.extend_from_slice(&(pattern.len() as u32).to_le_bytes());
+            input.extend_from_slice(pattern.as_bytes());
+        }
+        let mut out = [0u8; 128];
+        let len = unsafe {
+            nntmux_blacklist_compile(input.as_ptr(), input.len(), out.as_mut_ptr(), out.len())
+        };
+        assert!(len > 0);
+        assert_eq!(
+            unsafe { nntmux_blacklist_compile(input.as_ptr(), input.len(), out.as_mut_ptr(), 1) },
+            -len
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_blacklist_match(
+                    out.as_ptr(),
+                    len as usize,
+                    b"clean".as_ptr(),
+                    5,
+                    b"POSTER\n".as_ptr(),
+                    7,
+                    b"<ID>".as_ptr(),
+                    4,
+                )
+            },
+            2
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_blacklist_match(
+                    out.as_ptr(),
+                    len as usize,
+                    b"clean".as_ptr(),
+                    5,
+                    b"other".as_ptr(),
+                    5,
+                    b"<ID>".as_ptr(),
+                    4,
+                )
+            },
+            3
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_blacklist_compile(
+                    input.as_ptr(),
+                    input.len() - 1,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_blacklist_match(
+                    out.as_ptr(),
+                    1,
+                    b"".as_ptr(),
+                    0,
+                    b"".as_ptr(),
+                    0,
+                    b"".as_ptr(),
+                    0,
+                )
+            },
+            -1
+        );
+    }
 
     #[test]
     fn test_nzbsplit_unwrap_and_literal_payload() {
