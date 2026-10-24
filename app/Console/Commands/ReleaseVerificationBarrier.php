@@ -19,12 +19,76 @@ class ReleaseVerificationBarrier extends Command
 
     protected $description = 'Hold verification workers on every host out until this command is stopped';
 
+    // Keep PHP as the production default: the JSON FFI round trip is slower than these helpers (< 1.5x).
+    private static ?bool $useRustFfi = null;
+
     private bool $stopping = false;
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::useRustFfi();
+    }
+
+    /** `--release --all` clears every pause; plain `--release` only deployment pauses. */
+    public static function resolveReleaseScopeReason(bool $all): ?string
+    {
+        return self::useRustFfi() ? self::resolveReleaseScopeReasonNative($all) : self::resolveReleaseScopeReasonPhp($all);
+    }
+
+    public static function resolveReleaseScopeReasonPhp(bool $all): ?string
+    {
+        return $all ? null : 'deployment';
+    }
+
+    public static function resolveReleaseScopeReasonNative(bool $all): ?string
+    {
+        return GetArticleRange::transformNative(6, [$all], $result) && ($result === null || \is_string($result))
+            ? $result
+            : self::resolveReleaseScopeReasonPhp($all);
+    }
+
+    public static function clampTimeoutSeconds(mixed $timeout): int
+    {
+        return self::useRustFfi() ? self::clampTimeoutSecondsNative($timeout) : self::clampTimeoutSecondsPhp($timeout);
+    }
+
+    public static function clampTimeoutSecondsPhp(mixed $timeout): int
+    {
+        return max(1, (int) $timeout);
+    }
+
+    public static function clampTimeoutSecondsNative(mixed $timeout): int
+    {
+        return GetArticleRange::transformNative(7, [$timeout], $result) && \is_int($result) ? $result : self::clampTimeoutSecondsPhp($timeout);
+    }
+
+    /** The held barrier re-verifies its database session at most every five seconds. */
+    public static function shouldCheckLiveness(int $now, int $lastChecked): bool
+    {
+        return self::useRustFfi() ? self::shouldCheckLivenessNative($now, $lastChecked) : self::shouldCheckLivenessPhp($now, $lastChecked);
+    }
+
+    public static function shouldCheckLivenessPhp(int $now, int $lastChecked): bool
+    {
+        return $now - $lastChecked >= 5;
+    }
+
+    public static function shouldCheckLivenessNative(int $now, int $lastChecked): bool
+    {
+        return GetArticleRange::transformNative(8, [$now, $lastChecked], $result) && \is_bool($result)
+            ? $result
+            : self::shouldCheckLivenessPhp($now, $lastChecked);
+    }
 
     public function handle(): int
     {
         if ($this->option('release')) {
-            $reason = $this->option('all') ? null : 'deployment';
+            $reason = self::resolveReleaseScopeReason((bool) $this->option('all'));
             VerificationWorkerLocks::unpause(null, $reason);
             $this->line('barrier released');
 
@@ -43,7 +107,7 @@ class ReleaseVerificationBarrier extends Command
         $token = bin2hex(random_bytes(16));
         VerificationWorkerLocks::pause($token, 'deployment');
         $locks = new VerificationWorkerLocks;
-        if (! $locks->drain(max(1, (int) $this->option('timeout')))) {
+        if (! $locks->drain(self::clampTimeoutSeconds($this->option('timeout')))) {
             VerificationWorkerLocks::unpause($token);
             $this->error('Verification workers are still running on a host; the barrier was not taken.');
 
@@ -56,7 +120,7 @@ class ReleaseVerificationBarrier extends Command
             $this->line('barrier held');
             $checked = 0;
             while (! $this->stopping) {
-                if (time() - $checked >= 5) {
+                if (self::shouldCheckLiveness(time(), $checked)) {
                     try {
                         $held = $locks->protects(0);
                         if ($held) {
@@ -83,5 +147,10 @@ class ReleaseVerificationBarrier extends Command
         } finally {
             $locks->close();
         }
+    }
+
+    private static function useRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
     }
 }
