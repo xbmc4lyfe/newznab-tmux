@@ -6,6 +6,9 @@ namespace App\Services\NameFixing\Checkers;
 
 use App\Services\NameFixing\Data\NameFixResult;
 use App\Services\NameFixing\Patterns\MoviePatterns;
+use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
 
 /**
  * Name checker for Movie releases.
@@ -15,6 +18,30 @@ use App\Services\NameFixing\Patterns\MoviePatterns;
  */
 class MovieNameChecker extends AbstractNameChecker
 {
+    private const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_name_check_tv(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_name_check_movie(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_name_check_game(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_name_check_app(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        C;
+
+    private static bool $ffiResolved = false;
+
+    private static ?FFI $defaultFfi = null;
+
+    private static ?CData $defaultBuf = null;
+
+    private static int $defaultCap = 0;
+
+    /**
+     * Rust remains opt-in: paired caller benchmarks did not meet the 1.5x
+     * common-path and uncommon p99 gate. PHP remains the production default.
+     */
+    public function __construct(
+        private readonly ?string $libraryPath = null,
+        private readonly bool $useRust = false,
+    ) {}
+
     protected int $priority = 20;
 
     protected string $name = 'Movie';
@@ -55,6 +82,70 @@ class MovieNameChecker extends AbstractNameChecker
      * Override to provide more specific movie checking with pattern priority.
      */
     public function check(object $release, string $textstring): ?NameFixResult
+    {
+        // Subclasses may customize pattern order or result formatting.
+        if (! $this->useRust || get_class($this) !== self::class) {
+            return $this->checkPhp($release, $textstring);
+        }
+
+        if ($this->libraryPath !== null) {
+            $ffi = RustPipelineLibrary::resolveDomain('name_checkers', self::FFI_CDEF, $this->libraryPath);
+        } else {
+            if (! self::$ffiResolved) {
+                self::$defaultFfi = RustPipelineLibrary::resolveDomain('name_checkers', self::FFI_CDEF);
+                if (self::$defaultFfi !== null) {
+                    self::$defaultBuf = RustPipelineLibrary::obtainScratch(self::$defaultFfi, 4096, self::$defaultCap);
+                }
+                self::$ffiResolved = true;
+            }
+            $ffi = self::$defaultFfi;
+        }
+
+        if ($ffi !== null) {
+            try {
+                $len = strlen($textstring);
+                if ($this->libraryPath === null && self::$defaultBuf !== null && $len + 64 <= self::$defaultCap) {
+                    $buf = self::$defaultBuf;
+                    $cap = self::$defaultCap;
+                } else {
+                    $cap = 0;
+                    $buf = RustPipelineLibrary::obtainScratch($ffi, $len + 64, $cap);
+                }
+                if ($buf !== null) {
+                    // @phpstan-ignore method.notFound
+                    $written = $ffi->nntmux_name_check_movie($textstring, $len, $buf, $cap);
+                    if ($written === 0) {
+                        return null;
+                    }
+                    if ($written > 0) {
+                        [$patternName, $matched] = explode("\0", FFI::string($buf, $written), 2);
+
+                        return $this->fromNativeMatch($patternName, $matched);
+                    }
+                }
+            } catch (\Throwable) {
+                // Unavailable symbols or allocation errors retain the PHP path.
+            }
+        }
+
+        return $this->checkPhp($release, $textstring);
+    }
+
+    /** Build the same result for individual and fused native matches. */
+    public function fromNativeMatch(string $patternName, string $matched): NameFixResult
+    {
+        return NameFixResult::fromMatch(
+            newName: $matched,
+            method: $this->formatMethod($patternName),
+            checkerName: $this->getName(),
+            confidence: in_array($patternName, ['UHD_HDR', 'UHD_REMUX', 'STREAMING_4K'], true) ? 0.95 : ($patternName === 'GENERIC' ? 0.70 : 0.85),
+        );
+    }
+
+    /**
+     * Original PCRE implementation, also used when Rust declines an input.
+     */
+    public function checkPhp(object $release, string $textstring): ?NameFixResult
     {
         // Try 4K/UHD patterns first (most specific and modern)
         foreach (MoviePatterns::get4KPatterns() as $patternName => $pattern) {

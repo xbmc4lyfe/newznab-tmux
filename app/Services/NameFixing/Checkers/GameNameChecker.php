@@ -6,6 +6,9 @@ namespace App\Services\NameFixing\Checkers;
 
 use App\Services\NameFixing\Data\NameFixResult;
 use App\Services\NameFixing\Patterns\GamePatterns;
+use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
 
 /**
  * Name checker for Game releases.
@@ -15,6 +18,30 @@ use App\Services\NameFixing\Patterns\GamePatterns;
  */
 class GameNameChecker extends AbstractNameChecker
 {
+    private const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_name_check_tv(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_name_check_movie(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_name_check_game(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_name_check_app(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        C;
+
+    private static bool $ffiResolved = false;
+
+    private static ?FFI $defaultFfi = null;
+
+    private static ?CData $defaultBuf = null;
+
+    private static int $defaultCap = 0;
+
+    /**
+     * Rust remains opt-in: paired caller benchmarks did not meet the 1.5x
+     * common-path and uncommon p99 gate. PHP remains the production default.
+     */
+    public function __construct(
+        private readonly ?string $libraryPath = null,
+        private readonly bool $useRust = false,
+    ) {}
+
     protected int $priority = 30;
 
     protected string $name = 'Game';
@@ -53,6 +80,76 @@ class GameNameChecker extends AbstractNameChecker
      * Override to handle special cases like OUTLAWS group naming.
      */
     public function check(object $release, string $textstring): ?NameFixResult
+    {
+        // Subclasses may customize pattern order or result formatting.
+        if (! $this->useRust || get_class($this) !== self::class) {
+            return $this->checkPhp($release, $textstring);
+        }
+
+        if ($this->libraryPath !== null) {
+            $ffi = RustPipelineLibrary::resolveDomain('name_checkers', self::FFI_CDEF, $this->libraryPath);
+        } else {
+            if (! self::$ffiResolved) {
+                self::$defaultFfi = RustPipelineLibrary::resolveDomain('name_checkers', self::FFI_CDEF);
+                if (self::$defaultFfi !== null) {
+                    self::$defaultBuf = RustPipelineLibrary::obtainScratch(self::$defaultFfi, 4096, self::$defaultCap);
+                }
+                self::$ffiResolved = true;
+            }
+            $ffi = self::$defaultFfi;
+        }
+
+        if ($ffi !== null) {
+            try {
+                $len = strlen($textstring);
+                if ($this->libraryPath === null && self::$defaultBuf !== null && $len + 64 <= self::$defaultCap) {
+                    $buf = self::$defaultBuf;
+                    $cap = self::$defaultCap;
+                } else {
+                    $cap = 0;
+                    $buf = RustPipelineLibrary::obtainScratch($ffi, $len + 64, $cap);
+                }
+                if ($buf !== null) {
+                    // @phpstan-ignore method.notFound
+                    $written = $ffi->nntmux_name_check_game($textstring, $len, $buf, $cap);
+                    if ($written === 0) {
+                        return null;
+                    }
+                    if ($written > 0) {
+                        [$patternName, $matched] = explode("\0", FFI::string($buf, $written), 2);
+
+                        return $this->fromNativeMatch($patternName, $matched);
+                    }
+                }
+            } catch (\Throwable) {
+                // Unavailable symbols or allocation errors retain the PHP path.
+            }
+        }
+
+        return $this->checkPhp($release, $textstring);
+    }
+
+    /** Build the same result for individual and fused native matches. */
+    public function fromNativeMatch(string $patternName, string $matched): NameFixResult
+    {
+        if ($patternName === 'OUTLAWS') {
+            $matched = str_replace('OUTLAWS', 'PC GAME OUTLAWS', $matched);
+        } elseif ($patternName === 'ALIAS') {
+            $matched = str_replace('-ALiAS', ' PC GAME ALiAS', $matched);
+        }
+
+        return NameFixResult::fromMatch(
+            newName: $matched,
+            method: $this->formatMethod($patternName),
+            checkerName: $this->getName(),
+            confidence: in_array($patternName, ['MODERN_CONSOLE', 'REGION_CONSOLE', 'CONSOLE_SCENE_GROUP'], true) ? 0.90 : 0.85,
+        );
+    }
+
+    /**
+     * Original PCRE implementation, also used when Rust declines an input.
+     */
+    public function checkPhp(object $release, string $textstring): ?NameFixResult
     {
         // Try console patterns first
         foreach (GamePatterns::getConsolePatterns() as $patternName => $pattern) {
