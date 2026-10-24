@@ -18581,3 +18581,316 @@ pub mod media_browse_controllers {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// BookPipe, ConsolePipe, MoviePipe, MusicPipe and TvPipe specification helpers
+// ---------------------------------------------------------------------------
+
+/// Wave 27.3: content categorization pipe specification helpers.
+///
+/// Backs the `*Native()` helpers on `BookPipe`, `ConsolePipe`, `MoviePipe`, `MusicPipe` and
+/// `TvPipe`: the pipe name, its pipeline priority and the category-result evaluation mask.
+/// The name export returns the number of bytes written, `-1` for invalid arguments or a
+/// caught panic, and `-(required capacity)` (never `-1`) without writing when `out_cap` is
+/// too small. The priority and evaluation exports return `-1` for invalid arguments.
+pub mod categorization_pipes_spec {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::ptr;
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+
+    pub const KIND_BOOK: u8 = 0;
+    pub const KIND_CONSOLE: u8 = 1;
+    pub const KIND_MOVIE: u8 = 2;
+    pub const KIND_MUSIC: u8 = 3;
+    pub const KIND_TV: u8 = 4;
+
+    /// The result passes `CategorizationResult::isSuccessful()`.
+    pub const RESULT_SUCCESSFUL: i32 = 1;
+    /// The category id lies in the pipe's `<root>..=<root + 999>` category family.
+    pub const RESULT_IN_DOMAIN: i32 = 2;
+    /// The confidence reaches the `CategorizationPassable` stop threshold (`>= 0.95`).
+    pub const RESULT_TERMINAL: i32 = 4;
+
+    pub const CATEGORY_OTHER_MISC: i64 = 10;
+    pub const STOP_CONFIDENCE: f64 = 0.95;
+
+    /// `(name, priority, category root)` for a pipe kind.
+    #[inline]
+    pub fn spec(kind: u8) -> Option<(&'static [u8], i64, i64)> {
+        match kind {
+            KIND_BOOK => Some((b"Book", 45, 7000)),
+            KIND_CONSOLE => Some((b"Console", 35, 1000)),
+            KIND_MOVIE => Some((b"Movie", 25, 2000)),
+            KIND_MUSIC => Some((b"Music", 40, 3000)),
+            KIND_TV => Some((b"TV", 20, 5000)),
+            _ => None,
+        }
+    }
+
+    /// Mirrors the PHP `evaluateResultPhp()` mask, including NaN handling
+    /// (`NAN <= 0` and `NAN >= 0.95` are both false in PHP and Rust).
+    #[inline]
+    pub fn evaluate_result(
+        kind: u8,
+        category_id: i64,
+        confidence: f64,
+        matched_by: &[u8],
+    ) -> Option<i32> {
+        let (_, _, root) = spec(kind)?;
+        let mut mask = 0;
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
+        let positive = !(confidence <= 0.0);
+        if positive && !(category_id == CATEGORY_OTHER_MISC && matched_by == b"no_match") {
+            mask |= RESULT_SUCCESSFUL;
+        }
+        if (root..=root + 999).contains(&category_id) {
+            mask |= RESULT_IN_DOMAIN;
+        }
+        if confidence >= STOP_CONFIDENCE {
+            mask |= RESULT_TERMINAL;
+        }
+        Some(mask)
+    }
+
+    #[inline]
+    unsafe fn valid_in<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null() || len > isize::MAX as usize || (ptr as usize).checked_add(len).is_none() {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out(ptr: *mut u8, len: usize) -> bool {
+        !ptr.is_null()
+            && ptr.is_aligned()
+            && len <= isize::MAX as usize
+            && (ptr as usize).checked_add(len).is_some()
+    }
+
+    #[inline]
+    fn required(total: usize) -> isize {
+        // `-1` is reserved for DECLINE, so a one-byte requirement reports `-2`.
+        if total <= 1 { -2 } else { -(total as isize) }
+    }
+
+    /// Backs `<Pipe>::pipeNameNative()`.
+    ///
+    /// # Safety
+    ///
+    /// `out_buf` must be writable for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_categorize_pipes_spec_name(
+        kind: u8,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some((name, _, _)) = spec(kind) else {
+                return DECLINE;
+            };
+            if name.len() > out_cap {
+                return required(name.len());
+            }
+            unsafe { ptr::copy_nonoverlapping(name.as_ptr(), out_buf, name.len()) };
+            name.len() as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `<Pipe>::pipePriorityNative()`; returns `-1` for an unknown kind.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_categorize_pipes_spec_priority(kind: u8) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            spec(kind).map_or(-1, |(_, priority, _)| priority)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Backs `<Pipe>::evaluateResultNative()`.
+    ///
+    /// Returns the `RESULT_*` bit mask, or `-1` for an unknown kind or invalid input.
+    ///
+    /// # Safety
+    ///
+    /// `matched_by_ptr` must be readable for `matched_by_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_categorize_pipes_spec_evaluate_result(
+        kind: u8,
+        category_id: i64,
+        confidence: f64,
+        matched_by_ptr: *const u8,
+        matched_by_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(matched_by) = (unsafe { valid_in(matched_by_ptr, matched_by_len) }) else {
+                return -1;
+            };
+            evaluate_result(kind, category_id, confidence, matched_by).unwrap_or(-1)
+        }))
+        .unwrap_or(-1)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn name(kind: u8, cap: usize) -> (isize, Vec<u8>) {
+            let mut buf = vec![b'Z'; cap.max(1)];
+            let rc = unsafe { nntmux_categorize_pipes_spec_name(kind, buf.as_mut_ptr(), cap) };
+            (rc, buf)
+        }
+
+        fn evaluate(kind: u8, category_id: i64, confidence: f64, matched_by: &[u8]) -> i32 {
+            unsafe {
+                nntmux_categorize_pipes_spec_evaluate_result(
+                    kind,
+                    category_id,
+                    confidence,
+                    matched_by.as_ptr(),
+                    matched_by.len(),
+                )
+            }
+        }
+
+        #[test]
+        fn names_and_priorities_match_the_php_pipes() {
+            let expected: [(u8, &[u8], i64); 5] = [
+                (KIND_BOOK, b"Book", 45),
+                (KIND_CONSOLE, b"Console", 35),
+                (KIND_MOVIE, b"Movie", 25),
+                (KIND_MUSIC, b"Music", 40),
+                (KIND_TV, b"TV", 20),
+            ];
+            for (kind, label, priority) in expected {
+                let (rc, buf) = name(kind, 16);
+                assert_eq!(rc, label.len() as isize);
+                assert_eq!(&buf[..label.len()], label);
+                assert_eq!(nntmux_categorize_pipes_spec_priority(kind), priority);
+            }
+            assert_eq!(nntmux_categorize_pipes_spec_priority(5), -1);
+            assert_eq!(nntmux_categorize_pipes_spec_priority(u8::MAX), -1);
+            assert_eq!(name(5, 16).0, DECLINE);
+        }
+
+        #[test]
+        fn name_reports_capacity_without_writing() {
+            let (rc, buf) = name(KIND_CONSOLE, 4);
+            assert_eq!(rc, -7);
+            assert_eq!(buf, b"ZZZZ");
+            let (rc, buf) = name(KIND_TV, 1);
+            assert_eq!(rc, -2);
+            assert_eq!(buf, b"Z");
+            assert_eq!(name(KIND_TV, 0).0, -2);
+            let (rc, buf) = name(KIND_TV, 2);
+            assert_eq!(rc, 2);
+            assert_eq!(buf, b"TV");
+        }
+
+        #[test]
+        fn name_rejects_invalid_buffers() {
+            let mut buf = [0u8; 8];
+            unsafe {
+                assert_eq!(
+                    nntmux_categorize_pipes_spec_name(KIND_BOOK, ptr::null_mut(), 8),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_categorize_pipes_spec_name(KIND_BOOK, buf.as_mut_ptr(), usize::MAX),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_categorize_pipes_spec_name(
+                        KIND_BOOK,
+                        buf.as_mut_ptr(),
+                        isize::MAX as usize + 1
+                    ),
+                    DECLINE
+                );
+            }
+            assert_eq!(buf, [0u8; 8]);
+        }
+
+        #[test]
+        fn evaluation_masks() {
+            let all = RESULT_SUCCESSFUL | RESULT_IN_DOMAIN | RESULT_TERMINAL;
+            assert_eq!(evaluate(KIND_BOOK, 7020, 0.95, b"ebook"), all);
+            assert_eq!(
+                evaluate(KIND_BOOK, 7020, 0.9499999, b"ebook"),
+                RESULT_SUCCESSFUL | RESULT_IN_DOMAIN
+            );
+            assert_eq!(evaluate(KIND_BOOK, 6999, 0.5, b"x"), RESULT_SUCCESSFUL);
+            assert_eq!(
+                evaluate(KIND_BOOK, 7999, 0.5, b"x"),
+                RESULT_SUCCESSFUL | RESULT_IN_DOMAIN
+            );
+            assert_eq!(evaluate(KIND_BOOK, 8000, 0.5, b"x"), RESULT_SUCCESSFUL);
+            assert_eq!(evaluate(KIND_CONSOLE, 1000, 0.0, b"x"), RESULT_IN_DOMAIN);
+            assert_eq!(evaluate(KIND_MOVIE, 2045, -0.0, b"x"), RESULT_IN_DOMAIN);
+            assert_eq!(evaluate(KIND_MUSIC, 10, 0.0, b"no_match"), 0);
+            assert_eq!(evaluate(KIND_MUSIC, 10, 1.0, b"no_match"), RESULT_TERMINAL);
+            assert_eq!(
+                evaluate(KIND_MUSIC, 10, 1.0, b"no_match\0"),
+                RESULT_SUCCESSFUL | RESULT_TERMINAL
+            );
+            assert_eq!(
+                evaluate(KIND_MUSIC, 11, 0.1, b"no_match"),
+                RESULT_SUCCESSFUL
+            );
+            assert_eq!(
+                evaluate(KIND_TV, 5070, f64::NAN, b""),
+                RESULT_SUCCESSFUL | RESULT_IN_DOMAIN
+            );
+            assert_eq!(
+                evaluate(KIND_TV, i64::MAX, f64::INFINITY, b""),
+                RESULT_SUCCESSFUL | RESULT_TERMINAL
+            );
+            assert_eq!(evaluate(KIND_TV, i64::MIN, f64::NEG_INFINITY, b""), 0);
+            assert_eq!(evaluate(9, 5070, 1.0, b""), -1);
+        }
+
+        #[test]
+        fn evaluation_rejects_invalid_input() {
+            unsafe {
+                assert_eq!(
+                    nntmux_categorize_pipes_spec_evaluate_result(
+                        KIND_TV,
+                        5000,
+                        1.0,
+                        ptr::null(),
+                        0
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_categorize_pipes_spec_evaluate_result(
+                        KIND_TV,
+                        5000,
+                        1.0,
+                        b"x".as_ptr(),
+                        usize::MAX
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_categorize_pipes_spec_evaluate_result(
+                        KIND_TV,
+                        5000,
+                        1.0,
+                        b"x".as_ptr(),
+                        isize::MAX as usize + 1
+                    ),
+                    -1
+                );
+            }
+        }
+    }
+}
