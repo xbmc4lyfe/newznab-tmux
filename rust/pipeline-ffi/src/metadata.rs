@@ -5203,6 +5203,939 @@ pub unsafe extern "C" fn nntmux_par2_relate_nzb_file_prefixes(
     unsafe { par2_emit(out_buf, out_cap, &out) }
 }
 
+// ---- CompactFingerprintCollector helpers ------------------------------------
+
+const COMPACT_FP_SAMPLE_LIMIT: usize = 12;
+const COMPACT_FP_LARGEST_FILES_SAMPLED: usize = 3;
+const COMPACT_FP_MAX_LISTED_FILES: usize = 200;
+const COMPACT_FP_MAX_NAME_LENGTH: usize = 120;
+const COMPACT_FP_MAX_LISTED_GROUPS: usize = 20;
+
+#[inline]
+fn php_trim_bytes(bytes: &[u8]) -> &[u8] {
+    let mut start = 0;
+    let mut end = bytes.len();
+    while start < end && is_php_trim_byte(bytes[start]) {
+        start += 1;
+    }
+    while end > start && is_php_trim_byte(bytes[end - 1]) {
+        end -= 1;
+    }
+    &bytes[start..end]
+}
+
+/// `CompactFingerprintCollector::subjectFilename`:
+/// `preg_match('/"([^"]+)"/', $subject, $match) === 1 ? $match[1] : $subject`.
+#[inline]
+fn compact_fp_subject_filename(subject: &[u8]) -> &[u8] {
+    let mut prev_quote: Option<usize> = None;
+    for (i, &b) in subject.iter().enumerate() {
+        if b == b'"' {
+            if let Some(q) = prev_quote
+                && i > q + 1
+            {
+                return &subject[q + 1..i];
+            }
+            prev_quote = Some(i);
+        }
+    }
+    subject
+}
+
+/// `CompactFingerprintCollector::bounded` on valid UTF-8 input.
+/// Returns `None` when `bytes` is not valid UTF-8 so PHP can run `mb_convert_encoding`.
+#[inline]
+fn compact_fp_bounded(bytes: &[u8]) -> Option<&[u8]> {
+    let s = str::from_utf8(bytes).ok()?;
+    if s.len() <= COMPACT_FP_MAX_NAME_LENGTH {
+        return Some(bytes);
+    }
+    let mut end = COMPACT_FP_MAX_NAME_LENGTH;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(&bytes[..end])
+}
+
+#[inline]
+fn compact_fp_bounded_node<'a>(node: Option<&PhpNode<'a>>) -> Option<Option<Cow<'a, [u8]>>> {
+    let Some(node) = node else {
+        return Some(None);
+    };
+    match node.val {
+        PhpVal::Str(s) => compact_fp_bounded(s).map(|b| Some(Cow::Borrowed(b))),
+        PhpVal::Int(i) => Some(Some(Cow::Owned(i.to_string().into_bytes()))),
+        _ => Some(None),
+    }
+}
+
+/// Accelerates `CompactFingerprintCollector::subjectFilename` and `CompactFingerprintCollector::bounded`.
+///
+/// - `mode = 0`: `subjectFilename(input)`
+/// - `mode = 1`: `bounded(input)`
+/// - `mode = 2`: `bounded(subjectFilename(input))`
+/// - `mode = 3`: NUL-separated batch of `bounded(subjectFilename(part))`
+///
+/// Returns the output byte length (`>= 0`), `-(required)` when `out_cap` is too small,
+/// or `-1` when the input contains invalid UTF-8 and must be handled by PHP.
+///
+/// # Safety
+///
+/// `input` must be valid for `input_len` bytes when `input_len > 0`; `out_buf` must be valid for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_compact_fp_subject_filename_bounded(
+    input: *const u8,
+    input_len: usize,
+    mode: u32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input.is_null() && input_len > 0 {
+        return PAR2_FALLBACK;
+    }
+    let data: &[u8] = if input_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(input, input_len) }
+    };
+    match mode {
+        0 => {
+            let res = compact_fp_subject_filename(data);
+            unsafe { par2_emit(out_buf, out_cap, res) }
+        }
+        1 => {
+            let Some(res) = compact_fp_bounded(data) else {
+                return PAR2_FALLBACK;
+            };
+            unsafe { par2_emit(out_buf, out_cap, res) }
+        }
+        2 => {
+            let Some(res) = compact_fp_bounded(compact_fp_subject_filename(data)) else {
+                return PAR2_FALLBACK;
+            };
+            unsafe { par2_emit(out_buf, out_cap, res) }
+        }
+        3 => {
+            let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+            for (idx, part) in data.split(|&b| b == 0).enumerate() {
+                if idx > 0 {
+                    out.push(0);
+                }
+                let Some(bounded) = compact_fp_bounded(compact_fp_subject_filename(part)) else {
+                    return PAR2_FALLBACK;
+                };
+                out.extend(bounded);
+            }
+            out.finish()
+        }
+        _ => PAR2_FALLBACK,
+    }
+}
+
+/// Accelerates `CompactFingerprintCollector::verifiedPartPrefixMd5`.
+///
+/// Returns `32` with the lowercase hex MD5 written to `out_buf`, `0` when ineligible (`null`),
+/// or `-32` when `out_cap < 32`.
+///
+/// # Safety
+///
+/// `decoded` must be valid for `decoded_len` bytes when `decoded_len > 0`;
+/// `out_buf` must be valid for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_compact_fp_verified_part_prefix_md5(
+    decoded: *const u8,
+    decoded_len: usize,
+    file_size: i64,
+    begin: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if file_size < 1 || begin != 1 {
+        return 0;
+    }
+    let length = usize::try_from(file_size.min(16_384)).unwrap_or(0);
+    if length == 0 || decoded.is_null() || decoded_len < length {
+        return 0;
+    }
+    if out_buf.is_null() || out_cap < 32 {
+        return -32;
+    }
+    let bytes = unsafe { slice::from_raw_parts(decoded, length) };
+    let hex = crate::md5_hex_slice(bytes);
+    unsafe { par2_emit(out_buf, out_cap, &hex) }
+}
+
+fn compact_fp_select_samples(doc: &PhpNode<'_>) -> Option<Vec<u8>> {
+    struct SampleFile<'n, 'a> {
+        index: i64,
+        kind: &'a [u8],
+        file_bytes: i64,
+        segments: &'n [(PhpKey<'a>, PhpNode<'a>)],
+    }
+
+    if !doc.is_arr() {
+        return None;
+    }
+    let mut par2_files: Vec<SampleFile<'_, '_>> = Vec::new();
+    let mut data_files: Vec<SampleFile<'_, '_>> = Vec::new();
+
+    for (_, file) in doc.items() {
+        if !file.is_arr() {
+            return None;
+        }
+        let Some(segments_node) = file.coalesce(b"segments") else {
+            continue;
+        };
+        if !segments_node.is_arr() || segments_node.items().is_empty() {
+            continue;
+        }
+        let segments = segments_node.items();
+        for (expected_idx, (k, seg)) in segments.iter().enumerate() {
+            if !matches!(k, PhpKey::Int(i) if *i == expected_idx as i64) || !seg.is_arr() {
+                return None;
+            }
+        }
+        let index = file.get(b"index").and_then(PhpNode::as_int)?;
+        let kind: &[u8] = match file.coalesce(b"kind") {
+            None => b"",
+            Some(n) => n.as_str()?,
+        };
+        let file_bytes = file
+            .get(b"advertised_bytes")
+            .and_then(PhpNode::as_int)
+            .unwrap_or(0);
+        let entry = SampleFile {
+            index,
+            kind,
+            file_bytes,
+            segments,
+        };
+        if kind == b"par2" {
+            par2_files.push(entry);
+        } else {
+            data_files.push(entry);
+        }
+    }
+
+    par2_files.sort_by(|a, b| (a.file_bytes, a.index).cmp(&(b.file_bytes, b.index)));
+    data_files.sort_by(|a, b| {
+        b.file_bytes
+            .cmp(&a.file_bytes)
+            .then_with(|| a.index.cmp(&b.index))
+    });
+
+    let mut candidates: Vec<(&SampleFile<'_, '_>, usize, &'static [u8])> =
+        Vec::with_capacity(par2_files.len() + data_files.len() * 3);
+    if let Some(first_par2) = par2_files.first() {
+        candidates.push((first_par2, 0, b"par2"));
+    }
+    for file in data_files.iter().take(COMPACT_FP_LARGEST_FILES_SAMPLED) {
+        let last = file.segments.len() - 1;
+        candidates.push((file, 0, b"first"));
+        if last > 1 {
+            candidates.push((file, last / 2, b"middle"));
+        }
+        if last > 0 {
+            candidates.push((file, last, b"last"));
+        }
+    }
+    for file in par2_files.iter().skip(1).take(1) {
+        candidates.push((file, 0, b"first"));
+    }
+    for file in data_files.iter().skip(COMPACT_FP_LARGEST_FILES_SAMPLED) {
+        candidates.push((file, 0, b"first"));
+    }
+    for file in par2_files.iter().skip(2) {
+        candidates.push((file, 0, b"first"));
+    }
+
+    let mut seen: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    let mut samples_buf = PhpSerWriter::new();
+    let mut sample_count = 0usize;
+    let mut omitted = 0i64;
+
+    for (file, position, role) in candidates {
+        let seg = &file.segments[position].1;
+        let msg_id: &[u8] = match seg.coalesce(b"messageid") {
+            None => b"",
+            Some(n) => n.as_str()?,
+        };
+        if msg_id.is_empty() || !seen.insert(msg_id) {
+            continue;
+        }
+        if sample_count >= COMPACT_FP_SAMPLE_LIMIT {
+            omitted += 1;
+            continue;
+        }
+        let seg_num = match seg.coalesce(b"number") {
+            None => 0,
+            Some(n) => n.as_int()?,
+        };
+        samples_buf.idx(sample_count);
+        samples_buf.arr_open(5);
+        samples_buf.key(b"file_index");
+        samples_buf.int(file.index);
+        samples_buf.key(b"kind");
+        samples_buf.str(file.kind);
+        samples_buf.key(b"segment_number");
+        samples_buf.int(seg_num);
+        samples_buf.key(b"messageid");
+        samples_buf.str(msg_id);
+        samples_buf.key(b"role");
+        samples_buf.str(role);
+        samples_buf.arr_close();
+        sample_count += 1;
+    }
+
+    let mut w = PhpSerWriter::new();
+    w.arr_open(2);
+    w.idx(0);
+    w.arr_open(sample_count);
+    w.raw(&samples_buf.buf);
+    w.arr_close();
+    w.idx(1);
+    w.int(omitted);
+    w.arr_close();
+    Some(w.buf)
+}
+
+/// Accelerates `CompactFingerprintCollector::selectSamples` over `serialize($files)`.
+///
+/// Returns the serialized `[$samples, $omitted]` length, `-(required)` when `out_cap` is too small,
+/// or `-1` when PHP must evaluate the input itself.
+///
+/// # Safety
+///
+/// `input` must be valid for `input_len` bytes; `out_buf` must be valid for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_compact_fp_select_samples(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(data) = (unsafe { par2_input(input, input_len) }) else {
+        return PAR2_FALLBACK;
+    };
+    let Some(out) = PhpSerParser::parse_document(data)
+        .as_ref()
+        .and_then(compact_fp_select_samples)
+    else {
+        return PAR2_FALLBACK;
+    };
+    unsafe { par2_emit(out_buf, out_cap, &out) }
+}
+
+fn format_utc_iso8601(ts: i64) -> Option<[u8; 20]> {
+    if !(1..=253_402_300_799).contains(&ts) {
+        return None;
+    }
+    let days = ts.div_euclid(86_400);
+    let secs = ts.rem_euclid(86_400);
+    let hour = (secs / 3600) as u32;
+    let min = ((secs % 3600) / 60) as u32;
+    let sec = (secs % 60) as u32;
+
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = (if m <= 2 { y + 1 } else { y }) as u32;
+
+    let mut out = [0u8; 20];
+    out[0] = b'0' + ((year / 1000) % 10) as u8;
+    out[1] = b'0' + ((year / 100) % 10) as u8;
+    out[2] = b'0' + ((year / 10) % 10) as u8;
+    out[3] = b'0' + (year % 10) as u8;
+    out[4] = b'-';
+    out[5] = b'0' + (m / 10) as u8;
+    out[6] = b'0' + (m % 10) as u8;
+    out[7] = b'-';
+    out[8] = b'0' + (d / 10) as u8;
+    out[9] = b'0' + (d % 10) as u8;
+    out[10] = b'T';
+    out[11] = b'0' + (hour / 10) as u8;
+    out[12] = b'0' + (hour % 10) as u8;
+    out[13] = b':';
+    out[14] = b'0' + (min / 10) as u8;
+    out[15] = b'0' + (min % 10) as u8;
+    out[16] = b':';
+    out[17] = b'0' + (sec / 10) as u8;
+    out[18] = b'0' + (sec % 10) as u8;
+    out[19] = b'Z';
+    Some(out)
+}
+
+fn compact_fp_summarize_files(doc: &PhpNode<'_>) -> Option<Vec<u8>> {
+    let [(_, manifest), (_, first_prefix_md5)] = doc.items() else {
+        return None;
+    };
+    if !manifest.is_arr() || !first_prefix_md5.is_arr() {
+        return None;
+    }
+    let files_node = manifest.get(b"files").filter(|n| n.is_arr())?;
+    let manifest_file_count = manifest.get(b"file_count").and_then(PhpNode::as_int)?;
+
+    let mut md5_by_index: std::collections::HashMap<i64, &[u8]> = std::collections::HashMap::new();
+    for (k, v) in first_prefix_md5.items() {
+        let PhpKey::Int(idx) = k else {
+            return None;
+        };
+        match v.val {
+            PhpVal::Null => {}
+            PhpVal::Str(s) => {
+                md5_by_index.insert(*idx, s);
+            }
+            _ => return None,
+        }
+    }
+
+    let mut raw_groups: Vec<Vec<u8>> = Vec::new();
+    let mut posters: Vec<(&[u8], usize)> = Vec::new();
+    let mut segments: i64 = 0;
+    let mut bytes: Option<i64> = Some(0);
+    let mut kinds: std::collections::BTreeMap<&[u8], i64> = std::collections::BTreeMap::new();
+    let mut min_date: Option<i64> = None;
+    let mut max_date: Option<i64> = None;
+    let mut invalid_files: i64 = 0;
+
+    for (_, file) in files_node.items() {
+        if !file.is_arr() {
+            return None;
+        }
+        if let Some(groups_node) = file.coalesce(b"groups") {
+            if !groups_node.is_arr() {
+                return None;
+            }
+            for (_, g) in groups_node.items() {
+                let g_str = g.as_str()?;
+                if php_maybe_numeric(g_str) {
+                    return None;
+                }
+                if !raw_groups.iter().any(|existing| existing.as_slice() == g_str) {
+                    raw_groups.push(g_str.to_vec());
+                }
+            }
+        }
+        let poster: &[u8] = match file.coalesce(b"poster") {
+            None => b"",
+            Some(n) => n.as_str()?,
+        };
+        if !poster.is_empty() {
+            if php_maybe_numeric(poster) {
+                return None;
+            }
+            if let Some(entry) = posters.iter_mut().find(|(p, _)| *p == poster) {
+                entry.1 += 1;
+            } else {
+                posters.push((poster, 1));
+            }
+        }
+        let seg_count = match file.coalesce(b"segment_count") {
+            None => 0,
+            Some(n) => n.as_int()?,
+        };
+        segments = segments.checked_add(seg_count)?;
+
+        let file_bytes = file.get(b"advertised_bytes").and_then(PhpNode::as_int);
+        bytes = match (bytes, file_bytes) {
+            (Some(total), Some(fb)) if fb >= 0 && fb <= i64::MAX - total => Some(total + fb),
+            (Some(_), Some(fb)) if fb < 0 => return None,
+            _ => None,
+        };
+
+        let kind: &[u8] = match file.coalesce(b"kind") {
+            None => b"other",
+            Some(n) => n.as_str()?,
+        };
+        if php_maybe_numeric(kind) {
+            return None;
+        }
+        *kinds.entry(kind).or_insert(0) += 1;
+
+        if let Some(d) = file.get(b"date").and_then(PhpNode::as_int)
+            && d > 0
+        {
+            min_date = Some(min_date.map_or(d, |cur| cur.min(d)));
+            max_date = Some(max_date.map_or(d, |cur| cur.max(d)));
+        }
+
+        let inv_rec = match file.coalesce(b"invalid_segment_record_count") {
+            None => 0,
+            Some(n) => n.as_int()?,
+        };
+        let inv_meta = match file.coalesce(b"invalid_segment_metadata_count") {
+            None => 0,
+            Some(n) => n.as_int()?,
+        };
+        let dup_msg = match file.coalesce(b"duplicate_message_id_count") {
+            None => 0,
+            Some(n) => n.as_int()?,
+        };
+        let dup_num = match file.coalesce(b"duplicate_segment_number_count") {
+            None => 0,
+            Some(n) => n.as_int()?,
+        };
+        let seq_invalid = opt_is_false(file.get(b"segment_number_sequence_valid"));
+        let overflow = opt_is_true(file.get(b"advertised_bytes_overflow"));
+        if inv_rec > 0 || inv_meta > 0 || dup_msg > 0 || dup_num > 0 || seq_invalid || overflow {
+            invalid_files += 1;
+        }
+    }
+
+    let sorted_groups = php_unique_sorted(raw_groups)?;
+    let group_count = sorted_groups.len();
+    let listed_group_count = group_count.min(COMPACT_FP_MAX_LISTED_GROUPS);
+    let mut bounded_groups: Vec<&[u8]> = Vec::with_capacity(listed_group_count);
+    for g in sorted_groups.iter().take(listed_group_count) {
+        bounded_groups.push(compact_fp_bounded(g)?);
+    }
+
+    let best_poster: Option<&[u8]> = posters
+        .iter()
+        .fold(None::<(&[u8], usize)>, |best, &(p, c)| match best {
+            None => Some((p, c)),
+            Some((_, best_c)) if c > best_c => Some((p, c)),
+            Some(cur) => Some(cur),
+        })
+        .map(|(p, _)| p);
+    let bounded_poster = match best_poster {
+        Some(p) => Some(compact_fp_bounded(p)?),
+        None => None,
+    };
+
+    let mut file_rows_buf = PhpSerWriter::new();
+    let mut file_row_count = 0usize;
+    for (_, file) in files_node.items().iter().take(COMPACT_FP_MAX_LISTED_FILES) {
+        let index = file.get(b"index").and_then(PhpNode::as_int)?;
+        let subject: &[u8] = match file.coalesce(b"subject") {
+            None => b"",
+            Some(n) => n.as_str()?,
+        };
+        let name = compact_fp_bounded(compact_fp_subject_filename(subject))?;
+        let size = file.get(b"advertised_bytes").and_then(PhpNode::as_int);
+        let first16k_md5 = md5_by_index.get(&index).copied();
+        let format_hint = match file.coalesce(b"format_hint") {
+            None => None,
+            Some(n) => Some(n.as_str()?),
+        };
+
+        file_rows_buf.idx(file_row_count);
+        file_rows_buf.arr_open(5);
+        file_rows_buf.key(b"file_index");
+        file_rows_buf.int(index);
+        file_rows_buf.key(b"name");
+        file_rows_buf.str(name);
+        file_rows_buf.key(b"size");
+        file_rows_buf.opt_int(size);
+        file_rows_buf.key(b"first16k_md5");
+        file_rows_buf.opt_str(first16k_md5);
+        file_rows_buf.key(b"format_hint");
+        file_rows_buf.opt_str(format_hint);
+        file_rows_buf.arr_close();
+        file_row_count += 1;
+    }
+
+    let totals_valid_flag = !opt_is_false(manifest.get(b"advertised_byte_totals_valid"));
+    let total_invalid = !totals_valid_flag || bytes.is_none();
+    let invalid_file_count = if invalid_files == 0 && total_invalid {
+        1
+    } else {
+        invalid_files
+    };
+
+    let mut w = PhpSerWriter::new();
+    w.arr_open(5);
+    w.key(b"nzb");
+    w.arr_open(6);
+    w.key(b"file_count");
+    w.int(manifest_file_count);
+    w.key(b"segment_count");
+    w.int(segments);
+    w.key(b"total_bytes");
+    w.opt_int(bytes);
+    w.key(b"groups");
+    w.arr_open(bounded_groups.len());
+    for (i, g) in bounded_groups.iter().enumerate() {
+        w.idx(i);
+        w.str(g);
+    }
+    w.arr_close();
+    w.key(b"poster");
+    w.opt_str(bounded_poster);
+    w.key(b"kinds");
+    w.arr_open(kinds.len());
+    for (k, v) in &kinds {
+        w.key(k);
+        w.int(*v);
+    }
+    w.arr_close();
+    w.arr_close();
+
+    w.key(b"files");
+    w.arr_open(file_row_count);
+    w.raw(&file_rows_buf.buf);
+    w.arr_close();
+
+    w.key(b"posting");
+    if let (Some(first), Some(last)) = (min_date, max_date) {
+        let first_utc = format_utc_iso8601(first)?;
+        let last_utc = format_utc_iso8601(last)?;
+        w.arr_open(3);
+        w.key(b"first_utc");
+        w.str(&first_utc);
+        w.key(b"last_utc");
+        w.str(&last_utc);
+        w.key(b"span_s");
+        w.int(last - first);
+        w.arr_close();
+    } else {
+        w.null();
+    }
+
+    w.key(b"invalid_file_count");
+    w.int(invalid_file_count);
+    w.key(b"group_count");
+    w.int(group_count as i64);
+    w.arr_close();
+    Some(w.buf)
+}
+
+/// Accelerates `CompactFingerprintCollector::nzbSummary`, `nzbGroups`, `fileRows`, `posting`,
+/// and `manifestInvalidFileCount` over `serialize([$manifest, $firstPrefixMd5])`.
+///
+/// # Safety
+///
+/// `input` must be valid for `input_len` bytes; `out_buf` must be valid for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_compact_fp_summarize_files(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(data) = (unsafe { par2_input(input, input_len) }) else {
+        return PAR2_FALLBACK;
+    };
+    let Some(out) = PhpSerParser::parse_document(data)
+        .as_ref()
+        .and_then(compact_fp_summarize_files)
+    else {
+        return PAR2_FALLBACK;
+    };
+    unsafe { par2_emit(out_buf, out_cap, &out) }
+}
+
+fn pad_crc32_lower_8(raw: &[u8]) -> Vec<u8> {
+    let stripped = &raw[raw.iter().position(|&b| b != b'0').unwrap_or(raw.len())..];
+    let mut out = Vec::with_capacity(stripped.len().max(8));
+    if stripped.len() < 8 {
+        out.resize(8 - stripped.len(), b'0');
+    }
+    for &b in stripped {
+        out.push(b.to_ascii_lowercase());
+    }
+    out
+}
+
+fn parse_hex_u32_strict(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() || bytes.len() > 8 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let mut val = 0u32;
+    for &b in bytes {
+        val = (val << 4) | u32::from(hex_val(b)?);
+    }
+    Some(val)
+}
+
+fn compact_fp_part_without_trailer_part(yenc: &PhpNode<'_>) -> Option<bool> {
+    let trailer = yenc.get(b"trailer_fields").filter(|n| n.is_arr());
+    let header = yenc.get(b"header_fields").filter(|n| n.is_arr());
+    let declared = trailer.and_then(|t| t.coalesce(b"pcrc32"));
+    let observed = yenc.coalesce(b"observed_decoded_crc32");
+    let s0 = opt_str(yenc.get(b"multipart_structure_status"));
+    let s1 = opt_str(yenc.get(b"multipart_pcrc32_status"));
+    let unpadded_pcrc32 = declared
+        .and_then(PhpNode::as_str)
+        .is_some_and(|d| (1..=7).contains(&d.len()) && d.iter().all(u8::is_ascii_hexdigit));
+
+    let structure_ok = (s0 == Some(b"incomplete") && s1 == Some(b"present-hex"))
+        || (s0 == Some(b"invalid") && s1 == Some(b"malformed") && unpadded_pcrc32);
+    if !opt_is_true(yenc.get(b"multipart"))
+        || !structure_ok
+        || trailer.and_then(|t| t.get(b"part")).is_some()
+        || trailer.and_then(|t| t.get(b"total")).is_some()
+        || header.and_then(|h| h.coalesce(b"part")).is_none()
+        || header.and_then(|h| h.coalesce(b"size")).is_none()
+        || trailer.and_then(|t| t.coalesce(b"size")).is_none()
+        || !opt_int(yenc.get(b"part")).is_some_and(|p| p >= 1)
+        || !opt_is_true(yenc.get(b"ypart_range_valid"))
+        || !opt_is_true(yenc.get(b"header_numeric_fields_valid"))
+        || !opt_is_true(yenc.get(b"trailer_numeric_fields_valid"))
+    {
+        return Some(false);
+    }
+    let Some(declared_bytes) = declared.and_then(PhpNode::as_str) else {
+        return Some(false);
+    };
+    let declared_trimmed = php_trim_bytes(declared_bytes);
+    let Some(declared_u32) = parse_hex_u32_strict(declared_trimmed) else {
+        return Some(false);
+    };
+    let Some(observed_bytes) = observed.and_then(PhpNode::as_str) else {
+        return Some(false);
+    };
+    // If observed is a non-hex string, defer to PHP's hexdec() behavior.
+    let observed_u32 = parse_hex_u32_strict(observed_bytes)?;
+    Some(declared_u32 == observed_u32)
+}
+
+fn compact_fp_declared_crcs_contradict(yenc: &PhpNode<'_>) -> Option<bool> {
+    let observed_node = yenc.coalesce(b"observed_decoded_crc32");
+    if let Some(n) = observed_node
+        && !matches!(n.val, PhpVal::Str(_))
+    {
+        return None;
+    }
+    let observed = observed_node.and_then(PhpNode::as_str).unwrap_or(b"");
+    let trailer = yenc.get(b"trailer_fields").filter(|n| n.is_arr());
+    let fields: &[&[u8]] = if opt_is_true(yenc.get(b"multipart")) {
+        &[b"pcrc32"]
+    } else {
+        &[b"crc32", b"pcrc32"]
+    };
+    for &field in fields {
+        if let Some(declared) = trailer.and_then(|t| opt_str(t.get(field)))
+            && !observed.is_empty()
+            && pad_crc32_lower_8(php_trim_bytes(declared)) != pad_crc32_lower_8(observed)
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+fn compact_fp_empty_single_part(yenc: &PhpNode<'_>) -> bool {
+    let header = yenc.get(b"header_fields").filter(|n| n.is_arr());
+    for field in [&b"line"[..], b"part", b"total"] {
+        if let Some(val) = header.and_then(|h| h.get(field)) {
+            let valid = val.as_str().is_some_and(|s| {
+                (1..=19).contains(&s.len())
+                    && matches!(s[0], b'1'..=b'9')
+                    && s[1..].iter().all(u8::is_ascii_digit)
+            });
+            if !valid {
+                return false;
+            }
+        }
+    }
+    opt_is_false(yenc.get(b"multipart"))
+        && header.and_then(|h| opt_str(h.get(b"size"))) == Some(b"0")
+        && opt_int(yenc.get(b"decoded_segment_size")) == Some(0)
+        && opt_is_true(yenc.get(b"decoded_size_matches_yend_size"))
+}
+
+fn compact_fp_sizes_agree(yenc: &PhpNode<'_>) -> Option<bool> {
+    let c1 = yenc.get(b"decoded_size_matches_yend_size");
+    let c2 = yenc.get(if opt_is_true(yenc.get(b"multipart")) {
+        b"decoded_size_matches_ypart_range"
+    } else {
+        b"decoded_size_matches_yenc"
+    });
+    if opt_is_false(c1) || opt_is_false(c2) {
+        Some(false)
+    } else if opt_is_true(c1) && opt_is_true(c2) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+fn compact_fp_yenc_integrity(doc: &PhpNode<'_>) -> Option<Vec<u8>> {
+    if !doc.is_arr() {
+        let mut w = PhpSerWriter::new();
+        w.arr_open(6);
+        w.key(b"errors");
+        w.arr_open(1);
+        w.idx(0);
+        w.str(b"YencUnverified");
+        w.arr_close();
+        w.key(b"summary");
+        w.null();
+        w.key(b"part_without_trailer_part");
+        w.bool(false);
+        w.key(b"declared_crcs_contradict");
+        w.bool(false);
+        w.key(b"empty_single_part");
+        w.bool(false);
+        w.key(b"sizes_agree");
+        w.null();
+        w.arr_close();
+        return Some(w.buf);
+    }
+
+    let mut errors: Vec<&'static [u8]> = Vec::with_capacity(4);
+    if opt_is_false(doc.get(b"declared_crc32_matches")) {
+        errors.push(b"YencCrcMismatch");
+    }
+    for check in [
+        &b"decoded_size_matches_yenc"[..],
+        b"decoded_size_matches_ypart_range",
+        b"decoded_size_matches_yend_size",
+    ] {
+        if opt_is_false(doc.get(check)) {
+            errors.push(b"YencSizeMismatch");
+            break;
+        }
+    }
+    if opt_is_false(doc.get(b"payload_escape_state_valid")) {
+        errors.push(b"YencFramingInvalid");
+    }
+    let declared_crcs_contradict = compact_fp_declared_crcs_contradict(doc)?;
+    if declared_crcs_contradict && !errors.contains(&&b"YencCrcMismatch"[..]) {
+        errors.push(b"YencCrcMismatch");
+    }
+
+    let part_without_trailer_part = compact_fp_part_without_trailer_part(doc)?;
+    let empty_single_part = compact_fp_empty_single_part(doc);
+    let sizes_agree = compact_fp_sizes_agree(doc);
+
+    let checks: &[&[u8]] = if empty_single_part {
+        &[
+            b"decoded_size_matches_yenc",
+            b"decoded_size_matches_ypart_range",
+            b"ypart_range_valid",
+            b"header_numeric_fields_representable",
+            b"trailer_numeric_fields_valid",
+            b"trailer_numeric_fields_representable",
+            b"trailer_part_matches_header",
+            b"trailer_total_matches_header",
+        ]
+    } else {
+        &[
+            b"decoded_size_matches_yenc",
+            b"decoded_size_matches_ypart_range",
+            b"ypart_range_valid",
+            b"header_numeric_fields_valid",
+            b"header_numeric_fields_representable",
+            b"trailer_numeric_fields_valid",
+            b"trailer_numeric_fields_representable",
+            b"trailer_part_matches_header",
+            b"trailer_total_matches_header",
+        ]
+    };
+    let any_check_false = checks.iter().any(|&c| opt_is_false(doc.get(c)));
+    let conflicting_empty = match doc.get(b"conflicting_control_fields") {
+        Some(n) if n.is_arr() => n.items().is_empty(),
+        _ => true,
+    };
+
+    let verified = (opt_is_true(doc.get(b"declared_crc32_matches")) || part_without_trailer_part)
+        && !opt_is_false(doc.get(b"all_declared_crc32_fields_are_hex"))
+        && (sizes_agree == Some(true) || empty_single_part)
+        && (matches!(
+            opt_str(doc.get(b"multipart_structure_status")),
+            Some(b"single-part" | b"complete")
+        ) || part_without_trailer_part)
+        && opt_is_true(doc.get(b"payload_escape_state_valid"))
+        && !opt_is_true(doc.get(b"integrity_checks_ambiguous"))
+        && opt_is_true(doc.get(b"decoded_size_matches_yend_size"))
+        && !any_check_false
+        && conflicting_empty;
+
+    if !verified && errors.is_empty() {
+        errors.push(b"YencUnverified");
+    }
+
+    let bounded_name = compact_fp_bounded_node(doc.coalesce(b"name"))?;
+    let crc_ok: Option<bool> = match doc.get(b"declared_crc32_matches").map(|n| &n.val) {
+        Some(PhpVal::Bool(b)) => Some(*b),
+        _ => (errors.is_empty() && part_without_trailer_part).then_some(true),
+    };
+
+    let mut w = PhpSerWriter::new();
+    w.arr_open(6);
+    w.key(b"errors");
+    w.arr_open(errors.len());
+    for (i, err) in errors.iter().enumerate() {
+        w.idx(i);
+        w.str(err);
+    }
+    w.arr_close();
+
+    w.key(b"summary");
+    w.arr_open(8);
+    w.key(b"name");
+    w.opt_str(bounded_name.as_deref());
+    w.key(b"size");
+    w.opt_int(opt_int(doc.get(b"file_size")));
+    w.key(b"part");
+    w.opt_int(opt_int(doc.get(b"part")));
+    w.key(b"total");
+    w.opt_int(opt_int(doc.get(b"total_parts")));
+    w.key(b"begin");
+    w.opt_int(opt_int(doc.get(b"begin")));
+    w.key(b"end");
+    w.opt_int(opt_int(doc.get(b"end")));
+    w.key(b"crc_ok");
+    match crc_ok {
+        Some(b) => w.bool(b),
+        None => w.null(),
+    }
+    w.key(b"size_ok");
+    match sizes_agree {
+        Some(b) => w.bool(b),
+        None => w.null(),
+    }
+    w.arr_close();
+
+    w.key(b"part_without_trailer_part");
+    w.bool(part_without_trailer_part);
+    w.key(b"declared_crcs_contradict");
+    w.bool(declared_crcs_contradict);
+    w.key(b"empty_single_part");
+    w.bool(empty_single_part);
+    w.key(b"sizes_agree");
+    match sizes_agree {
+        Some(b) => w.bool(b),
+        None => w.null(),
+    }
+    w.arr_close();
+    Some(w.buf)
+}
+
+/// Accelerates `CompactFingerprintCollector::yencIntegrityErrors`, `yencSummary`,
+/// `partWithoutTrailerPart`, `declaredCrcsContradict`, `emptySinglePart`, and `sizesAgree`
+/// over `serialize($yenc)`.
+///
+/// # Safety
+///
+/// `input` must be valid for `input_len` bytes; `out_buf` must be valid for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_compact_fp_yenc_integrity(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(data) = (unsafe { par2_input(input, input_len) }) else {
+        return PAR2_FALLBACK;
+    };
+    let Some(out) = PhpSerParser::parse_document(data)
+        .as_ref()
+        .and_then(compact_fp_yenc_integrity)
+    else {
+        return PAR2_FALLBACK;
+    };
+    unsafe { par2_emit(out_buf, out_cap, &out) }
+}
+
 #[cfg(test)]
 mod par2_metadata_proof_tests {
     use super::*;
@@ -5357,5 +6290,41 @@ mod par2_metadata_proof_tests {
         assert_eq!(parse(b"s:2:\"1a\";"), None);
         assert_eq!(parse(b"s:0:\"\";"), None);
         assert_eq!(parse(b"b:1;"), None);
+    }
+
+    #[test]
+    fn compact_fp_subject_and_bounded_match_php() {
+        assert_eq!(
+            compact_fp_subject_filename(b"[01/12] - \"movie.part01.rar\" yEnc (1/5)"),
+            b"movie.part01.rar"
+        );
+        assert_eq!(compact_fp_subject_filename(b"\"\" \"actual.bin\""), b" ");
+        assert_eq!(
+            compact_fp_subject_filename(b"unquoted subject"),
+            b"unquoted subject"
+        );
+
+        let multibyte = "名".repeat(50);
+        let cut = compact_fp_bounded(multibyte.as_bytes()).expect("valid utf8");
+        assert_eq!(cut.len(), 120);
+        assert!(str::from_utf8(cut).is_ok());
+
+        let boundary = format!("{}{}", "a".repeat(119), "名");
+        let cut2 = compact_fp_bounded(boundary.as_bytes()).expect("valid utf8");
+        assert_eq!(cut2.len(), 119);
+        assert_eq!(cut2, "a".repeat(119).as_bytes());
+    }
+
+    #[test]
+    fn compact_fp_utc_iso8601_matches_gmdate() {
+        assert_eq!(
+            format_utc_iso8601(1_790_812_800),
+            Some(*b"2026-10-01T00:00:00Z")
+        );
+        assert_eq!(
+            format_utc_iso8601(1_790_812_921),
+            Some(*b"2026-10-01T00:02:01Z")
+        );
+        assert_eq!(format_utc_iso8601(0), None);
     }
 }
