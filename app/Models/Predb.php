@@ -6,10 +6,13 @@ namespace App\Models;
 
 use App\Facades\Search;
 use App\Support\PredbSearchDocument;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
+use Throwable;
 
 /**
  * App\Models\Predb.
@@ -53,6 +56,82 @@ use Illuminate\Support\Facades\Log;
  */
 class Predb extends Model
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_wave21_predb_exact_name(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function enableRustFfi(): void
+    {
+        self::$useRustFfi = true;
+    }
+
+    public static function disableRustFfi(): void
+    {
+        self::$useRustFfi = false;
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = false;
+        self::$ffi = null;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi && self::ffi() !== null;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        try {
+            self::$ffi ??= RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) ?? false;
+
+            return self::$ffi === false ? null : self::$ffi;
+        } catch (Throwable) {
+            self::$ffi = false;
+
+            return null;
+        }
+    }
+
+    public static function exactName(string $value): string
+    {
+        return (self::$useRustFfi ? self::exactNameNative($value) : null)
+            ?? self::exactNamePhp($value);
+    }
+
+    public static function exactNamePhp(string $value): string
+    {
+        return PredbSearchDocument::exactValue($value);
+    }
+
+    public static function exactNameNative(string $value): ?string
+    {
+        try {
+            $ffi = self::ffi();
+            if ($ffi === null) {
+                return null;
+            }
+
+            $length = strlen($value);
+            $capacity = max(1, $length);
+            $buffer = $ffi->new("char[$capacity]");
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_wave21_predb_exact_name($value, $length, $buffer, $capacity);
+            if (! is_int($written) || $written < 0 || $written !== $length || $written > $capacity) {
+                return null;
+            }
+
+            return $written === 0 ? '' : FFI::string($buffer, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     // Nuke status.
     public const PRE_NONUKE = 0; // Pre is not nuked.
 
@@ -120,7 +199,7 @@ class Predb extends Model
             cli()->primary(number_format($total).' releases to match.');
 
             foreach ($res as $row) {
-                if (PredbSearchDocument::exactValue((string) $row['predb_title']) !== PredbSearchDocument::exactValue((string) $row['release_searchname'])) {
+                if (self::exactName((string) $row['predb_title']) !== self::exactName((string) $row['release_searchname'])) {
                     continue;
                 }
 
@@ -161,7 +240,7 @@ class Predb extends Model
 
         try {
             $hit = Search::matchPredbExact($cleanerName);
-        } catch (\Throwable $exception) {
+        } catch (Throwable $exception) {
             Log::warning('PreDB exact lookup failed', ['exception_class' => $exception::class]);
 
             return false;
@@ -176,9 +255,9 @@ class Predb extends Model
             return false;
         }
 
-        $name = PredbSearchDocument::exactValue($cleanerName);
-        if (PredbSearchDocument::exactValue($pre->title) !== $name
-            && PredbSearchDocument::exactValue($pre->filename) !== $name) {
+        $name = self::exactName($cleanerName);
+        if (self::exactName($pre->title) !== $name
+            && self::exactName($pre->filename) !== $name) {
             return false;
         }
 

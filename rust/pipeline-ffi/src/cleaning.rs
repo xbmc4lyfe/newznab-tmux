@@ -14191,3 +14191,563 @@ mod wave20_overlap_tests {
         }
     }
 }
+
+// Wave 21.1: PreDB names, comment hosts, DNZB counts, blacklist constants and feed keys.
+const WAVE21_FEED_KEYS: &[&[u8]] = &[
+    b"predb_club",
+    b"predb_net",
+    b"predb_me",
+    b"predb_org",
+    b"predatabase",
+    b"srrdb",
+    b"xrel",
+    b"xrel_p2p",
+    b"scnsrc_me",
+    b"eztv",
+    b"predb_ovh",
+    b"apibay",
+    b"nfodb",
+    b"one_techno",
+    b"one_gabba",
+    b"ddlvalley",
+    b"hdencode",
+    b"hdencode_tv",
+    b"mp3scene",
+    b"nima4k",
+    b"gload",
+    b"hdworld",
+    b"g4u",
+    b"nswdb",
+    b"3dsdb",
+    b"gabber",
+    b"movieblog",
+    b"scnlog",
+    b"knaben",
+    b"crowdnfo",
+    b"seriousaboutsound",
+    b"dats_pciso_1998",
+    b"nzedb_archive",
+    b"scene_archive_sql",
+];
+
+fn wave21_predb_exact_name(_mode: u32, input: &[u8]) -> Result<Vec<u8>, isize> {
+    if !input.is_ascii() {
+        return Err(-1);
+    }
+    Ok(input.to_ascii_lowercase())
+}
+
+fn wave21_comment_host(mode: u32, input: &[u8]) -> Result<Vec<u8>, isize> {
+    match mode {
+        0 => Ok(vec![1]),
+        1 => {
+            let len = input.len().checked_add(1).ok_or(-1isize)?;
+            if len > isize::MAX as usize {
+                return Err(-1);
+            }
+            let mut result = Vec::with_capacity(len);
+            result.push(1);
+            result.extend_from_slice(input);
+            Ok(result)
+        }
+        2 if input.is_empty() => Ok(vec![0]),
+        _ => Err(-1),
+    }
+}
+
+fn wave21_feed_keys(_mode: u32, input: &[u8]) -> Result<Vec<u8>, isize> {
+    if !input.is_empty() {
+        return Err(-1);
+    }
+    Ok(WAVE21_FEED_KEYS.join(&0))
+}
+
+unsafe fn wave21_dispatch(
+    build: fn(u32, &[u8]) -> Result<Vec<u8>, isize>,
+    mode: u32,
+    input: *const u8,
+    input_len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if !cleaning_ffi_region_valid(input, input_len) || !cleaning_ffi_region_valid(out, out_cap) {
+        return -1;
+    }
+    let result = {
+        let input = unsafe { slice::from_raw_parts(input, input_len) };
+        match build(mode, input) {
+            Ok(result) => result,
+            Err(code) => return code,
+        }
+    };
+    if result.len() > isize::MAX as usize {
+        return -1;
+    }
+    if result.len() > out_cap {
+        return -2;
+    }
+    // The input borrow has ended; only the owned result is read during copying.
+    if !result.is_empty() {
+        unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len()) };
+    }
+    result.len() as isize
+}
+
+/// Lowercases ASCII PreDB names without treating embedded NUL as a terminator.
+/// Returns bytes written, -1 for invalid/non-ASCII input, or -2 for short output.
+/// Errors leave output unchanged.
+///
+/// # Safety
+/// Pointers must be non-null and valid for their stated byte extents, even when
+/// empty. Extents must fit isize; input and output regions may overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_wave21_predb_exact_name(
+    input: *const u8,
+    input_len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave21_dispatch(wave21_predb_exact_name, 0, input, input_len, out, out_cap)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Encodes comment host presence: mode 0 = empty string, 1 = supplied bytes,
+/// 2 = null (requires empty input). The first byte is 1 for strings, 0 for null.
+/// Returns bytes written, -1 for invalid input/mode, or -2 for short output.
+/// Errors leave output unchanged.
+///
+/// # Safety
+/// Pointers must be non-null and valid for their stated byte extents, even when
+/// empty. Extents must fit isize; input and output regions may overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_wave21_comment_host(
+    mode: u32,
+    input: *const u8,
+    input_len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave21_dispatch(wave21_comment_host, mode, input, input_len, out, out_cap)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Returns 0 for PHP-false counts and 1 otherwise. Mode 0 accepts only canonical
+/// signed i64 decimal integers; mode 1 accepts arbitrary PHP string bytes.
+/// Returns -1 for invalid input/mode or panic.
+///
+/// # Safety
+/// Input must be non-null and valid for its byte extent, even when empty.
+/// The extent must fit isize and must not overflow the pointer address.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_wave21_dnzb_failed_count(
+    mode: u32,
+    input: *const u8,
+    input_len: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len) {
+            return -1;
+        }
+        let input = unsafe { slice::from_raw_parts(input, input_len) };
+        match mode {
+            0 => {
+                let negative = input.first() == Some(&b'-');
+                let digits = if negative { &input[1..] } else { input };
+                if digits.is_empty()
+                    || !digits.iter().all(u8::is_ascii_digit)
+                    || (digits[0] == b'0' && (digits.len() != 1 || negative))
+                {
+                    return -1;
+                }
+                let Ok(text) = std::str::from_utf8(input) else {
+                    return -1;
+                };
+                match text.parse::<i64>() {
+                    Ok(value) => isize::from(value != 0),
+                    Err(_) => -1,
+                }
+            }
+            1 => isize::from(!input.is_empty() && input != b"0"),
+            _ => -1,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Resolves exact blacklist constant names; unknown ASCII names return 0.
+/// Returns -1 for invalid/non-ASCII input or panic.
+///
+/// # Safety
+/// Input must be non-null and valid for its byte extent, even when empty.
+/// The extent must fit isize and must not overflow the pointer address.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_wave21_blacklist_constant(
+    input: *const u8,
+    input_len: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len) {
+            return -1;
+        }
+        let input = unsafe { slice::from_raw_parts(input, input_len) };
+        if !input.is_ascii() {
+            return -1;
+        }
+        match input {
+            b"OPTYPE_BLACKLIST" | b"BLACKLIST_ENABLED" | b"BLACKLIST_FIELD_SUBJECT" => 1,
+            b"OPTYPE_WHITELIST" | b"BLACKLIST_FIELD_FROM" => 2,
+            b"BLACKLIST_FIELD_MESSAGEID" => 3,
+            _ => 0,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Returns factory feed keys in source order, joined by NUL with no trailing NUL.
+/// Input must be empty. Returns bytes written, -1 for invalid input, or -2 for
+/// short output. Errors leave output unchanged.
+///
+/// # Safety
+/// Pointers must be non-null and valid for their stated byte extents, even when
+/// empty. Extents must fit isize; input and output regions may overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_wave21_feed_keys(
+    input: *const u8,
+    input_len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave21_dispatch(wave21_feed_keys, 0, input, input_len, out, out_cap)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Returns an exact feed key's zero-based source-order index, -2 for an unknown
+/// ASCII key, or -1 for invalid/non-ASCII input or panic.
+///
+/// # Safety
+/// Input must be non-null and valid for its byte extent, even when empty.
+/// The extent must fit isize and must not overflow the pointer address.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_wave21_feed_key_index(input: *const u8, input_len: usize) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len) {
+            return -1;
+        }
+        let input = unsafe { slice::from_raw_parts(input, input_len) };
+        if !input.is_ascii() {
+            return -1;
+        }
+        WAVE21_FEED_KEYS
+            .iter()
+            .position(|key| *key == input)
+            .map_or(-2, |index| index as isize)
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave21_tests {
+    use super::*;
+
+    type OutputExport = unsafe fn(u32, *const u8, usize, *mut u8, usize) -> isize;
+    type ScalarExport = unsafe fn(u32, *const u8, usize) -> isize;
+
+    unsafe fn predb(_: u32, input: *const u8, len: usize, out: *mut u8, cap: usize) -> isize {
+        unsafe { nntmux_wave21_predb_exact_name(input, len, out, cap) }
+    }
+
+    unsafe fn comment(mode: u32, input: *const u8, len: usize, out: *mut u8, cap: usize) -> isize {
+        unsafe { nntmux_wave21_comment_host(mode, input, len, out, cap) }
+    }
+
+    unsafe fn feeds(_: u32, input: *const u8, len: usize, out: *mut u8, cap: usize) -> isize {
+        unsafe { nntmux_wave21_feed_keys(input, len, out, cap) }
+    }
+
+    unsafe fn count(mode: u32, input: *const u8, len: usize) -> isize {
+        unsafe { nntmux_wave21_dnzb_failed_count(mode, input, len) }
+    }
+
+    unsafe fn constant(_: u32, input: *const u8, len: usize) -> isize {
+        unsafe { nntmux_wave21_blacklist_constant(input, len) }
+    }
+
+    unsafe fn feed_index(_: u32, input: *const u8, len: usize) -> isize {
+        unsafe { nntmux_wave21_feed_key_index(input, len) }
+    }
+
+    fn assert_output(export: OutputExport, mode: u32, input: &[u8], expected: &[u8]) {
+        let mut output = vec![0x5a; expected.len() + 1];
+        let written = unsafe {
+            export(
+                mode,
+                input.as_ptr(),
+                input.len(),
+                output.as_mut_ptr(),
+                expected.len(),
+            )
+        };
+        assert_eq!(written, expected.len() as isize);
+        assert_eq!(&output[..expected.len()], expected);
+        assert_eq!(output[expected.len()], 0x5a);
+    }
+
+    #[test]
+    fn predb_lowercases_ascii_and_preserves_binary_nul() {
+        assert_output(predb, 0, b"AbC\0Z-123_\x7f", b"abc\0z-123_\x7f");
+        assert_output(predb, 0, b"", b"");
+        let mut output = [0x5a; 8];
+        for input in [b"\x80".as_slice(), b"\xc3\x89"] {
+            assert_eq!(
+                unsafe {
+                    nntmux_wave21_predb_exact_name(
+                        input.as_ptr(),
+                        input.len(),
+                        output.as_mut_ptr(),
+                        8,
+                    )
+                },
+                -1
+            );
+            assert_eq!(output, [0x5a; 8]);
+        }
+    }
+
+    #[test]
+    fn comment_modes_preserve_host_presence_and_arbitrary_bytes() {
+        assert_output(comment, 0, b"discarded\0\xff", b"\x01");
+        assert_output(comment, 1, b"host\0\xff", b"\x01host\0\xff");
+        assert_output(comment, 1, b"", b"\x01");
+        assert_output(comment, 2, b"", b"\0");
+        let mut output = [0x5a; 8];
+        for (mode, input) in [(2, b"host".as_slice()), (3, b""), (u32::MAX, b"")] {
+            assert_eq!(
+                unsafe {
+                    nntmux_wave21_comment_host(
+                        mode,
+                        input.as_ptr(),
+                        input.len(),
+                        output.as_mut_ptr(),
+                        8,
+                    )
+                },
+                -1
+            );
+            assert_eq!(output, [0x5a; 8]);
+        }
+    }
+
+    #[test]
+    fn dnzb_accepts_only_canonical_i64_or_php_string_truthiness() {
+        for (input, expected) in [
+            (b"0".as_slice(), 0),
+            (b"1", 1),
+            (b"-1", 1),
+            (b"9223372036854775807", 1),
+            (b"-9223372036854775808", 1),
+        ] {
+            assert_eq!(
+                unsafe { nntmux_wave21_dnzb_failed_count(0, input.as_ptr(), input.len()) },
+                expected
+            );
+        }
+        for input in [
+            b"".as_slice(),
+            b"+1",
+            b"+0",
+            b"-0",
+            b"00",
+            b"01",
+            b"-01",
+            b"-",
+            b"1.0",
+            b"1e0",
+            b" 1",
+            b"1\n",
+            b"1\0",
+            b"\xff",
+            b"9223372036854775808",
+            b"-9223372036854775809",
+        ] {
+            assert_eq!(
+                unsafe { nntmux_wave21_dnzb_failed_count(0, input.as_ptr(), input.len()) },
+                -1,
+                "{input:?}"
+            );
+        }
+        for (input, expected) in [
+            (b"".as_slice(), 0),
+            (b"0", 0),
+            (b"00", 1),
+            (b"-0", 1),
+            (b"false", 1),
+            (b"\0", 1),
+            (b"\xff", 1),
+        ] {
+            assert_eq!(
+                unsafe { nntmux_wave21_dnzb_failed_count(1, input.as_ptr(), input.len()) },
+                expected
+            );
+        }
+        for mode in [2, u32::MAX] {
+            assert_eq!(
+                unsafe { nntmux_wave21_dnzb_failed_count(mode, b"0".as_ptr(), 1) },
+                -1
+            );
+        }
+    }
+
+    #[test]
+    fn blacklist_names_are_exact_ascii() {
+        for (input, expected) in [
+            (b"OPTYPE_BLACKLIST".as_slice(), 1),
+            (b"OPTYPE_WHITELIST", 2),
+            (b"BLACKLIST_ENABLED", 1),
+            (b"BLACKLIST_FIELD_SUBJECT", 1),
+            (b"BLACKLIST_FIELD_FROM", 2),
+            (b"BLACKLIST_FIELD_MESSAGEID", 3),
+            (b"", 0),
+            (b"UNKNOWN", 0),
+            (b"optype_blacklist", 0),
+            (b"OPTYPE_BLACKLIST\0", 0),
+            (b"\xff", -1),
+        ] {
+            assert_eq!(
+                unsafe { nntmux_wave21_blacklist_constant(input.as_ptr(), input.len()) },
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn feed_keys_and_indices_match_factory_order() {
+        let expected = b"predb_club\0predb_net\0predb_me\0predb_org\0predatabase\0srrdb\0xrel\0xrel_p2p\0scnsrc_me\0eztv\0predb_ovh\0apibay\0nfodb\0one_techno\0one_gabba\0ddlvalley\0hdencode\0hdencode_tv\0mp3scene\0nima4k\0gload\0hdworld\0g4u\0nswdb\03dsdb\0gabber\0movieblog\0scnlog\0knaben\0crowdnfo\0seriousaboutsound\0dats_pciso_1998\0nzedb_archive\0scene_archive_sql";
+        assert_output(feeds, 0, b"", expected);
+        assert_eq!(expected.split(|byte| *byte == 0).count(), 34);
+        for (index, key) in expected.split(|byte| *byte == 0).enumerate() {
+            assert_eq!(
+                unsafe { nntmux_wave21_feed_key_index(key.as_ptr(), key.len()) },
+                index as isize
+            );
+        }
+        for input in [b"".as_slice(), b"unknown", b"PREDB_CLUB", b"predb_club\0"] {
+            assert_eq!(
+                unsafe { nntmux_wave21_feed_key_index(input.as_ptr(), input.len()) },
+                -2
+            );
+        }
+        assert_eq!(
+            unsafe { nntmux_wave21_feed_key_index(b"\xff".as_ptr(), 1) },
+            -1
+        );
+        let mut output = [0x5a; 8];
+        assert_eq!(
+            unsafe { nntmux_wave21_feed_keys(b"x".as_ptr(), 1, output.as_mut_ptr(), 8) },
+            -1
+        );
+        assert_eq!(output, [0x5a; 8]);
+    }
+
+    #[test]
+    fn byte_exports_reject_invalid_regions_before_access() {
+        let exports: [OutputExport; 3] = [predb, comment, feeds];
+        for export in exports {
+            let mut output = [0x5a; 8];
+            let too_long = isize::MAX as usize + 1;
+            unsafe {
+                assert_eq!(export(0, std::ptr::null(), 0, output.as_mut_ptr(), 8), -1);
+                assert_eq!(export(0, b"".as_ptr(), 0, std::ptr::null_mut(), 0), -1);
+                assert_eq!(
+                    export(0, b"".as_ptr(), too_long, output.as_mut_ptr(), 8),
+                    -1
+                );
+                assert_eq!(
+                    export(0, b"".as_ptr(), 0, output.as_mut_ptr(), too_long),
+                    -1
+                );
+                assert_eq!(
+                    export(0, usize::MAX as *const u8, 1, output.as_mut_ptr(), 8),
+                    -1
+                );
+                assert_eq!(export(0, b"".as_ptr(), 0, usize::MAX as *mut u8, 1), -1);
+            }
+            assert_eq!(output, [0x5a; 8]);
+        }
+        // Byte pointers have alignment 1; the shared validator also rejects
+        // misaligned typed regions before they can be used by other exports.
+        assert!(!cleaning_ffi_region_valid(1usize as *const u32, 0));
+    }
+
+    #[test]
+    fn scalar_exports_reject_invalid_regions_before_access() {
+        let exports: [ScalarExport; 3] = [count, constant, feed_index];
+        for export in exports {
+            unsafe {
+                assert_eq!(export(0, std::ptr::null(), 0), -1);
+                assert_eq!(export(0, b"".as_ptr(), isize::MAX as usize + 1), -1);
+                assert_eq!(export(0, usize::MAX as *const u8, 1), -1);
+            }
+        }
+    }
+
+    #[test]
+    fn short_output_leaves_every_byte_unchanged() {
+        let fixtures: [(OutputExport, u32, &[u8]); 3] =
+            [(predb, 0, b"ABC"), (comment, 1, b"host"), (feeds, 0, b"")];
+        for (export, mode, input) in fixtures {
+            let mut output = [0x5a; 8];
+            assert_eq!(
+                unsafe { export(mode, input.as_ptr(), input.len(), output.as_mut_ptr(), 1) },
+                -2
+            );
+            assert_eq!(output, [0x5a; 8]);
+        }
+        let mut output = [0x5a; 8];
+        for mode in [0, 2] {
+            assert_eq!(
+                unsafe { comment(mode, b"".as_ptr(), 0, output.as_mut_ptr(), 0) },
+                -2
+            );
+            assert_eq!(output, [0x5a; 8]);
+        }
+    }
+
+    #[test]
+    fn byte_exports_support_exact_and_partial_aliasing() {
+        let feed_output = WAVE21_FEED_KEYS.join(&0);
+        let fixtures: [(OutputExport, u32, &[u8], &[u8]); 3] = [
+            (predb, 0, b"Ab\0Z", b"ab\0z"),
+            (comment, 1, b"host\0\xff", b"\x01host\0\xff"),
+            (feeds, 0, b"", &feed_output),
+        ];
+        for (export, mode, input, expected) in fixtures {
+            for (input_start, output_start) in [(1usize, 1usize), (1, 2), (2, 1)] {
+                let mut buffer = vec![0x5a; input.len().max(expected.len()) + 4];
+                buffer[input_start..input_start + input.len()].copy_from_slice(input);
+                let base = buffer.as_mut_ptr();
+                assert_eq!(
+                    unsafe {
+                        export(
+                            mode,
+                            base.add(input_start),
+                            input.len(),
+                            base.add(output_start),
+                            expected.len(),
+                        )
+                    },
+                    expected.len() as isize
+                );
+                assert_eq!(
+                    &buffer[output_start..output_start + expected.len()],
+                    expected
+                );
+            }
+        }
+    }
+}
