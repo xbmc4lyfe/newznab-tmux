@@ -5503,3 +5503,981 @@ mod imdb_search_tests {
         }
     }
 }
+
+// ============================================================================
+// Wave 14 Slice 5: ReleaseImageService, ReleaseDuplicateFinder,
+// ReleaseManagementService, CategorizationResult, and ApiReleaseRowCache
+// ============================================================================
+
+/// Validates a release image basename matching `ReleaseImageService::isValidBasename`
+/// (`/\A[A-Za-z0-9][A-Za-z0-9_-]*\z/D`), rejecting empty strings, `.`, `..`, `/`, `\`, and NUL bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_image_is_valid_basename(
+    input: *const u8,
+    input_len: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if input.is_null() {
+            return if input_len == 0 { 0 } else { -1 };
+        }
+        if input_len == 0 {
+            return 0;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+        if bytes[0].is_ascii_alphanumeric()
+            && bytes[1..]
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            1
+        } else {
+            0
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+#[inline]
+fn write_invalid_url(mut out: OutCursor) -> isize {
+    out.push_slice(b"[invalid-url]");
+    out.finish()
+}
+
+#[inline]
+fn push_url_sanitized_slice(out: &mut OutCursor, bytes: &[u8]) {
+    for &b in bytes {
+        out.push_byte(if b < 0x20 || b == 0x7f { b'_' } else { b });
+    }
+}
+
+#[inline]
+fn push_u16_decimal(out: &mut OutCursor, mut n: u16) {
+    if n == 0 {
+        out.push_byte(b'0');
+        return;
+    }
+    let mut buf = [0u8; 5];
+    let mut pos = 5;
+    while n > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    out.push_slice(&buf[pos..]);
+}
+
+/// Redacts a remote image URL matching `ReleaseImageService::redactedUrl`.
+/// Returns bytes written (`> 0`), `-(required_len)` if `out_cap` is too small, or `-1` when
+/// declined to PHP `parse_url` (e.g. non-standard port suffix or malformed IPv6 bracket).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_image_redact_url(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if (input.is_null() && input_len > 0) || (out_buf.is_null() && out_cap > 0) {
+            return -1;
+        }
+        let bytes: &[u8] = if input.is_null() || input_len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(input, input_len) }
+        };
+        let mut out = OutCursor::new(out_buf, if out_buf.is_null() { 0 } else { out_cap });
+
+        let Some(colon_pos) = bytes
+            .iter()
+            .position(|&b| !(b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')))
+        else {
+            return write_invalid_url(out);
+        };
+        if colon_pos == 0 || bytes.get(colon_pos..colon_pos + 3) != Some(b"://") {
+            return write_invalid_url(out);
+        }
+
+        let after_scheme = colon_pos + 3;
+        let auth_end = bytes[after_scheme..]
+            .iter()
+            .position(|&b| matches!(b, b'/' | b'?' | b'#'))
+            .map_or(bytes.len(), |i| after_scheme + i);
+        let auth = &bytes[after_scheme..auth_end];
+        if auth.is_empty() {
+            return write_invalid_url(out);
+        }
+
+        let host_port = match auth.iter().rposition(|&b| b == b'@') {
+            Some(at) => &auth[at + 1..],
+            None => auth,
+        };
+        if host_port.is_empty() {
+            return write_invalid_url(out);
+        }
+
+        let (host, port_opt): (&[u8], Option<&[u8]>) = if host_port[0] == b'[' {
+            let Some(rel_close) = host_port[1..].iter().position(|&b| b == b']') else {
+                return -1;
+            };
+            let close = 1 + rel_close;
+            let rest = &host_port[close + 1..];
+            if rest.is_empty() {
+                (&host_port[..=close], None)
+            } else if rest[0] == b':' {
+                (&host_port[..=close], Some(&rest[1..]))
+            } else {
+                return -1;
+            }
+        } else if let Some(c) = host_port.iter().rposition(|&b| b == b':') {
+            (&host_port[..c], Some(&host_port[c + 1..]))
+        } else {
+            (host_port, None)
+        };
+
+        if host.is_empty() {
+            return write_invalid_url(out);
+        }
+
+        let parsed_port: Option<u16> = match port_opt {
+            None | Some(b"") => None,
+            Some(p) => {
+                if p.len() > 5 {
+                    return write_invalid_url(out);
+                }
+                if !p.iter().all(u8::is_ascii_digit) {
+                    if !p[0].is_ascii_digit() && p[0] != b'+' && !p[0].is_ascii_whitespace() {
+                        return write_invalid_url(out);
+                    }
+                    return -1;
+                }
+                let mut port_val = 0u32;
+                for &d in p {
+                    port_val = port_val * 10 + u32::from(d - b'0');
+                }
+                if port_val > 65535 {
+                    return write_invalid_url(out);
+                }
+                Some(port_val as u16)
+            }
+        };
+
+        let path: &[u8] = if auth_end < bytes.len() && bytes[auth_end] == b'/' {
+            let path_end = bytes[auth_end..]
+                .iter()
+                .position(|&b| matches!(b, b'?' | b'#'))
+                .map_or(bytes.len(), |i| auth_end + i);
+            &bytes[auth_end..path_end]
+        } else {
+            b"/"
+        };
+
+        for &b in &bytes[..colon_pos] {
+            out.push_byte(b.to_ascii_lowercase());
+        }
+        out.push_slice(b"://");
+        push_url_sanitized_slice(&mut out, host);
+        if let Some(port) = parsed_port {
+            out.push_byte(b':');
+            push_u16_decimal(&mut out, port);
+        }
+        push_url_sanitized_slice(&mut out, path);
+        out.finish()
+    }))
+    .unwrap_or(-1)
+}
+
+/// Computes proportional downscaled dimensions (`(new_w << 32) | new_h`, or `0` if no resize is needed)
+/// and optionally classifies the output format (`1` = jpg/jpeg, `2` = png, `0` = webp/default)
+/// for `ReleaseImageService`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_image_scale_dimensions(
+    width: i64,
+    height: i64,
+    max_width: i64,
+    max_height: i64,
+    format: *const u8,
+    format_len: usize,
+    out_format: *mut i32,
+) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if format.is_null() && format_len > 0 {
+            return -1;
+        }
+        if !out_format.is_null() {
+            let fmt_bytes: &[u8] = if format.is_null() || format_len == 0 {
+                &[]
+            } else {
+                unsafe { slice::from_raw_parts(format, format_len) }
+            };
+            let code = if fmt_bytes.eq_ignore_ascii_case(b"jpg")
+                || fmt_bytes.eq_ignore_ascii_case(b"jpeg")
+            {
+                1
+            } else if fmt_bytes.eq_ignore_ascii_case(b"png") {
+                2
+            } else {
+                0
+            };
+            unsafe {
+                *out_format = code;
+            }
+        }
+
+        if width <= 0 || height <= 0 || max_width <= 0 || max_height <= 0 {
+            return 0;
+        }
+
+        let w = width as f64;
+        let h = height as f64;
+        let mw = max_width as f64;
+        let mh = max_height as f64;
+        let ratio = (mh / h).min(mw / w).min(1.0);
+        let new_w = (ratio * w).floor() as i64;
+        let new_h = (ratio * h).floor() as i64;
+
+        if ratio < 1.0
+            && new_w > 10
+            && new_h > 10
+            && new_w <= i32::MAX as i64
+            && new_h <= i32::MAX as i64
+        {
+            (((new_w as u64) << 32) | (new_h as u32 as u64)) as i64
+        } else {
+            0
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Resolves the duplicate match reason code for `ReleaseDuplicateFinder::resolveReason`:
+/// - `1` = `predb_id_match`
+/// - `2` = `searchname_match`
+/// - `0` = `name_match_fallback`
+/// - `-1` = invalid pointer/length arguments
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_duplicate_resolve_reason(
+    dup_predb_id: i64,
+    predb_id: i64,
+    dup_search_name: *const u8,
+    dup_search_name_len: usize,
+    search_name: *const u8,
+    search_name_len: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if (dup_search_name.is_null() && dup_search_name_len > 0)
+            || (search_name.is_null() && search_name_len > 0)
+        {
+            return -1;
+        }
+        if predb_id > 0 && dup_predb_id == predb_id {
+            return 1;
+        }
+        if search_name_len > 0 {
+            let dup_bytes: &[u8] = if dup_search_name.is_null() || dup_search_name_len == 0 {
+                &[]
+            } else {
+                unsafe { slice::from_raw_parts(dup_search_name, dup_search_name_len) }
+            };
+            let search_bytes = unsafe { slice::from_raw_parts(search_name, search_name_len) };
+            if dup_bytes == search_bytes {
+                return 2;
+            }
+        }
+        0
+    }))
+    .unwrap_or(-1)
+}
+
+/// Computes `[low_size, high_size]` tolerance bounds for `ReleaseDuplicateFinder`:
+/// `low = floor(filesize * (1.0 - tolerance))`, `high = ceil(filesize * (1.0 + tolerance))`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_duplicate_size_bounds(
+    filesize: i64,
+    tolerance: f64,
+    out_low: *mut i64,
+    out_high: *mut i64,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_low.is_null() || out_high.is_null() || !tolerance.is_finite() {
+            return -1;
+        }
+        let f = filesize as f64;
+        let low_f = (f * (1.0 - tolerance)).floor();
+        let high_f = (f * (1.0 + tolerance)).ceil();
+        if !low_f.is_finite()
+            || !high_f.is_finite()
+            || low_f < (i64::MIN as f64)
+            || low_f >= (i64::MAX as f64)
+            || high_f < (i64::MIN as f64)
+            || high_f >= (i64::MAX as f64)
+        {
+            return -1;
+        }
+        unsafe {
+            *out_low = low_f as i64;
+            *out_high = high_f as i64;
+        }
+        0
+    }))
+    .unwrap_or(-1)
+}
+
+/// Converts a `DD/MM/YYYY` (or 3-part `/`-delimited) export filter date into
+/// `part[2]-part[1]-part[0]00:00:00` (`is_end_of_day == 0`) or `23:59:59` (`is_end_of_day != 0`),
+/// matching `ReleaseManagementService::getForExport`. Returns `0` when the input does not have
+/// exactly 3 `/`-separated parts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_management_export_date(
+    input: *const u8,
+    input_len: usize,
+    is_end_of_day: u32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if (input.is_null() && input_len > 0) || (out_buf.is_null() && out_cap > 0) {
+            return -1;
+        }
+        if input.is_null() || input_len == 0 {
+            return 0;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+        let Some(s1) = bytes.iter().position(|&b| b == b'/') else {
+            return 0;
+        };
+        let Some(s2_rel) = bytes[s1 + 1..].iter().position(|&b| b == b'/') else {
+            return 0;
+        };
+        let s2 = s1 + 1 + s2_rel;
+        if bytes[s2 + 1..].contains(&b'/') {
+            return 0;
+        }
+
+        let mut out = OutCursor::new(out_buf, if out_buf.is_null() { 0 } else { out_cap });
+        out.push_slice(&bytes[s2 + 1..]);
+        out.push_byte(b'-');
+        out.push_slice(&bytes[s1 + 1..s2]);
+        out.push_byte(b'-');
+        out.push_slice(&bytes[..s1]);
+        out.push_slice(if is_end_of_day != 0 {
+            b"23:59:59"
+        } else {
+            b"00:00:00"
+        });
+        out.finish()
+    }))
+    .unwrap_or(-1)
+}
+
+const CAT_OTHER_MISC: i64 = 10;
+const CAT_OTHER_HASHED: i64 = 20;
+
+#[inline]
+fn is_protected_misc_inner(category_id: i64, matched_by: &[u8]) -> bool {
+    if category_id == CAT_OTHER_HASHED {
+        return true;
+    }
+    if category_id != CAT_OTHER_MISC {
+        return false;
+    }
+    matched_by.starts_with(b"hash_")
+        || matched_by.starts_with(b"obfuscated_")
+        || matched_by.starts_with(b"gibberish_")
+        || matched_by == b"group_only_low_signal"
+}
+
+/// Matches `CategorizationResult::isSuccessful`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_categorization_result_is_successful(
+    category_id: i64,
+    confidence: f64,
+    matched_by: *const u8,
+    matched_by_len: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if matched_by.is_null() && matched_by_len > 0 {
+            return -1;
+        }
+        if confidence <= 0.0 {
+            return 0;
+        }
+        let mb: &[u8] = if matched_by.is_null() || matched_by_len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(matched_by, matched_by_len) }
+        };
+        if category_id == CAT_OTHER_MISC && mb == b"no_match" {
+            return 0;
+        }
+        1
+    }))
+    .unwrap_or(-1)
+}
+
+/// Matches `CategorizationResult::isProtectedMiscResult`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_categorization_result_is_protected_misc(
+    category_id: i64,
+    matched_by: *const u8,
+    matched_by_len: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if matched_by.is_null() && matched_by_len > 0 {
+            return -1;
+        }
+        let mb: &[u8] = if matched_by.is_null() || matched_by_len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(matched_by, matched_by_len) }
+        };
+        i32::from(is_protected_misc_inner(category_id, mb))
+    }))
+    .unwrap_or(-1)
+}
+
+/// Matches `CategorizationResult::shouldOverride`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_categorization_result_should_override(
+    self_category_id: i64,
+    self_confidence: f64,
+    self_matched_by: *const u8,
+    self_matched_by_len: usize,
+    other_category_id: i64,
+    other_confidence: f64,
+    other_matched_by: *const u8,
+    other_matched_by_len: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if (self_matched_by.is_null() && self_matched_by_len > 0)
+            || (other_matched_by.is_null() && other_matched_by_len > 0)
+        {
+            return -1;
+        }
+        let other_mb: &[u8] = if other_matched_by.is_null() || other_matched_by_len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(other_matched_by, other_matched_by_len) }
+        };
+
+        if self_category_id != CAT_OTHER_MISC
+            && self_category_id != CAT_OTHER_HASHED
+            && is_protected_misc_inner(other_category_id, other_mb)
+            && self_confidence < 0.6
+        {
+            return 0;
+        }
+        if self_confidence > other_confidence {
+            return 1;
+        }
+        if self_confidence == other_confidence {
+            return i32::from(
+                self_category_id != CAT_OTHER_MISC && other_category_id == CAT_OTHER_MISC,
+            );
+        }
+        0
+    }))
+    .unwrap_or(-1)
+}
+
+#[inline]
+fn might_be_php_numeric(s: &[u8]) -> bool {
+    let mut i = 0;
+    while i < s.len() && matches!(s[i], b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) {
+        i += 1;
+    }
+    if i < s.len() && matches!(s[i], b'+' | b'-') {
+        i += 1;
+    }
+    if i < s.len() && s[i] == b'.' {
+        i += 1;
+    }
+    i < s.len() && s[i].is_ascii_digit()
+}
+
+enum ApiCacheJsonVal {
+    Str(Vec<u8>),
+    Int(i64),
+    Bool(bool),
+    Null,
+    EmptyArr,
+    IntArr(Vec<i64>),
+    StrArr(Vec<Vec<u8>>),
+    Obj(Vec<(Vec<u8>, ApiCacheJsonVal)>),
+}
+
+struct ApiCacheJsonParser<'a> {
+    s: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ApiCacheJsonParser<'a> {
+    #[inline]
+    fn ws(&mut self) {
+        while self
+            .s
+            .get(self.pos)
+            .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            self.pos += 1;
+        }
+    }
+
+    #[inline]
+    fn eat(&mut self, b: u8) -> bool {
+        self.ws();
+        if self.s.get(self.pos) == Some(&b) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn parse_string(&mut self) -> Option<Vec<u8>> {
+        if !self.eat(b'"') {
+            return None;
+        }
+        let mut out = Vec::new();
+        loop {
+            let b = *self.s.get(self.pos)?;
+            self.pos += 1;
+            match b {
+                b'"' => return Some(out),
+                0..=0x1f => return None,
+                b'\\' => {
+                    let esc = *self.s.get(self.pos)?;
+                    self.pos += 1;
+                    match esc {
+                        b'"' | b'\\' | b'/' => out.push(esc),
+                        b'b' => out.push(0x08),
+                        b'f' => out.push(0x0c),
+                        b'n' => out.push(0x0a),
+                        b'r' => out.push(0x0d),
+                        b't' => out.push(0x09),
+                        b'u' => {
+                            let hex = self.s.get(self.pos..self.pos + 4)?;
+                            self.pos += 4;
+                            let mut code = 0u16;
+                            for &h in hex {
+                                let d = match h {
+                                    b'0'..=b'9' => h - b'0',
+                                    b'a'..=b'f' => h - b'a' + 10,
+                                    b'A'..=b'F' => h - b'A' + 10,
+                                    _ => return None,
+                                };
+                                code = (code << 4) | u16::from(d);
+                            }
+                            if code > 0x7f {
+                                return None;
+                            }
+                            out.push(code as u8);
+                        }
+                        _ => return None,
+                    }
+                }
+                _ => out.push(b),
+            }
+        }
+    }
+
+    fn parse_int(&mut self) -> Option<i64> {
+        self.ws();
+        let start = self.pos;
+        if self.s.get(self.pos) == Some(&b'-') {
+            self.pos += 1;
+        }
+        match self.s.get(self.pos)? {
+            b'0' => {
+                if start + 1 == self.pos {
+                    // Reject `-0`
+                    return None;
+                }
+                self.pos += 1;
+                if self.s.get(self.pos).is_some_and(u8::is_ascii_digit) {
+                    return None;
+                }
+            }
+            b'1'..=b'9' => {
+                while self.s.get(self.pos).is_some_and(u8::is_ascii_digit) {
+                    self.pos += 1;
+                }
+            }
+            _ => return None,
+        }
+        if self
+            .s
+            .get(self.pos)
+            .is_some_and(|b| matches!(b, b'.' | b'e' | b'E'))
+        {
+            return None;
+        }
+        std::str::from_utf8(&self.s[start..self.pos])
+            .ok()?
+            .parse::<i64>()
+            .ok()
+    }
+
+    fn parse_literal(&mut self, lit: &[u8]) -> Option<()> {
+        self.ws();
+        if !self.s.get(self.pos..)?.starts_with(lit) {
+            return None;
+        }
+        self.pos += lit.len();
+        Some(())
+    }
+
+    fn parse_list(&mut self) -> Option<ApiCacheJsonVal> {
+        if !self.eat(b'[') {
+            return None;
+        }
+        if self.eat(b']') {
+            return Some(ApiCacheJsonVal::EmptyArr);
+        }
+        self.ws();
+        let first_byte = *self.s.get(self.pos)?;
+        if first_byte == b'"' {
+            let mut items = Vec::new();
+            loop {
+                let s = self.parse_string()?;
+                if might_be_php_numeric(&s) {
+                    return None;
+                }
+                items.push(s);
+                if self.eat(b']') {
+                    break;
+                }
+                if !self.eat(b',') {
+                    return None;
+                }
+                self.ws();
+                if self.s.get(self.pos) != Some(&b'"') {
+                    return None;
+                }
+            }
+            items.sort();
+            items.dedup();
+            Some(ApiCacheJsonVal::StrArr(items))
+        } else if first_byte == b'-' || first_byte.is_ascii_digit() {
+            let mut items = Vec::new();
+            loop {
+                let n = self.parse_int()?;
+                items.push(n);
+                if self.eat(b']') {
+                    break;
+                }
+                if !self.eat(b',') {
+                    return None;
+                }
+                self.ws();
+                let next = *self.s.get(self.pos)?;
+                if next != b'-' && !next.is_ascii_digit() {
+                    return None;
+                }
+            }
+            items.sort_unstable();
+            items.dedup();
+            Some(ApiCacheJsonVal::IntArr(items))
+        } else {
+            None
+        }
+    }
+
+    fn parse_object(&mut self, depth: usize) -> Option<ApiCacheJsonVal> {
+        if depth > 64 || !self.eat(b'{') {
+            return None;
+        }
+        let mut entries = Vec::new();
+        if !self.eat(b'}') {
+            loop {
+                let key = self.parse_string()?;
+                if might_be_php_numeric(&key) {
+                    return None;
+                }
+                if !self.eat(b':') {
+                    return None;
+                }
+                self.ws();
+                let val = match *self.s.get(self.pos)? {
+                    b'"' => {
+                        let raw = self.parse_string()?;
+                        ApiCacheJsonVal::Str(trim_php_ws(&raw).to_vec())
+                    }
+                    b'{' => self.parse_object(depth + 1)?,
+                    b'[' => self.parse_list()?,
+                    b't' => {
+                        self.parse_literal(b"true")?;
+                        ApiCacheJsonVal::Bool(true)
+                    }
+                    b'f' => {
+                        self.parse_literal(b"false")?;
+                        ApiCacheJsonVal::Bool(false)
+                    }
+                    b'n' => {
+                        self.parse_literal(b"null")?;
+                        ApiCacheJsonVal::Null
+                    }
+                    b'-' | b'0'..=b'9' => ApiCacheJsonVal::Int(self.parse_int()?),
+                    _ => return None,
+                };
+                entries.push((key, val));
+                if self.eat(b'}') {
+                    break;
+                }
+                if !self.eat(b',') {
+                    return None;
+                }
+            }
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        if entries.windows(2).any(|w| w[0].0 == w[1].0) {
+            return None;
+        }
+        Some(ApiCacheJsonVal::Obj(entries))
+    }
+}
+
+fn write_json_string(out: &mut OutCursor, s: &[u8]) {
+    out.push_byte(b'"');
+    for &b in s {
+        match b {
+            b'"' => out.push_slice(b"\\\""),
+            b'\\' => out.push_slice(b"\\\\"),
+            0x08 => out.push_slice(b"\\b"),
+            0x09 => out.push_slice(b"\\t"),
+            0x0a => out.push_slice(b"\\n"),
+            0x0c => out.push_slice(b"\\f"),
+            0x0d => out.push_slice(b"\\r"),
+            0x00..=0x1f => {
+                let hex = crate::HEX_LOWER;
+                out.push_slice(&[b'\\', b'u', b'0', b'0', hex[(b >> 4) as usize], hex[(b & 0x0f) as usize]]);
+            }
+            _ => out.push_byte(b),
+        }
+    }
+    out.push_byte(b'"');
+}
+
+fn write_i64_decimal(out: &mut OutCursor, n: i64) {
+    if n == 0 {
+        out.push_byte(b'0');
+        return;
+    }
+    let neg = n < 0;
+    let mut u = n.unsigned_abs();
+    let mut buf = [0u8; 20];
+    let mut pos = 20;
+    while u > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (u % 10) as u8;
+        u /= 10;
+    }
+    if neg {
+        out.push_byte(b'-');
+    }
+    out.push_slice(&buf[pos..]);
+}
+
+fn write_json_val(out: &mut OutCursor, val: &ApiCacheJsonVal) {
+    match val {
+        ApiCacheJsonVal::Str(s) => write_json_string(out, s),
+        ApiCacheJsonVal::Int(n) => write_i64_decimal(out, *n),
+        ApiCacheJsonVal::Bool(true) => out.push_slice(b"true"),
+        ApiCacheJsonVal::Bool(false) => out.push_slice(b"false"),
+        ApiCacheJsonVal::Null => out.push_slice(b"null"),
+        ApiCacheJsonVal::EmptyArr => out.push_slice(b"[]"),
+        ApiCacheJsonVal::IntArr(items) => {
+            out.push_byte(b'[');
+            for (i, &n) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_byte(b',');
+                }
+                write_i64_decimal(out, n);
+            }
+            out.push_byte(b']');
+        }
+        ApiCacheJsonVal::StrArr(items) => {
+            out.push_byte(b'[');
+            for (i, s) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_byte(b',');
+                }
+                write_json_string(out, s);
+            }
+            out.push_byte(b']');
+        }
+        ApiCacheJsonVal::Obj(entries) => {
+            out.push_byte(b'{');
+            for (i, (k, v)) in entries.iter().enumerate() {
+                if i > 0 {
+                    out.push_byte(b',');
+                }
+                write_json_string(out, k);
+                out.push_byte(b':');
+                write_json_val(out, v);
+            }
+            out.push_byte(b'}');
+        }
+    }
+}
+
+/// Normalizes a JSON-encoded parameter map for `ApiReleaseRowCache::normalize`:
+/// recursively sorts associative keys (`ksort`), trims string values, and deduplicates/sorts
+/// list arrays. Returns `-1` when declined to PHP fallback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_api_release_cache_normalize_json(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if input.is_null() || input_len == 0 || (out_buf.is_null() && out_cap > 0) {
+            return -1;
+        }
+        let s = unsafe { slice::from_raw_parts(input, input_len) };
+        if std::str::from_utf8(s).is_err() {
+            return -1;
+        }
+        let mut parser = ApiCacheJsonParser { s, pos: 0 };
+        parser.ws();
+        let root = match parser.s.get(parser.pos) {
+            Some(&b'{') => parser.parse_object(0),
+            Some(&b'[') => {
+                parser.pos += 1;
+                if parser.eat(b']') {
+                    Some(ApiCacheJsonVal::EmptyArr)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let Some(val) = root else {
+            return -1;
+        };
+        parser.ws();
+        if parser.pos != parser.s.len() {
+            return -1;
+        }
+
+        let mut out = OutCursor::new(out_buf, if out_buf.is_null() { 0 } else { out_cap });
+        write_json_val(&mut out, &val);
+        out.finish()
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave14_slice5_tests {
+    use super::*;
+
+    #[test]
+    fn release_image_basename_and_redact_url_and_scale() {
+        assert_eq!(unsafe { nntmux_release_image_is_valid_basename(b"cover_1-a".as_ptr(), 9) }, 1);
+        assert_eq!(unsafe { nntmux_release_image_is_valid_basename(b"".as_ptr(), 0) }, 0);
+        assert_eq!(unsafe { nntmux_release_image_is_valid_basename(b".".as_ptr(), 1) }, 0);
+        assert_eq!(unsafe { nntmux_release_image_is_valid_basename(b"..".as_ptr(), 2) }, 0);
+        assert_eq!(unsafe { nntmux_release_image_is_valid_basename(b"../cover".as_ptr(), 8) }, 0);
+        assert_eq!(unsafe { nntmux_release_image_is_valid_basename(b"a/b".as_ptr(), 3) }, 0);
+        assert_eq!(unsafe { nntmux_release_image_is_valid_basename(b"a\\b".as_ptr(), 3) }, 0);
+        assert_eq!(unsafe { nntmux_release_image_is_valid_basename(b"a\0b".as_ptr(), 3) }, 0);
+        assert_eq!(unsafe { nntmux_release_image_is_valid_basename(std::ptr::null(), 2) }, -1);
+
+        let mut buf = [0u8; 256];
+        let u1 = b"HTTPS://user:pass@Images.Example.Test:8443/covers/a.jpg?token=secret#frag";
+        let n1 = unsafe { nntmux_release_image_redact_url(u1.as_ptr(), u1.len(), buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(&buf[..n1 as usize], b"https://Images.Example.Test:8443/covers/a.jpg");
+
+        let u2 = b"not-a-valid-url";
+        let n2 = unsafe { nntmux_release_image_redact_url(u2.as_ptr(), u2.len(), buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(&buf[..n2 as usize], b"[invalid-url]");
+
+        let mut fmt = -1i32;
+        let packed = unsafe {
+            nntmux_release_image_scale_dimensions(400, 200, 250, 250, b"JPG".as_ptr(), 3, &mut fmt)
+        };
+        assert_eq!(fmt, 1);
+        assert_eq!(packed >> 32, 250);
+        assert_eq!(packed & 0xFFFF_FFFF, 125);
+        assert_eq!(
+            unsafe { nntmux_release_image_scale_dimensions(40, 20, 250, 250, b"webp".as_ptr(), 4, &mut fmt) },
+            0
+        );
+        assert_eq!(fmt, 0);
+    }
+
+    #[test]
+    fn duplicate_reason_size_bounds_export_date_and_categorization() {
+        assert_eq!(
+            unsafe { nntmux_release_duplicate_resolve_reason(42, 42, b"a".as_ptr(), 1, b"b".as_ptr(), 1) },
+            1
+        );
+        assert_eq!(
+            unsafe { nntmux_release_duplicate_resolve_reason(0, 0, b"Ubuntu".as_ptr(), 6, b"Ubuntu".as_ptr(), 6) },
+            2
+        );
+        assert_eq!(
+            unsafe { nntmux_release_duplicate_resolve_reason(0, 0, b"Ubuntu".as_ptr(), 6, b"Other".as_ptr(), 5) },
+            0
+        );
+
+        let (mut low, mut high) = (0i64, 0i64);
+        assert_eq!(
+            unsafe { nntmux_release_duplicate_size_bounds(1000, 0.05, &mut low, &mut high) },
+            0
+        );
+        assert_eq!((low, high), (950, 1050));
+
+        let mut buf = [0u8; 64];
+        let d = b"15/04/2026";
+        let n = unsafe { nntmux_release_management_export_date(d.as_ptr(), d.len(), 0, buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(&buf[..n as usize], b"2026-04-1500:00:00");
+        let n2 = unsafe { nntmux_release_management_export_date(d.as_ptr(), d.len(), 1, buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(&buf[..n2 as usize], b"2026-04-1523:59:59");
+        assert_eq!(
+            unsafe { nntmux_release_management_export_date(b"bad".as_ptr(), 3, 0, buf.as_mut_ptr(), buf.len()) },
+            0
+        );
+
+        assert_eq!(
+            unsafe { nntmux_categorization_result_is_successful(10, 0.0, b"no_match".as_ptr(), 8) },
+            0
+        );
+        assert_eq!(
+            unsafe { nntmux_categorization_result_is_successful(10, 0.5, b"obfuscated_pattern".as_ptr(), 18) },
+            1
+        );
+        assert_eq!(
+            unsafe { nntmux_categorization_result_is_protected_misc(10, b"hash_md5".as_ptr(), 8) },
+            1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_categorization_result_should_override(
+                    2000,
+                    0.5,
+                    b"group".as_ptr(),
+                    5,
+                    10,
+                    0.4,
+                    b"hash_md5".as_ptr(),
+                    8,
+                )
+            },
+            0
+        );
+    }
+
+    #[test]
+    fn api_release_cache_json_normalization() {
+        let mut buf = [0u8; 256];
+        let json = br#"{"id":" ubuntu ","category":[5030,5040,5030],"nested":{"z":" b ","a":["x","a","x"]}}"#;
+        let n = unsafe {
+            nntmux_api_release_cache_normalize_json(json.as_ptr(), json.len(), buf.as_mut_ptr(), buf.len())
+        };
+        assert_eq!(
+            &buf[..n as usize],
+            br#"{"category":[5030,5040],"id":"ubuntu","nested":{"a":["a","x"],"z":"b"}}"#
+        );
+    }
+}
