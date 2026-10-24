@@ -466,7 +466,7 @@ class AdminAnidbController extends BasePageController
             return self::normalizeUpdatePayloadPhp($input, $fallbackId);
         }
 
-        $rawIdStr = is_bool($rawId) ? '' : (string) ($rawId ?? '');
+        $rawIdStr = (string) ($rawId ?? '');
 
         try {
             $outId = $ffi->new('int64_t[1]');

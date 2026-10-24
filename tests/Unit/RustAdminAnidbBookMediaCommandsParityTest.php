@@ -266,6 +266,30 @@ class RustAdminAnidbBookMediaCommandsParityTest extends TestCase
                 ['anidbid' => 1001],
                 1001,
             ],
+            'boolean_and_formfeed_or_nul_trimmed_anidbid' => [
+                '',
+                'edit',
+                'submit',
+                99,
+                ['anidbid' => true],
+                99,
+            ],
+            'nul_trimmed_anidbid_and_formfeed_fallback' => [
+                '',
+                'edit',
+                'submit',
+                99,
+                ['anidbid' => "\x00777\x00"],
+                99,
+            ],
+            'formfeed_anidbid_falls_back' => [
+                '',
+                'edit',
+                'submit',
+                99,
+                ['anidbid' => "\x0c777"],
+                99,
+            ],
         ];
     }
 
@@ -316,6 +340,7 @@ class RustAdminAnidbBookMediaCommandsParityTest extends TestCase
             'invalid_publishdate_uses_fallback' => ['not-a-valid-date', null, true],
             'epoch_zero_uses_fallback' => ['1970-01-01 00:00:00', '2019-04-01', false],
             'slash_date_falls_back_to_php_carbon' => ['2024/03/15', '2020-01-01', 2],
+            'formfeed_prefixed_date_falls_back_to_php' => ["\x0c2024-02-29", '2020-01-01', true],
         ];
     }
 
@@ -405,6 +430,16 @@ class RustAdminAnidbBookMediaCommandsParityTest extends TestCase
                     'total_reviews' => 1041,
                 ],
             ],
+            'negative_zero_and_large_float_prices_fallback_parity' => [
+                ['title' => 'Edge Price'],
+                [
+                    'currency' => 'USD',
+                    'final' => -0.001,
+                    'initial' => 1e12,
+                    'discount_percent' => 10,
+                ],
+                ['total_positive' => 1, 'total_negative' => 0, 'total_reviews' => 1],
+            ],
         ];
     }
 
@@ -439,6 +474,10 @@ class RustAdminAnidbBookMediaCommandsParityTest extends TestCase
             $this->assertSame($phpPrice, SteamLookupGame::formatPriceRows($price));
             $this->assertSame($phpReviews, SteamLookupGame::formatReviewsRows($reviews));
         }
+
+        $extremeSummaryPhp = ReprocessMissingEpisodes::formatSummaryRowPhp(1, 1_000_000_000_000_000, 0);
+        $extremeSummaryNative = ReprocessMissingEpisodes::formatSummaryRowNative(1, 1_000_000_000_000_000, 0);
+        $this->assertSame($extremeSummaryPhp, $extremeSummaryNative);
     }
 
     /**

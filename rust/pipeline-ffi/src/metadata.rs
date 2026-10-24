@@ -29367,21 +29367,21 @@ pub mod admin_anidb_book_media_commands {
     }
 
     #[inline]
-    fn is_php_numeric_ws(b: u8) -> bool {
-        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c')
+    fn is_php_trim_ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\0')
     }
 
     #[inline]
-    fn trim_php_numeric_ws(mut slice: &[u8]) -> &[u8] {
+    fn trim_php_default_ws(mut slice: &[u8]) -> &[u8] {
         while let Some((&first, rest)) = slice.split_first() {
-            if is_php_numeric_ws(first) {
+            if is_php_trim_ws(first) {
                 slice = rest;
             } else {
                 break;
             }
         }
         while let Some((&last, rest)) = slice.split_last() {
-            if is_php_numeric_ws(last) {
+            if is_php_trim_ws(last) {
                 slice = rest;
             } else {
                 break;
@@ -29457,7 +29457,7 @@ pub mod admin_anidb_book_media_commands {
 
     #[inline]
     fn parse_iso_datetime_utc(input: &[u8]) -> Option<i64> {
-        let s = trim_php_numeric_ws(input);
+        let s = input;
         if s.len() != 10 && s.len() != 19 {
             return None;
         }
@@ -29518,7 +29518,7 @@ pub mod admin_anidb_book_media_commands {
 
     #[inline]
     fn format_usd_price(val: f64) -> Option<String> {
-        if !val.is_finite() || val.abs() > 1e14 {
+        if !val.is_finite() || val.is_sign_negative() || val > 1e7 {
             return None;
         }
         let scaled = val * 100.0;
@@ -29526,16 +29526,10 @@ pub mod admin_anidb_book_media_commands {
         if (scaled - rounded).abs() > 0.499_999 && (scaled - rounded).abs() < 0.500_001 {
             return None;
         }
-        let cents = rounded as i64;
-        let neg = cents < 0;
-        let abs_cents = cents.unsigned_abs();
+        let abs_cents = rounded as u64;
         let dollars = abs_cents / 100;
         let rem = abs_cents % 100;
-        if neg {
-            Some(format!("$-{dollars}.{rem:02}"))
-        } else {
-            Some(format!("${dollars}.{rem:02}"))
-        }
+        Some(format!("${dollars}.{rem:02}"))
     }
 
     #[inline]
@@ -29546,8 +29540,11 @@ pub mod admin_anidb_book_media_commands {
         if processed == 0 {
             return Some("0%".to_string());
         }
+        if matched > processed.saturating_mul(1_000_000) {
+            return None;
+        }
         let pct = (matched as f64 / processed as f64) * 100.0;
-        if !pct.is_finite() {
+        if !pct.is_finite() || pct >= 1e8 {
             return None;
         }
         let scaled = pct * 100.0;
@@ -29688,7 +29685,7 @@ pub mod admin_anidb_book_media_commands {
             let Some(raw) = (unsafe { valid_slice(anidbid_ptr, anidbid_len) }) else {
                 return DECLINE as i32;
             };
-            let trimmed = trim_php_numeric_ws(raw);
+            let trimmed = trim_php_default_ws(raw);
             let resolved = if trimmed.is_empty() {
                 fallback_id
             } else if let Some(parsed) = parse_signed_ascii_i64(trimmed) {
