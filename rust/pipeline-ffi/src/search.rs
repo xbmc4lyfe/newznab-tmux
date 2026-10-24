@@ -22144,3 +22144,482 @@ mod wave30_5_schema_log_steam {
         .unwrap_or(DECLINE)
     }
 }
+
+/// Pure byte-preserving helpers for activity, CAPTCHA, Cloudflare and expiry commands.
+mod wave31_5_activity_captcha_cloudflare_expiry {
+    use std::collections::HashSet;
+
+    const DECLINE: isize = isize::MIN;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const MAX_PARTS: usize = 100_000;
+
+    fn unpack(input: &[u8]) -> Option<Vec<&[u8]>> {
+        let count = u32::from_le_bytes(input.get(..4)?.try_into().ok()?) as usize;
+        if count > MAX_PARTS || count > (input.len() - 4) / 4 {
+            return None;
+        }
+        let mut cursor = 4usize;
+        let mut parts = Vec::with_capacity(count);
+        for _ in 0..count {
+            let length_end = cursor.checked_add(4)?;
+            let length =
+                u32::from_le_bytes(input.get(cursor..length_end)?.try_into().ok()?) as usize;
+            let end = length_end.checked_add(length)?;
+            parts.push(input.get(length_end..end)?);
+            cursor = end;
+        }
+        (cursor == input.len()).then_some(parts)
+    }
+
+    fn integer(bytes: &[u8]) -> Option<i64> {
+        std::str::from_utf8(bytes).ok()?.parse().ok()
+    }
+
+    fn flag(bytes: &[u8]) -> Option<bool> {
+        match bytes {
+            b"0" => Some(false),
+            b"1" => Some(true),
+            _ => None,
+        }
+    }
+
+    fn bool_bytes(value: bool) -> Vec<u8> {
+        if value { b"1" } else { b"0" }.to_vec()
+    }
+
+    fn ended_line(prefix: &[u8], name: &[u8], date: &[u8]) -> Vec<u8> {
+        let mut out = prefix.to_vec();
+        out.extend_from_slice(name);
+        out.extend_from_slice(b" (ended: ");
+        out.extend_from_slice(date);
+        out.push(b')');
+        out
+    }
+
+    fn transform(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        Some(match mode {
+            1 => {
+                let [kind] = parts else { return None };
+                vec![bool_bytes(matches!(*kind, b"daily" | b"hourly"))]
+            }
+            2 => {
+                let [collected, skipped] = parts else {
+                    return None;
+                };
+                let collected = integer(collected)?;
+                let skipped = integer(skipped)?;
+                let mut lines = vec![
+                    b"Backfill completed!".to_vec(),
+                    format!("Stats collected: {collected}").into_bytes(),
+                ];
+                if skipped > 0 {
+                    lines.push(format!("Stats skipped (already existed): {skipped}").into_bytes());
+                }
+                lines
+            }
+            3 => {
+                let [re, rk, rs, te, tk, ts] = parts else {
+                    return None;
+                };
+                // Validate every flag even when a provider is disabled.
+                let (re, rk, rs) = (flag(re)?, flag(rk)?, flag(rs)?);
+                let (te, tk, ts) = (flag(te)?, flag(tk)?, flag(ts)?);
+                let recaptcha = re && rk && rs;
+                let turnstile = te && tk && ts;
+                let provider: &[u8] = if recaptcha {
+                    b"recaptcha"
+                } else if turnstile {
+                    b"turnstile"
+                } else {
+                    b""
+                };
+                vec![
+                    bool_bytes(recaptcha),
+                    bool_bytes(turnstile),
+                    bool_bytes(recaptcha && turnstile),
+                    provider.to_vec(),
+                ]
+            }
+            4 => {
+                let mut seen = HashSet::with_capacity(parts.len());
+                parts
+                    .iter()
+                    .copied()
+                    .filter(|part| seen.insert(*part))
+                    .map(<[u8]>::to_vec)
+                    .collect()
+            }
+            5 => {
+                let [v4, v6, all, manual, effective] = parts else {
+                    return None;
+                };
+                vec![
+                    format!("Cloudflare IPv4 ranges: {}", integer(v4)?).into_bytes(),
+                    format!("Cloudflare IPv6 ranges: {}", integer(v6)?).into_bytes(),
+                    format!("Combined Cloudflare proxy count: {}", integer(all)?).into_bytes(),
+                    format!("Manual proxy count: {}", integer(manual)?).into_bytes(),
+                    format!("Effective trusted proxy count: {}", integer(effective)?).into_bytes(),
+                ]
+            }
+            6 | 8 => {
+                let [name, date] = parts else { return None };
+                let prefix: &[u8] = if mode == 6 {
+                    b"Disabled promotion: "
+                } else {
+                    b"Marked registration period as done: "
+                };
+                vec![ended_line(prefix, name, date)]
+            }
+            7 | 9 => {
+                let [count] = parts else { return None };
+                let count = integer(count)?;
+                let message = match (mode, count) {
+                    (7, 0) => "No expired promotions found.".to_owned(),
+                    (9, 0) => "No expired registration periods found.".to_owned(),
+                    (7, _) => format!("Successfully disabled {count} expired promotion(s)."),
+                    _ => format!("Successfully completed {count} expired registration period(s)."),
+                };
+                vec![message.into_bytes()]
+            }
+            _ => return None,
+        })
+    }
+
+    fn pack(parts: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let count = u32::try_from(parts.len()).ok()?;
+        let size = parts.iter().try_fold(4usize, |size, part| {
+            u32::try_from(part.len()).ok()?;
+            size.checked_add(4)?.checked_add(part.len())
+        })?;
+        if size > isize::MAX as usize {
+            return None;
+        }
+        let mut out = Vec::with_capacity(size);
+        out.extend_from_slice(&count.to_le_bytes());
+        for part in parts {
+            out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            out.extend_from_slice(part);
+        }
+        Some(out)
+    }
+
+    /// Dispatch count-prefixed, length-prefixed byte strings (little-endian u32).
+    /// Returns written bytes, negative required capacity, or `isize::MIN` for
+    /// invalid input. Failure never writes to the output buffer.
+    ///
+    /// # Safety
+    /// Non-null pointers must refer to readable/writable allocations of the
+    /// declared lengths. Null pointers require zero length/capacity. Input and
+    /// output may overlap; the result is fully owned before any output write.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_activity_captcha_cloudflare_expiry(
+        mode: u32,
+        input: *const u8,
+        input_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        std::panic::catch_unwind(|| {
+            if input_len > MAX_INPUT
+                || input_len > isize::MAX as usize
+                || cap > isize::MAX as usize
+                || (input.is_null() && input_len != 0)
+                || (out.is_null() && cap != 0)
+            {
+                return DECLINE;
+            }
+            let input = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(input, input_len) }
+            };
+            let Some(parts) = unpack(input) else {
+                return DECLINE;
+            };
+            let Some(result) = transform(mode, &parts).and_then(|parts| pack(&parts)) else {
+                return DECLINE;
+            };
+            if cap < result.len() {
+                return -(result.len() as isize);
+            }
+            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len()) };
+            result.len() as isize
+        })
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn packet(parts: &[&[u8]]) -> Vec<u8> {
+            pack(&parts.iter().map(|part| part.to_vec()).collect::<Vec<_>>()).unwrap()
+        }
+
+        fn call(mode: u32, parts: &[&[u8]]) -> Vec<Vec<u8>> {
+            let input = packet(parts);
+            let needed = unsafe {
+                nntmux_activity_captcha_cloudflare_expiry(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert!(needed < 0 && needed != DECLINE);
+            let mut out = vec![0x5a; (-needed) as usize];
+            assert_eq!(
+                unsafe {
+                    nntmux_activity_captcha_cloudflare_expiry(
+                        mode,
+                        input.as_ptr(),
+                        input.len(),
+                        out.as_mut_ptr(),
+                        out.len(),
+                    )
+                },
+                -needed
+            );
+            unpack(&out)
+                .unwrap()
+                .into_iter()
+                .map(<[u8]>::to_vec)
+                .collect()
+        }
+
+        #[test]
+        fn backfill_validation_and_signed_completion_counts() {
+            for value in [b"daily".as_slice(), b"hourly"] {
+                assert_eq!(call(1, &[value]), vec![b"1".to_vec()]);
+            }
+            for value in [b"".as_slice(), b"DAILY", b"daily\0", b"hourly ", b"\xff"] {
+                assert_eq!(call(1, &[value]), vec![b"0".to_vec()]);
+            }
+            for n in [i64::MIN, -1, 0, 1, i64::MAX] {
+                for skipped in [i64::MIN, -1, 0, 1, i64::MAX] {
+                    let mut expected = vec![
+                        b"Backfill completed!".to_vec(),
+                        format!("Stats collected: {n}").into_bytes(),
+                    ];
+                    if skipped > 0 {
+                        expected.push(
+                            format!("Stats skipped (already existed): {skipped}").into_bytes(),
+                        );
+                    }
+                    assert_eq!(
+                        call(
+                            2,
+                            &[n.to_string().as_bytes(), skipped.to_string().as_bytes()]
+                        ),
+                        expected
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn captcha_all_boolean_combinations() {
+            for mask in 0..64u8 {
+                let fields: Vec<Vec<u8>> = (0..6)
+                    .map(|bit| bool_bytes(mask & (1 << bit) != 0))
+                    .collect();
+                let fields: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
+                let re = mask & 7 == 7;
+                let ts = mask & 56 == 56;
+                assert_eq!(
+                    call(3, &fields),
+                    vec![
+                        bool_bytes(re),
+                        bool_bytes(ts),
+                        bool_bytes(re && ts),
+                        if re {
+                            b"recaptcha".to_vec()
+                        } else if ts {
+                            b"turnstile".to_vec()
+                        } else {
+                            vec![]
+                        },
+                    ]
+                );
+            }
+        }
+
+        #[test]
+        fn cloudflare_keeps_byte_identity_and_first_seen_order() {
+            assert_eq!(call(4, &[]), Vec::<Vec<u8>>::new());
+            assert_eq!(
+                call(4, &[b"a", b"", b"\0\xff", b"a", b"0", b"00", b"\0\xff"]),
+                vec![
+                    b"a".to_vec(),
+                    b"".to_vec(),
+                    b"\0\xff".to_vec(),
+                    b"0".to_vec(),
+                    b"00".to_vec()
+                ]
+            );
+            assert_eq!(
+                call(
+                    5,
+                    &[
+                        b"1",
+                        b"-2",
+                        b"3",
+                        b"-9223372036854775808",
+                        b"9223372036854775807"
+                    ]
+                ),
+                vec![
+                    b"Cloudflare IPv4 ranges: 1".to_vec(),
+                    b"Cloudflare IPv6 ranges: -2".to_vec(),
+                    b"Combined Cloudflare proxy count: 3".to_vec(),
+                    b"Manual proxy count: -9223372036854775808".to_vec(),
+                    b"Effective trusted proxy count: 9223372036854775807".to_vec(),
+                ]
+            );
+        }
+
+        #[test]
+        fn expiry_lines_preserve_arbitrary_bytes_and_counts() {
+            for (mode, prefix) in [
+                (6, "Disabled promotion: "),
+                (8, "Marked registration period as done: "),
+            ] {
+                assert_eq!(
+                    call(mode, &[b"", b""]),
+                    vec![format!("{prefix} (ended: )").into_bytes()]
+                );
+                let mut expected = format!("{prefix}Café 日本語 😀\0").into_bytes();
+                expected.extend_from_slice(b"\xff (ended: \0\xfe)");
+                let mut name = "Café 日本語 😀\0".as_bytes().to_vec();
+                name.push(0xff);
+                assert_eq!(call(mode, &[&name, b"\0\xfe"]), vec![expected]);
+            }
+            for count in [i64::MIN, -1, 0, 1, i64::MAX] {
+                let raw = count.to_string();
+                let promotion = if count == 0 {
+                    "No expired promotions found.".to_owned()
+                } else {
+                    format!("Successfully disabled {count} expired promotion(s).")
+                };
+                let registration = if count == 0 {
+                    "No expired registration periods found.".to_owned()
+                } else {
+                    format!("Successfully completed {count} expired registration period(s).")
+                };
+                assert_eq!(call(7, &[raw.as_bytes()]), vec![promotion.into_bytes()]);
+                assert_eq!(call(9, &[raw.as_bytes()]), vec![registration.into_bytes()]);
+            }
+        }
+
+        #[test]
+        fn malformed_requests_never_write_output() {
+            let mut cases = vec![
+                (1, vec![]),
+                (1, vec![0, 0, 0]),
+                (1, vec![1, 0, 0, 0]),
+                (1, vec![1, 0, 0, 0, 255, 255, 255, 255]),
+                (1, vec![0, 0, 0, 0, 0]),
+                (4, 100_001u32.to_le_bytes().to_vec()),
+            ];
+            for mode in [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, u32::MAX] {
+                cases.push((mode, packet(&[])));
+            }
+            for (mode, parts) in [
+                (1, vec![b"daily".as_slice(), b"hourly"]),
+                (2, vec![b"1"]),
+                (2, vec![b"9223372036854775808", b"0"]),
+                (2, vec![b"0", b"-9223372036854775809"]),
+                (3, vec![b"0", b"2", b"1", b"0", b"1", b"1"]),
+                (5, vec![b"0", b"0", b"0", b"0", b"\xff"]),
+                (6, vec![b"name"]),
+                (7, vec![b"1.0"]),
+                (8, vec![b"a", b"b", b"c"]),
+                (9, vec![b" 1"]),
+                (9, vec![b"0\0"]),
+            ] {
+                cases.push((mode, packet(&parts)));
+            }
+            for (mode, input) in cases {
+                let mut out = [0x5a; 64];
+                assert_eq!(
+                    unsafe {
+                        nntmux_activity_captcha_cloudflare_expiry(
+                            mode,
+                            input.as_ptr(),
+                            input.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    DECLINE,
+                    "accepted mode {mode} input {input:?}"
+                );
+                assert_eq!(out, [0x5a; 64]);
+            }
+        }
+
+        #[test]
+        fn nulls_bounds_capacity_and_overlapping_buffers() {
+            let input = packet(&[b"daily"]);
+            let mut out = [0x5a; 64];
+            for (ptr, len, dst, cap) in [
+                (std::ptr::null(), 1, out.as_mut_ptr(), out.len()),
+                (std::ptr::null(), 0, out.as_mut_ptr(), out.len()),
+                (input.as_ptr(), input.len(), std::ptr::null_mut(), 1),
+                (input.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()),
+                (input.as_ptr(), usize::MAX, out.as_mut_ptr(), out.len()),
+                (input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+            ] {
+                assert_eq!(
+                    unsafe { nntmux_activity_captcha_cloudflare_expiry(1, ptr, len, dst, cap) },
+                    DECLINE
+                );
+                assert_eq!(out, [0x5a; 64]);
+            }
+            for cap in 0..9 {
+                assert_eq!(
+                    unsafe {
+                        nntmux_activity_captcha_cloudflare_expiry(
+                            1,
+                            input.as_ptr(),
+                            input.len(),
+                            out.as_mut_ptr(),
+                            cap,
+                        )
+                    },
+                    -9
+                );
+                assert_eq!(out, [0x5a; 64]);
+            }
+            assert_eq!(
+                unsafe {
+                    nntmux_activity_captcha_cloudflare_expiry(
+                        1,
+                        input.as_ptr(),
+                        input.len(),
+                        out.as_mut_ptr(),
+                        9,
+                    )
+                },
+                9
+            );
+            assert_eq!(&out[..9], packet(&[b"1"]));
+            assert_eq!(&out[9..], &[0x5a; 55]);
+            let mut alias = input.clone();
+            assert_eq!(
+                unsafe {
+                    nntmux_activity_captcha_cloudflare_expiry(
+                        1,
+                        alias.as_ptr(),
+                        alias.len(),
+                        alias.as_mut_ptr(),
+                        alias.len(),
+                    )
+                },
+                9
+            );
+            assert_eq!(&alias[..9], packet(&[b"1"]));
+        }
+    }
+}
