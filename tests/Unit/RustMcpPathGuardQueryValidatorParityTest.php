@@ -458,6 +458,10 @@ class RustMcpPathGuardQueryValidatorParityTest extends TestCase
         $params65['p65'] = 65;
         $requests['max_65_params_rejected'] = $this->makeQueryRequest([], (string) json_encode($params65));
         $requests['max_65_split_url_and_body_rejected'] = $this->makeQueryRequest(['url_p' => '1'], (string) json_encode($params64));
+        $params67InvalidKey = $params65;
+        $params67InvalidKey['p66'] = 66;
+        $params67InvalidKey['bad-key'] = 67;
+        $requests['max_67_params_with_invalid_67th_key'] = $this->makeQueryRequest([], (string) json_encode($params67InvalidKey));
 
         $declinedCases = [
             'valid_unicode_escapes',
@@ -468,6 +472,7 @@ class RustMcpPathGuardQueryValidatorParityTest extends TestCase
             'duplicate_url_and_escaped_body_key',
             'duplicate_keys_inside_json_body',
             'duplicate_keys_inside_json_body_turned_invalid',
+            'max_67_params_with_invalid_67th_key',
         ];
 
         foreach ($requests as $name => $request) {

@@ -7217,10 +7217,11 @@ fn parse_top_level_query_json<'a>(
         {
             return JsonParseOutcome::Decline;
         }
-        if *entries_len < 66 {
-            entries[*entries_len] = (key_slice, val_kind);
-            *entries_len += 1;
+        if *entries_len >= 66 {
+            return JsonParseOutcome::Decline;
         }
+        entries[*entries_len] = (key_slice, val_kind);
+        *entries_len += 1;
         i = skip_json_ws(bytes, after_val);
         if i >= bytes.len() {
             return JsonParseOutcome::InvalidOrTooDeep;
@@ -7636,7 +7637,7 @@ fn has_ambiguous_mb_list_encodings_ascii(s: &[u8]) -> bool {
             return true;
         }
         if b == b'+' {
-            if s.get(i + 1) == Some(&b'-') {
+            if i + 3 >= s.len() || s.get(i + 1) == Some(&b'-') {
                 return true;
             }
             // UTF-7 requires >= 3 base64 chars after '+' to form at least one 16-bit UTF-16 code unit

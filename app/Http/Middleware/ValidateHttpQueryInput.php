@@ -279,21 +279,6 @@ final class ValidateHttpQueryInput
 
     public function isJsonMediaType(?string $contentType): bool
     {
-        if ($contentType === null) {
-            return false;
-        }
-
-        if (! \str_contains($contentType, ';')) {
-            return strtolower(trim($contentType)) === 'application/json';
-        }
-
-        if (self::$useRustFfi) {
-            $native = self::isJsonMediaTypeNative($contentType);
-            if ($native !== null) {
-                return $native;
-            }
-        }
-
         return $this->isJsonMediaTypePhp($contentType);
     }
 
