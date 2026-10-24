@@ -18,6 +18,9 @@ class OpenLibraryService
 
     protected const ISBN_URL = 'https://openlibrary.org/isbn/';
 
+    /** Null selects the benchmark-qualified production default. */
+    public ?bool $useRustFfi = null;
+
     protected Client $client;
 
     protected int $limit = 5;
@@ -157,9 +160,36 @@ class OpenLibraryService
      */
     private function normalizeIsbnResult(array $book, string $isbn): array
     {
+        return ($this->useRustFfi ?? false) ? $this->normalizeIsbnResultNative($book, $isbn) : $this->normalizeIsbnResultPhp($book, $isbn);
+    }
+
+    /**
+     * @param  array<string, mixed>  $book
+     * @return array<string, mixed>
+     */
+    public function normalizeIsbnResultNative(array $book, string $isbn): array
+    {
+        $parts = GoogleBooksService::providerFields(2, [$book['authors'] ?? null, $book['publish_date'] ?? null], 3);
+        if ($parts === null) {
+            return $this->normalizeIsbnResultPhp($book, $isbn);
+        }
+
+        return $this->normalizeIsbnResultPhp($book, $isbn, [
+            'author' => $parts[0],
+            'publishdate' => $parts[1] === '1' ? ($parts[2] === '' ? null : $parts[2]) : $this->normalizePublishDate($book['publish_date'] ?? null),
+        ]);
+    }
+
+    /**
+     * @param  array<string, mixed>  $book
+     * @param  array{author: string, publishdate: ?string}|null  $native
+     * @return array<string, mixed>
+     */
+    public function normalizeIsbnResultPhp(array $book, string $isbn, ?array $native = null): array
+    {
         $title = (string) ($book['title'] ?? '');
         $authors = [];
-        if (is_array($book['authors'] ?? null)) {
+        if ($native === null && is_array($book['authors'] ?? null)) {
             foreach ($book['authors'] as $author) {
                 if (is_array($author) && isset($author['name'])) {
                     $authors[] = (string) $author['name'];
@@ -167,7 +197,7 @@ class OpenLibraryService
             }
         }
 
-        $publishDate = $this->normalizePublishDate($book['publish_date'] ?? null);
+        $publishDate = $native !== null ? $native['publishdate'] : $this->normalizePublishDate($book['publish_date'] ?? null);
         $coverUrl = '';
         if (is_array($book['covers'] ?? null) && isset($book['covers'][0])) {
             $coverUrl = 'https://covers.openlibrary.org/b/id/'.(int) $book['covers'][0].'-L.jpg';
@@ -175,7 +205,7 @@ class OpenLibraryService
 
         return [
             'title' => $title,
-            'author' => implode(', ', $authors),
+            'author' => $native['author'] ?? implode(', ', $authors),
             'asin' => 'openlibrary:'.$isbn,
             'isbn' => strlen($isbn) === 13 ? $isbn : null,
             'ean' => strlen($isbn) === 10 ? $isbn : null,
@@ -197,9 +227,35 @@ class OpenLibraryService
      */
     private function normalizeSearchResult(array $doc): array
     {
-        $isbn13 = null;
-        $isbn10 = null;
-        if (is_array($doc['isbn'] ?? null)) {
+        return ($this->useRustFfi ?? false) ? $this->normalizeSearchResultNative($doc) : $this->normalizeSearchResultPhp($doc);
+    }
+
+    /**
+     * @param  array<string, mixed>  $doc
+     * @return array<string, mixed>
+     */
+    public function normalizeSearchResultNative(array $doc): array
+    {
+        $parts = GoogleBooksService::providerFields(1, [$doc['isbn'] ?? null, $doc['author_name'] ?? null], 3);
+        if ($parts === null) {
+            return $this->normalizeSearchResultPhp($doc);
+        }
+
+        return $this->normalizeSearchResultPhp($doc, [
+            'isbn13' => $parts[0] === '' ? null : $parts[0], 'isbn10' => $parts[1] === '' ? null : $parts[1], 'author' => $parts[2],
+        ]);
+    }
+
+    /**
+     * @param  array<string, mixed>  $doc
+     * @param  array{isbn13: ?string, isbn10: ?string, author: string}|null  $native
+     * @return array<string, mixed>
+     */
+    public function normalizeSearchResultPhp(array $doc, ?array $native = null): array
+    {
+        $isbn13 = $native['isbn13'] ?? null;
+        $isbn10 = $native['isbn10'] ?? null;
+        if ($native === null && is_array($doc['isbn'] ?? null)) {
             foreach ($doc['isbn'] as $isbn) {
                 $normalized = BookIsbn::normalize((string) $isbn);
                 if ($normalized === null) {
@@ -214,7 +270,7 @@ class OpenLibraryService
         }
 
         $identifier = $isbn13 ?? $isbn10 ?? (string) ($doc['key'] ?? md5((string) json_encode($doc)));
-        $authorNames = is_array($doc['author_name'] ?? null)
+        $authorNames = $native === null && is_array($doc['author_name'] ?? null)
             ? array_values(array_filter(array_map('strval', $doc['author_name'])))
             : [];
 
@@ -224,7 +280,7 @@ class OpenLibraryService
 
         return [
             'title' => (string) ($doc['title'] ?? ''),
-            'author' => implode(', ', $authorNames),
+            'author' => $native['author'] ?? implode(', ', $authorNames),
             'asin' => 'openlibrary:'.$identifier,
             'isbn' => $isbn13,
             'ean' => $isbn10,

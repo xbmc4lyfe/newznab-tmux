@@ -4,11 +4,14 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use App\Support\RustPipelineLibrary;
 use Carbon\Carbon;
+use FFI;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
+use Throwable;
 
 /**
  * Custom iTunes Search API Service.
@@ -22,6 +25,16 @@ class ItunesService
     protected const API_URL = 'https://itunes.apple.com/search';
 
     protected const LOOKUP_URL = 'https://itunes.apple.com/lookup';
+
+    public const NORMALIZER_FFI_CDEF = <<<'C'
+        ssize_t nntmux_itunes_high_res_cover(const char *input, size_t len, int64_t size, char *out, size_t cap);
+        ssize_t nntmux_itunes_result_fields(const char *input, size_t len, int64_t size, char *out, size_t cap);
+        C;
+
+    /** Null selects the benchmark-qualified production default. */
+    public ?bool $useRustFfi = null;
+
+    private static FFI|false|null $normalizerFfi = null;
 
     protected Client $client;
 
@@ -299,6 +312,77 @@ class ItunesService
         }
     }
 
+    public static function normalizerFfi(): ?FFI
+    {
+        if (self::$normalizerFfi === null) {
+            self::$normalizerFfi = RustPipelineLibrary::resolveDomain('metadata', self::NORMALIZER_FFI_CDEF) ?? false;
+        }
+
+        return self::$normalizerFfi === false ? null : self::$normalizerFfi;
+    }
+
+    /** PCRE `\d` follows LC_CTYPE character tables outside the C locales. */
+    public static function normalizerEnvironmentSupported(): bool
+    {
+        return in_array(setlocale(LC_CTYPE, '0'), ['C', 'POSIX', 'C.UTF-8', 'C.utf8'], true);
+    }
+
+    /** Return null when Rust declines or the library is unavailable. */
+    private static function normalizerString(string $symbol, string $input, int $size): ?string
+    {
+        if (! self::normalizerEnvironmentSupported() || ($ffi = self::normalizerFfi()) === null) {
+            return null;
+        }
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, strlen($input) + 64, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            $written = $ffi->$symbol($input, strlen($input), $size, $buffer, $capacity);
+            if (is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                $written = $ffi->$symbol($input, strlen($input), $size, $buffer, $capacity);
+            }
+
+            return is_int($written) && $written >= 0 && $written <= $capacity ? FFI::string($buffer, $written) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Rust `release_date` and `cover`; null keeps the PHP path (including its TypeErrors).
+     *
+     * @param  array<string, mixed>  $result
+     * @return array{release_date: ?string, cover: string}|null
+     */
+    private function nativeResultFields(array $result): ?array
+    {
+        $date = $result['releaseDate'] ?? null;
+        $artwork = $result['artworkUrl100'] ?? '';
+        if (($date !== null && ! is_string($date)) || ! is_string($artwork)) {
+            return null;
+        }
+        $input = ($date === null ? '0' : '1')."\0".$date."\0".$artwork."\0";
+        if (substr_count($input, "\0") !== 3) {
+            return null;
+        }
+        $output = self::normalizerString('nntmux_itunes_result_fields', $input, 800);
+        $parts = $output === null ? [] : explode("\0", $output);
+        if (count($parts) !== 4 || $parts[3] !== '') {
+            return null;
+        }
+
+        return [
+            'release_date' => $parts[0] === '1' ? ($parts[1] === '' ? null : $parts[1]) : $this->parseDate((string) $date),
+            'cover' => $parts[2],
+        ];
+    }
+
     /**
      * Normalize album result to consistent format.
      *
@@ -307,15 +391,34 @@ class ItunesService
      */
     protected function normalizeAlbumResult(array $result): array
     {
+        return ($this->useRustFfi ?? true) ? $this->normalizeAlbumResultNative($result) : $this->normalizeAlbumResultPhp($result);
+    }
+
+    /**
+     * @param  array<string, mixed>  $result
+     * @return array<string, mixed>
+     */
+    public function normalizeAlbumResultNative(array $result): array
+    {
+        return $this->normalizeAlbumResultPhp($result, $this->nativeResultFields($result));
+    }
+
+    /**
+     * @param  array<string, mixed>  $result
+     * @param  array{release_date: ?string, cover: string}|null  $native
+     * @return array<string, mixed>
+     */
+    public function normalizeAlbumResultPhp(array $result, ?array $native = null): array
+    {
         return [
             'id' => $result['collectionId'] ?? null,
             'name' => $result['collectionName'] ?? '',
             'artist' => $result['artistName'] ?? '',
             'artist_id' => $result['artistId'] ?? null,
             'genre' => $result['primaryGenreName'] ?? '',
-            'release_date' => isset($result['releaseDate']) ? $this->parseDate($result['releaseDate']) : null,
+            'release_date' => $native !== null ? $native['release_date'] : (isset($result['releaseDate']) ? $this->parseDate($result['releaseDate']) : null),
             'track_count' => $result['trackCount'] ?? 0,
-            'cover' => $this->getHighResCover($result['artworkUrl100'] ?? ''),
+            'cover' => $native['cover'] ?? $this->getHighResCover($result['artworkUrl100'] ?? ''),
             'store_url' => $result['collectionViewUrl'] ?? '',
             'price' => $result['collectionPrice'] ?? null,
             'currency' => $result['currency'] ?? 'USD',
@@ -333,6 +436,25 @@ class ItunesService
      */
     protected function normalizeTrackResult(array $result): array
     {
+        return ($this->useRustFfi ?? true) ? $this->normalizeTrackResultNative($result) : $this->normalizeTrackResultPhp($result);
+    }
+
+    /**
+     * @param  array<string, mixed>  $result
+     * @return array<string, mixed>
+     */
+    public function normalizeTrackResultNative(array $result): array
+    {
+        return $this->normalizeTrackResultPhp($result, $this->nativeResultFields($result));
+    }
+
+    /**
+     * @param  array<string, mixed>  $result
+     * @param  array{release_date: ?string, cover: string}|null  $native
+     * @return array<string, mixed>
+     */
+    public function normalizeTrackResultPhp(array $result, ?array $native = null): array
+    {
         return [
             'id' => $result['trackId'] ?? null,
             'name' => $result['trackName'] ?? '',
@@ -341,9 +463,9 @@ class ItunesService
             'album' => $result['collectionName'] ?? '',
             'album_id' => $result['collectionId'] ?? null,
             'genre' => $result['primaryGenreName'] ?? '',
-            'release_date' => isset($result['releaseDate']) ? $this->parseDate($result['releaseDate']) : null,
+            'release_date' => $native !== null ? $native['release_date'] : (isset($result['releaseDate']) ? $this->parseDate($result['releaseDate']) : null),
             'duration_ms' => $result['trackTimeMillis'] ?? 0,
-            'cover' => $this->getHighResCover($result['artworkUrl100'] ?? ''),
+            'cover' => $native['cover'] ?? $this->getHighResCover($result['artworkUrl100'] ?? ''),
             'preview_url' => $result['previewUrl'] ?? '',
             'store_url' => $result['trackViewUrl'] ?? '',
             'price' => $result['trackPrice'] ?? null,
@@ -361,6 +483,25 @@ class ItunesService
      */
     protected function normalizeEbookResult(array $result): array
     {
+        return ($this->useRustFfi ?? true) ? $this->normalizeEbookResultNative($result) : $this->normalizeEbookResultPhp($result);
+    }
+
+    /**
+     * @param  array<string, mixed>  $result
+     * @return array<string, mixed>
+     */
+    public function normalizeEbookResultNative(array $result): array
+    {
+        return $this->normalizeEbookResultPhp($result, $this->nativeResultFields($result));
+    }
+
+    /**
+     * @param  array<string, mixed>  $result
+     * @param  array{release_date: ?string, cover: string}|null  $native
+     * @return array<string, mixed>
+     */
+    public function normalizeEbookResultPhp(array $result, ?array $native = null): array
+    {
         return [
             'id' => $result['trackId'] ?? null,
             'name' => $result['trackName'] ?? '',
@@ -368,9 +509,9 @@ class ItunesService
             'author_id' => $result['artistId'] ?? null,
             'genres' => $result['genres'] ?? [],
             'genre' => $result['primaryGenreName'] ?? ($result['genres'][0] ?? ''),
-            'release_date' => isset($result['releaseDate']) ? $this->parseDate($result['releaseDate']) : null,
+            'release_date' => $native !== null ? $native['release_date'] : (isset($result['releaseDate']) ? $this->parseDate($result['releaseDate']) : null),
             'description' => $result['description'] ?? '',
-            'cover' => $this->getHighResCover($result['artworkUrl100'] ?? ''),
+            'cover' => $native['cover'] ?? $this->getHighResCover($result['artworkUrl100'] ?? ''),
             'store_url' => $result['trackViewUrl'] ?? '',
             'price' => $result['price'] ?? null,
             'currency' => $result['currency'] ?? 'USD',
@@ -384,6 +525,20 @@ class ItunesService
      * Convert iTunes 100x100 artwork URL to higher resolution.
      */
     protected function getHighResCover(string $url, int $size = 800): string
+    {
+        return ($this->useRustFfi ?? false) ? $this->getHighResCoverNative($url, $size) : $this->getHighResCoverPhp($url, $size);
+    }
+
+    public function getHighResCoverNative(string $url, int $size = 800): string
+    {
+        if (empty($url)) {
+            return '';
+        }
+
+        return self::normalizerString('nntmux_itunes_high_res_cover', $url, $size) ?? $this->getHighResCoverPhp($url, $size);
+    }
+
+    public function getHighResCoverPhp(string $url, int $size = 800): string
     {
         if (empty($url)) {
             return '';

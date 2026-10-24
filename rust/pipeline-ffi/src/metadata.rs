@@ -11859,3 +11859,655 @@ mod book_candidate_ranking {
         }
     }
 }
+
+// ============================================================================
+// GoogleBooks / OpenLibrary / iTunes / Steam normalizer helpers
+// ============================================================================
+
+/// Pure-CPU normalizer pieces for book, iTunes and Steam provider payloads.
+/// Every export declines (`-1`) when PHP value semantics (float casts,
+/// array-to-string warnings, framing, unsupported markup or date forms)
+/// cannot be reproduced exactly, so the PHP caller recomputes.
+mod book_itunes_steam_normalizer {
+    use super::{OutCursor, PhpNode, PhpSerParser, PhpVal, book_isbn_normalize};
+    use std::borrow::Cow;
+    use std::slice;
+
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 4 << 20;
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT {
+            return None;
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    unsafe fn emit(out: *mut u8, cap: usize, data: Option<Vec<u8>>) -> isize {
+        let Some(data) = data else {
+            return DECLINE;
+        };
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        cursor.extend(&data);
+        cursor.finish()
+    }
+
+    /// Appends one NUL-terminated field; declines payloads containing NUL.
+    #[inline]
+    fn field(out: &mut Vec<u8>, value: &[u8]) -> Option<()> {
+        if value.contains(&0) {
+            return None;
+        }
+        out.extend_from_slice(value);
+        out.push(0);
+        Some(())
+    }
+
+    /// `strval()` / `(string)` for values whose conversion has no side effects.
+    #[inline]
+    fn strval<'a>(node: Option<&PhpNode<'a>>) -> Option<Cow<'a, [u8]>> {
+        match node.map(|n| &n.val) {
+            None | Some(PhpVal::Null) | Some(PhpVal::Bool(false)) => Some(Cow::Borrowed(b"")),
+            Some(PhpVal::Bool(true)) => Some(Cow::Borrowed(b"1")),
+            Some(PhpVal::Int(i)) => Some(Cow::Owned(i.to_string().into_bytes())),
+            Some(PhpVal::Str(s)) => Some(Cow::Borrowed(s)),
+            Some(PhpVal::Float) | Some(PhpVal::Arr(_)) => None,
+        }
+    }
+
+    /// `empty()` on a decoded value; `None` when float truthiness is required.
+    #[inline]
+    fn empty(node: Option<&PhpNode<'_>>) -> Option<bool> {
+        match node.map(|n| &n.val) {
+            None | Some(PhpVal::Null) => Some(true),
+            Some(PhpVal::Bool(b)) => Some(!b),
+            Some(PhpVal::Int(i)) => Some(*i == 0),
+            Some(PhpVal::Str(s)) => Some(s.is_empty() || *s == b"0"),
+            Some(PhpVal::Arr(items)) => Some(items.is_empty()),
+            Some(PhpVal::Float) => None,
+        }
+    }
+
+    /// `implode(', ', array_filter(array_map('strval', $items)))`.
+    fn join_filtered(list: Option<&PhpNode<'_>>, separator: &[u8]) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        let Some(list) = list.filter(|n| n.is_arr()) else {
+            return Some(out);
+        };
+        for (_, item) in list.items() {
+            let value = strval(Some(item))?;
+            if value.is_empty() || *value == *b"0" {
+                continue;
+            }
+            if !out.is_empty() {
+                out.extend_from_slice(separator);
+            }
+            out.extend_from_slice(&value);
+        }
+        Some(out)
+    }
+
+    /// `BookIsbn::normalize()` over raw bytes.
+    fn isbn(value: &[u8]) -> Option<String> {
+        let filtered: String = value
+            .iter()
+            .filter_map(|&b| match b {
+                b'0'..=b'9' => Some(b as char),
+                b'x' | b'X' => Some('X'),
+                _ => None,
+            })
+            .collect();
+        book_isbn_normalize(&filtered)
+    }
+
+    fn digits(s: &[u8]) -> Option<u32> {
+        if s.is_empty() || !s.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        s.iter().try_fold(0u32, |acc, &b| {
+            acc.checked_mul(10)?.checked_add(u32::from(b - b'0'))
+        })
+    }
+
+    fn valid_ymd(year: u32, month: u32, day: u32) -> bool {
+        if year == 0 || !(1..=12).contains(&month) || day == 0 {
+            return false;
+        }
+        let leap =
+            year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+        let days = [
+            31,
+            if leap { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
+        day <= days[month as usize - 1]
+    }
+
+    /// Strict `YYYY-MM-DD` with a real calendar day.
+    fn iso_date(s: &[u8]) -> bool {
+        s.len() == 10
+            && s[4] == b'-'
+            && s[7] == b'-'
+            && matches!(
+                (digits(&s[..4]), digits(&s[5..7]), digits(&s[8..])),
+                (Some(y), Some(m), Some(d)) if valid_ymd(y, m, d)
+            )
+    }
+
+    /// `Carbon::parse($s)->format('Y-m-d')` for the forms reproduced exactly:
+    /// `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM:SSZ` and English `Month D, YYYY`.
+    fn carbon_date(s: &[u8]) -> Option<Vec<u8>> {
+        if iso_date(s) {
+            return Some(s.to_vec());
+        }
+        if s.len() == 20 && iso_date(&s[..10]) && s[10] == b'T' && s[19] == b'Z' {
+            let t = &s[11..19];
+            let ok = t[2] == b':'
+                && t[5] == b':'
+                && digits(&t[..2]).is_some_and(|h| h < 24)
+                && digits(&t[3..5]).is_some_and(|m| m < 60)
+                && digits(&t[6..]).is_some_and(|sec| sec < 60);
+            return ok.then(|| s[..10].to_vec());
+        }
+        const MONTHS: [&[u8]; 12] = [
+            b"January",
+            b"February",
+            b"March",
+            b"April",
+            b"May",
+            b"June",
+            b"July",
+            b"August",
+            b"September",
+            b"October",
+            b"November",
+            b"December",
+        ];
+        let space = s.iter().position(|&b| b == b' ')?;
+        let month = MONTHS.iter().position(|m| *m == &s[..space])? as u32 + 1;
+        let rest = &s[space + 1..];
+        let comma = rest.iter().position(|&b| b == b',')?;
+        let (day, year) = (&rest[..comma], &rest[comma + 1..]);
+        if !(1..=2).contains(&day.len()) || year.len() != 5 || year[0] != b' ' {
+            return None;
+        }
+        let (d, y) = (digits(day)?, digits(&year[1..])?);
+        valid_ymd(y, month, d).then(|| format!("{:04}-{month:02}-{d:02}", y).into_bytes())
+    }
+
+    /// Book `normalizePublishDate()` status/value pair: `1` with the date
+    /// (empty for `null`) when reproduced, otherwise `0` for PHP to compute.
+    fn publish_date(out: &mut Vec<u8>, node: Option<&PhpNode<'_>>) -> Option<()> {
+        let date = match node.map(|n| &n.val) {
+            Some(PhpVal::Str(s)) => {
+                let trimmed = s
+                    .iter()
+                    .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B));
+                if trimmed {
+                    Some(Vec::new())
+                } else {
+                    carbon_date(s)
+                }
+            }
+            _ => Some(Vec::new()),
+        };
+        field(out, if date.is_some() { b"1" } else { b"0" })?;
+        field(out, &date.unwrap_or_default())
+    }
+
+    /// `strip_tags()` for text whose tags are plain `<name ...>` / `</name>`
+    /// without quotes, nesting, comments, processing instructions or NUL.
+    fn strip_tags(s: &[u8]) -> Option<Vec<u8>> {
+        let mut out = Vec::with_capacity(s.len());
+        let mut i = 0;
+        while i < s.len() {
+            match s[i] {
+                0 | b'>' => return None,
+                b'<' => {
+                    let first = *s.get(i + 1)?;
+                    if !(first.is_ascii_alphabetic() || first == b'/') {
+                        return None;
+                    }
+                    let close = s[i + 1..].iter().position(|&b| b == b'>')? + i + 1;
+                    if s[i + 1..close]
+                        .iter()
+                        .any(|&b| matches!(b, b'<' | b'"' | b'\'' | 0))
+                    {
+                        return None;
+                    }
+                    i = close + 1;
+                }
+                b => {
+                    out.push(b);
+                    i += 1;
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// Input: `serialize([identifiers, authors, categories, description, publishedDate])`.
+    /// Output fields: isbn13, isbn10, author, genre, overview, date status, date.
+    fn google_books_fields(doc: &PhpNode<'_>) -> Option<Vec<u8>> {
+        let at = |i: i64| doc.get_int_key(i);
+        if doc.items().len() != 5 {
+            return None;
+        }
+        let (mut isbn13, mut isbn10) = (String::new(), String::new());
+        if let Some(ids) = at(0).filter(|n| n.is_arr()) {
+            for (_, id) in ids.items() {
+                if !id.is_arr() {
+                    continue;
+                }
+                let kind = strval(id.coalesce(b"type"))?;
+                let value = strval(id.coalesce(b"identifier"))?;
+                let value = isbn(&value);
+                match (&*kind, value) {
+                    (b"ISBN_13", Some(v)) if v.len() == 13 => isbn13 = v,
+                    (b"ISBN_10", Some(v)) if v.len() == 10 => isbn10 = v,
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        field(&mut out, isbn13.as_bytes())?;
+        field(&mut out, isbn10.as_bytes())?;
+        field(&mut out, &join_filtered(at(1), b", ")?)?;
+        field(&mut out, &join_filtered(at(2), b", ")?)?;
+        field(&mut out, &strip_tags(&strval(at(3))?)?)?;
+        publish_date(&mut out, at(4))?;
+        Some(out)
+    }
+
+    /// Input: `serialize([isbns, author_names])`. Output: isbn13, isbn10, author.
+    fn open_library_search_fields(doc: &PhpNode<'_>) -> Option<Vec<u8>> {
+        if doc.items().len() != 2 {
+            return None;
+        }
+        let (mut isbn13, mut isbn10) = (None, None);
+        if let Some(list) = doc.get_int_key(0).filter(|n| n.is_arr()) {
+            for (_, item) in list.items() {
+                let Some(v) = isbn(&strval(Some(item))?) else {
+                    continue;
+                };
+                if v.len() == 13 && isbn13.is_none() {
+                    isbn13 = Some(v);
+                } else if v.len() == 10 && isbn10.is_none() {
+                    isbn10 = Some(v);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        field(&mut out, isbn13.unwrap_or_default().as_bytes())?;
+        field(&mut out, isbn10.unwrap_or_default().as_bytes())?;
+        field(&mut out, &join_filtered(doc.get_int_key(1), b", ")?)?;
+        Some(out)
+    }
+
+    /// Input: `serialize([authors, publish_date])`. Output: author, date status, date.
+    fn open_library_isbn_fields(doc: &PhpNode<'_>) -> Option<Vec<u8>> {
+        if doc.items().len() != 2 {
+            return None;
+        }
+        let mut author = Vec::new();
+        let mut first = true;
+        if let Some(list) = doc.get_int_key(0).filter(|n| n.is_arr()) {
+            for (_, item) in list.items() {
+                let Some(name) = item.coalesce(b"name").filter(|_| item.is_arr()) else {
+                    continue;
+                };
+                if !first {
+                    author.extend_from_slice(b", ");
+                }
+                first = false;
+                author.extend_from_slice(&strval(Some(name))?);
+            }
+        }
+        let mut out = Vec::new();
+        field(&mut out, &author)?;
+        publish_date(&mut out, doc.get_int_key(1))?;
+        Some(out)
+    }
+
+    /// `preg_replace('/\d+x\d+(bb)?\./', "{size}x{size}bb.", $url)` (C locale).
+    fn high_res_cover(url: &[u8], size: i64) -> Vec<u8> {
+        if url.is_empty() || url == b"0" {
+            return Vec::new();
+        }
+        let replacement = format!("{size}x{size}bb.");
+        let mut out = Vec::with_capacity(url.len() + replacement.len());
+        let n = url.len();
+        let run = |mut k: usize| {
+            while k < n && url[k].is_ascii_digit() {
+                k += 1;
+            }
+            k
+        };
+        let mut i = 0;
+        while i < n {
+            if !url[i].is_ascii_digit() {
+                out.push(url[i]);
+                i += 1;
+                continue;
+            }
+            // Every start inside one digit run reaches the same `x`, so a
+            // failed run is copied whole before scanning continues.
+            let j = run(i);
+            if j < n && url[j] == b'x' {
+                let k = run(j + 1);
+                if k > j + 1 {
+                    let end = if url[k..].starts_with(b"bb.") {
+                        Some(k + 3)
+                    } else if url.get(k) == Some(&b'.') {
+                        Some(k + 1)
+                    } else {
+                        None
+                    };
+                    if let Some(end) = end {
+                        out.extend_from_slice(replacement.as_bytes());
+                        i = end;
+                        continue;
+                    }
+                }
+            }
+            out.extend_from_slice(&url[i..j]);
+            i = j;
+        }
+        out
+    }
+
+    /// Typed scalar for Steam reshaping: `N` null, `S` string, `I` int,
+    /// `B1`/`B0` bool. Floats and arrays decline.
+    fn typed(out: &mut Vec<u8>, node: Option<&PhpNode<'_>>) -> Option<()> {
+        let value: Cow<'_, [u8]> = match node.map(|n| &n.val) {
+            None | Some(PhpVal::Null) => Cow::Borrowed(b"N"),
+            Some(PhpVal::Bool(b)) => Cow::Borrowed(if *b { b"B1" } else { b"B0" }),
+            Some(PhpVal::Int(i)) => Cow::Owned(format!("I{i}").into_bytes()),
+            Some(PhpVal::Str(s)) => {
+                let mut v = Vec::with_capacity(s.len() + 1);
+                v.push(b'S');
+                v.extend_from_slice(s);
+                Cow::Owned(v)
+            }
+            Some(PhpVal::Float) | Some(PhpVal::Arr(_)) => return None,
+        };
+        field(out, &value)
+    }
+
+    /// `$node[$key] ?? null` where `$node` may be any PHP value.
+    fn offset<'n, 'a>(
+        node: Option<&'n PhpNode<'a>>,
+        key: &[u8],
+    ) -> Option<Option<&'n PhpNode<'a>>> {
+        match node.map(|n| &n.val) {
+            Some(PhpVal::Arr(_)) => Some(node.and_then(|n| n.coalesce(key))),
+            // String offsets with non-numeric keys are unset.
+            _ => Some(None),
+        }
+    }
+
+    /// `$movie['mp4']['max'] ?? ($movie['mp4']['480'] ?? null)`.
+    fn video<'n, 'a>(node: Option<&'n PhpNode<'a>>) -> Option<Option<&'n PhpNode<'a>>> {
+        match node.map(|n| &n.val) {
+            Some(PhpVal::Arr(_)) => {
+                let n = node?;
+                Some(n.coalesce(b"max").or_else(|| {
+                    n.get_int_key(480)
+                        .filter(|v| !matches!(v.val, PhpVal::Null))
+                }))
+            }
+            // `$string['480']` reads a byte once the string is long enough.
+            Some(PhpVal::Str(s)) if s.len() > 480 => None,
+            _ => Some(None),
+        }
+    }
+
+    fn steam_fields(op: u32, doc: &PhpNode<'_>) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        match op {
+            0 => {
+                for (_, ss) in doc.items() {
+                    typed(&mut out, offset(Some(ss), b"path_thumbnail")?)?;
+                    typed(&mut out, offset(Some(ss), b"path_full")?)?;
+                }
+            }
+            1 => {
+                let mut trailer: Option<Vec<u8>> = None;
+                let mut body = Vec::new();
+                for (_, movie) in doc.items() {
+                    let movie = Some(movie);
+                    let mp4 = video(offset(movie, b"mp4")?)?;
+                    typed(&mut body, offset(movie, b"id")?)?;
+                    typed(&mut body, offset(movie, b"name")?)?;
+                    typed(&mut body, offset(movie, b"thumbnail")?)?;
+                    typed(&mut body, video(offset(movie, b"webm")?)?)?;
+                    typed(&mut body, mp4)?;
+                    if trailer.is_none() && !empty(mp4)? {
+                        let mut t = Vec::new();
+                        typed(&mut t, mp4)?;
+                        trailer = Some(t);
+                    }
+                }
+                match trailer {
+                    Some(t) => out.extend_from_slice(&t),
+                    None => typed(&mut out, None)?,
+                }
+                out.extend_from_slice(&body);
+            }
+            2 => {
+                for (_, item) in doc.items() {
+                    let description = offset(Some(item), b"description")?;
+                    if !empty(description)? {
+                        field(&mut out, &strval(description)?)?;
+                    }
+                }
+            }
+            3 => {
+                for (key, label) in [
+                    (&b"windows"[..], &b"Windows"[..]),
+                    (b"mac", b"Mac"),
+                    (b"linux", b"Linux"),
+                ] {
+                    if !empty(doc.coalesce(key))? {
+                        field(&mut out, label)?;
+                    }
+                }
+            }
+            4 => return join_filtered(Some(doc), b", "),
+            5 => {
+                for (_, item) in doc.items() {
+                    let value = strval(Some(item))?;
+                    if !value.is_empty() && *value != *b"0" {
+                        field(&mut out, &value)?;
+                    }
+                }
+            }
+            _ => return None,
+        }
+        Some(out)
+    }
+
+    /// Input frame `query\0title\0author\0isbn\0`; output is the search query.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_google_books_query_nul(
+        ptr: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let result = unsafe { input(ptr, len) }.and_then(|bytes| {
+            let body = bytes.strip_suffix(b"\0")?;
+            let f: Vec<&[u8]> = body.split(|&b| b == 0).collect();
+            let [query, title, author, isbn] = f.as_slice() else {
+                return None;
+            };
+            if !isbn.is_empty() {
+                return Some([&b"isbn:"[..], isbn].concat());
+            }
+            let mut q = Vec::with_capacity(len + 18);
+            if !title.is_empty() {
+                q.extend_from_slice(b"intitle:");
+                q.extend_from_slice(title);
+            }
+            if !author.is_empty() {
+                if !q.is_empty() {
+                    q.push(b' ');
+                }
+                q.extend_from_slice(b"inauthor:");
+                q.extend_from_slice(author);
+            }
+            Some(if q.is_empty() { query.to_vec() } else { q })
+        });
+        unsafe { emit(out, cap, result) }
+    }
+
+    /// `op`: 0 Google Books item, 1 Open Library search doc, 2 Open Library ISBN book.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_book_provider_fields(
+        op: u32,
+        ptr: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let result = unsafe { input(ptr, len) }
+            .and_then(PhpSerParser::parse_document)
+            .filter(PhpNode::is_arr)
+            .and_then(|doc| match op {
+                0 => google_books_fields(&doc),
+                1 => open_library_search_fields(&doc),
+                2 => open_library_isbn_fields(&doc),
+                _ => None,
+            });
+        unsafe { emit(out, cap, result) }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_itunes_high_res_cover(
+        ptr: *const u8,
+        len: usize,
+        size: i64,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let result = unsafe { input(ptr, len) }.map(|url| high_res_cover(url, size));
+        unsafe { emit(out, cap, result) }
+    }
+
+    /// Input frame `has_date\0date\0artwork\0`; output `status\0date\0cover\0`
+    /// where status `0` asks PHP to run `parseDate()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_itunes_result_fields(
+        ptr: *const u8,
+        len: usize,
+        size: i64,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let result = unsafe { input(ptr, len) }.and_then(|bytes| {
+            let body = bytes.strip_suffix(b"\0")?;
+            let f: Vec<&[u8]> = body.split(|&b| b == 0).collect();
+            let [has_date, date, artwork] = f.as_slice() else {
+                return None;
+            };
+            let date = match *has_date {
+                b"0" => Some(Vec::new()),
+                b"1" => carbon_date(date),
+                _ => return None,
+            };
+            let mut out = Vec::new();
+            field(&mut out, if date.is_some() { b"1" } else { b"0" })?;
+            field(&mut out, &date.unwrap_or_default())?;
+            field(&mut out, &high_res_cover(artwork, size))?;
+            Some(out)
+        });
+        unsafe { emit(out, cap, result) }
+    }
+
+    /// `op`: 0 screenshots, 1 movies (trailer first), 2 genres/categories,
+    /// 3 platforms, 4 publisher, 5 developers. Input is `serialize()` of the list.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_steam_list_fields(
+        op: u32,
+        ptr: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let result = unsafe { input(ptr, len) }
+            .and_then(PhpSerParser::parse_document)
+            .filter(PhpNode::is_arr)
+            .and_then(|doc| steam_fields(op, &doc));
+        unsafe { emit(out, cap, result) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn parse(s: &str) -> PhpNode<'_> {
+            PhpSerParser::parse_document(s.as_bytes()).unwrap()
+        }
+
+        #[test]
+        fn covers_dates_and_tags() {
+            let cover = |u: &str| String::from_utf8(high_res_cover(u.as_bytes(), 800)).unwrap();
+            assert_eq!(cover("https://a/100x100bb.jpg"), "https://a/800x800bb.jpg");
+            assert_eq!(cover("a/12x34.png/5x6bb.x"), "a/800x800bb.png/800x800bb.x");
+            assert_eq!(cover("1x2b.3x4."), "1x2b.800x800bb.");
+            assert_eq!(cover("x1x.0"), "x1x.0");
+            assert_eq!(cover("0"), "");
+            assert_eq!(carbon_date(b"2020-02-29T23:59:59Z").unwrap(), b"2020-02-29");
+            assert_eq!(carbon_date(b"September 1, 2020").unwrap(), b"2020-09-01");
+            assert!(carbon_date(b"2019-02-29").is_none());
+            assert!(carbon_date(b"2020").is_none());
+            assert_eq!(strip_tags(b"<p>One</p> <br/>Two").unwrap(), b"One Two");
+            assert!(strip_tags(b"a < b").is_none());
+            assert!(strip_tags(b"<a href=\"x\">").is_none());
+        }
+
+        #[test]
+        fn provider_and_steam_frames() {
+            let doc = parse(
+                "a:2:{i:0;a:3:{i:0;s:3:\"bad\";i:1;i:9780132350884;i:2;s:10:\"0132350882\";}i:1;a:3:{i:0;s:1:\"0\";i:1;s:1:\"A\";i:2;b:1;}}",
+            );
+            assert_eq!(
+                open_library_search_fields(&doc).unwrap(),
+                b"9780132350884\x000132350882\x00A, 1\x00"
+            );
+            let doc = parse("a:2:{i:0;a:1:{s:3:\"max\";d:1.5;}i:1;i:0;}");
+            assert!(steam_fields(0, &doc).is_some());
+            assert!(
+                steam_fields(2, &parse("a:1:{i:0;a:1:{s:11:\"description\";d:1.5;}}")).is_none()
+            );
+            assert_eq!(
+                steam_fields(3, &parse("a:2:{s:3:\"mac\";i:1;s:5:\"linux\";s:1:\"0\";}")).unwrap(),
+                b"Mac\0"
+            );
+            unsafe {
+                assert_eq!(
+                    nntmux_steam_list_fields(9, b"a:0:{}".as_ptr(), 6, std::ptr::null_mut(), 0),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_google_books_query_nul(b"q\0".as_ptr(), 2, std::ptr::null_mut(), 0),
+                    DECLINE
+                );
+            }
+        }
+    }
+}

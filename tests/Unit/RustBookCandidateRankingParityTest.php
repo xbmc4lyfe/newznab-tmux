@@ -318,6 +318,8 @@ final class RustBookCandidateRankingParityTest extends TestCase
         } finally {
             $property->setValue(null, $previous);
             mb_internal_encoding($encoding);
+            // Reset PCRE character tables to ASCII before restoring the prior locale.
+            setlocale(LC_CTYPE, 'C');
             if ($locale !== false) {
                 setlocale(LC_CTYPE, $locale);
             }
