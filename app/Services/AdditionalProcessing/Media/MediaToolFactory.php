@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace App\Services\AdditionalProcessing\Media;
 
 use App\Services\AdditionalProcessing\Config\ProcessingConfiguration;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use FFMpeg\FFMpeg;
 use FFMpeg\FFProbe;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
@@ -17,6 +19,15 @@ use Symfony\Component\Cache\Adapter\ArrayAdapter;
  */
 class MediaToolFactory
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_mtf_driver_mask(int32_t ffmpeg_is_string, size_t ffmpeg_len, int32_t ffprobe_is_string, size_t ffprobe_len);
+        C;
+
+    // PHP remains the production default until benchmarks qualify Rust.
+    public static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
     private const int PROBE_CACHE_ITEMS = 64;
 
     private ?FFProbe $ffprobe = null;
@@ -39,18 +50,86 @@ class MediaToolFactory
         return $this->ffmpeg ??= FFMpeg::create($this->driverConfiguration(), null, $this->ffprobe());
     }
 
+    public static function setUseRustFfi(bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi;
+    }
+
+    public static function additionalFfi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
     /**
      * @return array{timeout: int, 'ffmpeg.binaries'?: string, 'ffprobe.binaries'?: string}
      */
     public function driverConfiguration(): array
     {
-        $configuration = ['timeout' => $this->config->mediaFfmpegTimeout];
+        return self::driverConfigurationFor(
+            $this->config->mediaFfmpegTimeout,
+            $this->config->ffmpegPath,
+            $this->config->ffprobePath,
+        );
+    }
 
-        if (is_string($this->config->ffmpegPath) && $this->config->ffmpegPath !== '') {
-            $configuration['ffmpeg.binaries'] = $this->config->ffmpegPath;
+    /**
+     * @return array{timeout: int, 'ffmpeg.binaries'?: string, 'ffprobe.binaries'?: string}
+     */
+    public static function driverConfigurationFor(int $timeout, string|false $ffmpegPath, string|false $ffprobePath): array
+    {
+        return self::$useRustFfi
+            ? self::driverConfigurationNative($timeout, $ffmpegPath, $ffprobePath)
+            : self::driverConfigurationPhp($timeout, $ffmpegPath, $ffprobePath);
+    }
+
+    /**
+     * @return array{timeout: int, 'ffmpeg.binaries'?: string, 'ffprobe.binaries'?: string}
+     */
+    public static function driverConfigurationPhp(int $timeout, string|false $ffmpegPath, string|false $ffprobePath): array
+    {
+        $configuration = ['timeout' => $timeout];
+
+        if (is_string($ffmpegPath) && $ffmpegPath !== '') {
+            $configuration['ffmpeg.binaries'] = $ffmpegPath;
         }
-        if (is_string($this->config->ffprobePath) && $this->config->ffprobePath !== '') {
-            $configuration['ffprobe.binaries'] = $this->config->ffprobePath;
+        if (is_string($ffprobePath) && $ffprobePath !== '') {
+            $configuration['ffprobe.binaries'] = $ffprobePath;
+        }
+
+        return $configuration;
+    }
+
+    /**
+     * @return array{timeout: int, 'ffmpeg.binaries'?: string, 'ffprobe.binaries'?: string}
+     */
+    public static function driverConfigurationNative(int $timeout, string|false $ffmpegPath, string|false $ffprobePath): array
+    {
+        $ffi = self::additionalFfi();
+        if ($ffi === null) {
+            return self::driverConfigurationPhp($timeout, $ffmpegPath, $ffprobePath);
+        }
+
+        // @phpstan-ignore method.notFound
+        $mask = $ffi->nntmux_mtf_driver_mask(
+            is_string($ffmpegPath) ? 1 : 0,
+            is_string($ffmpegPath) ? strlen($ffmpegPath) : 0,
+            is_string($ffprobePath) ? 1 : 0,
+            is_string($ffprobePath) ? strlen($ffprobePath) : 0,
+        );
+        if (! is_int($mask) || $mask < 0 || $mask > 3) {
+            return self::driverConfigurationPhp($timeout, $ffmpegPath, $ffprobePath);
+        }
+
+        $configuration = ['timeout' => $timeout];
+        if (($mask & 1) !== 0 && is_string($ffmpegPath)) {
+            $configuration['ffmpeg.binaries'] = $ffmpegPath;
+        }
+        if (($mask & 2) !== 0 && is_string($ffprobePath)) {
+            $configuration['ffprobe.binaries'] = $ffprobePath;
         }
 
         return $configuration;

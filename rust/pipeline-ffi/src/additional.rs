@@ -12212,3 +12212,804 @@ mod wave16_additional_budget_metrics_tests {
         assert_eq!(out, [3, 1, 8, 1]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 17: ProcessingConfiguration, ReleaseProcessingResult, MediaToolFactory,
+// ReleaseSearchSyncCoordinator and PersistenceMetricsCollector helpers.
+// ---------------------------------------------------------------------------
+
+/// Number of `ProcessingConfiguration` integer limits normalized by
+/// `nntmux_pcfg_normalize_limits`.
+pub(crate) const W17_LIMIT_COUNT: usize = 14;
+
+#[inline]
+fn w17_aligned<T>(ptr: *const T, count: usize) -> bool {
+    !ptr.is_null()
+        && (ptr as usize).is_multiple_of(std::mem::align_of::<T>())
+        && count
+            .checked_mul(std::mem::size_of::<T>())
+            .is_some_and(|bytes| {
+                bytes <= isize::MAX as usize && (ptr as usize).checked_add(bytes).is_some()
+            })
+}
+
+/// PHP truthiness of a `string|false` value: false, `""` and `"0"` are falsy.
+#[inline]
+fn w17_php_string_truthy(present: bool, value: &[u8]) -> bool {
+    present && !value.is_empty() && value != b"0"
+}
+
+/// `ProcessingConfiguration::getKillString`.
+pub(crate) fn w17_kill_string(present: bool, path: &[u8], timeout_seconds: i64) -> Vec<u8> {
+    if !w17_php_string_truthy(present, path) || timeout_seconds <= 0 {
+        return b"\"".to_vec();
+    }
+    let mut out = Vec::with_capacity(path.len() + 56);
+    out.push(b'"');
+    out.extend_from_slice(path);
+    out.extend_from_slice(b"\" --foreground --signal=KILL ");
+    out.extend_from_slice(timeout_seconds.to_string().as_bytes());
+    out.extend_from_slice(b" \"");
+    out
+}
+
+/// PHP's `dirname()` for POSIX paths (`zend_dirname`).
+pub(crate) fn w17_php_dirname(path: &[u8]) -> &[u8] {
+    if path.is_empty() {
+        return b"";
+    }
+    let mut end = path.len();
+    while end > 0 && path[end - 1] == b'/' {
+        end -= 1;
+    }
+    if end == 0 {
+        return b"/";
+    }
+    while end > 0 && path[end - 1] != b'/' {
+        end -= 1;
+    }
+    if end == 0 {
+        return b".";
+    }
+    while end > 0 && path[end - 1] == b'/' {
+        end -= 1;
+    }
+    if end == 0 {
+        return b"/";
+    }
+    &path[..end]
+}
+
+/// `dirname($ffmpegPath).DIRECTORY_SEPARATOR.'ffprobe'`.
+pub(crate) fn w17_ffprobe_sibling(ffmpeg_path: &[u8]) -> Vec<u8> {
+    let dir = w17_php_dirname(ffmpeg_path);
+    let mut out = Vec::with_capacity(dir.len() + 8);
+    out.extend_from_slice(dir);
+    out.extend_from_slice(b"/ffprobe");
+    out
+}
+
+/// Clamp rules for the `ProcessingConfiguration` limits, in caller order:
+/// archiveProbeFiles, seasonPackArchiveSets, seasonPackMaxReleaseFiles,
+/// par2IndexMaxSegments, par2VerifyFiles, mediaMaxBytes, mediaSampleMaxBytes,
+/// mediaMidBytes, mediaMainVideoMinBytes, mediaImageMaxBytes, mediaStageMaxSeconds,
+/// mediaFfmpegTimeout, thumbnailFrameAttempts, maximumRarPasswordChecks.
+const W17_LIMIT_RULES: [(i64, i64); W17_LIMIT_COUNT] = [
+    (0, i64::MAX),
+    (1, 50),
+    (11, 200),
+    (1, i64::MAX),
+    (0, i64::MAX),
+    (0, i64::MAX),
+    (1_048_576, i64::MAX),
+    (262_144, i64::MAX),
+    (0, i64::MAX),
+    (1_048_576, i64::MAX),
+    (0, i64::MAX),
+    (1, i64::MAX),
+    (1, 10),
+    (1, i64::MAX),
+];
+
+pub(crate) fn w17_normalize_limits(raw: &[i64; W17_LIMIT_COUNT]) -> [i64; W17_LIMIT_COUNT] {
+    let mut out = [0i64; W17_LIMIT_COUNT];
+    for (slot, (&value, &(min, max))) in out.iter_mut().zip(raw.iter().zip(W17_LIMIT_RULES.iter()))
+    {
+        *slot = value.max(min).min(max);
+    }
+    out
+}
+
+/// `ProcessingOutcome::isSuccessful` by backing value; `None` for an unknown value.
+pub(crate) fn w17_outcome_successful(value: &[u8]) -> Option<bool> {
+    match value {
+        b"completed" | b"no-useful-artifacts" | b"passworded" => Some(true),
+        b"group-unavailable"
+        | b"temporary-workspace-unavailable"
+        | b"timed-out"
+        | b"deleted-after-timeout"
+        | b"deleted-broken-nzb"
+        | b"deleted-par2-only"
+        | b"not-found"
+        | b"awaiting-late-articles"
+        | b"failed" => Some(false),
+        _ => None,
+    }
+}
+
+/// `ReleaseProcessingResult::durationSummary` over little-endian f64 stage durations:
+/// `(stage total, slowest seconds, unaccounted seconds, slowest index + 1 or 0)`.
+pub(crate) fn w17_duration_summary(packed: &[u8], elapsed: f64) -> Option<(f64, f64, f64, u64)> {
+    if !packed.len().is_multiple_of(8) {
+        return None;
+    }
+    let mut total = 0.0f64;
+    let mut slowest = 0.0f64;
+    let mut slowest_index = 0u64;
+    for (index, chunk) in packed.as_chunks::<8>().0.iter().enumerate() {
+        let seconds = f64::from_le_bytes(*chunk);
+        total += seconds;
+        if slowest_index == 0 || seconds > slowest {
+            slowest = seconds;
+            slowest_index = u64::try_from(index).ok()?.checked_add(1)?;
+        }
+    }
+    let mut unaccounted = elapsed - total;
+    if unaccounted < 0.0 {
+        unaccounted = 0.0;
+    }
+    Some((total, slowest, unaccounted, slowest_index))
+}
+
+/// `MediaToolFactory::driverConfiguration` binary inclusion mask: bit 0 for ffmpeg,
+/// bit 1 for ffprobe (each a non-empty string).
+#[inline]
+pub(crate) fn w17_driver_mask(
+    ffmpeg_is_string: bool,
+    ffmpeg_len: usize,
+    ffprobe_is_string: bool,
+    ffprobe_len: usize,
+) -> i32 {
+    i32::from(ffmpeg_is_string && ffmpeg_len > 0)
+        | (i32::from(ffprobe_is_string && ffprobe_len > 0) << 1)
+}
+
+/// Search-sync coalescing state after one coordinator operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct W17SyncState {
+    pub scope: Option<i64>,
+    pub pending: bool,
+    pub execute: Option<i64>,
+}
+
+/// `ReleaseSearchSyncCoordinator` transitions: 0 begin, 1 request, 2 discard, 3 finish.
+pub(crate) fn w17_sync_decide(
+    op: i32,
+    coalesce: bool,
+    scope: Option<i64>,
+    pending: bool,
+    arg: i64,
+) -> Option<W17SyncState> {
+    let unchanged = W17SyncState {
+        scope,
+        pending,
+        execute: None,
+    };
+    Some(match op {
+        0 if !coalesce => unchanged,
+        0 => W17SyncState {
+            scope: Some(arg),
+            pending: false,
+            execute: None,
+        },
+        1 if coalesce && scope == Some(arg) => W17SyncState {
+            scope,
+            pending: true,
+            execute: None,
+        },
+        1 => W17SyncState {
+            scope,
+            pending,
+            execute: Some(arg),
+        },
+        2 if coalesce && scope == Some(arg) => W17SyncState {
+            scope,
+            pending: false,
+            execute: None,
+        },
+        2 => unchanged,
+        3 if !coalesce => unchanged,
+        3 => W17SyncState {
+            scope: None,
+            pending: false,
+            execute: if pending { scope } else { None },
+        },
+        _ => return None,
+    })
+}
+
+/// `PersistenceMetricsCollector` counters: statements, sync requests, sync executions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct W17Metrics {
+    pub statements: i64,
+    pub milliseconds: f64,
+    pub requests: i64,
+    pub executions: i64,
+}
+
+/// Applies one collector event (0 statement, 1 sync request, 2 sync execution).
+/// `Ok(true)` when counters changed, `Ok(false)` when out of scope, `Err` on an unknown
+/// event or counter overflow.
+pub(crate) fn w17_metrics_apply(
+    event: i32,
+    scope: Option<i64>,
+    arg_id: i64,
+    arg_ms: f64,
+    metrics: &mut W17Metrics,
+) -> Result<bool, ()> {
+    match event {
+        0 => {
+            if scope.is_none() {
+                return Ok(false);
+            }
+            metrics.statements = metrics.statements.checked_add(1).ok_or(())?;
+            metrics.milliseconds += arg_ms;
+            Ok(true)
+        }
+        1 | 2 => {
+            if scope != Some(arg_id) {
+                return Ok(false);
+            }
+            let counter = if event == 1 {
+                &mut metrics.requests
+            } else {
+                &mut metrics.executions
+            };
+            *counter = counter.checked_add(1).ok_or(())?;
+            Ok(true)
+        }
+        _ => Err(()),
+    }
+}
+
+/// `ProcessingConfiguration::getKillString`. `path_present` is 0 for `false`.
+/// Returns bytes written, `-needed` for a short buffer or -1 for invalid input.
+///
+/// # Safety
+/// Non-null pointers must be valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_pcfg_kill_string(
+    path: *const u8,
+    path_len: usize,
+    path_present: i32,
+    timeout_seconds: i64,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(path) = w15_input(path, path_len) else {
+            return -1;
+        };
+        w15_write(
+            out,
+            cap,
+            &w17_kill_string(path_present != 0, path, timeout_seconds),
+        )
+    })
+    .unwrap_or(-1)
+}
+
+/// Sibling ffprobe candidate for an ffmpeg path. Returns bytes written, `-needed` for a
+/// short buffer or -1 for invalid input.
+///
+/// # Safety
+/// Non-null pointers must be valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_pcfg_ffprobe_sibling(
+    path: *const u8,
+    path_len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(path) = w15_input(path, path_len) else {
+            return -1;
+        };
+        w15_write(out, cap, &w17_ffprobe_sibling(path))
+    })
+    .unwrap_or(-1)
+}
+
+/// Normalizes the 14 `ProcessingConfiguration` integer limits. Returns the number of
+/// values written or -1 for invalid input (null/misaligned pointers, a wrong count or a
+/// short output). `raw` and `out` may alias.
+///
+/// # Safety
+/// `raw` must be readable for `count` and `out` writable for `out_count` `int64_t`s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_pcfg_normalize_limits(
+    raw: *const i64,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        if count != W17_LIMIT_COUNT
+            || out_count < W17_LIMIT_COUNT
+            || !w17_aligned(raw, count)
+            || !w17_aligned(out.cast_const(), out_count)
+        {
+            return -1;
+        }
+        let mut values = [0i64; W17_LIMIT_COUNT];
+        // SAFETY: `raw` is non-null, aligned and readable for `W17_LIMIT_COUNT` values.
+        unsafe { std::ptr::copy(raw, values.as_mut_ptr(), W17_LIMIT_COUNT) };
+        let normalized = w17_normalize_limits(&values);
+        // SAFETY: `out` is non-null, aligned and writable for `W17_LIMIT_COUNT` values.
+        unsafe { std::ptr::copy(normalized.as_ptr(), out, W17_LIMIT_COUNT) };
+        W17_LIMIT_COUNT as i32
+    })
+    .unwrap_or(-1)
+}
+
+/// `ProcessingOutcome::isSuccessful` by backing value: 1, 0 or -1 for an unknown value or
+/// invalid input.
+///
+/// # Safety
+/// A non-null `ptr` must be readable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_rpresult_outcome_successful(ptr: *const u8, len: usize) -> i32 {
+    std::panic::catch_unwind(
+        || match w15_input(ptr, len).and_then(w17_outcome_successful) {
+            Some(successful) => i32::from(successful),
+            None => -1,
+        },
+    )
+    .unwrap_or(-1)
+}
+
+/// Stage-duration summary. Writes 32 bytes `[f64 total][f64 slowest][f64 unaccounted]
+/// [u64 slowest index + 1]` (little-endian) and returns 32, or -1 for invalid input or an
+/// output shorter than 32 bytes.
+///
+/// # Safety
+/// Non-null pointers must be valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_rpresult_duration_summary(
+    packed: *const u8,
+    len: usize,
+    elapsed: f64,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        if cap < 32 {
+            return -1;
+        }
+        let Some(input) = w15_input(packed, len) else {
+            return -1;
+        };
+        let Some((total, slowest, unaccounted, index)) = w17_duration_summary(input, elapsed)
+        else {
+            return -1;
+        };
+        let mut bytes = [0u8; 32];
+        bytes[0..8].copy_from_slice(&total.to_le_bytes());
+        bytes[8..16].copy_from_slice(&slowest.to_le_bytes());
+        bytes[16..24].copy_from_slice(&unaccounted.to_le_bytes());
+        bytes[24..32].copy_from_slice(&index.to_le_bytes());
+        w15_write(out, cap, &bytes)
+    })
+    .unwrap_or(-1)
+}
+
+/// `MediaToolFactory::driverConfiguration` binary mask (bit 0 ffmpeg, bit 1 ffprobe).
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_mtf_driver_mask(
+    ffmpeg_is_string: i32,
+    ffmpeg_len: usize,
+    ffprobe_is_string: i32,
+    ffprobe_len: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        w17_driver_mask(
+            ffmpeg_is_string != 0,
+            ffmpeg_len,
+            ffprobe_is_string != 0,
+            ffprobe_len,
+        )
+    })
+    .unwrap_or(-1)
+}
+
+/// `ReleaseSearchSyncCoordinator` transition (0 begin, 1 request, 2 discard, 3 finish).
+/// Writes `[has scope, scope id, pending, execute, execute id]` to `out` and returns 0,
+/// or -1 for an unknown operation or invalid output.
+///
+/// # Safety
+/// `out` must be writable for `out_count` `int64_t`s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_rssc_decide(
+    op: i32,
+    coalesce: i32,
+    has_scope: i32,
+    scope_id: i64,
+    pending: i32,
+    arg_id: i64,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        if out_count < 5 || !w17_aligned(out.cast_const(), out_count) {
+            return -1;
+        }
+        let scope = (has_scope != 0).then_some(scope_id);
+        let Some(state) = w17_sync_decide(op, coalesce != 0, scope, pending != 0, arg_id) else {
+            return -1;
+        };
+        let values = [
+            i64::from(state.scope.is_some()),
+            state.scope.unwrap_or(0),
+            i64::from(state.pending),
+            i64::from(state.execute.is_some()),
+            state.execute.unwrap_or(0),
+        ];
+        // SAFETY: `out` is non-null, aligned and writable for at least five values.
+        unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), out, 5) };
+        0
+    })
+    .unwrap_or(-1)
+}
+
+/// `PersistenceMetricsCollector` event (0 statement, 1 sync request, 2 sync execution).
+/// `counters` holds `[statements, requests, executions]` and `milliseconds` the latency
+/// total; both are updated in place. Returns 1 when changed, 0 when out of scope and -1
+/// for an unknown event, counter overflow or invalid pointers (leaving outputs untouched).
+///
+/// # Safety
+/// `counters` must be valid for `counter_count` `int64_t`s and `milliseconds` for one
+/// `double`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_pmc_apply(
+    event: i32,
+    has_scope: i32,
+    scope_id: i64,
+    arg_id: i64,
+    arg_ms: f64,
+    counters: *mut i64,
+    counter_count: usize,
+    milliseconds: *mut f64,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        if counter_count < 3
+            || !w17_aligned(counters.cast_const(), counter_count)
+            || !w17_aligned(milliseconds.cast_const(), 1)
+        {
+            return -1;
+        }
+        // SAFETY: both pointers are non-null, aligned and valid for the declared counts.
+        let (values, ms) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(counters, 3),
+                &mut *milliseconds,
+            )
+        };
+        let mut metrics = W17Metrics {
+            statements: values[0],
+            milliseconds: *ms,
+            requests: values[1],
+            executions: values[2],
+        };
+        let scope = (has_scope != 0).then_some(scope_id);
+        match w17_metrics_apply(event, scope, arg_id, arg_ms, &mut metrics) {
+            Ok(true) => {
+                values[0] = metrics.statements;
+                values[1] = metrics.requests;
+                values[2] = metrics.executions;
+                *ms = metrics.milliseconds;
+                1
+            }
+            Ok(false) => 0,
+            Err(()) => -1,
+        }
+    })
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave17_additional_config_metrics_sync_tests {
+    use super::*;
+
+    #[test]
+    fn kill_string_matches_php_truthiness() {
+        assert_eq!(w17_kill_string(false, b"", 30), b"\"");
+        assert_eq!(w17_kill_string(true, b"", 30), b"\"");
+        assert_eq!(w17_kill_string(true, b"0", 30), b"\"");
+        assert_eq!(w17_kill_string(true, b"/usr/bin/timeout", 0), b"\"");
+        assert_eq!(w17_kill_string(true, b"/usr/bin/timeout", -5), b"\"");
+        assert_eq!(
+            w17_kill_string(true, b"/usr/bin/timeout", 60),
+            b"\"/usr/bin/timeout\" --foreground --signal=KILL 60 \""
+        );
+        assert_eq!(
+            w17_kill_string(true, b"00", i64::MAX),
+            format!("\"00\" --foreground --signal=KILL {} \"", i64::MAX).as_bytes()
+        );
+        let mut tiny = [0u8; 4];
+        let needed =
+            unsafe { nntmux_pcfg_kill_string(b"/t".as_ptr(), 2, 1, 5, tiny.as_mut_ptr(), 4) };
+        assert_eq!(needed, -35);
+        assert_eq!(
+            unsafe { nntmux_pcfg_kill_string(std::ptr::null(), 3, 1, 5, tiny.as_mut_ptr(), 4) },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_pcfg_kill_string(b"x".as_ptr(), usize::MAX, 1, 5, tiny.as_mut_ptr(), 4)
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_pcfg_kill_string(std::ptr::null(), 0, 0, 5, tiny.as_mut_ptr(), 4) },
+            1
+        );
+        assert_eq!(tiny[0], b'"');
+    }
+
+    #[test]
+    fn dirname_matches_php() {
+        for (input, expected) in [
+            (&b""[..], &b""[..]),
+            (b"ffmpeg", b"."),
+            (b"/", b"/"),
+            (b"///", b"/"),
+            (b"/ffmpeg", b"/"),
+            (b"//ffmpeg", b"/"),
+            (b"/usr/bin/ffmpeg", b"/usr/bin"),
+            (b"/usr/bin//ffmpeg", b"/usr/bin"),
+            (b"/usr/bin/", b"/usr"),
+            (b"usr/bin", b"usr"),
+            (b"///a//b//", b"///a"),
+            (b"./ffmpeg", b"."),
+            (b"../ffmpeg", b".."),
+        ] {
+            assert_eq!(w17_php_dirname(input), expected, "{input:?}");
+        }
+        assert_eq!(w17_ffprobe_sibling(b"/opt/bin/ffmpeg"), b"/opt/bin/ffprobe");
+        assert_eq!(w17_ffprobe_sibling(b""), b"/ffprobe");
+        assert_eq!(w17_ffprobe_sibling(b"ffmpeg"), b"./ffprobe");
+    }
+
+    #[test]
+    fn normalize_limits_clamps_and_validates() {
+        let raw = [-1, 0, 500, 0, -3, -9, 10, 10, -1, 0, -1, 0, 99, 0];
+        assert_eq!(
+            w17_normalize_limits(&raw),
+            [
+                0, 1, 200, 1, 0, 0, 1_048_576, 262_144, 0, 1_048_576, 0, 1, 10, 1
+            ]
+        );
+        let mut buf = [i64::MIN; W17_LIMIT_COUNT];
+        assert_eq!(
+            unsafe {
+                nntmux_pcfg_normalize_limits(
+                    buf.as_ptr(),
+                    W17_LIMIT_COUNT,
+                    buf.as_mut_ptr(),
+                    W17_LIMIT_COUNT,
+                )
+            },
+            14
+        );
+        assert_eq!(buf[12], 1);
+        assert_eq!(buf[2], 11);
+        let mut out = [0i64; W17_LIMIT_COUNT];
+        assert_eq!(
+            unsafe { nntmux_pcfg_normalize_limits(buf.as_ptr(), 13, out.as_mut_ptr(), 14) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_pcfg_normalize_limits(buf.as_ptr(), 14, out.as_mut_ptr(), 13) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_pcfg_normalize_limits(std::ptr::null(), 14, out.as_mut_ptr(), 14) },
+            -1
+        );
+        let bytes = [0u8; 8 * 15];
+        let misaligned = unsafe { bytes.as_ptr().add(1) }.cast::<i64>();
+        assert_eq!(
+            unsafe { nntmux_pcfg_normalize_limits(misaligned, 14, out.as_mut_ptr(), 14) },
+            -1
+        );
+    }
+
+    #[test]
+    fn outcome_and_duration_summary() {
+        assert_eq!(w17_outcome_successful(b"completed"), Some(true));
+        assert_eq!(w17_outcome_successful(b"passworded"), Some(true));
+        assert_eq!(w17_outcome_successful(b"failed"), Some(false));
+        assert_eq!(w17_outcome_successful(b"Completed"), None);
+        assert_eq!(
+            unsafe { nntmux_rpresult_outcome_successful(std::ptr::null(), 4) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_rpresult_outcome_successful(b"timed-out".as_ptr(), 9) },
+            0
+        );
+
+        let pack = |values: &[f64]| {
+            values
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>()
+        };
+        assert_eq!(w17_duration_summary(&[], 1.5), Some((0.0, 0.0, 1.5, 0)));
+        assert_eq!(
+            w17_duration_summary(&pack(&[0.5, 2.0, 2.0, 1.0]), 4.0),
+            Some((5.5, 2.0, 0.0, 2))
+        );
+        let (total, _, unaccounted, index) =
+            w17_duration_summary(&pack(&[f64::NAN, 1.0]), 3.0).unwrap();
+        assert!(total.is_nan() && unaccounted.is_nan());
+        assert_eq!(index, 1);
+        assert!(w17_duration_summary(&[0u8; 7], 0.0).is_none());
+        let mut out = [0u8; 32];
+        assert_eq!(
+            unsafe {
+                nntmux_rpresult_duration_summary(std::ptr::null(), 0, 1.0, out.as_mut_ptr(), 31)
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_rpresult_duration_summary(std::ptr::null(), 8, 1.0, out.as_mut_ptr(), 32)
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_rpresult_duration_summary(std::ptr::null(), 0, 1.0, out.as_mut_ptr(), 32)
+            },
+            32
+        );
+        assert_eq!(f64::from_le_bytes(out[16..24].try_into().unwrap()), 1.0);
+    }
+
+    #[test]
+    fn driver_mask() {
+        assert_eq!(nntmux_mtf_driver_mask(0, 0, 0, 0), 0);
+        assert_eq!(nntmux_mtf_driver_mask(1, 0, 1, 0), 0);
+        assert_eq!(nntmux_mtf_driver_mask(1, 5, 0, 5), 1);
+        assert_eq!(nntmux_mtf_driver_mask(0, 5, 1, 5), 2);
+        assert_eq!(nntmux_mtf_driver_mask(1, 5, 1, 5), 3);
+    }
+
+    #[test]
+    fn sync_transitions() {
+        let s = |scope, pending, execute| W17SyncState {
+            scope,
+            pending,
+            execute,
+        };
+        assert_eq!(
+            w17_sync_decide(0, true, None, true, 7),
+            Some(s(Some(7), false, None))
+        );
+        assert_eq!(
+            w17_sync_decide(0, false, Some(3), true, 7),
+            Some(s(Some(3), true, None))
+        );
+        assert_eq!(
+            w17_sync_decide(1, true, Some(7), false, 7),
+            Some(s(Some(7), true, None))
+        );
+        assert_eq!(
+            w17_sync_decide(1, true, Some(7), false, 8),
+            Some(s(Some(7), false, Some(8)))
+        );
+        assert_eq!(
+            w17_sync_decide(1, false, Some(7), false, 7),
+            Some(s(Some(7), false, Some(7)))
+        );
+        assert_eq!(
+            w17_sync_decide(2, true, Some(7), true, 7),
+            Some(s(Some(7), false, None))
+        );
+        assert_eq!(
+            w17_sync_decide(2, true, Some(7), true, 8),
+            Some(s(Some(7), true, None))
+        );
+        assert_eq!(
+            w17_sync_decide(3, true, Some(7), true, 0),
+            Some(s(None, false, Some(7)))
+        );
+        assert_eq!(
+            w17_sync_decide(3, true, Some(7), false, 0),
+            Some(s(None, false, None))
+        );
+        assert_eq!(
+            w17_sync_decide(3, false, Some(7), true, 0),
+            Some(s(Some(7), true, None))
+        );
+        assert_eq!(w17_sync_decide(9, true, None, false, 0), None);
+        let mut out = [0i64; 5];
+        assert_eq!(
+            unsafe { nntmux_rssc_decide(3, 1, 1, -4, 1, 0, out.as_mut_ptr(), 5) },
+            0
+        );
+        assert_eq!(out, [0, 0, 0, 1, -4]);
+        assert_eq!(
+            unsafe { nntmux_rssc_decide(3, 1, 1, -4, 1, 0, out.as_mut_ptr(), 4) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_rssc_decide(3, 1, 1, -4, 1, 0, std::ptr::null_mut(), 5) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_rssc_decide(-1, 1, 1, -4, 1, 0, out.as_mut_ptr(), 5) },
+            -1
+        );
+    }
+
+    #[test]
+    fn metrics_events() {
+        let mut m = W17Metrics {
+            statements: 0,
+            milliseconds: 0.0,
+            requests: 0,
+            executions: 0,
+        };
+        assert_eq!(w17_metrics_apply(0, None, 0, 1.5, &mut m), Ok(false));
+        assert_eq!(w17_metrics_apply(0, Some(4), 0, 1.5, &mut m), Ok(true));
+        assert_eq!(w17_metrics_apply(1, Some(4), 4, 0.0, &mut m), Ok(true));
+        assert_eq!(w17_metrics_apply(2, Some(4), 5, 0.0, &mut m), Ok(false));
+        assert_eq!(w17_metrics_apply(2, None, 0, 0.0, &mut m), Ok(false));
+        assert_eq!(
+            m,
+            W17Metrics {
+                statements: 1,
+                milliseconds: 1.5,
+                requests: 1,
+                executions: 0
+            }
+        );
+        assert_eq!(w17_metrics_apply(7, Some(4), 4, 0.0, &mut m), Err(()));
+        m.statements = i64::MAX;
+        assert_eq!(w17_metrics_apply(0, Some(4), 0, 1.0, &mut m), Err(()));
+
+        let mut counters = [i64::MAX, 0, 0];
+        let mut ms = 2.0f64;
+        assert_eq!(
+            unsafe { nntmux_pmc_apply(0, 1, 1, 0, 1.0, counters.as_mut_ptr(), 3, &mut ms) },
+            -1
+        );
+        assert_eq!((counters, ms), ([i64::MAX, 0, 0], 2.0));
+        assert_eq!(
+            unsafe { nntmux_pmc_apply(1, 1, 1, 1, 0.0, counters.as_mut_ptr(), 3, &mut ms) },
+            1
+        );
+        assert_eq!(counters, [i64::MAX, 1, 0]);
+        assert_eq!(
+            unsafe { nntmux_pmc_apply(1, 1, 1, 1, 0.0, counters.as_mut_ptr(), 2, &mut ms) },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_pmc_apply(
+                    1,
+                    1,
+                    1,
+                    1,
+                    0.0,
+                    counters.as_mut_ptr(),
+                    3,
+                    std::ptr::null_mut(),
+                )
+            },
+            -1
+        );
+    }
+}
