@@ -8074,3 +8074,980 @@ mod wave11_binaries_part_handler_par2_checkpoint_tests {
     }
 }
 
+
+// ---- Wave 12: NZB source custody, upload manifests, PAR2 recovery and password metadata ----
+
+pub mod nzb_custody {
+    use std::slice;
+    use std::sync::OnceLock;
+
+    /// Domain prefix hashed ahead of the decoded NZB by `NzbSourceGuard::digest`.
+    pub const SOURCE_DIGEST_PREFIX: &[u8] = b"nntmux:nzb-archive-naming:1\0";
+
+    const K256: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    const H256: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+
+    type CompressFn = unsafe fn(&mut [u32; 8], &[[u8; 64]]);
+
+    fn compress_soft(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
+        for block in blocks {
+            let mut w = [0u32; 64];
+            for (i, chunk) in block.as_chunks::<4>().0.iter().enumerate() {
+                w[i] = u32::from_be_bytes(*chunk);
+            }
+            for i in 16..64 {
+                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+                w[i] = w[i - 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(w[i - 7])
+                    .wrapping_add(s1);
+            }
+            let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+            for i in 0..64 {
+                let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+                let ch = (e & f) ^ ((!e) & g);
+                let t1 = h
+                    .wrapping_add(s1)
+                    .wrapping_add(ch)
+                    .wrapping_add(K256[i])
+                    .wrapping_add(w[i]);
+                let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+                let maj = (a & b) ^ (a & c) ^ (b & c);
+                let t2 = s0.wrapping_add(maj);
+                h = g;
+                g = f;
+                f = e;
+                e = d.wrapping_add(t1);
+                d = c;
+                c = b;
+                b = a;
+                a = t1.wrapping_add(t2);
+            }
+            for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+                *slot = slot.wrapping_add(value);
+            }
+        }
+    }
+
+    unsafe fn compress_soft_entry(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
+        compress_soft(state, blocks);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "sha2")]
+    unsafe fn compress_arm(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
+        use std::arch::aarch64::*;
+        unsafe {
+            let mut abcd = vld1q_u32(state.as_ptr());
+            let mut efgh = vld1q_u32(state.as_ptr().add(4));
+            for block in blocks {
+                let abcd_saved = abcd;
+                let efgh_saved = efgh;
+                let p = block.as_ptr();
+                let mut m = [
+                    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p))),
+                    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p.add(16)))),
+                    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p.add(32)))),
+                    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p.add(48)))),
+                ];
+                for group in 0..16 {
+                    let lane = group & 3;
+                    let wk = vaddq_u32(m[lane], vld1q_u32(K256.as_ptr().add(group * 4)));
+                    let abcd_prev = abcd;
+                    abcd = vsha256hq_u32(abcd, efgh, wk);
+                    efgh = vsha256h2q_u32(efgh, abcd_prev, wk);
+                    if group < 12 {
+                        m[lane] = vsha256su1q_u32(
+                            vsha256su0q_u32(m[lane], m[(lane + 1) & 3]),
+                            m[(lane + 2) & 3],
+                            m[(lane + 3) & 3],
+                        );
+                    }
+                }
+                abcd = vaddq_u32(abcd, abcd_saved);
+                efgh = vaddq_u32(efgh, efgh_saved);
+            }
+            vst1q_u32(state.as_mut_ptr(), abcd);
+            vst1q_u32(state.as_mut_ptr().add(4), efgh);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
+    unsafe fn compress_x86(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
+        use std::arch::x86_64::*;
+        unsafe {
+            let mask = _mm_set_epi64x(
+                0x0C0D_0E0F_0809_0A0B_u64 as i64,
+                0x0405_0607_0001_0203_u64 as i64,
+            );
+            let state_ptr = state.as_ptr().cast::<__m128i>();
+            let dcba = _mm_loadu_si128(state_ptr);
+            let efgh = _mm_loadu_si128(state_ptr.add(1));
+            let cdab = _mm_shuffle_epi32(dcba, 0xB1);
+            let efgh = _mm_shuffle_epi32(efgh, 0x1B);
+            let mut abef = _mm_alignr_epi8(cdab, efgh, 8);
+            let mut cdgh = _mm_blend_epi16(efgh, cdab, 0xF0);
+            for block in blocks {
+                let abef_saved = abef;
+                let cdgh_saved = cdgh;
+                let data = block.as_ptr().cast::<__m128i>();
+                let mut w = [
+                    _mm_shuffle_epi8(_mm_loadu_si128(data), mask),
+                    _mm_shuffle_epi8(_mm_loadu_si128(data.add(1)), mask),
+                    _mm_shuffle_epi8(_mm_loadu_si128(data.add(2)), mask),
+                    _mm_shuffle_epi8(_mm_loadu_si128(data.add(3)), mask),
+                ];
+                for group in 0..16 {
+                    let lane = group & 3;
+                    if group >= 4 {
+                        let t1 = _mm_sha256msg1_epu32(w[lane], w[(lane + 1) & 3]);
+                        let t2 = _mm_alignr_epi8(w[(lane + 3) & 3], w[(lane + 2) & 3], 4);
+                        w[lane] = _mm_sha256msg2_epu32(_mm_add_epi32(t1, t2), w[(lane + 3) & 3]);
+                    }
+                    let k = _mm_loadu_si128(K256.as_ptr().add(group * 4).cast::<__m128i>());
+                    let wk = _mm_add_epi32(w[lane], k);
+                    cdgh = _mm_sha256rnds2_epu32(cdgh, abef, wk);
+                    abef = _mm_sha256rnds2_epu32(abef, cdgh, _mm_shuffle_epi32(wk, 0x0E));
+                }
+                abef = _mm_add_epi32(abef, abef_saved);
+                cdgh = _mm_add_epi32(cdgh, cdgh_saved);
+            }
+            let feba = _mm_shuffle_epi32(abef, 0x1B);
+            let dchg = _mm_shuffle_epi32(cdgh, 0xB1);
+            let dcba = _mm_blend_epi16(feba, dchg, 0xF0);
+            let hgef = _mm_alignr_epi8(dchg, feba, 8);
+            let out = state.as_mut_ptr().cast::<__m128i>();
+            _mm_storeu_si128(out, dcba);
+            _mm_storeu_si128(out.add(1), hgef);
+        }
+    }
+
+    /// Streams `prefix || data` through `compress` without copying `data`.
+    fn sha256_prefixed_with(compress: CompressFn, prefix: &[u8], data: &[u8]) -> [u8; 32] {
+        debug_assert!(prefix.len() < 64);
+        let mut state = H256;
+        let mut head = [0u8; 64];
+        head[..prefix.len()].copy_from_slice(prefix);
+        let fill = 64 - prefix.len();
+        let rest = if data.len() >= fill {
+            head[prefix.len()..].copy_from_slice(&data[..fill]);
+            unsafe { compress(&mut state, slice::from_ref(&head)) };
+            let (blocks, rest) = data[fill..].as_chunks::<64>();
+            unsafe { compress(&mut state, blocks) };
+            rest
+        } else {
+            &[][..]
+        };
+        let mut tail = [[0u8; 64]; 2];
+        let flat = tail.as_flattened_mut();
+        let pending = if data.len() >= fill {
+            flat[..rest.len()].copy_from_slice(rest);
+            rest.len()
+        } else {
+            flat[..prefix.len()].copy_from_slice(prefix);
+            flat[prefix.len()..prefix.len() + data.len()].copy_from_slice(data);
+            prefix.len() + data.len()
+        };
+        flat[pending] = 0x80;
+        let used = if pending < 56 { 1 } else { 2 };
+        let total = (prefix.len() as u64).wrapping_add(data.len() as u64);
+        flat[used * 64 - 8..used * 64].copy_from_slice(&total.wrapping_mul(8).to_be_bytes());
+        unsafe { compress(&mut state, &tail[..used]) };
+        let mut digest = [0u8; 32];
+        for (out, word) in digest.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+            *out = word.to_be_bytes();
+        }
+        digest
+    }
+
+    fn accelerated() -> Option<CompressFn> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            if std::arch::is_aarch64_feature_detected!("sha2") {
+                return Some(compress_arm as CompressFn);
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("sha")
+                && is_x86_feature_detected!("sse2")
+                && is_x86_feature_detected!("ssse3")
+                && is_x86_feature_detected!("sse4.1")
+            {
+                return Some(compress_x86 as CompressFn);
+            }
+        }
+        None
+    }
+
+    /// The accelerated compressor is adopted only after it reproduces the portable digest.
+    fn compressor() -> CompressFn {
+        static SELECTED: OnceLock<CompressFn> = OnceLock::new();
+        *SELECTED.get_or_init(|| {
+            if let Some(fast) = accelerated() {
+                let probe: Vec<u8> = (0..300u32)
+                    .map(|i| (i.wrapping_mul(31) ^ 0x5a) as u8)
+                    .collect();
+                let agrees = (0..probe.len()).step_by(7).all(|len| {
+                    sha256_prefixed_with(fast, SOURCE_DIGEST_PREFIX, &probe[..len])
+                        == sha256_prefixed_with(compress_soft_entry, SOURCE_DIGEST_PREFIX, &probe[..len])
+                });
+                if agrees {
+                    return fast;
+                }
+            }
+            compress_soft_entry as CompressFn
+        })
+    }
+
+    /// `hash('sha256', "nntmux:nzb-archive-naming:1\0" . $decoded)` as lowercase hex.
+    pub fn source_digest_hex(decoded: &[u8]) -> [u8; 64] {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let digest = sha256_prefixed_with(compressor(), SOURCE_DIGEST_PREFIX, decoded);
+        let mut out = [0u8; 64];
+        for (i, byte) in digest.iter().enumerate() {
+            out[i * 2] = HEX[(byte >> 4) as usize];
+            out[i * 2 + 1] = HEX[(byte & 15) as usize];
+        }
+        out
+    }
+
+    /// PHP `basename()` for ASCII-compatible locales on POSIX.
+    pub fn php_basename(s: &[u8]) -> &[u8] {
+        let mut end = s.len();
+        while end > 0 && s[end - 1] == b'/' {
+            end -= 1;
+        }
+        if end == 0 {
+            return &[];
+        }
+        let mut start = end;
+        while start > 0 && s[start - 1] != b'/' {
+            start -= 1;
+        }
+        &s[start..end]
+    }
+
+    /// PHP `dirname()` (one level) on POSIX.
+    pub fn php_dirname(s: &[u8]) -> &[u8] {
+        if s.is_empty() {
+            return &[];
+        }
+        let mut end = s.len();
+        while end > 0 && s[end - 1] == b'/' {
+            end -= 1;
+        }
+        if end == 0 {
+            return b"/";
+        }
+        while end > 0 && s[end - 1] != b'/' {
+            end -= 1;
+        }
+        if end == 0 {
+            return b".";
+        }
+        while end > 0 && s[end - 1] == b'/' {
+            end -= 1;
+        }
+        if end == 0 {
+            return b"/";
+        }
+        &s[..end]
+    }
+
+    #[inline]
+    fn is_guid(guid: &[u8]) -> bool {
+        (1..=40).contains(&guid.len())
+            && guid
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    }
+
+    #[inline]
+    fn receipt_field_ok(s: &[u8]) -> bool {
+        !s.is_empty() && !s.contains(&0)
+    }
+
+    /// Mirrors the string checks of `NzbSourceGuard::validateAnchor` after the PHP side has
+    /// confirmed the version, kind and string types:
+    /// `0` valid, `1` malformed receipt, `2` receipt does not match its source.
+    pub fn validate_anchor_code(
+        absent: bool,
+        guid: &[u8],
+        path: &[u8],
+        anchor: &[u8],
+        dev: &[u8],
+        ino: &[u8],
+    ) -> i32 {
+        if !receipt_field_ok(guid) || !receipt_field_ok(path) {
+            return 1;
+        }
+        if !absent
+            && (!receipt_field_ok(anchor) || !receipt_field_ok(dev) || !receipt_field_ok(ino))
+        {
+            return 1;
+        }
+        if !is_guid(guid) {
+            return 2;
+        }
+        let base = php_basename(path);
+        let matches_source = base.len() > guid.len()
+            && base.starts_with(guid)
+            && matches!(&base[guid.len()..], b".nzb.gz" | b".nzb");
+        if !matches_source {
+            return 2;
+        }
+        if absent {
+            return 0;
+        }
+        if php_dirname(path) != php_dirname(anchor) {
+            return 2;
+        }
+        // `/^\.archive-audit-<guid>\-[a-f0-9]{32}\.anchor$/D`
+        let anchor_base = php_basename(anchor);
+        let expected_len = 15 + guid.len() + 1 + 32 + 7;
+        let anchor_ok = anchor_base.len() == expected_len
+            && anchor_base.starts_with(b".archive-audit-")
+            && &anchor_base[15..15 + guid.len()] == guid
+            && anchor_base[15 + guid.len()] == b'-'
+            && anchor_base[16 + guid.len()..48 + guid.len()]
+                .iter()
+                .all(|&b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            && &anchor_base[48 + guid.len()..] == b".anchor";
+        if !anchor_ok
+            || !dev.iter().all(u8::is_ascii_digit)
+            || !ino.iter().all(u8::is_ascii_digit)
+        {
+            return 2;
+        }
+        0
+    }
+
+    #[inline]
+    fn decimal_equals(value: i64, digits: &[u8]) -> bool {
+        let mut buf = [0u8; 20];
+        let mut pos = buf.len();
+        let negative = value < 0;
+        let mut magnitude = value.unsigned_abs();
+        loop {
+            pos -= 1;
+            buf[pos] = b'0' + (magnitude % 10) as u8;
+            magnitude /= 10;
+            if magnitude == 0 {
+                break;
+            }
+        }
+        if negative {
+            match digits.split_first() {
+                Some((b'-', rest)) => rest == &buf[pos..],
+                _ => false,
+            }
+        } else {
+            digits == &buf[pos..]
+        }
+    }
+
+    /// `NzbSourceGuard::matchesAnchor` for an available stat record.
+    pub fn matches_anchor(mode: i64, dev: i64, ino: i64, receipt_dev: &[u8], receipt_ino: &[u8]) -> bool {
+        (mode & 0o170000) == 0o100000
+            && decimal_equals(dev, receipt_dev)
+            && decimal_equals(ino, receipt_ino)
+    }
+
+    /// `/^(.+)\.nzb\.gz\.c\d+-[0-9a-f]{16}\.next$/D`; returns the captured GUID length.
+    pub fn staged_guid_len(name: &[u8]) -> Option<usize> {
+        const SUFFIX: &[u8] = b".next";
+        const MARK: &[u8] = b".nzb.gz.c";
+        let n = name.len();
+        if n < 1 + MARK.len() + 1 + 1 + 16 + SUFFIX.len() || !name.ends_with(SUFFIX) {
+            return None;
+        }
+        let hex_end = n - SUFFIX.len();
+        let hex_start = hex_end - 16;
+        if !name[hex_start..hex_end]
+            .iter()
+            .all(|&b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || name[hex_start - 1] != b'-'
+        {
+            return None;
+        }
+        let digits_end = hex_start - 1;
+        let mut digits_start = digits_end;
+        while digits_start > 0 && name[digits_start - 1].is_ascii_digit() {
+            digits_start -= 1;
+        }
+        if digits_start == digits_end || digits_start < MARK.len() + 1 {
+            return None;
+        }
+        let guid_end = digits_start - MARK.len();
+        if &name[guid_end..digits_start] != MARK || name[..guid_end].contains(&b'\n') {
+            return None;
+        }
+        Some(guid_end)
+    }
+
+    #[inline]
+    fn php_trim_is_empty(s: &[u8]) -> bool {
+        s.iter()
+            .all(|&b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B))
+    }
+
+    /// `NzbUploadManifestService::assertSafeFilename` without throwing: `true` when safe.
+    pub fn safe_upload_filename(filename: &[u8], extension: &[u8]) -> bool {
+        if filename.is_empty()
+            || filename == b"."
+            || filename == b".."
+            || php_basename(filename) != filename
+            || filename.contains(&0)
+        {
+            return false;
+        }
+        let (stem, ext) = match filename.iter().rposition(|&b| b == b'.') {
+            Some(dot) => (&filename[..dot], &filename[dot + 1..]),
+            None => (filename, &[][..]),
+        };
+        ext.len() == extension.len()
+            && ext
+                .iter()
+                .zip(extension)
+                .all(|(&a, &b)| a.to_ascii_lowercase() == b)
+            && !php_trim_is_empty(stem)
+    }
+
+    #[inline]
+    fn is_lower_hex(b: u8) -> bool {
+        b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
+    }
+
+    /// `NzbUploadManifestService::canReconcileCandidate`; `None` encodes a non-string value.
+    pub fn can_reconcile_candidate(state: Option<&[u8]>, identity: Option<&[u8]>) -> bool {
+        match state {
+            Some(b"nzb_pending") => true,
+            Some(b"metadata_review" | b"metadata_deferred") => {
+                matches!(identity, Some(id) if id.len() == 40 && id.iter().copied().all(is_lower_hex))
+            }
+            _ => false,
+        }
+    }
+
+    /// One password: at most 4096 bytes of valid UTF-8 limited to XML 1.0 characters.
+    pub fn password_value_valid(value: &[u8]) -> bool {
+        if value.len() > 4096 {
+            return false;
+        }
+        if value.is_ascii() {
+            return value
+                .iter()
+                .all(|&b| b >= 0x20 || matches!(b, b'\t' | b'\n' | b'\r'));
+        }
+        match std::str::from_utf8(value) {
+            Ok(text) => text.chars().all(|c| {
+                matches!(c as u32, 0x09 | 0x0A | 0x0D | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF)
+            }),
+            Err(_) => false,
+        }
+    }
+
+    pub(crate) fn base64_equals(raw: &[u8], encoded: &[u8]) -> bool {
+        const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        if encoded.len() != raw.len().div_ceil(3) * 4 {
+            return false;
+        }
+        let (chunks, rest) = raw.as_chunks::<3>();
+        let (quads, _) = encoded.as_chunks::<4>();
+        for (chunk, quad) in chunks.iter().zip(quads) {
+            let v = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
+            if quad[0] != TABLE[(v >> 18) as usize & 63]
+                || quad[1] != TABLE[(v >> 12) as usize & 63]
+                || quad[2] != TABLE[(v >> 6) as usize & 63]
+                || quad[3] != TABLE[v as usize & 63]
+            {
+                return false;
+            }
+        }
+        if rest.is_empty() {
+            return true;
+        }
+        let quad = &encoded[chunks.len() * 4..];
+        let b0 = u32::from(rest[0]);
+        let b1 = rest.get(1).copied().map_or(0, u32::from);
+        let v = (b0 << 16) | (b1 << 8);
+        let third = if rest.len() == 2 {
+            TABLE[(v >> 6) as usize & 63]
+        } else {
+            b'='
+        };
+        quad[0] == TABLE[(v >> 18) as usize & 63]
+            && quad[1] == TABLE[(v >> 12) as usize & 63]
+            && quad[2] == third
+            && quad[3] == b'='
+    }
+
+    /// Inputs to `Par2CandidateRecovery::validatePart` for one decoded yEnc article.
+    pub struct YencPartView<'a> {
+        pub name: &'a [u8],
+        pub size: i64,
+        pub part: Option<i64>,
+        pub begin: Option<i64>,
+        pub end: Option<i64>,
+    }
+
+    /// The prior article's continuity identity.
+    pub struct PartIdentityView<'a> {
+        pub name_base64: &'a [u8],
+        pub size: i64,
+        pub part: Option<i64>,
+    }
+
+    /// `0` no framing, `1` valid, `2` framing changed, `3` invalid identity, `4` identity changed,
+    /// `5` missing multipart offsets, `6` discontinuous offsets.
+    pub fn validate_part_code(
+        part: Option<&YencPartView<'_>>,
+        body_len: usize,
+        segment_number: i64,
+        segment_count: i64,
+        offset: i64,
+        identity: Option<&PartIdentityView<'_>>,
+    ) -> i32 {
+        let Some(part) = part else {
+            return if identity.is_some() { 2 } else { 0 };
+        };
+        if part.name.is_empty()
+            || part.name.len() > 65536
+            || part.name.iter().any(|&b| matches!(b, 0 | b'\r' | b'\n'))
+            || part.size < 1
+            || (offset > 0 && identity.is_none())
+            || matches!(part.part, Some(number) if number != segment_number)
+        {
+            return 3;
+        }
+        if let Some(identity) = identity {
+            let part_breaks = match identity.part {
+                None => false,
+                Some(previous) => match (part.part, previous.checked_add(1)) {
+                    (Some(number), Some(next)) => number != next,
+                    _ => true,
+                },
+            };
+            if !base64_equals(part.name, identity.name_base64) || part.size != identity.size || part_breaks {
+                return 4;
+            }
+        }
+        let body_len = body_len as i128;
+        match (part.begin, part.end) {
+            (Some(begin), Some(end)) => {
+                if offset == i64::MAX
+                    || begin != offset + 1
+                    || end < begin
+                    || end > part.size
+                    || i128::from(end) - i128::from(begin) + 1 != body_len
+                {
+                    return 6;
+                }
+            }
+            _ => {
+                if segment_count != 1
+                    || offset != 0
+                    || part.begin.is_some()
+                    || part.end.is_some()
+                    || body_len != i128::from(part.size)
+                {
+                    return 5;
+                }
+            }
+        }
+        1
+    }
+
+    #[inline]
+    pub(crate) unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            Some(&[])
+        } else if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { slice::from_raw_parts(ptr, len) })
+        }
+    }
+}
+
+/// Writes `NzbSourceGuard::digest($decoded)` as 64 lowercase hex bytes into `out`.
+/// Returns `64`, `-1` for invalid pointers, or `-2` when `out_cap < 64`.
+///
+/// # Safety
+///
+/// `ptr` must be valid for `len` bytes when `len > 0`; `out` must be writable for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_source_digest(
+    ptr: *const u8,
+    len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> i32 {
+    let Some(data) = (unsafe { nzb_custody::bytes(ptr, len) }) else {
+        return -1;
+    };
+    if out.is_null() {
+        return -1;
+    }
+    if out_cap < 64 {
+        return -2;
+    }
+    let hex = nzb_custody::source_digest_hex(data);
+    unsafe { std::ptr::copy_nonoverlapping(hex.as_ptr(), out, 64) };
+    64
+}
+
+/// `NzbSourceGuard::validateAnchor` string checks: `0` valid, `1` malformed, `2` source mismatch,
+/// `-1` invalid pointer. `anchor`, `dev` and `ino` are ignored when `absent != 0`.
+///
+/// # Safety
+///
+/// Each pointer must be valid for its length when that length is non-zero.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_nzb_source_validate_anchor(
+    absent: u32,
+    guid_ptr: *const u8,
+    guid_len: usize,
+    path_ptr: *const u8,
+    path_len: usize,
+    anchor_ptr: *const u8,
+    anchor_len: usize,
+    dev_ptr: *const u8,
+    dev_len: usize,
+    ino_ptr: *const u8,
+    ino_len: usize,
+) -> i32 {
+    let (Some(guid), Some(path), Some(anchor), Some(dev), Some(ino)) = (unsafe {
+        (
+            nzb_custody::bytes(guid_ptr, guid_len),
+            nzb_custody::bytes(path_ptr, path_len),
+            nzb_custody::bytes(anchor_ptr, anchor_len),
+            nzb_custody::bytes(dev_ptr, dev_len),
+            nzb_custody::bytes(ino_ptr, ino_len),
+        )
+    }) else {
+        return -1;
+    };
+    nzb_custody::validate_anchor_code(absent != 0, guid, path, anchor, dev, ino)
+}
+
+/// `NzbSourceGuard::matchesAnchor` for a stat record: `1` match, `0` mismatch, `-1` invalid pointer.
+///
+/// # Safety
+///
+/// Each pointer must be valid for its length when that length is non-zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_source_matches_anchor(
+    mode: i64,
+    dev: i64,
+    ino: i64,
+    receipt_dev_ptr: *const u8,
+    receipt_dev_len: usize,
+    receipt_ino_ptr: *const u8,
+    receipt_ino_len: usize,
+) -> i32 {
+    let (Some(receipt_dev), Some(receipt_ino)) = (unsafe {
+        (
+            nzb_custody::bytes(receipt_dev_ptr, receipt_dev_len),
+            nzb_custody::bytes(receipt_ino_ptr, receipt_ino_len),
+        )
+    }) else {
+        return -1;
+    };
+    i32::from(nzb_custody::matches_anchor(mode, dev, ino, receipt_dev, receipt_ino))
+}
+
+/// `NzbSourceGuard::STAGED_NAME`: returns the GUID prefix length, `-2` when the name does not
+/// match, or `-1` for an invalid pointer.
+///
+/// # Safety
+///
+/// `ptr` must be valid for `len` bytes when `len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_source_staged_guid_len(ptr: *const u8, len: usize) -> i64 {
+    let Some(name) = (unsafe { nzb_custody::bytes(ptr, len) }) else {
+        return -1;
+    };
+    nzb_custody::staged_guid_len(name).map_or(-2, |n| n as i64)
+}
+
+/// `NzbUploadManifestService::assertSafeFilename`: `1` safe, `0` unsafe, `-1` invalid pointer.
+///
+/// # Safety
+///
+/// Each pointer must be valid for its length when that length is non-zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_upload_manifest_safe_filename(
+    name_ptr: *const u8,
+    name_len: usize,
+    ext_ptr: *const u8,
+    ext_len: usize,
+) -> i32 {
+    let (Some(name), Some(ext)) = (unsafe {
+        (nzb_custody::bytes(name_ptr, name_len), nzb_custody::bytes(ext_ptr, ext_len))
+    }) else {
+        return -1;
+    };
+    i32::from(nzb_custody::safe_upload_filename(name, ext))
+}
+
+/// `NzbUploadManifestService::canReconcileCandidate`: `1` reconcilable, `0` not, `-1` invalid pointer.
+/// A value that is not a PHP string is passed with its `*_is_string` flag cleared.
+///
+/// # Safety
+///
+/// Each pointer must be valid for its length when that length is non-zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_upload_manifest_can_reconcile(
+    state_ptr: *const u8,
+    state_len: usize,
+    state_is_string: u32,
+    identity_ptr: *const u8,
+    identity_len: usize,
+    identity_is_string: u32,
+) -> i32 {
+    let (Some(state), Some(identity)) = (unsafe {
+        (
+            nzb_custody::bytes(state_ptr, state_len),
+            nzb_custody::bytes(identity_ptr, identity_len),
+        )
+    }) else {
+        return -1;
+    };
+    i32::from(nzb_custody::can_reconcile_candidate(
+        (state_is_string != 0).then_some(state),
+        (identity_is_string != 0).then_some(identity),
+    ))
+}
+
+/// `NzbPasswordMetadata::isValid` over `count` strings concatenated in `data`, with their byte
+/// lengths packed as native `u64` values in `lens`: `1` valid, `0` invalid, `-1` invalid input.
+///
+/// # Safety
+///
+/// `data` must be valid for `data_len` bytes and `lens` for `count * 8` bytes when non-zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_password_metadata_valid(
+    data: *const u8,
+    data_len: usize,
+    lens: *const u8,
+    count: usize,
+) -> i32 {
+    if count > 64 {
+        return 0;
+    }
+    let (Some(data), Some(lens)) = (unsafe {
+        (nzb_custody::bytes(data, data_len), nzb_custody::bytes(lens, count * 8))
+    }) else {
+        return -1;
+    };
+    let mut offset = 0usize;
+    for chunk in lens.as_chunks::<8>().0 {
+        let len = u64::from_ne_bytes(*chunk);
+        let Some(end) = usize::try_from(len).ok().and_then(|len| offset.checked_add(len)) else {
+            return -1;
+        };
+        if end > data.len() {
+            return -1;
+        }
+        if !nzb_custody::password_value_valid(&data[offset..end]) {
+            return 0;
+        }
+        offset = end;
+    }
+    if offset != data.len() {
+        return -1;
+    }
+    1
+}
+
+/// `Par2CandidateRecovery::validatePart` (see `nzb_custody::validate_part_code`), or `-1` for an
+/// invalid pointer. Optional integers are passed with `has_*` flags.
+///
+/// # Safety
+///
+/// Each pointer must be valid for its length when that length is non-zero.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_par2_recovery_validate_part(
+    has_part: u32,
+    name_ptr: *const u8,
+    name_len: usize,
+    size: i64,
+    has_number: u32,
+    number: i64,
+    has_begin: u32,
+    begin: i64,
+    has_end: u32,
+    end: i64,
+    body_len: usize,
+    segment_number: i64,
+    segment_count: i64,
+    offset: i64,
+    has_identity: u32,
+    identity_b64_ptr: *const u8,
+    identity_b64_len: usize,
+    identity_size: i64,
+    identity_has_part: u32,
+    identity_part: i64,
+) -> i32 {
+    let (Some(name), Some(identity_b64)) = (unsafe {
+        (
+            nzb_custody::bytes(name_ptr, name_len),
+            nzb_custody::bytes(identity_b64_ptr, identity_b64_len),
+        )
+    }) else {
+        return -1;
+    };
+    let part = nzb_custody::YencPartView {
+        name,
+        size,
+        part: (has_number != 0).then_some(number),
+        begin: (has_begin != 0).then_some(begin),
+        end: (has_end != 0).then_some(end),
+    };
+    let identity = nzb_custody::PartIdentityView {
+        name_base64: identity_b64,
+        size: identity_size,
+        part: (identity_has_part != 0).then_some(identity_part),
+    };
+    nzb_custody::validate_part_code(
+        (has_part != 0).then_some(&part),
+        body_len,
+        segment_number,
+        segment_count,
+        offset,
+        (has_identity != 0).then_some(&identity),
+    )
+}
+
+#[cfg(test)]
+mod wave12_nzb_custody_par2_recovery_tests {
+    use super::nzb_custody::*;
+    use super::*;
+
+    fn digest_of(data: &[u8]) -> String {
+        String::from_utf8(source_digest_hex(data).to_vec()).unwrap()
+    }
+
+    #[test]
+    fn digest_matches_portable_and_known_vector() {
+        // sha256("nntmux:nzb-archive-naming:1\0") computed independently.
+        let mut prefixed = SOURCE_DIGEST_PREFIX.to_vec();
+        for len in [0usize, 1, 35, 36, 37, 99, 100, 101, 163, 164, 1000, 4099] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            prefixed.truncate(SOURCE_DIGEST_PREFIX.len());
+            prefixed.extend_from_slice(&data);
+            let expected = crate::metadata::candidate_inventory::sha256(&prefixed);
+            let hex: String = expected.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(digest_of(&data), hex, "length {len}");
+        }
+    }
+
+    #[test]
+    fn digest_ffi_contract() {
+        let mut out = [0u8; 64];
+        assert_eq!(unsafe { nntmux_nzb_source_digest(std::ptr::null(), 0, out.as_mut_ptr(), 64) }, 64);
+        assert_eq!(unsafe { nntmux_nzb_source_digest(std::ptr::null(), 1, out.as_mut_ptr(), 64) }, -1);
+        assert_eq!(unsafe { nntmux_nzb_source_digest(b"x".as_ptr(), 1, out.as_mut_ptr(), 63) }, -2);
+    }
+
+    #[test]
+    fn basename_dirname_follow_php() {
+        assert_eq!(php_basename(b"/a/b.nzb.gz"), b"b.nzb.gz");
+        assert_eq!(php_basename(b"/a/b/"), b"b");
+        assert_eq!(php_basename(b"///"), b"");
+        assert_eq!(php_dirname(b"/a/b"), b"/a");
+        assert_eq!(php_dirname(b"b"), b".");
+        assert_eq!(php_dirname(b"/b"), b"/");
+        assert_eq!(php_dirname(b"//"), b"/");
+        assert_eq!(php_dirname(b"a//b//"), b"a");
+    }
+
+    #[test]
+    fn anchor_validation() {
+        let guid = b"0123456789abcdef0123456789abcdef";
+        let anchor = b"/d/.archive-audit-0123456789abcdef0123456789abcdef-00112233445566778899aabbccddeeff.anchor";
+        assert_eq!(validate_anchor_code(false, guid, b"/d/0123456789abcdef0123456789abcdef.nzb.gz", anchor, b"1", b"2"), 0);
+        assert_eq!(validate_anchor_code(true, guid, b"/x/0123456789abcdef0123456789abcdef.nzb", b"", b"", b""), 0);
+        assert_eq!(validate_anchor_code(false, guid, b"/e/0123456789abcdef0123456789abcdef.nzb.gz", anchor, b"1", b"2"), 2);
+        assert_eq!(validate_anchor_code(false, guid, b"/d/0123456789abcdef0123456789abcdef.nzb.gz", anchor, b"1", b""), 1);
+        assert_eq!(validate_anchor_code(false, guid, b"/d/0123456789abcdef0123456789abcdef.nzb.gz", anchor, b"-1", b"2"), 2);
+        assert!(matches_anchor(0o100644, 5, -7, b"5", b"-7"));
+        assert!(!matches_anchor(0o040755, 5, 7, b"5", b"7"));
+        assert!(!matches_anchor(0o100644, 5, 7, b"05", b"7"));
+    }
+
+    #[test]
+    fn staged_names() {
+        assert_eq!(staged_guid_len(b"abc.nzb.gz.c12-0123456789abcdef.next"), Some(3));
+        assert_eq!(staged_guid_len(b"a.nzb.gz.c1.nzb.gz.c2-0123456789abcdef.next"), Some(11));
+        assert_eq!(staged_guid_len(b".nzb.gz.c2-0123456789abcdef.next"), None);
+        assert_eq!(staged_guid_len(b"a.nzb.gz.c-0123456789abcdef.next"), None);
+        assert_eq!(staged_guid_len(b"a.nzb.gz.c1-0123456789ABCDEF.next"), None);
+        assert_eq!(staged_guid_len(b"a\n.nzb.gz.c1-0123456789abcdef.next"), None);
+    }
+
+    #[test]
+    fn upload_manifest_rules() {
+        assert!(safe_upload_filename(b"Show.NZB", b"nzb"));
+        assert!(!safe_upload_filename(b" .nzb", b"nzb"));
+        assert!(!safe_upload_filename(b"a/b.nzb", b"nzb"));
+        assert!(!safe_upload_filename(b"nzb", b"nzb"));
+        assert!(safe_upload_filename(b".x.nfo", b"nfo"));
+        assert!(can_reconcile_candidate(Some(b"nzb_pending"), None));
+        assert!(can_reconcile_candidate(Some(b"metadata_review"), Some(&[b'a'; 40])));
+        assert!(!can_reconcile_candidate(Some(b"metadata_review"), Some(&[b'A'; 40])));
+        assert!(!can_reconcile_candidate(None, None));
+    }
+
+    #[test]
+    fn password_values() {
+        assert!(password_value_valid("pässwörd\t\u{10FFFF}".as_bytes()));
+        assert!(!password_value_valid(b"bad\x01"));
+        assert!(!password_value_valid("\u{FFFE}".as_bytes()));
+        assert!(!password_value_valid(b"\xC3"));
+        assert!(!password_value_valid(&[b'a'; 4097]));
+    }
+
+    #[test]
+    fn base64_and_parts() {
+        for raw in [&b""[..], b"f", b"fo", b"foo", b"file.par2"] {
+            let encoded: &[u8] = match raw {
+                b"" => b"",
+                b"f" => b"Zg==",
+                b"fo" => b"Zm8=",
+                b"foo" => b"Zm9v",
+                _ => b"ZmlsZS5wYXIy",
+            };
+            assert!(base64_equals(raw, encoded));
+        }
+        let part = YencPartView { name: b"file.par2", size: 10, part: Some(2), begin: Some(6), end: Some(10) };
+        let identity = PartIdentityView { name_base64: b"ZmlsZS5wYXIy", size: 10, part: Some(1) };
+        assert_eq!(validate_part_code(Some(&part), 5, 2, 2, 5, Some(&identity)), 1);
+        assert_eq!(validate_part_code(Some(&part), 4, 2, 2, 5, Some(&identity)), 6);
+        assert_eq!(validate_part_code(None, 4, 2, 2, 5, Some(&identity)), 2);
+        assert_eq!(validate_part_code(None, 4, 2, 2, 5, None), 0);
+        let max = PartIdentityView { name_base64: b"ZmlsZS5wYXIy", size: 10, part: Some(i64::MAX) };
+        assert_eq!(validate_part_code(Some(&part), 5, 2, 2, 5, Some(&max)), 4);
+    }
+}
