@@ -5203,6 +5203,2129 @@ pub unsafe extern "C" fn nntmux_par2_relate_nzb_file_prefixes(
     unsafe { par2_emit(out_buf, out_cap, &out) }
 }
 
+// ---- CompactFingerprintCollector helpers ------------------------------------
+
+const COMPACT_FP_SAMPLE_LIMIT: usize = 12;
+const COMPACT_FP_LARGEST_FILES_SAMPLED: usize = 3;
+const COMPACT_FP_MAX_LISTED_FILES: usize = 200;
+const COMPACT_FP_MAX_NAME_LENGTH: usize = 120;
+const COMPACT_FP_MAX_LISTED_GROUPS: usize = 20;
+
+#[inline]
+fn php_trim_bytes(bytes: &[u8]) -> &[u8] {
+    let mut start = 0;
+    let mut end = bytes.len();
+    while start < end && is_php_trim_byte(bytes[start]) {
+        start += 1;
+    }
+    while end > start && is_php_trim_byte(bytes[end - 1]) {
+        end -= 1;
+    }
+    &bytes[start..end]
+}
+
+/// `CompactFingerprintCollector::subjectFilename`:
+/// `preg_match('/"([^"]+)"/', $subject, $match) === 1 ? $match[1] : $subject`.
+#[inline]
+fn compact_fp_subject_filename(subject: &[u8]) -> &[u8] {
+    let mut prev_quote: Option<usize> = None;
+    for (i, &b) in subject.iter().enumerate() {
+        if b == b'"' {
+            if let Some(q) = prev_quote
+                && i > q + 1
+            {
+                return &subject[q + 1..i];
+            }
+            prev_quote = Some(i);
+        }
+    }
+    subject
+}
+
+/// `CompactFingerprintCollector::bounded` on valid UTF-8 input.
+/// Returns `None` when `bytes` is not valid UTF-8 so PHP can run `mb_convert_encoding`.
+#[inline]
+fn compact_fp_bounded(bytes: &[u8]) -> Option<&[u8]> {
+    let s = str::from_utf8(bytes).ok()?;
+    if s.len() <= COMPACT_FP_MAX_NAME_LENGTH {
+        return Some(bytes);
+    }
+    let mut end = COMPACT_FP_MAX_NAME_LENGTH;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(&bytes[..end])
+}
+
+#[inline]
+fn compact_fp_bounded_node<'a>(node: Option<&PhpNode<'a>>) -> Option<Option<Cow<'a, [u8]>>> {
+    let Some(node) = node else {
+        return Some(None);
+    };
+    match node.val {
+        PhpVal::Str(s) => compact_fp_bounded(s).map(|b| Some(Cow::Borrowed(b))),
+        PhpVal::Int(i) => Some(Some(Cow::Owned(i.to_string().into_bytes()))),
+        _ => Some(None),
+    }
+}
+
+/// Accelerates `CompactFingerprintCollector::subjectFilename` and `CompactFingerprintCollector::bounded`.
+///
+/// - `mode = 0`: `subjectFilename(input)`
+/// - `mode = 1`: `bounded(input)`
+/// - `mode = 2`: `bounded(subjectFilename(input))`
+/// - `mode = 3`: NUL-separated batch of `bounded(subjectFilename(part))`
+///
+/// Returns the output byte length (`>= 0`), `-(required)` when `out_cap` is too small,
+/// or `-1` when the input contains invalid UTF-8 and must be handled by PHP.
+///
+/// # Safety
+///
+/// `input` must be valid for `input_len` bytes when `input_len > 0`; `out_buf` must be valid for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_compact_fp_subject_filename_bounded(
+    input: *const u8,
+    input_len: usize,
+    mode: u32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input.is_null() && input_len > 0 {
+        return PAR2_FALLBACK;
+    }
+    let data: &[u8] = if input_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(input, input_len) }
+    };
+    match mode {
+        0 => {
+            let res = compact_fp_subject_filename(data);
+            unsafe { par2_emit(out_buf, out_cap, res) }
+        }
+        1 => {
+            let Some(res) = compact_fp_bounded(data) else {
+                return PAR2_FALLBACK;
+            };
+            unsafe { par2_emit(out_buf, out_cap, res) }
+        }
+        2 => {
+            let Some(res) = compact_fp_bounded(compact_fp_subject_filename(data)) else {
+                return PAR2_FALLBACK;
+            };
+            unsafe { par2_emit(out_buf, out_cap, res) }
+        }
+        3 => {
+            let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+            for (idx, part) in data.split(|&b| b == 0).enumerate() {
+                if idx > 0 {
+                    out.push(0);
+                }
+                let Some(bounded) = compact_fp_bounded(compact_fp_subject_filename(part)) else {
+                    return PAR2_FALLBACK;
+                };
+                out.extend(bounded);
+            }
+            out.finish()
+        }
+        _ => PAR2_FALLBACK,
+    }
+}
+
+/// Accelerates `CompactFingerprintCollector::verifiedPartPrefixMd5`.
+///
+/// Returns `32` with the lowercase hex MD5 written to `out_buf`, `0` when ineligible (`null`),
+/// or `-32` when `out_cap < 32`.
+///
+/// # Safety
+///
+/// `decoded` must be valid for `decoded_len` bytes when `decoded_len > 0`;
+/// `out_buf` must be valid for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_compact_fp_verified_part_prefix_md5(
+    decoded: *const u8,
+    decoded_len: usize,
+    file_size: i64,
+    begin: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if file_size < 1 || begin != 1 {
+        return 0;
+    }
+    let length = usize::try_from(file_size.min(16_384)).unwrap_or(0);
+    if length == 0 || decoded.is_null() || decoded_len < length {
+        return 0;
+    }
+    if out_buf.is_null() || out_cap < 32 {
+        return -32;
+    }
+    let bytes = unsafe { slice::from_raw_parts(decoded, length) };
+    let hex = crate::md5_hex_slice(bytes);
+    unsafe { par2_emit(out_buf, out_cap, &hex) }
+}
+
+fn compact_fp_select_samples(doc: &PhpNode<'_>) -> Option<Vec<u8>> {
+    struct SampleFile<'n, 'a> {
+        index: i64,
+        kind: &'a [u8],
+        file_bytes: i64,
+        segments: &'n [(PhpKey<'a>, PhpNode<'a>)],
+    }
+
+    if !doc.is_arr() {
+        return None;
+    }
+    let mut par2_files: Vec<SampleFile<'_, '_>> = Vec::new();
+    let mut data_files: Vec<SampleFile<'_, '_>> = Vec::new();
+
+    for (_, file) in doc.items() {
+        if !file.is_arr() {
+            return None;
+        }
+        let Some(segments_node) = file.coalesce(b"segments") else {
+            continue;
+        };
+        if !segments_node.is_arr() || segments_node.items().is_empty() {
+            continue;
+        }
+        let segments = segments_node.items();
+        for (expected_idx, (k, seg)) in segments.iter().enumerate() {
+            if !matches!(k, PhpKey::Int(i) if *i == expected_idx as i64) || !seg.is_arr() {
+                return None;
+            }
+        }
+        let index = file.get(b"index").and_then(PhpNode::as_int)?;
+        let kind: &[u8] = match file.coalesce(b"kind") {
+            None => b"",
+            Some(n) => n.as_str()?,
+        };
+        let file_bytes = file
+            .get(b"advertised_bytes")
+            .and_then(PhpNode::as_int)
+            .unwrap_or(0);
+        let entry = SampleFile {
+            index,
+            kind,
+            file_bytes,
+            segments,
+        };
+        if kind == b"par2" {
+            par2_files.push(entry);
+        } else {
+            data_files.push(entry);
+        }
+    }
+
+    par2_files.sort_by(|a, b| (a.file_bytes, a.index).cmp(&(b.file_bytes, b.index)));
+    data_files.sort_by(|a, b| {
+        b.file_bytes
+            .cmp(&a.file_bytes)
+            .then_with(|| a.index.cmp(&b.index))
+    });
+
+    let mut candidates: Vec<(&SampleFile<'_, '_>, usize, &'static [u8])> =
+        Vec::with_capacity(par2_files.len() + data_files.len() * 3);
+    if let Some(first_par2) = par2_files.first() {
+        candidates.push((first_par2, 0, b"par2"));
+    }
+    for file in data_files.iter().take(COMPACT_FP_LARGEST_FILES_SAMPLED) {
+        let last = file.segments.len() - 1;
+        candidates.push((file, 0, b"first"));
+        if last > 1 {
+            candidates.push((file, last / 2, b"middle"));
+        }
+        if last > 0 {
+            candidates.push((file, last, b"last"));
+        }
+    }
+    for file in par2_files.iter().skip(1).take(1) {
+        candidates.push((file, 0, b"first"));
+    }
+    for file in data_files.iter().skip(COMPACT_FP_LARGEST_FILES_SAMPLED) {
+        candidates.push((file, 0, b"first"));
+    }
+    for file in par2_files.iter().skip(2) {
+        candidates.push((file, 0, b"first"));
+    }
+
+    let mut seen: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    let mut samples_buf = PhpSerWriter::new();
+    let mut sample_count = 0usize;
+    let mut omitted = 0i64;
+
+    for (file, position, role) in candidates {
+        let seg = &file.segments[position].1;
+        let msg_id: &[u8] = match seg.coalesce(b"messageid") {
+            None => b"",
+            Some(n) => n.as_str()?,
+        };
+        if msg_id.is_empty() || !seen.insert(msg_id) {
+            continue;
+        }
+        if sample_count >= COMPACT_FP_SAMPLE_LIMIT {
+            omitted += 1;
+            continue;
+        }
+        let seg_num = match seg.coalesce(b"number") {
+            None => 0,
+            Some(n) => n.as_int()?,
+        };
+        samples_buf.idx(sample_count);
+        samples_buf.arr_open(5);
+        samples_buf.key(b"file_index");
+        samples_buf.int(file.index);
+        samples_buf.key(b"kind");
+        samples_buf.str(file.kind);
+        samples_buf.key(b"segment_number");
+        samples_buf.int(seg_num);
+        samples_buf.key(b"messageid");
+        samples_buf.str(msg_id);
+        samples_buf.key(b"role");
+        samples_buf.str(role);
+        samples_buf.arr_close();
+        sample_count += 1;
+    }
+
+    let mut w = PhpSerWriter::new();
+    w.arr_open(2);
+    w.idx(0);
+    w.arr_open(sample_count);
+    w.raw(&samples_buf.buf);
+    w.arr_close();
+    w.idx(1);
+    w.int(omitted);
+    w.arr_close();
+    Some(w.buf)
+}
+
+/// Accelerates `CompactFingerprintCollector::selectSamples` over `serialize($files)`.
+///
+/// Returns the serialized `[$samples, $omitted]` length, `-(required)` when `out_cap` is too small,
+/// or `-1` when PHP must evaluate the input itself.
+///
+/// # Safety
+///
+/// `input` must be valid for `input_len` bytes; `out_buf` must be valid for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_compact_fp_select_samples(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(data) = (unsafe { par2_input(input, input_len) }) else {
+        return PAR2_FALLBACK;
+    };
+    let Some(out) = PhpSerParser::parse_document(data)
+        .as_ref()
+        .and_then(compact_fp_select_samples)
+    else {
+        return PAR2_FALLBACK;
+    };
+    unsafe { par2_emit(out_buf, out_cap, &out) }
+}
+
+fn format_utc_iso8601(ts: i64) -> Option<[u8; 20]> {
+    if !(1..=253_402_300_799).contains(&ts) {
+        return None;
+    }
+    let days = ts.div_euclid(86_400);
+    let secs = ts.rem_euclid(86_400);
+    let hour = (secs / 3600) as u32;
+    let min = ((secs % 3600) / 60) as u32;
+    let sec = (secs % 60) as u32;
+
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = (if m <= 2 { y + 1 } else { y }) as u32;
+
+    let mut out = [0u8; 20];
+    out[0] = b'0' + ((year / 1000) % 10) as u8;
+    out[1] = b'0' + ((year / 100) % 10) as u8;
+    out[2] = b'0' + ((year / 10) % 10) as u8;
+    out[3] = b'0' + (year % 10) as u8;
+    out[4] = b'-';
+    out[5] = b'0' + (m / 10) as u8;
+    out[6] = b'0' + (m % 10) as u8;
+    out[7] = b'-';
+    out[8] = b'0' + (d / 10) as u8;
+    out[9] = b'0' + (d % 10) as u8;
+    out[10] = b'T';
+    out[11] = b'0' + (hour / 10) as u8;
+    out[12] = b'0' + (hour % 10) as u8;
+    out[13] = b':';
+    out[14] = b'0' + (min / 10) as u8;
+    out[15] = b'0' + (min % 10) as u8;
+    out[16] = b':';
+    out[17] = b'0' + (sec / 10) as u8;
+    out[18] = b'0' + (sec % 10) as u8;
+    out[19] = b'Z';
+    Some(out)
+}
+
+fn compact_fp_summarize_files(doc: &PhpNode<'_>) -> Option<Vec<u8>> {
+    let [(_, manifest), (_, first_prefix_md5)] = doc.items() else {
+        return None;
+    };
+    if !manifest.is_arr() || !first_prefix_md5.is_arr() {
+        return None;
+    }
+    let files_node = manifest.get(b"files").filter(|n| n.is_arr())?;
+    let manifest_file_count = manifest.get(b"file_count").and_then(PhpNode::as_int)?;
+
+    let mut md5_by_index: std::collections::HashMap<i64, &[u8]> = std::collections::HashMap::new();
+    for (k, v) in first_prefix_md5.items() {
+        let PhpKey::Int(idx) = k else {
+            return None;
+        };
+        match v.val {
+            PhpVal::Null => {}
+            PhpVal::Str(s) => {
+                md5_by_index.insert(*idx, s);
+            }
+            _ => return None,
+        }
+    }
+
+    let mut raw_groups: Vec<Vec<u8>> = Vec::new();
+    let mut posters: Vec<(&[u8], usize)> = Vec::new();
+    let mut segments: i64 = 0;
+    let mut bytes: Option<i64> = Some(0);
+    let mut kinds: std::collections::BTreeMap<&[u8], i64> = std::collections::BTreeMap::new();
+    let mut min_date: Option<i64> = None;
+    let mut max_date: Option<i64> = None;
+    let mut invalid_files: i64 = 0;
+
+    for (_, file) in files_node.items() {
+        if !file.is_arr() {
+            return None;
+        }
+        if let Some(groups_node) = file.coalesce(b"groups") {
+            if !groups_node.is_arr() {
+                return None;
+            }
+            for (_, g) in groups_node.items() {
+                let g_str = g.as_str()?;
+                if php_maybe_numeric(g_str) {
+                    return None;
+                }
+                if !raw_groups
+                    .iter()
+                    .any(|existing| existing.as_slice() == g_str)
+                {
+                    raw_groups.push(g_str.to_vec());
+                }
+            }
+        }
+        let poster: &[u8] = match file.coalesce(b"poster") {
+            None => b"",
+            Some(n) => n.as_str()?,
+        };
+        if !poster.is_empty() {
+            if php_maybe_numeric(poster) {
+                return None;
+            }
+            if let Some(entry) = posters.iter_mut().find(|(p, _)| *p == poster) {
+                entry.1 += 1;
+            } else {
+                posters.push((poster, 1));
+            }
+        }
+        let seg_count = match file.coalesce(b"segment_count") {
+            None => 0,
+            Some(n) => n.as_int()?,
+        };
+        segments = segments.checked_add(seg_count)?;
+
+        let file_bytes = file.get(b"advertised_bytes").and_then(PhpNode::as_int);
+        bytes = match (bytes, file_bytes) {
+            (Some(total), Some(fb)) if fb >= 0 && fb <= i64::MAX - total => Some(total + fb),
+            (Some(_), Some(fb)) if fb < 0 => return None,
+            _ => None,
+        };
+
+        let kind: &[u8] = match file.coalesce(b"kind") {
+            None => b"other",
+            Some(n) => n.as_str()?,
+        };
+        if php_maybe_numeric(kind) {
+            return None;
+        }
+        *kinds.entry(kind).or_insert(0) += 1;
+
+        if let Some(d) = file.get(b"date").and_then(PhpNode::as_int)
+            && d > 0
+        {
+            min_date = Some(min_date.map_or(d, |cur| cur.min(d)));
+            max_date = Some(max_date.map_or(d, |cur| cur.max(d)));
+        }
+
+        let inv_rec = match file.coalesce(b"invalid_segment_record_count") {
+            None => 0,
+            Some(n) => n.as_int()?,
+        };
+        let inv_meta = match file.coalesce(b"invalid_segment_metadata_count") {
+            None => 0,
+            Some(n) => n.as_int()?,
+        };
+        let dup_msg = match file.coalesce(b"duplicate_message_id_count") {
+            None => 0,
+            Some(n) => n.as_int()?,
+        };
+        let dup_num = match file.coalesce(b"duplicate_segment_number_count") {
+            None => 0,
+            Some(n) => n.as_int()?,
+        };
+        let seq_invalid = opt_is_false(file.get(b"segment_number_sequence_valid"));
+        let overflow = opt_is_true(file.get(b"advertised_bytes_overflow"));
+        if inv_rec > 0 || inv_meta > 0 || dup_msg > 0 || dup_num > 0 || seq_invalid || overflow {
+            invalid_files += 1;
+        }
+    }
+
+    let sorted_groups = php_unique_sorted(raw_groups)?;
+    let group_count = sorted_groups.len();
+    let listed_group_count = group_count.min(COMPACT_FP_MAX_LISTED_GROUPS);
+    let mut bounded_groups: Vec<&[u8]> = Vec::with_capacity(listed_group_count);
+    for g in sorted_groups.iter().take(listed_group_count) {
+        bounded_groups.push(compact_fp_bounded(g)?);
+    }
+
+    let best_poster: Option<&[u8]> = posters
+        .iter()
+        .fold(None::<(&[u8], usize)>, |best, &(p, c)| match best {
+            None => Some((p, c)),
+            Some((_, best_c)) if c > best_c => Some((p, c)),
+            Some(cur) => Some(cur),
+        })
+        .map(|(p, _)| p);
+    let bounded_poster = match best_poster {
+        Some(p) => Some(compact_fp_bounded(p)?),
+        None => None,
+    };
+
+    let mut file_rows_buf = PhpSerWriter::new();
+    let mut file_row_count = 0usize;
+    for (_, file) in files_node.items().iter().take(COMPACT_FP_MAX_LISTED_FILES) {
+        let index = file.get(b"index").and_then(PhpNode::as_int)?;
+        let subject: &[u8] = match file.coalesce(b"subject") {
+            None => b"",
+            Some(n) => n.as_str()?,
+        };
+        let name = compact_fp_bounded(compact_fp_subject_filename(subject))?;
+        let size = file.get(b"advertised_bytes").and_then(PhpNode::as_int);
+        let first16k_md5 = md5_by_index.get(&index).copied();
+        let format_hint = match file.coalesce(b"format_hint") {
+            None => None,
+            Some(n) => Some(n.as_str()?),
+        };
+
+        file_rows_buf.idx(file_row_count);
+        file_rows_buf.arr_open(5);
+        file_rows_buf.key(b"file_index");
+        file_rows_buf.int(index);
+        file_rows_buf.key(b"name");
+        file_rows_buf.str(name);
+        file_rows_buf.key(b"size");
+        file_rows_buf.opt_int(size);
+        file_rows_buf.key(b"first16k_md5");
+        file_rows_buf.opt_str(first16k_md5);
+        file_rows_buf.key(b"format_hint");
+        file_rows_buf.opt_str(format_hint);
+        file_rows_buf.arr_close();
+        file_row_count += 1;
+    }
+
+    let totals_valid_flag = !opt_is_false(manifest.get(b"advertised_byte_totals_valid"));
+    let total_invalid = !totals_valid_flag || bytes.is_none();
+    let invalid_file_count = if invalid_files == 0 && total_invalid {
+        1
+    } else {
+        invalid_files
+    };
+
+    let mut w = PhpSerWriter::new();
+    w.arr_open(5);
+    w.key(b"nzb");
+    w.arr_open(6);
+    w.key(b"file_count");
+    w.int(manifest_file_count);
+    w.key(b"segment_count");
+    w.int(segments);
+    w.key(b"total_bytes");
+    w.opt_int(bytes);
+    w.key(b"groups");
+    w.arr_open(bounded_groups.len());
+    for (i, g) in bounded_groups.iter().enumerate() {
+        w.idx(i);
+        w.str(g);
+    }
+    w.arr_close();
+    w.key(b"poster");
+    w.opt_str(bounded_poster);
+    w.key(b"kinds");
+    w.arr_open(kinds.len());
+    for (k, v) in &kinds {
+        w.key(k);
+        w.int(*v);
+    }
+    w.arr_close();
+    w.arr_close();
+
+    w.key(b"files");
+    w.arr_open(file_row_count);
+    w.raw(&file_rows_buf.buf);
+    w.arr_close();
+
+    w.key(b"posting");
+    if let (Some(first), Some(last)) = (min_date, max_date) {
+        let first_utc = format_utc_iso8601(first)?;
+        let last_utc = format_utc_iso8601(last)?;
+        w.arr_open(3);
+        w.key(b"first_utc");
+        w.str(&first_utc);
+        w.key(b"last_utc");
+        w.str(&last_utc);
+        w.key(b"span_s");
+        w.int(last - first);
+        w.arr_close();
+    } else {
+        w.null();
+    }
+
+    w.key(b"invalid_file_count");
+    w.int(invalid_file_count);
+    w.key(b"group_count");
+    w.int(group_count as i64);
+    w.arr_close();
+    Some(w.buf)
+}
+
+/// Accelerates `CompactFingerprintCollector::nzbSummary`, `nzbGroups`, `fileRows`, `posting`,
+/// and `manifestInvalidFileCount` over `serialize([$manifest, $firstPrefixMd5])`.
+///
+/// # Safety
+///
+/// `input` must be valid for `input_len` bytes; `out_buf` must be valid for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_compact_fp_summarize_files(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(data) = (unsafe { par2_input(input, input_len) }) else {
+        return PAR2_FALLBACK;
+    };
+    let Some(out) = PhpSerParser::parse_document(data)
+        .as_ref()
+        .and_then(compact_fp_summarize_files)
+    else {
+        return PAR2_FALLBACK;
+    };
+    unsafe { par2_emit(out_buf, out_cap, &out) }
+}
+
+fn pad_crc32_lower_8(raw: &[u8]) -> Vec<u8> {
+    let stripped = &raw[raw.iter().position(|&b| b != b'0').unwrap_or(raw.len())..];
+    let mut out = Vec::with_capacity(stripped.len().max(8));
+    if stripped.len() < 8 {
+        out.resize(8 - stripped.len(), b'0');
+    }
+    for &b in stripped {
+        out.push(b.to_ascii_lowercase());
+    }
+    out
+}
+
+fn parse_hex_u32_strict(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() || bytes.len() > 8 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let mut val = 0u32;
+    for &b in bytes {
+        val = (val << 4) | u32::from(hex_val(b)?);
+    }
+    Some(val)
+}
+
+fn compact_fp_part_without_trailer_part(yenc: &PhpNode<'_>) -> Option<bool> {
+    let trailer = yenc.get(b"trailer_fields").filter(|n| n.is_arr());
+    let header = yenc.get(b"header_fields").filter(|n| n.is_arr());
+    let declared = trailer.and_then(|t| t.coalesce(b"pcrc32"));
+    let observed = yenc.coalesce(b"observed_decoded_crc32");
+    let s0 = opt_str(yenc.get(b"multipart_structure_status"));
+    let s1 = opt_str(yenc.get(b"multipart_pcrc32_status"));
+    let unpadded_pcrc32 = declared
+        .and_then(PhpNode::as_str)
+        .is_some_and(|d| (1..=7).contains(&d.len()) && d.iter().all(u8::is_ascii_hexdigit));
+
+    let structure_ok = (s0 == Some(b"incomplete") && s1 == Some(b"present-hex"))
+        || (s0 == Some(b"invalid") && s1 == Some(b"malformed") && unpadded_pcrc32);
+    if !opt_is_true(yenc.get(b"multipart"))
+        || !structure_ok
+        || trailer.and_then(|t| t.get(b"part")).is_some()
+        || trailer.and_then(|t| t.get(b"total")).is_some()
+        || header.and_then(|h| h.coalesce(b"part")).is_none()
+        || header.and_then(|h| h.coalesce(b"size")).is_none()
+        || trailer.and_then(|t| t.coalesce(b"size")).is_none()
+        || !opt_int(yenc.get(b"part")).is_some_and(|p| p >= 1)
+        || !opt_is_true(yenc.get(b"ypart_range_valid"))
+        || !opt_is_true(yenc.get(b"header_numeric_fields_valid"))
+        || !opt_is_true(yenc.get(b"trailer_numeric_fields_valid"))
+    {
+        return Some(false);
+    }
+    let Some(declared_bytes) = declared.and_then(PhpNode::as_str) else {
+        return Some(false);
+    };
+    let declared_trimmed = php_trim_bytes(declared_bytes);
+    let Some(declared_u32) = parse_hex_u32_strict(declared_trimmed) else {
+        return Some(false);
+    };
+    let Some(observed_bytes) = observed.and_then(PhpNode::as_str) else {
+        return Some(false);
+    };
+    // If observed is a non-hex string, defer to PHP's hexdec() behavior.
+    let observed_u32 = parse_hex_u32_strict(observed_bytes)?;
+    Some(declared_u32 == observed_u32)
+}
+
+fn compact_fp_declared_crcs_contradict(yenc: &PhpNode<'_>) -> Option<bool> {
+    let observed_node = yenc.coalesce(b"observed_decoded_crc32");
+    if let Some(n) = observed_node
+        && !matches!(n.val, PhpVal::Str(_))
+    {
+        return None;
+    }
+    let observed = observed_node.and_then(PhpNode::as_str).unwrap_or(b"");
+    let trailer = yenc.get(b"trailer_fields").filter(|n| n.is_arr());
+    let fields: &[&[u8]] = if opt_is_true(yenc.get(b"multipart")) {
+        &[b"pcrc32"]
+    } else {
+        &[b"crc32", b"pcrc32"]
+    };
+    for &field in fields {
+        if let Some(declared) = trailer.and_then(|t| opt_str(t.get(field)))
+            && !observed.is_empty()
+            && pad_crc32_lower_8(php_trim_bytes(declared)) != pad_crc32_lower_8(observed)
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+fn compact_fp_empty_single_part(yenc: &PhpNode<'_>) -> bool {
+    let header = yenc.get(b"header_fields").filter(|n| n.is_arr());
+    for field in [&b"line"[..], b"part", b"total"] {
+        if let Some(val) = header.and_then(|h| h.get(field)) {
+            let valid = val.as_str().is_some_and(|s| {
+                (1..=19).contains(&s.len())
+                    && matches!(s[0], b'1'..=b'9')
+                    && s[1..].iter().all(u8::is_ascii_digit)
+            });
+            if !valid {
+                return false;
+            }
+        }
+    }
+    opt_is_false(yenc.get(b"multipart"))
+        && header.and_then(|h| opt_str(h.get(b"size"))) == Some(b"0")
+        && opt_int(yenc.get(b"decoded_segment_size")) == Some(0)
+        && opt_is_true(yenc.get(b"decoded_size_matches_yend_size"))
+}
+
+fn compact_fp_sizes_agree(yenc: &PhpNode<'_>) -> Option<bool> {
+    let c1 = yenc.get(b"decoded_size_matches_yend_size");
+    let c2 = yenc.get(if opt_is_true(yenc.get(b"multipart")) {
+        b"decoded_size_matches_ypart_range"
+    } else {
+        b"decoded_size_matches_yenc"
+    });
+    if opt_is_false(c1) || opt_is_false(c2) {
+        Some(false)
+    } else if opt_is_true(c1) && opt_is_true(c2) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+fn compact_fp_yenc_integrity(doc: &PhpNode<'_>) -> Option<Vec<u8>> {
+    if !doc.is_arr() {
+        let mut w = PhpSerWriter::new();
+        w.arr_open(6);
+        w.key(b"errors");
+        w.arr_open(1);
+        w.idx(0);
+        w.str(b"YencUnverified");
+        w.arr_close();
+        w.key(b"summary");
+        w.null();
+        w.key(b"part_without_trailer_part");
+        w.bool(false);
+        w.key(b"declared_crcs_contradict");
+        w.bool(false);
+        w.key(b"empty_single_part");
+        w.bool(false);
+        w.key(b"sizes_agree");
+        w.null();
+        w.arr_close();
+        return Some(w.buf);
+    }
+
+    let mut errors: Vec<&'static [u8]> = Vec::with_capacity(4);
+    if opt_is_false(doc.get(b"declared_crc32_matches")) {
+        errors.push(b"YencCrcMismatch");
+    }
+    for check in [
+        &b"decoded_size_matches_yenc"[..],
+        b"decoded_size_matches_ypart_range",
+        b"decoded_size_matches_yend_size",
+    ] {
+        if opt_is_false(doc.get(check)) {
+            errors.push(b"YencSizeMismatch");
+            break;
+        }
+    }
+    if opt_is_false(doc.get(b"payload_escape_state_valid")) {
+        errors.push(b"YencFramingInvalid");
+    }
+    let declared_crcs_contradict = compact_fp_declared_crcs_contradict(doc)?;
+    if declared_crcs_contradict && !errors.contains(&&b"YencCrcMismatch"[..]) {
+        errors.push(b"YencCrcMismatch");
+    }
+
+    let part_without_trailer_part = compact_fp_part_without_trailer_part(doc)?;
+    let empty_single_part = compact_fp_empty_single_part(doc);
+    let sizes_agree = compact_fp_sizes_agree(doc);
+
+    let checks: &[&[u8]] = if empty_single_part {
+        &[
+            b"decoded_size_matches_yenc",
+            b"decoded_size_matches_ypart_range",
+            b"ypart_range_valid",
+            b"header_numeric_fields_representable",
+            b"trailer_numeric_fields_valid",
+            b"trailer_numeric_fields_representable",
+            b"trailer_part_matches_header",
+            b"trailer_total_matches_header",
+        ]
+    } else {
+        &[
+            b"decoded_size_matches_yenc",
+            b"decoded_size_matches_ypart_range",
+            b"ypart_range_valid",
+            b"header_numeric_fields_valid",
+            b"header_numeric_fields_representable",
+            b"trailer_numeric_fields_valid",
+            b"trailer_numeric_fields_representable",
+            b"trailer_part_matches_header",
+            b"trailer_total_matches_header",
+        ]
+    };
+    let any_check_false = checks.iter().any(|&c| opt_is_false(doc.get(c)));
+    let conflicting_empty = match doc.get(b"conflicting_control_fields") {
+        Some(n) if n.is_arr() => n.items().is_empty(),
+        _ => true,
+    };
+
+    let verified = (opt_is_true(doc.get(b"declared_crc32_matches")) || part_without_trailer_part)
+        && !opt_is_false(doc.get(b"all_declared_crc32_fields_are_hex"))
+        && (sizes_agree == Some(true) || empty_single_part)
+        && (matches!(
+            opt_str(doc.get(b"multipart_structure_status")),
+            Some(b"single-part" | b"complete")
+        ) || part_without_trailer_part)
+        && opt_is_true(doc.get(b"payload_escape_state_valid"))
+        && !opt_is_true(doc.get(b"integrity_checks_ambiguous"))
+        && opt_is_true(doc.get(b"decoded_size_matches_yend_size"))
+        && !any_check_false
+        && conflicting_empty;
+
+    if !verified && errors.is_empty() {
+        errors.push(b"YencUnverified");
+    }
+
+    let bounded_name = compact_fp_bounded_node(doc.coalesce(b"name"))?;
+    let crc_ok: Option<bool> = match doc.get(b"declared_crc32_matches").map(|n| &n.val) {
+        Some(PhpVal::Bool(b)) => Some(*b),
+        _ => (errors.is_empty() && part_without_trailer_part).then_some(true),
+    };
+
+    let mut w = PhpSerWriter::new();
+    w.arr_open(6);
+    w.key(b"errors");
+    w.arr_open(errors.len());
+    for (i, err) in errors.iter().enumerate() {
+        w.idx(i);
+        w.str(err);
+    }
+    w.arr_close();
+
+    w.key(b"summary");
+    w.arr_open(8);
+    w.key(b"name");
+    w.opt_str(bounded_name.as_deref());
+    w.key(b"size");
+    w.opt_int(opt_int(doc.get(b"file_size")));
+    w.key(b"part");
+    w.opt_int(opt_int(doc.get(b"part")));
+    w.key(b"total");
+    w.opt_int(opt_int(doc.get(b"total_parts")));
+    w.key(b"begin");
+    w.opt_int(opt_int(doc.get(b"begin")));
+    w.key(b"end");
+    w.opt_int(opt_int(doc.get(b"end")));
+    w.key(b"crc_ok");
+    match crc_ok {
+        Some(b) => w.bool(b),
+        None => w.null(),
+    }
+    w.key(b"size_ok");
+    match sizes_agree {
+        Some(b) => w.bool(b),
+        None => w.null(),
+    }
+    w.arr_close();
+
+    w.key(b"part_without_trailer_part");
+    w.bool(part_without_trailer_part);
+    w.key(b"declared_crcs_contradict");
+    w.bool(declared_crcs_contradict);
+    w.key(b"empty_single_part");
+    w.bool(empty_single_part);
+    w.key(b"sizes_agree");
+    match sizes_agree {
+        Some(b) => w.bool(b),
+        None => w.null(),
+    }
+    w.arr_close();
+    Some(w.buf)
+}
+
+/// Accelerates `CompactFingerprintCollector::yencIntegrityErrors`, `yencSummary`,
+/// `partWithoutTrailerPart`, `declaredCrcsContradict`, `emptySinglePart`, and `sizesAgree`
+/// over `serialize($yenc)`.
+///
+/// # Safety
+///
+/// `input` must be valid for `input_len` bytes; `out_buf` must be valid for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_compact_fp_yenc_integrity(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(data) = (unsafe { par2_input(input, input_len) }) else {
+        return PAR2_FALLBACK;
+    };
+    let Some(out) = PhpSerParser::parse_document(data)
+        .as_ref()
+        .and_then(compact_fp_yenc_integrity)
+    else {
+        return PAR2_FALLBACK;
+    };
+    unsafe { par2_emit(out_buf, out_cap, &out) }
+}
+
+#[inline]
+fn is_nzb_xml_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+#[inline]
+fn skip_nzb_xml_ws(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && is_nzb_xml_ws(bytes[pos]) {
+        pos += 1;
+    }
+    pos
+}
+
+fn skip_nzb_xml_ws_and_comments(bytes: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        pos = skip_nzb_xml_ws(bytes, pos);
+        if bytes.get(pos..pos + 4) == Some(b"<!--") {
+            pos += 4;
+            let mut found = false;
+            while pos + 2 <= bytes.len() {
+                if &bytes[pos..pos + 2] == b"--" {
+                    if bytes.get(pos + 2) == Some(&b'>') {
+                        pos += 3;
+                        found = true;
+                        break;
+                    }
+                    return None;
+                }
+                pos += 1;
+            }
+            if !found {
+                return None;
+            }
+        } else {
+            return Some(pos);
+        }
+    }
+}
+
+#[inline]
+fn unescape_nzb_xml_slice<'a>(
+    raw: &'a [u8],
+    is_attr: bool,
+    scratch: &mut Vec<u8>,
+) -> Option<Cow<'a, [u8]>> {
+    if is_attr {
+        let mut has_amp = false;
+        for &b in raw {
+            if matches!(b, b'\t' | b'\r' | b'\n' | b'<') {
+                return None;
+            }
+            if b == b'&' {
+                has_amp = true;
+            }
+        }
+        if !has_amp {
+            return Some(Cow::Borrowed(raw));
+        }
+    } else {
+        let mut has_amp = false;
+        let mut has_cr = false;
+        let mut has_rbracket = false;
+        for &b in raw {
+            if b == b'<' {
+                return None;
+            }
+            if b == b'&' {
+                has_amp = true;
+            } else if b == b'\r' {
+                has_cr = true;
+            } else if b == b']' {
+                has_rbracket = true;
+            }
+        }
+        if (has_cr && php_trim_bytes(raw).contains(&b'\r'))
+            || (has_rbracket && raw.windows(3).any(|w| w == b"]]>"))
+        {
+            return None;
+        }
+        if !has_amp {
+            return Some(Cow::Borrowed(raw));
+        }
+    }
+    scratch.clear();
+    let mut i = 0usize;
+    let n = raw.len();
+    while i < n {
+        let b = raw[i];
+        if b == b'<' {
+            return None;
+        }
+        if b != b'&' {
+            scratch.push(b);
+            i += 1;
+            continue;
+        }
+        let rest = &raw[i + 1..];
+        let semi = rest.iter().take(12).position(|&c| c == b';')?;
+        let ent = &rest[..semi];
+        match ent {
+            b"amp" => scratch.push(b'&'),
+            b"lt" => scratch.push(b'<'),
+            b"gt" => scratch.push(b'>'),
+            b"quot" => scratch.push(b'"'),
+            b"apos" => scratch.push(b'\''),
+            _ if ent.starts_with(b"#x") || ent.starts_with(b"#X") => {
+                let hex_digits = &ent[2..];
+                if hex_digits.is_empty()
+                    || hex_digits.len() > 6
+                    || !hex_digits.iter().all(u8::is_ascii_hexdigit)
+                {
+                    return None;
+                }
+                let s = str::from_utf8(hex_digits).ok()?;
+                let code = u32::from_str_radix(s, 16).ok()?;
+                if code < 0x20 || code == 0x7F {
+                    return None;
+                }
+                let ch = char::from_u32(code)?;
+                let mut u8_buf = [0u8; 4];
+                scratch.extend_from_slice(ch.encode_utf8(&mut u8_buf).as_bytes());
+            }
+            _ if ent.starts_with(b"#") => {
+                let dec_digits = &ent[1..];
+                if dec_digits.is_empty()
+                    || dec_digits.len() > 7
+                    || !dec_digits.iter().all(u8::is_ascii_digit)
+                {
+                    return None;
+                }
+                let s = str::from_utf8(dec_digits).ok()?;
+                let code = s.parse::<u32>().ok()?;
+                if code < 0x20 || code == 0x7F {
+                    return None;
+                }
+                let ch = char::from_u32(code)?;
+                let mut u8_buf = [0u8; 4];
+                scratch.extend_from_slice(ch.encode_utf8(&mut u8_buf).as_bytes());
+            }
+            _ => return None,
+        }
+        i += 1 + semi + 1;
+    }
+    Some(Cow::Owned(scratch.clone()))
+}
+
+#[inline]
+fn match_nzb_tag_exact(bytes: &[u8], pos: usize, tag_exact: &[u8]) -> Option<usize> {
+    let end = pos + tag_exact.len();
+    if bytes.get(pos..end) != Some(tag_exact) {
+        return None;
+    }
+    let next = bytes.get(end).copied()?;
+    if is_nzb_xml_ws(next) || next == b'>' || next == b'/' {
+        Some(end)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn expect_nzb_closing_tag(bytes: &[u8], pos: usize, close_exact: &[u8]) -> Option<usize> {
+    let end = pos + close_exact.len();
+    if bytes.get(pos..end) != Some(close_exact) {
+        return None;
+    }
+    let after_ws = skip_nzb_xml_ws(bytes, end);
+    if bytes.get(after_ws) == Some(&b'>') {
+        Some(after_ws + 1)
+    } else {
+        None
+    }
+}
+
+fn parse_nzb_xml_attributes<'a, F>(
+    bytes: &'a [u8],
+    mut pos: usize,
+    allow_xmlns: bool,
+    mut on_attr: F,
+) -> Option<(usize, bool)>
+where
+    F: FnMut(&'a [u8], &'a [u8]) -> bool,
+{
+    let mut seen_names: [&[u8]; 12] = [&[]; 12];
+    let mut seen_count = 0usize;
+
+    loop {
+        let prev_pos = pos;
+        pos = skip_nzb_xml_ws(bytes, pos);
+        let b = *bytes.get(pos)?;
+        if b == b'>' {
+            return Some((pos + 1, false));
+        }
+        if b == b'/' {
+            if bytes.get(pos + 1) == Some(&b'>') {
+                return Some((pos + 2, true));
+            }
+            return None;
+        }
+        if seen_count > 0 && pos == prev_pos {
+            return None;
+        }
+        if !b.is_ascii_alphabetic() && b != b'_' {
+            return None;
+        }
+        let name_start = pos;
+        pos += 1;
+        while pos < bytes.len() {
+            let c = bytes[pos];
+            if c == b':' {
+                return None;
+            }
+            if c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.') {
+                pos += 1;
+            } else {
+                break;
+            }
+        }
+        let attr_name = &bytes[name_start..pos];
+        if !allow_xmlns && attr_name == b"xmlns" {
+            return None;
+        }
+        if seen_count >= seen_names.len() || seen_names[..seen_count].contains(&attr_name) {
+            return None;
+        }
+        seen_names[seen_count] = attr_name;
+        seen_count += 1;
+
+        pos = skip_nzb_xml_ws(bytes, pos);
+        if bytes.get(pos) != Some(&b'=') {
+            return None;
+        }
+        pos = skip_nzb_xml_ws(bytes, pos + 1);
+        let quote = *bytes.get(pos)?;
+        if quote != b'"' && quote != b'\'' {
+            return None;
+        }
+        pos += 1;
+        let val_start = pos;
+        let rel_end = bytes[val_start..].iter().position(|&c| c == quote)?;
+        pos = val_start + rel_end;
+        let attr_val = &bytes[val_start..pos];
+        pos += 1;
+        if !on_attr(attr_name, attr_val) {
+            return None;
+        }
+    }
+}
+
+fn parse_nzb_xml_decl(bytes: &[u8], mut pos: usize) -> Option<usize> {
+    if bytes.get(pos..pos + 5) != Some(b"<?xml") {
+        return Some(pos);
+    }
+    let after_kw = pos + 5;
+    if !bytes.get(after_kw).copied().is_some_and(is_nzb_xml_ws) {
+        return None;
+    }
+    pos = after_kw;
+    let mut seen_version = false;
+    let mut seen_encoding = false;
+    let mut seen_standalone = false;
+
+    loop {
+        let prev = pos;
+        pos = skip_nzb_xml_ws(bytes, pos);
+        if bytes.get(pos..pos + 2) == Some(b"?>") {
+            return if seen_version { Some(pos + 2) } else { None };
+        }
+        if pos == prev {
+            return None;
+        }
+        let name_start = pos;
+        while pos < bytes.len() && bytes[pos].is_ascii_alphabetic() {
+            pos += 1;
+        }
+        let name = &bytes[name_start..pos];
+        pos = skip_nzb_xml_ws(bytes, pos);
+        if bytes.get(pos) != Some(&b'=') {
+            return None;
+        }
+        pos = skip_nzb_xml_ws(bytes, pos + 1);
+        let quote = *bytes.get(pos)?;
+        if quote != b'"' && quote != b'\'' {
+            return None;
+        }
+        pos += 1;
+        let val_start = pos;
+        while pos < bytes.len() && bytes[pos] != quote {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            return None;
+        }
+        let val = &bytes[val_start..pos];
+        pos += 1;
+
+        match name {
+            b"version" => {
+                if seen_version || seen_encoding || seen_standalone || val != b"1.0" {
+                    return None;
+                }
+                seen_version = true;
+            }
+            b"encoding" => {
+                if !seen_version
+                    || seen_encoding
+                    || seen_standalone
+                    || !val.eq_ignore_ascii_case(b"utf-8")
+                {
+                    return None;
+                }
+                seen_encoding = true;
+            }
+            b"standalone" => {
+                if !seen_version || seen_standalone || (val != b"yes" && val != b"no") {
+                    return None;
+                }
+                seen_standalone = true;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn match_standard_nzb_doctype(bytes: &[u8], mut pos: usize) -> Option<usize> {
+    if bytes.len() - pos < 90 || !bytes[pos..pos + 9].eq_ignore_ascii_case(b"<!doctype") {
+        return None;
+    }
+    pos += 9;
+    let ws1 = pos;
+    while pos < bytes.len() && is_nzb_xml_ws(bytes[pos]) {
+        pos += 1;
+    }
+    if pos == ws1 || bytes.len() - pos < 3 || !bytes[pos..pos + 3].eq_ignore_ascii_case(b"nzb") {
+        return None;
+    }
+    pos += 3;
+    let ws2 = pos;
+    while pos < bytes.len() && is_nzb_xml_ws(bytes[pos]) {
+        pos += 1;
+    }
+    if pos == ws2 || bytes.len() - pos < 6 || !bytes[pos..pos + 6].eq_ignore_ascii_case(b"public") {
+        return None;
+    }
+    pos += 6;
+    let ws3 = pos;
+    while pos < bytes.len() && is_nzb_xml_ws(bytes[pos]) {
+        pos += 1;
+    }
+    if pos == ws3 {
+        return None;
+    }
+    let q1 = *bytes.get(pos)?;
+    if q1 != b'"' && q1 != b'\'' {
+        return None;
+    }
+    pos += 1;
+    const PUB_ID: &[u8] = b"-//newzbin//dtd nzb 1.1//en";
+    if bytes.len() - pos < PUB_ID.len() + 1
+        || !bytes[pos..pos + PUB_ID.len()].eq_ignore_ascii_case(PUB_ID)
+    {
+        return None;
+    }
+    pos += PUB_ID.len();
+    if bytes.get(pos) != Some(&q1) {
+        return None;
+    }
+    pos += 1;
+    let ws4 = pos;
+    while pos < bytes.len() && is_nzb_xml_ws(bytes[pos]) {
+        pos += 1;
+    }
+    if pos == ws4 {
+        return None;
+    }
+    let q2 = *bytes.get(pos)?;
+    if q2 != b'"' && q2 != b'\'' {
+        return None;
+    }
+    pos += 1;
+    const SYS_ID: &[u8] = b"http://www.newzbin.com/dtd/nzb/nzb-1.1.dtd";
+    if bytes.len() - pos < SYS_ID.len() + 1
+        || !bytes[pos..pos + SYS_ID.len()].eq_ignore_ascii_case(SYS_ID)
+    {
+        return None;
+    }
+    pos += SYS_ID.len();
+    if bytes.get(pos) != Some(&q2) {
+        return None;
+    }
+    pos += 1;
+    pos = skip_nzb_xml_ws(bytes, pos);
+    if bytes.get(pos) == Some(&b'>') {
+        Some(pos + 1)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn parse_i64_dec_strict(tok: &[u8]) -> Option<i64> {
+    if tok.is_empty() {
+        return None;
+    }
+    let mut val = 0i64;
+    for &b in tok {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        val = val.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+    }
+    Some(val)
+}
+
+fn compact_fp_analyze_nzb_xml_direct(bytes: &[u8]) -> Option<Vec<u8>> {
+    #[derive(Clone)]
+    struct SampleSeg<'a> {
+        number: i64,
+        msg_id: Cow<'a, [u8]>,
+    }
+
+    struct SampleFile<'a> {
+        index: i64,
+        kind: &'static [u8],
+        file_bytes: i64,
+        seg_count: usize,
+        seg_first: SampleSeg<'a>,
+        seg_middle: SampleSeg<'a>,
+        seg_last: SampleSeg<'a>,
+    }
+
+    if bytes.is_empty() || bytes.len() > 33_554_432 {
+        return None;
+    }
+    let mut pos = if bytes.starts_with(b"\xEF\xBB\xBF") {
+        3
+    } else {
+        0
+    };
+    if str::from_utf8(&bytes[pos..]).is_err() {
+        return None;
+    }
+
+    let mut doctype_occurrences = 0usize;
+    {
+        let body = &bytes[pos..];
+        let len = body.len();
+        let mut i = 0usize;
+        while i < len {
+            let b = body[i];
+            if (b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r')) || b == 0x7F {
+                return None;
+            }
+            if b == b'<' && body.get(i + 1) == Some(&b'!') {
+                if body
+                    .get(i + 2..i + 8)
+                    .is_some_and(|s| s.eq_ignore_ascii_case(b"entity"))
+                {
+                    return None;
+                }
+                if body
+                    .get(i + 2..i + 9)
+                    .is_some_and(|s| s.eq_ignore_ascii_case(b"doctype"))
+                {
+                    doctype_occurrences += 1;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    pos = parse_nzb_xml_decl(bytes, pos)?;
+
+    let mut seen_doctype = false;
+    loop {
+        pos = skip_nzb_xml_ws_and_comments(bytes, pos)?;
+        if bytes
+            .get(pos..pos + 9)
+            .is_some_and(|s| s.eq_ignore_ascii_case(b"<!doctype"))
+        {
+            if seen_doctype {
+                return None;
+            }
+            pos = match_standard_nzb_doctype(bytes, pos)?;
+            seen_doctype = true;
+        } else {
+            break;
+        }
+    }
+    if doctype_occurrences != usize::from(seen_doctype) {
+        return None;
+    }
+
+    let nzb_attr_start = match_nzb_tag_exact(bytes, pos, b"<nzb")?;
+    let mut scratch = Vec::with_capacity(256);
+    let (after_nzb_open, nzb_self_closing) =
+        parse_nzb_xml_attributes(bytes, nzb_attr_start, true, |_k, v| {
+            unescape_nzb_xml_slice(v, true, &mut scratch).is_some()
+        })?;
+    if nzb_self_closing {
+        return None;
+    }
+    pos = after_nzb_open;
+
+    let mut raw_groups: Vec<Vec<u8>> = Vec::new();
+    let mut posters: Vec<(Cow<'_, [u8]>, usize)> = Vec::new();
+    let mut total_segments: i64 = 0;
+    let mut total_bytes: Option<i64> = Some(0);
+    let mut total_adv_bytes_by_kind: [Option<i64>; 3] = [Some(0), Some(0), Some(0)];
+    let mut kinds: std::collections::BTreeMap<&'static [u8], i64> =
+        std::collections::BTreeMap::new();
+    let mut min_date: Option<i64> = None;
+    let mut max_date: Option<i64> = None;
+    let mut invalid_files: i64 = 0;
+    let mut file_count = 0usize;
+
+    let mut segment_counts_buf = PhpSerWriter::new();
+    let mut file_rows_buf = PhpSerWriter::new();
+    let mut file_row_count = 0usize;
+    let mut nzb_names: Vec<Cow<'_, [u8]>> = Vec::new();
+    let mut nzb_names_set: std::collections::HashSet<Cow<'_, [u8]>> =
+        std::collections::HashSet::new();
+    let mut par2_files: Vec<SampleFile<'_>> = Vec::new();
+    let mut data_files: Vec<SampleFile<'_>> = Vec::new();
+
+    let mut file_segs: Vec<SampleSeg<'_>> = Vec::with_capacity(64);
+    let mut msg_idx_buf: Vec<usize> = Vec::with_capacity(64);
+
+    loop {
+        pos = skip_nzb_xml_ws_and_comments(bytes, pos)?;
+
+        if let Some(after_nzb_close) = expect_nzb_closing_tag(bytes, pos, b"</nzb") {
+            let end_pos = skip_nzb_xml_ws_and_comments(bytes, after_nzb_close)?;
+            if end_pos != bytes.len() {
+                return None;
+            }
+            break;
+        }
+
+        if let Some(head_attr_start) = match_nzb_tag_exact(bytes, pos, b"<head") {
+            let (after_head_open, head_self_closing) =
+                parse_nzb_xml_attributes(bytes, head_attr_start, false, |_k, v| {
+                    unescape_nzb_xml_slice(v, true, &mut scratch).is_some()
+                })?;
+            pos = after_head_open;
+            if !head_self_closing {
+                loop {
+                    pos = skip_nzb_xml_ws_and_comments(bytes, pos)?;
+                    if let Some(after_head_close) = expect_nzb_closing_tag(bytes, pos, b"</head") {
+                        pos = after_head_close;
+                        break;
+                    }
+                    let meta_attr_start = match_nzb_tag_exact(bytes, pos, b"<meta")?;
+                    let (after_meta_open, meta_self_closing) =
+                        parse_nzb_xml_attributes(bytes, meta_attr_start, false, |_k, v| {
+                            unescape_nzb_xml_slice(v, true, &mut scratch).is_some()
+                        })?;
+                    pos = after_meta_open;
+                    if !meta_self_closing {
+                        let text_start = pos;
+                        while pos < bytes.len() && bytes[pos] != b'<' {
+                            pos += 1;
+                        }
+                        unescape_nzb_xml_slice(&bytes[text_start..pos], false, &mut scratch)?;
+                        pos = expect_nzb_closing_tag(bytes, pos, b"</meta")?;
+                    }
+                }
+            }
+            continue;
+        }
+
+        let file_attr_start = match_nzb_tag_exact(bytes, pos, b"<file")?;
+        let mut attr_subject: Cow<'_, [u8]> = Cow::Borrowed(b"");
+        let mut attr_poster: Cow<'_, [u8]> = Cow::Borrowed(b"");
+        let mut attr_date: Cow<'_, [u8]> = Cow::Borrowed(b"");
+        let (after_file_open, file_self_closing) =
+            parse_nzb_xml_attributes(bytes, file_attr_start, false, |k, v| match k {
+                b"subject" => {
+                    if let Some(val) = unescape_nzb_xml_slice(v, true, &mut scratch) {
+                        attr_subject = val;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                b"poster" => {
+                    if let Some(val) = unescape_nzb_xml_slice(v, true, &mut scratch) {
+                        attr_poster = val;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                b"date" => {
+                    if let Some(val) = unescape_nzb_xml_slice(v, true, &mut scratch) {
+                        attr_date = val;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => unescape_nzb_xml_slice(v, true, &mut scratch).is_some(),
+            })?;
+        pos = after_file_open;
+
+        let subject_cow: Cow<'_, [u8]> = match attr_subject {
+            Cow::Borrowed(s) => Cow::Borrowed(php_trim_bytes(s)),
+            Cow::Owned(v) => Cow::Owned(php_trim_bytes(&v).to_vec()),
+        };
+        let kind_code = crate::nfo::nzb_file_kind_code(&subject_cow);
+        let kind_str: &'static [u8] = match kind_code {
+            2 => b"par2",
+            1 => b"rar",
+            _ => b"other",
+        };
+        let mut format_hint_buf = [0u8; 8];
+        let format_hint_len = crate::nfo::nzb_format_hint_slice(&subject_cow, &mut format_hint_buf);
+        let date_parsed = parse_i64_dec_strict(php_trim_bytes(&attr_date));
+
+        file_segs.clear();
+        let mut segs_sorted = true;
+        let mut prev_seg_num = i64::MIN;
+        let mut invalid_segment_record_count = 0usize;
+        let mut invalid_segment_metadata_count = 0usize;
+        let mut advertised_bytes: Option<i64> = Some(0);
+        let mut advertised_bytes_overflow = false;
+        let mut file_has_group = false;
+
+        if !file_self_closing {
+            loop {
+                pos = skip_nzb_xml_ws_and_comments(bytes, pos)?;
+                if let Some(after_file_close) = expect_nzb_closing_tag(bytes, pos, b"</file") {
+                    pos = after_file_close;
+                    break;
+                }
+                if let Some(groups_attr_start) = match_nzb_tag_exact(bytes, pos, b"<groups") {
+                    let (after_groups_open, groups_self_closing) =
+                        parse_nzb_xml_attributes(bytes, groups_attr_start, false, |_k, v| {
+                            unescape_nzb_xml_slice(v, true, &mut scratch).is_some()
+                        })?;
+                    pos = after_groups_open;
+                    if !groups_self_closing {
+                        loop {
+                            pos = skip_nzb_xml_ws_and_comments(bytes, pos)?;
+                            if let Some(after_groups_close) =
+                                expect_nzb_closing_tag(bytes, pos, b"</groups")
+                            {
+                                pos = after_groups_close;
+                                break;
+                            }
+                            let group_attr_start = match_nzb_tag_exact(bytes, pos, b"<group")?;
+                            let (after_group_open, group_self_closing) = parse_nzb_xml_attributes(
+                                bytes,
+                                group_attr_start,
+                                false,
+                                |_k, v| unescape_nzb_xml_slice(v, true, &mut scratch).is_some(),
+                            )?;
+                            pos = after_group_open;
+                            let g_cow: Cow<'_, [u8]> = if !group_self_closing {
+                                let text_start = pos;
+                                while pos < bytes.len() && bytes[pos] != b'<' {
+                                    pos += 1;
+                                }
+                                let unescaped = unescape_nzb_xml_slice(
+                                    &bytes[text_start..pos],
+                                    false,
+                                    &mut scratch,
+                                )?;
+                                pos = expect_nzb_closing_tag(bytes, pos, b"</group")?;
+                                unescaped
+                            } else {
+                                Cow::Borrowed(b"")
+                            };
+                            let g_trimmed = php_trim_bytes(&g_cow);
+                            if php_maybe_numeric(g_trimmed) {
+                                return None;
+                            }
+                            file_has_group = true;
+                            if !raw_groups
+                                .iter()
+                                .any(|existing| existing.as_slice() == g_trimmed)
+                            {
+                                raw_groups.push(g_trimmed.to_vec());
+                            }
+                        }
+                    }
+                } else if let Some(segs_attr_start) = match_nzb_tag_exact(bytes, pos, b"<segments")
+                {
+                    let (after_segs_open, segs_self_closing) =
+                        parse_nzb_xml_attributes(bytes, segs_attr_start, false, |_k, v| {
+                            unescape_nzb_xml_slice(v, true, &mut scratch).is_some()
+                        })?;
+                    pos = after_segs_open;
+                    if !segs_self_closing {
+                        loop {
+                            pos = skip_nzb_xml_ws_and_comments(bytes, pos)?;
+                            if let Some(after_segs_close) =
+                                expect_nzb_closing_tag(bytes, pos, b"</segments")
+                            {
+                                pos = after_segs_close;
+                                break;
+                            }
+                            let seg_attr_start = match_nzb_tag_exact(bytes, pos, b"<segment")?;
+                            let mut seg_num_attr: Cow<'_, [u8]> = Cow::Borrowed(b"");
+                            let mut seg_bytes_attr: Cow<'_, [u8]> = Cow::Borrowed(b"");
+                            let (after_seg_open, seg_self_closing) =
+                                parse_nzb_xml_attributes(bytes, seg_attr_start, false, |k, v| {
+                                    match k {
+                                        b"number" => {
+                                            if let Some(val) =
+                                                unescape_nzb_xml_slice(v, true, &mut scratch)
+                                            {
+                                                seg_num_attr = val;
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        b"bytes" => {
+                                            if let Some(val) =
+                                                unescape_nzb_xml_slice(v, true, &mut scratch)
+                                            {
+                                                seg_bytes_attr = val;
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        _ => {
+                                            unescape_nzb_xml_slice(v, true, &mut scratch).is_some()
+                                        }
+                                    }
+                                })?;
+                            pos = after_seg_open;
+                            let seg_text: Cow<'_, [u8]> = if !seg_self_closing {
+                                let text_start = pos;
+                                let rel_lt = bytes[text_start..].iter().position(|&c| c == b'<')?;
+                                pos = text_start + rel_lt;
+                                let unescaped = unescape_nzb_xml_slice(
+                                    &bytes[text_start..pos],
+                                    false,
+                                    &mut scratch,
+                                )?;
+                                pos = expect_nzb_closing_tag(bytes, pos, b"</segment")?;
+                                unescaped
+                            } else {
+                                Cow::Borrowed(b"")
+                            };
+
+                            let msg_trimmed = php_trim_bytes(&seg_text);
+                            let mut msg_start = 0usize;
+                            let mut msg_end = msg_trimmed.len();
+                            while msg_start < msg_end
+                                && (msg_trimmed[msg_start] == b'<'
+                                    || msg_trimmed[msg_start] == b'>')
+                            {
+                                msg_start += 1;
+                            }
+                            while msg_end > msg_start
+                                && (msg_trimmed[msg_end - 1] == b'<'
+                                    || msg_trimmed[msg_end - 1] == b'>')
+                            {
+                                msg_end -= 1;
+                            }
+                            let msg_stripped = &msg_trimmed[msg_start..msg_end];
+                            if msg_trimmed.is_empty()
+                                || msg_stripped.is_empty()
+                                || !msg_stripped
+                                    .iter()
+                                    .all(|&b| b > 0x20 && b != b'<' && b != b'>' && b != 0x7F)
+                            {
+                                invalid_segment_record_count += 1;
+                                continue;
+                            }
+
+                            let seg_num_trimmed = php_trim_bytes(&seg_num_attr);
+                            let seg_bytes_trimmed = php_trim_bytes(&seg_bytes_attr);
+                            let parsed_num = parse_i64_dec_strict(seg_num_trimmed);
+                            let parsed_bytes = parse_i64_dec_strict(seg_bytes_trimmed);
+                            if parsed_num.is_none_or(|n| n < 1) || parsed_bytes.is_none() {
+                                invalid_segment_metadata_count += 1;
+                            }
+                            let bytes_is_digits = !seg_bytes_trimmed.is_empty()
+                                && seg_bytes_trimmed.iter().all(u8::is_ascii_digit);
+                            if (parsed_bytes.is_none() && bytes_is_digits)
+                                || (advertised_bytes.is_some()
+                                    && parsed_bytes.is_some()
+                                    && parsed_bytes.unwrap() > i64::MAX - advertised_bytes.unwrap())
+                            {
+                                advertised_bytes_overflow = true;
+                            }
+                            advertised_bytes = match (advertised_bytes, parsed_bytes) {
+                                (Some(a), Some(b)) => a.checked_add(b),
+                                _ => None,
+                            };
+
+                            let num_val = parsed_num.unwrap_or(0);
+                            if num_val < prev_seg_num {
+                                segs_sorted = false;
+                            }
+                            prev_seg_num = num_val;
+
+                            let msg_cow: Cow<'_, [u8]> = match seg_text {
+                                Cow::Borrowed(orig) => {
+                                    // Compute subslice inside `orig`
+                                    let ptr_offset =
+                                        msg_stripped.as_ptr() as usize - orig.as_ptr() as usize;
+                                    Cow::Borrowed(
+                                        &orig[ptr_offset..ptr_offset + msg_stripped.len()],
+                                    )
+                                }
+                                Cow::Owned(_) => Cow::Owned(msg_stripped.to_vec()),
+                            };
+                            file_segs.push(SampleSeg {
+                                number: num_val,
+                                msg_id: msg_cow,
+                            });
+                        }
+                    }
+                } else {
+                    return None;
+                }
+            }
+        }
+
+        let _ = file_has_group;
+        let seg_count = file_segs.len();
+        if seg_count > 1 && !segs_sorted {
+            file_segs.sort_by_key(|s| s.number);
+        }
+
+        let segment_number_sequence_valid = seg_count > 0
+            && file_segs
+                .iter()
+                .enumerate()
+                .all(|(idx, s)| s.number == (idx as i64) + 1);
+        let has_dup_seg_num = file_segs.windows(2).any(|w| w[0].number == w[1].number);
+
+        let mut file_invalid = invalid_segment_record_count > 0
+            || invalid_segment_metadata_count > 0
+            || has_dup_seg_num
+            || !segment_number_sequence_valid
+            || advertised_bytes_overflow;
+
+        if !file_invalid && seg_count > 1 {
+            msg_idx_buf.clear();
+            msg_idx_buf.extend(0..seg_count);
+            msg_idx_buf.sort_unstable_by(|&a, &b| file_segs[a].msg_id.cmp(&file_segs[b].msg_id));
+            if msg_idx_buf
+                .windows(2)
+                .any(|w| file_segs[w[0]].msg_id == file_segs[w[1]].msg_id)
+            {
+                file_invalid = true;
+            }
+        }
+        if file_invalid {
+            invalid_files += 1;
+        }
+
+        let k_idx = kind_code as usize;
+        total_adv_bytes_by_kind[k_idx] = match (total_adv_bytes_by_kind[k_idx], advertised_bytes) {
+            (Some(a), Some(b)) => a.checked_add(b),
+            _ => None,
+        };
+
+        let idx_i64 = file_count as i64;
+        segment_counts_buf.idx(file_count);
+        segment_counts_buf.int(seg_count as i64);
+
+        if seg_count > 0 {
+            let seg_first = file_segs[0].clone();
+            let seg_middle = if seg_count > 2 {
+                file_segs[(seg_count - 1) / 2].clone()
+            } else {
+                SampleSeg {
+                    number: 0,
+                    msg_id: Cow::Borrowed(b""),
+                }
+            };
+            let seg_last = if seg_count > 1 {
+                file_segs[seg_count - 1].clone()
+            } else {
+                SampleSeg {
+                    number: 0,
+                    msg_id: Cow::Borrowed(b""),
+                }
+            };
+            let entry = SampleFile {
+                index: idx_i64,
+                kind: kind_str,
+                file_bytes: advertised_bytes.unwrap_or(0),
+                seg_count,
+                seg_first,
+                seg_middle,
+                seg_last,
+            };
+            if kind_code == 2 {
+                par2_files.push(entry);
+            } else {
+                data_files.push(entry);
+            }
+        }
+
+        if !attr_poster.is_empty() {
+            if php_maybe_numeric(&attr_poster) {
+                return None;
+            }
+            if let Some(entry) = posters
+                .iter_mut()
+                .find(|(p, _)| p.as_ref() == attr_poster.as_ref())
+            {
+                entry.1 += 1;
+            } else {
+                posters.push((attr_poster, 1));
+            }
+        }
+
+        total_segments = total_segments.checked_add(seg_count as i64)?;
+        total_bytes = match (total_bytes, advertised_bytes) {
+            (Some(t), Some(fb)) if fb >= 0 && fb <= i64::MAX - t => Some(t + fb),
+            (Some(_), Some(fb)) if fb < 0 => return None,
+            _ => None,
+        };
+
+        *kinds.entry(kind_str).or_insert(0) += 1;
+
+        if let Some(d) = date_parsed
+            && d > 0
+        {
+            min_date = Some(min_date.map_or(d, |cur| cur.min(d)));
+            max_date = Some(max_date.map_or(d, |cur| cur.max(d)));
+        }
+
+        let subj_fname_slice = compact_fp_subject_filename(&subject_cow);
+        if php_maybe_numeric(subj_fname_slice) {
+            return None;
+        }
+        let subj_fname_cow: Cow<'_, [u8]> = match &subject_cow {
+            Cow::Borrowed(orig) => {
+                let ptr_offset = subj_fname_slice.as_ptr() as usize - orig.as_ptr() as usize;
+                Cow::Borrowed(&orig[ptr_offset..ptr_offset + subj_fname_slice.len()])
+            }
+            Cow::Owned(_) => Cow::Owned(subj_fname_slice.to_vec()),
+        };
+
+        if file_row_count < COMPACT_FP_MAX_LISTED_FILES {
+            let bounded_name = compact_fp_bounded(&subj_fname_cow)?;
+            let format_hint_slice: &[u8] = if format_hint_len == 0 {
+                b"unknown"
+            } else {
+                &format_hint_buf[..format_hint_len]
+            };
+            file_rows_buf.idx(file_row_count);
+            file_rows_buf.arr_open(5);
+            file_rows_buf.key(b"file_index");
+            file_rows_buf.int(idx_i64);
+            file_rows_buf.key(b"name");
+            file_rows_buf.str(bounded_name);
+            file_rows_buf.key(b"size");
+            file_rows_buf.opt_int(advertised_bytes);
+            file_rows_buf.key(b"first16k_md5");
+            file_rows_buf.null();
+            file_rows_buf.key(b"format_hint");
+            file_rows_buf.str(format_hint_slice);
+            file_rows_buf.arr_close();
+            file_row_count += 1;
+        }
+
+        if nzb_names_set.insert(subj_fname_cow.clone()) {
+            nzb_names.push(subj_fname_cow);
+        }
+
+        file_count += 1;
+    }
+
+    if file_count == 0 {
+        return None;
+    }
+
+    par2_files.sort_by(|a, b| (a.file_bytes, a.index).cmp(&(b.file_bytes, b.index)));
+    data_files.sort_by(|a, b| {
+        b.file_bytes
+            .cmp(&a.file_bytes)
+            .then_with(|| a.index.cmp(&b.index))
+    });
+
+    let mut candidates: Vec<(&SampleFile<'_>, &SampleSeg<'_>, &'static [u8])> =
+        Vec::with_capacity(par2_files.len() + data_files.len() * 3);
+    if let Some(first_par2) = par2_files.first() {
+        candidates.push((first_par2, &first_par2.seg_first, b"par2"));
+    }
+    for file in data_files.iter().take(COMPACT_FP_LARGEST_FILES_SAMPLED) {
+        let last = file.seg_count - 1;
+        candidates.push((file, &file.seg_first, b"first"));
+        if last > 1 {
+            candidates.push((file, &file.seg_middle, b"middle"));
+        }
+        if last > 0 {
+            candidates.push((file, &file.seg_last, b"last"));
+        }
+    }
+    for file in par2_files.iter().skip(1).take(1) {
+        candidates.push((file, &file.seg_first, b"first"));
+    }
+    for file in data_files.iter().skip(COMPACT_FP_LARGEST_FILES_SAMPLED) {
+        candidates.push((file, &file.seg_first, b"first"));
+    }
+    for file in par2_files.iter().skip(2) {
+        candidates.push((file, &file.seg_first, b"first"));
+    }
+
+    let mut seen: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    let mut samples_buf = PhpSerWriter::new();
+    let mut sample_count = 0usize;
+    let mut omitted = 0i64;
+
+    for (file, seg, role) in candidates {
+        let msg_bytes = seg.msg_id.as_ref();
+        if msg_bytes.is_empty() || !seen.insert(msg_bytes) {
+            continue;
+        }
+        if sample_count >= COMPACT_FP_SAMPLE_LIMIT {
+            omitted += 1;
+            continue;
+        }
+        samples_buf.idx(sample_count);
+        samples_buf.arr_open(5);
+        samples_buf.key(b"file_index");
+        samples_buf.int(file.index);
+        samples_buf.key(b"kind");
+        samples_buf.str(file.kind);
+        samples_buf.key(b"segment_number");
+        samples_buf.int(seg.number);
+        samples_buf.key(b"messageid");
+        samples_buf.str(msg_bytes);
+        samples_buf.key(b"role");
+        samples_buf.str(role);
+        samples_buf.arr_close();
+        sample_count += 1;
+    }
+
+    let sorted_groups = php_unique_sorted(raw_groups)?;
+    let group_count = sorted_groups.len();
+    let listed_group_count = group_count.min(COMPACT_FP_MAX_LISTED_GROUPS);
+    let mut bounded_groups: Vec<&[u8]> = Vec::with_capacity(listed_group_count);
+    for g in sorted_groups.iter().take(listed_group_count) {
+        bounded_groups.push(compact_fp_bounded(g)?);
+    }
+
+    let best_poster: Option<&[u8]> = posters
+        .iter()
+        .fold(None::<(&[u8], usize)>, |best, (p, c)| match best {
+            None => Some((p.as_ref(), *c)),
+            Some((_, best_c)) if *c > best_c => Some((p.as_ref(), *c)),
+            Some(cur) => Some(cur),
+        })
+        .map(|(p, _)| p);
+    let bounded_poster = match best_poster {
+        Some(p) => Some(compact_fp_bounded(p)?),
+        None => None,
+    };
+
+    let adv_totals_valid = total_adv_bytes_by_kind[0].is_some()
+        && total_adv_bytes_by_kind[1].is_some()
+        && total_adv_bytes_by_kind[2].is_some();
+    let total_invalid = !adv_totals_valid || total_bytes.is_none();
+    let manifest_invalid_files = if invalid_files == 0 && total_invalid {
+        1
+    } else {
+        invalid_files
+    };
+
+    let mut w = PhpSerWriter::new();
+    w.arr_open(10);
+
+    w.key(b"samples");
+    w.arr_open(sample_count);
+    w.raw(&samples_buf.buf);
+    w.arr_close();
+
+    w.key(b"omitted");
+    w.int(omitted);
+
+    w.key(b"segment_counts");
+    w.arr_open(file_count);
+    w.raw(&segment_counts_buf.buf);
+    w.arr_close();
+
+    w.key(b"manifest_invalid_files");
+    w.int(manifest_invalid_files);
+
+    w.key(b"nzb");
+    w.arr_open(6);
+    w.key(b"file_count");
+    w.int(file_count as i64);
+    w.key(b"segment_count");
+    w.int(total_segments);
+    w.key(b"total_bytes");
+    w.opt_int(total_bytes);
+    w.key(b"groups");
+    w.arr_open(bounded_groups.len());
+    for (i, g) in bounded_groups.iter().enumerate() {
+        w.idx(i);
+        w.str(g);
+    }
+    w.arr_close();
+    w.key(b"poster");
+    w.opt_str(bounded_poster);
+    w.key(b"kinds");
+    w.arr_open(kinds.len());
+    for (k, v) in &kinds {
+        w.key(k);
+        w.int(*v);
+    }
+    w.arr_close();
+    w.arr_close();
+
+    w.key(b"files");
+    w.arr_open(file_row_count);
+    w.raw(&file_rows_buf.buf);
+    w.arr_close();
+
+    w.key(b"posting");
+    if let (Some(first), Some(last)) = (min_date, max_date) {
+        let first_utc = format_utc_iso8601(first)?;
+        let last_utc = format_utc_iso8601(last)?;
+        w.arr_open(3);
+        w.key(b"first_utc");
+        w.str(&first_utc);
+        w.key(b"last_utc");
+        w.str(&last_utc);
+        w.key(b"span_s");
+        w.int(last - first);
+        w.arr_close();
+    } else {
+        w.null();
+    }
+
+    w.key(b"group_count");
+    w.int(group_count as i64);
+
+    w.key(b"file_count");
+    w.int(file_count as i64);
+
+    w.key(b"nzb_names");
+    w.arr_open(nzb_names.len());
+    for name in &nzb_names {
+        w.key(name);
+        w.bool(true);
+    }
+    w.arr_close();
+
+    w.arr_close();
+    Some(w.buf)
+}
+
+/// Single-pass NZB XML analysis and compact-v1 summarization for
+/// `CompactFingerprintCollector::collectFromNzb`.
+///
+/// Parses the raw NZB XML directly in Rust and computes `samples`, `omitted`,
+/// `segment_counts`, `manifest_invalid_files`, `nzb`, `files`, `posting`, `group_count`,
+/// `file_count`, and `nzb_names` without materializing intermediate per-file/per-segment
+/// PHP arrays or wire buffers.
+///
+/// Returns the serialized result length (`> 0`), `-(required)` when `out_cap` is too small,
+/// or `-1` when PHP must evaluate the input itself (e.g., invalid XML to raise `RuntimeException`).
+///
+/// # Safety
+///
+/// `xml` must be valid for `xml_len` bytes; `out_buf` must be valid for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_compact_fp_analyze_nzb_xml(
+    xml: *const u8,
+    xml_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if xml.is_null() || xml_len == 0 || xml_len > 33_554_432 {
+        return PAR2_FALLBACK;
+    }
+    let bytes = unsafe { slice::from_raw_parts(xml, xml_len) };
+    let Some(out) = compact_fp_analyze_nzb_xml_direct(bytes) else {
+        return PAR2_FALLBACK;
+    };
+    unsafe { par2_emit(out_buf, out_cap, &out) }
+}
+
 #[cfg(test)]
 mod par2_metadata_proof_tests {
     use super::*;
@@ -5357,5 +7480,58 @@ mod par2_metadata_proof_tests {
         assert_eq!(parse(b"s:2:\"1a\";"), None);
         assert_eq!(parse(b"s:0:\"\";"), None);
         assert_eq!(parse(b"b:1;"), None);
+    }
+
+    #[test]
+    fn compact_fp_subject_and_bounded_match_php() {
+        assert_eq!(
+            compact_fp_subject_filename(b"[01/12] - \"movie.part01.rar\" yEnc (1/5)"),
+            b"movie.part01.rar"
+        );
+        assert_eq!(compact_fp_subject_filename(b"\"\" \"actual.bin\""), b" ");
+        assert_eq!(
+            compact_fp_subject_filename(b"unquoted subject"),
+            b"unquoted subject"
+        );
+
+        let multibyte = "名".repeat(50);
+        let cut = compact_fp_bounded(multibyte.as_bytes()).expect("valid utf8");
+        assert_eq!(cut.len(), 120);
+        assert!(str::from_utf8(cut).is_ok());
+
+        let boundary = format!("{}{}", "a".repeat(119), "名");
+        let cut2 = compact_fp_bounded(boundary.as_bytes()).expect("valid utf8");
+        assert_eq!(cut2.len(), 119);
+        assert_eq!(cut2, "a".repeat(119).as_bytes());
+    }
+
+    #[test]
+    fn compact_fp_utc_iso8601_matches_gmdate() {
+        assert_eq!(
+            format_utc_iso8601(1_790_812_800),
+            Some(*b"2026-10-01T00:00:00Z")
+        );
+        assert_eq!(
+            format_utc_iso8601(1_790_812_921),
+            Some(*b"2026-10-01T00:02:01Z")
+        );
+        assert_eq!(format_utc_iso8601(0), None);
+    }
+
+    #[test]
+    fn compact_fp_analyze_nzb_xml_summarizes_manifest() {
+        let xml = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><file poster=\"p@example\" date=\"1790812800\" subject=\"&quot;movie.par2&quot; yEnc (1/1)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">f0-s1@fixture</segment></segments></file><file poster=\"p@example\" date=\"1790812801\" subject=\"&quot;movie.part01.rar&quot; yEnc (1/3)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"2000\" number=\"1\">f1-s1@fixture</segment><segment bytes=\"2000\" number=\"2\">f1-s2@fixture</segment><segment bytes=\"2000\" number=\"3\">f1-s3@fixture</segment></segments></file></nzb>";
+        let mut out = vec![0u8; 8192];
+        let rc = unsafe {
+            nntmux_compact_fp_analyze_nzb_xml(xml.as_ptr(), xml.len(), out.as_mut_ptr(), out.len())
+        };
+        assert!(rc > 0);
+        let doc = PhpSerParser::parse_document(&out[..rc as usize]).expect("valid php serialize");
+        assert_eq!(opt_int(doc.get(b"file_count")), Some(2));
+        assert_eq!(opt_int(doc.get(b"group_count")), Some(1));
+        assert_eq!(opt_int(doc.get(b"omitted")), Some(0));
+        assert_eq!(opt_int(doc.get(b"manifest_invalid_files")), Some(0));
+        let samples = doc.get(b"samples").expect("samples");
+        assert_eq!(samples.items().len(), 4);
     }
 }
