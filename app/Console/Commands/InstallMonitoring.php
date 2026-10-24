@@ -4,17 +4,40 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Process;
 use RuntimeException;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Process\Process as SymfonyProcess;
+use Throwable;
 
 #[AsCommand(name: 'monitoring:install')]
 class InstallMonitoring extends Command
 {
     private const array SUPPORTED_UBUNTU = ['22.04', '24.04'];
+
+    private const FFI_CDEF = <<<'CDEF'
+int32_t nntmux_install_monitoring_is_valid_web_server(const char *value_ptr, size_t value_len);
+int32_t nntmux_install_monitoring_is_supported_ubuntu_version(const char *value_ptr, size_t value_len);
+ssize_t nntmux_install_monitoring_project_relative_path(
+    const char *base_ptr,
+    size_t base_len,
+    const char *path_ptr,
+    size_t path_len,
+    uint8_t *out_buf,
+    size_t out_cap
+);
+CDEF;
+
+    /** Rust stays opt-in: these one-shot checks are too small for FFI to beat PHP by 1.5x. */
+    private const RUST_FFI_DEFAULT = false;
+
+    private static bool $useRustFfi = self::RUST_FFI_DEFAULT;
+
+    private static FFI|false|null $ffi = null;
 
     /**
      * @var string
@@ -29,6 +52,102 @@ class InstallMonitoring extends Command
      */
     protected $description = 'Check prerequisites and install Prometheus + Grafana monitoring (Ubuntu host or Sail)';
 
+    public static function useRustFfi(bool $enabled = true): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = self::RUST_FFI_DEFAULT;
+        self::$ffi = null;
+    }
+
+    public static function setFfiForTesting(FFI|false|null $ffi = null): void
+    {
+        self::$ffi = $ffi;
+    }
+
+    public static function isValidWebServer(string $webServer): bool
+    {
+        return self::$useRustFfi ? self::isValidWebServerNative($webServer) : self::isValidWebServerPhp($webServer);
+    }
+
+    public static function isValidWebServerPhp(string $webServer): bool
+    {
+        return in_array($webServer, ['nginx', 'apache'], true);
+    }
+
+    public static function isValidWebServerNative(string $webServer): bool
+    {
+        // @phpstan-ignore method.notFound
+        $result = self::callNative(static fn (FFI $ffi): mixed => $ffi->nntmux_install_monitoring_is_valid_web_server($webServer, strlen($webServer)));
+
+        return match ($result) {
+            1 => true,
+            0 => false,
+            default => self::isValidWebServerPhp($webServer),
+        };
+    }
+
+    public static function isSupportedUbuntuVersion(string $version): bool
+    {
+        return self::$useRustFfi ? self::isSupportedUbuntuVersionNative($version) : self::isSupportedUbuntuVersionPhp($version);
+    }
+
+    public static function isSupportedUbuntuVersionPhp(string $version): bool
+    {
+        return in_array($version, self::SUPPORTED_UBUNTU, true);
+    }
+
+    public static function isSupportedUbuntuVersionNative(string $version): bool
+    {
+        // @phpstan-ignore method.notFound
+        $result = self::callNative(static fn (FFI $ffi): mixed => $ffi->nntmux_install_monitoring_is_supported_ubuntu_version($version, strlen($version)));
+
+        return match ($result) {
+            1 => true,
+            0 => false,
+            default => self::isSupportedUbuntuVersionPhp($version),
+        };
+    }
+
+    public static function formatProjectRelativePath(string $basePath, string $path): string
+    {
+        return self::$useRustFfi ? self::formatProjectRelativePathNative($basePath, $path) : self::formatProjectRelativePathPhp($basePath, $path);
+    }
+
+    public static function formatProjectRelativePathPhp(string $basePath, string $path): string
+    {
+        $base = rtrim($basePath, '/').'/';
+
+        return str_starts_with($path, $base) ? substr($path, strlen($base)) : $path;
+    }
+
+    public static function formatProjectRelativePathNative(string $basePath, string $path): string
+    {
+        $cap = strlen($path) + 1;
+        $result = self::callNative(static function (FFI $ffi) use ($basePath, $path, $cap): ?string {
+            $out = $ffi->new("uint8_t[{$cap}]");
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_install_monitoring_project_relative_path($basePath, strlen($basePath), $path, strlen($path), $out, $cap);
+
+            return is_int($written) && $written >= 0 && $written <= $cap ? FFI::string($out, $written) : null;
+        });
+
+        return is_string($result) ? $result : self::formatProjectRelativePathPhp($basePath, $path);
+    }
+
     public function handle(): int
     {
         return $this->option('sail') ? $this->configureSail() : $this->prepareHostInstall();
@@ -39,7 +158,7 @@ class InstallMonitoring extends Command
         $script = base_path('scripts/install-monitoring.sh');
         $webServer = $this->option('web-server');
 
-        if ($webServer !== null && ! in_array($webServer, ['nginx', 'apache'], true)) {
+        if ($webServer !== null && (! is_string($webServer) || ! self::isValidWebServer($webServer))) {
             $this->components->error('--web-server must be nginx or apache.');
 
             return self::FAILURE;
@@ -52,7 +171,7 @@ class InstallMonitoring extends Command
         }
 
         $release = $this->ubuntuRelease();
-        if ($release === null || ! in_array($release, self::SUPPORTED_UBUNTU, true)) {
+        if ($release === null || ! self::isSupportedUbuntuVersion($release)) {
             $this->components->warn('The installer supports Ubuntu '.implode(' and ', self::SUPPORTED_UBUNTU).'; this host reports '.($release === null ? 'a non-Ubuntu OS' : "Ubuntu {$release}").'.');
         }
 
@@ -112,7 +231,7 @@ class InstallMonitoring extends Command
             'GRAFANA_URL' => '/grafana',
             // docker/8.5/nginx.conf authenticates /grafana/ with auth_request.
             'GRAFANA_AUTH' => 'proxy',
-            'GRAFANA_JWT_PRIVATE_KEY_PATH' => $this->projectRelativePath($privateKey),
+            'GRAFANA_JWT_PRIVATE_KEY_PATH' => self::formatProjectRelativePath(base_path(), $privateKey),
             'MONITORING_PUSHGATEWAY_URL' => 'http://pushgateway:9091',
         ]);
 
@@ -171,13 +290,6 @@ class InstallMonitoring extends Command
         File::put($path, $contents);
     }
 
-    private function projectRelativePath(string $path): string
-    {
-        $base = rtrim(base_path(), '/').'/';
-
-        return str_starts_with($path, $base) ? substr($path, strlen($base)) : $path;
-    }
-
     private function ubuntuRelease(): ?string
     {
         if (! is_readable('/etc/os-release')) {
@@ -191,5 +303,38 @@ class InstallMonitoring extends Command
         }
 
         return isset($release['VERSION_ID']) ? (string) $release['VERSION_ID'] : null;
+    }
+
+    /**
+     * @param  callable(FFI): mixed  $call
+     */
+    private static function callNative(callable $call): mixed
+    {
+        $ffi = self::additionalFfi();
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+
+        try {
+            return $call($ffi);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function additionalFfi(): ?FFI
+    {
+        if (self::$ffi === false) {
+            return null;
+        }
+
+        if (self::$ffi instanceof FFI) {
+            return self::$ffi;
+        }
+
+        $ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF);
+        self::$ffi = $ffi ?? false;
+
+        return $ffi;
     }
 }
