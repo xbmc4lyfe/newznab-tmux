@@ -18634,3 +18634,674 @@ mod w24_mcp_inspect_prompt_tests {
         assert!(out.iter().all(|b| *b == 0xa5));
     }
 }
+
+// Wave 25 Slice 2: pure API audit/account-job candidates. PHP retains storage,
+// clock/timezone interpretation and Carbon fallback for unsupported dates.
+// Production remains native until caller-inclusive performance gates qualify.
+pub mod wave25_api_audit_account_job {
+    use super::*;
+
+    const MAX_BYTES: usize = 67_108_864;
+
+    fn nullable_int(value: &VerificationOutboxValue) -> Option<Option<i64>> {
+        match value {
+            VerificationOutboxValue::Null => Some(None),
+            VerificationOutboxValue::Int(value) => Some(Some(*value)),
+            _ => None,
+        }
+    }
+
+    fn cache_key(user_id: i64) -> VerificationOutboxValue {
+        w16_string(format!("api_access_update:{user_id}").as_bytes())
+    }
+
+    fn leap_year(year: i64) -> bool {
+        year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0)
+    }
+
+    fn month_days(year: i64, month: i64) -> Option<i64> {
+        Some(match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap_year(year) => 29,
+            2 => 28,
+            _ => return None,
+        })
+    }
+
+    // March-based Gregorian eras keep the leap day at each year's end. Inputs
+    // are bounded first, so every intermediate fits comfortably in i64 even
+    // for negative/zero years. Euclidean division handles negative eras.
+    fn ordinal(year: i64, month: i64, day: i64) -> Option<i64> {
+        if !(-9999..=9999).contains(&year) || !(1..=month_days(year, month)?).contains(&day) {
+            return None;
+        }
+        let year = year.checked_sub(i64::from(month <= 2))?;
+        let era = year.div_euclid(400);
+        let year_of_era = year.checked_sub(era.checked_mul(400)?)?;
+        let march_month = month.checked_add(if month > 2 { -3 } else { 9 })?;
+        let day_of_year = march_month
+            .checked_mul(153)?
+            .checked_add(2)?
+            .checked_div(5)?
+            .checked_add(day)?
+            .checked_sub(1)?;
+        let day_of_era = year_of_era
+            .checked_mul(365)?
+            .checked_add(year_of_era / 4)?
+            .checked_sub(year_of_era / 100)?
+            .checked_add(day_of_year)?;
+        era.checked_mul(146_097)?.checked_add(day_of_era)
+    }
+
+    fn subtract_days(year: i64, month: i64, day: i64, days: i64) -> Option<[i64; 3]> {
+        let serial = ordinal(year, month, day)?.checked_sub(days)?;
+        if serial < ordinal(-9999, 1, 1)? || serial > ordinal(9999, 12, 31)? {
+            return None;
+        }
+        let era = serial.div_euclid(146_097);
+        let day_of_era = serial.checked_sub(era.checked_mul(146_097)?)?;
+        let year_of_era = day_of_era
+            .checked_sub(day_of_era / 1460)?
+            .checked_add(day_of_era / 36_524)?
+            .checked_sub(day_of_era / 146_096)?
+            / 365;
+        let year = era.checked_mul(400)?.checked_add(year_of_era)?;
+        let day_of_year = day_of_era.checked_sub(
+            year_of_era
+                .checked_mul(365)?
+                .checked_add(year_of_era / 4)?
+                .checked_sub(year_of_era / 100)?,
+        )?;
+        let march_month = day_of_year.checked_mul(5)?.checked_add(2)? / 153;
+        let day = day_of_year
+            .checked_sub(march_month.checked_mul(153)?.checked_add(2)? / 5)?
+            .checked_add(1)?;
+        let month = march_month.checked_add(if march_month < 10 { 3 } else { -9 })?;
+        let year = year.checked_add(i64::from(month <= 2))?;
+        (-9999..=9999).contains(&year).then_some([year, month, day])
+    }
+
+    fn compute(
+        operation: u32,
+        args: &[VerificationOutboxValue],
+    ) -> Option<VerificationOutboxValue> {
+        use VerificationOutboxValue as V;
+        Some(match (operation, args) {
+            (0, [user_id, interval]) => w16_map(vec![
+                ("key", cache_key(w16_int(user_id)?)),
+                ("interval", V::Int(w16_int(interval)?.max(1))),
+            ]),
+            (1, [user_id, request_uri, occurred_at]) => w16_map(vec![
+                ("users_id", V::Int(w16_int(user_id)?)),
+                ("request", w16_string(w16_bytes(request_uri)?)),
+                ("timestamp", w16_string(w16_bytes(occurred_at)?)),
+            ]),
+            (2, [occurred_at, ip]) => {
+                let mut fields = vec![("apiaccess", w16_string(w16_bytes(occurred_at)?))];
+                match ip {
+                    V::Null => {}
+                    V::Bytes(ip) => fields.push(("host", w16_string(ip))),
+                    _ => return None,
+                }
+                w16_map(fields)
+            }
+            (3, [occurred_at, ip]) => w16_map(vec![
+                ("lastlogin", w16_string(w16_bytes(occurred_at)?)),
+                ("host", w16_string(w16_bytes(ip)?)),
+            ]),
+            (4, [year, month, day, purge_days]) => {
+                let date = subtract_days(
+                    w16_int(year)?,
+                    w16_int(month)?,
+                    w16_int(day)?,
+                    w16_int(purge_days)?,
+                )?;
+                w16_list(date.into_iter().map(V::Int).collect())
+            }
+            (5, [created, updated, login, api, download, grabs, threshold]) => {
+                // Validate every type before evaluating the short-circuit predicate.
+                let created = nullable_int(created)?;
+                let updated = nullable_int(updated)?;
+                let login = nullable_int(login)?;
+                let api = nullable_int(api)?;
+                let download = nullable_int(download)?;
+                let grabs = w16_int(grabs)?;
+                let threshold = w16_int(threshold)?;
+                let before = |time: Option<i64>| time.is_some_and(|time| time < threshold);
+                V::Bool(
+                    before(login.or(created))
+                        && before(api.or(created))
+                        && match download {
+                            Some(download) => download < threshold,
+                            None if grabs > 0 => before(updated),
+                            None => before(created),
+                        },
+                )
+            }
+            (6, [user_id]) => cache_key(w16_int(user_id)?),
+            (7, [interval]) => V::Int(w16_int(interval)?.max(1)),
+            (8, [user_id, username, ip, time]) => w16_map(vec![
+                ("user_id", V::Int(w16_int(user_id)?)),
+                ("username", w16_string(w16_bytes(username)?)),
+                ("ip", w16_string(w16_bytes(ip)?)),
+                ("time", w16_string(w16_bytes(time)?)),
+            ]),
+            _ => return None,
+        })
+    }
+
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> i32 {
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_BYTES
+            || capacity > MAX_BYTES
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let mut parser = VerificationOutboxParser {
+            bytes,
+            pos: 0,
+            remaining: 32768,
+        };
+        let Some(value) = parser.value(448) else {
+            return -1;
+        };
+        if parser.pos != length || !w19_list(&value) || !w20_canonical(&value) {
+            return -1;
+        }
+        let mut canonical = Vec::new();
+        value.serialize(&mut canonical);
+        if canonical != bytes {
+            return -1;
+        }
+        let Some(entries) = w16_entries(&value) else {
+            return -1;
+        };
+        let args: Vec<_> = entries.iter().map(|(_, value)| value.clone()).collect();
+        let Some(result) = compute(operation, &args) else {
+            return -1;
+        };
+        let mut wire = Vec::new();
+        result.serialize(&mut wire);
+        if wire.len() > MAX_BYTES {
+            return -1;
+        }
+        let Ok(needed) = i32::try_from(wire.len()) else {
+            return -1;
+        };
+        if wire.len() > capacity {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(wire.as_ptr(), output, wire.len()) };
+        needed
+    }
+
+    #[cfg(test)]
+    mod w25_api_audit_account_job_tests {
+        use super::*;
+        use VerificationOutboxValue as V;
+
+        fn wire(args: Vec<V>) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            w16_list(args).serialize(&mut bytes);
+            bytes
+        }
+
+        fn parity(operation: u32, args: Vec<V>, expected: V) {
+            let input = wire(args);
+            let mut expected_wire = Vec::new();
+            expected.serialize(&mut expected_wire);
+            let mut out = vec![0xa5; expected_wire.len() + 2];
+            for capacity in [0, 1, expected_wire.len() - 1] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w25_api_audit_account_job(
+                            operation,
+                            input.as_ptr(),
+                            input.len(),
+                            out.as_mut_ptr(),
+                            capacity,
+                        )
+                    },
+                    -(expected_wire.len() as i32),
+                );
+                assert!(out.iter().all(|byte| *byte == 0xa5));
+            }
+            let mut unaligned = vec![0x5a; input.len() + 2];
+            unaligned[1..1 + input.len()].copy_from_slice(&input);
+            assert_eq!(
+                unsafe {
+                    nntmux_w25_api_audit_account_job(
+                        operation,
+                        unaligned.as_ptr().add(1),
+                        input.len(),
+                        out.as_mut_ptr().add(1),
+                        expected_wire.len(),
+                    )
+                },
+                expected_wire.len() as i32,
+            );
+            assert_eq!(&out[1..1 + expected_wire.len()], &expected_wire);
+            assert_eq!(out[0], 0xa5);
+            assert_eq!(out[out.len() - 1], 0xa5);
+            assert_eq!(unaligned[0], 0x5a);
+            assert_eq!(unaligned[unaligned.len() - 1], 0x5a);
+            assert_eq!(&unaligned[1..1 + input.len()], &input);
+        }
+
+        fn rejected(operation: u32, args: Vec<V>) {
+            let input = wire(args);
+            let mut out = [0xa5; 512];
+            assert_eq!(
+                unsafe {
+                    nntmux_w25_api_audit_account_job(
+                        operation,
+                        input.as_ptr(),
+                        input.len(),
+                        out.as_mut_ptr(),
+                        out.len(),
+                    )
+                },
+                -1,
+            );
+            assert!(out.iter().all(|byte| *byte == 0xa5));
+        }
+
+        #[test]
+        fn w25_api_audit_account_job_maps_keys_intervals_and_binary_strings() {
+            for id in [i64::MIN, -1, 0, i64::MAX] {
+                let expected_key = w16_string(format!("api_access_update:{id}").as_bytes());
+                parity(6, vec![V::Int(id)], expected_key.clone());
+                for interval in [i64::MIN, -1, 0, 1, i64::MAX] {
+                    parity(
+                        0,
+                        vec![V::Int(id), V::Int(interval)],
+                        w16_map(vec![
+                            ("key", expected_key.clone()),
+                            ("interval", V::Int(interval.max(1))),
+                        ]),
+                    );
+                }
+            }
+            for (interval, expected) in [(i64::MIN, 1), (0, 1), (1, 1), (i64::MAX, i64::MAX)] {
+                parity(7, vec![V::Int(interval)], V::Int(expected));
+            }
+            parity(
+                1,
+                vec![V::Int(i64::MIN), w16_string(b"/?x=\0\xff"), w16_string(b"")],
+                w16_map(vec![
+                    ("users_id", V::Int(i64::MIN)),
+                    ("request", w16_string(b"/?x=\0\xff")),
+                    ("timestamp", w16_string(b"")),
+                ]),
+            );
+            parity(
+                2,
+                vec![w16_string(b"\0\xff"), V::Null],
+                w16_map(vec![("apiaccess", w16_string(b"\0\xff"))]),
+            );
+            for ip in [b"".as_slice(), b"\xff\0", b"2001:db8::1"] {
+                parity(
+                    2,
+                    vec![w16_string(b""), w16_string(ip)],
+                    w16_map(vec![
+                        ("apiaccess", w16_string(b"")),
+                        ("host", w16_string(ip)),
+                    ]),
+                );
+                parity(
+                    3,
+                    vec![w16_string(b"\xff\0"), w16_string(ip)],
+                    w16_map(vec![
+                        ("lastlogin", w16_string(b"\xff\0")),
+                        ("host", w16_string(ip)),
+                    ]),
+                );
+            }
+            parity(
+                8,
+                vec![
+                    V::Int(i64::MAX),
+                    w16_string(b"\xff\0"),
+                    w16_string(b""),
+                    w16_string(b"time"),
+                ],
+                w16_map(vec![
+                    ("user_id", V::Int(i64::MAX)),
+                    ("username", w16_string(b"\xff\0")),
+                    ("ip", w16_string(b"")),
+                    ("time", w16_string(b"time")),
+                ]),
+            );
+        }
+
+        #[test]
+        fn w25_api_audit_account_job_calendar_leaps_negative_days_and_extremes() {
+            for (date, days, expected) in [
+                ([2024, 3, 1], 1, [2024, 2, 29]),
+                ([2000, 3, 1], 1, [2000, 2, 29]),
+                ([1900, 3, 1], 1, [1900, 2, 28]),
+                ([2024, 2, 28], -1, [2024, 2, 29]),
+                ([2024, 2, 29], -366, [2025, 3, 1]),
+                ([2024, 1, 1], 1, [2023, 12, 31]),
+                ([0, 3, 1], 1, [0, 2, 29]),
+                ([-400, 3, 1], 1, [-400, 2, 29]),
+                ([-100, 3, 1], 1, [-100, 2, 28]),
+                ([0, 1, 1], 1, [-1, 12, 31]),
+                ([1, 1, 1], 1, [0, 12, 31]),
+                ([-1, 12, 31], -1, [0, 1, 1]),
+                ([-9999, 1, 1], 0, [-9999, 1, 1]),
+                ([9999, 12, 31], 0, [9999, 12, 31]),
+            ] {
+                parity(
+                    4,
+                    vec![
+                        V::Int(date[0]),
+                        V::Int(date[1]),
+                        V::Int(date[2]),
+                        V::Int(days),
+                    ],
+                    w16_list(expected.into_iter().map(V::Int).collect()),
+                );
+            }
+            for args in [
+                [2023, 2, 29, 0],
+                [1900, 2, 29, 0],
+                [2024, 0, 1, 0],
+                [2024, 13, 1, 0],
+                [2024, 1, 0, 0],
+                [2024, 4, 31, 0],
+                [-10000, 1, 1, 0],
+                [10000, 1, 1, 0],
+                [i64::MIN, 1, 1, 0],
+                [2024, i64::MAX, 1, 0],
+                [2024, 1, i64::MAX, 0],
+                [-9999, 1, 1, 1],
+                [9999, 12, 31, -1],
+                [2024, 1, 1, i64::MIN],
+                [2024, 1, 1, i64::MAX],
+            ] {
+                rejected(4, args.into_iter().map(V::Int).collect());
+            }
+        }
+
+        #[test]
+        fn w25_api_audit_account_job_calendar_month_boundaries_across_gregorian_eras() {
+            // The expected neighboring dates come directly from calendar month
+            // lengths, independently of the ordinal conversion under test.
+            for year in -800..=800 {
+                for month in 1..=12 {
+                    let previous = if month == 1 {
+                        [year - 1, 12, 31]
+                    } else {
+                        [year, month - 1, month_days(year, month - 1).unwrap()]
+                    };
+                    let next = if month == 12 {
+                        [year + 1, 1, 1]
+                    } else {
+                        [year, month + 1, 1]
+                    };
+                    assert_eq!(subtract_days(year, month, 1, 1), Some(previous));
+                    assert_eq!(
+                        subtract_days(year, month, month_days(year, month).unwrap(), -1),
+                        Some(next),
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn w25_api_audit_account_job_purge_null_fallbacks_strict_thresholds_and_grabs() {
+            let n = None;
+            let old = Some(9);
+            let equal = Some(10);
+            let new = Some(11);
+            // Each row: created, updated, login, API, download, grabs, expected.
+            for (created, updated, login, api, download, grabs, expected) in [
+                (old, n, n, n, n, 0, true),
+                (old, n, n, n, n, -1, true),
+                (old, n, n, n, n, 1, false),
+                (old, old, n, n, n, 1, true),
+                (old, equal, n, n, n, 1, false),
+                (old, old, n, n, equal, 1, false),
+                (old, new, n, n, old, i64::MAX, true),
+                (old, old, equal, n, n, 0, false),
+                (old, old, n, equal, n, 0, false),
+                (equal, old, n, n, n, 0, false),
+                (new, old, old, old, old, 0, true),
+                (new, old, old, old, n, 0, false),
+                (n, old, old, old, old, 0, true),
+                (n, old, old, old, n, 1, true),
+                (n, old, old, old, n, 0, false),
+                (n, old, n, old, old, 1, false),
+                (n, old, old, n, old, 1, false),
+                (n, n, n, n, n, 0, false),
+            ] {
+                let mut args: Vec<V> = [created, updated, login, api, download]
+                    .into_iter()
+                    .map(|value| value.map_or(V::Null, V::Int))
+                    .collect();
+                args.extend([V::Int(grabs), V::Int(10)]);
+                parity(5, args, V::Bool(expected));
+            }
+            for (created, threshold, expected) in [
+                (i64::MIN, i64::MAX, true),
+                (i64::MIN, i64::MIN, false),
+                (i64::MAX, i64::MAX, false),
+                (i64::MAX, i64::MIN, false),
+            ] {
+                parity(
+                    5,
+                    vec![
+                        V::Int(created),
+                        V::Null,
+                        V::Null,
+                        V::Null,
+                        V::Null,
+                        V::Int(i64::MIN),
+                        V::Int(threshold),
+                    ],
+                    V::Bool(expected),
+                );
+            }
+        }
+
+        #[test]
+        fn w25_api_audit_account_job_wrong_operations_types_and_arities_are_atomic() {
+            let valid = [
+                (0, vec![V::Int(1), V::Int(1)]),
+                (1, vec![V::Int(1), w16_string(b"uri"), w16_string(b"at")]),
+                (2, vec![w16_string(b"at"), V::Null]),
+                (3, vec![w16_string(b"at"), w16_string(b"ip")]),
+                (4, vec![V::Int(2024), V::Int(1), V::Int(1), V::Int(0)]),
+                (
+                    5,
+                    vec![
+                        V::Null,
+                        V::Null,
+                        V::Null,
+                        V::Null,
+                        V::Null,
+                        V::Int(0),
+                        V::Int(0),
+                    ],
+                ),
+                (6, vec![V::Int(1)]),
+                (7, vec![V::Int(1)]),
+                (
+                    8,
+                    vec![
+                        V::Int(1),
+                        w16_string(b"name"),
+                        w16_string(b"ip"),
+                        w16_string(b"at"),
+                    ],
+                ),
+            ];
+            for (operation, args) in valid {
+                let mut too_many = args.clone();
+                too_many.push(V::Null);
+                rejected(operation, too_many);
+                rejected(operation, args[..args.len() - 1].to_vec());
+                for index in 0..args.len() {
+                    for wrong in [V::Bool(false), V::Float(b"1".to_vec()), w16_list(vec![])] {
+                        let mut incorrect = args.clone();
+                        incorrect[index] = wrong;
+                        rejected(operation, incorrect);
+                    }
+                    // NULL is supported only by op 2's IP and op 5's timestamps.
+                    if !((operation == 2 && index == 1) || (operation == 5 && index < 5)) {
+                        let mut incorrect = args.clone();
+                        incorrect[index] = V::Null;
+                        rejected(operation, incorrect);
+                    }
+                }
+            }
+            rejected(9, vec![]);
+            rejected(u32::MAX, vec![V::Int(1)]);
+            rejected(0, vec![w16_string(b"1"), V::Int(1)]);
+            rejected(2, vec![w16_string(b"at"), V::Int(1)]);
+            rejected(
+                5,
+                vec![
+                    w16_string(b"1"),
+                    V::Null,
+                    V::Null,
+                    V::Null,
+                    V::Null,
+                    V::Int(0),
+                    V::Int(0),
+                ],
+            );
+        }
+
+        #[test]
+        fn w25_api_audit_account_job_malformed_and_noncanonical_wire_is_atomic() {
+            let mut out = [0xa5; 256];
+            for malformed in [
+                b"".as_slice(),
+                b"N;",
+                b"i:1;",
+                b"a:1:{i:0;i:1;}}",
+                b"a:1:{i:0;i:1;}junk",
+                b"a:01:{i:0;i:1;}",
+                b"a:1:{i:00;i:1;}",
+                b"a:1:{i:0;i:+1;}",
+                b"a:1:{i:0;i:01;}",
+                b"a:1:{i:0;i:-0;}",
+                b"a:1:{i:0;i:9223372036854775808;}",
+                b"a:1:{i:1;i:1;}",
+                b"a:1:{s:1:\"0\";i:1;}",
+                b"a:2:{i:0;i:1;i:0;i:2;}",
+                b"a:1:{i:0;O:8:\"stdClass\":0:{}}",
+                b"a:1:{i:0;R:1;}",
+                b"a:1:{i:0;s:99999999999999999999999:\"x\";}",
+                b"a:1:{i:0;s:1:\"\";}",
+            ] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w25_api_audit_account_job(
+                            6,
+                            malformed.as_ptr(),
+                            malformed.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    -1,
+                    "malformed wire: {malformed:?}",
+                );
+                assert!(out.iter().all(|byte| *byte == 0xa5));
+            }
+        }
+
+        #[test]
+        fn w25_api_audit_account_job_null_overflow_oversized_and_overlapping_ranges() {
+            let input = wire(vec![V::Int(1)]);
+            let mut out = [0xa5; 256];
+            let run =
+                |p, len, o, cap| unsafe { nntmux_w25_api_audit_account_job(6, p, len, o, cap) };
+            assert_eq!(run(std::ptr::null(), 0, out.as_mut_ptr(), out.len()), -1);
+            assert_eq!(run(std::ptr::null(), 1, out.as_mut_ptr(), out.len()), -1);
+            assert_eq!(
+                run(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), std::ptr::null_mut(), 1),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), usize::MAX, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(usize::MAX as *const u8, 2, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), usize::MAX as *mut u8, 2),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), MAX_BYTES + 1, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), out.as_mut_ptr(), MAX_BYTES + 1),
+                -1
+            );
+            let pointer = out.as_mut_ptr();
+            assert_eq!(run(pointer, input.len(), pointer, out.len()), -1);
+            assert_eq!(
+                run(unsafe { pointer.add(1) }, input.len(), pointer, out.len()),
+                -1
+            );
+            assert_eq!(
+                run(
+                    pointer,
+                    input.len(),
+                    unsafe { pointer.add(1) },
+                    out.len() - 1
+                ),
+                -1
+            );
+            assert!(out.iter().all(|byte| *byte == 0xa5));
+        }
+    }
+}
+
+/// Evaluate canonical serialized PHP list arguments for the Wave 25.2 helpers.
+/// Returns -1 for unsupported/invalid input, -required without any write for
+/// insufficient capacity, or the exact positive byte count without a terminator.
+///
+/// # Safety
+/// Callers must provide live, disjoint readable/writable allocations covering
+/// the declared byte ranges, with non-null pointers even for zero-byte ranges.
+/// Byte alignment is one. Arithmetic checks cannot prove allocation provenance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w25_api_audit_account_job(
+    operation: u32,
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave25_api_audit_account_job::evaluate(operation, input, length, output, capacity)
+    }))
+    .unwrap_or(-1)
+}
