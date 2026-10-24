@@ -22890,3 +22890,526 @@ pub mod group_multiprocessing_release_commands {
         }
     }
 }
+
+/// Wave 32.3: `ProcessBinaries`, `ProcessReleasesMulti`, `ProcessUpdatePerGroup`,
+/// `AdminFailedReleasesController` and `AdminCommentsController` option, plan, page-state and
+/// id helpers. Every export returns `-1` for invalid input so the PHP caller falls back.
+pub mod multiprocessing_admin_controllers {
+    use super::group_multiprocessing_release_commands::positive_group_id;
+    use super::recategorize_groups_backfill_commands::php_int_cast;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: i32 = -1;
+
+    /// Scalar kinds marshalled by the PHP callers.
+    pub const KIND_NULL: u8 = 0;
+    pub const KIND_INT: u8 = 2;
+    pub const KIND_STRING: u8 = 4;
+    /// Any other PHP type (bool, float, array, object).
+    pub const KIND_OTHER: u8 = 5;
+
+    /// `[page, perPage, offset]` written by the index-state export.
+    pub const INDEX_STATE_LEN: usize = 3;
+
+    /// `(int) $maxHeaders` for `int|string|null`; `None` for an unknown kind.
+    pub fn max_headers(kind: u8, int_value: i64, text: &[u8]) -> Option<i64> {
+        match kind {
+            KIND_NULL => Some(0),
+            KIND_INT => Some(int_value),
+            KIND_STRING => Some(php_int_cast(text)),
+            _ => None,
+        }
+    }
+
+    /// `max(1, $configuredThreads)`, the worker cap the release runners apply.
+    #[inline]
+    pub fn release_max_processes(configured_threads: i64) -> i64 {
+        configured_threads.max(1)
+    }
+
+    /// `PHP_FILTER_TRIM_DEFAULT` characters.
+    #[inline]
+    fn is_filter_trim_byte(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\r' | 0x0B | b'\n')
+    }
+
+    /// `filter_var($text, FILTER_VALIDATE_INT)` without flags or options.
+    pub fn filter_validate_int(text: &[u8]) -> Option<i64> {
+        if text.is_empty() {
+            return None;
+        }
+        let mut start = 0;
+        let mut end = text.len();
+        while start < end && is_filter_trim_byte(text[start]) {
+            start += 1;
+        }
+        while end > start && is_filter_trim_byte(text[end - 1]) {
+            end -= 1;
+        }
+        let trimmed = &text[start..end];
+        if trimmed.first() == Some(&b'0') {
+            return (trimmed.len() == 1).then_some(0);
+        }
+        let (negative, digits) = match trimmed.first() {
+            Some(b'-') => (true, &trimmed[1..]),
+            Some(b'+') => (false, &trimmed[1..]),
+            _ => (false, trimmed),
+        };
+        if digits == b"0" {
+            return Some(0);
+        }
+        if !matches!(digits.first(), Some(b'1'..=b'9')) {
+            return None;
+        }
+        let mut value: i64 = 0;
+        for &byte in digits {
+            if !byte.is_ascii_digit() {
+                return None;
+            }
+            let digit = i64::from(byte - b'0');
+            value = value.checked_mul(10)?;
+            value = if negative {
+                value.checked_sub(digit)?
+            } else {
+                value.checked_add(digit)?
+            };
+        }
+        Some(value)
+    }
+
+    /// Laravel's current-page rule: a `FILTER_VALIDATE_INT` value of at least one, else `1`.
+    pub fn resolve_page(kind: u8, int_value: i64, text: &[u8]) -> Option<i64> {
+        let page = match kind {
+            KIND_NULL => None,
+            KIND_INT => Some(int_value),
+            KIND_STRING => filter_validate_int(text),
+            _ => return None,
+        };
+        Some(page.filter(|&page| page >= 1).unwrap_or(1))
+    }
+
+    /// `[page, max(1, perPage), (page - 1) * perPage]`, the offset saturating at `i64::MAX`.
+    pub fn index_state(kind: u8, int_value: i64, text: &[u8], per_page: i64) -> Option<[i64; 3]> {
+        let page = resolve_page(kind, int_value, text)?;
+        let per_page = per_page.max(1);
+        let offset = (page - 1).checked_mul(per_page).unwrap_or(i64::MAX);
+        Some([page, per_page, offset])
+    }
+
+    /// `Some(Some(id))` to delete a non-zero id, `Some(None)` to skip; `None` for an unknown kind.
+    pub fn comment_target(kind: u8, int_value: i64, text: &[u8]) -> Option<Option<i64>> {
+        let id = match kind {
+            KIND_INT => Some(int_value),
+            KIND_STRING => filter_validate_int(text),
+            KIND_NULL | KIND_OTHER => None,
+            _ => return None,
+        };
+        Some(id.filter(|&id| id != 0))
+    }
+
+    #[inline]
+    unsafe fn valid_in<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null() || len > isize::MAX as usize || (ptr as usize).checked_add(len).is_none() {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    /// The string payload for `KIND_STRING`; other kinds ignore the pointer.
+    #[inline]
+    unsafe fn kind_text<'a>(kind: u8, ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if kind == KIND_STRING {
+            unsafe { valid_in(ptr, len) }
+        } else {
+            Some(&[])
+        }
+    }
+
+    #[inline]
+    fn valid_out<T>(ptr: *mut T) -> bool {
+        !ptr.is_null() && ptr.is_aligned()
+    }
+
+    #[inline]
+    fn guarded(body: impl FnOnce() -> i32) -> i32 {
+        catch_unwind(AssertUnwindSafe(body)).unwrap_or(DECLINE)
+    }
+
+    /// Backs `ProcessBinaries::normalizeMaxHeadersOptionNative()`: writes `(int) $maxHeaders`
+    /// and returns `1` when it limits downloads (`> 0`), `0` otherwise, or `-1`.
+    ///
+    /// # Safety
+    ///
+    /// For `KIND_STRING`, `text_ptr` must be readable for `text_len` bytes; `out_max` must be
+    /// writable for one `i64`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_mac_max_headers(
+        kind: u8,
+        int_value: i64,
+        text_ptr: *const u8,
+        text_len: usize,
+        out_max: *mut i64,
+    ) -> i32 {
+        guarded(|| {
+            if !valid_out(out_max) {
+                return DECLINE;
+            }
+            let Some(max) = unsafe { kind_text(kind, text_ptr, text_len) }
+                .and_then(|text| max_headers(kind, int_value, text))
+            else {
+                return DECLINE;
+            };
+            unsafe { out_max.write(max) };
+            i32::from(max > 0)
+        })
+    }
+
+    /// Backs `ProcessReleasesMulti::buildMultiReleaseExecutionPlanNative()`: writes the worker
+    /// cap and returns `1` when the configured count was clamped up to one, `0`, or `-1`.
+    ///
+    /// # Safety
+    ///
+    /// `out_max_processes` must be writable for one `i64`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_mac_release_plan(
+        configured_threads: i64,
+        out_max_processes: *mut i64,
+    ) -> i32 {
+        guarded(|| {
+            if !valid_out(out_max_processes) {
+                return DECLINE;
+            }
+            unsafe { out_max_processes.write(release_max_processes(configured_threads)) };
+            i32::from(configured_threads < 1)
+        })
+    }
+
+    /// Backs `ProcessUpdatePerGroup::parseGroupProcessTargetNative()`: writes the group id and
+    /// returns `1` for a positive digit-only id, `0` (unwritten) otherwise, or `-1`.
+    ///
+    /// # Safety
+    ///
+    /// `text_ptr` must be readable for `text_len` bytes; `out_id` writable for one `i64`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_mac_group_target(
+        text_ptr: *const u8,
+        text_len: usize,
+        out_id: *mut i64,
+    ) -> i32 {
+        guarded(|| {
+            if !valid_out(out_id) {
+                return DECLINE;
+            }
+            let Some(text) = (unsafe { valid_in(text_ptr, text_len) }) else {
+                return DECLINE;
+            };
+            match positive_group_id(text) {
+                Some(id) => {
+                    unsafe { out_id.write(id) };
+                    1
+                }
+                None => 0,
+            }
+        })
+    }
+
+    /// Backs `AdminFailedReleasesController::normalizeFailedReleasesIndexStateNative()`: writes
+    /// `[page, perPage, offset]` and returns `3`; returns `-3` unwritten when `out_cap < 3`, or `-1`.
+    ///
+    /// # Safety
+    ///
+    /// For `KIND_STRING`, `text_ptr` must be readable for `text_len` bytes; `out` must be
+    /// writable for `out_cap` `i64` values.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_mac_index_state(
+        kind: u8,
+        int_value: i64,
+        text_ptr: *const u8,
+        text_len: usize,
+        per_page: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i32 {
+        guarded(|| {
+            if !valid_out(out) {
+                return DECLINE;
+            }
+            let Some(state) = unsafe { kind_text(kind, text_ptr, text_len) }
+                .and_then(|text| index_state(kind, int_value, text, per_page))
+            else {
+                return DECLINE;
+            };
+            if out_cap < INDEX_STATE_LEN {
+                return -(INDEX_STATE_LEN as i32);
+            }
+            unsafe { std::ptr::copy_nonoverlapping(state.as_ptr(), out, INDEX_STATE_LEN) };
+            INDEX_STATE_LEN as i32
+        })
+    }
+
+    /// Backs `AdminCommentsController::normalizeCommentDeleteTargetNative()`: writes the id and
+    /// returns `1` to delete, writes `0` and returns `0` otherwise, or returns `-1`.
+    ///
+    /// # Safety
+    ///
+    /// For `KIND_STRING`, `text_ptr` must be readable for `text_len` bytes; `out_id` must be
+    /// writable for one `i64`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_mac_comment_target(
+        kind: u8,
+        int_value: i64,
+        text_ptr: *const u8,
+        text_len: usize,
+        out_id: *mut i64,
+    ) -> i32 {
+        guarded(|| {
+            if !valid_out(out_id) {
+                return DECLINE;
+            }
+            let Some(target) = unsafe { kind_text(kind, text_ptr, text_len) }
+                .and_then(|text| comment_target(kind, int_value, text))
+            else {
+                return DECLINE;
+            };
+            unsafe { out_id.write(target.unwrap_or(0)) };
+            i32::from(target.is_some())
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        #[test]
+        fn max_headers_matches_php_int_cast() {
+            assert_eq!(max_headers(KIND_NULL, 9, b"9"), Some(0));
+            assert_eq!(max_headers(KIND_INT, -4, b""), Some(-4));
+            assert_eq!(max_headers(KIND_STRING, 0, b"0"), Some(0));
+            assert_eq!(max_headers(KIND_STRING, 0, b" 25 "), Some(25));
+            assert_eq!(max_headers(KIND_STRING, 0, b"1e3"), Some(1000));
+            assert_eq!(max_headers(KIND_STRING, 0, b"12abc"), Some(12));
+            assert_eq!(max_headers(KIND_STRING, 0, b"abc"), Some(0));
+            assert_eq!(
+                max_headers(KIND_STRING, 0, b"99999999999999999999"),
+                Some(i64::MAX)
+            );
+            assert_eq!(max_headers(KIND_OTHER, 0, b""), None);
+            assert_eq!(max_headers(9, 0, b""), None);
+        }
+
+        #[test]
+        fn release_plan_clamps_to_one_worker() {
+            assert_eq!(release_max_processes(i64::MIN), 1);
+            assert_eq!(release_max_processes(0), 1);
+            assert_eq!(release_max_processes(1), 1);
+            assert_eq!(release_max_processes(64), 64);
+        }
+
+        #[test]
+        fn filter_validate_int_matches_php() {
+            for (text, expected) in [
+                (&b"0"[..], Some(0)),
+                (b"+0", Some(0)),
+                (b"-0", Some(0)),
+                (b" 7\n", Some(7)),
+                (b"\x0b7\r\t", Some(7)),
+                (b"-12", Some(-12)),
+                (b"+12", Some(12)),
+                (b"9223372036854775807", Some(i64::MAX)),
+                (b"-9223372036854775808", Some(i64::MIN)),
+                (b"9223372036854775808", None),
+                (b"-9223372036854775809", None),
+                (b"", None),
+                (b"   ", None),
+                (b"00", None),
+                (b"01", None),
+                (b"-01", None),
+                (b"1.0", None),
+                (b"1e3", None),
+                (b"0x1A", None),
+                (b"\x0c1", None),
+                (b"\x001", None),
+                (b"1\x00", None),
+                (b"--1", None),
+                (b"+", None),
+                (b"1 2", None),
+            ] {
+                assert_eq!(filter_validate_int(text), expected, "{text:?}");
+            }
+        }
+
+        #[test]
+        fn index_state_matches_laravel_page_resolution() {
+            assert_eq!(index_state(KIND_NULL, 0, b"", 50), Some([1, 50, 0]));
+            assert_eq!(index_state(KIND_INT, 3, b"", 50), Some([3, 50, 100]));
+            assert_eq!(index_state(KIND_INT, 0, b"", 50), Some([1, 50, 0]));
+            assert_eq!(index_state(KIND_INT, i64::MIN, b"", 50), Some([1, 50, 0]));
+            assert_eq!(index_state(KIND_STRING, 0, b" 4 ", 10), Some([4, 10, 30]));
+            assert_eq!(index_state(KIND_STRING, 0, b"-4", 10), Some([1, 10, 0]));
+            assert_eq!(index_state(KIND_STRING, 0, b"abc", 0), Some([1, 1, 0]));
+            assert_eq!(index_state(KIND_INT, 2, b"", i64::MIN), Some([2, 1, 1]));
+            assert_eq!(
+                index_state(KIND_INT, i64::MAX, b"", 50),
+                Some([i64::MAX, 50, i64::MAX])
+            );
+            assert_eq!(index_state(KIND_OTHER, 0, b"", 50), None);
+        }
+
+        #[test]
+        fn comment_target_mirrors_truthy_int_ids() {
+            assert_eq!(comment_target(KIND_INT, 5, b""), Some(Some(5)));
+            assert_eq!(comment_target(KIND_INT, -5, b""), Some(Some(-5)));
+            assert_eq!(comment_target(KIND_INT, 0, b""), Some(None));
+            assert_eq!(comment_target(KIND_STRING, 0, b"12"), Some(Some(12)));
+            assert_eq!(comment_target(KIND_STRING, 0, b"0"), Some(None));
+            assert_eq!(comment_target(KIND_STRING, 0, b"12abc"), Some(None));
+            assert_eq!(comment_target(KIND_NULL, 0, b""), Some(None));
+            assert_eq!(comment_target(KIND_OTHER, 1, b""), Some(None));
+            assert_eq!(comment_target(7, 1, b""), None);
+        }
+
+        #[test]
+        fn exports_validate_inputs_and_short_buffers() {
+            let mut value = 0x5A5Ai64;
+            let mut state = [0x5Ai64; 3];
+            unsafe {
+                assert_eq!(
+                    nntmux_cat_mac_max_headers(KIND_STRING, 0, b"10".as_ptr(), 2, &mut value),
+                    1
+                );
+                assert_eq!(value, 10);
+                assert_eq!(
+                    nntmux_cat_mac_max_headers(KIND_INT, 0, ptr::null(), 0, &mut value),
+                    0
+                );
+                assert_eq!(value, 0);
+                assert_eq!(
+                    nntmux_cat_mac_max_headers(KIND_STRING, 0, ptr::null(), 0, &mut value),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_cat_mac_max_headers(KIND_INT, 1, ptr::null(), 0, ptr::null_mut()),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_cat_mac_max_headers(KIND_OTHER, 1, ptr::null(), 0, &mut value),
+                    DECLINE
+                );
+
+                assert_eq!(nntmux_cat_mac_release_plan(0, &mut value), 1);
+                assert_eq!(value, 1);
+                assert_eq!(nntmux_cat_mac_release_plan(8, &mut value), 0);
+                assert_eq!(value, 8);
+                assert_eq!(nntmux_cat_mac_release_plan(8, ptr::null_mut()), DECLINE);
+
+                value = 99;
+                assert_eq!(nntmux_cat_mac_group_target(b"0".as_ptr(), 1, &mut value), 0);
+                assert_eq!(value, 99);
+                assert_eq!(
+                    nntmux_cat_mac_group_target(b"007".as_ptr(), 3, &mut value),
+                    1
+                );
+                assert_eq!(value, 7);
+                assert_eq!(
+                    nntmux_cat_mac_group_target(ptr::null(), 0, &mut value),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_cat_mac_group_target(b"1".as_ptr(), 1, ptr::null_mut()),
+                    DECLINE
+                );
+
+                assert_eq!(
+                    nntmux_cat_mac_index_state(
+                        KIND_STRING,
+                        0,
+                        b"2".as_ptr(),
+                        1,
+                        50,
+                        state.as_mut_ptr(),
+                        2
+                    ),
+                    -3
+                );
+                assert_eq!(state, [0x5A; 3]);
+                assert_eq!(
+                    nntmux_cat_mac_index_state(
+                        KIND_STRING,
+                        0,
+                        b"2".as_ptr(),
+                        1,
+                        50,
+                        state.as_mut_ptr(),
+                        3
+                    ),
+                    3
+                );
+                assert_eq!(state, [2, 50, 50]);
+                assert_eq!(
+                    nntmux_cat_mac_index_state(
+                        KIND_OTHER,
+                        0,
+                        ptr::null(),
+                        0,
+                        50,
+                        state.as_mut_ptr(),
+                        3
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_cat_mac_index_state(
+                        KIND_STRING,
+                        0,
+                        ptr::null(),
+                        0,
+                        50,
+                        state.as_mut_ptr(),
+                        3
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_cat_mac_index_state(
+                        KIND_NULL,
+                        0,
+                        ptr::null(),
+                        0,
+                        50,
+                        ptr::null_mut(),
+                        3
+                    ),
+                    DECLINE
+                );
+
+                assert_eq!(
+                    nntmux_cat_mac_comment_target(KIND_INT, 3, ptr::null(), 0, &mut value),
+                    1
+                );
+                assert_eq!(value, 3);
+                assert_eq!(
+                    nntmux_cat_mac_comment_target(KIND_STRING, 0, b"x".as_ptr(), 1, &mut value),
+                    0
+                );
+                assert_eq!(value, 0);
+                assert_eq!(
+                    nntmux_cat_mac_comment_target(KIND_STRING, 0, ptr::null(), 0, &mut value),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_cat_mac_comment_target(9, 0, ptr::null(), 0, &mut value),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_cat_mac_comment_target(KIND_INT, 1, ptr::null(), 0, ptr::null_mut()),
+                    DECLINE
+                );
+            }
+        }
+    }
+}
