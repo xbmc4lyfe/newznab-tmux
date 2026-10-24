@@ -3755,6 +3755,339 @@ pub unsafe extern "C" fn nntmux_redis_format_duration(
     out.finish()
 }
 
+// A length-prefixed byte protocol keeps arbitrary command bytes, including NULs,
+// separate without interpreting shell syntax or database policy.
+fn runner_fields(mut input: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut fields = Vec::new();
+    while !input.is_empty() {
+        let size = u32::from_be_bytes(input.get(..4)?.try_into().ok()?) as usize;
+        input = &input[4..];
+        fields.push(input.get(..size)?);
+        input = &input[size..];
+    }
+    Some(fields)
+}
+
+fn runner_join(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for part in parts {
+        out.extend_from_slice(part);
+    }
+    out
+}
+
+fn runner_list(fields: &[Vec<u8>]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for field in fields {
+        out.extend_from_slice(&u32::try_from(field.len()).ok()?.to_be_bytes());
+        out.extend_from_slice(field);
+    }
+    Some(out)
+}
+
+fn runner_output_tail(input: &[u8]) -> Option<Vec<u8>> {
+    let mut stripped = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i..].starts_with(b"\x1b[") {
+            let mut end = i + 2;
+            while input
+                .get(end)
+                .is_some_and(|b| b.is_ascii_digit() || *b == b';')
+            {
+                end += 1;
+            }
+            if input.get(end) == Some(&b'm') {
+                i = end + 1;
+                continue;
+            }
+        }
+        stripped.push(input[i]);
+        i += 1;
+    }
+    let trimmed = std::str::from_utf8(php_trim(&stripped)).ok()?;
+    let offset = trimmed.char_indices().rev().nth(399).map_or(0, |(i, _)| i);
+    Some(trimmed.as_bytes()[offset..].to_vec())
+}
+
+const RUNNER_TRAPS: &[u8] = b"trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP; ";
+
+fn runner_transform(mode: u32, f: &[&[u8]]) -> Option<Vec<u8>> {
+    let result = match mode {
+        0 if f.len() == 4 && matches!(f[3], b"0" | b"1") => {
+            let mut out = runner_join(&[
+                RUNNER_TRAPS,
+                b"nntmux_status=0; ",
+                f[1],
+                b"( ",
+                f[0],
+                b" ); nntmux_status=$?; ",
+                f[1],
+            ]);
+            if f[3] == b"1" {
+                out.extend(runner_join(&[b"date +\"%Y-%m-%d %T\"; ", f[2], b"; "]));
+            }
+            out.extend_from_slice(b"exit \"$nntmux_status\"");
+            out
+        }
+        1 if !f.is_empty() => {
+            let mut out = runner_join(&[RUNNER_TRAPS, b"nntmux_batch_status=0; "]);
+            for command in &f[1..] {
+                out.extend(runner_join(&[f[0], b"( ", command, b" ); nntmux_child_status=$?; if [ \"$nntmux_batch_status\" -eq 0 ]; then nntmux_batch_status=$nntmux_child_status; fi; "]));
+            }
+            out.extend_from_slice(b"exit \"$nntmux_batch_status\"");
+            out
+        }
+        2 if f.len() == 2 => runner_join(&[
+            b"nntmux_draining=$(",
+            f[0],
+            b" 2>/dev/null); if [ \"$nntmux_draining\" = \"1\" ]; then exit \"$",
+            f[1],
+            b"\"; fi; ",
+        ]),
+        3 if f.len() == 7 && matches!(f[0], b"0" | b"1") => {
+            if f[0] == b"1" {
+                runner_join(&[
+                    b"nice -n", f[1], b" ", f[2], b" ", f[3], b" ", f[4], b" ", f[5], b" ", f[6],
+                ])
+            } else {
+                runner_join(&[b"sleep ", f[4]])
+            }
+        }
+        4 if f.len() == 3 => runner_join(&[f[0], b"/", f[1], b"-", f[2], b".log"]),
+        5 if f.len() == 8 && f[1..6].iter().all(|v| matches!(*v, b"0" | b"1")) => {
+            let (rename, full, predbft, scheduled, full_config) = (
+                f[1] == b"1",
+                f[2] == b"1",
+                f[3] == b"1",
+                f[4] == b"1",
+                f[5] == b"1",
+            );
+            let mut levels = Vec::new();
+            if rename {
+                levels.extend([3, 5, 9, 11, 13, 15, 17, 19]);
+            }
+            if full {
+                levels.extend([4, 6, 10, 12, 14, 16, 18, 20]);
+            }
+            if !scheduled {
+                if rename {
+                    levels.push(7);
+                }
+                if full || (rename && full_config) {
+                    levels.push(8);
+                }
+            }
+            let mut commands = Vec::new();
+            for level in levels {
+                commands.push(runner_join(&[
+                    f[0],
+                    b" releases:fix-names ",
+                    level.to_string().as_bytes(),
+                    b" --update --category=",
+                    f[6],
+                    b" --set-status",
+                    f[7],
+                    b" --show",
+                ]));
+            }
+            if predbft {
+                commands.push(runner_join(&[
+                    f[0],
+                    b" multiprocessing:fixrelnames predbft",
+                ]));
+            }
+            runner_list(&commands)?
+        }
+        6 if f.len() == 2 => {
+            if f[0] == b"sqlite" {
+                runner_join(&[b"substr(", f[1], b", 1, 1)"])
+            } else {
+                runner_join(&[b"LEFT(", f[1], b", 1)"])
+            }
+        }
+        7 if f.len() == 2 => runner_join(&[
+            b"\n            SELECT DISTINCT ",
+            f[0],
+            b" AS id\n            FROM releases\n            WHERE ",
+            f[1],
+            b"\n            LIMIT 16",
+        ]),
+        8 if f.len() == 2 && matches!(f[1], b"0" | b"1") => {
+            let lookup = std::str::from_utf8(f[0]).ok()?.parse::<i64>().ok()?;
+            if lookup <= 0 {
+                b"-1".to_vec()
+            } else if f[1] == b"1" {
+                b"2".to_vec()
+            } else {
+                f[0].to_vec()
+            }
+        }
+        9 if f.len() == 3 => {
+            let args = php_trim(f[2]);
+            let mut parts = Vec::new();
+            let mut rest = args;
+            while let Some(i) = rest.windows(2).position(|w| w == b"  ") {
+                parts.push(&rest[..i]);
+                rest = &rest[i + 2..];
+            }
+            parts.push(rest);
+            let command = parts.remove(0);
+            let part = |i: usize, default: &'static [u8]| -> Vec<u8> {
+                parts.get(i).copied().unwrap_or(default).to_vec()
+            };
+            let mut worker: Vec<Vec<u8>> = match command {
+                b"backfill" => vec![b"backfill:group".to_vec(), part(0, b""), part(1, b"1")],
+                b"backfill_all_quantity" => vec![
+                    b"backfill:group".to_vec(),
+                    part(0, b""),
+                    b"1".to_vec(),
+                    part(1, b""),
+                ],
+                b"backfill_all_quick" => vec![
+                    b"backfill:group".to_vec(),
+                    part(0, b""),
+                    b"1".to_vec(),
+                    b"10000".to_vec(),
+                ],
+                b"get_range" => vec![
+                    b"articles:get-range".to_vec(),
+                    part(0, b""),
+                    part(1, b""),
+                    part(2, b"0"),
+                    part(3, b"0"),
+                ],
+                b"part_repair" => vec![b"binaries:part-repair".to_vec(), part(0, b"")],
+                b"update_group_headers" => vec![b"group:update-headers".to_vec(), part(0, b"")],
+                b"update_per_group" => vec![b"group:update-all".to_vec(), part(0, b"")],
+                b"releases" => {
+                    let mut v = vec![b"releases:process".to_vec()];
+                    v.extend(parts.iter().map(|p| p.to_vec()));
+                    v
+                }
+                b"pp_additional" | b"pp_nfo" | b"pp_movie" | b"pp_tv" => {
+                    let kind: &[u8] = match command {
+                        b"pp_additional" => b"additional",
+                        b"pp_nfo" => b"nfo",
+                        b"pp_movie" => b"movie",
+                        _ => b"tv",
+                    };
+                    let mut v = vec![b"postprocess:guid".to_vec(), kind.to_vec()];
+                    v.extend(parts.iter().map(|p| p.to_vec()));
+                    v
+                }
+                _ => return None,
+            };
+            worker.insert(0, f[1].to_vec());
+            worker.insert(0, f[0].to_vec());
+            runner_list(&worker)?
+        }
+        10 if f.len() == 3 && matches!(f[0], b"0" | b"1") => {
+            if f[0] == b"1" {
+                Vec::new()
+            } else {
+                let stderr = runner_output_tail(f[1])?;
+                let stdout = runner_output_tail(f[2])?;
+                let mut out = Vec::new();
+                if !stderr.is_empty() {
+                    out.extend_from_slice(b"stderr: ");
+                    out.extend(stderr);
+                }
+                if !stdout.is_empty() {
+                    out.extend_from_slice(b"\nstdout: ");
+                    out.extend(stdout);
+                }
+                php_trim(&out).to_vec()
+            }
+        }
+        11 if f.len() == 5 && matches!(f[1], b"0" | b"1") => {
+            if f[1] == b"1" {
+                if php_trim(f[2])
+                    .split(|b| *b == b'\n')
+                    .any(|line| line == f[0])
+                {
+                    b"1".to_vec()
+                } else {
+                    b"0".to_vec()
+                }
+            } else {
+                let error = php_trim(f[3]);
+                if f[4] == b"1"
+                    && (error.starts_with(b"no server running on ")
+                        || (error.starts_with(b"error connecting to ")
+                            && error.ends_with(b"(No such file or directory)")))
+                {
+                    b"0".to_vec()
+                } else {
+                    b"2".to_vec()
+                }
+            }
+        }
+        12 if f.len() == 1 => {
+            std::str::from_utf8(f[0]).ok()?.parse::<i64>().ok()?;
+            f[0].to_vec()
+        }
+        13 if f.len() == 1 => Vec::new(),
+        14 if f.is_empty() => b"15".to_vec(),
+        _ => return None,
+    };
+    Some(result)
+}
+
+/// # Safety
+/// Input must be readable for `input_len` bytes and output writable for `out_cap`,
+/// with no overlap between those regions.
+/// Returns -1 for invalid input, negative required capacity (at least -2) when
+/// the output is too small, and the bytes written on success. No panic crosses FFI.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_runner_transform(
+    mode: u32,
+    input: *const c_char,
+    input_len: usize,
+    out: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        if input_len > isize::MAX as usize
+            || out_cap > isize::MAX as usize
+            || (input.is_null() && input_len != 0)
+            || (out.is_null() && out_cap != 0)
+        {
+            return -1;
+        }
+        let input = if input_len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(input.cast::<u8>(), input_len) }
+        };
+        let Some(fields) = runner_fields(input) else {
+            return -1;
+        };
+        let Some(result) = runner_transform(mode, &fields) else {
+            return -1;
+        };
+        if result.len() > isize::MAX as usize {
+            return -1;
+        }
+        if result.len() > out_cap {
+            return -(result.len().max(2) as isize);
+        }
+        if !result.is_empty() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(result.as_ptr(), out.cast::<u8>(), result.len())
+            };
+        }
+        result.len() as isize
+    })
+    .unwrap_or(-1)
+}
+
+/// Returns the follow-up eligibility deadline without touching worker state.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_runner_follow_up_deadline(started_at: f64, interval: i64) -> f64 {
+    std::panic::catch_unwind(|| started_at + interval as f64).unwrap_or(f64::NAN)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4439,5 +4772,356 @@ mod tests {
                 -1
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod runner_candidate_tests {
+    use super::*;
+
+    fn fields(values: &[&[u8]]) -> Vec<u8> {
+        let mut packed = Vec::new();
+        for value in values {
+            packed.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            packed.extend_from_slice(value);
+        }
+        packed
+    }
+
+    fn transform(mode: u32, values: &[&[u8]]) -> Vec<u8> {
+        let input = fields(values);
+        let mut output = vec![0xa5; 16384];
+        let result = unsafe {
+            nntmux_tmux_runner_transform(
+                mode,
+                input.as_ptr().cast(),
+                input.len(),
+                output.as_mut_ptr().cast(),
+                output.len(),
+            )
+        };
+        assert!(result >= 0, "mode {mode} failed");
+        assert!(output[result as usize..].iter().all(|b| *b == 0xa5));
+        output.truncate(result as usize);
+        output
+    }
+
+    #[test]
+    fn tmux_runner_shell_transform_contracts() {
+        assert_eq!(transform(0,&[b"a\0b",b"GUARD; ",b"sleep 7",b"1"]),runner_join(&[RUNNER_TRAPS,b"nntmux_status=0; GUARD; ( a\0b ); nntmux_status=$?; GUARD; date +\"%Y-%m-%d %T\"; sleep 7; exit \"$nntmux_status\""]));
+        assert_eq!(
+            transform(0, &[b"false", b"", b"ignored", b"0"]),
+            runner_join(&[
+                RUNNER_TRAPS,
+                b"nntmux_status=0; ( false ); nntmux_status=$?; exit \"$nntmux_status\""
+            ])
+        );
+        assert_eq!(transform(1,&[b"G",b"a",b"b"]),runner_join(&[RUNNER_TRAPS,b"nntmux_batch_status=0; G( a ); nntmux_child_status=$?; if [ \"$nntmux_batch_status\" -eq 0 ]; then nntmux_batch_status=$nntmux_child_status; fi; G( b ); nntmux_child_status=$?; if [ \"$nntmux_batch_status\" -eq 0 ]; then nntmux_batch_status=$nntmux_child_status; fi; exit \"$nntmux_batch_status\""]));
+        assert_eq!(transform(2,&[b"'tmux' '-u'",b"status"]),b"nntmux_draining=$('tmux' '-u' 2>/dev/null); if [ \"$nntmux_draining\" = \"1\" ]; then exit \"$status\"; fi; ");
+        assert_eq!(
+            transform(
+                3,
+                &[
+                    b"1",
+                    b"-2",
+                    b"'php'",
+                    b"'script'",
+                    b"10",
+                    b"'session'",
+                    b"'socket'"
+                ]
+            ),
+            b"nice -n-2 'php' 'script' 10 'session' 'socket'"
+        );
+        assert_eq!(
+            transform(3, &[b"0", b"", b"", b"", b"0", b"", b""]),
+            b"sleep 0"
+        );
+        assert_eq!(
+            transform(4, &[b"/tmp", b"monitor", b"2026_10_24"]),
+            b"/tmp/monitor-2026_10_24.log"
+        );
+    }
+
+    #[test]
+    fn tmux_runner_fix_names_and_query_contracts() {
+        for rename in [b"0".as_slice(), b"1"] {
+            for full in [b"0".as_slice(), b"1"] {
+                for scheduled in [b"0".as_slice(), b"1"] {
+                    for full_config in [b"0".as_slice(), b"1"] {
+                        let result = transform(
+                            5,
+                            &[
+                                b"php artisan",
+                                rename,
+                                full,
+                                b"1",
+                                scheduled,
+                                full_config,
+                                b"'x'",
+                                b" --limit=5",
+                            ],
+                        );
+                        let parsed = runner_fields(&result).unwrap();
+                        let mut levels = Vec::new();
+                        if rename == b"1" {
+                            levels.extend([3, 5, 9, 11, 13, 15, 17, 19]);
+                        }
+                        if full == b"1" {
+                            levels.extend([4, 6, 10, 12, 14, 16, 18, 20]);
+                        }
+                        if scheduled == b"0" {
+                            if rename == b"1" {
+                                levels.push(7);
+                            }
+                            if full == b"1" || (rename == b"1" && full_config == b"1") {
+                                levels.push(8);
+                            }
+                        }
+                        assert_eq!(parsed.len(), levels.len() + 1);
+                        for (command, level) in parsed.iter().zip(levels) {
+                            assert_eq!(*command,format!("php artisan releases:fix-names {level} --update --category='x' --set-status --limit=5 --show").as_bytes());
+                        }
+                        assert_eq!(
+                            *parsed.last().unwrap(),
+                            b"php artisan multiprocessing:fixrelnames predbft"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            transform(6, &[b"sqlite", b"releases.guid"]),
+            b"substr(releases.guid, 1, 1)"
+        );
+        assert_eq!(transform(6, &[b"mysql", b"guid"]), b"LEFT(guid, 1)");
+        assert_eq!(transform(7,&[b"LEFT(guid, 1)",b"x = 1"]),b"\n            SELECT DISTINCT LEFT(guid, 1) AS id\n            FROM releases\n            WHERE x = 1\n            LIMIT 16");
+        for (mode, renamed, expected) in [
+            (b"-8".as_slice(), b"1".as_slice(), b"-1".as_slice()),
+            (b"0", b"0", b"-1"),
+            (b"1", b"1", b"2"),
+            (b"3", b"0", b"3"),
+        ] {
+            assert_eq!(transform(8, &[mode, renamed]), expected);
+        }
+    }
+
+    #[test]
+    fn base_runner_command_tail_and_constant_contracts() {
+        for (args, expected) in [
+            (
+                b"backfill  group".as_slice(),
+                vec![b"backfill:group".as_slice(), b"group", b"1"],
+            ),
+            (
+                b"backfill_all_quantity  g  25",
+                vec![b"backfill:group", b"g", b"1", b"25"],
+            ),
+            (
+                b"backfill_all_quick  g",
+                vec![b"backfill:group", b"g", b"1", b"10000"],
+            ),
+            (
+                b"get_range  g  10",
+                vec![b"articles:get-range", b"g", b"10", b"0", b"0"],
+            ),
+            (b"part_repair", vec![b"binaries:part-repair", b""]),
+            (
+                b"releases  a\0b    last",
+                vec![b"releases:process", b"a\0b", b"", b"last"],
+            ),
+            (
+                b"update_group_headers  g",
+                vec![b"group:update-headers", b"g"],
+            ),
+            (b"update_per_group  g", vec![b"group:update-all", b"g"]),
+            (
+                b"pp_additional  a",
+                vec![b"postprocess:guid", b"additional", b"a"],
+            ),
+            (b"pp_nfo  b", vec![b"postprocess:guid", b"nfo", b"b"]),
+            (b"pp_movie  c", vec![b"postprocess:guid", b"movie", b"c"]),
+            (b"\0\tpp_tv  d \r\n", vec![b"postprocess:guid", b"tv", b"d"]),
+        ] {
+            let result = transform(9, &[b"php", b"artisan", args]);
+            let mut wanted = vec![b"php".as_slice(), b"artisan"];
+            wanted.extend(expected);
+            assert_eq!(runner_fields(&result).unwrap(), wanted);
+        }
+        assert_eq!(
+            transform(10, &[b"0", b"\x1b[1;31m failed \x1b[m \n", b" done \n"]),
+            b"stderr: failed\nstdout: done"
+        );
+        let unicode = "é".repeat(401);
+        assert_eq!(
+            transform(10, &[b"0", b"", unicode.as_bytes()]),
+            format!("stdout: {}", "é".repeat(400)).as_bytes()
+        );
+        assert_eq!(transform(10, &[b"1", b"ignore", b"ignore"]), b"");
+        assert!(runner_transform(10, &[b"0", b"\xff", b""]).is_none());
+        assert_eq!(transform(12, &[b"-7"]), b"-7");
+        assert_eq!(transform(13, &[b"worker"]), b"");
+        assert_eq!(transform(14, &[]), b"15");
+        assert_eq!(nntmux_runner_follow_up_deadline(10.25, 60), 70.25);
+        assert_eq!(nntmux_runner_follow_up_deadline(10.25, 0), 10.25);
+    }
+
+    #[test]
+    fn stop_session_absence_contracts() {
+        for (session, success, output, error, code, expected) in [
+            (
+                b"nntmux".as_slice(),
+                b"1".as_slice(),
+                b"other\nnntmux\n".as_slice(),
+                b"".as_slice(),
+                b"".as_slice(),
+                b"1".as_slice(),
+            ),
+            (b"nntmux", b"1", b"other\n", b"", b"", b"0"),
+            (b"", b"1", b"", b"", b"", b"1"),
+            (
+                b"nntmux",
+                b"0",
+                b"",
+                b" no server running on /tmp/socket \n",
+                b"1",
+                b"0",
+            ),
+            (
+                b"nntmux",
+                b"0",
+                b"",
+                b"error connecting to /tmp/socket (No such file or directory)",
+                b"1",
+                b"0",
+            ),
+            (
+                b"nntmux",
+                b"0",
+                b"",
+                b"no server running on /tmp/socket",
+                b"2",
+                b"2",
+            ),
+            (b"nntmux", b"0", b"", b"permission denied", b"1", b"2"),
+            (
+                b"nntmux",
+                b"0",
+                b"",
+                b"error connecting to socket (Permission denied)",
+                b"1",
+                b"2",
+            ),
+        ] {
+            assert_eq!(
+                transform(11, &[session, success, output, error, code]),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn runner_transform_rejects_bad_lengths_and_reports_capacity() {
+        let input = fields(&[b"sqlite", b"guid"]);
+        let mut output = [0xa5; 64];
+        unsafe {
+            assert_eq!(
+                nntmux_tmux_runner_transform(
+                    6,
+                    input.as_ptr().cast(),
+                    input.len(),
+                    output.as_mut_ptr().cast(),
+                    1
+                ),
+                -18
+            );
+            assert_eq!(
+                nntmux_tmux_runner_transform(
+                    6,
+                    std::ptr::null(),
+                    1,
+                    output.as_mut_ptr().cast(),
+                    64
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_tmux_runner_transform(
+                    6,
+                    input.as_ptr().cast(),
+                    usize::MAX,
+                    output.as_mut_ptr().cast(),
+                    64
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_tmux_runner_transform(
+                    6,
+                    input.as_ptr().cast(),
+                    input.len(),
+                    output.as_mut_ptr().cast(),
+                    usize::MAX
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_tmux_runner_transform(
+                    6,
+                    input.as_ptr().cast(),
+                    input.len(),
+                    std::ptr::null_mut(),
+                    1
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_tmux_runner_transform(
+                    6,
+                    input.as_ptr().cast(),
+                    input.len() - 1,
+                    output.as_mut_ptr().cast(),
+                    64
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_tmux_runner_transform(
+                    99,
+                    input.as_ptr().cast(),
+                    input.len(),
+                    output.as_mut_ptr().cast(),
+                    64
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_tmux_runner_transform(14, std::ptr::null(), 0, std::ptr::null_mut(), 0),
+                -2
+            );
+            let one = fields(&[b"1", b"0"]);
+            assert_eq!(
+                nntmux_tmux_runner_transform(
+                    8,
+                    one.as_ptr().cast(),
+                    one.len(),
+                    std::ptr::null_mut(),
+                    0
+                ),
+                -2
+            );
+            let empty = fields(&[b"any"]);
+            assert_eq!(
+                nntmux_tmux_runner_transform(
+                    13,
+                    empty.as_ptr().cast(),
+                    empty.len(),
+                    std::ptr::null_mut(),
+                    0
+                ),
+                0
+            );
+        }
+        assert!(output.iter().all(|b| *b == 0xa5));
     }
 }
