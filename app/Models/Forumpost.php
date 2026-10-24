@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Models;
 
+use App\Support\RustPipelineLibrary;
 use Carbon\Carbon;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
 use Illuminate\Database\Eloquent\Model;
@@ -55,23 +56,73 @@ class Forumpost extends Model
      */
     protected $guarded = [];
 
+    private const FFI_CDEF = <<<'CDEF'
+int32_t nntmux_forumpost_build_post_attributes(
+    int64_t parent_id,
+    int64_t user_id,
+    const char *message_ptr,
+    size_t message_len,
+    int64_t locked,
+    int64_t sticky,
+    int64_t replies,
+    int64_t *out_fields,
+    size_t out_cap
+);
+int32_t nntmux_forumpost_is_root_topic(int64_t parent_id);
+CDEF;
+
+    /**
+     * `forumid`, `parentid`, `users_id`, `locked`, `sticky`, `replies`.
+     */
+    private const POST_ATTRIBUTE_FIELDS = 6;
+
+    /**
+     * Production default stays PHP: paired benchmarks in RustForumPolicyPostParityTest show
+     * per-call FFI marshaling outweighs this validation/routing (< 1.5x required speedup).
+     */
+    private static bool $useRustFfi = false;
+
+    private static \FFI|false|null $ffi = null;
+
+    public static function enableRustFfi(): void
+    {
+        self::$useRustFfi = true;
+    }
+
+    public static function disableRustFfi(): void
+    {
+        self::$useRustFfi = false;
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = false;
+        self::$ffi = null;
+    }
+
+    public static function setUseRustFfi(bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    public static function setFfiForTesting(\FFI|false|null $ffi): void
+    {
+        self::$ffi = $ffi;
+    }
+
     public static function add(mixed $parentId, mixed $userid, mixed $subject, mixed $message, int $locked = 0, int $sticky = 0, int $replies = 0): int
     {
-        if ($message === '') {
-            return -1;
-        }
-
-        if ($parentId !== 0) {
-            $par = self::getParent($parentId);
-            if ($par === false) {
-                return -1;
-            }
-
-            self::query()->where('id', $parentId)->increment('replies', 1, ['updated_at' => now()]);
-        }
-
-        return self::create(
-            [
+        if (is_int($parentId) && is_int($userid) && is_string($subject) && is_string($message)) {
+            $attributes = self::validateAndBuildPostAttributes($parentId, $userid, $subject, $message, $locked, $sticky, $replies);
+            $isReply = ! self::isRootTopicPost($parentId);
+        } else {
+            // Untyped callers keep the original strict checks and raw payload values.
+            $attributes = $message === '' ? null : [
                 'forumid' => 1,
                 'parentid' => $parentId,
                 'users_id' => $userid,
@@ -80,8 +131,143 @@ class Forumpost extends Model
                 'locked' => $locked,
                 'sticky' => $sticky,
                 'replies' => $replies,
-            ]
-        )->id;
+            ];
+            $isReply = $parentId !== 0;
+        }
+
+        if ($attributes === null) {
+            return -1;
+        }
+
+        if ($isReply) {
+            $par = self::getParent($parentId);
+            if ($par === false) {
+                return -1;
+            }
+
+            self::query()->where('id', $parentId)->increment('replies', 1, ['updated_at' => now()]);
+        }
+
+        return self::create($attributes)->id;
+    }
+
+    /**
+     * Validate a new post and build its insert payload; returns null when the message is empty.
+     *
+     * @return array{forumid: int, parentid: int, users_id: int, subject: string, message: string, locked: int, sticky: int, replies: int}|null
+     */
+    public static function validateAndBuildPostAttributes(int $parentId, int $userId, string $subject, string $message, int $locked, int $sticky, int $replies): ?array
+    {
+        if (self::$useRustFfi) {
+            return self::validateAndBuildPostAttributesNative($parentId, $userId, $subject, $message, $locked, $sticky, $replies);
+        }
+
+        return self::validateAndBuildPostAttributesPhp($parentId, $userId, $subject, $message, $locked, $sticky, $replies);
+    }
+
+    /**
+     * @return array{forumid: int, parentid: int, users_id: int, subject: string, message: string, locked: int, sticky: int, replies: int}|null
+     */
+    public static function validateAndBuildPostAttributesPhp(int $parentId, int $userId, string $subject, string $message, int $locked, int $sticky, int $replies): ?array
+    {
+        if ($message === '') {
+            return null;
+        }
+
+        return [
+            'forumid' => 1,
+            'parentid' => $parentId,
+            'users_id' => $userId,
+            'subject' => $subject,
+            'message' => $message,
+            'locked' => $locked,
+            'sticky' => $sticky,
+            'replies' => $replies,
+        ];
+    }
+
+    /**
+     * @return array{forumid: int, parentid: int, users_id: int, subject: string, message: string, locked: int, sticky: int, replies: int}|null
+     */
+    public static function validateAndBuildPostAttributesNative(int $parentId, int $userId, string $subject, string $message, int $locked, int $sticky, int $replies): ?array
+    {
+        $ffi = self::forumpostFfi();
+        if (! $ffi instanceof \FFI) {
+            return self::validateAndBuildPostAttributesPhp($parentId, $userId, $subject, $message, $locked, $sticky, $replies);
+        }
+
+        try {
+            $fields = $ffi->new('int64_t['.self::POST_ATTRIBUTE_FIELDS.']');
+            // @phpstan-ignore method.notFound
+            $rc = $ffi->nntmux_forumpost_build_post_attributes(
+                $parentId,
+                $userId,
+                $message,
+                strlen($message),
+                $locked,
+                $sticky,
+                $replies,
+                $fields,
+                self::POST_ATTRIBUTE_FIELDS
+            );
+            if ($rc === 0) {
+                return null;
+            }
+            if ($rc !== 1) {
+                return self::validateAndBuildPostAttributesPhp($parentId, $userId, $subject, $message, $locked, $sticky, $replies);
+            }
+
+            return [
+                'forumid' => (int) $fields[0],
+                'parentid' => (int) $fields[1],
+                'users_id' => (int) $fields[2],
+                'subject' => $subject,
+                'message' => $message,
+                'locked' => (int) $fields[3],
+                'sticky' => (int) $fields[4],
+                'replies' => (int) $fields[5],
+            ];
+        } catch (\Throwable) {
+            return self::validateAndBuildPostAttributesPhp($parentId, $userId, $subject, $message, $locked, $sticky, $replies);
+        }
+    }
+
+    /**
+     * Root topics have no parent; deleting one removes the whole topic with its replies.
+     */
+    public static function isRootTopicPost(int $parentId): bool
+    {
+        if (self::$useRustFfi) {
+            return self::isRootTopicPostNative($parentId);
+        }
+
+        return self::isRootTopicPostPhp($parentId);
+    }
+
+    public static function isRootTopicPostPhp(int $parentId): bool
+    {
+        return $parentId === 0;
+    }
+
+    public static function isRootTopicPostNative(int $parentId): bool
+    {
+        $ffi = self::forumpostFfi();
+        if (! $ffi instanceof \FFI) {
+            return self::isRootTopicPostPhp($parentId);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $rc = $ffi->nntmux_forumpost_is_root_topic($parentId);
+        } catch (\Throwable) {
+            return self::isRootTopicPostPhp($parentId);
+        }
+
+        return match ($rc) {
+            1 => true,
+            0 => false,
+            default => self::isRootTopicPostPhp($parentId),
+        };
     }
 
     /**
@@ -158,7 +344,7 @@ class Forumpost extends Model
     {
         $post = self::getPost($id);
         if ($post) {
-            if ((int) $post['parentid'] === 0) {
+            if (self::isRootTopicPost((int) $post['parentid'])) {
                 self::deleteParent($id);
             } else {
                 self::query()->where('id', $id)->delete();
@@ -215,5 +401,21 @@ class Forumpost extends Model
     public static function lockUnlockTopic(mixed $id, mixed $lock): void
     {
         self::query()->where('id', $id)->orWhere('parentid', $id)->update(['locked' => $lock]);
+    }
+
+    private static function forumpostFfi(): ?\FFI
+    {
+        if (self::$ffi === false) {
+            return null;
+        }
+
+        if (self::$ffi instanceof \FFI) {
+            return self::$ffi;
+        }
+
+        $ffi = RustPipelineLibrary::resolveDomain('categorize', self::FFI_CDEF);
+        self::$ffi = $ffi ?? false;
+
+        return $ffi;
     }
 }
