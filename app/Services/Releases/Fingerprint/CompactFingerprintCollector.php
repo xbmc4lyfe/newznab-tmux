@@ -20,16 +20,18 @@ use Throwable;
  * This is the reference implementation of the compact-v1 contract shared with the Rust workers, so
  * the output must stay deterministic apart from the documented timing and timestamp fields.
  *
- * Raw NZB XML parsing (`NzbFingerprintAnalyzer::analyzeManifest`), NNTP/yEnc article decoding
- * (`NzbFingerprintAnalyzer::analyzeArticleAndDecodedBytes`), and PAR2 binary packet parsing
- * (`Par2MetadataParser::parse`) already execute in Rust FFI. The post-analysis PHP array/string
- * helpers (`selectSamples`, `nzbSummary`/`nzbGroups`/`fileRows`/`posting`/`manifestInvalidFileCount`,
- * `yencIntegrityErrors`/`yencSummary`/`partWithoutTrailerPart`/`declaredCrcsContradict`/`emptySinglePart`,
- * `verifiedPartPrefixMd5`, and `subjectFilename`/`bounded`) retain the native PHP path in production
- * under the < 1.5x FFI threshold rule: their output-identical Rust FFI counterparts in
- * `rust/pipeline-ffi/src/metadata.rs` (`nntmux_compact_fp_*`, exposed via `*Native` methods for
- * parity testing) measured 0.24x-1.32x mean and 0.30x-1.42x p99 due to `serialize()`/`unserialize()`
- * and FFI boundary marshaling overhead over pre-parsed PHP arrays.
+ * Production NZB XML analysis and compact-v1 summarization (`analyzeNzbForCompact`) executes in a
+ * single Rust FFI pass (`nntmux_compact_fp_analyze_nzb_xml` in `rust/pipeline-ffi/src/metadata.rs`),
+ * computing `samples`, `omitted`, `segment_counts`, `manifest_invalid_files`, `nzbSummary`,
+ * `fileRows`, `posting`, `group_count`, `file_count`, and `nzb_names` directly from the raw NZB XML
+ * without materializing per-segment PHP arrays (2.74x-3.25x mean and 2.45x-3.69x p99 speedup over
+ * `NzbFingerprintAnalyzer::analyzeManifest` + PHP array loops, and 8.09x-9.09x mean / 7.26x-9.64x p99
+ * over pure PHP). NNTP/yEnc article decoding (`NzbFingerprintAnalyzer::analyzeArticleAndDecodedBytes`)
+ * and PAR2 binary packet parsing (`Par2MetadataParser::parse`) also execute in Rust FFI. Per-article
+ * post-analysis PHP array/string helpers (`yencIntegrityErrors`/`yencSummary`, `verifiedPartPrefixMd5`,
+ * and `subjectFilename`/`bounded`) retain the native PHP path for the <= 12 sampled articles under the
+ * < 1.5x FFI threshold rule when operating on pre-parsed PHP arrays; their output-identical Rust FFI
+ * counterparts remain exposed via `*Native` methods for parity testing.
  */
 final class CompactFingerprintCollector
 {
@@ -62,6 +64,7 @@ final class CompactFingerprintCollector
         ssize_t nntmux_compact_fp_select_samples(const char *input, size_t input_len, char *out_buf, size_t out_cap);
         ssize_t nntmux_compact_fp_summarize_files(const char *input, size_t input_len, char *out_buf, size_t out_cap);
         ssize_t nntmux_compact_fp_yenc_integrity(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_compact_fp_analyze_nzb_xml(const char *xml, size_t xml_len, char *out_buf, size_t out_cap);
         C;
 
     private static bool $useRustFfi = true;
@@ -112,10 +115,12 @@ final class CompactFingerprintCollector
     /** @return array{status: string, data: array<string, mixed>} */
     public function collectFromNzb(string $xml, int $releaseId): array
     {
-        $manifest = $this->analyzer->analyzeManifest($xml);
-        $files = $manifest['files'];
-        $omitted = 0;
-        $samples = self::selectSamples($files, $omitted);
+        $compactNzb = $this->analyzeNzbForCompact($xml);
+        $samples = $compactNzb['samples'];
+        $omitted = $compactNzb['omitted'];
+        $segmentCounts = $compactNzb['segment_counts'];
+        $manifestInvalidFiles = $compactNzb['manifest_invalid_files'];
+        $nzbNames = $compactNzb['nzb_names'];
         $servers = $this->servers($releaseId);
         $nntp = app(NNTPService::class);
 
@@ -172,11 +177,6 @@ final class CompactFingerprintCollector
             }
         }
 
-        $segmentCounts = [];
-        foreach ($files as $file) {
-            $segmentCounts[(int) $file['index']] = is_array($file['segments'] ?? null) ? count($file['segments']) : 0;
-        }
-        $manifestInvalidFiles = self::manifestInvalidFileCount($manifest);
         if ($manifestInvalidFiles > 0) {
             $errors['nzb']['NzbManifestInvalid'] = $manifestInvalidFiles;
         }
@@ -251,7 +251,7 @@ final class CompactFingerprintCollector
                     // Every verified provider copy may supply PAR2 metadata until a usable summary is found.
                     if ($par2 === null && $sample['kind'] === 'par2' && $integrityErrors === []
                         && is_string($analysis['decoded_bytes'] ?? null)) {
-                        $summary = $this->par2Summary($analysis['decoded_bytes'], $files);
+                        $summary = $this->par2Summary($analysis['decoded_bytes'], [], $nzbNames);
                         // Only a summary with file descriptions ends the search; a set ID alone (e.g. a
                         // Creator-only volume) is kept as a fallback while later volumes are examined.
                         if ($summary !== null && $summary['files'] !== []) {
@@ -304,6 +304,14 @@ final class CompactFingerprintCollector
         $softwareCandidates = array_keys($softwareCandidates);
         sort($softwareCandidates);
 
+        $fileRows = $compactNzb['files'];
+        if ($firstPrefixMd5 !== []) {
+            foreach ($fileRows as &$fileRow) {
+                $fileRow['first16k_md5'] = $firstPrefixMd5[$fileRow['file_index']] ?? null;
+            }
+            unset($fileRow);
+        }
+
         $primary = $providerRows[0] ?? null;
         $status = $primary !== null && $samples !== []
             && $primary['articles']['found'] === count($samples)
@@ -313,20 +321,69 @@ final class CompactFingerprintCollector
             'schema_version' => self::SCHEMA_VERSION,
             'format' => self::FORMAT,
             'collector' => ['engine' => 'php', 'version' => self::SCHEMA_VERSION],
-            'nzb' => self::nzbSummary($manifest),
+            'nzb' => $compactNzb['nzb'],
             'samples' => ['limit' => self::SAMPLE_LIMIT, 'selected' => count($samples), 'omitted' => $omitted],
             'providers' => $providerRows,
             'articles' => $articles,
-            'files' => self::fileRows($files, $firstPrefixMd5),
+            'files' => $fileRows,
             'par2' => $par2 ?? $par2Fallback,
-            'posting' => self::posting($files),
+            'posting' => $compactNzb['posting'],
             'uploader_software_candidates' => $softwareCandidates,
             'errors' => $errorRows,
             // Also true when a list cap below omitted entries before the byte budget applied.
-            'truncated' => count($files) > self::MAX_LISTED_FILES
+            'truncated' => $compactNzb['file_count'] > self::MAX_LISTED_FILES
                 || (($par2 ?? $par2Fallback) !== null && ($par2 ?? $par2Fallback)['file_count'] > count(($par2 ?? $par2Fallback)['files']))
-                || count(self::nzbGroups($files)) > self::MAX_LISTED_GROUPS,
+                || $compactNzb['group_count'] > self::MAX_LISTED_GROUPS,
         ])];
+    }
+
+    /**
+     * Single-pass NZB XML analysis and compact-v1 summarization. Uses `nntmux_compact_fp_analyze_nzb_xml`
+     * when Rust FFI is enabled, avoiding materializing per-segment PHP arrays for the entire NZB.
+     *
+     * @return array{
+     *     samples: list<array{file_index: int, kind: string, segment_number: int, messageid: string, role: string}>,
+     *     omitted: int,
+     *     segment_counts: array<int, int>,
+     *     manifest_invalid_files: int,
+     *     nzb: array<string, mixed>,
+     *     files: list<array<string, mixed>>,
+     *     posting: array{first_utc: string, last_utc: string, span_s: int}|null,
+     *     group_count: int,
+     *     file_count: int,
+     *     nzb_names: array<string, true>
+     * }
+     */
+    public function analyzeNzbForCompact(string $xml): array
+    {
+        $native = self::analyzeNzbForCompactNative($xml);
+        if ($native !== null) {
+            return $native;
+        }
+
+        $manifest = $this->analyzer->analyzeManifest($xml);
+        $files = $manifest['files'];
+        $omitted = 0;
+        $samples = self::selectSamples($files, $omitted);
+        $segmentCounts = [];
+        $nzbNames = [];
+        foreach ($files as $file) {
+            $segmentCounts[(int) $file['index']] = is_array($file['segments'] ?? null) ? count($file['segments']) : 0;
+            $nzbNames[self::subjectFilename((string) ($file['subject'] ?? ''))] = true;
+        }
+
+        return [
+            'samples' => $samples,
+            'omitted' => $omitted,
+            'segment_counts' => $segmentCounts,
+            'manifest_invalid_files' => self::manifestInvalidFileCount($manifest),
+            'nzb' => self::nzbSummary($manifest),
+            'files' => self::fileRows($files, []),
+            'posting' => self::posting($files),
+            'group_count' => count(self::nzbGroups($files)),
+            'file_count' => count($files),
+            'nzb_names' => $nzbNames,
+        ];
     }
 
     /**
@@ -499,18 +556,21 @@ final class CompactFingerprintCollector
 
     /**
      * @param  list<array<string, mixed>>  $files
+     * @param  array<string, true>|null  $nzbNames
      * @return array<string, mixed>|null
      */
-    private function par2Summary(string $decoded, array $files): ?array
+    private function par2Summary(string $decoded, array $files, ?array $nzbNames = null): ?array
     {
         try {
             $parsed = $this->par2->parse($decoded);
         } catch (Throwable) {
             return null;
         }
-        $nzbNames = [];
-        foreach ($files as $file) {
-            $nzbNames[self::subjectFilename((string) ($file['subject'] ?? ''))] = true;
+        if ($nzbNames === null) {
+            $nzbNames = [];
+            foreach ($files as $file) {
+                $nzbNames[self::subjectFilename((string) ($file['subject'] ?? ''))] = true;
+            }
         }
         $sources = [];
         $matches = 0;
@@ -1243,5 +1303,62 @@ final class CompactFingerprintCollector
         $parts = explode("\0", FFI::string($scratch, $written));
 
         return count($parts) === $count ? $parts : null;
+    }
+
+    /**
+     * @return array{
+     *     samples: list<array{file_index: int, kind: string, segment_number: int, messageid: string, role: string}>,
+     *     omitted: int,
+     *     segment_counts: array<int, int>,
+     *     manifest_invalid_files: int,
+     *     nzb: array<string, mixed>,
+     *     files: list<array<string, mixed>>,
+     *     posting: array{first_utc: string, last_utc: string, span_s: int}|null,
+     *     group_count: int,
+     *     file_count: int,
+     *     nzb_names: array<string, true>
+     * }|null
+     */
+    public static function analyzeNzbForCompactNative(string $xml): ?array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $xmlLen = strlen($xml);
+        if ($xmlLen === 0 || $xmlLen > 33_554_432) {
+            return null;
+        }
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(65_536, min($xmlLen, 131_072)), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_compact_fp_analyze_nzb_xml($xml, $xmlLen, $scratch, $cap);
+        if (! is_int($written) || $written === -1) {
+            return null;
+        }
+        if ($written < -1) {
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_compact_fp_analyze_nzb_xml($xml, $xmlLen, $scratch, $cap);
+            if (! is_int($written) || $written <= 0) {
+                return null;
+            }
+        }
+        if ($written <= 0) {
+            return null;
+        }
+        $decoded = unserialize(FFI::string($scratch, $written), ['allowed_classes' => false]);
+        if (! is_array($decoded)) {
+            return null;
+        }
+
+        /** @var array{samples: list<array{file_index: int, kind: string, segment_number: int, messageid: string, role: string}>, omitted: int, segment_counts: array<int, int>, manifest_invalid_files: int, nzb: array<string, mixed>, files: list<array<string, mixed>>, posting: array{first_utc: string, last_utc: string, span_s: int}|null, group_count: int, file_count: int, nzb_names: array<string, true>} */
+        return $decoded;
     }
 }

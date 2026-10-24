@@ -4,12 +4,18 @@ declare(strict_types=1);
 
 namespace Tests\Unit;
 
+use App\Services\Nzb\NzbService;
 use App\Services\Releases\Fingerprint\CompactFingerprintCollector;
+use App\Services\Releases\Fingerprint\NzbFingerprintAnalyzer;
+use App\Services\Releases\Fingerprint\Par2MetadataParser;
+use App\Services\YencService;
 use App\Support\RustPipelineLibrary;
 use FFI;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
+use ReflectionClass;
 use ReflectionMethod;
+use RuntimeException;
 
 /**
  * Parity and FFI boundary tests for `CompactFingerprintCollector` Rust helpers
@@ -18,18 +24,19 @@ use ReflectionMethod;
  * Paired randomized benchmark results (`N=40` interleaved pairs, warmup outside timed region,
  * release dylib `opt-level=3, lto=true, codegen-units=1` on Apple Silicon macOS):
  *
- * | Helper / Workload | PHP Mean / p99 (ms) | Rust FFI Mean / p99 (ms) | Mean / p99 Speedup | Production Path |
+ * | Helper / Workload | Baseline Mean / p99 (ms) | Rust FFI Mean / p99 (ms) | Mean / p99 Speedup | Production Path |
  * | --- | --- | --- | --- | --- |
- * | `selectSamples` (common 42 files) | 0.813 / 1.136 | 1.701 / 2.221 | 0.48x / 0.51x | Retained PHP (`< 1.5x`) |
- * | `selectSamples` (p99 252 files) | 1.726 / 2.479 | 3.971 / 5.415 | 0.43x / 0.46x | Retained PHP (`< 1.5x`) |
- * | `summarizeFiles` (common 42 files) | 0.690 / 1.120 | 2.324 / 3.139 | 0.30x / 0.36x | Retained PHP (`< 1.5x`) |
- * | `summarizeFiles` (p99 252 files) | 1.349 / 2.586 | 5.723 / 8.484 | 0.24x / 0.30x | Retained PHP (`< 1.5x`) |
- * | `yencIntegrity` (common 12 articles) | 0.650 / 1.321 | 0.493 / 1.200 | 1.32x / 1.10x | Retained PHP (`< 1.5x`) |
- * | `yencIntegrity` (p99 12 articles) | 0.791 / 1.252 | 0.777 / 1.150 | 1.02x / 1.09x | Retained PHP (`< 1.5x`) |
+ * | `analyzeNzbForCompact` vs Prev (`analyzeManifest`+PHP, common 42x10 segs, x20) | 6.190 / 7.522 | 2.257 / 3.066 | 2.74x / 2.45x | Adopted Rust FFI (`>= 1.5x`) |
+ * | `analyzeNzbForCompact` vs Pure PHP (DOM+PHP, common 42x10 segs, x20) | 18.246 / 22.248 | 2.257 / 3.066 | 8.09x / 7.26x | Adopted Rust FFI (`>= 1.5x`) |
+ * | `analyzeNzbForCompact` vs Prev (`analyzeManifest`+PHP, p99 252x20 segs, x5) | 15.580 / 25.748 | 5.375 / 9.828 | 2.90x / 2.62x | Adopted Rust FFI (`>= 1.5x`) |
+ * | `analyzeNzbForCompact` vs Pure PHP (DOM+PHP, p99 252x20 segs, x5) | 46.398 / 86.610 | 5.375 / 9.828 | 8.63x / 8.81x | Adopted Rust FFI (`>= 1.5x`) |
+ * | `analyzeNzbForCompact` vs Prev (`analyzeManifest`+PHP, heavy p99 252x50 segs, x3) | 20.732 / 26.876 | 6.376 / 7.293 | 3.25x / 3.69x | Adopted Rust FFI (`>= 1.5x`) |
+ * | `analyzeNzbForCompact` vs Pure PHP (DOM+PHP, heavy p99 252x50 segs, x3) | 57.949 / 70.320 | 6.376 / 7.293 | 9.09x / 9.64x | Adopted Rust FFI (`>= 1.5x`) |
+ * | `selectSamples` over pre-parsed PHP array (common 42 files) | 0.813 / 1.136 | 1.701 / 2.221 | 0.48x / 0.51x | Subsumed by `analyzeNzbForCompact` |
+ * | `summarizeFiles` over pre-parsed PHP array (common 42 files) | 0.690 / 1.120 | 2.324 / 3.139 | 0.30x / 0.36x | Subsumed by `analyzeNzbForCompact` |
+ * | `yencIntegrity` over pre-parsed PHP array (common 12 articles) | 0.650 / 1.321 | 0.493 / 1.200 | 1.32x / 1.10x | Retained PHP (`< 1.5x`) |
  * | `verifiedPartPrefixMd5` (common 20 KiB x12) | 13.959 / 15.408 | 13.955 / 15.999 | 1.00x / 0.96x | Retained PHP (`< 1.5x`) |
- * | `verifiedPartPrefixMd5` (p99 768 KiB x12) | 14.052 / 15.678 | 14.509 / 16.378 | 0.97x / 0.96x | Retained PHP (`< 1.5x`) |
- * | `subjectFilename+bounded` (common 42 files, batch) | 0.244 / 0.362 | 0.152 / 0.255 | 1.61x / 1.42x | Retained PHP (`p99 < 1.5x`) |
- * | `subjectFilename+bounded` (p99 252 files, batch) | 0.950 / 1.270 | 1.372 / 1.792 | 0.69x / 0.71x | Retained PHP (`< 1.5x`) |
+ * | `subjectFilename+bounded` (common 42 files, batch) | 0.244 / 0.362 | 0.152 / 0.255 | 1.61x / 1.42x | Subsumed by `analyzeNzbForCompact` |
  */
 final class RustCompactFingerprintCollectorParityTest extends TestCase
 {
@@ -41,6 +48,7 @@ final class RustCompactFingerprintCollectorParityTest extends TestCase
         ssize_t nntmux_compact_fp_select_samples(const char *input, size_t input_len, char *out_buf, size_t out_cap);
         ssize_t nntmux_compact_fp_summarize_files(const char *input, size_t input_len, char *out_buf, size_t out_cap);
         ssize_t nntmux_compact_fp_yenc_integrity(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_compact_fp_analyze_nzb_xml(const char *xml, size_t xml_len, char *out_buf, size_t out_cap);
         C;
 
     private ?FFI $ffi = null;
@@ -58,7 +66,99 @@ final class RustCompactFingerprintCollectorParityTest extends TestCase
     protected function tearDown(): void
     {
         CompactFingerprintCollector::setUseRustFfi(true);
+        NzbFingerprintAnalyzer::setUseRustFfi(true);
         parent::tearDown();
+    }
+
+    #[Test]
+    public function analyze_nzb_for_compact_matches_php_across_randomized_nzb_xml_manifests(): void
+    {
+        mt_srand(5100);
+        $nzbStub = (new ReflectionClass(NzbService::class))->newInstanceWithoutConstructor();
+        $collector = new CompactFingerprintCollector($nzbStub, new NzbFingerprintAnalyzer(new YencService), new Par2MetadataParser);
+
+        $invalidObserved = 0;
+        $overflowObserved = 0;
+        $nullPostingObserved = 0;
+        $cappedObserved = 0;
+
+        for ($i = 0; $i < 120; $i++) {
+            $fileCount = $i % 20 === 0 ? mt_rand(205, 225) : mt_rand(1, 25);
+            $xml = self::randomNzbXml($fileCount, $i);
+
+            NzbFingerprintAnalyzer::setUseRustFfi(false);
+            CompactFingerprintCollector::setUseRustFfi(false);
+            $expectedPurePhp = $collector->analyzeNzbForCompact($xml);
+
+            NzbFingerprintAnalyzer::setUseRustFfi(true);
+            CompactFingerprintCollector::setUseRustFfi(false);
+            $expectedHybrid = $collector->analyzeNzbForCompact($xml);
+
+            CompactFingerprintCollector::setUseRustFfi(true);
+            $actualNative = CompactFingerprintCollector::analyzeNzbForCompactNative($xml);
+            $actualMethod = $collector->analyzeNzbForCompact($xml);
+
+            self::assertNotNull($actualNative, "native returned null on iteration {$i}");
+            self::assertSame($expectedPurePhp, $expectedHybrid, "hybrid mismatch on iteration {$i}");
+            self::assertSame($expectedPurePhp, $actualNative, "native mismatch on iteration {$i}");
+            self::assertSame($expectedPurePhp, $actualMethod, "method mismatch on iteration {$i}");
+
+            if ($expectedPurePhp['manifest_invalid_files'] > 0) {
+                $invalidObserved++;
+            }
+            if ($expectedPurePhp['nzb']['total_bytes'] === null) {
+                $overflowObserved++;
+            }
+            if ($expectedPurePhp['posting'] === null) {
+                $nullPostingObserved++;
+            }
+            if ($expectedPurePhp['file_count'] > 200) {
+                $cappedObserved++;
+            }
+        }
+
+        self::assertGreaterThan(0, $invalidObserved);
+        self::assertGreaterThan(0, $overflowObserved);
+        self::assertGreaterThan(0, $nullPostingObserved);
+        self::assertGreaterThan(0, $cappedObserved);
+    }
+
+    #[Test]
+    public function analyze_nzb_for_compact_defers_invalid_xml_to_php_exceptions(): void
+    {
+        $nzbStub = (new ReflectionClass(NzbService::class))->newInstanceWithoutConstructor();
+        $collector = new CompactFingerprintCollector($nzbStub, new NzbFingerprintAnalyzer(new YencService), new Par2MetadataParser);
+
+        $invalidInputs = [
+            'empty string' => '',
+            'malformed xml' => '<nzb><file></nzb>',
+            'empty nzb without files' => '<?xml version="1.0" encoding="UTF-8"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"></nzb>',
+            'entity declaration' => '<?xml version="1.0"?><!DOCTYPE nzb [<!ENTITY xxe "bad">]><nzb><file subject="a"><segments><segment bytes="1" number="1">m@x</segment></segments></file></nzb>',
+            'unsupported doctype' => '<?xml version="1.0"?><!DOCTYPE html><nzb><file subject="a"><segments><segment bytes="1" number="1">m@x</segment></segments></file></nzb>',
+        ];
+
+        foreach ($invalidInputs as $label => $xml) {
+            CompactFingerprintCollector::setUseRustFfi(true);
+            self::assertNull(CompactFingerprintCollector::analyzeNzbForCompactNative($xml), $label);
+
+            CompactFingerprintCollector::setUseRustFfi(false);
+            $expectedMessage = null;
+            try {
+                $collector->analyzeNzbForCompact($xml);
+            } catch (RuntimeException $e) {
+                $expectedMessage = $e->getMessage();
+            }
+            self::assertNotNull($expectedMessage, "expected RuntimeException on {$label}");
+
+            CompactFingerprintCollector::setUseRustFfi(true);
+            $actualMessage = null;
+            try {
+                $collector->analyzeNzbForCompact($xml);
+            } catch (RuntimeException $e) {
+                $actualMessage = $e->getMessage();
+            }
+            self::assertSame($expectedMessage, $actualMessage, "exception message mismatch on {$label}");
+        }
     }
 
     #[Test]
@@ -282,6 +382,68 @@ final class RustCompactFingerprintCollectorParityTest extends TestCase
         // @phpstan-ignore method.notFound
         $md5Small = $this->ffi->nntmux_compact_fp_verified_part_prefix_md5($payload, strlen($payload), 1024, 1, $small, 8);
         self::assertSame(-32, $md5Small);
+
+        $validXml = self::randomNzbXml(4, 1);
+        // @phpstan-ignore method.notFound
+        $xmlSmall = $this->ffi->nntmux_compact_fp_analyze_nzb_xml($validXml, strlen($validXml), $small, 8);
+        self::assertLessThan(-8, $xmlSmall);
+
+        // @phpstan-ignore method.notFound
+        $xmlInvalid = $this->ffi->nntmux_compact_fp_analyze_nzb_xml('<nzb></nzb>', 11, $small, 8);
+        self::assertSame(-1, $xmlInvalid);
+    }
+
+    private static function randomNzbXml(int $fileCount, int $iteration): string
+    {
+        $doctype = $iteration % 3 === 0
+            ? '<!DOCTYPE nzb PUBLIC "-//newzBin//DTD NZB 1.1//EN" "http://www.newzbin.com/DTD/nzb/nzb-1.1.dtd">'
+            : '';
+        $xml = '<?xml version="1.0" encoding="UTF-8"?>'.$doctype.'<!-- header comment --><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">'
+            .'<head><meta type="title">Release &amp; Title '.$iteration.'</meta></head>';
+
+        $posters = ['poster1@example.com', 'poster2@example.com', '名'.str_repeat('p', 130).'@example.com', 'poster&amp;3@example.com', ''];
+        $exts = ['par2', 'rar', 'nfo', 'mkv'];
+        $allZeroDate = $iteration % 9 === 0;
+
+        for ($i = 0; $i < $fileCount; $i++) {
+            $ext = $i < 2 ? 'par2' : $exts[mt_rand(0, count($exts) - 1)];
+            $segCount = mt_rand(1, 5);
+            $subjBase = match ($i % 5) {
+                0 => '&quot;'.str_repeat('名', 45).".part{$i}.{$ext}&quot; yEnc (1/{$segCount})",
+                1 => "unquoted.file.{$i}.{$ext} yEnc (1/{$segCount})",
+                2 => '&quot;Release &amp; Bonus &#x3042; '."part{$i}.{$ext}&quot; yEnc (1/{$segCount})",
+                default => "&quot;Movie.2026.part{$i}.{$ext}&quot; yEnc (1/{$segCount})",
+            };
+            $poster = $posters[mt_rand(0, count($posters) - 1)];
+            $date = $allZeroDate || mt_rand(0, 5) === 0 ? 0 : 1_790_812_800 + mt_rand(0, 7_200);
+
+            $xml .= '<file poster="'.$poster.'" date="'.$date.'" subject="'.$subjBase.'"><groups>';
+            $groupCount = $iteration % 11 === 0 && $i === 0 ? 24 : mt_rand(1, 3);
+            for ($g = 0; $g < $groupCount; $g++) {
+                $gName = $g === 0 && mt_rand(0, 6) === 0
+                    ? 'alt.binaries.'.str_repeat('名', 45).".{$g}"
+                    : "alt.binaries.group{$g}";
+                $xml .= "<group>{$gName}</group>";
+            }
+            $xml .= '</groups><segments>';
+
+            $reverseOrder = mt_rand(0, 4) === 0;
+            $segIndices = range(1, $segCount);
+            if ($reverseOrder) {
+                $segIndices = array_reverse($segIndices);
+            }
+            foreach ($segIndices as $s) {
+                $segNum = $iteration % 7 === 0 && $i === 0 && $s === $segCount && $segCount > 1 ? 1 : $s;
+                $segBytes = $iteration % 13 === 0 && $i === 0 ? PHP_INT_MAX : mt_rand(1_000, 500_000);
+                $msgId = $iteration % 8 === 0 && $i === 0 && $s > 1
+                    ? "dup-f{$i}@fixture"
+                    : "f{$i}-s{$s}-&#65;@fixture";
+                $xml .= '<segment bytes="'.$segBytes.'" number="'.$segNum.'">'.$msgId.'</segment>';
+            }
+            $xml .= '</segments></file>';
+        }
+
+        return $xml.'</nzb>';
     }
 
     /**
