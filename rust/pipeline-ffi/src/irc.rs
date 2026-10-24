@@ -1152,6 +1152,11 @@ impl<'a> SeenCidrs<'a> {
     }
 
     #[inline]
+    fn count(&self) -> usize {
+        self.len + self.overflow_vec.len()
+    }
+
+    #[inline]
     fn write_lines(&self, out: &mut OutCursor<'_>) {
         for i in 0..self.len {
             if i > 0 {
@@ -1446,6 +1451,1290 @@ pub unsafe extern "C" fn nntmux_proxy_detector_cache_key_nul(
     if seen != count {
         return -1;
     }
+    out.finish()
+}
+
+#[inline]
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    let first = needle[0];
+    let rest = &needle[1..];
+    let mut s = haystack;
+    while s.len() >= needle.len() {
+        let Some(pos) = find_byte(s, first) else {
+            return false;
+        };
+        s = &s[pos..];
+        if s.len() < needle.len() {
+            return false;
+        }
+        if &s[1..needle.len()] == rest {
+            return true;
+        }
+        s = &s[1..];
+    }
+    false
+}
+
+#[inline]
+fn is_pcre_linebreak_byte(b: u8) -> bool {
+    matches!(b, b'\n' | b'\r' | 0x0b | 0x0c | 0x85)
+}
+
+#[inline]
+fn extract_peer_endpoint_slice(line: &[u8]) -> Option<&[u8]> {
+    let trimmed = php_trim(line);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut col = 0usize;
+    let mut i = 0usize;
+    loop {
+        let start = i;
+        while i < trimmed.len() && !ws(trimmed[i]) {
+            i += 1;
+        }
+        if col == 4 {
+            return Some(&trimmed[start..i]);
+        }
+        if i >= trimmed.len() {
+            return None;
+        }
+        while i < trimmed.len() && ws(trimmed[i]) {
+            i += 1;
+        }
+        col += 1;
+    }
+}
+
+#[inline]
+fn socket_line_has_peer_port_with_peer(
+    line: &[u8],
+    peer: Option<&[u8]>,
+    port: &[u8],
+) -> Option<bool> {
+    if let Some(p) = peer {
+        if let Some(colon_pos) = p.iter().rposition(|&b| b == b':') {
+            let peer_port = &p[colon_pos + 1..];
+            return Some(peer_port == port || (port == b"443" && peer_port == b"https"));
+        }
+    }
+    if port.iter().any(|&b| ws(b)) {
+        return None;
+    }
+    let min_tok_len = port.len() + 2;
+    let mut i = 0usize;
+    while i < line.len() {
+        while i < line.len() && ws(line[i]) {
+            i += 1;
+        }
+        let start = i;
+        while i < line.len() && !ws(line[i]) {
+            i += 1;
+        }
+        let tok = &line[start..i];
+        if tok.len() >= min_tok_len
+            && tok.ends_with(port)
+            && tok[tok.len() - port.len() - 1] == b':'
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+#[inline]
+fn peer_matches_address(peer: &[u8], ip: &[u8]) -> bool {
+    if peer == ip {
+        return true;
+    }
+    if peer.len() > ip.len() && peer.starts_with(ip) && peer[ip.len()] == b':' {
+        return true;
+    }
+    peer.len() >= ip.len() + 3
+        && peer[0] == b'['
+        && &peer[1..1 + ip.len()] == ip
+        && &peer[1 + ip.len()..1 + ip.len() + 2] == b"]:"
+}
+
+#[inline]
+fn socket_line_matches_any_address_with_peer(
+    line: &[u8],
+    peer: Option<&[u8]>,
+    addresses: &[&[u8]],
+) -> bool {
+    match peer {
+        Some(p) => addresses.iter().any(|&ip| peer_matches_address(p, ip)),
+        None => addresses.iter().any(|&ip| contains_subslice(line, ip)),
+    }
+}
+
+fn collect_nul_slices<'a>(
+    raw: &'a [u8],
+    count: usize,
+    stack: &mut [&'a [u8]; 32],
+    overflow: &mut Vec<&'a [u8]>,
+) -> Option<usize> {
+    if count == 0 {
+        return raw.is_empty().then_some(0);
+    }
+    let mut seen = 0usize;
+    for part in raw.split(|&b| b == 0) {
+        if seen < 32 {
+            stack[seen] = part;
+        } else {
+            overflow.push(part);
+        }
+        seen += 1;
+    }
+    (seen == count).then_some(seen)
+}
+
+#[inline]
+fn matches_any_collected(
+    line: &[u8],
+    peer: Option<&[u8]>,
+    stack: &[&[u8]; 32],
+    overflow: &[&[u8]],
+    count: usize,
+) -> bool {
+    let stack_len = count.min(32);
+    if socket_line_matches_any_address_with_peer(line, peer, &stack[..stack_len]) {
+        return true;
+    }
+    !overflow.is_empty() && socket_line_matches_any_address_with_peer(line, peer, overflow)
+}
+
+/// Extracts column 4 (`$columns[4] ?? null` from `preg_split('/\s+/', trim($line))`) for `Tmux::extractPeerEndpoint`.
+/// Returns `-1` when absent (`null`) or on invalid arguments, `0` when empty string, `> 0` bytes written,
+/// or `-(needed as isize)` (`<= -2`) when `out_cap` is insufficient.
+///
+/// # Safety
+/// `line` must be readable for `line_len` bytes and `out_buf` writable for `out_cap` bytes without overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_extract_peer_endpoint(
+    line: *const c_char,
+    line_len: usize,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if (line.is_null() && line_len != 0)
+        || (out_buf.is_null() && out_cap != 0)
+        || line_len > isize::MAX as usize
+        || out_cap > isize::MAX as usize
+    {
+        return -1;
+    }
+    let bytes = if line_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(line.cast::<u8>(), line_len) }
+    };
+    let Some(peer) = extract_peer_endpoint_slice(bytes) else {
+        return -1;
+    };
+    if peer.is_empty() {
+        return 0;
+    }
+    if out_buf.is_null() || out_cap < peer.len() {
+        return -(peer.len().max(2) as isize);
+    }
+    unsafe {
+        copy_field(peer, out_buf.cast::<u8>());
+    }
+    peer.len() as isize
+}
+
+/// Checks whether a socket snapshot line matches `port` (`Tmux::socketLineHasPeerPort`).
+/// Returns `1` if matched, `0` if not matched, or `-1` on invalid arguments / declined input.
+///
+/// # Safety
+/// `line` and `port` must be readable for their respective byte lengths when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_socket_line_has_peer_port(
+    line: *const c_char,
+    line_len: usize,
+    port: *const c_char,
+    port_len: usize,
+) -> i32 {
+    if (line.is_null() && line_len != 0) || (port.is_null() && port_len != 0) {
+        return -1;
+    }
+    let line_bytes = if line_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(line.cast::<u8>(), line_len) }
+    };
+    let port_bytes = if port_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(port.cast::<u8>(), port_len) }
+    };
+    let peer = extract_peer_endpoint_slice(line_bytes);
+    match socket_line_has_peer_port_with_peer(line_bytes, peer, port_bytes) {
+        Some(matched) => i32::from(matched),
+        None => -1,
+    }
+}
+
+/// Checks whether a socket snapshot line matches any of `addr_count` NUL-separated addresses
+/// (`Tmux::socketLineMatchesAnyAddress`). Returns `1` if matched, `0` if not, or `-1` on invalid input.
+///
+/// # Safety
+/// `line`, `addresses`, and `port` must be readable for their respective byte lengths when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_socket_line_matches_any_address_nul(
+    line: *const c_char,
+    line_len: usize,
+    addresses: *const c_char,
+    addresses_len: usize,
+    addr_count: usize,
+    port: *const c_char,
+    port_len: usize,
+) -> i32 {
+    if (line.is_null() && line_len != 0)
+        || (addresses.is_null() && addresses_len != 0)
+        || (port.is_null() && port_len != 0)
+    {
+        return -1;
+    }
+    if addr_count == 0 {
+        return if addresses_len == 0 { 0 } else { -1 };
+    }
+    let line_bytes = if line_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(line.cast::<u8>(), line_len) }
+    };
+    let addr_bytes = if addresses_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(addresses.cast::<u8>(), addresses_len) }
+    };
+    let mut stack = [&[][..]; 32];
+    let mut overflow = Vec::new();
+    if collect_nul_slices(addr_bytes, addr_count, &mut stack, &mut overflow).is_none() {
+        return -1;
+    }
+    let peer = extract_peer_endpoint_slice(line_bytes);
+    i32::from(matches_any_collected(
+        line_bytes,
+        peer,
+        &stack,
+        &overflow,
+        addr_count,
+    ))
+}
+
+/// Evaluates `Tmux::getUSPConnections` over a complete `ss -nH` socket snapshot in a single zero-allocation pass.
+/// Returns packed `((total as i64) << 32) | (active as i64)` (`>= 0`), or `-1` on invalid/declined input.
+///
+/// # Safety
+/// All non-null pointers must be readable for their stated byte lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_count_usp_connections(
+    is_alternate: u8,
+    port: *const c_char,
+    port_len: usize,
+    other_port: *const c_char,
+    other_port_len: usize,
+    ips: *const c_char,
+    ips_len: usize,
+    ips_count: usize,
+    other_ips: *const c_char,
+    other_ips_len: usize,
+    other_ips_count: usize,
+    snapshot: *const c_char,
+    snapshot_len: usize,
+) -> i64 {
+    if (port.is_null() && port_len != 0)
+        || (other_port.is_null() && other_port_len != 0)
+        || (ips.is_null() && ips_len != 0)
+        || (other_ips.is_null() && other_ips_len != 0)
+        || (snapshot.is_null() && snapshot_len != 0)
+        || is_alternate > 1
+    {
+        return -1;
+    }
+    let port_bytes = if port_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(port.cast::<u8>(), port_len) }
+    };
+    let other_port_bytes = if other_port_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(other_port.cast::<u8>(), other_port_len) }
+    };
+    let ips_bytes = if ips_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(ips.cast::<u8>(), ips_len) }
+    };
+    let other_ips_bytes = if other_ips_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(other_ips.cast::<u8>(), other_ips_len) }
+    };
+    let snap_bytes = if snapshot_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(snapshot.cast::<u8>(), snapshot_len) }
+    };
+
+    let mut ips_stack = [&[][..]; 32];
+    let mut ips_overflow = Vec::new();
+    if collect_nul_slices(ips_bytes, ips_count, &mut ips_stack, &mut ips_overflow).is_none() {
+        return -1;
+    }
+    let mut other_stack = [&[][..]; 32];
+    let mut other_overflow = Vec::new();
+    if collect_nul_slices(
+        other_ips_bytes,
+        other_ips_count,
+        &mut other_stack,
+        &mut other_overflow,
+    )
+    .is_none()
+    {
+        return -1;
+    }
+
+    let has_port = !port_bytes.is_empty();
+    let same_port_as_other = has_port && port_bytes == other_port_bytes;
+
+    let mut port_lines_found = false;
+    let mut pass1_total = 0u32;
+    let mut pass1_active = 0u32;
+    let mut pass2_total = 0u32;
+    let mut pass2_active = 0u32;
+
+    let mut pos = 0usize;
+    while pos < snap_bytes.len() {
+        let start = pos;
+        while pos < snap_bytes.len() && !is_pcre_linebreak_byte(snap_bytes[pos]) {
+            pos += 1;
+        }
+        let line = &snap_bytes[start..pos];
+        if pos < snap_bytes.len() {
+            if snap_bytes[pos] == b'\r' && snap_bytes.get(pos + 1) == Some(&b'\n') {
+                pos += 2;
+            } else {
+                pos += 1;
+            }
+        }
+        if php_trim(line).is_empty() {
+            continue;
+        }
+
+        let peer = extract_peer_endpoint_slice(line);
+        if has_port {
+            let Some(has_peer_port) = socket_line_has_peer_port_with_peer(line, peer, port_bytes)
+            else {
+                return -1;
+            };
+            if has_peer_port {
+                port_lines_found = true;
+                let keep = if same_port_as_other {
+                    if is_alternate != 0 {
+                        ips_count > 0
+                            && matches_any_collected(
+                                line,
+                                peer,
+                                &ips_stack,
+                                &ips_overflow,
+                                ips_count,
+                            )
+                    } else {
+                        other_ips_count == 0
+                            || !matches_any_collected(
+                                line,
+                                peer,
+                                &other_stack,
+                                &other_overflow,
+                                other_ips_count,
+                            )
+                    }
+                } else {
+                    true
+                };
+                if keep {
+                    pass1_total += 1;
+                    if contains_subslice(line, b"ESTAB") {
+                        pass1_active += 1;
+                    }
+                }
+            }
+        }
+
+        if !port_lines_found
+            && ips_count > 0
+            && matches_any_collected(line, peer, &ips_stack, &ips_overflow, ips_count)
+        {
+            pass2_total += 1;
+            if contains_subslice(line, b"ESTAB") {
+                pass2_active += 1;
+            }
+        }
+    }
+
+    if port_lines_found {
+        ((pass1_total as i64) << 32) | (pass1_active as i64)
+    } else if pass2_total > 0 {
+        ((pass2_total as i64) << 32) | (pass2_active as i64)
+    } else {
+        0
+    }
+}
+
+#[inline]
+fn php_round_2(val: f64) -> f64 {
+    if !val.is_finite() || val == 0.0 {
+        return 0.0;
+    }
+    let f1 = 100.0_f64;
+    let mut tmp = val * f1;
+    let abs = val.abs();
+    let precision_places = 14 - (abs.log10().floor() as i32);
+    if precision_places > 2 && precision_places - 2 < 15 {
+        let f2 = 10.0_f64.powi(precision_places - 2);
+        let tmp2 = tmp * f2;
+        tmp = (if tmp2 >= 0.0 {
+            (tmp2 + 0.5).floor()
+        } else {
+            (tmp2 - 0.5).ceil()
+        }) / f2;
+    }
+    tmp = if tmp >= 0.0 {
+        (tmp + 0.5).floor()
+    } else {
+        (tmp - 0.5).ceil()
+    };
+    tmp / f1
+}
+
+fn write_u64_ascii(mut val: u64, buf: &mut [u8; 24]) -> &[u8] {
+    let mut i = buf.len();
+    if val == 0 {
+        i -= 1;
+        buf[i] = b'0';
+        return &buf[i..];
+    }
+    while val > 0 {
+        i -= 1;
+        buf[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+    }
+    &buf[i..]
+}
+
+/// Formats `Tmux::decodeSize(int|float $bytes): string`.
+/// Returns bytes written (`> 0`), `-(needed as isize)` (`<= -2`) when `out_cap` is too small,
+/// or `-1` when non-finite or out of range so PHP can handle it.
+///
+/// # Safety
+/// `out_buf` must be writable for `out_cap` bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_decode_size(
+    bytes: f64,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if (out_buf.is_null() && out_cap != 0) || out_cap > isize::MAX as usize || !bytes.is_finite() {
+        return -1;
+    }
+    if bytes == 0.0 {
+        let mut out = unsafe { OutCursor::new(out_buf.cast::<u8>(), out_cap) };
+        if bytes.is_sign_negative() {
+            out.extend(b"-0 B");
+        } else {
+            out.extend(b"0 B");
+        }
+        return out.finish();
+    }
+    let neg = bytes < 0.0;
+    let mut b = bytes.abs();
+    const UNITS: [&[u8]; 7] = [b"B", b"KB", b"MB", b"GB", b"TB", b"PB", b"EB"];
+    let mut idx = 0usize;
+    while b >= 1024.0 && idx < UNITS.len() - 1 {
+        b /= 1024.0;
+        idx += 1;
+    }
+    if b >= 1.0e12 {
+        return -1;
+    }
+    let rounded = php_round_2(b);
+    let hundredths = (rounded * 100.0).round() as u64;
+    let whole = hundredths / 100;
+    let rem = (hundredths % 100) as u8;
+
+    let mut out = unsafe { OutCursor::new(out_buf.cast::<u8>(), out_cap) };
+    if neg {
+        out.push(b'-');
+    }
+    let mut num_buf = [0u8; 24];
+    out.extend(write_u64_ascii(whole, &mut num_buf));
+    if rem != 0 {
+        out.push(b'.');
+        if rem.is_multiple_of(10) {
+            out.push(b'0' + rem / 10);
+        } else {
+            out.push(b'0' + rem / 10);
+            out.push(b'0' + rem % 10);
+        }
+    }
+    out.push(b' ');
+    out.extend(UNITS[idx]);
+    out.finish()
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn count_nl_proc_neon_chunk(bytes: &[u8], base: usize, m: std::arch::aarch64::uint8x16_t) -> usize {
+    use std::arch::aarch64::*;
+    let mut count = 0usize;
+    let (mut lo, mut hi) = unsafe {
+        let u64s = vreinterpretq_u64_u8(m);
+        (vgetq_lane_u64::<0>(u64s), vgetq_lane_u64::<1>(u64s))
+    };
+    while lo != 0 {
+        let lane = (lo.trailing_zeros() >> 3) as usize;
+        let j = base + lane;
+        if bytes.get(j + 2..j + 10) == Some(b"rocessor") {
+            count += 1;
+        }
+        lo &= !(0xFFu64 << (lane * 8));
+    }
+    while hi != 0 {
+        let lane = (hi.trailing_zeros() >> 3) as usize;
+        let j = base + 8 + lane;
+        if bytes.get(j + 2..j + 10) == Some(b"rocessor") {
+            count += 1;
+        }
+        hi &= !(0xFFu64 << (lane * 8));
+    }
+    count
+}
+
+#[inline]
+fn count_newline_processor(bytes: &[u8]) -> usize {
+    let mut count = 0usize;
+    let mut i = 0usize;
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let nl = vdupq_n_u8(b'\n');
+        let p = vdupq_n_u8(b'p');
+        while i + 65 <= bytes.len() {
+            let ptr = bytes.as_ptr().add(i);
+            let m0 = vandq_u8(vceqq_u8(vld1q_u8(ptr), nl), vceqq_u8(vld1q_u8(ptr.add(1)), p));
+            let m1 = vandq_u8(
+                vceqq_u8(vld1q_u8(ptr.add(16)), nl),
+                vceqq_u8(vld1q_u8(ptr.add(17)), p),
+            );
+            let m2 = vandq_u8(
+                vceqq_u8(vld1q_u8(ptr.add(32)), nl),
+                vceqq_u8(vld1q_u8(ptr.add(33)), p),
+            );
+            let m3 = vandq_u8(
+                vceqq_u8(vld1q_u8(ptr.add(48)), nl),
+                vceqq_u8(vld1q_u8(ptr.add(49)), p),
+            );
+            let any = vorrq_u8(vorrq_u8(m0, m1), vorrq_u8(m2, m3));
+            if vmaxvq_u8(any) != 0 {
+                if vmaxvq_u8(m0) != 0 {
+                    count += count_nl_proc_neon_chunk(bytes, i, m0);
+                }
+                if vmaxvq_u8(m1) != 0 {
+                    count += count_nl_proc_neon_chunk(bytes, i + 16, m1);
+                }
+                if vmaxvq_u8(m2) != 0 {
+                    count += count_nl_proc_neon_chunk(bytes, i + 32, m2);
+                }
+                if vmaxvq_u8(m3) != 0 {
+                    count += count_nl_proc_neon_chunk(bytes, i + 48, m3);
+                }
+            }
+            i += 64;
+        }
+        while i + 17 <= bytes.len() {
+            let ptr = bytes.as_ptr().add(i);
+            let m0 = vandq_u8(vceqq_u8(vld1q_u8(ptr), nl), vceqq_u8(vld1q_u8(ptr.add(1)), p));
+            if vmaxvq_u8(m0) != 0 {
+                count += count_nl_proc_neon_chunk(bytes, i, m0);
+            }
+            i += 16;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let nl = _mm_set1_epi8(b'\n' as i8);
+        let p = _mm_set1_epi8(b'p' as i8);
+        while i + 17 <= bytes.len() {
+            let v_nl = _mm_loadu_si128(bytes.as_ptr().add(i).cast());
+            let v_p = _mm_loadu_si128(bytes.as_ptr().add(i + 1).cast());
+            let mut mask = _mm_movemask_epi8(_mm_and_si128(
+                _mm_cmpeq_epi8(v_nl, nl),
+                _mm_cmpeq_epi8(v_p, p),
+            )) as u32;
+            while mask != 0 {
+                let lane = mask.trailing_zeros() as usize;
+                let j = i + lane;
+                if bytes.get(j + 2..j + 10) == Some(b"rocessor") {
+                    count += 1;
+                }
+                mask &= mask - 1;
+            }
+            i += 16;
+        }
+    }
+    while i + 10 <= bytes.len() {
+        if bytes[i] == b'\n' && &bytes[i + 1..i + 10] == b"processor" {
+            count += 1;
+        }
+        i += 1;
+    }
+    count
+}
+
+/// Counts `/^processor/m` matches in `/proc/cpuinfo` (`SystemMetricsService::getCpuCount`),
+/// returning `count.max(1)` (`>= 1`) or `-1` on invalid arguments.
+///
+/// # Safety
+/// `cpuinfo` must be readable for `cpuinfo_len` bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_metrics_parse_cpu_count(
+    cpuinfo: *const c_char,
+    cpuinfo_len: usize,
+) -> i32 {
+    if cpuinfo.is_null() && cpuinfo_len != 0 {
+        return -1;
+    }
+    let bytes = if cpuinfo_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(cpuinfo.cast::<u8>(), cpuinfo_len) }
+    };
+    let mut count = usize::from(bytes.starts_with(b"processor"));
+    count += count_newline_processor(bytes);
+    if count > i32::MAX as usize {
+        return -1;
+    }
+    count.max(1) as i32
+}
+
+#[inline]
+fn parse_ws_digits_u64(s: &[u8]) -> Result<Option<(u64, usize)>, ()> {
+    let mut i = 0usize;
+    while i < s.len() && ws(s[i]) {
+        i += 1;
+    }
+    if i == 0 || i >= s.len() || !s[i].is_ascii_digit() {
+        return Ok(None);
+    }
+    let start = i;
+    while i < s.len() && s[i].is_ascii_digit() {
+        i += 1;
+    }
+    let mut val = 0u64;
+    for &b in &s[start..i] {
+        val = val
+            .checked_mul(10)
+            .ok_or(())?
+            .checked_add(u64::from(b - b'0'))
+            .ok_or(())?;
+    }
+    Ok(Some((val, i)))
+}
+
+fn extract_labeled_u64(mut s: &[u8], label: &[u8]) -> Result<Option<(u64, usize)>, ()> {
+    let mut base_offset = 0usize;
+    if s.len() > label.len() && s.starts_with(label) {
+        if let Some((val, consumed)) = parse_ws_digits_u64(&s[label.len()..])? {
+            return Ok(Some((val, label.len() + consumed)));
+        }
+        s = &s[1..];
+        base_offset = 1;
+    }
+    // Search on label[3] ('T' for MemTotal:, 'A' for MemAvailable:) using libc::memchr
+    let anchor = label[3];
+    while s.len() > label.len() {
+        let search = &s[3..];
+        let found = unsafe { memchr(search.as_ptr(), anchor.into(), search.len()) };
+        if found.is_null() {
+            return Ok(None);
+        }
+        let pos = unsafe { found.offset_from(search.as_ptr()) as usize };
+        s = &s[pos..];
+        base_offset += pos;
+        if s.len() <= label.len() {
+            return Ok(None);
+        }
+        if s.starts_with(label)
+            && let Some((val, consumed)) = parse_ws_digits_u64(&s[label.len()..])?
+        {
+            return Ok(Some((val, base_offset + label.len() + consumed)));
+        }
+        s = &s[1..];
+        base_offset += 1;
+    }
+    Ok(None)
+}
+
+/// Parses `MemTotal:\s+(\d+)` and `MemAvailable:\s+(\d+)` from `/proc/meminfo` (`SystemMetricsService::getRamUsage`),
+/// computing `used`, `total`, and `percentage` rounded to 2 decimal places (`PHP_ROUND_HALF_UP`).
+/// Returns `0` when either field is absent,
+/// `1 | ((pct_hundredths as i64) << 1) | ((total_hundredths as i64) << 18) | ((used_hundredths as i64) << 40)` (`> 0`)
+/// when both are present and within bit bounds, or `-1` on invalid arguments / `total_kb == 0` / negative used / overflow.
+///
+/// # Safety
+/// `meminfo` must be readable for `meminfo_len` bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_metrics_parse_meminfo(
+    meminfo: *const c_char,
+    meminfo_len: usize,
+) -> i64 {
+    if meminfo.is_null() && meminfo_len != 0 {
+        return -1;
+    }
+    let bytes = if meminfo_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(meminfo.cast::<u8>(), meminfo_len) }
+    };
+    let (total, total_end) = match extract_labeled_u64(bytes, b"MemTotal:") {
+        Ok(Some(v)) => v,
+        Ok(None) => return 0,
+        Err(()) => return -1,
+    };
+    // Fast path: in standard /proc/meminfo, MemAvailable follows shortly after MemTotal
+    let available = match extract_labeled_u64(&bytes[total_end..], b"MemAvailable:") {
+        Ok(Some((v, _))) => v,
+        Ok(None) => match extract_labeled_u64(&bytes[..total_end], b"MemAvailable:") {
+            Ok(Some((v, _))) => v,
+            Ok(None) => return 0,
+            Err(()) => return -1,
+        },
+        Err(()) => return -1,
+    };
+    if total == 0 || available > total {
+        return -1;
+    }
+    let total_f = total as f64;
+    let avail_f = available as f64;
+    let used_f = total_f - avail_f;
+    let used_gb = php_round_2(used_f / 1024.0 / 1024.0);
+    let total_gb = php_round_2(total_f / 1024.0 / 1024.0);
+    let pct = php_round_2((used_f / total_f) * 100.0);
+
+    let used_h = (used_gb * 100.0).round() as u64;
+    let total_h = (total_gb * 100.0).round() as u64;
+    let pct_h = (pct * 100.0).round() as u64;
+    if used_h > 0x3F_FFFF || total_h > 0x3F_FFFF || pct_h > 0x1_FFFF {
+        return -1;
+    }
+    1 | ((pct_h as i64) << 1) | ((total_h as i64) << 18) | ((used_h as i64) << 40)
+}
+
+#[inline]
+fn match_colon_digits(s: &[u8]) -> Option<(&[u8], usize)> {
+    let mut i = 0usize;
+    while i < s.len() && ws(s[i]) {
+        i += 1;
+    }
+    if s.get(i) != Some(&b':') {
+        return None;
+    }
+    i += 1;
+    while i < s.len() && ws(s[i]) {
+        i += 1;
+    }
+    let start = i;
+    while i < s.len() && s[i].is_ascii_digit() {
+        i += 1;
+    }
+    (i > start).then_some((&s[start..i], i))
+}
+
+#[inline]
+fn match_colon_rest_of_line(s: &[u8]) -> Option<&[u8]> {
+    let mut i = 0usize;
+    while i < s.len() && ws(s[i]) {
+        i += 1;
+    }
+    if s.get(i) != Some(&b':') {
+        return None;
+    }
+    let val_slice = &s[i + 1..];
+    let mut ws_end = 0usize;
+    while ws_end < val_slice.len() && ws(val_slice[ws_end]) {
+        ws_end += 1;
+    }
+    if ws_end < val_slice.len() {
+        let line_end =
+            ws_end + find_byte(&val_slice[ws_end..], b'\n').unwrap_or(val_slice.len() - ws_end);
+        return Some(&val_slice[ws_end..line_end]);
+    }
+    let mut back = val_slice.len();
+    while back > 0 {
+        back -= 1;
+        if val_slice[back] != b'\n'
+            && (back + 1 == val_slice.len() || val_slice[back + 1] == b'\n')
+        {
+            return Some(&val_slice[back..back + 1]);
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn inspect_cpuinfo_line_at<'a>(
+    bytes: &'a [u8],
+    pos: usize,
+    found_cores: &mut bool,
+    cores: &mut u64,
+    threads: &mut u64,
+    found_model: &mut bool,
+    model: &mut &'a [u8],
+    phys_seen: &mut SeenCidrs<'a>,
+    next_phys_min_pos: &mut usize,
+) -> Result<(), ()> {
+    let rest = &bytes[pos..];
+    match rest.first() {
+        Some(&b'p') => {
+            if rest.starts_with(b"processor") {
+                *threads += 1;
+            } else if pos >= *next_phys_min_pos
+                && rest.starts_with(b"physical id")
+                && let Some((digits, consumed)) = match_colon_digits(&rest[11..])
+            {
+                phys_seen.insert(digits);
+                *next_phys_min_pos = pos + 11 + consumed;
+            }
+        }
+        Some(&b'c') => {
+            if !*found_cores
+                && rest.starts_with(b"cpu cores")
+                && let Some((digits, _)) = match_colon_digits(&rest[9..])
+            {
+                *found_cores = true;
+                let mut val = 0u64;
+                for &b in digits {
+                    val = val
+                        .checked_mul(10)
+                        .and_then(|v| v.checked_add(u64::from(b - b'0')))
+                        .ok_or(())?;
+                }
+                *cores = val;
+            }
+        }
+        Some(&b'm') => {
+            if !*found_model
+                && rest.starts_with(b"model name")
+                && let Some(captured) = match_colon_rest_of_line(&rest[10..])
+            {
+                *found_model = true;
+                if captured != b"0" {
+                    *model = php_trim(captured);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Parses `/proc/cpuinfo` (`SystemMetricsService::getCpuInfo`) in a single SIMD-accelerated pass,
+/// writing `"{cores}\0{threads}\0{model}"` into `out_buf`.
+/// Returns bytes written (`> 0`), `-(needed as isize)` (`<= -2`) when `out_cap` is too small,
+/// or `-1` on invalid arguments / overflow / embedded NUL in model.
+///
+/// # Safety
+/// `cpuinfo` must be readable for `cpuinfo_len` bytes and `out_buf` writable for `out_cap` bytes without overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_metrics_parse_cpu_info(
+    cpuinfo: *const c_char,
+    cpuinfo_len: usize,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if (cpuinfo.is_null() && cpuinfo_len != 0)
+        || (out_buf.is_null() && out_cap != 0)
+        || cpuinfo_len > isize::MAX as usize
+        || out_cap > isize::MAX as usize
+    {
+        return -1;
+    }
+    let bytes = if cpuinfo_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(cpuinfo.cast::<u8>(), cpuinfo_len) }
+    };
+
+    let mut found_cores = false;
+    let mut cores = 0u64;
+    let mut threads = 0u64;
+    let mut found_model = false;
+    let mut model: &[u8] = b"Unknown";
+    let mut phys_seen = SeenCidrs::new();
+    let mut next_phys_min_pos = 0usize;
+
+    if !bytes.is_empty()
+        && inspect_cpuinfo_line_at(
+            bytes,
+            0,
+            &mut found_cores,
+            &mut cores,
+            &mut threads,
+            &mut found_model,
+            &mut model,
+            &mut phys_seen,
+            &mut next_phys_min_pos,
+        )
+        .is_err()
+    {
+        return -1;
+    }
+
+    let mut i = 0usize;
+    while i + 22 <= bytes.len() {
+        if found_cores && found_model && cores > 0 {
+            threads += count_newline_processor(&bytes[i..]) as u64;
+            i = bytes.len();
+            break;
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            use std::arch::aarch64::*;
+            let ptr = bytes.as_ptr().add(i);
+            let is_nl = vceqq_u8(vld1q_u8(ptr), vdupq_n_u8(b'\n'));
+            let v1 = vld1q_u8(ptr.add(1));
+            let v5 = vld1q_u8(ptr.add(5));
+            let m = if found_model {
+                vandq_u8(
+                    is_nl,
+                    vorrq_u8(vceqq_u8(v1, vdupq_n_u8(b'p')), vceqq_u8(v5, vdupq_n_u8(b'c'))),
+                )
+            } else {
+                vandq_u8(
+                    is_nl,
+                    vorrq_u8(
+                        vceqq_u8(v1, vdupq_n_u8(b'p')),
+                        vorrq_u8(
+                            vceqq_u8(v5, vdupq_n_u8(b'c')),
+                            vceqq_u8(v1, vdupq_n_u8(b'm')),
+                        ),
+                    ),
+                )
+            };
+            if vmaxvq_u8(m) != 0 {
+                let u64s = vreinterpretq_u64_u8(m);
+                let mut lo = vgetq_lane_u64::<0>(u64s);
+                while lo != 0 {
+                    let lane = (lo.trailing_zeros() >> 3) as usize;
+                    if inspect_cpuinfo_line_at(
+                        bytes,
+                        i + lane + 1,
+                        &mut found_cores,
+                        &mut cores,
+                        &mut threads,
+                        &mut found_model,
+                        &mut model,
+                        &mut phys_seen,
+                        &mut next_phys_min_pos,
+                    )
+                    .is_err()
+                    {
+                        return -1;
+                    }
+                    lo &= !(0xFFu64 << (lane * 8));
+                }
+                let mut hi = vgetq_lane_u64::<1>(u64s);
+                while hi != 0 {
+                    let lane = (hi.trailing_zeros() >> 3) as usize;
+                    if inspect_cpuinfo_line_at(
+                        bytes,
+                        i + 8 + lane + 1,
+                        &mut found_cores,
+                        &mut cores,
+                        &mut threads,
+                        &mut found_model,
+                        &mut model,
+                        &mut phys_seen,
+                        &mut next_phys_min_pos,
+                    )
+                    .is_err()
+                    {
+                        return -1;
+                    }
+                    hi &= !(0xFFu64 << (lane * 8));
+                }
+            }
+            i += 16;
+            continue;
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::*;
+            let ptr = bytes.as_ptr().add(i);
+            let is_nl = _mm_cmpeq_epi8(_mm_loadu_si128(ptr.cast()), _mm_set1_epi8(b'\n' as i8));
+            let v1 = _mm_loadu_si128(ptr.add(1).cast());
+            let v5 = _mm_loadu_si128(ptr.add(5).cast());
+            let m = if found_model {
+                _mm_and_si128(
+                    is_nl,
+                    _mm_or_si128(
+                        _mm_cmpeq_epi8(v1, _mm_set1_epi8(b'p' as i8)),
+                        _mm_cmpeq_epi8(v5, _mm_set1_epi8(b'c' as i8)),
+                    ),
+                )
+            } else {
+                _mm_and_si128(
+                    is_nl,
+                    _mm_or_si128(
+                        _mm_cmpeq_epi8(v1, _mm_set1_epi8(b'p' as i8)),
+                        _mm_or_si128(
+                            _mm_cmpeq_epi8(v5, _mm_set1_epi8(b'c' as i8)),
+                            _mm_cmpeq_epi8(v1, _mm_set1_epi8(b'm' as i8)),
+                        ),
+                    ),
+                )
+            };
+            let mut mask = _mm_movemask_epi8(m) as u32;
+            while mask != 0 {
+                let lane = mask.trailing_zeros() as usize;
+                if inspect_cpuinfo_line_at(
+                    bytes,
+                    i + lane + 1,
+                    &mut found_cores,
+                    &mut cores,
+                    &mut threads,
+                    &mut found_model,
+                    &mut model,
+                    &mut phys_seen,
+                    &mut next_phys_min_pos,
+                )
+                .is_err()
+                {
+                    return -1;
+                }
+                mask &= mask - 1;
+            }
+            i += 16;
+            continue;
+        }
+        #[allow(unreachable_code)]
+        {
+            for j in i..i + 16 {
+                if bytes[j] == b'\n'
+                    && matches!(bytes[j + 1], b'p' | b'c' | b'm')
+                    && inspect_cpuinfo_line_at(
+                        bytes,
+                        j + 1,
+                        &mut found_cores,
+                        &mut cores,
+                        &mut threads,
+                        &mut found_model,
+                        &mut model,
+                        &mut phys_seen,
+                        &mut next_phys_min_pos,
+                    )
+                    .is_err()
+                {
+                    return -1;
+                }
+            }
+            i += 16;
+        }
+    }
+
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'\n'
+            && matches!(bytes[i + 1], b'p' | b'c' | b'm')
+            && inspect_cpuinfo_line_at(
+                bytes,
+                i + 1,
+                &mut found_cores,
+                &mut cores,
+                &mut threads,
+                &mut found_model,
+                &mut model,
+                &mut phys_seen,
+                &mut next_phys_min_pos,
+            )
+            .is_err()
+        {
+            return -1;
+        }
+        i += 1;
+    }
+
+    if cores == 0 {
+        let unique_phys = phys_seen.count().max(1) as u64;
+        cores = threads / unique_phys;
+    }
+    if find_byte(model, 0).is_some() {
+        return -1;
+    }
+
+    let mut out = unsafe { OutCursor::new(out_buf.cast::<u8>(), out_cap) };
+    let mut num_buf = [0u8; 24];
+    out.extend(write_u64_ascii(cores, &mut num_buf));
+    out.push(0);
+    out.extend(write_u64_ascii(threads, &mut num_buf));
+    out.push(0);
+    out.extend(model);
+    out.finish()
+}
+
+#[inline]
+fn extract_redis_db_keys(mut s: &[u8]) -> Option<i64> {
+    if s.len() >= 6 && s.starts_with(b"keys=") && s[5].is_ascii_digit() {
+        let mut end = 6usize;
+        while end < s.len() && s[end].is_ascii_digit() {
+            end += 1;
+        }
+        let mut val = 0i64;
+        for &b in &s[5..end] {
+            val = val.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+        }
+        return Some(val);
+    }
+    while s.len() >= 6 {
+        let Some(pos) = find_byte(s, b'k') else {
+            return Some(0);
+        };
+        s = &s[pos..];
+        if s.len() < 6 {
+            return Some(0);
+        }
+        if s.starts_with(b"keys=") && s[5].is_ascii_digit() {
+            let mut end = 6usize;
+            while end < s.len() && s[end].is_ascii_digit() {
+                end += 1;
+            }
+            let mut val = 0i64;
+            for &b in &s[5..end] {
+                val = val.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+            }
+            return Some(val);
+        }
+        s = &s[1..];
+    }
+    Some(0)
+}
+
+/// Sums `keys=(\d+)` across `count` NUL-separated Redis keyspace `db0`..`db15` strings (`RedisMonitorService::parseRedisInfo`).
+/// Returns total keys (`>= 0`), or `-1` on invalid arguments / segment count mismatch / integer overflow.
+///
+/// # Safety
+/// `input` must be readable for `input_len` bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_redis_sum_db_keys_nul(
+    input: *const c_char,
+    input_len: usize,
+    count: usize,
+) -> i64 {
+    if input.is_null() && input_len != 0 {
+        return -1;
+    }
+    if count == 0 {
+        return if input_len == 0 { 0 } else { -1 };
+    }
+    let bytes = if input_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(input.cast::<u8>(), input_len) }
+    };
+    let mut seen = 0usize;
+    let mut total = 0i64;
+    for part in bytes.split(|&b| b == 0) {
+        seen += 1;
+        let Some(keys) = extract_redis_db_keys(part) else {
+            return -1;
+        };
+        let Some(next) = total.checked_add(keys) else {
+            return -1;
+        };
+        total = next;
+    }
+    if seen != count {
+        return -1;
+    }
+    total
+}
+
+/// Computes `RedisMonitorService::parseRedisInfo` hit rate:
+/// `$totalOps = $hits + $misses; $totalOps > 0 ? round(($hits * 100) / $totalOps, 2) : 0.0`.
+/// Returns `-1.0` on integer overflow.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_redis_hit_rate(hits: i64, misses: i64) -> f64 {
+    let Some(total_ops) = hits.checked_add(misses) else {
+        return -1.0;
+    };
+    if total_ops <= 0 {
+        return 0.0;
+    }
+    let Some(scaled) = hits.checked_mul(100) else {
+        return -1.0;
+    };
+    php_round_2((scaled as f64) / (total_ops as f64))
+}
+
+/// Formats `RedisMonitorService::formatBytes(int $bytes): string`.
+/// Returns bytes written (`> 0`), `-(needed as isize)` (`<= -2`) when `out_cap` is too small,
+/// or `-1` on invalid arguments / out-of-range input (`|bytes| >= 2^52`).
+///
+/// # Safety
+/// `out_buf` must be writable for `out_cap` bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_redis_format_bytes(
+    bytes: i64,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if (out_buf.is_null() && out_cap != 0)
+        || out_cap > isize::MAX as usize
+        || bytes <= -(1i64 << 52)
+        || bytes >= (1i64 << 52)
+    {
+        return -1;
+    }
+    let mut out = unsafe { OutCursor::new(out_buf.cast::<u8>(), out_cap) };
+    let mut num_buf = [0u8; 24];
+    if bytes < 1024 {
+        if bytes < 0 {
+            out.push(b'-');
+            out.extend(write_u64_ascii((-bytes) as u64, &mut num_buf));
+        } else {
+            out.extend(write_u64_ascii(bytes as u64, &mut num_buf));
+        }
+        out.extend(b" B");
+        return out.finish();
+    }
+    let (divisor, unit): (f64, &[u8]) = if bytes >= 1_073_741_824 {
+        (1_073_741_824.0, b" GB")
+    } else if bytes >= 1_048_576 {
+        (1_048_576.0, b" MB")
+    } else {
+        (1_024.0, b" KB")
+    };
+    let val = (bytes as f64) / divisor;
+    let hundredths = (val * 100.0).round_ties_even() as u64;
+    let whole = hundredths / 100;
+    let rem = (hundredths % 100) as u8;
+    out.extend(write_u64_ascii(whole, &mut num_buf));
+    out.push(b'.');
+    out.push(b'0' + rem / 10);
+    out.push(b'0' + rem % 10);
+    out.extend(unit);
     out.finish()
 }
 
@@ -1843,6 +3132,114 @@ mod tests {
                 &out[..written as usize],
                 b"proxy_detect:ip:1d64d10fff2ff210518623b74a8c1696:indexer_ua"
             );
+        }
+    }
+
+    #[test]
+    fn tmux_socket_metrics_and_redis_parser_contracts() {
+        let mut out = [0u8; 128];
+        let line = b"ESTAB 0 0 10.0.0.2:41001 185.90.196.65:563";
+        unsafe {
+            let written = nntmux_tmux_extract_peer_endpoint(
+                line.as_ptr().cast(),
+                line.len(),
+                out.as_mut_ptr().cast(),
+                out.len(),
+            );
+            assert_eq!(written, 17);
+            assert_eq!(&out[..17], b"185.90.196.65:563");
+            assert_eq!(
+                nntmux_tmux_socket_line_has_peer_port(
+                    line.as_ptr().cast(),
+                    line.len(),
+                    b"563".as_ptr().cast(),
+                    3
+                ),
+                1
+            );
+            let addrs = b"185.90.196.65\0185.90.196.97";
+            assert_eq!(
+                nntmux_tmux_socket_line_matches_any_address_nul(
+                    line.as_ptr().cast(),
+                    line.len(),
+                    addrs.as_ptr().cast(),
+                    addrs.len(),
+                    2,
+                    b"563".as_ptr().cast(),
+                    3
+                ),
+                1
+            );
+
+            let snapshot = b"ESTAB 0 0 10.0.0.2:41001 185.90.196.65:563\nESTAB 0 0 10.0.0.2:41002 185.90.196.97:563\nTIME-WAIT 0 0 10.0.0.2:41004 85.12.62.251:563\nESTAB 0 0 10.0.0.2:41005 198.51.100.40:563\nCLOSE-WAIT 0 0 10.0.0.2:41007 198.51.100.41:563\n";
+            let other_addrs = b"198.51.100.40\0198.51.100.41";
+            let packed_primary = nntmux_tmux_count_usp_connections(
+                0,
+                b"563".as_ptr().cast(),
+                3,
+                b"563".as_ptr().cast(),
+                3,
+                addrs.as_ptr().cast(),
+                addrs.len(),
+                2,
+                other_addrs.as_ptr().cast(),
+                other_addrs.len(),
+                2,
+                snapshot.as_ptr().cast(),
+                snapshot.len(),
+            );
+            assert_eq!(packed_primary >> 32, 3);
+            assert_eq!(packed_primary & 0xFFFF_FFFF, 2);
+
+            let packed_alt = nntmux_tmux_count_usp_connections(
+                1,
+                b"563".as_ptr().cast(),
+                3,
+                b"563".as_ptr().cast(),
+                3,
+                other_addrs.as_ptr().cast(),
+                other_addrs.len(),
+                2,
+                addrs.as_ptr().cast(),
+                addrs.len(),
+                2,
+                snapshot.as_ptr().cast(),
+                snapshot.len(),
+            );
+            assert_eq!(packed_alt >> 32, 2);
+            assert_eq!(packed_alt & 0xFFFF_FFFF, 1);
+
+            let sz_len = nntmux_tmux_decode_size(1536.0, out.as_mut_ptr().cast(), out.len());
+            assert_eq!(&out[..sz_len as usize], b"1.5 KB");
+
+            let cpuinfo = b"processor\t: 0\nmodel name\t: AMD EPYC 7763\ncpu cores\t: 8\n\nprocessor\t: 1\n";
+            assert_eq!(
+                nntmux_metrics_parse_cpu_count(cpuinfo.as_ptr().cast(), cpuinfo.len()),
+                2
+            );
+            let info_len = nntmux_metrics_parse_cpu_info(
+                cpuinfo.as_ptr().cast(),
+                cpuinfo.len(),
+                out.as_mut_ptr().cast(),
+                out.len(),
+            );
+            assert_eq!(&out[..info_len as usize], b"8\02\0AMD EPYC 7763");
+
+            let meminfo = b"MemTotal:       32768000 kB\nMemFree:         4000000 kB\nMemAvailable:   16384000 kB\n";
+            let packed_mem = nntmux_metrics_parse_meminfo(meminfo.as_ptr().cast(), meminfo.len());
+            assert_eq!(packed_mem >> 40, 1563);
+            assert_eq!((packed_mem >> 18) & 0x3F_FFFF, 3125);
+            assert_eq!((packed_mem >> 1) & 0x1_FFFF, 5000);
+
+            let redis_dbs = b"keys=125430,expires=10\0keys=8420,expires=0\0keys=150,expires=1";
+            assert_eq!(
+                nntmux_redis_sum_db_keys_nul(redis_dbs.as_ptr().cast(), redis_dbs.len(), 3),
+                134_000
+            );
+            assert_eq!(nntmux_redis_hit_rate(40_000_000, 5_000_000), 88.89);
+
+            let fb_len = nntmux_redis_format_bytes(1_572_864, out.as_mut_ptr().cast(), out.len());
+            assert_eq!(&out[..fb_len as usize], b"1.50 MB");
         }
     }
 }

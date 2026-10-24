@@ -5,10 +5,35 @@ declare(strict_types=1);
 namespace App\Services;
 
 use App\Models\SystemMetric;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\Log;
+use Throwable;
 
 class SystemMetricsService
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_metrics_parse_cpu_count(const char *cpuinfo, size_t cpuinfo_len);
+        int64_t nntmux_metrics_parse_meminfo(const char *meminfo, size_t meminfo_len);
+        ssize_t nntmux_metrics_parse_cpu_info(const char *cpuinfo, size_t cpuinfo_len, char *out_buf, size_t out_cap);
+        C;
+
+    private static bool $useRustFfi = true;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
     /**
      * Collect and store current system metrics
      */
@@ -171,6 +196,16 @@ class SystemMetricsService
         return 0;
     }
 
+    private static function ffi(): ?FFI
+    {
+        if (! self::$ffiResolved) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('irc', self::FFI_CDEF);
+            self::$ffiResolved = true;
+        }
+
+        return self::$ffi;
+    }
+
     /**
      * Get number of CPU cores
      */
@@ -186,15 +221,56 @@ class SystemMetricsService
                 }
             } else {
                 $cpuinfo = file_get_contents('/proc/cpuinfo');
-                preg_match_all('/^processor/m', $cpuinfo, $matches);
+                if ($cpuinfo === false) {
+                    return 1;
+                }
 
-                return count($matches[0]) ?: 1;
+                return $this->parseCpuCount($cpuinfo);
             }
         } catch (\Exception $e) {
             return 1;
         }
 
         return 1;
+    }
+
+    public function parseCpuCount(string $cpuinfo): int
+    {
+        if (self::$useRustFfi) {
+            $ffi = self::$ffiResolved ? self::$ffi : self::ffi();
+            if ($ffi !== null) {
+                // @phpstan-ignore method.notFound
+                $res = $ffi->nntmux_metrics_parse_cpu_count($cpuinfo, strlen($cpuinfo));
+                if (is_int($res) && $res >= 1) {
+                    return $res;
+                }
+            }
+        }
+
+        return $this->parseCpuCountPhp($cpuinfo);
+    }
+
+    public static function parseCpuCountNative(string $cpuinfo): ?int
+    {
+        $ffi = self::$ffiResolved ? self::$ffi : self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $res = $ffi->nntmux_metrics_parse_cpu_count($cpuinfo, strlen($cpuinfo));
+
+            return is_int($res) && $res >= 1 ? $res : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private function parseCpuCountPhp(string $cpuinfo): int
+    {
+        preg_match_all('/^processor/m', $cpuinfo, $matches);
+
+        return count($matches[0]) ?: 1;
     }
 
     /**
@@ -225,23 +301,80 @@ class SystemMetricsService
                 }
             } else {
                 $meminfo = file_get_contents('/proc/meminfo');
-                preg_match('/MemTotal:\s+(\d+)/', $meminfo, $total);
-                preg_match('/MemAvailable:\s+(\d+)/', $meminfo, $available);
-
-                if (isset($total[1]) && isset($available[1])) {
-                    $totalKb = (float) $total[1];
-                    $availableKb = (float) $available[1];
-                    $usedKb = $totalKb - $availableKb;
-
-                    return [
-                        'used' => round($usedKb / 1024 / 1024, 2),
-                        'total' => round($totalKb / 1024 / 1024, 2),
-                        'percentage' => round(($usedKb / $totalKb) * 100, 2),
-                    ];
+                if ($meminfo !== false) {
+                    return $this->parseMeminfo($meminfo);
                 }
             }
         } catch (\Exception $e) {
             Log::warning('Could not get RAM usage: '.$e->getMessage());
+        }
+
+        return [
+            'used' => 0,
+            'total' => 0,
+            'percentage' => 0,
+        ];
+    }
+
+    /**
+     * @return array{used: int|float, total: int|float, percentage: int|float}
+     */
+    public function parseMeminfo(string $meminfo): array
+    {
+        return $this->parseMeminfoPhp($meminfo);
+    }
+
+    /**
+     * @return array{used: int|float, total: int|float, percentage: int|float}|null
+     */
+    public static function parseMeminfoNative(string $meminfo): ?array
+    {
+        $ffi = self::$ffiResolved ? self::$ffi : self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $packed = $ffi->nntmux_metrics_parse_meminfo($meminfo, strlen($meminfo));
+            if (! is_int($packed) || $packed < 0) {
+                return null;
+            }
+            if ($packed === 0) {
+                return [
+                    'used' => 0,
+                    'total' => 0,
+                    'percentage' => 0,
+                ];
+            }
+
+            return [
+                'used' => ($packed >> 40) / 100.0,
+                'total' => (($packed >> 18) & 0x3FFFFF) / 100.0,
+                'percentage' => (($packed >> 1) & 0x1FFFF) / 100.0,
+            ];
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @return array{used: int|float, total: int|float, percentage: int|float}
+     */
+    private function parseMeminfoPhp(string $meminfo): array
+    {
+        preg_match('/MemTotal:\s+(\d+)/', $meminfo, $total);
+        preg_match('/MemAvailable:\s+(\d+)/', $meminfo, $available);
+
+        if (isset($total[1]) && isset($available[1])) {
+            $totalKb = (float) $total[1];
+            $availableKb = (float) $available[1];
+            $usedKb = $totalKb - $availableKb;
+
+            return [
+                'used' => round($usedKb / 1024 / 1024, 2),
+                'total' => round($totalKb / 1024 / 1024, 2),
+                'percentage' => round(($usedKb / $totalKb) * 100, 2),
+            ];
         }
 
         return [
@@ -287,28 +420,106 @@ class SystemMetricsService
                 }
             } else {
                 $cpuinfo = file_get_contents('/proc/cpuinfo');
-
-                preg_match_all('/^cpu cores\s*:\s*(\d+)/m', $cpuinfo, $coresMatches);
-                if (! empty($coresMatches[1])) {
-                    $info['cores'] = (int) $coresMatches[1][0];
-                }
-
-                preg_match_all('/^processor/m', $cpuinfo, $processorMatches);
-                $info['threads'] = count($processorMatches[0]) ?: 0;
-
-                preg_match('/^model name\s*:\s*(.+)$/m', $cpuinfo, $modelMatches);
-                if (! empty($modelMatches[1])) {
-                    $info['model'] = trim($modelMatches[1]);
-                }
-
-                if ($info['cores'] === 0) {
-                    preg_match_all('/^physical id\s*:\s*(\d+)/m', $cpuinfo, $physicalMatches);
-                    $uniquePhysical = ! empty($physicalMatches[1]) ? count(array_unique($physicalMatches[1])) : 1;
-                    $info['cores'] = (int) ($info['threads'] / $uniquePhysical);
+                if ($cpuinfo !== false) {
+                    return $this->parseCpuInfo($cpuinfo);
                 }
             }
         } catch (\Exception $e) {
             Log::warning('Could not get CPU info: '.$e->getMessage());
+        }
+
+        return $info;
+    }
+
+    /**
+     * @return array{cores: int, threads: int, model: string}
+     */
+    public function parseCpuInfo(string $cpuinfo): array
+    {
+        if (self::$useRustFfi) {
+            $native = self::parseCpuInfoNative($cpuinfo);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->parseCpuInfoPhp($cpuinfo);
+    }
+
+    /**
+     * @return array{cores: int, threads: int, model: string}|null
+     */
+    public static function parseCpuInfoNative(string $cpuinfo): ?array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, 512, $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_metrics_parse_cpu_info($cpuinfo, strlen($cpuinfo), $scratch, $cap);
+            if (! is_int($written) || $written === -1) {
+                return null;
+            }
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_metrics_parse_cpu_info($cpuinfo, strlen($cpuinfo), $scratch, $cap);
+                if (! is_int($written) || $written <= 0) {
+                    return null;
+                }
+            }
+            $parts = explode("\0", FFI::string($scratch, $written), 3);
+            if (count($parts) !== 3) {
+                return null;
+            }
+
+            return [
+                'cores' => (int) $parts[0],
+                'threads' => (int) $parts[1],
+                'model' => $parts[2],
+            ];
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @return array{cores: int, threads: int, model: string}
+     */
+    private function parseCpuInfoPhp(string $cpuinfo): array
+    {
+        $info = [
+            'cores' => 0,
+            'threads' => 0,
+            'model' => 'Unknown',
+        ];
+
+        preg_match_all('/^cpu cores\s*:\s*(\d+)/m', $cpuinfo, $coresMatches);
+        if (! empty($coresMatches[1])) {
+            $info['cores'] = (int) $coresMatches[1][0];
+        }
+
+        preg_match_all('/^processor/m', $cpuinfo, $processorMatches);
+        $info['threads'] = count($processorMatches[0]) ?: 0;
+
+        preg_match('/^model name\s*:\s*(.+)$/m', $cpuinfo, $modelMatches);
+        if (! empty($modelMatches[1])) {
+            $info['model'] = trim($modelMatches[1]);
+        }
+
+        if ($info['cores'] === 0) {
+            preg_match_all('/^physical id\s*:\s*(\d+)/m', $cpuinfo, $physicalMatches);
+            $uniquePhysical = ! empty($physicalMatches[1]) ? count(array_unique($physicalMatches[1])) : 1;
+            $info['cores'] = (int) ($info['threads'] / $uniquePhysical);
         }
 
         return $info;
