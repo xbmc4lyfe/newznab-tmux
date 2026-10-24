@@ -13,11 +13,14 @@ use App\Services\TvProcessing\Providers\TmdbProvider;
 use App\Services\TvProcessing\Providers\TraktProvider;
 use App\Services\TvProcessing\Providers\TvdbProvider;
 use App\Services\TvProcessing\Providers\TvMazeProvider;
+use App\Support\RustPipelineLibrary;
 use DariusIII\TVMaze\TVShow;
+use FFI;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use InvalidArgumentException;
 use RuntimeException;
+use Throwable;
 
 /**
  * Resolve a TV show by external ID (tvdb, tvmaze, tmdb, trakt, imdb) and
@@ -30,6 +33,43 @@ use RuntimeException;
 class TvShowAdder
 {
     public const SUPPORTED_SOURCES = ['tvdb', 'tvmaze', 'tmdb', 'trakt', 'imdb'];
+
+    public const string FFI_CDEF = <<<'C'
+        int64_t nntmux_tv_show_adder_normalize_id(const char *source, size_t source_len, const char *id, size_t id_len);
+        int32_t nntmux_tv_show_adder_video_column(const char *source, size_t source_len);
+        C;
+
+    /** Column order returned by nntmux_tv_show_adder_video_column(). */
+    private const array NATIVE_VIDEO_COLUMNS = ['tvdb', 'tvmaze', 'tmdb', 'trakt', 'imdb'];
+
+    private const string INVALID_IMDB_MESSAGE = 'IMDB ID must look like "tt1234567" or its numeric part.';
+
+    /** Null selects the benchmark-qualified production default (PHP; see RustTvShowAdderAndMetadataParityTest). */
+    private static ?bool $useRustFfi = null;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(?bool $use = true): void
+    {
+        self::$useRustFfi = $use;
+        if ($use === null) {
+            self::$ffi = null;
+        }
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('metadata', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
 
     /**
      * Resolve + persist. Returns metadata about the operation.
@@ -135,7 +175,7 @@ class TvShowAdder
     {
         try {
             $extended = $provider->seriesExtended($tvdbId);
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::warning('TvShowAdder: TVDB lookup failed', ['id' => $tvdbId, 'error' => $e->getMessage()]);
 
             return null;
@@ -197,7 +237,7 @@ class TvShowAdder
         try {
             $client = app(TvMazeClient::class);
             $show = $kind === 'tvmaze' ? $client->showById((int) $id) : $client->lookup($kind, $id);
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::warning('TvShowAdder: TVMaze lookup failed', ['id' => $id, 'kind' => $kind, 'error' => $e->getMessage()]);
 
             return null;
@@ -339,7 +379,7 @@ class TvShowAdder
                     }
                 }
             }
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::info('TvShowAdder: IMDB→TMDB preview failed', ['imdb' => $imdbId, 'error' => $e->getMessage()]);
         }
 
@@ -359,7 +399,7 @@ class TvShowAdder
                     }
                 }
             }
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::info('TvShowAdder: IMDB→Trakt preview failed', ['imdb' => $imdbId, 'error' => $e->getMessage()]);
         }
 
@@ -370,7 +410,7 @@ class TvShowAdder
             if ($show !== null) {
                 return $provider->formatShowInfo($show);
             }
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::info('TvShowAdder: IMDB→TVMaze preview failed', ['imdb' => $imdbId, 'error' => $e->getMessage()]);
         }
 
@@ -394,7 +434,7 @@ class TvShowAdder
                     }
                 }
             }
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::info('TvShowAdder: IMDB→TMDB add failed', ['imdb' => $imdbId, 'error' => $e->getMessage()]);
         }
 
@@ -409,7 +449,7 @@ class TvShowAdder
                     return $this->addViaTrakt((int) $firstResult['show']['ids']['trakt'], $type);
                 }
             }
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::info('TvShowAdder: IMDB→Trakt add failed', ['imdb' => $imdbId, 'error' => $e->getMessage()]);
         }
 
@@ -464,7 +504,7 @@ class TvShowAdder
         if ($videoId > 0) {
             try {
                 $provider->getPoster($videoId);
-            } catch (\Throwable $e) {
+            } catch (Throwable $e) {
                 Log::info('TvShowAdder: poster fetch failed', ['videoId' => $videoId, 'error' => $e->getMessage()]);
             }
         }
@@ -484,6 +524,33 @@ class TvShowAdder
 
     private function videoColumnForSource(string $source): string
     {
+        return self::usesRustFfi()
+            ? $this->videoColumnForSourceNative($source)
+            : $this->videoColumnForSourcePhp($source);
+    }
+
+    public function videoColumnForSourceNative(string $source): string
+    {
+        if (($ffi = self::ffi()) === null) {
+            return $this->videoColumnForSourcePhp($source);
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $index = $ffi->nntmux_tv_show_adder_video_column($source, \strlen($source));
+        } catch (Throwable) {
+            return $this->videoColumnForSourcePhp($source);
+        }
+        if ($index === -2) {
+            throw new InvalidArgumentException("Unsupported source: {$source}");
+        }
+
+        return \is_int($index) && isset(self::NATIVE_VIDEO_COLUMNS[$index])
+            ? self::NATIVE_VIDEO_COLUMNS[$index]
+            : $this->videoColumnForSourcePhp($source);
+    }
+
+    public function videoColumnForSourcePhp(string $source): string
+    {
         return match ($source) {
             'tvdb' => 'tvdb',
             'tvmaze' => 'tvmaze',
@@ -496,6 +563,37 @@ class TvShowAdder
 
     private function normalizeId(string $source, string $id): string
     {
+        return self::usesRustFfi()
+            ? $this->normalizeIdNative($source, $id)
+            : $this->normalizeIdPhp($source, $id);
+    }
+
+    public function normalizeIdNative(string $source, string $id): string
+    {
+        if (($ffi = self::ffi()) === null) {
+            return $this->normalizeIdPhp($source, $id);
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $span = $ffi->nntmux_tv_show_adder_normalize_id($source, \strlen($source), $id, \strlen($id));
+        } catch (Throwable) {
+            return $this->normalizeIdPhp($source, $id);
+        }
+        if ($span === -2) {
+            throw new InvalidArgumentException(self::INVALID_IMDB_MESSAGE);
+        }
+        if ($span === -3) {
+            throw new InvalidArgumentException(strtoupper($source).' ID must be a positive integer.');
+        }
+        if (! \is_int($span) || $span < 0) {
+            return $this->normalizeIdPhp($source, $id);
+        }
+
+        return substr($id, $span >> 32, $span & 0xFFFFFFFF);
+    }
+
+    public function normalizeIdPhp(string $source, string $id): string
+    {
         $id = trim($id);
         if ($source === 'imdb') {
             // Accept "tt0944947" or "0944947" — store/lookup as the numeric portion.
@@ -505,7 +603,7 @@ class TvShowAdder
             if (ctype_digit($id)) {
                 return $id;
             }
-            throw new InvalidArgumentException('IMDB ID must look like "tt1234567" or its numeric part.');
+            throw new InvalidArgumentException(self::INVALID_IMDB_MESSAGE);
         }
 
         if (! ctype_digit($id) || (int) $id <= 0) {
