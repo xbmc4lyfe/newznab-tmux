@@ -11496,7 +11496,9 @@ pub mod categorize_metrics_and_status {
         catch_unwind(AssertUnwindSafe(|| {
             if is_no_match > 1
                 || out_category_id.is_null()
+                || !out_category_id.is_aligned()
                 || out_confidence.is_null()
+                || !out_confidence.is_aligned()
                 || out_cap > isize::MAX as usize
                 || (out_cap > 0 && out_buf.is_null())
             {
@@ -11523,7 +11525,8 @@ pub mod categorize_metrics_and_status {
 
             match cursor.pos {
                 n if n <= cursor.buf.len() => n as isize,
-                n => -(n.max(2) as isize),
+                n if n <= isize::MAX as usize => -(n.max(2) as isize),
+                _ => DECLINED,
             }
         }))
         .unwrap_or(DECLINED)
@@ -11579,6 +11582,9 @@ pub mod categorize_metrics_and_status {
     ) -> isize {
         catch_unwind(AssertUnwindSafe(|| {
             if !out_invalid_index.is_null() {
+                if !out_invalid_index.is_aligned() {
+                    return DECLINED;
+                }
                 unsafe {
                     *out_invalid_index = usize::MAX;
                 }
@@ -11632,7 +11638,8 @@ pub mod categorize_metrics_and_status {
 
             match cursor.pos {
                 n if n <= cursor.buf.len() => n as isize,
-                n => -(n.max(4) as isize),
+                n if n <= isize::MAX as usize => -(n.max(4) as isize),
+                _ => DECLINED,
             }
         }))
         .unwrap_or(DECLINED)
@@ -11680,8 +11687,11 @@ pub mod categorize_metrics_and_status {
     ) -> isize {
         catch_unwind(AssertUnwindSafe(|| {
             if out_scalar_indices.is_null()
+                || !out_scalar_indices.is_aligned()
                 || out_table_indices.is_null()
+                || !out_table_indices.is_aligned()
                 || out_category_indices.is_null()
+                || !out_category_indices.is_aligned()
                 || count > i32::MAX as usize
                 || out_cap > isize::MAX as usize
                 || (out_cap > 0 && out_buf.is_null())
@@ -11761,7 +11771,8 @@ pub mod categorize_metrics_and_status {
 
             match cursor.pos {
                 n if n <= cursor.buf.len() => n as isize,
-                n => -(n.max(4) as isize),
+                n if n <= isize::MAX as usize => -(n.max(4) as isize),
+                _ => DECLINED,
             }
         }))
         .unwrap_or(DECLINED)
@@ -11843,7 +11854,7 @@ pub mod categorize_metrics_and_status {
         out_civil_epoch: *mut i64,
     ) -> i32 {
         catch_unwind(AssertUnwindSafe(|| {
-            if out_civil_epoch.is_null() {
+            if out_civil_epoch.is_null() || !out_civil_epoch.is_aligned() {
                 return -1;
             }
             let Some(raw) = (unsafe { input(input_ptr, input_len) }) else {
@@ -11873,7 +11884,7 @@ pub mod categorize_metrics_and_status {
     ) -> i64 {
         catch_unwind(AssertUnwindSafe(|| {
             if count > (isize::MAX as usize) / std::mem::size_of::<i64>()
-                || (count > 0 && offsets_ptr.is_null())
+                || (count > 0 && (offsets_ptr.is_null() || !offsets_ptr.is_aligned()))
             {
                 return -1;
             }
@@ -11929,8 +11940,9 @@ pub mod categorize_metrics_and_status {
     ) -> i32 {
         catch_unwind(AssertUnwindSafe(|| {
             if out_timestamp.is_null()
+                || !out_timestamp.is_aligned()
                 || count > (isize::MAX as usize) / std::mem::size_of::<i64>()
-                || (count > 0 && candidates_ptr.is_null())
+                || (count > 0 && (candidates_ptr.is_null() || !candidates_ptr.is_aligned()))
             {
                 return -1;
             }
@@ -12026,14 +12038,14 @@ pub mod categorize_metrics_and_status {
             let max_pairs = (isize::MAX as usize) / (2 * std::mem::size_of::<i64>());
             if pair_count > max_pairs
                 || out_pair_cap > max_pairs
-                || (out_pair_cap > 0 && out_pairs_ptr.is_null())
+                || (out_pair_cap > 0 && (out_pairs_ptr.is_null() || !out_pairs_ptr.is_aligned()))
             {
                 return DECLINED;
             }
             if pair_count == 0 {
                 return 0;
             }
-            if flat_pairs_ptr.is_null() {
+            if flat_pairs_ptr.is_null() || !flat_pairs_ptr.is_aligned() {
                 return DECLINED;
             }
 
@@ -12370,6 +12382,177 @@ pub mod categorize_metrics_and_status {
             assert_eq!(
                 unsafe { nntmux_site_status_map_incident_impact(b"critical".as_ptr(), 8) },
                 4
+            );
+        }
+
+        #[test]
+        fn unaligned_pointers_are_rejected_across_ffi_entrypoints() {
+            let mut raw = [0u8; 256];
+            let unaligned_i64 = unsafe { raw.as_mut_ptr().add(1).cast::<i64>() };
+            let unaligned_f64 = unsafe { raw.as_mut_ptr().add(1).cast::<f64>() };
+            let unaligned_usize = unsafe { raw.as_mut_ptr().add(1).cast::<usize>() };
+            let unaligned_i32 = unsafe { raw.as_mut_ptr().add(1).cast::<i32>() };
+            let mut aligned_i64 = 0i64;
+            let mut aligned_f64 = 0.0f64;
+            let mut aligned_i32_10 = [0i32; 10];
+            let mut aligned_i32_4 = [0i32; 4];
+            let mut aligned_i32_8 = [0i32; 8];
+            let mut buf = [0u8; 64];
+
+            assert_eq!(
+                unsafe {
+                    nntmux_categorize_pipe_format_result_meta(
+                        1,
+                        5040,
+                        0.9,
+                        std::ptr::null(),
+                        0,
+                        unaligned_i64,
+                        &mut aligned_f64,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_categorize_pipe_format_result_meta(
+                        1,
+                        5040,
+                        0.9,
+                        std::ptr::null(),
+                        0,
+                        &mut aligned_i64,
+                        unaligned_f64,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+
+            let pairs = b"server\0primary";
+            assert_eq!(
+                unsafe {
+                    nntmux_prometheus_normalize_labels_nul(
+                        pairs.as_ptr(),
+                        pairs.len(),
+                        1,
+                        unaligned_usize,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+
+            let keys = b"tv";
+            assert_eq!(
+                unsafe {
+                    nntmux_tmux_collector_classify_count_keys_nul(
+                        keys.as_ptr(),
+                        keys.len(),
+                        1,
+                        unaligned_i32,
+                        aligned_i32_4.as_mut_ptr(),
+                        aligned_i32_8.as_mut_ptr(),
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_tmux_collector_classify_count_keys_nul(
+                        keys.as_ptr(),
+                        keys.len(),
+                        1,
+                        aligned_i32_10.as_mut_ptr(),
+                        unaligned_i32,
+                        aligned_i32_8.as_mut_ptr(),
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_tmux_collector_classify_count_keys_nul(
+                        keys.as_ptr(),
+                        keys.len(),
+                        1,
+                        aligned_i32_10.as_mut_ptr(),
+                        aligned_i32_4.as_mut_ptr(),
+                        unaligned_i32,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+
+            assert_eq!(
+                unsafe {
+                    nntmux_downtime_parse_civil_datetime(
+                        b"2026-10-11 12:00:00".as_ptr(),
+                        19,
+                        unaligned_i64,
+                    )
+                },
+                -1
+            );
+
+            assert_eq!(
+                unsafe { nntmux_downtime_largest_offset_change(unaligned_i64.cast_const(), 2) },
+                -1
+            );
+
+            let cands = [1_000i64, 2_000i64];
+            assert_eq!(
+                unsafe {
+                    nntmux_downtime_select_timestamp_not_after(
+                        1_000,
+                        2_000,
+                        unaligned_i64.cast_const(),
+                        2,
+                        &mut aligned_i64,
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_downtime_select_timestamp_not_after(
+                        1_000,
+                        2_000,
+                        cands.as_ptr(),
+                        2,
+                        unaligned_i64,
+                    )
+                },
+                -1
+            );
+
+            let mut out_pairs = [0i64; 4];
+            assert_eq!(
+                unsafe {
+                    nntmux_site_status_merge_intervals(
+                        unaligned_i64.cast_const(),
+                        1,
+                        out_pairs.as_mut_ptr(),
+                        2,
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_site_status_merge_intervals(cands.as_ptr(), 1, unaligned_i64, 2)
+                },
+                -1
             );
         }
     }
