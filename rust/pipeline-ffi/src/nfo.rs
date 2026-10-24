@@ -12144,3 +12144,388 @@ mod nzb_nfo_candidate_tests {
         assert_eq!(&buf[42..46], b"id@x");
     }
 }
+
+// Wave 12 verification helpers. Storage names, publication lock keys and filename
+// limits intentionally follow the existing PHP contract, not a new wire format.
+unsafe fn verification_input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+    if !yenc_valid_range(ptr as usize, len) {
+        return None;
+    }
+    Some(unsafe { slice::from_raw_parts(ptr, len) })
+}
+
+fn verification_manifest_name(name: &[u8]) -> bool {
+    name.len() == 72
+        && name.ends_with(b".json.gz")
+        && name[..64]
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+}
+
+/// # Safety
+/// Input must be readable and output writable for their supplied lengths,
+/// with no overlap. Null output is allowed only with zero capacity.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_verification_manifest_identity(
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    let Some(data) = (unsafe { verification_input(input, len) }) else {
+        return -1;
+    };
+    if !(out.is_null() && cap == 0 || yenc_valid_range(out as usize, cap))
+        || yenc_ranges_overlap(input as usize, len, out as usize, cap)
+    {
+        return -1;
+    }
+    let mut cursor = unsafe { OutCursor::new(out, cap) };
+    cursor.extend(&sha256_fast_hex(data));
+    cursor.finish()
+}
+
+/// # Safety
+/// The input must be readable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_verification_manifest_name(input: *const u8, len: usize) -> i32 {
+    unsafe { verification_input(input, len) }
+        .map(|name| i32::from(verification_manifest_name(name)))
+        .unwrap_or(-1)
+}
+
+/// Gzip inflation stays in PHP's zlib; Rust checks the header and decoded digest.
+/// # Safety
+/// All three inputs must be readable for their respective lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_verification_manifest_body(
+    name: *const u8,
+    name_len: usize,
+    body: *const u8,
+    body_len: usize,
+    json: *const u8,
+    json_len: usize,
+) -> i32 {
+    let (Some(name), Some(body), Some(json)) = (unsafe {
+        (
+            verification_input(name, name_len),
+            verification_input(body, body_len),
+            verification_input(json, json_len),
+        )
+    }) else {
+        return -1;
+    };
+    i32::from(
+        verification_manifest_name(name)
+            && body.starts_with(b"\x1f\x8b")
+            && sha256_fast_hex(json) == name[..64],
+    )
+}
+
+/// Compare the actual inflater output and complete-member accounting. A trailer
+/// CRC or ISIZE alone cannot establish that a gzip member consumed every byte.
+/// # Safety
+/// Both input buffers must be readable for their supplied lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_verification_manifest_consumes(
+    body_len: usize,
+    json: *const u8,
+    json_len: usize,
+    inflated: *const u8,
+    inflated_len: usize,
+    consumed: usize,
+    status: i32,
+) -> i32 {
+    let (Some(json), Some(inflated)) = (unsafe {
+        (
+            verification_input(json, json_len),
+            verification_input(inflated, inflated_len),
+        )
+    }) else {
+        return -1;
+    };
+    i32::from(status == 1 && consumed == body_len && json == inflated)
+}
+
+/// Emit the existing ordered PHP key list, including duplicates and the size
+/// key. Names have already gone through PHP Str::ascii's collation tables.
+/// # Safety
+/// Inputs must be readable and output writable, disjoint from all inputs.
+/// A null output is allowed only with zero capacity.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_verification_publication_keys(
+    size: i64,
+    predb: i64,
+    fingerprint: *const u8,
+    fingerprint_len: usize,
+    name: *const u8,
+    name_len: usize,
+    search: *const u8,
+    search_len: usize,
+    has_name: u8,
+    has_search: u8,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    let (Some(fp), Some(name_data), Some(search_data)) = (unsafe {
+        (
+            verification_input(fingerprint, fingerprint_len),
+            verification_input(name, name_len),
+            verification_input(search, search_len),
+        )
+    }) else {
+        return -1;
+    };
+    if !(out.is_null() && cap == 0 || yenc_valid_range(out as usize, cap))
+        || [
+            (fingerprint, fingerprint_len),
+            (name, name_len),
+            (search, search_len),
+        ]
+        .iter()
+        .any(|&(ptr, len)| yenc_ranges_overlap(ptr as usize, len, out as usize, cap))
+    {
+        return -1;
+    }
+    let mut keys = Vec::with_capacity(5);
+    if !fp.is_empty() {
+        let mut key = b"fingerprint:".to_vec();
+        key.extend(fp.iter().map(u8::to_ascii_lowercase));
+        keys.push(key);
+    }
+    if predb > 0 {
+        keys.push(format!("predb:{predb}").into_bytes());
+    }
+    if has_search != 0 {
+        keys.push([b"name:", search_data].concat());
+    }
+    if has_name != 0 {
+        keys.push([b"name:", name_data].concat());
+    }
+    if size > 0 {
+        keys.push(format!("size:{size}").into_bytes());
+    }
+    let mut cursor = unsafe { OutCursor::new(out, cap) };
+    cursor.extend(b"a:");
+    write_usize_decimal(&mut cursor, keys.len());
+    cursor.extend(b":{");
+    for (index, key) in keys.iter().enumerate() {
+        cursor.extend(b"i:");
+        write_usize_decimal(&mut cursor, index);
+        cursor.extend(b";");
+        write_yenc_serialized_string(&mut cursor, key, false);
+    }
+    cursor.push(b'}');
+    cursor.finish()
+}
+
+/// # Safety
+/// Input must be readable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_verification_publication_stripe(
+    input: *const u8,
+    len: usize,
+) -> i32 {
+    unsafe { verification_input(input, len) }
+        .map(|key| (crc32_ieee(key) % 1024) as i32)
+        .unwrap_or(-1)
+}
+
+fn verification_article_framing(raw: &[u8]) -> i32 {
+    let Some(frame) = parse_yenc_article_frame(raw) else {
+        return -1;
+    };
+    // PHP associative arrays keep the last duplicate field.
+    let field =
+        |fields: &[(Vec<u8>, Vec<u8>)], key: &[u8]| fields.iter().rposition(|(k, _)| k == key);
+    let get = |fields: &[(Vec<u8>, Vec<u8>)], key: &[u8]| {
+        field(fields, key).map(|index| fields[index].1.clone())
+    };
+    let name = get(&frame.header, b"name").unwrap_or_default();
+    if name.is_empty()
+        || name.len() > 200
+        || matches!(name[0], b'.' | b'-')
+        || std::str::from_utf8(&name).is_err()
+        || name
+            .iter()
+            .any(|b| *b <= 31 || matches!(b, 127 | b'/' | b'\\'))
+    {
+        return 1;
+    }
+    let size = get(&frame.header, b"size").unwrap_or_default();
+    let part = get(&frame.header, b"part").unwrap_or_else(|| b"1".to_vec());
+    let begin = frame
+        .part
+        .as_ref()
+        .and_then(|p| get(p, b"begin"))
+        .unwrap_or_else(|| b"1".to_vec());
+    let total = get(&frame.header, b"total");
+    let number = |bytes: &[u8]| -> Option<u64> {
+        if bytes.is_empty() || bytes.len() > 18 || !bytes.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let value = bytes.iter().fold(0u64, |n, b| n * 10 + u64::from(b - b'0'));
+        (value > 0).then_some(value)
+    };
+    if [&size, &part, &begin].iter().any(|v| number(v).is_none())
+        || total.as_ref().is_some_and(|v| number(v).is_none())
+    {
+        return 2;
+    }
+    if total.is_some_and(|v| number(&part) > number(&v)) {
+        return 3;
+    }
+    if field(
+        &frame.trailer,
+        if frame.part.is_some() {
+            b"pcrc32"
+        } else {
+            b"crc32"
+        },
+    )
+    .is_none()
+    {
+        return 4;
+    }
+    0
+}
+
+/// Framing checks precede the unchanged strict PHP decoder's range/CRC checks.
+/// # Safety
+/// Input must be readable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_verification_article_framing(input: *const u8, len: usize) -> i32 {
+    unsafe { verification_input(input, len) }
+        .map(verification_article_framing)
+        .unwrap_or(-1)
+}
+
+fn verification_subject_par2(subject: &[u8]) -> bool {
+    subject.windows(5).enumerate().any(|(offset, token)| {
+        token.eq_ignore_ascii_case(b".par2")
+            && subject
+                .get(offset + 5)
+                .is_none_or(|b| matches!(b, b'"' | b'\'' | b' ' | b'\t' | b'\n' | b'\r' | 11 | 12))
+    })
+}
+
+/// Packed strings are u32-LE byte length followed by bytes. Mode 0 is all PAR2
+/// filenames, mode 1 is any subject without the existing PAR2 marker pattern.
+/// # Safety
+/// Input must be readable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_verification_collection_inspect(
+    input: *const u8,
+    len: usize,
+    mode: u8,
+) -> i32 {
+    let Some(mut packed) = (unsafe { verification_input(input, len) }) else {
+        return -1;
+    };
+    if mode > 1 {
+        return -1;
+    }
+    let mut result = mode == 0;
+    while !packed.is_empty() {
+        let Some(length) = packed.get(..4) else {
+            return -1;
+        };
+        let length = u32::from_le_bytes(length.try_into().unwrap()) as usize;
+        packed = &packed[4..];
+        let Some(value) = packed.get(..length) else {
+            return -1;
+        };
+        // Locale-specific PCRE tables may recognize non-ASCII whitespace. Let
+        // PHP retain that contract instead of guessing a table in Rust.
+        if mode == 1 && !value.is_ascii() {
+            return -1;
+        }
+        let parity = if mode == 0 {
+            value.len() >= 5 && value[value.len() - 5..].eq_ignore_ascii_case(b".par2")
+        } else {
+            verification_subject_par2(value)
+        };
+        if mode == 0 {
+            result &= parity;
+        } else {
+            result |= !parity;
+        }
+        packed = &packed[length..];
+    }
+    i32::from(result)
+}
+
+#[cfg(test)]
+mod verification_manifest_tests {
+    use super::*;
+
+    #[test]
+    fn names_digest_and_capacity_are_exact() {
+        assert!(verification_manifest_name(
+            &[b"a".repeat(64), b".json.gz".to_vec()].concat()
+        ));
+        assert!(!verification_manifest_name(
+            &[b"A".repeat(64), b".json.gz".to_vec()].concat()
+        ));
+        assert!(!verification_manifest_name(
+            &[b"a".repeat(64), b".json.gz\n".to_vec()].concat()
+        ));
+        let mut out = [0u8; 64];
+        assert_eq!(
+            unsafe {
+                nntmux_verification_manifest_identity(b"abc".as_ptr(), 3, out.as_mut_ptr(), 63)
+            },
+            -64
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_verification_manifest_identity(b"abc".as_ptr(), 3, out.as_mut_ptr(), 64)
+            },
+            64
+        );
+        assert_eq!(
+            &out,
+            b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_verification_manifest_identity(std::ptr::null(), 1, out.as_mut_ptr(), 64)
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn collection_wire_rejects_truncation_and_preserves_boundaries() {
+        for bad in [&b"\x01"[..], &b"\x08\0\0\0abc"[..]] {
+            assert_eq!(
+                unsafe { nntmux_verification_collection_inspect(bad.as_ptr(), bad.len(), 0) },
+                -1
+            );
+        }
+        assert!(verification_subject_par2(
+            b"[1/2] \"file.VOL001+02.PAR2\" yEnc"
+        ));
+        assert!(!verification_subject_par2(b"file.par2.exe"));
+        assert!(verification_subject_par2(b"file.par2\n"));
+        assert!(!verification_subject_par2(b"file.par2\0"));
+    }
+
+    #[test]
+    fn framing_keeps_filename_and_dimension_limits() {
+        let valid = b"=ybegin line=128 size=4 part=1 total=2 name=test.bin\r\n=ypart begin=1 end=4\r\n*+,-\r\n=yend size=4 pcrc32=9b0d08f1";
+        assert_eq!(verification_article_framing(valid), 0);
+        let invalid = String::from_utf8(valid.to_vec())
+            .unwrap()
+            .replace("total=2", "total=0");
+        assert_eq!(verification_article_framing(invalid.as_bytes()), 2);
+        let invalid = String::from_utf8(valid.to_vec())
+            .unwrap()
+            .replace("part=1", "part=3");
+        assert_eq!(verification_article_framing(invalid.as_bytes()), 3);
+        let invalid = String::from_utf8(valid.to_vec())
+            .unwrap()
+            .replace("test.bin", "../test.bin");
+        assert_eq!(verification_article_framing(invalid.as_bytes()), 1);
+    }
+}
