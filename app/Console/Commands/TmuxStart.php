@@ -13,11 +13,39 @@ use App\Services\Tmux\TmuxLayoutBuilder;
 use App\Services\Tmux\TmuxPaneManager;
 use App\Services\Tmux\TmuxSessionManager;
 use App\Support\MetadataSources;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Process;
+use Throwable;
 
 class TmuxStart extends Command
 {
+    private const FFI_CDEF = <<<'CDEF'
+int32_t nntmux_tmux_start_verify_which_output(
+    uint8_t successful,
+    const char *output_ptr,
+    size_t output_len,
+    int32_t *out_installed
+);
+ssize_t nntmux_tmux_start_format_ready_channel(
+    const char *hex_ptr,
+    size_t hex_len,
+    uint8_t *out_buf,
+    size_t out_cap
+);
+ssize_t nntmux_tmux_start_format_attach_hint(
+    const char *session_ptr,
+    size_t session_len,
+    uint8_t *out_buf,
+    size_t out_cap
+);
+CDEF;
+
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
     /**
      * The name and signature of the console command.
      *
@@ -40,6 +68,160 @@ class TmuxStart extends Command
     private TmuxLayoutBuilder $layoutBuilder;
 
     private bool $sessionCreated = false;
+
+    public static function enableRustFfi(): void
+    {
+        self::$useRustFfi = true;
+    }
+
+    public static function disableRustFfi(): void
+    {
+        self::$useRustFfi = false;
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = false;
+        self::$ffi = null;
+    }
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = (bool) $useRustFfi;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    public static function setFfiForTesting(FFI|false|null $ffi = null): void
+    {
+        self::$ffi = $ffi;
+    }
+
+    public static function verifyWhichTmuxOutput(bool $successful, string $output): bool
+    {
+        if (self::$useRustFfi) {
+            return self::verifyWhichTmuxOutputNative($successful, $output);
+        }
+
+        return self::verifyWhichTmuxOutputPhp($successful, $output);
+    }
+
+    public static function verifyWhichTmuxOutputPhp(bool $successful, string $output): bool
+    {
+        return $successful && str_contains($output, 'tmux');
+    }
+
+    public static function verifyWhichTmuxOutputNative(bool $successful, string $output): bool
+    {
+        $ffi = self::additionalFfi();
+        if (! $ffi instanceof FFI) {
+            return self::verifyWhichTmuxOutputPhp($successful, $output);
+        }
+
+        try {
+            $outInstalled = $ffi->new('int32_t[1]');
+            // @phpstan-ignore method.notFound
+            $rc = $ffi->nntmux_tmux_start_verify_which_output(
+                $successful ? 1 : 0,
+                $output,
+                strlen($output),
+                $outInstalled
+            );
+            $val = $outInstalled[0];
+            if ($rc !== 1 || ! is_int($val)) {
+                return self::verifyWhichTmuxOutputPhp($successful, $output);
+            }
+
+            return $val === 1;
+        } catch (Throwable) {
+            return self::verifyWhichTmuxOutputPhp($successful, $output);
+        }
+    }
+
+    public static function formatReadyChannelToken(string $hex): string
+    {
+        if (self::$useRustFfi) {
+            return self::formatReadyChannelTokenNative($hex);
+        }
+
+        return self::formatReadyChannelTokenPhp($hex);
+    }
+
+    public static function formatReadyChannelTokenPhp(string $hex): string
+    {
+        return 'nntmux-ready-'.$hex;
+    }
+
+    public static function formatReadyChannelTokenNative(string $hex): string
+    {
+        $ffi = self::additionalFfi();
+        if (! $ffi instanceof FFI) {
+            return self::formatReadyChannelTokenPhp($hex);
+        }
+
+        try {
+            $cap = max(64, strlen($hex) + 32);
+            $outBuf = $ffi->new("uint8_t[{$cap}]");
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tmux_start_format_ready_channel(
+                $hex,
+                strlen($hex),
+                $outBuf,
+                $cap
+            );
+            if (! is_int($written) || $written <= 0) {
+                return self::formatReadyChannelTokenPhp($hex);
+            }
+
+            return FFI::string($outBuf, $written);
+        } catch (Throwable) {
+            return self::formatReadyChannelTokenPhp($hex);
+        }
+    }
+
+    public static function formatAttachCommandHint(string $sessionName): string
+    {
+        if (self::$useRustFfi) {
+            return self::formatAttachCommandHintNative($sessionName);
+        }
+
+        return self::formatAttachCommandHintPhp($sessionName);
+    }
+
+    public static function formatAttachCommandHintPhp(string $sessionName): string
+    {
+        return '💡 To attach, run: php artisan tmux:attach --session='.escapeshellarg($sessionName);
+    }
+
+    public static function formatAttachCommandHintNative(string $sessionName): string
+    {
+        $ffi = self::additionalFfi();
+        if (! $ffi instanceof FFI) {
+            return self::formatAttachCommandHintPhp($sessionName);
+        }
+
+        try {
+            $cap = max(128, strlen($sessionName) * 4 + 96);
+            $outBuf = $ffi->new("uint8_t[{$cap}]");
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tmux_start_format_attach_hint(
+                $sessionName,
+                strlen($sessionName),
+                $outBuf,
+                $cap
+            );
+            if (! is_int($written) || $written <= 0) {
+                return self::formatAttachCommandHintPhp($sessionName);
+            }
+
+            return FFI::string($outBuf, $written);
+        } catch (Throwable) {
+            return self::formatAttachCommandHintPhp($sessionName);
+        }
+    }
 
     /**
      * Execute the console command.
@@ -129,7 +311,7 @@ class TmuxStart extends Command
                     return Command::FAILURE;
                 }
             } else {
-                $this->info('💡 To attach, run: php artisan tmux:attach --session='.escapeshellarg($sessionName));
+                $this->info(self::formatAttachCommandHint($sessionName));
             }
 
             return Command::SUCCESS;
@@ -158,7 +340,7 @@ class TmuxStart extends Command
         $result = Process::timeout(5)
             ->run('which tmux 2>/dev/null');
 
-        return $result->successful() && str_contains($result->output(), 'tmux');
+        return self::verifyWhichTmuxOutput($result->successful(), $result->output());
     }
 
     /**
@@ -182,7 +364,7 @@ class TmuxStart extends Command
         $paneManager = new TmuxPaneManager($sessionName);
 
         $command = TmuxCommand::monitor($sessionName);
-        $channel = 'nntmux-ready-'.bin2hex(random_bytes(12));
+        $channel = self::formatReadyChannelToken(bin2hex(random_bytes(12)));
         $command[] = '--ready-channel='.$channel;
 
         $monitorPane = $paneManager->paneForRole(TmuxPaneRole::Monitor, '0.0');
@@ -193,5 +375,21 @@ class TmuxStart extends Command
         if (! $ready->successful()) {
             throw new \RuntimeException('Tmux monitor did not acknowledge readiness.');
         }
+    }
+
+    private static function additionalFfi(): ?FFI
+    {
+        if (self::$ffi === false) {
+            return null;
+        }
+
+        if (self::$ffi instanceof FFI) {
+            return self::$ffi;
+        }
+
+        $ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF);
+        self::$ffi = $ffi ?? false;
+
+        return $ffi;
     }
 }
