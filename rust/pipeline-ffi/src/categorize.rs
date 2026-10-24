@@ -22111,3 +22111,782 @@ pub mod recategorize_groups_backfill_commands {
         }
     }
 }
+/// Wave 31.3: pure helpers behind `UpdatePerGroup`, `ProcessReleasesCommand`,
+/// `ProcessPostProcess`, `ProcessSafe` and `ProcessBackfill`.
+pub mod group_multiprocessing_release_commands {
+    use super::recategorize_groups_backfill_commands::php_int_cast;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::ptr;
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+
+    /// Scalar kinds marshalled by the PHP callers.
+    pub const KIND_NULL: u8 = 0;
+    pub const KIND_BOOL: u8 = 1;
+    pub const KIND_INT: u8 = 2;
+    pub const KIND_FLOAT: u8 = 3;
+    pub const KIND_STRING: u8 = 4;
+
+    /// Commands for the shared type and help exports.
+    pub const COMMAND_POSTPROCESS: u8 = 0;
+    pub const COMMAND_SAFE: u8 = 1;
+
+    /// `ProcessReleasesCommand::resolveExecutionPlan()` outcomes.
+    pub const PLAN_ALL: i32 = 0;
+    pub const PLAN_GROUP: i32 = 1;
+    pub const PLAN_MAINTENANCE_ONLY: i32 = 2;
+    pub const PLAN_READY_ONLY: i32 = 3;
+    pub const PLAN_ERROR_GROUP_ID: i32 = 4;
+    pub const PLAN_ERROR_MAINTENANCE_WITH_GROUP: i32 = 5;
+    pub const PLAN_ERROR_READY_ONLY: i32 = 6;
+
+    /// `UpdatePerGroup` stage message prefixes, in command order.
+    pub const STAGE_PREFIXES: [&[u8]; 6] = [
+        b"Updating binaries for group: ",
+        b"Backfilling group: ",
+        b"Processing releases for group: ",
+        b"Post-processing additional for group: ",
+        b"Processing NFO files for group: ",
+        b"Completed all processing for group: ",
+    ];
+
+    pub const POSTPROCESS_TYPES: [&[u8]; 10] = [
+        b"ama", b"add", b"ani", b"mov", b"nfo", b"tv", b"boo", b"mus", b"con", b"gam",
+    ];
+    pub const SAFE_TYPES: [&[u8]; 2] = [b"binaries", b"backfill"];
+
+    /// The error line followed by the help lines, joined with `\n` (no line contains one).
+    pub const POSTPROCESS_HELP: &[u8] = b"Type must be one of: ama, add, ani, mov, nfo, tv, boo, mus, con, gam\n\nama => Do amazon (books+music+console+games) processing in parallel\nboo => Do books processing\nmus => Do music processing\ncon => Do console processing\ngam => Do games processing\nadd => Do additional (rar|zip) processing\nani => Do anime processing\nmov => Do movie processing\nnfo => Do NFO processing\ntv  => Do TV processing";
+    pub const SAFE_HELP: &[u8] = b"Type must be either: binaries or backfill\n\nbinaries => Do Safe Binaries update\nbackfill => Do Safe Backfill update";
+
+    /// PHP numeric-string whitespace (leading and, since PHP 8, trailing).
+    #[inline]
+    fn is_numeric_whitespace(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C)
+    }
+
+    #[inline]
+    fn skip_digits(s: &[u8], mut i: usize) -> usize {
+        while i < s.len() && s[i].is_ascii_digit() {
+            i += 1;
+        }
+        i
+    }
+
+    /// The numeric token of a PHP 8 numeric string (surrounding whitespace removed), or `None`.
+    pub fn numeric_token(s: &[u8]) -> Option<&[u8]> {
+        let mut start = 0;
+        while start < s.len() && is_numeric_whitespace(s[start]) {
+            start += 1;
+        }
+        let mut i = start;
+        if i < s.len() && matches!(s[i], b'+' | b'-') {
+            i += 1;
+        }
+        let integer_end = skip_digits(s, i);
+        if integer_end > i {
+            i = integer_end;
+            if i < s.len() && s[i] == b'.' {
+                i = skip_digits(s, i + 1);
+            }
+        } else if i + 1 < s.len() && s[i] == b'.' && s[i + 1].is_ascii_digit() {
+            i = skip_digits(s, i + 1);
+        } else {
+            return None;
+        }
+        if i < s.len() && matches!(s[i], b'e' | b'E') {
+            let mut j = i + 1;
+            if j < s.len() && matches!(s[j], b'+' | b'-') {
+                j += 1;
+            }
+            if j < s.len() && s[j].is_ascii_digit() {
+                i = skip_digits(s, j);
+            }
+        }
+        let end = i;
+        while i < s.len() && is_numeric_whitespace(s[i]) {
+            i += 1;
+        }
+        (i == s.len()).then(|| &s[start..end])
+    }
+
+    /// PHP `is_numeric()` for a string.
+    #[inline]
+    pub fn is_numeric_string(s: &[u8]) -> bool {
+        numeric_token(s).is_some()
+    }
+
+    /// PHP `is_numeric()` for a marshalled scalar; `None` for an unknown kind.
+    pub fn is_numeric_kind(kind: u8, text: &[u8]) -> Option<bool> {
+        match kind {
+            KIND_NULL | KIND_BOOL => Some(false),
+            KIND_INT | KIND_FLOAT => Some(true),
+            KIND_STRING => Some(is_numeric_string(text)),
+            _ => None,
+        }
+    }
+
+    pub fn stage_messages(group_name: &[u8]) -> (Vec<u8>, [usize; 6]) {
+        let mut joined = Vec::with_capacity(
+            STAGE_PREFIXES.iter().map(|p| p.len()).sum::<usize>() + 6 * group_name.len(),
+        );
+        let mut lengths = [0usize; 6];
+        for (length, prefix) in lengths.iter_mut().zip(STAGE_PREFIXES) {
+            joined.extend_from_slice(prefix);
+            joined.extend_from_slice(group_name);
+            *length = prefix.len() + group_name.len();
+        }
+        (joined, lengths)
+    }
+
+    /// `ctype_digit($groupId) && (int) $groupId > 0`, with PHP's saturating `(int)` value.
+    pub fn positive_group_id(text: &[u8]) -> Option<i64> {
+        if text.is_empty() || !text.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let first = text.iter().position(|&byte| byte != b'0')?;
+        let digits = &text[first..];
+        if digits.len() > 19 {
+            return Some(i64::MAX);
+        }
+        let magnitude = digits
+            .iter()
+            .fold(0u64, |acc, digit| acc * 10 + u64::from(digit - b'0'));
+        Some(i64::try_from(magnitude).unwrap_or(i64::MAX))
+    }
+
+    /// The plan code and, for `PLAN_GROUP` and `PLAN_READY_ONLY`, the group id.
+    pub fn execution_plan(
+        group_id: Option<&[u8]>,
+        ready_only: bool,
+        maintenance_only: bool,
+    ) -> (i32, Option<i64>) {
+        let parsed = match group_id {
+            Some(text) => match positive_group_id(text) {
+                Some(value) => Some(value),
+                None => return (PLAN_ERROR_GROUP_ID, None),
+            },
+            None => None,
+        };
+        if maintenance_only && parsed.is_some() {
+            return (PLAN_ERROR_MAINTENANCE_WITH_GROUP, None);
+        }
+        if ready_only && (parsed.is_none() || maintenance_only) {
+            return (PLAN_ERROR_READY_ONLY, None);
+        }
+        match (ready_only, maintenance_only, parsed) {
+            (true, _, id) => (PLAN_READY_ONLY, id),
+            (false, true, _) => (PLAN_MAINTENANCE_ONLY, None),
+            (false, false, Some(id)) => (PLAN_GROUP, Some(id)),
+            (false, false, None) => (PLAN_ALL, None),
+        }
+    }
+
+    pub fn is_valid_type(command: u8, text: &[u8]) -> Option<bool> {
+        let types: &[&[u8]] = match command {
+            COMMAND_POSTPROCESS => &POSTPROCESS_TYPES,
+            COMMAND_SAFE => &SAFE_TYPES,
+            _ => return None,
+        };
+        Some(types.contains(&text))
+    }
+
+    pub fn help_text(command: u8) -> Option<&'static [u8]> {
+        match command {
+            COMMAND_POSTPROCESS => Some(POSTPROCESS_HELP),
+            COMMAND_SAFE => Some(SAFE_HELP),
+            _ => None,
+        }
+    }
+
+    /// `$renamed === 'true' || $renamed === true`.
+    pub fn renamed_only(kind: u8, int_value: i64, text: &[u8]) -> Option<bool> {
+        match kind {
+            KIND_NULL | KIND_INT | KIND_FLOAT => Some(false),
+            KIND_BOOL => match int_value {
+                0 | 1 => Some(int_value == 1),
+                _ => None,
+            },
+            KIND_STRING => Some(text == b"true"),
+            _ => None,
+        }
+    }
+
+    /// PHP `(int)` for a float without the "not representable" warning; `None` when PHP warns.
+    #[inline]
+    fn representable_float_to_int(value: f64) -> Option<i64> {
+        (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0)
+            .contains(&value)
+            .then_some(value as i64)
+    }
+
+    /// `$limit !== null && is_numeric($limit) && $limit > 0 ? (int) $limit : false` as
+    /// `Some(Some(n))`/`Some(None)`; the outer `None` declines (unknown kind or a PHP warning).
+    pub fn backfill_limit(
+        kind: u8,
+        int_value: i64,
+        float_value: f64,
+        text: &[u8],
+    ) -> Option<Option<i64>> {
+        match kind {
+            KIND_NULL | KIND_BOOL => Some(None),
+            KIND_INT => Some((int_value > 0).then_some(int_value)),
+            KIND_FLOAT => {
+                if float_value > 0.0 {
+                    representable_float_to_int(float_value).map(Some)
+                } else {
+                    Some(None)
+                }
+            }
+            KIND_STRING => {
+                let Some(token) = numeric_token(text) else {
+                    return Some(None);
+                };
+                // The token is ASCII by construction and matches Rust's float grammar.
+                let positive = std::str::from_utf8(token)
+                    .ok()
+                    .and_then(|token| token.parse::<f64>().ok())
+                    .is_some_and(|value| value > 0.0);
+                Some(positive.then(|| php_int_cast(text)))
+            }
+            _ => None,
+        }
+    }
+
+    #[inline]
+    unsafe fn valid_in<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null() || len > isize::MAX as usize || (ptr as usize).checked_add(len).is_none() {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    unsafe fn optional_in<'a>(present: u8, ptr: *const u8, len: usize) -> Option<Option<&'a [u8]>> {
+        match present {
+            0 => Some(None),
+            1 => unsafe { valid_in(ptr, len) }.map(Some),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn flag(value: u8) -> Option<bool> {
+        match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn valid_out<T>(ptr: *mut T, len: usize) -> bool {
+        !ptr.is_null()
+            && ptr.is_aligned()
+            && len <= isize::MAX as usize / size_of::<T>()
+            && (ptr as usize).checked_add(len * size_of::<T>()).is_some()
+    }
+
+    #[inline]
+    fn required(total: usize) -> isize {
+        // `-1` is reserved for DECLINE, so a one-byte requirement reports `-2`.
+        if total <= 1 { -2 } else { -(total as isize) }
+    }
+
+    /// Copies `bytes` to a validated output buffer, or reports the required capacity unwritten.
+    #[inline]
+    unsafe fn write_bytes(out: *mut u8, out_cap: usize, bytes: &[u8]) -> isize {
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return required(bytes.len());
+        }
+        if !bytes.is_empty() {
+            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    #[inline]
+    fn guarded_isize(body: impl FnOnce() -> isize) -> isize {
+        catch_unwind(AssertUnwindSafe(body)).unwrap_or(DECLINE)
+    }
+
+    #[inline]
+    fn guarded_i32(body: impl FnOnce() -> i32) -> i32 {
+        catch_unwind(AssertUnwindSafe(body)).unwrap_or(-1)
+    }
+
+    /// Backs `UpdatePerGroup::isNumericGroupIdNative()`: `1`/`0`, or `-1` for invalid input.
+    ///
+    /// # Safety
+    ///
+    /// `text_ptr` must be readable for `text_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_gmr_cmd_is_numeric(
+        kind: u8,
+        text_ptr: *const u8,
+        text_len: usize,
+    ) -> i32 {
+        guarded_i32(|| {
+            unsafe { valid_in(text_ptr, text_len) }
+                .and_then(|text| is_numeric_kind(kind, text))
+                .map_or(-1, i32::from)
+        })
+    }
+
+    /// Backs `UpdatePerGroup::formatStageProgressMessagesNative()`: the six messages
+    /// concatenated, with each message's length in `out_lengths[0..6]`.
+    ///
+    /// # Safety
+    ///
+    /// `name_ptr` must be readable for `name_len` bytes, `out_lengths` writable for six values
+    /// and `out_buf` writable for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_gmr_cmd_stage_messages(
+        name_ptr: *const u8,
+        name_len: usize,
+        out_lengths: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        guarded_isize(|| {
+            let Some(name) = (unsafe { valid_in(name_ptr, name_len) }) else {
+                return DECLINE;
+            };
+            if !valid_out(out_lengths, 6) || !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (joined, lengths) = stage_messages(name);
+            let written = unsafe { write_bytes(out_buf, out_cap, &joined) };
+            if written >= 0 {
+                unsafe { ptr::copy_nonoverlapping(lengths.as_ptr(), out_lengths, 6) };
+            }
+            written
+        })
+    }
+
+    /// Backs `ProcessReleasesCommand::resolveExecutionPlanNative()`: returns a `PLAN_*` code and
+    /// writes the group id for `PLAN_GROUP`/`PLAN_READY_ONLY`; `-1` for invalid input.
+    ///
+    /// # Safety
+    ///
+    /// A present `group_ptr` must be readable for `group_len` bytes and `out_group_id` writable.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_gmr_cmd_execution_plan(
+        group_present: u8,
+        group_ptr: *const u8,
+        group_len: usize,
+        ready_only: u8,
+        maintenance_only: u8,
+        out_group_id: *mut i64,
+    ) -> i32 {
+        guarded_i32(|| {
+            let (Some(group), Some(ready_only), Some(maintenance_only)) = (
+                unsafe { optional_in(group_present, group_ptr, group_len) },
+                flag(ready_only),
+                flag(maintenance_only),
+            ) else {
+                return -1;
+            };
+            if !valid_out(out_group_id, 1) {
+                return -1;
+            }
+            let (code, group_id) = execution_plan(group, ready_only, maintenance_only);
+            if let Some(group_id) = group_id {
+                unsafe { out_group_id.write(group_id) };
+            }
+            code
+        })
+    }
+
+    /// Backs `ProcessPostProcess::isValidTypeNative()` and `ProcessSafe::isValidSafeTypeNative()`.
+    ///
+    /// # Safety
+    ///
+    /// `text_ptr` must be readable for `text_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_gmr_cmd_is_valid_type(
+        command: u8,
+        text_ptr: *const u8,
+        text_len: usize,
+    ) -> i32 {
+        guarded_i32(|| {
+            unsafe { valid_in(text_ptr, text_len) }
+                .and_then(|text| is_valid_type(command, text))
+                .map_or(-1, i32::from)
+        })
+    }
+
+    /// Backs `ProcessPostProcess::buildHelpLinesNative()` and `ProcessSafe::buildHelpLinesNative()`.
+    ///
+    /// # Safety
+    ///
+    /// `out_buf` must be writable for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_gmr_cmd_help_lines(
+        command: u8,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        guarded_isize(|| {
+            let Some(text) = help_text(command) else {
+                return DECLINE;
+            };
+            if !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            unsafe { write_bytes(out_buf, out_cap, text) }
+        })
+    }
+
+    /// Backs `ProcessPostProcess::normalizeRenamedOnlyNative()`.
+    ///
+    /// # Safety
+    ///
+    /// `text_ptr` must be readable for `text_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_gmr_cmd_renamed_only(
+        kind: u8,
+        int_value: i64,
+        text_ptr: *const u8,
+        text_len: usize,
+    ) -> i32 {
+        guarded_i32(|| {
+            unsafe { valid_in(text_ptr, text_len) }
+                .and_then(|text| renamed_only(kind, int_value, text))
+                .map_or(-1, i32::from)
+        })
+    }
+
+    /// Backs `ProcessBackfill::normalizeBackfillOptionsNative()`: `1` with the limit in
+    /// `out_value`, `0` for `false`, or `-1` to decline.
+    ///
+    /// # Safety
+    ///
+    /// `text_ptr` must be readable for `text_len` bytes and `out_value` writable.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_gmr_cmd_backfill_options(
+        kind: u8,
+        int_value: i64,
+        float_value: f64,
+        text_ptr: *const u8,
+        text_len: usize,
+        out_value: *mut i64,
+    ) -> i32 {
+        guarded_i32(|| {
+            let Some(text) = (unsafe { valid_in(text_ptr, text_len) }) else {
+                return -1;
+            };
+            if !valid_out(out_value, 1) {
+                return -1;
+            }
+            match backfill_limit(kind, int_value, float_value, text) {
+                Some(Some(limit)) => {
+                    unsafe { out_value.write(limit) };
+                    1
+                }
+                Some(None) => 0,
+                None => -1,
+            }
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn numeric_strings_follow_php_8() {
+            for numeric in [
+                "0",
+                "1",
+                "-1",
+                "+1",
+                " 1",
+                "1 ",
+                "\t\n\r\x0b\x0c1\x0c\x0b\r\n\t",
+                "1.",
+                ".5",
+                "1.5",
+                "-.5e3",
+                "+.5e+3",
+                "1e5",
+                "1E-5",
+                "1.e5",
+                "00012",
+                "1e1000",
+                "99999999999999999999",
+            ] {
+                assert!(is_numeric_string(numeric.as_bytes()), "{numeric:?}");
+            }
+            for other in [
+                "", " ", ".", "-", "+", "e5", ".e5", "1e", "1e+", "1 e5", "+ 1", "0x1A", "1\0",
+                "\x001", "inf", "nan", "1_000", "１", "1.5.5", "--1",
+            ] {
+                assert!(!is_numeric_string(other.as_bytes()), "{other:?}");
+            }
+            assert_eq!(is_numeric_kind(KIND_FLOAT, b""), Some(true));
+            assert_eq!(is_numeric_kind(KIND_BOOL, b""), Some(false));
+            assert_eq!(is_numeric_kind(9, b""), None);
+        }
+
+        #[test]
+        fn stage_messages_keep_their_order_and_lengths() {
+            let (joined, lengths) = stage_messages("a.b\0é".as_bytes());
+            let mut rest = joined.as_slice();
+            for (prefix, length) in STAGE_PREFIXES.iter().zip(lengths) {
+                let (message, tail) = rest.split_at(length);
+                assert_eq!(message, [*prefix, "a.b\0é".as_bytes()].concat());
+                rest = tail;
+            }
+            assert!(rest.is_empty());
+        }
+
+        #[test]
+        fn execution_plan_matches_the_command_validation_order() {
+            assert_eq!(execution_plan(None, false, false), (PLAN_ALL, None));
+            assert_eq!(
+                execution_plan(Some(b"007"), false, false),
+                (PLAN_GROUP, Some(7))
+            );
+            assert_eq!(
+                execution_plan(None, false, true),
+                (PLAN_MAINTENANCE_ONLY, None)
+            );
+            assert_eq!(
+                execution_plan(Some(b"5"), true, false),
+                (PLAN_READY_ONLY, Some(5))
+            );
+            for invalid in [
+                &b""[..],
+                b"0",
+                b"000",
+                b"-1",
+                b"+1",
+                b" 1",
+                b"1 ",
+                b"1.0",
+                b"1e3",
+                b"\x001",
+            ] {
+                assert_eq!(
+                    execution_plan(Some(invalid), true, true),
+                    (PLAN_ERROR_GROUP_ID, None)
+                );
+            }
+            assert_eq!(
+                execution_plan(Some(b"99999999999999999999"), false, false),
+                (PLAN_GROUP, Some(i64::MAX))
+            );
+            assert_eq!(
+                execution_plan(Some(b"9223372036854775808"), false, false),
+                (PLAN_GROUP, Some(i64::MAX))
+            );
+            assert_eq!(
+                execution_plan(Some(b"0009223372036854775807"), false, false),
+                (PLAN_GROUP, Some(i64::MAX))
+            );
+            assert_eq!(
+                execution_plan(Some(b"1"), true, true),
+                (PLAN_ERROR_MAINTENANCE_WITH_GROUP, None)
+            );
+            assert_eq!(
+                execution_plan(Some(b"1"), false, true),
+                (PLAN_ERROR_MAINTENANCE_WITH_GROUP, None)
+            );
+            assert_eq!(
+                execution_plan(None, true, false),
+                (PLAN_ERROR_READY_ONLY, None)
+            );
+            assert_eq!(
+                execution_plan(None, true, true),
+                (PLAN_ERROR_READY_ONLY, None)
+            );
+        }
+
+        #[test]
+        fn types_renamed_and_help_are_exact() {
+            assert_eq!(is_valid_type(COMMAND_POSTPROCESS, b"tv"), Some(true));
+            assert_eq!(is_valid_type(COMMAND_POSTPROCESS, b"TV"), Some(false));
+            assert_eq!(is_valid_type(COMMAND_POSTPROCESS, b"tv\0"), Some(false));
+            assert_eq!(is_valid_type(COMMAND_SAFE, b"backfill"), Some(true));
+            assert_eq!(is_valid_type(COMMAND_SAFE, b"tv"), Some(false));
+            assert_eq!(is_valid_type(2, b"tv"), None);
+            assert_eq!(renamed_only(KIND_STRING, 0, b"true"), Some(true));
+            assert_eq!(renamed_only(KIND_STRING, 0, b"TRUE"), Some(false));
+            assert_eq!(renamed_only(KIND_BOOL, 1, b""), Some(true));
+            assert_eq!(renamed_only(KIND_BOOL, 2, b""), None);
+            assert_eq!(renamed_only(KIND_INT, 1, b""), Some(false));
+            assert_eq!(
+                help_text(COMMAND_SAFE).map(|text| text.split(|&b| b == b'\n').count()),
+                Some(4)
+            );
+            assert_eq!(
+                help_text(COMMAND_POSTPROCESS).map(|text| text.split(|&b| b == b'\n').count()),
+                Some(12)
+            );
+            assert_eq!(help_text(7), None);
+        }
+
+        #[test]
+        fn backfill_limit_matches_php() {
+            let string = |text: &str| backfill_limit(KIND_STRING, 0, 0.0, text.as_bytes());
+            assert_eq!(string("5"), Some(Some(5)));
+            assert_eq!(string(" 5 "), Some(Some(5)));
+            assert_eq!(string("0.5"), Some(Some(0)));
+            assert_eq!(string("1e3"), Some(Some(1000)));
+            assert_eq!(string("1e100"), Some(Some(i64::MAX)));
+            assert_eq!(string("1e1000"), Some(Some(0)));
+            assert_eq!(string("99999999999999999999"), Some(Some(i64::MAX)));
+            assert_eq!(string("3e-324"), Some(Some(0)));
+            for falsy in ["0", "-5", "1e-400", "-0.0", "", "abc", "0x1A", "5 x"] {
+                assert_eq!(string(falsy), Some(None), "{falsy:?}");
+            }
+            assert_eq!(backfill_limit(KIND_INT, 7, 0.0, b""), Some(Some(7)));
+            assert_eq!(backfill_limit(KIND_INT, 0, 0.0, b""), Some(None));
+            assert_eq!(backfill_limit(KIND_FLOAT, 0, 1.9, b""), Some(Some(1)));
+            assert_eq!(backfill_limit(KIND_FLOAT, 0, f64::NAN, b""), Some(None));
+            assert_eq!(
+                backfill_limit(KIND_FLOAT, 0, -f64::INFINITY, b""),
+                Some(None)
+            );
+            assert_eq!(backfill_limit(KIND_FLOAT, 0, f64::INFINITY, b""), None);
+            assert_eq!(
+                backfill_limit(KIND_FLOAT, 0, 9_223_372_036_854_775_808.0, b""),
+                None
+            );
+            assert_eq!(backfill_limit(KIND_BOOL, 1, 0.0, b""), Some(None));
+            assert_eq!(backfill_limit(KIND_NULL, 0, 0.0, b""), Some(None));
+            assert_eq!(backfill_limit(9, 0, 0.0, b""), None);
+        }
+
+        #[test]
+        fn exports_validate_inputs_and_short_buffers() {
+            let mut buf = [0x5Au8; 16];
+            let mut lengths = [0usize; 6];
+            unsafe {
+                assert_eq!(
+                    nntmux_cat_gmr_cmd_is_numeric(KIND_STRING, b" 1".as_ptr(), 2),
+                    1
+                );
+                assert_eq!(
+                    nntmux_cat_gmr_cmd_is_numeric(KIND_STRING, ptr::null(), 0),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_cat_gmr_cmd_is_valid_type(COMMAND_SAFE, b"binaries".as_ptr(), 8),
+                    1
+                );
+                assert_eq!(
+                    nntmux_cat_gmr_cmd_renamed_only(KIND_STRING, 0, b"true".as_ptr(), 4),
+                    1
+                );
+                let total = STAGE_PREFIXES.iter().map(|p| p.len() + 1).sum::<usize>();
+                assert_eq!(
+                    nntmux_cat_gmr_cmd_stage_messages(
+                        b"x".as_ptr(),
+                        1,
+                        lengths.as_mut_ptr(),
+                        buf.as_mut_ptr(),
+                        buf.len()
+                    ),
+                    -(total as isize)
+                );
+                assert_eq!(lengths, [0; 6]);
+                assert_eq!(
+                    nntmux_cat_gmr_cmd_stage_messages(
+                        b"x".as_ptr(),
+                        1,
+                        ptr::null_mut(),
+                        buf.as_mut_ptr(),
+                        buf.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_cat_gmr_cmd_help_lines(COMMAND_SAFE, buf.as_mut_ptr(), buf.len()),
+                    -(SAFE_HELP.len() as isize)
+                );
+                assert_eq!(
+                    nntmux_cat_gmr_cmd_help_lines(5, buf.as_mut_ptr(), buf.len()),
+                    DECLINE
+                );
+                assert_eq!(buf, [0x5Au8; 16]);
+
+                let mut value = 0i64;
+                assert_eq!(
+                    nntmux_cat_gmr_cmd_execution_plan(1, b"12".as_ptr(), 2, 1, 0, &mut value),
+                    PLAN_READY_ONLY
+                );
+                assert_eq!(value, 12);
+                assert_eq!(
+                    nntmux_cat_gmr_cmd_execution_plan(2, b"12".as_ptr(), 2, 1, 0, &mut value),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_cat_gmr_cmd_execution_plan(0, ptr::null(), 0, 0, 2, &mut value),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_cat_gmr_cmd_execution_plan(0, ptr::null(), 0, 0, 0, ptr::null_mut()),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_cat_gmr_cmd_execution_plan(0, ptr::null(), 0, 0, 0, &mut value),
+                    PLAN_ALL
+                );
+                assert_eq!(
+                    nntmux_cat_gmr_cmd_backfill_options(
+                        KIND_STRING,
+                        0,
+                        0.0,
+                        b"1e3".as_ptr(),
+                        3,
+                        &mut value
+                    ),
+                    1
+                );
+                assert_eq!(value, 1000);
+                assert_eq!(
+                    nntmux_cat_gmr_cmd_backfill_options(
+                        KIND_STRING,
+                        0,
+                        0.0,
+                        b"-1".as_ptr(),
+                        2,
+                        &mut value
+                    ),
+                    0
+                );
+                assert_eq!(
+                    nntmux_cat_gmr_cmd_backfill_options(
+                        KIND_FLOAT,
+                        0,
+                        f64::INFINITY,
+                        b"".as_ptr(),
+                        0,
+                        &mut value
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_cat_gmr_cmd_backfill_options(
+                        KIND_INT,
+                        3,
+                        0.0,
+                        b"".as_ptr(),
+                        0,
+                        ptr::null_mut()
+                    ),
+                    -1
+                );
+            }
+        }
+    }
+}
