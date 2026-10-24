@@ -6,17 +6,31 @@ namespace App\Http\Controllers;
 
 use App\Models\Category;
 use App\Models\User;
+use App\Services\Api\ApiQueryParameters;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Support\Configuration\SiteConfigurationData;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Http\Request;
 use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Illuminate\View\View;
+use Throwable;
 
 class BasePageController extends Controller
 {
+    private static FFI|false|null $baseFfi = null;
+
+    private static ?bool $useBaseRustFfi = null;
+
+    private static bool $adoptLocalReturnUrlFfi = false;
+
+    private static bool $adoptResolvePageFfi = false;
+
+    private static bool $adoptIntegerInputFfi = false;
+
     public SiteConfigurationData $siteConfiguration;
 
     public string $title = '';
@@ -96,7 +110,7 @@ class BasePageController extends Controller
     {
         try {
             return Cache::remember($key, $ttl, $callback);
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             if (config('app.debug')) {
                 Log::debug('BasePageController cache bypassed: '.$e->getMessage());
             }
@@ -113,7 +127,79 @@ class BasePageController extends Controller
         return new LengthAwarePaginator($query, $totalCount, $items, $page, ['path' => $path, 'query' => $reqQuery]);
     }
 
+    public static function setUseRustFfi(?bool $enabled): void
+    {
+        self::$useBaseRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useBaseRustFfi ?? self::$adoptLocalReturnUrlFfi;
+    }
+
+    public static function baseFfi(): ?FFI
+    {
+        return self::$baseFfi !== null ? (self::$baseFfi === false ? null : self::$baseFfi) : self::resolveBaseFfi();
+    }
+
     protected function resolvePage(Request $request, string $key = 'page'): int
+    {
+        if (self::$useBaseRustFfi ?? self::$adoptResolvePageFfi) {
+            $supported = false;
+            $native = $this->resolvePageNative($request, $key, $supported);
+            if ($supported && $native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->resolvePagePhp($request, $key);
+    }
+
+    /**
+     * @param-out bool $supported
+     */
+    public function resolvePageNative(Request $request, string $key = 'page', bool &$supported = false): ?int
+    {
+        $supported = false;
+        if (self::$useBaseRustFfi === false) {
+            return null;
+        }
+        $page = $request->input($key, 1);
+        if (! is_scalar($page)) {
+            $supported = true;
+
+            return 1;
+        }
+
+        $page = (string) $page;
+        if ($page === '') {
+            $supported = true;
+
+            return 1;
+        }
+
+        $ffi = self::$baseFfi ?? self::resolveBaseFfi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $res = $ffi->nntmux_page_resolve_page($page, \strlen($page));
+            if (! \is_int($res) || $res < 1) {
+                return null;
+            }
+            $supported = true;
+
+            return $res;
+        } catch (Throwable) {
+            $supported = false;
+
+            return null;
+        }
+    }
+
+    public function resolvePagePhp(Request $request, string $key = 'page'): int
     {
         $page = $request->input($key, 1);
         if (! is_scalar($page)) {
@@ -183,6 +269,50 @@ class BasePageController extends Controller
 
     protected function integerInput(Request $request, string $key, int $default = 0): int
     {
+        if (self::$useBaseRustFfi ?? self::$adoptIntegerInputFfi) {
+            $supported = false;
+            $native = $this->integerInputNative($request, $key, $default, $supported);
+            if ($supported && $native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->integerInputPhp($request, $key, $default);
+    }
+
+    /**
+     * @param-out bool $supported
+     */
+    public function integerInputNative(Request $request, string $key, int $default = 0, bool &$supported = false): ?int
+    {
+        $supported = false;
+        if (self::$useBaseRustFfi === false || $default === PHP_INT_MIN) {
+            return null;
+        }
+        $ffi = self::$baseFfi ?? self::resolveBaseFfi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+
+        $value = $this->scalarInput($request, $key, (string) $default);
+        try {
+            // @phpstan-ignore method.notFound
+            $res = $ffi->nntmux_page_parse_integer($value, \strlen($value), $default);
+            if (! \is_int($res) || $res === PHP_INT_MIN) {
+                return null;
+            }
+            $supported = true;
+
+            return $res;
+        } catch (Throwable) {
+            $supported = false;
+
+            return null;
+        }
+    }
+
+    public function integerInputPhp(Request $request, string $key, int $default = 0): int
+    {
         $value = $this->scalarInput($request, $key, (string) $default);
 
         return preg_match('/^-?\d+$/', $value) === 1 ? (int) $value : $default;
@@ -199,6 +329,74 @@ class BasePageController extends Controller
     }
 
     protected function localReturnUrl(Request $request, string $fallback, string $key = 'from'): string
+    {
+        if (self::$useBaseRustFfi ?? self::$adoptLocalReturnUrlFfi) {
+            $supported = false;
+            $native = $this->localReturnUrlNative($request, $fallback, $key, $supported);
+            if ($supported && $native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->localReturnUrlPhp($request, $fallback, $key);
+    }
+
+    /**
+     * @param-out bool $supported
+     */
+    public function localReturnUrlNative(Request $request, string $fallback, string $key = 'from', bool &$supported = false): ?string
+    {
+        $supported = false;
+        if (self::$useBaseRustFfi === false) {
+            return null;
+        }
+
+        $from = \trim($this->scalarInput($request, $key));
+        if ($from === '') {
+            $supported = true;
+
+            return url($fallback);
+        }
+
+        $ffi = self::$baseFfi ?? self::resolveBaseFfi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+
+        $hasColon = $from[0] !== '/' && \str_contains($from, ':');
+        $scheme = $hasColon ? $request->getScheme() : '';
+        $host = $hasColon ? $request->getHost() : '';
+        $port = $hasColon ? (int) $request->getPort() : -1;
+
+        try {
+            // @phpstan-ignore method.notFound
+            $kind = $ffi->nntmux_page_classify_return_url(
+                $from,
+                \strlen($from),
+                $scheme,
+                \strlen($scheme),
+                $host,
+                \strlen($host),
+                $port
+            );
+            if (! \is_int($kind) || $kind < 0) {
+                return null;
+            }
+            $supported = true;
+
+            return match ($kind) {
+                1 => $from,
+                2 => url($from),
+                default => url($fallback),
+            };
+        } catch (Throwable) {
+            $supported = false;
+
+            return null;
+        }
+    }
+
+    public function localReturnUrlPhp(Request $request, string $fallback, string $key = 'from'): string
     {
         $from = trim($this->scalarInput($request, $key));
         if ($from === '' || preg_match('/[\\x00-\\x20\\x7f\\\\\\\\]/', $from) === 1 || str_starts_with($from, '//')) {
@@ -222,6 +420,22 @@ class BasePageController extends Controller
         }
 
         return url($from);
+    }
+
+    private static function resolveBaseFfi(): ?FFI
+    {
+        if (self::$baseFfi !== null) {
+            return self::$baseFfi === false ? null : self::$baseFfi;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('categorize', ApiQueryParameters::FFI_CDEF);
+        if ($ffi === null) {
+            self::$baseFfi = false;
+
+            return null;
+        }
+        self::$baseFfi = $ffi;
+
+        return $ffi;
     }
 
     /**

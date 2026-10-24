@@ -9712,3 +9712,769 @@ pub mod tv_providers_trakt_matching {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// API query parameters, ApiV2Controller, BasePageController, SeriesController
+// ---------------------------------------------------------------------------
+
+pub mod api_query_and_page_params {
+    use std::cell::RefCell;
+    use std::slice;
+
+    use super::{php_trim_ascii, strip_trailing_pcre_newline};
+    use crate::OutCursor;
+
+    pub const DECLINED: isize = -1;
+    pub const CATEGORIES_DEFAULT_ALL: isize = -2;
+    pub const CATEGORIES_NEED_WEBDL_CONFIG: isize = -3;
+    pub const SORT_INVALID: isize = -2;
+    pub const SEASON_NONE: i64 = -2;
+
+    thread_local! {
+        static CAT_SCRATCH: RefCell<(Vec<u8>, Vec<u8>)> = RefCell::new((
+            Vec::with_capacity(256),
+            Vec::with_capacity(128),
+        ));
+    }
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            Some(&[])
+        } else if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { slice::from_raw_parts(ptr, len) })
+        }
+    }
+
+    #[inline]
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    /// PHP `urldecode()` byte-for-byte (`+` -> `' '`, `%HH` -> `0xHH` when both hex digits are valid).
+    fn php_urldecode_into(src: &[u8], dst: &mut Vec<u8>) {
+        dst.clear();
+        dst.reserve(src.len());
+        let mut i = 0usize;
+        while i < src.len() {
+            let b = src[i];
+            if b == b'+' {
+                dst.push(b' ');
+                i += 1;
+            } else if b == b'%' && i + 2 < src.len() {
+                if let (Some(hi), Some(lo)) = (hex_val(src[i + 1]), hex_val(src[i + 2])) {
+                    dst.push((hi << 4) | lo);
+                    i += 3;
+                } else {
+                    dst.push(b'%');
+                    i += 1;
+                }
+            } else {
+                dst.push(b);
+                i += 1;
+            }
+        }
+    }
+
+    #[inline]
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.len() >= needle.len() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    pub(crate) fn parse_categories(
+        raw: &[u8],
+        is_array: bool,
+        webdl_mode: i32,
+        out: &mut OutCursor<'_>,
+    ) -> isize {
+        if !matches!(webdl_mode, -1..=1) {
+            return DECLINED;
+        }
+        CAT_SCRATCH.with(|cell| {
+            let (value, seg_dec) = &mut *cell.borrow_mut();
+            value.clear();
+            if is_array {
+                if !raw.is_empty() {
+                    for seg in raw.split(|&b| b == 0) {
+                        php_urldecode_into(php_trim_ascii(seg), seg_dec);
+                        if !seg_dec.is_empty() {
+                            if !value.is_empty() {
+                                value.push(b',');
+                            }
+                            value.extend_from_slice(seg_dec);
+                        }
+                    }
+                }
+            } else {
+                php_urldecode_into(php_trim_ascii(raw), value);
+            }
+
+            if value.is_empty() {
+                return CATEGORIES_DEFAULT_ALL;
+            }
+
+            if contains_subslice(value, b"5040") && !contains_subslice(value, b"5010") {
+                if webdl_mode == -1 {
+                    return CATEGORIES_NEED_WEBDL_CONFIG;
+                }
+                if webdl_mode == 1 {
+                    value.extend_from_slice(b",5010");
+                }
+            }
+
+            let mut count = 0usize;
+            for part in value.split(|&b| b == b',') {
+                let tok = php_trim_ascii(part);
+                if tok.is_empty() {
+                    continue;
+                }
+                if tok.contains(&b'\n') {
+                    return DECLINED;
+                }
+                if count > 0 {
+                    out.push(b'\n');
+                }
+                out.extend(tok);
+                count += 1;
+            }
+
+            if count == 0 {
+                0
+            } else {
+                match out.pos {
+                    n if n <= out.buf.len() => n as isize,
+                    n => -(n.max(4) as isize),
+                }
+            }
+        })
+    }
+
+    #[inline]
+    pub(crate) fn canonical_sort(trimmed: &[u8]) -> Option<&'static [u8]> {
+        if trimmed.len() < 7 || trimmed.len() > 11 {
+            return None;
+        }
+        let mut buf = [0u8; 11];
+        for (d, &s) in buf.iter_mut().zip(trimmed.iter()) {
+            *d = s.to_ascii_lowercase();
+        }
+        match &buf[..trimmed.len()] {
+            b"cat_asc" => Some(b"cat_asc"),
+            b"cat_desc" => Some(b"cat_desc"),
+            b"name_asc" => Some(b"name_asc"),
+            b"name_desc" => Some(b"name_desc"),
+            b"size_asc" => Some(b"size_asc"),
+            b"size_desc" => Some(b"size_desc"),
+            b"files_asc" => Some(b"files_asc"),
+            b"files_desc" => Some(b"files_desc"),
+            b"stats_asc" => Some(b"stats_asc"),
+            b"stats_desc" => Some(b"stats_desc"),
+            b"posted_asc" => Some(b"posted_asc"),
+            b"posted_desc" => Some(b"posted_desc"),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_non_negative_int_str(raw: &[u8]) -> bool {
+        let trimmed = php_trim_ascii(raw);
+        (1..=9).contains(&trimmed.len()) && trimmed.iter().all(u8::is_ascii_digit)
+    }
+
+    pub(crate) fn combine_tv_airdate(
+        series: &[u8],
+        episode: &[u8],
+        out: &mut OutCursor<'_>,
+    ) -> isize {
+        let year = strip_trailing_pcre_newline(series);
+        let valid_year = year.len() == 4
+            && (year.starts_with(b"19") || year.starts_with(b"20"))
+            && year[2].is_ascii_digit()
+            && year[3].is_ascii_digit();
+        if !valid_year || !episode.contains(&b'/') {
+            return 0;
+        }
+        out.extend(&year[..4]);
+        out.push(b'-');
+        for &b in episode {
+            out.push(if b == b'/' { b'-' } else { b });
+        }
+        match out.pos {
+            n if n <= out.buf.len() => n as isize,
+            n => -(n.max(6) as isize),
+        }
+    }
+
+    #[inline]
+    fn parse_u64_digits(digits: &[u8]) -> Option<u64> {
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let mut acc = 0u64;
+        for &b in digits {
+            acc = acc.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+        }
+        Some(acc)
+    }
+
+    #[inline]
+    pub(crate) fn resolve_page(raw: &[u8]) -> Option<i64> {
+        let body = strip_trailing_pcre_newline(raw);
+        if body.is_empty() || !body.iter().all(u8::is_ascii_digit) {
+            return Some(1);
+        }
+        let val = parse_u64_digits(body)?;
+        if val > i64::MAX as u64 {
+            return None;
+        }
+        Some((val as i64).max(1))
+    }
+
+    #[inline]
+    pub(crate) fn parse_integer_input(raw: &[u8], default_val: i64) -> Option<i64> {
+        if default_val == i64::MIN {
+            return None;
+        }
+        let body = strip_trailing_pcre_newline(raw);
+        let (neg, digits) = match body.strip_prefix(b"-") {
+            Some(rest) => (true, rest),
+            None => (false, body),
+        };
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return Some(default_val);
+        }
+        let val = parse_u64_digits(digits)?;
+        if val > i64::MAX as u64 {
+            return None;
+        }
+        Some(if neg { -(val as i64) } else { val as i64 })
+    }
+
+    #[inline]
+    pub(crate) fn resolve_season(raw: &[u8]) -> Option<i64> {
+        let body = strip_trailing_pcre_newline(raw);
+        if body.is_empty() || !body.iter().all(u8::is_ascii_digit) {
+            return Some(SEASON_NONE);
+        }
+        let val = parse_u64_digits(body)?;
+        if val > i64::MAX as u64 {
+            return None;
+        }
+        Some(val as i64)
+    }
+
+    /// Classify `localReturnUrl()` target:
+    /// - `0`: rejected (`url($fallback)`)
+    /// - `1`: accepted same-origin absolute URL (`$from`)
+    /// - `2`: accepted relative URL (`url($from)`)
+    /// - `-1`: decline to PHP `parse_url()` path
+    pub(crate) fn classify_return_url(
+        raw_from: &[u8],
+        req_scheme: &[u8],
+        req_host: &[u8],
+        req_port: i64,
+    ) -> i32 {
+        let from = php_trim_ascii(raw_from);
+        if from.is_empty()
+            || from.starts_with(b"//")
+            || from.iter().any(|&b| b <= 0x20 || b == 0x7f || b == b'\\')
+        {
+            return 0;
+        }
+
+        let q_or_h = from
+            .iter()
+            .position(|&b| b == b'?' || b == b'#')
+            .unwrap_or(from.len());
+        let before_qh = &from[..q_or_h];
+        let Some(colon) = before_qh.iter().position(|&b| b == b':') else {
+            return 2;
+        };
+
+        let valid_scheme = colon > 0
+            && before_qh[..colon]
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'));
+        if !valid_scheme || !before_qh[colon..].starts_with(b"://") {
+            return -1;
+        }
+        if req_port < 0 {
+            return -1;
+        }
+
+        let scheme = &before_qh[..colon];
+        let after_slashes = &from[colon + 3..];
+        let auth_end = after_slashes
+            .iter()
+            .position(|&b| matches!(b, b'/' | b'?' | b'#'))
+            .unwrap_or(after_slashes.len());
+        let auth = &after_slashes[..auth_end];
+        if auth.is_empty() || auth.contains(&b'@') {
+            return 0;
+        }
+        if auth.contains(&b'[') || auth.contains(&b']') {
+            return -1;
+        }
+
+        let (host, port) = if let Some(c) = auth.iter().position(|&b| b == b':') {
+            let h = &auth[..c];
+            let p_bytes = &auth[c + 1..];
+            if h.is_empty() || p_bytes.contains(&b':') {
+                return -1;
+            }
+            if p_bytes.is_empty() {
+                let default_port = if scheme.eq_ignore_ascii_case(b"https") {
+                    443
+                } else {
+                    80
+                };
+                (h, default_port)
+            } else {
+                if p_bytes.len() > 5
+                    || p_bytes.starts_with(b"0")
+                    || !p_bytes.iter().all(u8::is_ascii_digit)
+                {
+                    return -1;
+                }
+                let Some(p) = parse_u64_digits(p_bytes) else {
+                    return -1;
+                };
+                if p == 0 || p > 65535 {
+                    return 0;
+                }
+                (h, p as i64)
+            }
+        } else {
+            let default_port = if scheme.eq_ignore_ascii_case(b"https") {
+                443
+            } else {
+                80
+            };
+            (auth, default_port)
+        };
+
+        let scheme_ok = scheme.len() == req_scheme.len()
+            && scheme
+                .iter()
+                .zip(req_scheme.iter())
+                .all(|(&a, &b)| a.to_ascii_lowercase() == b);
+        let host_ok = host.eq_ignore_ascii_case(req_host);
+        let port_ok = port == req_port;
+
+        if scheme_ok && host_ok && port_ok {
+            1
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    pub(crate) fn classify_title_bucket(title: &[u8]) -> u8 {
+        if let Some(&first) = title.first() {
+            if first.is_ascii_digit() {
+                return b'0';
+            }
+            if first.is_ascii_alphabetic() {
+                return first.to_ascii_uppercase();
+            }
+            for &b in &title[1..] {
+                if b.is_ascii_alphabetic() {
+                    return b.to_ascii_uppercase();
+                }
+            }
+        }
+        b'#'
+    }
+
+    // -- C ABI -------------------------------------------------------------------------------
+
+    /// Parse and normalize `ApiQueryParameters::categories()` from scalar or NUL-joined array.
+    ///
+    /// # Safety
+    ///
+    /// `input_ptr` must be valid for `input_len` reads when non-null, and `out_buf` for `out_cap` writes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_api_parse_categories(
+        input_ptr: *const u8,
+        input_len: usize,
+        is_array: u32,
+        webdl_mode: i32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if is_array > 1 || (out_cap > 0 && out_buf.is_null()) {
+            return DECLINED;
+        }
+        let Some(raw) = (unsafe { input(input_ptr, input_len) }) else {
+            return DECLINED;
+        };
+        let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+        parse_categories(raw, is_array == 1, webdl_mode, &mut cursor)
+    }
+
+    /// Normalize `ApiQueryParameters::sort()` (`strtolower(trim($raw))`).
+    ///
+    /// # Safety
+    ///
+    /// `input_ptr` must be valid for `input_len` reads when non-null, and `out_buf` for `out_cap` writes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_api_normalize_sort(
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if out_cap > 0 && out_buf.is_null() {
+            return DECLINED;
+        }
+        let Some(raw) = (unsafe { input(input_ptr, input_len) }) else {
+            return DECLINED;
+        };
+        let trimmed = php_trim_ascii(raw);
+        if trimmed.is_empty() {
+            return 0;
+        }
+        if trimmed.len() > out_cap {
+            return -(trimmed.len().max(2) as isize);
+        }
+        let out = unsafe { slice::from_raw_parts_mut(out_buf, trimmed.len()) };
+        for (d, &s) in out.iter_mut().zip(trimmed.iter()) {
+            *d = s.to_ascii_lowercase();
+        }
+        trimmed.len() as isize
+    }
+
+    /// Validate `ApiQueryParameters::hasValidSort()`.
+    ///
+    /// # Safety
+    ///
+    /// `input_ptr` must be valid for `input_len` reads when non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_api_is_valid_sort(
+        input_ptr: *const u8,
+        input_len: usize,
+    ) -> i32 {
+        let Some(raw) = (unsafe { input(input_ptr, input_len) }) else {
+            return -1;
+        };
+        i32::from(canonical_sort(php_trim_ascii(raw)).is_some())
+    }
+
+    /// Validate and canonicalize `ApiV2Controller::parseSort()`.
+    /// Returns canonical length (`7..=11`), `0` if empty after trim, `SORT_INVALID` (`-2`) if invalid,
+    /// `<= -7` when `out_cap` is too small, or `DECLINED` (`-1`) on invalid pointers.
+    ///
+    /// # Safety
+    ///
+    /// `input_ptr` must be valid for `input_len` reads when non-null, and `out_buf` for `out_cap` writes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_api_validate_sort(
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if out_cap > 0 && out_buf.is_null() {
+            return DECLINED;
+        }
+        let Some(raw) = (unsafe { input(input_ptr, input_len) }) else {
+            return DECLINED;
+        };
+        let trimmed = php_trim_ascii(raw);
+        if trimmed.is_empty() {
+            return 0;
+        }
+        let Some(canon) = canonical_sort(trimmed) else {
+            return SORT_INVALID;
+        };
+        if canon.len() > out_cap {
+            return -(canon.len() as isize);
+        }
+        unsafe {
+            slice::from_raw_parts_mut(out_buf, canon.len()).copy_from_slice(canon);
+        }
+        canon.len() as isize
+    }
+
+    /// Check `ApiV2Controller::isNonNegativeInteger()` for a string argument.
+    ///
+    /// # Safety
+    ///
+    /// `input_ptr` must be valid for `input_len` reads when non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_api_is_non_negative_int_str(
+        input_ptr: *const u8,
+        input_len: usize,
+    ) -> i32 {
+        let Some(raw) = (unsafe { input(input_ptr, input_len) }) else {
+            return -1;
+        };
+        i32::from(is_non_negative_int_str(raw))
+    }
+
+    /// Combine TV season year (`^(19|20)\d{2}$`) and slash-delimited episode (`MM/DD`) into `YYYY-MM-DD`.
+    ///
+    /// # Safety
+    ///
+    /// `series_ptr` and `episode_ptr` must be valid for reads of their lengths when non-null,
+    /// and `out_buf` for `out_cap` writes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_api_combine_tv_airdate(
+        series_ptr: *const u8,
+        series_len: usize,
+        episode_ptr: *const u8,
+        episode_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if out_cap > 0 && out_buf.is_null() {
+            return DECLINED;
+        }
+        let (Some(series), Some(episode)) =
+            (unsafe { (input(series_ptr, series_len), input(episode_ptr, episode_len)) })
+        else {
+            return DECLINED;
+        };
+        let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+        combine_tv_airdate(series, episode, &mut cursor)
+    }
+
+    /// Resolve `BasePageController::resolvePage()` from a scalar string input.
+    ///
+    /// # Safety
+    ///
+    /// `input_ptr` must be valid for `input_len` reads when non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_page_resolve_page(
+        input_ptr: *const u8,
+        input_len: usize,
+    ) -> i64 {
+        let Some(raw) = (unsafe { input(input_ptr, input_len) }) else {
+            return -1;
+        };
+        resolve_page(raw).unwrap_or(-1)
+    }
+
+    /// Resolve `BasePageController::integerInput()` from a scalar string input, or `i64::MIN` to decline.
+    ///
+    /// # Safety
+    ///
+    /// `input_ptr` must be valid for `input_len` reads when non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_page_parse_integer(
+        input_ptr: *const u8,
+        input_len: usize,
+        default_val: i64,
+    ) -> i64 {
+        let Some(raw) = (unsafe { input(input_ptr, input_len) }) else {
+            return i64::MIN;
+        };
+        parse_integer_input(raw, default_val).unwrap_or(i64::MIN)
+    }
+
+    /// Classify `BasePageController::localReturnUrl()` target.
+    ///
+    /// # Safety
+    ///
+    /// All pointers must be valid for reads of their lengths when non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_page_classify_return_url(
+        from_ptr: *const u8,
+        from_len: usize,
+        req_scheme_ptr: *const u8,
+        req_scheme_len: usize,
+        req_host_ptr: *const u8,
+        req_host_len: usize,
+        req_port: i64,
+    ) -> i32 {
+        let (Some(from), Some(scheme), Some(host)) = (unsafe {
+            (
+                input(from_ptr, from_len),
+                input(req_scheme_ptr, req_scheme_len),
+                input(req_host_ptr, req_host_len),
+            )
+        }) else {
+            return -1;
+        };
+        classify_return_url(from, scheme, host, req_port)
+    }
+
+    /// Classify a single series title into bucket code `b'0'` (`0-9`), `b'A'..=b'Z'`, or `b'#'`.
+    ///
+    /// # Safety
+    ///
+    /// `title_ptr` must be valid for `title_len` reads when non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_series_classify_title_bucket(
+        title_ptr: *const u8,
+        title_len: usize,
+    ) -> i32 {
+        let Some(title) = (unsafe { input(title_ptr, title_len) }) else {
+            return -1;
+        };
+        i32::from(classify_title_bucket(title))
+    }
+
+    /// Batch-classify `count` NUL-separated series titles into `count` bucket bytes (`0`, `A..Z`, `#`).
+    ///
+    /// # Safety
+    ///
+    /// `titles_ptr` must be valid for `titles_len` reads when non-null, and `out_buf` for `out_cap` writes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_series_classify_titles_nul(
+        titles_ptr: *const u8,
+        titles_len: usize,
+        count: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if count > isize::MAX as usize || (out_cap > 0 && out_buf.is_null()) {
+            return DECLINED;
+        }
+        if count == 0 {
+            return 0;
+        }
+        let Some(titles) = (unsafe { input(titles_ptr, titles_len) }) else {
+            return DECLINED;
+        };
+        if count > out_cap {
+            if titles.iter().filter(|&&b| b == 0).count() != count - 1 {
+                return DECLINED;
+            }
+            return -(count.max(2) as isize);
+        }
+        let out = unsafe { slice::from_raw_parts_mut(out_buf, count) };
+        let mut written = 0usize;
+        for title in titles.split(|&b| b == 0) {
+            if written >= count {
+                return DECLINED;
+            }
+            out[written] = classify_title_bucket(title);
+            written += 1;
+        }
+        if written != count {
+            return DECLINED;
+        }
+        count as isize
+    }
+
+    /// Resolve `SeriesController::resolveSeason()` from a scalar string input.
+    /// Returns `>= 0` on valid season, `SEASON_NONE` (`-2`) for `null`, or `-1` to decline.
+    ///
+    /// # Safety
+    ///
+    /// `input_ptr` must be valid for `input_len` reads when non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_series_resolve_season(
+        input_ptr: *const u8,
+        input_len: usize,
+    ) -> i64 {
+        let Some(raw) = (unsafe { input(input_ptr, input_len) }) else {
+            return -1;
+        };
+        resolve_season(raw).unwrap_or(-1)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn categories_and_sort_helpers_match_php_contracts() {
+            let mut buf = [0u8; 256];
+            let run_cat = |s: &[u8], is_arr: bool, mode: i32, b: &mut [u8]| -> isize {
+                let mut cur = unsafe { OutCursor::new(b.as_mut_ptr(), b.len()) };
+                parse_categories(s, is_arr, mode, &mut cur)
+            };
+            assert_eq!(
+                run_cat(b"  ", false, 0, &mut buf),
+                CATEGORIES_DEFAULT_ALL
+            );
+            assert_eq!(run_cat(b"+", false, 0, &mut buf), 0);
+            assert_eq!(run_cat(b",,,", false, 0, &mut buf), 0);
+            let n = run_cat(b" 2000 %2C 5030 , , 2040 ", false, -1, &mut buf) as usize;
+            assert_eq!(&buf[..n], b"2000\n5030\n2040");
+            assert_eq!(
+                run_cat(b"2000,5040", false, -1, &mut buf),
+                CATEGORIES_NEED_WEBDL_CONFIG
+            );
+            let n = run_cat(b"2000,5040", false, 1, &mut buf) as usize;
+            assert_eq!(&buf[..n], b"2000\n5040\n5010");
+            let n = run_cat(b"2000,5040,5010", false, -1, &mut buf) as usize;
+            assert_eq!(&buf[..n], b"2000\n5040\n5010");
+
+            assert_eq!(unsafe { nntmux_api_is_valid_sort(b" NAME_ASC ".as_ptr(), 10) }, 1);
+            assert_eq!(unsafe { nntmux_api_is_valid_sort(b"invalid".as_ptr(), 7) }, 0);
+            assert_eq!(
+                unsafe { nntmux_api_validate_sort(b"  ".as_ptr(), 2, buf.as_mut_ptr(), buf.len()) },
+                0
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_api_validate_sort(b"bad".as_ptr(), 3, buf.as_mut_ptr(), buf.len())
+                },
+                SORT_INVALID
+            );
+        }
+
+        #[test]
+        fn controller_and_series_helpers_match_php_contracts() {
+            assert!(is_non_negative_int_str(b" 0 "));
+            assert!(is_non_negative_int_str(b"123456789"));
+            assert!(!is_non_negative_int_str(b"1234567890"));
+            assert!(!is_non_negative_int_str(b"-1"));
+
+            let mut buf = [0u8; 64];
+            let mut cur = unsafe { OutCursor::new(buf.as_mut_ptr(), buf.len()) };
+            let n = combine_tv_airdate(b"2024\n", b"03/15", &mut cur) as usize;
+            assert_eq!(&buf[..n], b"2024-03-15");
+
+            assert_eq!(resolve_page(b"0"), Some(1));
+            assert_eq!(resolve_page(b"5\n"), Some(5));
+            assert_eq!(resolve_page(b" 5"), Some(1));
+            assert_eq!(parse_integer_input(b"-42\n", 9), Some(-42));
+            assert_eq!(parse_integer_input(b"+42", 9), Some(9));
+            assert_eq!(resolve_season(b""), Some(SEASON_NONE));
+            assert_eq!(resolve_season(b"02\n"), Some(2));
+
+            assert_eq!(
+                classify_return_url(b"/browse?page=2", b"https", b"nntmux.test", 443),
+                2
+            );
+            assert_eq!(
+                classify_return_url(
+                    b"https://nntmux.test/browse?page=2",
+                    b"https",
+                    b"nntmux.test",
+                    443
+                ),
+                1
+            );
+            assert_eq!(
+                classify_return_url(
+                    b"https://evil.example/browse",
+                    b"https",
+                    b"nntmux.test",
+                    443
+                ),
+                0
+            );
+            assert_eq!(
+                classify_return_url(b"//evil.example/browse", b"https", b"nntmux.test", 443),
+                0
+            );
+
+            assert_eq!(classify_title_bucket(b"24"), b'0');
+            assert_eq!(classify_title_bucket(b"'Allo 'Allo!"), b'A');
+            assert_eq!(classify_title_bucket(b"\xc3\x89lite"), b'L');
+            assert_eq!(classify_title_bucket(b" - 123"), b'#');
+        }
+    }
+}
