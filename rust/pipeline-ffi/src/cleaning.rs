@@ -12843,3 +12843,551 @@ mod wave18_runner_release_tests {
         }
     }
 }
+
+/// Reject malformed regions before creating slices or dereferencing scalar outputs.
+/// Allocation validity and aliasing remain the unsafe caller's responsibility.
+#[inline]
+fn cleaning_ffi_region_valid<T>(ptr: *const T, len: usize) -> bool {
+    let Some(bytes) = len.checked_mul(std::mem::size_of::<T>()) else {
+        return false;
+    };
+    !ptr.is_null()
+        && ptr.is_aligned()
+        && bytes <= isize::MAX as usize
+        && (ptr as usize).checked_add(bytes).is_some()
+}
+
+// Wave 19.1: pattern catalogs and NameFixResult pure helpers.
+const NAME_FIX_APP_PATTERNS: &[(&[u8], &[u8])] = &[
+    (b"WITH_KEYGEN", br#"/\w[\-\w.',;& ]+(\d{1,10}|v\d+[\.\d]*|Linux|UNIX|MacOS)[._ -](RPM|DEB)?[._ -]?(X64|X86|ARM64)?[._ -]?(Incl|With)?[._ -]?(Keygen|Patch|Crack|Serial|License)[\-\w.',;& ]+\w/i"#),
+    (b"WINDOWS", br#"/\w[\-\w.',;& ]+\d{1,8}[._ -](winall|win32|win64|x64|x86)[._ -]?(freeware|portable|repack)?[\-\w.',;& ]+\w/i"#),
+    (b"MACOS", br#"/\w[\-\w.',;& ]+(MacOS|Mac[._ -]?OS[._ -]?X|OSX)[._ -][\-\w.',;& ]+\w/i"#),
+    (b"LINUX", br#"/\w[\-\w.',;& ]+(Linux|Ubuntu|Debian|CentOS|RHEL|Fedora)[._ -](x64|x86|arm64)?[\-\w.',;& ]+\w/i"#),
+    (b"ADOBE", br#"/\w[\-\w.',;& ]*(Adobe|Photoshop|Illustrator|Premiere|After[._ -]?Effects|InDesign|Lightroom)[._ -][\-\w.',;& ]+\w/i"#),
+    (b"MICROSOFT", br#"/\w[\-\w.',;& ]*(Microsoft|Office|Windows|Visual[._ -]?Studio)[._ -]\d{2,4}[._ -][\-\w.',;& ]+\w/i"#),
+    (b"WITH_VERSION", br#"/\w[\-\w.',;& ]+[._ -]v?\d+[\.\d]+[._ -](Multilingual|MULTi|Portable|Repack|Cracked)[\-\w.',;& ]+\w/i"#),
+];
+
+const NAME_FIX_GAME_PATTERNS: &[(&[u8], &[u8])] = &[
+    (b"MODERN_CONSOLE", br#"/\w[\-\w.',;& ]+(NSW|PS[345P]|PSV|XBSX|XSX|XBOX[._ -]?SERIES[._ -]?[XS]|XBOX[._ -]?ONE|XBOX360?|WiiU?|Switch)[._ -](INTERNAL|PROPER|READNFO|READ[._ -]?NFO|MULTI\d{1,2})?[._ -]?[\-\w.',;& ]+\-[A-Za-z0-9]+$/i"#),
+    (b"REGION_CONSOLE", br#"/\w[\-\w.',;& ]+(ASIA|DLC|EUR|GOTY|JPN|KOR|MULTI\d{1}|NTSCU?|PAL|RF|Region[._ -]?Free|USA|XBLA)[._ -](DLC[._ -]Complete|FRENCH|GERMAN|MULTI\d{1}|PROPER|PSN|READ[._ -]?NFO|UMD)?[._ -]?(GC|NDS|NGC|PS[345P]|PSP|PSV|Switch|NSW|Wii(U)?|XBOX(360|ONE|SERIES)?|XBSX)[\-\w.',;& ]+\w/i"#),
+    (b"CONSOLE_SCENE_GROUP", br#"/\w[\-\w.',;& ]+(GC|NDS|NGC|PS[345P]|Switch|NSW|Wii(U)?|XBOX(360|ONE|SERIES)?|XBSX)[._ -](CODEX|DUPLEX|PLAZA|SKIDROW|RELOADED|CPY|EMPRESS|RAZOR1911|HOODLUM|DARKSiDERS|FLT|TiNYiSO|ANOMALY|iNSOMNi|OneUp|STRANGE|SWAG|SKY|SUXXORS)[\-\w.',;& ]+\w/i"#),
+    (b"PC_SCENE_GROUP", br#"/\w[\-\w.',;& ]+(PC|WIN(32|64)?|MAC(OSX?)?|LINUX)[._ -]?(CODEX|SKIDROW|RELOADED|CPY|EMPRESS|RAZOR1911|HOODLUM|DARKSiDERS|FLT|GOG|PROPHET|TiNYiSO|PLAZA|P2P|SiMPLEX|rG)[\-\w.',;& ]+\w/i"#),
+    (b"DLC_UPDATE", br#"/\w[\-\w.',;& ]+(DLC|Update|Patch|Hotfix)[._ -](v?\d+[\.\d]*)?[._ -]?(CODEX|SKIDROW|RELOADED|PLAZA|EMPRESS|FLT|GOG|P2P|TiNYiSO)[\-\w.',;& ]+\w/i"#),
+    (b"OUTLAWS", br#"/\w[\w.',;-].+-OUTLAWS/i"#),
+    (b"ALIAS", br#"/\w[\w.',;-].+\-ALiAS/i"#),
+    (b"GOG", br#"/\w[\-\w.',;& ]+[._ -]GOG[._ -]?(Classic|Galaxy)?[\-\w.',;& ]+\w/i"#),
+    (b"REPACK", br#"/\w[\-\w.',;& ]+[._ -](REPACK|RIP)[._ -](FitGirl|DODI|xatab|R\.G\.|Mechanics)[\-\w.',;& ]+\w/i"#),
+];
+
+const NAME_FIX_MOVIE_PATTERNS: &[(&[u8], &[u8])] = &[
+    (b"UHD_HDR", br#"/\w[\-\w.',;& ]+((19|20)\d\d)[._ -](2160p|4K|UHD)[._ -](HDR10\+?|DV|Dolby[._ -]?Vision|HLG)?[._ -]?(REMUX|BluRay|WEB-?DL|WEB-?RIP|UHD[._ -]?BluRay)[._ -](HEVC|x265|H\.?265|AV1)[._ -]?(Atmos|DTS[._ -]?(HD)?|TrueHD)?[\-\w.',;& ]+\w/i"#),
+    (b"UHD_REMUX", br#"/\w[\-\w.',;& ]+((19|20)\d\d)[._ -](2160p|4K)[._ -](REMUX|Complete[._ -]?UHD)[._ -](HEVC|x265|H\.?265)[\-\w.',;& ]+\w/i"#),
+    (b"STREAMING_4K", br#"/\w[\-\w.',;& ]+((19|20)\d\d)[._ -](2160p|4K)[._ -](AMZN|ATVP|DSNP|HMAX|HULU|iT|NF|PMTP|PCOK|ROKU|STAN|VUDU)[._ -](WEB-?DL|WEB-?RIP)[._ -](HDR10\+?|DV)?[._ -]?(HEVC|x265|H\.?265)[\-\w.',;& ]+\w/i"#),
+    (b"STREAMING_HD", br#"/\w[\-\w.',;& ]+((19|20)\d\d)[._ -](1080p|720p)[._ -](AMZN|ATVP|DSNP|HMAX|HULU|iT|NF|PMTP|PCOK|ROKU|STAN|VUDU)[._ -](WEB-?DL|WEB-?RIP)[._ -](x264|x265|H\.?264|H\.?265|HEVC)[\-\w.',;& ]+\w/i"#),
+    (b"YEAR_RES_VCODEC", br#"/\w[\-\w.',;& ]+((19|20)\d\d)[\-\w.',;& ]+(480|720|1080|2160)[ip]?[._ -](DivX|[HX][._ -]?264|[HX][._ -]?265|HEVC|MPEG2|XviD(HD)?|WMV|AV1)[\-\w.',;& ]+\w/i"#),
+    (b"YEAR_SOURCE_VCODEC_RES", br#"/\w[\-\w.',;& ]+((19|20)\d\d)[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -](DivX|[HX][._ -]?264|[HX][._ -]?265|HEVC|MPEG2|XviD(HD)?|WMV|AV1)[._ -](480|720|1080|2160)[ip]?[\-\w.',;& ]+\w/i"#),
+    (b"YEAR_SOURCE_VCODEC_ACODEC", br#"/\w[\-\w.',;& ]+((19|20)\d\d)[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -](DivX|[HX][._ -]?264|[HX][._ -]?265|HEVC|MPEG2|XviD(HD)?|WMV|AV1)[._ -](AAC( LC)?|AC-?3|DD5([._ -]1)?|(A_)?DTS-?(HD)?(-?MA)?|Dolby( ?TrueHD)?|MP3|TrueHD|Atmos|EAC3|FLAC)[\-\w.',;& ]+\w/i"#),
+    (b"RES_SOURCE_ACODEC_VCODEC", br#"/\w[\-\w.',;& ]+(480|720|1080|2160)[ip]?[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -](AAC( LC)?|AC-?3|DD5([._ -]1)?|(A_)?DTS-?(HD)?(-?MA)?|Dolby( ?TrueHD)?|MP3|TrueHD|Atmos|EAC3|FLAC)[._ -](DivX|[HX][._ -]?264|[HX][._ -]?265|HEVC|MPEG2|XviD(HD)?|WMV|AV1)[\-\w.',;& ]+\w/i"#),
+    (b"RES_ACODEC_SOURCE_YEAR", br#"/\w[\-\w.',;& ]+(480|720|1080|2160)[ip]?[._ -](AAC( LC)?|AC-?3|DD5([._ -]1)?|(A_)?DTS-?(HD)?(-?MA)?|Dolby( ?TrueHD)?|MP3|TrueHD|Atmos|EAC3|FLAC)[\-\w.',;& ]+(BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -]((19|20)\d\d)[\-\w.',;& ]+\w/i"#),
+    (b"MULTI_LANGUAGE", br#"/\w[\-\w.',;& ]+(Brazilian|Chinese|Croatian|Danish|Deutsch|Dutch|Estonian|English|Finnish|Flemish|Francais|French|German|Greek|Hebrew|Icelandic|Italian|Japenese|Japan|Japanese|Korean|Latin|Nordic|Norwegian|Polish|Portuguese|Russian|Serbian|Slovenian|Swedish|Spanisch|Spanish|Thai|Turkish|MULTi)[._ -]((19|20)\d\d)[._ -](AAC( LC)?|AC-?3|DD5([._ -]1)?|(A_)?DTS-?(HD)?(-?MA)?|Dolby( ?TrueHD)?|MP3|TrueHD|Atmos|EAC3|FLAC)[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[\-\w.',;& ]+\w/i"#),
+    (b"GENERIC", br#"/\w[\-\w.',;& ]+((19|20)\d\d)[\-\w.',;& ]+(480|720|1080|2160)[ip]?[\-\w.',;& ]+(BluRay|BDRip|DVDRip|HDTV|WEB-?DL|WEB-?RIP)[\-\w.',;& ]+\w/i"#),
+];
+
+const NAME_FIX_TV_PATTERNS: &[(&[u8], &[u8])] = &[
+    (b"STREAMING_4K_HDR", br#"/\w[\-\w.',;& ]+((s\d{1,2}[._ -]?e\d{1,3}(-?e\d{1,3})?)|(?<!\d)[S|]\d{1,2}[E|x]\d{1,}(?!\d)|ep[._ -]?\d{2,3})[._ -](2160p|4K|UHD)[._ -](AMZN|ATVP|DSNP|HMAX|HULU|iT|NF|PMTP|PCOK|ROKU|STAN|VUDU)[._ -](WEB-?DL|WEB-?RIP)[._ -](HDR10?\+?|DV|Dolby[._ -]?Vision)?[._ -]?(HEVC|x265|H\.?265)[\-\w.',;& ]+\w/i"#),
+    (b"STREAMING_HD", br#"/\w[\-\w.',;& ]+((s\d{1,2}[._ -]?e\d{1,3}(-?e\d{1,3})?)|(?<!\d)[S|]\d{1,2}[E|x]\d{1,}(?!\d)|ep[._ -]?\d{2,3})[._ -](1080p|720p)[._ -](AMZN|ATVP|DSNP|HMAX|HULU|iT|NF|PMTP|PCOK|ROKU|STAN|VUDU)[._ -](WEB-?DL|WEB-?RIP)[\-\w.',;& ]+\w/i"#),
+    (b"TV_RES_SOURCE_VCODEC", br#"/\w[\-\w.',;& ]+((s\d{1,2}[._ -]?[bde]\d{1,2}(-?e\d{1,3})?)|(?<!\d)\d{1,2}x\d{2}(?!\d)|ep[._ -]?\d{2,3})[\-\w.',;& ]+(480|720|1080|2160)[ip]?[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -](DivX|[HX][._ -]?264|[HX][._ -]?265|HEVC|MPEG2|XviD(HD)?|WMV|AV1)[\-\w.',;& ]+\w/i"#),
+    (b"TV_AUDIO_SOURCE_RES_VCODEC", br#"/\w[\-\w.',;& ]+((s\d{1,2}[._ -]?[bde]\d{1,2}(-?e\d{1,3})?)|(?<!\d)\d{1,2}x\d{2}(?!\d)|ep[._ -]?\d{2})[._ -](AAC( LC)?|AC-?3|DD5([._ -]1)?|(A_)?DTS-?(HD)?(-?MA)?|Dolby( ?TrueHD)?|MP3|TrueHD|Atmos|EAC3)[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -](480|720|1080|2160)[ip]?[._ -](DivX|[HX][._ -]?264|[HX][._ -]?265|HEVC|MPEG2|XviD(HD)?|WMV|AV1)[\-\w.',;& ]+\w/i"#),
+    (b"TV_SOURCE_VCODEC", br#"/\w[\-\w.',;& ]+((s\d{1,2}[._ -]?[bde]\d{1,2}(-?e\d{1,3})?)|(?<!\d)\d{1,2}x\d{2}(?!\d)|ep[._ -]?\d{2})[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -](DivX|[HX][._ -]?264|[HX][._ -]?265|HEVC|MPEG2|XviD(HD)?|WMV|AV1)[\-\w.',;& ]+\w/i"#),
+    (b"TV_SOURCE_GROUP", br#"/\w[\-\w.',;& ]+((s\d{1,2}[._ -]?[bde]\d{1,2}(-?e\d{1,3})?)|(?<!\d)[S|]\d{1,2}[E|x]\d{1,}(?!\d)|ep[._ -]?\d{2})[\-\w.',;.()]+(BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -][\-\w.',;& ]+\w/i"#),
+    (b"TV_YEAR_SEASON", br#"/\w[\-\w.',;& ]+((19|20)\d\d)[._ -]((s\d{1,2}[._ -]?[bde]\d{1,2}(-?e\d{1,3})?)|(?<!\d)\d{1,2}x\d{2}(?!\d)|ep[._ -]?\d{2})[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[\-\w.',;& ]+\w/i"#),
+    (b"TV_WITH_YEAR", br#"/\w[\-\w.',;& ]+((s\d{1,2}[._ -]?[bde]\d{1,2}(-?e\d{1,3})?)|(?<!\d)\d{1,2}x\d{2}(?!\d)|ep[._ -]?\d{2})[\-\w.',;& ]+((19|20)\d\d)[\-\w.',;& ]+\w/i"#),
+    (b"DAILY_SHOW", br#"/\w[\-\w.',;& ]+(19|20)\d\d[._ -]\d{2}[._ -]\d{2}[._ -](720p|1080p|2160p|HDTV|WEB-?DL|WEB-?RIP)[\-\w.',;& ]+\w/i"#),
+    (b"SPORTS", br#"/\w(19|20)\d\d[._ -]\d{2}[._ -]\d{2}[._ -](IndyCar|F1|Formula[._ -]?1|MotoGP|NBA|NCW([TY])S|NNS|NSCS?|NFL|NHL|MLB|UFC|WWE|Boxing)([._ -](19|20)\d\d)?[\-\w.',;& ]+\w/i"#),
+    (b"COMPLETE_SEASON", br#"/\w[\-\w.',;& ]+[._ -]S\d{1,2}[._ -](COMPLETE|FULL)[._ -](720p|1080p|2160p|HDTV|WEB-?DL|WEB-?RIP|BluRay)[\-\w.',;& ]+\w/i"#),
+    (b"ANIME", br#"/\w[\-\w.',;& ]+[._ -](\d{2,4})[._ -](480p|720p|1080p|2160p)[._ -](HEVC|x265|x264|H\.?264)[._ -](10bit)?[\-\w.',;& ]+\w/i"#),
+];
+
+fn name_fix_patterns(kind: u32) -> Option<&'static [(&'static [u8], &'static [u8])]> {
+    match kind {
+        0 => Some(NAME_FIX_APP_PATTERNS),
+        1 => Some(NAME_FIX_GAME_PATTERNS),
+        2 => Some(NAME_FIX_MOVIE_PATTERNS),
+        3 => Some(NAME_FIX_TV_PATTERNS),
+        _ => None,
+    }
+}
+
+fn name_fix_copy(value: &[u8], out: *mut u8, cap: usize) -> isize {
+    if value.len() > cap {
+        return -2;
+    }
+    // All callers have validated the output allocation and byte extent. The
+    // value is separately allocated or static, so it cannot overlap `out`.
+    if !value.is_empty() {
+        unsafe { std::ptr::copy_nonoverlapping(value.as_ptr(), out, value.len()) };
+    }
+    value.len() as isize
+}
+
+/// Catalog modes: 0 = alternating key/regex fields; 1 = priority key fields;
+/// 2 = count (return value); 3 = exact case-sensitive regex lookup;
+/// 4 = zero-based priority key lookup. Fields are u32 LE length + raw bytes.
+/// Returns bytes/count, -1 for malformed arguments/panic, -2 for capacity,
+/// or -3 for unknown key/index. Errors do not modify the caller's output.
+///
+/// # Safety
+/// Every pointer must be non-null/aligned and valid for its stated byte extent,
+/// even for zero lengths. Allocation validity remains the caller's obligation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_name_fixing_patterns(
+    kind: u32,
+    mode: u32,
+    key: *const u8,
+    key_len: usize,
+    index: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(key, key_len) || !cleaning_ffi_region_valid(out, cap) {
+            return -1;
+        }
+        let Some(patterns) = name_fix_patterns(kind) else {
+            return -1;
+        };
+        let key = unsafe { slice::from_raw_parts(key, key_len) };
+        match mode {
+            0 | 1 => {
+                let mut output = RunnerReleaseOutput {
+                    bytes: Vec::new(),
+                    cap,
+                };
+                for &(name, pattern) in patterns {
+                    if let Err(code) = output.field(name) {
+                        return code;
+                    }
+                    if mode == 0 {
+                        if let Err(code) = output.field(pattern) {
+                            return code;
+                        }
+                    }
+                }
+                name_fix_copy(&output.bytes, out, cap)
+            }
+            2 => patterns.len() as isize,
+            3 => patterns
+                .iter()
+                .find(|&&(name, _)| name == key)
+                .map_or(-3, |&(_, pattern)| name_fix_copy(pattern, out, cap)),
+            4 => patterns
+                .get(index)
+                .map_or(-3, |&(name, _)| name_fix_copy(name, out, cap)),
+            _ => -1,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+fn name_fix_result_build(
+    mode: u32,
+    input: &[u8],
+    predb_id: i64,
+    matched: u32,
+    cap: usize,
+) -> Result<Vec<u8>, isize> {
+    let fields = name_query_fields(input)?;
+    let mut output = RunnerReleaseOutput {
+        bytes: Vec::new(),
+        cap,
+    };
+    match mode {
+        0 | 2 => {
+            if fields.len() != 3 {
+                return Err(-1);
+            }
+            let has_match = mode == 0 || matched == 1;
+            output.field(if has_match { fields[0] } else { b"" })?;
+            output.field(if has_match { fields[1] } else { b"" })?;
+            output.field(fields[2])?;
+            output.number(if has_match { predb_id } else { 0 })?;
+        }
+        1 => {
+            if fields.len() != 1 {
+                return Err(-1);
+            }
+            for value in [b"".as_slice(), b"", fields[0], b"0"] {
+                output.field(value)?;
+            }
+        }
+        4 => {
+            if fields.len() % 2 != 0 {
+                return Err(-1);
+            }
+            // Preserve raw string keys/values; PHP owns non-string values and
+            // Spatie transformation contexts. Re-emit validated framed pairs.
+            for field in fields {
+                output.field(field)?;
+            }
+        }
+        5 => {
+            if fields.len() != 3 {
+                return Err(-1);
+            }
+            let values = if fields[0].is_empty() {
+                vec![fields[2], b": no match".as_slice()]
+            } else {
+                vec![fields[2], b": ", fields[1], b" => ", fields[0]]
+            };
+            let size = values
+                .iter()
+                .try_fold(0usize, |size, value| size.checked_add(value.len()))
+                .ok_or(-1isize)?;
+            if size > cap {
+                return Err(-2);
+            }
+            output.bytes.try_reserve(size).map_err(|_| -3isize)?;
+            for value in values {
+                output.bytes.extend_from_slice(value);
+            }
+        }
+        _ => return Err(-1),
+    }
+    Ok(output.bytes)
+}
+
+/// NameFixResult modes: 0 = matched; 1 = unmatched; 2 = nullable check result;
+/// 3 = nonempty raw name predicate (return 0/1); 4 = string-pair array projection;
+/// 5 = summary. Factory inputs/outputs are framed as documented above. Floating
+/// confidence, metadata, object identity and Spatie contexts remain owned by PHP.
+/// Errors (-1 malformed/panic, -2 capacity, -3 allocation) never modify output.
+///
+/// # Safety
+/// Every pointer must be non-null/aligned and valid for its stated byte extent,
+/// including zero lengths. Input and output may overlap: output is built first.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_name_fix_result(
+    mode: u32,
+    input: *const u8,
+    len: usize,
+    predb_id: i64,
+    matched: u32,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len)
+            || !cleaning_ffi_region_valid(out, cap)
+            || matched > 1
+        {
+            return -1;
+        }
+        let input = unsafe { slice::from_raw_parts(input, len) };
+        if mode == 3 {
+            return isize::from(!input.is_empty());
+        }
+        match name_fix_result_build(mode, input, predb_id, matched, cap) {
+            Ok(bytes) => name_fix_copy(&bytes, out, cap),
+            Err(code) => code,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod cleaning_wave19_name_fix_tests {
+    use super::*;
+
+    fn frames(fields: &[&[u8]]) -> Vec<u8> {
+        let mut output = RunnerReleaseOutput {
+            bytes: Vec::new(),
+            cap: 65536,
+        };
+        for field in fields {
+            output.field(field).unwrap();
+        }
+        output.bytes
+    }
+
+    #[test]
+    fn catalog_preserves_priority_count_bytes_and_lookup_boundaries() {
+        for (kind, count, first, last) in [
+            (0, 7, b"WITH_KEYGEN".as_slice(), b"WITH_VERSION".as_slice()),
+            (1, 9, b"MODERN_CONSOLE", b"REPACK"),
+            (2, 11, b"UHD_HDR", b"GENERIC"),
+            (3, 12, b"STREAMING_4K_HDR", b"ANIME"),
+        ] {
+            let patterns = name_fix_patterns(kind).unwrap();
+            assert_eq!(patterns.len(), count);
+            assert_eq!(patterns[0].0, first);
+            assert_eq!(patterns[count - 1].0, last);
+            let mut out = [0u8; 32768];
+            unsafe {
+                let size = nntmux_name_fixing_patterns(
+                    kind,
+                    0,
+                    b"".as_ptr(),
+                    0,
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                );
+                assert!(size > 0);
+                let catalog = out[..size as usize].to_vec();
+                let fields = name_query_fields(&catalog).unwrap();
+                for (index, &(name, pattern)) in patterns.iter().enumerate() {
+                    assert_eq!(fields[index * 2], name);
+                    assert_eq!(fields[index * 2 + 1], pattern);
+                    let size = nntmux_name_fixing_patterns(
+                        kind,
+                        3,
+                        name.as_ptr(),
+                        name.len(),
+                        0,
+                        out.as_mut_ptr(),
+                        out.len(),
+                    );
+                    assert_eq!(&out[..size as usize], pattern);
+                }
+                assert_eq!(
+                    nntmux_name_fixing_patterns(kind, 2, b"".as_ptr(), 0, 0, out.as_mut_ptr(), 0),
+                    count as isize
+                );
+                assert_eq!(
+                    nntmux_name_fixing_patterns(
+                        kind,
+                        3,
+                        b"unknown\0\xff".as_ptr(),
+                        9,
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -3
+                );
+                assert_eq!(
+                    nntmux_name_fixing_patterns(
+                        kind,
+                        4,
+                        b"".as_ptr(),
+                        0,
+                        count,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -3
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn factories_and_summaries_preserve_binary_empty_names_and_signed_ids() {
+        let input = frames(&[b"0\0\xff", b"method\n", "番組".as_bytes()]);
+        for id in [i64::MIN, -1, 0, 1, i64::MAX] {
+            let result = name_fix_result_build(0, &input, id, 1, 65536).unwrap();
+            let fields = name_query_fields(&result).unwrap();
+            assert_eq!(
+                fields,
+                vec![
+                    b"0\0\xff".as_slice(),
+                    b"method\n",
+                    "番組".as_bytes(),
+                    id.to_string().as_bytes()
+                ]
+            );
+            assert_eq!(
+                name_fix_result_build(2, &input, id, 1, 65536).unwrap(),
+                result
+            );
+        }
+        assert_eq!(
+            name_fix_result_build(5, &input, 0, 0, 65536).unwrap(),
+            "番組: method\n => 0\0"
+                .as_bytes()
+                .iter()
+                .copied()
+                .chain([0xff])
+                .collect::<Vec<_>>()
+        );
+        let unmatched = name_fix_result_build(1, &frames(&[b"checker"]), 123, 1, 65536).unwrap();
+        assert_eq!(
+            name_query_fields(&unmatched).unwrap(),
+            vec![b"".as_slice(), b"", b"checker", b"0"]
+        );
+        assert_eq!(
+            name_fix_result_build(2, &frames(&[b"name", b"method", b"checker"]), 123, 0, 65536)
+                .unwrap(),
+            unmatched
+        );
+        assert_eq!(
+            name_fix_result_build(5, &frames(&[b"", b"method", b"checker"]), 0, 0, 65536).unwrap(),
+            b"checker: no match"
+        );
+        let pairs = frames(&[b"newName", b"0\0\xff", b"checkerName", "番組".as_bytes()]);
+        assert_eq!(
+            name_fix_result_build(4, &pairs, 0, 0, pairs.len()).unwrap(),
+            pairs
+        );
+        assert_eq!(name_fix_result_build(4, &[], 0, 0, 0).unwrap(), b"");
+    }
+
+    #[test]
+    fn abi_rejects_bad_regions_frames_flags_and_preserves_output_on_failure() {
+        let mut out = [0x5au8; 32];
+        let input = frames(&[b"name", b"method", b"checker"]);
+        unsafe {
+            for mode in 0..=5 {
+                assert_eq!(
+                    nntmux_name_fix_result(
+                        mode,
+                        std::ptr::null(),
+                        0,
+                        0,
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_name_fix_result(
+                        mode,
+                        input.as_ptr(),
+                        usize::MAX,
+                        0,
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_name_fix_result(
+                        mode,
+                        input.as_ptr(),
+                        input.len(),
+                        0,
+                        0,
+                        std::ptr::null_mut(),
+                        0
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_name_fix_result(
+                        mode,
+                        input.as_ptr(),
+                        input.len(),
+                        0,
+                        2,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -1
+                );
+            }
+            for mode in [0, 1, 2, 4, 5] {
+                assert_eq!(
+                    nntmux_name_fix_result(
+                        mode,
+                        b"\xff\xff\xff\xff".as_ptr(),
+                        4,
+                        0,
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -1
+                );
+            }
+            assert_eq!(
+                nntmux_name_fix_result(5, input.as_ptr(), input.len(), 0, 1, out.as_mut_ptr(), 1),
+                -2
+            );
+            assert_eq!(
+                nntmux_name_fix_result(3, b"".as_ptr(), 0, 0, 0, out.as_mut_ptr(), 0),
+                0
+            );
+            assert_eq!(
+                nntmux_name_fix_result(3, b"0".as_ptr(), 1, 0, 0, out.as_mut_ptr(), 0),
+                1
+            );
+            assert_eq!(
+                nntmux_name_fixing_patterns(0, 0, b"".as_ptr(), 0, 0, out.as_mut_ptr(), 1),
+                -2
+            );
+            assert_eq!(
+                nntmux_name_fixing_patterns(0, 0, b"".as_ptr(), 0, 0, out.as_mut_ptr(), usize::MAX),
+                -1
+            );
+            assert_eq!(
+                nntmux_name_fixing_patterns(
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    0,
+                    out.as_mut_ptr(),
+                    out.len()
+                ),
+                -1
+            );
+        }
+        assert_eq!(out, [0x5a; 32]);
+        // u8 pointers have alignment 1; typed ABI rejection is covered by the
+        // actual i64/i32 exports in strict_cleaning_abi_tests.
+    }
+
+    #[test]
+    fn result_abi_accepts_exact_capacity_and_overlapping_input_output() {
+        let mut input = frames(&[b"newName", b"bytes\0\xff"]);
+        let expected = input.clone();
+        let pointer = input.as_mut_ptr();
+        unsafe {
+            assert_eq!(
+                nntmux_name_fix_result(4, pointer, input.len(), 0, 0, pointer, input.len()),
+                input.len() as isize
+            );
+        }
+        assert_eq!(input, expected);
+        for mode in [0, 1, 2, 5] {
+            let input = if mode == 1 {
+                frames(&[b"checker"])
+            } else {
+                frames(&[b"name", b"method", b"checker"])
+            };
+            let expected = name_fix_result_build(mode, &input, i64::MIN, 1, 65536).unwrap();
+            let mut out = vec![0x5a; expected.len()];
+            unsafe {
+                assert_eq!(
+                    nntmux_name_fix_result(
+                        mode,
+                        input.as_ptr(),
+                        input.len(),
+                        i64::MIN,
+                        1,
+                        out.as_mut_ptr(),
+                        out.len() - 1
+                    ),
+                    -2
+                );
+                assert!(out.iter().all(|&b| b == 0x5a));
+                assert_eq!(
+                    nntmux_name_fix_result(
+                        mode,
+                        input.as_ptr(),
+                        input.len(),
+                        i64::MIN,
+                        1,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    expected.len() as isize
+                );
+            }
+            assert_eq!(out, expected);
+        }
+    }
+}
