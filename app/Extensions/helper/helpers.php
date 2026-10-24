@@ -164,10 +164,83 @@ if (! function_exists('getUserBrowseOrdering')) {
     }
 }
 
+if (! function_exists('helpers_native_library')) {
+    /**
+     * Rust exports for release_flag(), getSimilarName() and imdb_id_is_valid().
+     */
+    function helpers_native_library(): ?FFI
+    {
+        static $ffi = null;
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('helpers_language_flag', <<<'C'
+                int32_t nntmux_release_flag_case(const char *text, size_t len);
+                int64_t nntmux_similar_name_spans(const char *name, size_t len);
+                int32_t nntmux_imdb_id_is_valid(const char *id, size_t len);
+                C) ?? false;
+        }
+
+        return $ffi ?: null;
+    }
+}
+
+if (! function_exists('helpers_native_pcre_ready')) {
+    /**
+     * Whether a Rust result computed with PCRE's default (ASCII) character tables is valid.
+     * Rust declines (< 0) unless LC_CTYPE is C, POSIX or C.UTF-8; bit 0x100 reports a decision
+     * that examined a byte >= 0x80 classified by libc. An explicit setlocale() makes PHP rebuild
+     * its tables (macOS C.UTF-8 marks Latin-1 letters as \w), so those results probe them.
+     */
+    function helpers_native_pcre_ready(int $result): bool
+    {
+        static $highBytes = null;
+
+        return $result >= 0 && ($result < 0x100
+            || preg_match('/[\w\d]/', $highBytes ??= implode('', array_map(chr(...), range(0x80, 0xFF)))) === 0);
+    }
+}
+
 if (! function_exists('getSimilarName')) {
     function getSimilarName(string $name): string
     {
+        return getSimilarNameNative($name) ?? getSimilarNamePhp($name);
+    }
+}
+
+if (! function_exists('getSimilarNamePhp')) {
+    function getSimilarNamePhp(string $name): string
+    {
         return implode(' ', \array_slice(str_word_count(str_replace(['.', '_', '-'], ' ', $name), 2), 0, 2));
+    }
+}
+
+if (! function_exists('getSimilarNameNative')) {
+    /**
+     * Rust returns the first two word spans; libc isalpha() classifies bytes >= 0x80 exactly
+     * like str_word_count(). null requests the PHP implementation.
+     */
+    function getSimilarNameNative(string $name): ?string
+    {
+        static $ffi = null;
+        $ffi ??= helpers_native_library() ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            $spans = $ffi->nntmux_similar_name_spans($name, \strlen($name));
+        } catch (Throwable) {
+            return null;
+        }
+        if ($spans < 0) {
+            return null;
+        }
+        $firstLength = ($spans >> 15) & 0x7FFF;
+        if ($firstLength === 0) {
+            return '';
+        }
+        $first = substr($name, $spans & 0x7FFF, $firstLength);
+        $secondLength = ($spans >> 45) & 0x7FFF;
+
+        return $secondLength === 0 ? $first : $first.' '.substr($name, ($spans >> 30) & 0x7FFF, $secondLength);
     }
 }
 
@@ -226,12 +299,42 @@ if (! function_exists('imdb_id_is_valid')) {
      */
     function imdb_id_is_valid(int|string|null $id): bool
     {
+        // Rust imdb_id_is_valid_native() missed the 1.5x admission gate (parity test benchmark).
+        return imdb_id_is_valid_php($id);
+    }
+}
+
+if (! function_exists('imdb_id_is_valid_php')) {
+    function imdb_id_is_valid_php(int|string|null $id): bool
+    {
         if ($id === null || $id === '' || $id === 0) {
             return false;
         }
         $s = preg_replace('/\D/', '', trim((string) $id));
 
         return $s !== '' && $s !== '0' && ((int) $s) !== 0;
+    }
+}
+
+if (! function_exists('imdb_id_is_valid_native')) {
+    /** Strings only; null requests the PHP implementation (non-strings, 309+ digits, locale tables). */
+    function imdb_id_is_valid_native(int|string|null $id): ?bool
+    {
+        if (! \is_string($id)) {
+            return null;
+        }
+        $ffi = helpers_native_library();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound (domain C ABI)
+            $result = $ffi->nntmux_imdb_id_is_valid($id, \strlen($id));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return helpers_native_pcre_ready($result) ? ($result & 1) === 1 : null;
     }
 }
 
@@ -380,6 +483,18 @@ if (! function_exists('release_flag')) {
      */
     function release_flag(string $text, string $page): bool|string
     {
+        // Rust release_flag_native() missed the 1.5x gate on the browse page (asset() dominates).
+        return release_flag_php($text, $page);
+    }
+}
+
+if (! function_exists('release_flag_php')) {
+    /**
+     * @param  string  $text  Text to match against.
+     * @param  string  $page  Type of page. browse or search.
+     */
+    function release_flag_php(string $text, string $page): bool|string
+    {
         $code = $language = '';
 
         switch (true) {
@@ -493,6 +608,13 @@ if (! function_exists('release_flag')) {
                 break;
         }
 
+        return release_flag_output($code, $language, $page);
+    }
+}
+
+if (! function_exists('release_flag_output')) {
+    function release_flag_output(string $code, string $language, string $page): bool|string
+    {
         if ($code !== '' && $page === 'browse') {
             return '<img title="'.$language.'" alt="'.$language.'" src="'.asset('/assets/images/flags/'.$code.'.png').'"/>';
         }
@@ -506,6 +628,43 @@ if (! function_exists('release_flag')) {
         }
 
         return '';
+    }
+}
+
+if (! function_exists('release_flag_native')) {
+    /**
+     * Rust evaluates the release_flag_php() cases in order and returns the first match (1-27).
+     * null requests the PHP implementation.
+     *
+     * @param  string  $text  Text to match against.
+     * @param  string  $page  Type of page. browse or search.
+     */
+    function release_flag_native(string $text, string $page): bool|string|null
+    {
+        static $flags = [
+            1 => ['PK', 'Arabic'], ['TW', 'Cantonese'], ['CN', 'Chinese'], ['CZ', 'Czech'], ['DK', 'Danish'],
+            ['FI', 'Finnish'], ['NL', 'Dutch'], ['FR', 'French'], ['DE', 'German'], ['GR', 'Greek'],
+            ['IL', 'Hebrew'], ['IN', 'Hindi'], ['HU', 'Hungarian'], ['IT', 'Italian'], ['JP', 'Japanese'],
+            ['KR', 'Korean'], ['NO', 'Norwegian'], ['PL', 'Polish'], ['PT', 'Portugese'], ['RO', 'Romanian'],
+            ['ES', 'Spanish'], ['SE', 'Swedish'], ['PH', 'Tagalog|Filipino'], ['TH', 'Thai'], ['TR', 'Turkish'],
+            ['RU', 'Russian'], ['VN', 'Vietnamese'],
+        ];
+        $ffi = helpers_native_library();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound (domain C ABI)
+            $result = $ffi->nntmux_release_flag_case($text, \strlen($text));
+        } catch (Throwable) {
+            return null;
+        }
+        if (! helpers_native_pcre_ready($result)) {
+            return null;
+        }
+        [$code, $language] = $flags[$result & 0xFF] ?? ['', ''];
+
+        return release_flag_output($code, $language, $page);
     }
 }
 
