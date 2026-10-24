@@ -32933,3 +32933,961 @@ pub mod postprocess_tv_anidb_steam_commands {
         }
     }
 }
+
+/// Wave 32.4: attribute normalization for the `AnidbTitle`, `AudioData`, `MusicInfo`,
+/// `TvEpisode` and `VideoData` Eloquent models.
+///
+/// String inputs arrive as one buffer of `0x1F`-separated fields; bit `i` of `null_mask` marks
+/// field `i` as PHP `null` (its field must be empty). Outputs are `0x1F`-separated with `0x1E`
+/// alone for `null`. Inputs that are not UTF-8 or that embed either marker byte decline with
+/// `-1` so PHP keeps its own implementation.
+pub mod media_catalogue_models {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+    use std::str;
+
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const DECLINE: isize = -1;
+    const FIELD_SEP: u8 = 0x1F;
+    const NULL_MARK: u8 = 0x1E;
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B\x0C";
+    const U32_MAX: i64 = 4_294_967_295;
+    const I32_MAX: i64 = 2_147_483_647;
+    const SMALLINT_MAX: i64 = 65_535;
+    const ASPECT_TOLERANCE: f64 = 0.02;
+
+    /// `VideoData::ASPECT_RATIOS`, in PHP's iteration order.
+    const ASPECT_RATIOS: [(&str, f64); 11] = [
+        ("1:1", 1.0),
+        ("5:4", 1.25),
+        ("4:3", 4.0 / 3.0),
+        ("3:2", 1.5),
+        ("16:10", 1.6),
+        ("16:9", 16.0 / 9.0),
+        ("1.85:1", 1.85),
+        ("2:1", 2.0),
+        ("2.20:1", 2.2),
+        ("2.35:1", 2.35),
+        ("2.39:1", 2.39),
+    ];
+
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    #[inline]
+    fn flag(value: u32) -> Option<bool> {
+        match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Copies `bytes` into `out_buf`, returning the length or `-required` when it does not fit.
+    unsafe fn write_bytes(bytes: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return -(bytes.len() as isize);
+        }
+        if !bytes.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    /// Splits the wire buffer into exactly `expected` UTF-8 fields (`None` for PHP `null`).
+    fn split_fields(input: &[u8], expected: usize, null_mask: u32) -> Option<Vec<Option<&str>>> {
+        if expected > 32 || (expected < 32 && null_mask >> expected != 0) {
+            return None;
+        }
+        let mut fields = Vec::with_capacity(expected);
+        for part in input.split(|&b| b == FIELD_SEP) {
+            if fields.len() == expected || part.contains(&NULL_MARK) {
+                return None;
+            }
+            if null_mask & (1 << fields.len()) != 0 {
+                if !part.is_empty() {
+                    return None;
+                }
+                fields.push(None);
+            } else {
+                fields.push(Some(str::from_utf8(part).ok()?));
+            }
+        }
+        (fields.len() == expected).then_some(fields)
+    }
+
+    /// PHP `trim($value, " \t\n\r\0\x0B\x0C")`.
+    fn trim_ws(value: &str) -> &str {
+        value.trim_matches(|c: char| c.is_ascii() && TRIM_SET.contains(&(c as u8)))
+    }
+
+    /// PHP `preg_replace('/[ \t\n\r\x0B\x0C]+/', ' ', $value)`.
+    fn collapse_ws(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        let mut in_run = false;
+        for c in value.chars() {
+            if matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0B' | '\x0C') {
+                if !in_run {
+                    out.push(' ');
+                    in_run = true;
+                }
+            } else {
+                out.push(c);
+                in_run = false;
+            }
+        }
+        out
+    }
+
+    /// PHP `mb_substr($value, 0, $max, 'UTF-8')` for valid UTF-8.
+    fn char_prefix(value: &str, max: usize) -> &str {
+        match value.char_indices().nth(max) {
+            Some((index, _)) => &value[..index],
+            None => value,
+        }
+    }
+
+    /// Trims, maps an empty result to `null` and keeps at most `max` characters.
+    fn clean_opt(value: Option<&str>, max: usize) -> Option<&str> {
+        value
+            .map(trim_ws)
+            .filter(|v| !v.is_empty())
+            .map(|v| char_prefix(v, max))
+    }
+
+    fn clean_text(value: &str, max: usize) -> String {
+        char_prefix(trim_ws(&collapse_ws(value)), max).to_owned()
+    }
+
+    /// Joins already-encoded fields with the separator, keeping empty leading fields intact.
+    fn encode(fields: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (i, field) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(FIELD_SEP);
+            }
+            out.extend_from_slice(field.unwrap_or(&[NULL_MARK]));
+        }
+        out
+    }
+
+    fn has_marker(bytes: &[u8]) -> bool {
+        bytes.iter().any(|&b| b == FIELD_SEP || b == NULL_MARK)
+    }
+
+    /// `AnidbTitle::normalizeTitleAttributesPhp()`.
+    pub fn anidb_title_attributes(
+        anidb_id: i64,
+        kind: &str,
+        lang: &str,
+        title: &str,
+    ) -> (i64, String, String, String, String) {
+        let id = anidb_id.clamp(0, U32_MAX);
+        let kind = char_prefix(trim_ws(kind), 25).to_ascii_lowercase();
+        let lang = char_prefix(trim_ws(lang), 25).to_ascii_lowercase();
+        let title = clean_text(title, 255);
+        let key = format!("{id}|{kind}|{lang}|{}", title.to_ascii_lowercase());
+        (id, kind, lang, title, key)
+    }
+
+    /// `AudioData::channelCountPhp()`: leading 1–3 digit channel count, `None` for zero.
+    pub fn audio_channel_count(channels: Option<&str>) -> Option<i64> {
+        let channels = channels?;
+        let digits = channels.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 || digits > 3 {
+            return None;
+        }
+        let count: i64 = channels[..digits].parse().ok()?;
+        (count != 0).then_some(count)
+    }
+
+    /// `MusicInfo::extractYearPhp()`: first standalone 1800–2199 year, else empty.
+    pub fn music_year(year: Option<&str>) -> &str {
+        let Some(year) = year else {
+            return "";
+        };
+        let bytes = year.as_bytes();
+        if bytes.len() < 4 {
+            return "";
+        }
+        for start in 0..=bytes.len() - 4 {
+            let window = &bytes[start..start + 4];
+            if !window.iter().all(u8::is_ascii_digit) {
+                continue;
+            }
+            if start > 0 && bytes[start - 1].is_ascii_digit() {
+                continue;
+            }
+            if start + 4 < bytes.len() && bytes[start + 4].is_ascii_digit() {
+                continue;
+            }
+            if matches!(&window[..2], b"18" | b"19" | b"20" | b"21") {
+                return &year[start..start + 4];
+            }
+        }
+        ""
+    }
+
+    /// `MusicInfo::normalizeGenreIdPhp()`.
+    pub fn music_genre_id(genre_id: Option<i64>) -> Option<i64> {
+        genre_id.filter(|&g| g > 0 && g <= I32_MAX)
+    }
+
+    /// `TvEpisode::formatSeasonEpisodeCodePhp()`: `(series, episode, se_complete, canonical)`.
+    pub fn tv_season_episode(
+        series: i64,
+        episode: i64,
+        raw: Option<&str>,
+    ) -> (i64, i64, String, String) {
+        let series = series.clamp(0, SMALLINT_MAX);
+        let episode = episode.clamp(0, SMALLINT_MAX);
+        let canonical = format!("S{series:02}E{episode:02}");
+        let raw = raw.map(trim_ws).unwrap_or("");
+        let source = if raw.is_empty() { canonical.as_str() } else { raw };
+        let se_complete = char_prefix(source, 10).to_ascii_uppercase();
+        (series, episode, se_complete, canonical)
+    }
+
+    fn positive_dimension(value: Option<i64>) -> Option<i64> {
+        value.filter(|&v| v > 0 && v <= I32_MAX)
+    }
+
+    /// `VideoData::aspectLabelPhp()`.
+    pub fn video_aspect_label(width: i64, height: i64) -> String {
+        let ratio = width as f64 / height as f64;
+        let mut best: Option<&str> = None;
+        let mut best_diff = f64::INFINITY;
+        for (label, target) in ASPECT_RATIOS {
+            let diff = (ratio - target).abs();
+            if diff < best_diff {
+                best = Some(label);
+                best_diff = diff;
+            }
+        }
+        if let Some(label) = best.filter(|_| best_diff <= ASPECT_TOLERANCE) {
+            return label.to_owned();
+        }
+        let hundredths = (200 * width + height) / (2 * height);
+        let label = format!("{}.{:02}:1", hundredths / 100, hundredths % 100);
+        char_prefix(&label, 10).to_owned()
+    }
+
+    /// `VideoData::resolutionClassPhp()`.
+    pub fn video_resolution_class(width: Option<i64>, height: Option<i64>) -> &'static str {
+        if width.is_none() && height.is_none() {
+            return "unknown";
+        }
+        let w = width.unwrap_or(0);
+        let h = height.unwrap_or(0);
+        if h >= 2000 || w >= 3800 {
+            "2160p"
+        } else if h >= 1400 || w >= 2500 {
+            "1440p"
+        } else if h >= 1000 || w >= 1900 {
+            "1080p"
+        } else if h >= 700 || w >= 1260 {
+            "720p"
+        } else if h >= 540 {
+            "576p"
+        } else if h >= 400 {
+            "480p"
+        } else {
+            "sd"
+        }
+    }
+
+    /// `VideoData::normalizeFrameRatePhp()` keep decision.
+    pub fn video_frame_rate_valid(frame_rate: Option<f64>) -> bool {
+        frame_rate.is_some_and(|f| f.is_finite() && f > 0.0 && f < 1000.0)
+    }
+
+    fn anidb_encode(anidb_id: i64, input: &[u8]) -> Option<Vec<u8>> {
+        let fields = split_fields(input, 3, 0)?;
+        let (Some(kind), Some(lang), Some(title)) = (fields[0], fields[1], fields[2]) else {
+            return None;
+        };
+        let (id, kind, lang, title, key) = anidb_title_attributes(anidb_id, kind, lang, title);
+        let id = id.to_string();
+        Some(encode(&[
+            Some(id.as_bytes()),
+            Some(kind.as_bytes()),
+            Some(lang.as_bytes()),
+            Some(title.as_bytes()),
+            Some(key.as_bytes()),
+        ]))
+    }
+
+    fn audio_encode(
+        release_id: i64,
+        audio_id: i64,
+        null_mask: u32,
+        input: &[u8],
+    ) -> Option<Vec<u8>> {
+        const LIMITS: [usize; 7] = [50, 50, 50, 10, 25, 25, 50];
+        let fields = split_fields(input, LIMITS.len(), null_mask)?;
+        let release_id = release_id.clamp(0, U32_MAX);
+        let audio_id = audio_id.clamp(0, U32_MAX);
+        let cleaned: Vec<Option<&str>> = fields
+            .iter()
+            .zip(LIMITS)
+            .map(|(field, max)| clean_opt(*field, max))
+            .collect();
+        let channel_count = audio_channel_count(cleaned[4]).map(|c| c.to_string());
+        let release = release_id.to_string();
+        let audio = audio_id.to_string();
+        let key = format!("{release_id}:{audio_id}");
+        let mut out: Vec<Option<&[u8]>> = vec![Some(release.as_bytes()), Some(audio.as_bytes())];
+        out.extend(cleaned.iter().map(|f| f.map(str::as_bytes)));
+        out.push(channel_count.as_deref().map(str::as_bytes));
+        out.push(Some(key.as_bytes()));
+        Some(encode(&out))
+    }
+
+    fn music_encode(
+        genre_id: Option<i64>,
+        cover: bool,
+        null_mask: u32,
+        input: &[u8],
+    ) -> Option<Vec<u8>> {
+        let fields = split_fields(input, 4, null_mask)?;
+        let title = clean_text(fields[0]?, 255);
+        let artist = fields[1]
+            .map(|a| clean_text(a, 255))
+            .filter(|a| !a.is_empty());
+        let year = music_year(fields[2]);
+        let asin = clean_opt(fields[3], 128);
+        let genre = music_genre_id(genre_id).map(|g| g.to_string());
+        let search_key = match &artist {
+            Some(artist) => format!("{artist} - {title}"),
+            None => title.clone(),
+        }
+        .to_ascii_lowercase();
+        Some(encode(&[
+            Some(title.as_bytes()),
+            artist.as_deref().map(str::as_bytes),
+            Some(year.as_bytes()),
+            asin.map(str::as_bytes),
+            genre.as_deref().map(str::as_bytes),
+            Some(if cover { b"1" } else { b"0" }),
+            Some(search_key.as_bytes()),
+        ]))
+    }
+
+    fn tv_encode(series: i64, episode: i64, raw: Option<&[u8]>) -> Option<Vec<u8>> {
+        let raw = match raw {
+            Some(raw) if has_marker(raw) => return None,
+            Some(raw) => Some(str::from_utf8(raw).ok()?),
+            None => None,
+        };
+        let (series, episode, se_complete, canonical) = tv_season_episode(series, episode, raw);
+        let series_s = series.to_string();
+        let episode_s = episode.to_string();
+        Some(encode(&[
+            Some(series_s.as_bytes()),
+            Some(episode_s.as_bytes()),
+            Some(se_complete.as_bytes()),
+            Some(canonical.as_bytes()),
+            Some(if series == 0 { b"1" } else { b"0" }),
+            Some(if episode == 0 { b"1" } else { b"0" }),
+        ]))
+    }
+
+    fn video_encode(
+        release_id: i64,
+        width: Option<i64>,
+        height: Option<i64>,
+        frame_rate: Option<f64>,
+        null_mask: u32,
+        input: &[u8],
+    ) -> Option<Vec<u8>> {
+        let fields = split_fields(input, 2, null_mask)?;
+        let release = release_id.clamp(0, U32_MAX).to_string();
+        let container = clean_opt(fields[0], 50);
+        let codec = clean_opt(fields[1], 50);
+        let width = positive_dimension(width);
+        let height = positive_dimension(height);
+        let aspect = match (width, height) {
+            (Some(w), Some(h)) => Some(video_aspect_label(w, h)),
+            _ => None,
+        };
+        let width_s = width.map(|w| w.to_string());
+        let height_s = height.map(|h| h.to_string());
+        Some(encode(&[
+            Some(release.as_bytes()),
+            container.map(str::as_bytes),
+            codec.map(str::as_bytes),
+            width_s.as_deref().map(str::as_bytes),
+            height_s.as_deref().map(str::as_bytes),
+            aspect.as_deref().map(str::as_bytes),
+            Some(video_resolution_class(width, height).as_bytes()),
+            video_frame_rate_valid(frame_rate).then_some(&b"1"[..]),
+        ]))
+    }
+
+    fn finish(encoded: Option<Vec<u8>>, out_buf: *mut u8, out_cap: usize) -> isize {
+        match encoded {
+            Some(bytes) => unsafe { write_bytes(&bytes, out_buf, out_cap) },
+            None => DECLINE,
+        }
+    }
+
+    /// `AnidbTitle::normalizeTitleAttributes()`; input is `type`, `lang`, `title`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_anidb_title_normalize_attributes(
+        anidb_id: i64,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            finish(anidb_encode(anidb_id, input), out_buf, out_cap)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `AudioData::normalizeAudioTrackAttributes()`; input is the seven nullable text fields.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_audio_data_normalize_track(
+        release_id: i64,
+        audio_id: i64,
+        null_mask: u32,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            finish(
+                audio_encode(release_id, audio_id, null_mask, input),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `MusicInfo::normalizeMusicCatalogueAttributes()`; input is `title`, `artist`, `year`, `asin`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_music_info_normalize_catalogue(
+        has_genre: u32,
+        genre_id: i64,
+        cover: u32,
+        null_mask: u32,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (Some(has_genre), Some(cover)) = (flag(has_genre), flag(cover)) else {
+                return DECLINE;
+            };
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            let genre = has_genre.then_some(genre_id);
+            finish(
+                music_encode(genre, cover, null_mask, input),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `TvEpisode::formatSeasonEpisodeCode()`; `raw` is the subject's `se_complete` text.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_episode_format_se_code(
+        series: i64,
+        episode: i64,
+        has_raw: u32,
+        raw_ptr: *const u8,
+        raw_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(has_raw) = flag(has_raw) else {
+                return DECLINE;
+            };
+            let Some(raw) = (unsafe { valid_slice(raw_ptr, raw_len) }) else {
+                return DECLINE;
+            };
+            finish(
+                tv_encode(series, episode, has_raw.then_some(raw)),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `VideoData::normalizeVideoStreamAttributes()`; input is `container`, `codec`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_video_data_normalize_stream(
+        release_id: i64,
+        has_width: u32,
+        width: i64,
+        has_height: u32,
+        height: i64,
+        has_frame_rate: u32,
+        frame_rate: f64,
+        null_mask: u32,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (Some(has_width), Some(has_height), Some(has_frame_rate)) =
+                (flag(has_width), flag(has_height), flag(has_frame_rate))
+            else {
+                return DECLINE;
+            };
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            finish(
+                video_encode(
+                    release_id,
+                    has_width.then_some(width),
+                    has_height.then_some(height),
+                    has_frame_rate.then_some(frame_rate),
+                    null_mask,
+                    input,
+                ),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn call(f: impl Fn(*mut u8, usize) -> isize) -> Result<Vec<u8>, isize> {
+            let mut buf = vec![0u8; 4096];
+            let n = f(buf.as_mut_ptr(), buf.len());
+            if n < 0 {
+                return Err(n);
+            }
+            buf.truncate(n as usize);
+            Ok(buf)
+        }
+
+        fn fields(bytes: &[u8]) -> Vec<Option<String>> {
+            bytes
+                .split(|&b| b == FIELD_SEP)
+                .map(|f| (f != [NULL_MARK]).then(|| String::from_utf8(f.to_vec()).unwrap()))
+                .collect()
+        }
+
+        fn s(v: &str) -> Option<String> {
+            Some(v.to_owned())
+        }
+
+        #[test]
+        fn text_helpers_match_php() {
+            assert_eq!(trim_ws("\0\x0B\x0C a b \t\r\n"), "a b");
+            assert_eq!(trim_ws("\u{a0}x\u{a0}"), "\u{a0}x\u{a0}");
+            assert_eq!(collapse_ws("a \t\n b\x0B\x0Cc\0d"), "a b c\0d");
+            assert_eq!(char_prefix("héllo", 2), "hé");
+            assert_eq!(char_prefix("ab", 5), "ab");
+            assert_eq!(clean_opt(Some("  "), 5), None);
+            assert_eq!(clean_opt(None, 5), None);
+            assert_eq!(clean_opt(Some(" abcdef "), 3), Some("abc"));
+        }
+
+        #[test]
+        fn split_fields_validates_wire() {
+            assert_eq!(
+                split_fields(b"a\x1F\x1F", 3, 0b010),
+                Some(vec![Some("a"), None, Some("")])
+            );
+            assert_eq!(split_fields(b"a\x1Fx\x1F", 3, 0b010), None);
+            assert_eq!(split_fields(b"a\x1F\x1F", 3, 0b1000), None);
+            assert_eq!(split_fields(b"a\x1Fb", 3, 0), None);
+            assert_eq!(split_fields(b"a\x1Fb\x1Fc\x1Fd", 3, 0), None);
+            assert_eq!(split_fields(b"\x1E\x1Fb\x1Fc", 3, 0), None);
+            assert_eq!(split_fields(b"\xff\x1Fb\x1Fc", 3, 0), None);
+            assert_eq!(split_fields(b"", 1, 0), Some(vec![Some("")]));
+            assert_eq!(split_fields(b"", 1, 1), Some(vec![None]));
+        }
+
+        #[test]
+        fn anidb_title_attributes_normalize() {
+            let (id, kind, lang, title, key) =
+                anidb_title_attributes(-5, " Official ", "EN\t", "  Cowboy \n\t Bebop  ");
+            assert_eq!((id, kind.as_str(), lang.as_str()), (0, "official", "en"));
+            assert_eq!(title, "Cowboy Bebop");
+            assert_eq!(key, "0|official|en|cowboy bebop");
+            assert_eq!(anidb_title_attributes(i64::MAX, "", "", "").0, U32_MAX);
+            let long = "é".repeat(300);
+            assert_eq!(
+                anidb_title_attributes(1, "", "", &long).3.chars().count(),
+                255
+            );
+        }
+
+        #[test]
+        fn audio_channel_count_parses_prefix() {
+            for (raw, expected) in [
+                (Some("6"), Some(6)),
+                (Some("2 channels"), Some(2)),
+                (Some("006"), Some(6)),
+                (Some("0"), None),
+                (Some("1000"), None),
+                (Some("x6"), None),
+                (None, None),
+            ] {
+                assert_eq!(audio_channel_count(raw), expected, "{raw:?}");
+            }
+        }
+
+        #[test]
+        fn music_year_extraction() {
+            for (raw, expected) in [
+                (Some("1999"), "1999"),
+                (Some("2023-05-01"), "2023"),
+                (Some("c. 1975 remaster"), "1975"),
+                (Some("12345 2001"), "2001"),
+                (Some("1799"), ""),
+                (Some("2200"), ""),
+                (Some("99"), ""),
+                (Some("x1999x"), "1999"),
+                (None, ""),
+            ] {
+                assert_eq!(music_year(raw), expected, "{raw:?}");
+            }
+            assert_eq!(music_genre_id(Some(-1)), None);
+            assert_eq!(music_genre_id(Some(0)), None);
+            assert_eq!(music_genre_id(Some(I32_MAX + 1)), None);
+            assert_eq!(music_genre_id(Some(7)), Some(7));
+        }
+
+        #[test]
+        fn tv_codes() {
+            assert_eq!(
+                tv_season_episode(2, 5, None),
+                (2, 5, "S02E05".into(), "S02E05".into())
+            );
+            assert_eq!(
+                tv_season_episode(-1, 70_000, Some(" ")),
+                (0, 65_535, "S00E65535".into(), "S00E65535".into())
+            );
+            assert_eq!(
+                tv_season_episode(65_535, 65_535, None).2,
+                "S65535E655"
+            );
+            assert_eq!(
+                tv_season_episode(2, 21, Some(" s02e21+22 ")).2,
+                "S02E21+22"
+            );
+        }
+
+        #[test]
+        fn video_classification() {
+            assert_eq!(video_aspect_label(1920, 1080), "16:9");
+            assert_eq!(video_aspect_label(1920, 800), "2.39:1");
+            assert_eq!(video_aspect_label(640, 480), "4:3");
+            assert_eq!(video_aspect_label(1000, 100), "10.00:1");
+            assert_eq!(video_aspect_label(1, 3), "0.33:1");
+            assert_eq!(video_aspect_label(I32_MAX, 1), "2147483647");
+            assert_eq!(video_resolution_class(Some(3840), Some(2160)), "2160p");
+            assert_eq!(video_resolution_class(Some(1920), Some(800)), "1080p");
+            assert_eq!(video_resolution_class(Some(1280), Some(536)), "720p");
+            assert_eq!(video_resolution_class(None, Some(576)), "576p");
+            assert_eq!(video_resolution_class(Some(640), None), "sd");
+            assert_eq!(video_resolution_class(None, None), "unknown");
+            assert!(video_frame_rate_valid(Some(23.976)));
+            assert!(!video_frame_rate_valid(Some(f64::NAN)));
+            assert!(!video_frame_rate_valid(Some(1000.0)));
+            assert!(!video_frame_rate_valid(Some(0.0)));
+            assert!(!video_frame_rate_valid(None));
+        }
+
+        #[test]
+        fn exports_encode_and_decline() {
+            let input = b" Main \x1Fx-jat\x1F Kimi  no  Na wa ";
+            let out = call(|b, c| unsafe {
+                nntmux_anidb_title_normalize_attributes(7, input.as_ptr(), input.len(), b, c)
+            })
+            .unwrap();
+            assert_eq!(
+                fields(&out),
+                vec![
+                    s("7"),
+                    s("main"),
+                    s("x-jat"),
+                    s("Kimi no Na wa"),
+                    s("7|main|x-jat|kimi no na wa")
+                ]
+            );
+
+            let input = b"AAC\x1F\x1FCBR\x1F 192 kb/s \x1F6 channels\x1F48.0 kHz\x1F ";
+            let out = call(|b, c| unsafe {
+                nntmux_audio_data_normalize_track(10, 2, 0b10, input.as_ptr(), input.len(), b, c)
+            })
+            .unwrap();
+            assert_eq!(
+                fields(&out),
+                vec![
+                    s("10"),
+                    s("2"),
+                    s("AAC"),
+                    None,
+                    s("CBR"),
+                    s("192 kb/s"),
+                    s("6 channels"),
+                    s("48.0 kHz"),
+                    None,
+                    s("6"),
+                    s("10:2")
+                ]
+            );
+
+            let input = b"Abbey  Road\x1FThe Beatles\x1F1969-09-26\x1F B000002UAX ";
+            let out = call(|b, c| unsafe {
+                nntmux_music_info_normalize_catalogue(
+                    1,
+                    -1,
+                    1,
+                    0,
+                    input.as_ptr(),
+                    input.len(),
+                    b,
+                    c,
+                )
+            })
+            .unwrap();
+            assert_eq!(
+                fields(&out),
+                vec![
+                    s("Abbey Road"),
+                    s("The Beatles"),
+                    s("1969"),
+                    s("B000002UAX"),
+                    None,
+                    s("1"),
+                    s("the beatles - abbey road")
+                ]
+            );
+
+            let raw = b"s01e02";
+            let out = call(|b, c| unsafe {
+                nntmux_tv_episode_format_se_code(1, 2, 1, raw.as_ptr(), raw.len(), b, c)
+            })
+            .unwrap();
+            assert_eq!(
+                fields(&out),
+                vec![s("1"), s("2"), s("S01E02"), s("S01E02"), s("0"), s("0")]
+            );
+
+            let input = b"Matroska\x1F";
+            let out = call(|b, c| unsafe {
+                nntmux_video_data_normalize_stream(
+                    3,
+                    1,
+                    1920,
+                    1,
+                    1080,
+                    1,
+                    23.976,
+                    0b10,
+                    input.as_ptr(),
+                    input.len(),
+                    b,
+                    c,
+                )
+            })
+            .unwrap();
+            assert_eq!(
+                fields(&out),
+                vec![
+                    s("3"),
+                    s("Matroska"),
+                    None,
+                    s("1920"),
+                    s("1080"),
+                    s("16:9"),
+                    s("1080p"),
+                    s("1")
+                ]
+            );
+        }
+
+        #[test]
+        fn exports_reject_malformed_input() {
+            let mut buf = [b'Z'; 4];
+            let bad = b"\xff\x1Fen\x1Ftitle";
+            assert_eq!(
+                unsafe {
+                    nntmux_anidb_title_normalize_attributes(
+                        1,
+                        bad.as_ptr(),
+                        bad.len(),
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                DECLINE
+            );
+            let ok = b"main\x1Fen\x1Ftitle";
+            let rc = unsafe {
+                nntmux_anidb_title_normalize_attributes(
+                    1,
+                    ok.as_ptr(),
+                    ok.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(rc < DECLINE);
+            assert_eq!(buf, [b'Z'; 4]);
+            let mut big = vec![0u8; (-rc) as usize];
+            assert_eq!(
+                unsafe {
+                    nntmux_anidb_title_normalize_attributes(
+                        1,
+                        ok.as_ptr(),
+                        ok.len(),
+                        big.as_mut_ptr(),
+                        big.len(),
+                    )
+                },
+                -rc
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_anidb_title_normalize_attributes(
+                        1,
+                        std::ptr::null(),
+                        0,
+                        big.as_mut_ptr(),
+                        big.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_anidb_title_normalize_attributes(
+                        1,
+                        ok.as_ptr(),
+                        ok.len(),
+                        std::ptr::null_mut(),
+                        16,
+                    )
+                },
+                DECLINE
+            );
+            let input = b"a\x1Fb\x1Fc\x1Fd";
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_audio_data_normalize_track(1, 1, 0, input.as_ptr(), input.len(), b, c)
+                }),
+                Err(DECLINE)
+            );
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_music_info_normalize_catalogue(2, 0, 0, 0, input.as_ptr(), 1, b, c)
+                }),
+                Err(DECLINE)
+            );
+            let null_title = b"\x1F\x1F\x1F";
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_music_info_normalize_catalogue(
+                        0,
+                        0,
+                        0,
+                        0b1111,
+                        null_title.as_ptr(),
+                        null_title.len(),
+                        b,
+                        c,
+                    )
+                }),
+                Err(DECLINE)
+            );
+            let marked = b"S01\x1FE02";
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_tv_episode_format_se_code(1, 2, 1, marked.as_ptr(), marked.len(), b, c)
+                }),
+                Err(DECLINE)
+            );
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_tv_episode_format_se_code(1, 2, 0, marked.as_ptr(), marked.len(), b, c)
+                })
+                .map(|o| fields(&o)[2].clone()),
+                Ok(s("S01E02"))
+            );
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_video_data_normalize_stream(
+                        1,
+                        3,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0.0,
+                        0b11,
+                        b"\x1F".as_ptr(),
+                        1,
+                        b,
+                        c,
+                    )
+                }),
+                Err(DECLINE)
+            );
+        }
+    }
+}
