@@ -7817,6 +7817,1920 @@ pub unsafe extern "C" fn nntmux_api_perf_classify_slow_request(
     .unwrap_or(-1)
 }
 
+// ============================================================================
+// Wave 18 Worker 6: AbstractCategorizer, IrcNetworks, TmuxCommand,
+// SettingsPageCatalog, and ClearanceMiddleware helpers
+// ============================================================================
+
+/// Resolves the default priority (`AbstractCategorizer::getPriority`) into `*out_priority`
+/// and returns the default skip decision (`0` = `false` for `AbstractCategorizer::shouldSkip`),
+/// or `-1` on invalid/unaligned pointers or out-of-bounds lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_abstract_categorizer_priority_and_skip(
+    priority: i64,
+    release_name: *const u8,
+    release_name_len: usize,
+    out_priority: *mut i64,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_priority.is_null() || !out_priority.is_aligned() {
+            return -1;
+        }
+        if (unsafe { valid_slice_bounded(release_name, release_name_len, (isize::MAX as usize) / 4) })
+            .is_none()
+        {
+            return -1;
+        }
+        unsafe {
+            *out_priority = priority;
+        }
+        0
+    }))
+    .unwrap_or(-1)
+}
+
+/// Formats `CategorizationResult` scalar metadata for `AbstractCategorizer::matched`
+/// (`is_no_match == 0`) and `AbstractCategorizer::noMatch` (`is_no_match != 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_abstract_categorizer_format_result_meta(
+    is_no_match: u32,
+    category_id: i64,
+    confidence: f64,
+    matched_by_ptr: *const u8,
+    matched_by_len: usize,
+    out_category_id: *mut i64,
+    out_confidence: *mut f64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_category_id.is_null()
+            || !out_category_id.is_aligned()
+            || out_confidence.is_null()
+            || !out_confidence.is_aligned()
+        {
+            return -1;
+        }
+        let Some(matched_by) = (unsafe {
+            valid_slice_bounded(matched_by_ptr, matched_by_len, (isize::MAX as usize) / 4)
+        }) else {
+            return -1;
+        };
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+
+        if is_no_match != 0 {
+            unsafe {
+                *out_category_id = CAT_OTHER_MISC;
+                *out_confidence = 0.0;
+            }
+            out.push_slice(b"no_match");
+            return finish_out_cursor_checked(out);
+        }
+
+        if !confidence.is_finite() {
+            return -1;
+        }
+        unsafe {
+            *out_category_id = category_id;
+            *out_confidence = confidence;
+        }
+        out.push_slice(matched_by);
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Filters NUL-separated IRC network keys (`IrcNetworks::enabled`) using a parallel `flags`
+/// byte array (`b'1'` = enabled, `b'0'` = disabled), writing the enabled keys separated by NUL
+/// into `out_buf` and storing the number of enabled keys in `*out_count`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_irc_networks_filter_enabled_nul(
+    keys_nul: *const u8,
+    keys_len: usize,
+    flags: *const u8,
+    count: usize,
+    out_count: *mut i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_count.is_null() || !out_count.is_aligned() {
+            return -1;
+        }
+        let max_seg = (isize::MAX as usize) / 4;
+        if count > max_seg {
+            return -1;
+        }
+        let (Some(keys_s), Some(flags_s)) = (
+            unsafe { valid_slice_bounded(keys_nul, keys_len, max_seg) },
+            unsafe { valid_slice_bounded(flags, count, max_seg) },
+        ) else {
+            return -1;
+        };
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+
+        if count == 0 {
+            if keys_len != 0 {
+                return -1;
+            }
+            unsafe {
+                *out_count = 0;
+            }
+            return 0;
+        }
+
+        let nul_count = keys_s.iter().filter(|&&b| b == 0).count();
+        if nul_count + 1 != count {
+            return -1;
+        }
+
+        let mut kept: i64 = 0;
+        for (idx, seg) in keys_s.split(|&b| b == 0).enumerate() {
+            let flag = *flags_s.get(idx).unwrap_or(&b'0');
+            if flag != b'0' {
+                if kept > 0 {
+                    out.push_byte(0);
+                }
+                out.push_slice(seg);
+                kept += 1;
+            }
+        }
+        unsafe {
+            *out_count = kept;
+        }
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+fn parse_php_serialized_uint(s: &[u8], pos: &mut usize) -> Option<usize> {
+    let start = *pos;
+    while *pos < s.len() && s[*pos].is_ascii_digit() {
+        *pos += 1;
+    }
+    if *pos == start {
+        return None;
+    }
+    let digits = &s[start..*pos];
+    if digits.len() > 1 && digits[0] == b'0' {
+        return None;
+    }
+    std::str::from_utf8(digits).ok()?.parse::<usize>().ok()
+}
+
+fn parse_php_serialized_string<'a>(s: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
+    if s.get(*pos..*pos + 2) != Some(b"s:") {
+        return None;
+    }
+    *pos += 2;
+    let len = parse_php_serialized_uint(s, pos)?;
+    if s.get(*pos..*pos + 2) != Some(b":\"") {
+        return None;
+    }
+    *pos += 2;
+    let end = (*pos).checked_add(len)?;
+    let bytes = s.get(*pos..end)?;
+    if bytes.contains(&0) {
+        return None;
+    }
+    *pos = end;
+    if s.get(*pos..*pos + 2) != Some(b"\";") {
+        return None;
+    }
+    *pos += 2;
+    Some(bytes)
+}
+
+fn parse_php_serialized_channel_map(raw: &[u8]) -> Option<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+    if raw.is_empty() || raw == b"0" {
+        return Some(vec![(b"#PreNNTmux".to_vec(), None)]);
+    }
+    if raw.get(..2) != Some(b"a:") {
+        return None;
+    }
+    let mut pos = 2usize;
+    let count = parse_php_serialized_uint(raw, &mut pos)?;
+    if count > 4096 || raw.get(pos..pos + 2) != Some(b":{") {
+        return None;
+    }
+    pos += 2;
+    if count == 0 {
+        if raw.get(pos..) == Some(b"}") {
+            return Some(vec![(b"#PreNNTmux".to_vec(), None)]);
+        }
+        return None;
+    }
+
+    let mut entries: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let key = parse_php_serialized_string(raw, &mut pos)?;
+        if is_canonical_php_int_key(key) {
+            return None;
+        }
+        let val = if raw.get(pos..pos + 2) == Some(b"N;") {
+            pos += 2;
+            None
+        } else {
+            let v = parse_php_serialized_string(raw, &mut pos)?;
+            Some(v.to_vec())
+        };
+        if let Some(existing) = entries.iter_mut().find(|(k, _)| k.as_slice() == key) {
+            existing.1 = val;
+        } else {
+            entries.push((key.to_vec(), val));
+        }
+    }
+
+    if raw.get(pos..) != Some(b"}") {
+        return None;
+    }
+    if entries.is_empty() {
+        return Some(vec![(b"#PreNNTmux".to_vec(), None)]);
+    }
+    Some(entries)
+}
+
+fn write_channel_pairs_nul(out: &mut OutCursor, entries: &[(Vec<u8>, Option<Vec<u8>>)]) {
+    for (idx, (ch, pw)) in entries.iter().enumerate() {
+        if idx > 0 {
+            out.push_byte(0);
+        }
+        out.push_slice(ch);
+        out.push_byte(0);
+        match pw {
+            None => out.push_byte(b'0'),
+            Some(p) => {
+                out.push_byte(b'1');
+                out.push_slice(p);
+            }
+        }
+    }
+}
+
+/// Parses `irc_settings.scrape_irc_channels` (`IrcNetworks::legacyChannels`) into NUL-separated
+/// `(channel, '0' | '1'.password)` pairs and writes the pair count to `*out_count`.
+/// Returns `-1` when declined to PHP `unserialize`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_irc_networks_parse_legacy_channels(
+    input: *const u8,
+    input_len: usize,
+    out_count: *mut i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_count.is_null() || !out_count.is_aligned() {
+            return -1;
+        }
+        let Some(raw) =
+            (unsafe { valid_slice_bounded(input, input_len, (isize::MAX as usize) / 4) })
+        else {
+            return -1;
+        };
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+
+        let Some(entries) = parse_php_serialized_channel_map(raw) else {
+            return -1;
+        };
+        unsafe {
+            *out_count = entries.len() as i64;
+        }
+        write_channel_pairs_nul(&mut out, &entries);
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Resolves an IRC or WebSocket network profile (`IrcNetworks::resolve`) for either the legacy
+/// `synirc` network or a modern `irc_settings.networks.<key>` profile.
+///
+/// Writes:
+/// - `*out_port`: resolved integer port
+/// - `*out_flags`: bitmask (`bit 0` = `tls`, `bits 1..2` = `tls_verify_peer_name + 1` where
+///   `0 = null, 1 = false, 2 = true`, `bit 3` = `has_source`, `bit 4` = `has_url`)
+/// - `*out_channel_count`: number of channel entries
+/// - `out_buf`: NUL-separated `name \0 type \0 format \0 source \0 server \0 url [ \0 ch \0 ('0'|'1'.pw) ... ]`
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_irc_networks_resolve_profile(
+    key: *const u8,
+    key_len: usize,
+    has_type: u32,
+    net_type: *const u8,
+    net_type_len: usize,
+    has_format: u32,
+    format: *const u8,
+    format_len: usize,
+    has_source: u32,
+    source: *const u8,
+    source_len: usize,
+    has_server: u32,
+    server: *const u8,
+    server_len: usize,
+    has_port: u32,
+    port: i64,
+    has_tls: u32,
+    tls: u32,
+    has_tls_verify_peer_name: u32,
+    tls_verify_peer_name: u32,
+    has_url: u32,
+    url: *const u8,
+    url_len: usize,
+    channels_raw: *const u8,
+    channels_len: usize,
+    channels_count: usize,
+    out_port: *mut i64,
+    out_flags: *mut i32,
+    out_channel_count: *mut i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_port.is_null()
+            || !out_port.is_aligned()
+            || out_flags.is_null()
+            || !out_flags.is_aligned()
+            || out_channel_count.is_null()
+            || !out_channel_count.is_aligned()
+        {
+            return -1;
+        }
+        let max_seg = (isize::MAX as usize) / 16;
+        if channels_count > max_seg {
+            return -1;
+        }
+        let (
+            Some(key_s),
+            Some(type_s),
+            Some(format_s),
+            Some(source_s),
+            Some(server_s),
+            Some(url_s),
+            Some(chan_s),
+        ) = (
+            unsafe { valid_slice_bounded(key, key_len, max_seg) },
+            unsafe { valid_slice_bounded(net_type, net_type_len, max_seg) },
+            unsafe { valid_slice_bounded(format, format_len, max_seg) },
+            unsafe { valid_slice_bounded(source, source_len, max_seg) },
+            unsafe { valid_slice_bounded(server, server_len, max_seg) },
+            unsafe { valid_slice_bounded(url, url_len, max_seg) },
+            unsafe { valid_slice_bounded(channels_raw, channels_len, max_seg) },
+        ) else {
+            return -1;
+        };
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+        if key_s.is_empty()
+            || key_s.contains(&0)
+            || type_s.contains(&0)
+            || format_s.contains(&0)
+            || source_s.contains(&0)
+            || server_s.contains(&0)
+            || url_s.contains(&0)
+        {
+            return -1;
+        }
+
+        if key_s == b"synirc" {
+            let Some(channels) = parse_php_serialized_channel_map(chan_s) else {
+                return -1;
+            };
+            let resolved_port = if has_port != 0 { port } else { 0 };
+            let resolved_tls = i32::from(has_tls != 0 && tls != 0);
+            unsafe {
+                *out_port = resolved_port;
+                *out_flags = resolved_tls;
+                *out_channel_count = channels.len() as i64;
+            }
+            out.push_slice(key_s);
+            out.push_byte(0);
+            out.push_slice(b"irc\0nntmux\0\0");
+            out.push_slice(if has_server != 0 { server_s } else { b"" });
+            out.push_slice(b"\0");
+            if !channels.is_empty() {
+                out.push_byte(0);
+                write_channel_pairs_nul(&mut out, &channels);
+            }
+            return finish_out_cursor_checked(out);
+        }
+
+        let mut channels: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(channels_count);
+        if channels_count == 0 {
+            if !chan_s.is_empty() {
+                return -1;
+            }
+        } else {
+            let nul_count = chan_s.iter().filter(|&&b| b == 0).count();
+            let Some(expected_parts) = channels_count.checked_mul(2) else {
+                return -1;
+            };
+            if nul_count + 1 != expected_parts {
+                return -1;
+            }
+            let mut iter = chan_s.split(|&b| b == 0);
+            for _ in 0..channels_count {
+                let (Some(ch), Some(pw)) = (iter.next(), iter.next()) else {
+                    return -1;
+                };
+                if is_canonical_php_int_key(ch) {
+                    return -1;
+                }
+                let norm_pw = if pw.is_empty() {
+                    None
+                } else {
+                    Some(pw.to_vec())
+                };
+                channels.push((ch.to_vec(), norm_pw));
+            }
+        }
+
+        let resolved_type: &[u8] = if has_type != 0 { type_s } else { b"irc" };
+        let resolved_format: &[u8] = if has_format != 0 { format_s } else { b"" };
+        let resolved_source: &[u8] = if has_source != 0 { source_s } else { key_s };
+        let resolved_server: &[u8] = if has_server != 0 { server_s } else { b"" };
+        let resolved_port: i64 = if has_port != 0 { port } else { 6667 };
+        let resolved_tls = i32::from(has_tls != 0 && tls != 0);
+        let tls_verify_state: i32 = if has_tls_verify_peer_name == 0 {
+            0
+        } else if tls_verify_peer_name != 0 {
+            2
+        } else {
+            1
+        };
+        let has_url_bit = i32::from(has_url != 0);
+        let resolved_url: &[u8] = if has_url != 0 { url_s } else { b"" };
+
+        unsafe {
+            *out_port = resolved_port;
+            *out_flags = resolved_tls | (tls_verify_state << 1) | (1 << 3) | (has_url_bit << 4);
+            *out_channel_count = channels.len() as i64;
+        }
+
+        out.push_slice(key_s);
+        out.push_byte(0);
+        out.push_slice(resolved_type);
+        out.push_byte(0);
+        out.push_slice(resolved_format);
+        out.push_byte(0);
+        out.push_slice(resolved_source);
+        out.push_byte(0);
+        out.push_slice(resolved_server);
+        out.push_byte(0);
+        out.push_slice(resolved_url);
+        if !channels.is_empty() {
+            out.push_byte(0);
+            write_channel_pairs_nul(&mut out, &channels);
+        }
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Builds the NUL-separated `TmuxCommand::arguments` argv list:
+/// `['tmux', '-u', ...($socket === '' ? [] : ['-L', $socket]), ...$arguments]`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_command_arguments_nul(
+    socket: *const u8,
+    socket_len: usize,
+    args_nul: *const u8,
+    args_len: usize,
+    args_count: usize,
+    out_count: *mut i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_count.is_null() || !out_count.is_aligned() {
+            return -1;
+        }
+        let max_seg = (isize::MAX as usize) / 4;
+        if args_count > max_seg {
+            return -1;
+        }
+        let (Some(socket_s), Some(args_s)) = (
+            unsafe { valid_slice_bounded(socket, socket_len, max_seg) },
+            unsafe { valid_slice_bounded(args_nul, args_len, max_seg) },
+        ) else {
+            return -1;
+        };
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+        if socket_s.contains(&0) {
+            return -1;
+        }
+        if args_count == 0 {
+            if !args_s.is_empty() {
+                return -1;
+            }
+        } else {
+            let nul_count = args_s.iter().filter(|&&b| b == 0).count();
+            if nul_count + 1 != args_count {
+                return -1;
+            }
+        }
+
+        let base_count = if socket_s.is_empty() { 2usize } else { 4usize };
+        let Some(total_count) = base_count.checked_add(args_count) else {
+            return -1;
+        };
+        if total_count > i64::MAX as usize {
+            return -1;
+        }
+
+        out.push_slice(b"tmux\0-u");
+        if !socket_s.is_empty() {
+            out.push_slice(b"\0-L\0");
+            out.push_slice(socket_s);
+        }
+        if args_count > 0 {
+            out.push_byte(0);
+            out.push_slice(args_s);
+        }
+        unsafe {
+            *out_count = total_count as i64;
+        }
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Builds the NUL-separated 4-element `TmuxCommand::monitor` argv list:
+/// `[PHP_BINARY, base_path('artisan'), 'tmux:monitor', '--session='.$session]`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_command_monitor_nul(
+    php_binary: *const u8,
+    php_binary_len: usize,
+    artisan_path: *const u8,
+    artisan_path_len: usize,
+    session: *const u8,
+    session_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let max_seg = (isize::MAX as usize) / 8;
+        let (Some(php_s), Some(artisan_s), Some(session_s)) = (
+            unsafe { valid_slice_bounded(php_binary, php_binary_len, max_seg) },
+            unsafe { valid_slice_bounded(artisan_path, artisan_path_len, max_seg) },
+            unsafe { valid_slice_bounded(session, session_len, max_seg) },
+        ) else {
+            return -1;
+        };
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+        if php_s.contains(&0) || artisan_s.contains(&0) || session_s.contains(&0) {
+            return -1;
+        }
+
+        out.push_slice(php_s);
+        out.push_byte(0);
+        out.push_slice(artisan_s);
+        out.push_slice(b"\0tmux:monitor\0--session=");
+        out.push_slice(session_s);
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+const SETTINGS_SITE_COLS: &[&[u8]] = &[
+    b"title",
+    b"home_link",
+    b"site_logo",
+    b"strapline",
+    b"meta_title",
+    b"meta_description",
+    b"meta_keywords",
+    b"footer",
+    b"dereferrer_link",
+    b"terms",
+    b"trailers_display",
+    b"trailers_size_x",
+    b"trailers_size_y",
+];
+
+const SETTINGS_REGISTRATION_COLS: &[&[u8]] = &[b"status"];
+
+const SETTINGS_INGESTION_COLS: &[&[u8]] = &[
+    b"binary_threads",
+    b"backfill_threads",
+    b"release_threads",
+    b"collection_delay_hours",
+    b"collection_timeout_hours",
+    b"cross_post_hours",
+    b"completion_percent",
+    b"grab_status",
+    b"max_headers_per_iteration",
+    b"max_messages",
+    b"max_releases_created",
+    b"nntp_retries",
+    b"nzb_split_level",
+    b"part_retention_hours",
+    b"release_retention_days",
+    b"misc_other_retention_hours",
+    b"misc_hashed_retention_hours",
+    b"min_files_to_form_release",
+    b"min_size_to_form_release",
+    b"max_size_to_form_release",
+    b"new_group_scan_method",
+    b"new_group_days_to_scan",
+    b"new_group_messages_to_scan",
+    b"safe_backfill_date",
+    b"disable_backfill_group",
+    b"part_repair",
+    b"safe_part_repair",
+    b"max_part_repair",
+    b"part_repair_max_tries",
+    b"categorize_foreign",
+    b"categorize_web_dl",
+    b"show_passworded_releases",
+    b"delete_passworded_releases",
+    b"backfill_days_mode",
+    b"backfill_order",
+    b"backfill_quantity",
+];
+
+const SETTINGS_POST_PROCESSING_COLS: &[&[u8]] = &[
+    b"post_threads",
+    b"post_threads_amazon",
+    b"post_threads_non",
+    b"nfo_threads",
+    b"fix_name_threads",
+    b"timeout_seconds",
+    b"release_timeout_seconds",
+    b"max_timeout_count",
+    b"max_additional_processed",
+    b"max_parts_processed",
+    b"password_check_attempts",
+    b"fix_names_per_run",
+    b"max_nested_levels",
+    b"extract_using_rar_info",
+    b"segments_to_download",
+    b"ffmpeg_duration",
+    b"inner_file_blacklist",
+    b"process_jpg",
+    b"process_thumbnails",
+    b"process_videos",
+    b"save_audio_preview",
+    b"min_size_to_post_process",
+    b"max_size_to_post_process",
+    b"min_size_to_process_nfo",
+    b"max_size_to_process_nfo",
+    b"max_nfo_processed",
+    b"max_nfo_retries",
+    b"lookup_nfo",
+    b"lookup_par2",
+];
+
+const SETTINGS_METADATA_COLS: &[&[u8]] = &[
+    b"anime_lookup",
+    b"book_lookup",
+    b"game_lookup",
+    b"movie_lookup",
+    b"music_lookup",
+    b"tv_lookup",
+    b"movie_language",
+    b"imdb_alternate_url",
+    b"max_anime_processed",
+    b"max_books_processed",
+    b"max_games_processed",
+    b"max_movies_processed",
+    b"max_music_processed",
+    b"max_tv_processed",
+    b"amazon_sleep_milliseconds",
+];
+
+const SETTINGS_TMUX_COLS: &[&[u8]] = &[
+    b"session_name",
+    b"monitor_delay",
+    b"niceness",
+    b"sequential_mode",
+    b"sequential_timer",
+    b"binaries_enabled",
+    b"binaries_timer",
+    b"binaries_kill_timer",
+    b"backfill_mode",
+    b"backfill_groups",
+    b"backfill_timer",
+    b"progressive_backfill",
+    b"releases_enabled",
+    b"release_timer",
+    b"post_mode",
+    b"post_timer",
+    b"post_kill_timer",
+    b"post_amazon_mode",
+    b"post_amazon_timer",
+    b"post_non_mode",
+    b"post_non_timer",
+    b"fix_names_enabled",
+    b"fix_timer",
+    b"cleanup_mode",
+    b"cleanup_timer",
+    b"run_irc_scraper",
+    b"console_enabled",
+    b"htop_enabled",
+    b"mytop_enabled",
+    b"nmon_enabled",
+    b"vnstat_enabled",
+    b"vnstat_args",
+    b"tcp_track_enabled",
+    b"tcp_track_args",
+    b"bwmng_enabled",
+    b"redis_enabled",
+    b"redis_args",
+    b"write_logs",
+    b"collections_kill_threshold",
+    b"post_process_kill_threshold",
+    b"colors_start",
+    b"colors_end",
+    b"cleanup_rules",
+    b"color_exclusions",
+];
+
+const SETTINGS_BOOLEANS: &[&[u8]] = &[
+    b"trailers_display",
+    b"grab_status",
+    b"disable_backfill_group",
+    b"part_repair",
+    b"safe_part_repair",
+    b"categorize_foreign",
+    b"categorize_web_dl",
+    b"show_passworded_releases",
+    b"delete_passworded_releases",
+    b"extract_using_rar_info",
+    b"process_jpg",
+    b"process_thumbnails",
+    b"process_videos",
+    b"save_audio_preview",
+    b"lookup_nfo",
+    b"lookup_par2",
+    b"imdb_alternate_url",
+    b"binaries_enabled",
+    b"progressive_backfill",
+    b"releases_enabled",
+    b"fix_names_enabled",
+    b"run_irc_scraper",
+    b"console_enabled",
+    b"htop_enabled",
+    b"mytop_enabled",
+    b"nmon_enabled",
+    b"vnstat_enabled",
+    b"tcp_track_enabled",
+    b"bwmng_enabled",
+    b"redis_enabled",
+    b"write_logs",
+];
+
+const SETTINGS_BYTES: &[&[u8]] = &[
+    b"min_size_to_form_release",
+    b"max_size_to_form_release",
+    b"min_size_to_post_process",
+    b"max_size_to_post_process",
+    b"min_size_to_process_nfo",
+    b"max_size_to_process_nfo",
+];
+
+const SETTINGS_TEXTAREAS: &[&[u8]] = &[
+    b"meta_description",
+    b"meta_keywords",
+    b"footer",
+    b"terms",
+];
+
+const SETTINGS_NULLABLE: &[&[u8]] = &[
+    b"site_logo",
+    b"vnstat_args",
+    b"tcp_track_args",
+    b"redis_args",
+];
+
+const SETTINGS_POSITIVE_INTEGERS: &[&[u8]] = &[
+    b"trailers_size_x",
+    b"trailers_size_y",
+    b"binary_threads",
+    b"backfill_threads",
+    b"release_threads",
+    b"collection_timeout_hours",
+    b"max_headers_per_iteration",
+    b"max_messages",
+    b"max_releases_created",
+    b"backfill_quantity",
+    b"post_threads",
+    b"post_threads_amazon",
+    b"post_threads_non",
+    b"nfo_threads",
+    b"fix_name_threads",
+    b"release_timeout_seconds",
+    b"max_timeout_count",
+    b"max_additional_processed",
+    b"max_parts_processed",
+    b"password_check_attempts",
+    b"fix_names_per_run",
+    b"max_nested_levels",
+    b"segments_to_download",
+    b"ffmpeg_duration",
+    b"max_nfo_processed",
+    b"max_anime_processed",
+    b"max_books_processed",
+    b"max_games_processed",
+    b"max_movies_processed",
+    b"max_music_processed",
+    b"max_tv_processed",
+    b"monitor_delay",
+    b"sequential_timer",
+    b"binaries_timer",
+    b"backfill_groups",
+    b"backfill_timer",
+    b"release_timer",
+    b"post_timer",
+    b"post_amazon_timer",
+    b"post_non_timer",
+    b"fix_timer",
+    b"cleanup_timer",
+];
+
+const SETTINGS_CLEANUP_RULES: &[(&[u8], &[u8])] = &[
+    (b"blacklist", b"Blacklist"),
+    (b"blfiles", b"Blfiles"),
+    (b"executable", b"Executable"),
+    (b"gibberish", b"Gibberish"),
+    (b"hashed", b"Hashed"),
+    (b"installbin", b"Installbin"),
+    (b"passworded", b"Passworded"),
+    (b"passwordurl", b"Passwordurl"),
+    (b"sample", b"Sample"),
+    (b"scr", b"Scr"),
+    (b"short", b"Short"),
+    (b"size", b"Size"),
+    (b"nzb", b"Nzb"),
+    (b"codec", b"Codec"),
+];
+
+#[inline]
+fn settings_domain_columns(domain: &[u8]) -> Option<&'static [&'static [u8]]> {
+    match domain {
+        b"site" => Some(SETTINGS_SITE_COLS),
+        b"registration" => Some(SETTINGS_REGISTRATION_COLS),
+        b"ingestion" => Some(SETTINGS_INGESTION_COLS),
+        b"post-processing" => Some(SETTINGS_POST_PROCESSING_COLS),
+        b"metadata" => Some(SETTINGS_METADATA_COLS),
+        b"tmux" => Some(SETTINGS_TMUX_COLS),
+        _ => None,
+    }
+}
+
+#[inline]
+fn settings_domain_guidance(domain: &[u8]) -> Option<&'static [u8]> {
+    match domain {
+        b"site" | b"registration" | b"metadata" => Some(b"Takes effect immediately."),
+        b"tmux" => Some(
+            b"The monitor reloads this value on its next cycle; layout changes require a tmux restart.",
+        ),
+        b"ingestion" | b"post-processing" => {
+            Some(b"Restart active workers after changing this value.")
+        }
+        _ => None,
+    }
+}
+
+#[inline]
+fn settings_column_options(column: &[u8]) -> &'static [(&'static [u8], &'static [u8])] {
+    if column == b"status" {
+        return &[
+            (b"0", b"Open"),
+            (b"1", b"Invite"),
+            (b"2", b"Closed"),
+        ];
+    }
+    if column.ends_with(b"_lookup") {
+        return &[
+            (b"0", b"Disabled"),
+            (b"1", b"All releases"),
+            (b"2", b"Renamed releases only"),
+        ];
+    }
+    match column {
+        b"new_group_scan_method" => &[(b"0", b"Posts"), (b"1", b"Days")],
+        b"backfill_days_mode" => &[
+            (b"1", b"Days per group"),
+            (b"2", b"Safe backfill date"),
+        ],
+        b"backfill_order" => &[
+            (b"1", b"Newest"),
+            (b"2", b"Oldest"),
+            (b"3", b"Alphabetical"),
+            (b"4", b"Alphabetical reverse"),
+            (b"5", b"Most posts"),
+            (b"6", b"Fewest posts"),
+        ],
+        b"sequential_mode" => &[
+            (b"0", b"Full"),
+            (b"1", b"Basic"),
+            (b"2", b"Stripped"),
+        ],
+        b"backfill_mode" => &[
+            (b"0", b"Disabled"),
+            (b"1", b"All"),
+            (b"4", b"Safe"),
+        ],
+        b"post_non_mode" | b"post_amazon_mode" => &[(b"0", b"Disabled"), (b"1", b"Enabled")],
+        b"post_mode" => &[
+            (b"0", b"Disabled"),
+            (b"1", b"Additional"),
+            (b"2", b"NFO"),
+            (b"3", b"All"),
+        ],
+        _ => &[],
+    }
+}
+
+#[inline]
+fn settings_column_unit(column: &[u8]) -> Option<&'static [u8]> {
+    if column.ends_with(b"_seconds") {
+        Some(b"seconds")
+    } else if column.ends_with(b"_hours") {
+        Some(b"hours")
+    } else if column.ends_with(b"_days") {
+        Some(b"days")
+    } else if column.ends_with(b"_milliseconds") {
+        Some(b"milliseconds")
+    } else if column.ends_with(b"_timer") || column == b"monitor_delay" {
+        Some(b"seconds")
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn slice_in_table(needle: &[u8], table: &[&[u8]]) -> bool {
+    table.iter().any(|&item| item == needle)
+}
+
+#[inline]
+fn settings_column_is_integer(column: &[u8]) -> bool {
+    if slice_in_table(column, SETTINGS_BOOLEANS)
+        || slice_in_table(column, SETTINGS_BYTES)
+        || slice_in_table(column, SETTINGS_TEXTAREAS)
+        || slice_in_table(column, SETTINGS_NULLABLE)
+        || matches!(
+            column,
+            b"safe_backfill_date"
+                | b"inner_file_blacklist"
+                | b"title"
+                | b"home_link"
+                | b"strapline"
+                | b"meta_title"
+                | b"dereferrer_link"
+                | b"movie_language"
+                | b"session_name"
+                | b"cleanup_mode"
+        )
+    {
+        return false;
+    }
+    settings_column_options(column).is_empty()
+}
+
+fn titlecase_ascii_into(part: &[u8], out: &mut Vec<u8>) {
+    let mut prev_alpha = false;
+    for &b in part {
+        if b.is_ascii_alphabetic() {
+            if prev_alpha {
+                out.push(b.to_ascii_lowercase());
+            } else {
+                out.push(b.to_ascii_uppercase());
+            }
+            prev_alpha = true;
+        } else {
+            out.push(b);
+            prev_alpha = false;
+        }
+    }
+}
+
+/// Computes `Illuminate\Support\Str::headline($value)` for ASCII identifier/whitespace strings,
+/// or returns `None` when non-ASCII or punctuation bytes are present so PHP can run `Str::headline`.
+fn str_headline_ascii(value: &[u8]) -> Option<Vec<u8>> {
+    if !value.iter().all(|&b| {
+        b.is_ascii_alphanumeric()
+            || matches!(b, b'_' | b'-' | b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+    }) {
+        return None;
+    }
+
+    let mut ws_parts: Vec<&[u8]> = Vec::new();
+    let mut i = 0usize;
+    while i < value.len() {
+        while i < value.len() && is_ascii_ws(value[i]) {
+            i += 1;
+        }
+        let start = i;
+        while i < value.len() && !is_ascii_ws(value[i]) {
+            i += 1;
+        }
+        if start < i {
+            ws_parts.push(&value[start..i]);
+        }
+    }
+
+    let mut joined = Vec::with_capacity(value.len() + 8);
+    if ws_parts.len() > 1 {
+        for (idx, part) in ws_parts.iter().enumerate() {
+            if idx > 0 {
+                joined.push(b'_');
+            }
+            titlecase_ascii_into(part, &mut joined);
+        }
+    } else if let Some(&single) = ws_parts.first() {
+        let mut piece_start = 0usize;
+        let mut first_piece = true;
+        for idx in 1..single.len() {
+            if single[idx].is_ascii_uppercase() {
+                if !first_piece {
+                    joined.push(b'_');
+                }
+                titlecase_ascii_into(&single[piece_start..idx], &mut joined);
+                first_piece = false;
+                piece_start = idx;
+            }
+        }
+        if piece_start < single.len() {
+            if !first_piece {
+                joined.push(b'_');
+            }
+            titlecase_ascii_into(&single[piece_start..], &mut joined);
+        }
+    }
+
+    for b in &mut joined {
+        if *b == b'-' || *b == b' ' {
+            *b = b'_';
+        }
+    }
+
+    let mut out = Vec::with_capacity(joined.len());
+    for seg in joined.split(|&b| b == b'_') {
+        if seg.is_empty() || seg == b"0" {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(b' ');
+        }
+        out.extend_from_slice(seg);
+    }
+    Some(out)
+}
+
+fn settings_column_help(column: &[u8]) -> Option<Vec<u8>> {
+    match column {
+        b"home_link" => Some(b"Home path or absolute URL used by site navigation.".to_vec()),
+        b"dereferrer_link" => {
+            Some(b"Optional URL prefix placed before outbound metadata links.".to_vec())
+        }
+        b"completion_percent" => {
+            Some(b"Minimum completion percentage retained during release processing.".to_vec())
+        }
+        b"monitor_delay" => Some(b"Seconds between tmux monitor refresh cycles.".to_vec()),
+        b"movie_language" => Some(b"ISO language code used for movie metadata lookup.".to_vec()),
+        b"movie_lookup" => {
+            Some(b"Choose which releases receive movie metadata processing.".to_vec())
+        }
+        b"max_movies_processed" => Some(b"Maximum movies processed per run.".to_vec()),
+        b"post_non_mode" => Some(
+            b"Enable the tmux TV, anime and movie panes. Movie Lookup must also be enabled for the Movies pane to process releases."
+                .to_vec(),
+        ),
+        b"post_amazon_mode" => Some(
+            b"Enable the tmux book, music, console and game panes. Each metadata lookup must also be enabled."
+                .to_vec(),
+        ),
+        b"extract_using_rar_info" => Some(
+            b"Use the built-in PHP RAR/ZIP header parser only. Lists inner files without running unrar/7z, which disables media extraction (mediainfo, samples, and previews)."
+                .to_vec(),
+        ),
+        _ => {
+            let mut headline = str_headline_ascii(column)?;
+            for b in &mut headline {
+                *b = b.to_ascii_lowercase();
+            }
+            let mut help = Vec::with_capacity(10 + headline.len());
+            help.extend_from_slice(b"Controls ");
+            help.extend_from_slice(&headline);
+            help.push(b'.');
+            Some(help)
+        }
+    }
+}
+
+fn settings_column_label(column: &[u8]) -> Option<Vec<u8>> {
+    match column {
+        b"movie_lookup" => Some(b"Process Movies".to_vec()),
+        b"post_non_mode" => Some(b"TV, Anime and Movie Panes".to_vec()),
+        b"post_amazon_mode" => Some(b"Book, Music, Console and Game Panes".to_vec()),
+        b"extract_using_rar_info" => {
+            Some(b"List Archives Without Extracting (Disables Media Extraction)".to_vec())
+        }
+        _ => str_headline_ascii(column),
+    }
+}
+
+/// Writes the NUL-separated writable columns for a `ConfigurationDomain`
+/// (`SettingsPageCatalog::writableColumns`) into `out_buf` and stores the count in `*out_count`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_settings_catalog_writable_columns_nul(
+    domain: *const u8,
+    domain_len: usize,
+    out_count: *mut i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_count.is_null() || !out_count.is_aligned() {
+            return -1;
+        }
+        let Some(domain_s) =
+            (unsafe { valid_slice_bounded(domain, domain_len, (isize::MAX as usize) / 4) })
+        else {
+            return -1;
+        };
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+        let Some(cols) = settings_domain_columns(domain_s) else {
+            return -1;
+        };
+
+        let mut count = 0i64;
+        for &col in cols {
+            if col == b"cleanup_rules" || col == b"color_exclusions" {
+                continue;
+            }
+            if count > 0 {
+                out.push_byte(0);
+            }
+            out.push_slice(col);
+            count += 1;
+        }
+        unsafe {
+            *out_count = count;
+        }
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Writes the NUL-separated `SettingsPageCatalog::cleanupRules()` list into `out_buf`
+/// and stores the rule count (`14`) in `*out_count`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_settings_catalog_cleanup_rules_nul(
+    out_count: *mut i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_count.is_null() || !out_count.is_aligned() {
+            return -1;
+        }
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+        for (idx, (rule, _)) in SETTINGS_CLEANUP_RULES.iter().enumerate() {
+            if idx > 0 {
+                out.push_byte(0);
+            }
+            out.push_slice(rule);
+        }
+        unsafe {
+            *out_count = SETTINGS_CLEANUP_RULES.len() as i64;
+        }
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Resolves `SettingsPageCatalog::unit(string $column)` into `out_buf` (or returns `0` for `null`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_settings_catalog_unit(
+    column: *const u8,
+    column_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(col_s) =
+            (unsafe { valid_slice_bounded(column, column_len, (isize::MAX as usize) / 4) })
+        else {
+            return -1;
+        };
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+        let Some(unit) = settings_column_unit(col_s) else {
+            return 0;
+        };
+        out.push_slice(unit);
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Resolves `SettingsPageCatalog::options(string $column)` as NUL-separated `key \0 label` pairs
+/// and writes the pair count to `*out_count` (`0` when the column has no enum options).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_settings_catalog_options_nul(
+    column: *const u8,
+    column_len: usize,
+    out_count: *mut i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_count.is_null() || !out_count.is_aligned() {
+            return -1;
+        }
+        let Some(col_s) =
+            (unsafe { valid_slice_bounded(column, column_len, (isize::MAX as usize) / 4) })
+        else {
+            return -1;
+        };
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+        let opts = settings_column_options(col_s);
+        unsafe {
+            *out_count = opts.len() as i64;
+        }
+        if opts.is_empty() {
+            return 0;
+        }
+        for (idx, (k, v)) in opts.iter().enumerate() {
+            if idx > 0 {
+                out.push_byte(0);
+            }
+            out.push_slice(k);
+            out.push_byte(0);
+            out.push_slice(v);
+        }
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Evaluates `SettingsPageCatalog::isInteger(ConfigurationDomain $domain, string $column)`.
+/// Returns `1` (`true`), `0` (`false`), or `-1` on invalid arguments.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_settings_catalog_is_integer(
+    domain: *const u8,
+    domain_len: usize,
+    column: *const u8,
+    column_len: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let max_seg = (isize::MAX as usize) / 4;
+        let (Some(domain_s), Some(col_s)) = (
+            unsafe { valid_slice_bounded(domain, domain_len, max_seg) },
+            unsafe { valid_slice_bounded(column, column_len, max_seg) },
+        ) else {
+            return -1;
+        };
+        if settings_domain_columns(domain_s).is_none() {
+            return -1;
+        }
+        i32::from(settings_column_is_integer(col_s))
+    }))
+    .unwrap_or(-1)
+}
+
+/// Resolves `SettingsPageCatalog::help(string $column)` into `out_buf`, or returns `-1` when
+/// declined to PHP `Str::headline`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_settings_catalog_help(
+    column: *const u8,
+    column_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(col_s) =
+            (unsafe { valid_slice_bounded(column, column_len, (isize::MAX as usize) / 4) })
+        else {
+            return -1;
+        };
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+        let Some(help) = settings_column_help(col_s) else {
+            return -1;
+        };
+        out.push_slice(&help);
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Resolves the complete `ConfigurationField` metadata for `SettingsPageCatalog::field($domain, $column)`.
+///
+/// Writes:
+/// - `*out_rules_count`: number of validation rule strings `R`
+/// - `*out_options_count`: number of `(key, label)` option pairs `M`
+/// - `*out_options_int_keys`: `1` when option keys are `int`, `0` when option keys are `string`
+/// - `out_buf`: NUL-separated `label \0 help \0 control \0 unit \0 guidance [ \0 rule_i ... ] [ \0 opt_k \0 opt_v ... ]`
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_settings_catalog_field_nul(
+    domain: *const u8,
+    domain_len: usize,
+    column: *const u8,
+    column_len: usize,
+    out_rules_count: *mut i64,
+    out_options_count: *mut i64,
+    out_options_int_keys: *mut i32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_rules_count.is_null()
+            || !out_rules_count.is_aligned()
+            || out_options_count.is_null()
+            || !out_options_count.is_aligned()
+            || out_options_int_keys.is_null()
+            || !out_options_int_keys.is_aligned()
+        {
+            return -1;
+        }
+        let max_seg = (isize::MAX as usize) / 8;
+        let (Some(domain_s), Some(col_s)) = (
+            unsafe { valid_slice_bounded(domain, domain_len, max_seg) },
+            unsafe { valid_slice_bounded(column, column_len, max_seg) },
+        ) else {
+            return -1;
+        };
+        if col_s.contains(&0) {
+            return -1;
+        }
+        let Some(guidance) = settings_domain_guidance(domain_s) else {
+            return -1;
+        };
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+
+        let emit_field = |out: &mut OutCursor,
+                          label: &[u8],
+                          help: &[u8],
+                          control: &[u8],
+                          unit: &[u8],
+                          guidance: &[u8],
+                          rules: &[&[u8]],
+                          options: &[(&[u8], &[u8])],
+                          int_keys: i32| {
+            unsafe {
+                *out_rules_count = rules.len() as i64;
+                *out_options_count = options.len() as i64;
+                *out_options_int_keys = int_keys;
+            }
+            out.push_slice(label);
+            out.push_byte(0);
+            out.push_slice(help);
+            out.push_byte(0);
+            out.push_slice(control);
+            out.push_byte(0);
+            out.push_slice(unit);
+            out.push_byte(0);
+            out.push_slice(guidance);
+            for &r in rules {
+                out.push_byte(0);
+                out.push_slice(r);
+            }
+            for &(k, v) in options {
+                out.push_byte(0);
+                out.push_slice(k);
+                out.push_byte(0);
+                out.push_slice(v);
+            }
+        };
+
+        if col_s == b"site_logo" {
+            let rules: &[&[u8]] = &[
+                b"nullable",
+                b"image",
+                b"mimes:png,jpg,jpeg,webp",
+                b"max:2048",
+            ];
+            emit_field(
+                &mut out,
+                b"Site Logo",
+                b"PNG, JPEG, or WebP image, up to 2 MB.",
+                b"upload",
+                b"",
+                guidance,
+                rules,
+                &[],
+                0,
+            );
+            return finish_out_cursor_checked(out);
+        }
+
+        if col_s == b"cleanup_rules" {
+            let rules: &[&[u8]] = &[b"nullable", b"array"];
+            emit_field(
+                &mut out,
+                b"Cleanup Rules",
+                b"Select release cleanup checks to run.",
+                b"multiselect",
+                b"",
+                guidance,
+                rules,
+                SETTINGS_CLEANUP_RULES,
+                0,
+            );
+            return finish_out_cursor_checked(out);
+        }
+
+        if col_s == b"color_exclusions" {
+            let rules: &[&[u8]] = &[b"nullable", b"string"];
+            emit_field(
+                &mut out,
+                b"Color Exclusions",
+                b"Comma-separated tmux color indexes from 0 through 255.",
+                b"number-list",
+                b"",
+                guidance,
+                rules,
+                &[],
+                0,
+            );
+            return finish_out_cursor_checked(out);
+        }
+
+        let Some(label) = settings_column_label(col_s) else {
+            return -1;
+        };
+
+        let opts = settings_column_options(col_s);
+        if !opts.is_empty() {
+            let Some(help) = settings_column_help(col_s) else {
+                return -1;
+            };
+            let mut in_rule = b"in:".to_vec();
+            for (idx, (k, _)) in opts.iter().enumerate() {
+                if idx > 0 {
+                    in_rule.push(b',');
+                }
+                in_rule.extend_from_slice(k);
+            }
+            let rules: &[&[u8]] = &[b"required", b"integer", in_rule.as_slice()];
+            emit_field(
+                &mut out,
+                &label,
+                &help,
+                b"enum",
+                b"",
+                guidance,
+                rules,
+                opts,
+                1,
+            );
+            return finish_out_cursor_checked(out);
+        }
+
+        if slice_in_table(col_s, SETTINGS_BOOLEANS) {
+            let Some(help) = settings_column_help(col_s) else {
+                return -1;
+            };
+            let rules: &[&[u8]] = &[b"required", b"boolean"];
+            let bool_opts: &[(&[u8], &[u8])] = &[(b"1", b"Enabled"), (b"0", b"Disabled")];
+            emit_field(
+                &mut out,
+                &label,
+                &help,
+                b"boolean",
+                b"",
+                guidance,
+                rules,
+                bool_opts,
+                1,
+            );
+            return finish_out_cursor_checked(out);
+        }
+
+        if slice_in_table(col_s, SETTINGS_BYTES) {
+            let Some(help) = settings_column_help(col_s) else {
+                return -1;
+            };
+            let rules: &[&[u8]] = &[b"required", b"numeric", b"min:0"];
+            emit_field(
+                &mut out,
+                &label,
+                &help,
+                b"bytes",
+                b"MB/GB",
+                guidance,
+                rules,
+                &[],
+                0,
+            );
+            return finish_out_cursor_checked(out);
+        }
+
+        if col_s == b"safe_backfill_date" {
+            let rules: &[&[u8]] = &[b"required", b"date_format:Y-m-d"];
+            emit_field(
+                &mut out,
+                &label,
+                b"Oldest date allowed for safe backfill.",
+                b"date",
+                b"",
+                guidance,
+                rules,
+                &[],
+                0,
+            );
+            return finish_out_cursor_checked(out);
+        }
+
+        if col_s == b"inner_file_blacklist" {
+            let rules: &[&[u8]] = &[b"required", b"string", b"max:2000"];
+            emit_field(
+                &mut out,
+                &label,
+                b"Regular expression used to reject unsafe inner filenames.",
+                b"regex",
+                b"",
+                guidance,
+                rules,
+                &[],
+                0,
+            );
+            return finish_out_cursor_checked(out);
+        }
+
+        if slice_in_table(col_s, SETTINGS_TEXTAREAS) {
+            let Some(help) = settings_column_help(col_s) else {
+                return -1;
+            };
+            let (control, rules): (&[u8], &[&[u8]]) = if col_s == b"terms" {
+                (b"rich-text", &[b"nullable", b"string", b"max:65000"])
+            } else {
+                (b"textarea", &[b"required", b"string", b"max:65000"])
+            };
+            emit_field(
+                &mut out,
+                &label,
+                &help,
+                control,
+                b"",
+                guidance,
+                rules,
+                &[],
+                0,
+            );
+            return finish_out_cursor_checked(out);
+        }
+
+        if settings_column_is_integer(col_s) {
+            let Some(help) = settings_column_help(col_s) else {
+                return -1;
+            };
+            let min_rule: &[u8] = if col_s == b"niceness" {
+                b"min:-20"
+            } else if slice_in_table(col_s, SETTINGS_POSITIVE_INTEGERS) {
+                b"min:1"
+            } else {
+                b"min:0"
+            };
+            let max_rule: Option<&[u8]> = match col_s {
+                b"completion_percent" => Some(b"max:100"),
+                b"niceness" => Some(b"max:19"),
+                b"colors_start" | b"colors_end" => Some(b"max:255"),
+                _ => None,
+            };
+            let unit = settings_column_unit(col_s).unwrap_or(b"");
+            if let Some(mx) = max_rule {
+                let rules: &[&[u8]] = &[b"required", b"integer", min_rule, mx];
+                emit_field(
+                    &mut out,
+                    &label,
+                    &help,
+                    b"integer",
+                    unit,
+                    guidance,
+                    rules,
+                    &[],
+                    0,
+                );
+            } else {
+                let rules: &[&[u8]] = &[b"required", b"integer", min_rule];
+                emit_field(
+                    &mut out,
+                    &label,
+                    &help,
+                    b"integer",
+                    unit,
+                    guidance,
+                    rules,
+                    &[],
+                    0,
+                );
+            }
+            return finish_out_cursor_checked(out);
+        }
+
+        let Some(help) = settings_column_help(col_s) else {
+            return -1;
+        };
+        let is_nullable = slice_in_table(col_s, SETTINGS_NULLABLE) || col_s == b"dereferrer_link";
+        let rules: &[&[u8]] = if is_nullable {
+            &[b"nullable", b"string", b"max:1000"]
+        } else {
+            &[b"required", b"string", b"max:1000"]
+        };
+        let control: &[u8] = if col_s == b"dereferrer_link" {
+            b"url"
+        } else {
+            b"text"
+        };
+        emit_field(
+            &mut out,
+            &label,
+            &help,
+            control,
+            b"",
+            guidance,
+            rules,
+            &[],
+            0,
+        );
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Evaluates `ClearanceMiddleware::matchesCategoryPath(string $path, string $category)`
+/// case-insensitively against `<cat>`, `<cat>/*`, `browse/<cat>`, and `browse/<cat>/*`.
+/// Returns `1` on match, `0` on non-match, or `-1` on invalid pointer/length arguments.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_clearance_matches_category_path(
+    path: *const u8,
+    path_len: usize,
+    category: *const u8,
+    category_len: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let max_seg = (isize::MAX as usize) / 4;
+        let (Some(path_s), Some(cat_s)) = (
+            unsafe { valid_slice_bounded(path, path_len, max_seg) },
+            unsafe { valid_slice_bounded(category, category_len, max_seg) },
+        ) else {
+            return -1;
+        };
+
+        let clen = cat_s.len();
+        let plen = path_s.len();
+
+        let direct_match = (plen == clen && path_s.eq_ignore_ascii_case(cat_s))
+            || (plen > clen
+                && path_s[clen] == b'/'
+                && path_s[..clen].eq_ignore_ascii_case(cat_s));
+        if direct_match {
+            return 1;
+        }
+
+        let browse_cat_len = match 7usize.checked_add(clen) {
+            Some(v) => v,
+            None => return 0,
+        };
+        let browse_match = plen >= browse_cat_len
+            && path_s[..7].eq_ignore_ascii_case(b"browse/")
+            && path_s[7..browse_cat_len].eq_ignore_ascii_case(cat_s)
+            && (plen == browse_cat_len || path_s[browse_cat_len] == b'/');
+
+        i32::from(browse_match)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Resolves the required permission and blocked category display name for
+/// `ClearanceMiddleware::checkMainCategoryPermission` as `"<permission>\0<display_name>"`,
+/// or returns `0` when the category has no main-category permission mapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_clearance_resolve_main_category(
+    parent_category: *const u8,
+    parent_category_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(cat_s) = (unsafe {
+            valid_slice_bounded(parent_category, parent_category_len, (isize::MAX as usize) / 4)
+        }) else {
+            return -1;
+        };
+        let Some(mut out) = valid_out_cursor_checked(out_buf, out_cap) else {
+            return -1;
+        };
+
+        let resolved: Option<&[u8]> = if cat_s.eq_ignore_ascii_case(b"movies") {
+            Some(b"view movies\0Movies")
+        } else if cat_s.eq_ignore_ascii_case(b"console") {
+            Some(b"view console\0Console")
+        } else if cat_s.eq_ignore_ascii_case(b"books") {
+            Some(b"view books\0Books")
+        } else if cat_s.eq_ignore_ascii_case(b"audio") {
+            Some(b"view audio\0Audio")
+        } else if cat_s.eq_ignore_ascii_case(b"xxx") {
+            Some(b"view adult\0Adult")
+        } else if cat_s.eq_ignore_ascii_case(b"games") || cat_s.eq_ignore_ascii_case(b"pc") {
+            Some(b"view pc\0PC")
+        } else if cat_s.eq_ignore_ascii_case(b"tv") {
+            Some(b"view tv\0TV")
+        } else {
+            None
+        };
+
+        let Some(pair) = resolved else {
+            return 0;
+        };
+        out.push_slice(pair);
+        finish_out_cursor_checked(out)
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave18_worker6_tests {
+    use super::*;
+
+    #[test]
+    fn abstract_categorizer_and_clearance_helpers() {
+        let mut prio = 0i64;
+        assert_eq!(
+            unsafe {
+                nntmux_abstract_categorizer_priority_and_skip(50, b"Ubuntu.ISO".as_ptr(), 10, &mut prio)
+            },
+            0
+        );
+        assert_eq!(prio, 50);
+        assert_eq!(
+            unsafe {
+                nntmux_abstract_categorizer_priority_and_skip(50, std::ptr::null(), 5, &mut prio)
+            },
+            -1
+        );
+
+        let mut cat = 0i64;
+        let mut conf = 0.0f64;
+        let mut buf = [0u8; 64];
+        let n = unsafe {
+            nntmux_abstract_categorizer_format_result_meta(
+                0,
+                2040,
+                0.85,
+                b"movie_uhd".as_ptr(),
+                9,
+                &mut cat,
+                &mut conf,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(cat, 2040);
+        assert!((conf - 0.85).abs() < 1e-12);
+        assert_eq!(&buf[..n as usize], b"movie_uhd");
+
+        let n_no = unsafe {
+            nntmux_abstract_categorizer_format_result_meta(
+                1,
+                9999,
+                0.99,
+                b"ignored".as_ptr(),
+                7,
+                &mut cat,
+                &mut conf,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(cat, 10);
+        assert_eq!(conf, 0.0);
+        assert_eq!(&buf[..n_no as usize], b"no_match");
+
+        assert_eq!(
+            unsafe { nntmux_clearance_matches_category_path(b"Movies/HD".as_ptr(), 9, b"movies".as_ptr(), 6) },
+            1
+        );
+        assert_eq!(
+            unsafe { nntmux_clearance_matches_category_path(b"browse/TV/SD".as_ptr(), 12, b"tv".as_ptr(), 2) },
+            1
+        );
+        assert_eq!(
+            unsafe { nntmux_clearance_matches_category_path(b"movies_extra".as_ptr(), 12, b"movies".as_ptr(), 6) },
+            0
+        );
+
+        let nc = unsafe {
+            nntmux_clearance_resolve_main_category(b"XXX".as_ptr(), 3, buf.as_mut_ptr(), buf.len())
+        };
+        assert_eq!(&buf[..nc as usize], b"view adult\0Adult");
+        assert_eq!(
+            unsafe { nntmux_clearance_resolve_main_category(b"other".as_ptr(), 5, buf.as_mut_ptr(), buf.len()) },
+            0
+        );
+    }
+
+    #[test]
+    fn irc_networks_tmux_command_and_settings_catalog_helpers() {
+        let mut buf = [0u8; 2048];
+        let mut count = 0i64;
+        let keys = b"synirc\0corruptnet\0zenet";
+        let flags = b"110";
+        let ne = unsafe {
+            nntmux_irc_networks_filter_enabled_nul(
+                keys.as_ptr(),
+                keys.len(),
+                flags.as_ptr(),
+                3,
+                &mut count,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(count, 2);
+        assert_eq!(&buf[..ne as usize], b"synirc\0corruptnet");
+
+        let ser = br##"a:2:{s:10:"#PreNNTmux";N;s:8:"#private";s:2:"pw";}"##;
+        let nl = unsafe {
+            nntmux_irc_networks_parse_legacy_channels(
+                ser.as_ptr(),
+                ser.len(),
+                &mut count,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(count, 2);
+        assert_eq!(&buf[..nl as usize], b"#PreNNTmux\00\0#private\01pw");
+
+        let nt = unsafe {
+            nntmux_tmux_command_arguments_nul(
+                b"nntmux".as_ptr(),
+                6,
+                b"has-session\0-t\0main".as_ptr(),
+                19,
+                3,
+                &mut count,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(count, 7);
+        assert_eq!(&buf[..nt as usize], b"tmux\0-u\0-L\0nntmux\0has-session\0-t\0main");
+
+        let nm = unsafe {
+            nntmux_tmux_command_monitor_nul(
+                b"/usr/bin/php".as_ptr(),
+                12,
+                b"/app/artisan".as_ptr(),
+                12,
+                b"nntmux".as_ptr(),
+                6,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(
+            &buf[..nm as usize],
+            b"/usr/bin/php\0/app/artisan\0tmux:monitor\0--session=nntmux"
+        );
+
+        let mut rules_count = 0i64;
+        let mut opts_count = 0i64;
+        let mut int_keys = 0i32;
+        let nf = unsafe {
+            nntmux_settings_catalog_field_nul(
+                b"ingestion".as_ptr(),
+                9,
+                b"completion_percent".as_ptr(),
+                18,
+                &mut rules_count,
+                &mut opts_count,
+                &mut int_keys,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(nf > 0);
+        assert_eq!(rules_count, 4);
+        assert_eq!(opts_count, 0);
+    }
+}
+
 #[cfg(test)]
 mod wave16_slice6_tests {
     use super::*;
