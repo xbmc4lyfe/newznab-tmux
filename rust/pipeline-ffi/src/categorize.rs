@@ -8399,3 +8399,772 @@ pub mod games_steam_title_matching {
         }
     }
 }
+
+/// Wave 10 slice 3: `ReleaseContext` marker predicates and the `release_flag()`,
+/// `getSimilarName()` and `imdb_id_is_valid()` helpers.
+///
+/// Every PHP pattern involved is ASCII, byte mode (no `/u`), so PCRE folds and classifies
+/// ASCII exactly as here while `LC_CTYPE` is C, POSIX or C.UTF-8 (other locales, e.g. Turkish
+/// `i`/`I` folding, decline). Bytes >= 0x80 depend on PHP's PCRE character tables: the
+/// built-in tables classify none of them, while an explicit `setlocale()` makes PHP rebuild
+/// the tables from libc (macOS `C.UTF-8` marks Latin-1 letters `\w`). Matching uses the
+/// built-in classes and records whether any evaluated `\w`/`\d` decision examined a byte that
+/// libc classifies; only then could rebuilt tables decide differently (they never fold such a
+/// byte to ASCII, since PCRE folds the ASCII pattern side), so the result carries
+/// `HIGH_BYTE_SEEN` and the PHP caller probes the live tables before trusting it.
+/// `str_word_count()` uses libc `isalpha()` directly, as does this module.
+pub mod release_context_language_flag {
+    use std::{cell::Cell, panic::catch_unwind, slice, sync::OnceLock};
+
+    pub const DECLINED: i32 = -1;
+    pub const HIGH_BYTE_SEEN: i32 = 0x100;
+    const MAX_SIMILAR_NAME: usize = 0x7fff;
+    /// 309+ significant digits may overflow `strtod` to INF, which PHP's `(int)` maps to 0.
+    const MAX_FINITE_DIGITS: usize = 308;
+
+    unsafe extern "C" {
+        fn isalpha(c: i32) -> i32;
+        fn isalnum(c: i32) -> i32;
+        fn isdigit(c: i32) -> i32;
+        fn setlocale(category: i32, locale: *const std::ffi::c_char) -> *mut std::ffi::c_char;
+    }
+
+    #[cfg(target_vendor = "apple")]
+    const LC_CTYPE: i32 = 2;
+    #[cfg(not(target_vendor = "apple"))]
+    const LC_CTYPE: i32 = 0;
+
+    /// The guard PHP callers would otherwise run as `setlocale(LC_CTYPE, '0')`: PHP returns the
+    /// same libc query, and only these names keep PCRE's ASCII case folding and classes.
+    fn ascii_ctype_locale() -> bool {
+        // SAFETY: a null locale only queries; the result is read before any other libc call.
+        let name = unsafe { setlocale(LC_CTYPE, std::ptr::null()) };
+        if name.is_null() {
+            return false;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+        matches!(name, b"C" | b"POSIX" | b"C.UTF-8" | b"C.utf8")
+    }
+
+    /// # Safety
+    /// A non-null pointer must reference `len` readable bytes. Null is valid only for `len == 0`.
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            Some(&[])
+        } else if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { slice::from_raw_parts(ptr, len) })
+        }
+    }
+
+    /// Set when a decision examined a byte >= 0x80 that libc classifies as alnum or digit.
+    type Track = Cell<bool>;
+
+    #[inline]
+    fn libc_classified(b: u8) -> bool {
+        // SAFETY: both accept every `unsigned char` value.
+        unsafe { isalnum(i32::from(b)) != 0 || isdigit(i32::from(b)) != 0 }
+    }
+
+    /// PCRE `\w` (and `\b`) under the built-in tables.
+    #[inline]
+    fn word(b: u8, t: &Track) -> bool {
+        if b < 0x80 {
+            b.is_ascii_alphanumeric() || b == b'_'
+        } else {
+            if libc_classified(b) {
+                t.set(true);
+            }
+            false
+        }
+    }
+
+    #[inline]
+    fn digit(b: u8, t: &Track) -> bool {
+        if b < 0x80 {
+            b.is_ascii_digit()
+        } else {
+            if libc_classified(b) {
+                t.set(true);
+            }
+            false
+        }
+    }
+
+    #[inline]
+    fn sep(b: u8) -> bool {
+        matches!(b, b'.' | b'_' | b' ' | b'-')
+    }
+
+    /// Case-insensitive ASCII literal; PCRE folds the pattern side, so bytes >= 0x80 never match.
+    #[inline]
+    fn ci_at(h: &[u8], pos: usize, lit: &[u8]) -> bool {
+        h.len() >= pos + lit.len()
+            && h[pos..pos + lit.len()]
+                .iter()
+                .zip(lit)
+                .all(|(&a, &b)| a.to_ascii_lowercase() == b)
+    }
+
+    /// `/(?:^|[._ -])S\d{1,3}(?=$|[._ -])/i`; `$` also matches before a final LF.
+    pub fn has_standalone_season_token(h: &[u8], t: &Track) -> bool {
+        let n = h.len();
+        for i in 0..n {
+            if h[i] | 0x20 != b's' || (i > 0 && !sep(h[i - 1])) {
+                continue;
+            }
+            let mut j = i + 1;
+            while j < n && j - i <= 3 && digit(h[j], t) {
+                j += 1;
+            }
+            if j > i + 1 && (j == n || sep(h[j]) || (j + 1 == n && h[j] == b'\n')) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `str_starts_with($name, 'OF.') || preg_match('/\bOnly[-_ ]?Fans\b/i', $name)`.
+    pub fn has_only_fans_marker(h: &[u8], t: &Track) -> bool {
+        if h.starts_with(b"OF.") {
+            return true;
+        }
+        (0..h.len().saturating_sub(7)).any(|i| {
+            ci_at(h, i, b"only")
+                && (i == 0 || !word(h[i - 1], t))
+                && bounded_at(h, i + 4, b"^fans", t)
+        })
+    }
+
+    /// Lower-case alternatives of a `\b(...)\b` group; `~` stands for `[._ -]?`.
+    const ADULT_STUDIOS: &[&[u8]] = &[
+        b"xxx",
+        b"porn",
+        b"anal",
+        b"brazzers",
+        b"bangbros",
+        b"naughtyamerica",
+        b"realitykings",
+        b"tushy",
+        b"vixen",
+        b"blacked",
+        b"onlyfans",
+        b"metart",
+        b"joymii",
+        b"creampie",
+        b"mp4-xxx",
+        b"puretaboo",
+        b"lady~lyne",
+        b"teamskeet",
+        b"girlsway",
+        b"evilangel",
+        b"kink",
+        b"fakehub",
+        b"faketaxi",
+        b"sexart",
+        b"nubiles",
+        b"defloration",
+        b"deeper",
+        b"bellesa",
+        b"twistys",
+        b"mofos",
+        b"missax",
+        b"legalporno",
+        b"analvids",
+        b"jav",
+        b"hentai",
+        b"roccosiffredi",
+        b"divinebitches",
+        b"device~bondage",
+        b"hogtied",
+        b"wired~pussy",
+        b"fucking~machines",
+        b"ultimate~surrender",
+        b"public~disgrace",
+        b"sex~and~submission",
+        b"bound~gang~bangs",
+        b"electro~sluts",
+        b"whipped~ass",
+        b"ts~seduction",
+        b"infernal~restraints",
+        b"sexually~broken",
+    ];
+    const ADULT_KEYWORDS: &[&[u8]] = &[
+        b"fuck",
+        b"fucked",
+        b"fucking",
+        b"cock",
+        b"dick",
+        b"pussy",
+        b"cum",
+        b"cumshot",
+        b"blowjob",
+        b"handjob",
+        b"milf",
+        b"teen",
+        b"lesbian",
+        b"threesome",
+        b"gangbang",
+        b"hardcore",
+        b"interracial",
+    ];
+    const ADULT_RESOLUTIONS: &[&[u8]] = &[b"720p", b"1080p", b"2160p", b"4k", b"mp4"];
+
+    const SLOTS: usize = 37;
+
+    /// Dense index of an ASCII letter (case-folded) or digit for the prefix tables; 36 = other.
+    const SLOT: [u8; 256] = {
+        let mut table = [36u8; 256];
+        let mut b = 0;
+        while b < 26 {
+            table[b'a' as usize + b] = b as u8;
+            table[b'A' as usize + b] = b as u8;
+            b += 1;
+        }
+        let mut d = 0;
+        while d < 10 {
+            table[b'0' as usize + d] = 26 + d as u8;
+            d += 1;
+        }
+        table
+    };
+
+    /// Built-in-table `\w` as a lookup table.
+    const WORD: [u8; 256] = {
+        let mut table = [0u8; 256];
+        let mut b = 0;
+        while b < 256 {
+            table[b] = (SLOT[b] != 36 || b == b'_' as usize) as u8;
+            b += 1;
+        }
+        table
+    };
+
+    #[inline]
+    fn pair_slot(h: &[u8], i: usize) -> usize {
+        let next = if i + 1 < h.len() {
+            SLOT[h[i + 1] as usize]
+        } else {
+            36
+        };
+        SLOT[h[i] as usize] as usize * SLOTS + next as usize
+    }
+
+    /// Calls `visit` for each position (ascending) whose two-byte prefix has an entry in
+    /// `known`, optionally only at word starts; the scan is branch-free per byte. Candidates
+    /// start with an ASCII alphanumeric byte, so only a preceding high byte needs tracking.
+    #[inline]
+    fn for_each_candidate(
+        h: &[u8],
+        known: &[u8],
+        word_starts: bool,
+        t: &Track,
+        mut visit: impl FnMut(usize) -> bool,
+    ) -> bool {
+        let n = h.len();
+        let mut base = 0;
+        while base < n {
+            let end = (base + 64).min(n);
+            let (mut bits, mut high_prev) = (0u64, 0u64);
+            for i in base..end {
+                let mut cand = known[pair_slot(h, i)];
+                if word_starts && i > 0 {
+                    let prev = h[i - 1];
+                    high_prev |= u64::from(cand & (prev >> 7)) << (i - base);
+                    cand &= WORD[prev as usize] ^ 1;
+                }
+                bits |= u64::from(cand) << (i - base);
+            }
+            while high_prev != 0 {
+                let i = base + high_prev.trailing_zeros() as usize;
+                high_prev &= high_prev - 1;
+                word(h[i - 1], t);
+            }
+            while bits != 0 {
+                let i = base + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if visit(i) {
+                    return true;
+                }
+            }
+            base = end;
+        }
+        false
+    }
+
+    /// Adult alternatives in one table: kind 0 decides alone, kinds 1 and 2 only together.
+    /// `^` stands for the OnlyFans `[-_ ]?`; it is folded in so one pass covers every group.
+    struct AdultTable {
+        pats: Vec<(&'static [u8], u8)>,
+        prefix: Vec<u128>,
+        known: Vec<u8>,
+    }
+
+    fn adult_table() -> &'static AdultTable {
+        static CELL: OnceLock<AdultTable> = OnceLock::new();
+        CELL.get_or_init(|| {
+            let mut pats: Vec<(&'static [u8], u8)> = vec![(b"only^fans", 0)];
+            pats.extend(ADULT_STUDIOS.iter().map(|&p| (p, 0)));
+            pats.extend(ADULT_KEYWORDS.iter().map(|&p| (p, 1)));
+            pats.extend(ADULT_RESOLUTIONS.iter().map(|&p| (p, 2)));
+            assert!(pats.len() <= 128);
+            let mut prefix = vec![0u128; SLOTS * SLOTS];
+            for (k, (p, _)) in pats.iter().enumerate() {
+                assert!(SLOT[p[0] as usize] != 36 && SLOT[p[1] as usize] != 36);
+                prefix[SLOT[p[0] as usize] as usize * SLOTS + SLOT[p[1] as usize] as usize] |=
+                    1u128 << k;
+            }
+            let known = prefix.iter().map(|&m| u8::from(m != 0)).collect();
+            AdultTable {
+                pats,
+                prefix,
+                known,
+            }
+        })
+    }
+
+    /// Matches `pat` at `pos` followed by `\b`, trying both arms of each optional separator.
+    fn bounded_at(h: &[u8], pos: usize, pat: &[u8], t: &Track) -> bool {
+        match pat.split_first() {
+            None => pos == h.len() || !word(h[pos], t),
+            Some((&b'~', rest)) => {
+                (pos < h.len() && sep(h[pos]) && bounded_at(h, pos + 1, rest, t))
+                    || bounded_at(h, pos, rest, t)
+            }
+            Some((&b'^', rest)) => {
+                (pos < h.len()
+                    && matches!(h[pos], b'-' | b'_' | b' ')
+                    && bounded_at(h, pos + 1, rest, t))
+                    || bounded_at(h, pos, rest, t)
+            }
+            Some((&c, rest)) => {
+                pos < h.len() && h[pos].to_ascii_lowercase() == c && bounded_at(h, pos + 1, rest, t)
+            }
+        }
+    }
+
+    /// `ReleaseContext::hasAdultMarkers()`: every alternation is `\b(...)\b` and each
+    /// alternative starts with two word bytes, so only word starts with a known prefix are tried.
+    pub fn has_adult_markers(h: &[u8], t: &Track) -> bool {
+        if h.starts_with(b"OF.") {
+            return true;
+        }
+        let table = adult_table();
+        let (mut keyword, mut resolution) = (false, false);
+        for_each_candidate(h, &table.known, true, t, |i| {
+            let mut mask = table.prefix[pair_slot(h, i)];
+            while mask != 0 {
+                let (pat, kind) = table.pats[mask.trailing_zeros() as usize];
+                mask &= mask - 1;
+                if (kind == 1 && keyword)
+                    || (kind == 2 && resolution)
+                    || !bounded_at(h, i + 2, &pat[2..], t)
+                {
+                    continue;
+                }
+                match kind {
+                    0 => return true,
+                    1 => keyword = true,
+                    _ => resolution = true,
+                }
+                if keyword && resolution {
+                    return true;
+                }
+            }
+            false
+        })
+    }
+
+    /// `(literal, release_flag() case number, \b on both sides)`; literals are lower case.
+    const FLAG_TERMS: &[(&[u8], u8, bool)] = &[
+        (b"arabic", 1, false),
+        (b"cantonese", 2, false),
+        (b"chinese", 3, false),
+        (b"mandarin", 3, false),
+        (b"ch", 3, true),
+        (b"cn", 3, true),
+        (b"czech", 4, true),
+        (b"danish", 5, false),
+        (b"finnish", 6, false),
+        (b"flemish", 7, false),
+        (b"dutch", 7, true),
+        (b"nl", 7, true),
+        (b"nlsub", 7, false),
+        (b"french", 8, false),
+        (b"vostfr", 8, false),
+        (b"multi", 8, false),
+        (b"german", 9, false),
+        (b"ger", 9, true),
+        (b"greek", 10, true),
+        (b"hebrew", 11, false),
+        (b"yiddish", 11, false),
+        (b"hindi", 12, true),
+        (b"hungarian", 13, false),
+        (b"hun", 13, true),
+        (b"italian", 14, false),
+        (b"ita", 14, true),
+        (b"japanese", 15, false),
+        (b"jp", 15, true),
+        (b"korean", 16, false),
+        (b"kr", 16, true),
+        (b"norwegian", 17, false),
+        (b"polish", 18, false),
+        (b"portuguese", 19, false),
+        (b"romanian", 20, false),
+        (b"spanish", 21, false),
+        (b"swedish", 22, false),
+        (b"swesub", 22, false),
+        (b"tagalog", 23, false),
+        (b"filipino", 23, false),
+        (b"thai", 24, true),
+        (b"turkish", 25, false),
+        (b"russian", 26, false),
+        (b"vietnamese", 27, false),
+    ];
+
+    fn flag_prefix() -> &'static (Vec<u64>, Vec<u8>) {
+        static CELL: OnceLock<(Vec<u64>, Vec<u8>)> = OnceLock::new();
+        CELL.get_or_init(|| {
+            assert!(FLAG_TERMS.len() <= 64);
+            let mut prefix = vec![0u64; SLOTS * SLOTS];
+            for (k, (lit, _, _)) in FLAG_TERMS.iter().enumerate() {
+                prefix[SLOT[lit[0] as usize] as usize * SLOTS + SLOT[lit[1] as usize] as usize] |=
+                    1u64 << k;
+            }
+            let known = prefix.iter().map(|&m| u8::from(m != 0)).collect();
+            (prefix, known)
+        })
+    }
+
+    /// The first `switch (true)` case of `release_flag()` that matches (1-27), or 0.
+    pub fn release_flag_case(h: &[u8], t: &Track) -> u8 {
+        let (prefix, known) = flag_prefix();
+        let n = h.len();
+        let mut best = u8::MAX;
+        for_each_candidate(h, known, false, t, |i| {
+            let mut mask = prefix[pair_slot(h, i)];
+            while mask != 0 {
+                let (lit, case, bounded) = FLAG_TERMS[mask.trailing_zeros() as usize];
+                mask &= mask - 1;
+                if case >= best
+                    || (bounded && i > 0 && word(h[i - 1], t))
+                    || !ci_at(h, i + 2, &lit[2..])
+                {
+                    continue;
+                }
+                let end = i + lit.len();
+                if !bounded || end == n || !word(h[end], t) {
+                    best = case;
+                }
+            }
+            best == 1
+        });
+        if best == u8::MAX { 0 } else { best }
+    }
+
+    #[inline]
+    fn word_count_alpha(b: u8) -> bool {
+        if b.is_ascii() {
+            b.is_ascii_alphabetic() || b == b'\''
+        } else {
+            // SAFETY: `isalpha` accepts every `unsigned char` value.
+            unsafe { isalpha(i32::from(b)) != 0 }
+        }
+    }
+
+    /// First two `str_word_count(str_replace(['.', '_', '-'], ' ', $name), 2)` words as
+    /// `(offset, length)` pairs; a missing word has length 0.
+    pub fn similar_name_spans(h: &[u8]) -> [(usize, usize); 2] {
+        let mut spans = [(0usize, 0usize); 2];
+        let mut found = 0;
+        let n = h.len();
+        // The first byte may not be `'`; `-` never survives the replacement.
+        let mut p = usize::from(n > 0 && h[0] == b'\'');
+        while p < n && found < 2 {
+            let s = p;
+            while p < n && !matches!(h[p], b'.' | b'_' | b'-') && word_count_alpha(h[p]) {
+                p += 1;
+            }
+            if p > s {
+                spans[found] = (s, p - s);
+                found += 1;
+            }
+            p += 1;
+        }
+        spans
+    }
+
+    /// `imdb_id_is_valid()` for a string under the built-in tables: some digit after `\D`
+    /// removal is non-zero and the digits stay finite as a double. `None` asks PHP to decide.
+    pub fn imdb_id_is_valid(h: &[u8]) -> Option<bool> {
+        let mut significant = 0usize;
+        for &b in h {
+            if b.is_ascii_digit() && (significant > 0 || b != b'0') {
+                significant += 1;
+            }
+        }
+        if significant > MAX_FINITE_DIGITS {
+            None
+        } else {
+            Some(significant > 0)
+        }
+    }
+
+    macro_rules! predicate_export {
+        ($name:ident, $f:ident) => {
+            /// # Safety
+            /// `ptr` must reference `len` readable bytes (null only when `len == 0`).
+            /// Returns 0/1 (or a `release_flag()` case), OR-ed with `HIGH_BYTE_SEEN` when
+            /// libc-built PCRE tables might answer differently, or `DECLINED` (bad input or
+            /// unsupported `LC_CTYPE`).
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(ptr: *const u8, len: usize) -> i32 {
+                catch_unwind(|| {
+                    let Some(h) = (unsafe { input(ptr, len) }) else {
+                        return DECLINED;
+                    };
+                    if !ascii_ctype_locale() {
+                        return DECLINED;
+                    }
+                    let t = Track::new(false);
+                    let result = i32::from($f(h, &t));
+                    if t.get() {
+                        result | HIGH_BYTE_SEEN
+                    } else {
+                        result
+                    }
+                })
+                .unwrap_or(DECLINED)
+            }
+        };
+    }
+    predicate_export!(
+        nntmux_release_context_has_standalone_season_token,
+        has_standalone_season_token
+    );
+    predicate_export!(
+        nntmux_release_context_has_only_fans_marker,
+        has_only_fans_marker
+    );
+    predicate_export!(nntmux_release_context_has_adult_markers, has_adult_markers);
+    predicate_export!(nntmux_release_flag_case, release_flag_case);
+
+    /// # Safety
+    /// `ptr` must reference `len` readable bytes (null only when `len == 0`).
+    /// Returns `s1 | l1 << 15 | s2 << 30 | l2 << 45` (15-bit fields), or -1 for inputs
+    /// longer than 32767 bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_similar_name_spans(ptr: *const u8, len: usize) -> i64 {
+        catch_unwind(|| {
+            let Some(h) = (unsafe { input(ptr, len) }) else {
+                return -1;
+            };
+            if h.len() > MAX_SIMILAR_NAME {
+                return -1;
+            }
+            let [(s1, l1), (s2, l2)] = similar_name_spans(h);
+            (s1 | l1 << 15 | s2 << 30 | l2 << 45) as i64
+        })
+        .unwrap_or(-1)
+    }
+
+    /// # Safety
+    /// `ptr` must reference `len` readable bytes (null only when `len == 0`).
+    /// Returns 0/1, or `DECLINED` for bad input, unsupported `LC_CTYPE`, 309+ significant
+    /// digits, or a byte >= 0x80 that libc classifies (rebuilt tables may keep it as `\d`).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_imdb_id_is_valid(ptr: *const u8, len: usize) -> i32 {
+        catch_unwind(|| {
+            let Some(h) = (unsafe { input(ptr, len) }) else {
+                return DECLINED;
+            };
+            if !ascii_ctype_locale() || h.iter().any(|&b| b >= 0x80 && libc_classified(b)) {
+                return DECLINED;
+            }
+            imdb_id_is_valid(h).map_or(DECLINED, i32::from)
+        })
+        .unwrap_or(DECLINED)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::categorize::Re;
+
+        fn re(p: &str) -> Re {
+            Re::new(p, true)
+        }
+
+        fn alternation(list: &[&[u8]]) -> String {
+            let alts: Vec<String> = list
+                .iter()
+                .map(|p| {
+                    String::from_utf8(p.to_vec())
+                        .unwrap()
+                        .replace('~', "[._ -]?")
+                })
+                .collect();
+            format!(r"\b({})\b", alts.join("|"))
+        }
+
+        fn corpus() -> Vec<Vec<u8>> {
+            let tokens: &[&[u8]] = &[
+                b"S01",
+                b"s1",
+                b"S1234",
+                b"S12",
+                b"Only",
+                b"Fans",
+                b"only-fans",
+                b"OnlyFans",
+                b"OF.",
+                b"XXX",
+                b"Lady",
+                b"Lyne",
+                b"Device",
+                b"Bondage",
+                b"Teen",
+                b"1080p",
+                b"4k",
+                b"mp4",
+                b"MP4-XXX",
+                b"French",
+                b"ger",
+                b"German",
+                b"ch",
+                b"cn",
+                b"nl",
+                b"NlSub",
+                b"Thai",
+                b"jp",
+                b"Swesub",
+                b"Show",
+                b"x264",
+                b"\xc3\xa9",
+                b"\xff",
+                b".",
+                b"_",
+                b" ",
+                b"-",
+                b"\n",
+                b"'",
+                b"0",
+                b"7",
+            ];
+            let mut seed = 0x9e3779b97f4a7c15u64;
+            let mut out = vec![Vec::new(), b"\n".to_vec(), b"S01\n".to_vec()];
+            for _ in 0..20000 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let count = (seed % 9) as usize;
+                let mut s = Vec::new();
+                for k in 0..count {
+                    s.extend_from_slice(tokens[((seed >> (k * 6)) % tokens.len() as u64) as usize]);
+                }
+                out.push(s);
+            }
+            out
+        }
+
+        #[test]
+        fn predicates_match_reference_engine() {
+            let season = re(r"(?:^|[._ -])S\d{1,3}(?=$|[._ -])");
+            let only_fans = re(r"\bOnly[-_ ]?Fans\b");
+            let studios = re(&alternation(ADULT_STUDIOS));
+            let keywords = re(&alternation(ADULT_KEYWORDS));
+            let resolutions = re(&alternation(ADULT_RESOLUTIONS));
+            for s in corpus() {
+                assert_eq!(
+                    has_standalone_season_token(&s, &Track::new(false)),
+                    season.is_match(&s),
+                    "{s:?}"
+                );
+                let of = s.starts_with(b"OF.") || only_fans.is_match(&s);
+                assert_eq!(has_only_fans_marker(&s, &Track::new(false)), of, "{s:?}");
+                let adult = of
+                    || studios.is_match(&s)
+                    || (keywords.is_match(&s) && resolutions.is_match(&s));
+                assert_eq!(has_adult_markers(&s, &Track::new(false)), adult, "{s:?}");
+            }
+        }
+
+        #[test]
+        fn release_flag_cases_match_reference_engine() {
+            let cases: Vec<Re> = [
+                r"Arabic",
+                r"Cantonese",
+                r"Chinese|Mandarin|\bc[hn]\b",
+                r"\bCzech\b",
+                r"Danish",
+                r"Finnish",
+                r"Flemish|\b(Dutch|nl)\b|NlSub",
+                r"French|Vostfr|Multi",
+                r"German(bed)?|\bger\b",
+                r"\bGreek\b",
+                r"Hebrew|Yiddish",
+                r"\bHindi\b",
+                r"Hungarian|\bhun\b",
+                r"Italian|\bita\b",
+                r"Japanese|\bjp\b",
+                r"Korean|\bkr\b",
+                r"Norwegian",
+                r"Polish",
+                r"Portuguese",
+                r"Romanian",
+                r"Spanish",
+                r"Swe(dish|sub)",
+                r"Tagalog|Filipino",
+                r"\bThai\b",
+                r"Turkish",
+                r"Russian",
+                r"Vietnamese",
+            ]
+            .iter()
+            .map(|p| re(p))
+            .collect();
+            for s in corpus() {
+                let expected = cases
+                    .iter()
+                    .position(|r| r.is_match(&s))
+                    .map_or(0, |i| i + 1);
+                assert_eq!(
+                    release_flag_case(&s, &Track::new(false)) as usize,
+                    expected,
+                    "{s:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn similar_name_and_imdb_edges() {
+            assert_eq!(similar_name_spans(b"'abc 'def x"), [(1, 3), (5, 4)]);
+            assert_eq!(similar_name_spans(b"..A_b-c"), [(2, 1), (4, 1)]);
+            assert_eq!(similar_name_spans(b"123 456"), [(0, 0), (0, 0)]);
+            assert_eq!(similar_name_spans(b"''x"), [(1, 2), (0, 0)]);
+            assert_eq!(imdb_id_is_valid(b" tt0137523 "), Some(true));
+            assert_eq!(imdb_id_is_valid(b"0000000"), Some(false));
+            assert_eq!(imdb_id_is_valid(&[b'9'; 308]), Some(true));
+            assert_eq!(imdb_id_is_valid(&[b'9'; 309]), None);
+            assert_eq!(
+                unsafe { nntmux_release_flag_case(std::ptr::null(), 1) },
+                DECLINED
+            );
+            let flagged = if libc_classified(0xff) {
+                HIGH_BYTE_SEEN
+            } else {
+                0
+            };
+            assert_eq!(
+                unsafe { nntmux_release_context_has_adult_markers(b"XXX\xff".as_ptr(), 4) },
+                1 | flagged
+            );
+            // `!` is never a word byte, so the 0xff after it is never examined.
+            assert_eq!(
+                unsafe { nntmux_release_context_has_adult_markers(b"XXX!\xff".as_ptr(), 5) },
+                1
+            );
+        }
+    }
+}
