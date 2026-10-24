@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace App\Services\Runners;
 
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
 use Symfony\Component\Process\Exception\ProcessTimedOutException;
@@ -12,6 +14,122 @@ use Symfony\Component\Process\Process;
 
 abstract class BaseRunner
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_tmux_runner_transform(uint32_t mode, const char *input, size_t input_len, char *out, size_t cap);
+        double nntmux_runner_follow_up_deadline(double started_at, int64_t interval);
+        C;
+
+    /** No Slice 2 candidate met all four 1.5x thresholds; see RustTmuxRunnersAndDrainParityTest. */
+    private static ?bool $useRustFfi = null;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
+    public static function setUseRustFfi(?bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (! self::$ffiResolved) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('irc', self::FFI_CDEF);
+            self::$ffiResolved = true;
+        }
+
+        return self::$ffi;
+    }
+
+    /** @param list<string> $fields */
+    public static function runnerTransformNative(int $mode, array $fields): ?string
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            $input = '';
+            foreach ($fields as $field) {
+                if (strlen($field) > 0xFFFFFFFF) {
+                    return null;
+                }
+                $input .= pack('N', strlen($field)).$field;
+            }
+            $capacity = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, strlen($input) + 512), $capacity);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $length = (int) $ffi->nntmux_tmux_runner_transform($mode, $input, strlen($input), $scratch, $capacity);
+            if ($length < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$length, $capacity);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $length = (int) $ffi->nntmux_tmux_runner_transform($mode, $input, strlen($input), $scratch, $capacity);
+            }
+
+            return $length >= 0 && $length <= $capacity ? FFI::string($scratch, $length) : null;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  list<string>  $fields
+     * @return list<string>|null
+     */
+    public static function runnerTransformListNative(int $mode, array $fields): ?array
+    {
+        $output = self::runnerTransformNative($mode, $fields);
+        if ($output === null) {
+            return null;
+        }
+        $fields = [];
+        $offset = 0;
+        $length = strlen($output);
+        while ($offset < $length) {
+            if ($length - $offset < 4) {
+                return null;
+            }
+            $decoded = unpack('Nlength', $output, $offset);
+            if ($decoded === false) {
+                return null;
+            }
+            $size = (int) $decoded['length'];
+            $offset += 4;
+            if ($size > $length - $offset) {
+                return null;
+            }
+            $fields[] = substr($output, $offset, $size);
+            $offset += $size;
+        }
+
+        return $fields;
+    }
+
+    public static function followUpDeadlineNative(float $startedAt, int $interval): ?float
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            return (float) $ffi->nntmux_runner_follow_up_deadline($startedAt, $interval);
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
     /** @var array<string|int, array{status: string, exit_code: ?int}> */
     protected array $workerOutcomes = [];
 
@@ -46,6 +164,18 @@ abstract class BaseRunner
 
     protected function workerConcurrencyKey(string|int $key): string|int|null
     {
+        return self::usesRustFfi() ? $this->workerConcurrencyKeyNative($key) : $this->workerConcurrencyKeyPhp($key);
+    }
+
+    public function workerConcurrencyKeyPhp(string|int $key): string|int|null
+    {
+        return null;
+    }
+
+    public function workerConcurrencyKeyNative(string|int $key): string|int|null
+    {
+        self::runnerTransformNative(13, [(string) $key]);
+
         return null;
     }
 
@@ -66,6 +196,18 @@ abstract class BaseRunner
      */
     protected function concurrencyTimeout(): int
     {
+        return (self::usesRustFfi() ? $this->concurrencyTimeoutNative() : null) ?? $this->concurrencyTimeoutPhp();
+    }
+
+    public function concurrencyTimeoutNative(): ?int
+    {
+        $value = self::runnerTransformNative(12, [(string) $this->concurrencyTimeoutPhp()]);
+
+        return $value !== null ? (int) $value : null;
+    }
+
+    public function concurrencyTimeoutPhp(): int
+    {
         $configured = config('nntmux.concurrency_timeout');
 
         return (int) ($configured ?? config('nntmux.multiprocessing_max_child_time', 1800));
@@ -78,6 +220,18 @@ abstract class BaseRunner
 
     /** @return list<string> */
     protected function buildDnrCommand(string $args): array
+    {
+        return (self::usesRustFfi() ? $this->buildDnrCommandNative($args) : null) ?? $this->buildDnrCommandPhp($args);
+    }
+
+    /** @return list<string>|null */
+    public function buildDnrCommandNative(string $args): ?array
+    {
+        return self::runnerTransformListNative(9, [PHP_BINARY, base_path('artisan'), $args]);
+    }
+
+    /** @return list<string> */
+    public function buildDnrCommandPhp(string $args): array
     {
         $parts = explode('  ', trim($args));
         $command = array_shift($parts);
@@ -389,6 +543,23 @@ abstract class BaseRunner
      * only the tmux pane. Bounded, and only read for workers that did not succeed.
      */
     private function outputTail(Process $process): string
+    {
+        return (self::usesRustFfi() ? $this->outputTailNative($process) : null) ?? $this->outputTailPhp($process);
+    }
+
+    public function outputTailNative(Process $process): ?string
+    {
+        if ($process->isSuccessful()) {
+            return '';
+        }
+        if (strcasecmp(mb_internal_encoding(), 'UTF-8') !== 0) {
+            return null;
+        }
+
+        return self::runnerTransformNative(10, ['0', $process->getErrorOutput(), $process->getOutput()]);
+    }
+
+    public function outputTailPhp(Process $process): string
     {
         if ($process->isSuccessful()) {
             return '';

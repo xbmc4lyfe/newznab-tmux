@@ -23,6 +23,16 @@ class PostProcessRunner extends BaseRunner
 
     private function guidBucketExpression(string $column = 'leftguid'): string
     {
+        return self::usesRustFfi() ? $this->guidBucketExpressionNative($column) : $this->guidBucketExpressionPhp($column);
+    }
+
+    public function guidBucketExpressionNative(string $column = 'leftguid'): string
+    {
+        return self::runnerTransformNative(6, [DB::getDriverName(), $column]) ?? $this->guidBucketExpressionPhp($column);
+    }
+
+    public function guidBucketExpressionPhp(string $column = 'leftguid'): string
+    {
         return DB::getDriverName() === 'sqlite'
             ? 'substr('.$column.', 1, 1)'
             : 'LEFT('.$column.', 1)';
@@ -159,16 +169,45 @@ class PostProcessRunner extends BaseRunner
      */
     private function getBooksBuckets(): array
     {
-        $bucketExpr = $this->guidBucketExpression();
+        return self::usesRustFfi() ? $this->getBooksBucketsNative() : $this->getBooksBucketsPhp();
+    }
+
+    /** @return array<int, object{id: string}> */
+    public function getBooksBucketsNative(): array
+    {
+        return DB::select($this->getBooksBucketsSqlNative());
+    }
+
+    /** @return array<int, object{id: string}> */
+    public function getBooksBucketsPhp(): array
+    {
+        return DB::select($this->getBooksBucketsSqlPhp());
+    }
+
+    public function getBooksBucketsSqlPhp(): string
+    {
+        $bucketExpr = $this->guidBucketExpressionPhp();
         $workCondition = BookProcessingCandidateQuery::workCondition(
             (int) app(ConfigurationProvider::class)->metadata()->bookLookup->value
         );
 
-        return DB::select('
+        return '
             SELECT DISTINCT '.$bucketExpr.' AS id
             FROM releases
             WHERE '.$workCondition.'
-            LIMIT 16');
+            LIMIT 16';
+    }
+
+    public function getBooksBucketsSqlNative(): string
+    {
+        $bucketExpr = $this->guidBucketExpressionNative();
+        $workCondition = BookProcessingCandidateQuery::workCondition(
+            (int) app(ConfigurationProvider::class)->metadata()->bookLookup->value
+        );
+
+        $condition = $workCondition;
+
+        return self::runnerTransformNative(7, [$bucketExpr, $condition]) ?? $this->getBooksBucketsSqlPhp();
     }
 
     /**
@@ -176,15 +215,43 @@ class PostProcessRunner extends BaseRunner
      */
     private function getMusicBuckets(): array
     {
-        $bucketExpr = $this->guidBucketExpression();
+        return self::usesRustFfi() ? $this->getMusicBucketsNative() : $this->getMusicBucketsPhp();
+    }
 
-        return DB::select('
+    /** @return array<int, object{id: string}> */
+    public function getMusicBucketsNative(): array
+    {
+        return DB::select($this->getMusicBucketsSqlNative());
+    }
+
+    /** @return array<int, object{id: string}> */
+    public function getMusicBucketsPhp(): array
+    {
+        return DB::select($this->getMusicBucketsSqlPhp());
+    }
+
+    public function getMusicBucketsSqlPhp(): string
+    {
+        $bucketExpr = $this->guidBucketExpressionPhp();
+
+        return '
             SELECT DISTINCT '.$bucketExpr.' AS id
             FROM releases
             WHERE categories_id IN ('.Category::MUSIC_MP3.', '.Category::MUSIC_LOSSLESS.', '.Category::MUSIC_OTHER.')
             AND musicinfo_id IS NULL
             AND '.Release::nzbSettledSql().'
-            LIMIT 16');
+            LIMIT 16';
+    }
+
+    public function getMusicBucketsSqlNative(): string
+    {
+        $bucketExpr = $this->guidBucketExpressionNative();
+
+        $condition = 'categories_id IN ('.Category::MUSIC_MP3.', '.Category::MUSIC_LOSSLESS.', '.Category::MUSIC_OTHER.')
+            AND musicinfo_id IS NULL
+            AND '.Release::nzbSettledSql();
+
+        return self::runnerTransformNative(7, [$bucketExpr, $condition]) ?? $this->getMusicBucketsSqlPhp();
     }
 
     /**
@@ -192,17 +259,47 @@ class PostProcessRunner extends BaseRunner
      */
     private function getConsoleBuckets(): array
     {
-        $bucketExpr = $this->guidBucketExpression();
+        return self::usesRustFfi() ? $this->getConsoleBucketsNative() : $this->getConsoleBucketsPhp();
+    }
+
+    /** @return array<int, object{id: string}> */
+    public function getConsoleBucketsNative(): array
+    {
+        return DB::select($this->getConsoleBucketsSqlNative());
+    }
+
+    /** @return array<int, object{id: string}> */
+    public function getConsoleBucketsPhp(): array
+    {
+        return DB::select($this->getConsoleBucketsSqlPhp());
+    }
+
+    public function getConsoleBucketsSqlPhp(): string
+    {
+        $bucketExpr = $this->guidBucketExpressionPhp();
         $renamedFilter = (int) app(ConfigurationProvider::class)->metadata()->gameLookup->value === 2 ? 'AND isrenamed = 1' : '';
 
-        return DB::select('
+        return '
             SELECT DISTINCT '.$bucketExpr.' AS id
             FROM releases
             WHERE categories_id BETWEEN '.Category::GAME_ROOT.' AND '.Category::GAME_OTHER.'
             AND consoleinfo_id IS NULL
             AND '.Release::nzbSettledSql().'
             '.$renamedFilter.'
-            LIMIT 16');
+            LIMIT 16';
+    }
+
+    public function getConsoleBucketsSqlNative(): string
+    {
+        $bucketExpr = $this->guidBucketExpressionNative();
+        $renamedFilter = (int) app(ConfigurationProvider::class)->metadata()->gameLookup->value === 2 ? 'AND isrenamed = 1' : '';
+
+        $condition = 'categories_id BETWEEN '.Category::GAME_ROOT.' AND '.Category::GAME_OTHER.'
+            AND consoleinfo_id IS NULL
+            AND '.Release::nzbSettledSql().'
+            '.$renamedFilter;
+
+        return self::runnerTransformNative(7, [$bucketExpr, $condition]) ?? $this->getConsoleBucketsSqlPhp();
     }
 
     /**
@@ -210,17 +307,47 @@ class PostProcessRunner extends BaseRunner
      */
     private function getGamesBuckets(): array
     {
-        $bucketExpr = $this->guidBucketExpression();
+        return self::usesRustFfi() ? $this->getGamesBucketsNative() : $this->getGamesBucketsPhp();
+    }
+
+    /** @return array<int, object{id: string}> */
+    public function getGamesBucketsNative(): array
+    {
+        return DB::select($this->getGamesBucketsSqlNative());
+    }
+
+    /** @return array<int, object{id: string}> */
+    public function getGamesBucketsPhp(): array
+    {
+        return DB::select($this->getGamesBucketsSqlPhp());
+    }
+
+    public function getGamesBucketsSqlPhp(): string
+    {
+        $bucketExpr = $this->guidBucketExpressionPhp();
         $renamedFilter = (int) app(ConfigurationProvider::class)->metadata()->gameLookup->value === 2 ? 'AND isrenamed = 1' : '';
 
-        return DB::select('
+        return '
             SELECT DISTINCT '.$bucketExpr.' AS id
             FROM releases
             WHERE categories_id = '.Category::PC_GAMES.'
             AND gamesinfo_id = 0
             AND '.Release::nzbSettledSql().'
             '.$renamedFilter.'
-            LIMIT 16');
+            LIMIT 16';
+    }
+
+    public function getGamesBucketsSqlNative(): string
+    {
+        $bucketExpr = $this->guidBucketExpressionNative();
+        $renamedFilter = (int) app(ConfigurationProvider::class)->metadata()->gameLookup->value === 2 ? 'AND isrenamed = 1' : '';
+
+        $condition = 'categories_id = '.Category::PC_GAMES.'
+            AND gamesinfo_id = 0
+            AND '.Release::nzbSettledSql().'
+            '.$renamedFilter;
+
+        return self::runnerTransformNative(7, [$bucketExpr, $condition]) ?? $this->getGamesBucketsSqlPhp();
     }
 
     public function processAdditional(): void
@@ -459,6 +586,23 @@ class PostProcessRunner extends BaseRunner
      * SQL selecting the releases the TV workers will pick up, or null when TV lookups are disabled.
      */
     private function tvWorkCondition(bool $renamedOnly): ?string
+    {
+        return self::usesRustFfi() ? $this->tvWorkConditionNative($renamedOnly) : $this->tvWorkConditionPhp($renamedOnly);
+    }
+
+    public function tvWorkConditionNative(bool $renamedOnly): ?string
+    {
+        $lookupMode = (int) app(ConfigurationProvider::class)->metadata()->tvLookup->value;
+        $mode = self::runnerTransformNative(8, [(string) $lookupMode, $renamedOnly ? '1' : '0']);
+        if ($mode === null) {
+            return $this->tvWorkConditionPhp($renamedOnly);
+        }
+
+        // Keep shared provider eligibility and schema-dependent policy in its existing owner.
+        return $mode === '-1' ? null : TvProcessingCandidateQuery::workCondition((int) $mode);
+    }
+
+    public function tvWorkConditionPhp(bool $renamedOnly): ?string
     {
         $lookupMode = (int) app(ConfigurationProvider::class)->metadata()->tvLookup->value;
         if ($lookupMode <= 0) {

@@ -7,6 +7,7 @@ namespace App\Services\Tmux;
 use App\Enums\TmuxPaneRole;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
+use App\Services\Runners\BaseRunner;
 use Illuminate\Contracts\Cache\Repository;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
@@ -17,6 +18,19 @@ use Throwable;
  */
 class TmuxTaskRunner
 {
+    /** PHP remains the default: no candidate met every 1.5x benchmark threshold. */
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $use = false): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
     private const string CANCELLATION_TRAPS = "trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP; ";
 
     private const string FULL_BACKLOG_SLOT = 'tmux:fix-names:full-backlog';
@@ -106,6 +120,22 @@ class TmuxTaskRunner
      */
     public function buildCommand(string $baseCommand, array $options = []): string
     {
+        return self::$useRustFfi ? $this->buildCommandNative($baseCommand, $options) : $this->buildCommandPhp($baseCommand, $options);
+    }
+
+    /** @param array<string, mixed> $options */
+    public function buildCommandNative(string $baseCommand, array $options = []): string
+    {
+        return BaseRunner::runnerTransformNative(0, [
+            $baseCommand, $this->drainGuardNative('nntmux_status'),
+            isset($options['sleep']) ? $this->buildSleepCommand((int) $options['sleep']) : '',
+            isset($options['sleep']) ? '1' : '0',
+        ]) ?? $this->buildCommandPhp($baseCommand, $options);
+    }
+
+    /** @param array<string, mixed> $options */
+    public function buildCommandPhp(string $baseCommand, array $options = []): string
+    {
         $command = self::CANCELLATION_TRAPS.'nntmux_status=0; '.$this->drainGuard('nntmux_status').'( '.$baseCommand.' ); nntmux_status=$?; '.$this->drainGuard('nntmux_status');
         if (isset($options['sleep'])) {
             $command .= 'date +"%Y-%m-%d %T"; '.$this->buildSleepCommand((int) $options['sleep']).'; ';
@@ -152,6 +182,19 @@ class TmuxTaskRunner
     /** @param list<string> $commands */
     private function batchCommand(array $commands): string
     {
+        return self::$useRustFfi ? $this->batchCommandNative($commands) : $this->batchCommandPhp($commands);
+    }
+
+    /** @param list<string> $commands */
+    public function batchCommandNative(array $commands): string
+    {
+        return BaseRunner::runnerTransformNative(1, [$this->drainGuardNative('nntmux_batch_status'), ...$commands])
+            ?? $this->batchCommandPhp($commands);
+    }
+
+    /** @param list<string> $commands */
+    public function batchCommandPhp(array $commands): string
+    {
         $script = self::CANCELLATION_TRAPS.'nntmux_batch_status=0; ';
         foreach ($commands as $command) {
             $script .= $this->drainGuard('nntmux_batch_status').'( '.$command.' ); nntmux_child_status=$?; if [ "$nntmux_batch_status" -eq 0 ]; then nntmux_batch_status=$nntmux_child_status; fi; ';
@@ -161,6 +204,20 @@ class TmuxTaskRunner
     }
 
     private function drainGuard(string $statusVariable): string
+    {
+        return self::$useRustFfi ? $this->drainGuardNative($statusVariable) : $this->drainGuardPhp($statusVariable);
+    }
+
+    public function drainGuardNative(string $statusVariable): string
+    {
+        $query = implode(' ', array_map('escapeshellarg', TmuxCommand::arguments([
+            'display-message', '-p', '-t', '='.$this->sessionName.':', '#{@nntmux_draining}',
+        ])));
+
+        return BaseRunner::runnerTransformNative(2, [$query, $statusVariable]) ?? $this->drainGuardPhp($statusVariable);
+    }
+
+    public function drainGuardPhp(string $statusVariable): string
     {
         $query = implode(' ', array_map('escapeshellarg', TmuxCommand::arguments([
             'display-message', '-p', '-t', '='.$this->sessionName.':', '#{@nntmux_draining}',
@@ -173,6 +230,26 @@ class TmuxTaskRunner
      * Build sleep command
      */
     protected function buildSleepCommand(int $seconds): string
+    {
+        return self::$useRustFfi ? $this->buildSleepCommandNative($seconds) : $this->buildSleepCommandPhp($seconds);
+    }
+
+    public function buildSleepCommandNative(int $seconds): string
+    {
+        $niceness = $this->getNiceness();
+        $script = base_path('app/Services/Tmux/Scripts/showsleep.php');
+        if (! file_exists($script)) {
+            return BaseRunner::runnerTransformNative(3, ['0', '', '', '', (string) $seconds, '', '']) ?? "sleep {$seconds}";
+        }
+
+        return BaseRunner::runnerTransformNative(3, [
+            '1', (string) $niceness, escapeshellarg(PHP_BINARY),
+            escapeshellarg($script), (string) $seconds, escapeshellarg($this->sessionName),
+            escapeshellarg((string) config('tmux.socket_name', '')),
+        ]) ?? $this->buildSleepCommandPhp($seconds);
+    }
+
+    public function buildSleepCommandPhp(int $seconds): string
     {
         $niceness = $this->getNiceness();
         $sleepScript = base_path('app/Services/Tmux/Scripts/showsleep.php');
@@ -188,6 +265,25 @@ class TmuxTaskRunner
      * Get log file path for a pane
      */
     protected function getLogFile(string $paneName): string
+    {
+        return self::$useRustFfi ? $this->getLogFileNative($paneName) : $this->getLogFilePhp($paneName);
+    }
+
+    public function getLogFileNative(string $paneName): string
+    {
+        if ((int) app(ConfigurationProvider::class)->tmux()->writeLogs !== 1) {
+            return '/dev/null';
+        }
+        $logDir = config('tmux.paths.logs', storage_path('logs/tmux'));
+        if (! is_dir($logDir)) {
+            mkdir($logDir, 0755, true);
+        }
+        $date = now()->format('Y_m_d');
+
+        return BaseRunner::runnerTransformNative(4, [$logDir, $paneName, $date]) ?? "{$logDir}/{$paneName}-{$date}.log";
+    }
+
+    public function getLogFilePhp(string $paneName): string
     {
         $logsEnabled = (int) app(ConfigurationProvider::class)->tmux()->writeLogs === 1;
 
@@ -502,6 +598,29 @@ class TmuxTaskRunner
      * @return list<string>
      */
     protected function fixNamesCommands(bool $renamePasses, bool $fullBacklog, bool $predbft): array
+    {
+        return self::$useRustFfi ? $this->fixNamesCommandsNative($renamePasses, $fullBacklog, $predbft)
+            : $this->fixNamesCommandsPhp($renamePasses, $fullBacklog, $predbft);
+    }
+
+    /** @return list<string> */
+    public function fixNamesCommandsNative(bool $renamePasses, bool $fullBacklog, bool $predbft): array
+    {
+        $batchLimit = config('tmux.fix_names.batch_limit');
+        $result = BaseRunner::runnerTransformListNative(5, [
+            escapeshellarg(PHP_BINARY).' '.escapeshellarg(base_path('artisan')),
+            $renamePasses ? '1' : '0', $fullBacklog ? '1' : '0', $predbft ? '1' : '0',
+            config('tmux.fix_names.par2_scheduled', false) ? '1' : '0',
+            config('tmux.fix_names.full_backlog', true) ? '1' : '0',
+            escapeshellarg((string) config('tmux.fix_names.category', 'other')),
+            $batchLimit !== null && (int) $batchLimit > 0 ? ' --limit='.(int) $batchLimit : '',
+        ]);
+
+        return $result ?? $this->fixNamesCommandsPhp($renamePasses, $fullBacklog, $predbft);
+    }
+
+    /** @return list<string> */
+    public function fixNamesCommandsPhp(bool $renamePasses, bool $fullBacklog, bool $predbft): array
     {
         $artisan = escapeshellarg(PHP_BINARY).' '.escapeshellarg(base_path('artisan'));
         // Bounded PAR2 batches follow database-only work. The historical sweep has its own cursor,
