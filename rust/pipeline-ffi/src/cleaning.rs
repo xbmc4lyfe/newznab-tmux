@@ -15318,3 +15318,464 @@ pub unsafe extern "C" fn nntmux_wave22_admin_request(
     }))
     .unwrap_or(-1)
 }
+
+// Wave 23.1: GDPR inventory, export and mail pure helpers. Append-only slice.
+const W23_GDPR_INVENTORIES: [&[u8]; 5] = [
+    br###"[{"table":"payments","reason":"Accounting, fraud prevention, dispute handling, and legal/tax obligations; direct account identifiers are anonymized while transaction details are retained.","erasure_action":"retained_anonymized"},{"table":"paypal_payments","reason":"Legacy payment audit data retained for accounting and dispute handling; linked account identity resolves only to the anonymized/deleted account record.","erasure_action":"retained_minimized"},{"table":"user_activities","reason":"Security and administrative audit trail.","erasure_action":"retained_minimized"},{"table":"gdpr_audit_logs","reason":"GDPR accountability record for data subject requests.","erasure_action":"retained_minimized"},{"table":"user_role_history","reason":"Administrative audit trail for role changes, upgrades, expirations, and account security reviews.","erasure_action":"retained_minimized"}]"###,
+    br###"{"user_requests":{"user_column":"users_id"},"user_downloads":{"user_column":"users_id"},"dnzb_failures":{"user_column":"users_id"},"users_releases":{"user_column":"users_id"},"user_series":{"user_column":"users_id"},"user_movies":{"user_column":"users_id"},"user_excluded_categories":{"user_column":"users_id"},"user_invitations":{"user_column":"user_id"},"trusted_devices":{"user_column":"user_id"},"password_securities":{"user_column":"user_id"},"passkeys":{"user_column":"authenticatable_id","extra":{"authenticatable_type":"App\\Models\\User"}},"model_has_permissions":{"user_column":"model_id","extra":{"model_type":"App\\Models\\User"}},"model_has_roles":{"user_column":"model_id","extra":{"model_type":"App\\Models\\User"}},"role_promotion_stats":{"user_column":"user_id"}}"###,
+    br###"{"release_comments":{"user_column":"users_id","updates":{"username":"Deleted user","host":null}},"release_reports":{"user_column":"users_id","updates":{"description":"[Removed during account erasure]"}}}"###,
+    br###"{"user_requests":{"user_column":"users_id","order_by":"timestamp"},"user_downloads":{"user_column":"users_id","order_by":"timestamp"},"dnzb_failures":{"user_column":"users_id"},"users_releases":{"user_column":"users_id","order_by":"created_at"},"user_series":{"user_column":"users_id"},"user_movies":{"user_column":"users_id"},"user_excluded_categories":{"user_column":"users_id"},"user_invitations":{"user_column":"user_id","order_by":"created_at"},"release_comments":{"user_column":"users_id","order_by":"created_at"},"release_reports":{"user_column":"users_id","order_by":"created_at"},"invitations_sent":{"table":"invitations","user_column":"invited_by","order_by":"created_at"},"invitations_used":{"table":"invitations","user_column":"used_by","order_by":"used_at"},"trusted_devices":{"user_column":"user_id","order_by":"created_at"},"role_history":{"table":"user_role_history","user_column":"user_id","order_by":"created_at"},"promotion_stats":{"table":"role_promotion_stats","user_column":"user_id","order_by":"created_at"},"gdpr_requests":{"user_column":"user_id","order_by":"created_at"},"gdpr_consents":{"user_column":"user_id","order_by":"created_at"},"gdpr_audit_logs":{"user_column":"user_id","order_by":"created_at"}}"###,
+    br###"[{"name":"session","purpose":"Keeps you signed in and stores security/session state.","type":"essential"},{"name":"XSRF-TOKEN","purpose":"Protects forms and authenticated requests from cross-site request forgery.","type":"essential"},{"name":"2fa_trusted_device","purpose":"Optional security cookie used only when a user chooses to trust a device for two-factor authentication.","type":"essential_security"},{"name":"theme/color local storage","purpose":"Stores display preferences for guests; authenticated preferences are stored on the account.","type":"essential_preference"}]"###,
+];
+
+const W23_REDACTED_USER_COLUMNS: &[&[u8]] = &[
+    b"password",
+    b"remember_token",
+    b"session_token",
+    b"api_token",
+    b"resetguid",
+    b"verification_token",
+    b"sabapikey",
+    b"nzbgetpassword",
+    b"nzbvortex_api_key",
+    b"cp_api",
+];
+
+fn w23_frame<'a>(frames: &[Option<&'a [u8]>], index: usize) -> Result<&'a [u8], isize> {
+    frames.get(index).copied().flatten().ok_or(-1)
+}
+
+fn w23_i64(value: &[u8]) -> Result<i64, isize> {
+    let text = std::str::from_utf8(value).map_err(|_| -1isize)?;
+    let parsed = text.parse::<i64>().map_err(|_| -1isize)?;
+    if parsed.to_string().as_bytes() != value {
+        return Err(-1);
+    }
+    Ok(parsed)
+}
+
+// PHP FILTER_VALIDATE_EMAIL is the final authority for quoted local parts and
+// address literals: decline those forms rather than approximate their grammar.
+// Ordinary ASCII dot-atoms and DNS domains are evaluated entirely in Rust.
+fn w23_email(input: &[u8]) -> Result<Vec<u8>, isize> {
+    let email = wave22_php_trim(input);
+    if email.contains(&b'"') || email.contains(&b'[') || email.contains(&b']') {
+        return Err(-1);
+    }
+    if email.len() > 254 || !email.is_ascii() {
+        return Ok(Vec::new());
+    }
+    let parts: Vec<_> = email.split(|byte| *byte == b'@').collect();
+    if parts.len() != 2 {
+        return Ok(Vec::new());
+    }
+    let (local, domain) = (parts[0], parts[1]);
+    if local.is_empty() || local.len() > 64 || domain.is_empty() || domain.len() > 253 {
+        return Ok(Vec::new());
+    }
+    for atom in local.split(|byte| *byte == b'.') {
+        if atom.is_empty()
+            || !atom
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(b))
+        {
+            return Ok(Vec::new());
+        }
+    }
+    let labels: Vec<_> = domain.split(|byte| *byte == b'.').collect();
+    if labels.len() < 2
+        || !labels
+            .last()
+            .is_some_and(|label| label.first().is_some_and(u8::is_ascii_alphabetic))
+    {
+        return Ok(Vec::new());
+    }
+    for label in labels {
+        if label.is_empty()
+            || label.len() > 63
+            || !label[0].is_ascii_alphanumeric()
+            || !label[label.len() - 1].is_ascii_alphanumeric()
+            || !label
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        {
+            return Ok(Vec::new());
+        }
+    }
+    Ok(email.to_vec())
+}
+
+fn w23_gdpr_output(operation: u32, input: &[u8]) -> Result<Vec<u8>, isize> {
+    if operation <= 4 {
+        if !input.is_empty() {
+            return Err(-1);
+        }
+        return Ok(W23_GDPR_INVENTORIES[operation as usize].to_vec());
+    }
+    let frames = wave22_frames(input)?;
+    let expected_count = match operation {
+        5 => Some(3),
+        8 | 11 => Some(1),
+        9 | 12 => Some(2),
+        10 => Some(5),
+        13 => Some(4),
+        6 | 7 => None,
+        _ => return Err(-1),
+    };
+    if expected_count.is_some_and(|count| frames.len() != count) {
+        return Err(-1);
+    }
+    let mut output = Vec::new();
+    match operation {
+        5 => {
+            w23_i64(w23_frame(&frames, 0)?)?;
+            output.extend_from_slice(b"gdpr/exports/user-");
+            output.extend_from_slice(w23_frame(&frames, 0)?);
+            output.push(b'-');
+            output.extend_from_slice(w23_frame(&frames, 1)?);
+            output.push(b'-');
+            output.extend_from_slice(w23_frame(&frames, 2)?);
+            output.extend_from_slice(b".json");
+        }
+        6 => {
+            for key in frames {
+                let key = key.ok_or(-1isize)?;
+                output.push(if W23_REDACTED_USER_COLUMNS.contains(&key) {
+                    b'1'
+                } else {
+                    b'0'
+                });
+            }
+        }
+        7 => {
+            let count = usize::try_from(w23_i64(w23_frame(&frames, 0)?)?).map_err(|_| -1isize)?;
+            let boundary = count.checked_add(1).ok_or(-1isize)?;
+            if boundary > frames.len() || frames.iter().any(Option::is_none) {
+                return Err(-1);
+            }
+            let columns = &frames[boundary..];
+            for key in &frames[1..boundary] {
+                output.push(if columns.contains(key) { b'1' } else { b'0' });
+            }
+        }
+        8 => return w23_email(w23_frame(&frames, 0)?),
+        9 => {
+            let request_type = w23_frame(&frames, 0)?;
+            let event = w23_frame(&frames, 1)?;
+            let admin = request_type == b"erasure" && event == b"submitted";
+            output.push(if admin { b'1' } else { b'0' });
+        }
+        10 => {
+            let request_type = w23_frame(&frames, 0)?;
+            let status = w23_frame(&frames, 1)?;
+            let now = w23_i64(w23_frame(&frames, 4)?)?;
+            let future = match frames[3] {
+                None => true,
+                Some(expiry) => w23_i64(expiry)? > now,
+            };
+            let downloadable = request_type == b"export"
+                && status == b"completed"
+                && frames[2].is_some()
+                && future;
+            output.push(if downloadable { b'1' } else { b'0' });
+        }
+        11 => {
+            output = w23_frame(&frames, 0)?
+                .iter()
+                .map(|b| if *b == b'_' { b' ' } else { *b })
+                .collect();
+            if let Some(first) = output.first_mut() {
+                first.make_ascii_uppercase();
+            }
+        }
+        12 => {
+            let username = frames[0]
+                .filter(|v| !v.is_empty() && *v != b"0")
+                .unwrap_or(b"Unknown user");
+            let email = frames[1]
+                .filter(|v| !v.is_empty() && *v != b"0")
+                .unwrap_or(b"unknown email");
+            output.extend_from_slice(username);
+            output.extend_from_slice(b" <");
+            output.extend_from_slice(email);
+            output.push(b'>');
+            output = wave22_php_trim(&output).to_vec();
+        }
+        13 => {
+            let request_type = w23_frame(&frames, 0)?;
+            let event = w23_frame(&frames, 1)?;
+            let admin = match w23_frame(&frames, 2)? {
+                b"1" => true,
+                b"0" => false,
+                _ => return Err(-1),
+            };
+            // Owned bytes preserve binary request labels without a UTF-8/JSON round trip.
+            let interpolate = |prefix: &[u8], suffix: &[u8]| -> Vec<u8> {
+                [prefix, request_type, suffix].concat()
+            };
+            let (subject, heading, body, action): (Vec<u8>, &[u8], Vec<u8>, Option<&[u8]>) =
+                if admin {
+                    (
+                        interpolate(b"New GDPR ", b" request"),
+                        b"New GDPR request submitted",
+                        interpolate(
+                            b"A GDPR ",
+                            b" request was submitted and may require administrator review.",
+                        ),
+                        Some(b"Review request"),
+                    )
+                } else {
+                    match event {
+                    b"submitted" => (interpolate(b"GDPR ", b" request received"), b"We received your GDPR request",
+                        interpolate(b"Your GDPR ", b" request has been received and recorded."), Some(b"Open Privacy Center")),
+                    b"export_ready" => (b"Your GDPR data export is ready".to_vec(), b"Your data export is ready",
+                        b"Your GDPR data export has been generated and is available for download until its listed expiry time.".to_vec(), Some(b"Download export")),
+                    b"erasure_completed" => (b"Your GDPR erasure request is complete".to_vec(), b"Your account erasure is complete",
+                        b"Your GDPR erasure request has been completed. Account data was removed or anonymized, and retained payment/audit records were anonymized or minimized where practical.".to_vec(), None),
+                    b"rejected" => (b"Your GDPR request was rejected".to_vec(), b"Your GDPR request was rejected",
+                        interpolate(b"Your GDPR ", b" request was reviewed and rejected. See the notes below for the reason provided by the administrator."), Some(b"Open Privacy Center")),
+                    _ => (b"GDPR request update".to_vec(), b"GDPR request update",
+                        interpolate(b"There has been an update to your GDPR ", b" request."), Some(b"Open Privacy Center")),
+                }
+                };
+            for field in [
+                Some(subject.as_slice()),
+                Some(heading),
+                Some(body.as_slice()),
+                action,
+                if action.is_some() { frames[3] } else { None },
+            ] {
+                wave22_append_frame(&mut output, field)?;
+            }
+        }
+        _ => return Err(-1),
+    }
+    Ok(output)
+}
+
+/// Pure GDPR helpers. Input/output byte regions must be non-null (also when
+/// empty), allocated for their stated extents, and fit isize without address
+/// overflow. Byte alignment is sufficient; there are no typed output pointers.
+/// Returns bytes written, -1 on invalid/declined input or panic, or the negated
+/// required length on insufficient capacity. Errors never modify output.
+/// Input and output may overlap: all input is consumed into owned output first.
+///
+/// # Safety
+/// Caller guarantees allocation validity for every region that passes the
+/// structural checks; arbitrary non-null addresses cannot be proven allocated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w23_gdpr_export_mail(
+    operation: u32,
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, out_cap) {
+            return -1;
+        }
+        let output = {
+            let input = unsafe { slice::from_raw_parts(input, len) };
+            match w23_gdpr_output(operation, input) {
+                Ok(output) => output,
+                Err(_) => return -1,
+            }
+        };
+        let Ok(needed) = i32::try_from(output.len()) else {
+            return -1;
+        };
+        if output.len() > out_cap {
+            return -needed;
+        }
+        if !output.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(output.as_ptr(), out, output.len()) };
+        }
+        needed
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod w23_gdpr_tests {
+    use super::*;
+
+    fn wire(values: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut output = Vec::new();
+        for value in values {
+            wave22_append_frame(&mut output, *value).unwrap();
+        }
+        output
+    }
+
+    #[test]
+    fn gdpr_helpers_preserve_binary_and_boundary_semantics() {
+        assert_eq!(
+            w23_gdpr_output(
+                5,
+                &wire(&[
+                    Some(b"-9223372036854775808"),
+                    Some(b"\0\xff"),
+                    Some(b"random")
+                ])
+            )
+            .unwrap(),
+            b"gdpr/exports/user--9223372036854775808-\0\xff-random.json"
+        );
+        assert_eq!(
+            w23_gdpr_output(
+                6,
+                &wire(&[Some(b"password"), Some(b"Password"), Some(b"api_token")])
+            )
+            .unwrap(),
+            b"101"
+        );
+        assert_eq!(
+            w23_gdpr_output(
+                7,
+                &wire(&[Some(b"2"), Some(b"0"), Some(b"data"), Some(b"data")])
+            )
+            .unwrap(),
+            b"01"
+        );
+        assert_eq!(
+            w23_gdpr_output(11, &wire(&[Some(b"export_ready\xff")])).unwrap(),
+            b"Export ready\xff"
+        );
+        assert_eq!(
+            w23_gdpr_output(12, &wire(&[Some(b"0"), None])).unwrap(),
+            b"Unknown user <unknown email>"
+        );
+        for (expires, now, expected) in [
+            (b"1".as_slice(), b"1".as_slice(), b"0".as_slice()),
+            (b"9223372036854775807", b"-9223372036854775808", b"1"),
+        ] {
+            assert_eq!(
+                w23_gdpr_output(
+                    10,
+                    &wire(&[
+                        Some(b"export"),
+                        Some(b"completed"),
+                        Some(b""),
+                        Some(expires),
+                        Some(now)
+                    ])
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            w23_gdpr_output(8, &wire(&[Some(b" \tAlice+tag@Example.com\r\n")])).unwrap(),
+            b"Alice+tag@Example.com"
+        );
+        assert!(
+            w23_gdpr_output(8, &wire(&[Some(b"a..b@example.com")]))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(w23_gdpr_output(8, &wire(&[Some(b"\"quoted\"@example.com")])).is_err());
+        for op in 0..5 {
+            assert!(!w23_gdpr_output(op, b"").unwrap().is_empty());
+        }
+        assert!(w23_gdpr_output(99, b"").is_err());
+        assert!(w23_gdpr_output(11, &[1, 0, 0, 0]).is_err());
+        assert!(w23_gdpr_output(7, &wire(&[Some(b"9223372036854775807")])).is_err());
+    }
+
+    #[test]
+    fn gdpr_abi_checks_regions_and_reports_required_capacity_without_writes() {
+        let input = wire(&[Some(b"export_ready")]);
+        let mut output = [0x7bu8; 32];
+        unsafe {
+            assert_eq!(
+                nntmux_w23_gdpr_export_mail(
+                    11,
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr(),
+                    1
+                ),
+                -12
+            );
+            assert_eq!(output, [0x7b; 32]);
+            assert_eq!(
+                nntmux_w23_gdpr_export_mail(11, std::ptr::null(), 0, output.as_mut_ptr(), 32),
+                -1
+            );
+            assert_eq!(
+                nntmux_w23_gdpr_export_mail(
+                    11,
+                    input.as_ptr(),
+                    input.len(),
+                    std::ptr::null_mut(),
+                    0
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_w23_gdpr_export_mail(
+                    11,
+                    usize::MAX as *const u8,
+                    1,
+                    output.as_mut_ptr(),
+                    32
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_w23_gdpr_export_mail(
+                    11,
+                    input.as_ptr(),
+                    input.len(),
+                    usize::MAX as *mut u8,
+                    1
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_w23_gdpr_export_mail(
+                    11,
+                    input.as_ptr(),
+                    usize::MAX,
+                    output.as_mut_ptr(),
+                    32
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_w23_gdpr_export_mail(
+                    11,
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr(),
+                    usize::MAX
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_w23_gdpr_export_mail(
+                    11,
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr().add(1),
+                    12
+                ),
+                12
+            );
+            assert_eq!(&output[1..13], b"Export ready");
+            let mut overlap = input;
+            assert_eq!(
+                nntmux_w23_gdpr_export_mail(
+                    11,
+                    overlap.as_ptr(),
+                    overlap.len(),
+                    overlap.as_mut_ptr(),
+                    overlap.len()
+                ),
+                12
+            );
+            assert_eq!(&overlap[..12], b"Export ready");
+        }
+    }
+}
