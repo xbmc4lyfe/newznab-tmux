@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace App\Models;
 
 use App\Facades\Search;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
@@ -12,6 +14,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\HasOne;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 /**
  * App\Models\Video.
@@ -66,6 +69,315 @@ class Video extends Model
      * @var bool
      */
     public $timestamps = false;
+
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_video_series_list_cache_key(const char *uid_ptr, size_t uid_len, const char *letter_ptr, size_t letter_len, const char *showname_ptr, size_t showname_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_video_series_letter_filter(const char *letter_ptr, size_t letter_len, size_t *out_sql_len, uint32_t *out_has_binding, char *out_buf, size_t out_cap);
+        ssize_t nntmux_video_series_showname_filter(const char *showname_ptr, size_t showname_len, uint32_t search_available, const int64_t *ids_ptr, size_t ids_len, size_t *out_sql_len, uint32_t *out_has_binding, uint32_t *out_empty_hits, char *out_buf, size_t out_cap);
+        C;
+
+    /** Null selects the benchmark-qualified production default (PHP; see RustTvProviderLookupVideoMovieObserverParityTest). */
+    private static ?bool $useRustFfi = null;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(?bool $use = true): void
+    {
+        self::$useRustFfi = $use;
+        if ($use === null) {
+            self::$ffi = null;
+        }
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    public static function setFfiForTesting(FFI|false|null $override = null): void
+    {
+        self::$ffi = $override;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('metadata', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
+    /**
+     * Build the cache key for {@see getSeriesList}.
+     */
+    public static function buildSeriesListCacheKey(mixed $uid, string $letter = '', string $showname = ''): string
+    {
+        return self::usesRustFfi()
+            ? self::buildSeriesListCacheKeyNative($uid, $letter, $showname)
+            : self::buildSeriesListCacheKeyPhp($uid, $letter, $showname);
+    }
+
+    public static function buildSeriesListCacheKeyNative(mixed $uid, string $letter = '', string $showname = ''): string
+    {
+        if (($ffi = self::ffi()) === null || \is_array($uid) || (\is_object($uid) && ! $uid instanceof \Stringable)) {
+            return self::buildSeriesListCacheKeyPhp($uid, $letter, $showname);
+        }
+        $uidStr = (string) $uid;
+        $capacity = 0;
+        $buffer = RustPipelineLibrary::obtainScratch($ffi, 64, $capacity);
+        if ($buffer === null) {
+            return self::buildSeriesListCacheKeyPhp($uid, $letter, $showname);
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_video_series_list_cache_key(
+                $uidStr,
+                \strlen($uidStr),
+                $letter,
+                \strlen($letter),
+                $showname,
+                \strlen($showname),
+                $buffer,
+                $capacity,
+            );
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return self::buildSeriesListCacheKeyPhp($uid, $letter, $showname);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_video_series_list_cache_key(
+                    $uidStr,
+                    \strlen($uidStr),
+                    $letter,
+                    \strlen($letter),
+                    $showname,
+                    \strlen($showname),
+                    $buffer,
+                    $capacity,
+                );
+            }
+            if (! \is_int($written) || $written !== 50 || $written > $capacity) {
+                return self::buildSeriesListCacheKeyPhp($uid, $letter, $showname);
+            }
+
+            return FFI::string($buffer, $written);
+        } catch (Throwable) {
+            return self::buildSeriesListCacheKeyPhp($uid, $letter, $showname);
+        }
+    }
+
+    public static function buildSeriesListCacheKeyPhp(mixed $uid, string $letter = '', string $showname = ''): string
+    {
+        return 'video_series_list:'.md5(serialize([(string) $uid, $letter, $showname]));
+    }
+
+    /**
+     * Build the SQL condition and optional `:letter` parameter binding for {@see getSeriesListUncached}.
+     *
+     * @return array{sql: string, binding: ?string}
+     */
+    public static function buildSeriesLetterFilter(string $letter): array
+    {
+        return self::usesRustFfi()
+            ? self::buildSeriesLetterFilterNative($letter)
+            : self::buildSeriesLetterFilterPhp($letter);
+    }
+
+    /**
+     * @return array{sql: string, binding: ?string}
+     */
+    public static function buildSeriesLetterFilterNative(string $letter): array
+    {
+        if (($ffi = self::ffi()) === null) {
+            return self::buildSeriesLetterFilterPhp($letter);
+        }
+        $letterLen = \strlen($letter);
+        $capacity = 0;
+        $buffer = RustPipelineLibrary::obtainScratch($ffi, max(128, $letterLen + 64), $capacity);
+        if ($buffer === null) {
+            return self::buildSeriesLetterFilterPhp($letter);
+        }
+        try {
+            $outSqlLen = $ffi->new('size_t[1]');
+            $outHasBinding = $ffi->new('uint32_t[1]');
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_video_series_letter_filter($letter, $letterLen, $outSqlLen, $outHasBinding, $buffer, $capacity);
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return self::buildSeriesLetterFilterPhp($letter);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_video_series_letter_filter($letter, $letterLen, $outSqlLen, $outHasBinding, $buffer, $capacity);
+            }
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return self::buildSeriesLetterFilterPhp($letter);
+            }
+            if ($written === 0) {
+                return ['sql' => '', 'binding' => null];
+            }
+            $sqlLen = (int) $outSqlLen[0];
+            $hasBinding = (int) $outHasBinding[0] !== 0;
+            if ($sqlLen < 0 || $sqlLen > $written) {
+                return self::buildSeriesLetterFilterPhp($letter);
+            }
+            $blob = FFI::string($buffer, $written);
+
+            return [
+                'sql' => substr($blob, 0, $sqlLen),
+                'binding' => $hasBinding ? substr($blob, $sqlLen) : null,
+            ];
+        } catch (Throwable) {
+            return self::buildSeriesLetterFilterPhp($letter);
+        }
+    }
+
+    /**
+     * @return array{sql: string, binding: ?string}
+     */
+    public static function buildSeriesLetterFilterPhp(string $letter): array
+    {
+        if ($letter === '') {
+            return ['sql' => '', 'binding' => null];
+        }
+        if ($letter === '0-9' || $letter === '[0-9]') {
+            return ['sql' => "AND videos.title REGEXP '^[0-9]'", 'binding' => null];
+        }
+
+        return [
+            'sql' => 'AND videos.title LIKE :letter',
+            'binding' => $letter.'%',
+        ];
+    }
+
+    /**
+     * Build the SQL condition and optional `:showname` binding for {@see getSeriesListUncached},
+     * or return `null` when search is available for a non-empty `$showname` and yields no matching show IDs.
+     *
+     * @param  array<int|string, mixed>  $rawHitIds
+     * @return array{sql: string, binding: ?string}|null
+     */
+    public static function buildSeriesShownameFilter(string $showname, bool $searchAvailable, array $rawHitIds = []): ?array
+    {
+        return self::usesRustFfi()
+            ? self::buildSeriesShownameFilterNative($showname, $searchAvailable, $rawHitIds)
+            : self::buildSeriesShownameFilterPhp($showname, $searchAvailable, $rawHitIds);
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $rawHitIds
+     * @return array{sql: string, binding: ?string}|null
+     */
+    public static function buildSeriesShownameFilterNative(string $showname, bool $searchAvailable, array $rawHitIds = []): ?array
+    {
+        if (($ffi = self::ffi()) === null) {
+            return self::buildSeriesShownameFilterPhp($showname, $searchAvailable, $rawHitIds);
+        }
+        $shownameLen = \strlen($showname);
+        $idsCount = $searchAvailable && $showname !== '' ? \count($rawHitIds) : 0;
+        $capacity = 0;
+        $buffer = RustPipelineLibrary::obtainScratch($ffi, max(128, $shownameLen + ($idsCount * 22) + 64), $capacity);
+        if ($buffer === null) {
+            return self::buildSeriesShownameFilterPhp($showname, $searchAvailable, $rawHitIds);
+        }
+        try {
+            $idsBuf = null;
+            if ($idsCount > 0) {
+                $idsBuf = $ffi->new("int64_t[{$idsCount}]");
+                $idx = 0;
+                foreach ($rawHitIds as $id) {
+                    $idsBuf[$idx] = (int) $id;
+                    $idx++;
+                }
+            }
+            $outSqlLen = $ffi->new('size_t[1]');
+            $outHasBinding = $ffi->new('uint32_t[1]');
+            $outEmptyHits = $ffi->new('uint32_t[1]');
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_video_series_showname_filter(
+                $showname,
+                $shownameLen,
+                $searchAvailable ? 1 : 0,
+                $idsBuf,
+                $idsCount,
+                $outSqlLen,
+                $outHasBinding,
+                $outEmptyHits,
+                $buffer,
+                $capacity,
+            );
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return self::buildSeriesShownameFilterPhp($showname, $searchAvailable, $rawHitIds);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_video_series_showname_filter(
+                    $showname,
+                    $shownameLen,
+                    $searchAvailable ? 1 : 0,
+                    $idsBuf,
+                    $idsCount,
+                    $outSqlLen,
+                    $outHasBinding,
+                    $outEmptyHits,
+                    $buffer,
+                    $capacity,
+                );
+            }
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return self::buildSeriesShownameFilterPhp($showname, $searchAvailable, $rawHitIds);
+            }
+            if ((int) $outEmptyHits[0] !== 0) {
+                return null;
+            }
+            if ($written === 0) {
+                return ['sql' => '', 'binding' => null];
+            }
+            $sqlLen = (int) $outSqlLen[0];
+            $hasBinding = (int) $outHasBinding[0] !== 0;
+            if ($sqlLen < 0 || $sqlLen > $written) {
+                return self::buildSeriesShownameFilterPhp($showname, $searchAvailable, $rawHitIds);
+            }
+            $blob = FFI::string($buffer, $written);
+
+            return [
+                'sql' => substr($blob, 0, $sqlLen),
+                'binding' => $hasBinding ? substr($blob, $sqlLen) : null,
+            ];
+        } catch (Throwable) {
+            return self::buildSeriesShownameFilterPhp($showname, $searchAvailable, $rawHitIds);
+        }
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $rawHitIds
+     * @return array{sql: string, binding: ?string}|null
+     */
+    public static function buildSeriesShownameFilterPhp(string $showname, bool $searchAvailable, array $rawHitIds = []): ?array
+    {
+        if ($showname === '') {
+            return ['sql' => '', 'binding' => null];
+        }
+        if ($searchAvailable) {
+            $vids = array_values(array_filter(array_map(static fn ($id): int => (int) $id, $rawHitIds)));
+            if ($vids === []) {
+                return null;
+            }
+
+            return [
+                'sql' => 'AND videos.id IN ('.implode(',', $vids).')',
+                'binding' => null,
+            ];
+        }
+
+        return [
+            'sql' => 'AND videos.title LIKE :showname',
+            'binding' => '%'.$showname.'%',
+        ];
+    }
 
     /**
      * @return HasMany<VideoAlias, $this>
@@ -151,7 +463,7 @@ class Video extends Model
      */
     public static function getSeriesList(mixed $uid, string $letter = '', string $showname = ''): array
     {
-        $cacheKey = 'video_series_list:'.md5(serialize([(string) $uid, $letter, $showname]));
+        $cacheKey = self::buildSeriesListCacheKey($uid, $letter, $showname);
 
         return Cache::remember($cacheKey, now()->addMinutes((int) config('nntmux.cache_expiry_medium', 60)), function () use ($uid, $letter, $showname): array {
             return self::getSeriesListUncached($uid, $letter, $showname);
@@ -170,28 +482,27 @@ class Video extends Model
             'now' => now()->toDateTimeString(),
         ];
 
-        $letterCondition = '';
-        if ($letter !== '') {
-            if ($letter === '0-9' || $letter === '[0-9]') {
-                $letterCondition = "AND videos.title REGEXP '^[0-9]'";
-            } else {
-                $letterCondition = 'AND videos.title LIKE :letter';
-                $params['letter'] = $letter.'%';
-            }
+        $letterFilter = self::buildSeriesLetterFilter($letter);
+        $letterCondition = $letterFilter['sql'];
+        if ($letterFilter['binding'] !== null) {
+            $params['letter'] = $letterFilter['binding'];
         }
 
         $shownameCondition = '';
         if ($showname !== '') {
-            if (Search::isAvailable()) {
+            $searchAvailable = Search::isAvailable();
+            $rawHitIds = [];
+            if ($searchAvailable) {
                 $hits = Search::searchTvShows($showname, 800);
-                $vids = array_values(array_filter(array_map(static fn ($id): int => (int) $id, $hits['id'] ?? [])));
-                if ($vids === []) {
-                    return [];
-                }
-                $shownameCondition = 'AND videos.id IN ('.implode(',', $vids).')';
-            } else {
-                $shownameCondition = 'AND videos.title LIKE :showname';
-                $params['showname'] = '%'.$showname.'%';
+                $rawHitIds = \is_array($hits['id'] ?? null) ? $hits['id'] : [];
+            }
+            $shownameFilter = self::buildSeriesShownameFilter($showname, $searchAvailable, $rawHitIds);
+            if ($shownameFilter === null) {
+                return [];
+            }
+            $shownameCondition = $shownameFilter['sql'];
+            if ($shownameFilter['binding'] !== null) {
+                $params['showname'] = $shownameFilter['binding'];
             }
         }
 
