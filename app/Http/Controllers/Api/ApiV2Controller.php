@@ -24,6 +24,9 @@ use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseSearchService;
 use App\Services\Search\DTO\SearchCursor;
 use App\Services\Search\SearchCursorCodec;
+use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
 use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -34,9 +37,22 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Str;
 use STS\ZipStream\Builder;
 use Symfony\Component\HttpFoundation\StreamedResponse;
+use Throwable;
 
 class ApiV2Controller extends BasePageController
 {
+    private static FFI|false|null $v2Ffi = null;
+
+    private static ?CData $v2OutBuf512 = null;
+
+    private static ?bool $useRustFfi = null;
+
+    private static bool $adoptIsNonNegativeIntegerFfi = false;
+
+    private static bool $adoptParseSortFfi = false;
+
+    private static bool $adoptCombineTvAirDateFfi = false;
+
     private ReleaseSearchService $releaseSearchService;
 
     private ReleaseBrowseService $releaseBrowseService;
@@ -272,7 +288,76 @@ class ApiV2Controller extends BasePageController
         return $this->queryParameters->limit($request);
     }
 
-    private function isNonNegativeInteger(mixed $value): bool
+    public static function setUseRustFfi(?bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? (self::$adoptIsNonNegativeIntegerFfi || self::$adoptParseSortFfi || self::$adoptCombineTvAirDateFfi);
+    }
+
+    public static function v2Ffi(): ?FFI
+    {
+        return self::$v2Ffi !== null ? (self::$v2Ffi === false ? null : self::$v2Ffi) : self::resolveV2Ffi();
+    }
+
+    public function isNonNegativeInteger(mixed $value): bool
+    {
+        if (self::$useRustFfi ?? self::$adoptIsNonNegativeIntegerFfi) {
+            $supported = false;
+            $native = $this->isNonNegativeIntegerNative($value, $supported);
+            if ($supported && $native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->isNonNegativeIntegerPhp($value);
+    }
+
+    /**
+     * @param-out bool $supported
+     */
+    public function isNonNegativeIntegerNative(mixed $value, bool &$supported = false): ?bool
+    {
+        $supported = false;
+        if (self::$useRustFfi === false) {
+            return null;
+        }
+        if (\is_int($value)) {
+            $supported = true;
+
+            return $value >= 0;
+        }
+        if (! \is_string($value)) {
+            $supported = true;
+
+            return false;
+        }
+
+        $ffi = self::$v2Ffi ?? self::resolveV2Ffi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $res = $ffi->nntmux_api_is_non_negative_int_str($value, \strlen($value));
+            if (! \is_int($res) || $res < 0) {
+                return null;
+            }
+            $supported = true;
+
+            return $res === 1;
+        } catch (Throwable) {
+            $supported = false;
+
+            return null;
+        }
+    }
+
+    public function isNonNegativeIntegerPhp(mixed $value): bool
     {
         return (is_int($value) && $value >= 0)
             || (is_string($value) && preg_match('/^\d{1,9}$/', trim($value)) === 1);
@@ -293,7 +378,68 @@ class ApiV2Controller extends BasePageController
         return (int) $request->input('maxage');
     }
 
-    private function parseSort(Request $request): string|JsonResponse
+    public function parseSort(Request $request): string|JsonResponse
+    {
+        if (self::$useRustFfi ?? self::$adoptParseSortFfi) {
+            $supported = false;
+            $native = $this->parseSortNative($request, $supported);
+            if ($supported && $native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->parseSortPhp($request);
+    }
+
+    /**
+     * @param-out bool $supported
+     */
+    public function parseSortNative(Request $request, bool &$supported = false): string|JsonResponse|null
+    {
+        $supported = false;
+        if (self::$useRustFfi === false) {
+            return null;
+        }
+        if (! $request->has('sort')) {
+            $supported = true;
+
+            return 'posted_desc';
+        }
+
+        $ffi = self::$v2Ffi ?? self::resolveV2Ffi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+
+        $raw = (string) $request->input('sort');
+        $scratch = self::$v2OutBuf512;
+        if ($scratch === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_api_validate_sort($raw, \strlen($raw), $scratch, 512);
+            if (! \is_int($written) || $written === -1 || $written < -2) {
+                return null;
+            }
+            $supported = true;
+            if ($written === 0) {
+                return $this->jsonResponse(['error' => 'Incorrect parameter (sort must not be empty)'], 400);
+            }
+            if ($written === -2) {
+                return $this->jsonResponse(['error' => 'Incorrect parameter (sort must be one of: cat_asc/desc, name_asc/desc, size_asc/desc, files_asc/desc, stats_asc/desc, posted_asc/desc)'], 400);
+            }
+
+            return FFI::string($scratch, $written);
+        } catch (Throwable) {
+            $supported = false;
+
+            return null;
+        }
+    }
+
+    public function parseSortPhp(Request $request): string|JsonResponse
     {
         if (! $request->has('sort')) {
             return 'posted_desc';
@@ -310,6 +456,103 @@ class ApiV2Controller extends BasePageController
         return $sort;
     }
 
+    public function combineTvAirDate(string $series, string $episode): string
+    {
+        if (self::$useRustFfi ?? self::$adoptCombineTvAirDateFfi) {
+            $supported = false;
+            $native = $this->combineTvAirDateNative($series, $episode, $supported);
+            if ($supported && $native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->combineTvAirDatePhp($series, $episode);
+    }
+
+    /**
+     * @param-out bool $supported
+     */
+    public function combineTvAirDateNative(string $series, string $episode, bool &$supported = false): ?string
+    {
+        $supported = false;
+        if (self::$useRustFfi === false) {
+            return null;
+        }
+        $ffi = self::$v2Ffi ?? self::resolveV2Ffi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+
+        $sLen = \strlen($series);
+        $eLen = \strlen($episode);
+        $cap = 512;
+        $scratch = ($eLen + 8) <= 512 ? self::$v2OutBuf512 : RustPipelineLibrary::obtainScratch($ffi, $eLen + 8, $cap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_api_combine_tv_airdate($series, $sLen, $episode, $eLen, $scratch, $cap);
+            if (! \is_int($written)) {
+                return null;
+            }
+            if ($written <= -6) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_api_combine_tv_airdate($series, $sLen, $episode, $eLen, $scratch, $cap);
+                if (! \is_int($written)) {
+                    return null;
+                }
+            }
+            if ($written < 0) {
+                return null;
+            }
+            $supported = true;
+
+            return $written === 0 ? '' : FFI::string($scratch, $written);
+        } catch (Throwable) {
+            $supported = false;
+
+            return null;
+        }
+    }
+
+    public function combineTvAirDatePhp(string $series, string $episode): string
+    {
+        if (preg_match('#^(19|20)\d{2}$#', $series, $year) && str_contains($episode, '/')) {
+            return str_replace('/', '-', $year[0].'-'.$episode);
+        }
+
+        return '';
+    }
+
+    private static function resolveV2Ffi(): ?FFI
+    {
+        if (self::$v2Ffi !== null) {
+            return self::$v2Ffi === false ? null : self::$v2Ffi;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('categorize', ApiQueryParameters::FFI_CDEF);
+        if ($ffi === null) {
+            self::$v2Ffi = false;
+
+            return null;
+        }
+        try {
+            self::$v2OutBuf512 = $ffi->new('char[512]');
+            self::$v2Ffi = $ffi;
+
+            return $ffi;
+        } catch (Throwable) {
+            self::$v2Ffi = false;
+
+            return null;
+        }
+    }
+
     public function capabilities(Request $request): JsonResponse
     {
         $response = $this->jsonResponse($this->capabilitiesService->v2());
@@ -322,7 +565,7 @@ class ApiV2Controller extends BasePageController
     }
 
     /**
-     * @throws \Throwable
+     * @throws Throwable
      */
     public function movie(Request $request): JsonResponse
     {
@@ -623,7 +866,7 @@ class ApiV2Controller extends BasePageController
 
     /**
      * @throws \Exception
-     * @throws \Throwable
+     * @throws Throwable
      */
     public function apiSearch(Request $request): JsonResponse
     {
@@ -702,7 +945,7 @@ class ApiV2Controller extends BasePageController
 
     /**
      * @throws \Exception
-     * @throws \Throwable
+     * @throws Throwable
      */
     public function tv(Request $request): JsonResponse
     {
@@ -737,12 +980,9 @@ class ApiV2Controller extends BasePageController
 
         // Process season only queries or Season and Episode/Airdate queries
 
-        $series = $request->input('season') ?? '';
-        $episode = $request->input('ep') ?? '';
-
-        if (preg_match('#^(19|20)\d{2}$#', $series, $year) && str_contains($episode, '/')) {
-            $airDate = str_replace('/', '-', $year[0].'-'.$episode);
-        }
+        $series = (string) ($request->input('season') ?? '');
+        $episode = (string) ($request->input('ep') ?? '');
+        $airDate = $this->combineTvAirDate($series, $episode);
 
         $limit = $this->parseLimit($request);
         if (! is_int($limit)) {
@@ -753,7 +993,6 @@ class ApiV2Controller extends BasePageController
             return $offset;
         }
         $categoryID = $this->queryParameters->categories($request);
-        $airDate = $airDate ?? '';
         $searchName = $request->input('id') ?? '';
 
         $relData = $this->releaseRowCache->remember('v2', 'tv', [
