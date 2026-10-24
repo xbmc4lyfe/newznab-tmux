@@ -12952,3 +12952,603 @@ mod wave20_tests {
         );
     }
 }
+/// Wave 21 Slice 21.4: `SearchUnavailableException`, `ReleaseObserver`,
+/// `UserApiCacheObserver`, `VerifyFailedReleaseRequest`, and `Google2FAMiddleware`
+/// C-ABI helpers.
+///
+/// Every export wraps its body in `catch_unwind(...).unwrap_or(-1)`, validates raw
+/// pointers for non-null, alignment, `<= isize::MAX` lengths, and checked address
+/// ranges, and never writes partial output: a short buffer returns
+/// `-(needed + 1)` without touching `out`. `-1` means invalid input or a panic, so
+/// PHP callers fall back to their native implementation.
+pub mod search_unavailable_observers_failed_release_2fa {
+    use std::mem::size_of;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 1 << 20;
+    const MAX_KEYS: usize = 4096;
+
+    /// `ReleaseObserver::INDEXED_FIELDS`, in the same order.
+    const RELEASE_INDEXED_FIELDS: [&[u8]; 22] = [
+        b"name",
+        b"guid",
+        b"searchname",
+        b"fromname",
+        b"categories_id",
+        b"imdbid",
+        b"anidbid",
+        b"movieinfo_id",
+        b"videos_id",
+        b"tv_episodes_id",
+        b"size",
+        b"totalpart",
+        b"grabs",
+        b"passwordstatus",
+        b"groups_id",
+        b"nzbstatus",
+        b"nfostatus",
+        b"haspreview",
+        b"jpgstatus",
+        b"comments",
+        b"postdate",
+        b"adddate",
+    ];
+
+    /// `UserApiCacheObserver::CACHE_RELEVANT_FIELDS`, in the same order.
+    const USER_CACHE_FIELDS: [&[u8]; 6] = [
+        b"api_token",
+        b"roles_id",
+        b"rate_limit",
+        b"verified",
+        b"email_verified_at",
+        b"deleted_at",
+    ];
+
+    #[inline]
+    fn range_ok(addr: usize, bytes: usize) -> bool {
+        bytes <= isize::MAX as usize && addr.checked_add(bytes).is_some()
+    }
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT || !range_ok(ptr as usize, len) {
+            return None;
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    unsafe fn usize_array<'a>(ptr: *const usize, count: usize) -> Option<&'a [usize]> {
+        if count == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || !ptr.is_aligned() || count > MAX_KEYS {
+            return None;
+        }
+        let bytes = count.checked_mul(size_of::<usize>())?;
+        if !range_ok(ptr as usize, bytes) {
+            return None;
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, count) })
+    }
+
+    /// Copies `parts` contiguously into `out` only when all of them fit.
+    #[inline]
+    unsafe fn write_all(parts: &[&[u8]], out: *mut u8, cap: usize) -> isize {
+        let Some(needed) = parts
+            .iter()
+            .try_fold(0usize, |acc, p| acc.checked_add(p.len()))
+        else {
+            return DECLINE;
+        };
+        if needed > isize::MAX as usize - 1 {
+            return DECLINE;
+        }
+        if cap < needed {
+            return -(needed as isize) - 1;
+        }
+        if needed == 0 {
+            return 0;
+        }
+        if out.is_null() || !range_ok(out as usize, cap) {
+            return DECLINE;
+        }
+        let dst = unsafe { slice::from_raw_parts_mut(out, needed) };
+        let mut pos = 0;
+        for p in parts {
+            dst[pos..pos + p.len()].copy_from_slice(p);
+            pos += p.len();
+        }
+        needed as isize
+    }
+
+    #[inline]
+    fn i64_decimal(v: i64, buf: &mut [u8; 20]) -> &[u8] {
+        let mut n = v.unsigned_abs();
+        let mut i = buf.len();
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        if v < 0 {
+            i -= 1;
+            buf[i] = b'-';
+        }
+        &buf[i..]
+    }
+
+    /// Splits `packed` into `lens.len()` consecutive keys whose lengths sum to `packed.len()`.
+    fn any_key_in(packed: &[u8], lens: &[usize], fields: &[&[u8]]) -> Option<bool> {
+        let mut pos = 0usize;
+        let mut found = false;
+        for &len in lens {
+            let end = pos.checked_add(len)?;
+            let key = packed.get(pos..end)?;
+            if !found && fields.contains(&key) {
+                found = true;
+            }
+            pos = end;
+        }
+        (pos == packed.len()).then_some(found)
+    }
+
+    unsafe fn keys_contain_any(
+        packed: *const u8,
+        packed_len: usize,
+        lens: *const usize,
+        count: usize,
+        fields: &[&[u8]],
+    ) -> i32 {
+        let Some(packed) = (unsafe { input(packed, packed_len) }) else {
+            return -1;
+        };
+        let Some(lens) = (unsafe { usize_array(lens, count) }) else {
+            return -1;
+        };
+        match any_key_in(packed, lens, fields) {
+            Some(found) => i32::from(found),
+            None => -1,
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. SearchUnavailableException
+    // -------------------------------------------------------------------------
+
+    /// `SearchUnavailableException::renderDriver()`: 1 (v2 JSON) when the API
+    /// version is exactly `v2`, 0 (legacy XML) otherwise, -1 for invalid input.
+    ///
+    /// # Safety
+    /// `version` holds `version_len` readable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_search_unavailable_render_driver(
+        version: *const u8,
+        version_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            match unsafe { input(version, version_len) } {
+                Some(v) => i32::from(v == b"v2"),
+                None => -1,
+            }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// `SearchUnavailableException::retryAfterHeaderValue()`: `(string) $seconds`.
+    ///
+    /// # Safety
+    /// `out` holds `cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_search_unavailable_retry_after(
+        seconds: i64,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let mut buf = [0u8; 20];
+            let digits = i64_decimal(seconds, &mut buf);
+            unsafe { write_all(&[digits], out, cap) }
+        }))
+        .unwrap_or(-1)
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. ReleaseObserver
+    // -------------------------------------------------------------------------
+
+    /// `ReleaseObserver::hasIndexedFieldChange()`: 1 when any of the `count` dirty
+    /// attribute names (concatenated in `keys`, lengths in `lens`) is an indexed
+    /// field, 0 otherwise, -1 for invalid input.
+    ///
+    /// # Safety
+    /// `keys` holds `keys_len` bytes; `lens` holds `count` aligned `size_t` values.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_release_observer_has_indexed_change(
+        keys: *const u8,
+        keys_len: usize,
+        lens: *const usize,
+        count: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| unsafe {
+            keys_contain_any(keys, keys_len, lens, count, &RELEASE_INDEXED_FIELDS)
+        }))
+        .unwrap_or(-1)
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. UserApiCacheObserver
+    // -------------------------------------------------------------------------
+
+    /// `UserApiCacheObserver::hasCacheRelevantChange()`: 1 when any changed
+    /// attribute name affects cached API users, 0 otherwise, -1 for invalid input.
+    ///
+    /// # Safety
+    /// `keys` holds `keys_len` bytes; `lens` holds `count` aligned `size_t` values.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_user_api_cache_relevant_change(
+        keys: *const u8,
+        keys_len: usize,
+        lens: *const usize,
+        count: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| unsafe {
+            keys_contain_any(keys, keys_len, lens, count, &USER_CACHE_FIELDS)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// `UserApiCacheObserver::tokenCacheKeys()`: writes the NUL-separated keys
+    /// `api_user:<md5(token)>`, `api_user_stats:<id>`, and
+    /// `user_category_exclusions_<id>`. Writes nothing and returns 0 for an empty
+    /// token.
+    ///
+    /// # Safety
+    /// `token` holds `token_len` bytes and `out` `cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_user_api_token_cache_keys(
+        token: *const u8,
+        token_len: usize,
+        user_id: i64,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(token) = (unsafe { input(token, token_len) }) else {
+                return DECLINE;
+            };
+            if token.is_empty() {
+                return 0;
+            }
+            let hash = crate::md5_hex_slice(token);
+            let mut buf = [0u8; 20];
+            let id = i64_decimal(user_id, &mut buf);
+            unsafe {
+                write_all(
+                    &[
+                        b"api_user:",
+                        &hash,
+                        b"\0api_user_stats:",
+                        id,
+                        b"\0user_category_exclusions_",
+                        id,
+                    ],
+                    out,
+                    cap,
+                )
+            }
+        }))
+        .unwrap_or(-1)
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. VerifyFailedReleaseRequest
+    // -------------------------------------------------------------------------
+
+    /// `VerifyFailedReleaseRequest::requestAction()`: 0 pass through (API token
+    /// present), 1 verify CSRF (`POST`), 2 reject with 405, -1 for invalid input.
+    ///
+    /// # Safety
+    /// `method` holds `method_len` readable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_failed_release_request_action(
+        has_api_token: u32,
+        method: *const u8,
+        method_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if has_api_token > 1 {
+                return -1;
+            }
+            let Some(method) = (unsafe { input(method, method_len) }) else {
+                return -1;
+            };
+            if has_api_token == 1 {
+                0
+            } else if method == b"POST" {
+                1
+            } else {
+                2
+            }
+        }))
+        .unwrap_or(-1)
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. Google2FAMiddleware
+    // -------------------------------------------------------------------------
+
+    /// `Route::named('passkeys.*', 'password.confirm')` via `Str::is()`: the
+    /// wildcard regex runs with the `su` flags, so any valid UTF-8 suffix matches
+    /// and invalid UTF-8 never does.
+    #[inline]
+    fn is_security_route(name: &[u8]) -> bool {
+        name == b"password.confirm"
+            || name == b"passkeys.*"
+            || (name.starts_with(b"passkeys.") && std::str::from_utf8(name).is_ok())
+    }
+
+    /// `Google2FAMiddleware::intendedUrlAction()`: 1 store the profile security
+    /// URL, 2 store the full request URL (`GET`), 0 leave the session alone, -1 for
+    /// invalid input.
+    ///
+    /// # Safety
+    /// `name` holds `name_len` bytes and `method` `method_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_google2fa_intended_action(
+        has_route_name: u32,
+        name: *const u8,
+        name_len: usize,
+        method: *const u8,
+        method_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if has_route_name > 1 {
+                return -1;
+            }
+            let (Some(name), Some(method)) = (unsafe { input(name, name_len) }, unsafe {
+                input(method, method_len)
+            }) else {
+                return -1;
+            };
+            if has_route_name == 1 && is_security_route(name) {
+                1
+            } else if method == b"GET" {
+                2
+            } else {
+                0
+            }
+        }))
+        .unwrap_or(-1)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn pack(keys: &[&[u8]]) -> (Vec<u8>, Vec<usize>) {
+            let mut packed = Vec::new();
+            let mut lens = Vec::new();
+            for k in keys {
+                packed.extend_from_slice(k);
+                lens.push(k.len());
+            }
+            (packed, lens)
+        }
+
+        fn buf_call(f: impl Fn(*mut u8, usize) -> isize) -> Result<Vec<u8>, isize> {
+            let mut out = vec![0u8; 256];
+            let n = f(out.as_mut_ptr(), out.len());
+            if n < 0 {
+                return Err(n);
+            }
+            out.truncate(n as usize);
+            Ok(out)
+        }
+
+        #[test]
+        fn search_unavailable_driver_and_retry_after() {
+            let driver =
+                |v: &[u8]| unsafe { nntmux_search_unavailable_render_driver(v.as_ptr(), v.len()) };
+            assert_eq!(driver(b"v2"), 1);
+            assert_eq!(driver(b"v1"), 0);
+            assert_eq!(driver(b"V2"), 0);
+            assert_eq!(driver(b""), 0);
+            assert_eq!(driver(b"v2\0"), 0);
+            assert_eq!(
+                unsafe { nntmux_search_unavailable_render_driver(std::ptr::null(), 2) },
+                -1
+            );
+
+            let retry =
+                |s: i64| buf_call(|o, c| unsafe { nntmux_search_unavailable_retry_after(s, o, c) });
+            assert_eq!(retry(30).unwrap(), b"30");
+            assert_eq!(retry(0).unwrap(), b"0");
+            assert_eq!(retry(-5).unwrap(), b"-5");
+            assert_eq!(retry(i64::MIN).unwrap(), b"-9223372036854775808");
+            let mut small = [0xAAu8; 1];
+            assert_eq!(
+                unsafe { nntmux_search_unavailable_retry_after(30, small.as_mut_ptr(), 1) },
+                -3
+            );
+            assert_eq!(small, [0xAA]);
+            assert_eq!(
+                unsafe { nntmux_search_unavailable_retry_after(30, std::ptr::null_mut(), 8) },
+                -1
+            );
+        }
+
+        #[test]
+        fn search_observer_key_sets() {
+            let release = |keys: &[&[u8]]| {
+                let (p, l) = pack(keys);
+                unsafe {
+                    nntmux_release_observer_has_indexed_change(
+                        p.as_ptr(),
+                        p.len(),
+                        l.as_ptr(),
+                        l.len(),
+                    )
+                }
+            };
+            assert_eq!(release(&[]), 0);
+            assert_eq!(release(&[b"updated_at"]), 0);
+            assert_eq!(release(&[b"updated_at", b"grabs"]), 1);
+            assert_eq!(release(&[b"guid"]), 1);
+            assert_eq!(release(&[b"Name", b"guid "]), 0);
+            assert_eq!(release(&[b"", b"adddate"]), 1);
+
+            let user = |keys: &[&[u8]]| {
+                let (p, l) = pack(keys);
+                unsafe {
+                    nntmux_user_api_cache_relevant_change(p.as_ptr(), p.len(), l.as_ptr(), l.len())
+                }
+            };
+            assert_eq!(user(&[b"updated_at", b"password"]), 0);
+            assert_eq!(user(&[b"deleted_at"]), 1);
+            assert_eq!(user(&[b"api_token\0"]), 0);
+
+            // Lengths that do not cover the packed bytes exactly are rejected.
+            let lens = [3usize];
+            assert_eq!(
+                unsafe {
+                    nntmux_release_observer_has_indexed_change(
+                        b"name".as_ptr(),
+                        4,
+                        lens.as_ptr(),
+                        1,
+                    )
+                },
+                -1
+            );
+            let lens = [5usize];
+            assert_eq!(
+                unsafe {
+                    nntmux_release_observer_has_indexed_change(
+                        b"name".as_ptr(),
+                        4,
+                        lens.as_ptr(),
+                        1,
+                    )
+                },
+                -1
+            );
+            let mut raw = [0u8; 32];
+            let misaligned = unsafe { raw.as_mut_ptr().add(1) } as *const usize;
+            assert_eq!(
+                unsafe {
+                    nntmux_user_api_cache_relevant_change(b"name".as_ptr(), 4, misaligned, 1)
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_user_api_cache_relevant_change(b"name".as_ptr(), 4, std::ptr::null(), 1)
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_user_api_cache_relevant_change(
+                        b"name".as_ptr(),
+                        4,
+                        lens.as_ptr(),
+                        usize::MAX,
+                    )
+                },
+                -1
+            );
+        }
+
+        #[test]
+        fn search_user_token_cache_keys() {
+            let keys = |t: &[u8], id: i64| {
+                buf_call(|o, c| unsafe {
+                    nntmux_user_api_token_cache_keys(t.as_ptr(), t.len(), id, o, c)
+                })
+            };
+            assert_eq!(keys(b"", 5).unwrap(), b"");
+            assert_eq!(
+                keys(b"abc", 42).unwrap(),
+                b"api_user:900150983cd24fb0d6963f7d28e17f72\0api_user_stats:42\0user_category_exclusions_42"
+                    .to_vec()
+            );
+            let mut small = [0xAAu8; 16];
+            let n = unsafe {
+                nntmux_user_api_token_cache_keys(b"abc".as_ptr(), 3, 42, small.as_mut_ptr(), 16)
+            };
+            assert_eq!(n, -(87 + 1));
+            assert_eq!(small, [0xAA; 16]);
+            assert_eq!(
+                unsafe {
+                    nntmux_user_api_token_cache_keys(std::ptr::null(), 3, 1, small.as_mut_ptr(), 16)
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_user_api_token_cache_keys(
+                        b"abc".as_ptr(),
+                        isize::MAX as usize + 1,
+                        1,
+                        small.as_mut_ptr(),
+                        16,
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_user_api_token_cache_keys(
+                        b"abc".as_ptr(),
+                        3,
+                        1,
+                        small.as_mut_ptr(),
+                        usize::MAX,
+                    )
+                },
+                -1
+            );
+        }
+
+        #[test]
+        fn search_failed_release_and_google2fa_actions() {
+            let action = |has: u32, m: &[u8]| unsafe {
+                nntmux_failed_release_request_action(has, m.as_ptr(), m.len())
+            };
+            assert_eq!(action(1, b"GET"), 0);
+            assert_eq!(action(0, b"POST"), 1);
+            assert_eq!(action(0, b"post"), 2);
+            assert_eq!(action(0, b"GET"), 2);
+            assert_eq!(action(2, b"POST"), -1);
+
+            let fa = |has: u32, n: &[u8], m: &[u8]| unsafe {
+                nntmux_google2fa_intended_action(has, n.as_ptr(), n.len(), m.as_ptr(), m.len())
+            };
+            assert_eq!(fa(1, b"passkeys.index", b"POST"), 1);
+            assert_eq!(fa(1, b"passkeys.", b"GET"), 1);
+            assert_eq!(fa(1, b"passkeys.\n\xc3\xa9", b"GET"), 1);
+            assert_eq!(fa(1, b"passkeys.\xff", b"GET"), 2);
+            assert_eq!(fa(1, b"passkeys", b"GET"), 2);
+            assert_eq!(fa(1, b"password.confirm", b"DELETE"), 1);
+            assert_eq!(fa(1, b"password.confirm\n", b"DELETE"), 0);
+            assert_eq!(fa(0, b"passkeys.index", b"GET"), 2);
+            assert_eq!(fa(1, b"home", b"HEAD"), 0);
+            assert_eq!(fa(3, b"home", b"GET"), -1);
+            assert_eq!(
+                unsafe {
+                    nntmux_google2fa_intended_action(1, std::ptr::null(), 4, b"GET".as_ptr(), 3)
+                },
+                -1
+            );
+        }
+    }
+}
