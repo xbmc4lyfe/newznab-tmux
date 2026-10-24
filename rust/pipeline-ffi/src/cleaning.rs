@@ -5102,3 +5102,695 @@ mod mcp_tests {
     }
 }
 
+
+// Wave 8 town patterns deliberately retain PHP branch order, captures and modifiers.
+mod release_town {
+    use std::sync::LazyLock;
+
+    const E0: &str = r##"([\-_](proof|sample|thumbs?))*(\.part\d*(\.rar)?|\.rar|\.7z|\.par2)?(\d{1,3}\.rev"|\.vol\d+\+\d+.+?"|\.[A-Za-z0-9]{2,4}"|")"##;
+    const END: &str = r"[\-_\s]{0,3}yEnc$";
+    const SIZE: &str = r"[\-_\s]{0,3}\d+([.,]\d+)? [kKmMgG][bB][\-_\s]{0,3}";
+    const PATTERNS: &[(&str, usize, bool, bool)] = &[
+        (
+            r##"^<TOWN>.+?town\.ag.+?(www\..+?|News)\.[iI]nfo.+? \[\d+\/\d+\]( -)? "(.+?)(-sample)?{e0} - \d+[.,]\d+ [kKmMgG][bB]M? yEnc$"##,
+            3,
+            false,
+            false,
+        ),
+        (
+            r##"^\[\s*TOWN\s*\][\-_\s]{0,3}\[\s*www\.town\.ag\s*\][\-_\s]{0,3}\[\s*partner of www\.ssl-news\.info\s*\][\-_\s]{0,3}\[\s* .*\s*\][\-_\s]{0,3}\[\d+\/\d+\][\-_\s]{0,4}"([\w\säöüÄÖÜß+¤¶!.,&_()\[\]'\`{}#-]{8,}?\b.?){e2}"##,
+            1,
+            true,
+            true,
+        ),
+        (
+            r##"^<TOWN>.+?town\.ag.+?(www\..+?|News)\.[iI]nfo.+? \[\d+\/\d+\]( -)? "(.+?)(-sample)?{e1}"##,
+            3,
+            true,
+            true,
+        ),
+        (
+            r##"^\(\d+\/\d+\) -<TOWN><www\.town\.ag >\s+<partner.+> - ("|#34;)([\w. ()-]{8,}?\b)(\.par2|-\.part\d+\.rar|\.nfo)("|#34;) - \d+[.,]\d+ [kKmMgG][bB]( -)? yEnc$"##,
+            2,
+            false,
+            false,
+        ),
+        (
+            r##"^\[ TOWN \][ _-]{0,3}\[ www\.town\.ag \][ _-]{0,3}\[ partner of www\.ssl-news\.info \][ _-]{0,3}\[ .* \] \[\d+\/\d+\][ _-]{0,3}("|#34;)(.+)((\.part\d+\.rar)|(\.vol\d+\+\d+\.par2))("|#34;)[ _-]{0,3}\d+[.,]\d+ [kKmMgG][bB][ _-]{0,3}yEnc$"##,
+            2,
+            true,
+            false,
+        ),
+        (
+            r##"^\[ TOWN \][ _-]{0,3}\[ www\.town\.ag \][ _-]{0,3}\[ partner of www\.ssl-news\.info \][ _-]{0,3}\[ .* \] \[\d+\/\d+\][ _-]{0,3}("|#34;)(.+)\.(par2|rar|nfo|nzb)("|#34;)[ _-]{0,3}\d+[.,]\d+ [kKmMgG][bB][ _-]{0,3}yEnc$"##,
+            2,
+            true,
+            false,
+        ),
+        (
+            r##"^\[ TOWN \][ _-]{0,3}\[ www\.town\.ag \][ _-]{0,3}\[ partner of www\.ssl-news\.info \][ _-]{0,3}(\[ TV \] )?\[\d+\/\d+\][ _-]{0,3}("|#34;)(.+)((\.part\d+\.rar)|(\.vol\d+\+\d+\.par2)|\.nfo|\.vol\d+\+\.par2)("|#34;)[ _-]{0,3}\d+[.,]\d+ [kKmMgG][bB][ _-]{0,3}yEnc$"##,
+            3,
+            true,
+            false,
+        ),
+        (
+            r##"^\[ TOWN \][ _-]{0,3}\[ www\.town\.ag \][ _-]{0,3}\[ partner of www\.ssl-news\.info \][ _-]{0,3}(\[ TV \] )?\[\d+\/\d+\][ _-]{0,3}("|#34;)(.+)\.par2("|#34;)[ _-]{0,3}\d+[.,]\d+ [kKmMgG][bB][ _-]{0,3}yEnc$"##,
+            3,
+            true,
+            false,
+        ),
+        (
+            r##"^\d+\.-\.(.+) <TOWN><www\.town\.ag >\s+<partner .+>\s+<.+>\s+\[\d+\/\d+\] - ("|#34;).+("|#34;).+yEnc$"##,
+            1,
+            false,
+            false,
+        ),
+        (
+            r##"^\d+\.-\.(.+) <TOWN><www\.town\.ag >\s+<partner .+>\s+<.+>\s+\[\d+\/\d+\] - ("|#34;).+"##,
+            1,
+            false,
+            false,
+        ),
+        (
+            r##"^(\w.+) <TOWN><www\.town\.ag >\s+<partner.+>\s+\[\d+\/\d+\] - ("|#34;).+("|#34;).+yEnc$"##,
+            1,
+            false,
+            false,
+        ),
+        (
+            r##"^(\w.+) <TOWN><www\.town\.ag >\s+<partner.+>\s+\[\d+\/\d+\] - ("|#34;).+"##,
+            1,
+            false,
+            false,
+        ),
+        (
+            r##"^<TOWN><www\.town\.ag >\s+<partner .+>\s+(.+)\s+\[\d+\/\d+\] - ("|#34;).+("|#34;).+yEnc$"##,
+            1,
+            false,
+            false,
+        ),
+        (
+            r##"^<TOWN><www\.town\.ag >\s+<partner .+>\s+(.+)\s+\[\d+\/\d+\] - ("|#34;).+"##,
+            1,
+            false,
+            false,
+        ),
+        (
+            r##"^[ <\[]{0,2}TOWN[ >\]]{0,2}[ _-]{0,3}[ <\[]{0,2}www\.town\.ag[ >\]]{0,2}[ _-]{0,3}[ <\[]{0,2}partner of www.ssl-news\.info[ >\]]{0,2}[ _-]{0,3}\[\d+\/\d+\][ _-]{0,3}("|#34;)(.+)\.(par|vol|rar|nfo).*?("|#34;).+?yEnc$"##,
+            2,
+            true,
+            false,
+        ),
+        (
+            r##"^<TOWN> www\.town\.ag > sponsored by www\.ssl-news\.info > \(\d+\/\d+\) "([\w\säöüÄÖÜß+¤¶!.,&_()\[\]'\`{}#-]{8,}?\b.?){e0} - \d+[,.]\d+ [mMkKgG][bB] - yEnc$"##,
+            1,
+            false,
+            false,
+        ),
+        (
+            r##"^\(\d+\/\d+\).+?www\.town\.ag.+?sponsored by (www\.)?ssl-news\.info<+?.+? "([\w\säöüÄÖÜß+¤¶!.,&_()\[\]'\`{}#-]{8,}?\b.?){e1}"##,
+            2,
+            true,
+            true,
+        ),
+        (
+            r##"^\[ TOWN \][ _-]{0,3}\[ www\.town\.ag \][ _-]{0,3}\[ (.+?) \][ _-]{0,3}\[ partner of www\.ssl-news\.info \][ _-]{0,3}\[\d+\/(\d+\])[ _-]{0,3}"(.+)(\.part\d*|\.rar)?(\.vol.+ \(\d+\/\d+\) "|\.[A-Za-z0-9]{2,4}")[ _-]{0,3}yEnc$"##,
+            1,
+            true,
+            false,
+        ),
+        (
+            r##"^\(TOWN\)\(www\.town\.ag \)[ _-]{0,3}\(partner of www\.ssl-news\.info \)[ _-]{0,3} (.+?) \[\d+\/(\d+\][ _-]{0,3}("|#34;).+?)\.(par2|rar|nfo|nzb)("|#34;)[ _-]{0,3}\d+[.,]\d+ [kKmMgG][bB][ _-]{0,3}yEnc$"##,
+            1,
+            false,
+            false,
+        ),
+        (
+            r##"^<TOWN><www\.town\.ag > <partner of www\.ssl-news\.info > (.+) \[\d+\/\d+\][ _-]{0,3}("|#34;).+?("|#34;).+?yEnc$"##,
+            1,
+            true,
+            false,
+        ),
+        (
+            r##"^\[ TOWN \][ _-]{0,3}\[ www\.town\.ag \][ _-]{0,3}\[ .* \][ _-]{0,3}\[\d+\/\d+\][ _-]{0,3}"([\w\säöüÄÖÜß+¤¶!.,&_()\[\]'\`{}#-]{8,}?\b.?){e2}"##,
+            1,
+            true,
+            true,
+        ),
+    ];
+
+    // A small, bounded backtracking VM for this fixed pattern set. No external regex
+    // dependency or locale is introduced. Alternatives, greedy/lazy repeats, saves
+    // and assertions execute in PCRE order rather than choosing a longest match.
+    #[derive(Clone, Default)]
+    struct Set {
+        ranges: Vec<(u32, u32)>,
+        word: bool,
+        space: bool,
+        digit: bool,
+        any: bool,
+    }
+
+    impl Set {
+        fn literal(c: u32) -> Self {
+            Self {
+                ranges: vec![(c, c)],
+                ..Self::default()
+            }
+        }
+
+        fn accepts(&self, c: u32, insensitive: bool, utf: bool) -> bool {
+            let word = |c: u32| {
+                if utf {
+                    c == 95 || char::from_u32(c).is_some_and(char::is_alphanumeric)
+                } else {
+                    c < 128 && super::is_pcre_word(c as u8)
+                }
+            };
+            if self.any && c != 10
+                || self.word && word(c)
+                || self.space
+                    && if utf {
+                        char::from_u32(c).is_some_and(char::is_whitespace)
+                    } else {
+                        c < 128 && super::is_pcre_space(c as u8)
+                    }
+                || self.digit && (48..=57).contains(&c)
+            {
+                return true;
+            }
+            let in_ranges = |c| self.ranges.iter().any(|&(a, b)| a <= c && c <= b);
+            if in_ranges(c) {
+                return true;
+            }
+            if insensitive {
+                if utf {
+                    // The admitted UTF grammar is Latin-1. All case partners outside
+                    // it (e.g. Kelvin sign/long s) decline before executing this VM.
+                    if let Some(ch) = char::from_u32(c) {
+                        let mut lower = ch.to_lowercase();
+                        let lower_first = lower.next().unwrap();
+                        let mut upper = ch.to_uppercase();
+                        let upper_first = upper.next().unwrap();
+                        return lower.next().is_none() && in_ranges(lower_first as u32)
+                            || upper.next().is_none() && in_ranges(upper_first as u32);
+                    }
+                } else if c < 128 {
+                    return in_ranges((c as u8).to_ascii_lowercase() as u32)
+                        || in_ranges((c as u8).to_ascii_uppercase() as u32);
+                }
+            }
+            false
+        }
+    }
+
+    enum Node {
+        Char(Set),
+        Start,
+        End,
+        Boundary,
+        Sequence(Vec<Node>),
+        Either(Vec<Node>),
+        Capture(usize, Box<Node>),
+        Repeat(Box<Node>, usize, Option<usize>, bool),
+    }
+
+    struct Parser<'a> {
+        bytes: &'a [u8],
+        pos: usize,
+        captures: usize,
+        utf: bool,
+    }
+
+    impl Parser<'_> {
+        fn next(&mut self) -> u32 {
+            let c = if self.utf {
+                std::str::from_utf8(&self.bytes[self.pos..])
+                    .unwrap()
+                    .chars()
+                    .next()
+                    .unwrap()
+            } else {
+                self.bytes[self.pos] as char
+            };
+            self.pos += if self.utf { c.len_utf8() } else { 1 };
+            c as u32
+        }
+
+        fn escaped(&mut self) -> Set {
+            match self.next() {
+                119 => Set {
+                    word: true,
+                    ..Set::default()
+                },
+                115 => Set {
+                    space: true,
+                    ..Set::default()
+                },
+                100 => Set {
+                    digit: true,
+                    ..Set::default()
+                },
+                c => Set::literal(c),
+            }
+        }
+
+        fn number(&mut self) -> usize {
+            let mut n = 0;
+            while let Some(b'0'..=b'9') = self.bytes.get(self.pos) {
+                n = n * 10 + (self.bytes[self.pos] - b'0') as usize;
+                self.pos += 1;
+            }
+            n
+        }
+
+        fn expression(&mut self) -> Node {
+            let mut branches = vec![self.sequence()];
+            while self.bytes.get(self.pos) == Some(&b'|') {
+                self.pos += 1;
+                branches.push(self.sequence());
+            }
+            if branches.len() == 1 {
+                branches.pop().unwrap()
+            } else {
+                Node::Either(branches)
+            }
+        }
+
+        fn sequence(&mut self) -> Node {
+            let mut nodes = Vec::new();
+            while self.pos < self.bytes.len() && !matches!(self.bytes[self.pos], b')' | b'|') {
+                let mut node = match self.next() {
+                    94 => Node::Start,
+                    36 => Node::End,
+                    46 => Node::Char(Set {
+                        any: true,
+                        ..Set::default()
+                    }),
+                    40 => {
+                        self.captures += 1;
+                        let capture = self.captures;
+                        let child = self.expression();
+                        assert_eq!(self.next(), 41);
+                        Node::Capture(capture, Box::new(child))
+                    }
+                    92 => {
+                        if self.bytes.get(self.pos) == Some(&b'b') {
+                            self.pos += 1;
+                            Node::Boundary
+                        } else {
+                            Node::Char(self.escaped())
+                        }
+                    }
+                    91 => {
+                        let mut set = Set::default();
+                        while self.bytes[self.pos] != b']' {
+                            let first = if self.bytes[self.pos] == b'\\' {
+                                self.pos += 1;
+                                self.escaped()
+                            } else {
+                                Set::literal(self.next())
+                            };
+                            if self.bytes.get(self.pos) == Some(&b'-')
+                                && self.bytes.get(self.pos + 1) != Some(&b']')
+                            {
+                                self.pos += 1;
+                                let end = self.next();
+                                assert_eq!(first.ranges.len(), 1);
+                                set.ranges.push((first.ranges[0].0, end));
+                            } else {
+                                set.ranges.extend(first.ranges);
+                                set.word |= first.word;
+                                set.space |= first.space;
+                                set.digit |= first.digit;
+                            }
+                        }
+                        self.pos += 1;
+                        Node::Char(set)
+                    }
+                    c => Node::Char(Set::literal(c)),
+                };
+                let repeat = match self.bytes.get(self.pos) {
+                    Some(b'*') => Some((0, None)),
+                    Some(b'+') => Some((1, None)),
+                    Some(b'?') => Some((0, Some(1))),
+                    Some(b'{') => {
+                        self.pos += 1;
+                        let min = self.number();
+                        let max = if self.bytes.get(self.pos) == Some(&b',') {
+                            self.pos += 1;
+                            if self.bytes.get(self.pos) == Some(&b'}') {
+                                None
+                            } else {
+                                Some(self.number())
+                            }
+                        } else {
+                            Some(min)
+                        };
+                        assert_eq!(self.bytes.get(self.pos), Some(&b'}'));
+                        Some((min, max))
+                    }
+                    _ => None,
+                };
+                if let Some((min, max)) = repeat {
+                    self.pos += 1;
+                    let lazy = self.bytes.get(self.pos) == Some(&b'?');
+                    if lazy {
+                        self.pos += 1;
+                    }
+                    node = Node::Repeat(Box::new(node), min, max, lazy);
+                }
+                nodes.push(node);
+            }
+            Node::Sequence(nodes)
+        }
+    }
+
+    enum Op {
+        Char(Set),
+        Start,
+        End,
+        Boundary,
+        Save(usize),
+        Split(usize, usize),
+        Jump(usize),
+        Match,
+    }
+
+    fn compile(node: &Node, ops: &mut Vec<Op>) {
+        match node {
+            Node::Char(set) => ops.push(Op::Char(set.clone())),
+            Node::Start => ops.push(Op::Start),
+            Node::End => ops.push(Op::End),
+            Node::Boundary => ops.push(Op::Boundary),
+            Node::Sequence(nodes) => nodes.iter().for_each(|n| compile(n, ops)),
+            Node::Capture(index, child) => {
+                ops.push(Op::Save(index * 2));
+                compile(child, ops);
+                ops.push(Op::Save(index * 2 + 1));
+            }
+            Node::Either(nodes) => {
+                let mut exits = Vec::new();
+                for (i, child) in nodes.iter().enumerate() {
+                    if i + 1 == nodes.len() {
+                        compile(child, ops);
+                        break;
+                    }
+                    let split = ops.len();
+                    ops.push(Op::Split(0, 0));
+                    compile(child, ops);
+                    exits.push(ops.len());
+                    ops.push(Op::Jump(0));
+                    ops[split] = Op::Split(split + 1, ops.len());
+                }
+                let end = ops.len();
+                for exit in exits {
+                    ops[exit] = Op::Jump(end);
+                }
+            }
+            Node::Repeat(child, min, max, lazy) => {
+                for _ in 0..*min {
+                    compile(child, ops);
+                }
+                let repeats = max.map_or(1, |m| m - min);
+                for _ in 0..repeats {
+                    let split = ops.len();
+                    ops.push(Op::Split(0, 0));
+                    compile(child, ops);
+                    if max.is_none() {
+                        ops.push(Op::Jump(split));
+                    }
+                    let end = ops.len();
+                    ops[split] = if *lazy {
+                        Op::Split(end, split + 1)
+                    } else {
+                        Op::Split(split + 1, end)
+                    };
+                }
+            }
+        }
+    }
+
+    struct Pattern {
+        ops: Vec<Op>,
+        capture: usize,
+        insensitive: bool,
+        utf: bool,
+    }
+
+    static PROGRAMS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
+        PATTERNS
+            .iter()
+            .map(|&(source, capture, insensitive, utf)| {
+                let source = source
+                    .replace("{e2}", &format!("{E0}{SIZE}{END}"))
+                    .replace("{e1}", &format!("{E0}{END}"))
+                    .replace("{e0}", E0);
+                let mut parser = Parser {
+                    bytes: source.as_bytes(),
+                    pos: 0,
+                    captures: 0,
+                    utf,
+                };
+                let tree = parser.expression();
+                assert_eq!(parser.pos, source.len());
+                assert!(parser.captures < 16);
+                let mut ops = Vec::new();
+                compile(&tree, &mut ops);
+                ops.push(Op::Match);
+                Pattern {
+                    ops,
+                    capture,
+                    insensitive,
+                    utf,
+                }
+            })
+            .collect()
+    });
+
+    impl Pattern {
+        fn run(&self, subject: &[u8], budget: &mut usize) -> Result<Option<(usize, usize)>, ()> {
+            let mut stack = Vec::new();
+            let (mut pc, mut pos, mut captures) = (0, 0, [0usize; 32]);
+            loop {
+                if *budget == 0 || stack.len() > 8192 {
+                    return Err(());
+                }
+                *budget -= 1;
+                let valid = match &self.ops[pc] {
+                    Op::Char(set) => {
+                        if pos == subject.len() {
+                            false
+                        } else {
+                            let (c, len) = if self.utf {
+                                let c = std::str::from_utf8(&subject[pos..])
+                                    .unwrap()
+                                    .chars()
+                                    .next()
+                                    .unwrap();
+                                (c as u32, c.len_utf8())
+                            } else {
+                                (subject[pos] as u32, 1)
+                            };
+                            if set.accepts(c, self.insensitive, self.utf) {
+                                pos += len;
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    }
+                    Op::Start => pos == 0,
+                    Op::End => {
+                        pos == subject.len() || pos + 1 == subject.len() && subject[pos] == b'\n'
+                    }
+                    Op::Boundary => {
+                        let word = |c: char| c == '_' || c.is_alphanumeric();
+                        let (left, right) = if self.utf {
+                            (
+                                std::str::from_utf8(&subject[..pos])
+                                    .unwrap()
+                                    .chars()
+                                    .next_back()
+                                    .is_some_and(word),
+                                std::str::from_utf8(&subject[pos..])
+                                    .unwrap()
+                                    .chars()
+                                    .next()
+                                    .is_some_and(word),
+                            )
+                        } else {
+                            (
+                                pos > 0 && super::is_pcre_word(subject[pos - 1]),
+                                pos < subject.len() && super::is_pcre_word(subject[pos]),
+                            )
+                        };
+                        left != right
+                    }
+                    Op::Save(slot) => {
+                        captures[*slot] = pos;
+                        true
+                    }
+                    Op::Split(first, second) => {
+                        stack.push((*second, pos, captures));
+                        pc = *first;
+                        continue;
+                    }
+                    Op::Jump(target) => {
+                        pc = *target;
+                        continue;
+                    }
+                    Op::Match => {
+                        return Ok(Some((
+                            captures[self.capture * 2],
+                            captures[self.capture * 2 + 1],
+                        )));
+                    }
+                };
+                if valid {
+                    pc += 1;
+                } else if let Some(state) = stack.pop() {
+                    (pc, pos, captures) = state;
+                } else {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    pub(super) fn capture(subject: &[u8]) -> Result<Option<&[u8]>, ()> {
+        if subject.len() > 16_384 {
+            return Err(());
+        }
+        let utf = std::str::from_utf8(subject);
+        let mut budget = 200_000;
+        for pattern in PROGRAMS.iter() {
+            if pattern.utf {
+                // PCRE /u rejects the whole subject, even when the invalid byte is
+                // outside the captured name. Other branches still use raw bytes.
+                let Ok(text) = utf else {
+                    continue;
+                };
+                // Keep unsupported Unicode properties/case folds on PCRE instead
+                // of approximating them with Rust's different Unicode version.
+                if text.chars().any(|c| c as u32 > 255) {
+                    return Err(());
+                }
+            }
+            if let Some((start, end)) = pattern.run(subject, &mut budget)? {
+                return Ok(Some(&subject[start..end]));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Ordered town cleaner: >=0 is the matched string's byte length; -3 requests
+/// the PHP fallback ARRAY (`releaseCleanerHelper`, properlynamed=false); -2 is
+/// unsupported/over budget; -1 is invalid arguments; <=-4 encodes -(needed+4).
+/// Fallback cleaning stays in PHP so overridden releaseCleanerHelper is honored.
+///
+/// # Safety
+/// Non-null subject/out_buf must be readable/writable for subject_len/out_cap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_generic_town(
+    subject: *const u8,
+    subject_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if subject_len > isize::MAX as usize
+        || subject.is_null() && subject_len != 0
+        || out_buf.is_null() && out_cap != 0
+        || out_cap > isize::MAX as usize
+    {
+        return -1;
+    }
+    let subject = if subject_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(subject, subject_len) }
+    };
+    match release_town::capture(subject) {
+        Ok(Some(name)) => {
+            let length = name.len();
+            if length > out_cap {
+                return -(length as isize) - 4;
+            }
+            if length != 0 {
+                // memmove semantics also permit a C caller's in-place output.
+                unsafe {
+                    std::ptr::copy(name.as_ptr(), out_buf, length);
+                }
+            }
+            length as isize
+        }
+        Ok(None) => -3,
+        Err(()) => -2,
+    }
+}
+
+#[cfg(test)]
+mod release_town_tests {
+    use super::{nntmux_release_generic_town, release_town};
+
+    #[test]
+    fn town_order_laziness_greediness_and_byte_class() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"<TOWN><www.town.ag > <partner of www.ssl-news.info > [1/3] - \"Release.Name-GRP-sample.part01.rar\" - 7,87 GB yEnc", b"Release.Name-GRP"),
+            (b"<town><www.town.ag > <partner of www.ssl-news.info > [1/3] - \"Release.Name-GRP.part01.rar\" - 7,87 GB yEnc", b"Release.Name-GRP.part01"),
+            (b"<TOWN> www.town.ag > sponsored by www.ssl-news.info > (1/3) \"Byte\xb6\xc3Name-GRP.par2\" - 43,89 MB - yEnc", b"Byte\xb6\xc3Name-GRP"),
+            (b"<TOWN><www.town.ag > <partner of www.ssl-news.info > Title-GRP  [1/3] - #34;file.par2#34; - 1,23 MB - yEnc", b"Title-GRP "),
+        ];
+        for &(subject, expected) in cases {
+            assert_eq!(release_town::capture(subject), Ok(Some(expected)));
+        }
+    }
+
+    #[test]
+    fn town_abi_statuses_exact_capacity_and_declines() {
+        let mut buf = [b'Z'; 32];
+        let subject = b"<TOWN><www.town.ag > <partner of www.ssl-news.info > [1/3] - \"Release-GRP.rar\" yEnc";
+        unsafe {
+            assert_eq!(
+                nntmux_release_generic_town(std::ptr::null(), 1, buf.as_mut_ptr(), buf.len()),
+                -1
+            );
+            assert_eq!(
+                nntmux_release_generic_town(std::ptr::null(), 0, buf.as_mut_ptr(), buf.len()),
+                -3
+            );
+            assert_eq!(
+                nntmux_release_generic_town(
+                    subject.as_ptr(),
+                    subject.len(),
+                    std::ptr::null_mut(),
+                    1
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_release_generic_town(
+                    subject.as_ptr(),
+                    subject.len(),
+                    std::ptr::null_mut(),
+                    0
+                ),
+                -15
+            );
+            assert_eq!(
+                nntmux_release_generic_town(subject.as_ptr(), subject.len(), buf.as_mut_ptr(), 1),
+                -15
+            );
+            assert_eq!(buf, [b'Z'; 32]);
+            assert_eq!(
+                nntmux_release_generic_town(subject.as_ptr(), subject.len(), buf.as_mut_ptr(), 11),
+                11
+            );
+            assert_eq!(&buf[..12], b"Release-GRPZ");
+        }
+        assert_eq!(release_town::capture(&vec![b'x'; 16_385]), Err(()));
+        assert_eq!(release_town::capture(b"unmatched subject"), Ok(None));
+        assert_eq!(release_town::capture("Unicode\u{212a}".as_bytes()), Err(()));
+    }
+}

@@ -240,6 +240,56 @@ class ReleaseCleaningService
      */
     public function generic_town()
     {
+        // Paired caller benchmarks failed the 1.5x mean/p99 gate; retain PCRE.
+        // The Rust candidate remains available via genericTownNative() for parity.
+        return $this->genericTownPhp();
+    }
+
+    /**
+     * Rust candidate; null means unavailable/declined, not the unmatched array result.
+     *
+     * @return array{cleansubject: string, properlynamed: false}|string|null
+     */
+    public function genericTownNative(): array|string|null
+    {
+        $extensions = CollectionsCleaningService::REGEX_FILE_EXTENSIONS;
+        if ($this->e0 !== $extensions
+            || $this->e1 !== $extensions.CollectionsCleaningService::REGEX_END
+            || $this->e2 !== $extensions.CollectionsCleaningService::REGEX_SUBJECT_SIZE.CollectionsCleaningService::REGEX_END
+            || ini_get('pcre.backtrack_limit') !== '1000000'
+            || ini_get('pcre.recursion_limit') !== '100000'
+        ) {
+            return null;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('release_town', 'ssize_t nntmux_release_generic_town(const char *subject, size_t subject_len, char *out_buf, size_t out_cap);');
+        if ($ffi === null) {
+            return null;
+        }
+        $capacity = 0;
+        $buffer = RustPipelineLibrary::obtainScratch($ffi, max(256, strlen($this->subject)), $capacity);
+        if ($buffer === null) {
+            return null;
+        }
+        // The output is a capture of the input, so it cannot outgrow this buffer.
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_release_generic_town($this->subject, strlen($this->subject), $buffer, $capacity);
+        if ($written === -3) {
+            return ['cleansubject' => $this->releaseCleanerHelper($this->subject), 'properlynamed' => false];
+        }
+        if (! is_int($written) || $written < 0 || $written > $capacity) {
+            return null;
+        }
+
+        return $written === 0 ? '' : \FFI::string($buffer, $written);
+    }
+
+    /**
+     * Original ordered PCRE implementation, also used when the candidate declines.
+     *
+     * @return array<string, mixed>|string
+     */
+    public function genericTownPhp()
+    {
         // <TOWN><www.town.ag > <download all our files with>>> www.ssl-news.info <<< > [05/87] - "Deep.Black.Ass.5.XXX.1080p.WEBRip.x264-TBP.part03.rar" - 7,87 GB yEnc
         // <TOWN><www.town.ag > <partner of www.ssl-news.info > [02/24] - "Dragons.Den.UK.S11E02.HDTV.x264-ANGELiC.nfo" - 288,96 MB yEnc
         // <TOWN><www.town.ag > <SSL - News.Info> [6/6] - "TTT.Magazine.2013.08.vol0+1.par2" - 33,47 MB yEnc
