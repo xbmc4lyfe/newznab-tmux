@@ -17647,3 +17647,512 @@ pub unsafe extern "C" fn nntmux_w22_article_source_enums_log_requests(
     }))
     .unwrap_or(-1)
 }
+
+// Wave 23 slice 23.2: MCP tool runner value transforms. PHP retains process,
+// filesystem, probe execution, redaction and validation error ownership.
+const W23_MCP_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+// PHP's SORT_REGULAR compares two numeric strings numerically. Instruction
+// filenames are nonnumeric; decline numeric inputs rather than alter ordering.
+fn w23_mcp_numeric_string(bytes: &[u8]) -> bool {
+    let bytes = bytes.trim_ascii();
+    let mut i = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let mut digits = 0;
+    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+        i += 1;
+        digits += 1;
+    }
+    if bytes.get(i) == Some(&b'.') {
+        i += 1;
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return false;
+    }
+    if matches!(bytes.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(bytes.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        let start = i;
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+        if start == i {
+            return false;
+        }
+    }
+    i == bytes.len()
+}
+
+fn w23_mcp_cut(bytes: &[u8], maximum: i64) -> Option<(&[u8], bool)> {
+    let maximum = usize::try_from(maximum.max(1)).ok()?;
+    if bytes.len() <= maximum {
+        return Some((bytes, false));
+    }
+    // mb_strcut uses the configured encoding. The PHP adapter only sends a
+    // truncated candidate when that encoding is UTF-8 and the input is valid.
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut end = maximum;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some((&bytes[..end], true))
+}
+
+fn w23_mcp_string_values(value: &VerificationOutboxValue) -> Option<Vec<&[u8]>> {
+    w16_entries(value)?
+        .iter()
+        .map(|(_, value)| w16_bytes(value))
+        .collect()
+}
+
+fn w23_mcp_compute(
+    operation: u32,
+    args: &[VerificationOutboxValue],
+) -> Option<VerificationOutboxValue> {
+    use VerificationOutboxValue as V;
+    Some(match (operation, args) {
+        (0, [output, maximum]) => {
+            let (cut, truncated) = w23_mcp_cut(w16_bytes(output)?, w16_int(maximum)?)?;
+            let mut output = cut.to_vec();
+            if truncated {
+                output.extend_from_slice(b"\\n[output truncated]");
+            }
+            w16_list(vec![w16_string(&output), V::Bool(truncated)])
+        }
+        (1, [command, exit_code, duration_ms, status, output, truncated]) => {
+            w23_mcp_string_values(command)?;
+            w19_nullable_int(exit_code)?;
+            w16_int(duration_ms)?;
+            w16_bytes(status)?;
+            w16_bytes(output)?;
+            w16_bool(truncated)?;
+            w16_map(vec![
+                ("command", command.clone()),
+                ("exit_code", exit_code.clone()),
+                ("duration_ms", duration_ms.clone()),
+                ("status", status.clone()),
+                ("output", output.clone()),
+                ("truncated", truncated.clone()),
+            ])
+        }
+        (2, [identifiers]) => {
+            let mut seen = std::collections::HashSet::new();
+            w16_list(
+                w23_mcp_string_values(identifiers)?
+                    .into_iter()
+                    .filter(|value| seen.insert(*value))
+                    .map(w16_string)
+                    .collect(),
+            )
+        }
+        (3, [results]) => {
+            let mut passed = true;
+            for (_, result) in w16_entries(results)? {
+                // The original strict PHP bool return rejects non-bools.
+                if !w16_bool(result.field(b"ok")?)? {
+                    passed = false;
+                    break;
+                }
+            }
+            w16_string(if passed { b"passed" } else { b"failed" })
+        }
+        (4, [id, ok, latency_ms, impact, reason, metadata]) => {
+            w16_bytes(id)?;
+            w16_bool(ok)?;
+            w16_int(latency_ms)?;
+            if !matches!(impact, V::Null | V::Bytes(_)) {
+                return None;
+            }
+            w16_bytes(reason)?;
+            w16_entries(metadata)?;
+            w16_map(vec![
+                ("id", id.clone()),
+                ("ok", ok.clone()),
+                ("latency_ms", latency_ms.clone()),
+                ("impact", impact.clone()),
+                ("reason", reason.clone()),
+                ("metadata", metadata.clone()),
+            ])
+        }
+        (5, [paths]) => {
+            let mut paths = w23_mcp_string_values(paths)?;
+            if paths.iter().any(|path| w23_mcp_numeric_string(path)) {
+                return None;
+            }
+            paths.sort();
+            paths.dedup();
+            w16_list(paths.into_iter().map(w16_string).collect())
+        }
+        (6, [sections, maximum, schema_version]) => {
+            let sections = w23_mcp_string_values(sections)?;
+            let maximum = w16_int(maximum)?;
+            let schema_version = w16_int(schema_version)?;
+            let mut size = sections.len().saturating_sub(1).checked_mul(2)?;
+            for section in &sections {
+                size = size.checked_add(section.len())?;
+            }
+            if size > W23_MCP_MAX_BYTES {
+                return None;
+            }
+            let mut content = Vec::with_capacity(size);
+            for (i, section) in sections.into_iter().enumerate() {
+                if i > 0 {
+                    content.extend_from_slice(b"\n\n");
+                }
+                content.extend_from_slice(section);
+            }
+            let (cut, truncated) = w23_mcp_cut(&content, maximum)?;
+            let mut document = format!(
+                "<!-- schema_version: {schema_version} -->\n<!-- truncated: {} -->\n",
+                if truncated { "true" } else { "false" }
+            )
+            .into_bytes();
+            document.extend_from_slice(cut);
+            if truncated {
+                document.extend_from_slice(b"\n\n[project instructions truncated]");
+            }
+            w16_string(&document)
+        }
+        (7, [total, failed, schema_version]) => {
+            let total = w16_int(total)?;
+            let failed = w16_int(failed)?;
+            let schema_version = w16_int(schema_version)?;
+            w16_map(vec![
+                ("schema_version", V::Int(schema_version)),
+                (
+                    "summary",
+                    w16_string(
+                        format!("Completed {total} probe(s); {failed} reported unhealthy.")
+                            .as_bytes(),
+                    ),
+                ),
+                (
+                    "warnings",
+                    w16_list(if failed > 0 {
+                        vec![w16_string(
+                            b"One or more selected runtime services reported unhealthy.",
+                        )]
+                    } else {
+                        vec![]
+                    }),
+                ),
+                ("truncated", V::Bool(false)),
+            ])
+        }
+        (8, [status, result_count]) => {
+            let status = w16_bytes(status)?;
+            let result_count = w16_int(result_count)?;
+            let mut summary = b"Verification ".to_vec();
+            summary.extend_from_slice(status);
+            summary.extend_from_slice(format!(" with {result_count} result(s).").as_bytes());
+            w16_string(&summary)
+        }
+        (9, [check]) => V::Bool(
+            [
+                b"targeted".as_slice(),
+                b"phpunit",
+                b"phpstan",
+                b"pint",
+                b"php-lint",
+                b"diff",
+                b"composer",
+                b"frontend",
+            ]
+            .contains(&w16_bytes(check)?),
+        ),
+        _ => return None,
+    })
+}
+
+/// Evaluate the bounded PHP scalar/array wire protocol for MCP pure helpers.
+/// Returns -1 on decline, -required on insufficient capacity (without writes),
+/// or the positive serialized result length. No typed output pointers are used;
+/// byte buffers may start at any byte address.
+///
+/// # Safety
+/// The caller must own live disjoint readable/writable allocations covering the
+/// declared byte ranges. Pointers must be non-null even for zero-length ranges.
+/// Arithmetic checks cannot establish allocation provenance or accessibility.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w23_mcp_tool_runner(
+    operation: u32,
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > W23_MCP_MAX_BYTES
+            || capacity > W23_MCP_MAX_BYTES
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let mut parser = VerificationOutboxParser {
+            bytes,
+            pos: 0,
+            remaining: 32768,
+        };
+        // At most 64 nested arrays, irrespective of the PHP application limit.
+        let Some(value) = parser.value(448) else {
+            return -1;
+        };
+        if parser.pos != length || !w19_list(&value) || !w20_canonical(&value) {
+            return -1;
+        }
+        let mut canonical = Vec::new();
+        value.serialize(&mut canonical);
+        if canonical != bytes {
+            return -1;
+        }
+        let args: Vec<_> = w16_entries(&value)
+            .unwrap()
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect();
+        let Some(result) = w23_mcp_compute(operation, &args) else {
+            return -1;
+        };
+        let mut wire = Vec::new();
+        result.serialize(&mut wire);
+        if wire.len() > W23_MCP_MAX_BYTES {
+            return -1;
+        }
+        let Ok(needed) = i32::try_from(wire.len()) else {
+            return -1;
+        };
+        if wire.len() > capacity {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(wire.as_ptr(), output, wire.len()) };
+        needed
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod w23_mcp_tool_runner_tests {
+    use super::*;
+
+    fn wire(args: Vec<VerificationOutboxValue>) -> Vec<u8> {
+        let mut wire = Vec::new();
+        w16_list(args).serialize(&mut wire);
+        wire
+    }
+
+    fn parity(
+        operation: u32,
+        args: Vec<VerificationOutboxValue>,
+        expected: VerificationOutboxValue,
+    ) {
+        let input = wire(args);
+        let mut expected_wire = Vec::new();
+        expected.serialize(&mut expected_wire);
+        let mut output = vec![0xa5; expected_wire.len() + 9];
+        let run = |out, cap| unsafe {
+            nntmux_w23_mcp_tool_runner(operation, input.as_ptr(), input.len(), out, cap)
+        };
+        for capacity in [0, expected_wire.len() - 1] {
+            assert_eq!(
+                run(output.as_mut_ptr(), capacity),
+                -(expected_wire.len() as i32)
+            );
+            assert!(output.iter().all(|b| *b == 0xa5));
+        }
+        // Byte pointers deliberately offset by one are legal, with sentinels.
+        assert_eq!(
+            run(unsafe { output.as_mut_ptr().add(1) }, expected_wire.len()),
+            expected_wire.len() as i32
+        );
+        assert_eq!(&output[1..1 + expected_wire.len()], &expected_wire);
+        assert_eq!(output[0], 0xa5);
+        assert!(output[1 + expected_wire.len()..].iter().all(|b| *b == 0xa5));
+    }
+
+    #[test]
+    fn w23_mcp_all_operations_and_atomic_buffers() {
+        use VerificationOutboxValue as V;
+        parity(
+            0,
+            vec![w16_string("a😀b".as_bytes()), V::Int(4)],
+            w16_list(vec![w16_string(b"a\\n[output truncated]"), V::Bool(true)]),
+        );
+        parity(
+            0,
+            vec![w16_string(b"\xff\0"), V::Int(2)],
+            w16_list(vec![w16_string(b"\xff\0"), V::Bool(false)]),
+        );
+        parity(
+            1,
+            vec![
+                w16_list(vec![w16_string(b"php")]),
+                V::Null,
+                V::Int(3),
+                w16_string(b"failed"),
+                w16_string(b"\0\xff"),
+                V::Bool(false),
+            ],
+            w16_map(vec![
+                ("command", w16_list(vec![w16_string(b"php")])),
+                ("exit_code", V::Null),
+                ("duration_ms", V::Int(3)),
+                ("status", w16_string(b"failed")),
+                ("output", w16_string(b"\0\xff")),
+                ("truncated", V::Bool(false)),
+            ]),
+        );
+        parity(
+            2,
+            vec![w16_list(vec![
+                w16_string(b"01"),
+                w16_string(b"1"),
+                w16_string(b"01"),
+            ])],
+            w16_list(vec![w16_string(b"01"), w16_string(b"1")]),
+        );
+        parity(3, vec![w16_list(vec![])], w16_string(b"passed"));
+        parity(
+            3,
+            vec![w16_list(vec![w16_map(vec![("ok", V::Bool(false))])])],
+            w16_string(b"failed"),
+        );
+        parity(
+            4,
+            vec![
+                w16_string(b"disk"),
+                V::Bool(true),
+                V::Int(2),
+                V::Null,
+                w16_string(b"ok"),
+                w16_map(vec![("ratio", V::Float(b"1.25".to_vec()))]),
+            ],
+            w16_map(vec![
+                ("id", w16_string(b"disk")),
+                ("ok", V::Bool(true)),
+                ("latency_ms", V::Int(2)),
+                ("impact", V::Null),
+                ("reason", w16_string(b"ok")),
+                (
+                    "metadata",
+                    w16_map(vec![("ratio", V::Float(b"1.25".to_vec()))]),
+                ),
+            ]),
+        );
+        parity(
+            5,
+            vec![w16_list(vec![
+                w16_string(b"b"),
+                w16_string(b"a"),
+                w16_string(b"b"),
+            ])],
+            w16_list(vec![w16_string(b"a"), w16_string(b"b")]),
+        );
+        parity(6, vec![w16_list(vec![w16_string(b"a"), w16_string(b"b")]), V::Int(2), V::Int(-1)], w16_string(b"<!-- schema_version: -1 -->\n<!-- truncated: true -->\na\n\n\n[project instructions truncated]"));
+        parity(
+            7,
+            vec![V::Int(1), V::Int(1), V::Int(2)],
+            w16_map(vec![
+                ("schema_version", V::Int(2)),
+                (
+                    "summary",
+                    w16_string(b"Completed 1 probe(s); 1 reported unhealthy."),
+                ),
+                (
+                    "warnings",
+                    w16_list(vec![w16_string(
+                        b"One or more selected runtime services reported unhealthy.",
+                    )]),
+                ),
+                ("truncated", V::Bool(false)),
+            ]),
+        );
+        parity(
+            8,
+            vec![w16_string(b"\xff\0"), V::Int(i64::MIN)],
+            w16_string(b"Verification \xff\0 with -9223372036854775808 result(s)."),
+        );
+        parity(9, vec![w16_string(b"phpunit")], V::Bool(true));
+        parity(9, vec![w16_string(b"PHPUNIT")], V::Bool(false));
+    }
+
+    #[test]
+    fn w23_mcp_declines_malformed_and_unsafe_ranges() {
+        let mut out = [0xa5; 256];
+        for input in [
+            b"".as_slice(),
+            b"N;",
+            b"a:0:{}junk",
+            b"a:1:{i:00;s:1:\"a\";}",
+            b"a:1:{i:0;O:8:\"stdClass\":0:{}}",
+            b"a:1:{i:0;R:1;}",
+            b"a:1:{s:1:\"0\";N;}",
+            b"a:2:{i:0;N;i:0;N;}",
+        ] {
+            assert_eq!(
+                unsafe {
+                    nntmux_w23_mcp_tool_runner(
+                        2,
+                        input.as_ptr(),
+                        input.len(),
+                        out.as_mut_ptr(),
+                        out.len(),
+                    )
+                },
+                -1
+            );
+        }
+        let input = wire(vec![w16_string(b"diff")]);
+        let run = |op, p, n, o, cap| unsafe { nntmux_w23_mcp_tool_runner(op, p, n, o, cap) };
+        assert_eq!(
+            run(999, input.as_ptr(), input.len(), out.as_mut_ptr(), 256),
+            -1
+        );
+        assert_eq!(run(9, std::ptr::null(), 0, out.as_mut_ptr(), 256), -1);
+        assert_eq!(
+            run(9, input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+            -1
+        );
+        assert_eq!(
+            run(9, input.as_ptr(), usize::MAX, out.as_mut_ptr(), 256),
+            -1
+        );
+        assert_eq!(
+            run(9, usize::MAX as *const u8, 2, out.as_mut_ptr(), 256),
+            -1
+        );
+        assert_eq!(
+            run(9, input.as_ptr(), input.len(), usize::MAX as *mut u8, 2),
+            -1
+        );
+        assert_eq!(
+            run(9, input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+            -1
+        );
+        assert_eq!(
+            run(
+                9,
+                input.as_ptr(),
+                W23_MCP_MAX_BYTES + 1,
+                out.as_mut_ptr(),
+                256
+            ),
+            -1
+        );
+        assert_eq!(run(9, out.as_ptr(), 1, out.as_mut_ptr(), 256), -1);
+        assert!(out.iter().all(|b| *b == 0xa5));
+        for value in [b"1".as_slice(), b" .1e2 ", b"-2", b"+3.5", b"1e999"] {
+            assert!(w23_mcp_numeric_string(value));
+        }
+        for value in [b"a1".as_slice(), b"1a", b"e2", b"+", b".", b"1e"] {
+            assert!(!w23_mcp_numeric_string(value));
+        }
+    }
+}
