@@ -3474,3 +3474,1618 @@ mod collections_tests {
         }
     }
 }
+
+// ============================================================================
+// Wave 7 Slice 7.5: MCP SensitiveValueRedactor & RepositoryContextCollector
+// ============================================================================
+
+#[inline]
+fn find_byte(haystack: &[u8], byte: u8) -> Option<usize> {
+    if haystack.is_empty() {
+        return None;
+    }
+    let ptr = unsafe { crate::memchr(haystack.as_ptr(), i32::from(byte), haystack.len()) };
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { ptr.offset_from_unsigned(haystack.as_ptr()) })
+    }
+}
+
+#[inline]
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if haystack.len() < needle.len() {
+        return None;
+    }
+    let first = needle[0];
+    let max_start = haystack.len() - needle.len();
+    let mut pos = 0usize;
+    while pos <= max_start {
+        let rel = find_byte(&haystack[pos..=max_start], first)?;
+        let idx = pos + rel;
+        if &haystack[idx..idx + needle.len()] == needle {
+            return Some(idx);
+        }
+        pos = idx + 1;
+    }
+    None
+}
+
+/// Evaluates `SensitiveValueRedactor::isSensitiveKey(key)` with exact PCRE `/i` semantics:
+/// `/(?:password|passwd|token|secret|api[_-]?key|authorization|credential)/i`
+#[inline]
+pub fn mcp_is_sensitive_key_slice(key: &[u8]) -> bool {
+    if key.len() < 5 {
+        return false;
+    }
+    let mut i = 0usize;
+    while i + 5 <= key.len() {
+        let rem = &key[i..];
+        match rem[0] | 0x20 {
+            b'p' => {
+                if rem.len() >= 6 && rem[..6].eq_ignore_ascii_case(b"passwd") {
+                    return true;
+                }
+                if rem.len() >= 8 && rem[..8].eq_ignore_ascii_case(b"password") {
+                    return true;
+                }
+            }
+            b't' => {
+                if rem[..5].eq_ignore_ascii_case(b"token") {
+                    return true;
+                }
+            }
+            b's' => {
+                if rem.len() >= 6 && rem[..6].eq_ignore_ascii_case(b"secret") {
+                    return true;
+                }
+            }
+            b'a' => {
+                if rem.len() >= 6 && rem[..3].eq_ignore_ascii_case(b"api") {
+                    if rem[3..6].eq_ignore_ascii_case(b"key") {
+                        return true;
+                    }
+                    if rem.len() >= 7
+                        && matches!(rem[3], b'_' | b'-')
+                        && rem[4..7].eq_ignore_ascii_case(b"key")
+                    {
+                        return true;
+                    }
+                }
+                if rem.len() >= 13 && rem[..13].eq_ignore_ascii_case(b"authorization") {
+                    return true;
+                }
+            }
+            b'c' => {
+                if rem.len() >= 10 && rem[..10].eq_ignore_ascii_case(b"credential") {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+const SWAR_01: u64 = 0x0101_0101_0101_0101;
+const SWAR_20: u64 = 0x2020_2020_2020_2020;
+const SWAR_80: u64 = 0x8080_8080_8080_8080;
+
+#[inline(always)]
+fn swar_eq_mask(word: u64, repeated_byte: u64) -> u64 {
+    let x = word ^ repeated_byte;
+    x.wrapping_sub(SWAR_01) & !x & SWAR_80
+}
+
+#[inline]
+fn mcp_redact_pass1_pem(s: &[u8], out: &mut Vec<u8>) -> bool {
+    // `/-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?-----END [^-\r\n]*PRIVATE KEY-----/s`
+    if s.len() < 52 {
+        return false;
+    }
+    let mut matched_any = false;
+    let mut last_emit = 0usize;
+    let mut scan_pos = 0usize;
+
+    while scan_pos + 52 <= s.len() {
+        let Some(rel_b) = find_subslice(&s[scan_pos + 5..], b"BEGIN ") else {
+            break;
+        };
+        let b_pos = scan_pos + 5 + rel_b;
+        let begin_pos = b_pos - 5;
+        if &s[begin_pos..b_pos] != b"-----" {
+            scan_pos = b_pos - 4;
+            continue;
+        }
+        let label_start = begin_pos + 11;
+        let mut k = label_start;
+        while k < s.len() && !matches!(s[k], b'-' | b'\r' | b'\n') {
+            k += 1;
+        }
+        if k < label_start + 11
+            || &s[k - 11..k] != b"PRIVATE KEY"
+            || !s[k..].starts_with(b"-----")
+        {
+            scan_pos = label_start;
+            continue;
+        }
+
+        let body_start = k + 5;
+        let mut end_search = body_start;
+        let mut matched_end: Option<usize> = None;
+        while end_search + 25 <= s.len() {
+            let Some(rel_end_e) = find_subslice(&s[end_search + 5..], b"END ") else {
+                break;
+            };
+            let e_pos = end_search + 5 + rel_end_e;
+            let end_pos = e_pos - 5;
+            if &s[end_pos..e_pos] != b"-----" {
+                end_search = e_pos - 4;
+                continue;
+            }
+            let end_label_start = end_pos + 9;
+            let mut m = end_label_start;
+            while m < s.len() && !matches!(s[m], b'-' | b'\r' | b'\n') {
+                m += 1;
+            }
+            if m >= end_label_start + 11
+                && &s[m - 11..m] == b"PRIVATE KEY"
+                && s[m..].starts_with(b"-----")
+            {
+                matched_end = Some(m + 5);
+                break;
+            }
+            end_search = end_label_start;
+        }
+
+        let Some(block_end) = matched_end else {
+            break;
+        };
+
+        if !matched_any {
+            matched_any = true;
+            out.clear();
+            out.reserve(s.len());
+        }
+        out.extend_from_slice(&s[last_emit..begin_pos]);
+        out.extend_from_slice(b"[REDACTED PRIVATE KEY]");
+        last_emit = block_end;
+        scan_pos = block_end;
+    }
+
+    if matched_any {
+        out.extend_from_slice(&s[last_emit..]);
+    }
+    matched_any
+}
+
+#[inline]
+fn is_bearer_token_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'+' | b'/' | b'-')
+}
+
+#[inline]
+fn mcp_redact_pass2_bearer(s: &[u8], out: &mut Vec<u8>) -> bool {
+    // `/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/i`
+    if s.len() < 8 {
+        return false;
+    }
+    let mut matched_any = false;
+    let mut last_emit = 0usize;
+    let max_start = s.len() - 8;
+    let mut i = 0usize;
+
+    while i + 8 <= max_start + 1 {
+        let w0 = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+        let mb = swar_eq_mask(w0 | SWAR_20, 0x6262_6262_6262_6262);
+        if mb == 0 {
+            i += 8;
+            continue;
+        }
+        let w5 = u64::from_le_bytes(s[i + 5..i + 13].try_into().unwrap());
+        let mr = swar_eq_mask(w5 | SWAR_20, 0x7272_7272_7272_7272);
+        let mut hits = mb & mr;
+        if hits == 0 {
+            i += 8;
+            continue;
+        }
+        let base = i;
+        let mut jumped = false;
+        while hits != 0 {
+            let lane = (hits.trailing_zeros() >> 3) as usize;
+            hits &= hits - 1;
+            let idx = base + lane;
+            if is_pcre_space(s[idx + 6])
+                && (idx == 0 || !is_pcre_word(s[idx - 1]))
+                && s[idx..idx + 6].eq_ignore_ascii_case(b"bearer")
+            {
+                let mut p = idx + 7;
+                while p < s.len() && is_pcre_space(s[p]) {
+                    p += 1;
+                }
+                let tok_start = p;
+                while p < s.len() && is_bearer_token_char(s[p]) {
+                    p += 1;
+                }
+                if p > tok_start {
+                    while p < s.len() && s[p] == b'=' {
+                        p += 1;
+                    }
+                    if !matched_any {
+                        matched_any = true;
+                        out.clear();
+                        out.reserve(s.len());
+                    }
+                    out.extend_from_slice(&s[last_emit..idx]);
+                    out.extend_from_slice(b"Bearer [REDACTED]");
+                    last_emit = p;
+                    i = p;
+                    jumped = true;
+                    break;
+                }
+            }
+        }
+        if !jumped {
+            i = base + 8;
+        }
+    }
+
+    while i <= max_start {
+        if matches!(s[i], b'B' | b'b')
+            && is_pcre_space(s[i + 6])
+            && (i == 0 || !is_pcre_word(s[i - 1]))
+            && s[i..i + 6].eq_ignore_ascii_case(b"bearer")
+        {
+            let mut p = i + 7;
+            while p < s.len() && is_pcre_space(s[p]) {
+                p += 1;
+            }
+            let tok_start = p;
+            while p < s.len() && is_bearer_token_char(s[p]) {
+                p += 1;
+            }
+            if p > tok_start {
+                while p < s.len() && s[p] == b'=' {
+                    p += 1;
+                }
+                if !matched_any {
+                    matched_any = true;
+                    out.clear();
+                    out.reserve(s.len());
+                }
+                out.extend_from_slice(&s[last_emit..i]);
+                out.extend_from_slice(b"Bearer [REDACTED]");
+                last_emit = p;
+                i = p;
+                continue;
+            }
+            i += 6;
+            continue;
+        }
+        i += 1;
+    }
+
+    if matched_any {
+        out.extend_from_slice(&s[last_emit..]);
+    }
+    matched_any
+}
+
+#[inline]
+fn is_scheme_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-')
+}
+
+#[inline]
+fn mcp_redact_pass3_url(s: &[u8], out: &mut Vec<u8>) -> bool {
+    // `#\b([a-z][a-z0-9+.-]*://)[^\s/:@]+:[^\s/@]+@#i`
+    if s.len() < 8 {
+        return false;
+    }
+    let mut matched_any = false;
+    let mut last_emit = 0usize;
+    let mut scan_pos = 1usize;
+
+    while scan_pos + 6 <= s.len() {
+        let Some(rel_colon) = find_subslice(&s[scan_pos..], b"://") else {
+            break;
+        };
+        let colon_pos = scan_pos + rel_colon;
+        let scheme_end = colon_pos + 3;
+
+        let mut sc = colon_pos;
+        while sc > last_emit && is_scheme_char(s[sc - 1]) {
+            sc -= 1;
+        }
+        let mut valid_scheme = false;
+        let mut k = sc;
+        while k < colon_pos {
+            if s[k].is_ascii_alphabetic() && (k == 0 || !is_pcre_word(s[k - 1])) {
+                valid_scheme = true;
+                break;
+            }
+            k += 1;
+        }
+
+        if valid_scheme {
+            let mut u_end = scheme_end;
+            while u_end < s.len()
+                && !is_pcre_space(s[u_end])
+                && !matches!(s[u_end], b'/' | b':' | b'@')
+            {
+                u_end += 1;
+            }
+            if u_end > scheme_end && s.get(u_end) == Some(&b':') {
+                let pw_start = u_end + 1;
+                let mut pw_end = pw_start;
+                while pw_end < s.len()
+                    && !is_pcre_space(s[pw_end])
+                    && !matches!(s[pw_end], b'/' | b'@')
+                {
+                    pw_end += 1;
+                }
+                if pw_end > pw_start && s.get(pw_end) == Some(&b'@') {
+                    let match_end = pw_end + 1;
+                    if !matched_any {
+                        matched_any = true;
+                        out.clear();
+                        out.reserve(s.len());
+                    }
+                    out.extend_from_slice(&s[last_emit..scheme_end]);
+                    out.extend_from_slice(b"[REDACTED]@");
+                    last_emit = match_end;
+                    scan_pos = match_end + 1;
+                    continue;
+                }
+            }
+        }
+        scan_pos = scheme_end;
+    }
+
+    if matched_any {
+        out.extend_from_slice(&s[last_emit..]);
+    }
+    matched_any
+}
+
+#[inline]
+fn is_pass4_val_byte(b: u8) -> bool {
+    !is_pcre_space(b) && !matches!(b, b',' | b'"' | b'\'' | b'}')
+}
+
+#[inline]
+fn ends_with_pass4_keyword_at_boundary(s: &[u8], min_start: usize, kw_end: usize) -> bool {
+    // `(password|passwd|token|secret|api[_-]?key|authorization)` with `\b` before keyword
+    if kw_end < min_start + 5 {
+        return false;
+    }
+    let last_lower = s[kw_end - 1] | 0x20;
+    if !matches!(last_lower, b'd' | b'n' | b't' | b'y') {
+        return false;
+    }
+    let slice = &s[..kw_end];
+    let kw_len = match last_lower {
+        b'd' => {
+            if kw_end >= min_start + 8 && slice[kw_end - 8..].eq_ignore_ascii_case(b"password") {
+                8
+            } else if kw_end >= min_start + 6 && slice[kw_end - 6..].eq_ignore_ascii_case(b"passwd")
+            {
+                6
+            } else {
+                return false;
+            }
+        }
+        b'n' => {
+            if kw_end >= min_start + 5 && slice[kw_end - 5..].eq_ignore_ascii_case(b"token") {
+                5
+            } else if kw_end >= min_start + 13
+                && slice[kw_end - 13..].eq_ignore_ascii_case(b"authorization")
+            {
+                13
+            } else {
+                return false;
+            }
+        }
+        b't' => {
+            if kw_end >= min_start + 6 && slice[kw_end - 6..].eq_ignore_ascii_case(b"secret") {
+                6
+            } else {
+                return false;
+            }
+        }
+        b'y' => {
+            if kw_end >= min_start + 6 && slice[kw_end - 3..].eq_ignore_ascii_case(b"key") {
+                if slice[kw_end - 6..kw_end - 3].eq_ignore_ascii_case(b"api") {
+                    6
+                } else if kw_end >= min_start + 7
+                    && matches!(slice[kw_end - 4], b'_' | b'-')
+                    && slice[kw_end - 7..kw_end - 4].eq_ignore_ascii_case(b"api")
+                {
+                    7
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        _ => return false,
+    };
+
+    let kw_start = kw_end - kw_len;
+    kw_start == 0 || !is_pcre_word(s[kw_start - 1])
+}
+
+#[inline]
+fn try_redact_pass4_at(
+    s: &[u8],
+    op_pos: usize,
+    last_emit: &mut usize,
+    matched_any: &mut bool,
+    out: &mut Vec<u8>,
+) -> Option<usize> {
+    let b = s[op_pos];
+    if b != b'=' && b != b':' {
+        return None;
+    }
+    let prev = s[op_pos - 1];
+    if !is_pcre_space(prev)
+        && !matches!(prev, b'"' | b'\'')
+        && !matches!(prev | 0x20, b'd' | b'n' | b't' | b'y')
+    {
+        return None;
+    }
+
+    // Walk backwards from `op_pos` over `\s*["\']?\s*`
+    let mut p = op_pos;
+    while p > *last_emit && is_pcre_space(s[p - 1]) {
+        p -= 1;
+    }
+    if p > *last_emit && matches!(s[p - 1], b'"' | b'\'') {
+        p -= 1;
+    }
+    while p > *last_emit && is_pcre_space(s[p - 1]) {
+        p -= 1;
+    }
+
+    if !ends_with_pass4_keyword_at_boundary(s, *last_emit, p) {
+        return None;
+    }
+
+    if b == b'=' && s.get(op_pos + 1) == Some(&b'>') {
+        let mut q = op_pos + 2;
+        while q < s.len() && is_pcre_space(s[q]) {
+            q += 1;
+        }
+        if q < s.len() && matches!(s[q], b'"' | b'\'') {
+            q += 1;
+        }
+        if q < s.len() && is_pass4_val_byte(s[q]) {
+            let mut val_end = q + 1;
+            while val_end < s.len() && is_pass4_val_byte(s[val_end]) {
+                val_end += 1;
+            }
+            if !*matched_any {
+                *matched_any = true;
+                out.clear();
+                out.reserve(s.len());
+            }
+            out.extend_from_slice(&s[*last_emit..q]);
+            out.extend_from_slice(b"[REDACTED]");
+            *last_emit = val_end;
+            return Some(val_end + 5);
+        }
+        // Backtrack `(?:=>|=|:)` from `=>` to `=`: `>` at `op_pos + 1` becomes `$3`
+        let q = op_pos + 1;
+        let mut val_end = op_pos + 2;
+        while val_end < s.len() && is_pass4_val_byte(s[val_end]) {
+            val_end += 1;
+        }
+        if !*matched_any {
+            *matched_any = true;
+            out.clear();
+            out.reserve(s.len());
+        }
+        out.extend_from_slice(&s[*last_emit..q]);
+        out.extend_from_slice(b"[REDACTED]");
+        *last_emit = val_end;
+        return Some(val_end + 5);
+    }
+
+    let mut q = op_pos + 1;
+    while q < s.len() && is_pcre_space(s[q]) {
+        q += 1;
+    }
+    if q < s.len() && matches!(s[q], b'"' | b'\'') {
+        q += 1;
+    }
+    if q < s.len() && is_pass4_val_byte(s[q]) {
+        let mut val_end = q + 1;
+        while val_end < s.len() && is_pass4_val_byte(s[val_end]) {
+            val_end += 1;
+        }
+        if !*matched_any {
+            *matched_any = true;
+            out.clear();
+            out.reserve(s.len());
+        }
+        out.extend_from_slice(&s[*last_emit..q]);
+        out.extend_from_slice(b"[REDACTED]");
+        *last_emit = val_end;
+        return Some(val_end + 5);
+    }
+
+    None
+}
+
+#[inline]
+fn mcp_redact_pass4_kv(s: &[u8], out: &mut Vec<u8>) -> bool {
+    // `/\b(password|passwd|token|secret|api[_-]?key|authorization)(\s*["\']?\s*(?:=>|=|:)\s*["\']?)([^\s,"\'}]+)/i`
+    if s.len() < 7 {
+        return false;
+    }
+    let mut matched_any = false;
+    let mut last_emit = 0usize;
+    let mut op_pos = 5usize;
+    let limit = s.len() - 1;
+
+    while op_pos + 8 <= limit {
+        let w = u64::from_le_bytes(s[op_pos..op_pos + 8].try_into().unwrap());
+        let mut hits = swar_eq_mask(w, 0x3D3D_3D3D_3D3D_3D3D)
+            | swar_eq_mask(w, 0x3A3A_3A3A_3A3A_3A3A);
+        if hits == 0 {
+            op_pos += 8;
+            continue;
+        }
+        let base = op_pos;
+        let mut jumped = false;
+        while hits != 0 {
+            let lane = (hits.trailing_zeros() >> 3) as usize;
+            hits &= hits - 1;
+            let idx = base + lane;
+            if let Some(next_pos) =
+                try_redact_pass4_at(s, idx, &mut last_emit, &mut matched_any, out)
+            {
+                op_pos = next_pos;
+                jumped = true;
+                break;
+            }
+        }
+        if !jumped {
+            op_pos = base + 8;
+        }
+    }
+
+    while op_pos < limit {
+        if let Some(next_pos) =
+            try_redact_pass4_at(s, op_pos, &mut last_emit, &mut matched_any, out)
+        {
+            op_pos = next_pos;
+        } else {
+            op_pos += 1;
+        }
+    }
+
+    if matched_any {
+        out.extend_from_slice(&s[last_emit..]);
+    }
+    matched_any
+}
+
+#[inline]
+fn ends_with_pass5_env_suffix(after_first_char: &[u8]) -> bool {
+    let Some(&last) = after_first_char.last() else {
+        return false;
+    };
+    if !matches!(last, b'Y' | b'N' | b'T' | b'D') {
+        return false;
+    }
+    after_first_char.ends_with(b"KEY")
+        || after_first_char.ends_with(b"TOKEN")
+        || after_first_char.ends_with(b"SECRET")
+        || after_first_char.ends_with(b"PASSWORD")
+        || after_first_char.ends_with(b"PASSWD")
+}
+
+#[inline]
+fn mcp_redact_pass5_env(s: &[u8], out: &mut Vec<u8>) -> bool {
+    // `/\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD))=([^\s]+)/`
+    if s.len() < 6 {
+        return false;
+    }
+    let mut matched_any = false;
+    let mut last_emit = 0usize;
+    let mut eq_pos = 4usize;
+    let limit = s.len() - 1;
+
+    while eq_pos + 8 <= limit {
+        let w = u64::from_le_bytes(s[eq_pos..eq_pos + 8].try_into().unwrap());
+        let mut hits = swar_eq_mask(w, 0x3D3D_3D3D_3D3D_3D3D);
+        if hits == 0 {
+            eq_pos += 8;
+            continue;
+        }
+        let base = eq_pos;
+        let mut jumped = false;
+        while hits != 0 {
+            let lane = (hits.trailing_zeros() >> 3) as usize;
+            hits &= hits - 1;
+            let idx = base + lane;
+            if s[idx] == b'='
+                && matches!(s[idx - 1], b'Y' | b'N' | b'T' | b'D')
+                && !is_pcre_space(s[idx + 1])
+            {
+                let mut k = idx;
+                while k > last_emit
+                    && (s[k - 1].is_ascii_uppercase()
+                        || s[k - 1].is_ascii_digit()
+                        || s[k - 1] == b'_')
+                {
+                    k -= 1;
+                }
+                if idx >= k + 4
+                    && s[k].is_ascii_uppercase()
+                    && (k == 0 || !is_pcre_word(s[k - 1]))
+                    && ends_with_pass5_env_suffix(&s[k + 1..idx])
+                {
+                    let eq_after = idx + 1;
+                    let mut val_end = eq_after + 1;
+                    while val_end < s.len() && !is_pcre_space(s[val_end]) {
+                        val_end += 1;
+                    }
+                    if !matched_any {
+                        matched_any = true;
+                        out.clear();
+                        out.reserve(s.len());
+                    }
+                    out.extend_from_slice(&s[last_emit..eq_after]);
+                    out.extend_from_slice(b"[REDACTED]");
+                    last_emit = val_end;
+                    eq_pos = val_end + 4;
+                    jumped = true;
+                    break;
+                }
+            }
+        }
+        if !jumped {
+            eq_pos = base + 8;
+        }
+    }
+
+    while eq_pos < limit {
+        if s[eq_pos] == b'='
+            && matches!(s[eq_pos - 1], b'Y' | b'N' | b'T' | b'D')
+            && !is_pcre_space(s[eq_pos + 1])
+        {
+            let mut k = eq_pos;
+            while k > last_emit
+                && (s[k - 1].is_ascii_uppercase() || s[k - 1].is_ascii_digit() || s[k - 1] == b'_')
+            {
+                k -= 1;
+            }
+            if eq_pos >= k + 4
+                && s[k].is_ascii_uppercase()
+                && (k == 0 || !is_pcre_word(s[k - 1]))
+                && ends_with_pass5_env_suffix(&s[k + 1..eq_pos])
+            {
+                let eq_after = eq_pos + 1;
+                let mut val_end = eq_after + 1;
+                while val_end < s.len() && !is_pcre_space(s[val_end]) {
+                    val_end += 1;
+                }
+                if !matched_any {
+                    matched_any = true;
+                    out.clear();
+                    out.reserve(s.len());
+                }
+                out.extend_from_slice(&s[last_emit..eq_after]);
+                out.extend_from_slice(b"[REDACTED]");
+                last_emit = val_end;
+                eq_pos = val_end + 4;
+                continue;
+            }
+        }
+        eq_pos += 1;
+    }
+
+    if matched_any {
+        out.extend_from_slice(&s[last_emit..]);
+    }
+    matched_any
+}
+
+/// Evaluates `SensitiveValueRedactor::redact(value)`.
+/// Returns `None` if `value` is unchanged (fast path with zero heap allocations).
+pub fn mcp_redact_bytes(input: &[u8]) -> Option<Vec<u8>> {
+    if input.len() < 6 {
+        return None;
+    }
+
+    let mut buf_a = Vec::new();
+    let mut buf_b = Vec::new();
+    let mut state = 0u8; // 0 = input, 1 = buf_a, 2 = buf_b
+
+    if mcp_redact_pass1_pem(input, &mut buf_a) {
+        state = 1;
+    }
+
+    {
+        let (src, dst) = match state {
+            0 => (input, &mut buf_a),
+            1 => (buf_a.as_slice(), &mut buf_b),
+            _ => (buf_b.as_slice(), &mut buf_a),
+        };
+        if mcp_redact_pass2_bearer(src, dst) {
+            state = if state == 1 { 2 } else { 1 };
+        }
+    }
+
+    {
+        let (src, dst) = match state {
+            0 => (input, &mut buf_a),
+            1 => (buf_a.as_slice(), &mut buf_b),
+            _ => (buf_b.as_slice(), &mut buf_a),
+        };
+        if mcp_redact_pass3_url(src, dst) {
+            state = if state == 1 { 2 } else { 1 };
+        }
+    }
+
+    {
+        let (src, dst) = match state {
+            0 => (input, &mut buf_a),
+            1 => (buf_a.as_slice(), &mut buf_b),
+            _ => (buf_b.as_slice(), &mut buf_a),
+        };
+        if mcp_redact_pass4_kv(src, dst) {
+            state = if state == 1 { 2 } else { 1 };
+        }
+    }
+
+    {
+        let (src, dst) = match state {
+            0 => (input, &mut buf_a),
+            1 => (buf_a.as_slice(), &mut buf_b),
+            _ => (buf_b.as_slice(), &mut buf_a),
+        };
+        if mcp_redact_pass5_env(src, dst) {
+            state = if state == 1 { 2 } else { 1 };
+        }
+    }
+
+    match state {
+        0 => None,
+        1 => Some(buf_a),
+        _ => Some(buf_b),
+    }
+}
+
+/// C-ABI export for `SensitiveValueRedactor::redact(value)`.
+///
+/// Returns:
+/// - `0` when `input` requires no redaction (caller returns original string without copying/allocating)
+/// - `> 0` bytes written to `out_buf` when redaction occurred
+/// - `< -1` (`-(required_len as isize)`) when `out_cap` is insufficient
+/// - `-1` on invalid arguments
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_mcp_redact_string(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input.is_null() && input_len > 0 {
+        return -1;
+    }
+    if input_len == 0 {
+        return 0;
+    }
+    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+    let Some(redacted) = mcp_redact_bytes(bytes) else {
+        return 0;
+    };
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+    out.extend(&redacted);
+    out.finish()
+}
+
+/// C-ABI export for `SensitiveValueRedactor::isSensitiveKey(key)`.
+///
+/// Returns `1` if sensitive, `0` if not sensitive, or `-1` on invalid arguments.
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_mcp_is_sensitive_key(
+    input: *const u8,
+    input_len: usize,
+) -> i32 {
+    if input.is_null() && input_len > 0 {
+        return -1;
+    }
+    if input_len < 5 {
+        return 0;
+    }
+    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+    i32::from(mcp_is_sensitive_key_slice(bytes))
+}
+
+#[inline]
+fn is_pcre_r_single_byte(b: u8) -> bool {
+    matches!(b, b'\n' | 0x0B | 0x0C | b'\r' | 0x85)
+}
+
+/// Splits `bytes` using PCRE `/\R/` byte-mode semantics (`\r\n` or `[\n\x0b\x0c\r\x85]`),
+/// invoking `f(line)` for each line until `f` returns `false`.
+#[inline]
+fn for_each_pcre_r_line(bytes: &[u8], mut f: impl FnMut(&[u8]) -> bool) {
+    if find_byte(bytes, b'\r').is_none()
+        && find_byte(bytes, 0x0B).is_none()
+        && find_byte(bytes, 0x0C).is_none()
+        && find_byte(bytes, 0x85).is_none()
+    {
+        let mut start = 0usize;
+        while let Some(rel) = find_byte(&bytes[start..], b'\n') {
+            let end = start + rel;
+            if !f(&bytes[start..end]) {
+                return;
+            }
+            start = end + 1;
+        }
+        let _ = f(&bytes[start..]);
+        return;
+    }
+
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if is_pcre_r_single_byte(bytes[i]) {
+            if !f(&bytes[start..i]) {
+                return;
+            }
+            if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    let _ = f(&bytes[start..]);
+}
+
+/// C-ABI export for `RepositoryContextCollector::search()` ripgrep line parsing + excerpt redaction.
+///
+/// Parses up to `max_results` lines matching `/^([^:]+):(\d+):(.*)$/` from `input[..input_len]`
+/// split on `/\R/`, trims `$3` with PHP `trim()` semantics, redacts sensitive values, and writes
+/// `path:line:redacted_excerpt` records separated by `\n` into `out_buf`.
+///
+/// Returns `0` when 0 lines matched, `> 0` bytes written, `< -1` when `out_cap` is too small,
+/// or `-1` on invalid arguments.
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_mcp_parse_and_redact_rg_output(
+    input: *const u8,
+    input_len: usize,
+    max_results: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input.is_null() && input_len > 0 {
+        return -1;
+    }
+    if input_len == 0 || max_results == 0 {
+        return 0;
+    }
+    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+    let mut count = 0usize;
+
+    for_each_pcre_r_line(bytes, |line| {
+        if line.len() < 4 {
+            return true;
+        }
+        let Some(colon1) = find_byte(line, b':') else {
+            return true;
+        };
+        if colon1 == 0 || colon1 + 2 >= line.len() {
+            return true;
+        }
+        let after_colon1 = &line[colon1 + 1..];
+        let Some(rel_colon2) = find_byte(after_colon1, b':') else {
+            return true;
+        };
+        if rel_colon2 == 0 {
+            return true;
+        }
+        let digits = &after_colon1[..rel_colon2];
+        if !digits.iter().all(u8::is_ascii_digit) {
+            return true;
+        }
+        let path = &line[..colon1];
+        let excerpt = php_trim_ascii(&after_colon1[rel_colon2 + 1..]);
+
+        if count > 0 {
+            out.push(b'\n');
+        }
+        out.extend(path);
+        out.push(b':');
+        out.extend(digits);
+        out.push(b':');
+        if let Some(redacted) = mcp_redact_bytes(excerpt) {
+            out.extend(&redacted);
+        } else {
+            out.extend(excerpt);
+        }
+        count += 1;
+        count < max_results
+    });
+
+    out.finish()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GlobToken {
+    Literal(u8),
+    AnyExceptSlash,
+    AnyExceptLf,
+}
+
+#[inline]
+fn epsilon_close_glob(state: &mut [bool], tokens: &[GlobToken]) {
+    for (k, &tok) in tokens.iter().enumerate() {
+        if state[k] && matches!(tok, GlobToken::AnyExceptSlash | GlobToken::AnyExceptLf) {
+            state[k + 1] = true;
+        }
+    }
+}
+
+#[inline]
+fn run_glob_nfa(tokens: &[GlobToken], path: &[u8], curr: &mut [bool], next: &mut [bool]) -> bool {
+    let n = tokens.len();
+    curr.fill(false);
+    curr[0] = true;
+    epsilon_close_glob(curr, tokens);
+
+    for (idx, &b) in path.iter().enumerate() {
+        if idx + 1 == path.len() && b == b'\n' && curr[n] {
+            return true;
+        }
+        next.fill(false);
+        for k in 0..n {
+            if curr[k] {
+                match tokens[k] {
+                    GlobToken::Literal(c) => {
+                        if b == c {
+                            next[k + 1] = true;
+                        }
+                    }
+                    GlobToken::AnyExceptSlash => {
+                        if b != b'/' {
+                            next[k] = true;
+                        }
+                    }
+                    GlobToken::AnyExceptLf => {
+                        if b != b'\n' {
+                            next[k] = true;
+                        }
+                    }
+                }
+            }
+        }
+        epsilon_close_glob(next, tokens);
+        curr.copy_from_slice(next);
+        if !curr.iter().any(|&v| v) {
+            return false;
+        }
+    }
+
+    curr[n]
+}
+
+/// Evaluates `RepositoryContextCollector::globMatches(glob, path)` with exact PCRE semantics.
+pub fn mcp_glob_matches_slice(glob: &[u8], path: &[u8]) -> bool {
+    if glob == b"**" {
+        return true;
+    }
+
+    // Fast path when `path` contains no `\n`: strip literal prefix before first `*`
+    // and literal suffix after last `*`, then evaluate only `(mid_glob, mid_path)`.
+    let (eval_glob, eval_path) = if find_byte(path, b'\n').is_none() {
+        let Some(first_star) = find_byte(glob, b'*') else {
+            return glob == path;
+        };
+        if !path.starts_with(&glob[..first_star]) {
+            return false;
+        }
+        let last_star = glob.iter().rposition(|&b| b == b'*').unwrap_or(first_star);
+        let suffix = &glob[last_star + 1..];
+        if path.len() < first_star + suffix.len() || !path.ends_with(suffix) {
+            return false;
+        }
+        let mid_glob = &glob[first_star..=last_star];
+        let mid_path = &path[first_star..path.len() - suffix.len()];
+        if mid_glob == b"*" {
+            return find_byte(mid_path, b'/').is_none();
+        }
+        if mid_glob == b"**" {
+            return true;
+        }
+        if mid_glob == b"**/*" {
+            return find_byte(mid_path, b'/').is_some();
+        }
+        (mid_glob, mid_path)
+    } else {
+        (glob, path)
+    };
+
+    if eval_glob.len() <= 62 {
+        let mut tok_buf = [GlobToken::Literal(0); 62];
+        let mut n = 0usize;
+        let mut star_mask = 0u64;
+        let mut slash_star_mask = 0u64;
+        let mut lf_star_mask = 0u64;
+        let mut i = 0usize;
+        while i < eval_glob.len() {
+            if eval_glob[i..].starts_with(b"**") {
+                if n == 0 || tok_buf[n - 1] != GlobToken::AnyExceptLf {
+                    tok_buf[n] = GlobToken::AnyExceptLf;
+                    let bit = 1u64 << n;
+                    star_mask |= bit;
+                    lf_star_mask |= bit;
+                    n += 1;
+                }
+                i += 2;
+            } else if eval_glob[i] == b'*' {
+                if n == 0 || tok_buf[n - 1] != GlobToken::AnyExceptSlash {
+                    tok_buf[n] = GlobToken::AnyExceptSlash;
+                    let bit = 1u64 << n;
+                    star_mask |= bit;
+                    slash_star_mask |= bit;
+                    n += 1;
+                }
+                i += 1;
+            } else {
+                tok_buf[n] = GlobToken::Literal(eval_glob[i]);
+                n += 1;
+                i += 1;
+            }
+        }
+
+        let goal_bit = 1u64 << n;
+        let mut state = 1u64;
+        state |= (state & star_mask) << 1;
+        state |= (state & star_mask) << 1;
+
+        for (idx, &b) in eval_path.iter().enumerate() {
+            if idx + 1 == eval_path.len() && b == b'\n' && (state & goal_bit) != 0 {
+                return true;
+            }
+            let mut next = 0u64;
+            if b != b'/' {
+                next |= state & slash_star_mask;
+            }
+            if b != b'\n' {
+                next |= state & lf_star_mask;
+            }
+            let mut lit_states = state & !star_mask & (goal_bit - 1);
+            while lit_states != 0 {
+                let k = lit_states.trailing_zeros() as usize;
+                if tok_buf[k] == GlobToken::Literal(b) {
+                    next |= 1u64 << (k + 1);
+                }
+                lit_states &= lit_states - 1;
+            }
+            next |= (next & star_mask) << 1;
+            next |= (next & star_mask) << 1;
+            state = next;
+            if state == 0 {
+                return false;
+            }
+        }
+
+        return (state & goal_bit) != 0;
+    }
+
+    if eval_glob.len() <= 256 {
+        let mut tok_buf = [GlobToken::Literal(0); 256];
+        let mut n = 0usize;
+        let mut i = 0usize;
+        while i < eval_glob.len() {
+            if eval_glob[i..].starts_with(b"**") {
+                if n == 0 || tok_buf[n - 1] != GlobToken::AnyExceptLf {
+                    tok_buf[n] = GlobToken::AnyExceptLf;
+                    n += 1;
+                }
+                i += 2;
+            } else if eval_glob[i] == b'*' {
+                if n == 0 || tok_buf[n - 1] != GlobToken::AnyExceptSlash {
+                    tok_buf[n] = GlobToken::AnyExceptSlash;
+                    n += 1;
+                }
+                i += 1;
+            } else {
+                tok_buf[n] = GlobToken::Literal(eval_glob[i]);
+                n += 1;
+                i += 1;
+            }
+        }
+        let mut curr_buf = [false; 257];
+        let mut next_buf = [false; 257];
+        return run_glob_nfa(
+            &tok_buf[..n],
+            eval_path,
+            &mut curr_buf[..=n],
+            &mut next_buf[..=n],
+        );
+    }
+
+    let mut tokens = Vec::with_capacity(eval_glob.len());
+    let mut i = 0usize;
+    while i < eval_glob.len() {
+        if eval_glob[i..].starts_with(b"**") {
+            if tokens.last() != Some(&GlobToken::AnyExceptLf) {
+                tokens.push(GlobToken::AnyExceptLf);
+            }
+            i += 2;
+        } else if eval_glob[i] == b'*' {
+            if tokens.last() != Some(&GlobToken::AnyExceptSlash) {
+                tokens.push(GlobToken::AnyExceptSlash);
+            }
+            i += 1;
+        } else {
+            tokens.push(GlobToken::Literal(eval_glob[i]));
+            i += 1;
+        }
+    }
+
+    let n = tokens.len();
+    let mut curr = vec![false; n + 1];
+    let mut next = vec![false; n + 1];
+    run_glob_nfa(&tokens, eval_path, &mut curr, &mut next)
+}
+
+/// C-ABI export for `RepositoryContextCollector::globMatches(glob, path)`.
+///
+/// Returns `1` on match, `0` on non-match, or `-1` on invalid arguments.
+///
+/// # Safety
+///
+/// `glob` and `path` must be valid for reads of their respective lengths when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_mcp_glob_matches(
+    glob: *const u8,
+    glob_len: usize,
+    path: *const u8,
+    path_len: usize,
+) -> i32 {
+    if (glob.is_null() && glob_len > 0) || (path.is_null() && path_len > 0) {
+        return -1;
+    }
+    let glob_bytes: &[u8] = if glob_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(glob, glob_len) }
+    };
+    let path_bytes: &[u8] = if path_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(path, path_len) }
+    };
+    i32::from(mcp_glob_matches_slice(glob_bytes, path_bytes))
+}
+
+/// C-ABI export for `RepositoryContextCollector::configurationKeys` regex extraction:
+/// `/\b(?:config|env)\(\s*["\']([^"\']+)["\']/`
+///
+/// Writes all matched `$1` configuration/env keys separated by `\n` into `out_buf`.
+/// Returns `0` when no keys matched, `> 0` bytes written, `-2` when declined (key contains `\n`),
+/// `< -2` when `out_cap` is too small, or `-1` on invalid arguments.
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_mcp_extract_config_keys(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input.is_null() && input_len > 0 {
+        return -1;
+    }
+    if input_len < 7 {
+        return 0;
+    }
+    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+    let mut paren_pos = 3usize;
+    let end_limit = bytes.len() - 3;
+    let mut first = true;
+
+    while paren_pos + 32 <= end_limit {
+        let chunk: &[u8; 32] = bytes[paren_pos..paren_pos + 32].try_into().unwrap();
+        let prev_chunk: &[u8; 32] = bytes[paren_pos - 1..paren_pos + 31].try_into().unwrap();
+        let mut any = 0u8;
+        for k in 0..32 {
+            let is_paren = u8::from(chunk[k] == b'(');
+            let is_gv = u8::from(prev_chunk[k] == b'g') | u8::from(prev_chunk[k] == b'v');
+            any |= is_paren & is_gv;
+        }
+        if any == 0 {
+            paren_pos += 32;
+            continue;
+        }
+        let chunk_end = paren_pos + 32;
+        while paren_pos < chunk_end && paren_pos < end_limit {
+            if bytes[paren_pos] != b'(' {
+                paren_pos += 1;
+                continue;
+            }
+            let prev = bytes[paren_pos - 1];
+            if prev != b'g' && prev != b'v' {
+                paren_pos += 1;
+                continue;
+            }
+            let kw_ok = if prev == b'g' {
+                paren_pos >= 6
+                    && &bytes[paren_pos - 6..paren_pos] == b"config"
+                    && (paren_pos == 6 || !is_pcre_word(bytes[paren_pos - 7]))
+            } else {
+                &bytes[paren_pos - 3..paren_pos] == b"env"
+                    && (paren_pos == 3 || !is_pcre_word(bytes[paren_pos - 4]))
+            };
+
+            if !kw_ok {
+                paren_pos += 1;
+                continue;
+            }
+
+            let mut p = paren_pos + 1;
+            while p < bytes.len() && is_pcre_space(bytes[p]) {
+                p += 1;
+            }
+            if p >= bytes.len() || !matches!(bytes[p], b'"' | b'\'') {
+                paren_pos += 1;
+                continue;
+            }
+
+            let key_start = p + 1;
+            let mut q = key_start;
+            let mut has_lf = false;
+            while q < bytes.len() && !matches!(bytes[q], b'"' | b'\'') {
+                if bytes[q] == b'\n' {
+                    has_lf = true;
+                }
+                q += 1;
+            }
+            if q >= bytes.len() {
+                let res = out.finish();
+                return if res == -1 { -2 } else { res };
+            }
+            if q == key_start {
+                paren_pos = q + 1;
+                continue;
+            }
+            if has_lf {
+                return -2;
+            }
+
+            let key_slice = &bytes[key_start..q];
+            if !first {
+                out.push(b'\n');
+            }
+            first = false;
+            out.extend(key_slice);
+            paren_pos = q + 1;
+        }
+    }
+
+    while paren_pos < end_limit {
+        if bytes[paren_pos] != b'(' {
+            paren_pos += 1;
+            continue;
+        }
+        let prev = bytes[paren_pos - 1];
+        if prev != b'g' && prev != b'v' {
+            paren_pos += 1;
+            continue;
+        }
+        let kw_ok = if prev == b'g' {
+            paren_pos >= 6
+                && &bytes[paren_pos - 6..paren_pos] == b"config"
+                && (paren_pos == 6 || !is_pcre_word(bytes[paren_pos - 7]))
+        } else {
+            &bytes[paren_pos - 3..paren_pos] == b"env"
+                && (paren_pos == 3 || !is_pcre_word(bytes[paren_pos - 4]))
+        };
+
+        if !kw_ok {
+            paren_pos += 1;
+            continue;
+        }
+
+        let mut p = paren_pos + 1;
+        while p < bytes.len() && is_pcre_space(bytes[p]) {
+            p += 1;
+        }
+        if p >= bytes.len() || !matches!(bytes[p], b'"' | b'\'') {
+            paren_pos += 1;
+            continue;
+        }
+
+        let key_start = p + 1;
+        let mut q = key_start;
+        let mut has_lf = false;
+        while q < bytes.len() && !matches!(bytes[q], b'"' | b'\'') {
+            if bytes[q] == b'\n' {
+                has_lf = true;
+            }
+            q += 1;
+        }
+        if q >= bytes.len() {
+            break;
+        }
+        if q == key_start {
+            paren_pos = q + 1;
+            continue;
+        }
+        if has_lf {
+            return -2;
+        }
+
+        let key_slice = &bytes[key_start..q];
+        if !first {
+            out.push(b'\n');
+        }
+        first = false;
+        out.extend(key_slice);
+        paren_pos = q + 1;
+    }
+
+    let res = out.finish();
+    if res == -1 {
+        -2
+    } else {
+        res
+    }
+}
+
+#[inline]
+fn ends_with_mcp_symbol_suffix(s: &[u8]) -> bool {
+    s.ends_with(b"Exception")
+        || s.ends_with(b"Service")
+        || s.ends_with(b"Controller")
+        || s.ends_with(b"Command")
+        || s.ends_with(b"Runner")
+        || s.ends_with(b"Probe")
+}
+
+#[inline]
+fn normalize_mcp_search_term(raw: &[u8]) -> &[u8] {
+    let mut trimmed = raw;
+    while let Some(&last) = trimmed.last() {
+        if last == b'/' || last == b'\\' {
+            trimmed = &trimmed[..trimmed.len() - 1];
+        } else {
+            break;
+        }
+    }
+    let base = match trimmed.iter().rposition(|&b| b == b'/' || b == b'\\') {
+        Some(pos) => &trimmed[pos + 1..],
+        None => trimmed,
+    };
+    if base.len() > 4 && base.ends_with(b".php") {
+        &base[..base.len() - 4]
+    } else {
+        base
+    }
+}
+
+/// C-ABI export for `RepositoryContextCollector::searchTerms` error/symbol extraction:
+/// `/(?:App\\[A-Za-z0-9_\\]+|app\/[A-Za-z0-9_\/.\-]+\.php|[A-Z][A-Za-z0-9_]+(?:Exception|Service|Controller|Command|Runner|Probe))/`
+///
+/// Writes up to 5 deduplicated normalized terms separated by `\n` into `out_buf`.
+/// Returns `0` when 0 terms matched (caller falls back to `[mb_substr(trim($query), 0, 120)]`),
+/// `> 0` bytes written, `< -1` when `out_cap` is too small, or `-1` on invalid arguments.
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_mcp_search_terms(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input.is_null() && input_len > 0 {
+        return -1;
+    }
+    if input_len < 5 {
+        return 0;
+    }
+    let s = unsafe { slice::from_raw_parts(input, input_len) };
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+    let mut seen: [&[u8]; 5] = [&[]; 5];
+    let mut seen_len = 0usize;
+    let mut i = 0usize;
+
+    while i + 5 <= s.len() {
+        let mut matched: Option<&[u8]> = None;
+
+        if s[i..].starts_with(b"App\\")
+            && s.get(i + 4)
+                .is_some_and(|&b| is_pcre_word(b) || b == b'\\')
+        {
+            let mut end = i + 5;
+            while end < s.len() && (is_pcre_word(s[end]) || s[end] == b'\\') {
+                end += 1;
+            }
+            matched = Some(&s[i..end]);
+            i = end;
+        } else if s[i..].starts_with(b"app/") {
+            let mut max_end = i + 4;
+            while max_end < s.len()
+                && (is_pcre_word(s[max_end]) || matches!(s[max_end], b'/' | b'.' | b'-'))
+            {
+                max_end += 1;
+            }
+            let mut found_end: Option<usize> = None;
+            let mut end = max_end;
+            while end >= i + 9 {
+                if &s[end - 4..end] == b".php" {
+                    found_end = Some(end);
+                    break;
+                }
+                end -= 1;
+            }
+            if let Some(end) = found_end {
+                matched = Some(&s[i..end]);
+                i = end;
+            } else {
+                i += 1;
+            }
+        } else if s[i].is_ascii_uppercase() {
+            let mut max_end = i + 1;
+            while max_end < s.len() && is_pcre_word(s[max_end]) {
+                max_end += 1;
+            }
+            let mut found_end: Option<usize> = None;
+            let mut end = max_end;
+            while end >= i + 7 {
+                if ends_with_mcp_symbol_suffix(&s[i + 2..end]) {
+                    found_end = Some(end);
+                    break;
+                }
+                end -= 1;
+            }
+            if let Some(end) = found_end {
+                matched = Some(&s[i..end]);
+                i = end;
+            } else if max_end >= i + 3
+                && (&s[max_end - 3..max_end] == b"App" || &s[max_end - 3..max_end] == b"app")
+            {
+                i = max_end - 3;
+            } else {
+                i = max_end;
+            }
+        } else {
+            i += 1;
+        }
+
+        if let Some(raw) = matched {
+            let norm = normalize_mcp_search_term(raw);
+            if !norm.is_empty() && norm != b"0" && !seen[..seen_len].contains(&norm) {
+                if seen_len > 0 {
+                    out.push(b'\n');
+                }
+                out.extend(norm);
+                seen[seen_len] = norm;
+                seen_len += 1;
+                if seen_len == 5 {
+                    break;
+                }
+            }
+        }
+    }
+
+    out.finish()
+}
+
+#[cfg(test)]
+mod mcp_tests {
+    use super::*;
+
+    #[test]
+    fn mcp_redact_and_sensitive_key_parity() {
+        assert_eq!(mcp_redact_bytes(b"clean string without secrets"), None);
+        assert_eq!(
+            mcp_redact_bytes(
+                b"mysql://alice:secret@db Bearer abc.def= API_TOKEN=token-value password: hunter2"
+            ),
+            Some(
+                b"mysql://[REDACTED]@db Bearer [REDACTED] API_TOKEN=[REDACTED] password: [REDACTED]"
+                    .to_vec()
+            )
+        );
+        assert_eq!(
+            mcp_redact_bytes(
+                b"-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----"
+            ),
+            Some(b"[REDACTED PRIVATE KEY]".to_vec())
+        );
+        assert!(mcp_is_sensitive_key_slice(b"api_token"));
+        assert!(mcp_is_sensitive_key_slice(b"X-API-Key"));
+        assert!(mcp_is_sensitive_key_slice(b"user_credentials"));
+        assert!(!mcp_is_sensitive_key_slice(b"safe_paths"));
+    }
+
+    #[test]
+    fn mcp_glob_config_rg_and_search_terms() {
+        assert!(mcp_glob_matches_slice(b"**", b"a\nb"));
+        assert!(!mcp_glob_matches_slice(b"a**b", b"a\nb"));
+        assert!(mcp_glob_matches_slice(b"a*b", b"a\nb"));
+        assert!(!mcp_glob_matches_slice(b"a*b", b"a/b"));
+        assert!(mcp_glob_matches_slice(b"app/**/*.php", b"app/Services/Foo.php"));
+
+        let mut out = [0u8; 512];
+        let rg = b"app/Foo.php:12:  $dsn = 'mysql://u:p@db';  \nnot-a-match\napp/Bar.php:34:API_KEY=xyz";
+        let len = unsafe {
+            nntmux_mcp_parse_and_redact_rg_output(
+                rg.as_ptr(),
+                rg.len(),
+                10,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert!(len > 0);
+        assert_eq!(
+            &out[..len as usize],
+            b"app/Foo.php:12:$dsn = 'mysql://[REDACTED]@db';\napp/Bar.php:34:API_KEY=[REDACTED]"
+        );
+
+        let php_src = b"$a = config('app.name'); $b = env(\"DB_HOST\", 'localhost');";
+        let klen = unsafe {
+            nntmux_mcp_extract_config_keys(
+                php_src.as_ptr(),
+                php_src.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert!(klen > 0);
+        assert_eq!(&out[..klen as usize], b"app.name\nDB_HOST");
+
+        let err = b"RuntimeException in App\\Services\\Mcp\\RepositoryContextCollector:42 at app/Services/Mcp/ProcessRunner.php:18";
+        let tlen = unsafe {
+            nntmux_mcp_search_terms(err.as_ptr(), err.len(), out.as_mut_ptr(), out.len())
+        };
+        assert!(tlen > 0);
+        assert_eq!(
+            &out[..tlen as usize],
+            b"RuntimeException\nRepositoryContextCollector\nProcessRunner"
+        );
+    }
+}
+

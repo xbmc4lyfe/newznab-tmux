@@ -4,16 +4,37 @@ declare(strict_types=1);
 
 namespace App\Services\Mcp;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\Log;
+use Throwable;
 
 class RepositoryContextCollector
 {
+    private const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_mcp_parse_and_redact_rg_output(const char *input, size_t input_len, size_t max_results, char *out_buf, size_t out_cap);
+        int32_t nntmux_mcp_glob_matches(const char *glob, size_t glob_len, const char *path, size_t path_len);
+        ssize_t nntmux_mcp_extract_config_keys(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_mcp_search_terms(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        C;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
+    private static bool $useRustFfi = true;
+
     public function __construct(
         private readonly ProjectPathGuard $paths,
         private readonly ProcessRunner $processes,
         private readonly SensitiveValueRedactor $redactor,
         private readonly VerificationPlanner $verificationPlanner,
     ) {}
+
+    public static function setUseRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
 
     /**
      * @return array<string, mixed>
@@ -136,6 +157,21 @@ class RepositoryContextCollector
             return [trim($query)];
         }
 
+        if (self::$useRustFfi) {
+            $native = self::searchTermsNative($query);
+            if ($native !== null) {
+                return $native !== [] ? $native : [mb_substr(trim($query), 0, 120)];
+            }
+        }
+
+        return $this->searchTermsPhp($query);
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function searchTermsPhp(string $query): array
+    {
         preg_match_all('/(?:App\\\\[A-Za-z0-9_\\\\]+|app\/[A-Za-z0-9_\/.\-]+\.php|[A-Z][A-Za-z0-9_]+(?:Exception|Service|Controller|Command|Runner|Probe))/', $query, $matches);
         $terms = array_map(
             fn (string $term): string => basename(str_replace('\\', '/', preg_replace('/:\d+$/', '', $term) ?? $term), '.php'),
@@ -143,6 +179,54 @@ class RepositoryContextCollector
         );
 
         return array_slice(array_values(array_unique(array_filter($terms))), 0, 5) ?: [mb_substr(trim($query), 0, 120)];
+    }
+
+    /**
+     * @return list<string>|null
+     */
+    public static function searchTermsNative(string $query): ?array
+    {
+        $len = \strlen($query);
+        if ($len < 5) {
+            return [];
+        }
+
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $len + 64), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_mcp_search_terms($query, $len, $scratch, $cap);
+            if (! \is_int($written) || $written === -1) {
+                return null;
+            }
+            if ($written === 0) {
+                return [];
+            }
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_mcp_search_terms($query, $len, $scratch, $cap);
+                if (! \is_int($written) || $written <= 0) {
+                    return null;
+                }
+            }
+
+            return explode("\n", FFI::string($scratch, $written));
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     /**
@@ -166,24 +250,123 @@ class RepositoryContextCollector
                 'rg', '--line-number', '--no-heading', '--color=never', '--fixed-strings', '--', $term, ...$roots,
             ], (int) config('nntmux-mcp.timeouts.repository_seconds', 20));
 
-            foreach (preg_split('/\R/', $result['output']) ?: [] as $line) {
-                if (preg_match('/^([^:]+):(\d+):(.*)$/', $line, $parts) !== 1) {
+            $remaining = $maximumResults - \count($matches);
+            if ($remaining <= 0) {
+                break;
+            }
+
+            if (self::$useRustFfi) {
+                $parsed = self::parseAndRedactRgOutputNative($result['output'], $remaining);
+                if ($parsed !== null) {
+                    foreach ($parsed as $item) {
+                        $matches[] = $item;
+                    }
+                    if (\count($matches) >= $maximumResults) {
+                        break;
+                    }
+
                     continue;
                 }
+            }
 
-                $matches[] = [
-                    'path' => $parts[1],
-                    'line' => (int) $parts[2],
-                    'excerpt' => $this->redactor->redact(trim($parts[3])),
-                ];
-
-                if (count($matches) >= $maximumResults) {
-                    break 2;
-                }
+            foreach ($this->parseAndRedactRgOutputPhp($result['output'], $remaining) as $item) {
+                $matches[] = $item;
+            }
+            if (\count($matches) >= $maximumResults) {
+                break;
             }
         }
 
         return $this->uniqueMatches($matches);
+    }
+
+    /**
+     * @return list<array{path: string, line: int, excerpt: string}>
+     */
+    private function parseAndRedactRgOutputPhp(string $output, int $maximumResults): array
+    {
+        if ($output === '' || $maximumResults <= 0) {
+            return [];
+        }
+
+        $matches = [];
+        foreach (preg_split('/\R/', $output) ?: [] as $line) {
+            if (preg_match('/^([^:]+):(\d+):(.*)$/', $line, $parts) !== 1) {
+                continue;
+            }
+
+            $matches[] = [
+                'path' => $parts[1],
+                'line' => (int) $parts[2],
+                'excerpt' => $this->redactor->redact(trim($parts[3])),
+            ];
+
+            if (\count($matches) >= $maximumResults) {
+                break;
+            }
+        }
+
+        return $matches;
+    }
+
+    /**
+     * @return list<array{path: string, line: int, excerpt: string}>|null
+     */
+    public static function parseAndRedactRgOutputNative(string $output, int $maximumResults): ?array
+    {
+        if ($output === '' || $maximumResults <= 0) {
+            return [];
+        }
+
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        $len = \strlen($output);
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(512, $len + 256), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_mcp_parse_and_redact_rg_output($output, $len, $maximumResults, $scratch, $cap);
+            if (! \is_int($written) || $written === -1) {
+                return null;
+            }
+            if ($written === 0) {
+                return [];
+            }
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_mcp_parse_and_redact_rg_output($output, $len, $maximumResults, $scratch, $cap);
+                if (! \is_int($written) || $written <= 0) {
+                    return null;
+                }
+            }
+
+            $matches = [];
+            foreach (explode("\n", FFI::string($scratch, $written)) as $row) {
+                $parts = explode(':', $row, 3);
+                if (\count($parts) === 3) {
+                    $matches[] = [
+                        'path' => $parts[0],
+                        'line' => (int) $parts[1],
+                        'excerpt' => $parts[2],
+                    ];
+                }
+            }
+
+            return $matches;
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     /**
@@ -255,10 +438,42 @@ class RepositoryContextCollector
             return true;
         }
 
+        // Retain native PHP in production: two-string FFI marshaling on short (~35B) paths
+        // yields 1.18x-1.21x mean and 1.17x-1.26x p99 speedup, below the 1.5x adoption bar.
+        return $this->globMatchesPhp($glob, $path);
+    }
+
+    private function globMatchesPhp(string $glob, string $path): bool
+    {
+        if ($glob === '**') {
+            return true;
+        }
+
         $quoted = preg_quote($glob, '#');
         $pattern = str_replace(['\*\*', '\*'], ['.*', '[^/]*'], $quoted);
 
         return preg_match('#^'.$pattern.'$#', $path) === 1;
+    }
+
+    public static function globMatchesNative(string $glob, string $path): ?bool
+    {
+        if ($glob === '**') {
+            return true;
+        }
+
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $res = $ffi->nntmux_mcp_glob_matches($glob, \strlen($glob), $path, \strlen($path));
+
+            return \is_int($res) && $res >= 0 ? ($res === 1) : null;
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     /**
@@ -280,11 +495,87 @@ class RepositoryContextCollector
             }
 
             $contents = (string) file_get_contents(base_path($safePath));
-            preg_match_all('/\b(?:config|env)\(\s*["\']([^"\']+)["\']/', $contents, $matches);
-            $keys = [...$keys, ...$matches[1]];
+            if (self::$useRustFfi) {
+                $extracted = self::extractConfigKeysNative($contents);
+                if ($extracted !== null) {
+                    $keys = [...$keys, ...$extracted];
+
+                    continue;
+                }
+            }
+
+            $keys = [...$keys, ...$this->extractConfigKeysPhp($contents)];
         }
 
         return array_values(array_unique($keys));
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function extractConfigKeysPhp(string $contents): array
+    {
+        preg_match_all('/\b(?:config|env)\(\s*["\']([^"\']+)["\']/', $contents, $matches);
+
+        return $matches[1];
+    }
+
+    /**
+     * @return list<string>|null
+     */
+    public static function extractConfigKeysNative(string $contents): ?array
+    {
+        $len = \strlen($contents);
+        if ($len < 7) {
+            return [];
+        }
+
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, intdiv($len, 4) + 64), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_mcp_extract_config_keys($contents, $len, $scratch, $cap);
+            if (! \is_int($written) || $written === -1 || $written === -2) {
+                return null;
+            }
+            if ($written === 0) {
+                return [];
+            }
+            if ($written < -2) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_mcp_extract_config_keys($contents, $len, $scratch, $cap);
+                if (! \is_int($written) || $written <= 0) {
+                    return null;
+                }
+            }
+
+            return explode("\n", FFI::string($scratch, $written));
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (! self::$ffiResolved) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('mcp_repository_context_collector', self::FFI_CDEF);
+            self::$ffiResolved = true;
+        }
+
+        return self::$ffi;
     }
 
     /**
