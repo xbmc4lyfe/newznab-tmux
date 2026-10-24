@@ -9,14 +9,28 @@ use App\Services\AdditionalProcessing\DTO\ArchiveCandidate;
 use App\Services\AdditionalProcessing\Enums\DownloadKind;
 use App\Services\AdditionalProcessing\Media\ImageCandidateRanker;
 use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Support\Facades\File;
+use Throwable;
 
 /**
  * Shared fallback logic for extracting known files back out of downloaded archives.
  */
 class ReleaseFilesArchiveFallback
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_rfaf_is_archive_image_name(const char *ptr, size_t len);
+        ssize_t nntmux_rfaf_extracted_file_suffix(const char *ptr, size_t len, char *out, size_t out_cap);
+        C;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
+    private static bool $useRustFfi = true;
+
     public function __construct(
         private readonly ArchiveExtractionService $archiveService,
         private readonly MediaExtractionService $mediaService,
@@ -39,7 +53,7 @@ class ReleaseFilesArchiveFallback
             $files,
             static fn (mixed $file): bool => is_array($file)
                 && empty($file['pass'])
-                && preg_match('/\.(jpe?g|png|webp)$/i', (string) ($file['name'] ?? '')) === 1
+                && self::isArchiveImageName((string) ($file['name'] ?? ''))
         ));
 
         if ($imageFiles === []) {
@@ -340,9 +354,7 @@ class ReleaseFilesArchiveFallback
         string $tempPrefix,
         callable $handler
     ): bool {
-        $extension = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
-        $suffix = $extension === '' ? '' : '.'.$extension;
-        $tempPath = $context->tmpPath.$tempPrefix.uniqid('', true).$suffix;
+        $tempPath = $context->tmpPath.$tempPrefix.uniqid('', true).self::extractedFileSuffix($filename);
         File::put($tempPath, $fileData);
 
         try {
@@ -350,5 +362,114 @@ class ReleaseFilesArchiveFallback
         } finally {
             File::delete($tempPath);
         }
+    }
+
+    /**
+     * Whether an archive entry name is a JPG/PNG/WebP image.
+     *
+     * Retains the native PHP path: the FFI crossing exceeds one anchored PCRE match
+     * (0.36x mean / 0.40x p99 common, 0.52x / 1.00x uncommon).
+     */
+    public static function isArchiveImageName(string $name): bool
+    {
+        return self::isArchiveImageNamePhp($name);
+    }
+
+    public static function isArchiveImageNamePhp(string $name): bool
+    {
+        return preg_match('/\.(jpe?g|png|webp)$/i', $name) === 1;
+    }
+
+    public static function isArchiveImageNameNative(string $name, bool &$supported = false): bool
+    {
+        $supported = false;
+        $ffi = self::rustFfi();
+        if ($ffi === null || ! self::environmentSupported()) {
+            return self::isArchiveImageNamePhp($name);
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_rfaf_is_archive_image_name($name, strlen($name));
+        } catch (Throwable) {
+            return self::isArchiveImageNamePhp($name);
+        }
+        if ($status !== 0 && $status !== 1) {
+            return self::isArchiveImageNamePhp($name);
+        }
+        $supported = true;
+
+        return $status === 1;
+    }
+
+    /**
+     * Lower-case extension suffix (with its dot) for a temporary copy of an extracted file.
+     *
+     * Retains the native PHP path: 0.36x mean / 0.38x p99 common, 0.39x / 0.56x uncommon.
+     */
+    public static function extractedFileSuffix(string $filename): string
+    {
+        return self::extractedFileSuffixPhp($filename);
+    }
+
+    public static function extractedFileSuffixPhp(string $filename): string
+    {
+        $extension = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+
+        return $extension === '' ? '' : '.'.$extension;
+    }
+
+    public static function extractedFileSuffixNative(string $filename, bool &$supported = false): string
+    {
+        $supported = false;
+        $ffi = self::rustFfi();
+        if ($ffi === null || ! self::environmentSupported()) {
+            return self::extractedFileSuffixPhp($filename);
+        }
+        try {
+            $len = strlen($filename);
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, $len + 2, $capacity);
+            if ($buffer === null) {
+                return self::extractedFileSuffixPhp($filename);
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_rfaf_extracted_file_suffix($filename, $len, $buffer, $capacity);
+            if (! is_int($written) || $written < 0 || $written > $capacity) {
+                return self::extractedFileSuffixPhp($filename);
+            }
+            $suffix = $written === 0 ? '' : FFI::string($buffer, $written);
+        } catch (Throwable) {
+            return self::extractedFileSuffixPhp($filename);
+        }
+        $supported = true;
+
+        return $suffix;
+    }
+
+    /**
+     * Toggle the Rust helpers; disabled, every *Native method falls back to PHP.
+     */
+    public static function useRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    /** basename() and PCRE case folding follow LC_CTYPE outside the ASCII-compatible C locales. */
+    private static function environmentSupported(): bool
+    {
+        return in_array(setlocale(LC_CTYPE, '0'), ['C', 'POSIX', 'C.UTF-8', 'C.utf8'], true);
+    }
+
+    private static function rustFfi(): ?FFI
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        if (! self::$ffiResolved) {
+            self::$ffiResolved = true;
+            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF);
+        }
+
+        return self::$ffi;
     }
 }

@@ -13,7 +13,9 @@ use App\Services\NameFixing\NameFixingService;
 use App\Services\NNTP\NNTPService;
 use App\Support\Par2DescriptorEvidence;
 use App\Support\Par2FileHashEvidence;
+use App\Support\RustPipelineLibrary;
 use dariusiii\rarinfo\Par2Info;
+use FFI;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use RuntimeException;
@@ -24,6 +26,16 @@ use Throwable;
  */
 class Par2Processor
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_par2_set_fits_payload_budget(const char *sizes, size_t len, size_t count, int64_t max_payload_bytes);
+        C;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
+    private static bool $useRustFfi = true;
+
     private NameFixingService $nameFixingService;
 
     private Par2Info $par2Info;
@@ -322,6 +334,16 @@ class Par2Processor
      */
     public static function setFitsPayloadBudget(array $setFiles, ?int $maxPayloadBytes): bool
     {
+        // Retains the native PHP path: building the FFI input costs more than the check itself
+        // (0.56x mean / 0.55x p99 common, 0.28x / 0.29x uncommon); see setFitsPayloadBudgetNative().
+        return self::setFitsPayloadBudgetPhp($setFiles, $maxPayloadBytes);
+    }
+
+    /**
+     * @param  array<string|int, array{name?: string, size?: int|float, size_decimal?: string, hash?: string, hash_16K?: string, blocks?: int, next_offset?: int}>  $setFiles
+     */
+    public static function setFitsPayloadBudgetPhp(array $setFiles, ?int $maxPayloadBytes): bool
+    {
         if ($maxPayloadBytes === null) {
             return true;
         }
@@ -359,6 +381,82 @@ class Par2Processor
         }
 
         return true;
+    }
+
+    /**
+     * Rust budget check over newline-joined decimal candidates; float sizes decline to PHP.
+     *
+     * @param  array<string|int, array{name?: string, size?: int|float, size_decimal?: string, hash?: string, hash_16K?: string, blocks?: int, next_offset?: int}>  $setFiles
+     */
+    public static function setFitsPayloadBudgetNative(array $setFiles, ?int $maxPayloadBytes, bool &$supported = false): bool
+    {
+        $supported = false;
+        if ($maxPayloadBytes === null || $maxPayloadBytes <= 0) {
+            $supported = true;
+
+            return $maxPayloadBytes === null;
+        }
+        $ffi = self::rustFfi();
+        if ($ffi === null) {
+            return self::setFitsPayloadBudgetPhp($setFiles, $maxPayloadBytes);
+        }
+        $sizes = [];
+        foreach ($setFiles as $file) {
+            $rawDecimal = $file['size_decimal'] ?? null;
+            $rawSize = $file['size'] ?? null;
+            if ($rawDecimal === null && $rawSize === null && ! isset($file['name'])) {
+                continue;
+            }
+            if (is_int($rawSize) && $rawSize >= 0 && ($rawDecimal === null || $rawDecimal === (string) $rawSize)) {
+                $sizes[] = $rawSize;
+
+                continue;
+            }
+            if (is_float($rawSize)) {
+                return self::setFitsPayloadBudgetPhp($setFiles, $maxPayloadBytes);
+            }
+            $candidate = $rawDecimal ?? $rawSize;
+            if (! is_string($candidate) && (! is_int($candidate) || $candidate < 0)) {
+                $supported = true;
+
+                return false;
+            }
+            $sizes[] = $candidate;
+        }
+        $joined = implode("\n", $sizes);
+        try {
+            // @phpstan-ignore method.notFound
+            $fits = $ffi->nntmux_par2_set_fits_payload_budget($joined, strlen($joined), count($sizes), $maxPayloadBytes);
+        } catch (Throwable) {
+            return self::setFitsPayloadBudgetPhp($setFiles, $maxPayloadBytes);
+        }
+        if ($fits !== 0 && $fits !== 1) {
+            return self::setFitsPayloadBudgetPhp($setFiles, $maxPayloadBytes);
+        }
+        $supported = true;
+
+        return $fits === 1;
+    }
+
+    /**
+     * Toggle the Rust helpers; disabled, every *Native method falls back to PHP.
+     */
+    public static function useRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    private static function rustFfi(): ?FFI
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        if (! self::$ffiResolved) {
+            self::$ffiResolved = true;
+            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF);
+        }
+
+        return self::$ffi;
     }
 
     private static function setHasCompleteDescriptors(?Par2Info $parser, bool $streamComplete): bool
