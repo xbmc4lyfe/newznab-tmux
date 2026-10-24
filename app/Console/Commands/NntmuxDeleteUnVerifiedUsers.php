@@ -5,10 +5,37 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Models\User;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Console\Command;
+use Throwable;
 
 class NntmuxDeleteUnVerifiedUsers extends Command
 {
+    private const FFI_CDEF = <<<'CDEF'
+int32_t nntmux_w32_table_account_gdpr_cleanup_commands(
+    const char *input,
+    size_t len,
+    uint8_t *out,
+    size_t out_cap
+);
+CDEF;
+
+    /** Rust stays opt-in: the JSON FFI round trip is slower than these PHP helpers (< 1.5x). */
+    private const bool RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useRustFfi = null;
+
+    private static FFI|false|null $ffi = null;
+
+    /** User::deleteUnVerified() does not report how many users it deleted. */
+    public const int UNKNOWN_COUNT = -1;
+
+    /** Matches the fixed window in User::deleteUnVerified(). */
+    public const int DEFAULT_CLEANUP_DAYS = 3;
+
+    private const int MAX_CLEANUP_DAYS = 36500;
+
     /**
      * The name and signature of the console command.
      *
@@ -33,13 +60,153 @@ class NntmuxDeleteUnVerifiedUsers extends Command
         parent::__construct();
     }
 
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    public static function setUseRustFfi(?bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = null;
+        self::$ffi = null;
+    }
+
+    public static function setFfiForTesting(FFI|false|null $ffi = null): void
+    {
+        self::$ffi = $ffi;
+    }
+
     /**
      * Execute the console command.
      */
     public function handle(): void
     {
-        $this->info('Deleting unverified users.');
+        $window = self::normalizeCleanupWindow(self::DEFAULT_CLEANUP_DAYS);
+        $this->info($window['start_message']);
         User::deleteUnVerified();
-        $this->info('Unverified users deleted.');
+        $this->info(self::formatDeleteSummary(self::UNKNOWN_COUNT));
+    }
+
+    /**
+     * Clamps the age (in days) unverified accounts must reach before cleanup to 1..36500.
+     *
+     * @return array{days: int, start_message: string}
+     */
+    public static function normalizeCleanupWindow(int $days = self::DEFAULT_CLEANUP_DAYS): array
+    {
+        return self::usesRustFfi() ? self::normalizeCleanupWindowNative($days) : self::normalizeCleanupWindowPhp($days);
+    }
+
+    /**
+     * @return array{days: int, start_message: string}
+     */
+    public static function normalizeCleanupWindowPhp(int $days = self::DEFAULT_CLEANUP_DAYS): array
+    {
+        return [
+            'days' => max(1, min(self::MAX_CLEANUP_DAYS, $days)),
+            'start_message' => 'Deleting unverified users.',
+        ];
+    }
+
+    /**
+     * @return array{days: int, start_message: string}
+     */
+    public static function normalizeCleanupWindowNative(int $days = self::DEFAULT_CLEANUP_DAYS): array
+    {
+        if (self::callNative(['delete_unverified.normalize_cleanup_window', $days], $result)
+            && is_array($result)
+            && array_keys($result) === ['days', 'start_message']
+            && is_int($result['days'])
+            && is_string($result['start_message'])) {
+            /** @var array{days: int, start_message: string} $result */
+            return $result;
+        }
+
+        return self::normalizeCleanupWindowPhp($days);
+    }
+
+    /**
+     * Completion line; a negative count (UNKNOWN_COUNT) keeps the generic message.
+     */
+    public static function formatDeleteSummary(int $deletedCount): string
+    {
+        return self::usesRustFfi() ? self::formatDeleteSummaryNative($deletedCount) : self::formatDeleteSummaryPhp($deletedCount);
+    }
+
+    public static function formatDeleteSummaryPhp(int $deletedCount): string
+    {
+        return $deletedCount < 0 ? 'Unverified users deleted.' : $deletedCount.' unverified user(s) deleted.';
+    }
+
+    public static function formatDeleteSummaryNative(int $deletedCount): string
+    {
+        if (self::callNative(['delete_unverified.format_delete_summary', $deletedCount], $result) && is_string($result)) {
+            return $result;
+        }
+
+        return self::formatDeleteSummaryPhp($deletedCount);
+    }
+
+    /**
+     * Evaluates `[operation, ...arguments]` in Rust; false means the caller keeps its PHP result.
+     *
+     * @param  list<mixed>  $request
+     *
+     * @param-out mixed $result
+     */
+    private static function callNative(array $request, mixed &$result = null): bool
+    {
+        $ffi = self::nativeFfi();
+        if (! $ffi instanceof FFI) {
+            return false;
+        }
+
+        try {
+            $json = json_encode($request, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION | JSON_THROW_ON_ERROR);
+            $capacity = max(256, strlen($json) * 2 + 256);
+            for ($attempt = 0; $attempt < 2; $attempt++) {
+                $buffer = $ffi->new("uint8_t[{$capacity}]");
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w32_table_account_gdpr_cleanup_commands($json, strlen($json), $buffer, $capacity);
+                if (! is_int($written) || $written === -1 || $written === 0) {
+                    return false;
+                }
+                if ($written < 0) {
+                    $capacity = -$written;
+
+                    continue;
+                }
+                $decoded = json_decode(FFI::string($buffer, $written), true, 8, JSON_THROW_ON_ERROR);
+                if (! is_array($decoded) || count($decoded) !== 1 || ! array_key_exists(0, $decoded)) {
+                    return false;
+                }
+                $result = $decoded[0];
+
+                return true;
+            }
+        } catch (Throwable) {
+            return false;
+        }
+
+        return false;
+    }
+
+    private static function nativeFfi(): ?FFI
+    {
+        if (self::$ffi === false) {
+            return null;
+        }
+        if (self::$ffi instanceof FFI) {
+            return self::$ffi;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF);
+        self::$ffi = $ffi ?? false;
+
+        return $ffi;
     }
 }

@@ -21753,3 +21753,511 @@ mod wave31_benchmark_binaries_cbp_reset_commands_tests {
         }
     }
 }
+
+pub mod wave32_table_account_gdpr_cleanup_commands {
+    //! Request: a JSON array `[operation, ...arguments]`. Response: a JSON array `[result]`.
+    //! Inputs whose PHP semantics are not reproduced exactly are declined with `Err`, so the
+    //! PHP caller falls back to its native implementation.
+
+    use super::wave30_nzb_release_cleanup_commands::{Value, encode, parse};
+
+    const START_DELETE_UNVERIFIED: &[u8] = b"Deleting unverified users.";
+    const PURGE_START: &[u8] = b"Starting to purge accounts that were soft deleted 6 months ago...";
+    const PURGE_DISPATCHED: &[u8] = b"Job dispatched to purge deleted accounts";
+    const ROLE_MESSAGES: [&[u8]; 2] = [
+        b"Updating expired roles.",
+        b"Updating users that will have their roles expire or are already expired",
+    ];
+    const ROLE_WARNING_PERIODS: [&[u8]; 3] = [b"day", b"week", b"month"];
+    const MAX_CLEANUP_DAYS: i64 = 36_500;
+
+    fn int(value: &Value) -> Result<i64, ()> {
+        match value {
+            Value::Int(number) => Ok(*number),
+            _ => Err(()),
+        }
+    }
+
+    fn boolean(value: &Value) -> Result<bool, ()> {
+        match value {
+            Value::Bool(flag) => Ok(*flag),
+            _ => Err(()),
+        }
+    }
+
+    fn string(value: &Value) -> Result<&[u8], ()> {
+        match value {
+            Value::Str(text) => Ok(text),
+            _ => Err(()),
+        }
+    }
+
+    fn optional_string(value: &Value) -> Result<Option<&[u8]>, ()> {
+        match value {
+            Value::Null => Ok(None),
+            Value::Str(text) => Ok(Some(text)),
+            _ => Err(()),
+        }
+    }
+
+    fn text(parts: &[&[u8]]) -> Value {
+        Value::Str(parts.concat())
+    }
+
+    fn map(entries: Vec<(&[u8], Value)>) -> Value {
+        Value::Map(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key.to_vec(), value))
+                .collect(),
+        )
+    }
+
+    fn strings(items: &[&[u8]]) -> Value {
+        Value::List(items.iter().map(|item| Value::Str(item.to_vec())).collect())
+    }
+
+    /// Bytes PHP's default `trim()` strips.
+    fn is_php_trim_byte(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    fn php_trim(text: &[u8]) -> &[u8] {
+        let start = text
+            .iter()
+            .position(|byte| !is_php_trim_byte(*byte))
+            .unwrap_or(text.len());
+        let end = text
+            .iter()
+            .rposition(|byte| !is_php_trim_byte(*byte))
+            .map_or(start, |index| index + 1);
+        &text[start..end]
+    }
+
+    /// PHP `checkdate($month, $day, $year)` for a strict `YYYY-MM-DD` string.
+    pub fn is_valid_iso_date(date: &[u8]) -> bool {
+        if date.len() != 10 || date[4] != b'-' || date[7] != b'-' {
+            return false;
+        }
+        let number = |range: std::ops::Range<usize>| -> Option<u32> {
+            date[range].iter().try_fold(0u32, |acc, byte| {
+                byte.is_ascii_digit()
+                    .then(|| acc * 10 + u32::from(byte - b'0'))
+            })
+        };
+        let (Some(year), Some(month), Some(day)) = (number(0..4), number(5..7), number(8..10))
+        else {
+            return false;
+        };
+        if year < 1 || !(1..=12).contains(&month) || day < 1 {
+            return false;
+        }
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let days_in_month = match month {
+            2 if leap => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        day <= days_in_month
+    }
+
+    fn evaluate(operation: &[u8], args: &[Value]) -> Result<Value, ()> {
+        Ok(match (operation, args) {
+            (b"optimize_tables.normalize_request", [force, tables, threshold]) => {
+                let force = boolean(force)?;
+                let Value::List(tables) = tables else {
+                    return Err(());
+                };
+                let names = tables
+                    .iter()
+                    .map(|table| string(table).map(<[u8]>::to_vec))
+                    .collect::<Result<Vec<_>, ()>>()?;
+                let optimize_all = names.first().is_none_or(|first| first == b"all");
+                let threshold = int(threshold)?.clamp(0, 100);
+                map(vec![
+                    (b"optimize_all", Value::Bool(optimize_all)),
+                    (
+                        b"tables",
+                        Value::List(if optimize_all {
+                            Vec::new()
+                        } else {
+                            names.into_iter().map(Value::Str).collect()
+                        }),
+                    ),
+                    (b"force", Value::Bool(force)),
+                    (b"free_threshold_percent", Value::Int(threshold)),
+                ])
+            }
+            (b"optimize_tables.build_optimize_sql", [table]) => {
+                text(&[b"OPTIMIZE TABLE ", string(table)?])
+            }
+            (b"delete_unverified.normalize_cleanup_window", [days]) => map(vec![
+                (b"days", Value::Int(int(days)?.clamp(1, MAX_CLEANUP_DAYS))),
+                (b"start_message", Value::Str(START_DELETE_UNVERIFIED.to_vec())),
+            ]),
+            (b"delete_unverified.format_delete_summary", [count]) => {
+                let count = int(count)?;
+                if count < 0 {
+                    Value::Str(b"Unverified users deleted.".to_vec())
+                } else {
+                    text(&[count.to_string().as_bytes(), b" unverified user(s) deleted."])
+                }
+            }
+            (b"purge_deleted.normalize_summary", [dry_run, retention, count]) => {
+                let dry_run = boolean(dry_run)?;
+                let retention = int(retention)?.max(0);
+                let count = int(count)?.max(0);
+                let finish = if dry_run {
+                    text(&[
+                        b"Dry run: ",
+                        count.to_string().as_bytes(),
+                        b" account(s) soft deleted more than ",
+                        retention.to_string().as_bytes(),
+                        b" day(s) ago would be purged",
+                    ])
+                } else {
+                    Value::Str(PURGE_DISPATCHED.to_vec())
+                };
+                map(vec![
+                    (b"dry_run", Value::Bool(dry_run)),
+                    (b"retention_days", Value::Int(retention)),
+                    (b"count", Value::Int(count)),
+                    (b"start_message", Value::Str(PURGE_START.to_vec())),
+                    (b"finish_message", finish),
+                ])
+            }
+            (b"update_expired_roles.normalize_plan", [date, role]) => {
+                let date = optional_string(date)?.map_or(&b""[..], php_trim);
+                let role = int(role)?;
+                let (date_valid, run_date) = if date.is_empty() {
+                    (true, Value::Null)
+                } else if is_valid_iso_date(date) {
+                    (true, Value::Str(date.to_vec()))
+                } else {
+                    (false, Value::Null)
+                };
+                map(vec![
+                    (b"valid", Value::Bool(date_valid && role > 0)),
+                    (b"run_date", run_date),
+                    (b"default_role_id", Value::Int(role.max(0))),
+                    (b"warning_periods", strings(&ROLE_WARNING_PERIODS)),
+                    (b"messages", strings(&ROLE_MESSAGES)),
+                ])
+            }
+            (b"update_expired_roles.format_summary", [count]) => {
+                let count = int(count)?;
+                if count < 0 {
+                    Value::Str(b"Expired roles updated.".to_vec())
+                } else {
+                    text(&[
+                        b"Expired roles updated for ",
+                        count.to_string().as_bytes(),
+                        b" user(s).",
+                    ])
+                }
+            }
+            (b"gdpr_exports.summarize_purge_result", [count, error]) => {
+                let count = int(count)?;
+                match optional_string(error)? {
+                    None => map(vec![
+                        (b"success", Value::Bool(true)),
+                        (b"level", Value::Str(b"info".to_vec())),
+                        (
+                            b"message",
+                            text(&[
+                                b"Purged ",
+                                count.to_string().as_bytes(),
+                                b" expired GDPR export file(s).",
+                            ]),
+                        ),
+                        (b"exit_code", Value::Int(0)),
+                    ]),
+                    Some(error) => map(vec![
+                        (b"success", Value::Bool(false)),
+                        (b"level", Value::Str(b"error".to_vec())),
+                        (
+                            b"message",
+                            text(&[b"Failed to purge expired GDPR exports: ", error]),
+                        ),
+                        (b"exit_code", Value::Int(1)),
+                    ]),
+                }
+            }
+            _ => return Err(()),
+        })
+    }
+
+    /// Evaluates one JSON request and returns its JSON response bytes.
+    pub fn output(input: &[u8]) -> Result<Vec<u8>, ()> {
+        let Value::List(items) = parse(input)? else {
+            return Err(());
+        };
+        let Some((Value::Str(operation), args)) = items.split_first() else {
+            return Err(());
+        };
+        let result = evaluate(operation, args)?;
+        let mut out = Vec::with_capacity(128);
+        out.push(b'[');
+        encode(&mut out, &result)?;
+        out.push(b']');
+        Ok(out)
+    }
+}
+
+/// Evaluate one JSON-dispatched NntmuxOptimizeTables, NntmuxDeleteUnVerifiedUsers,
+/// NntmuxPurgeDeletedAccounts, NntmuxUpdateExpiredRoles or PurgeExpiredGdprExports helper
+/// request without partially writing output.
+/// Returns bytes written, -1 on invalid or declined input/panic, or the negated required size (always <= -3).
+///
+/// # Safety
+/// Both regions must be non-null and allocated for their stated extents, with
+/// lengths fitting isize and no address overflow. Only byte alignment is needed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w32_table_account_gdpr_cleanup_commands(
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, out_cap) {
+            return -1;
+        }
+        let output = {
+            let input = unsafe { std::slice::from_raw_parts(input, len) };
+            match wave32_table_account_gdpr_cleanup_commands::output(input) {
+                Ok(output) => output,
+                Err(()) => return -1,
+            }
+        };
+        let Ok(needed) = i32::try_from(output.len()) else {
+            return -1;
+        };
+        if output.len() > out_cap {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(output.as_ptr(), out, output.len()) };
+        needed
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave32_table_account_gdpr_cleanup_commands_tests {
+    use super::nntmux_w32_table_account_gdpr_cleanup_commands as ffi;
+    use super::wave32_table_account_gdpr_cleanup_commands::{is_valid_iso_date, output};
+
+    fn run(request: &str) -> Option<String> {
+        output(request.as_bytes())
+            .ok()
+            .map(|bytes| String::from_utf8(bytes).unwrap())
+    }
+
+    fn ok(request: &str, expected: &str) {
+        assert_eq!(run(request).as_deref(), Some(expected), "request {request}");
+    }
+
+    fn declined(request: &str) {
+        assert_eq!(run(request), None, "request {request}");
+    }
+
+    #[test]
+    fn optimize_tables_helpers_match_php() {
+        ok(
+            r#"["optimize_tables.normalize_request",false,[],5]"#,
+            r#"[{"optimize_all":true,"tables":[],"force":false,"free_threshold_percent":5}]"#,
+        );
+        ok(
+            r#"["optimize_tables.normalize_request",true,["all","parts"],-4]"#,
+            r#"[{"optimize_all":true,"tables":[],"force":true,"free_threshold_percent":0}]"#,
+        );
+        ok(
+            r#"["optimize_tables.normalize_request",false,["parts","all"," x "],250]"#,
+            r#"[{"optimize_all":false,"tables":["parts","all"," x "],"force":false,"free_threshold_percent":100}]"#,
+        );
+        ok(
+            r#"["optimize_tables.normalize_request",false,["ALL"],9223372036854775807]"#,
+            r#"[{"optimize_all":false,"tables":["ALL"],"force":false,"free_threshold_percent":100}]"#,
+        );
+        declined(r#"["optimize_tables.normalize_request",false,[1],5]"#);
+        declined(r#"["optimize_tables.normalize_request",false,{"1":"a"},5]"#);
+        declined(r#"["optimize_tables.normalize_request",0,[],5]"#);
+        declined(r#"["optimize_tables.normalize_request",false,[],5.0]"#);
+        ok(
+            r#"["optimize_tables.build_optimize_sql","`releases`"]"#,
+            r#"["OPTIMIZE TABLE `releases`"]"#,
+        );
+        ok(
+            r#"["optimize_tables.build_optimize_sql",""]"#,
+            r#"["OPTIMIZE TABLE "]"#,
+        );
+        declined(r#"["optimize_tables.build_optimize_sql",null]"#);
+    }
+
+    #[test]
+    fn account_cleanup_helpers_match_php() {
+        for (days, expected) in [
+            ("3", "3"),
+            ("0", "1"),
+            ("-9223372036854775808", "1"),
+            ("36500", "36500"),
+            ("36501", "36500"),
+        ] {
+            ok(
+                &format!(r#"["delete_unverified.normalize_cleanup_window",{days}]"#),
+                &format!(r#"[{{"days":{expected},"start_message":"Deleting unverified users."}}]"#),
+            );
+        }
+        ok(
+            r#"["delete_unverified.format_delete_summary",-1]"#,
+            r#"["Unverified users deleted."]"#,
+        );
+        ok(
+            r#"["delete_unverified.format_delete_summary",0]"#,
+            r#"["0 unverified user(s) deleted."]"#,
+        );
+        ok(
+            r#"["purge_deleted.normalize_summary",false,180,0]"#,
+            r#"[{"dry_run":false,"retention_days":180,"count":0,"start_message":"Starting to purge accounts that were soft deleted 6 months ago...","finish_message":"Job dispatched to purge deleted accounts"}]"#,
+        );
+        ok(
+            r#"["purge_deleted.normalize_summary",true,-1,-5]"#,
+            r#"[{"dry_run":true,"retention_days":0,"count":0,"start_message":"Starting to purge accounts that were soft deleted 6 months ago...","finish_message":"Dry run: 0 account(s) soft deleted more than 0 day(s) ago would be purged"}]"#,
+        );
+        declined(r#"["purge_deleted.normalize_summary",true,180]"#);
+    }
+
+    #[test]
+    fn role_and_gdpr_helpers_match_php() {
+        let plan = |valid: &str, date: &str, role: &str| {
+            format!(
+                r#"[{{"valid":{valid},"run_date":{date},"default_role_id":{role},"warning_periods":["day","week","month"],"messages":["Updating expired roles.","Updating users that will have their roles expire or are already expired"]}}]"#
+            )
+        };
+        ok(
+            r#"["update_expired_roles.normalize_plan",null,1]"#,
+            &plan("true", "null", "1"),
+        );
+        ok(
+            r#"["update_expired_roles.normalize_plan"," \t2024-02-29\n",3]"#,
+            &plan("true", r#""2024-02-29""#, "3"),
+        );
+        ok(
+            r#"["update_expired_roles.normalize_plan","2023-02-29",1]"#,
+            &plan("false", "null", "1"),
+        );
+        ok(
+            r#"["update_expired_roles.normalize_plan","",0]"#,
+            &plan("false", "null", "0"),
+        );
+        ok(
+            r#"["update_expired_roles.normalize_plan","2024-01-01",-7]"#,
+            &plan("false", r#""2024-01-01""#, "0"),
+        );
+        declined(r#"["update_expired_roles.normalize_plan",5,1]"#);
+        for date in ["2000-02-29", "1900-02-28", "0001-01-01", "9999-12-31"] {
+            assert!(is_valid_iso_date(date.as_bytes()), "{date}");
+        }
+        for date in [
+            "1900-02-29",
+            "0000-01-01",
+            "2024-13-01",
+            "2024-00-10",
+            "2024-04-31",
+            "2024-1-01",
+            "2024/01/01",
+            "２024-01-01",
+        ] {
+            assert!(!is_valid_iso_date(date.as_bytes()), "{date}");
+        }
+        ok(
+            r#"["update_expired_roles.format_summary",-1]"#,
+            r#"["Expired roles updated."]"#,
+        );
+        ok(
+            r#"["update_expired_roles.format_summary",7]"#,
+            r#"["Expired roles updated for 7 user(s)."]"#,
+        );
+
+        ok(
+            r#"["gdpr_exports.summarize_purge_result",3,null]"#,
+            r#"[{"success":true,"level":"info","message":"Purged 3 expired GDPR export file(s).","exit_code":0}]"#,
+        );
+        ok(
+            r#"["gdpr_exports.summarize_purge_result",0,"disk \"full\"\n"]"#,
+            r#"[{"success":false,"level":"error","message":"Failed to purge expired GDPR exports: disk \"full\"\n","exit_code":1}]"#,
+        );
+        declined(r#"["gdpr_exports.summarize_purge_result",0]"#);
+        declined(r#"["gdpr_exports.summarize_purge_result",0,1]"#);
+    }
+
+    #[test]
+    fn malformed_requests_are_declined() {
+        for request in [
+            "",
+            "[]",
+            "{}",
+            "[1]",
+            r#"["unknown"]"#,
+            r#"["delete_unverified.format_delete_summary",5"#,
+            r#"["delete_unverified.format_delete_summary",5] x"#,
+            r#"["delete_unverified.format_delete_summary",5.0]"#,
+            r#"["delete_unverified.format_delete_summary",9223372036854775808]"#,
+            r#"["optimize_tables.build_optimize_sql","\ud800"]"#,
+        ] {
+            declined(request);
+        }
+        assert!(output(b"[\"optimize_tables.build_optimize_sql\",\"\xff\"]").is_err());
+    }
+
+    #[test]
+    fn ffi_rejects_bad_regions_and_leaves_short_output_untouched() {
+        let input = br#"["update_expired_roles.format_summary",12]"#;
+        let expected = br#"["Expired roles updated for 12 user(s)."]"#;
+        let mut target = vec![0xab_u8; expected.len() + 8];
+        unsafe {
+            for capacity in [0, 1, expected.len() - 1] {
+                assert_eq!(
+                    ffi(input.as_ptr(), input.len(), target.as_mut_ptr(), capacity),
+                    -(expected.len() as i32)
+                );
+                assert!(target.iter().all(|byte| *byte == 0xab));
+            }
+            assert_eq!(
+                ffi(std::ptr::null(), 0, target.as_mut_ptr(), target.len()),
+                -1
+            );
+            assert_eq!(
+                ffi(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                ffi(
+                    input.as_ptr(),
+                    usize::MAX,
+                    target.as_mut_ptr(),
+                    target.len()
+                ),
+                -1
+            );
+            let bad = br#"["unknown"]"#;
+            assert_eq!(
+                ffi(bad.as_ptr(), bad.len(), target.as_mut_ptr(), target.len()),
+                -1
+            );
+            assert!(target.iter().all(|byte| *byte == 0xab));
+            assert_eq!(
+                ffi(
+                    input.as_ptr(),
+                    input.len(),
+                    target.as_mut_ptr().add(1),
+                    expected.len()
+                ),
+                expected.len() as i32
+            );
+            assert_eq!(&target[1..1 + expected.len()], expected);
+            assert_eq!(target[0], 0xab);
+        }
+    }
+}
