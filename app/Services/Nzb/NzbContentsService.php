@@ -11,22 +11,42 @@ use App\Services\NfoService;
 use App\Services\NNTP\NNTPService;
 use App\Services\PostProcessService;
 use App\Support\Par2RenameProgress;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Cache\Lock;
 use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use JsonException;
 use RuntimeException;
 use SimpleXMLElement;
 use Throwable;
 use UnexpectedValueException;
+use WeakMap;
 
 /**
  * Service for processing NZB contents - extracting NFO files, PAR2 information,
  * and calculating release completion from NZB files.
+ *
+ * {@see par2Candidates()} runs in Rust (`nntmux_nzb_par2_candidates_batch` in
+ * `rust/pipeline-ffi/src/predb_feeds.rs`) over the source {@see loadNzb()} parsed (or the element's `asXML()`)
+ * when the pipeline library is available, and the PAR2 progress signature is hashed there too;
+ * {@see par2CandidatesPhp()} remains the fallback and parity reference. {@see par2FamilyKeyNative()}
+ * (`nntmux_par2_family_key`) is kept for parity tests only: one FFI call per subject did not reach the 1.5x gate.
  */
 class NzbContentsService
 {
+    private const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_nzb_par2_candidates_batch(const char *xml, size_t xml_len, uint32_t raw, int64_t max_bytes, const char *families, size_t families_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_par2_family_key(const char *subject, size_t subject_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_par2_signature_sha256(const char *head, size_t head_len, const char *manifest, size_t manifest_len, const char *tail, size_t tail_len, char *out_hex);
+        C;
+
+    private static bool $useRustFfi = true;
+
+    private static FFI|false|null $ffi = null;
+
     protected NzbService $nzbService;
 
     protected NzbParserService $parserService;
@@ -48,10 +68,16 @@ class NzbContentsService
 
     private bool $par2StructureValid = true;
 
-    /** @var list<array<string, mixed>> */
-    private array $par2Manifest = [];
+    /** JSON encoding of the manifest (subject, classification and raw segment attributes per file). */
+    private string $par2Manifest = '[]';
 
     private int $par2NonExplicitBytes = 0;
+
+    /** Rust's JSON encoding of the last par2Candidates() result, identical to json_encode(); null after PHP. */
+    private ?string $par2CandidatesJson = null;
+
+    /** @var WeakMap<SimpleXMLElement, string>|null NZB source text of documents returned by loadNzb() */
+    private ?WeakMap $nzbSources = null;
 
     public function __construct(
         ?NzbService $nzbService = null,
@@ -251,7 +277,13 @@ class NzbContentsService
             return false;
         }
 
-        return $this->parserService->parseNzbXml($nzbContents, $this->echoOutput, $guid);
+        $nzb = $this->parserService->parseNzbXml($nzbContents, $this->echoOutput, $guid);
+        if ($nzb !== false && self::$useRustFfi) {
+            $this->nzbSources ??= new WeakMap;
+            $this->nzbSources[$nzb] = $nzbContents;
+        }
+
+        return $nzb;
     }
 
     /**
@@ -342,8 +374,8 @@ class NzbContentsService
             $maxArticleBytes = max(1, (int) config('tmux.fix_names.par2_max_probe_bytes', 2097152));
             $maxStateBytes = max(1, (int) config('tmux.fix_names.par2_max_state_bytes', 8388608));
             $alternate = $this->alternateNntp;
-            $signature = hash('sha256', json_encode(['guid' => $guid, 'group' => $groupID, 'article_limit' => $maxArticleBytes,
-                'state_limit' => $maxStateBytes, 'alternate' => $alternate, 'manifest' => $this->par2Manifest, 'candidates' => $candidates], JSON_THROW_ON_ERROR));
+            $signature = $this->par2Signature(['guid' => $guid, 'group' => $groupID, 'article_limit' => $maxArticleBytes,
+                'state_limit' => $maxStateBytes, 'alternate' => $alternate], $candidates);
             $progress = $this->strictPar2Progress($relID, $signature, count($candidates));
             $offset = $progress['offset'] ?? 0;
             $retry = [];
@@ -493,6 +525,42 @@ class NzbContentsService
         return false;
     }
 
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    /**
+     * sha256 of json_encode($head + ['manifest' => manifest, 'candidates' => $candidates]), built from the
+     * pre-encoded manifest (and Rust's candidate JSON when par2Candidates() ran in Rust).
+     *
+     * @param  array<string, mixed>  $head
+     * @param  list<array<string, mixed>>  $candidates
+     */
+    private function par2Signature(array $head, array $candidates): string
+    {
+        $prefix = substr(json_encode($head, JSON_THROW_ON_ERROR), 0, -1).',"manifest":';
+        $suffix = ',"candidates":'.($this->par2CandidatesJson ?? json_encode($candidates, JSON_THROW_ON_ERROR)).'}';
+        $ffi = self::$useRustFfi ? (self::$ffi ??= RustPipelineLibrary::resolveDomain('nzb_par2_candidates', self::FFI_CDEF) ?? false) : false;
+        if ($ffi !== false) {
+            try {
+                $digest = $ffi->new('char[64]');
+                // @phpstan-ignore method.notFound
+                if ($ffi->nntmux_par2_signature_sha256($prefix, strlen($prefix), $this->par2Manifest, strlen($this->par2Manifest), $suffix, strlen($suffix), $digest) === 64) {
+                    return FFI::string($digest, 64);
+                }
+            } catch (Throwable) {
+                // Hash in PHP below.
+            }
+        }
+        $hash = hash_init('sha256');
+        hash_update($hash, $prefix);
+        hash_update($hash, $this->par2Manifest);
+        hash_update($hash, $suffix);
+
+        return hash_final($hash);
+    }
+
     private function par2FamilyKey(string $subject): ?string
     {
         $subject = preg_replace('/^\s*\[\d+\/\d+\]\s*/', '', $subject) ?? $subject;
@@ -506,6 +574,31 @@ class NzbContentsService
         $name = preg_replace('/\.vol\d+\+\d+\.par2$/i', '.par2', $name) ?? $name;
 
         return preg_match('/\.par2$/i', $name) === 1 ? $name : null;
+    }
+
+    /**
+     * Rust equivalent of {@see par2FamilyKey()}; $supported is false when the library is unavailable.
+     */
+    public function par2FamilyKeyNative(string $subject, bool &$supported = false): ?string
+    {
+        $supported = false;
+        $ffi = self::$ffi ??= RustPipelineLibrary::resolveDomain('nzb_par2_candidates', self::FFI_CDEF) ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        $capacity = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, strlen($subject) + 16, $capacity);
+        if ($scratch === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_par2_family_key($subject, strlen($subject), $scratch, $capacity);
+        if (! is_int($written) || $written < -1) {
+            return null;
+        }
+        $supported = true;
+
+        return $written === -1 ? null : FFI::string($scratch, $written);
     }
 
     /**
@@ -586,11 +679,96 @@ class NzbContentsService
     /** @return list<array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>,classification:string}> */
     private function par2Candidates(SimpleXMLElement $nzb): array
     {
-        $explicit = $volumes = $firstVolumes = $matchingVolumes = $indexFamilies = $families = $legacy = $hidden = [];
-        $this->par2Manifest = [];
+        $maxBytes = max(1, (int) config('tmux.fix_names.par2_max_probe_bytes', 2097152));
+
+        return (self::$useRustFfi ? $this->par2CandidatesNative($nzb, $maxBytes) : null) ?? $this->par2CandidatesPhp($nzb, $maxBytes);
+    }
+
+    /**
+     * Rust {@see par2CandidatesPhp()} over the document's `asXML()` output, or null when PHP must decide: library
+     * missing, a parser override or non-C locale (subject patterns), or a document outside the reproduced subset.
+     *
+     * @return list<array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>,classification:string}>|null
+     */
+    private function par2CandidatesNative(SimpleXMLElement $nzb, int $maxBytes): ?array
+    {
+        if ($this->parserService::class !== NzbParserService::class
+            || ! in_array(setlocale(LC_CTYPE, '0'), ['C', 'POSIX', 'C.UTF-8', 'C.utf8'], true)) {
+            return null;
+        }
+        $ffi = self::$ffi ??= RustPipelineLibrary::resolveDomain('nzb_par2_candidates', self::FFI_CDEF) ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        $source = $this->nzbSources[$nzb] ?? null;
+        $raw = $source !== null;
+        $output = $raw ? $this->par2CandidatesCall($ffi, $source, true, $maxBytes) : null;
+        if ($output === null) {
+            // The source scan declines what libxml normalizes (such as literal tabs in attribute values); the
+            // serialization does not. A child element serializes without its document's encoding declaration.
+            $source = $nzb->asXML();
+            $raw = false;
+            if (! is_string($source) || ! str_starts_with($source, '<?xml')) {
+                return null;
+            }
+            $output = $this->par2CandidatesCall($ffi, $source, false, $maxBytes);
+        }
+        if ($output !== null && $output[0] === 'F') {
+            // Family keys outside Rust's lowercase table: repeat the scan with mb_strtolower's answers.
+            $lower = implode("\0", array_map(mb_strtolower(...), explode("\0", substr($output, 1))));
+            $output = $this->par2CandidatesCall($ffi, $source, $raw, $maxBytes, $lower);
+        }
+        if ($output === null || $output[0] === 'F') {
+            return null;
+        }
+        $parts = explode("\n", $output);
+        if (count($parts) !== 3) {
+            return null;
+        }
+        try {
+            /** @var list<array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>,classification:string}> $candidates */
+            $candidates = json_decode($parts[1], true, 8, JSON_THROW_ON_ERROR);
+        } catch (JsonException) {
+            return null;
+        }
+        $this->par2Manifest = $parts[0];
+        $this->par2CandidatesJson = $parts[1];
+        $this->par2StructureValid = $parts[2][0] === '1';
+        $this->par2NonExplicitBytes = (int) substr($parts[2], 1);
+
+        return $candidates;
+    }
+
+    /** Output of `nntmux_nzb_par2_candidates_batch`, or null when Rust declined the document. */
+    private function par2CandidatesCall(FFI $ffi, string $xml, bool $raw, int $maxBytes, string $families = ''): ?string
+    {
+        $length = strlen($xml);
+        $capacity = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, $length + 4096, $capacity);
+        if ($scratch === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_nzb_par2_candidates_batch($xml, $length, (int) $raw, $maxBytes, $families, strlen($families), $scratch, $capacity);
+        if (is_int($written) && $written < -1) {
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_nzb_par2_candidates_batch($xml, $length, (int) $raw, $maxBytes, $families, strlen($families), $scratch, $capacity);
+        }
+
+        return is_int($written) && $written > 0 ? FFI::string($scratch, $written) : null;
+    }
+
+    /** @return list<array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>,classification:string}> */
+    private function par2CandidatesPhp(SimpleXMLElement $nzb, int $maxBytes): array
+    {
+        $explicit = $volumes = $firstVolumes = $matchingVolumes = $indexFamilies = $families = $legacy = $hidden = $manifest = [];
+        $this->par2CandidatesJson = null;
         $this->par2NonExplicitBytes = 0;
         $this->par2StructureValid = count($nzb->file) > 0;
-        $maxBytes = max(1, (int) config('tmux.fix_names.par2_max_probe_bytes', 2097152));
         foreach ($nzb->file as $file) {
             $subject = (string) $file->attributes()->subject;
             $segments = $raw = [];
@@ -623,7 +801,7 @@ class NzbContentsService
                     $classification = $singlePart && preg_match('/\.(par[" ]|\d{2,3}").+\(1\/1\)/i', $subject) === 1 ? 'legacy' : 'hidden';
                 }
             }
-            $this->par2Manifest[] = ['subject' => $subject, 'classification' => $classification, 'segments' => $raw];
+            $manifest[] = ['subject' => $subject, 'classification' => $classification, 'segments' => $raw];
             if (! $valid && $classification !== 'excluded') {
                 $this->par2StructureValid = false;
             }
@@ -652,6 +830,7 @@ class NzbContentsService
                 }
             }
         }
+        $this->par2Manifest = json_encode($manifest, JSON_THROW_ON_ERROR);
         uasort($hidden, static fn (array $left, array $right): int => $left['segments'][0]['bytes'] <=> $right['segments'][0]['bytes']);
 
         foreach ($firstVolumes as $key => $candidate) {
