@@ -29,6 +29,8 @@ use App\Support\PredbSearchDocument;
 use App\Support\ReleaseArchiveNamingEvidence;
 use App\Support\RustPipelineLibrary;
 use dariusiii\rarinfo\Par2Info;
+use FFI;
+use FFI\CData;
 use Illuminate\Contracts\Filesystem\FileNotFoundException;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Carbon;
@@ -42,7 +44,21 @@ use Illuminate\Support\Facades\Log;
  */
 class ReleaseFileManager
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_rfm_is_nfo_filename(const char *ptr, size_t len);
+        ssize_t nntmux_rfm_extract_release_name(const char *ptr, size_t len, char *out_ptr, size_t out_cap);
+        int32_t nntmux_rfm_normalize_file_size(const char *ptr, size_t len, int64_t *out);
+        C;
+
     private const int DEFAULT_RELEASE_FILE_LIMIT = 11;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
+    private static bool $useRustFfi = true;
+
+    private static ?CData $fileSizeOut = null;
 
     private readonly ReleaseUpdateService $releaseUpdateService;
 
@@ -919,10 +935,19 @@ class ReleaseFileManager
     /**
      * Check if a filename looks like an NFO file.
      *
+     * Retains the native PHP path in production: paired single-call benchmarks measured
+     * 1.25x-1.61x mean and 1.40x-2.00x p99, inconsistently below the 1.5x threshold on the
+     * uncommon mean and common p99; see isNfoFilenameNative().
+     *
      * @param  string  $filename  The filename to check.
      * @return bool True if the filename matches NFO patterns.
      */
     public function isNfoFilename(string $filename): bool
+    {
+        return self::isNfoFilenamePhp($filename);
+    }
+
+    public static function isNfoFilenamePhp(string $filename): bool
     {
         // Standard NFO extensions
         if (preg_match('/\.(?:nfo|diz|info?)$/i', $filename)) {
@@ -946,6 +971,37 @@ class ReleaseFileManager
         }
 
         return false;
+    }
+
+    public static function isNfoFilenameNative(string $filename, bool &$supported = false, ?string $libraryPath = null): bool
+    {
+        $supported = false;
+        $ffi = self::$useRustFfi && $libraryPath === null && self::$ffiResolved ? self::$ffi : self::rustFfi($libraryPath);
+        if ($ffi === null) {
+            return self::isNfoFilenamePhp($filename);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_rfm_is_nfo_filename($filename, strlen($filename));
+        } catch (\Throwable) {
+            return self::isNfoFilenamePhp($filename);
+        }
+
+        if (! is_int($status) || $status < 0) {
+            return self::isNfoFilenamePhp($filename);
+        }
+        $supported = true;
+
+        return $status === 1;
+    }
+
+    /**
+     * Toggle the Rust helpers; disabled, every *Native method falls back to PHP.
+     */
+    public static function useRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
     }
 
     /**
@@ -1124,8 +1180,16 @@ class ReleaseFileManager
 
     /**
      * Extract the release name from a filename.
+     *
+     * Retains the native PHP path in production (~0.90x common, ~1.20x uncommon mean in
+     * paired benchmarks; FFI string marshaling dominates); see extractReleaseNameFromFileNative().
      */
     private function extractReleaseNameFromFile(string $filename): ?string
+    {
+        return $this->extractReleaseNameFromFilePhp($filename);
+    }
+
+    public function extractReleaseNameFromFilePhp(string $filename): ?string
     {
         $basename = basename($filename);
 
@@ -1149,6 +1213,42 @@ class ReleaseFileManager
         }
 
         return null;
+    }
+
+    public function extractReleaseNameFromFileNative(string $filename, bool &$supported = false, ?string $libraryPath = null): ?string
+    {
+        $supported = false;
+        // The fused export embeds the default cleaner's NZBSPLIT unwrapping.
+        $ffi = $this->fileNameCleaner::class === FileNameCleaner::class ? self::rustFfi($libraryPath) : null;
+        if ($ffi === null) {
+            return $this->extractReleaseNameFromFilePhp($filename);
+        }
+
+        $len = strlen($filename);
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, $len + 16, $cap);
+        if ($scratch === null) {
+            return $this->extractReleaseNameFromFilePhp($filename);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_rfm_extract_release_name($filename, $len, $scratch, $cap);
+        } catch (\Throwable) {
+            return $this->extractReleaseNameFromFilePhp($filename);
+        }
+
+        if ($written === -3) {
+            $supported = true;
+
+            return null;
+        }
+        if (! is_int($written) || $written < 0) {
+            return $this->extractReleaseNameFromFilePhp($filename);
+        }
+        $supported = true;
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
     }
 
     /**
@@ -1232,7 +1332,16 @@ class ReleaseFileManager
         return Carbon::createFromTimestamp($createdTime, date_default_timezone_get())->format('Y-m-d H:i:s');
     }
 
+    /**
+     * Retains the native PHP path in production (~0.90x mean in paired benchmarks); see
+     * normalizeFileSizeNative().
+     */
     private function normalizeFileSize(mixed $size): ?int
+    {
+        return self::normalizeFileSizePhp($size);
+    }
+
+    public static function normalizeFileSizePhp(mixed $size): ?int
     {
         if (is_int($size)) {
             return $size >= 0 ? $size : null;
@@ -1261,6 +1370,49 @@ class ReleaseFileManager
         }
 
         return (int) $normalizedSize;
+    }
+
+    public static function normalizeFileSizeNative(mixed $size, bool &$supported = false, ?string $libraryPath = null): ?int
+    {
+        $supported = false;
+        if (! is_string($size)) {
+            return self::normalizeFileSizePhp($size);
+        }
+        $ffi = self::rustFfi($libraryPath);
+        if ($ffi === null) {
+            return self::normalizeFileSizePhp($size);
+        }
+
+        try {
+            $out = self::$fileSizeOut ??= $ffi->new('int64_t[1]');
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_rfm_normalize_file_size($size, strlen($size), $out);
+        } catch (\Throwable) {
+            return self::normalizeFileSizePhp($size);
+        }
+
+        if (! is_int($status) || $status < 0) {
+            return self::normalizeFileSizePhp($size);
+        }
+        $supported = true;
+
+        return $status === 1 ? (int) $out[0] : null;
+    }
+
+    private static function rustFfi(?string $libraryPath = null): ?FFI
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        if ($libraryPath !== null) {
+            return RustPipelineLibrary::resolveDomain('release_file_manager', self::FFI_CDEF, $libraryPath);
+        }
+        if (! self::$ffiResolved) {
+            self::$ffiResolved = true;
+            self::$ffi = RustPipelineLibrary::resolveDomain('release_file_manager', self::FFI_CDEF);
+        }
+
+        return self::$ffi;
     }
 
     private function releaseHasNzbSplitWrapper(Release $release): bool

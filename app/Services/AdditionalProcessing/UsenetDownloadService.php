@@ -10,7 +10,9 @@ use App\Services\AdditionalProcessing\DTO\Par2FileEntry;
 use App\Services\AdditionalProcessing\Enums\DownloadKind;
 use App\Services\NNTP\NNTPService;
 use App\Services\Yenc\YencPart;
+use App\Support\RustPipelineLibrary;
 use Exception;
+use FFI;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -19,6 +21,19 @@ use Illuminate\Support\Facades\Log;
  */
 class UsenetDownloadService
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_rfm_is_group_unavailable(const char *ptr, size_t len);
+        int32_t nntmux_rfm_mapped_article_kind(const char *ptr, size_t len);
+        C;
+
+    private const string DEFAULT_VIDEO_FILE_REGEX = '\.(AVI|F4V|IFO|M1V|M2V|M4V|MKV|MOV|MP4|MPEG|MPG|MPGV|MPV|OGV|QT|RM|RMVB|TS|VOB|WMV)';
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
+    private static bool $useRustFfi = true;
+
     private const int MAX_CACHE_ENTRIES = 4;
 
     private const int MAX_CACHE_ENTRY_BYTES = 8_388_608;
@@ -448,11 +463,10 @@ class UsenetDownloadService
                 && ($article['part']->name !== $file->name || $article['part']->size !== $file->size))) {
             return;
         }
-        $archive = preg_match('/\.(?:rar|7z(?:\.\d+)?|zip|\d{3})$/i', $file->name) === 1;
+        $archive = self::isMappedArchiveName($file->name);
         $video = $allowVideo && ! $archive && $this->config->processThumbnails && $this->config->mediaMainVideoFallback
             && $file->size >= $this->config->mediaMainVideoMinBytes
-            && stripos($file->name, 'sample') === false
-            && preg_match('/'.$this->config->videoFileRegex.'$/i', $file->name) === 1
+            && self::isMappedVideoName($file->name, $this->config->videoFileRegex)
             && $article['part']->size === $file->size && $article['part']->offset() === 0
             && ($article['part']->part === null || $article['part']->part === 1);
         $key = $article['key'];
@@ -502,10 +516,130 @@ class UsenetDownloadService
         return count($this->releaseCache) + count($this->mappedArchiveArticles) + count($this->mappedVideoArticles) + ($this->pendingMappingArticle === null ? 0 : 1);
     }
 
+    /**
+     * Retains the native PHP path in production (~0.44x-0.72x mean in paired benchmarks);
+     * see isMappedArchiveNameNative().
+     */
+    public static function isMappedArchiveName(string $name): bool
+    {
+        return self::isMappedArchiveNamePhp($name);
+    }
+
+    public static function isMappedArchiveNamePhp(string $name): bool
+    {
+        return preg_match('/\.(?:rar|7z(?:\.\d+)?|zip|\d{3})$/i', $name) === 1;
+    }
+
+    public static function isMappedArchiveNameNative(string $name, bool &$supported = false, ?string $libraryPath = null): bool
+    {
+        $kind = self::mappedArticleKind($name, $libraryPath);
+        $supported = $kind !== null;
+
+        return $kind === null ? self::isMappedArchiveNamePhp($name) : ($kind & 1) === 1;
+    }
+
+    /**
+     * A main-video name: not a sample and ending in a configured video extension.
+     *
+     * Retains the native PHP path in production (~0.76x common, ~1.14x-1.32x uncommon mean
+     * in paired benchmarks); see isMappedVideoNameNative().
+     */
+    public static function isMappedVideoName(string $name, string $videoFileRegex): bool
+    {
+        return self::isMappedVideoNamePhp($name, $videoFileRegex);
+    }
+
+    public static function isMappedVideoNamePhp(string $name, string $videoFileRegex): bool
+    {
+        return stripos($name, 'sample') === false
+            && preg_match('/'.$videoFileRegex.'$/i', $name) === 1;
+    }
+
+    public static function isMappedVideoNameNative(string $name, string $videoFileRegex, bool &$supported = false, ?string $libraryPath = null): bool
+    {
+        $kind = $videoFileRegex === self::DEFAULT_VIDEO_FILE_REGEX ? self::mappedArticleKind($name, $libraryPath) : null;
+        $supported = $kind !== null;
+
+        return $kind === null ? self::isMappedVideoNamePhp($name, $videoFileRegex) : ($kind & 2) === 2;
+    }
+
+    /**
+     * Retains the native PHP path in production (~0.37x-0.52x mean in paired benchmarks);
+     * see isGroupUnavailableMessageNative().
+     */
     private function isGroupUnavailableMessage(string $errorMessage): bool
+    {
+        return self::isGroupUnavailableMessagePhp($errorMessage);
+    }
+
+    public static function isGroupUnavailableMessagePhp(string $errorMessage): bool
     {
         return stripos($errorMessage, 'No such news group') !== false
             || stripos($errorMessage, 'Group not found') !== false;
+    }
+
+    public static function isGroupUnavailableMessageNative(string $errorMessage, bool &$supported = false, ?string $libraryPath = null): bool
+    {
+        $supported = false;
+        $ffi = self::rustFfi($libraryPath);
+        if ($ffi === null) {
+            return self::isGroupUnavailableMessagePhp($errorMessage);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_rfm_is_group_unavailable($errorMessage, strlen($errorMessage));
+        } catch (\Throwable) {
+            return self::isGroupUnavailableMessagePhp($errorMessage);
+        }
+
+        if (! is_int($status) || $status < 0) {
+            return self::isGroupUnavailableMessagePhp($errorMessage);
+        }
+        $supported = true;
+
+        return $status === 1;
+    }
+
+    /**
+     * Toggle the Rust helpers; disabled, every *Native method falls back to PHP.
+     */
+    public static function useRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    private static function mappedArticleKind(string $name, ?string $libraryPath): ?int
+    {
+        $ffi = self::rustFfi($libraryPath);
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $kind = $ffi->nntmux_rfm_mapped_article_kind($name, strlen($name));
+        } catch (\Throwable) {
+            return null;
+        }
+
+        return is_int($kind) && $kind >= 0 ? $kind : null;
+    }
+
+    private static function rustFfi(?string $libraryPath = null): ?FFI
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        if ($libraryPath !== null) {
+            return RustPipelineLibrary::resolveDomain('usenet_download', self::FFI_CDEF, $libraryPath);
+        }
+        if (! self::$ffiResolved) {
+            self::$ffiResolved = true;
+            self::$ffi = RustPipelineLibrary::resolveDomain('usenet_download', self::FFI_CDEF);
+        }
+
+        return self::$ffi;
     }
 
     /**
