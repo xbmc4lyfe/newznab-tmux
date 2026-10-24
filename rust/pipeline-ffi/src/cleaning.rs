@@ -2706,3 +2706,771 @@ mod tests {
         );
     }
 }
+
+// Collections use byte-mode PCRE, followed by PHP trim and encoding detection. This
+// fast path accepts a certified grammar rather than approximating arbitrary regexes.
+// Everything outside it is returned to PHP, including subjects over this stack bound.
+const COLLECTIONS_MAX_SUBJECT: usize = 4096;
+
+fn collections_counter(bytes: &[u8], max_digits: usize) -> Option<usize> {
+    let close = match bytes.first()? {
+        b'[' => b']',
+        b'(' => b')',
+        _ => return None,
+    };
+    let mut pos = 1;
+    let first = pos;
+    while bytes.get(pos).is_some_and(u8::is_ascii_digit) {
+        pos += 1;
+    }
+    if !(1..=max_digits).contains(&(pos - first)) || bytes.get(pos) != Some(&b'/') {
+        return None;
+    }
+    pos += 1;
+    let second = pos;
+    while bytes.get(pos).is_some_and(u8::is_ascii_digit) {
+        pos += 1;
+    }
+    if !(1..=max_digits).contains(&(pos - second)) || bytes.get(pos) != Some(&close) {
+        return None;
+    }
+    Some(pos + 1)
+}
+
+fn collections_has_ci(bytes: &[u8], needle: &[u8]) -> bool {
+    bytes
+        .windows(needle.len())
+        .any(|v| v.eq_ignore_ascii_case(needle))
+}
+
+// Certify that none of the five replacement stages can alter this scene-style
+// name. Prefix checks intentionally decline more than the PHP patterns match.
+fn collections_safe_title(title: &[u8]) -> bool {
+    if title.is_empty() || title[0].is_ascii_digit() {
+        return false;
+    }
+    for (pos, &byte) in title.iter().enumerate() {
+        if !byte.is_ascii_alphanumeric() && !matches!(byte, b'.' | b'_' | b'-') {
+            return false;
+        }
+        let tail = &title[pos..];
+        let forbidden = match byte.to_ascii_lowercase() {
+            b'p' => tail
+                .get(..4)
+                .is_some_and(|v| v.eq_ignore_ascii_case(b"part")),
+            b'v' => tail
+                .get(..3)
+                .is_some_and(|v| v.eq_ignore_ascii_case(b"vol")),
+            b'a' => {
+                tail.get(..10)
+                    .is_some_and(|v| v.eq_ignore_ascii_case(b"autorarpar"))
+                    || tail
+                        .get(..7)
+                        .is_some_and(|v| v.eq_ignore_ascii_case(b"amateur"))
+            }
+            b'c' => tail
+                .get(..7)
+                .is_some_and(|v| v.eq_ignore_ascii_case(b"classic")),
+            b'-' => tail.get(1).is_some_and(u8::is_ascii_digit),
+            b'0'..=b'9' => tail
+                .get(1..4)
+                .is_some_and(|v| v[..2].eq_ignore_ascii_case(b"of") && v[2].is_ascii_digit()),
+            _ => false,
+        };
+        if forbidden {
+            return false;
+        }
+        if byte != b'.' {
+            continue;
+        }
+        let tail = &title[pos + 1..];
+        if tail.len() == 3 && tail.iter().all(u8::is_ascii_digit) {
+            return false;
+        }
+        if tail
+            .get(..2)
+            .is_some_and(|v| v.eq_ignore_ascii_case(b"7z") || v.eq_ignore_ascii_case(b"zz"))
+        {
+            return false;
+        }
+        let Some(prefix) = tail.get(..3) else {
+            continue;
+        };
+        let prefix = [
+            prefix[0].to_ascii_lowercase(),
+            prefix[1].to_ascii_lowercase(),
+            prefix[2].to_ascii_lowercase(),
+        ];
+        if matches!(
+            &prefix,
+            b"avi"
+                | b"diz"
+                | b"doc"
+                | b"idx"
+                | b"iso"
+                | b"jpg"
+                | b"m3u"
+                | b"m4a"
+                | b"mds"
+                | b"mkv"
+                | b"mp4"
+                | b"mu3"
+                | b"nfo"
+                | b"nzb"
+                | b"par"
+                | b"pdf"
+                | b"rar"
+                | b"rev"
+                | b"rtf"
+                | b"sfv"
+                | b"srs"
+                | b"srr"
+                | b"sub"
+                | b"txt"
+                | b"xls"
+                | b"zip"
+        ) || prefix[0] == b'r' && prefix[1].is_ascii_digit() && prefix[2].is_ascii_digit()
+            || prefix == *b"epu" && tail.get(3).is_some_and(|v| v.eq_ignore_ascii_case(&b'b'))
+            || prefix == *b"mob" && tail.get(3).is_some_and(|v| v.eq_ignore_ascii_case(&b'i'))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn collections_normalize(input: &[u8], output: &mut [u8]) -> Option<usize> {
+    let mut written = 0;
+    let mut pos = 0;
+    // Delay trim bytes: trailing PHP trim characters must disappear, but a
+    // single form feed survives while a run of form feeds becomes one space.
+    let mut kept = 0;
+    while pos < input.len() {
+        let mut byte = input[pos];
+        pos += 1;
+        if is_pcre_space(byte) && input.get(pos).is_some_and(|b| is_pcre_space(*b)) {
+            while input.get(pos).is_some_and(|b| is_pcre_space(*b)) {
+                pos += 1;
+            }
+            byte = b' ';
+        }
+        if written == 0 && is_php_trim_char(byte) {
+            continue;
+        }
+        *output.get_mut(written)? = byte;
+        written += 1;
+        if !is_php_trim_char(byte) {
+            kept = written;
+        }
+    }
+    Some(kept)
+}
+
+fn collections_pre_normalize(subject: &[u8], music: bool, output: &mut [u8]) -> Option<usize> {
+    if subject.len() > COLLECTIONS_MAX_SUBJECT {
+        return None;
+    }
+    let mut start = 0;
+    let mut end = subject.len();
+    while start < end && (is_pcre_space(subject[start]) || subject[start] == 0) {
+        start += 1;
+    }
+    while end > start && (is_pcre_space(subject[end - 1]) || subject[end - 1] == 0) {
+        end -= 1;
+    }
+    let mut core = &subject[start..end];
+    let mut stage = [0u8; COLLECTIONS_MAX_SUBJECT];
+    let mut cursor = 0;
+    stage[..start].copy_from_slice(&subject[..start]);
+    cursor += start;
+    let max_digits = if music { 4 } else { 5 };
+    if let Some(count) = collections_counter(core, max_digits) {
+        stage[cursor] = b' ';
+        cursor += 1;
+        core = &core[count..];
+        if core.starts_with(b" - ") {
+            stage[cursor..cursor + 3].copy_from_slice(b" - ");
+            cursor += 3;
+            core = &core[3..];
+        } else if core.starts_with(b" ") {
+            core = &core[1..];
+        } else if !core.is_empty() {
+            return None;
+        }
+    }
+    let mut trailing_counter = false;
+    if core.ends_with(b")") || core.ends_with(b"]") {
+        if let Some(pos) = core.iter().rposition(|&b| b == b'(' || b == b'[') {
+            if pos > 0
+                && core[pos - 1] == b' '
+                && collections_counter(&core[pos..], max_digits) == Some(core.len() - pos)
+            {
+                trailing_counter = true;
+                core = &core[..pos - 1];
+            }
+        }
+    }
+    let mut yenc = &b""[..];
+    if core.len() >= 5
+        && core[core.len() - 5] == b' '
+        && core[core.len() - 4..].eq_ignore_ascii_case(b"yenc")
+    {
+        yenc = &core[core.len() - 5..];
+        core = &core[..core.len() - 5];
+    }
+    let mut title_prefix = &b""[..];
+    if let Some(quote) = core.iter().position(|&b| b == b'"') {
+        if quote > 0 {
+            if core[quote - 1] != b' ' {
+                return None;
+            }
+            let prefix = &core[..quote - 1];
+            if !collections_safe_title(prefix) || prefix.first().is_some_and(u8::is_ascii_digit) {
+                return None;
+            }
+            title_prefix = &core[..quote];
+            core = &core[quote..];
+        }
+    }
+    let quoted = core.starts_with(b"\"");
+    if quoted {
+        if core.len() < 2 || !core.ends_with(b"\"") {
+            return None;
+        }
+        core = &core[1..core.len() - 1];
+    }
+    if music && quoted {
+        // The numbering stage cannot consume a quote or use its greedy .+
+        // branch without whitespace inside this token. Its local replacements
+        // therefore leave both quotes for the next stage's greedy quote removal.
+        if core.is_empty() || core.iter().any(|&b| is_pcre_space(b) || b == b'"') {
+            return None;
+        }
+        stage[cursor..cursor + title_prefix.len()].copy_from_slice(title_prefix);
+        cursor += title_prefix.len();
+        stage[cursor] = b' ';
+        cursor += 1;
+        stage[cursor..cursor + yenc.len()].copy_from_slice(yenc);
+        cursor += yenc.len();
+        if trailing_counter {
+            stage[cursor] = b' ';
+            cursor += 1;
+        }
+        stage[cursor..cursor + subject.len() - end].copy_from_slice(&subject[end..]);
+        cursor += subject.len() - end;
+        return collections_normalize(&stage[..cursor], output);
+    }
+    let mut title = core;
+    let mut archive = false;
+    let mut part_archive = false;
+    if core.len() >= 4 && core[core.len() - 4..].eq_ignore_ascii_case(b".rar") {
+        archive = true;
+        title = &core[..core.len() - 4];
+        let mut digit = title.len();
+        while digit > 0 && title[digit - 1].is_ascii_digit() {
+            digit -= 1;
+        }
+        if digit < title.len()
+            && digit >= 5
+            && title[digit - 5..digit].eq_ignore_ascii_case(b".part")
+        {
+            if title.len() - digit > 5 {
+                return None;
+            }
+            part_archive = true;
+            title = &title[..digit - 5];
+        }
+        if part_archive
+            && title.len() >= 4
+            && title[title.len() - 4] == b'.'
+            && title[title.len() - 3..].iter().all(u8::is_ascii_digit)
+        {
+            return None;
+        }
+        // Certify before suffix digit removal: otherwise it can erase the
+        // final digit in a numbering pattern such as A.12341of2.rar, hiding
+        // an earlier PHP replacement stage from the final-title guard.
+        if !collections_safe_title(title) {
+            return None;
+        }
+        // Stage four consumes up to five title digits even across the space
+        // inserted when stage two replaced .partNN. Preserve this PHP quirk.
+        let mut digit = title.len();
+        let trim_digits = if music && part_archive { 3 } else { 5 };
+        while digit > 0 && title[digit - 1].is_ascii_digit() && title.len() - digit < trim_digits {
+            digit -= 1;
+        }
+        title = &title[..digit];
+        // Decline optional sample suffixes; music and generic replacement order differs.
+        if collections_has_ci(title, b"sample") {
+            return None;
+        }
+    }
+    if !collections_safe_title(title) && !(core.is_empty() && !quoted) {
+        return None;
+    }
+    if quoted && !archive {
+        return None;
+    }
+    if !archive {
+        if let Some(dot) = title.iter().rposition(|&b| b == b'.') {
+            if title.len() - dot == 4
+                && title[dot + 1..].iter().all(u8::is_ascii_digit)
+                && (!yenc.is_empty() || trailing_counter)
+            {
+                return None;
+            }
+        }
+    }
+    stage[cursor..cursor + title_prefix.len()].copy_from_slice(title_prefix);
+    cursor += title_prefix.len();
+    if quoted {
+        stage[cursor] = b' ';
+        cursor += 1;
+    }
+    stage[cursor..cursor + title.len()].copy_from_slice(title);
+    cursor += title.len();
+    if archive {
+        stage[cursor] = b' ';
+        cursor += 1;
+    }
+    stage[cursor..cursor + yenc.len()].copy_from_slice(yenc);
+    cursor += yenc.len();
+    if trailing_counter {
+        stage[cursor] = b' ';
+        cursor += 1;
+    }
+    stage[cursor..cursor + subject.len() - end].copy_from_slice(&subject[end..]);
+    cursor += subject.len() - end;
+    collections_normalize(&stage[..cursor], output)
+}
+
+fn collections_special_music(subject: &[u8]) -> bool {
+    let subject = subject.strip_suffix(b"\n").unwrap_or(subject);
+    let mut pos = 0;
+    while subject.get(pos).is_some_and(|&b| is_pcre_word(b)) {
+        pos += 1;
+    }
+    if pos < 10 || subject.get(pos) != Some(&b'-') {
+        return false;
+    }
+    pos += 1;
+    let album = pos;
+    while subject.get(pos).is_some_and(u8::is_ascii_alphanumeric) {
+        pos += 1;
+    }
+    if pos == album || !subject[pos..].starts_with(b" \"") {
+        return false;
+    }
+    pos += 2;
+    if !subject.get(pos).is_some_and(u8::is_ascii_digit)
+        || !subject.get(pos + 1).is_some_and(u8::is_ascii_digit)
+        || subject.get(pos + 2) != Some(&b'-')
+    {
+        return false;
+    }
+    pos += 3;
+    subject.len() >= pos + 7
+        && subject.ends_with(b"\" yEnc")
+        && !subject[pos..subject.len() - 6].contains(&b'\n')
+}
+
+/// Return collapsed and PHP-trimmed bytes before mbstring encoding detection,
+/// or -1 when any replacement is outside the certified byte grammar.
+///
+/// # Safety
+/// Input must be readable for its length and output writable for its capacity.
+/// Buffers must not overlap. Null pointers are always declined, including empty inputs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_collections_clean_generic_pre_normalize(
+    input: *const u8,
+    input_len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input.is_null()
+        || out.is_null()
+        || out_cap > isize::MAX as usize
+        || input_len > COLLECTIONS_MAX_SUBJECT
+    {
+        return -1;
+    }
+    collections_pre_normalize(
+        unsafe { slice::from_raw_parts(input, input_len) },
+        false,
+        unsafe { slice::from_raw_parts_mut(out, out_cap) },
+    )
+    .map_or(-1, |len| len as isize)
+}
+
+/// Music route: -2 means a nonmusic group, -3 delegates the exact musicSubject
+/// special pattern, -1 delegates generic music cleaning; otherwise bytes before encoding.
+///
+/// # Safety
+/// Pointers must be non-null and readable/writable for their respective lengths.
+/// Input, group and output buffers must not overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_collections_music_subject(
+    input: *const u8,
+    input_len: usize,
+    group: *const u8,
+    group_len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input.is_null()
+        || group.is_null()
+        || out.is_null()
+        || input_len > COLLECTIONS_MAX_SUBJECT
+        || group_len > isize::MAX as usize
+        || out_cap > isize::MAX as usize
+    {
+        return -1;
+    }
+    let group = unsafe { slice::from_raw_parts(group, group_len) };
+    if ![
+        b".flac".as_slice(),
+        b".lossless",
+        b".mp3",
+        b".music",
+        b".sounds",
+    ]
+    .iter()
+    .any(|needle| group.windows(needle.len()).any(|v| v == *needle))
+    {
+        return -2;
+    }
+    let subject = unsafe { slice::from_raw_parts(input, input_len) };
+    if collections_special_music(subject) {
+        return -3;
+    }
+    collections_pre_normalize(subject, true, unsafe {
+        slice::from_raw_parts_mut(out, out_cap)
+    })
+    .map_or(-1, |len| len as isize)
+}
+
+/// Exact short-name enhancement for no-LF subjects with balanced, nonempty quote
+/// pairs. Return -1 for ambiguous pairing/extension interactions or insufficient output.
+///
+/// # Safety
+/// Pointers must be non-null and valid for their lengths. Buffers must not overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_collections_enhance_short_subject(
+    input: *const u8,
+    input_len: usize,
+    clean: *const u8,
+    clean_len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input.is_null()
+        || clean.is_null()
+        || out.is_null()
+        || input_len > COLLECTIONS_MAX_SUBJECT
+        || clean_len > isize::MAX as usize
+        || out_cap > isize::MAX as usize
+    {
+        return -1;
+    }
+    let subject = unsafe { slice::from_raw_parts(input, input_len) };
+    let clean = unsafe { slice::from_raw_parts(clean, clean_len) };
+    if subject.contains(&b'\n') {
+        return -1;
+    }
+    let mut inside = false;
+    let mut open = 0;
+    let mut capture = None;
+    let mut first_non_alnum = [0u8; 3];
+    let mut first_count = 0;
+    let mut punctuation = [0u8; COLLECTIONS_MAX_SUBJECT];
+    let mut punctuation_len = 0;
+    for (pos, &byte) in subject.iter().enumerate() {
+        if !byte.is_ascii_alphanumeric() && first_count < 3 {
+            first_non_alnum[first_count] = byte;
+            first_count += 1;
+        }
+        if byte == b'"' {
+            if inside {
+                if pos == open + 1 {
+                    return -1;
+                }
+                inside = false;
+            } else {
+                inside = true;
+                open = pos;
+            }
+            if subject.get(pos + 1).is_some_and(u8::is_ascii_alphanumeric)
+                && subject[pos + 1..].contains(&b'"')
+            {
+                let mut end = pos + 1;
+                while subject.get(end).is_some_and(u8::is_ascii_alphanumeric) {
+                    end += 1;
+                }
+                capture = Some(&subject[pos..end]);
+            }
+        } else if !inside && !byte.is_ascii_alphanumeric() {
+            punctuation[punctuation_len] = byte;
+            punctuation_len += 1;
+        }
+    }
+    if inside {
+        return -1;
+    }
+    let capture = capture.unwrap_or(b"");
+    let Some(needed) = clean
+        .len()
+        .checked_add(punctuation_len)
+        .and_then(|n| n.checked_add(capture.len()))
+        .and_then(|n| n.checked_add(first_count))
+    else {
+        return -1;
+    };
+    if needed > out_cap || needed > isize::MAX as usize {
+        return -1;
+    }
+    let output = unsafe { slice::from_raw_parts_mut(out, out_cap) };
+    let mut pos = 0;
+    for piece in [
+        clean,
+        &punctuation[..punctuation_len],
+        capture,
+        &first_non_alnum[..first_count],
+    ] {
+        output[pos..pos + piece.len()].copy_from_slice(piece);
+        pos += piece.len();
+    }
+    needed as isize
+}
+
+#[cfg(test)]
+mod collections_tests {
+    use super::*;
+
+    fn generic(subject: &[u8]) -> Result<Vec<u8>, isize> {
+        let mut out = [0u8; 4096];
+        let len = unsafe {
+            nntmux_collections_clean_generic_pre_normalize(
+                subject.as_ptr(),
+                subject.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        if len < 0 {
+            Err(len)
+        } else {
+            Ok(out[..len as usize].to_vec())
+        }
+    }
+    fn music(subject: &[u8], group: &[u8]) -> Result<Vec<u8>, isize> {
+        let mut out = [0u8; 4096];
+        let len = unsafe {
+            nntmux_collections_music_subject(
+                subject.as_ptr(),
+                subject.len(),
+                group.as_ptr(),
+                group.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        if len < 0 {
+            Err(len)
+        } else {
+            Ok(out[..len as usize].to_vec())
+        }
+    }
+    fn enhance(subject: &[u8], clean: &[u8]) -> Result<Vec<u8>, isize> {
+        let mut out = [0u8; 4096];
+        let len = unsafe {
+            nntmux_collections_enhance_short_subject(
+                subject.as_ptr(),
+                subject.len(),
+                clean.as_ptr(),
+                clean.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        if len < 0 {
+            Err(len)
+        } else {
+            Ok(out[..len as usize].to_vec())
+        }
+    }
+
+    #[test]
+    fn collections_common_archive_preserves_yenc_and_punctuation() {
+        assert_eq!(
+            generic(br#"[01/25] - "Movie.Title.2026-GRP.part01.rar" yEnc (1/50)"#),
+            Ok(b"- Movie.Title.2026-GRP yEnc".to_vec())
+        );
+        assert_eq!(
+            generic(br#""Movie.Title-GRP.rar" yEnc"#),
+            Ok(b"Movie.Title-GRP yEnc".to_vec())
+        );
+        assert_eq!(
+            generic(br#"Movie.Title.2026.part001.rar"#),
+            Ok(b"Movie.Title.".to_vec())
+        );
+        assert_eq!(
+            generic(
+                br#"[1/50] Some.Show.S01E02.1080p.WEB-DL-GROUP "release.part001.rar" yEnc (1/50)"#
+            ),
+            Ok(b"Some.Show.S01E02.1080p.WEB-DL-GROUP release yEnc".to_vec())
+        );
+        assert_eq!(generic(b"Plain.Title-GRP"), Ok(b"Plain.Title-GRP".to_vec()));
+    }
+
+    #[test]
+    fn collections_whitespace_uses_pcre_runs_and_php_trim() {
+        assert_eq!(
+            generic(b"\0\tPlain.Title-GRP\r\0"),
+            Ok(b"Plain.Title-GRP".to_vec())
+        );
+        assert_eq!(
+            generic(b"\x0cPlain.Title-GRP\x0c"),
+            Ok(b"\x0cPlain.Title-GRP\x0c".to_vec())
+        );
+        assert_eq!(
+            generic(b"\x0c\x0cPlain.Title-GRP\x0c\x0c"),
+            Ok(b"Plain.Title-GRP".to_vec())
+        );
+        assert_eq!(
+            generic(b"\x0c\0\t\"Title.Name-GRP.rar\" (1/50)"),
+            Ok(b"\x0c\0 Title.Name-GRP".to_vec())
+        );
+        assert_eq!(generic(b""), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn collections_music_routes_groups_and_special_pattern() {
+        assert_eq!(
+            music(b"Movie.2026.part001.rar", b"alt.music"),
+            Ok(b"Movie.2".to_vec())
+        );
+        assert_eq!(music(b"Plain.Title-GRP", b"alt.binaries.Music"), Err(-2));
+        assert_eq!(
+            music(b"Plain.Title-GRP", b"alt.binaries.music"),
+            Ok(b"Plain.Title-GRP".to_vec())
+        );
+        assert_eq!(
+            music(
+                br#"[01/25] - "Album.Title-GRP.part01.rar" yEnc (1/50)"#,
+                b"alt.binaries.flac"
+            ),
+            Ok(b"- yEnc".to_vec())
+        );
+        assert_eq!(
+            music(
+                br#"[1/50] Artist_Album_2026_GRP "release.part001.rar" yEnc (1/50)"#,
+                b"alt.binaries.music"
+            ),
+            Ok(b"Artist_Album_2026_GRP yEnc".to_vec())
+        );
+        assert_eq!(
+            music(
+                br#"Broderick_Smith-Unknown "00-broderick.sfv" yEnc"#,
+                b"alt.music"
+            ),
+            Err(-3)
+        );
+    }
+
+    #[test]
+    fn collections_complex_branches_decline_instead_of_approximating() {
+        for subject in [
+            b"Movie 365.15 KB yEnc".as_slice(),
+            b"Title1of2.Name.rar",
+            b"A.12341of2.rar",
+            b" 1024KB ",
+            b"[1/5] foo.mu3",
+            b"Title.123.part01.rar",
+            br#"[1/2] "Title.123.part01.rar" yEnc"#,
+            b"Title1OF2.Name.rar",
+            b"AutoRarPar123 Movie",
+            b"AutoRarPar1",
+            b"22Amateur",
+            b"Movie.vol01+03.par2",
+            b"Album 01. artist.mp3",
+            b"abce-12-34.rar",
+            b"Movie.jpg",
+            b"test.foo\"",
+            b"a\nb",
+            b"\xffMovie.rar",
+            b"Movie.part123456.rar",
+            b"Movie - sample.rar",
+        ] {
+            assert_eq!(generic(subject), Err(-1), "{:?}", subject);
+        }
+    }
+
+    #[test]
+    fn collections_enhancement_preserves_byte_append_order() {
+        assert_eq!(enhance(b"a-b_c.d", b"short"), Ok(b"short-_.-_.".to_vec()));
+        assert_eq!(
+            enhance(br#""ABC.def" yEnc (1/2)"#, b"yEnc"),
+            Ok(br##"yEnc  (/)"ABC".""##.to_vec())
+        );
+        assert_eq!(enhance(b"\xffa\0b!", b"x"), Ok(b"x\xff\0!\xff\0!".to_vec()));
+        assert_eq!(enhance(br#"unmatched "foo.rar"#, b"x"), Err(-1));
+        assert_eq!(enhance(b"a\nb", b"x"), Err(-1));
+    }
+
+    #[test]
+    fn collections_abi_rejects_null_and_insufficient_capacity() {
+        let mut out = [0x55; 2];
+        unsafe {
+            assert_eq!(
+                nntmux_collections_clean_generic_pre_normalize(
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    2
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_collections_clean_generic_pre_normalize(
+                    b"Title".as_ptr(),
+                    5,
+                    out.as_mut_ptr(),
+                    2
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_collections_clean_generic_pre_normalize(
+                    b"".as_ptr(),
+                    0,
+                    std::ptr::null_mut(),
+                    0
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_collections_music_subject(
+                    b"Title".as_ptr(),
+                    5,
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    2
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_collections_enhance_short_subject(
+                    b"".as_ptr(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    2
+                ),
+                -1
+            );
+        }
+    }
+}
