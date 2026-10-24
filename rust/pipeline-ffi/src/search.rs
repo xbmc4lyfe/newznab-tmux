@@ -5910,7 +5910,11 @@ fn w11_count_query(query: &[u8], fallback: bool) -> Option<Vec<u8>> {
     let mut s = query.to_vec();
     if let Some((at, _)) = (0..s.len()).find_map(|i| {
         w11_words(&s, i, &[b"ORDER", b"BY"])
-            .filter(|&end| end < s.len() && !s[end..].contains(&b')'))
+            .filter(|&end| {
+                s.get(end).is_some_and(|b| is_ascii_ws(*b))
+                    && end + 1 < s.len()
+                    && !s[end + 1..].contains(&b')')
+            })
             .map(|end| (i, end))
     }) {
         s.truncate(at);
@@ -5932,13 +5936,17 @@ fn w11_count_query(query: &[u8], fallback: bool) -> Option<Vec<u8>> {
     let mut copied = 0;
     let mut scan = 0;
     while let Some((at, select_end)) = w11_find(&s, scan, &[b"SELECT"]) {
-        if w11_ws(&s, select_end).is_none() {
+        let Some(ws) = w11_ws(&s, select_end) else {
             scan = at + 1;
             continue;
-        }
-        // SELECT\s+.+?\s+FROM: at least one whitespace and one body byte.
-        let found = (select_end + 2..s.len())
-            .find_map(|i| w11_ws(&s, i).and_then(|end| w11_word(&s, end, b"FROM")));
+        };
+        // SELECT\s+.+?\s+FROM: \s+ after SELECT is greedy, then lazy .+? (at least 1 byte), then \s+FROM.
+        let found = (ws + 1..s.len())
+            .find_map(|i| w11_ws(&s, i).and_then(|end| w11_word(&s, end, b"FROM")))
+            .or_else(|| {
+                (select_end + 2..s.len())
+                    .find_map(|i| w11_ws(&s, i).and_then(|end| w11_word(&s, end, b"FROM")))
+            });
         if let Some(end) = found {
             result.extend_from_slice(&s[copied..at]);
             result.extend_from_slice(replacement);
