@@ -2763,6 +2763,772 @@ pub unsafe extern "C" fn nntmux_verified_nzb_document(
     }
 }
 
+// ---------------------------------------------------------------------------
+// ConstrainedPredbMatcher (`parse`, `suggest`, `completeEvidence` parity).
+// ---------------------------------------------------------------------------
+
+const CP_MARKER_GROUP: usize = 0;
+const CP_MARKER_YEAR: usize = 1;
+const CP_MARKER_EPISODE: usize = 2;
+const CP_MARKER_SEASON: usize = 3;
+const CP_MARKER_RESOLUTION: usize = 4;
+const CP_MARKER_LANGUAGE: usize = 5;
+const CP_MARKER_EDITION: usize = 6;
+const CP_MARKER_ADULT: usize = 7;
+const CP_MARKER_COUNT: usize = 8;
+
+const CP_MARKER_NAMES: [&[u8]; CP_MARKER_COUNT] = [
+    b"group",
+    b"year",
+    b"episode",
+    b"season",
+    b"resolution",
+    b"language",
+    b"edition",
+    b"adult",
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConstrainedParseStatus {
+    Ok,
+    Null,
+    Declined,
+}
+
+struct ConstrainedParsed {
+    arena: [u8; 1024],
+    title_spans: [(u16, u16); 64],
+    title_len: usize,
+    title_char_sum: usize,
+    empty_single_title: bool,
+    suffix_spans: [(u16, u16); 64],
+    suffix_len: usize,
+    marker_spans: [Option<(u16, u16)>; CP_MARKER_COUNT],
+    marker_order: [u8; CP_MARKER_COUNT],
+    marker_order_len: usize,
+}
+
+impl ConstrainedParsed {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            arena: [0u8; 1024],
+            title_spans: [(0, 0); 64],
+            title_len: 0,
+            title_char_sum: 0,
+            empty_single_title: false,
+            suffix_spans: [(0, 0); 64],
+            suffix_len: 0,
+            marker_spans: [None; CP_MARKER_COUNT],
+            marker_order: [0; CP_MARKER_COUNT],
+            marker_order_len: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn title_token(&self, idx: usize) -> &[u8] {
+        let (off, len) = self.title_spans[idx];
+        let o = usize::from(off);
+        &self.arena[o..o + usize::from(len)]
+    }
+
+    #[inline(always)]
+    fn suffix_token(&self, idx: usize) -> &[u8] {
+        let (off, len) = self.suffix_spans[idx];
+        let o = usize::from(off);
+        &self.arena[o..o + usize::from(len)]
+    }
+
+    #[inline(always)]
+    fn marker_slice(&self, key: usize) -> Option<&[u8]> {
+        self.marker_spans[key].map(|(off, len)| {
+            let o = usize::from(off);
+            &self.arena[o..o + usize::from(len)]
+        })
+    }
+}
+
+#[inline]
+fn trim_php_default(mut s: &[u8]) -> &[u8] {
+    while let Some(&b) = s.first() {
+        if matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x00 | 0x0B) {
+            s = &s[1..];
+        } else {
+            break;
+        }
+    }
+    while let Some(&b) = s.last() {
+        if matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x00 | 0x0B) {
+            s = &s[..s.len() - 1];
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+#[inline]
+fn match_and_normalize_episode_in_place(buf: &mut [u8]) -> Option<usize> {
+    if buf.len() < 4 || buf[0] != b's' {
+        return None;
+    }
+    let mut pos = 1usize;
+    let s_start = pos;
+    while pos < buf.len() && buf[pos].is_ascii_digit() {
+        pos += 1;
+    }
+    let s_digits = pos - s_start;
+    if !(1..=2).contains(&s_digits) || pos >= buf.len() {
+        return None;
+    }
+    let mut check_pos = pos;
+    while check_pos < buf.len() {
+        if buf[check_pos] != b'e' {
+            return None;
+        }
+        check_pos += 1;
+        let e_start = check_pos;
+        while check_pos < buf.len() && buf[check_pos].is_ascii_digit() {
+            check_pos += 1;
+        }
+        let e_digits = check_pos - e_start;
+        if !(1..=3).contains(&e_digits) {
+            return None;
+        }
+    }
+
+    // Valid episode token; strip leading zeros on each digit run in-place.
+    let mut write_pos = 1usize;
+    let mut s_nz = s_start;
+    while s_nz + 1 < pos && buf[s_nz] == b'0' {
+        s_nz += 1;
+    }
+    for i in s_nz..pos {
+        buf[write_pos] = buf[i];
+        write_pos += 1;
+    }
+    while pos < buf.len() {
+        // buf[pos] == b'e'
+        buf[write_pos] = b'e';
+        write_pos += 1;
+        pos += 1;
+        let e_start = pos;
+        while pos < buf.len() && buf[pos].is_ascii_digit() {
+            pos += 1;
+        }
+        let mut e_nz = e_start;
+        while e_nz + 1 < pos && buf[e_nz] == b'0' {
+            e_nz += 1;
+        }
+        for i in e_nz..pos {
+            buf[write_pos] = buf[i];
+            write_pos += 1;
+        }
+    }
+    Some(write_pos)
+}
+
+#[inline]
+fn classify_constrained_marker(tok: &mut [u8]) -> Option<(usize, usize)> {
+    let len = tok.len();
+    if len == 4
+        && (tok.starts_with(b"19") || tok.starts_with(b"20"))
+        && tok[2].is_ascii_digit()
+        && tok[3].is_ascii_digit()
+    {
+        return Some((CP_MARKER_YEAR, 4));
+    }
+    if tok.first() == Some(&b's') {
+        if let Some(ep_len) = match_and_normalize_episode_in_place(tok) {
+            return Some((CP_MARKER_EPISODE, ep_len));
+        }
+        if (len == 2 && tok[1].is_ascii_digit())
+            || (len == 3 && tok[1].is_ascii_digit() && tok[2].is_ascii_digit())
+        {
+            return Some((CP_MARKER_SEASON, len));
+        }
+    }
+    let tok: &[u8] = tok;
+    if matches!(
+        tok,
+        b"480p"
+            | b"480i"
+            | b"576p"
+            | b"576i"
+            | b"720p"
+            | b"720i"
+            | b"1080p"
+            | b"1080i"
+            | b"2160p"
+            | b"2160i"
+    ) {
+        return Some((CP_MARKER_RESOLUTION, len));
+    }
+    if matches!(
+        tok,
+        b"english"
+            | b"german"
+            | b"french"
+            | b"finnish"
+            | b"japanese"
+            | b"dutch"
+            | b"spanish"
+            | b"italian"
+            | b"multi"
+            | b"dual"
+    ) {
+        return Some((CP_MARKER_LANGUAGE, len));
+    }
+    if matches!(
+        tok,
+        b"extended"
+            | b"unrated"
+            | b"directors"
+            | b"theatrical"
+            | b"remastered"
+            | b"repack"
+            | b"proper"
+    ) {
+        return Some((CP_MARKER_EDITION, len));
+    }
+    if tok == b"xxx" {
+        return Some((CP_MARKER_ADULT, 3));
+    }
+    None
+}
+
+#[inline]
+fn is_constrained_boundary_token(tok: &[u8]) -> bool {
+    matches!(
+        tok,
+        b"bluray"
+            | b"bdrip"
+            | b"web"
+            | b"webdl"
+            | b"webrip"
+            | b"hdtv"
+            | b"x264"
+            | b"x265"
+            | b"h264"
+            | b"h265"
+            | b"hevc"
+            | b"avc"
+            | b"ddp"
+            | b"dts"
+            | b"hdr"
+            | b"dovi"
+            | b"aac"
+            | b"mp4"
+    )
+}
+
+#[inline]
+fn is_constrained_stopword(tok: &[u8]) -> bool {
+    matches!(tok, b"the" | b"a" | b"an" | b"and" | b"of")
+}
+
+fn constrained_predb_parse_into(input: &[u8], out: &mut ConstrainedParsed) -> ConstrainedParseStatus {
+    out.title_len = 0;
+    out.title_char_sum = 0;
+    out.empty_single_title = false;
+    out.suffix_len = 0;
+    out.marker_spans = [None; CP_MARKER_COUNT];
+    out.marker_order_len = 0;
+
+    if input.is_empty() || input.len() > 512 {
+        return ConstrainedParseStatus::Null;
+    }
+    if !input.is_ascii() {
+        return if std::str::from_utf8(input).is_err() {
+            ConstrainedParseStatus::Null
+        } else {
+            ConstrainedParseStatus::Declined
+        };
+    }
+
+    let trimmed = trim_php_default(input);
+    let mut norm_len = 0usize;
+    let mut in_dot_sep = false;
+    for &b in trimmed {
+        if matches!(b, b'.' | b'_' | b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r') {
+            if !in_dot_sep {
+                out.arena[norm_len] = b'.';
+                norm_len += 1;
+                in_dot_sep = true;
+            }
+        } else {
+            out.arena[norm_len] = b.to_ascii_lowercase();
+            norm_len += 1;
+            in_dot_sep = false;
+        }
+    }
+
+    let mut s_len = norm_len;
+    if s_len >= 4 {
+        let tail4 = &out.arena[s_len - 4..s_len];
+        if matches!(tail4, b".mkv" | b".mp4" | b".avi" | b".rar" | b".nfo") {
+            s_len -= 4;
+        } else if s_len >= 5 && &out.arena[s_len - 5..s_len] == b".par2" {
+            s_len -= 5;
+        }
+    }
+
+    let mut raw_markers = [(0u8, 0u16, 0u16); 65];
+    let mut raw_markers_len = 0usize;
+    let mut marker_multi_mask = 0u8;
+
+    let mut group_len = 0usize;
+    while group_len < s_len && out.arena[s_len - 1 - group_len].is_ascii_alphanumeric() {
+        group_len += 1;
+    }
+    if (2..=20).contains(&group_len) && s_len > group_len && out.arena[s_len - 1 - group_len] == b'-'
+    {
+        let g_off = (s_len - group_len) as u16;
+        let g_len = group_len as u16;
+        out.marker_spans[CP_MARKER_GROUP] = Some((g_off, g_len));
+        out.marker_order[0] = CP_MARKER_GROUP as u8;
+        out.marker_order_len = 1;
+        raw_markers[0] = (CP_MARKER_GROUP as u8, g_off, g_len);
+        raw_markers_len = 1;
+        s_len -= 1 + group_len;
+    }
+
+    let mut token_spans = [(0u16, 0u16); 64];
+    let mut token_count = 0usize;
+    let mut pos = 0usize;
+    while pos < s_len {
+        while pos < s_len && !out.arena[pos].is_ascii_alphanumeric() {
+            pos += 1;
+        }
+        if pos >= s_len {
+            break;
+        }
+        let start = pos;
+        while pos < s_len && out.arena[pos].is_ascii_alphanumeric() {
+            pos += 1;
+        }
+        if token_count >= 64 {
+            return ConstrainedParseStatus::Null;
+        }
+        token_spans[token_count] = (start as u16, (pos - start) as u16);
+        token_count += 1;
+    }
+
+    if token_count == 0 {
+        out.title_spans[0] = (0, 0);
+        out.title_len = 1;
+        out.empty_single_title = true;
+        return ConstrainedParseStatus::Ok;
+    }
+
+    let mut after_boundary = false;
+    for &(t_off, t_len) in &token_spans[..token_count] {
+        let start = usize::from(t_off);
+        let end = start + usize::from(t_len);
+        if let Some((key, m_len)) = classify_constrained_marker(&mut out.arena[start..end]) {
+            let m_len_u16 = m_len as u16;
+            if out.marker_spans[key].is_none() {
+                out.marker_spans[key] = Some((t_off, m_len_u16));
+                out.marker_order[out.marker_order_len] = key as u8;
+                out.marker_order_len += 1;
+            } else {
+                marker_multi_mask |= 1u8 << key;
+            }
+            raw_markers[raw_markers_len] = (key as u8, t_off, m_len_u16);
+            raw_markers_len += 1;
+            after_boundary = true;
+            continue;
+        }
+
+        let tok = &out.arena[start..end];
+        if is_constrained_boundary_token(tok) {
+            after_boundary = true;
+        }
+        if after_boundary {
+            out.suffix_spans[out.suffix_len] = (t_off, t_len);
+            out.suffix_len += 1;
+        } else if !is_constrained_stopword(tok) {
+            out.title_spans[out.title_len] = (t_off, t_len);
+            out.title_len += 1;
+            out.title_char_sum += usize::from(t_len);
+        }
+    }
+
+    if marker_multi_mask != 0 {
+        let mut cursor = norm_len;
+        for key in 0..CP_MARKER_COUNT {
+            if (marker_multi_mask & (1u8 << key)) == 0 {
+                continue;
+            }
+            let joined_start = cursor;
+            let mut first = true;
+            for &(rk, r_off, r_len) in &raw_markers[..raw_markers_len] {
+                if usize::from(rk) != key {
+                    continue;
+                }
+                if !first {
+                    out.arena[cursor] = b' ';
+                    cursor += 1;
+                }
+                first = false;
+                let ro = usize::from(r_off);
+                let rl = usize::from(r_len);
+                out.arena.copy_within(ro..ro + rl, cursor);
+                cursor += rl;
+            }
+            out.marker_spans[key] = Some((joined_start as u16, (cursor - joined_start) as u16));
+        }
+    }
+
+    ConstrainedParseStatus::Ok
+}
+
+/// Bounded byte-level Levenshtein distance returning `<= max_dist` or `max_dist + 1` when exceeded.
+#[inline]
+fn constrained_levenshtein_bounded(a: &[u8], b: &[u8], max_dist: usize) -> usize {
+    if a.len().abs_diff(b.len()) > max_dist {
+        return max_dist + 1;
+    }
+    let m = a.len();
+    let n = b.len();
+    let mut prev = [0u16; 513];
+    let mut curr = [0u16; 513];
+    for (j, slot) in prev.iter_mut().enumerate().take(n + 1) {
+        *slot = j as u16;
+    }
+    let limit = max_dist as u16;
+    for i in 1..=m {
+        curr[0] = i as u16;
+        let mut row_min = curr[0];
+        let ca = a[i - 1];
+        for j in 1..=n {
+            let cost = u16::from(ca != b[j - 1]);
+            let v = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+            curr[j] = v;
+            if v < row_min {
+                row_min = v;
+            }
+        }
+        if row_min > limit {
+            return max_dist + 1;
+        }
+        prev[..=n].copy_from_slice(&curr[..=n]);
+    }
+    usize::from(prev[n])
+}
+
+#[inline]
+fn parse_positive_i64_ascii(bytes: &[u8]) -> Option<i64> {
+    if bytes.is_empty() || bytes.len() > 19 {
+        return None;
+    }
+    let mut acc: i64 = 0;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        acc = acc.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+    }
+    if acc > 0 { Some(acc) } else { None }
+}
+
+/// Accelerates `ConstrainedPredbMatcher::parse(string $name)`.
+/// Returns:
+/// - `-1` when declined to PHP (non-ASCII UTF-8 input),
+/// - `-2` when `parse()` returns `null` (empty, `> 512` bytes, invalid UTF-8, or `> 64` tokens),
+/// - `< -2` when `out_buf` capacity is too small (needed bytes = `-ret`),
+/// - `>= 0` number of bytes written to `out_buf` in format `"{title_line}\n{markers_line}\n{suffix_line}"`.
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_constrained_predb_parse(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input_len > 0 && input.is_null() {
+        return -1;
+    }
+    if input_len == 0 || input_len > 512 {
+        return -2;
+    }
+    let slice = unsafe { slice::from_raw_parts(input, input_len) };
+    let mut parsed = ConstrainedParsed::new();
+    match constrained_predb_parse_into(slice, &mut parsed) {
+        ConstrainedParseStatus::Null => return -2,
+        ConstrainedParseStatus::Declined => return -1,
+        ConstrainedParseStatus::Ok => {}
+    }
+
+    let mut cur = OutCursor::new(out_buf, out_cap);
+    if parsed.empty_single_title {
+        cur.push_byte(0x01);
+    } else {
+        for i in 0..parsed.title_len {
+            if i > 0 {
+                cur.push_byte(b' ');
+            }
+            cur.push_slice(parsed.title_token(i));
+        }
+    }
+    cur.push_byte(b'\n');
+
+    for i in 0..parsed.marker_order_len {
+        if i > 0 {
+            cur.push_byte(b'\t');
+        }
+        let key = usize::from(parsed.marker_order[i]);
+        cur.push_slice(CP_MARKER_NAMES[key]);
+        cur.push_byte(b':');
+        if let Some(val) = parsed.marker_slice(key) {
+            cur.push_slice(val);
+        }
+    }
+    cur.push_byte(b'\n');
+
+    for i in 0..parsed.suffix_len {
+        if i > 0 {
+            cur.push_byte(b' ');
+        }
+        cur.push_slice(parsed.suffix_token(i));
+    }
+
+    cur.finish()
+}
+
+/// Accelerates `ConstrainedPredbMatcher::suggest` and `ConstrainedPredbMatcher::completeEvidence`
+/// across a batch of `hit_count` NUL-separated `(id_ascii, title)` pairs in a single FFI call.
+///
+/// Return status codes:
+/// - `-1`: declined to PHP (non-ASCII bytes or malformed packing)
+/// - `0`: `candidate_overflow` (`hit_count > 50`)
+/// - `1`: `insufficient_title`
+/// - `2`: `missing_identity_anchor`
+/// - `3`: `constraints_or_score`
+/// - `4`: `ambiguous` (`out_f64[0..4]` = `[idx0, idx1, score0, score1]`)
+/// - `5`: `constrained_match` with complete marker/suffix evidence (`out_f64[0]` = `idx0`, `out_f64[2]` = `score0`)
+/// - `6`: `constrained_match` with `unresolved_release_variant` (`out_f64[0]` = `idx0`, `out_f64[2]` = `score0`)
+///
+/// # Safety
+///
+/// `query` and `hits_nul` must be valid for reads of their lengths when length > 0.
+/// `out_f64` must be valid for writes of 4 `f64` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_constrained_predb_suggest_batch(
+    query: *const u8,
+    query_len: usize,
+    hits_nul: *const u8,
+    hits_len: usize,
+    hit_count: usize,
+    out_f64: *mut f64,
+) -> i32 {
+    if (query_len > 0 && query.is_null())
+        || (hits_len > 0 && hits_nul.is_null())
+        || out_f64.is_null()
+    {
+        return -1;
+    }
+    if hit_count > 50 {
+        return 0;
+    }
+    let q_bytes = if query_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(query, query_len) }
+    };
+
+    let mut q = ConstrainedParsed::new();
+    match constrained_predb_parse_into(q_bytes, &mut q) {
+        ConstrainedParseStatus::Declined => return -1,
+        ConstrainedParseStatus::Null => return 1,
+        ConstrainedParseStatus::Ok => {}
+    }
+
+    if q.title_len < 2 || q.title_char_sum < 9 {
+        return 1;
+    }
+    if q.marker_spans[CP_MARKER_YEAR].is_none() && q.marker_spans[CP_MARKER_EPISODE].is_none() {
+        return 2;
+    }
+    if hit_count == 0 {
+        return 3;
+    }
+
+    let h_slice = if hits_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(hits_nul, hits_len) }
+    };
+
+    #[derive(Clone, Copy)]
+    struct RankedHit {
+        id: i64,
+        hit_idx: u32,
+        rounded_score: f64,
+        complete_match: bool,
+    }
+
+    let mut ranked = [RankedHit {
+        id: 0,
+        hit_idx: 0,
+        rounded_score: 0.0,
+        complete_match: false,
+    }; 50];
+    let mut ranked_len = 0usize;
+    let mut c = ConstrainedParsed::new();
+
+    let mut pos = 0usize;
+    'candidates: for idx in 0..hit_count {
+        let Some(id_end_rel) = h_slice[pos..].iter().position(|&b| b == 0) else {
+            return -1;
+        };
+        let id_bytes = &h_slice[pos..pos + id_end_rel];
+        pos += id_end_rel + 1;
+
+        let title_bytes = if idx + 1 == hit_count {
+            let rem = &h_slice[pos..];
+            if rem.contains(&0) {
+                return -1;
+            }
+            pos = h_slice.len();
+            rem
+        } else {
+            let Some(t_end_rel) = h_slice[pos..].iter().position(|&b| b == 0) else {
+                return -1;
+            };
+            let t = &h_slice[pos..pos + t_end_rel];
+            pos += t_end_rel + 1;
+            t
+        };
+
+        let Some(hit_id) = parse_positive_i64_ascii(id_bytes) else {
+            return -1;
+        };
+
+        match constrained_predb_parse_into(title_bytes, &mut c) {
+            ConstrainedParseStatus::Declined => return -1,
+            ConstrainedParseStatus::Null => continue,
+            ConstrainedParseStatus::Ok => {}
+        }
+
+        if c.title_len != q.title_len {
+            continue;
+        }
+
+        // All markers present on q must match c; year, edition, language, adult must match even when absent on q.
+        for key in 0..CP_MARKER_COUNT {
+            let q_val = q.marker_slice(key);
+            let c_val = c.marker_slice(key);
+            if matches!(
+                key,
+                CP_MARKER_YEAR | CP_MARKER_EDITION | CP_MARKER_LANGUAGE | CP_MARKER_ADULT
+            ) {
+                if c_val != q_val {
+                    continue 'candidates;
+                }
+            } else if q_val.is_some() && c_val != q_val {
+                continue 'candidates;
+            }
+        }
+
+        if q.suffix_len > 0 {
+            if c.suffix_len != q.suffix_len {
+                continue;
+            }
+            for s_idx in 0..q.suffix_len {
+                if q.suffix_token(s_idx) != c.suffix_token(s_idx) {
+                    continue 'candidates;
+                }
+            }
+        }
+
+        let mut sum = 0.0f64;
+        let mut exact = 0usize;
+        let mut edits = 0usize;
+        for t_idx in 0..q.title_len {
+            let tok = q.title_token(t_idx);
+            let cand_tok = c.title_token(t_idx);
+            if tok == cand_tok {
+                exact += 1;
+                sum += 1.0;
+                continue;
+            }
+            let min_len = tok.len().min(cand_tok.len());
+            if min_len < 5
+                || edits >= 2
+                || tok.iter().all(|b| b.is_ascii_digit())
+                || cand_tok.iter().all(|b| b.is_ascii_digit())
+            {
+                continue 'candidates;
+            }
+            let length = tok.len().max(cand_tok.len());
+            let max_allowed = (if length >= 10 { 2usize } else { 1usize }).min(2 - edits);
+            let dist = constrained_levenshtein_bounded(tok, cand_tok, max_allowed);
+            if dist > max_allowed {
+                continue 'candidates;
+            }
+            edits += dist;
+            sum += 1.0 - (dist as f64) / (length as f64);
+        }
+
+        let score = 100.0 * sum / (q.title_len as f64);
+        if exact < 1 || edits > 2 || score < 90.0 {
+            continue;
+        }
+
+        let rounded_score = (score * 1000.0 + 0.5).floor() / 1000.0;
+        let complete_match =
+            c.marker_order_len == q.marker_order_len && c.suffix_len == q.suffix_len;
+
+        let entry = RankedHit {
+            id: hit_id,
+            hit_idx: idx as u32,
+            rounded_score,
+            complete_match,
+        };
+
+        let mut existing_slot = None;
+        for (slot_idx, existing) in ranked[..ranked_len].iter().enumerate() {
+            if existing.id == hit_id {
+                existing_slot = Some(slot_idx);
+                break;
+            }
+        }
+        if let Some(slot_idx) = existing_slot {
+            ranked[slot_idx] = entry;
+        } else {
+            ranked[ranked_len] = entry;
+            ranked_len += 1;
+        }
+    }
+
+    if ranked_len == 0 {
+        return 3;
+    }
+
+    ranked[..ranked_len].sort_by(|a, b| b.rounded_score.total_cmp(&a.rounded_score));
+
+    if ranked_len >= 2 && ranked[0].rounded_score - ranked[1].rounded_score < 8.0 {
+        unsafe {
+            *out_f64.add(0) = f64::from(ranked[0].hit_idx);
+            *out_f64.add(1) = f64::from(ranked[1].hit_idx);
+            *out_f64.add(2) = ranked[0].rounded_score;
+            *out_f64.add(3) = ranked[1].rounded_score;
+        }
+        return 4;
+    }
+
+    unsafe {
+        *out_f64.add(0) = f64::from(ranked[0].hit_idx);
+        *out_f64.add(2) = ranked[0].rounded_score;
+    }
+    if ranked[0].complete_match { 5 } else { 6 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2974,5 +3740,52 @@ mod tests {
             nntmux_release_plain_search_name(sn.as_ptr(), sn.len(), buf.as_mut_ptr(), buf.len())
         };
         assert_eq!(&buf[..n as usize], b"Release Name 2026");
+    }
+
+    #[test]
+    fn test_constrained_predb_parse_and_suggest_batch() {
+        let input = b"Kanata.Kara.S01E02.1080p.AMZN.WEB-DL.JPN.DDP2.0.H.264-ToonsHub.mkv";
+        let mut buf = [0u8; 512];
+        let n = unsafe {
+            nntmux_constrained_predb_parse(input.as_ptr(), input.len(), buf.as_mut_ptr(), buf.len())
+        };
+        assert!(n > 0);
+        assert_eq!(
+            &buf[..n as usize],
+            b"kanata kara\ngroup:toonshub\tepisode:s1e2\tresolution:1080p\namzn web dl jpn ddp2 0 h 264"
+        );
+
+        // Partial query suggests hit 0 with unresolved release variant (status 6)
+        let q1 = b"kazata.kara.s1e2";
+        let hits = b"1\0Kanata.Kara.S01E02.1080p.AMZN.WEB-DL.JPN.DDP2.0.H.264-ToonsHub";
+        let mut out_f64 = [0.0f64; 4];
+        let s1 = unsafe {
+            nntmux_constrained_predb_suggest_batch(
+                q1.as_ptr(),
+                q1.len(),
+                hits.as_ptr(),
+                hits.len(),
+                1,
+                out_f64.as_mut_ptr(),
+            )
+        };
+        assert_eq!(s1, 6);
+        assert_eq!(out_f64[0] as usize, 0);
+        assert!((out_f64[2] - 91.667).abs() < 1e-6);
+
+        // Full query suggests hit 0 with complete evidence (status 5)
+        let q2 = b"Kazata.Kara.S01E02.1080p.AMZN.WEB-DL.JPN.DDP2.0.H.264-ToonsHub";
+        let s2 = unsafe {
+            nntmux_constrained_predb_suggest_batch(
+                q2.as_ptr(),
+                q2.len(),
+                hits.as_ptr(),
+                hits.len(),
+                1,
+                out_f64.as_mut_ptr(),
+            )
+        };
+        assert_eq!(s2, 5);
+        assert_eq!(out_f64[0] as usize, 0);
     }
 }
