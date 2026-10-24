@@ -32094,3 +32094,842 @@ pub mod movie_anime_tv_reprocess_commands {
         }
     }
 }
+/// Wave 31.4 helpers for the `UpdatePostProcess`, `PostProcessTvPipeline`,
+/// `NntmuxResetTvShowPostProcessing`, `NntmuxPopulateAniDB` and `NntmuxPopulateSteamApps`
+/// console commands. Every export returns `-1` (or `-required` for an undersized buffer) to make
+/// the PHP caller fall back to its native implementation.
+pub mod postprocess_tv_anidb_steam_commands {
+    use std::mem::size_of;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const DECLINE: isize = -1;
+    const DECLINE_I32: i32 = -1;
+
+    /// `UpdatePostProcess::VALID_TYPES`: type name and whether it needs an NNTP connection.
+    const UPDATE_POSTPROCESS_TYPES: [(&[u8], bool); 11] = [
+        (b"additional", false),
+        (b"all", true),
+        (b"amazon", false),
+        (b"anime", false),
+        (b"book", false),
+        (b"console", false),
+        (b"games", false),
+        (b"movies", false),
+        (b"music", false),
+        (b"nfo", true),
+        (b"tv", false),
+    ];
+
+    /// Bit set in the `nntmux_update_postprocess_type_flags()` result for a known type.
+    pub const TYPE_FLAG_VALID: i32 = 1;
+    /// Bit set in the `nntmux_update_postprocess_type_flags()` result for an NNTP type.
+    pub const TYPE_FLAG_REQUIRES_NNTP: i32 = 2;
+
+    /// `NntmuxPopulateAniDB::resolvePopulateMode()` mode codes.
+    pub const ANIDB_MODE_SINGLE: i32 = 0;
+    pub const ANIDB_MODE_ALL: i32 = 1;
+    pub const ANIDB_MODE_MISSING_INFO: i32 = 2;
+
+    /// PHP value kinds for the AniList id argument.
+    const KIND_OTHER: u32 = 0;
+    const KIND_INT: u32 = 1;
+    const KIND_FLOAT: u32 = 2;
+    const KIND_STRING: u32 = 3;
+
+    /// 2^63 as `f64`; PHP warns when casting a float outside `[-2^63, 2^63)` to int.
+    const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+
+    #[inline]
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    #[inline]
+    fn valid_mut_ptr<T>(ptr: *mut T) -> bool {
+        !ptr.is_null() && ptr.is_aligned() && (ptr as usize).checked_add(size_of::<T>()).is_some()
+    }
+
+    #[inline]
+    fn flag(value: u32) -> Option<bool> {
+        match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Copies `bytes` into `out_buf`, returning the length or `-required` when it does not fit.
+    unsafe fn write_bytes(bytes: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.is_empty() {
+            return 0;
+        }
+        if bytes.len() > out_cap {
+            return -(bytes.len() as isize);
+        }
+        unsafe { slice::from_raw_parts_mut(out_buf, bytes.len()) }.copy_from_slice(bytes);
+        bytes.len() as isize
+    }
+
+    /// `array_key_exists($type, VALID_TYPES)` and `VALID_TYPES[$type]` as a bit set.
+    pub fn update_postprocess_type_flags(type_name: &[u8]) -> i32 {
+        UPDATE_POSTPROCESS_TYPES
+            .iter()
+            .find(|(name, _)| *name == type_name)
+            .map_or(0, |&(_, nntp)| {
+                TYPE_FLAG_VALID | if nntp { TYPE_FLAG_REQUIRES_NNTP } else { 0 }
+            })
+    }
+
+    /// `"Invalid type: {$type}"`.
+    pub fn update_postprocess_invalid_type_message(type_name: &[u8]) -> Vec<u8> {
+        [b"Invalid type: ".as_slice(), type_name].concat()
+    }
+
+    /// `in_array($str, ['a'..'f', '0'..'9'], true)`.
+    pub fn is_valid_hex_char(value: &[u8]) -> bool {
+        matches!(value, [b'a'..=b'f' | b'0'..=b'9'])
+    }
+
+    /// PHP `number_format($value)` for an integer: thousands grouped with `,`.
+    pub fn number_format_int(value: i64) -> String {
+        let digits = value.unsigned_abs().to_string();
+        let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+        if value < 0 {
+            out.push('-');
+        }
+        for (index, digit) in digits.chars().enumerate() {
+            if index > 0 && (digits.len() - index).is_multiple_of(3) {
+                out.push(',');
+            }
+            out.push(digit);
+        }
+        out
+    }
+
+    /// `"videos_id {$videoId} not found or is not a TV show (type=0)"`.
+    pub fn reset_tv_show_video_not_found(video_id: i64) -> Vec<u8> {
+        format!("videos_id {video_id} not found or is not a TV show (type=0)").into_bytes()
+    }
+
+    /// `"[Dry Run] Would reset {$total} release(s) for TV show: {$title} (videos_id={$videoId})"`.
+    pub fn reset_tv_show_dry_run(total: i64, title: &[u8], video_id: i64) -> Vec<u8> {
+        [
+            format!("[Dry Run] Would reset {total} release(s) for TV show: ").as_bytes(),
+            title,
+            format!(" (videos_id={video_id})").as_bytes(),
+        ]
+        .concat()
+    }
+
+    /// `"Resetting postprocessing for TV show: {$title} (videos_id={$videoId})"`.
+    pub fn reset_tv_show_resetting(title: &[u8], video_id: i64) -> Vec<u8> {
+        [
+            b"Resetting postprocessing for TV show: ".as_slice(),
+            title,
+            format!(" (videos_id={video_id})").as_bytes(),
+        ]
+        .concat()
+    }
+
+    /// `number_format($updated).' release(s) reset. They will be considered for TV postprocessing again.'`.
+    pub fn reset_tv_show_reset_complete(updated: i64) -> Vec<u8> {
+        format!(
+            "{} release(s) reset. They will be considered for TV postprocessing again.",
+            number_format_int(updated)
+        )
+        .into_bytes()
+    }
+
+    /// PHP `is_numeric()` followed by `(int)` for a string; `None` when not numeric.
+    pub fn php_numeric_string_to_int(raw: &[u8]) -> Option<i64> {
+        let is_ws = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c');
+        let start = raw.iter().position(|&b| !is_ws(b))?;
+        let end = raw.iter().rposition(|&b| !is_ws(b))? + 1;
+        let core = &raw[start..end];
+
+        let mut idx = 0usize;
+        if matches!(core.first(), Some(b'+' | b'-')) {
+            idx = 1;
+        }
+        let int_start = idx;
+        while idx < core.len() && core[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        let int_digits = idx - int_start;
+        let mut is_float = false;
+        let mut frac_digits = 0usize;
+        if idx < core.len() && core[idx] == b'.' {
+            is_float = true;
+            idx += 1;
+            let frac_start = idx;
+            while idx < core.len() && core[idx].is_ascii_digit() {
+                idx += 1;
+            }
+            frac_digits = idx - frac_start;
+        }
+        if int_digits == 0 && frac_digits == 0 {
+            return None;
+        }
+        if idx < core.len() && matches!(core[idx], b'e' | b'E') {
+            let mut exp_idx = idx + 1;
+            if matches!(core.get(exp_idx), Some(b'+' | b'-')) {
+                exp_idx += 1;
+            }
+            let exp_start = exp_idx;
+            while exp_idx < core.len() && core[exp_idx].is_ascii_digit() {
+                exp_idx += 1;
+            }
+            if exp_idx == exp_start {
+                return None;
+            }
+            is_float = true;
+            idx = exp_idx;
+        }
+        if idx != core.len() {
+            return None;
+        }
+
+        let text = std::str::from_utf8(core).ok()?;
+        if !is_float && let Ok(value) = text.parse::<i64>() {
+            return Some(value);
+        }
+        // PHP converts float-like (and overflowing integer) strings with `zend_dval_to_lval_cap()`.
+        let value = text.parse::<f64>().ok()?;
+        if !value.is_finite() {
+            return Some(0);
+        }
+        if value >= TWO_POW_63 {
+            return Some(i64::MAX);
+        }
+        if value < -TWO_POW_63 {
+            return Some(i64::MIN);
+        }
+        Some(value as i64)
+    }
+
+    /// AniList id resolution: `Ok(Some(id))` for numeric input, `Ok(None)` when not numeric and
+    /// `Err(())` for floats whose PHP `(int)` cast warns (left to PHP).
+    fn anilist_id(
+        kind: u32,
+        int_value: i64,
+        float_value: f64,
+        text: &[u8],
+    ) -> Result<Option<i64>, ()> {
+        match kind {
+            KIND_OTHER => Ok(None),
+            KIND_INT => Ok(Some(int_value)),
+            KIND_FLOAT => {
+                if float_value.is_finite() && (-TWO_POW_63..TWO_POW_63).contains(&float_value) {
+                    Ok(Some(float_value as i64))
+                } else {
+                    Err(())
+                }
+            }
+            KIND_STRING => Ok(php_numeric_string_to_int(text)),
+            _ => Err(()),
+        }
+    }
+
+    /// `NntmuxPopulateAniDB::handle()` branching: `(mode, anilist_id)`.
+    fn resolve_populate_mode(info: bool, id: Option<i64>) -> (i32, Option<i64>) {
+        match (info, id) {
+            (true, Some(id)) => (ANIDB_MODE_SINGLE, Some(id)),
+            (true, None) => (ANIDB_MODE_ALL, None),
+            (false, _) => (ANIDB_MODE_MISSING_INFO, None),
+        }
+    }
+
+    /// `$processed > 0 && $processed % 1000 === 0`.
+    pub fn steam_should_report_progress(processed: i64) -> bool {
+        processed > 0 && processed % 1000 == 0
+    }
+
+    /// `"Processed {$processed} of {$total} apps"`.
+    pub fn steam_progress_line(processed: i64, total: i64) -> Vec<u8> {
+        format!("Processed {processed} of {total} apps").into_bytes()
+    }
+
+    /// `sprintf('Added %d new steam app(s), %d skipped, %d errors', ...)`.
+    pub fn steam_summary_line(inserted: i64, dupe: i64, errors: i64) -> Vec<u8> {
+        format!("Added {inserted} new steam app(s), {dupe} skipped, {errors} errors").into_bytes()
+    }
+
+    /// `UpdatePostProcess::isValidType()` / `requiresNntpConnection()`: a bit set of
+    /// `TYPE_FLAG_VALID` and `TYPE_FLAG_REQUIRES_NNTP`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_update_postprocess_type_flags(
+        type_ptr: *const u8,
+        type_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(type_name) = (unsafe { valid_slice(type_ptr, type_len) }) else {
+                return DECLINE_I32;
+            };
+            update_postprocess_type_flags(type_name)
+        }))
+        .unwrap_or(DECLINE_I32)
+    }
+
+    /// `UpdatePostProcess::formatInvalidTypeMessage()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_update_postprocess_format_invalid_type(
+        type_ptr: *const u8,
+        type_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(type_name) = (unsafe { valid_slice(type_ptr, type_len) }) else {
+                return DECLINE;
+            };
+            unsafe {
+                write_bytes(
+                    &update_postprocess_invalid_type_message(type_name),
+                    out_buf,
+                    out_cap,
+                )
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `PostProcessTvPipeline::isValidHexChar()`: 1 when valid, 0 otherwise.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_postprocess_tv_pipeline_is_valid_hex_char(
+        value_ptr: *const u8,
+        value_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(value) = (unsafe { valid_slice(value_ptr, value_len) }) else {
+                return DECLINE_I32;
+            };
+            i32::from(is_valid_hex_char(value))
+        }))
+        .unwrap_or(DECLINE_I32)
+    }
+
+    /// `PostProcessTvPipeline::normalizeRenamedArg()`: `has_renamed` is 0 for PHP `null`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_postprocess_tv_pipeline_normalize_renamed(
+        has_renamed: u32,
+        renamed_ptr: *const u8,
+        renamed_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(has_renamed) = flag(has_renamed) else {
+                return DECLINE;
+            };
+            let Some(renamed) = (unsafe { valid_slice(renamed_ptr, renamed_len) }) else {
+                return DECLINE;
+            };
+            let value: &[u8] = if has_renamed { renamed } else { &[] };
+            unsafe { write_bytes(value, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `PostProcessTvPipeline::shouldWarnDeprecatedMode()`: 1 when the `--mode` option is set.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_postprocess_tv_pipeline_should_warn_mode(mode_is_null: u32) -> i32 {
+        match flag(mode_is_null) {
+            Some(is_null) => i32::from(!is_null),
+            None => DECLINE_I32,
+        }
+    }
+
+    /// `NntmuxResetTvShowPostProcessing::formatVideoNotFoundMessage()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_reset_tv_show_format_video_not_found(
+        video_id: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            unsafe { write_bytes(&reset_tv_show_video_not_found(video_id), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `NntmuxResetTvShowPostProcessing::formatDryRunSummary()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_reset_tv_show_format_dry_run(
+        total: i64,
+        title_ptr: *const u8,
+        title_len: usize,
+        video_id: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(title) = (unsafe { valid_slice(title_ptr, title_len) }) else {
+                return DECLINE;
+            };
+            unsafe {
+                write_bytes(
+                    &reset_tv_show_dry_run(total, title, video_id),
+                    out_buf,
+                    out_cap,
+                )
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `NntmuxResetTvShowPostProcessing::formatResettingMessage()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_reset_tv_show_format_resetting(
+        title_ptr: *const u8,
+        title_len: usize,
+        video_id: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(title) = (unsafe { valid_slice(title_ptr, title_len) }) else {
+                return DECLINE;
+            };
+            unsafe { write_bytes(&reset_tv_show_resetting(title, video_id), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `NntmuxResetTvShowPostProcessing::formatResetCompleteMessage()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_reset_tv_show_format_reset_complete(
+        updated: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            unsafe { write_bytes(&reset_tv_show_reset_complete(updated), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `NntmuxPopulateAniDB::resolvePopulateMode()`: returns the mode code and stores the
+    /// `(int)` AniList id (with `*out_has_id = 1`) for the single mode. `kind` is 0 for values
+    /// `is_numeric()` rejects by type, 1 int, 2 float and 3 string.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_populate_anidb_resolve_mode(
+        info: u32,
+        kind: u32,
+        int_value: i64,
+        float_value: f64,
+        str_ptr: *const u8,
+        str_len: usize,
+        out_has_id: *mut u32,
+        out_id: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_ptr(out_has_id) || !valid_mut_ptr(out_id) {
+                return DECLINE_I32;
+            }
+            let Some(info) = flag(info) else {
+                return DECLINE_I32;
+            };
+            let Some(text) = (unsafe { valid_slice(str_ptr, str_len) }) else {
+                return DECLINE_I32;
+            };
+            // `&&` short-circuits: without `--info` the id is never inspected.
+            let id = if info {
+                match anilist_id(kind, int_value, float_value, text) {
+                    Ok(id) => id,
+                    Err(()) => return DECLINE_I32,
+                }
+            } else if kind > KIND_STRING {
+                return DECLINE_I32;
+            } else {
+                None
+            };
+            let (mode, id) = resolve_populate_mode(info, id);
+            unsafe {
+                *out_has_id = u32::from(id.is_some());
+                *out_id = id.unwrap_or(0);
+            }
+            mode
+        }))
+        .unwrap_or(DECLINE_I32)
+    }
+
+    /// `NntmuxPopulateSteamApps::shouldReportProgress()`: 1 when a progress line is due.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_populate_steam_apps_should_report_progress(processed: i64) -> i32 {
+        i32::from(steam_should_report_progress(processed))
+    }
+
+    /// `NntmuxPopulateSteamApps::formatProgressLine()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_populate_steam_apps_format_progress(
+        processed: i64,
+        total: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            unsafe { write_bytes(&steam_progress_line(processed, total), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `NntmuxPopulateSteamApps::formatFinalSummaryLine()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_populate_steam_apps_format_summary(
+        inserted: i64,
+        dupe: i64,
+        errors: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            unsafe {
+                write_bytes(
+                    &steam_summary_line(inserted, dupe, errors),
+                    out_buf,
+                    out_cap,
+                )
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn call_buf(f: impl Fn(*mut u8, usize) -> isize) -> Vec<u8> {
+            let mut buf = vec![0u8; 512];
+            let written = f(buf.as_mut_ptr(), buf.len());
+            assert!(written >= 0, "export declined: {written}");
+            buf.truncate(written as usize);
+            buf
+        }
+
+        #[test]
+        fn update_postprocess_type_flags_match_valid_types() {
+            for (name, nntp) in UPDATE_POSTPROCESS_TYPES {
+                let expected = TYPE_FLAG_VALID | if nntp { TYPE_FLAG_REQUIRES_NNTP } else { 0 };
+                assert_eq!(update_postprocess_type_flags(name), expected);
+                assert_eq!(
+                    unsafe { nntmux_update_postprocess_type_flags(name.as_ptr(), name.len()) },
+                    expected
+                );
+            }
+            for name in [
+                &b""[..],
+                b"ALL",
+                b" all",
+                b"all\0",
+                b"tv ",
+                b"0",
+                b"1",
+                "tv\u{301}".as_bytes(),
+            ] {
+                assert_eq!(update_postprocess_type_flags(name), 0, "{name:?}");
+            }
+            assert_eq!(
+                unsafe { nntmux_update_postprocess_type_flags(std::ptr::null(), 0) },
+                DECLINE_I32
+            );
+        }
+
+        #[test]
+        fn update_postprocess_invalid_type_message_keeps_bytes() {
+            let name = b"bad\0\xff\xfe\xc3\xa9";
+            let out = call_buf(|buf, cap| unsafe {
+                nntmux_update_postprocess_format_invalid_type(name.as_ptr(), name.len(), buf, cap)
+            });
+            assert_eq!(out, [b"Invalid type: ".as_slice(), name].concat());
+            let empty = call_buf(|buf, cap| unsafe {
+                nntmux_update_postprocess_format_invalid_type(b"".as_ptr(), 0, buf, cap)
+            });
+            assert_eq!(empty, b"Invalid type: ");
+        }
+
+        #[test]
+        fn hex_char_and_renamed_and_mode() {
+            for byte in 0u8..=255 {
+                let expected = matches!(byte, b'a'..=b'f' | b'0'..=b'9');
+                assert_eq!(is_valid_hex_char(&[byte]), expected);
+            }
+            for value in [&b""[..], b"ab", b"A", b"g", b"0 ", b"\xc3\xa1", b"a\0"] {
+                assert!(!is_valid_hex_char(value), "{value:?}");
+                assert_eq!(
+                    unsafe {
+                        nntmux_postprocess_tv_pipeline_is_valid_hex_char(
+                            value.as_ptr(),
+                            value.len(),
+                        )
+                    },
+                    0
+                );
+            }
+            let renamed = b"re\0named";
+            let kept = call_buf(|buf, cap| unsafe {
+                nntmux_postprocess_tv_pipeline_normalize_renamed(
+                    1,
+                    renamed.as_ptr(),
+                    renamed.len(),
+                    buf,
+                    cap,
+                )
+            });
+            assert_eq!(kept, renamed);
+            let empty = call_buf(|buf, cap| unsafe {
+                nntmux_postprocess_tv_pipeline_normalize_renamed(0, b"".as_ptr(), 0, buf, cap)
+            });
+            assert!(empty.is_empty());
+            let mut buf = [0u8; 8];
+            assert_eq!(
+                unsafe {
+                    nntmux_postprocess_tv_pipeline_normalize_renamed(
+                        2,
+                        b"".as_ptr(),
+                        0,
+                        buf.as_mut_ptr(),
+                        8,
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(nntmux_postprocess_tv_pipeline_should_warn_mode(0), 1);
+            assert_eq!(nntmux_postprocess_tv_pipeline_should_warn_mode(1), 0);
+            assert_eq!(
+                nntmux_postprocess_tv_pipeline_should_warn_mode(2),
+                DECLINE_I32
+            );
+        }
+
+        #[test]
+        fn number_format_matches_php() {
+            assert_eq!(number_format_int(0), "0");
+            assert_eq!(number_format_int(999), "999");
+            assert_eq!(number_format_int(1000), "1,000");
+            assert_eq!(number_format_int(-1_234_567), "-1,234,567");
+            assert_eq!(number_format_int(i64::MAX), "9,223,372,036,854,775,807");
+            assert_eq!(number_format_int(i64::MIN), "-9,223,372,036,854,775,808");
+        }
+
+        #[test]
+        fn reset_tv_show_messages() {
+            assert_eq!(
+                reset_tv_show_video_not_found(-5),
+                b"videos_id -5 not found or is not a TV show (type=0)"
+            );
+            let title = "Caf\u{e9} \u{1f3ac}\0X".as_bytes();
+            let mut expected = b"[Dry Run] Would reset 3 release(s) for TV show: ".to_vec();
+            expected.extend_from_slice(title);
+            expected.extend_from_slice(b" (videos_id=42)");
+            let out = call_buf(|buf, cap| unsafe {
+                nntmux_reset_tv_show_format_dry_run(3, title.as_ptr(), title.len(), 42, buf, cap)
+            });
+            assert_eq!(out, expected);
+            assert_eq!(
+                reset_tv_show_resetting(b"", i64::MIN),
+                b"Resetting postprocessing for TV show:  (videos_id=-9223372036854775808)"
+            );
+            assert_eq!(
+                reset_tv_show_reset_complete(1234),
+                b"1,234 release(s) reset. They will be considered for TV postprocessing again."
+            );
+            let mut small = [b'Z'; 4];
+            assert_eq!(
+                unsafe { nntmux_reset_tv_show_format_video_not_found(1, small.as_mut_ptr(), 4) },
+                -50
+            );
+            assert_eq!(small, [b'Z'; 4]);
+        }
+
+        #[test]
+        fn numeric_strings_follow_php() {
+            for (raw, expected) in [
+                (&b"12"[..], Some(12)),
+                (b" 12 ", Some(12)),
+                (b"\x0c12", Some(12)),
+                (b"1.", Some(1)),
+                (b".5", Some(0)),
+                (b"-0", Some(0)),
+                (b"+5", Some(5)),
+                (b"1e3", Some(1000)),
+                (b"1e100", Some(i64::MAX)),
+                (b"-1e100", Some(i64::MIN)),
+                (b"1e400", Some(0)),
+                (b"99999999999999999999", Some(i64::MAX)),
+                (b".", None),
+                (b"", None),
+                (b" ", None),
+                (b"0x1A", None),
+                (b"1_000", None),
+                (b"5\0", None),
+                (b"\xef\xbc\x91", None),
+            ] {
+                assert_eq!(php_numeric_string_to_int(raw), expected, "{raw:?}");
+            }
+        }
+
+        fn resolve(
+            info: u32,
+            kind: u32,
+            int_value: i64,
+            float_value: f64,
+            text: &[u8],
+        ) -> (i32, u32, i64) {
+            let mut has_id = 9u32;
+            let mut id = 9i64;
+            let mode = unsafe {
+                nntmux_populate_anidb_resolve_mode(
+                    info,
+                    kind,
+                    int_value,
+                    float_value,
+                    text.as_ptr(),
+                    text.len(),
+                    &mut has_id,
+                    &mut id,
+                )
+            };
+            (mode, has_id, id)
+        }
+
+        #[test]
+        fn populate_anidb_modes() {
+            assert_eq!(
+                resolve(1, KIND_INT, 77, 0.0, b""),
+                (ANIDB_MODE_SINGLE, 1, 77)
+            );
+            assert_eq!(
+                resolve(1, KIND_STRING, 0, 0.0, b" 12.9 "),
+                (ANIDB_MODE_SINGLE, 1, 12)
+            );
+            assert_eq!(
+                resolve(1, KIND_FLOAT, 0, -3.7, b""),
+                (ANIDB_MODE_SINGLE, 1, -3)
+            );
+            assert_eq!(
+                resolve(1, KIND_STRING, 0, 0.0, b"abc"),
+                (ANIDB_MODE_ALL, 0, 0)
+            );
+            assert_eq!(resolve(1, KIND_OTHER, 0, 0.0, b""), (ANIDB_MODE_ALL, 0, 0));
+            assert_eq!(
+                resolve(0, KIND_INT, 77, 0.0, b""),
+                (ANIDB_MODE_MISSING_INFO, 0, 0)
+            );
+            assert_eq!(
+                resolve(0, KIND_FLOAT, 0, f64::NAN, b""),
+                (ANIDB_MODE_MISSING_INFO, 0, 0)
+            );
+            assert_eq!(resolve(1, KIND_FLOAT, 0, f64::NAN, b"").0, DECLINE_I32);
+            assert_eq!(resolve(1, KIND_FLOAT, 0, TWO_POW_63, b"").0, DECLINE_I32);
+            assert_eq!(
+                resolve(1, KIND_FLOAT, 0, -TWO_POW_63, b""),
+                (ANIDB_MODE_SINGLE, 1, i64::MIN)
+            );
+            assert_eq!(resolve(2, KIND_INT, 1, 0.0, b"").0, DECLINE_I32);
+            assert_eq!(resolve(1, 9, 1, 0.0, b"").0, DECLINE_I32);
+            assert_eq!(resolve(0, 9, 1, 0.0, b"").0, DECLINE_I32);
+            let mut has_id = 0u32;
+            assert_eq!(
+                unsafe {
+                    nntmux_populate_anidb_resolve_mode(
+                        1,
+                        KIND_INT,
+                        1,
+                        0.0,
+                        b"".as_ptr(),
+                        0,
+                        &mut has_id,
+                        std::ptr::null_mut(),
+                    )
+                },
+                DECLINE_I32
+            );
+        }
+
+        #[test]
+        fn steam_helpers() {
+            for (processed, expected) in [
+                (0, false),
+                (1, false),
+                (999, false),
+                (1000, true),
+                (2000, true),
+                (-1000, false),
+                (i64::MIN, false),
+            ] {
+                assert_eq!(
+                    steam_should_report_progress(processed),
+                    expected,
+                    "{processed}"
+                );
+                assert_eq!(
+                    nntmux_populate_steam_apps_should_report_progress(processed),
+                    i32::from(expected)
+                );
+            }
+            let out = call_buf(|buf, cap| unsafe {
+                nntmux_populate_steam_apps_format_progress(1000, -1, buf, cap)
+            });
+            assert_eq!(out, b"Processed 1000 of -1 apps");
+            let out = call_buf(|buf, cap| unsafe {
+                nntmux_populate_steam_apps_format_summary(i64::MAX, 0, i64::MIN, buf, cap)
+            });
+            assert_eq!(
+                out,
+                b"Added 9223372036854775807 new steam app(s), 0 skipped, -9223372036854775808 errors"
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_populate_steam_apps_format_summary(1, 2, 3, std::ptr::null_mut(), 64)
+                },
+                DECLINE
+            );
+        }
+    }
+}
