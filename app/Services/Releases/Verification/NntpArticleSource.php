@@ -7,11 +7,39 @@ namespace App\Services\Releases\Verification;
 use App\Services\NNTP\NNTPService;
 use App\Services\NNTP\VerificationPipelineRetryException;
 use App\Services\YencService;
+use App\Support\RustPipelineLibrary;
 use Exception;
+use FFI;
 use RuntimeException;
+use Throwable;
 
 final class NntpArticleSource implements ArticleSource
 {
+    public const string FFI_CDEF = 'intptr_t nntmux_w22_article_source_enums_log_requests(uint32_t operation, const char *input, size_t length, char *output, size_t capacity);';
+
+    // Retain PHP unless every paired common/uncommon mean and p99 gate passes.
+    private static bool $useRustFfi = false;
+
+    public static function enableRustFfi(): void
+    {
+        self::$useRustFfi = true;
+    }
+
+    public static function disableRustFfi(): void
+    {
+        self::$useRustFfi = false;
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = false;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
     private bool $connected = false;
 
     private bool $alternateConnected = false;
@@ -28,12 +56,127 @@ final class NntpArticleSource implements ArticleSource
 
     public function batchSize(): int
     {
-        $frames = max(1, intdiv(max(1, (int) config('release_verification.download_buffer_bytes', 67108864)),
-            max(1, (int) config('release_verification.article_bytes'))));
-        $connections = min($frames, max(1, min(8, (int) config('release_verification.download_connections', 1))));
-        $window = min(max(1, intdiv($frames, $connections)), max(1, min(16, (int) config('release_verification.pipeline_window', 1))));
+        return self::batchSizing(
+            (int) config('release_verification.download_buffer_bytes', 67108864),
+            (int) config('release_verification.article_bytes'),
+            (int) config('release_verification.download_connections', 1),
+            (int) config('release_verification.pipeline_window', 1),
+        );
+    }
+
+    public static function batchSizing(int $bufferBytes, int $articleBytes, int $connections, int $window): int
+    {
+        return (self::$useRustFfi ? self::batchSizingNative($bufferBytes, $articleBytes, $connections, $window) : null)
+            ?? self::batchSizingPhp($bufferBytes, $articleBytes, $connections, $window);
+    }
+
+    public static function batchSizingPhp(int $bufferBytes, int $articleBytes, int $connections, int $window): int
+    {
+        $frames = max(1, intdiv(max(1, $bufferBytes), max(1, $articleBytes)));
+        $connections = min($frames, max(1, min(8, $connections)));
+        $window = min(max(1, intdiv($frames, $connections)), max(1, min(16, $window)));
 
         return $connections * $window;
+    }
+
+    public static function batchSizingNative(int $bufferBytes, int $articleBytes, int $connections, int $window): int
+    {
+        $result = self::computeNative(0, [$bufferBytes, $articleBytes, $connections, $window]);
+
+        return is_int($result) ? $result : self::batchSizingPhp($bufferBytes, $articleBytes, $connections, $window);
+    }
+
+    /** @return array{connections: int, window: int} */
+    public static function prefetchSizing(int $count, int $connections): array
+    {
+        return self::$useRustFfi ? self::prefetchSizingNative($count, $connections) : self::prefetchSizingPhp($count, $connections);
+    }
+
+    /**
+     * @return array{connections: int, window: int}
+     *
+     * @throws \DivisionByZeroError
+     */
+    public static function prefetchSizingPhp(int $count, int $connections): array
+    {
+        $connections = min($count, max(1, min(8, $connections)));
+
+        return ['connections' => $connections, 'window' => (int) ceil($count / $connections)];
+    }
+
+    /**
+     * @return array{connections: int, window: int}
+     *
+     * @throws \DivisionByZeroError
+     */
+    public static function prefetchSizingNative(int $count, int $connections): array
+    {
+        $result = self::computeNative(1, [$count, $connections]);
+        if (is_array($result) && is_int($result['connections'] ?? null) && is_int($result['window'] ?? null)) {
+            return ['connections' => $result['connections'], 'window' => $result['window']];
+        }
+
+        return self::prefetchSizingPhp($count, $connections);
+    }
+
+    public static function articleByteCap(int $articleBytes, ?int $maximumBytes): int
+    {
+        return self::$useRustFfi ? self::articleByteCapNative($articleBytes, $maximumBytes) : self::articleByteCapPhp($articleBytes, $maximumBytes);
+    }
+
+    public static function articleByteCapPhp(int $articleBytes, ?int $maximumBytes): int
+    {
+        return min($articleBytes, $maximumBytes ?? PHP_INT_MAX);
+    }
+
+    public static function articleByteCapNative(int $articleBytes, ?int $maximumBytes): int
+    {
+        $result = self::computeNative(2, [$articleBytes, $maximumBytes]);
+
+        return is_int($result) ? $result : self::articleByteCapPhp($articleBytes, $maximumBytes);
+    }
+
+    public static function bufferByteCap(int $maximumBytes, int $bufferBytes): int
+    {
+        return self::$useRustFfi ? self::bufferByteCapNative($maximumBytes, $bufferBytes) : self::bufferByteCapPhp($maximumBytes, $bufferBytes);
+    }
+
+    public static function bufferByteCapPhp(int $maximumBytes, int $bufferBytes): int
+    {
+        return max($maximumBytes, $bufferBytes);
+    }
+
+    public static function bufferByteCapNative(int $maximumBytes, int $bufferBytes): int
+    {
+        $result = self::computeNative(10, [$maximumBytes, $bufferBytes]);
+
+        return is_int($result) ? $result : self::bufferByteCapPhp($maximumBytes, $bufferBytes);
+    }
+
+    /** @param list<int|null> $arguments */
+    private static function computeNative(int $operation, array $arguments): mixed
+    {
+        try {
+            $input = serialize($arguments);
+            $ffi = RustPipelineLibrary::resolveDomain('wave22-article-source-sizing', self::FFI_CDEF);
+            if ($ffi === null) {
+                return null;
+            }
+            $capacity = 0;
+            $output = RustPipelineLibrary::obtainScratch($ffi, 1024, $capacity);
+            if ($output === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by FFI_CDEF.)
+            $written = $ffi->nntmux_w22_article_source_enums_log_requests($operation, $input, strlen($input), $output, $capacity);
+            if (! is_int($written) || $written < 2 || $written > $capacity) {
+                return null;
+            }
+
+            return unserialize(FFI::string($output, $written), ['allowed_classes' => false]);
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     public function clearPrefetched(): void
@@ -53,8 +196,7 @@ final class NntpArticleSource implements ArticleSource
             throw new RuntimeException('Too many articles in a verification prefetch.');
         }
         $maximumBytes = $this->maximumArticleBytes();
-        $connectionCount = min(count($ids), max(1, min(8, (int) config('release_verification.download_connections', 1))));
-        $window = (int) ceil(count($ids) / $connectionCount);
+        $window = self::prefetchSizing(count($ids), (int) config('release_verification.download_connections', 1))['window'];
         $batches = [];
         if (! $this->connected || ! $this->nntp->isConnected()) {
             try {
@@ -102,7 +244,7 @@ final class NntpArticleSource implements ArticleSource
         }
         try {
             $this->prefetched += NNTPService::verificationArticleBatch($batches, $maximumBytes,
-                max($maximumBytes, (int) config('release_verification.download_buffer_bytes', 67108864)), $heartbeat);
+                self::bufferByteCap($maximumBytes, (int) config('release_verification.download_buffer_bytes', 67108864)), $heartbeat);
         } finally {
             $this->connected = $this->nntp->isConnected();
         }
@@ -285,7 +427,7 @@ final class NntpArticleSource implements ArticleSource
 
     private function maximumArticleBytes(): int
     {
-        return min((int) config('release_verification.article_bytes'), $this->maximumBytes ?? PHP_INT_MAX);
+        return self::articleByteCap((int) config('release_verification.article_bytes'), $this->maximumBytes);
     }
 
     public function __destruct()
