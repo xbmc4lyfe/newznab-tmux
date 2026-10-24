@@ -12,6 +12,8 @@ use App\Services\CollectionCleanupService;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Releases\Fingerprint\FingerprintDispatch;
 use App\Support\Data\NzbCreationResult;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
@@ -24,6 +26,25 @@ use Throwable;
  */
 class NzbService
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_nzb_groups_from_xref(const char *xref, size_t xref_len, char *out_buf, size_t out_cap);
+        int32_t nntmux_nzb_is_temporary_path_name(const char *path, size_t path_len);
+        C;
+
+    private static FFI|false|null $ffi = null;
+
+    private static bool $useRustFfi = true;
+
+    public static function setUseRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
     public const NZB_NONE = 0; // Release has no NZB file yet.
 
     public const NZB_ADDED = 1; // Release had an NZB file created.
@@ -836,7 +857,17 @@ class NzbService
     /**
      * @return list<string>
      */
-    private function groupsFromXref(string $xref): array
+    public function groupsFromXref(string $xref): array
+    {
+        // Retain native PHP in production: string copy + `explode("\n", ...)` across FFI (~332-531 ns)
+        // is 0.79x-1.06x vs cached PCRE `#(\S+):\S+#` (~262-565 ns).
+        return $this->groupsFromXrefPhp($xref);
+    }
+
+    /**
+     * @return list<string>
+     */
+    public function groupsFromXrefPhp(string $xref): array
     {
         if (preg_match_all('#(\S+):\S+#', $xref, $hits)) {
             return array_values(array_unique($hits[1]));
@@ -850,6 +881,53 @@ class NzbService
     }
 
     /**
+     * @return list<string>|null
+     */
+    public static function groupsFromXrefNative(string $xref): ?array
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        if ($xref === '') {
+            return [];
+        }
+        $ffi = self::$ffi ?? self::resolveFfi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+
+        $len = \strlen($xref);
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $len), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_nzb_groups_from_xref($xref, $len, $scratch, $cap);
+            if (! \is_int($written) || $written === -1) {
+                return null;
+            }
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_nzb_groups_from_xref($xref, $len, $scratch, $cap);
+                if (! \is_int($written) || $written < 0) {
+                    return null;
+                }
+            }
+
+            return $written === 0 ? [] : explode("\n", FFI::string($scratch, $written));
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
      * Temporary sibling for an NZB being written; recognised by {@see findStaleTemporaryNzbPaths()}.
      */
     public static function temporaryNzbPathFor(string $path): string
@@ -859,7 +937,45 @@ class NzbService
 
     public static function isTemporaryNzbPathName(string $path): bool
     {
+        // Retain native PHP in production: `basename()` + cached PCRE (~91-98 ns) beats
+        // single-call FFI boundary (~137-139 ns, 0.66x-0.71x).
+        return self::isTemporaryNzbPathNamePhp($path);
+    }
+
+    public static function isTemporaryNzbPathNamePhp(string $path): bool
+    {
         return preg_match('/\.nzb\.gz\.tmp\.\d+\.[0-9a-f]{12}$/', basename($path)) === 1;
+    }
+
+    public static function isTemporaryNzbPathNameNative(string $path): ?bool
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        $ffi = self::$ffi ?? self::resolveFfi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $res = $ffi->nntmux_nzb_is_temporary_path_name($path, \strlen($path));
+
+            return \is_int($res) && $res >= 0 ? ($res === 1) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function resolveFfi(): ?FFI
+    {
+        if (self::$ffi !== null) {
+            return self::$ffi === false ? null : self::$ffi;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF);
+        self::$ffi = $ffi ?? false;
+
+        return $ffi;
     }
 
     /**

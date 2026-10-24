@@ -6496,3 +6496,1574 @@ mod wave9_cleaning_tests {
         }
     }
 }
+
+const DEFAULT_MCP_ALLOWED_ROOT_FILES: &[&[u8]] = &[
+    b".env.example",
+    b"AGENTS.md",
+    b"README.md",
+    b"composer.json",
+    b"composer.lock",
+    b"package.json",
+    b"package-lock.json",
+    b"phpstan.neon",
+    b"phpunit.xml",
+    b"pint.json",
+    b"vite.config.js",
+];
+
+const DEFAULT_MCP_ALLOWED_ROOTS: &[&[u8]] = &[
+    b"app",
+    b"bootstrap",
+    b"config",
+    b"database",
+    b"resources",
+    b"routes",
+    b"tests",
+];
+
+const DEFAULT_MCP_DENIED_SEGMENTS: &[&[u8]] = &[
+    b".git",
+    b"node_modules",
+    b"public/build",
+    b"storage",
+    b"storage-runtime",
+    b"vendor",
+];
+
+const DEFAULT_BLOCKED_USER_AGENTS: &[&[u8]] = &[b"aiostreams", b"usenetstreamer", b"stremio"];
+
+#[inline]
+fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    let first_lower = needle[0].to_ascii_lowercase();
+    let first_upper = needle[0].to_ascii_uppercase();
+    let max_i = haystack.len() - needle.len();
+    let mut i = 0usize;
+    while i <= max_i {
+        let b = haystack[i];
+        if (b == first_lower || b == first_upper)
+            && haystack[i + 1..i + needle.len()].eq_ignore_ascii_case(&needle[1..])
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+#[inline]
+fn mcp_segment_is_credential_or_private_key(segment: &[u8]) -> bool {
+    // Matches `/(?:credential|private[_-]?key|id_rsa|id_ed25519|\.pem$|\.p12$|\.pfx$)/i`
+    let stripped_lf = segment.strip_suffix(b"\n").unwrap_or(segment);
+    if stripped_lf.len() >= 4 {
+        let tail = &stripped_lf[stripped_lf.len() - 4..];
+        if tail.eq_ignore_ascii_case(b".pem")
+            || tail.eq_ignore_ascii_case(b".p12")
+            || tail.eq_ignore_ascii_case(b".pfx")
+        {
+            return true;
+        }
+    }
+    if segment.len() < 6 {
+        return false;
+    }
+    if contains_ignore_ascii_case(segment, b"credential")
+        || contains_ignore_ascii_case(segment, b"id_rsa")
+        || contains_ignore_ascii_case(segment, b"id_ed25519")
+    {
+        return true;
+    }
+    // Check `private[_-]?key`
+    if segment.len() >= 10 {
+        let mut i = 0usize;
+        while i + 10 <= segment.len() {
+            if matches!(segment[i], b'p' | b'P')
+                && segment[i..i + 7].eq_ignore_ascii_case(b"private")
+            {
+                let rem = &segment[i + 7..];
+                if rem.len() >= 3 && rem[..3].eq_ignore_ascii_case(b"key") {
+                    return true;
+                }
+                if rem.len() >= 4
+                    && matches!(rem[0], b'_' | b'-')
+                    && rem[1..4].eq_ignore_ascii_case(b"key")
+                {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
+#[inline]
+fn mcp_check_not_sensitive_bytes(path: &[u8]) -> i32 {
+    for segment in path.split(|&b| b == b'/') {
+        if segment.eq_ignore_ascii_case(b".env")
+            || (segment.len() >= 5
+                && segment[..5].eq_ignore_ascii_case(b".env.")
+                && !segment.eq_ignore_ascii_case(b".env.example"))
+        {
+            return 1;
+        }
+        if mcp_segment_is_credential_or_private_key(segment) {
+            return 2;
+        }
+    }
+    0
+}
+
+#[inline]
+fn path_matches_denied_segment(path: &[u8], denied: &[u8]) -> bool {
+    // Matches `$path === $denied || str_starts_with($path, $denied.'/') || str_contains($path, '/'.$denied.'/')`
+    if path == denied {
+        return true;
+    }
+    if path.len() > denied.len() && path.starts_with(denied) && path[denied.len()] == b'/' {
+        return true;
+    }
+    let needle_len = denied.len() + 2;
+    if path.len() < needle_len {
+        return false;
+    }
+    let mut i = 0usize;
+    while i + needle_len <= path.len() {
+        if path[i] == b'/'
+            && path[i + 1 + denied.len()] == b'/'
+            && &path[i + 1..i + 1 + denied.len()] == denied
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+#[inline]
+fn mcp_check_allowed_location_bytes(
+    path: &[u8],
+    use_defaults: bool,
+    root_files_nul: Option<&[u8]>,
+    allowed_roots_nul: Option<&[u8]>,
+    denied_segments_nul: Option<&[u8]>,
+) -> i32 {
+    if use_defaults {
+        if DEFAULT_MCP_ALLOWED_ROOT_FILES.contains(&path) {
+            return 0;
+        }
+        let root = match path.iter().position(|&b| b == b'/') {
+            Some(pos) => &path[..pos],
+            None => path,
+        };
+        if !DEFAULT_MCP_ALLOWED_ROOTS.contains(&root) {
+            return 1;
+        }
+        for &denied in DEFAULT_MCP_DENIED_SEGMENTS {
+            if path_matches_denied_segment(path, denied) {
+                return 2;
+            }
+        }
+        return 0;
+    }
+
+    if let Some(rf) = root_files_nul {
+        if !rf.is_empty() && rf.split(|&b| b == 0).any(|item| item == path) {
+            return 0;
+        }
+    }
+    let root = match path.iter().position(|&b| b == b'/') {
+        Some(pos) => &path[..pos],
+        None => path,
+    };
+    let root_allowed = match allowed_roots_nul {
+        Some(ar) if !ar.is_empty() => ar.split(|&b| b == 0).any(|item| item == root),
+        _ => false,
+    };
+    if !root_allowed {
+        return 1;
+    }
+    if let Some(ds) = denied_segments_nul {
+        if !ds.is_empty() {
+            for denied in ds.split(|&b| b == 0) {
+                if path_matches_denied_segment(path, denied) {
+                    return 2;
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Checks `ProjectPathGuard::assertNotSensitive(path)`.
+/// Returns:
+/// - `0` when valid (not sensitive)
+/// - `1` when an `.env` file other than `.env.example` is detected
+/// - `2` when a credential or private-key segment is detected
+/// - `-1` on invalid arguments
+///
+/// # Safety
+/// `path` must be readable for `path_len` bytes when non-null and `path_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_mcp_check_not_sensitive(path: *const u8, path_len: usize) -> i32 {
+    let Some(bytes) = (unsafe { wave9_input(path, path_len) }) else {
+        return -1;
+    };
+    mcp_check_not_sensitive_bytes(bytes)
+}
+
+/// Checks `ProjectPathGuard::assertAllowedLocation(path)`.
+/// Returns:
+/// - `0` when allowed
+/// - `1` when outside allowed source roots
+/// - `2` when matching a denied segment
+/// - `-1` on invalid arguments
+///
+/// # Safety
+/// All non-null pointers must be readable for their respective lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_mcp_check_allowed_location(
+    path: *const u8,
+    path_len: usize,
+    use_defaults: u32,
+    root_files_nul: *const u8,
+    root_files_len: usize,
+    allowed_roots_nul: *const u8,
+    allowed_roots_len: usize,
+    denied_segments_nul: *const u8,
+    denied_segments_len: usize,
+) -> i32 {
+    let Some(bytes) = (unsafe { wave9_input(path, path_len) }) else {
+        return -1;
+    };
+    if use_defaults != 0 {
+        return mcp_check_allowed_location_bytes(bytes, true, None, None, None);
+    }
+    let Some(rf) = (unsafe { wave9_input(root_files_nul, root_files_len) }) else {
+        return -1;
+    };
+    let Some(ar) = (unsafe { wave9_input(allowed_roots_nul, allowed_roots_len) }) else {
+        return -1;
+    };
+    let Some(ds) = (unsafe { wave9_input(denied_segments_nul, denied_segments_len) }) else {
+        return -1;
+    };
+    mcp_check_allowed_location_bytes(bytes, false, Some(rf), Some(ar), Some(ds))
+}
+
+/// Normalizes and validates a relative path for `ProjectPathGuard::normalize(path)` up to filesystem resolution.
+///
+/// Writes `out_status`:
+/// - `0`: valid; normalized path written to `out_buf` (returns byte length `> 0`)
+/// - `1`: empty or interior NUL (`'A non-empty repository-relative path is required.'`)
+/// - `2`: absolute path (`'Absolute paths are not allowed.'`)
+/// - `3`: `.` or `..` traversal segment (`'Path traversal is not allowed.'`)
+/// - `4`: outside allowed source roots (normalized path written to `out_buf`, returns its byte length)
+/// - `5`: denied segment (normalized path written to `out_buf`, returns its byte length)
+/// - `6`: environment file violation (`'Environment files other than .env.example are not available through MCP.'`)
+/// - `7`: credential/private-key violation (`'Credential and private-key files are not available through MCP.'`)
+///
+/// Returns `< -1` (`-(required_len as isize)`) if `out_cap` is insufficient, or `-1` on invalid arguments.
+///
+/// # Safety
+/// All non-null pointers must be valid for reads/writes of their respective lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_mcp_normalize_relative_path(
+    path: *const u8,
+    path_len: usize,
+    use_defaults: u32,
+    root_files_nul: *const u8,
+    root_files_len: usize,
+    allowed_roots_nul: *const u8,
+    allowed_roots_len: usize,
+    denied_segments_nul: *const u8,
+    denied_segments_len: usize,
+    out_status: *mut i32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if out_status.is_null() || out_cap > isize::MAX as usize || (out_buf.is_null() && out_cap > 0) {
+        return -1;
+    }
+    let Some(bytes) = (unsafe { wave9_input(path, path_len) }) else {
+        return -1;
+    };
+    let (rf, ar, ds) = if use_defaults != 0 {
+        (None, None, None)
+    } else {
+        let Some(rf) = (unsafe { wave9_input(root_files_nul, root_files_len) }) else {
+            return -1;
+        };
+        let Some(ar) = (unsafe { wave9_input(allowed_roots_nul, allowed_roots_len) }) else {
+            return -1;
+        };
+        let Some(ds) = (unsafe { wave9_input(denied_segments_nul, denied_segments_len) }) else {
+            return -1;
+        };
+        (Some(rf), Some(ar), Some(ds))
+    };
+
+    // 1. `$path = trim(str_replace('\\', '/', $path));`
+    let trimmed = php_trim_ascii(bytes);
+    if trimmed.is_empty() || trimmed.contains(&0) {
+        unsafe { *out_status = 1 };
+        return 0;
+    }
+    // 2. `if (str_starts_with($path, '/') || preg_match('/^[A-Za-z]:\//', $path) === 1)`
+    if matches!(trimmed[0], b'/' | b'\\')
+        || (trimmed.len() >= 3
+            && trimmed[0].is_ascii_alphabetic()
+            && trimmed[1] == b':'
+            && matches!(trimmed[2], b'/' | b'\\'))
+    {
+        unsafe { *out_status = 2 };
+        return 0;
+    }
+
+    // 3. `$path = preg_replace('#/+#', '/', $path)` + replace `\` with `/`
+    let mut normalized = Vec::with_capacity(trimmed.len());
+    for &b in trimmed {
+        let mapped = if b == b'\\' { b'/' } else { b };
+        if mapped == b'/' && normalized.last() == Some(&b'/') {
+            continue;
+        }
+        normalized.push(mapped);
+    }
+
+    // 4. `if (in_array('..', $segments, true) || in_array('.', $segments, true))`
+    for seg in normalized.split(|&b| b == b'/') {
+        if seg == b"." || seg == b".." {
+            unsafe { *out_status = 3 };
+            return 0;
+        }
+    }
+
+    // Ensure `out_buf` can hold `normalized` (needed for status 0, 4, 5).
+    if normalized.len() > out_cap {
+        return -(normalized.len() as isize);
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(normalized.as_ptr(), out_buf, normalized.len());
+    }
+
+    // 5. `assertAllowedLocation`
+    let loc_status = mcp_check_allowed_location_bytes(&normalized, use_defaults != 0, rf, ar, ds);
+    if loc_status == 1 {
+        unsafe { *out_status = 4 };
+        return normalized.len() as isize;
+    }
+    if loc_status == 2 {
+        unsafe { *out_status = 5 };
+        return normalized.len() as isize;
+    }
+
+    // 6. `assertNotSensitive`
+    let sens_status = mcp_check_not_sensitive_bytes(&normalized);
+    if sens_status == 1 {
+        unsafe { *out_status = 6 };
+        return 0;
+    }
+    if sens_status == 2 {
+        unsafe { *out_status = 7 };
+        return 0;
+    }
+
+    unsafe { *out_status = 0 };
+    normalized.len() as isize
+}
+
+#[inline]
+fn http_is_json_media_type_bytes(bytes: &[u8]) -> bool {
+    let mut parts = bytes.split(|&b| b == b';');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    if !php_trim_ascii(first).eq_ignore_ascii_case(b"application/json") {
+        return false;
+    }
+    for raw_param in parts {
+        let param = php_trim_ascii(raw_param);
+        if param.is_empty() {
+            continue;
+        }
+        let Some(eq_pos) = param.iter().position(|&b| b == b'=') else {
+            return false;
+        };
+        let name = php_trim_ascii(&param[..eq_pos]);
+        if !name.eq_ignore_ascii_case(b"charset") {
+            return false;
+        }
+        let mut val = php_trim_ascii(&param[eq_pos + 1..]);
+        while let Some(&b'"') = val.first() {
+            val = &val[1..];
+        }
+        while let Some(&b'"') = val.last() {
+            val = &val[..val.len() - 1];
+        }
+        if !val.eq_ignore_ascii_case(b"utf-8") {
+            return false;
+        }
+    }
+    true
+}
+
+/// Checks `ValidateHttpQueryInput::isJsonMediaType(contentType)`.
+/// Returns `1` if valid JSON media type, `0` if invalid, or `-1` on invalid arguments.
+///
+/// # Safety
+/// `input` must be readable for `input_len` bytes when non-null and `input_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_http_is_json_media_type(input: *const u8, input_len: usize) -> i32 {
+    let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
+        return -1;
+    };
+    i32::from(http_is_json_media_type_bytes(bytes))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QueryBodyValKind {
+    Scalar,
+    ScalarList,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsonParseOutcome {
+    ValidObject,
+    ValidNonObject,
+    InvalidOrTooDeep,
+    Decline,
+}
+
+#[inline]
+fn skip_json_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+        i += 1;
+    }
+    i
+}
+
+/// Parses a JSON string literal starting at `bytes[i] == b'"'`.
+/// Returns `Ok((next_index, raw_inner_slice, has_backslash))` or `Err(JsonParseOutcome)`.
+fn parse_json_string<'a>(
+    bytes: &'a [u8],
+    i: usize,
+) -> Result<(usize, &'a [u8], bool), JsonParseOutcome> {
+    if i >= bytes.len() || bytes[i] != b'"' {
+        return Err(JsonParseOutcome::InvalidOrTooDeep);
+    }
+    let start = i + 1;
+    let mut p = start;
+    let mut has_backslash = false;
+    while p < bytes.len() {
+        let b = bytes[p];
+        if b == b'"' {
+            let inner = &bytes[start..p];
+            if !inner.is_ascii() && std::str::from_utf8(inner).is_err() {
+                return Err(JsonParseOutcome::InvalidOrTooDeep);
+            }
+            return Ok((p + 1, inner, has_backslash));
+        }
+        if b < 0x20 {
+            return Err(JsonParseOutcome::InvalidOrTooDeep);
+        }
+        if b == b'\\' {
+            has_backslash = true;
+            if p + 1 >= bytes.len() {
+                return Err(JsonParseOutcome::InvalidOrTooDeep);
+            }
+            let esc = bytes[p + 1];
+            match esc {
+                b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
+                    p += 2;
+                }
+                b'u' => {
+                    return Err(JsonParseOutcome::Decline);
+                }
+                _ => {
+                    return Err(JsonParseOutcome::InvalidOrTooDeep);
+                }
+            }
+        } else {
+            p += 1;
+        }
+    }
+    Err(JsonParseOutcome::InvalidOrTooDeep)
+}
+
+/// Parses a JSON number starting at `bytes[i]`.
+fn parse_json_number(bytes: &[u8], mut i: usize) -> Result<usize, JsonParseOutcome> {
+    let start = i;
+    if i < bytes.len() && bytes[i] == b'-' {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return Err(JsonParseOutcome::InvalidOrTooDeep);
+    }
+    if bytes[i] == b'0' {
+        i += 1;
+        if i < bytes.len() && bytes[i].is_ascii_digit() {
+            return Err(JsonParseOutcome::InvalidOrTooDeep);
+        }
+    } else if matches!(bytes[i], b'1'..=b'9') {
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    } else {
+        return Err(JsonParseOutcome::InvalidOrTooDeep);
+    }
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        let frac_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == frac_start {
+            return Err(JsonParseOutcome::InvalidOrTooDeep);
+        }
+    }
+    if i < bytes.len() && matches!(bytes[i], b'e' | b'E') {
+        return Err(JsonParseOutcome::Decline);
+    }
+    if i - start > 18 {
+        return Err(JsonParseOutcome::Decline);
+    }
+    Ok(i)
+}
+
+/// Parses any JSON value with PHP `json_decode(..., depth: 3)` container depth rules (`max_container_depth = 2`).
+fn parse_json_value(
+    bytes: &[u8],
+    mut i: usize,
+    container_depth: usize,
+) -> Result<(usize, QueryBodyValKind), JsonParseOutcome> {
+    i = skip_json_ws(bytes, i);
+    if i >= bytes.len() {
+        return Err(JsonParseOutcome::InvalidOrTooDeep);
+    }
+    match bytes[i] {
+        b'"' => {
+            let (next, _, _) = parse_json_string(bytes, i)?;
+            Ok((next, QueryBodyValKind::Scalar))
+        }
+        b'-' | b'0'..=b'9' => {
+            let next = parse_json_number(bytes, i)?;
+            Ok((next, QueryBodyValKind::Scalar))
+        }
+        b't' => {
+            if bytes[i..].starts_with(b"true") {
+                Ok((i + 4, QueryBodyValKind::Unsupported))
+            } else {
+                Err(JsonParseOutcome::InvalidOrTooDeep)
+            }
+        }
+        b'f' => {
+            if bytes[i..].starts_with(b"false") {
+                Ok((i + 5, QueryBodyValKind::Unsupported))
+            } else {
+                Err(JsonParseOutcome::InvalidOrTooDeep)
+            }
+        }
+        b'n' => {
+            if bytes[i..].starts_with(b"null") {
+                Ok((i + 4, QueryBodyValKind::Unsupported))
+            } else {
+                Err(JsonParseOutcome::InvalidOrTooDeep)
+            }
+        }
+        b'[' => {
+            if container_depth >= 2 {
+                return Err(JsonParseOutcome::InvalidOrTooDeep);
+            }
+            i = skip_json_ws(bytes, i + 1);
+            if i >= bytes.len() {
+                return Err(JsonParseOutcome::InvalidOrTooDeep);
+            }
+            if bytes[i] == b']' {
+                return Ok((i + 1, QueryBodyValKind::ScalarList));
+            }
+            let mut all_scalar = true;
+            loop {
+                let (next, elem_kind) = parse_json_value(bytes, i, container_depth + 1)?;
+                if elem_kind != QueryBodyValKind::Scalar {
+                    all_scalar = false;
+                }
+                i = skip_json_ws(bytes, next);
+                if i >= bytes.len() {
+                    return Err(JsonParseOutcome::InvalidOrTooDeep);
+                }
+                if bytes[i] == b']' {
+                    let kind = if all_scalar {
+                        QueryBodyValKind::ScalarList
+                    } else {
+                        QueryBodyValKind::Unsupported
+                    };
+                    return Ok((i + 1, kind));
+                }
+                if bytes[i] != b',' {
+                    return Err(JsonParseOutcome::InvalidOrTooDeep);
+                }
+                i += 1;
+            }
+        }
+        b'{' => {
+            if container_depth >= 2 {
+                return Err(JsonParseOutcome::InvalidOrTooDeep);
+            }
+            i = skip_json_ws(bytes, i + 1);
+            if i >= bytes.len() {
+                return Err(JsonParseOutcome::InvalidOrTooDeep);
+            }
+            if bytes[i] == b'}' {
+                return Ok((i + 1, QueryBodyValKind::Unsupported));
+            }
+            loop {
+                i = skip_json_ws(bytes, i);
+                let (after_key, _, has_bs) = parse_json_string(bytes, i)?;
+                if has_bs {
+                    return Err(JsonParseOutcome::Decline);
+                }
+                i = skip_json_ws(bytes, after_key);
+                if i >= bytes.len() || bytes[i] != b':' {
+                    return Err(JsonParseOutcome::InvalidOrTooDeep);
+                }
+                let (after_val, _) = parse_json_value(bytes, i + 1, container_depth + 1)?;
+                i = skip_json_ws(bytes, after_val);
+                if i >= bytes.len() {
+                    return Err(JsonParseOutcome::InvalidOrTooDeep);
+                }
+                if bytes[i] == b'}' {
+                    return Ok((i + 1, QueryBodyValKind::Unsupported));
+                }
+                if bytes[i] != b',' {
+                    return Err(JsonParseOutcome::InvalidOrTooDeep);
+                }
+                i += 1;
+            }
+        }
+        _ => Err(JsonParseOutcome::InvalidOrTooDeep),
+    }
+}
+
+fn parse_top_level_query_json<'a>(
+    bytes: &'a [u8],
+    entries: &mut [(&'a [u8], QueryBodyValKind); 66],
+    entries_len: &mut usize,
+) -> JsonParseOutcome {
+    *entries_len = 0;
+    let mut i = skip_json_ws(bytes, 0);
+    if i >= bytes.len() {
+        return JsonParseOutcome::InvalidOrTooDeep;
+    }
+    if bytes[i] != b'{' {
+        return match parse_json_value(bytes, i, 0) {
+            Ok((next, _)) => {
+                if skip_json_ws(bytes, next) == bytes.len() {
+                    JsonParseOutcome::ValidNonObject
+                } else {
+                    JsonParseOutcome::InvalidOrTooDeep
+                }
+            }
+            Err(outcome) => outcome,
+        };
+    }
+
+    i = skip_json_ws(bytes, i + 1);
+    if i >= bytes.len() {
+        return JsonParseOutcome::InvalidOrTooDeep;
+    }
+    if bytes[i] == b'}' {
+        return if skip_json_ws(bytes, i + 1) == bytes.len() {
+            JsonParseOutcome::ValidObject
+        } else {
+            JsonParseOutcome::InvalidOrTooDeep
+        };
+    }
+
+    loop {
+        i = skip_json_ws(bytes, i);
+        let (after_key, key_slice, has_bs) = match parse_json_string(bytes, i) {
+            Ok(v) => v,
+            Err(outcome) => return outcome,
+        };
+        if has_bs {
+            // Decline only if the escaped key might contain `\n` or match KEY_PATTERN;
+            // if the first byte is already outside `[A-Za-z0-9_]` (like `<a\"\r\n>`), it is
+            // guaranteed to fail KEY_PATTERN once the rest of the JSON syntax succeeds.
+            if key_slice
+                .first()
+                .is_none_or(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            {
+                return JsonParseOutcome::Decline;
+            }
+        }
+        i = skip_json_ws(bytes, after_key);
+        if i >= bytes.len() || bytes[i] != b':' {
+            return JsonParseOutcome::InvalidOrTooDeep;
+        }
+        let (after_val, val_kind) = match parse_json_value(bytes, i + 1, 1) {
+            Ok(v) => v,
+            Err(outcome) => return outcome,
+        };
+        if entries[..*entries_len]
+            .iter()
+            .any(|(existing, _)| *existing == key_slice)
+        {
+            return JsonParseOutcome::Decline;
+        }
+        if *entries_len >= 66 {
+            return JsonParseOutcome::Decline;
+        }
+        entries[*entries_len] = (key_slice, val_kind);
+        *entries_len += 1;
+        i = skip_json_ws(bytes, after_val);
+        if i >= bytes.len() {
+            return JsonParseOutcome::InvalidOrTooDeep;
+        }
+        if bytes[i] == b'}' {
+            return if skip_json_ws(bytes, i + 1) == bytes.len() {
+                JsonParseOutcome::ValidObject
+            } else {
+                JsonParseOutcome::InvalidOrTooDeep
+            };
+        }
+        if bytes[i] != b',' {
+            return JsonParseOutcome::InvalidOrTooDeep;
+        }
+        i += 1;
+    }
+}
+
+#[inline]
+fn is_valid_query_key_pattern(key: &[u8]) -> bool {
+    (1..=32).contains(&key.len()) && key.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Validates HTTP QUERY input (`ValidateHttpQueryInput::validate`).
+///
+/// Returns:
+/// - `0` when valid (`*out_status = 0`)
+/// - `> 0` bytes written to `out_buf` (error message) when invalid (`*out_status` set to `400`, `413`, or `415`)
+/// - `< -1` (`-(required_len as isize)`) when `out_cap` is too small for the error message
+/// - `-1` when declined to PHP fallback or on invalid arguments
+///
+/// # Safety
+/// All non-null pointers must be valid for reads/writes of their respective lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_http_validate_query(
+    content_type: *const u8,
+    content_type_len: usize,
+    has_content_type: u32,
+    raw_body: *const u8,
+    raw_body_len: usize,
+    max_body_bytes: usize,
+    query_keys_nul: *const u8,
+    query_keys_len: usize,
+    query_keys_count: usize,
+    out_status: *mut i32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if out_status.is_null() || out_cap > isize::MAX as usize || (out_buf.is_null() && out_cap > 0) {
+        return -1;
+    }
+    if query_keys_count > 66 {
+        return -1;
+    }
+    let Some(ct_bytes) = (unsafe { wave9_input(content_type, content_type_len) }) else {
+        return -1;
+    };
+    let Some(body_bytes) = (unsafe { wave9_input(raw_body, raw_body_len) }) else {
+        return -1;
+    };
+    let Some(qk_bytes) = (unsafe { wave9_input(query_keys_nul, query_keys_len) }) else {
+        return -1;
+    };
+
+    let write_err = |status: i32, msg: &[u8]| -> isize {
+        unsafe { *out_status = status };
+        let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+        out.extend(msg);
+        out.finish()
+    };
+
+    // 1. Content-Type check
+    if has_content_type == 0 || !http_is_json_media_type_bytes(ct_bytes) {
+        return write_err(
+            415,
+            b"QUERY requests must use Content-Type: application/json",
+        );
+    }
+
+    // 2. Max body size check
+    if raw_body_len > max_body_bytes {
+        return write_err(413, b"QUERY body exceeds the maximum size");
+    }
+
+    // 3. Parse JSON body with depth 3 using stack storage
+    let mut body_entries: [(&[u8], QueryBodyValKind); 66] = [(&[], QueryBodyValKind::Scalar); 66];
+    let mut body_len = 0usize;
+    match parse_top_level_query_json(body_bytes, &mut body_entries, &mut body_len) {
+        JsonParseOutcome::ValidObject => {}
+        JsonParseOutcome::ValidNonObject => {
+            return write_err(400, b"QUERY body must be a JSON object");
+        }
+        JsonParseOutcome::InvalidOrTooDeep => {
+            return write_err(400, b"QUERY body must be valid JSON without nested values");
+        }
+        JsonParseOutcome::Decline => {
+            return -1;
+        }
+    }
+
+    // Collect query keys on stack
+    let mut query_keys: [&[u8]; 66] = [&[]; 66];
+    let mut qk_len = 0usize;
+    if query_keys_count > 0 {
+        for qk in qk_bytes.split(|&b| b == 0) {
+            if qk.contains(&b'\n') || qk_len >= 66 {
+                return -1;
+            }
+            query_keys[qk_len] = qk;
+            qk_len += 1;
+        }
+        if qk_len != query_keys_count {
+            return -1;
+        }
+    }
+
+    let qk_slice = &query_keys[..qk_len];
+    let body_slice = &body_entries[..body_len];
+
+    // 4. Validate KEY_PATTERN on all keys
+    for &qk in qk_slice {
+        if !is_valid_query_key_pattern(qk) {
+            return write_err(
+                400,
+                b"Parameter names may only contain letters, digits and underscores (max 32)",
+            );
+        }
+    }
+    for &(bk, _) in body_slice {
+        if !is_valid_query_key_pattern(bk) {
+            return write_err(
+                400,
+                b"Parameter names may only contain letters, digits and underscores (max 32)",
+            );
+        }
+    }
+
+    // 5. Count unique keys (`count($keys) > 64`) and find first duplicate in `$query` order
+    let mut first_dup: Option<&[u8]> = None;
+    let mut overlap_count = 0usize;
+    for &qk in qk_slice {
+        if body_slice.iter().any(|&(bk, _)| bk == qk) {
+            overlap_count += 1;
+            if first_dup.is_none() {
+                first_dup = Some(qk);
+            }
+        }
+    }
+    let unique_keys = qk_slice.len() + body_slice.len() - overlap_count;
+    if unique_keys > 64 {
+        return write_err(400, b"QUERY requests accept at most 64 parameters");
+    }
+
+    // 6. Duplicate parameter in both URL and body
+    if let Some(dup) = first_dup {
+        unsafe { *out_status = 400 };
+        let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+        out.extend(b"Parameter ");
+        out.extend(dup);
+        out.extend(b" must not be sent in both the URL and the body");
+        return out.finish();
+    }
+
+    // 7. Validate body values
+    for &(bk, kind) in body_slice {
+        let valid = match kind {
+            QueryBodyValKind::Scalar => true,
+            QueryBodyValKind::ScalarList => bk == b"cat",
+            QueryBodyValKind::Unsupported => false,
+        };
+        if !valid {
+            unsafe { *out_status = 400 };
+            let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+            out.extend(b"Parameter ");
+            out.extend(bk);
+            out.extend(b" has an unsupported type");
+            return out.finish();
+        }
+    }
+
+    unsafe { *out_status = 0 };
+    0
+}
+
+/// Checks `BlockAbusiveServices::isBlockedUserAgent` and `matchesAnyUserAgentPattern`.
+/// When `use_default_blocked != 0`, checks against `DEFAULT_BLOCKED_USER_AGENTS` (`aiostreams`, `usenetstreamer`, `stremio`).
+/// Otherwise checks `patterns_count` NUL-separated patterns in `patterns_nul[..patterns_len]`.
+/// Returns `1` if matched, `0` if not matched, or `-1` on invalid arguments.
+///
+/// # Safety
+/// Non-null pointers must be readable for their respective lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_http_matches_user_agent_patterns_nul(
+    user_agent: *const u8,
+    user_agent_len: usize,
+    use_default_blocked: u32,
+    patterns_nul: *const u8,
+    patterns_len: usize,
+    patterns_count: usize,
+) -> i32 {
+    let Some(ua) = (unsafe { wave9_input(user_agent, user_agent_len) }) else {
+        return -1;
+    };
+    if use_default_blocked != 0 {
+        for &pat in DEFAULT_BLOCKED_USER_AGENTS {
+            if contains_ignore_ascii_case(ua, pat) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if patterns_count == 0 {
+        return 0;
+    }
+    let Some(pats) = (unsafe { wave9_input(patterns_nul, patterns_len) }) else {
+        return -1;
+    };
+    let mut seen = 0usize;
+    let mut matched = false;
+    for pat in pats.split(|&b| b == 0) {
+        seen += 1;
+        if !matched && contains_ignore_ascii_case(ua, pat) {
+            matched = true;
+        }
+    }
+    if seen != patterns_count {
+        return -1;
+    }
+    i32::from(matched)
+}
+
+#[inline]
+fn is_sensitive_http_query_param(key: &[u8]) -> bool {
+    key.eq_ignore_ascii_case(b"apikey")
+        || key.eq_ignore_ascii_case(b"api_token")
+        || key.eq_ignore_ascii_case(b"token")
+        || key.eq_ignore_ascii_case(b"passkey")
+}
+
+/// Classifies `keys_count` NUL-separated query parameter keys for `BlockAbusiveServices::redactSensitiveQueryParameters`.
+/// Writes `b'1'` (sensitive) or `b'0'` (not sensitive) per key into `out_buf`.
+///
+/// # Safety
+/// Non-null pointers must be valid for reads/writes of their respective lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_http_redact_sensitive_query_keys_nul(
+    keys_nul: *const u8,
+    keys_len: usize,
+    keys_count: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if out_cap > isize::MAX as usize || (out_buf.is_null() && out_cap > 0) {
+        return -1;
+    }
+    if keys_count == 0 {
+        return 0;
+    }
+    let Some(bytes) = (unsafe { wave9_input(keys_nul, keys_len) }) else {
+        return -1;
+    };
+    if keys_count > out_cap {
+        return -(keys_count as isize);
+    }
+    let mut idx = 0usize;
+    for key in bytes.split(|&b| b == 0) {
+        if idx >= keys_count {
+            return -1;
+        }
+        let flag = if is_sensitive_http_query_param(key) {
+            b'1'
+        } else {
+            b'0'
+        };
+        unsafe {
+            *out_buf.add(idx) = flag;
+        }
+        idx += 1;
+    }
+    if idx != keys_count {
+        return -1;
+    }
+    keys_count as isize
+}
+
+#[inline]
+fn unix_basename_span(path: &[u8]) -> (usize, usize) {
+    let mut end = path.len();
+    while end > 0 && path[end - 1] == b'/' {
+        end -= 1;
+    }
+    if end == 0 {
+        return (0, 0);
+    }
+    let start = match path[..end].iter().rposition(|&b| b == b'/') {
+        Some(slash) => slash + 1,
+        None => 0,
+    };
+    (start, end)
+}
+
+#[inline]
+fn matches_known_media_container_ext(ext: &[u8]) -> bool {
+    // `/\.(mkv|mp4|avi|mov|wmv|flv|m4v|ts|webm|mpg|mpeg|iso|m2ts|ogm|divx|vob)$/i`
+    if !(2..=4).contains(&ext.len()) {
+        return false;
+    }
+    let mut lower = [0u8; 4];
+    for (i, &b) in ext.iter().enumerate() {
+        lower[i] = b.to_ascii_lowercase();
+    }
+    matches!(
+        &lower[..ext.len()],
+        b"mkv"
+            | b"mp4"
+            | b"avi"
+            | b"mov"
+            | b"wmv"
+            | b"flv"
+            | b"m4v"
+            | b"ts"
+            | b"webm"
+            | b"mpg"
+            | b"mpeg"
+            | b"iso"
+            | b"m2ts"
+            | b"ogm"
+            | b"divx"
+            | b"vob"
+    )
+}
+
+/// Computes `NzbImportService::deriveReleaseNameFromNzbPath(path)` as a packed `(start << 32) | len` span (`>= 0`),
+/// or `-1` on invalid arguments / declined input containing `\n`.
+///
+/// # Safety
+/// `path` must be readable for `path_len` bytes when non-null and `path_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_derive_release_name_span(
+    path: *const u8,
+    path_len: usize,
+) -> i64 {
+    if path_len > u32::MAX as usize {
+        return -1;
+    }
+    let Some(bytes) = (unsafe { wave9_input(path, path_len) }) else {
+        return -1;
+    };
+    if bytes.contains(&b'\n') {
+        return -1;
+    }
+    let (start, mut end) = unix_basename_span(bytes);
+    let base = &bytes[start..end];
+
+    // 1. Strip trailing `.nzb` or `.nzb.gz` (case-insensitive)
+    if base.len() >= 7 && base[base.len() - 7..].eq_ignore_ascii_case(b".nzb.gz") {
+        end -= 7;
+    } else if base.len() >= 4 && base[base.len() - 4..].eq_ignore_ascii_case(b".nzb") {
+        end -= 4;
+    }
+
+    // 2. Strip one trailing known media/container extension
+    let after_nzb = &bytes[start..end];
+    if let Some(dot) = after_nzb.iter().rposition(|&b| b == b'.') {
+        if matches_known_media_container_ext(&after_nzb[dot + 1..]) {
+            end = start + dot;
+        }
+    }
+
+    // 3. `rtrim($name, ". \t\n\r\0\x0B")`
+    while end > start && (bytes[end - 1] == b'.' || is_php_trim_char(bytes[end - 1])) {
+        end -= 1;
+    }
+
+    let len = end - start;
+    ((start as i64) << 32) | (len as i64)
+}
+
+#[inline]
+fn strip_trailing_paren_part_counters(mut s: &[u8]) -> &[u8] {
+    // Strips all trailing `(\d+/\d+)` groups matching `/(\(\d+\/\d+\))*$/`
+    while s.ends_with(b")") {
+        let mut p = s.len() - 1;
+        let digits2_end = p;
+        while p > 0 && s[p - 1].is_ascii_digit() {
+            p -= 1;
+        }
+        if p == digits2_end || p == 0 || s[p - 1] != b'/' {
+            break;
+        }
+        p -= 1; // skip '/'
+        let digits1_end = p;
+        while p > 0 && s[p - 1].is_ascii_digit() {
+            p -= 1;
+        }
+        if p == digits1_end || p == 0 || s[p - 1] != b'(' {
+            break;
+        }
+        s = &s[..p - 1];
+    }
+    s
+}
+
+#[inline]
+fn is_utf7_base64_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'+' || b == b'/'
+}
+
+#[inline]
+fn has_ambiguous_mb_list_encodings_ascii(s: &[u8]) -> bool {
+    for (i, &b) in s.iter().enumerate() {
+        if !(0x20..=0x7E).contains(&b) || b == b'&' {
+            return true;
+        }
+        if b == b'+' {
+            if i + 3 >= s.len() || s.get(i + 1) == Some(&b'-') {
+                return true;
+            }
+            // UTF-7 requires >= 3 base64 chars after '+' to form at least one 16-bit UTF-16 code unit
+            if s.get(i + 1).is_some_and(|&c1| is_utf7_base64_byte(c1))
+                && s.get(i + 2).is_some_and(|&c2| is_utf7_base64_byte(c2))
+                && s.get(i + 3).is_some_and(|&c3| is_utf7_base64_byte(c3))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Computes `NzbImportService::normalizeImportedSubject(subject)`.
+/// Returns:
+/// - `>= 0`: normalized byte length written to `out_buf`
+/// - `< -1` (`-(required_len as isize)`): when `out_cap` is too small
+/// - `-1`: when declined to PHP fallback (`mb_convert_encoding` needed) or invalid arguments
+///
+/// # Safety
+/// Non-null pointers must be valid for reads/writes of their respective lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_normalize_imported_subject(
+    subject: *const u8,
+    subject_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if out_cap > isize::MAX as usize || (out_buf.is_null() && out_cap > 0) {
+        return -1;
+    }
+    let Some(bytes) = (unsafe { wave9_input(subject, subject_len) }) else {
+        return -1;
+    };
+    if bytes.contains(&b'\n') || bytes.contains(&b'\r') {
+        return -1;
+    }
+
+    let stripped = strip_trailing_paren_part_counters(bytes);
+
+    // Find first case-insensitive `yenc` in `stripped`
+    let mut prefix_end = stripped.len();
+    if stripped.len() >= 4 {
+        let mut i = 0usize;
+        while i + 4 <= stripped.len() {
+            if matches!(stripped[i], b'y' | b'Y')
+                && stripped[i + 1..i + 4].eq_ignore_ascii_case(b"enc")
+            {
+                prefix_end = i;
+                break;
+            }
+            i += 1;
+        }
+    }
+
+    // The pre-trim result is `stripped[..prefix_end] + "yEnc"`.
+    // Because `"yEnc"` ends with `'c'` (not a trim char), `trim(stripped[..prefix_end] + "yEnc")`
+    // only trims leading PHP trim chars from `stripped[..prefix_end]`.
+    let raw_prefix = &stripped[..prefix_end];
+    let mut start = 0usize;
+    while start < raw_prefix.len() && is_php_trim_char(raw_prefix[start]) {
+        start += 1;
+    }
+    let trimmed_prefix = &raw_prefix[start..];
+
+    if has_ambiguous_mb_list_encodings_ascii(trimmed_prefix) {
+        return -1;
+    }
+
+    let total_len = trimmed_prefix.len() + 4;
+    if total_len > out_cap {
+        return -(total_len as isize);
+    }
+    unsafe {
+        if !trimmed_prefix.is_empty() {
+            std::ptr::copy_nonoverlapping(trimmed_prefix.as_ptr(), out_buf, trimmed_prefix.len());
+        }
+        std::ptr::copy_nonoverlapping(b"yEnc".as_ptr(), out_buf.add(trimmed_prefix.len()), 4);
+    }
+    total_len as isize
+}
+
+/// Computes `NzbService::groupsFromXref(xref)` as `\n`-separated unique group names in `out_buf`.
+/// Returns `0` when no groups match, `> 0` bytes written, `< -1` when `out_cap` is too small,
+/// or `-1` on invalid arguments.
+///
+/// # Safety
+/// Non-null pointers must be valid for reads/writes of their respective lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_groups_from_xref(
+    xref: *const u8,
+    xref_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if out_cap > isize::MAX as usize || (out_buf.is_null() && out_cap > 0) {
+        return -1;
+    }
+    let Some(bytes) = (unsafe { wave9_input(xref, xref_len) }) else {
+        return -1;
+    };
+    if bytes.is_empty() {
+        return 0;
+    }
+
+    // Collect `\S+` tokens
+    let mut tokens: Vec<&[u8]> = Vec::new();
+    let mut colon_groups: Vec<&[u8]> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        while i < bytes.len() && is_pcre_space(bytes[i]) {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let start = i;
+        while i < bytes.len() && !is_pcre_space(bytes[i]) {
+            i += 1;
+        }
+        let tok = &bytes[start..i];
+        tokens.push(tok);
+        if tok.len() >= 3 {
+            if let Some(rel_colon) = tok[1..tok.len() - 1].iter().rposition(|&b| b == b':') {
+                let grp = &tok[..1 + rel_colon];
+                if !colon_groups.contains(&grp) {
+                    colon_groups.push(grp);
+                }
+            }
+        }
+    }
+
+    if tokens.is_empty() {
+        return 0;
+    }
+
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+    if !colon_groups.is_empty() {
+        for (idx, grp) in colon_groups.iter().enumerate() {
+            if idx > 0 {
+                out.push(b'\n');
+            }
+            out.extend(grp);
+        }
+    } else {
+        let mut unique_tokens: Vec<&[u8]> = Vec::with_capacity(tokens.len());
+        for tok in tokens {
+            if !unique_tokens.contains(&tok) {
+                unique_tokens.push(tok);
+            }
+        }
+        for (idx, tok) in unique_tokens.iter().enumerate() {
+            if idx > 0 {
+                out.push(b'\n');
+            }
+            out.extend(tok);
+        }
+    }
+    out.finish()
+}
+
+/// Checks `NzbService::isTemporaryNzbPathName(path)` (`/\.nzb\.gz\.tmp\.\d+\.[0-9a-f]{12}$/` on `basename($path)`).
+/// Returns `1` if matched, `0` if not matched, or `-1` on invalid arguments / declined input.
+///
+/// # Safety
+/// `path` must be readable for `path_len` bytes when non-null and `path_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_is_temporary_path_name(
+    path: *const u8,
+    path_len: usize,
+) -> i32 {
+    let Some(bytes) = (unsafe { wave9_input(path, path_len) }) else {
+        return -1;
+    };
+    if bytes.contains(&b'\n') {
+        return -1;
+    }
+    let (start, end) = unix_basename_span(bytes);
+    let base = &bytes[start..end];
+    // Minimum length: `.nzb.gz.tmp.` (12) + `1` (1) + `.` (1) + 12 hex (12) = 26
+    if base.len() < 26 {
+        return 0;
+    }
+    let hex_part = &base[base.len() - 12..];
+    if !hex_part
+        .iter()
+        .all(|&b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+    {
+        return 0;
+    }
+    if base[base.len() - 13] != b'.' {
+        return 0;
+    }
+    let digits_end = base.len() - 13;
+    let mut p = digits_end;
+    while p > 0 && base[p - 1].is_ascii_digit() {
+        p -= 1;
+    }
+    if p == digits_end || p < 12 {
+        return 0;
+    }
+    i32::from(&base[p - 12..p] == b".nzb.gz.tmp.")
+}
+
+#[cfg(test)]
+mod wave10_worker6_tests {
+    use super::*;
+
+    #[test]
+    fn mcp_path_guard_exports_validate_and_normalize() {
+        unsafe {
+            assert_eq!(nntmux_mcp_check_not_sensitive(std::ptr::null(), 1), -1);
+            assert_eq!(nntmux_mcp_check_not_sensitive(b".env".as_ptr(), 4), 1);
+            assert_eq!(
+                nntmux_mcp_check_not_sensitive(b"app/.env.local".as_ptr(), 14),
+                1
+            );
+            assert_eq!(
+                nntmux_mcp_check_not_sensitive(b".env.example".as_ptr(), 12),
+                0
+            );
+            assert_eq!(
+                nntmux_mcp_check_not_sensitive(b"tests/id_rsa".as_ptr(), 12),
+                2
+            );
+            assert_eq!(
+                nntmux_mcp_check_not_sensitive(b"app/cert.PEM".as_ptr(), 12),
+                2
+            );
+            assert_eq!(
+                nntmux_mcp_check_not_sensitive(b"app/Models/Release.php".as_ptr(), 22),
+                0
+            );
+
+            assert_eq!(
+                nntmux_mcp_check_allowed_location(
+                    b".env.example".as_ptr(),
+                    12,
+                    1,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                ),
+                0
+            );
+            assert_eq!(
+                nntmux_mcp_check_allowed_location(
+                    b"vendor/autoload.php".as_ptr(),
+                    19,
+                    1,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                ),
+                1
+            );
+            assert_eq!(
+                nntmux_mcp_check_allowed_location(
+                    b"app/vendor/test.php".as_ptr(),
+                    19,
+                    1,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                ),
+                2
+            );
+
+            let mut status = -1i32;
+            let mut buf = [0u8; 64];
+            let raw = b"  app\\\\Services//Mcp/ProjectPathGuard.php  ";
+            let written = nntmux_mcp_normalize_relative_path(
+                raw.as_ptr(),
+                raw.len(),
+                1,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                &mut status,
+                buf.as_mut_ptr(),
+                buf.len(),
+            );
+            assert_eq!(status, 0);
+            assert_eq!(
+                &buf[..written as usize],
+                b"app/Services/Mcp/ProjectPathGuard.php"
+            );
+        }
+    }
+
+    #[test]
+    fn http_query_validator_and_block_abusive_exports_work() {
+        unsafe {
+            let ct = b"Application/JSON; charset=\"utf-8\"";
+            assert_eq!(nntmux_http_is_json_media_type(ct.as_ptr(), ct.len()), 1);
+            let bad_ct = b"application/json; charset=latin1";
+            assert_eq!(
+                nntmux_http_is_json_media_type(bad_ct.as_ptr(), bad_ct.len()),
+                0
+            );
+
+            let mut status = -1i32;
+            let mut buf = [0u8; 128];
+            let body = br#"{"api_token":"abc","id":"ubuntu","cat":[2000,5030]}"#;
+            let qk = b"maxage\0minsize";
+            let res = nntmux_http_validate_query(
+                ct.as_ptr(),
+                ct.len(),
+                1,
+                body.as_ptr(),
+                body.len(),
+                8192,
+                qk.as_ptr(),
+                qk.len(),
+                2,
+                &mut status,
+                buf.as_mut_ptr(),
+                buf.len(),
+            );
+            assert_eq!(res, 0);
+            assert_eq!(status, 0);
+
+            // Duplicate key in URL and body
+            let dup_qk = b"id\0api_token";
+            let res_dup = nntmux_http_validate_query(
+                ct.as_ptr(),
+                ct.len(),
+                1,
+                body.as_ptr(),
+                body.len(),
+                8192,
+                dup_qk.as_ptr(),
+                dup_qk.len(),
+                2,
+                &mut status,
+                buf.as_mut_ptr(),
+                buf.len(),
+            );
+            assert!(res_dup > 0);
+            assert_eq!(status, 400);
+            assert_eq!(
+                &buf[..res_dup as usize],
+                b"Parameter id must not be sent in both the URL and the body"
+            );
+
+            // User-Agent matching
+            let ua = b"Mozilla/5.0 AIOStreams/1.2";
+            assert_eq!(
+                nntmux_http_matches_user_agent_patterns_nul(
+                    ua.as_ptr(),
+                    ua.len(),
+                    1,
+                    std::ptr::null(),
+                    0,
+                    0
+                ),
+                1
+            );
+            let keys = b"t\0ApIkEy\0id\0api_token";
+            let mut flags = [0u8; 8];
+            let n = nntmux_http_redact_sensitive_query_keys_nul(
+                keys.as_ptr(),
+                keys.len(),
+                4,
+                flags.as_mut_ptr(),
+                flags.len(),
+            );
+            assert_eq!(n, 4);
+            assert_eq!(&flags[..4], b"0101");
+        }
+    }
+
+    #[test]
+    fn nzb_import_and_service_helpers_match_php() {
+        unsafe {
+            let path = b"/tmp/nested/Show - S01E07 [1080p].mkv.. .nzb.gz";
+            let span = nntmux_nzb_derive_release_name_span(path.as_ptr(), path.len());
+            assert!(span >= 0);
+            let start = (span >> 32) as usize;
+            let len = (span & 0xFFFF_FFFF) as usize;
+            assert_eq!(&path[start..start + len], b"Show - S01E07 [1080p].mkv");
+
+            let path2 = b"/tmp/nested/Show - S01E07 [1080p].MKV.NZB.GZ";
+            let span2 = nntmux_nzb_derive_release_name_span(path2.as_ptr(), path2.len());
+            let start2 = (span2 >> 32) as usize;
+            let len2 = (span2 & 0xFFFF_FFFF) as usize;
+            assert_eq!(&path2[start2..start2 + len2], b"Show - S01E07 [1080p]");
+
+            let subj = b"  Show.Name.S01E01.1080p-GRP (1/10)(2/10)";
+            let mut out = [0u8; 64];
+            let w = nntmux_nzb_normalize_imported_subject(
+                subj.as_ptr(),
+                subj.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            );
+            assert_eq!(&out[..w as usize], b"Show.Name.S01E01.1080p-GRP yEnc");
+
+            let xref = b"alt.binaries.tv:123 alt.binaries.hd:456 alt.binaries.tv:789";
+            let wx =
+                nntmux_nzb_groups_from_xref(xref.as_ptr(), xref.len(), out.as_mut_ptr(), out.len());
+            assert_eq!(&out[..wx as usize], b"alt.binaries.tv\nalt.binaries.hd");
+
+            let tmp_path = b"/var/nzb/a/b/guid123.nzb.gz.tmp.48219.0123456789ab";
+            assert_eq!(
+                nntmux_nzb_is_temporary_path_name(tmp_path.as_ptr(), tmp_path.len()),
+                1
+            );
+            let upper_tmp = b"/var/nzb/a/b/guid123.nzb.gz.tmp.48219.0123456789AB";
+            assert_eq!(
+                nntmux_nzb_is_temporary_path_name(upper_tmp.as_ptr(), upper_tmp.len()),
+                0
+            );
+        }
+    }
+}

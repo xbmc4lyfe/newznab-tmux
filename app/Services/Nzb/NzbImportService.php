@@ -20,7 +20,9 @@ use App\Services\Releases\Verification\CandidateAdmissionDeferredException;
 use App\Services\Releases\Verification\CandidateCapacityException;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\NzbManifestReader;
+use App\Support\RustPipelineLibrary;
 use App\Support\Utf8;
+use FFI;
 use Illuminate\Cache\Lock;
 use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Contracts\Cache\LockTimeoutException;
@@ -31,12 +33,32 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
+use Throwable;
 
 /**
  * Service for importing NZB files into the database.
  */
 class NzbImportService
 {
+    public const string FFI_CDEF = <<<'C'
+        int64_t nntmux_nzb_derive_release_name_span(const char *path, size_t path_len);
+        ssize_t nntmux_nzb_normalize_imported_subject(const char *subject, size_t subject_len, char *out_buf, size_t out_cap);
+        C;
+
+    private static FFI|false|null $ffi = null;
+
+    private static bool $useRustFfi = true;
+
+    public static function setUseRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
     protected BlacklistService $blacklistService;
 
     protected ReleaseCleaningService $releaseCleaner;
@@ -294,7 +316,7 @@ class NzbImportService
                     continue;
                 } catch (NzbPasswordMetadataRejected) {
                     $importStatus = NzbImportStatus::MetadataIgnored;
-                } catch (\Throwable $exception) {
+                } catch (Throwable $exception) {
                     Log::error('NZB import failed while scanning or inserting a release.', [
                         'path' => $nzbFilePath,
                         'exception' => $exception,
@@ -341,7 +363,7 @@ class NzbImportService
                         if ($this->relId !== null) {
                             try {
                                 FingerprintDispatch::enqueue($this->relId);
-                            } catch (\Throwable $dispatchException) {
+                            } catch (Throwable $dispatchException) {
                                 Log::warning('Could not queue imported release fingerprint metadata collection.', [
                                     'release_id' => $this->relId,
                                     'exception' => $dispatchException::class,
@@ -410,7 +432,14 @@ class NzbImportService
      * extension (e.g. ".mkv", ".mp4"). Example:
      *   "Show - S01E07 [1080p].mkv.nzb.gz" => "Show - S01E07 [1080p]".
      */
-    protected function deriveReleaseNameFromNzbPath(string $path): string
+    public function deriveReleaseNameFromNzbPath(string $path): string
+    {
+        // Retain native PHP in production: 1.45x-1.52x mean / 1.40x-1.46x p99 speedup is
+        // slightly below the strict >= 1.5x p99 adoption gate across both workloads.
+        return $this->deriveReleaseNameFromNzbPathPhp($path);
+    }
+
+    public function deriveReleaseNameFromNzbPathPhp(string $path): string
     {
         $name = basename($path);
 
@@ -426,6 +455,32 @@ class NzbImportService
 
         // Tidy up any trailing dots/whitespace left behind.
         return rtrim($name, ". \t\n\r\0\x0B");
+    }
+
+    public static function deriveReleaseNameFromNzbPathNative(string $path): ?string
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        $ffi = self::$ffi ?? self::resolveFfi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $span = $ffi->nntmux_nzb_derive_release_name_span($path, \strlen($path));
+            if (! \is_int($span) || $span < 0) {
+                return null;
+            }
+
+            $start = $span >> 32;
+            $len = $span & 0xFFFFFFFF;
+
+            return $len === 0 ? '' : \substr($path, $start, $len);
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     protected function writeCompressedNzb(string $path, string $contents): bool
@@ -460,7 +515,7 @@ class NzbImportService
             $stored = File::isFile($path);
 
             return $stored;
-        } catch (\Throwable $exception) {
+        } catch (Throwable $exception) {
             Log::error('Imported NZB compression failed.', [
                 'path' => $path,
                 'exception' => $exception,
@@ -614,13 +669,13 @@ class NzbImportService
      * Record the article fingerprint of a just-inserted release; if that fails, remove the release
      * so it is not left marked as having an NZB that was never stored.
      *
-     * @throws \Throwable
+     * @throws Throwable
      */
     protected function persistArticleFingerprint(int $releaseId, ?string $fingerprint): void
     {
         try {
             ReleaseArticleFingerprintStore::store($releaseId, $fingerprint);
-        } catch (\Throwable $exception) {
+        } catch (Throwable $exception) {
             // Delete through the model so ReleaseObserver also removes the search document.
             Release::query()->find($releaseId)?->delete();
 
@@ -658,7 +713,7 @@ class NzbImportService
 
                 return $stored;
             });
-        } catch (\Throwable $exception) {
+        } catch (Throwable $exception) {
             Log::error('NZB import failed while storing the compressed file.', [
                 'guid' => $this->relGuid,
                 'path' => $path,
@@ -738,7 +793,7 @@ class NzbImportService
      * @return TResult
      *
      * @throws LockTimeoutException When another import holds the lock for longer than the wait.
-     * @throws \Throwable When the identity callback or cache backend fails.
+     * @throws Throwable When the identity callback or cache backend fails.
      */
     protected function withArticleIdentityLock(?string $fingerprint, callable $callback): mixed
     {
@@ -788,12 +843,12 @@ class NzbImportService
                 $this->verificationAdmission = $admission?->toArray();
             } catch (CandidateCapacityException|CandidateAdmissionDeferredException) {
                 return NzbImportStatus::MetadataDeferred;
-            } catch (\Throwable) {
+            } catch (Throwable) {
                 try {
                     Log::warning('NZB verification admission deferred.', [
                         'category' => 'unexpected_admission_failure',
                     ]);
-                } catch (\Throwable) {
+                } catch (Throwable) {
                     // A diagnostic failure must not relinquish the retained upload.
                 }
 
@@ -917,11 +972,75 @@ class NzbImportService
         return NzbImportStatus::Inserted;
     }
 
-    protected function normalizeImportedSubject(string $subject): string
+    public function normalizeImportedSubject(string $subject): string
+    {
+        if (self::$useRustFfi) {
+            $native = self::normalizeImportedSubjectNative($subject);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->normalizeImportedSubjectPhp($subject);
+    }
+
+    public function normalizeImportedSubjectPhp(string $subject): string
     {
         $partLess = preg_replace('/(\(\d+\/\d+\))*$/', 'yEnc', $subject) ?? $subject;
 
         return mb_convert_encoding(trim(preg_replace('/yEnc.*$/i', 'yEnc', $partLess) ?? $partLess), 'UTF-8', mb_list_encodings());
+    }
+
+    public static function normalizeImportedSubjectNative(string $subject): ?string
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        $ffi = self::$ffi ?? self::resolveFfi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+
+        $len = \strlen($subject);
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $len + 16), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_nzb_normalize_imported_subject($subject, $len, $scratch, $cap);
+            if (! \is_int($written) || $written === -1) {
+                return null;
+            }
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_nzb_normalize_imported_subject($subject, $len, $scratch, $cap);
+                if (! \is_int($written) || $written < 0) {
+                    return null;
+                }
+            }
+
+            return $written === 0 ? '' : FFI::string($scratch, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function resolveFfi(): ?FFI
+    {
+        if (self::$ffi !== null) {
+            return self::$ffi === false ? null : self::$ffi;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF);
+        self::$ffi = $ffi ?? false;
+
+        return $ffi;
     }
 
     protected function normalizeGroupName(\SimpleXMLElement|string $group): string
