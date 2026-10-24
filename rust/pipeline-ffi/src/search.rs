@@ -15604,3 +15604,943 @@ pub mod security_forum_support {
         }
     }
 }
+
+/// Wave 24.2 passkey, CAPTCHA, and password-rule helpers. No dependencies.
+///
+/// JSON uses PHP associative-array semantics, including `{}` becoming `[]`, key
+/// replacement retaining insertion order, and scalar-to-array extension casts.
+/// The registration fast path declines floats, integers outside i64, numeric-looking
+/// object keys, nesting above 64, inputs above 1 MiB, and hints other than a list of
+/// strings. PHP remains authoritative for those classes. Invalid/scalar registration
+/// JSON is returned byte-for-byte. All buffer exports are atomic: insufficient capacity
+/// returns the negative required byte length, and DECLINE always writes nothing.
+pub mod passkey_captcha_rule_support {
+    use std::mem::{align_of, size_of};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: i32 = i32::MIN;
+    const MAX_INPUT: usize = 1 << 20;
+    const ALGORITHMS: &[u8] = b"[{\"type\":\"public-key\",\"alg\":-7},{\"type\":\"public-key\",\"alg\":-257},{\"type\":\"public-key\",\"alg\":-8}]";
+
+    fn range_ok(address: usize, length: usize) -> bool {
+        length <= isize::MAX as usize && address.checked_add(length).is_some()
+    }
+
+    unsafe fn bytes<'a>(pointer: *const u8, length: usize) -> Option<&'a [u8]> {
+        if length > MAX_INPUT || !range_ok(pointer as usize, length) {
+            return None;
+        }
+        if length == 0 {
+            return Some(&[]);
+        }
+        if pointer.is_null() || !(pointer as usize).is_multiple_of(align_of::<u8>()) {
+            return None;
+        }
+        Some(unsafe { slice::from_raw_parts(pointer, length) })
+    }
+
+    unsafe fn output(data: &[u8], pointer: *mut u8, capacity: usize) -> i32 {
+        if data.len() > i32::MAX as usize
+            || !range_ok(pointer as usize, capacity)
+            || (capacity != 0 && pointer.is_null())
+        {
+            return DECLINE;
+        }
+        if capacity < data.len() {
+            return -(data.len() as i32);
+        }
+        if !data.is_empty() {
+            // u8 alignment is one. Data belongs to a local allocation (or constant),
+            // never to an input buffer, so the caller may reuse its input as output.
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), pointer, data.len()) };
+        }
+        data.len() as i32
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum Json {
+        Null,
+        Bool(bool),
+        Int(i64),
+        String(String),
+        List(Vec<Json>),
+        Map(Vec<(String, Json)>),
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum ParseError {
+        Invalid,
+        Decline,
+    }
+
+    struct Parser<'a> {
+        source: &'a [u8],
+        position: usize,
+    }
+
+    impl<'a> Parser<'a> {
+        fn parse(source: &'a [u8]) -> Result<Json, ParseError> {
+            std::str::from_utf8(source).map_err(|_| ParseError::Invalid)?;
+            let mut parser = Self {
+                source,
+                position: 0,
+            };
+            let value = parser.value(0)?;
+            parser.whitespace();
+            if parser.position != source.len() {
+                return Err(ParseError::Invalid);
+            }
+            Ok(value)
+        }
+
+        fn whitespace(&mut self) {
+            while self
+                .source
+                .get(self.position)
+                .is_some_and(|c| matches!(c, b' ' | b'\t' | b'\r' | b'\n'))
+            {
+                self.position += 1;
+            }
+        }
+
+        fn take(&mut self, expected: u8) -> bool {
+            self.whitespace();
+            if self.source.get(self.position) == Some(&expected) {
+                self.position += 1;
+                true
+            } else {
+                false
+            }
+        }
+
+        fn value(&mut self, depth: usize) -> Result<Json, ParseError> {
+            if depth > 64 {
+                return Err(ParseError::Decline);
+            }
+            self.whitespace();
+            match self.source.get(self.position).copied() {
+                Some(b'"') => Ok(Json::String(self.string()?)),
+                Some(b'n') => self.literal(b"null", Json::Null),
+                Some(b't') => self.literal(b"true", Json::Bool(true)),
+                Some(b'f') => self.literal(b"false", Json::Bool(false)),
+                Some(b'[') => {
+                    self.position += 1;
+                    let mut items = Vec::new();
+                    if self.take(b']') {
+                        return Ok(Json::List(items));
+                    }
+                    loop {
+                        items.push(self.value(depth + 1)?);
+                        if self.take(b']') {
+                            break;
+                        }
+                        if !self.take(b',') {
+                            return Err(ParseError::Invalid);
+                        }
+                    }
+                    Ok(Json::List(items))
+                }
+                Some(b'{') => {
+                    self.position += 1;
+                    let mut items = Vec::new();
+                    if self.take(b'}') {
+                        return Ok(Json::Map(items));
+                    }
+                    loop {
+                        self.whitespace();
+                        let key = self.string()?;
+                        // PHP coerces canonical integer keys to array indexes. Decline
+                        // all number-like keys rather than guessing platform casting.
+                        if !key.is_empty()
+                            && key
+                                .bytes()
+                                .all(|c| c.is_ascii_digit() || c == b'-' || c == b'+')
+                        {
+                            return Err(ParseError::Decline);
+                        }
+                        if !self.take(b':') {
+                            return Err(ParseError::Invalid);
+                        }
+                        let value = self.value(depth + 1)?;
+                        if let Some((_, old)) = items.iter_mut().find(|(k, _)| *k == key) {
+                            *old = value;
+                        } else {
+                            items.push((key, value));
+                        }
+                        if self.take(b'}') {
+                            break;
+                        }
+                        if !self.take(b',') {
+                            return Err(ParseError::Invalid);
+                        }
+                    }
+                    Ok(Json::Map(items))
+                }
+                Some(b'-' | b'0'..=b'9') => self.number(),
+                _ => Err(ParseError::Invalid),
+            }
+        }
+
+        fn literal(&mut self, literal: &[u8], value: Json) -> Result<Json, ParseError> {
+            let end = self
+                .position
+                .checked_add(literal.len())
+                .ok_or(ParseError::Invalid)?;
+            if self.source.get(self.position..end) != Some(literal) {
+                return Err(ParseError::Invalid);
+            }
+            self.position = end;
+            Ok(value)
+        }
+
+        fn number(&mut self) -> Result<Json, ParseError> {
+            let start = self.position;
+            if self.source.get(self.position) == Some(&b'-') {
+                self.position += 1;
+            }
+            match self.source.get(self.position) {
+                Some(b'0') => self.position += 1,
+                Some(b'1'..=b'9') => {
+                    self.position += 1;
+                    while self
+                        .source
+                        .get(self.position)
+                        .is_some_and(u8::is_ascii_digit)
+                    {
+                        self.position += 1;
+                    }
+                }
+                _ => return Err(ParseError::Invalid),
+            }
+            if self
+                .source
+                .get(self.position)
+                .is_some_and(|c| matches!(c, b'.' | b'e' | b'E'))
+            {
+                return Err(ParseError::Decline);
+            }
+            let number = std::str::from_utf8(&self.source[start..self.position])
+                .map_err(|_| ParseError::Invalid)?;
+            Ok(Json::Int(number.parse().map_err(|_| ParseError::Decline)?))
+        }
+
+        fn hex_unit(&mut self) -> Result<u16, ParseError> {
+            let mut unit = 0u16;
+            for _ in 0..4 {
+                let digit = match self.source.get(self.position) {
+                    Some(b'0'..=b'9') => self.source[self.position] - b'0',
+                    Some(b'a'..=b'f') => self.source[self.position] - b'a' + 10,
+                    Some(b'A'..=b'F') => self.source[self.position] - b'A' + 10,
+                    _ => return Err(ParseError::Invalid),
+                };
+                self.position += 1;
+                unit = (unit << 4) | u16::from(digit);
+            }
+            Ok(unit)
+        }
+
+        fn string(&mut self) -> Result<String, ParseError> {
+            if self.source.get(self.position) != Some(&b'"') {
+                return Err(ParseError::Invalid);
+            }
+            self.position += 1;
+            let mut decoded = Vec::new();
+            loop {
+                let byte = *self.source.get(self.position).ok_or(ParseError::Invalid)?;
+                self.position += 1;
+                match byte {
+                    b'"' => return String::from_utf8(decoded).map_err(|_| ParseError::Invalid),
+                    b'\\' => {
+                        let escape = *self.source.get(self.position).ok_or(ParseError::Invalid)?;
+                        self.position += 1;
+                        match escape {
+                            b'"' | b'\\' | b'/' => decoded.push(escape),
+                            b'b' => decoded.push(8),
+                            b'f' => decoded.push(12),
+                            b'n' => decoded.push(b'\n'),
+                            b'r' => decoded.push(b'\r'),
+                            b't' => decoded.push(b'\t'),
+                            b'u' => {
+                                let first = self.hex_unit()?;
+                                let code = if (0xd800..=0xdbff).contains(&first) {
+                                    if self.source.get(self.position..self.position + 2)
+                                        != Some(b"\\u")
+                                    {
+                                        return Err(ParseError::Invalid);
+                                    }
+                                    self.position += 2;
+                                    let second = self.hex_unit()?;
+                                    if !(0xdc00..=0xdfff).contains(&second) {
+                                        return Err(ParseError::Invalid);
+                                    }
+                                    0x10000
+                                        + ((u32::from(first) - 0xd800) << 10)
+                                        + u32::from(second)
+                                        - 0xdc00
+                                } else {
+                                    u32::from(first)
+                                };
+                                let character = char::from_u32(code).ok_or(ParseError::Invalid)?;
+                                let mut buffer = [0; 4];
+                                decoded.extend_from_slice(
+                                    character.encode_utf8(&mut buffer).as_bytes(),
+                                );
+                            }
+                            _ => return Err(ParseError::Invalid),
+                        }
+                    }
+                    0..=31 => return Err(ParseError::Invalid),
+                    _ => decoded.push(byte),
+                }
+            }
+        }
+    }
+
+    fn quote(source: &str, out: &mut Vec<u8>) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        out.push(b'"');
+        for character in source.chars() {
+            match character {
+                '"' => out.extend_from_slice(b"\\\""),
+                '\\' => out.extend_from_slice(b"\\\\"),
+                '/' => out.extend_from_slice(b"\\/"),
+                '\u{8}' => out.extend_from_slice(b"\\b"),
+                '\u{c}' => out.extend_from_slice(b"\\f"),
+                '\n' => out.extend_from_slice(b"\\n"),
+                '\r' => out.extend_from_slice(b"\\r"),
+                '\t' => out.extend_from_slice(b"\\t"),
+                c if c.is_ascii() && c >= ' ' => out.push(c as u8),
+                c => {
+                    let mut units = [0; 2];
+                    for &unit in c.encode_utf16(&mut units).iter() {
+                        out.extend_from_slice(b"\\u");
+                        for shift in [12, 8, 4, 0] {
+                            out.push(HEX[((unit >> shift) & 15) as usize]);
+                        }
+                    }
+                }
+            }
+        }
+        out.push(b'"');
+    }
+
+    impl Json {
+        fn is_array(&self) -> bool {
+            matches!(self, Self::List(_) | Self::Map(_))
+        }
+
+        fn map_mut(&mut self) -> &mut Vec<(String, Json)> {
+            if !matches!(self, Self::Map(_)) {
+                let old = std::mem::replace(self, Self::Null);
+                *self = Self::Map(match old {
+                    Self::List(items) => items
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, v)| (i.to_string(), v))
+                        .collect(),
+                    Self::Null => Vec::new(),
+                    scalar => vec![("0".to_owned(), scalar)],
+                });
+            }
+            match self {
+                Self::Map(items) => items,
+                _ => unreachable!(),
+            }
+        }
+
+        fn set(&mut self, key: &str, value: Json) {
+            let items = self.map_mut();
+            if let Some((_, old)) = items.iter_mut().find(|(k, _)| k == key) {
+                *old = value;
+            } else {
+                items.push((key.to_owned(), value));
+            }
+        }
+
+        fn render(&self, out: &mut Vec<u8>) {
+            match self {
+                Self::Null => out.extend_from_slice(b"null"),
+                Self::Bool(true) => out.extend_from_slice(b"true"),
+                Self::Bool(false) => out.extend_from_slice(b"false"),
+                Self::Int(number) => out.extend_from_slice(number.to_string().as_bytes()),
+                Self::String(string) => quote(string, out),
+                Self::List(items) => {
+                    out.push(b'[');
+                    for (index, item) in items.iter().enumerate() {
+                        if index != 0 {
+                            out.push(b',');
+                        }
+                        item.render(out);
+                    }
+                    out.push(b']');
+                }
+                Self::Map(items) if items.is_empty() => out.extend_from_slice(b"[]"),
+                Self::Map(items) => {
+                    out.push(b'{');
+                    for (index, (key, item)) in items.iter().enumerate() {
+                        if index != 0 {
+                            out.push(b',');
+                        }
+                        quote(key, out);
+                        out.push(b':');
+                        item.render(out);
+                    }
+                    out.push(b'}');
+                }
+            }
+        }
+    }
+
+    fn augment(value: &mut Json, hints: &[Json], cred_props: bool, algorithms: &Json) {
+        value.set("pubKeyCredParams", algorithms.clone());
+        if !hints.is_empty() {
+            value.set("hints", Json::List(hints.to_vec()));
+        }
+        if cred_props {
+            let items = value.map_mut();
+            if let Some((_, extension)) = items.iter_mut().find(|(key, _)| key == "extensions") {
+                extension.set("credProps", Json::Bool(true));
+            } else {
+                value.set(
+                    "extensions",
+                    Json::Map(vec![("credProps".to_owned(), Json::Bool(true))]),
+                );
+            }
+        }
+    }
+
+    /// # Safety
+    /// Input ranges must be readable; `out` must be writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_passkey_augment_register_json(
+        input: *const u8,
+        len: usize,
+        hints: *const u8,
+        hints_len: usize,
+        cred_props: u32,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if cred_props > 1 {
+                return DECLINE;
+            }
+            let Some(input) = (unsafe { bytes(input, len) }) else {
+                return DECLINE;
+            };
+            let Some(hints) = (unsafe { bytes(hints, hints_len) }) else {
+                return DECLINE;
+            };
+            let mut value = match Parser::parse(input) {
+                Ok(value) if value.is_array() => value,
+                Ok(_) | Err(ParseError::Invalid) => {
+                    return unsafe { output(&input.to_vec(), out, cap) };
+                }
+                Err(ParseError::Decline) => return DECLINE,
+            };
+            let Ok(Json::List(hints)) = Parser::parse(hints) else {
+                return DECLINE;
+            };
+            if hints.iter().any(|hint| !matches!(hint, Json::String(_))) {
+                return DECLINE;
+            }
+            let Ok(algorithms) = Parser::parse(ALGORITHMS) else {
+                return DECLINE;
+            };
+            augment(&mut value, &hints, cred_props != 0, &algorithms);
+            if let Some((_, public_key)) = value
+                .map_mut()
+                .iter_mut()
+                .find(|(key, _)| key == "publicKey")
+            {
+                if public_key.is_array() {
+                    augment(public_key, &hints, cred_props != 0, &algorithms);
+                }
+            }
+            let mut encoded = Vec::new();
+            value.render(&mut encoded);
+            unsafe { output(&encoded, out, cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Normalizes the exact Webauthn\AuthenticatorSelectionCriteria enum values.
+    /// # Safety
+    /// Input ranges must be readable; `out` must be writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_passkey_selection(
+        attachment: *const u8,
+        attachment_len: usize,
+        attachment_null: u32,
+        uv: *const u8,
+        uv_len: usize,
+        rk: *const u8,
+        rk_len: usize,
+        rk_null: u32,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if attachment_null > 1 || rk_null > 1 {
+                return DECLINE;
+            }
+            let Some(attachment) = (unsafe { bytes(attachment, attachment_len) }) else {
+                return DECLINE;
+            };
+            let Some(uv) = (unsafe { bytes(uv, uv_len) }) else {
+                return DECLINE;
+            };
+            let Some(rk) = (unsafe { bytes(rk, rk_len) }) else {
+                return DECLINE;
+            };
+            let attachment =
+                if attachment_null == 0 && matches!(attachment, b"platform" | b"cross-platform") {
+                    Json::String(String::from_utf8_lossy(attachment).into_owned())
+                } else {
+                    Json::Null
+                };
+            let uv = if matches!(uv, b"required" | b"preferred" | b"discouraged") {
+                uv
+            } else {
+                b"preferred"
+            };
+            let rk = if rk_null == 1 {
+                Json::Null
+            } else {
+                Json::String(
+                    String::from_utf8_lossy(
+                        if matches!(rk, b"required" | b"preferred" | b"discouraged") {
+                            rk
+                        } else {
+                            b"preferred"
+                        },
+                    )
+                    .into_owned(),
+                )
+            };
+            let mut encoded = Vec::new();
+            Json::List(vec![
+                attachment,
+                Json::String(String::from_utf8_lossy(uv).into_owned()),
+                rk,
+            ])
+            .render(&mut encoded);
+            unsafe { output(&encoded, out, cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `rp` must be readable for `len` bytes; `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_passkey_auth_rp(
+        rp: *const u8,
+        len: usize,
+        rp_null: u32,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if rp_null > 1 {
+                return DECLINE;
+            }
+            let Some(rp) = (unsafe { bytes(rp, len) }) else {
+                return DECLINE;
+            };
+            let data = if rp_null != 0 || rp.is_empty() {
+                b"localhost".to_vec()
+            } else {
+                rp.to_vec()
+            };
+            unsafe { output(&data, out, cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `out` must be writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_passkey_auth_session_key(out: *mut u8, cap: usize) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| unsafe {
+            output(b"passkey-authentication-options", out, cap)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// 0 = accepted/verification unknown, 1 = missing, 2 = verification failed.
+    /// # Safety
+    /// `token` must be readable for `len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_captcha_rule_input(
+        provider: u32,
+        is_string: u32,
+        token: *const u8,
+        len: usize,
+        verified: i32,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if provider > 1 || is_string > 1 || !matches!(verified, -1..=1) {
+                return DECLINE;
+            }
+            let Some(token) = (unsafe { bytes(token, len) }) else {
+                return DECLINE;
+            };
+            if is_string == 0 || token.is_empty() {
+                1
+            } else if verified == 0 {
+                2
+            } else {
+                0
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `out` must be aligned and writable for one i64.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_password_breach_threshold(
+        threshold: i64,
+        out: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null() || !out.is_aligned() || !range_ok(out as usize, size_of::<i64>()) {
+                return DECLINE;
+            }
+            unsafe { out.write(threshold.max(0)) };
+            0
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `password` must be readable for `len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_password_breach_should_check(
+        password: *const u8,
+        len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(password) = (unsafe { bytes(password, len) }) else {
+                return DECLINE;
+            };
+            i32::from(!password.is_empty())
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn buffer(call: impl Fn(*mut u8, usize) -> i32) -> Result<Vec<u8>, i32> {
+            let needed = call(std::ptr::null_mut(), 0);
+            if needed == DECLINE {
+                return Err(DECLINE);
+            }
+            if needed == 0 {
+                return Ok(Vec::new());
+            }
+            assert!(needed < 0);
+            let mut output = vec![0; (-needed) as usize];
+            assert_eq!(call(output.as_mut_ptr(), output.len()), output.len() as i32);
+            Ok(output)
+        }
+
+        fn register(input: &[u8], hints: &[u8], cred_props: u32) -> Result<Vec<u8>, i32> {
+            buffer(|out, cap| unsafe {
+                nntmux_passkey_augment_register_json(
+                    input.as_ptr(),
+                    input.len(),
+                    hints.as_ptr(),
+                    hints.len(),
+                    cred_props,
+                    out,
+                    cap,
+                )
+            })
+        }
+
+        #[test]
+        fn wave24_2_registration_shapes_and_php_escaping() {
+            let algorithms = std::str::from_utf8(ALGORITHMS).unwrap();
+            assert_eq!(
+                register(b"{}", b"[]", 1).unwrap(),
+                format!(
+                    "{{\"pubKeyCredParams\":{algorithms},\"extensions\":{{\"credProps\":true}}}}"
+                )
+                .as_bytes()
+            );
+            assert_eq!(
+                register(b"[]", b"[]", 0).unwrap(),
+                format!("{{\"pubKeyCredParams\":{algorithms}}}").as_bytes()
+            );
+            let input = br#"{"pubKeyCredParams":false,"empty":{},"publicKey":[],"hints":["old"],"extensions":["x"]}"#;
+            let expected = format!(
+                "{{\"pubKeyCredParams\":{algorithms},\"empty\":[],\"publicKey\":{{\"pubKeyCredParams\":{algorithms},\"hints\":[\"hybrid\"],\"extensions\":{{\"credProps\":true}}}},\"hints\":[\"hybrid\"],\"extensions\":{{\"0\":\"x\",\"credProps\":true}}}}"
+            );
+            assert_eq!(
+                register(input, br#"["hybrid"]"#, 1).unwrap(),
+                expected.as_bytes()
+            );
+            let input = "{\"s\":\"é😀/\\u0000\\n\",\"extensions\":false,\"publicKey\":null}";
+            let expected = format!(
+                "{{\"s\":\"\\u00e9\\ud83d\\ude00\\/\\u0000\\n\",\"extensions\":{{\"0\":false,\"credProps\":true}},\"publicKey\":null,\"pubKeyCredParams\":{algorithms}}}"
+            );
+            assert_eq!(
+                register(input.as_bytes(), b"[]", 1).unwrap(),
+                expected.as_bytes()
+            );
+            let duplicate = br#"{"x":1,"x":2,"extensions":{"credProps":false,"z":true}}"#;
+            let expected = format!(
+                "{{\"x\":2,\"extensions\":{{\"credProps\":true,\"z\":true}},\"pubKeyCredParams\":{algorithms}}}"
+            );
+            assert_eq!(register(duplicate, b"[]", 1).unwrap(), expected.as_bytes());
+        }
+
+        #[test]
+        fn wave24_2_registration_declines_and_preserves_invalid_scalars() {
+            for input in [
+                b"null".as_slice(),
+                b"false",
+                b" 42 ",
+                b"\"x\"",
+                b"invalid",
+                b"{",
+                b"[1,]",
+                b"\xff",
+                br#"{"s":"\ud800"}"#,
+            ] {
+                assert_eq!(register(input, b"[]", 1).unwrap(), input);
+            }
+            for input in [
+                br#"{"x":1.5}"#.as_slice(),
+                br#"{"x":9223372036854775808}"#,
+                br#"{"0":"x"}"#,
+            ] {
+                assert_eq!(register(input, b"[]", 1), Err(DECLINE));
+            }
+            assert_eq!(register(b"{}", b"[true]", 1), Err(DECLINE));
+            assert_eq!(register(b"{}", b"{}", 1), Err(DECLINE));
+            assert_eq!(register(b"{}", b"[]", 2), Err(DECLINE));
+            let deep = format!("{}0{}", "[".repeat(66), "]".repeat(66));
+            assert_eq!(register(deep.as_bytes(), b"[]", 1), Err(DECLINE));
+        }
+
+        #[test]
+        fn wave24_2_selection_and_rp() {
+            let select = |a: &[u8], an, uv: &[u8], rk: &[u8], rn| {
+                buffer(|out, cap| unsafe {
+                    nntmux_passkey_selection(
+                        a.as_ptr(),
+                        a.len(),
+                        an,
+                        uv.as_ptr(),
+                        uv.len(),
+                        rk.as_ptr(),
+                        rk.len(),
+                        rn,
+                        out,
+                        cap,
+                    )
+                })
+            };
+            assert_eq!(
+                select(b"platform", 0, b"required", b"discouraged", 0).unwrap(),
+                br#"["platform","required","discouraged"]"#
+            );
+            assert_eq!(
+                select(b"cross-platform", 0, b"discouraged", b"required", 0).unwrap(),
+                br#"["cross-platform","discouraged","required"]"#
+            );
+            assert_eq!(
+                select(b"bad", 0, b"bad", b"bad", 0).unwrap(),
+                br#"[null,"preferred","preferred"]"#
+            );
+            assert_eq!(
+                select(b"platform", 1, b"preferred", b"required", 1).unwrap(),
+                br#"[null,"preferred",null]"#
+            );
+            assert_eq!(select(b"", 2, b"", b"", 0), Err(DECLINE));
+            assert_eq!(select(b"", 0, b"", b"", 2), Err(DECLINE));
+            for (rp, null, expected) in [
+                (b"".as_slice(), 0, b"localhost".as_slice()),
+                (b"example.test", 1, b"localhost"),
+                (b" \0\xff ", 0, b" \0\xff "),
+            ] {
+                assert_eq!(
+                    buffer(|out, cap| unsafe {
+                        nntmux_passkey_auth_rp(rp.as_ptr(), rp.len(), null, out, cap)
+                    })
+                    .unwrap(),
+                    expected
+                );
+            }
+            assert_eq!(
+                buffer(|out, cap| unsafe { nntmux_passkey_auth_session_key(out, cap) }).unwrap(),
+                b"passkey-authentication-options"
+            );
+        }
+
+        #[test]
+        fn wave24_2_captcha_and_password() {
+            for provider in 0..=1 {
+                for verified in -1..=1 {
+                    assert_eq!(
+                        unsafe {
+                            nntmux_captcha_rule_input(provider, 1, b"".as_ptr(), 0, verified)
+                        },
+                        1
+                    );
+                    assert_eq!(
+                        unsafe {
+                            nntmux_captcha_rule_input(provider, 0, b"x".as_ptr(), 1, verified)
+                        },
+                        1
+                    );
+                    assert_eq!(
+                        unsafe {
+                            nntmux_captcha_rule_input(provider, 1, b"\0\xff".as_ptr(), 2, verified)
+                        },
+                        if verified == 0 { 2 } else { 0 }
+                    );
+                }
+            }
+            assert_eq!(
+                unsafe { nntmux_captcha_rule_input(2, 1, b"x".as_ptr(), 1, -1) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_captcha_rule_input(0, 2, b"x".as_ptr(), 1, -1) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_captcha_rule_input(0, 1, b"x".as_ptr(), 1, 2) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_password_breach_should_check(std::ptr::null(), 0) },
+                0
+            );
+            assert_eq!(
+                unsafe { nntmux_password_breach_should_check(b"\0\xff".as_ptr(), 2) },
+                1
+            );
+            for threshold in [i64::MIN, -1, 0, 1, i64::MAX] {
+                let mut out = -42;
+                assert_eq!(
+                    unsafe { nntmux_password_breach_threshold(threshold, &mut out) },
+                    0
+                );
+                assert_eq!(out, threshold.max(0));
+            }
+        }
+
+        #[test]
+        fn wave24_2_pointer_and_atomic_buffer_contract() {
+            let mut out = [0xa5; 128];
+            let original = out;
+            assert_eq!(
+                unsafe { nntmux_passkey_auth_session_key(out.as_mut_ptr(), 2) },
+                -30
+            );
+            assert_eq!(out, original);
+            assert_eq!(
+                unsafe {
+                    nntmux_passkey_augment_register_json(
+                        b"{}".as_ptr(),
+                        2,
+                        b"[]".as_ptr(),
+                        2,
+                        1,
+                        out.as_mut_ptr(),
+                        1,
+                    )
+                },
+                -((ALGORITHMS.len() + 53) as i32)
+            );
+            assert_eq!(out, original);
+            assert_eq!(
+                unsafe {
+                    nntmux_passkey_auth_rp(std::ptr::null(), 1, 0, out.as_mut_ptr(), out.len())
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_passkey_selection(
+                        std::ptr::null(),
+                        1,
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        0,
+                        out.as_mut_ptr(),
+                        out.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_captcha_rule_input(0, 1, std::ptr::null(), 1, -1) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_password_breach_should_check(std::ptr::null(), 1) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_password_breach_should_check(std::ptr::dangling(), usize::MAX) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_password_breach_should_check(usize::MAX as *const u8, 2) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_passkey_auth_session_key(std::ptr::null_mut(), 128) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_passkey_auth_session_key(out.as_mut_ptr(), usize::MAX) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_passkey_auth_session_key(usize::MAX as *mut u8, 128) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_password_breach_threshold(1, std::ptr::null_mut()) },
+                DECLINE
+            );
+            let mut aligned = [0u64; 2];
+            let misaligned = unsafe { (aligned.as_mut_ptr() as *mut u8).add(1) } as *mut i64;
+            assert_eq!(
+                unsafe { nntmux_password_breach_threshold(1, misaligned) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_password_breach_threshold(1, (usize::MAX - 7) as *mut i64) },
+                DECLINE
+            );
+            assert_eq!(out, original);
+            let mut alias = *b"example.test";
+            assert_eq!(
+                unsafe {
+                    nntmux_passkey_auth_rp(
+                        alias.as_ptr(),
+                        alias.len(),
+                        0,
+                        alias.as_mut_ptr(),
+                        alias.len(),
+                    )
+                },
+                alias.len() as i32
+            );
+            assert_eq!(&alias, b"example.test");
+        }
+    }
+}
