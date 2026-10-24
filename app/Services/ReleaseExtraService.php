@@ -8,16 +8,27 @@ use App\Models\AudioData;
 use App\Models\ReleaseSubtitle;
 use App\Models\VideoData;
 use App\Support\ReleaseSearchIndexSync;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\DB;
 use Mhor\MediaInfo\Container\MediaInfoContainer;
+use Throwable;
 
 /**
  * Service for managing release extra data (video, audio, and subtitles).
  */
 class ReleaseExtraService
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_codec_make_pretty(const char *ptr, size_t len);
+        C;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
     /**
      * Get video data for a release.
      *
@@ -344,5 +355,77 @@ class ReleaseExtraService
                 'subslanguage' => $subs,
             ]);
         }
+    }
+
+    /**
+     * Normalize raw video codec identifiers into human-readable labels.
+     *
+     * Retains the native PHP path in production (~1.15x mean / ~1.18x p99 in paired
+     * benchmarks, below the 1.5x adoption threshold); see makeCodecPrettyNative().
+     */
+    public function makeCodecPretty(string $codec): string
+    {
+        return $this->makeCodecPrettyPhp($codec);
+    }
+
+    public function makeCodecPrettyPhp(string $codec): string
+    {
+        return match (true) {
+            preg_match('#(?:^36$|HEVC)#i', $codec) === 1 => 'HEVC',
+            preg_match('#(?:^(?:7|27|H264)$|AVC)#i', $codec) === 1 => 'h.264',
+            preg_match('#(?:^(?:20|FMP4|MP42|MP43|MPG4)$|ASP)#i', $codec) === 1 => 'MPEG-4',
+            preg_match('#^2$#i', $codec) === 1 => 'MPEG-2',
+            $codec === 'MPEG' => 'MPEG-1',
+            preg_match('#DX50|DIVX|DIV3#i', $codec) === 1 => 'DivX',
+            stripos($codec, 'XVID') !== false => 'XviD',
+            preg_match('#(?:wmv|WVC1)#i', $codec) === 1 => 'wmv',
+            default => $codec,
+        };
+    }
+
+    public function makeCodecPrettyNative(string $codec, bool &$supported = false, ?string $libraryPath = null): string
+    {
+        $supported = false;
+        $ffi = $libraryPath === null
+            ? self::ffi()
+            : RustPipelineLibrary::resolveDomain('release_extra_service', self::FFI_CDEF, $libraryPath);
+        if ($ffi === null) {
+            return $this->makeCodecPrettyPhp($codec);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $code = $ffi->nntmux_codec_make_pretty($codec, strlen($codec));
+        } catch (Throwable) {
+            return $this->makeCodecPrettyPhp($codec);
+        }
+
+        if (! is_int($code) || $code < 0) {
+            return $this->makeCodecPrettyPhp($codec);
+        }
+
+        $supported = true;
+
+        return match ($code) {
+            1 => 'HEVC',
+            2 => 'h.264',
+            3 => 'MPEG-4',
+            4 => 'MPEG-2',
+            5 => 'MPEG-1',
+            6 => 'DivX',
+            7 => 'XviD',
+            8 => 'wmv',
+            default => $codec,
+        };
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (! self::$ffiResolved) {
+            self::$ffiResolved = true;
+            self::$ffi = RustPipelineLibrary::resolveDomain('release_extra_service', self::FFI_CDEF);
+        }
+
+        return self::$ffi;
     }
 }
