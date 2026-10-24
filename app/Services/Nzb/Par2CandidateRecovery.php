@@ -13,7 +13,9 @@ use App\Services\PostProcessService;
 use App\Services\Yenc\YencPart;
 use App\Support\Par2CandidateCheckpoint;
 use App\Support\Par2CandidateProgress;
+use App\Support\RustPipelineLibrary;
 use dariusiii\rarinfo\Par2Info;
+use FFI;
 use Illuminate\Support\Facades\DB;
 use InvalidArgumentException;
 use LengthException;
@@ -22,7 +24,34 @@ use Throwable;
 /** Reconstruct one ordered candidate without downloading committed articles again. */
 final class Par2CandidateRecovery
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_par2_recovery_validate_part(uint32_t has_part, const char *name_ptr, size_t name_len, int64_t size, uint32_t has_number, int64_t number, uint32_t has_begin, int64_t begin, uint32_t has_end, int64_t end, size_t body_len, int64_t segment_number, int64_t segment_count, int64_t offset, uint32_t has_identity, const char *identity_b64_ptr, size_t identity_b64_len, int64_t identity_size, uint32_t identity_has_part, int64_t identity_part);
+        C;
+
+    private static FFI|false|null $ffi = null;
+
+    private static bool $useRustFfi = true;
+
     public function __construct(private readonly NNTPService $nntp, private readonly PostProcessService $postprocess, private readonly bool $alternate = false) {}
+
+    public static function setUseRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    private static function resolveFfi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
 
     /**
      * @param  array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>}  $candidate
@@ -255,6 +284,59 @@ final class Par2CandidateRecovery
      * @return array{name_base64:string,size:int,part:?int}|null
      */
     private function validatePart(?YencPart $part, string $body, int $segmentNumber, int $segmentCount, int $offset, ?array $identity): ?array
+    {
+        return self::validatePartPhp($part, $body, $segmentNumber, $segmentCount, $offset, $identity);
+    }
+
+    /**
+     * Rust candidate for {@see validatePartPhp()}; `$supported` is false when the library is unavailable.
+     *
+     * @param  array{name_base64:string,size:int,part:?int}|null  $identity
+     * @return array{name_base64:string,size:int,part:?int}|null
+     */
+    public static function validatePartNative(?YencPart $part, string $body, int $segmentNumber, int $segmentCount, int $offset, ?array $identity, bool &$supported = false): ?array
+    {
+        $supported = false;
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        $ffi = self::$ffi ?? self::resolveFfi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+        $name = $part === null ? '' : $part->name;
+        $identityName = $identity === null ? '' : $identity['name_base64'];
+        // @phpstan-ignore method.notFound
+        $code = $ffi->nntmux_par2_recovery_validate_part(
+            $part === null ? 0 : 1, $name, \strlen($name), $part === null ? 0 : $part->size,
+            $part?->part === null ? 0 : 1, $part->part ?? 0,
+            $part?->begin === null ? 0 : 1, $part->begin ?? 0,
+            $part?->end === null ? 0 : 1, $part->end ?? 0,
+            \strlen($body), $segmentNumber, $segmentCount, $offset,
+            $identity === null ? 0 : 1, $identityName, \strlen($identityName), $identity === null ? 0 : $identity['size'],
+            $identity === null || $identity['part'] === null ? 0 : 1, $identity['part'] ?? 0,
+        );
+        if (! \is_int($code) || $code < 0) {
+            return null;
+        }
+        $supported = true;
+
+        return match ($code) {
+            0 => null,
+            1 => ['name_base64' => base64_encode($name), 'size' => $part === null ? 0 : $part->size, 'part' => $part?->part],
+            2 => throw new InvalidArgumentException('yEnc framing changed between articles'),
+            3 => throw new InvalidArgumentException('Invalid yEnc filename, size or part identity'),
+            4 => throw new InvalidArgumentException('yEnc file identity changed between articles'),
+            5 => throw new InvalidArgumentException('Missing yEnc multipart offsets'),
+            default => throw new InvalidArgumentException('Discontinuous yEnc article offsets'),
+        };
+    }
+
+    /**
+     * @param  array{name_base64:string,size:int,part:?int}|null  $identity
+     * @return array{name_base64:string,size:int,part:?int}|null
+     */
+    public static function validatePartPhp(?YencPart $part, string $body, int $segmentNumber, int $segmentCount, int $offset, ?array $identity): ?array
     {
         if ($part === null) {
             if ($identity !== null) {

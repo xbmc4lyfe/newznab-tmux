@@ -12,6 +12,8 @@ use App\Models\ReleaseNfo;
 use App\Services\NfoService;
 use App\Services\Releases\Verification\VerificationLedger;
 use App\Services\Releases\Verification\VerificationResetService;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Contracts\Filesystem\FileNotFoundException;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\DB;
@@ -42,7 +44,35 @@ final class NzbUploadManifestService
 
     public const STATE_NFO_FAILED = 'nfo_failed';
 
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_upload_manifest_safe_filename(const char *name_ptr, size_t name_len, const char *ext_ptr, size_t ext_len);
+        int32_t nntmux_upload_manifest_can_reconcile(const char *state_ptr, size_t state_len, uint32_t state_is_string, const char *identity_ptr, size_t identity_len, uint32_t identity_is_string);
+        C;
+
+    private static FFI|false|null $ffi = null;
+
+    private static bool $useRustFfi = true;
+
     public function __construct(private readonly Filesystem $filesystem) {}
+
+    public static function setUseRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    private static function resolveFfi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
 
     /**
      * @return array<string, mixed>
@@ -619,6 +649,39 @@ final class NzbUploadManifestService
      * @param  array<string, mixed>  $manifest
      */
     private function canReconcileCandidate(array $manifest): bool
+    {
+        return self::canReconcileCandidatePhp($manifest);
+    }
+
+    /**
+     * Rust candidate for {@see canReconcileCandidatePhp()}; null when the library is unavailable.
+     *
+     * @param  array<string, mixed>  $manifest
+     */
+    public static function canReconcileCandidateNative(array $manifest): ?bool
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        $ffi = self::$ffi ?? self::resolveFfi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+        $state = $manifest['state'];
+        $identity = $manifest['candidate_identity'] ?? null;
+        $stateBytes = is_string($state) ? $state : '';
+        $identityBytes = is_string($identity) ? $identity : '';
+        // @phpstan-ignore method.notFound
+        $code = $ffi->nntmux_upload_manifest_can_reconcile($stateBytes, \strlen($stateBytes), is_string($state) ? 1 : 0,
+            $identityBytes, \strlen($identityBytes), is_string($identity) ? 1 : 0);
+
+        return $code < 0 ? null : $code === 1;
+    }
+
+    /**
+     * @param  array<string, mixed>  $manifest
+     */
+    public static function canReconcileCandidatePhp(array $manifest): bool
     {
         if ($manifest['state'] === self::STATE_NZB_PENDING) {
             return true;
@@ -1497,6 +1560,32 @@ final class NzbUploadManifestService
     }
 
     private function assertSafeFilename(string $filename, string $extension): void
+    {
+        self::assertSafeFilenamePhp($filename, $extension);
+    }
+
+    /**
+     * Rust candidate for {@see assertSafeFilenamePhp()}; returns false without checking when the library is unavailable.
+     */
+    public static function assertSafeFilenameNative(string $filename, string $extension): bool
+    {
+        if (! self::$useRustFfi) {
+            return false;
+        }
+        $ffi = self::$ffi ?? self::resolveFfi();
+        if ($ffi === null || $ffi === false) {
+            return false;
+        }
+        // @phpstan-ignore method.notFound
+        $code = $ffi->nntmux_upload_manifest_safe_filename($filename, \strlen($filename), $extension, \strlen($extension));
+        if ($code === 0) {
+            throw new RuntimeException("Unsafe {$extension} filename in upload manifest");
+        }
+
+        return $code === 1;
+    }
+
+    public static function assertSafeFilenamePhp(string $filename, string $extension): void
     {
         if ($filename === ''
             || $filename === '.'
