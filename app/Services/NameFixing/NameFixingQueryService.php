@@ -7,7 +7,9 @@ namespace App\Services\NameFixing;
 use App\Models\Category;
 use App\Models\Release;
 use App\Support\Par2FileHashEvidence;
+use App\Support\RustPipelineLibrary;
 use Carbon\CarbonImmutable;
+use FFI;
 use Illuminate\Cache\DatabaseLock;
 use Illuminate\Cache\DatabaseStore;
 use Illuminate\Database\ConnectionInterface;
@@ -18,7 +20,59 @@ use RuntimeException;
 
 final class NameFixingQueryService
 {
-    public const PREDB_IDENTITY_POLICY = 'ff9ba61a9f1d2e1adaf9d556da5a2d804b05f98b958845152a966abe69ee9fc9';
+    private const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_name_fixing_query_pass(uint32_t mode, const char *input, size_t len, int64_t first, int64_t second, char *out, size_t cap);
+        C;
+
+    // Retained PHP: the paired caller benchmark must pass all four 1.5x gates.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    /** Negative ABI results retain the exact PHP implementation. */
+    private static function queryPassNative(int $mode, ?string $input, int $first = 0, int $second = 0, int $needed = 4096): ?string
+    {
+        if ($input === null || strlen($input) > intdiv(PHP_INT_MAX - 4096, 8)) {
+            return null;
+        }
+        try {
+            $ffi = RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF);
+            if ($ffi === null) {
+                return null;
+            }
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, max($needed, strlen($input) * 8 + 4096), $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_name_fixing_query_pass($mode, $input, strlen($input), $first, $second, $buffer, $capacity);
+
+            return is_int($written) && $written >= 0 && $written <= $capacity
+                ? ($written === 0 ? '' : FFI::string($buffer, $written)) : null;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /** @param list<string> $fields */
+    private static function queryPassFields(array $fields): ?string
+    {
+        $input = '';
+        foreach ($fields as $field) {
+            if (strlen($field) > 0xFFFFFFFF) {
+                return null;
+            }
+            $input .= pack('V', strlen($field)).$field;
+        }
+
+        return $input;
+    }
+
+    public const PREDB_IDENTITY_POLICY = '134506efa93e386de43b78b4f100d6b5df4b389b96cbcdb4aac67cadbbecc9ac';
 
     public const SOURCE_NFO = 'nfo';
 
@@ -79,6 +133,28 @@ final class NameFixingQueryService
 
     /** Pending sources inspected by the scheduled fix-names passes, counted once per release. */
     public static function pendingWorkCondition(): string
+    {
+        return (self::$useRustFfi ? self::pendingWorkConditionNative() : null) ?? self::pendingWorkConditionPhp();
+    }
+
+    private static function pendingWorkConditionNative(): ?string
+    {
+        $all = (string) config('tmux.fix_names.category', 'other') === 'all';
+        $full = (bool) config('tmux.fix_names.full_backlog', true);
+        $cutoff = $full ? '' : (DB::getDriverName() === 'sqlite'
+            ? "datetime(CURRENT_TIMESTAMP, '-6 hours')" : 'CURRENT_TIMESTAMP - INTERVAL 6 HOUR');
+        $fields = [(string) Category::OTHER_MISC, (string) Category::OTHER_HASHED,
+            implode(',', Category::OTHERS_GROUP), Release::nzbSettledSql('r'), $cutoff];
+        foreach (self::STATUS_COLUMNS as $source => $column) {
+            if ($source !== self::SOURCE_PAR2) {
+                array_push($fields, $source, $column, self::SOURCE_EXISTS[$source]);
+            }
+        }
+
+        return self::queryPassNative(14, self::queryPassFields($fields), (int) $all, (int) $full);
+    }
+
+    public static function pendingWorkConditionPhp(): string
     {
         $sources = [];
         foreach (self::STATUS_COLUMNS as $source => $column) {
@@ -706,15 +782,66 @@ final class NameFixingQueryService
      * @param  list<object>  $rows
      * @return array<int, list<object>>
      */
+    /** @param list<object> $rows
+     * @return array<int, list<object>>
+     */
     public function groupByReleaseId(array $rows): array
     {
-        return $this->groupByKey($rows, 'releases_id');
+        return (self::$useRustFfi ? $this->groupByReleaseIdNative($rows) : null) ?? $this->groupByReleaseIdPhp($rows);
+    }
+
+    /** @param list<object> $rows
+     * @return array<int, list<object>>|null
+     */
+    private function groupByReleaseIdNative(array $rows): ?array
+    {
+        return $this->groupByKeyNative($rows, 'releases_id');
+    }
+
+    /** @param list<object> $rows
+     * @return array<int, list<object>>
+     */
+    public function groupByReleaseIdPhp(array $rows): array
+    {
+        return $this->groupByKeyPhp($rows, 'releases_id');
     }
 
     /**
      * @return array{0: string, 1: list<mixed>}
      */
+    /** @return array{0: string, 1: list<mixed>} */
     private function candidateWhere(string $source, int $time, int $categories): array
+    {
+        return (self::$useRustFfi ? $this->candidateWhereNative($source, $time, $categories) : null) ?? $this->candidateWherePhp($source, $time, $categories);
+    }
+
+    /** @return array{0: string, 1: list<mixed>}|null */
+    private function candidateWhereNative(string $source, int $time, int $categories): ?array
+    {
+        if (! isset(self::SOURCE_EXISTS[$source], self::STATUS_COLUMNS[$source])) {
+            return null;
+        }
+        $where = self::queryPassNative(13, self::queryPassFields([
+            $source, self::STATUS_COLUMNS[$source], self::SOURCE_EXISTS[$source],
+            (string) Category::OTHER_MISC, (string) Category::OTHER_HASHED,
+            implode(',', Category::OTHERS_GROUP), Release::nzbSettledSql('r'),
+        ]), $time, $categories);
+        if ($where === null) {
+            return null;
+        }
+        $bindings = $categories !== 3 ? [Category::OTHER_MISC, Category::OTHER_HASHED] : [];
+        if ($time === 1) {
+            $bindings[] = CarbonImmutable::now()->subHours(6)->toDateTimeString();
+        }
+        if ($source === self::SOURCE_HASH) {
+            $bindings[] = CarbonImmutable::now()->toDateTimeString();
+        }
+
+        return [$where, $bindings];
+    }
+
+    /** @return array{0: string, 1: list<mixed>} */
+    private function candidateWherePhp(string $source, int $time, int $categories): array
     {
         if (! isset(self::SOURCE_EXISTS[$source], self::STATUS_COLUMNS[$source])) {
             throw new InvalidArgumentException("Unsupported name-fixing source [{$source}].");
@@ -794,7 +921,55 @@ final class NameFixingQueryService
      * @param  list<object>  $rows
      * @return array<int|string, list<object>>
      */
+    /** @param list<object> $rows
+     * @return array<int|string, list<object>>
+     */
     private function groupByKey(array $rows, string $key): array
+    {
+        return (self::$useRustFfi ? $this->groupByKeyNative($rows, $key) : null) ?? $this->groupByKeyPhp($rows, $key);
+    }
+
+    /** @param list<object> $rows
+     * @return array<int|string, list<object>>|null
+     */
+    private function groupByKeyNative(array $rows, string $key): ?array
+    {
+        $keys = [];
+        $fields = [];
+        foreach ($rows as $row) {
+            $value = $row->{$key};
+            // PHP owns array-key coercion and preserves the caller's object references.
+            if (! is_int($value) && ! is_string($value) && $value !== null) {
+                return null;
+            }
+            $normalized = array_key_first([$value => true]);
+            $keys[] = $normalized;
+            $fields[] = (is_int($normalized) ? 'i' : 's').(string) $normalized;
+        }
+        $raw = self::queryPassNative(12, self::queryPassFields($fields));
+        if ($raw === null) {
+            return null;
+        }
+        $representatives = $raw === '' ? [] : explode(',', $raw);
+        if (count($representatives) !== count($rows)) {
+            return null;
+        }
+        $grouped = [];
+        foreach (array_values($rows) as $index => $row) {
+            $representative = (int) $representatives[$index];
+            if (! array_key_exists($representative, $keys) || $representative > $index) {
+                return null;
+            }
+            $grouped[$keys[$representative]][] = $row;
+        }
+
+        return $grouped;
+    }
+
+    /** @param list<object> $rows
+     * @return array<int|string, list<object>>
+     */
+    private function groupByKeyPhp(array $rows, string $key): array
     {
         $grouped = [];
 
@@ -807,10 +982,34 @@ final class NameFixingQueryService
 
     private function placeholders(int $count): string
     {
+        return (self::$useRustFfi ? $this->placeholdersNative($count) : null) ?? $this->placeholdersPhp($count);
+    }
+
+    private function placeholdersNative(int $count): ?string
+    {
+        if ($count < 0 || $count > intdiv(PHP_INT_MAX - 1, 2)) {
+            return null;
+        }
+
+        return self::queryPassNative(2, '', $count, 0, max(1, $count * 2));
+    }
+
+    private function placeholdersPhp(int $count): string
+    {
         return implode(',', array_fill(0, $count, '?'));
     }
 
     private function escapeLike(string $value): string
+    {
+        return (self::$useRustFfi ? $this->escapeLikeNative($value) : null) ?? $this->escapeLikePhp($value);
+    }
+
+    private function escapeLikeNative(string $value): ?string
+    {
+        return self::queryPassNative(3, $value);
+    }
+
+    private function escapeLikePhp(string $value): string
     {
         return str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $value);
     }
