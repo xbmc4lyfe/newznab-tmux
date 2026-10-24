@@ -34,6 +34,8 @@ use WeakMap;
  * when the pipeline library is available, and the PAR2 progress signature is hashed there too;
  * {@see par2CandidatesPhp()} remains the fallback and parity reference. {@see par2FamilyKeyNative()}
  * (`nntmux_par2_family_key`) is kept for parity tests only: one FFI call per subject did not reach the 1.5x gate.
+ * {@see parseNzb()} classifies NFO/PAR2 candidates and completion in Rust straight from the NZB source
+ * ({@see scanNzb()}); {@see scanNzbFilesPhp()} remains the fallback and parity reference.
  */
 class NzbContentsService
 {
@@ -170,76 +172,22 @@ class NzbContentsService
      */
     public function parseNzb(string $guid, int $relID, int $groupID, bool $nfoCheck = false): bool|array
     {
-        $nzbFile = $this->loadNzb($guid);
-        if ($nzbFile === false) {
+        $scan = $this->scanNzb($guid, $nfoCheck, $this->lookupPar2);
+        if ($scan === null) {
             return false;
         }
+        $nfoMessageId = $scan['nfo'];
 
-        $messageID = $hiddenID = '';
-        $actualParts = $artificialParts = 0;
-        // Initialize foundPAR2 based on settings; if lookupPar2 is false, we don't need to find one.
-        $foundPAR2 = $this->lookupPar2 === false;
-        // Initialize NFO flags based on whether we are checking for NFOs.
-        $foundNFO = $hiddenNFO = $nfoCheck === false;
-        $nfoMessageId = null; // Store potential NFO message ID here
-        $hasNonPar2File = false;
-        foreach ($nzbFile->file as $nzbContents) {
-            if (preg_match('/\.par2(?:["\s]|$)/i', (string) $nzbContents->attributes()->subject) !== 1) {
-                $hasNonPar2File = true;
+        // --- PAR2 Detection ---
+        // Parse the first .par2 index file (often small, but not always 1/1) whose first segment parses.
+        foreach ($scan['par2'] as $firstSegmentId) {
+            if ($this->postProcessService->parsePAR2($firstSegmentId, $relID, $groupID, $this->nntp, 1) === true) {
+                Release::query()->where('id', $relID)->update(['proc_par2' => 1]);
                 break;
             }
         }
 
-        foreach ($nzbFile->file as $nzbContents) {
-            $segmentCountInFile = 0;
-            $firstSegmentId = null; // Initialize here for each file
-            foreach ($nzbContents->segments->segment as $segment) {
-                $actualParts++;
-                $segmentCountInFile++;
-                // Store the first segment ID of the current file, potentially useful for NFO/PAR2
-                if ($segmentCountInFile === 1) {
-                    $firstSegmentId = (string) $segment;
-                }
-            }
-
-            $subject = (string) $nzbContents->attributes()->subject;
-
-            // Calculate artificial parts from subject
-            $artificialParts += $this->parserService->extractPartsTotal($subject);
-
-            // --- NFO Detection ---
-            // Check for explicit NFO files first (with enhanced patterns)
-            if ($nfoCheck && ! $foundNFO && isset($firstSegmentId)) {
-                $nfoDetection = $this->parserService->detectNfoFile($subject);
-                if ($nfoDetection !== false) {
-                    $nfoMessageId = ['hidden' => $nfoDetection['hidden'], 'id' => $firstSegmentId, 'priority' => $nfoDetection['priority']];
-                    $foundNFO = true;
-                }
-            }
-
-            // Check for potential "hidden" NFOs with improved detection
-            // Only consider this if an explicit NFO wasn't found yet
-            if ($nfoCheck && ! $foundNFO && ! $hiddenNFO && isset($firstSegmentId)) {
-                $hiddenNfoDetection = $this->parserService->detectHiddenNfoFile($subject, $segmentCountInFile);
-                if ($hiddenNfoDetection !== false) {
-                    $nfoMessageId = ['hidden' => $hiddenNfoDetection['hidden'], 'id' => $firstSegmentId, 'priority' => $hiddenNfoDetection['priority']];
-                    $hiddenNFO = true;
-                }
-            }
-
-            // --- PAR2 Detection ---
-            // Look specifically for the .par2 index file (often small, but not always 1/1)
-            if ($this->lookupPar2 && $hasNonPar2File && ! $foundPAR2 && isset($firstSegmentId) && $this->parserService->detectPar2IndexFile($subject)) {
-                // Attempt to parse the PAR2 file using its first segment ID
-                if ($this->postProcessService->parsePAR2($firstSegmentId, $relID, $groupID, $this->nntp, 1) === true) {
-                    Release::query()->where('id', $relID)->update(['proc_par2' => 1]);
-                    $foundPAR2 = true;
-                }
-            }
-        } // End foreach $nzbFile->file
-
-        // Calculate completion
-        $completion = $this->calculateCompletion($actualParts, $artificialParts);
+        $completion = $scan['completion'];
 
         Release::query()->where('id', $relID)->update(['completion' => $completion]);
 
@@ -268,12 +216,8 @@ class NzbContentsService
      */
     public function loadNzb(string $guid): SimpleXMLElement|false
     {
-        $nzbContents = $this->nzbService->readNzbContents($guid);
-        if (empty($nzbContents)) {
-            if ($this->echoOutput) {
-                echo PHP_EOL."Unable to read NZB source for {$guid}, skipping.".PHP_EOL;
-            }
-
+        $nzbContents = $this->readNzbSource($guid);
+        if ($nzbContents === false) {
             return false;
         }
 
@@ -284,6 +228,20 @@ class NzbContentsService
         }
 
         return $nzb;
+    }
+
+    private function readNzbSource(string $guid): string|false
+    {
+        $nzbContents = $this->nzbService->readNzbContents($guid);
+        if (empty($nzbContents)) {
+            if ($this->echoOutput) {
+                echo PHP_EOL."Unable to read NZB source for {$guid}, skipping.".PHP_EOL;
+            }
+
+            return false;
+        }
+
+        return $nzbContents;
     }
 
     /**
@@ -842,6 +800,225 @@ class NzbContentsService
 
         // Family matches affect priority only; standalone and later volumes remain resumable.
         return array_values($explicit + $matchingVolumes + $legacy + $hidden + $firstVolumes + $volumes);
+    }
+
+    /**
+     * Load the NZB and classify its files for {@see parseNzb()}: segment totals, completion, the NFO
+     * candidate (explicit names win over the first hidden candidate) and, when $par2 is set and a
+     * non-PAR2 file exists, the first-segment ids of PAR2 index files in document order. Null when the
+     * NZB cannot be read or parsed.
+     *
+     * Rust (`nntmux_nzb_classify_nfo_par2_packed`) scans the source directly when the library is
+     * available, skipping the SimpleXML parse; documents it declines take {@see loadNzb()} and
+     * {@see scanNzbFilesPhp()}, which remain the fallback and parity reference. Subclasses (which may
+     * override loading or completion) and custom parsers keep the PHP path.
+     *
+     * @return array{files:int,actual:int,artificial:int,completion:float,nfo:array{hidden:bool,id:string,priority:int}|null,par2:list<string>}|null
+     */
+    protected function scanNzb(string $guid, bool $nfoCheck, bool $par2): ?array
+    {
+        if (! self::$useRustFfi || static::class !== self::class || $this->parserService::class !== NzbParserService::class) {
+            $nzbFile = $this->loadNzb($guid);
+
+            return $nzbFile === false ? null : $this->scanNzbFilesPhp($nzbFile, $nfoCheck, $par2);
+        }
+        $nzbContents = $this->readNzbSource($guid);
+        if ($nzbContents === false) {
+            return null;
+        }
+        $scan = $this->scanNzbFilesNative($nzbContents, $nfoCheck, $par2);
+        if ($scan !== null) {
+            // parseNzbXml() leaves libxml's internal error handling enabled; keep that process state.
+            libxml_use_internal_errors(true);
+
+            return $scan;
+        }
+        $nzbFile = $this->parserService->parseNzbXml($nzbContents, $this->echoOutput, $guid);
+
+        return $nzbFile === false ? null : $this->scanNzbFilesPhp($nzbFile, $nfoCheck, $par2);
+    }
+
+    /**
+     * @return array{files:int,actual:int,artificial:int,completion:float,nfo:array{hidden:bool,id:string,priority:int}|null,par2:list<string>}
+     */
+    public function scanNzbFilesPhp(SimpleXMLElement $nzbFile, bool $nfoCheck, bool $par2): array
+    {
+        $files = $actualParts = $artificialParts = 0;
+        // Initialize NFO flags based on whether we are checking for NFOs.
+        $foundNFO = $hiddenNFO = $nfoCheck === false;
+        $nfoMessageId = null; // Store potential NFO message ID here
+        $par2Ids = [];
+        $hasNonPar2File = false;
+        foreach ($nzbFile->file as $nzbContents) {
+            if (preg_match('/\.par2(?:["\s]|$)/i', (string) $nzbContents->attributes()->subject) !== 1) {
+                $hasNonPar2File = true;
+                break;
+            }
+        }
+
+        foreach ($nzbFile->file as $nzbContents) {
+            $files++;
+            $segmentCountInFile = 0;
+            $firstSegmentId = null; // Initialize here for each file
+            foreach ($nzbContents->segments->segment as $segment) {
+                $actualParts++;
+                $segmentCountInFile++;
+                // Store the first segment ID of the current file, potentially useful for NFO/PAR2
+                if ($segmentCountInFile === 1) {
+                    $firstSegmentId = (string) $segment;
+                }
+            }
+
+            $subject = (string) $nzbContents->attributes()->subject;
+
+            // Calculate artificial parts from subject
+            $artificialParts += $this->parserService->extractPartsTotal($subject);
+
+            // --- NFO Detection ---
+            // Check for explicit NFO files first (with enhanced patterns)
+            if (! $foundNFO && isset($firstSegmentId)) {
+                $nfoDetection = $this->parserService->detectNfoFile($subject);
+                if ($nfoDetection !== false) {
+                    $nfoMessageId = ['hidden' => $nfoDetection['hidden'], 'id' => $firstSegmentId, 'priority' => $nfoDetection['priority']];
+                    $foundNFO = true;
+                }
+            }
+
+            // Check for potential "hidden" NFOs with improved detection
+            // Only consider this if an explicit NFO wasn't found yet
+            if (! $foundNFO && ! $hiddenNFO && isset($firstSegmentId)) {
+                $hiddenNfoDetection = $this->parserService->detectHiddenNfoFile($subject, $segmentCountInFile);
+                if ($hiddenNfoDetection !== false) {
+                    $nfoMessageId = ['hidden' => $hiddenNfoDetection['hidden'], 'id' => $firstSegmentId, 'priority' => $hiddenNfoDetection['priority']];
+                    $hiddenNFO = true;
+                }
+            }
+
+            // Look specifically for the .par2 index file; parseNzb() parses them in this order.
+            if ($par2 && $hasNonPar2File && isset($firstSegmentId) && $this->parserService->detectPar2IndexFile($subject)) {
+                $par2Ids[] = $firstSegmentId;
+            }
+        }
+
+        return [
+            'files' => $files,
+            'actual' => $actualParts,
+            'artificial' => $artificialParts,
+            'completion' => $this->calculateCompletion($actualParts, $artificialParts),
+            'nfo' => $nfoMessageId,
+            'par2' => $par2Ids,
+        ];
+    }
+
+    /**
+     * Rust {@see scanNzbFilesPhp()} over the NZB source, or null when PHP must decide (library missing,
+     * non-C locale, or a document outside the strict subset the scanner reproduces).
+     *
+     * @return array{files:int,actual:int,artificial:int,completion:float,nfo:array{hidden:bool,id:string,priority:int}|null,par2:list<string>}|null
+     */
+    public function scanNzbFilesNative(string $source, bool $nfoCheck, bool $par2): ?array
+    {
+        $ffi = NzbParserService::nfoCandidateFfi();
+        if ($ffi === null) {
+            return null;
+        }
+        $output = self::classifyCall($ffi, 'nntmux_nzb_classify_nfo_par2_packed', $source, (int) $nfoCheck | ($par2 ? 2 : 0));
+
+        return $output === null ? null : self::decodeScan($output, null);
+    }
+
+    /**
+     * Rust batch over subjects and segment counts collected from SimpleXML
+     * (`nntmux_nzb_classify_nfo_par2_batch_nul`). Kept for parity tests: the SimpleXML walk it still
+     * needs dominates, so it does not reach the 1.5x gate.
+     *
+     * @return array{files:int,actual:int,artificial:int,completion:float,nfo:array{hidden:bool,id:string,priority:int}|null,par2:list<string>}|null
+     */
+    public function scanNzbFilesBatchNative(SimpleXMLElement $nzbFile, bool $nfoCheck, bool $par2): ?array
+    {
+        $ffi = NzbParserService::nfoCandidateFfi();
+        if ($ffi === null) {
+            return null;
+        }
+        $records = '';
+        $firstIds = [];
+        foreach ($nzbFile->file as $file) {
+            $count = 0;
+            $first = '';
+            foreach ($file->segments->segment as $segment) {
+                if ($count++ === 0) {
+                    $first = (string) $segment;
+                }
+            }
+            $subject = (string) $file->attributes()->subject;
+            if (str_contains($subject, "\0")) {
+                return null;
+            }
+            $records .= $subject."\0".$count."\0";
+            $firstIds[] = $first;
+        }
+        $output = self::classifyCall($ffi, 'nntmux_nzb_classify_nfo_par2_batch_nul', $records, (int) $nfoCheck | ($par2 ? 2 : 0));
+
+        return $output === null ? null : self::decodeScan($output, $firstIds);
+    }
+
+    private static function classifyCall(FFI $ffi, string $function, string $input, int $flags): ?string
+    {
+        $length = \strlen($input);
+        $capacity = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, 4096, $capacity);
+        if ($scratch === null) {
+            return null;
+        }
+        $written = $ffi->$function($input, $length, $flags, $scratch, $capacity);
+        if (\is_int($written) && $written < -1) {
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+            if ($scratch === null) {
+                return null;
+            }
+            $written = $ffi->$function($input, $length, $flags, $scratch, $capacity);
+        }
+
+        return \is_int($written) && $written > 0 ? FFI::string($scratch, $written) : null;
+    }
+
+    /**
+     * Decode the scanner record; $firstIds maps file indexes to ids for the batch variant.
+     *
+     * @param  list<string>|null  $firstIds
+     * @return array{files:int,actual:int,artificial:int,completion:float,nfo:array{hidden:bool,id:string,priority:int}|null,par2:list<string>}|null
+     */
+    private static function decodeScan(string $output, ?array $firstIds): ?array
+    {
+        /** @var array{files:int,actual:int,artificial:int,completion:float,kind:int,priority:int,index:int,length:int}|false $head */
+        $head = unpack('Pfiles/Pactual/Partificial/ecompletion/Ckind/Cpriority/Vindex/Vlength', $output);
+        if ($head === false) {
+            return null;
+        }
+        $offset = 42;
+        $nfo = null;
+        if ($head['kind'] !== 0) {
+            $nfo = ['hidden' => $head['kind'] === 2, 'id' => $firstIds === null ? substr($output, $offset, $head['length']) : $firstIds[$head['index']], 'priority' => $head['priority']];
+        }
+        $offset += $head['length'];
+        $count = unpack('V', $output, $offset)[1] ?? 0;
+        $offset += 4;
+        $par2 = [];
+        for ($i = 0; $i < $count; $i++) {
+            [, $index, $length] = unpack('V2', $output, $offset) ?: [0, 0, 0];
+            $offset += 8;
+            $par2[] = $firstIds === null ? substr($output, $offset, $length) : $firstIds[$index];
+            $offset += $length;
+        }
+
+        return [
+            'files' => $head['files'],
+            'actual' => $head['actual'],
+            'artificial' => $head['artificial'],
+            'completion' => $head['completion'],
+            'nfo' => $nfo,
+            'par2' => $par2,
+        ];
     }
 
     /**

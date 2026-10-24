@@ -10971,3 +10971,1176 @@ fn nfo_quality_first_byte(id: usize, byte: u8) -> bool {
         _ => false,
     }
 }
+
+// ============================================================================
+// NZB NFO / PAR2 candidate scanner (`NzbParserService` detectors and the
+// `NzbContentsService::parseNzb` classification loop)
+// ============================================================================
+//
+// Every matcher reproduces one PCRE pattern in the C locale (ASCII case folding, `\s` =
+// `[\t\n\v\f\r ]`, `\w` = `[A-Za-z0-9_]`, `.` excludes `\n`, `$` matches at the end or before
+// a final `\n`). PHP routes here only under a C/POSIX `LC_CTYPE`.
+
+/// PCRE `$` without `D`: for patterns whose byte before `$` cannot be `\n`, matching the
+/// subject minus one trailing `\n` is exact.
+#[inline]
+fn nzbc_dollar(s: &[u8]) -> &[u8] {
+    match s.last() {
+        Some(b'\n') => &s[..s.len() - 1],
+        _ => s,
+    }
+}
+
+#[inline]
+fn nzbc_find(s: &[u8], from: usize, needle: u8) -> Option<usize> {
+    if from >= s.len() {
+        return None;
+    }
+    let found = unsafe { memchr(s.as_ptr().add(from), needle as i32, s.len() - from) };
+    if found.is_null() {
+        None
+    } else {
+        Some(unsafe { found.offset_from(s.as_ptr()) } as usize)
+    }
+}
+
+#[inline]
+fn nzbc_at_ci(s: &[u8], at: usize, lower: &[u8]) -> bool {
+    s.get(at..at + lower.len())
+        .is_some_and(|w| w.eq_ignore_ascii_case(lower))
+}
+
+#[inline]
+fn nzbc_quote_or_space(b: u8) -> bool {
+    b == b'"' || is_pcre_space(b)
+}
+
+/// `(?:^|["\s])` before `pos`.
+#[inline]
+fn nzbc_anchor(s: &[u8], pos: usize) -> bool {
+    pos == 0 || nzbc_quote_or_space(s[pos - 1])
+}
+
+/// `(?:["\s]|$)` at `pos` (`$` before a final `\n` is covered by `\s`).
+#[inline]
+fn nzbc_follow(s: &[u8], pos: usize) -> bool {
+    s.get(pos).is_none_or(|&b| nzbc_quote_or_space(b))
+}
+
+/// `/\.\b(nfo|diz|info?)\b(?![.-])/i`
+fn nzbc_nfo_extension(s: &[u8]) -> bool {
+    let ends = |e: usize| {
+        s.get(e)
+            .is_none_or(|&c| !is_word_byte(c) && c != b'.' && c != b'-')
+    };
+    let mut from = 0;
+    while let Some(p) = nzbc_find(s, from, b'.') {
+        let t = p + 1;
+        if (nzbc_at_ci(s, t, b"nfo") || nzbc_at_ci(s, t, b"diz")) && ends(t + 3) {
+            return true;
+        }
+        if nzbc_at_ci(s, t, b"info") && ends(t + 4) {
+            return true;
+        }
+        if nzbc_at_ci(s, t, b"inf") && ends(t + 3) {
+            return true;
+        }
+        from = t;
+    }
+    false
+}
+
+/// Shortest keyword of the named-NFO alternation at `q`
+/// (`file(?:_?id)?|readme|release|info(?:rmation)?|about|desc(?:ription)?|notes?|read\.?me|00-|000-|0-|_-_`).
+#[inline]
+fn nzbc_nfo_keyword_len(s: &[u8], q: usize) -> Option<usize> {
+    let words: &[&[u8]] = match s[q].to_ascii_lowercase() {
+        b'f' => &[b"file"],
+        b'r' => &[b"readme", b"release", b"read.me"],
+        b'i' => &[b"info"],
+        b'a' => &[b"about"],
+        b'd' => &[b"desc"],
+        b'n' => &[b"note"],
+        b'0' => &[b"0-", b"00-", b"000-"],
+        b'_' => &[b"_-_"],
+        _ => return None,
+    };
+    words.iter().find(|w| nzbc_at_ci(s, q, w)).map(|w| w.len())
+}
+
+/// `/(?:^|["\s])(?:<keywords>).*?\.(?:txt|nfo|diz)(?:["\s]|$)/i`. A keyword can contain neither a
+/// quote nor whitespace, so the first anchored keyword of a line dominates every later one.
+fn nzbc_nfo_named(s: &[u8]) -> bool {
+    let mut start: Option<usize> = None;
+    for (i, &b) in s.iter().enumerate() {
+        if b == b'\n' {
+            start = None;
+            continue;
+        }
+        match start {
+            None => {
+                if nzbc_anchor(s, i) {
+                    start = nzbc_nfo_keyword_len(s, i).map(|k| i + k);
+                }
+            }
+            Some(from) => {
+                if b == b'.'
+                    && i >= from
+                    && (nzbc_at_ci(s, i + 1, b"txt")
+                        || nzbc_at_ci(s, i + 1, b"nfo")
+                        || nzbc_at_ci(s, i + 1, b"diz"))
+                    && nzbc_follow(s, i + 4)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `NzbParserService::detectNfoFile` priority: `1`, `2`, or `0` (not an NFO).
+pub fn nzb_nfo_priority(s: &[u8]) -> u8 {
+    if nzbc_nfo_extension(s) {
+        1
+    } else if nzbc_nfo_named(s) {
+        2
+    } else {
+        0
+    }
+}
+
+/// `/(?:^|["\s])(?:nfo|info|readme|release|file_?id|about)(?:["\s]|$)/i`
+fn nzbc_hidden_named(s: &[u8]) -> bool {
+    const WORDS: [&[u8]; 7] = [
+        b"nfo", b"info", b"readme", b"release", b"fileid", b"file_id", b"about",
+    ];
+    (0..s.len()).any(|q| {
+        nzbc_anchor(s, q)
+            && WORDS
+                .iter()
+                .any(|w| nzbc_at_ci(s, q, w) && nzbc_follow(s, q + w.len()))
+    })
+}
+
+/// `/^[a-z0-9]+[._-][a-z0-9._-]+["\s]*\(1\/1\)/i` (which implies the outer
+/// `/^[a-z0-9._-]+["\s]*\(1\/1\)/i`). The class run must end at a byte outside the class.
+fn nzbc_hidden_scene(s: &[u8]) -> bool {
+    let run = s
+        .iter()
+        .position(|&b| !(b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')))
+        .unwrap_or(s.len());
+    match s[..run].iter().position(|b| !b.is_ascii_alphanumeric()) {
+        Some(i) if i >= 1 && run >= i + 2 => {}
+        _ => return false,
+    }
+    let mut p = run;
+    while p < s.len() && nzbc_quote_or_space(s[p]) {
+        p += 1;
+    }
+    s[p..].starts_with(b"(1/1)")
+}
+
+/// `/yEnc\s*\(\d+\)\s*\[1\/1\]/i`
+fn nzbc_hidden_yenc(s: &[u8]) -> bool {
+    let mut from = 0;
+    while from < s.len() {
+        let Some(off) = find_ascii_ci(&s[from..], b"yenc") else {
+            return false;
+        };
+        let mut q = from + off + 4;
+        while q < s.len() && is_pcre_space(s[q]) {
+            q += 1;
+        }
+        if s.get(q) == Some(&b'(') {
+            let d = q + 1;
+            q = d;
+            while q < s.len() && s[q].is_ascii_digit() {
+                q += 1;
+            }
+            if q > d && s.get(q) == Some(&b')') {
+                q += 1;
+                while q < s.len() && is_pcre_space(s[q]) {
+                    q += 1;
+                }
+                if s[q..].starts_with(b"[1/1]") {
+                    return true;
+                }
+            }
+        }
+        from += off + 1;
+    }
+    false
+}
+
+/// Lowercase extensions of the hidden-NFO exclusion alternation, other than `[rst]\d{2}`.
+#[inline]
+fn nzbc_excluded_word(w: &[u8]) -> bool {
+    if w.len() == 3
+        && matches!(w[0], b'r' | b's' | b't')
+        && w[1].is_ascii_digit()
+        && w[2].is_ascii_digit()
+    {
+        return true;
+    }
+    matches!(
+        w,
+        b"exe"
+            | b"com"
+            | b"bat"
+            | b"cmd"
+            | b"scr"
+            | b"dll"
+            | b"msi"
+            | b"pkg"
+            | b"deb"
+            | b"rpm"
+            | b"apk"
+            | b"ipa"
+            | b"app"
+            | b"zip"
+            | b"rar"
+            | b"7z"
+            | b"ace"
+            | b"tar"
+            | b"gz"
+            | b"bz2"
+            | b"xz"
+            | b"lzma"
+            | b"cab"
+            | b"iso"
+            | b"bin"
+            | b"cue"
+            | b"img"
+            | b"mdf"
+            | b"nrg"
+            | b"dmg"
+            | b"vhd"
+            | b"mp3"
+            | b"flac"
+            | b"ogg"
+            | b"aac"
+            | b"wav"
+            | b"wma"
+            | b"m4a"
+            | b"opus"
+            | b"ape"
+            | b"wv"
+            | b"mpc"
+            | b"avi"
+            | b"mkv"
+            | b"mp4"
+            | b"mov"
+            | b"wmv"
+            | b"mpg"
+            | b"mpeg"
+            | b"ts"
+            | b"vob"
+            | b"m2ts"
+            | b"webm"
+            | b"flv"
+            | b"ogv"
+            | b"divx"
+            | b"xvid"
+            | b"jpg"
+            | b"jpeg"
+            | b"png"
+            | b"gif"
+            | b"bmp"
+            | b"tif"
+            | b"tiff"
+            | b"psd"
+            | b"webp"
+            | b"svg"
+            | b"ico"
+            | b"raw"
+            | b"cr2"
+            | b"nef"
+            | b"pdf"
+            | b"doc"
+            | b"docx"
+            | b"xls"
+            | b"xlsx"
+            | b"ppt"
+            | b"pptx"
+            | b"odt"
+            | b"ods"
+            | b"odp"
+            | b"rtf"
+            | b"epub"
+            | b"mobi"
+            | b"azw"
+            | b"html"
+            | b"htm"
+            | b"css"
+            | b"js"
+            | b"php"
+            | b"py"
+            | b"java"
+            | b"c"
+            | b"cpp"
+            | b"h"
+            | b"cs"
+            | b"sql"
+            | b"json"
+            | b"xml"
+            | b"yml"
+            | b"yaml"
+            | b"db"
+            | b"dbf"
+            | b"mdb"
+            | b"accdb"
+            | b"sqlite"
+            | b"csv"
+            | b"par"
+            | b"par2"
+            | b"sfv"
+            | b"md5"
+            | b"sha1"
+            | b"sha256"
+            | b"sha512"
+            | b"crc"
+            | b"url"
+            | b"lnk"
+            | b"cfg"
+            | b"ini"
+            | b"inf"
+            | b"sys"
+            | b"tmp"
+            | b"bak"
+            | b"log"
+            | b"srt"
+            | b"sub"
+            | b"idx"
+            | b"ass"
+            | b"ssa"
+            | b"vtt"
+    )
+}
+
+/// `/\.(?:<extensions>)\b/i`: every alternative is all word bytes, so it must equal the whole
+/// word run after the dot.
+fn nzbc_hidden_excluded(s: &[u8]) -> bool {
+    let mut from = 0;
+    while let Some(p) = nzbc_find(s, from, b'.') {
+        let mut e = p + 1;
+        while e < s.len() && is_word_byte(s[e]) {
+            e += 1;
+        }
+        let len = e - p - 1;
+        if (1..=6).contains(&len) {
+            let mut lower = [0u8; 6];
+            for (dst, src) in lower.iter_mut().zip(&s[p + 1..e]) {
+                *dst = src.to_ascii_lowercase();
+            }
+            if nzbc_excluded_word(&lower[..len]) {
+                return true;
+            }
+        }
+        from = p + 1;
+    }
+    false
+}
+
+/// Pattern bits of `NzbParserService::detectHiddenNfoFile`: `1` = `\(1\/1\)$`, `2` = named,
+/// `4` = scene style, `8` = yEnc `[1/1]`. The segment-count conditions are applied by the caller.
+pub fn nzb_hidden_nfo_patterns(s: &[u8]) -> u32 {
+    u32::from(nzbc_dollar(s).ends_with(b"(1/1)"))
+        | (u32::from(nzbc_hidden_named(s)) << 1)
+        | (u32::from(nzbc_hidden_scene(s)) << 2)
+        | (u32::from(nzbc_hidden_yenc(s)) << 3)
+}
+
+/// `NzbParserService::detectHiddenNfoFile($subject, $segmentCount) !== false`.
+pub fn nzb_is_hidden_nfo(s: &[u8], segments: u64) -> bool {
+    let p = nzb_hidden_nfo_patterns(s);
+    let candidate = (segments == 1 && p & (1 | 4 | 8) != 0) || (segments <= 2 && p & 2 != 0);
+    candidate && !nzbc_hidden_excluded(s)
+}
+
+/// `/\.par2$/i`
+pub fn nzb_is_par2_index(s: &[u8]) -> bool {
+    let d = nzbc_dollar(s);
+    d.len() >= 5 && d[d.len() - 5..].eq_ignore_ascii_case(b".par2")
+}
+
+/// `/\.par2(?:["\s]|$)/i`
+fn nzbc_is_explicit_par2(s: &[u8]) -> bool {
+    let mut from = 0;
+    while let Some(p) = nzbc_find(s, from, b'.') {
+        if nzbc_at_ci(s, p + 1, b"par2") && nzbc_follow(s, p + 5) {
+            return true;
+        }
+        from = p + 1;
+    }
+    false
+}
+
+#[inline]
+fn nzbc_digits(d: &[u8]) -> Option<i64> {
+    d.iter().try_fold(0i64, |v, &c| {
+        v.checked_mul(10)?.checked_add(i64::from(c - b'0'))
+    })
+}
+
+/// `NzbParserService::extractPartsTotal`, or `None` when PHP's integer cast would saturate.
+///
+/// `/(?:[(\[])?(\d+)[\/)\]](\d+)[)\]]?$/` captures the maximal digit run ending before an optional
+/// final `)`/`]`; `/(\d+)\)$/` the maximal digit run before a final `)`.
+pub fn nzb_parts_total(s: &[u8]) -> Option<i64> {
+    let t = nzbc_dollar(s);
+    let Some(&last) = t.last() else {
+        return Some(0);
+    };
+    let end = if last == b')' || last == b']' {
+        t.len() - 1
+    } else if last.is_ascii_digit() {
+        t.len()
+    } else {
+        return Some(0);
+    };
+    let mut start = end;
+    while start > 0 && t[start - 1].is_ascii_digit() {
+        start -= 1;
+    }
+    if start == end {
+        return Some(0);
+    }
+    if start >= 2 && matches!(t[start - 1], b'/' | b')' | b']') && t[start - 2].is_ascii_digit() {
+        let total = nzbc_digits(&t[start..end])?;
+        if total > 0 {
+            return Some(total);
+        }
+    }
+    if last == b')' {
+        return nzbc_digits(&t[start..end]);
+    }
+    Some(0)
+}
+
+/// `NzbContentsService::calculateCompletion` (PHP integer division stays integral when exact).
+pub fn nzb_completion(actual: u64, artificial: i64) -> f64 {
+    if artificial <= 0 {
+        return 0.0;
+    }
+    let a = actual as i64;
+    if a % artificial == 0 {
+        return if a == 0 { 0.0 } else { 100.0 };
+    }
+    let ratio = (a as f64 / artificial as f64) * 100.0;
+    if ratio < 100.0 { ratio } else { 100.0 }
+}
+
+const NZBC_NFO_CHECK: u32 = 1;
+const NZBC_PAR2: u32 = 2;
+
+/// Running state of the `parseNzb` classification loop.
+struct NzbcScan {
+    flags: u32,
+    files: u64,
+    actual: u64,
+    artificial: i64,
+    has_non_par2: bool,
+    nfo_kind: u8,
+    nfo_priority: u8,
+    nfo_index: u32,
+    nfo_id: Vec<u8>,
+    hidden_found: bool,
+    par2: Vec<(u32, usize, usize)>,
+    par2_ids: Vec<u8>,
+}
+
+impl NzbcScan {
+    fn new(flags: u32) -> Self {
+        Self {
+            flags,
+            files: 0,
+            actual: 0,
+            artificial: 0,
+            has_non_par2: false,
+            nfo_kind: 0,
+            nfo_priority: 0,
+            nfo_index: 0,
+            nfo_id: Vec::new(),
+            hidden_found: false,
+            par2: Vec::new(),
+            par2_ids: Vec::new(),
+        }
+    }
+
+    /// One `<file>`; `first_id` is the first segment's text when the file has segments.
+    /// Returns `false` when PHP must decide (integer overflow).
+    fn file(&mut self, subject: &[u8], segments: u64, first_id: Option<&[u8]>) -> bool {
+        let Ok(index) = u32::try_from(self.files) else {
+            return false;
+        };
+        let Some(actual) = self
+            .actual
+            .checked_add(segments)
+            .filter(|&v| v <= i64::MAX as u64)
+        else {
+            return false;
+        };
+        self.files += 1;
+        self.actual = actual;
+        let Some(total) = nzb_parts_total(subject) else {
+            return false;
+        };
+        let Some(sum) = self.artificial.checked_add(total) else {
+            return false;
+        };
+        self.artificial = sum;
+        if !self.has_non_par2 && !nzbc_is_explicit_par2(subject) {
+            self.has_non_par2 = true;
+        }
+        if segments == 0 {
+            return true;
+        }
+        let id = first_id.unwrap_or(&[]);
+        if self.flags & NZBC_NFO_CHECK != 0 && self.nfo_kind != 1 {
+            let priority = nzb_nfo_priority(subject);
+            if priority != 0 {
+                self.set_nfo(1, priority, index, id);
+            } else if !self.hidden_found && nzb_is_hidden_nfo(subject, segments) {
+                self.set_nfo(2, 10, index, id);
+                self.hidden_found = true;
+            }
+        }
+        if self.flags & NZBC_PAR2 != 0 && nzb_is_par2_index(subject) {
+            let start = self.par2_ids.len();
+            self.par2_ids.extend_from_slice(id);
+            self.par2.push((index, start, self.par2_ids.len()));
+        }
+        true
+    }
+
+    fn set_nfo(&mut self, kind: u8, priority: u8, index: u32, id: &[u8]) {
+        self.nfo_kind = kind;
+        self.nfo_priority = priority;
+        self.nfo_index = index;
+        self.nfo_id.clear();
+        self.nfo_id.extend_from_slice(id);
+    }
+
+    /// Little-endian record: `u64 files, u64 actual, i64 artificial, f64 completion, u8 nfo kind
+    /// (0 none, 1 explicit, 2 hidden), u8 priority, u32 file index, u32 id length, id, u32 PAR2
+    /// count, then per PAR2 index candidate (only when a non-PAR2 file exists) `u32 file index,
+    /// u32 id length, id`.
+    fn write(&self, out: &mut OutCursor<'_>) -> isize {
+        out.extend(&self.files.to_le_bytes());
+        out.extend(&self.actual.to_le_bytes());
+        out.extend(&self.artificial.to_le_bytes());
+        out.extend(&nzb_completion(self.actual, self.artificial).to_le_bytes());
+        out.push(self.nfo_kind);
+        out.push(self.nfo_priority);
+        out.extend(&self.nfo_index.to_le_bytes());
+        out.extend(&(self.nfo_id.len() as u32).to_le_bytes());
+        out.extend(&self.nfo_id);
+        let par2: &[(u32, usize, usize)] = if self.has_non_par2 { &self.par2 } else { &[] };
+        out.extend(&(par2.len() as u32).to_le_bytes());
+        for &(index, start, end) in par2 {
+            out.extend(&index.to_le_bytes());
+            out.extend(&((end - start) as u32).to_le_bytes());
+            out.extend(&self.par2_ids[start..end]);
+        }
+        finish_cursor_min_ref(out, 16)
+    }
+}
+
+/// Values, comments and whitespace runs libxml rejects without `XML_PARSE_HUGE` (and anything
+/// near that size) stay in PHP.
+const NZBC_MAX_VALUE: usize = 1_000_000;
+
+/// Bytes needing attention in a value, folded without early exit so the loop vectorizes:
+/// `1` control byte (only `\t\n\r` survive the document check), `2` `<`, `4` `&`, `8` `]`, `16` `\r`.
+#[inline]
+fn nzbc_value_flags(raw: &[u8]) -> u8 {
+    raw.iter().fold(0u8, |acc, &b| {
+        acc | u8::from(b < 0x20)
+            | (u8::from(b == b'<') << 1)
+            | (u8::from(b == b'&') << 2)
+            | (u8::from(b == b']') << 3)
+            | (u8::from(b == b'\r') << 4)
+    })
+}
+
+/// U+FFFE / U+FFFF are not XML characters (libxml rejects them, literal or referenced).
+#[inline]
+fn nzbc_has_nonchar(bytes: &[u8], from: usize) -> bool {
+    let mut from = from;
+    while let Some(p) = nzbc_find(bytes, from, 0xEF) {
+        if bytes.get(p + 1) == Some(&0xBF) && matches!(bytes.get(p + 2), Some(0xBE | 0xBF)) {
+            return true;
+        }
+        from = p + 1;
+    }
+    false
+}
+
+/// Control bytes other than `\t\n\r`, and DEL; branch-free per 64-byte block so it vectorizes.
+fn nzbc_has_invalid_control(bytes: &[u8]) -> bool {
+    let bad = |b: u8| {
+        (u8::from(b < 0x20) & u8::from(b != b'\t') & u8::from(b != b'\n') & u8::from(b != b'\r'))
+            | u8::from(b == 0x7F)
+    };
+    let (blocks, remainder) = bytes.as_chunks::<64>();
+    blocks
+        .iter()
+        .any(|block| block.iter().fold(0u8, |acc, &b| acc | bad(b)) != 0)
+        || remainder.iter().any(|&b| bad(b) != 0)
+}
+
+/// Decodes references in a validated value (rare: only values containing `&`).
+#[inline]
+fn nzbc_decode(raw: &[u8], is_attr: bool, out: &mut Vec<u8>) -> bool {
+    if raw.windows(3).any(|w| w == b"&#X") {
+        return false;
+    }
+    out.clear();
+    unescape_nzb_xml_utf8(raw, is_attr, out) && !nzbc_has_nonchar(out, 0)
+}
+
+/// Strict single-pass reader over the subset of NZB documents libxml provably parses the same way.
+struct NzbcReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    tmp: Vec<u8>,
+}
+
+impl<'a> NzbcReader<'a> {
+    /// Whitespace and comments (each bounded) between markup.
+    fn skip_misc(&mut self) -> bool {
+        loop {
+            let start = self.pos;
+            self.pos = skip_nzb_xml_ws(self.bytes, self.pos);
+            if self.pos - start > NZBC_MAX_VALUE {
+                return false;
+            }
+            if self.bytes.get(self.pos..self.pos + 4) != Some(b"<!--") {
+                return true;
+            }
+            let Some(end) = skip_nzb_xml_ws_and_comments(self.bytes, self.pos) else {
+                return false;
+            };
+            if end - self.pos > NZBC_MAX_VALUE {
+                return false;
+            }
+            self.pos = end;
+        }
+    }
+
+    /// Attribute value: literal tab/newline/CR (normalized by libxml) and `<` decline. With
+    /// `keep`, the decoded value is left in `dst`.
+    #[inline]
+    fn attr_value(raw: &[u8], keep: Option<&mut Vec<u8>>, tmp: &mut Vec<u8>) -> bool {
+        if raw.len() > NZBC_MAX_VALUE {
+            return false;
+        }
+        let flags = nzbc_value_flags(raw);
+        if flags & 0b11 != 0 {
+            return false;
+        }
+        if flags & 0b100 != 0 {
+            return nzbc_decode(raw, true, keep.unwrap_or(tmp));
+        }
+        if let Some(dst) = keep {
+            dst.clear();
+            dst.extend_from_slice(raw);
+        }
+        true
+    }
+
+    /// Start tag `open` with validated attributes (`subject` kept in `subject` when given);
+    /// returns whether it was self-closing.
+    #[inline]
+    fn start_tag(
+        &mut self,
+        open: &[u8],
+        allow_xmlns: bool,
+        mut subject: Option<&mut Vec<u8>>,
+    ) -> Option<bool> {
+        let attr_start = match_nzb_tag_exact(self.bytes, self.pos, open)?;
+        let tmp = &mut self.tmp;
+        let (after, self_closing) =
+            parse_nzb_xml_attributes(self.bytes, attr_start, allow_xmlns, |k, v| {
+                if k.len() > 1000 {
+                    return false;
+                }
+                if k == b"xmlns"
+                    && (v.contains(&b'&')
+                        || v == b"http://www.w3.org/XML/1998/namespace"
+                        || v == b"http://www.w3.org/2000/xmlns/")
+                {
+                    return false;
+                }
+                match subject.as_deref_mut() {
+                    Some(dst) if k == b"subject" => Self::attr_value(v, Some(dst), tmp),
+                    _ => Self::attr_value(v, None, tmp),
+                }
+            })?;
+        self.pos = after;
+        Some(self_closing)
+    }
+
+    /// Text content up to the closing tag; `\r` (normalized by libxml) declines. With `keep`,
+    /// the decoded text is left in `dst`.
+    #[inline]
+    fn text(&mut self, close: &[u8], keep: Option<&mut Vec<u8>>) -> bool {
+        let start = self.pos;
+        let Some(end) = nzbc_find(self.bytes, start, b'<') else {
+            return false;
+        };
+        let raw = &self.bytes[start..end];
+        if raw.len() > NZBC_MAX_VALUE {
+            return false;
+        }
+        let flags = nzbc_value_flags(raw);
+        if flags & 0b10000 != 0 || (flags & 0b1000 != 0 && raw.windows(3).any(|w| w == b"]]>")) {
+            return false;
+        }
+        if flags & 0b100 != 0 {
+            if !nzbc_decode(raw, false, keep.unwrap_or(&mut self.tmp)) {
+                return false;
+            }
+        } else if let Some(dst) = keep {
+            dst.clear();
+            dst.extend_from_slice(raw);
+        }
+        match expect_nzb_closing_tag(self.bytes, end, close) {
+            Some(after) => {
+                self.pos = after;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `<child>text</child>` elements until `close`; `on_child(index)` returns whether to keep
+    /// that child's text in `dst`. Returns the child count.
+    #[inline]
+    fn text_children(
+        &mut self,
+        close: &[u8],
+        child: (&[u8], &[u8]),
+        mut dst: Option<&mut Vec<u8>>,
+    ) -> Option<u64> {
+        let mut count = 0u64;
+        loop {
+            if !self.skip_misc() {
+                return None;
+            }
+            if let Some(after) = expect_nzb_closing_tag(self.bytes, self.pos, close) {
+                self.pos = after;
+                return Some(count);
+            }
+            let self_closing = self.start_tag(child.0, false, None)?;
+            let keep = if count == 0 { dst.take() } else { None };
+            if self_closing {
+                if let Some(d) = keep {
+                    d.clear();
+                }
+            } else if !self.text(child.1, keep) {
+                return None;
+            }
+            count += 1;
+        }
+    }
+
+    /// Container element (`<head>`, `<groups>`, `<segments>`) of text children; returns the count.
+    #[inline]
+    fn container(
+        &mut self,
+        open: &[u8],
+        close: &[u8],
+        child: (&[u8], &[u8]),
+        first: Option<&mut Vec<u8>>,
+    ) -> Option<u64> {
+        if self.start_tag(open, false, None)? {
+            return Some(0);
+        }
+        self.text_children(close, child, first)
+    }
+}
+
+/// Scans the document the way `parseNzb` walks `SimpleXML` (`$nzb->file`, the first
+/// `->segments->segment` list, `(string)` subjects and segment text), declining anything outside
+/// the strict subset libxml provably parses the same way, and files without `<segments>` (PHP
+/// iterates `null` and warns).
+fn nzbc_scan_document(bytes: &[u8], scan: &mut NzbcScan) -> bool {
+    if bytes.is_empty() || bytes.len() > 33_554_432 {
+        return false;
+    }
+    let start = if bytes.starts_with(b"\xEF\xBB\xBF") {
+        3
+    } else {
+        0
+    };
+    let body = &bytes[start..];
+    if std::str::from_utf8(body).is_err()
+        || nzbc_has_invalid_control(body)
+        || nzbc_has_nonchar(bytes, start)
+    {
+        return false;
+    }
+    let Some(after_decl) = parse_nzb_xml_decl(bytes, start) else {
+        return false;
+    };
+    let mut r = NzbcReader {
+        bytes,
+        pos: after_decl,
+        tmp: Vec::with_capacity(256),
+    };
+    let mut doctype = false;
+    loop {
+        if !r.skip_misc() {
+            return false;
+        }
+        if !bytes
+            .get(r.pos..r.pos + 9)
+            .is_some_and(|s| s.eq_ignore_ascii_case(b"<!doctype"))
+        {
+            break;
+        }
+        let name_pos = skip_nzb_xml_ws(bytes, r.pos + 9);
+        let pub_pos = skip_nzb_xml_ws(bytes, name_pos + 3);
+        if doctype
+            || bytes.get(r.pos..r.pos + 9) != Some(b"<!DOCTYPE")
+            || bytes.get(name_pos..name_pos + 3) != Some(b"nzb")
+            || bytes.get(pub_pos..pub_pos + 6) != Some(b"PUBLIC")
+        {
+            return false;
+        }
+        let Some(after) = match_standard_nzb_doctype(bytes, r.pos) else {
+            return false;
+        };
+        doctype = true;
+        r.pos = after;
+    }
+    if r.start_tag(b"<nzb", true, None) != Some(false) {
+        return false;
+    }
+    let mut subject = Vec::with_capacity(256);
+    let mut first_id = Vec::with_capacity(128);
+    loop {
+        if !r.skip_misc() {
+            return false;
+        }
+        if let Some(after) = expect_nzb_closing_tag(bytes, r.pos, b"</nzb") {
+            r.pos = after;
+            return r.skip_misc() && r.pos == bytes.len();
+        }
+        if match_nzb_tag_exact(bytes, r.pos, b"<head").is_some() {
+            if r.container(b"<head", b"</head", (b"<meta", b"</meta"), None)
+                .is_none()
+            {
+                return false;
+            }
+            continue;
+        }
+        subject.clear();
+        let Some(file_self_closing) = r.start_tag(b"<file", false, Some(&mut subject)) else {
+            return false;
+        };
+        // A self-closing file has no `<segments>`.
+        if file_self_closing {
+            return false;
+        }
+        let mut segments: Option<u64> = None;
+        loop {
+            if !r.skip_misc() {
+                return false;
+            }
+            if let Some(after) = expect_nzb_closing_tag(bytes, r.pos, b"</file") {
+                r.pos = after;
+                break;
+            }
+            if match_nzb_tag_exact(bytes, r.pos, b"<groups").is_some() {
+                if r.container(b"<groups", b"</groups", (b"<group", b"</group"), None)
+                    .is_none()
+                {
+                    return false;
+                }
+                continue;
+            }
+            // `->segments` selects the first list only; a second one stays in PHP.
+            if segments.is_some() {
+                return false;
+            }
+            let Some(count) = r.container(
+                b"<segments",
+                b"</segments",
+                (b"<segment", b"</segment"),
+                Some(&mut first_id),
+            ) else {
+                return false;
+            };
+            segments = Some(count);
+        }
+        let Some(count) = segments else {
+            return false;
+        };
+        if !scan.file(&subject, count, (count > 0).then_some(first_id.as_slice())) {
+            return false;
+        }
+    }
+}
+
+#[inline]
+unsafe fn nzbc_input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+    if len > isize::MAX as usize {
+        None
+    } else if ptr.is_null() {
+        if len > 0 { None } else { Some(&[]) }
+    } else if len == 0 {
+        Some(&[])
+    } else {
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+}
+
+/// `NzbParserService::detectNfoFile`: `0` when not an NFO, `1` with the priority byte (`1`/`2`)
+/// in `out_buf[0]`, or `-1` on invalid pointers or `out_cap == 0`.
+///
+/// # Safety
+///
+/// `title` must be valid for reads of `len` bytes and `out_buf` for writes of `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_detect_nfo_file(
+    title: *const u8,
+    len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(s) = (unsafe { nzbc_input(title, len) }) else {
+        return -1;
+    };
+    if out_buf.is_null() || out_cap == 0 {
+        return -1;
+    }
+    let priority = nzb_nfo_priority(s);
+    if priority == 0 {
+        return 0;
+    }
+    unsafe { *out_buf = priority };
+    1
+}
+
+/// Pattern bits of `NzbParserService::detectHiddenNfoFile` (see [`nzb_hidden_nfo_patterns`]) plus
+/// `16` when the exclusion pattern matches; `-1` on invalid pointers.
+///
+/// # Safety
+///
+/// `title` must be valid for reads of `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_detect_hidden_nfo_file(title: *const u8, len: usize) -> i32 {
+    let Some(s) = (unsafe { nzbc_input(title, len) }) else {
+        return -1;
+    };
+    (nzb_hidden_nfo_patterns(s) | (u32::from(nzbc_hidden_excluded(s)) << 4)) as i32
+}
+
+/// `NzbParserService::detectPar2IndexFile`: `1`/`0`, or `-1` on invalid pointers.
+///
+/// # Safety
+///
+/// `title` must be valid for reads of `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_detect_par2_index_file(title: *const u8, len: usize) -> i32 {
+    let Some(s) = (unsafe { nzbc_input(title, len) }) else {
+        return -1;
+    };
+    i32::from(nzb_is_par2_index(s))
+}
+
+/// `NzbParserService::extractPartsTotal`: `0..=i32::MAX`, `-1` on invalid pointers, or `-2`
+/// when the total exceeds `i32::MAX` (PHP decides).
+///
+/// # Safety
+///
+/// `title` must be valid for reads of `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_extract_parts_total(title: *const u8, len: usize) -> i32 {
+    let Some(s) = (unsafe { nzbc_input(title, len) }) else {
+        return -1;
+    };
+    nzb_parts_total(s)
+        .and_then(|v| i32::try_from(v).ok())
+        .unwrap_or(-2)
+}
+
+/// Classifies `subject\0segment_count\0` records (the `parseNzb` loop without XML access).
+/// `flags`: `1` = NFO check, `2` = PAR2 index candidates. Writes the [`NzbcScan::write`] record
+/// with empty ids; returns its length, `-1` on invalid input, or `-(required)` when `out_cap`
+/// is too small.
+///
+/// # Safety
+///
+/// `records` must be valid for reads of `records_len` bytes and `out_buf` for writes of `out_cap`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_classify_nfo_par2_batch_nul(
+    records: *const u8,
+    records_len: usize,
+    flags: u32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(input) = (unsafe { nzbc_input(records, records_len) }) else {
+        return -1;
+    };
+    if out_buf.is_null() && out_cap > 0 {
+        return -1;
+    }
+    let mut scan = NzbcScan::new(flags);
+    let mut pos = 0;
+    while pos < input.len() {
+        let Some(subject_end) = nzbc_find(input, pos, 0) else {
+            return -1;
+        };
+        let Some(count_end) = nzbc_find(input, subject_end + 1, 0) else {
+            return -1;
+        };
+        let digits = &input[subject_end + 1..count_end];
+        if digits.is_empty() || digits.len() > 18 || !digits.iter().all(u8::is_ascii_digit) {
+            return -1;
+        }
+        let segments = nzbc_digits(digits).unwrap_or(0) as u64;
+        if !scan.file(&input[pos..subject_end], segments, Some(&[])) {
+            return -1;
+        }
+        pos = count_end + 1;
+    }
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+    scan.write(&mut out)
+}
+
+/// One-call `parseNzb` classification over the NZB source: file and segment totals, completion,
+/// the selected NFO candidate and the PAR2 index candidates with first-segment message ids (see
+/// [`NzbcScan::write`]). Returns the record length, `-1` when PHP must decide (invalid pointers,
+/// documents outside the strict subset, integer overflow), or `-(required)` for a short buffer.
+///
+/// # Safety
+///
+/// `xml` must be valid for reads of `xml_len` bytes and `out_buf` for writes of `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_classify_nfo_par2_packed(
+    xml: *const u8,
+    xml_len: usize,
+    flags: u32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(bytes) = (unsafe { nzbc_input(xml, xml_len) }) else {
+        return -1;
+    };
+    if out_buf.is_null() && out_cap > 0 {
+        return -1;
+    }
+    let mut scan = NzbcScan::new(flags);
+    if !nzbc_scan_document(bytes, &mut scan) {
+        return -1;
+    }
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+    scan.write(&mut out)
+}
+
+#[cfg(test)]
+mod nzb_nfo_candidate_tests {
+    use super::*;
+
+    fn scan(xml: &str, flags: u32) -> Option<NzbcScan> {
+        let mut scan = NzbcScan::new(flags);
+        nzbc_scan_document(xml.as_bytes(), &mut scan).then_some(scan)
+    }
+
+    #[test]
+    fn subject_detectors_follow_the_pcre_patterns() {
+        assert_eq!(nzb_nfo_priority(b"\"a.nfo\" yEnc (1/1)"), 1);
+        assert_eq!(nzb_nfo_priority(b"a.info"), 1);
+        assert_eq!(nzb_nfo_priority(b"a.infoo"), 0);
+        assert_eq!(nzb_nfo_priority(b"a.nfo-x"), 0);
+        assert_eq!(nzb_nfo_priority(b"readme x.txt"), 2);
+        assert_eq!(nzb_nfo_priority(b"readme\nx.txt"), 0);
+        assert_eq!(nzb_nfo_priority(b"xreadme.txt"), 0);
+        assert!(nzb_is_hidden_nfo(b"abc-def (1/1)", 1));
+        assert!(!nzb_is_hidden_nfo(b"abc-def (1/1)", 2));
+        assert!(nzb_is_hidden_nfo(b"x release", 2));
+        assert!(!nzb_is_hidden_nfo(b"a.rar (1/1)", 1));
+        assert!(nzb_is_hidden_nfo(b"name yEnc (12) [1/1] tail", 1));
+        assert!(nzb_is_par2_index(b"A.PAR2\n"));
+        assert!(!nzb_is_par2_index(b"a.par2\n\n"));
+    }
+
+    #[test]
+    fn parts_total_matches_php_including_saturation() {
+        assert_eq!(nzb_parts_total(b"A (15/20)"), Some(20));
+        assert_eq!(nzb_parts_total(b"A [15/20]\n"), Some(20));
+        assert_eq!(nzb_parts_total(b"A (1/0)"), Some(0));
+        assert_eq!(nzb_parts_total(b"A 12)"), Some(12));
+        assert_eq!(nzb_parts_total(b"A 1)2)"), Some(2));
+        assert_eq!(nzb_parts_total(b"A (3/4)\n\n"), Some(0));
+        assert_eq!(nzb_parts_total(b"A (1/99999999999999999999)"), None);
+    }
+
+    #[test]
+    fn completion_keeps_php_integer_division() {
+        assert_eq!(nzb_completion(0, 5), 0.0);
+        assert_eq!(nzb_completion(10, 5), 100.0);
+        assert_eq!(nzb_completion(1, 3), (1.0f64 / 3.0) * 100.0);
+        assert_eq!(nzb_completion(4, 3), 100.0);
+        assert_eq!(nzb_completion(7, 0), 0.0);
+    }
+
+    #[test]
+    fn document_scan_selects_candidates_and_declines_outside_subset() {
+        let doc = "<nzb><file subject=\"abc-def (1/1)\"><segments><segment>h@x</segment></segments></file>\
+            <file subject=\"r.nfo (1/2)\"><groups><group>g</group></groups><segments><segment>n &amp; m</segment><segment>2</segment></segments></file>\
+            <file subject=\"r.par2\"><segments><segment>p@x</segment></segments></file></nzb>";
+        let s = scan(doc, 3).expect("accepted");
+        assert_eq!((s.files, s.actual, s.artificial), (3, 4, 3));
+        assert_eq!(
+            (s.nfo_kind, s.nfo_priority, s.nfo_index, s.nfo_id.as_slice()),
+            (1, 1, 1, &b"n & m"[..])
+        );
+        assert!(s.has_non_par2);
+        assert_eq!(s.par2.len(), 1);
+        assert!(scan(&doc.replace("n &amp; m", "<![CDATA[x]]>"), 3).is_none());
+        assert!(
+            scan(
+                &doc.replace("<segments><segment>p@x</segment></segments>", ""),
+                3
+            )
+            .is_none()
+        );
+        assert!(scan(&doc.replace("<groups>", "<x/><groups>"), 3).is_none());
+        assert!(scan(&doc.replace("h@x", "h@x\r"), 3).is_none());
+    }
+
+    #[test]
+    fn packed_export_reports_required_capacity() {
+        let doc = b"<nzb><file subject=\"a.nfo\"><segments><segment>id@x</segment></segments></file></nzb>";
+        let mut small = [0u8; 8];
+        let required = unsafe {
+            nntmux_nzb_classify_nfo_par2_packed(
+                doc.as_ptr(),
+                doc.len(),
+                1,
+                small.as_mut_ptr(),
+                small.len(),
+            )
+        };
+        assert!(required < -1);
+        let mut buf = vec![0u8; (-required) as usize];
+        let written = unsafe {
+            nntmux_nzb_classify_nfo_par2_packed(
+                doc.as_ptr(),
+                doc.len(),
+                1,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(written, -required);
+        assert_eq!(&buf[38..42], &4u32.to_le_bytes());
+        assert_eq!(&buf[42..46], b"id@x");
+    }
+}
