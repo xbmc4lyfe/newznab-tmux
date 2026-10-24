@@ -16,6 +16,79 @@ use Symfony\Component\HttpFoundation\Cookie;
 
 class AdminMonitoringController extends BasePageController
 {
+    // PHP remains the default unless every common and uncommon workload passes the 1.5x gate.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi ?? false;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    /**
+     * @return array{enabled: bool, monitoringConfigured: bool, defaultRange: string, defaultRefresh: string}
+     */
+    public static function buildViewConfiguration(bool $enabled, bool $monitoringConfigured, string $defaultRange, string $defaultRefresh): array
+    {
+        return self::$useRustFfi ? self::buildViewConfigurationNative($enabled, $monitoringConfigured, $defaultRange, $defaultRefresh) : self::buildViewConfigurationPhp($enabled, $monitoringConfigured, $defaultRange, $defaultRefresh);
+    }
+
+    /**
+     * @return array{enabled: bool, monitoringConfigured: bool, defaultRange: string, defaultRefresh: string}
+     */
+    public static function buildViewConfigurationPhp(bool $enabled, bool $monitoringConfigured, string $defaultRange, string $defaultRefresh): array
+    {
+        return ['enabled' => $enabled, 'monitoringConfigured' => $monitoringConfigured, 'defaultRange' => $defaultRange, 'defaultRefresh' => $defaultRefresh];
+    }
+
+    /**
+     * @return array{enabled: bool, monitoringConfigured: bool, defaultRange: string, defaultRefresh: string}
+     */
+    public static function buildViewConfigurationNative(bool $enabled, bool $monitoringConfigured, string $defaultRange, string $defaultRefresh): array
+    {
+        $result = AdminPaymentController::transformNative(5, [$enabled, $monitoringConfigured, $defaultRange, $defaultRefresh]);
+
+        return is_array($result) && isset($result['enabled'], $result['monitoringConfigured'], $result['defaultRange'], $result['defaultRefresh']) ? $result : self::buildViewConfigurationPhp($enabled, $monitoringConfigured, $defaultRange, $defaultRefresh);
+    }
+
+    public static function cookieSecure(bool $secure, bool $sessionSecure): bool
+    {
+        return self::$useRustFfi ? self::cookieSecureNative($secure, $sessionSecure) : self::cookieSecurePhp($secure, $sessionSecure);
+    }
+
+    public static function cookieSecurePhp(bool $secure, bool $sessionSecure): bool
+    {
+        return $secure || $sessionSecure;
+    }
+
+    public static function cookieSecureNative(bool $secure, bool $sessionSecure): bool
+    {
+        $result = AdminPaymentController::transformNative(6, [$secure, $sessionSecure]);
+
+        return is_bool($result) ? $result : self::cookieSecurePhp($secure, $sessionSecure);
+    }
+
+    public static function validAuthRequest(mixed $serverParam, bool $enabled): bool
+    {
+        return self::$useRustFfi ? self::validAuthRequestNative($serverParam, $enabled) : self::validAuthRequestPhp($serverParam, $enabled);
+    }
+
+    public static function validAuthRequestPhp(mixed $serverParam, bool $enabled): bool
+    {
+        return $serverParam === '1' && $enabled;
+    }
+
+    public static function validAuthRequestNative(mixed $serverParam, bool $enabled): bool
+    {
+        $result = AdminPaymentController::transformNative(7, [$serverParam, $enabled]);
+
+        return is_bool($result) ? $result : self::validAuthRequestPhp($serverParam, $enabled);
+    }
+
     /**
      * FastCGI parameter set only by the installer's internal nginx auth
      * location. Browsers cannot set it: client headers arrive as HTTP_*.
@@ -31,12 +104,14 @@ class AdminMonitoringController extends BasePageController
         $enabled = $grafana->isEnabled();
 
         return view('admin.monitoring', [
-            'enabled' => $enabled,
-            'monitoringConfigured' => (bool) config('monitoring.enabled'),
+            ...self::buildViewConfiguration(
+                $enabled,
+                (bool) config('monitoring.enabled'),
+                (string) config('monitoring.grafana.default_range', 'now-6h'),
+                (string) config('monitoring.grafana.default_refresh', '1m'),
+            ),
             'dashboards' => $enabled ? $grafana->dashboards() : [],
             'tokenUrl' => $grafana->tokenUrl(),
-            'defaultRange' => (string) config('monitoring.grafana.default_range', 'now-6h'),
-            'defaultRefresh' => (string) config('monitoring.grafana.default_refresh', '1m'),
             'title' => 'Monitoring',
             'meta_title' => 'Monitoring',
             'meta_description' => 'Grafana dashboards for host, service and processing metrics.',
@@ -67,7 +142,7 @@ class AdminMonitoringController extends BasePageController
             $issued['expires_at'],
             $grafana->cookiePath(),
             null,
-            $request->isSecure() || (bool) config('session.secure'),
+            self::cookieSecure($request->isSecure(), (bool) config('session.secure')),
             true,
             false,
             Cookie::SAMESITE_STRICT,
@@ -83,7 +158,7 @@ class AdminMonitoringController extends BasePageController
      */
     public function authorizeGrafana(Request $request, GrafanaEmbedService $grafana, GrafanaJwtIssuer $issuer): Response
     {
-        if ($request->server(self::AUTH_REQUEST_PARAM) !== '1' || ! $grafana->isEnabled()) {
+        if (! self::validAuthRequest($request->server(self::AUTH_REQUEST_PARAM), $grafana->isEnabled())) {
             abort(404);
         }
 

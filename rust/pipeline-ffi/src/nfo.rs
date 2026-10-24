@@ -20680,3 +20680,986 @@ pub unsafe extern "C" fn nntmux_w28_nzb_movie_log_dashboard_controllers(
     }))
     .unwrap_or(-1)
 }
+
+// Wave 29: pure admin settings, incident, monitoring and payment transforms.
+pub mod wave29_admin_settings_status_monitoring_payment {
+    use super::*;
+    use VerificationOutboxValue as V;
+    const MAX_BYTES: usize = 67_108_864;
+
+    fn key(bytes: &[u8]) -> V {
+        if let Some(number) = std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+        {
+            if number.to_string().as_bytes() == bytes {
+                return V::Int(number);
+            }
+        }
+        w16_string(bytes)
+    }
+
+    fn assign(entries: &mut Vec<(V, V)>, name: &[u8], value: V) {
+        if let Some((_, old)) = entries
+            .iter_mut()
+            .find(|(k, _)| matches!(k, V::Bytes(b) if b == name))
+        {
+            *old = value;
+        } else {
+            entries.push((w16_string(name), value));
+        }
+    }
+
+    fn column_keys(columns: &V) -> Option<Vec<V>> {
+        if !w19_list(columns) {
+            return None;
+        }
+        w16_entries(columns)?
+            .iter()
+            .map(|(_, value)| {
+                Some(match value {
+                    V::Bytes(bytes) => key(bytes),
+                    V::Int(_) => value.clone(),
+                    _ => return None,
+                })
+            })
+            .collect()
+    }
+
+    fn hmac(body: &[u8], secret: &[u8]) -> Vec<u8> {
+        use crate::metadata::candidate_inventory::sha256;
+        let mut block = [0u8; 64];
+        if secret.len() > block.len() {
+            block[..32].copy_from_slice(&sha256(secret));
+        } else {
+            block[..secret.len()].copy_from_slice(secret);
+        }
+        let mut inner = Vec::with_capacity(64 + body.len());
+        inner.extend(block.iter().map(|b| b ^ 0x36));
+        inner.extend_from_slice(body);
+        let mut outer = Vec::with_capacity(96);
+        outer.extend(block.iter().map(|b| b ^ 0x5c));
+        outer.extend_from_slice(&sha256(&inner));
+        let mut out = b"sha256=".to_vec();
+        const HEX: &[u8] = b"0123456789abcdef";
+        for byte in sha256(&outer) {
+            out.push(HEX[(byte >> 4) as usize]);
+            out.push(HEX[(byte & 15) as usize]);
+        }
+        out
+    }
+
+    fn word(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_'
+    }
+    fn space(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+    }
+
+    // PCRE's byte-mode \\w and \\s, without Unicode properties. A word run
+    // cannot match from a later suffix if its first position failed.
+    fn description(bytes: &[u8]) -> V {
+        let mut start = 0;
+        while start < bytes.len() {
+            if !word(bytes[start]) {
+                start += 1;
+                continue;
+            }
+            let mut end = start;
+            while end < bytes.len() && word(bytes[end]) {
+                end += 1;
+            }
+            let mut role_end = end;
+            if bytes.get(end).is_some_and(|b| space(*b))
+                && bytes.get(end + 1..end + 3) == Some(b"++")
+            {
+                role_end = end + 3;
+            }
+            let mut digits = role_end;
+            while digits < bytes.len() && space(bytes[digits]) {
+                digits += 1;
+            }
+            if digits > role_end && bytes.get(digits).is_some_and(u8::is_ascii_digit) {
+                let mut years = 0i64;
+                while digits < bytes.len() && bytes[digits].is_ascii_digit() {
+                    years = years
+                        .saturating_mul(10)
+                        .saturating_add(i64::from(bytes[digits] - b'0'));
+                    digits += 1;
+                }
+                return w16_map(vec![
+                    ("role", w16_string(&bytes[start..role_end])),
+                    ("addYears", V::Int(years)),
+                ]);
+            }
+            start = end;
+        }
+        w16_map(vec![("role", w16_string(bytes)), ("addYears", V::Null)])
+    }
+
+    // PHP's default serialize_precision=-1 uses shortest round-trip decimals,
+    // scientific notation below 1e-4 or at/above 1e17, and an explicit .0
+    // mantissa and positive exponent sign. Other PHP precision settings are
+    // safely declined by the caller's canonical-wire check.
+    fn double(value: f64) -> V {
+        let scientific = format!("{value:e}");
+        let (mantissa, exponent) = scientific.split_once('e').unwrap();
+        let exponent: i32 = exponent.parse().unwrap();
+        if !(-4..17).contains(&exponent) {
+            let decimal = if mantissa.contains('.') { "" } else { ".0" };
+            V::Float(format!("{mantissa}{decimal}E{exponent:+}").into_bytes())
+        } else {
+            w20_double(value)
+        }
+    }
+
+    fn compute(operation: u32, args: &[V]) -> Option<V> {
+        Some(match (operation, args) {
+            (0, [V::Array(attributes)]) => {
+                let mut result = attributes.clone();
+                for (column, value) in &mut result {
+                    if matches!(column, V::Bytes(b) if b == b"post_non_mode" || b == b"post_amazon_mode")
+                    {
+                        *value = V::Int(i64::from(w20_stored_int(value)? > 0));
+                    }
+                }
+                V::Array(result)
+            }
+            (
+                1,
+                [
+                    V::Bytes(column),
+                    V::Bool(clear),
+                    V::Bool(filled),
+                    value @ V::Bytes(_),
+                ],
+            ) => V::Array(if *clear || *filled {
+                vec![(key(column), if *clear { V::Null } else { value.clone() })]
+            } else {
+                vec![]
+            }),
+            (2, [V::Bytes(column), value]) => {
+                if matches!(value, V::Null) && (column == b"terms" || column == b"dereferrer_link")
+                {
+                    w16_string(b"")
+                } else {
+                    value.clone()
+                }
+            }
+            (
+                3,
+                [
+                    V::Array(attributes),
+                    V::Bool(post),
+                    movie_columns,
+                    video_columns,
+                ],
+            ) => {
+                let movie_keys = column_keys(movie_columns)?;
+                let video_keys = column_keys(video_columns)?;
+                let mut remaining = Vec::new();
+                let mut movie = Vec::new();
+                let mut tmux = Vec::new();
+                for entry @ (column, _) in attributes {
+                    let is_movie = *post && movie_keys.iter().any(|k| w20_strict_equal(k, column));
+                    let is_video = *post && video_keys.iter().any(|k| w20_strict_equal(k, column));
+                    if is_movie {
+                        movie.push(entry.clone());
+                    }
+                    if is_video {
+                        tmux.push(entry.clone());
+                    }
+                    if !is_movie && !is_video {
+                        remaining.push(entry.clone());
+                    }
+                }
+                w16_map(vec![
+                    ("attributes", V::Array(remaining)),
+                    ("movie", V::Array(movie)),
+                    ("tmux", V::Array(tmux)),
+                ])
+            }
+            (
+                4,
+                [
+                    data @ V::Array(entries),
+                    now @ V::Bytes(_),
+                    V::Bool(updating),
+                ],
+            ) => {
+                let mut result = entries.clone();
+                let resolved =
+                    matches!(data.field(b"status"), Some(V::Bytes(b)) if b == b"resolved");
+                if resolved {
+                    let value = match data.field(b"resolved_at") {
+                        None | Some(V::Null) => now.clone(),
+                        Some(value) if *updating && !w18_php_bool(value)? => now.clone(),
+                        Some(value) => value.clone(),
+                    };
+                    assign(&mut result, b"resolved_at", value);
+                } else if *updating {
+                    assign(&mut result, b"resolved_at", V::Null);
+                }
+                V::Array(result)
+            }
+            (
+                5,
+                [
+                    enabled @ V::Bool(_),
+                    configured @ V::Bool(_),
+                    range @ V::Bytes(_),
+                    refresh @ V::Bytes(_),
+                ],
+            ) => w16_map(vec![
+                ("enabled", enabled.clone()),
+                ("monitoringConfigured", configured.clone()),
+                ("defaultRange", range.clone()),
+                ("defaultRefresh", refresh.clone()),
+            ]),
+            (6, [V::Bool(secure), V::Bool(session_secure)]) => V::Bool(*secure || *session_secure),
+            (7, [server, V::Bool(enabled)]) => {
+                V::Bool(*enabled && matches!(server, V::Bytes(b) if b == b"1"))
+            }
+            (8, [filters @ V::Array(entries)]) => {
+                if entries
+                    .iter()
+                    .any(|(k, v)| !matches!((k, v), (V::Bytes(_), V::Bytes(_))))
+                {
+                    return None;
+                }
+                let fields = [
+                    "username",
+                    "email",
+                    "payment_status",
+                    "invoice_status",
+                    "start_date",
+                    "end_date",
+                ];
+                w16_map(
+                    fields
+                        .into_iter()
+                        .map(|name| {
+                            let original = filters
+                                .field(name.as_bytes())
+                                .and_then(w16_bytes)
+                                .unwrap_or(b"");
+                            let trimmed = if let Ok(utf8) = std::str::from_utf8(original) {
+                                utf8.trim_matches(|c: char| {
+                                    c.is_whitespace()
+                                        || matches!(
+                                            c as u32,
+                                            0x0000
+                                                | 0x00AD
+                                                | 0x034F
+                                                | 0x061C
+                                                | 0x115F
+                                                | 0x1160
+                                                | 0x17B4
+                                                | 0x17B5
+                                                | 0x180E
+                                                | 0x200B..=0x200F
+                                                | 0x2060..=0x2065
+                                                | 0x206A..=0x206F
+                                                | 0x2800
+                                                | 0x3164
+                                                | 0xFEFF
+                                                | 0xFFA0
+                                                | 0x1D159
+                                                | 0x1D173..=0x1D17A
+                                                | 0xE0020
+                                        )
+                                })
+                                .as_bytes()
+                            } else {
+                                // Invalid UTF-8 makes Str::trim's preg_replace(...u) return null and fall back to trim().
+                                let trim =
+                                    |b: &u8| matches!(b, 0 | b' ' | b'\t' | b'\n' | b'\r' | 0x0b);
+                                let first = original
+                                    .iter()
+                                    .position(|b| !trim(b))
+                                    .unwrap_or(original.len());
+                                let last = original
+                                    .iter()
+                                    .rposition(|b| !trim(b))
+                                    .map_or(first, |i| i + 1);
+                                &original[first..last]
+                            };
+                            (name, w16_string(trimmed))
+                        })
+                        .collect(),
+                )
+            }
+            (9, [V::Bytes(sort), columns]) => {
+                if !w19_list(columns) {
+                    return None;
+                }
+                let columns = w16_entries(columns)?;
+                if columns.iter().any(|(_, v)| !matches!(v, V::Bytes(_))) {
+                    return None;
+                }
+                w16_string(
+                    if columns
+                        .iter()
+                        .any(|(_, v)| matches!(v, V::Bytes(b) if b == sort))
+                    {
+                        sort
+                    } else {
+                        b"created_at"
+                    },
+                )
+            }
+            (10, [V::Bytes(order)]) => w16_string(if order.eq_ignore_ascii_case(b"asc") {
+                b"asc"
+            } else {
+                b"desc"
+            }),
+            (11, [V::Array(rows)]) => {
+                let (mut count, mut invoice, mut value) = (0i64, 0f64, 0f64);
+                for (_, row) in rows {
+                    count = count.checked_add(w16_int(row.field(b"tx_count")?)?)?;
+                    invoice += w20_float(row.field(b"invoice_total")?)?;
+                    value += w20_float(row.field(b"value_total")?)?;
+                }
+                if !invoice.is_finite() || !value.is_finite() {
+                    return None;
+                }
+                w16_map(vec![
+                    ("tx_count", V::Int(count)),
+                    ("invoice_total", double(invoice)),
+                    ("value_total", double(value)),
+                ])
+            }
+            (
+                12,
+                [
+                    V::Bytes(body),
+                    V::Bytes(secret),
+                    signature @ (V::Null | V::Bytes(_)),
+                ],
+            ) => {
+                let expected = hmac(body, secret);
+                let valid = if let V::Bytes(signature) = signature {
+                    if signature.len() != expected.len() {
+                        false
+                    } else {
+                        signature
+                            .iter()
+                            .zip(&expected)
+                            .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+                            == 0
+                    }
+                } else {
+                    false
+                };
+                V::Bool(valid)
+            }
+            (13, [V::Bytes(email)]) => {
+                w16_list(if let Some(local) = email.strip_suffix(b"@pm.me") {
+                    vec![
+                        w16_string(&[local, b"@proton.me"].concat()),
+                        w16_string(&[local, b"@protonmail.com"].concat()),
+                    ]
+                } else {
+                    vec![]
+                })
+            }
+            (14, [V::Bytes(bytes)]) => description(bytes),
+            (15, []) => w16_list(
+                ["Pending", "Processing", "Settled", "Invalid", "Manual"]
+                    .into_iter()
+                    .map(|s| w16_string(s.as_bytes()))
+                    .collect(),
+            ),
+            (16, []) => w16_list(
+                ["Pending", "Settled"]
+                    .into_iter()
+                    .map(|s| w16_string(s.as_bytes()))
+                    .collect(),
+            ),
+            _ => return None,
+        })
+    }
+
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> i32 {
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_BYTES
+            || capacity > MAX_BYTES
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let mut parser = VerificationOutboxParser {
+            bytes,
+            pos: 0,
+            remaining: 65_536,
+        };
+        let Some(value) = parser.value(480) else {
+            return -1;
+        };
+        if parser.pos != length || !w19_list(&value) || !w20_canonical(&value) {
+            return -1;
+        }
+        let mut canonical = Vec::new();
+        value.serialize(&mut canonical);
+        if canonical != bytes {
+            return -1;
+        }
+        let Some(entries) = w16_entries(&value) else {
+            return -1;
+        };
+        let args: Vec<_> = entries.iter().map(|(_, value)| value.clone()).collect();
+        let Some(result) = compute(operation, &args) else {
+            return -1;
+        };
+        let mut wire = Vec::new();
+        result.serialize(&mut wire);
+        if wire.len() > MAX_BYTES {
+            return -1;
+        }
+        let Ok(needed) = i32::try_from(wire.len()) else {
+            return -1;
+        };
+        if wire.len() > capacity {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(wire.as_ptr(), output, wire.len()) };
+        needed
+    }
+
+    #[cfg(test)]
+    mod w29_admin_settings_status_monitoring_payment_tests {
+        use super::*;
+
+        fn parity(op: u32, args: Vec<V>, expected: V) {
+            let mut input = vec![0x5a];
+            w16_list(args).serialize(&mut input);
+            input.push(0x5a);
+            let mut wire = Vec::new();
+            expected.serialize(&mut wire);
+            let mut out = vec![0xa5; wire.len() + 3];
+            for cap in [0, 1, wire.len() - 1, wire.len(), wire.len() + 1] {
+                out.fill(0xa5);
+                let result = unsafe {
+                    nntmux_w29_admin_settings_status_monitoring_payment(
+                        op,
+                        input.as_ptr().add(1),
+                        input.len() - 2,
+                        out.as_mut_ptr().add(1),
+                        cap,
+                    )
+                };
+                if cap < wire.len() {
+                    assert_eq!(result, -(wire.len() as i32));
+                    assert!(out.iter().all(|b| *b == 0xa5));
+                } else {
+                    assert_eq!(result, wire.len() as i32);
+                    assert_eq!(&out[1..1 + wire.len()], &wire);
+                    assert_eq!(out[0], 0xa5);
+                    assert!(out[1 + wire.len()..].iter().all(|b| *b == 0xa5));
+                }
+            }
+            assert_eq!(input[0], 0x5a);
+            assert_eq!(input[input.len() - 1], 0x5a);
+        }
+
+        #[test]
+        fn w29_admin_settings_status_monitoring_payment_settings_and_status() {
+            parity(
+                0,
+                vec![w16_map(vec![
+                    ("keep", V::Null),
+                    ("post_non_mode", w16_string(b" +02 ")),
+                    ("post_amazon_mode", V::Int(-1)),
+                ])],
+                w16_map(vec![
+                    ("keep", V::Null),
+                    ("post_non_mode", V::Int(1)),
+                    ("post_amazon_mode", V::Int(0)),
+                ]),
+            );
+            parity(0, vec![w16_list(vec![])], w16_list(vec![]));
+            for (clear, filled, result) in [
+                (true, true, w16_map(vec![("secret", V::Null)])),
+                (
+                    false,
+                    true,
+                    w16_map(vec![("secret", w16_string(b"\0\xff"))]),
+                ),
+                (false, false, w16_list(vec![])),
+            ] {
+                parity(
+                    1,
+                    vec![
+                        w16_string(b"secret"),
+                        V::Bool(clear),
+                        V::Bool(filled),
+                        w16_string(b"\0\xff"),
+                    ],
+                    result,
+                );
+            }
+            parity(
+                1,
+                vec![
+                    w16_string(b"123"),
+                    V::Bool(true),
+                    V::Bool(false),
+                    w16_string(b""),
+                ],
+                V::Array(vec![(V::Int(123), V::Null)]),
+            );
+            for name in [b"terms".as_slice(), b"dereferrer_link", b"other"] {
+                parity(
+                    2,
+                    vec![w16_string(name), V::Null],
+                    if name == b"other" {
+                        V::Null
+                    } else {
+                        w16_string(b"")
+                    },
+                );
+                parity(2, vec![w16_string(name), V::Bool(false)], V::Bool(false));
+            }
+            let attrs = w16_map(vec![
+                ("video", V::Int(1)),
+                ("other", V::Bool(false)),
+                ("movie", V::Null),
+                ("both", w16_string(b"x")),
+            ]);
+            let columns = w16_list(vec![w16_string(b"movie"), w16_string(b"both")]);
+            let videos = w16_list(vec![w16_string(b"video"), w16_string(b"both")]);
+            parity(
+                3,
+                vec![
+                    attrs.clone(),
+                    V::Bool(true),
+                    columns.clone(),
+                    videos.clone(),
+                ],
+                w16_map(vec![
+                    ("attributes", w16_map(vec![("other", V::Bool(false))])),
+                    (
+                        "movie",
+                        w16_map(vec![("movie", V::Null), ("both", w16_string(b"x"))]),
+                    ),
+                    (
+                        "tmux",
+                        w16_map(vec![("video", V::Int(1)), ("both", w16_string(b"x"))]),
+                    ),
+                ]),
+            );
+            parity(
+                3,
+                vec![attrs.clone(), V::Bool(false), columns, videos],
+                w16_map(vec![
+                    ("attributes", attrs),
+                    ("movie", w16_list(vec![])),
+                    ("tmux", w16_list(vec![])),
+                ]),
+            );
+            for updating in [false, true] {
+                for value in [
+                    V::Null,
+                    V::Bool(false),
+                    V::Int(0),
+                    w20_double(0.0),
+                    w16_string(b""),
+                    w16_string(b"0"),
+                    w16_list(vec![]),
+                    w16_string(b"old"),
+                ] {
+                    let expected = if matches!(value, V::Null)
+                        || (updating && !w18_php_bool(&value).unwrap())
+                    {
+                        w16_string(b"now")
+                    } else {
+                        value.clone()
+                    };
+                    parity(
+                        4,
+                        vec![
+                            w16_map(vec![
+                                ("resolved_at", value),
+                                ("status", w16_string(b"resolved")),
+                            ]),
+                            w16_string(b"now"),
+                            V::Bool(updating),
+                        ],
+                        w16_map(vec![
+                            ("resolved_at", expected),
+                            ("status", w16_string(b"resolved")),
+                        ]),
+                    );
+                }
+                parity(
+                    4,
+                    vec![
+                        w16_map(vec![("status", w16_string(b"resolved"))]),
+                        w16_string(b"now"),
+                        V::Bool(updating),
+                    ],
+                    w16_map(vec![
+                        ("status", w16_string(b"resolved")),
+                        ("resolved_at", w16_string(b"now")),
+                    ]),
+                );
+            }
+            parity(
+                4,
+                vec![
+                    w16_map(vec![
+                        ("status", w16_string(b"Resolved")),
+                        ("resolved_at", w16_string(b"old")),
+                    ]),
+                    w16_string(b"now"),
+                    V::Bool(true),
+                ],
+                w16_map(vec![
+                    ("status", w16_string(b"Resolved")),
+                    ("resolved_at", V::Null),
+                ]),
+            );
+            parity(
+                4,
+                vec![
+                    w16_map(vec![("status", w16_string(b"investigating"))]),
+                    w16_string(b"now"),
+                    V::Bool(false),
+                ],
+                w16_map(vec![("status", w16_string(b"investigating"))]),
+            );
+        }
+
+        #[test]
+        fn w29_admin_settings_status_monitoring_payment_monitoring_and_filters() {
+            parity(
+                5,
+                vec![
+                    V::Bool(true),
+                    V::Bool(false),
+                    w16_string(b"24h"),
+                    w16_string(b"30s"),
+                ],
+                w16_map(vec![
+                    ("enabled", V::Bool(true)),
+                    ("monitoringConfigured", V::Bool(false)),
+                    ("defaultRange", w16_string(b"24h")),
+                    ("defaultRefresh", w16_string(b"30s")),
+                ]),
+            );
+            for a in [false, true] {
+                for b in [false, true] {
+                    parity(6, vec![V::Bool(a), V::Bool(b)], V::Bool(a || b));
+                }
+            }
+            for enabled in [false, true] {
+                for server in [
+                    V::Null,
+                    V::Int(1),
+                    V::Bool(true),
+                    w16_string(b"1"),
+                    w16_string(b"01"),
+                    w16_list(vec![]),
+                ] {
+                    let expected = enabled && matches!(&server, V::Bytes(b) if b == b"1");
+                    parity(7, vec![server, V::Bool(enabled)], V::Bool(expected));
+                }
+            }
+            parity(
+                8,
+                vec![w16_map(vec![
+                    ("username", w16_string(b"\0\t\n\r \x0bAlice\x0b\0")),
+                    ("email", w16_string(b"\x0c\xc2\xa0email\xe2\x80\x8b\x0c")),
+                    ("payment_status", w16_string(b" \xff ")),
+                    ("ignored", w16_string(b"unused")),
+                ])],
+                w16_map(vec![
+                    ("username", w16_string(b"Alice")),
+                    ("email", w16_string(b"email")),
+                    ("payment_status", w16_string(b"\xff")),
+                    ("invoice_status", w16_string(b"")),
+                    ("start_date", w16_string(b"")),
+                    ("end_date", w16_string(b"")),
+                ]),
+            );
+            for (sort, expected) in [
+                (b"email".as_slice(), b"email".as_slice()),
+                (b"EMAIL", b"created_at"),
+                (b"", b"created_at"),
+            ] {
+                parity(
+                    9,
+                    vec![w16_string(sort), w16_list(vec![w16_string(b"email")])],
+                    w16_string(expected),
+                );
+            }
+            for (order, expected) in [
+                (b"AsC".as_slice(), b"asc".as_slice()),
+                (b"asc ", b"desc"),
+                (b"", b"desc"),
+                (b"\xff", b"desc"),
+            ] {
+                parity(10, vec![w16_string(order)], w16_string(expected));
+            }
+            parity(
+                11,
+                vec![w16_list(vec![])],
+                w16_map(vec![
+                    ("tx_count", V::Int(0)),
+                    ("invoice_total", w20_double(0.0)),
+                    ("value_total", w20_double(0.0)),
+                ]),
+            );
+            let row = |c, i, v| {
+                w16_map(vec![
+                    ("tx_count", V::Int(c)),
+                    ("invoice_total", w20_double(i)),
+                    ("value_total", w20_double(v)),
+                ])
+            };
+            parity(
+                11,
+                vec![w16_list(vec![row(1, 1.0e100, 1.0e-7)])],
+                w16_map(vec![
+                    ("tx_count", V::Int(1)),
+                    ("invoice_total", V::Float(b"1.0E+100".to_vec())),
+                    ("value_total", V::Float(b"1.0E-7".to_vec())),
+                ]),
+            );
+            parity(
+                11,
+                vec![w16_list(vec![row(2, 1.25, 2.5), row(3, 3.5, -1.0)])],
+                w16_map(vec![
+                    ("tx_count", V::Int(5)),
+                    ("invoice_total", w20_double(4.75)),
+                    ("value_total", w20_double(1.5)),
+                ]),
+            );
+        }
+
+        #[test]
+        fn w29_admin_settings_status_monitoring_payment_crypto_and_descriptions() {
+            let vectors: Vec<(&[u8], Vec<u8>, &[u8])> = vec![
+                (
+                    b"Hi There",
+                    vec![0x0b; 20],
+                    b"sha256=b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+                ),
+                (
+                    b"what do ya want for nothing?",
+                    b"Jefe".to_vec(),
+                    b"sha256=5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+                ),
+                (
+                    b"Test Using Larger Than Block-Size Key - Hash Key First",
+                    vec![0xaa; 131],
+                    b"sha256=60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
+                ),
+                (
+                    b"",
+                    vec![],
+                    b"sha256=b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad",
+                ),
+            ];
+            for (body, secret, expected) in vectors {
+                assert_eq!(hmac(body, &secret), expected);
+                parity(
+                    12,
+                    vec![w16_string(body), w16_string(&secret), w16_string(expected)],
+                    V::Bool(true),
+                );
+                parity(
+                    12,
+                    vec![w16_string(body), w16_string(&secret), V::Null],
+                    V::Bool(false),
+                );
+                let mut wrong = expected.to_vec();
+                wrong[7] ^= 1;
+                parity(
+                    12,
+                    vec![w16_string(body), w16_string(&secret), w16_string(&wrong)],
+                    V::Bool(false),
+                );
+            }
+            for (email, local) in [
+                (b"user@pm.me".as_slice(), Some(b"user".as_slice())),
+                (b"@pm.me", Some(b"".as_slice())),
+                (b"a\0\xff@pm.me", Some(b"a\0\xff".as_slice())),
+                (b"a@PM.ME", None),
+            ] {
+                let result = w16_list(local.map_or(vec![], |local| {
+                    vec![
+                        w16_string(&[local, b"@proton.me"].concat()),
+                        w16_string(&[local, b"@protonmail.com"].concat()),
+                    ]
+                }));
+                parity(13, vec![w16_string(email)], result);
+            }
+            for (input, role, years) in [
+                (b"VIP ++ 2 years".as_slice(), b"VIP ++".as_slice(), Some(2)),
+                (b"!VIP\x0c++\x0c03", b"VIP\x0c++", Some(3)),
+                (b"VIP + 1 then admin_2 99", b"admin_2", Some(99)),
+                (b"\xffrole\t7 tail", b"role", Some(7)),
+                (
+                    b"VIP 999999999999999999999999999999999999999",
+                    b"VIP",
+                    Some(i64::MAX),
+                ),
+                (b"role0 0000", b"role0", Some(0)),
+                (b"no match", b"no match", None),
+                (b"\xff\xfe", b"\xff\xfe", None),
+            ] {
+                parity(
+                    14,
+                    vec![w16_string(input)],
+                    w16_map(vec![
+                        ("role", w16_string(role)),
+                        ("addYears", years.map_or(V::Null, V::Int)),
+                    ]),
+                );
+            }
+            parity(
+                15,
+                vec![],
+                w16_list(
+                    ["Pending", "Processing", "Settled", "Invalid", "Manual"]
+                        .into_iter()
+                        .map(|s| w16_string(s.as_bytes()))
+                        .collect(),
+                ),
+            );
+            parity(
+                16,
+                vec![],
+                w16_list(
+                    ["Pending", "Settled"]
+                        .into_iter()
+                        .map(|s| w16_string(s.as_bytes()))
+                        .collect(),
+                ),
+            );
+        }
+
+        #[test]
+        fn w29_admin_settings_status_monitoring_payment_malformed_and_ranges() {
+            let mut out = [0xa5; 512];
+            for bytes in [
+                b"a:0:{}x".as_slice(),
+                b"a:00:{}",
+                b"a:1:{i:1;s:3:\"asc\";}",
+                b"a:1:{i:0;s:03:\"asc\";}",
+                b"a:1:{i:0;O:8:\"stdClass\":0:{}}",
+                b"a:1:{i:0;R:1;}",
+                b"a:1:{i:0;i:+1;}",
+                b"a:1:{i:0;i:9223372036854775808;}",
+                b"a:2:{i:0;s:3:\"asc\";i:0;s:3:\"asc\";}",
+            ] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w29_admin_settings_status_monitoring_payment(
+                            10,
+                            bytes.as_ptr(),
+                            bytes.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    -1
+                );
+                assert!(out.iter().all(|b| *b == 0xa5));
+            }
+            for (op, args) in [
+                (17, vec![]),
+                (15, vec![V::Null]),
+                (10, vec![]),
+                (10, vec![V::Int(1)]),
+                (10, vec![w16_string(b"asc"), V::Null]),
+                (
+                    11,
+                    vec![w16_list(vec![w16_map(vec![
+                        ("tx_count", V::Int(1)),
+                        ("invoice_total", V::Int(0)),
+                        ("value_total", w20_double(0.0)),
+                    ])])],
+                ),
+                (
+                    0,
+                    vec![w16_map(vec![("post_non_mode", w16_string(b"1e3"))])],
+                ),
+            ] {
+                let mut bytes = Vec::new();
+                w16_list(args).serialize(&mut bytes);
+                assert_eq!(
+                    unsafe {
+                        nntmux_w29_admin_settings_status_monitoring_payment(
+                            op,
+                            bytes.as_ptr(),
+                            bytes.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    -1
+                );
+                assert!(out.iter().all(|b| *b == 0xa5));
+            }
+            let input = b"a:0:{}";
+            let run = |p, len, o, cap| unsafe {
+                nntmux_w29_admin_settings_status_monitoring_payment(15, p, len, o, cap)
+            };
+            for len in [0, 1] {
+                assert_eq!(run(std::ptr::null(), len, out.as_mut_ptr(), out.len()), -1);
+                assert_eq!(
+                    run(input.as_ptr(), input.len(), std::ptr::null_mut(), len),
+                    -1
+                );
+            }
+            for len in [usize::MAX, MAX_BYTES + 1] {
+                assert_eq!(run(input.as_ptr(), len, out.as_mut_ptr(), out.len()), -1);
+                assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), len), -1);
+            }
+            assert_eq!(
+                run(usize::MAX as *const u8, 2, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), usize::MAX as *mut u8, 2),
+                -1
+            );
+            let p = out.as_mut_ptr();
+            assert_eq!(run(p, 6, p, out.len()), -1);
+            assert_eq!(run(unsafe { p.add(1) }, 6, p, out.len()), -1);
+            assert_eq!(run(p, 6, unsafe { p.add(1) }, out.len() - 1), -1);
+            assert!(out.iter().all(|b| *b == 0xa5));
+        }
+    }
+}
+
+/// Evaluate canonical PHP list arguments. Negative required size never writes output.
+///
+/// # Safety
+/// Both ranges must be live, disjoint readable/writable allocations. Pointers must
+/// be non-null even for zero lengths; arithmetic checks cannot prove provenance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w29_admin_settings_status_monitoring_payment(
+    operation: u32,
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave29_admin_settings_status_monitoring_payment::evaluate(
+            operation, input, length, output, capacity,
+        )
+    }))
+    .unwrap_or(-1)
+}
