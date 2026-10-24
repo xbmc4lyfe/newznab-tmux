@@ -207,7 +207,10 @@ final class RustImdbSearchVideoPatternParityTest extends TestCase
         foreach ([null, [], ['url' => ' x._V1_X.jpg '], [['url' => ' y._V1_X.png ']], ['z._V1_X.jpg'], 'x._V1_a.b.jpg?foo.bar', "x._V1_a\nb.jpg", "x._V1_a.b\nx._V1_c.d", '._V1_.', '._V1_'] as $image) {
             $this->assertParity($this->phpScraper, $this->scraper, 'normalizeImageUrl', $image);
         }
-        self::assertSame('tom_jerry_2020_', $this->invokeHelper($this->scraper, 'normalizeSearchSlug', '  Tom & Jerry (2020)  '));
+        self::assertSame('tom_jerry_2020', $this->invokeHelper($this->scraper, 'normalizeSearchSlug', '  Tom & Jerry (2020)  '));
+        self::assertSame('500_days_of_summer', $this->invokeHelper($this->scraper, 'normalizeSearchSlug', '(500) Days of Summer'));
+        self::assertSame('', $this->invokeHelper($this->scraper, 'normalizeSearchSlug', '!!! ---'));
+        self::assertSame('', $this->invokeHelper($this->scraper, 'normalizeSearchSlug', '東京物語'));
     }
 
     public function test_get_by_title_keeps_lookup_order_and_early_returns(): void
@@ -279,9 +282,11 @@ final class RustImdbSearchVideoPatternParityTest extends TestCase
         Cache::flush();
         $expected = [['imdbid' => '1234567', 'title' => 'Movie', 'year' => '2024']];
         self::assertSame($expected, $scraper->search('  Tom & Jerry (2020)  '));
-        self::assertSame($expected, $scraper->search('Tom---Jerry---2020!'));
+        self::assertSame($expected, $scraper->search('Tom & Jerry 2020!'));
+        self::assertSame([], $scraper->search('!!! ---'));
+        self::assertSame([], $scraper->search('東京物語'));
         self::assertCount(1, $history);
-        self::assertSame('https://v2.sg.media-imdb.com/suggestion/t/tom_jerry_2020_.json', (string) $history[0]['request']->getUri());
+        self::assertSame('https://v2.sg.media-imdb.com/suggestion/t/tom_jerry_2020.json', (string) $history[0]['request']->getUri());
         $encoding = mb_internal_encoding();
         try {
             mb_internal_encoding('UTF-16BE');

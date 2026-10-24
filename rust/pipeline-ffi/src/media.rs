@@ -5113,16 +5113,19 @@ pub unsafe extern "C" fn nntmux_imdb_search_text(
             }
         }
         2 => {
-            // mb_strtolower's encoding and Unicode mappings stay owned by PHP.
             if !s.is_ascii() { return -1; }
-            let mut sep = false;
-            for &b in imdb_trim(s) {
+            let mut started = false;
+            let mut pending_space = false;
+            for &b in s {
                 if b.is_ascii_alphanumeric() {
+                    if started && pending_space {
+                        out.push_byte(b'_');
+                    }
                     out.push_byte(b.to_ascii_lowercase());
-                    sep = false;
-                } else if !sep {
-                    out.push_byte(b'_');
-                    sep = true;
+                    started = true;
+                    pending_space = false;
+                } else if b == b' ' && started {
+                    pending_space = true;
                 }
             }
         }
@@ -5446,7 +5449,9 @@ mod imdb_search_tests {
             (0, &b"x19001 2020"[..], &b"1900"[..]),
             (1, b" x._V1_a.b.jpg?x.y ", b"x.y"),
             (1, b"x._V1_a\nb.jpg", b"x._V1_a\nb.jpg"),
-            (2, b" Tom & Jerry (2020) ", b"tom_jerry_2020_"),
+            (2, b" Tom & Jerry (2020) ", b"tom_jerry_2020"),
+            (2, b"!!! ---", b""),
+            (2, b"(500) Days of Summer", b"500_days_of_summer"),
             (3, b" Peter's  Show!\tX ", b"%%Peters%%Show\tX%%"),
             (4, b"The Show (2020)", b"The Show"),
             (4, b"(2020)", b"(2020)"),

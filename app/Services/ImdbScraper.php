@@ -1153,15 +1153,13 @@ class ImdbScraper
 
     private function normalizeSearchSlug(string $query): string
     {
-        return preg_replace('/[^a-z0-9]+/', '_', mb_strtolower(trim($query))) ?? '';
+        $norm = strtolower(preg_replace('/[^a-z0-9 ]/i', '', $query) ?? '');
+
+        return preg_replace('/\s+/', '_', trim($norm)) ?? '';
     }
 
     public function normalizeSearchSlugNative(string $query): string
     {
-        if (mb_internal_encoding() !== 'UTF-8') {
-            return $this->normalizeSearchSlug($query);
-        }
-
         return $this->searchNativeOutput($query, 'nntmux_imdb_search_text', 2) ?? $this->normalizeSearchSlug($query);
     }
 
