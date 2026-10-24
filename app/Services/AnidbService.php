@@ -6,14 +6,49 @@ namespace App\Services;
 
 use App\Models\AnidbTitle;
 use App\Models\Category;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 /**
  * Service class for AniDB data fetching and processing.
  */
 class AnidbService
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_anidb_clean_title(const char *ptr, size_t len, char *out, size_t cap);
+        ssize_t nntmux_anidb_extract_base_title(const char *ptr, size_t len, char *out, size_t cap);
+        C;
+
+    /** Null selects the benchmark-qualified production default. */
+    private static ?bool $useRustFfi = null;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(?bool $use = true): void
+    {
+        self::$useRustFfi = $use;
+        if ($use === null) {
+            self::$ffi = null;
+        }
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? true;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('metadata', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
     /**
      * Updates stored AniList entries in the database.
      * Note: AniList doesn't support episodes, so episode-related parameters are ignored.
@@ -62,7 +97,7 @@ class AnidbService
     /**
      * Deletes an AniDB title and associated info.
      *
-     * @throws \Throwable
+     * @throws Throwable
      */
     public function deleteTitle(int $anidbID): void
     {
@@ -255,5 +290,151 @@ class AnidbService
         }
 
         return $result;
+    }
+
+    /**
+     * Strip bracketed/parenthesized tags, language codes, episode markers, and quality noise from an anime title.
+     */
+    public function cleanTitle(string $title): string
+    {
+        return (self::$useRustFfi ?? true)
+            ? $this->cleanTitleNative($title)
+            : $this->cleanTitlePhp($title);
+    }
+
+    public function cleanTitleNative(string $title): string
+    {
+        return self::callNativeString('nntmux_anidb_clean_title', $title)
+            ?? $this->cleanTitlePhp($title);
+    }
+
+    public function cleanTitlePhp(string $title): string
+    {
+        $title = $this->fixEncodingPhp($title);
+        $title = (string) preg_replace('/\[[^\]]+\]/', ' ', $title);
+        $title = (string) preg_replace('/\([^)]+\)/', ' ', $title);
+        $title = (string) preg_replace('/\b(ENG|JAP|JPN|SUB|DUB|MULTI|RAW|HARDSUB|SOFTSUB|HARDDUB|SOFTDUB|ITA|SPA|FRE|GER|RUS|CHI|KOR)\b/i', ' ', $title);
+        $title = (string) preg_replace('/\b(JAV|Uncensored|Censored|Mosaic|Mosaic-less|HD|SD|FHD|UHD)\b/i', ' ', $title);
+        $title = (string) preg_replace('/\b\d{6}\b/', ' ', $title);
+        $title = (string) preg_replace('/[-_]\s*\d{1,4}\s*$/i', '', $title);
+        $title = (string) preg_replace('/\s+\d{1,4}\s*$/i', '', $title);
+        $title = (string) preg_replace('/\s*-\s*\d+x\d+.*$/i', '', $title);
+        $title = (string) preg_replace('/\s+S\d+E\d+.*$/i', '', $title);
+        $title = (string) preg_replace('/\s*-\s*\d{1,4}(?:\s*-\s*.*)?\s*$/i', '', $title);
+        $title = (string) preg_replace('/\s*-\s*$/i', '', $title);
+        $title = (string) preg_replace('/\s+E(?:p(?:isode)?)?\s*0*\d{1,4}\s*$/i', '', $title);
+        $title = (string) preg_replace('/\b(480p|720p|1080p|2160p|4K|BD|BDRip|BluRay|Blu-Ray|HEVC|x264|x265|H264|H265|WEB|WEBRip|DVDRip|TVRip)\b/i', ' ', $title);
+        $title = (string) preg_replace('/\b(PROPER|REPACK|RIP|ISO|CRACK|BETA|ALPHA|FINAL|COMPLETE|FULL)\b/i', ' ', $title);
+        $title = (string) preg_replace('/\s+Vol\.?\s*\d*\s*$/i', '', $title);
+        $title = (string) preg_replace('/\s+Ch\.?\s*\d*\s*$/i', '', $title);
+        $title = (string) preg_replace('/\s*[-_]\s*$/', '', $title);
+        $title = (string) preg_replace('/\s+/', ' ', $title);
+
+        return trim($title);
+    }
+
+    /**
+     * Extract the base anime title from a fansub/scene release name before episode/format markers.
+     */
+    public function extractBaseTitle(string $releaseName): string
+    {
+        return (self::$useRustFfi ?? true)
+            ? $this->extractBaseTitleNative($releaseName)
+            : $this->extractBaseTitlePhp($releaseName);
+    }
+
+    public function extractBaseTitleNative(string $releaseName): string
+    {
+        return self::callNativeString('nntmux_anidb_extract_base_title', $releaseName)
+            ?? $this->extractBaseTitlePhp($releaseName);
+    }
+
+    public function extractBaseTitlePhp(string $releaseName): string
+    {
+        $s = $this->fixEncodingPhp($releaseName);
+        $s = str_replace(['_', '.'], ' ', $s);
+        $s = (string) preg_replace('/\s+/', ' ', $s);
+        $s = trim($s);
+        $s = (string) preg_replace('/^(?:\[[^\]]+\]\s*)+/', '', $s);
+        $s = trim($s);
+        $s = (string) preg_replace('/\[(?:ENG|JAP|JPN|SUB|DUB|MULTI|RAW|HARDSUB|SOFTSUB|HARDDUB|SOFTDUB|ITA|SPA|FRE|GER|RUS|CHI|KOR)\]/i', ' ', $s);
+        $s = (string) preg_replace('/\((?:ENG|JAP|JPN|SUB|DUB|MULTI|RAW|HARDSUB|SOFTSUB|HARDDUB|SOFTDUB|ITA|SPA|FRE|GER|RUS|CHI|KOR)\)/i', ' ', $s);
+
+        if (preg_match('/\sS\d+E\d+/i', $s, $m, PREG_OFFSET_CAPTURE)) {
+            $title = substr($s, 0, (int) $m[0][1]);
+        } elseif (preg_match('/\s\d+x\d+/i', $s, $m, PREG_OFFSET_CAPTURE)) {
+            $title = substr($s, 0, (int) $m[0][1]);
+        } elseif (preg_match('/\s-\s*(\d{1,3})\b/', $s, $m, PREG_OFFSET_CAPTURE)) {
+            $title = substr($s, 0, (int) $m[0][1]);
+        } elseif (preg_match('/\sE(?:p(?:isode)?)?\s*0*(\d{1,3})\b/i', $s, $m, PREG_OFFSET_CAPTURE)) {
+            $title = substr($s, 0, (int) $m[0][1]);
+        } elseif (preg_match('/\b(Movie|OVA|Complete Series|Complete|Full Series)\b/i', $s, $m, PREG_OFFSET_CAPTURE)) {
+            $title = substr($s, 0, (int) $m[0][1]);
+        } elseif (preg_match('/\[(?:BD|BDRip|BluRay|Blu-Ray|\d{3,4}[ipx]|HEVC|x264|x265|H264|H265)\]/i', $s, $m, PREG_OFFSET_CAPTURE)) {
+            $title = substr($s, 0, (int) $m[0][1]);
+        } else {
+            $title = $s;
+        }
+
+        return $this->cleanTitlePhp($title);
+    }
+
+    protected function fixEncodingPhp(string $text): string
+    {
+        $text = (string) preg_replace('/Ã¢Â[_\sÂ]*/u', '', $text);
+        $text = (string) preg_replace('/Ã[¢Â©€£]/u', '', $text);
+        $text = (string) preg_replace('/Â+/u', '', $text);
+        $text = (string) preg_replace('/Ã[^\s]*/u', '', $text);
+
+        if (preg_match('/Ã[^\s]/u', $text)) {
+            $converted = @mb_convert_encoding($text, 'UTF-8', 'ISO-8859-1');
+            if ($converted !== false && ! preg_match('/Ã[^\s]/u', $converted)) {
+                $text = $converted;
+            }
+        }
+
+        $text = (string) preg_replace('/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/u', '', $text);
+
+        if (function_exists('normalizer_normalize')) {
+            $normalized = normalizer_normalize($text, \Normalizer::FORM_C);
+            if (is_string($normalized)) {
+                $text = $normalized;
+            }
+        }
+
+        return (string) preg_replace('/[\xC0-\xC1\xC2-\xC5]/u', '', $text);
+    }
+
+    private static function callNativeString(string $symbol, string $input): ?string
+    {
+        if (($ffi = self::ffi()) === null) {
+            return null;
+        }
+        $len = strlen($input);
+        $capacity = 0;
+        $buffer = RustPipelineLibrary::obtainScratch($ffi, max(256, $len + 32), $capacity);
+        if ($buffer === null) {
+            return null;
+        }
+        try {
+            $written = $ffi->$symbol($input, $len, $buffer, $capacity);
+            if (! is_int($written) || $written === -1 || $written === PHP_INT_MIN) {
+                return null;
+            }
+            if ($written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                $written = $ffi->$symbol($input, $len, $buffer, $capacity);
+            }
+            if (! is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+
+            return $written === 0 ? '' : FFI::string($buffer, $written);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
