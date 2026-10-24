@@ -12341,3 +12341,505 @@ pub unsafe extern "C" fn nntmux_name_fixing_query_pass(
     })
     .unwrap_or(-4)
 }
+
+// Wave 18 runner/release candidates. PHP retains database/NNTP effects and UTF-8 conversion.
+// Atomic status contract: >=0 written; -1 invalid frame/region; -2 capacity;
+// -3 unsupported arithmetic; -4 caught panic. No error changes the caller's output.
+struct RunnerReleaseOutput {
+    bytes: Vec<u8>,
+    cap: usize,
+}
+
+impl RunnerReleaseOutput {
+    fn field(&mut self, value: &[u8]) -> Result<(), isize> {
+        let len = u32::try_from(value.len()).map_err(|_| -3isize)?;
+        let required = self
+            .bytes
+            .len()
+            .checked_add(4)
+            .and_then(|n| n.checked_add(value.len()))
+            .ok_or(-3isize)?;
+        if required > self.cap {
+            return Err(-2);
+        }
+        self.bytes
+            .try_reserve(required - self.bytes.len())
+            .map_err(|_| -3isize)?;
+        self.bytes.extend_from_slice(&len.to_le_bytes());
+        self.bytes.extend_from_slice(value);
+        Ok(())
+    }
+    fn number(&mut self, n: i64) -> Result<(), isize> {
+        self.field(n.to_string().as_bytes())
+    }
+    fn command(&mut self, id: i64, command: &[u8], options: &[u8]) -> Result<(), isize> {
+        self.number(id)?;
+        self.field(command)?;
+        self.field(options)
+    }
+}
+
+fn runner_release_int(value: &[u8]) -> Result<i64, isize> {
+    std::str::from_utf8(value)
+        .map_err(|_| -1isize)?
+        .parse()
+        .map_err(|_| -3isize)
+}
+fn runner_release_count(value: &[u8]) -> Result<usize, isize> {
+    usize::try_from(runner_release_int(value)?).map_err(|_| -1isize)
+}
+// Restrict arithmetic involving PHP doubles to exact integers. Declined cases execute PHP.
+fn runner_release_exact(value: i128) -> Result<i64, isize> {
+    if value.abs() > (1i128 << 53) {
+        return Err(-3);
+    }
+    i64::try_from(value).map_err(|_| -3isize)
+}
+fn runner_release_build(mode: u32, input: &[u8], cap: usize) -> Result<Vec<u8>, isize> {
+    let fields = name_query_fields(input)?;
+    let mut out = RunnerReleaseOutput {
+        bytes: Vec::new(),
+        cap,
+    };
+    match mode {
+        0 => {
+            if fields.len() < 3 || (fields.len() - 3) % 5 != 0 {
+                return Err(-1);
+            }
+            let repair = runner_release_int(fields[0])?;
+            if !(0..=1).contains(&repair) {
+                return Err(-1);
+            }
+            let headers = runner_release_int(fields[1])?;
+            let messages = runner_release_int(fields[2])?;
+            let messages = if messages < 1 { 20000 } else { messages };
+            for row in fields[3..].chunks_exact(5) {
+                let id = runner_release_int(row[0])?;
+                let name = String::from_utf8_lossy(row[1]);
+                // Group names are binary-safe, so decline non-UTF8 instead of replacing bytes.
+                if std::str::from_utf8(row[1]).is_err() {
+                    return Err(-3);
+                }
+                let ours = runner_release_int(row[2])?;
+                let theirs = runner_release_int(row[3])?;
+                let total = runner_release_int(row[4])?;
+                let count = i128::from(theirs) - i128::from(ours) - 20000;
+                if ours == 0 || count <= i128::from(messages) * 2 {
+                    out.command(
+                        id,
+                        format!("update_group_headers  {name}").as_bytes(),
+                        format!("--max={messages}").as_bytes(),
+                    )?;
+                } else {
+                    let end = i64::try_from(i128::from(ours) + count.min(i128::from(headers)))
+                        .map_err(|_| -3isize)?;
+                    let mut first = ours.checked_add(1).ok_or(-3isize)?;
+                    let first_range = first;
+                    while first <= end {
+                        let last = i64::try_from(
+                            (i128::from(first) + i128::from(messages) - 1).min(i128::from(end)),
+                        )
+                        .map_err(|_| -3isize)?;
+                        out.command(
+                            id,
+                            format!("get_range  binaries  {name}  {first}  {last}").as_bytes(),
+                            if first == first_range {
+                                b"--contiguous\0--repair"
+                            } else {
+                                b"--contiguous"
+                            },
+                        )?;
+                        first = last.checked_add(1).ok_or(-3isize)?;
+                    }
+                }
+                if repair == 1 && total > 0 {
+                    out.command(id, format!("part_repair  {name}").as_bytes(), b"")?;
+                }
+            }
+        }
+        1 => {
+            if fields.len() % 2 != 0 {
+                return Err(-1);
+            }
+            let mut groups = Vec::new();
+            let mut total = 0usize;
+            for pair in fields.chunks_exact(2) {
+                let id = runner_release_int(pair[0])?;
+                let count = runner_release_count(pair[1])?;
+                total = total.checked_add(count).ok_or(-3isize)?;
+                // Every command emits at least ten bytes. Bound work by output capacity.
+                if total > cap / 10 {
+                    return Err(-2);
+                }
+                groups.push((id, count));
+            }
+            let rounds = groups.iter().map(|(_, count)| *count).max().unwrap_or(0);
+            for round in 0..rounds {
+                for &(id, count) in &groups {
+                    if round < count {
+                        out.number(id)?;
+                        out.number(i64::try_from(round).map_err(|_| -3isize)?)?;
+                    }
+                }
+            }
+        }
+        2 => {
+            if fields.len() != 1 {
+                return Err(-1);
+            }
+            out.field(match runner_release_int(fields[0])? {
+                1 => b"ORDER BY first_record_postdate DESC",
+                2 => b"ORDER BY first_record_postdate ASC",
+                3 => b"ORDER BY name ASC",
+                4 => b"ORDER BY name DESC",
+                5 => b"ORDER BY a.last_record DESC",
+                _ => b"ORDER BY a.last_record ASC",
+            })?;
+        }
+        3 => {
+            if fields.len() != 2 {
+                return Err(-1);
+            }
+            out.field(match runner_release_int(fields[0])? {
+                1 => b"g.backfill_target",
+                2 => fields[1],
+                _ => b"0",
+            })?;
+        }
+        4 => {
+            if fields.len() != 6 {
+                return Err(-1);
+            }
+            let name = std::str::from_utf8(fields[0]).map_err(|_| -3isize)?;
+            let ours = i128::from(runner_release_int(fields[1])?);
+            let theirs = i128::from(runner_release_int(fields[2])?);
+            let quantity = i128::from(runner_release_int(fields[3])?);
+            let threads = i128::from(runner_release_int(fields[4])?);
+            let messages = i128::from(runner_release_int(fields[5])?);
+            if ours <= theirs {
+                return Ok(out.bytes);
+            }
+            if messages <= 0 {
+                return Err(-3);
+            }
+            let target = i128::from(runner_release_exact(
+                (ours - theirs).min(quantity * threads),
+            )?);
+            if target <= 0 {
+                return Ok(out.bytes);
+            }
+            let batches = (target + messages - 1) / messages;
+            if batches > (cap / 4) as i128 {
+                return Err(-2);
+            }
+            for i in 0..batches {
+                let first = runner_release_exact(ours - i * messages - messages)?;
+                let last = runner_release_exact(ours - i * messages - 1)?;
+                out.field(
+                    format!("get_range  backfill  {name}  {first}  {last}  {}", i + 1).as_bytes(),
+                )?;
+            }
+        }
+        5 => {
+            if fields.len() != 2 {
+                return Err(-1);
+            }
+            // PHP str_replace processes needles sequentially, including newly
+            // formed multibyte characters after earlier byte removals.
+            let mut subject = fields[0].to_vec();
+            for needle in [
+                b"#".as_slice(),
+                b"@",
+                b"$",
+                b"%",
+                b"^",
+                "§".as_bytes(),
+                "¨".as_bytes(),
+                "©".as_bytes(),
+                "Ö".as_bytes(),
+            ] {
+                let mut read = 0usize;
+                let mut write = 0usize;
+                while read < subject.len() {
+                    if subject[read..].starts_with(needle) {
+                        read += needle.len();
+                    } else {
+                        subject[write] = subject[read];
+                        write += 1;
+                        read += 1;
+                    }
+                }
+                subject.truncate(write);
+            }
+            out.field(&subject)?;
+            let mut poster = fields[1];
+            while poster.first() == Some(&b'\'') {
+                poster = &poster[1..];
+            }
+            while poster.last() == Some(&b'\'') {
+                poster = &poster[..poster.len() - 1];
+            }
+            out.field(poster)?;
+        }
+        7 => {
+            if fields.is_empty() {
+                return Err(-1);
+            }
+            let count = runner_release_count(fields[0])?;
+            let dictionary_end = count
+                .checked_mul(2)
+                .and_then(|n| n.checked_add(1))
+                .ok_or(-1isize)?;
+            if dictionary_end > fields.len() {
+                return Err(-1);
+            }
+            let mut dictionary = std::collections::HashMap::new();
+            for pair in fields[1..dictionary_end].chunks_exact(2) {
+                dictionary.insert(pair[0], runner_release_int(pair[1])?);
+            }
+            let mut offset = dictionary_end;
+            while offset < fields.len() {
+                let id = runner_release_int(fields[offset])?;
+                let count = runner_release_count(*fields.get(offset + 1).ok_or(-1isize)?)?;
+                offset += 2;
+                let end = offset.checked_add(count).ok_or(-1isize)?;
+                let names = fields.get(offset..end).ok_or(-1isize)?;
+                let mut seen = std::collections::HashSet::new();
+                for name in names {
+                    if let Some(&group_id) = dictionary.get(name) {
+                        if seen.insert(group_id) {
+                            out.number(id)?;
+                            out.number(group_id)?;
+                        }
+                    }
+                }
+                offset = end;
+            }
+        }
+        8 => {
+            if fields.len() != 3 {
+                return Err(-1);
+            }
+            match runner_release_int(fields[0])? {
+                0 => {
+                    out.number(0)?;
+                    out.number(0)?;
+                    out.number(0)?;
+                }
+                1 => {
+                    out.number(runner_release_int(fields[1])?)?;
+                    out.number(runner_release_int(fields[2])?.max(0))?;
+                    out.number(1)?;
+                }
+                _ => return Err(-1),
+            }
+        }
+        9 => {
+            if fields.is_empty() || fields.len() % 2 != 1 {
+                return Err(-1);
+            }
+            for pair in fields[1..].chunks_exact(2) {
+                if pair[0] == fields[0] {
+                    out.number(runner_release_int(pair[1])?)?;
+                    break;
+                }
+            }
+        }
+        _ => return Err(-1),
+    }
+    Ok(out.bytes)
+}
+
+/// Pure runner/release planner with length-prefixed little-endian byte fields.
+/// # Safety
+/// Nonempty regions must be valid for reads/writes. Null is accepted only at
+/// length zero. Lengths, alignment, address arithmetic and capacity are checked
+/// before creating slices; callers remain responsible for allocation validity.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_runner_release_transform(
+    mode: u32,
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        if !wave16_region(input, len) || !wave16_region(out, cap) {
+            return -1;
+        }
+        let input = if len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(input, len) }
+        };
+        match runner_release_build(mode, input, cap) {
+            Ok(bytes) => {
+                if !bytes.is_empty() {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
+                    }
+                }
+                bytes.len() as isize
+            }
+            Err(code) => code,
+        }
+    })
+    .unwrap_or(-4)
+}
+
+/// Integer DTO normalization. Input is copied before output, permitting overlap.
+/// # Safety
+/// Nonempty regions must be valid, aligned i64 allocations. Counts are element
+/// counts; byte extents must fit isize and address arithmetic must not wrap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_creation_values(
+    mode: u32,
+    input: *const i64,
+    len: usize,
+    out: *mut i64,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        if !wave16_region(input, len) || !wave16_region(out, cap) {
+            return -1;
+        }
+        let required = match mode {
+            0 => 5,
+            1 => 4,
+            _ => return -1,
+        };
+        if len != (if mode == 0 { 4 } else { 2 }) {
+            return -1;
+        }
+        if cap < required {
+            return -2;
+        }
+        let values = unsafe { slice::from_raw_parts(input, len) };
+        let result: Vec<i64> = if mode == 0 {
+            if !(0..=1).contains(&values[3]) {
+                return -1;
+            }
+            vec![
+                values[0].min(100),
+                i64::from((0..=100).contains(&values[0])),
+                i64::from(values[1] > 0),
+                i64::from(values[2] > 0 && values[3] == 1),
+                i64::from(values[0] > 0),
+            ]
+        } else {
+            let Some(total) = values[0].checked_add(values[1]) else {
+                return -3;
+            };
+            vec![total, i64::from(values[0] > 0), values[0], values[1]]
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len());
+        }
+        result.len() as isize
+    })
+    .unwrap_or(-4)
+}
+
+#[cfg(test)]
+mod wave18_runner_release_tests {
+    use super::*;
+    fn frame(fields: &[&[u8]]) -> Vec<u8> {
+        let mut output = RunnerReleaseOutput {
+            bytes: vec![],
+            cap: 65536,
+        };
+        for field in fields {
+            output.field(field).unwrap();
+        }
+        output.bytes
+    }
+    #[test]
+    fn cleaning_wave18_plans_and_edges() {
+        let input = frame(&[
+            b"0",
+            b"50000",
+            b"20000",
+            b"1",
+            b"alt.test",
+            b"100",
+            b"200000",
+            b"0",
+        ]);
+        let result = runner_release_build(0, &input, 65536).unwrap();
+        let fields = name_query_fields(&result).unwrap();
+        assert_eq!(fields.len(), 9);
+        assert_eq!(fields[1], b"get_range  binaries  alt.test  101  20100");
+        assert_eq!(fields[2], b"--contiguous\0--repair");
+        assert_eq!(fields[7], b"get_range  binaries  alt.test  40101  50100");
+        let input = frame(&[b"1", b"2", b"9", b"1"]);
+        let result = runner_release_build(1, &input, 65536).unwrap();
+        assert_eq!(
+            name_query_fields(&result).unwrap(),
+            vec![b"1".as_slice(), b"0", b"9", b"0", b"1", b"1"]
+        );
+        let input = frame(&[b"alt.test", b"100", b"1", b"50", b"2", b"30"]);
+        let result = runner_release_build(4, &input, 65536).unwrap();
+        assert_eq!(name_query_fields(&result).unwrap().len(), 4);
+    }
+    #[test]
+    fn cleaning_wave18_abi_atomic_errors() {
+        unsafe {
+            let mut out = [77i64; 5];
+            let input = [101i64, 1, 2, 1];
+            assert_eq!(
+                nntmux_release_creation_values(0, input.as_ptr(), 4, out.as_mut_ptr(), 4),
+                -2
+            );
+            assert_eq!(out, [77; 5]);
+            assert_eq!(
+                nntmux_release_creation_values(0, input.as_ptr(), 4, out.as_mut_ptr(), 5),
+                5
+            );
+            assert_eq!(out, [100, 0, 1, 1, 1]);
+            assert_eq!(
+                nntmux_release_creation_values(1, [i64::MAX, 1].as_ptr(), 2, out.as_mut_ptr(), 5),
+                -3
+            );
+            assert_eq!(
+                nntmux_release_creation_values(0, std::ptr::null(), 4, out.as_mut_ptr(), 5),
+                -1
+            );
+            let unaligned = (input.as_ptr() as *const u8).add(1) as *const i64;
+            assert_eq!(
+                nntmux_release_creation_values(0, unaligned, 4, out.as_mut_ptr(), 5),
+                -1
+            );
+            assert_eq!(
+                nntmux_release_creation_values(0, input.as_ptr(), usize::MAX, out.as_mut_ptr(), 5),
+                -1
+            );
+            let input = frame(&[b"1"]);
+            let mut bytes = [77u8; 4];
+            assert_eq!(
+                nntmux_runner_release_transform(
+                    2,
+                    input.as_ptr(),
+                    input.len(),
+                    bytes.as_mut_ptr(),
+                    4
+                ),
+                -2
+            );
+            assert_eq!(bytes, [77; 4]);
+            assert_eq!(
+                nntmux_runner_release_transform(2, std::ptr::null(), 1, bytes.as_mut_ptr(), 4),
+                -1
+            );
+            assert_eq!(
+                nntmux_runner_release_transform(
+                    2,
+                    input.as_ptr(),
+                    input.len(),
+                    std::ptr::null_mut(),
+                    1
+                ),
+                -1
+            );
+        }
+    }
+}
