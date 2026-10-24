@@ -16806,3 +16806,699 @@ pub mod forum_policy_and_post {
         }
     }
 }
+
+/// Wave 25.3: profile/theme/admin FormRequest validation specs.
+///
+/// Backs the `*Native()` helpers on `UpdateProfileRequest`, `UpdateThemeRequest`,
+/// `AdminPromotionRequest`, `UpdateIncidentRequest` and `UpdateServiceHealthRequest`.
+/// Every export returns the number of bytes written, `-1` for invalid arguments or a
+/// caught panic, and `-(required capacity)` (never `-1`) without writing when `out_cap`
+/// is too small.
+pub mod profile_theme_admin_request {
+    use std::mem::size_of;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::ptr;
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+
+    pub const EMAIL_UNIQUE_PREFIX: &[u8] = b"unique:users,email,";
+    pub const PASSWORD_REGEX_RULE: &[u8] =
+        b"regex:/^(?=.*?[A-Z])(?=.*?[a-z])(?=.*?[0-9])(?=.*?[#?!@$%^&*-]).{8,}$/";
+    pub const THEME_PREFERENCE_RULE: &[u8] = b"in:light,dark,system";
+    pub const COLOR_SCHEME_RULE: &[u8] =
+        b"in:blue,indigo,cyan,teal,emerald,violet,pink,rose,red,orange,amber";
+
+    /// `[email_unique, password_regex, theme_preference, color_scheme]`.
+    pub const PROFILE_SPEC_FIELDS: usize = 4;
+    /// `[theme_preference, color_scheme]`.
+    pub const THEME_SPEC_FIELDS: usize = 2;
+    /// `[clean_impact_count, clean_status_count, title_max, service_status_ids_min]`.
+    pub const INCIDENT_META_FIELDS: usize = 4;
+    pub const INCIDENT_TITLE_MAX: usize = 255;
+    pub const INCIDENT_SERVICE_STATUS_IDS_MIN: usize = 1;
+
+    pub const PROMOTION_RULES: [(&[u8], &[u8]); 8] = [
+        (b"name", b"required|string|max:255"),
+        (b"description", b"nullable|string"),
+        (b"applicable_roles", b"nullable|array"),
+        (b"applicable_roles.*", b"exists:roles,id"),
+        (b"additional_days", b"required|integer|min:0"),
+        (b"start_date", b"nullable|date"),
+        (b"end_date", b"nullable|date|after_or_equal:start_date"),
+        (b"is_active", b"boolean"),
+    ];
+
+    const ID_KIND_NULL: u8 = 0;
+    const ID_KIND_INT: u8 = 1;
+    const ID_KIND_STRING: u8 = 2;
+
+    #[inline]
+    unsafe fn valid_in<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null() || len > isize::MAX as usize || (ptr as usize).checked_add(len).is_none() {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out<T>(ptr: *mut T, len: usize) -> bool {
+        if ptr.is_null() || !ptr.is_aligned() {
+            return false;
+        }
+        let Some(byte_len) = len.checked_mul(size_of::<T>()) else {
+            return false;
+        };
+        byte_len <= isize::MAX as usize && (ptr as usize).checked_add(byte_len).is_some()
+    }
+
+    #[inline]
+    fn required(total: usize) -> isize {
+        // `-1` is reserved for DECLINE, so a one-byte requirement reports `-2`.
+        if total <= 1 { -2 } else { -(total as isize) }
+    }
+
+    /// Sum part lengths plus `separators` with overflow checks.
+    fn total_len(parts: &[&[u8]], separators: usize) -> Option<usize> {
+        let mut total = separators;
+        for part in parts {
+            total = total.checked_add(part.len())?;
+        }
+        (total <= isize::MAX as usize).then_some(total)
+    }
+
+    /// Writes `parts` back to back into `out_buf`, recording each length in `out_lens`.
+    unsafe fn emit_fields(
+        parts: &[&[u8]],
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if !valid_out(out_lens, parts.len()) || !valid_out(out_buf, out_cap) {
+            return DECLINE;
+        }
+        let Some(total) = total_len(parts, 0) else {
+            return DECLINE;
+        };
+        if total > out_cap {
+            return required(total);
+        }
+        let lens = unsafe { slice::from_raw_parts_mut(out_lens, parts.len()) };
+        let mut offset = 0usize;
+        for (slot, part) in lens.iter_mut().zip(parts) {
+            unsafe { ptr::copy_nonoverlapping(part.as_ptr(), out_buf.add(offset), part.len()) };
+            offset += part.len();
+            *slot = part.len();
+        }
+        total as isize
+    }
+
+    /// Writes `items` joined by NUL into `out_buf`.
+    unsafe fn emit_nul_joined(items: &[&[u8]], out_buf: *mut u8, out_cap: usize) -> isize {
+        if !valid_out(out_buf, out_cap) {
+            return DECLINE;
+        }
+        let Some(total) = total_len(items, items.len().saturating_sub(1)) else {
+            return DECLINE;
+        };
+        if total > out_cap {
+            return required(total);
+        }
+        let mut offset = 0usize;
+        for (index, item) in items.iter().enumerate() {
+            if index > 0 {
+                unsafe { *out_buf.add(offset) = 0 };
+                offset += 1;
+            }
+            unsafe { ptr::copy_nonoverlapping(item.as_ptr(), out_buf.add(offset), item.len()) };
+            offset += item.len();
+        }
+        total as isize
+    }
+
+    /// Splits a NUL-packed list of exactly `count` entries (`count == 0` requires empty input).
+    pub fn unpack(packed: &[u8], count: usize) -> Option<Vec<&[u8]>> {
+        if count == 0 {
+            return packed.is_empty().then(Vec::new);
+        }
+        let items: Vec<&[u8]> = packed.split(|&b| b == 0).collect();
+        (items.len() == count).then_some(items)
+    }
+
+    #[inline]
+    fn is_php_trim_byte(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0)
+    }
+
+    /// PHP `trim()` with the default character mask.
+    pub fn php_trim(value: &[u8]) -> &[u8] {
+        let start = value
+            .iter()
+            .position(|&b| !is_php_trim_byte(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|&b| !is_php_trim_byte(b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    /// Trims, drops empty entries and removes duplicates while preserving first-seen order.
+    pub fn sanitize_enum_values<'a>(values: &[&'a [u8]]) -> Vec<&'a [u8]> {
+        let mut result: Vec<&'a [u8]> = Vec::with_capacity(values.len());
+        for value in values {
+            let trimmed = php_trim(value);
+            if !trimmed.is_empty() && !result.contains(&trimmed) {
+                result.push(trimmed);
+            }
+        }
+        result
+    }
+
+    /// Mirrors `'unique:users,email,'.$userId` for null, int and string ids.
+    pub fn email_unique_rule(kind: u8, int_val: i64, str_val: &[u8]) -> Option<Vec<u8>> {
+        let mut rule = EMAIL_UNIQUE_PREFIX.to_vec();
+        match kind {
+            ID_KIND_NULL => {}
+            ID_KIND_INT => rule.extend_from_slice(int_val.to_string().as_bytes()),
+            ID_KIND_STRING => rule.extend_from_slice(str_val),
+            _ => return None,
+        }
+        Some(rule)
+    }
+
+    /// Backs `UpdateProfileRequest::profileRuleSpecNative()`.
+    ///
+    /// Writes `[email_unique, password_regex, theme_preference, color_scheme]` back to back
+    /// with their lengths in `out_lens[0..4]`.
+    ///
+    /// # Safety
+    ///
+    /// For kind 2 `user_ptr` must be readable for `user_len` bytes. `out_lens` must be an
+    /// aligned, writable `size_t[4]` and `out_buf` writable for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_profile_rule_spec(
+        user_kind: u8,
+        user_int: i64,
+        user_ptr: *const u8,
+        user_len: usize,
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let user_str: &[u8] = if user_kind == ID_KIND_STRING {
+                match unsafe { valid_in(user_ptr, user_len) } {
+                    Some(bytes) => bytes,
+                    None => return DECLINE,
+                }
+            } else {
+                &[]
+            };
+            let Some(email_rule) = email_unique_rule(user_kind, user_int, user_str) else {
+                return DECLINE;
+            };
+            unsafe {
+                emit_fields(
+                    &[
+                        &email_rule,
+                        PASSWORD_REGEX_RULE,
+                        THEME_PREFERENCE_RULE,
+                        COLOR_SCHEME_RULE,
+                    ],
+                    out_lens,
+                    out_buf,
+                    out_cap,
+                )
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `UpdateThemeRequest::themeRuleSpecNative()`.
+    ///
+    /// Writes `[theme_preference, color_scheme]` back to back with lengths in `out_lens[0..2]`.
+    ///
+    /// # Safety
+    ///
+    /// `out_lens` must be an aligned, writable `size_t[2]` and `out_buf` writable for
+    /// `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_theme_rule_spec(
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| unsafe {
+            emit_fields(
+                &[THEME_PREFERENCE_RULE, COLOR_SCHEME_RULE],
+                out_lens,
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `AdminPromotionRequest::promotionRulesNative()`.
+    ///
+    /// Writes `key\0rule\0key\0rule...` and stores the pair count in `*out_pair_count`.
+    ///
+    /// # Safety
+    ///
+    /// `out_pair_count` must be an aligned, writable `size_t` and `out_buf` writable for
+    /// `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_promotion_rules(
+        out_pair_count: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out(out_pair_count, 1) {
+                return DECLINE;
+            }
+            let flat: Vec<&[u8]> = PROMOTION_RULES
+                .iter()
+                .flat_map(|(key, rule)| [*key, *rule])
+                .collect();
+            let written = unsafe { emit_nul_joined(&flat, out_buf, out_cap) };
+            if written >= 0 {
+                unsafe { *out_pair_count = PROMOTION_RULES.len() };
+            }
+            written
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `UpdateIncidentRequest::incidentRuleSpecNative()`.
+    ///
+    /// Inputs are NUL-packed lists. Writes the sanitized impact values followed by the
+    /// sanitized status values, all joined by NUL, and
+    /// `[clean_impact_count, clean_status_count, title_max, service_status_ids_min]` into
+    /// `out_meta`.
+    ///
+    /// # Safety
+    ///
+    /// Input pointers must be readable for their lengths, `out_meta` an aligned, writable
+    /// `size_t[4]` and `out_buf` writable for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_update_incident_rule_spec(
+        impact_ptr: *const u8,
+        impact_len: usize,
+        impact_count: usize,
+        status_ptr: *const u8,
+        status_len: usize,
+        status_count: usize,
+        out_meta: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let (Some(impact_raw), Some(status_raw)) =
+                (unsafe { valid_in(impact_ptr, impact_len) }, unsafe {
+                    valid_in(status_ptr, status_len)
+                })
+            else {
+                return DECLINE;
+            };
+            if !valid_out(out_meta, INCIDENT_META_FIELDS) {
+                return DECLINE;
+            }
+            let (Some(impact), Some(status)) = (
+                unpack(impact_raw, impact_count),
+                unpack(status_raw, status_count),
+            ) else {
+                return DECLINE;
+            };
+            let clean_impact = sanitize_enum_values(&impact);
+            let clean_status = sanitize_enum_values(&status);
+            let mut all = clean_impact.clone();
+            all.extend_from_slice(&clean_status);
+            let written = unsafe { emit_nul_joined(&all, out_buf, out_cap) };
+            if written >= 0 {
+                let meta = unsafe { slice::from_raw_parts_mut(out_meta, INCIDENT_META_FIELDS) };
+                meta.copy_from_slice(&[
+                    clean_impact.len(),
+                    clean_status.len(),
+                    INCIDENT_TITLE_MAX,
+                    INCIDENT_SERVICE_STATUS_IDS_MIN,
+                ]);
+            }
+            written
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `UpdateServiceHealthRequest::statusRuleValuesNative()`.
+    ///
+    /// Writes the sanitized, NUL-joined status values and their count in `*out_count`.
+    ///
+    /// # Safety
+    ///
+    /// `status_ptr` must be readable for `status_len` bytes, `out_count` an aligned,
+    /// writable `size_t` and `out_buf` writable for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_service_health_status_values(
+        status_ptr: *const u8,
+        status_len: usize,
+        status_count: usize,
+        out_count: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(status_raw) = (unsafe { valid_in(status_ptr, status_len) }) else {
+                return DECLINE;
+            };
+            if !valid_out(out_count, 1) {
+                return DECLINE;
+            }
+            let Some(status) = unpack(status_raw, status_count) else {
+                return DECLINE;
+            };
+            let clean = sanitize_enum_values(&status);
+            let written = unsafe { emit_nul_joined(&clean, out_buf, out_cap) };
+            if written >= 0 {
+                unsafe { *out_count = clean.len() };
+            }
+            written
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn profile(kind: u8, int_val: i64, s: &[u8], cap: usize) -> (isize, [usize; 4], Vec<u8>) {
+            let mut lens = [usize::MAX; PROFILE_SPEC_FIELDS];
+            let mut buf = vec![b'Z'; cap.max(1)];
+            let rc = unsafe {
+                nntmux_profile_rule_spec(
+                    kind,
+                    int_val,
+                    s.as_ptr(),
+                    s.len(),
+                    lens.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    cap,
+                )
+            };
+            (rc, lens, buf)
+        }
+
+        fn split_fields<'a>(buf: &'a [u8], lens: &[usize]) -> Vec<&'a [u8]> {
+            let mut offset = 0;
+            lens.iter()
+                .map(|&len| {
+                    let part = &buf[offset..offset + len];
+                    offset += len;
+                    part
+                })
+                .collect()
+        }
+
+        #[test]
+        fn profile_spec_formats_null_int_and_string_ids() {
+            let (rc, lens, buf) = profile(1, 42, b"", 512);
+            assert!(rc > 0);
+            let fields = split_fields(&buf, &lens);
+            assert_eq!(fields[0], b"unique:users,email,42");
+            assert_eq!(fields[1], PASSWORD_REGEX_RULE);
+            assert_eq!(fields[2], THEME_PREFERENCE_RULE);
+            assert_eq!(fields[3], COLOR_SCHEME_RULE);
+            assert_eq!(rc as usize, lens.iter().sum::<usize>());
+
+            let (_, lens, buf) = profile(1, -7, b"", 512);
+            assert_eq!(split_fields(&buf, &lens)[0], b"unique:users,email,-7");
+            let (_, lens, buf) = profile(0, 99, b"", 512);
+            assert_eq!(split_fields(&buf, &lens)[0], b"unique:users,email,");
+            let (_, lens, buf) = profile(2, 0, b"abc", 512);
+            assert_eq!(split_fields(&buf, &lens)[0], b"unique:users,email,abc");
+            assert_eq!(profile(3, 0, b"", 512).0, DECLINE);
+        }
+
+        #[test]
+        fn profile_spec_reports_capacity_without_writing() {
+            let (full, _, _) = profile(1, 42, b"", 512);
+            let (rc, lens, buf) = profile(1, 42, b"", 8);
+            assert_eq!(rc, -full);
+            assert_eq!(lens, [usize::MAX; 4]);
+            assert!(buf.iter().all(|&b| b == b'Z'));
+        }
+
+        #[test]
+        fn profile_spec_rejects_null_unaligned_and_oversized_pointers() {
+            let mut buf = [0u8; 512];
+            let mut lens = [0usize; 4];
+            unsafe {
+                assert_eq!(
+                    nntmux_profile_rule_spec(
+                        2,
+                        0,
+                        ptr::null(),
+                        0,
+                        lens.as_mut_ptr(),
+                        buf.as_mut_ptr(),
+                        512
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_profile_rule_spec(
+                        2,
+                        0,
+                        b"x".as_ptr(),
+                        usize::MAX,
+                        lens.as_mut_ptr(),
+                        buf.as_mut_ptr(),
+                        512
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_profile_rule_spec(
+                        1,
+                        1,
+                        ptr::null(),
+                        0,
+                        ptr::null_mut(),
+                        buf.as_mut_ptr(),
+                        512
+                    ),
+                    DECLINE
+                );
+                let mut raw = [0u8; 64];
+                let unaligned = raw.as_mut_ptr().add(1).cast::<usize>();
+                assert_eq!(
+                    nntmux_profile_rule_spec(
+                        1,
+                        1,
+                        ptr::null(),
+                        0,
+                        unaligned,
+                        buf.as_mut_ptr(),
+                        512
+                    ),
+                    DECLINE
+                );
+                assert_eq!(raw, [0u8; 64]);
+                assert_eq!(
+                    nntmux_profile_rule_spec(
+                        1,
+                        1,
+                        ptr::null(),
+                        0,
+                        lens.as_mut_ptr(),
+                        ptr::null_mut(),
+                        512
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_profile_rule_spec(
+                        1,
+                        1,
+                        ptr::null(),
+                        0,
+                        lens.as_mut_ptr(),
+                        buf.as_mut_ptr(),
+                        usize::MAX
+                    ),
+                    DECLINE
+                );
+            }
+        }
+
+        #[test]
+        fn theme_spec_round_trips() {
+            let mut lens = [0usize; THEME_SPEC_FIELDS];
+            let mut buf = [0u8; 256];
+            let rc =
+                unsafe { nntmux_theme_rule_spec(lens.as_mut_ptr(), buf.as_mut_ptr(), buf.len()) };
+            assert_eq!(
+                rc as usize,
+                THEME_PREFERENCE_RULE.len() + COLOR_SCHEME_RULE.len()
+            );
+            let fields = split_fields(&buf, &lens);
+            assert_eq!(fields, [THEME_PREFERENCE_RULE, COLOR_SCHEME_RULE]);
+
+            let mut small = [b'Z'; 4];
+            let mut untouched = [7usize; 2];
+            assert_eq!(
+                unsafe {
+                    nntmux_theme_rule_spec(untouched.as_mut_ptr(), small.as_mut_ptr(), small.len())
+                },
+                -rc
+            );
+            assert_eq!(small, [b'Z'; 4]);
+            assert_eq!(untouched, [7usize; 2]);
+            assert_eq!(
+                unsafe { nntmux_theme_rule_spec(ptr::null_mut(), buf.as_mut_ptr(), buf.len()) },
+                DECLINE
+            );
+        }
+
+        #[test]
+        fn promotion_rules_round_trip() {
+            let mut count = 0usize;
+            let mut buf = [0u8; 512];
+            let rc =
+                unsafe { nntmux_admin_promotion_rules(&mut count, buf.as_mut_ptr(), buf.len()) };
+            assert!(rc > 0);
+            assert_eq!(count, PROMOTION_RULES.len());
+            let parts: Vec<&[u8]> = buf[..rc as usize].split(|&b| b == 0).collect();
+            assert_eq!(parts.len(), PROMOTION_RULES.len() * 2);
+            assert_eq!(parts[0], b"name");
+            assert_eq!(parts[13], b"nullable|date|after_or_equal:start_date");
+
+            let mut small_count = 99usize;
+            let mut small = [b'Z'; 8];
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_promotion_rules(&mut small_count, small.as_mut_ptr(), small.len())
+                },
+                -rc
+            );
+            assert_eq!(small_count, 99);
+            assert_eq!(small, [b'Z'; 8]);
+        }
+
+        #[test]
+        fn incident_spec_sanitizes_and_counts() {
+            let impact = b"  none \0minor\0minor \0\0major";
+            let status = b"resolved\r\n";
+            let mut meta = [0usize; INCIDENT_META_FIELDS];
+            let mut buf = [0u8; 256];
+            let rc = unsafe {
+                nntmux_update_incident_rule_spec(
+                    impact.as_ptr(),
+                    impact.len(),
+                    5,
+                    status.as_ptr(),
+                    status.len(),
+                    1,
+                    meta.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..rc as usize], b"none\0minor\0major\0resolved");
+            assert_eq!(meta, [3, 1, 255, 1]);
+
+            // Count mismatch and empty-with-count are rejected.
+            let rc = unsafe {
+                nntmux_update_incident_rule_spec(
+                    impact.as_ptr(),
+                    impact.len(),
+                    4,
+                    status.as_ptr(),
+                    status.len(),
+                    1,
+                    meta.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(rc, DECLINE);
+            let rc = unsafe {
+                nntmux_update_incident_rule_spec(
+                    b"".as_ptr(),
+                    0,
+                    0,
+                    b"".as_ptr(),
+                    0,
+                    0,
+                    meta.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(rc, 0);
+            assert_eq!(meta, [0, 0, 255, 1]);
+        }
+
+        #[test]
+        fn service_health_values_and_capacity() {
+            let status = b"operational\0degraded\0 degraded";
+            let mut count = 0usize;
+            let mut buf = [0u8; 64];
+            let rc = unsafe {
+                nntmux_service_health_status_values(
+                    status.as_ptr(),
+                    status.len(),
+                    3,
+                    &mut count,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..rc as usize], b"operational\0degraded");
+            assert_eq!(count, 2);
+
+            let mut small = [b'Z'; 4];
+            let mut small_count = 9usize;
+            assert_eq!(
+                unsafe {
+                    nntmux_service_health_status_values(
+                        status.as_ptr(),
+                        status.len(),
+                        3,
+                        &mut small_count,
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -rc
+            );
+            assert_eq!((small, small_count), ([b'Z'; 4], 9));
+            assert_eq!(
+                unsafe {
+                    nntmux_service_health_status_values(
+                        ptr::null(),
+                        0,
+                        0,
+                        &mut count,
+                        buf.as_mut_ptr(),
+                        64,
+                    )
+                },
+                DECLINE
+            );
+        }
+
+        #[test]
+        fn one_byte_requirement_never_collides_with_decline() {
+            assert_eq!(required(1), -2);
+            assert_eq!(required(0), -2);
+            assert_eq!(required(9), -9);
+            assert_eq!(php_trim(b"\0 \x0Bx y\t"), b"x y");
+            assert_eq!(php_trim(b" \t"), b"");
+        }
+    }
+}
