@@ -13469,3 +13469,1249 @@ mod anilist_igdb_tv_metadata {
     }
 }
 
+// ============================================================================
+// Wave 13: GamesService, AnidbService, TmdbClient & FanartTvService FFI
+// ============================================================================
+
+pub mod games_anidb_tmdb_fanart {
+    use super::{
+        ANIME_SCRATCH, OutCursor, PhpKey, PhpNode, PhpSerParser, PhpVal, anime_clean_title_in_place,
+        anime_extract_title_into, anime_fix_encoding, games_clean_release_name,
+        games_normalize_for_match, is_ascii_word, is_title_trim_byte, match_games_edition_phrase,
+        match_games_release_or_update_tags, php_byte_levenshtein,
+    };
+    use crate::predb::similarity_percent;
+    use std::slice;
+    use std::str;
+
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 4 << 20;
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT {
+            return None;
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    unsafe fn emit_slice(out: *mut u8, cap: usize, data: &[u8]) -> isize {
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        cursor.extend(data);
+        cursor.finish()
+    }
+
+    #[inline]
+    fn is_pcre_c_space(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C)
+    }
+
+    #[inline]
+    fn is_php_trim_byte(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B)
+    }
+
+    #[inline]
+    fn php_trim_bytes(s: &[u8]) -> &[u8] {
+        let mut start = 0;
+        let mut end = s.len();
+        while start < end && is_php_trim_byte(s[start]) {
+            start += 1;
+        }
+        while end > start && is_php_trim_byte(s[end - 1]) {
+            end -= 1;
+        }
+        &s[start..end]
+    }
+
+    #[inline]
+    fn trim_title_bytes(s: &[u8]) -> &[u8] {
+        let mut start = 0;
+        let mut end = s.len();
+        while start < end && is_title_trim_byte(s[start]) {
+            start += 1;
+        }
+        while end > start && is_title_trim_byte(s[end - 1]) {
+            end -= 1;
+        }
+        &s[start..end]
+    }
+
+    #[inline]
+    fn collapse_pcre_multi_spaces(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if is_pcre_c_space(bytes[i]) {
+                let mut end = i + 1;
+                while end < bytes.len() && is_pcre_c_space(bytes[end]) {
+                    end += 1;
+                }
+                if end - i >= 2 {
+                    out.push(b' ');
+                } else {
+                    out.push(bytes[i]);
+                }
+                i = end;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    #[inline]
+    fn replace_rf_bytes(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i..].starts_with(b" RF ") {
+                out.push(b' ');
+                i += 4;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    // ---- 1. GamesService helpers --------------------------------------------
+
+    pub fn games_clean_spaces_bytes(input: &[u8]) -> Vec<u8> {
+        // 1) str_replace('%20', ' ', $title) + 2) preg_replace('/[._+]+/', ' ', $clean)
+        let mut step1 = Vec::with_capacity(input.len());
+        let mut i = 0;
+        let mut in_sep = false;
+        while i < input.len() {
+            if input[i..].starts_with(b"%20") {
+                step1.push(b' ');
+                in_sep = false;
+                i += 3;
+            } else if matches!(input[i], b'.' | b'_' | b'+') {
+                if !in_sep {
+                    step1.push(b' ');
+                    in_sep = true;
+                }
+                i += 1;
+            } else {
+                step1.push(input[i]);
+                in_sep = false;
+                i += 1;
+            }
+        }
+
+        // 3) preg_replace('/\s{2,}/', ' ', $clean)
+        let step2 = collapse_pcre_multi_spaces(&step1);
+        // 4) trim($clean, " \t\n\r\0\x0B-_")
+        let step3 = trim_title_bytes(&step2);
+        // 5) str_replace(' RF ', ' ', $clean)
+        let step4 = replace_rf_bytes(step3);
+        // 6) preg_replace('/\s{2,}/', ' ', $clean) + trim($clean, " \t\n\r\0\x0B-_")
+        let step5 = collapse_pcre_multi_spaces(&step4);
+        trim_title_bytes(&step5).to_vec()
+    }
+
+    fn strip_multi_token(input: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(input.len());
+        let mut i = 0;
+        while i < input.len() {
+            if is_pcre_c_space(input[i])
+                && i + 6 < input.len()
+                && input[i + 1..i + 6].eq_ignore_ascii_case(b"multi")
+            {
+                let mut end = i + 6;
+                if end < input.len() && input[end].is_ascii_digit() {
+                    end += 1;
+                }
+                if end < input.len() && is_pcre_c_space(input[end]) {
+                    i = end + 1;
+                    continue;
+                }
+            }
+            out.push(input[i]);
+            i += 1;
+        }
+        out
+    }
+
+    fn games_fallback_parse_bytes(release_name: &[u8]) -> Vec<u8> {
+        let cleaned = strip_multi_token(release_name);
+        let allowed = |b: &u8| is_ascii_word(*b) || is_pcre_c_space(*b) || *b == b'.';
+        let Some(start) = cleaned.iter().position(allowed) else {
+            return Vec::new();
+        };
+        let end = start + cleaned[start..].iter().take_while(|b| allowed(b)).count();
+        let title: Vec<u8> = cleaned[start..end]
+            .iter()
+            .map(|&b| if matches!(b, b'.' | b'_') { b' ' } else { b })
+            .collect();
+        let mut rf = replace_rf_bytes(&title);
+        let suffix_end = rf.len() - usize::from(rf.last() == Some(&b'\n'));
+        for lang in [
+            b"brazilian".as_slice(),
+            b"chinese",
+            b"croatian",
+            b"danish",
+            b"deutsch",
+            b"dutch",
+            b"english",
+            b"estonian",
+            b"flemish",
+            b"finnish",
+            b"french",
+            b"german",
+            b"greek",
+            b"hebrew",
+            b"icelandic",
+            b"italian",
+            b"latin",
+            b"nordic",
+            b"norwegian",
+            b"polish",
+            b"portuguese",
+            b"japenese",
+            b"japanese",
+            b"russian",
+            b"serbian",
+            b"slovenian",
+            b"spanish",
+            b"spanisch",
+            b"swedish",
+            b"thai",
+            b"turkish",
+        ] {
+            if suffix_end >= lang.len()
+                && rf[suffix_end - lang.len()..suffix_end].eq_ignore_ascii_case(lang)
+            {
+                rf.drain(suffix_end - lang.len()..suffix_end);
+                break;
+            }
+        }
+        let collapsed = collapse_pcre_multi_spaces(&rf);
+        let trimmed = php_trim_bytes(&collapsed);
+        if trimmed == b"0" {
+            Vec::new()
+        } else {
+            trimmed.to_vec()
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_games_service_clean_game_reg(
+        ptr: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(bytes) = (unsafe { input(ptr, len) }) else {
+            return DECLINE;
+        };
+        if !bytes.is_ascii()
+            || bytes
+                .iter()
+                .any(|&b| matches!(b, 0 | b'\n' | b'\r' | 0x0B))
+        {
+            return DECLINE;
+        }
+        let Ok(s) = str::from_utf8(bytes) else {
+            return DECLINE;
+        };
+        let Some(cleaned) = games_clean_release_name(s) else {
+            return DECLINE;
+        };
+        unsafe { emit_slice(out, cap, cleaned.as_bytes()) }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_games_service_parse_title(
+        ptr: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(bytes) = (unsafe { input(ptr, len) }) else {
+            return DECLINE;
+        };
+        if !bytes.is_ascii()
+            || bytes
+                .iter()
+                .any(|&b| matches!(b, 0 | b'\n' | b'\r' | 0x0B))
+        {
+            return DECLINE;
+        }
+        let Ok(s) = str::from_utf8(bytes) else {
+            return DECLINE;
+        };
+        let Some(cleaned) = games_clean_release_name(s) else {
+            return DECLINE;
+        };
+        if !cleaned.is_empty() {
+            let mut cursor = unsafe { OutCursor::new(out, cap) };
+            cursor.push(b'1');
+            cursor.extend(cleaned.as_bytes());
+            return cursor.finish();
+        }
+        let fb = games_fallback_parse_bytes(bytes);
+        if fb.is_empty() {
+            return 0;
+        }
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        cursor.push(b'2');
+        cursor.extend(&fb);
+        cursor.finish()
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_games_clean_spaces(
+        ptr: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(bytes) = (unsafe { input(ptr, len) }) else {
+            return DECLINE;
+        };
+        let cleaned = games_clean_spaces_bytes(bytes);
+        unsafe { emit_slice(out, cap, &cleaned) }
+    }
+
+    pub fn games_clean_search_title_str(input_str: &str) -> Option<String> {
+        if !input_str.is_ascii()
+            || input_str
+                .as_bytes()
+                .iter()
+                .any(|&b| matches!(b, 0 | b'\n' | b'\r' | 0x0B))
+        {
+            return None;
+        }
+        let mut name = if input_str.contains("%20") {
+            input_str.replace("%20", " ")
+        } else {
+            input_str.to_owned()
+        };
+
+        // Remove `\[[^\]]{1,80}\]|\([^)]{1,80}\)` -> ' '
+        if name.as_bytes().iter().any(|&b| matches!(b, b'[' | b'(')) {
+            let nb = name.as_bytes();
+            let len = nb.len();
+            let mut next_name = String::with_capacity(len);
+            let mut pos = 0;
+            while pos < len {
+                let close = match nb[pos] {
+                    b'[' => Some(b']'),
+                    b'(' => Some(b')'),
+                    _ => None,
+                };
+                if let Some(cb) = close
+                    && let Some(rel) = nb[pos + 1..].iter().position(|&x| x == cb)
+                    && (1..=80).contains(&rel)
+                {
+                    next_name.push(' ');
+                    pos += 1 + rel + 1;
+                    continue;
+                }
+                next_name.push(nb[pos] as char);
+                pos += 1;
+            }
+            name = next_name;
+        }
+
+        // Remove edition phrases & release/update tags at word boundaries
+        super::replace_ascii_wb_in_place(&mut name, |bytes, pos| {
+            match_games_edition_phrase(bytes, pos)
+                .or_else(|| match_games_release_or_update_tags(bytes, pos))
+        });
+
+        let mut cleaned = games_clean_spaces_bytes(name.as_bytes());
+        cleaned.make_ascii_lowercase();
+        String::from_utf8(cleaned).ok()
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_games_clean_search_title(
+        ptr: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(bytes) = (unsafe { input(ptr, len) }) else {
+            return DECLINE;
+        };
+        let Ok(s) = str::from_utf8(bytes) else {
+            return DECLINE;
+        };
+        let Some(cleaned) = games_clean_search_title_str(s) else {
+            return DECLINE;
+        };
+        unsafe { emit_slice(out, cap, cleaned.as_bytes()) }
+    }
+
+    pub fn extract_year_from_bytes(bytes: &[u8]) -> Option<i32> {
+        if bytes.len() < 4 {
+            return None;
+        }
+        let max_start = bytes.len() - 4;
+        for pos in 0..=max_start {
+            if pos > 0 && is_ascii_word(bytes[pos - 1]) {
+                continue;
+            }
+            if !matches!(&bytes[pos..pos + 2], b"19" | b"20") {
+                continue;
+            }
+            if !bytes[pos + 2].is_ascii_digit() || !bytes[pos + 3].is_ascii_digit() {
+                continue;
+            }
+            if pos + 4 < bytes.len() && is_ascii_word(bytes[pos + 4]) {
+                continue;
+            }
+            let year = i32::from(bytes[pos] - b'0') * 1000
+                + i32::from(bytes[pos + 1] - b'0') * 100
+                + i32::from(bytes[pos + 2] - b'0') * 10
+                + i32::from(bytes[pos + 3] - b'0');
+            return Some(year);
+        }
+        None
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_games_extract_year(ptr: *const u8, len: usize) -> i32 {
+        let Some(bytes) = (unsafe { input(ptr, len) }) else {
+            return -1;
+        };
+        extract_year_from_bytes(bytes).unwrap_or(0)
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_games_match_release_year(
+        rel_ptr: *const u8,
+        rel_len: usize,
+        cand_ptr: *const u8,
+        cand_len: usize,
+    ) -> i32 {
+        let (Some(rel_bytes), Some(cand_bytes)) = (
+            unsafe { input(rel_ptr, rel_len) },
+            unsafe { input(cand_ptr, cand_len) },
+        ) else {
+            return -1;
+        };
+        let Some(cand_year) = extract_year_from_bytes(cand_bytes) else {
+            return 1;
+        };
+        let Some(rel_year) = extract_year_from_bytes(rel_bytes) else {
+            return 1;
+        };
+        i32::from(rel_year == cand_year)
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_games_service_normalize_for_match(
+        ptr: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(bytes) = (unsafe { input(ptr, len) }) else {
+            return DECLINE;
+        };
+        if bytes.iter().any(|&b| matches!(b, 0 | b'\n' | b'\r' | 0x0B)) {
+            return DECLINE;
+        }
+        let Ok(s) = str::from_utf8(bytes) else {
+            return DECLINE;
+        };
+        let Some(norm) = games_normalize_for_match(s) else {
+            return DECLINE;
+        };
+        unsafe { emit_slice(out, cap, norm.as_bytes()) }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_games_levenshtein_percent(
+        a_ptr: *const u8,
+        a_len: usize,
+        b_ptr: *const u8,
+        b_len: usize,
+    ) -> f64 {
+        let (Some(a), Some(b)) = (
+            unsafe { input(a_ptr, a_len) },
+            unsafe { input(b_ptr, b_len) },
+        ) else {
+            return -1.0;
+        };
+        if a == b {
+            return 100.0;
+        }
+        let max_len = a.len().max(b.len());
+        if max_len == 0 {
+            return 100.0;
+        }
+        let dist = php_byte_levenshtein(a, b);
+        (1.0 - (dist as f64 / max_len as f64)) * 100.0
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_games_compute_title_similarity(
+        a_ptr: *const u8,
+        a_len: usize,
+        b_ptr: *const u8,
+        b_len: usize,
+    ) -> f64 {
+        let (Some(a), Some(b)) = (
+            unsafe { input(a_ptr, a_len) },
+            unsafe { input(b_ptr, b_len) },
+        ) else {
+            return -1.0;
+        };
+        if a == b {
+            return 100.0;
+        }
+        let max_len = a.len().max(b.len());
+        let lev = (1.0 - (php_byte_levenshtein(a, b) as f64 / max_len as f64)) * 100.0;
+        similarity_percent(a, b).max(lev)
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_games_detect_genre_key(
+        genre_ptr: *const u8,
+        genre_len: usize,
+        ser_ptr: *const u8,
+        ser_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let (Some(genre_bytes), Some(ser_bytes)) = (
+            unsafe { input(genre_ptr, genre_len) },
+            unsafe { input(ser_ptr, ser_len) },
+        ) else {
+            return DECLINE;
+        };
+        let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+            return DECLINE;
+        };
+        let PhpVal::Arr(items) = &doc.val else {
+            return DECLINE;
+        };
+        let target = php_trim_bytes(genre_bytes);
+        if target.is_empty() {
+            return 0;
+        }
+        for (key, node) in items {
+            if let PhpVal::Str(val_str) = node.val
+                && php_trim_bytes(val_str).eq_ignore_ascii_case(target)
+            {
+                let mut cursor = unsafe { OutCursor::new(out, cap) };
+                match key {
+                    PhpKey::Int(i) => {
+                        cursor.extend(b"i:");
+                        cursor.extend(i.to_string().as_bytes());
+                    }
+                    PhpKey::Str(k) => {
+                        cursor.extend(b"s:");
+                        cursor.extend(k);
+                    }
+                }
+                return cursor.finish();
+            }
+        }
+        0
+    }
+
+    // ---- 2. AnidbService helpers --------------------------------------------
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_anidb_clean_title(
+        ptr: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(bytes) = (unsafe { input(ptr, len) }) else {
+            return DECLINE;
+        };
+        if bytes.iter().any(|&b| matches!(b, 0 | b'\n' | b'\r' | 0x0B)) {
+            return DECLINE;
+        }
+        let Ok(s) = str::from_utf8(bytes) else {
+            return DECLINE;
+        };
+        let Some(fixed) = anime_fix_encoding(s) else {
+            return DECLINE;
+        };
+        if fixed.as_bytes().contains(&b'\n') {
+            return DECLINE;
+        }
+        ANIME_SCRATCH.with(|cell| {
+            let (buf, tmp) = &mut *cell.borrow_mut();
+            buf.clear();
+            buf.extend_from_slice(fixed.as_bytes());
+            anime_clean_title_in_place(buf, tmp);
+            unsafe { emit_slice(out, cap, buf) }
+        })
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_anidb_extract_base_title(
+        ptr: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(bytes) = (unsafe { input(ptr, len) }) else {
+            return DECLINE;
+        };
+        if bytes.iter().any(|&b| matches!(b, 0 | b'\n' | b'\r' | 0x0B)) {
+            return DECLINE;
+        }
+        let Ok(s) = str::from_utf8(bytes) else {
+            return DECLINE;
+        };
+        ANIME_SCRATCH.with(|cell| {
+            let (buf, tmp) = &mut *cell.borrow_mut();
+            if !anime_extract_title_into(s, buf, tmp) {
+                return DECLINE;
+            }
+            unsafe { emit_slice(out, cap, buf) }
+        })
+    }
+
+    // ---- 3. TmdbClient helpers ----------------------------------------------
+
+    fn parse_canonical_php_int_key(key: &[u8]) -> Option<i64> {
+        if key == b"0" {
+            return Some(0);
+        }
+        let (neg, digits) = if let Some(rest) = key.strip_prefix(b"-") {
+            (true, rest)
+        } else {
+            (false, key)
+        };
+        if digits.is_empty()
+            || ! matches!(digits[0], b'1'..=b'9')
+            || !digits.iter().all(u8::is_ascii_digit)
+        {
+            return None;
+        }
+        let s = str::from_utf8(key).ok()?;
+        s.parse::<i64>().ok().filter(|_| !neg || s != "-0")
+    }
+
+    #[inline]
+    fn tmdb_get_key<'a>(doc: &'a PhpNode<'a>, key: &[u8]) -> Option<&'a PhpNode<'a>> {
+        if let Some(int_key) = parse_canonical_php_int_key(key) {
+            doc.get_int_key(int_key)
+        } else {
+            doc.get(key)
+        }
+    }
+
+    #[inline]
+    fn is_strict_ascii_numeric_str(s: &[u8]) -> Option<bool> {
+        if !s.iter().any(u8::is_ascii_digit) {
+            return Some(false);
+        }
+        let mut p = 0;
+        while p < s.len() && is_pcre_c_space(s[p]) {
+            p += 1;
+        }
+        if matches!(s.get(p), Some(b'+' | b'-')) {
+            p += 1;
+        }
+        let rest = &s[p..];
+        if rest.is_empty() {
+            return Some(false);
+        }
+        if rest.iter().all(u8::is_ascii_digit) {
+            return Some(true);
+        }
+        // Float or scientific notation string: let PHP decide `is_numeric`
+        None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tmdb_get_string(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        key_ptr: *const u8,
+        key_len: usize,
+        def_ptr: *const u8,
+        def_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let (Some(ser_bytes), Some(key_bytes), Some(def_bytes)) = (
+            unsafe { input(ser_ptr, ser_len) },
+            unsafe { input(key_ptr, key_len) },
+            unsafe { input(def_ptr, def_len) },
+        ) else {
+            return DECLINE;
+        };
+        let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+            return DECLINE;
+        };
+        if !doc.is_arr() {
+            return DECLINE;
+        }
+        let Some(node) = tmdb_get_key(&doc, key_bytes) else {
+            return unsafe { emit_slice(out, cap, def_bytes) };
+        };
+        match &node.val {
+            PhpVal::Str(s) => unsafe { emit_slice(out, cap, s) },
+            _ => unsafe { emit_slice(out, cap, def_bytes) },
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tmdb_get_int(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        key_ptr: *const u8,
+        key_len: usize,
+        default_val: i64,
+        out_val: *mut i64,
+    ) -> i32 {
+        if out_val.is_null() {
+            return -1;
+        }
+        let (Some(ser_bytes), Some(key_bytes)) = (
+            unsafe { input(ser_ptr, ser_len) },
+            unsafe { input(key_ptr, key_len) },
+        ) else {
+            return -1;
+        };
+        let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+            return -1;
+        };
+        if !doc.is_arr() {
+            return -1;
+        }
+        let Some(node) = tmdb_get_key(&doc, key_bytes) else {
+            unsafe { *out_val = default_val };
+            return 1;
+        };
+        match &node.val {
+            PhpVal::Null | PhpVal::Bool(_) | PhpVal::Arr(_) => {
+                unsafe { *out_val = default_val };
+                1
+            }
+            PhpVal::Int(i) => {
+                unsafe { *out_val = *i };
+                1
+            }
+            PhpVal::Str(s) => match is_strict_ascii_numeric_str(s) {
+                Some(false) => {
+                    unsafe { *out_val = default_val };
+                    1
+                }
+                Some(true) => {
+                    let trimmed = str::from_utf8(php_trim_bytes(s)).ok();
+                    if let Some(Ok(v)) = trimmed.map(|t| t.trim_start_matches('+').parse::<i64>()) {
+                        unsafe { *out_val = v };
+                        1
+                    } else {
+                        -1
+                    }
+                }
+                None => -1,
+            },
+            PhpVal::Float => -1,
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tmdb_get_float(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        key_ptr: *const u8,
+        key_len: usize,
+        default_val: f64,
+        out_val: *mut f64,
+    ) -> i32 {
+        if out_val.is_null() {
+            return -1;
+        }
+        let (Some(ser_bytes), Some(key_bytes)) = (
+            unsafe { input(ser_ptr, ser_len) },
+            unsafe { input(key_ptr, key_len) },
+        ) else {
+            return -1;
+        };
+        let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+            return -1;
+        };
+        if !doc.is_arr() {
+            return -1;
+        }
+        let Some(node) = tmdb_get_key(&doc, key_bytes) else {
+            unsafe { *out_val = default_val };
+            return 1;
+        };
+        match &node.val {
+            PhpVal::Null | PhpVal::Bool(_) | PhpVal::Arr(_) => {
+                unsafe { *out_val = default_val };
+                1
+            }
+            PhpVal::Int(i) => {
+                unsafe { *out_val = *i as f64 };
+                1
+            }
+            PhpVal::Float => {
+                if node.raw.len() < 4 {
+                    return -1;
+                }
+                let raw_num = &node.raw[2..node.raw.len() - 1];
+                if let Ok(s) = str::from_utf8(raw_num)
+                    && let Ok(v) = s.parse::<f64>()
+                    && v.is_finite()
+                {
+                    unsafe { *out_val = v };
+                    1
+                } else {
+                    -1
+                }
+            }
+            PhpVal::Str(s) => {
+                if !s.iter().any(u8::is_ascii_digit) {
+                    unsafe { *out_val = default_val };
+                    return 1;
+                }
+                let trimmed = php_trim_bytes(s);
+                if trimmed
+                    .iter()
+                    .all(|&b| b.is_ascii_digit() || matches!(b, b'.' | b'+' | b'-'))
+                    && let Ok(ts) = str::from_utf8(trimmed)
+                    && let Ok(v) = ts.parse::<f64>()
+                    && v.is_finite()
+                {
+                    unsafe { *out_val = v };
+                    1
+                } else {
+                    -1
+                }
+            }
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tmdb_get_bool(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        key_ptr: *const u8,
+        key_len: usize,
+        default_val: u32,
+    ) -> i32 {
+        let (Some(ser_bytes), Some(key_bytes)) = (
+            unsafe { input(ser_ptr, ser_len) },
+            unsafe { input(key_ptr, key_len) },
+        ) else {
+            return -1;
+        };
+        let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+            return -1;
+        };
+        if !doc.is_arr() {
+            return -1;
+        }
+        let def = i32::from(default_val != 0);
+        let Some(node) = tmdb_get_key(&doc, key_bytes) else {
+            return def;
+        };
+        match &node.val {
+            PhpVal::Null | PhpVal::Arr(_) => def,
+            PhpVal::Bool(b) => i32::from(*b),
+            PhpVal::Int(i) => i32::from(*i != 0),
+            PhpVal::Str(s) => {
+                let t = php_trim_bytes(s);
+                if t.eq_ignore_ascii_case(b"1")
+                    || t.eq_ignore_ascii_case(b"true")
+                    || t.eq_ignore_ascii_case(b"yes")
+                    || t.eq_ignore_ascii_case(b"on")
+                {
+                    1
+                } else if t.is_empty()
+                    || t.eq_ignore_ascii_case(b"0")
+                    || t.eq_ignore_ascii_case(b"false")
+                    || t.eq_ignore_ascii_case(b"no")
+                    || t.eq_ignore_ascii_case(b"off")
+                {
+                    0
+                } else {
+                    def
+                }
+            }
+            PhpVal::Float => -1,
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tmdb_get_array(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        key_ptr: *const u8,
+        key_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let (Some(ser_bytes), Some(key_bytes)) = (
+            unsafe { input(ser_ptr, ser_len) },
+            unsafe { input(key_ptr, key_len) },
+        ) else {
+            return DECLINE;
+        };
+        let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+            return DECLINE;
+        };
+        if !doc.is_arr() {
+            return DECLINE;
+        }
+        let Some(node) = tmdb_get_key(&doc, key_bytes) else {
+            return 0;
+        };
+        if !node.is_arr() {
+            return 0;
+        }
+        if node.has_float {
+            return DECLINE;
+        }
+        unsafe { emit_slice(out, cap, node.raw) }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tmdb_get_image_url(
+        path_ptr: *const u8,
+        path_len: usize,
+        size_ptr: *const u8,
+        size_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let (Some(path_bytes), Some(size_bytes)) = (
+            unsafe { input(path_ptr, path_len) },
+            unsafe { input(size_ptr, size_len) },
+        ) else {
+            return DECLINE;
+        };
+        if path_bytes.is_empty() || path_bytes == b"0" {
+            return 0;
+        }
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        cursor.extend(b"https://image.tmdb.org/t/p/");
+        cursor.extend(size_bytes);
+        cursor.extend(path_bytes);
+        cursor.finish()
+    }
+
+    // ---- 4. FanartTvService helpers -----------------------------------------
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_fanart_normalize_imdb_id(
+        ptr: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(bytes) = (unsafe { input(ptr, len) }) else {
+            return DECLINE;
+        };
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        if bytes.len() >= 2 && bytes[..2].eq_ignore_ascii_case(b"tt") {
+            cursor.extend(bytes);
+        } else {
+            cursor.extend(b"tt");
+            cursor.extend(bytes);
+        }
+        cursor.finish()
+    }
+
+    #[inline]
+    fn extract_first_non_empty_url<'a>(
+        doc: &'a PhpNode<'a>,
+        section: &[u8],
+    ) -> Option<Option<&'a [u8]>> {
+        let Some(sec_node) = doc.get(section) else {
+            return Some(None);
+        };
+        match &sec_node.val {
+            PhpVal::Null | PhpVal::Bool(false) => Some(None),
+            PhpVal::Arr(_) => {
+                let Some(first) = sec_node.get_int_key(0) else {
+                    return Some(None);
+                };
+                match &first.val {
+                    PhpVal::Null | PhpVal::Bool(false) => Some(None),
+                    PhpVal::Arr(_) => {
+                        let Some(url_node) = first.get(b"url") else {
+                            return Some(None);
+                        };
+                        match &url_node.val {
+                            PhpVal::Null | PhpVal::Bool(false) => Some(None),
+                            PhpVal::Str(s) => {
+                                if s.is_empty() || *s == b"0" || s.contains(&0) {
+                                    if s.contains(&0) {
+                                        None
+                                    } else {
+                                        Some(None)
+                                    }
+                                } else {
+                                    Some(Some(s))
+                                }
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_fanart_parse_movie_properties(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        imdb_ptr: *const u8,
+        imdb_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let (Some(ser_bytes), Some(imdb_bytes)) = (
+            unsafe { input(ser_ptr, ser_len) },
+            unsafe { input(imdb_ptr, imdb_len) },
+        ) else {
+            return DECLINE;
+        };
+        if imdb_bytes.contains(&0) {
+            return DECLINE;
+        }
+        let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+            return DECLINE;
+        };
+        if !doc.is_arr() {
+            return DECLINE;
+        }
+        let Some(bg1) = extract_first_non_empty_url(&doc, b"moviebackground") else {
+            return DECLINE;
+        };
+        let backdrop = if let Some(u) = bg1 {
+            Some(u)
+        } else {
+            let Some(bg2) = extract_first_non_empty_url(&doc, b"moviethumb") else {
+                return DECLINE;
+            };
+            bg2
+        };
+        let Some(cover) = extract_first_non_empty_url(&doc, b"movieposter") else {
+            return DECLINE;
+        };
+        let Some(banner) = extract_first_non_empty_url(&doc, b"moviebanner") else {
+            return DECLINE;
+        };
+
+        let (Some(backdrop_url), Some(cover_url)) = (backdrop, cover) else {
+            return 0;
+        };
+
+        let title_bytes: &[u8] = match doc.coalesce(b"name") {
+            None => imdb_bytes,
+            Some(n) => {
+                let Some(s) = n.as_str() else {
+                    return DECLINE;
+                };
+                if s.contains(&0) {
+                    return DECLINE;
+                }
+                s
+            }
+        };
+
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        cursor.extend(backdrop_url);
+        cursor.push(0);
+        cursor.extend(cover_url);
+        cursor.push(0);
+        if let Some(banner_url) = banner {
+            cursor.extend(b"1\0");
+            cursor.extend(banner_url);
+            cursor.push(0);
+        } else {
+            cursor.extend(b"0\0\0");
+        }
+        cursor.extend(title_bytes);
+        cursor.push(0);
+        cursor.finish()
+    }
+
+    fn php_likes_to_i64(node: Option<&PhpNode<'_>>) -> Option<i64> {
+        match node.map(|n| &n.val) {
+            None | Some(PhpVal::Null | PhpVal::Bool(false)) => Some(0),
+            Some(PhpVal::Bool(true)) => Some(1),
+            Some(PhpVal::Int(i)) => Some(*i),
+            Some(PhpVal::Str(s)) => {
+                let mut p = 0;
+                while p < s.len() && is_pcre_c_space(s[p]) {
+                    p += 1;
+                }
+                let mut neg = false;
+                if let Some(&sign @ (b'+' | b'-')) = s.get(p) {
+                    neg = sign == b'-';
+                    p += 1;
+                }
+                let start = p;
+                while p < s.len() && s[p].is_ascii_digit() {
+                    p += 1;
+                }
+                if p == start {
+                    return Some(0);
+                }
+                let digits = &s[start..p];
+                let nz = digits
+                    .iter()
+                    .position(|&b| b != b'0')
+                    .unwrap_or(digits.len());
+                let sig = &digits[nz..];
+                if sig.is_empty() {
+                    return Some(0);
+                }
+                if sig.len() > 18 {
+                    return None;
+                }
+                let mut val: i64 = 0;
+                for &b in sig {
+                    val = val * 10 + i64::from(b - b'0');
+                }
+                Some(if neg { -val } else { val })
+            }
+            Some(PhpVal::Arr(_) | PhpVal::Float) => None,
+        }
+    }
+
+    fn select_best_poster_from_node<'a>(node: &'a PhpNode<'a>) -> Option<Option<&'a [u8]>> {
+        let PhpVal::Arr(items) = &node.val else {
+            return None;
+        };
+        if items.is_empty() {
+            return Some(None);
+        }
+        let mut best_likes = i64::MIN;
+        let mut best_item: Option<&'a PhpNode<'a>> = None;
+        for (_, item) in items {
+            if !item.is_arr() {
+                return None;
+            }
+            let likes = php_likes_to_i64(item.coalesce(b"likes"))?;
+            if best_item.is_none() || likes > best_likes {
+                best_likes = likes;
+                best_item = Some(item);
+            }
+        }
+        let winner = best_item?;
+        match winner.coalesce(b"url") {
+            None => Some(None),
+            Some(url_node) => match &url_node.val {
+                PhpVal::Str(s) => Some(Some(s)),
+                _ => None,
+            },
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_fanart_select_best_poster(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(ser_bytes) = (unsafe { input(ser_ptr, ser_len) }) else {
+            return DECLINE;
+        };
+        let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+            return DECLINE;
+        };
+        let Some(best_opt) = select_best_poster_from_node(&doc) else {
+            return DECLINE;
+        };
+        let Some(url_bytes) = best_opt else {
+            return 0;
+        };
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        cursor.push(b'1');
+        cursor.extend(url_bytes);
+        cursor.finish()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn games_service_clean_and_parse_and_year() {
+            let mut buf = [0u8; 256];
+            let rel = b"Cyberpunk.2077.v2.1.Ultimate.Edition-CODEX.iso";
+            let n = unsafe {
+                nntmux_games_service_clean_game_reg(rel.as_ptr(), rel.len(), buf.as_mut_ptr(), 256)
+            };
+            assert_eq!(&buf[..n as usize], b"Cyberpunk 2077");
+
+            let p = unsafe {
+                nntmux_games_service_parse_title(rel.as_ptr(), rel.len(), buf.as_mut_ptr(), 256)
+            };
+            assert_eq!(&buf[..p as usize], b"1Cyberpunk 2077");
+
+            assert_eq!(
+                unsafe { nntmux_games_extract_year(rel.as_ptr(), rel.len()) },
+                2077
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_games_match_release_year(rel.as_ptr(), rel.len(), b"2077".as_ptr(), 4)
+                },
+                1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_games_match_release_year(rel.as_ptr(), rel.len(), b"2020".as_ptr(), 4)
+                },
+                0
+            );
+        }
+
+        #[test]
+        fn anidb_tmdb_and_fanart_helpers() {
+            let mut buf = [0u8; 256];
+            let anime = b"[SubsPlease] Sousou no Frieren - 12 (1080p) [ABCD1234]";
+            let n = unsafe {
+                nntmux_anidb_extract_base_title(anime.as_ptr(), anime.len(), buf.as_mut_ptr(), 256)
+            };
+            assert_eq!(&buf[..n as usize], b"Sousou no Frieren");
+
+            let u = unsafe {
+                nntmux_tmdb_get_image_url(
+                    b"/abc.jpg".as_ptr(),
+                    8,
+                    b"w500".as_ptr(),
+                    4,
+                    buf.as_mut_ptr(),
+                    256,
+                )
+            };
+            assert_eq!(
+                &buf[..u as usize],
+                b"https://image.tmdb.org/t/p/w500/abc.jpg"
+            );
+
+            let im = unsafe {
+                nntmux_fanart_normalize_imdb_id(b"0111161".as_ptr(), 7, buf.as_mut_ptr(), 256)
+            };
+            assert_eq!(&buf[..im as usize], b"tt0111161");
+        }
+    }
+}
+
+

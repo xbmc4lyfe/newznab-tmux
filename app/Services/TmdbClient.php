@@ -5,10 +5,13 @@ declare(strict_types=1);
 namespace App\Services;
 
 use App\Exceptions\TvProviderException;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\RequestException;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Throwable;
 
 /**
  * Custom TMDB (The Movie Database) API Client
@@ -18,9 +21,45 @@ use Illuminate\Support\Facades\Log;
  */
 class TmdbClient
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_tmdb_get_string(const char *ser_ptr, size_t ser_len, const char *key_ptr, size_t key_len, const char *def_ptr, size_t def_len, char *out, size_t cap);
+        int32_t nntmux_tmdb_get_int(const char *ser_ptr, size_t ser_len, const char *key_ptr, size_t key_len, int64_t default_val, int64_t *out_val);
+        int32_t nntmux_tmdb_get_float(const char *ser_ptr, size_t ser_len, const char *key_ptr, size_t key_len, double default_val, double *out_val);
+        int32_t nntmux_tmdb_get_bool(const char *ser_ptr, size_t ser_len, const char *key_ptr, size_t key_len, uint32_t default_val);
+        ssize_t nntmux_tmdb_get_array(const char *ser_ptr, size_t ser_len, const char *key_ptr, size_t key_len, char *out, size_t cap);
+        ssize_t nntmux_tmdb_get_image_url(const char *path_ptr, size_t path_len, const char *size_ptr, size_t size_len, char *out, size_t cap);
+        C;
+
     protected const BASE_URL = 'https://api.themoviedb.org/3';
 
     protected const IMAGE_BASE_URL = 'https://image.tmdb.org/t/p';
+
+    /** Null selects the benchmark-qualified production default. */
+    private static ?bool $useRustFfi = null;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(?bool $use = true): void
+    {
+        self::$useRustFfi = $use;
+        if ($use === null) {
+            self::$ffi = null;
+        }
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('metadata', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
 
     protected string $apiKey;
 
@@ -80,7 +119,7 @@ class TmdbClient
 
         try {
             $response = Http::timeout($this->timeout)
-                ->retry($this->retryTimes, $this->retryDelay, function (\Throwable $exception, PendingRequest $request, ?string $key = null) {
+                ->retry($this->retryTimes, $this->retryDelay, function (Throwable $exception, PendingRequest $request, ?string $key = null) {
                     // Don't retry on 404 errors - resource simply doesn't exist
                     if ($exception instanceof RequestException) {
                         $status = $exception->response->status();
@@ -122,7 +161,7 @@ class TmdbClient
             return null;
         } catch (TvProviderException $e) {
             throw $e;
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             // Check if this is a 404 wrapped in an exception
             if ($e instanceof RequestException && $e->response->status() === 404) {
                 Log::debug('TMDB: Resource not found', ['endpoint' => $endpoint]);
@@ -150,6 +189,48 @@ class TmdbClient
      * @param  string  $size  The image size (w92, w154, w185, w342, w500, w780, original)
      */
     public function getImageUrl(?string $path, string $size = 'w500'): string
+    {
+        return (self::$useRustFfi ?? false)
+            ? $this->getImageUrlNative($path, $size)
+            : $this->getImageUrlPhp($path, $size);
+    }
+
+    public function getImageUrlNative(?string $path, string $size = 'w500'): string
+    {
+        if ($path === null || $path === '' || $path === '0') {
+            return '';
+        }
+        if (($ffi = self::ffi()) === null) {
+            return $this->getImageUrlPhp($path, $size);
+        }
+        try {
+            $pathLen = strlen($path);
+            $sizeLen = strlen($size);
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, max(256, $pathLen + $sizeLen + 64), $capacity);
+            if ($buffer === null) {
+                return $this->getImageUrlPhp($path, $size);
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tmdb_get_image_url($path, $pathLen, $size, $sizeLen, $buffer, $capacity);
+            if (is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return $this->getImageUrlPhp($path, $size);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_tmdb_get_image_url($path, $pathLen, $size, $sizeLen, $buffer, $capacity);
+            }
+            if (is_int($written) && $written >= 0 && $written <= $capacity) {
+                return $written === 0 ? '' : FFI::string($buffer, $written);
+            }
+        } catch (Throwable) {
+        }
+
+        return $this->getImageUrlPhp($path, $size);
+    }
+
+    public function getImageUrlPhp(?string $path, string $size = 'w500'): string
     {
         if (empty($path)) {
             return '';
@@ -530,6 +611,53 @@ class TmdbClient
      */
     public static function getString(array $data, string $key, string $default = ''): string
     {
+        return (self::$useRustFfi ?? false)
+            ? self::getStringNative($data, $key, $default)
+            : self::getStringPhp($data, $key, $default);
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     */
+    public static function getStringNative(array $data, string $key, string $default = ''): string
+    {
+        if (($ffi = self::ffi()) === null) {
+            return self::getStringPhp($data, $key, $default);
+        }
+        try {
+            $ser = @serialize($data);
+            $serLen = strlen($ser);
+            $keyLen = strlen($key);
+            $defLen = strlen($default);
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, max(256, $serLen + $defLen + 32), $capacity);
+            if ($buffer === null) {
+                return self::getStringPhp($data, $key, $default);
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tmdb_get_string($ser, $serLen, $key, $keyLen, $default, $defLen, $buffer, $capacity);
+            if (is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return self::getStringPhp($data, $key, $default);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_tmdb_get_string($ser, $serLen, $key, $keyLen, $default, $defLen, $buffer, $capacity);
+            }
+            if (is_int($written) && $written >= 0 && $written <= $capacity) {
+                return $written === 0 ? '' : FFI::string($buffer, $written);
+            }
+        } catch (Throwable) {
+        }
+
+        return self::getStringPhp($data, $key, $default);
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     */
+    public static function getStringPhp(array $data, string $key, string $default = ''): string
+    {
         return isset($data[$key]) && is_string($data[$key]) ? $data[$key] : $default;
     }
 
@@ -539,6 +667,41 @@ class TmdbClient
      * @param  array<string, mixed>  $data
      */
     public static function getInt(array $data, string $key, int $default = 0): int
+    {
+        return (self::$useRustFfi ?? false)
+            ? self::getIntNative($data, $key, $default)
+            : self::getIntPhp($data, $key, $default);
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     */
+    public static function getIntNative(array $data, string $key, int $default = 0): int
+    {
+        if (($ffi = self::ffi()) === null) {
+            return self::getIntPhp($data, $key, $default);
+        }
+        try {
+            $ser = @serialize($data);
+            $outVal = $ffi->new('int64_t[1]');
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_tmdb_get_int($ser, strlen($ser), $key, strlen($key), $default, FFI::addr($outVal[0]));
+            if ($status === 1) {
+                /** @var int $val */
+                $val = $outVal[0];
+
+                return $val;
+            }
+        } catch (Throwable) {
+        }
+
+        return self::getIntPhp($data, $key, $default);
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     */
+    public static function getIntPhp(array $data, string $key, int $default = 0): int
     {
         return isset($data[$key]) && is_numeric($data[$key]) ? (int) $data[$key] : $default;
     }
@@ -550,7 +713,106 @@ class TmdbClient
      */
     public static function getFloat(array $data, string $key, float $default = 0.0): float
     {
+        return (self::$useRustFfi ?? false)
+            ? self::getFloatNative($data, $key, $default)
+            : self::getFloatPhp($data, $key, $default);
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     */
+    public static function getFloatNative(array $data, string $key, float $default = 0.0): float
+    {
+        if (($ffi = self::ffi()) === null) {
+            return self::getFloatPhp($data, $key, $default);
+        }
+        try {
+            $ser = @serialize($data);
+            $outVal = $ffi->new('double[1]');
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_tmdb_get_float($ser, strlen($ser), $key, strlen($key), $default, FFI::addr($outVal[0]));
+            if ($status === 1) {
+                /** @var float $val */
+                $val = $outVal[0];
+
+                return $val;
+            }
+        } catch (Throwable) {
+        }
+
+        return self::getFloatPhp($data, $key, $default);
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     */
+    public static function getFloatPhp(array $data, string $key, float $default = 0.0): float
+    {
         return isset($data[$key]) && is_numeric($data[$key]) ? (float) $data[$key] : $default;
+    }
+
+    /**
+     * Safely get a boolean value from an array
+     *
+     * @param  array<string, mixed>  $data
+     */
+    public static function getBool(array $data, string $key, bool $default = false): bool
+    {
+        return (self::$useRustFfi ?? false)
+            ? self::getBoolNative($data, $key, $default)
+            : self::getBoolPhp($data, $key, $default);
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     */
+    public static function getBoolNative(array $data, string $key, bool $default = false): bool
+    {
+        if (($ffi = self::ffi()) === null) {
+            return self::getBoolPhp($data, $key, $default);
+        }
+        try {
+            $ser = @serialize($data);
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_tmdb_get_bool($ser, strlen($ser), $key, strlen($key), $default ? 1 : 0);
+            if ($status === 0 || $status === 1) {
+                return $status === 1;
+            }
+        } catch (Throwable) {
+        }
+
+        return self::getBoolPhp($data, $key, $default);
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     */
+    public static function getBoolPhp(array $data, string $key, bool $default = false): bool
+    {
+        if (! isset($data[$key])) {
+            return $default;
+        }
+        $val = $data[$key];
+        if (is_bool($val)) {
+            return $val;
+        }
+        if (is_int($val)) {
+            return $val !== 0;
+        }
+        if (is_float($val)) {
+            return (int) $val !== 0;
+        }
+        if (is_string($val)) {
+            $norm = strtolower(trim($val));
+            if (in_array($norm, ['1', 'true', 'yes', 'on'], true)) {
+                return true;
+            }
+            if (in_array($norm, ['0', 'false', 'no', 'off', ''], true)) {
+                return false;
+            }
+        }
+
+        return $default;
     }
 
     /**
@@ -561,6 +823,62 @@ class TmdbClient
      * @return array<string, mixed>
      */
     public static function getArray(array $data, string $key, array $default = []): array
+    {
+        return (self::$useRustFfi ?? false)
+            ? self::getArrayNative($data, $key, $default)
+            : self::getArrayPhp($data, $key, $default);
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     * @param  array<string, mixed>  $default
+     * @return array<string, mixed>
+     */
+    public static function getArrayNative(array $data, string $key, array $default = []): array
+    {
+        if (($ffi = self::ffi()) === null) {
+            return self::getArrayPhp($data, $key, $default);
+        }
+        try {
+            $ser = @serialize($data);
+            $serLen = strlen($ser);
+            $keyLen = strlen($key);
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, max(256, $serLen + 32), $capacity);
+            if ($buffer === null) {
+                return self::getArrayPhp($data, $key, $default);
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tmdb_get_array($ser, $serLen, $key, $keyLen, $buffer, $capacity);
+            if (is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return self::getArrayPhp($data, $key, $default);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_tmdb_get_array($ser, $serLen, $key, $keyLen, $buffer, $capacity);
+            }
+            if (is_int($written) && $written >= 0 && $written <= $capacity) {
+                if ($written === 0) {
+                    return $default;
+                }
+                $unserialized = @unserialize(FFI::string($buffer, $written), ['allowed_classes' => false]);
+                if (is_array($unserialized)) {
+                    return $unserialized;
+                }
+            }
+        } catch (Throwable) {
+        }
+
+        return self::getArrayPhp($data, $key, $default);
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     * @param  array<string, mixed>  $default
+     * @return array<string, mixed>
+     */
+    public static function getArrayPhp(array $data, string $key, array $default = []): array
     {
         return isset($data[$key]) && is_array($data[$key]) ? $data[$key] : $default;
     }
