@@ -5,7 +5,10 @@ declare(strict_types=1);
 namespace App\Mcp\Tools;
 
 use App\Mcp\Tools\Concerns\HasVersionedStructuredOutput;
+use App\Services\Mcp\ProcessRunner;
 use App\Services\Mcp\VerificationRunner;
+use App\Support\RustPipelineLibrary;
+use Closure;
 use Illuminate\Contracts\JsonSchema\JsonSchema;
 use InvalidArgumentException;
 use Laravel\Mcp\Request;
@@ -25,6 +28,19 @@ class RunVerificationTool extends Tool
 {
     use HasVersionedStructuredOutput;
 
+    // Opt-in only until correctness and end-to-end performance gates pass.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi && RustPipelineLibrary::resolveDomain('mcp-tool-runner', ProcessRunner::FFI_CDEF) !== null;
+    }
+
     private const array CHECKS = ['targeted', 'phpunit', 'phpstan', 'pint', 'php-lint', 'diff', 'composer', 'frontend'];
 
     public function schema(JsonSchema $schema): array
@@ -40,7 +56,11 @@ class RunVerificationTool extends Tool
     public function handle(Request $request, VerificationRunner $runner): ResponseFactory|Response
     {
         $validated = $request->validate([
-            'check' => ['required', 'string', 'in:'.implode(',', self::CHECKS)],
+            'check' => ['required', 'string', static function (string $attribute, mixed $value, Closure $fail): void {
+                if (is_array($value) || ! self::isAllowedCheck((string) $value)) {
+                    $fail('validation.in')->translate();
+                }
+            }],
             'paths' => ['required', 'array', 'min:1', 'max:20'],
             'paths.*' => ['required', 'string', 'distinct'],
             'test_path' => ['sometimes', 'string'],
@@ -60,12 +80,48 @@ class RunVerificationTool extends Tool
 
         $payload = [
             'schema_version' => (int) config('nntmux-mcp.schema_version', 1),
-            'summary' => sprintf('Verification %s with %d result(s).', $verification['status'], count($verification['results'])),
+            'summary' => self::formatVerificationSummary($verification['status'], count($verification['results'])),
             'results' => $verification,
             'warnings' => $verification['warnings'],
             'truncated' => $verification['truncated'],
         ];
 
         return Response::make(Response::text($payload['summary']))->withStructuredContent($payload);
+    }
+
+    public static function formatVerificationSummary(string $status, int $resultCount): string
+    {
+        return (self::$useRustFfi ? self::formatVerificationSummaryNative($status, $resultCount) : null)
+            ?? self::formatVerificationSummaryPhp($status, $resultCount);
+    }
+
+    public static function formatVerificationSummaryPhp(string $status, int $resultCount): string
+    {
+        return sprintf('Verification %s with %d result(s).', $status, $resultCount);
+    }
+
+    public static function formatVerificationSummaryNative(string $status, int $resultCount): ?string
+    {
+        $result = ProcessRunner::transformNative(8, [$status, $resultCount]);
+
+        return is_string($result) ? $result : null;
+    }
+
+    public static function isAllowedCheck(string $check): bool
+    {
+        return (self::$useRustFfi ? self::isAllowedCheckNative($check) : null)
+            ?? self::isAllowedCheckPhp($check);
+    }
+
+    public static function isAllowedCheckPhp(string $check): bool
+    {
+        return in_array($check, self::CHECKS, true);
+    }
+
+    public static function isAllowedCheckNative(string $check): ?bool
+    {
+        $result = ProcessRunner::transformNative(9, [$check]);
+
+        return is_bool($result) ? $result : null;
     }
 }
