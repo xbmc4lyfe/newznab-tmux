@@ -2331,6 +2331,1184 @@ pub unsafe extern "C" fn nntmux_movie_parse_search_name(
     (year_int << 16) | written
 }
 
+// ============================================================================
+// LogEntryParser, DonorMatchSelector, and BookIsbn Acceleration
+// ============================================================================
+
+#[derive(Clone, Copy)]
+struct MonologHeaderSpans {
+    ts_len: usize,
+    chan_start: usize,
+    chan_len: usize,
+    msg_start: usize,
+    level_code: u8,
+}
+
+#[inline]
+fn is_base_timestamp_19(s: &[u8]) -> bool {
+    s.len() >= 19
+        && s[0].is_ascii_digit()
+        && s[1].is_ascii_digit()
+        && s[2].is_ascii_digit()
+        && s[3].is_ascii_digit()
+        && s[4] == b'-'
+        && s[5].is_ascii_digit()
+        && s[6].is_ascii_digit()
+        && s[7] == b'-'
+        && s[8].is_ascii_digit()
+        && s[9].is_ascii_digit()
+        && matches!(s[10], b'T' | b' ')
+        && s[11].is_ascii_digit()
+        && s[12].is_ascii_digit()
+        && s[13] == b':'
+        && s[14].is_ascii_digit()
+        && s[15].is_ascii_digit()
+        && s[16] == b':'
+        && s[17].is_ascii_digit()
+        && s[18].is_ascii_digit()
+}
+
+#[inline]
+fn level_bytes_to_code(level_raw: &[u8]) -> u8 {
+    match level_raw {
+        b"DEBUG" => 0,
+        b"INFO" => 1,
+        b"NOTICE" => 2,
+        b"WARNING" => 3,
+        b"ERROR" => 4,
+        b"CRITICAL" => 5,
+        b"ALERT" => 6,
+        b"EMERGENCY" => 7,
+        _ => 8,
+    }
+}
+
+#[inline]
+fn level_code_to_bytes(code: u8) -> &'static [u8] {
+    match code {
+        0 => b"debug",
+        1 => b"info",
+        2 => b"notice",
+        3 => b"warning",
+        4 => b"error",
+        5 => b"critical",
+        6 => b"alert",
+        7 => b"emergency",
+        _ => b"",
+    }
+}
+
+#[inline]
+fn parse_monolog_header_spans(line: &[u8]) -> Option<MonologHeaderSpans> {
+    if line.len() < 26 || line[0] != b'[' || !is_base_timestamp_19(&line[1..]) {
+        return None;
+    }
+
+    let mut p = 20usize;
+    if p + 1 < line.len() && line[p] == b'.' && line[p + 1].is_ascii_digit() {
+        p += 2;
+        while p < line.len() && line[p].is_ascii_digit() {
+            p += 1;
+        }
+    }
+
+    if p < line.len() {
+        if line[p] == b'Z' {
+            p += 1;
+        } else if matches!(line[p], b'+' | b'-')
+            && p + 4 < line.len()
+            && line[p + 1].is_ascii_digit()
+            && line[p + 2].is_ascii_digit()
+        {
+            if line[p + 3] == b':' {
+                if p + 5 < line.len()
+                    && line[p + 4].is_ascii_digit()
+                    && line[p + 5].is_ascii_digit()
+                {
+                    p += 6;
+                }
+            } else if line[p + 3].is_ascii_digit() && line[p + 4].is_ascii_digit() {
+                p += 5;
+            }
+        }
+    }
+
+    if line.get(p) != Some(&b']') {
+        return None;
+    }
+    let ts_len = p - 1;
+    p += 1;
+
+    let ws_start = p;
+    while p < line.len() && is_ascii_ws(line[p]) {
+        p += 1;
+    }
+    if p == ws_start {
+        return None;
+    }
+
+    let chan_start = p;
+    while p < line.len() && (is_word_byte(line[p]) || matches!(line[p], b'.' | b'-')) {
+        p += 1;
+    }
+    if p >= line.len() || line[p] != b':' {
+        return None;
+    }
+
+    let token = &line[chan_start..p];
+    let last_dot = token.iter().rposition(|&b| b == b'.')?;
+    if last_dot == 0 || last_dot + 1 >= token.len() {
+        return None;
+    }
+    let level_raw = &token[last_dot + 1..];
+    if !level_raw.iter().all(|b| b.is_ascii_uppercase()) {
+        return None;
+    }
+
+    let mut msg_start = p + 1;
+    if msg_start < line.len() && is_ascii_ws(line[msg_start]) {
+        msg_start += 1;
+    }
+
+    Some(MonologHeaderSpans {
+        ts_len,
+        chan_start,
+        chan_len: last_dot,
+        msg_start,
+        level_code: level_bytes_to_code(level_raw),
+    })
+}
+
+#[inline]
+fn parse_plain_timestamp_offset(line: &[u8]) -> Option<usize> {
+    let mut p = 0usize;
+    while p < line.len() && is_ascii_ws(line[p]) {
+        p += 1;
+    }
+    if p < line.len() && line[p] == b'[' {
+        p += 1;
+    }
+    if is_base_timestamp_19(line.get(p..)?) {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// Parses a single Monolog header line and returns packed span offsets:
+/// `ts_len | (chan_start << 8) | (chan_len << 24) | (msg_start << 40) | (level_code << 56)`
+/// where `level_code` in `0..=7` maps to `LogEntryParser::LEVELS[level_code]` and `8` maps to `null`.
+/// Returns `-1` when the line is not a Monolog header, or `-2` when span offsets exceed 16-bit packing.
+///
+/// # Safety
+///
+/// `line` must be valid for reads of `line_len` bytes when non-null and `line_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_log_parse_header_spans(
+    line: *const u8,
+    line_len: usize,
+) -> i64 {
+    if line.is_null() || line_len < 26 {
+        return -1;
+    }
+    let bytes = unsafe { slice::from_raw_parts(line, line_len) };
+    let Some(spans) = parse_monolog_header_spans(bytes) else {
+        return -1;
+    };
+    if spans.ts_len > 255
+        || spans.chan_start > 0xFFFF
+        || spans.chan_len > 0xFFFF
+        || spans.msg_start > 0xFFFF
+    {
+        return -2;
+    }
+    (spans.ts_len as i64)
+        | ((spans.chan_start as i64) << 8)
+        | ((spans.chan_len as i64) << 24)
+        | ((spans.msg_start as i64) << 40)
+        | ((spans.level_code as i64) << 56)
+}
+
+/// Extracts the byte start offset of a 19-byte plain timestamp (`YYYY-MM-DD[T ]HH:MM:SS`)
+/// matching `LogEntryParser::PLAIN_TIMESTAMP_PATTERN`, or `-1` when not matched.
+///
+/// # Safety
+///
+/// `line` must be valid for reads of `line_len` bytes when non-null and `line_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_log_plain_timestamp_span(
+    line: *const u8,
+    line_len: usize,
+) -> i64 {
+    if line.is_null() || line_len < 19 {
+        return -1;
+    }
+    let bytes = unsafe { slice::from_raw_parts(line, line_len) };
+    match parse_plain_timestamp_offset(bytes) {
+        Some(off) => off as i64,
+        None => -1,
+    }
+}
+
+/// Batch-checks `count` NUL-separated log lines for `LogEntryParser::isHeadersBatch`.
+/// Writes `'1'` or `'0'` (1 byte per line) into `out_buf` and returns `count`.
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_log_is_header_batch_nul(
+    input: *const u8,
+    input_len: usize,
+    count: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if count == 0 {
+        return 0;
+    }
+    if input.is_null() && input_len > 0 {
+        return -1;
+    }
+    let bytes = if input_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(input, input_len) }
+    };
+
+    let mut cur = OutCursor::new(out_buf, out_cap);
+    let mut seen = 0usize;
+    for seg in bytes.split(|&b| b == 0) {
+        seen += 1;
+        if seen > count {
+            return -1;
+        }
+        cur.push_byte(if parse_monolog_header_spans(seg).is_some() {
+            b'1'
+        } else {
+            b'0'
+        });
+    }
+    if seen != count {
+        return -1;
+    }
+    cur.finish()
+}
+
+/// Batch-parses `count` NUL-separated log lines for `LogEntryParser`.
+/// For each matched header line, writes `{timestamp}\0{channel}\0{level_or_empty}\0{message}\0`.
+/// For each non-header line, writes `\0` (a single empty token).
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_log_parse_headers_batch_nul(
+    input: *const u8,
+    input_len: usize,
+    count: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if count == 0 {
+        return 0;
+    }
+    if input.is_null() && input_len > 0 {
+        return -1;
+    }
+    let bytes = if input_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(input, input_len) }
+    };
+
+    let mut cur = OutCursor::new(out_buf, out_cap);
+    let mut seen = 0usize;
+    for seg in bytes.split(|&b| b == 0) {
+        seen += 1;
+        if seen > count {
+            return -1;
+        }
+        if let Some(spans) = parse_monolog_header_spans(seg) {
+            cur.push_slice(&seg[1..1 + spans.ts_len]);
+            cur.push_byte(0);
+            cur.push_slice(&seg[spans.chan_start..spans.chan_start + spans.chan_len]);
+            cur.push_byte(0);
+            cur.push_slice(level_code_to_bytes(spans.level_code));
+            cur.push_byte(0);
+            cur.push_slice(&seg[spans.msg_start..]);
+            cur.push_byte(0);
+        } else {
+            cur.push_byte(0);
+        }
+    }
+    if seen != count {
+        return -1;
+    }
+    cur.finish()
+}
+
+struct PendingLogBlockState {
+    entry_idx: usize,
+    offset: usize,
+    line_no: usize,
+    level_code: u8,
+    body_bytes: usize,
+    truncated: bool,
+}
+
+#[inline]
+fn begin_log_block_entry(
+    cur: &mut OutCursor,
+    entry_idx: usize,
+    first_line: &[u8],
+    header_spans: Option<MonologHeaderSpans>,
+) -> u8 {
+    if entry_idx > 0 {
+        cur.push_byte(0);
+    }
+
+    if let Some(spans) = header_spans {
+        cur.push_slice(&first_line[1..1 + spans.ts_len]);
+        cur.push_byte(0);
+        cur.push_slice(&first_line[spans.chan_start..spans.chan_start + spans.chan_len]);
+        cur.push_byte(0);
+        cur.push_slice(&first_line[spans.msg_start..]);
+        cur.push_byte(0);
+        spans.level_code
+    } else {
+        if let Some(ts_off) = parse_plain_timestamp_offset(first_line) {
+            cur.push_slice(&first_line[ts_off..ts_off + 19]);
+        }
+        cur.push_byte(0);
+        cur.push_byte(0);
+        cur.push_slice(first_line);
+        cur.push_byte(0);
+        8
+    }
+}
+
+#[inline]
+unsafe fn write_log_entry_meta(
+    meta_out: *mut i64,
+    meta_cap: usize,
+    entry_idx: usize,
+    offset: usize,
+    end: usize,
+    line_no: usize,
+    level_code: u8,
+    truncated: bool,
+) -> bool {
+    let base = entry_idx * 2;
+    if meta_out.is_null() || base + 1 >= meta_cap {
+        return false;
+    }
+    let w0 = (offset as i64) | ((end as i64) << 32);
+    let w1 = (line_no as i64) | ((i64::from(level_code)) << 32) | ((i64::from(truncated)) << 40);
+    unsafe {
+        *meta_out.add(base) = w0;
+        *meta_out.add(base + 1) = w1;
+    }
+    true
+}
+
+/// Splits and parses a raw multi-line log block into `LogEntry` records without PCRE overhead.
+/// Writes 2 `i64` words per entry into `meta_out`:
+/// - `meta_out[e * 2] = offset | (end << 32)`
+/// - `meta_out[e * 2 + 1] = line_no | (level_code << 32) | (truncated << 40)`
+/// and streams 4 NUL-separated strings per entry into `out_buf`:
+/// `{ts}\0{chan}\0{msg}\0{body}` (separated by `\0` between entries).
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `meta_out` must be valid for writes of `meta_cap` `i64` elements when non-null and `meta_cap > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_log_parse_entries_block(
+    input: *const u8,
+    input_len: usize,
+    structured: u32,
+    max_entry_bytes: usize,
+    meta_out: *mut i64,
+    meta_cap: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input_len == 0 {
+        return 0;
+    }
+    if input.is_null() || meta_out.is_null() || max_entry_bytes == 0 || input_len > 0x7FFF_FFFF {
+        return -1;
+    }
+    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+    if bytes.contains(&0) {
+        return -1;
+    }
+
+    let is_structured = structured != 0;
+    let mut cur = OutCursor::new(out_buf, out_cap);
+    let mut pos = 0usize;
+    let mut line_no = 0usize;
+    let mut entry_count = 0usize;
+    let mut pending: Option<PendingLogBlockState> = None;
+
+    while pos < bytes.len() {
+        let line_offset = pos;
+        let rem = &bytes[pos..];
+        let (raw_line, next_pos) = match rem.iter().position(|&b| b == b'\n') {
+            Some(idx) => (&rem[..idx], pos + idx + 1),
+            None => (rem, bytes.len()),
+        };
+        let mut text = raw_line;
+        while text.last() == Some(&b'\r') {
+            text = &text[..text.len() - 1];
+        }
+
+        let header_check = if is_structured {
+            parse_monolog_header_spans(text)
+        } else {
+            None
+        };
+        if !is_structured || header_check.is_some() {
+            if let Some(prev) = pending.take() {
+                if !unsafe {
+                    write_log_entry_meta(
+                        meta_out,
+                        meta_cap,
+                        prev.entry_idx,
+                        prev.offset,
+                        line_offset,
+                        prev.line_no,
+                        prev.level_code,
+                        prev.truncated,
+                    )
+                } {
+                    return -1;
+                }
+            }
+        }
+
+        line_no += 1;
+        let capped_len = text.len().min(max_entry_bytes);
+        let first_capped = &text[..capped_len];
+        let line_truncated = text.len() > max_entry_bytes;
+
+        if !is_structured {
+            if !trim_php_ws(text).is_empty() {
+                let lvl = begin_log_block_entry(&mut cur, entry_count, first_capped, None);
+                if !unsafe {
+                    write_log_entry_meta(
+                        meta_out,
+                        meta_cap,
+                        entry_count,
+                        line_offset,
+                        next_pos,
+                        line_no,
+                        lvl,
+                        line_truncated,
+                    )
+                } {
+                    return -1;
+                }
+                entry_count += 1;
+            }
+        } else if let Some(ref mut p_entry) = pending {
+            if p_entry.body_bytes + first_capped.len() + 1 > max_entry_bytes {
+                p_entry.truncated = true;
+            } else {
+                if p_entry.body_bytes > 0 {
+                    cur.push_byte(b'\n');
+                }
+                cur.push_slice(first_capped);
+                p_entry.body_bytes += first_capped.len() + 1;
+                p_entry.truncated = p_entry.truncated || line_truncated;
+            }
+        } else {
+            let capped_spans = if header_check.is_some() && line_truncated {
+                parse_monolog_header_spans(first_capped)
+            } else {
+                header_check
+            };
+            let lvl = begin_log_block_entry(&mut cur, entry_count, first_capped, capped_spans);
+            pending = Some(PendingLogBlockState {
+                entry_idx: entry_count,
+                offset: line_offset,
+                line_no,
+                level_code: lvl,
+                body_bytes: 0,
+                truncated: line_truncated,
+            });
+            entry_count += 1;
+        }
+
+        pos = next_pos;
+    }
+
+    if let Some(prev) = pending.take() {
+        if !unsafe {
+            write_log_entry_meta(
+                meta_out,
+                meta_cap,
+                prev.entry_idx,
+                prev.offset,
+                bytes.len(),
+                prev.line_no,
+                prev.level_code,
+                prev.truncated,
+            )
+        } {
+            return -1;
+        }
+    }
+
+    cur.finish()
+}
+
+#[inline]
+fn is_known_unicode_c_char(c: char) -> bool {
+    let u = c as u32;
+    if u <= 0x001F || (0x007F..=0x009F).contains(&u) {
+        return true;
+    }
+    if (0xE000..=0xF8FF).contains(&u)
+        || (0xF0000..=0xFFFFD).contains(&u)
+        || (0x100000..=0x10FFFD).contains(&u)
+    {
+        return true;
+    }
+    if (0xFDD0..=0xFDEF).contains(&u) || (u & 0xFFFE) == 0xFFFE {
+        return true;
+    }
+    matches!(
+        u,
+        0x00AD
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
+}
+
+#[inline]
+fn is_known_non_c_unicode_char(c: char) -> bool {
+    let u = c as u32;
+    (0x00A0..=0x024F).contains(&u)
+        || (0x0400..=0x04FF).contains(&u)
+        || (0x4E00..=0x9FFF).contains(&u)
+        || u == 0x1F3B5
+}
+
+#[inline]
+fn validate_canonical_donor_pair(
+    predb_id: i64,
+    title: &[u8],
+    search_name: &[u8],
+) -> Option<bool> {
+    if predb_id <= 0 || trim_php_ws(title).is_empty() || title.len() > 255 * 4 {
+        return Some(false);
+    }
+
+    if title.is_ascii() && search_name.is_ascii() {
+        if title.len() > 255 || title.len() != search_name.len() {
+            return Some(false);
+        }
+        for (&tb, &sb) in title.iter().zip(search_name.iter()) {
+            if tb < 0x20 || tb == 0x7F || !tb.eq_ignore_ascii_case(&sb) {
+                return Some(false);
+            }
+        }
+        return Some(true);
+    }
+
+    let Ok(title_str) = std::str::from_utf8(title) else {
+        return Some(false);
+    };
+    let Ok(_search_str) = std::str::from_utf8(search_name) else {
+        return Some(false);
+    };
+
+    let mut chars = 0usize;
+    let mut needs_pcre = false;
+    for c in title_str.chars() {
+        chars += 1;
+        if chars > 255 || is_known_unicode_c_char(c) {
+            return Some(false);
+        }
+        if !c.is_ascii() && !is_known_non_c_unicode_char(c) {
+            needs_pcre = true;
+        }
+    }
+
+    if !needs_pcre && title == search_name {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn parse_i64_bytes(bytes: &[u8]) -> Option<i64> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let (neg, digits) = if bytes[0] == b'-' {
+        (true, &bytes[1..])
+    } else if bytes[0] == b'+' {
+        (false, &bytes[1..])
+    } else {
+        (false, bytes)
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut acc: i64 = 0;
+    for &b in digits {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        let d = i64::from(b - b'0');
+        acc = if neg {
+            acc.checked_mul(10)?.checked_sub(d)?
+        } else {
+            acc.checked_mul(10)?.checked_add(d)?
+        };
+    }
+    Some(acc)
+}
+
+/// Validates a single donor candidate for `DonorMatchSelector::selectCanonical`.
+/// Returns `1` when valid, `0` when invalid (`null`), `-1` on null pointers, or `-2` when
+/// non-ASCII case folding / `\p{C}` checks should fall back to PHP.
+///
+/// # Safety
+///
+/// `title` and `search_name` must be valid for reads of `title_len` and `search_name_len` bytes when non-empty.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_donor_validate_canonical_single(
+    predb_id: i64,
+    title: *const u8,
+    title_len: usize,
+    search_name: *const u8,
+    search_name_len: usize,
+) -> i32 {
+    if (title_len > 0 && title.is_null()) || (search_name_len > 0 && search_name.is_null()) {
+        return -1;
+    }
+    let t_slice = if title_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(title, title_len) }
+    };
+    let s_slice = if search_name_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(search_name, search_name_len) }
+    };
+
+    match validate_canonical_donor_pair(predb_id, t_slice, s_slice) {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => -2,
+    }
+}
+
+/// Selects the winning canonical donor index (`0..count`) for `DonorMatchSelector::selectCanonical`
+/// from `count` NUL-packed donor records (`predb_id\0releases_id\0canonical_title\0searchname`).
+/// Returns `-1` when rejected (`null`), or `-2` when declined to PHP fallback.
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_donor_select_canonical_batch_nul(
+    input: *const u8,
+    input_len: usize,
+    count: usize,
+) -> i32 {
+    if count == 0 || count > 256 {
+        return -1;
+    }
+    if input.is_null() {
+        return -2;
+    }
+    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+
+    let mut iter = bytes.split(|&b| b == 0);
+    let mut first_predb_id: i64 = 0;
+    let mut first_title: &[u8] = &[];
+    let mut best_idx: i32 = -1;
+    let mut best_releases_id: i64 = i64::MAX;
+    let mut needs_php = false;
+
+    for idx in 0..count {
+        let Some(predb_raw) = iter.next() else {
+            return -2;
+        };
+        let Some(rel_raw) = iter.next() else {
+            return -2;
+        };
+        let Some(title) = iter.next() else {
+            return -2;
+        };
+        let Some(search_name) = iter.next() else {
+            return -2;
+        };
+
+        let Some(predb_id) = parse_i64_bytes(predb_raw) else {
+            return -2;
+        };
+        let Some(releases_id) = parse_i64_bytes(rel_raw) else {
+            return -2;
+        };
+
+        match validate_canonical_donor_pair(predb_id, title, search_name) {
+            Some(false) => return -1,
+            None => {
+                needs_php = true;
+            }
+            Some(true) => {}
+        }
+
+        if idx == 0 {
+            first_predb_id = predb_id;
+            first_title = title;
+        } else {
+            if predb_id != first_predb_id {
+                return -1;
+            }
+            if first_title.is_ascii() && title.is_ascii() {
+                if !first_title.eq_ignore_ascii_case(title) {
+                    return -1;
+                }
+            } else if first_title != title {
+                needs_php = true;
+            }
+        }
+
+        if best_idx < 0 || releases_id < best_releases_id {
+            best_idx = idx as i32;
+            best_releases_id = releases_id;
+        }
+    }
+
+    if iter.next().is_some() {
+        return -2;
+    }
+    if needs_php {
+        return -2;
+    }
+    best_idx
+}
+
+/// Selects the best donor index (`0..count`) for `DonorMatchSelector::select` from `count` pairs
+/// of `(donor_size, donor_id)` in `pairs` (`count * 2` `i64` elements), or `-1` if none match.
+///
+/// # Safety
+///
+/// `pairs` must be valid for reads of `count * 2` `i64` elements when `count > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_donor_select_best_index(
+    pairs: *const i64,
+    count: usize,
+    target_size: i64,
+    tolerance_percent: i64,
+) -> i32 {
+    if target_size <= 0 || tolerance_percent < 0 || count == 0 || pairs.is_null() {
+        return -1;
+    }
+    let slice = unsafe { slice::from_raw_parts(pairs, count * 2) };
+    let tol = tolerance_percent as f64;
+
+    let mut best_idx: i32 = -1;
+    let mut best_diff: i64 = i64::MAX;
+    let mut best_id: i64 = i64::MAX;
+
+    for i in 0..count {
+        let donor_size = slice[i * 2];
+        if donor_size <= 0 {
+            continue;
+        }
+        let donor_id = slice[i * 2 + 1];
+        let diff = (donor_size - target_size).abs();
+        let diff_pct = ((diff as f64) / (donor_size as f64)) * 100.0;
+        if diff_pct <= tol
+            && (best_idx < 0 || diff < best_diff || (diff == best_diff && donor_id < best_id))
+        {
+            best_idx = i as i32;
+            best_diff = diff;
+            best_id = donor_id;
+        }
+    }
+
+    best_idx
+}
+
+/// Selects the best donor index (`0..count`) for `DonorMatchSelector::select` from `count` NUL-packed
+/// pairs `"size_0\0id_0\0size_1\0id_1..."`, or `-1` if none match / `-2` on malformed input.
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_donor_select_best_nul(
+    input: *const u8,
+    input_len: usize,
+    count: usize,
+    target_size: i64,
+    tolerance_percent: i64,
+) -> i32 {
+    if target_size <= 0 || tolerance_percent < 0 || count == 0 {
+        return -1;
+    }
+    if input.is_null() {
+        return -2;
+    }
+    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+    let tol = tolerance_percent as f64;
+
+    let mut iter = bytes.split(|&b| b == 0);
+    let mut best_idx: i32 = -1;
+    let mut best_diff: i64 = i64::MAX;
+    let mut best_id: i64 = i64::MAX;
+
+    for i in 0..count {
+        let Some(size_raw) = iter.next() else {
+            return -2;
+        };
+        let Some(id_raw) = iter.next() else {
+            return -2;
+        };
+        let Some(donor_size) = parse_i64_bytes(size_raw) else {
+            return -2;
+        };
+        let Some(donor_id) = parse_i64_bytes(id_raw) else {
+            return -2;
+        };
+        if donor_size <= 0 {
+            continue;
+        }
+        let diff = (donor_size - target_size).abs();
+        let diff_pct = ((diff as f64) / (donor_size as f64)) * 100.0;
+        if diff_pct <= tol
+            && (best_idx < 0 || diff < best_diff || (diff == best_diff && donor_id < best_id))
+        {
+            best_idx = i as i32;
+            best_diff = diff;
+            best_id = donor_id;
+        }
+    }
+    if iter.next().is_some() {
+        return -2;
+    }
+    best_idx
+}
+
+#[inline]
+fn isbn_normalize_stack(bytes: &[u8]) -> Option<([u8; 13], usize)> {
+    let mut buf = [0u8; 13];
+    let mut len = 0usize;
+    for &b in bytes {
+        if b.is_ascii_digit() {
+            if len == 13 {
+                return None;
+            }
+            buf[len] = b;
+            len += 1;
+        } else if matches!(b, b'x' | b'X') {
+            if len == 13 {
+                return None;
+            }
+            buf[len] = b'X';
+            len += 1;
+        }
+    }
+
+    match len {
+        10 => {
+            if !buf[..9].iter().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let mut sum = 0u32;
+            for (idx, &b) in buf[..10].iter().enumerate() {
+                let digit = if b == b'X' { 10 } else { u32::from(b - b'0') };
+                sum += digit * (10 - idx as u32);
+            }
+            if sum.is_multiple_of(11) {
+                Some((buf, 10))
+            } else {
+                None
+            }
+        }
+        13 => {
+            if !(buf.starts_with(b"978") || buf.starts_with(b"979"))
+                || !buf.iter().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            let mut sum = 0u32;
+            for (idx, &b) in buf.iter().enumerate() {
+                let digit = u32::from(b - b'0');
+                sum += digit * if idx % 2 == 0 { 1 } else { 3 };
+            }
+            if sum.is_multiple_of(10) {
+                Some((buf, 13))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+#[inline]
+fn isbn10_to_13_stack(isbn10: &[u8]) -> [u8; 13] {
+    let mut out = [0u8; 13];
+    out[0] = b'9';
+    out[1] = b'7';
+    out[2] = b'8';
+    out[3..12].copy_from_slice(&isbn10[..9]);
+    let mut sum = 0u32;
+    for (idx, &b) in out[..12].iter().enumerate() {
+        let digit = u32::from(b - b'0');
+        sum += digit * if idx % 2 == 0 { 1 } else { 3 };
+    }
+    let check = (10 - (sum % 10)) % 10;
+    out[12] = b'0' + check as u8;
+    out
+}
+
+#[inline]
+fn isbn13_to_10_stack(isbn13: &[u8]) -> Option<[u8; 10]> {
+    if !isbn13.starts_with(b"978") {
+        return None;
+    }
+    let mut out = [0u8; 10];
+    out[..9].copy_from_slice(&isbn13[3..12]);
+    let mut sum = 0u32;
+    for (idx, &b) in out[..9].iter().enumerate() {
+        let digit = u32::from(b - b'0');
+        sum += digit * (10 - idx as u32);
+    }
+    let check = (11 - (sum % 11)) % 11;
+    out[9] = if check == 10 {
+        b'X'
+    } else {
+        b'0' + check as u8
+    };
+    Some(out)
+}
+
+/// Normalizes or converts an ISBN string on the stack without heap allocations.
+/// `mode`:
+/// - `0`: `BookIsbn::normalize` (writes 10 or 13 bytes, or 0 if invalid)
+/// - `1`: `BookIsbn::toIsbn13` (writes 13 bytes, or 0 if not a valid ISBN-10)
+/// - `2`: `BookIsbn::toIsbn10` (writes 10 bytes, or 0 if not a valid `978` ISBN-13)
+/// - `3`: `BookIsbn::equivalents` (writes sorted NUL-separated identifiers, or 0 if invalid)
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_book_isbn_normalize(
+    input: *const u8,
+    input_len: usize,
+    mode: u32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input.is_null() && input_len > 0 {
+        return -1;
+    }
+    if input_len == 0 {
+        return 0;
+    }
+    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+    let Some((norm, norm_len)) = isbn_normalize_stack(bytes) else {
+        return 0;
+    };
+
+    let mut cur = OutCursor::new(out_buf, out_cap);
+    match mode {
+        0 => {
+            cur.push_slice(&norm[..norm_len]);
+        }
+        1 => {
+            if norm_len != 10 {
+                return 0;
+            }
+            let isbn13 = isbn10_to_13_stack(&norm[..10]);
+            cur.push_slice(&isbn13);
+        }
+        2 => {
+            if norm_len != 13 {
+                return 0;
+            }
+            let Some(isbn10) = isbn13_to_10_stack(&norm) else {
+                return 0;
+            };
+            cur.push_slice(&isbn10);
+        }
+        3 => {
+            if norm_len == 10 {
+                let isbn10 = &norm[..10];
+                let isbn13 = isbn10_to_13_stack(isbn10);
+                let isbn10_first = isbn10[9] != b'X' || isbn10 <= &isbn13[..];
+                if isbn10_first {
+                    cur.push_slice(isbn10);
+                    cur.push_byte(0);
+                    cur.push_slice(&isbn13);
+                } else {
+                    cur.push_slice(&isbn13);
+                    cur.push_byte(0);
+                    cur.push_slice(isbn10);
+                }
+            } else if let Some(isbn10) = isbn13_to_10_stack(&norm) {
+                let isbn10_first = isbn10[9] != b'X' || &isbn10[..] <= &norm[..];
+                if isbn10_first {
+                    cur.push_slice(&isbn10);
+                    cur.push_byte(0);
+                    cur.push_slice(&norm);
+                } else {
+                    cur.push_slice(&norm);
+                    cur.push_byte(0);
+                    cur.push_slice(&isbn10);
+                }
+            } else {
+                cur.push_slice(&norm);
+            }
+        }
+        _ => return -1,
+    }
+    cur.finish()
+}
+
+/// Compares two ISBN strings for equivalence (`BookIsbn::equivalent`) in a single zero-allocation call.
+/// Returns `1` when equivalent, `0` when not equivalent, or `-1` on null pointers with non-zero length.
+///
+/// # Safety
+///
+/// `left` and `right` must be valid for reads of `left_len` and `right_len` bytes when non-empty.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_book_isbn_equivalent(
+    left: *const u8,
+    left_len: usize,
+    right: *const u8,
+    right_len: usize,
+) -> i32 {
+    if (left_len > 0 && left.is_null()) || (right_len > 0 && right.is_null()) {
+        return -1;
+    }
+    if left_len == 0 || right_len == 0 {
+        return 0;
+    }
+    let l_bytes = unsafe { slice::from_raw_parts(left, left_len) };
+    let r_bytes = unsafe { slice::from_raw_parts(right, right_len) };
+
+    let Some((l_norm, l_len)) = isbn_normalize_stack(l_bytes) else {
+        return 0;
+    };
+    let Some((r_norm, r_len)) = isbn_normalize_stack(r_bytes) else {
+        return 0;
+    };
+
+    if l_len == r_len && l_norm[..l_len] == r_norm[..r_len] {
+        return 1;
+    }
+    if l_len == 10 && r_len == 13 {
+        let l13 = isbn10_to_13_stack(&l_norm[..10]);
+        return i32::from(l13 == r_norm);
+    }
+    if l_len == 13 && r_len == 10 {
+        let r13 = isbn10_to_13_stack(&r_norm[..10]);
+        return i32::from(l_norm == r13);
+    }
+    0
+}
+
+/// Batch normalizes or converts `count` NUL-separated ISBN strings into NUL-separated results.
+/// `mode`: `0` = normalize, `1` = toIsbn13, `2` = toIsbn10.
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_book_isbn_normalize_batch_nul(
+    input: *const u8,
+    input_len: usize,
+    count: usize,
+    mode: u32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if count == 0 {
+        return 0;
+    }
+    if (input.is_null() && input_len > 0) || mode > 2 {
+        return -1;
+    }
+    let bytes = if input_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(input, input_len) }
+    };
+
+    let mut cur = OutCursor::new(out_buf, out_cap);
+    let mut seen = 0usize;
+    for (idx, seg) in bytes.split(|&b| b == 0).enumerate() {
+        seen += 1;
+        if seen > count {
+            return -1;
+        }
+        if idx > 0 {
+            cur.push_byte(0);
+        }
+        if let Some((norm, norm_len)) = isbn_normalize_stack(seg) {
+            match mode {
+                0 => cur.push_slice(&norm[..norm_len]),
+                1 => {
+                    if norm_len == 10 {
+                        let isbn13 = isbn10_to_13_stack(&norm[..10]);
+                        cur.push_slice(&isbn13);
+                    }
+                }
+                2 => {
+                    if norm_len == 13
+                        && let Some(isbn10) = isbn13_to_10_stack(&norm)
+                    {
+                        cur.push_slice(&isbn10);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if seen != count {
+        return -1;
+    }
+    cur.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2366,5 +3544,68 @@ mod tests {
         let year = packed >> 16;
         assert_eq!(&buf[..written], b"The Free Fall");
         assert_eq!(year, 2022);
+    }
+
+    #[test]
+    fn test_log_header_and_plain_timestamp_spans() {
+        let line = b"[2026-10-06T18:11:29.123456+02:00] app.jobs.WARNING: slow {\"id\":1}";
+        let spans = unsafe { nntmux_log_parse_header_spans(line.as_ptr(), line.len()) };
+        assert!(spans > 0);
+        let ts_len = (spans & 0xFF) as usize;
+        let chan_start = ((spans >> 8) & 0xFFFF) as usize;
+        let chan_len = ((spans >> 24) & 0xFFFF) as usize;
+        let msg_start = ((spans >> 40) & 0xFFFF) as usize;
+        let lvl = ((spans >> 56) & 0xFF) as u8;
+        assert_eq!(&line[1..1 + ts_len], b"2026-10-06T18:11:29.123456+02:00");
+        assert_eq!(&line[chan_start..chan_start + chan_len], b"app.jobs");
+        assert_eq!(lvl, 3);
+        assert_eq!(&line[msg_start..], b"slow {\"id\":1}");
+
+        let plain = b"  2026-10-05 21:53:21 App\\Jobs\\ReindexReleaseJob ... DONE";
+        let ts_off = unsafe { nntmux_log_plain_timestamp_span(plain.as_ptr(), plain.len()) };
+        assert_eq!(ts_off, 2);
+    }
+
+    #[test]
+    fn test_donor_selection_and_canonical_validation() {
+        let pairs: [i64; 6] = [950, 20, 1050, 10, 900, 30];
+        let winner = unsafe { nntmux_donor_select_best_index(pairs.as_ptr(), 3, 1000, 10) };
+        assert_eq!(winner, 1);
+
+        let title = b"Valid.Scene.Release.2026-GROUP";
+        let sname = b"valid.scene.release.2026-group";
+        let ok = unsafe {
+            nntmux_donor_validate_canonical_single(
+                42,
+                title.as_ptr(),
+                title.len(),
+                sname.as_ptr(),
+                sname.len(),
+            )
+        };
+        assert_eq!(ok, 1);
+    }
+
+    #[test]
+    fn test_book_isbn_normalize_and_equivalent() {
+        let mut buf = [0u8; 64];
+        let raw10 = b"0-13-235088-2";
+        let n10 = unsafe {
+            nntmux_book_isbn_normalize(raw10.as_ptr(), raw10.len(), 0, buf.as_mut_ptr(), buf.len())
+        };
+        assert_eq!(n10, 10);
+        assert_eq!(&buf[..10], b"0132350882");
+
+        let n13 = unsafe {
+            nntmux_book_isbn_normalize(raw10.as_ptr(), raw10.len(), 1, buf.as_mut_ptr(), buf.len())
+        };
+        assert_eq!(n13, 13);
+        assert_eq!(&buf[..13], b"9780132350884");
+
+        let raw13 = b"978-0-13-235088-4";
+        let eq = unsafe {
+            nntmux_book_isbn_equivalent(raw10.as_ptr(), raw10.len(), raw13.as_ptr(), raw13.len())
+        };
+        assert_eq!(eq, 1);
     }
 }
