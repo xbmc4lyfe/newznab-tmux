@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
@@ -17,6 +19,138 @@ use RuntimeException;
  */
 final class RemoteReleasePublisher
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_w16_remote(uint32_t operation, const char *input, size_t length, char *output, size_t capacity);
+        C;
+
+    // Candidate helpers retain PHP defaults until every paired mean/p99 gate passes.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    /** Reject objects before serialize() can invoke user code; bound cycles and nesting. */
+    private static function nativeValueSupported(mixed $value, int &$remaining, int $depth): bool
+    {
+        if (--$remaining < 0 || $depth > 24) {
+            return false;
+        }
+        if (is_array($value)) {
+            foreach ($value as $item) {
+                if (! self::nativeValueSupported($item, $remaining, $depth + 1)) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        return $value === null || is_scalar($value);
+    }
+
+    /** @param list<mixed> $arguments */
+    private static function computeNative(int $operation, array $arguments): mixed
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        try {
+            $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+            if ($ffi === null) {
+                return null;
+            }
+            $remaining = 100000;
+            if (! self::nativeValueSupported($arguments, $remaining, 0)) {
+                return null;
+            }
+            $input = serialize($arguments);
+            $capacity = 0;
+            $output = RustPipelineLibrary::obtainScratch($ffi, max(4096, strlen($input) + 512), $capacity);
+            if ($output === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w16_remote($operation, $input, strlen($input), $output, $capacity);
+            if (! is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+
+            return unserialize(FFI::string($output, $written), ['allowed_classes' => false]);
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    public static function publicationGuard(bool $passed, string $verdict): int
+    {
+        return self::publicationGuardNative($passed, $verdict) ?? self::publicationGuardPhp($passed, $verdict);
+    }
+
+    public static function publicationGuardPhp(bool $passed, string $verdict): int
+    {
+        return ! $passed ? 0 : ($verdict === 'sampled' ? 1 : 2);
+    }
+
+    public static function publicationGuardNative(bool $passed, string $verdict): ?int
+    {
+        $result = self::computeNative(0, [$passed, $verdict]);
+
+        return is_int($result) ? $result : null;
+    }
+
+    public static function endpointUrl(string $url): string
+    {
+        return self::endpointUrlNative($url) ?? self::endpointUrlPhp($url);
+    }
+
+    public static function endpointUrlPhp(string $url): string
+    {
+        return trim($url);
+    }
+
+    public static function endpointUrlNative(string $url): ?string
+    {
+        $result = self::computeNative(1, [$url]);
+
+        return is_string($result) ? $result : null;
+    }
+
+    public static function batchFallback(int $status, bool $protocol, bool $maxItems): bool
+    {
+        return self::batchFallbackNative($status, $protocol, $maxItems) ?? self::batchFallbackPhp($status, $protocol, $maxItems);
+    }
+
+    public static function batchFallbackPhp(int $status, bool $protocol, bool $maxItems): bool
+    {
+        return in_array($status, [404, 405, 413], true) || ($status === 422 && ($protocol || $maxItems));
+    }
+
+    public static function batchFallbackNative(int $status, bool $protocol, bool $maxItems): ?bool
+    {
+        $result = self::computeNative(2, [$status, $protocol, $maxItems]);
+
+        return is_bool($result) ? $result : null;
+    }
+
+    public static function errorMessage(string $message): string
+    {
+        return self::errorMessageNative($message) ?? self::errorMessagePhp($message);
+    }
+
+    public static function errorMessagePhp(string $message): string
+    {
+        return mb_strcut($message, 0, 500, 'UTF-8');
+    }
+
+    public static function errorMessageNative(string $message): ?string
+    {
+        $result = self::computeNative(3, [$message]);
+
+        return is_string($result) ? $result : null;
+    }
+
     /** Seconds the single endpoint is used alone after the batch endpoint proved unavailable. */
     public const int BATCH_FALLBACK_SECONDS = 600;
 
@@ -43,10 +177,10 @@ final class RemoteReleasePublisher
     /** @param (callable(): void)|null $progress Caller ownership checks; failures propagate, unlike publishMany's best-effort markers. */
     public function publish(object $claim, VerificationResult $result, ?callable $progress = null): ?int
     {
-        if (! $result->passed()) {
+        if (self::publicationGuard($result->passed(), $result->verdict) === 0) {
             return null;
         }
-        if ($result->verdict !== 'sampled') {
+        if (self::publicationGuard($result->passed(), $result->verdict) === 2) {
             throw new RuntimeException('Only spot-checked results can be published by a remote worker.');
         }
         $payload = ['claim' => ['id' => (int) $claim->id, 'version' => (int) $claim->version,
@@ -61,7 +195,7 @@ final class RemoteReleasePublisher
                 ->withOptions($this->progressOptions($progress))
                 ->withRequestMiddleware($this->cancellationGate($progress))
                 ->retry(3, 1000, fn (\Throwable $error): bool => $error instanceof ConnectionException && ! $this->cancelledNow(), throw: false)
-                ->post((string) config('release_verification.publish_url'), $payload);
+                ->post(self::endpointUrl((string) config('release_verification.publish_url')), $payload);
         } catch (\Throwable $error) {
             $timing?->reportRoundTrip('threw', null);
 
@@ -76,7 +210,7 @@ final class RemoteReleasePublisher
             }
             $error = $response->json('error');
             throw new RuntimeException('Remote publication failed: '
-                .mb_strcut(is_string($error) ? $error : 'HTTP '.$response->status(), 0, 500, 'UTF-8'));
+                .self::errorMessage(is_string($error) ? $error : 'HTTP '.$response->status()));
         }
         $releaseId = $response->json('release_id');
 
@@ -172,14 +306,14 @@ final class RemoteReleasePublisher
                 continue;
             }
             try {
-                if ($item->result->verdict !== 'sampled') {
+                if (self::publicationGuard($item->result->passed(), $item->result->verdict) === 2) {
                     throw new RuntimeException('Only spot-checked results can be published by a remote worker.');
                 }
                 $payloads[$position] = ['claim' => ['id' => (int) $item->claim->id, 'version' => (int) $item->claim->version,
                     'manifest_hash' => (string) $item->claim->manifest_hash, 'lease_token' => (string) $item->claim->lease_token],
                     'reason' => $item->result->reason, 'evidence' => SpotCheckVerifier::evidence($item->result->manifest)];
             } catch (\Throwable $error) {
-                $outcomes[$position] = new PublicationOutcome(PublicationOutcome::ERROR, null, mb_strcut($error->getMessage(), 0, 500, 'UTF-8'));
+                $outcomes[$position] = new PublicationOutcome(PublicationOutcome::ERROR, null, self::errorMessage($error->getMessage()));
             }
         }
         // Groups follow the caller's order; each one request, or (when it cannot be batched) one by one.
@@ -206,6 +340,44 @@ final class RemoteReleasePublisher
      * @return list<array{batch: bool, payloads: array<int, array<string, mixed>>}>
      */
     private function groups(array $payloads): array
+    {
+        if ($payloads === []) {
+            return [];
+        }
+        $limit = $this->advertisedMaxBytes;
+        if ($limit === null) {
+            return [['batch' => true, 'payloads' => $payloads]];
+        }
+        $sizes = [];
+        $emptySize = $this->bodySize([]);
+        foreach ($payloads as $position => $payload) {
+            $sizes[$position] = $this->bodySize([$payload]);
+            if ($sizes[$position] < $emptySize) {
+                // Preserve json_encode's failure behavior, including mixed valid/invalid items.
+                return $this->groupsPhp($payloads);
+            }
+        }
+        $groups = [];
+        foreach (RemotePublicationService::batchPartition($sizes, $this->bodySize([]), $limit) as $group) {
+            $selected = [];
+            foreach ($group['positions'] as $position) {
+                $selected[$position] = $payloads[$position];
+            }
+            $groups[] = ['batch' => $group['batch'], 'payloads' => $selected];
+        }
+
+        return $groups;
+    }
+
+    /**
+     * Split the payloads into requests that fit the byte limit the primary advertised. Without one,
+     * all go in one request. A payload too large for a request even alone goes through the single
+     * endpoint (its own group, `batch` false), whose body limit is not the batch's.
+     *
+     * @param  array<int, array<string, mixed>>  $payloads  By position.
+     * @return list<array{batch: bool, payloads: array<int, array<string, mixed>>}>
+     */
+    private function groupsPhp(array $payloads): array
     {
         if ($payloads === []) {
             return [];
@@ -291,7 +463,7 @@ final class RemoteReleasePublisher
                 ->withOptions($this->progressOptions())
                 ->withRequestMiddleware($this->cancellationGate())
                 ->retry(3, 1000, fn (\Throwable $error): bool => $error instanceof ConnectionException && ! $this->cancelledNow(), throw: false)
-                ->post((string) config('release_verification.publish_batch_url'),
+                ->post(self::endpointUrl((string) config('release_verification.publish_batch_url')),
                     ['protocol' => RemotePublicationService::BATCH_PROTOCOL, 'items' => array_values($payloads)]);
         } catch (\Throwable $error) {
             $timing?->reportRoundTrip('threw', null, count($payloads));
@@ -300,13 +472,13 @@ final class RemoteReleasePublisher
         }
         $timing?->reportRoundTrip($response->successful() ? 'returned' : 'failed', $response->status(), count($payloads));
         $status = $response->status();
-        if (in_array($status, [404, 405], true) || ($status === 422 && $response->json('supported_protocol') !== null)) {
+        if (self::batchFallback($status, $response->json('supported_protocol') !== null, false) && $status !== 413) {
             // An older primary, a disabled endpoint or another protocol: the single endpoint does the work.
             $this->markBatchUnavailable();
 
             return null;
         }
-        if ($status === 413 || ($status === 422 && $response->json('max_items') !== null)) {
+        if (self::batchFallback($status, false, $response->json('max_items') !== null)) {
             // This batch is too big for the primary's limits; the endpoint itself works.
             $advertised = $response->json('max_items');
             if ($status === 422 && is_int($advertised) && $advertised >= 1) {
@@ -322,7 +494,7 @@ final class RemoteReleasePublisher
         if (! $response->successful()) {
             $error = $response->json('error');
             throw new RuntimeException('Remote batch publication failed: '
-                .mb_strcut(is_string($error) ? $error : 'HTTP '.$status, 0, 500, 'UTF-8'));
+                .self::errorMessage(is_string($error) ? $error : 'HTTP '.$status));
         }
         $results = $response->json('results');
         if ($response->json('protocol') !== RemotePublicationService::BATCH_PROTOCOL || ! is_array($results)) {
@@ -392,13 +564,13 @@ final class RemoteReleasePublisher
                 $failed = true;
                 // A refused or dropped connection or a timeout is no answer from the primary; an error
                 // response (a RuntimeException from publish()) is, and stays an ERROR below.
-                $unreachable = mb_strcut('Remote publication could not reach the primary: '.$error->getMessage(), 0, 500, 'UTF-8');
+                $unreachable = self::errorMessage('Remote publication could not reach the primary: '.$error->getMessage());
                 $outcomes[$position] = new PublicationOutcome(PublicationOutcome::TRANSPORT, null, $unreachable);
             } catch (\Throwable $error) {
                 // An error response is an answer, not a transport failure. One that says verification is paused for
                 // maintenance (the single endpoint answers 409) is the batch endpoint's `paused`: retry later.
                 $outcomes[$position] = new PublicationOutcome(str_contains($error->getMessage(), RemotePublicationService::PAUSED_MESSAGE)
-                    ? PublicationOutcome::PAUSED : PublicationOutcome::ERROR, null, mb_strcut($error->getMessage(), 0, 500, 'UTF-8'));
+                    ? PublicationOutcome::PAUSED : PublicationOutcome::ERROR, null, self::errorMessage($error->getMessage()));
             }
             $this->requests[] = ['items' => 1, 'started' => $started, 'finished' => hrtime(true), 'failed' => $failed];
         }
