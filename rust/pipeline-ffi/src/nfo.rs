@@ -15915,34 +15915,74 @@ fn w19_list(value: &VerificationOutboxValue) -> bool {
     })
 }
 
-fn w19_cursor_id(value: &VerificationOutboxValue) -> Option<i64> {
+fn w19_field<'a>(
+    value: &'a VerificationOutboxValue,
+    key: &[u8],
+) -> Option<&'a VerificationOutboxValue> {
+    if let Ok(s) = std::str::from_utf8(key)
+        && let Ok(n) = s.parse::<i64>()
+        && n.to_string().as_bytes() == key
+    {
+        return w16_entries(value)?.iter().find_map(|(k, v)| match k {
+            VerificationOutboxValue::Int(k) if *k == n => Some(v),
+            _ => None,
+        });
+    }
+    value.field(key)
+}
+
+fn w19_cursor_id(value: &VerificationOutboxValue) -> Option<Option<i64>> {
     use VerificationOutboxValue as V;
     match value {
-        V::Int(n) => Some(*n),
+        V::Int(n) => Some(Some(*n)),
         V::Float(_) => {
             let n = w17_number(value)?;
-            // Decline out-of-range casts; PHP's conversion owns that behavior.
-            (n >= i64::MIN as f64 && n < -(i64::MIN as f64)).then_some(n as i64)
+            // Decline non-finite or out-of-range casts; PHP's conversion owns that behavior.
+            if n.is_finite() && n >= i64::MIN as f64 && n < -(i64::MIN as f64) {
+                Some(Some(n as i64))
+            } else {
+                None
+            }
         }
         V::Bytes(bytes) => {
-            let text = std::str::from_utf8(bytes)
-                .ok()?
-                .trim_matches(|c: char| c.is_ascii_whitespace());
-            if text.is_empty()
-                || !text.bytes().any(|c| c.is_ascii_digit())
-                || text
-                    .bytes()
+            let trim_ws = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+            let start = bytes.iter().position(|b| !trim_ws(b)).unwrap_or(bytes.len());
+            let end = bytes
+                .iter()
+                .rposition(|b| !trim_ws(b))
+                .map_or(start, |i| i + 1);
+            let trimmed = &bytes[start..end];
+            if trimmed.is_empty()
+                || !trimmed.iter().any(u8::is_ascii_digit)
+                || trimmed
+                    .iter()
                     .any(|c| !c.is_ascii_digit() && !matches!(c, b'+' | b'-' | b'.' | b'e' | b'E'))
             {
-                return None;
+                return Some(None);
             }
-            if let Ok(n) = text.parse::<i64>() {
-                return Some(n);
+            let text = std::str::from_utf8(trimmed).ok()?;
+            if !trimmed.iter().any(|c| matches!(c, b'.' | b'e' | b'E')) {
+                let digits_slice = trimmed
+                    .strip_prefix(b"+")
+                    .or_else(|| trimmed.strip_prefix(b"-"))
+                    .unwrap_or(trimmed);
+                if digits_slice.is_empty() || !digits_slice.iter().all(u8::is_ascii_digit) {
+                    return Some(None);
+                }
+                // Valid integer string: if it fits in i64, return Some(Some(n)); if it overflows i64, decline to PHP.
+                return text.parse::<i64>().ok().map(Some);
             }
-            let n: f64 = text.parse().ok()?;
-            (n.is_finite() && n >= i64::MIN as f64 && n < -(i64::MIN as f64)).then_some(n as i64)
+            let Ok(n) = text.parse::<f64>() else {
+                return Some(None);
+            };
+            let max_exact = (1i64 << 53) as f64;
+            if n.is_finite() && (-max_exact..=max_exact).contains(&n) {
+                Some(Some(n as i64))
+            } else {
+                None
+            }
         }
-        _ => None,
+        _ => Some(None),
     }
 }
 
@@ -16056,10 +16096,12 @@ fn w19_compute(op: u32, args: &[VerificationOutboxValue]) -> Option<Verification
         31 => {
             let at_key = bytes(1)?;
             let id_key = bytes(2)?;
-            match (
-                args[0].field(at_key).and_then(w16_bytes),
-                args[0].field(id_key).and_then(w19_cursor_id),
-            ) {
+            let at = w19_field(&args[0], at_key).and_then(w16_bytes);
+            let id = match w19_field(&args[0], id_key) {
+                Some(v) => w19_cursor_id(v)?,
+                None => None,
+            };
+            match (at, id) {
                 (Some(at), Some(id)) => w16_map(vec![("at", w16_string(at)), ("id", V::Int(id))]),
                 _ => V::Null,
             }
@@ -16110,8 +16152,12 @@ fn w19_compute(op: u32, args: &[VerificationOutboxValue]) -> Option<Verification
             } else {
                 let receipt = receipt?;
                 let first = &w16_entries(paths?)?[0].1;
+                let receipt_path = receipt.field(b"path").unwrap_or(&V::Null);
+                if matches!(first, V::Float(_)) || matches!(receipt_path, V::Float(_)) {
+                    return None;
+                }
                 if receipt.field(b"guid").and_then(w16_bytes) != Some(guid)
-                    || !w16_equal(receipt.field(b"path").unwrap_or(&V::Null), first)
+                    || !w16_equal(receipt_path, first)
                 {
                     w16_string(b"Audit NZB receipt does not match its retained inventory.")
                 } else if w16_bytes(first).is_none_or(|p| p.is_empty()) {
