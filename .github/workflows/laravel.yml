@@ -5,7 +5,7 @@ on: [push]
 jobs:
   tests:
     # Avoid self-hosted workers that also advertise ubuntu-latest but have no Docker daemon.
-    runs-on: ubuntu-24.04
+    runs-on: [spot, ubuntu-latest]
 
     strategy:
       fail-fast: true
