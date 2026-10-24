@@ -4,8 +4,10 @@ declare(strict_types=1);
 
 namespace App\Support;
 
+use FFI;
 use Illuminate\Support\Facades\DB;
 use RuntimeException;
+use Throwable;
 
 final class Par2FileHashEvidence
 {
@@ -13,7 +15,52 @@ final class Par2FileHashEvidence
 
     public const INVENTORY_PROOF_VERSION = 1;
 
+    private const string FFI_CDEF = <<<'C'
+        int32_t nntmux_par2_size_decimal_valid(const char *s, size_t len);
+        ssize_t nntmux_par2_le_u64_to_decimal(const char *bytes, size_t len, char *out_buf, size_t out_cap);
+        C;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
+    private static bool $useRustFfi = true;
+
+    public static function setUseRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
     public static function sizeDecimal(mixed $size): ?string
+    {
+        // Retain native PHP validation in production: single-call FFI crossing on a 1..20 byte
+        // string is ~58 ns vs ~34 ns in PHP (0.60x mean / 0.62x p99).
+        return self::sizeDecimalPhp($size);
+    }
+
+    public static function sizeDecimalNative(mixed $size): ?string
+    {
+        if (is_int($size)) {
+            return $size >= 0 ? (string) $size : null;
+        }
+        if (! is_string($size) || $size === '' || strlen($size) > 20) {
+            return null;
+        }
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return self::sizeDecimalPhp($size);
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $valid = $ffi->nntmux_par2_size_decimal_valid($size, strlen($size));
+
+            return $valid === 1 ? $size : null;
+        } catch (Throwable) {
+            return self::sizeDecimalPhp($size);
+        }
+    }
+
+    private static function sizeDecimalPhp(mixed $size): ?string
     {
         if (is_int($size)) {
             return $size >= 0 ? (string) $size : null;
@@ -31,12 +78,61 @@ final class Par2FileHashEvidence
         if (strlen($bytes) !== 8) {
             throw new RuntimeException('A PAR2 file size requires eight bytes.');
         }
+        if (self::$useRustFfi) {
+            $native = self::littleEndianSizeNative($bytes);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return self::littleEndianSizePhp($bytes);
+    }
+
+    public static function littleEndianSizeNative(string $bytes): ?string
+    {
+        if (strlen($bytes) !== 8) {
+            return null;
+        }
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, 32, $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_par2_le_u64_to_decimal($bytes, 8, $scratch, $cap);
+            if (! is_int($written) || $written <= 0) {
+                return null;
+            }
+
+            return FFI::string($scratch, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function littleEndianSizePhp(string $bytes): string
+    {
         $words = unpack('Vlow/Vhigh', $bytes);
         if (! is_array($words)) {
             throw new RuntimeException('Could not decode a PAR2 file size.');
         }
 
         return bcadd(bcmul((string) $words['high'], '4294967296', 0), (string) $words['low'], 0);
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (! self::$ffiResolved) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('support_par2_evidence', self::FFI_CDEF);
+            self::$ffiResolved = true;
+        }
+
+        return self::$ffi;
     }
 
     /** @param array<string, mixed> $snapshot */
