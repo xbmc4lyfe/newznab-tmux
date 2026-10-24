@@ -2452,9 +2452,408 @@ pub unsafe extern "C" fn nntmux_datetime_to_unix_utc(input: *const u8, input_len
         + i64::from(sec)
 }
 
+// ---------------------------------------------------------------------------
+// Verified NZB 1.0 document renderer (VerifiedNzbWriter::document parity).
+//
+// Mirrors PHP XMLWriter output for a UTF-8 document byte-for-byte. Attribute values escape
+// `& < > "` plus `\t \n \r` as character references; element text escapes `& < > "` and `\r`.
+// Any other control byte (< 0x20) or invalid UTF-8 declines with -1 so PHP renders it.
+//
+// meta:  poster\0 date\0 group*\0 password*\0   (group_count, password_count tokens)
+// files: per non-empty file `subject (1/N)\0 segment_count\0` then per segment
+//        `number\0 bytes\0 messageid\0` (file_count files, segment_count segments in total).
+// flags: bit 0 = spot_check verification mode.
+// ---------------------------------------------------------------------------
+
+const VNZB_DECLINE: u8 = 2;
+
+const fn vnzb_escape_table(attr: bool) -> [u8; 256] {
+    let mut table = [0u8; 256];
+    let mut i = 0;
+    while i < 0x20 {
+        table[i] = VNZB_DECLINE;
+        i += 1;
+    }
+    table[b'\r' as usize] = 1;
+    table[b'\t' as usize] = if attr { 1 } else { 0 };
+    table[b'\n' as usize] = if attr { 1 } else { 0 };
+    table[b'&' as usize] = 1;
+    table[b'<' as usize] = 1;
+    table[b'>' as usize] = 1;
+    table[b'"' as usize] = 1;
+    table
+}
+
+static VNZB_ATTR: [u8; 256] = vnzb_escape_table(true);
+static VNZB_TEXT: [u8; 256] = vnzb_escape_table(false);
+
+trait VnzbSink {
+    fn put(&mut self, bytes: &[u8]);
+}
+
+impl VnzbSink for OutCursor {
+    #[inline]
+    fn put(&mut self, bytes: &[u8]) {
+        self.push_slice(bytes);
+    }
+}
+
+impl VnzbSink for Vec<u8> {
+    #[inline]
+    fn put(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+}
+
+#[inline]
+fn vnzb_escape<S: VnzbSink>(out: &mut S, s: &[u8], table: &[u8; 256]) -> bool {
+    let mut start = 0;
+    for (i, &b) in s.iter().enumerate() {
+        let class = table[b as usize];
+        if class == 0 {
+            continue;
+        }
+        if class == VNZB_DECLINE {
+            return false;
+        }
+        out.put(&s[start..i]);
+        let reference: &[u8] = match b {
+            b'&' => b"&amp;",
+            b'<' => b"&lt;",
+            b'>' => b"&gt;",
+            b'"' => b"&quot;",
+            b'\t' => b"&#9;",
+            b'\n' => b"&#10;",
+            _ => b"&#13;",
+        };
+        out.put(reference);
+        start = i + 1;
+    }
+    out.put(&s[start..]);
+    true
+}
+
+struct VnzbTokens<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> VnzbTokens<'a> {
+    #[inline]
+    fn next(&mut self) -> Option<&'a [u8]> {
+        let rest = &self.buf[self.pos..];
+        let end = rest.iter().position(|&b| b == 0)?;
+        self.pos += end + 1;
+        Some(&rest[..end])
+    }
+
+    #[inline]
+    fn exhausted(&self) -> bool {
+        self.pos == self.buf.len()
+    }
+}
+
+#[inline]
+fn vnzb_parse_count(token: &[u8]) -> Option<usize> {
+    if token.is_empty() || token.len() > 18 {
+        return None;
+    }
+    let mut value = 0usize;
+    for &b in token {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        value = value * 10 + usize::from(b - b'0');
+    }
+    Some(value)
+}
+
+#[inline]
+fn vnzb_trim_angle(mut s: &[u8]) -> &[u8] {
+    while let [b'<' | b'>', rest @ ..] = s {
+        s = rest;
+    }
+    while let [rest @ .., b'<' | b'>'] = s {
+        s = rest;
+    }
+    s
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verified_nzb_render(
+    meta: &[u8],
+    group_count: usize,
+    password_count: usize,
+    inventory: i64,
+    spot_check: bool,
+    files: &[u8],
+    file_count: usize,
+    segment_count: usize,
+    out: &mut OutCursor,
+) -> Option<()> {
+    if std::str::from_utf8(meta).is_err() || std::str::from_utf8(files).is_err() {
+        return None;
+    }
+    let mut meta_tokens = VnzbTokens { buf: meta, pos: 0 };
+    let poster = meta_tokens.next()?;
+    let date = meta_tokens.next()?;
+
+    // Shared per-file bytes: the poster/date attributes and the groups element.
+    let mut file_open: Vec<u8> = Vec::with_capacity(64 + poster.len() + date.len());
+    file_open.extend_from_slice(b"<file poster=\"");
+    if !vnzb_escape(&mut file_open, poster, &VNZB_ATTR) {
+        return None;
+    }
+    file_open.extend_from_slice(b"\" date=\"");
+    if !vnzb_escape(&mut file_open, date, &VNZB_ATTR) {
+        return None;
+    }
+    file_open.extend_from_slice(b"\" subject=\"");
+    let mut groups_xml: Vec<u8> = Vec::with_capacity(64);
+    if group_count == 0 {
+        groups_xml.extend_from_slice(b"<groups/>");
+    } else {
+        groups_xml.extend_from_slice(b"<groups>");
+        for _ in 0..group_count {
+            groups_xml.extend_from_slice(b"<group>");
+            if !vnzb_escape(&mut groups_xml, meta_tokens.next()?, &VNZB_TEXT) {
+                return None;
+            }
+            groups_xml.extend_from_slice(b"</group>");
+        }
+        groups_xml.extend_from_slice(b"</groups>");
+    }
+    groups_xml.extend_from_slice(b"<segments>");
+
+    out.push_slice(
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"",
+    );
+    let has_head = inventory > 0 || spot_check || password_count > 0;
+    if !has_head && file_count == 0 {
+        if password_count != 0 || !meta_tokens.exhausted() || !files.is_empty() {
+            return None;
+        }
+        out.push_slice(b"/>\n");
+        return Some(());
+    }
+    out.push_slice(b">");
+    if has_head {
+        out.push_slice(b"<head>");
+        let inventory_text = inventory.to_string();
+        if spot_check {
+            if inventory > 0 {
+                out.push_slice(b"<meta type=\"nntmux:declared-file-count\">");
+                out.push_slice(inventory_text.as_bytes());
+                out.push_slice(b"</meta>");
+            }
+            out.push_slice(b"<meta type=\"nntmux:verification-mode\">spot-check</meta>");
+        } else if inventory > 0 {
+            out.push_slice(b"<meta type=\"nntmux:verified-file-count\">");
+            out.push_slice(inventory_text.as_bytes());
+            out.push_slice(b"</meta>");
+        }
+        for _ in 0..password_count {
+            out.push_slice(b"<meta type=\"password\">");
+            if !vnzb_escape(out, meta_tokens.next()?, &VNZB_TEXT) {
+                return None;
+            }
+            out.push_slice(b"</meta>");
+        }
+        out.push_slice(b"</head>");
+    }
+    if !meta_tokens.exhausted() {
+        return None;
+    }
+
+    let mut file_tokens = VnzbTokens { buf: files, pos: 0 };
+    let mut segments_seen = 0usize;
+    for _ in 0..file_count {
+        let subject = file_tokens.next()?;
+        let segments = vnzb_parse_count(file_tokens.next()?)?;
+        if segments == 0 {
+            return None;
+        }
+        segments_seen = segments_seen.checked_add(segments)?;
+        if segments_seen > segment_count {
+            return None;
+        }
+        out.push_slice(&file_open);
+        if !vnzb_escape(out, subject, &VNZB_ATTR) {
+            return None;
+        }
+        out.push_slice(b"\">");
+        out.push_slice(&groups_xml);
+        for _ in 0..segments {
+            let number = file_tokens.next()?;
+            let bytes = file_tokens.next()?;
+            let message_id = vnzb_trim_angle(file_tokens.next()?);
+            out.push_slice(b"<segment number=\"");
+            if !vnzb_escape(out, number, &VNZB_ATTR) {
+                return None;
+            }
+            out.push_slice(b"\" bytes=\"");
+            if !vnzb_escape(out, bytes, &VNZB_ATTR) {
+                return None;
+            }
+            out.push_slice(b"\">");
+            if !vnzb_escape(out, message_id, &VNZB_TEXT) {
+                return None;
+            }
+            out.push_slice(b"</segment>");
+        }
+        out.push_slice(b"</segments></file>");
+    }
+    if segments_seen != segment_count || !file_tokens.exhausted() {
+        return None;
+    }
+    out.push_slice(b"</nzb>\n");
+    Some(())
+}
+
+/// Render a verified NZB document in `VerifiedNzbWriter::document` byte layout.
+///
+/// Returns the written length, `-1` when PHP must render the input (control bytes, invalid
+/// UTF-8, malformed packing), or `-(required)` (≤ -4) when `out_cap` is too small.
+///
+/// # Safety
+/// Non-empty input pointers must be readable for their lengths; `out_buf` writable for `out_cap`.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_verified_nzb_document(
+    meta: *const u8,
+    meta_len: usize,
+    group_count: usize,
+    password_count: usize,
+    inventory: i64,
+    flags: u32,
+    files: *const u8,
+    files_len: usize,
+    file_count: usize,
+    segment_count: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if (meta_len > 0 && meta.is_null()) || (files_len > 0 && files.is_null()) {
+        return -1;
+    }
+    let meta = if meta_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(meta, meta_len) }
+    };
+    let files = if files_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(files, files_len) }
+    };
+    let mut out = OutCursor::new(out_buf, out_cap);
+    match verified_nzb_render(
+        meta,
+        group_count,
+        password_count,
+        inventory,
+        flags & 1 == 1,
+        files,
+        file_count,
+        segment_count,
+        &mut out,
+    ) {
+        Some(()) => out.finish(),
+        None => -1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn render_verified_nzb(
+        meta: &[u8],
+        groups: usize,
+        passwords: usize,
+        inventory: i64,
+        flags: u32,
+        files: &[u8],
+        file_count: usize,
+        segment_count: usize,
+    ) -> Result<Vec<u8>, isize> {
+        let mut buf = vec![0u8; 4];
+        loop {
+            let n = unsafe {
+                nntmux_verified_nzb_document(
+                    meta.as_ptr(),
+                    meta.len(),
+                    groups,
+                    passwords,
+                    inventory,
+                    flags,
+                    files.as_ptr(),
+                    files.len(),
+                    file_count,
+                    segment_count,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            if n >= 0 {
+                buf.truncate(n as usize);
+                return Ok(buf);
+            }
+            if n == -1 {
+                return Err(n);
+            }
+            buf = vec![0u8; (-n) as usize];
+        }
+    }
+
+    #[test]
+    fn test_verified_nzb_document_matches_xmlwriter_layout() {
+        let doc = render_verified_nzb(
+            b"Po\"ster <a&b>\x001700000000\0alt.bin\0a&b\0pw\r1\0",
+            2,
+            1,
+            2,
+            0,
+            b"Sub\tj \"x\" (1/2)\x002\x001\x00100\x00<a@b>\x002\x0050\x00x&y\r\x00",
+            1,
+            2,
+        )
+        .unwrap();
+        let expected = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><head><meta type=\"nntmux:verified-file-count\">2</meta><meta type=\"password\">pw&#13;1</meta></head><file poster=\"Po&quot;ster &lt;a&amp;b&gt;\" date=\"1700000000\" subject=\"Sub&#9;j &quot;x&quot; (1/2)\"><groups><group>alt.bin</group><group>a&amp;b</group></groups><segments><segment number=\"1\" bytes=\"100\">a@b</segment><segment number=\"2\" bytes=\"50\">x&amp;y&#13;</segment></segments></file></nzb>\n";
+        assert_eq!(String::from_utf8(doc).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_verified_nzb_document_empty_and_spot_check() {
+        let empty = render_verified_nzb(b"\0\0", 0, 0, 0, 0, b"", 0, 0).unwrap();
+        assert_eq!(
+            empty,
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"/>\n"
+        );
+        let spot = render_verified_nzb(b"\0\0", 0, 0, 3, 1, b"", 0, 0).unwrap();
+        assert!(String::from_utf8(spot).unwrap().ends_with("<head><meta type=\"nntmux:declared-file-count\">3</meta><meta type=\"nntmux:verification-mode\">spot-check</meta></head></nzb>\n"));
+    }
+
+    #[test]
+    fn test_verified_nzb_document_declines_control_bytes_and_bad_packing() {
+        let render = |meta: &[u8], files: &[u8], segments: usize| {
+            render_verified_nzb(meta, 0, 0, 0, 0, files, 1, segments)
+        };
+        assert_eq!(
+            render(b"p\x01\0d\0", b"s\x001\x001\x002\x00m\x00", 1),
+            Err(-1)
+        );
+        assert_eq!(
+            render(b"p\0d\0", b"s\x001\x001\x002\x00m\xff\x00", 1),
+            Err(-1)
+        );
+        // Embedded NUL inside a message-id shifts the token stream and is rejected.
+        assert_eq!(
+            render(b"p\0d\0", b"s\x001\x001\x002\x00m\x00x\x00", 1),
+            Err(-1)
+        );
+        assert_eq!(render(b"p\0d\0", b"s\x001\x001\x002\x00m\x00", 2), Err(-1));
+    }
 
     #[test]
     fn test_manticore_escape_string_matches_php() {
