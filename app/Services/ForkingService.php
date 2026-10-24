@@ -9,8 +9,11 @@ use App\Services\Runners\BackfillRunner;
 use App\Services\Runners\BinariesRunner;
 use App\Services\Runners\PostProcessRunner;
 use App\Services\Runners\ReleasesRunner;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\Log;
 use Symfony\Component\Process\Process;
+use Throwable;
 
 /**
  * Service for multiprocessing various tasks.
@@ -20,6 +23,43 @@ use Symfony\Component\Process\Process;
  */
 class ForkingService
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_fork_max_retries(int64_t max_nfo_retries, int64_t *out);
+        int32_t nntmux_fork_work_type(const char *ptr, size_t len);
+        ssize_t nntmux_fork_timing_header(const char *task, size_t task_len, int64_t elapsed, const char *date, size_t date_len, char *out, size_t cap);
+        C;
+
+    /**
+     * Work types accepted by {@see processWorkType()}, in its match order.
+     *
+     * @var list<string>
+     */
+    public const array WORK_TYPES = [
+        'backfill',
+        'binaries',
+        'fixRelNames_standard',
+        'fixRelNames_predbft',
+        'releases',
+        'postProcess_add',
+        'postProcess_ani',
+        'postProcess_ama',
+        'postProcess_boo',
+        'postProcess_con',
+        'postProcess_gam',
+        'postProcess_mov',
+        'postProcess_mus',
+        'postProcess_nfo',
+        'postProcess_tv',
+        'safe_backfill',
+        'safe_binaries',
+        'update_per_group',
+    ];
+
+    // PHP remains the production default until benchmarks qualify Rust.
+    private static ?bool $useRustFfi = null;
+
+    private static FFI|false|null $ffi = null;
+
     protected BackfillRunner $backfillRunner;
 
     protected BinariesRunner $binariesRunner;
@@ -32,10 +72,7 @@ class ForkingService
 
     public function __construct()
     {
-        $this->maxRetries = (int) app(ConfigurationProvider::class)->postProcessing()->maxNfoRetries >= 0
-            ? -((int) app(ConfigurationProvider::class)->postProcessing()->maxNfoRetries + 1)
-            : NfoService::NFO_UNPROC;
-        $this->maxRetries = max($this->maxRetries, -8);
+        $this->maxRetries = self::maxRetriesFor((int) app(ConfigurationProvider::class)->postProcessing()->maxNfoRetries);
 
         // Initialize runners
         $this->backfillRunner = new BackfillRunner;
@@ -209,6 +246,12 @@ class ForkingService
      */
     public function processWorkType(string $type, array $options = []): void
     {
+        if (self::workTypeIndex($type) === null) {
+            Log::warning("Unknown work type: {$type}");
+
+            return;
+        }
+
         match ($type) {
             'backfill' => $this->backfill($options),
             'binaries' => $this->binaries((int) ($options[0] ?? 0)),
@@ -241,7 +284,7 @@ class ForkingService
 
         try {
             $task();
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::error("Task {$taskName} failed: {$e->getMessage()}", [
                 'exception' => $e,
             ]);
@@ -249,10 +292,7 @@ class ForkingService
         }
 
         if (config('nntmux.echocli')) {
-            cli()->header(
-                "Multi-processing for {$taskName} finished in ".(now()->timestamp - $startTime).
-                ' seconds at '.now()->toRfc2822String().'.'.PHP_EOL
-            );
+            cli()->header(self::timingHeader($taskName, now()->timestamp - $startTime, now()->toRfc2822String()));
         }
     }
 
@@ -294,5 +334,153 @@ class ForkingService
         if (config('nntmux.echocli')) {
             echo $message.PHP_EOL;
         }
+    }
+
+    public static function enableRustFfi(): void
+    {
+        self::$useRustFfi = true;
+    }
+
+    public static function disableRustFfi(): void
+    {
+        self::$useRustFfi = false;
+    }
+
+    /**
+     * Restore the production default and re-resolve the library on next use.
+     */
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = null;
+        self::$ffi = null;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    public static function setFfiForTesting(FFI|false|null $override = null): void
+    {
+        self::$ffi = $override;
+    }
+
+    /**
+     * NFO retry marker for a `maxNfoRetries` setting: `-(retries + 1)` when non-negative,
+     * otherwise {@see NfoService::NFO_UNPROC}, never below -8.
+     */
+    public static function maxRetriesFor(int $maxNfoRetries): int
+    {
+        return self::usesRustFfi() ? self::maxRetriesForNative($maxNfoRetries) : self::maxRetriesForPhp($maxNfoRetries);
+    }
+
+    public static function maxRetriesForPhp(int $maxNfoRetries): int
+    {
+        $maxRetries = $maxNfoRetries >= 0 ? -($maxNfoRetries + 1) : NfoService::NFO_UNPROC;
+
+        // `-(PHP_INT_MAX + 1)` is a float; it still clamps to -8.
+        return (int) max($maxRetries, -8);
+    }
+
+    public static function maxRetriesForNative(int $maxNfoRetries): int
+    {
+        if (($ffi = self::ffi()) === null) {
+            return self::maxRetriesForPhp($maxNfoRetries);
+        }
+        try {
+            $out = $ffi->new('int64_t[1]');
+            // @phpstan-ignore method.notFound
+            $code = $ffi->nntmux_fork_max_retries($maxNfoRetries, $out);
+            if ($code !== 0) {
+                return self::maxRetriesForPhp($maxNfoRetries);
+            }
+            $maxRetries = $out[0];
+        } catch (Throwable) {
+            return self::maxRetriesForPhp($maxNfoRetries);
+        }
+
+        return \is_int($maxRetries) ? $maxRetries : self::maxRetriesForPhp($maxNfoRetries);
+    }
+
+    /**
+     * Position of `$type` in {@see WORK_TYPES} (exact match), or null for an unknown type.
+     */
+    public static function workTypeIndex(string $type): ?int
+    {
+        return self::usesRustFfi() ? self::workTypeIndexNative($type) : self::workTypeIndexPhp($type);
+    }
+
+    public static function workTypeIndexPhp(string $type): ?int
+    {
+        $index = array_search($type, self::WORK_TYPES, true);
+
+        return $index === false ? null : $index;
+    }
+
+    public static function workTypeIndexNative(string $type): ?int
+    {
+        if (($ffi = self::ffi()) === null) {
+            return self::workTypeIndexPhp($type);
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $index = $ffi->nntmux_fork_work_type($type, \strlen($type));
+        } catch (Throwable) {
+            return self::workTypeIndexPhp($type);
+        }
+        if ($index === -2) {
+            return null;
+        }
+
+        return \is_int($index) && isset(self::WORK_TYPES[$index]) ? $index : self::workTypeIndexPhp($type);
+    }
+
+    /**
+     * Console line reporting how long a multi-processing task took.
+     */
+    public static function timingHeader(string $taskName, int $elapsedSeconds, string $finishedAt): string
+    {
+        return self::usesRustFfi()
+            ? self::timingHeaderNative($taskName, $elapsedSeconds, $finishedAt)
+            : self::timingHeaderPhp($taskName, $elapsedSeconds, $finishedAt);
+    }
+
+    public static function timingHeaderPhp(string $taskName, int $elapsedSeconds, string $finishedAt): string
+    {
+        return "Multi-processing for {$taskName} finished in ".$elapsedSeconds.
+            ' seconds at '.$finishedAt.'.'.PHP_EOL;
+    }
+
+    public static function timingHeaderNative(string $taskName, int $elapsedSeconds, string $finishedAt): string
+    {
+        if (($ffi = self::ffi()) === null || PHP_EOL !== "\n") {
+            return self::timingHeaderPhp($taskName, $elapsedSeconds, $finishedAt);
+        }
+        $needed = \strlen($taskName) + \strlen($finishedAt) + 80;
+        $capacity = 0;
+        $buffer = RustPipelineLibrary::obtainScratch($ffi, $needed, $capacity);
+        if ($buffer === null) {
+            return self::timingHeaderPhp($taskName, $elapsedSeconds, $finishedAt);
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_fork_timing_header($taskName, \strlen($taskName), $elapsedSeconds, $finishedAt, \strlen($finishedAt), $buffer, $capacity);
+            if (! \is_int($written) || $written <= 0 || $written > $capacity) {
+                return self::timingHeaderPhp($taskName, $elapsedSeconds, $finishedAt);
+            }
+
+            return FFI::string($buffer, $written);
+        } catch (Throwable) {
+            return self::timingHeaderPhp($taskName, $elapsedSeconds, $finishedAt);
+        }
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
     }
 }
