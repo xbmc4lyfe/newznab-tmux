@@ -4391,3 +4391,332 @@ mod coverage_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// 10. ContainerSplicer::splice offset scanner
+// ---------------------------------------------------------------------------
+
+const MATROSKA_CLUSTER: [u8; 4] = [0x1F, 0x43, 0xB6, 0x75];
+const MPEG_PACK_START: [u8; 4] = [0x00, 0x00, 0x01, 0xBA];
+
+/// First offset of the 4-byte `needle` in `hay` (PHP `strpos`), prefiltered on the needle bytes at
+/// `a` and `b`; pick rare ones (MPEG pack starts begin with two zero bytes).
+fn find4(hay: &[u8], needle: &[u8; 4], a: usize, b: usize) -> Option<usize> {
+    let last = hay.len().checked_sub(4)?;
+    let (x, y) = (needle[a], needle[b]);
+    let mut from = 0;
+    while from <= last {
+        let candidate = find_pair(hay, from, last, a, [x, x], b, [y, y])?;
+        if hay[candidate..candidate + 4] == *needle {
+            return Some(candidate);
+        }
+        from = candidate + 1;
+    }
+    None
+}
+
+/// First `p` in `from..=last` with `hay[p + a]` in `xs` and `hay[p + b]` in `ys`; `a, b < 4` and
+/// `last + 4 <= hay.len()`.
+fn find_pair(
+    hay: &[u8],
+    from: usize,
+    last: usize,
+    a: usize,
+    xs: [u8; 2],
+    b: usize,
+    ys: [u8; 2],
+) -> Option<usize> {
+    let mut p = from;
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::{
+            uint8x16_t, vandq_u8, vceqq_u8, vdupq_n_u8, vld1q_u8, vmaxvq_u8, vorrq_u8,
+        };
+        // SAFETY: each iteration loads 16 bytes at `p + a`, `p + b`, `p + 16 + a` and `p + 16 + b`,
+        // all ending by `p + 35 <= last + 3 < hay.len()`; NEON is baseline on aarch64.
+        unsafe {
+            let base = hay.as_ptr();
+            let (x0, x1, y0, y1) = (
+                vdupq_n_u8(xs[0]),
+                vdupq_n_u8(xs[1]),
+                vdupq_n_u8(ys[0]),
+                vdupq_n_u8(ys[1]),
+            );
+            let hit = |at: usize| -> uint8x16_t {
+                let (va, vb) = (vld1q_u8(base.add(at + a)), vld1q_u8(base.add(at + b)));
+                vandq_u8(
+                    vorrq_u8(vceqq_u8(va, x0), vceqq_u8(va, x1)),
+                    vorrq_u8(vceqq_u8(vb, y0), vceqq_u8(vb, y1)),
+                )
+            };
+            while p + 32 <= last {
+                if vmaxvq_u8(vorrq_u8(hit(p), hit(p + 16))) != 0 {
+                    break;
+                }
+                p += 32;
+            }
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{
+            __m128i, _mm_and_si128, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8,
+            _mm_or_si128, _mm_set1_epi8,
+        };
+        // SAFETY: as above; SSE2 is baseline on x86_64 and the loads are unaligned.
+        unsafe {
+            let base = hay.as_ptr();
+            let splat = |v: u8| _mm_set1_epi8(v as i8);
+            let (x0, x1, y0, y1) = (splat(xs[0]), splat(xs[1]), splat(ys[0]), splat(ys[1]));
+            let hit = |at: usize| -> __m128i {
+                let va = _mm_loadu_si128(base.add(at + a).cast());
+                let vb = _mm_loadu_si128(base.add(at + b).cast());
+                _mm_and_si128(
+                    _mm_or_si128(_mm_cmpeq_epi8(va, x0), _mm_cmpeq_epi8(va, x1)),
+                    _mm_or_si128(_mm_cmpeq_epi8(vb, y0), _mm_cmpeq_epi8(vb, y1)),
+                )
+            };
+            while p + 32 <= last {
+                if _mm_movemask_epi8(_mm_or_si128(hit(p), hit(p + 16))) != 0 {
+                    break;
+                }
+                p += 32;
+            }
+        }
+    }
+    (p..=last).find(|&q| xs.contains(&hay[q + a]) && ys.contains(&hay[q + b]))
+}
+
+/// Leftmost match of PCRE `/\d\d(?:dc|db|wb)/`: an AVI stream chunk id.
+fn find_avi_chunk(mid: &[u8]) -> Option<usize> {
+    let last = mid.len().checked_sub(4)?;
+    let mut from = 0;
+    while from <= last {
+        let p = find_pair(mid, from, last, 2, *b"dw", 3, *b"cb")?;
+        if mid[p].is_ascii_digit() && mid[p + 1].is_ascii_digit() && &mid[p + 2..p + 4] != b"wc" {
+            return Some(p);
+        }
+        from = p + 1;
+    }
+    None
+}
+
+/// `ContainerSplicer::splice()` as offsets: the result is `head[..head_end] . mid[mid_start..]`.
+/// Container codes follow `detect_video_container`; containers without a resume point give `None`.
+pub(crate) fn container_splice(container: u8, head: &[u8], mid: &[u8]) -> Option<(usize, usize)> {
+    match container {
+        1 => Some((
+            find4(head, &MATROSKA_CLUSTER, 0, 3)?,
+            find4(mid, &MATROSKA_CLUSTER, 0, 3)?,
+        )),
+        2 => {
+            let movi = find4(head, b"movi", 0, 3)?;
+            if movi < 8 || &head[movi - 8..movi - 4] != b"LIST" {
+                return None;
+            }
+            Some((movi + 4, find_avi_chunk(mid)?))
+        }
+        3 => Some((0, find4(mid, &MPEG_PACK_START, 2, 3)?)),
+        4 => Some((0, transport_stream_offset(mid)?)),
+        _ => None,
+    }
+}
+
+/// Returns 1 with both offsets written, 0 when the chunk cannot be spliced and -1 on invalid input.
+///
+/// # Safety
+/// `head_ptr`/`tail_ptr` must be readable for their lengths and the out pointers writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_container_splice(
+    container_code: u8,
+    head_ptr: *const u8,
+    head_len: usize,
+    tail_ptr: *const u8,
+    tail_len: usize,
+    out_head_end: *mut usize,
+    out_tail_start: *mut usize,
+) -> i32 {
+    if (head_ptr.is_null() && head_len > 0)
+        || (tail_ptr.is_null() && tail_len > 0)
+        || out_head_end.is_null()
+        || out_tail_start.is_null()
+    {
+        return -1;
+    }
+    let head = if head_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(head_ptr, head_len) }
+    };
+    let mid = if tail_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(tail_ptr, tail_len) }
+    };
+    match container_splice(container_code, head, mid) {
+        Some((head_end, tail_start)) => {
+            unsafe {
+                *out_head_end = head_end;
+                *out_tail_start = tail_start;
+            }
+            1
+        }
+        None => 0,
+    }
+}
+
+#[cfg(test)]
+mod container_splice_tests {
+    use super::*;
+
+    const CLUSTER: &[u8] = b"\x1F\x43\xB6\x75";
+
+    fn naive_find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
+
+    fn naive_avi(mid: &[u8]) -> Option<usize> {
+        mid.windows(4).position(|w| {
+            w[0].is_ascii_digit()
+                && w[1].is_ascii_digit()
+                && matches!(&w[2..], b"dc" | b"db" | b"wb")
+        })
+    }
+
+    fn noise(seed: u64, len: usize, alphabet: &[u8]) -> Vec<u8> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                alphabet[(state % alphabet.len() as u64) as usize]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scanners_match_naive_search_at_every_alignment() {
+        let alphabets: [&[u8]; 3] = [
+            b"\x1F\x43\xB6\x75\x00\x01\xBAx",
+            b"0123456789dcbw",
+            b"\x00\x00\x01\xBA\x47",
+        ];
+        for (seed, alphabet) in (1..400u64).zip(alphabets.iter().cycle()) {
+            let hay = noise(seed, (seed as usize * 7) % 300, alphabet);
+            assert_eq!(
+                find4(&hay, &MATROSKA_CLUSTER, 0, 3),
+                naive_find(&hay, CLUSTER),
+                "seed {seed}"
+            );
+            assert_eq!(
+                find4(&hay, &MPEG_PACK_START, 2, 3),
+                naive_find(&hay, &MPEG_PACK_START),
+                "seed {seed}"
+            );
+            assert_eq!(
+                find4(&hay, b"movi", 0, 3),
+                naive_find(&hay, b"movi"),
+                "seed {seed}"
+            );
+            assert_eq!(find_avi_chunk(&hay), naive_avi(&hay), "seed {seed}");
+        }
+        for at in 0..100 {
+            let mut hay = vec![0u8; 140];
+            hay[at..at + 4].copy_from_slice(CLUSTER);
+            assert_eq!(find4(&hay, &MATROSKA_CLUSTER, 0, 3), Some(at));
+            let mut avi = vec![b'x'; 140];
+            avi[at..at + 4].copy_from_slice(b"01wb");
+            assert_eq!(find_avi_chunk(&avi), Some(at));
+        }
+    }
+
+    #[test]
+    fn splice_offsets_follow_each_container() {
+        let head = [&b"\x1A\x45\xDF\xA3HEADERS"[..], CLUSTER, b"OPENING"].concat();
+        let mid = [&b"tail-of-a-block"[..], CLUSTER, b"MIDDLE"].concat();
+        assert_eq!(container_splice(1, &head, &mid), Some((11, 15)));
+        assert_eq!(container_splice(1, &head, b"no cluster here"), None);
+        assert_eq!(container_splice(1, b"", &mid), None);
+
+        let avi_head = b"RIFF\0\0\0\0AVI LIST\0\0\0\0hdrlLIST\0\0\0\0movi00dc";
+        assert_eq!(
+            container_splice(2, avi_head, b"junk1xdc01wb"),
+            Some((36, 8))
+        );
+        assert_eq!(container_splice(2, b"RIFFmovi....", b"00dc"), None);
+        assert_eq!(container_splice(2, b"xxxxJUNKxxxxmovi", b"00dc"), None);
+        assert_eq!(container_splice(2, avi_head, b"0adc"), None);
+
+        assert_eq!(
+            container_splice(3, b"", b"\x00\x00\x00\x01\xBA"),
+            Some((0, 1))
+        );
+        assert_eq!(container_splice(3, b"", b"\x00\x00\x01\xB3"), None);
+
+        let mut packets = b"junk!".to_vec();
+        for _ in 0..6 {
+            packets.push(0x47);
+            packets.extend([0x11; 187]);
+        }
+        assert_eq!(container_splice(4, b"", &packets), Some((0, 5)));
+        assert_eq!(container_splice(5, &head, &mid), None);
+        assert_eq!(container_splice(0, &head, &mid), None);
+    }
+
+    #[test]
+    fn ffi_rejects_null_buffers_and_writes_offsets() {
+        let (mut head_end, mut tail_start) = (usize::MAX, usize::MAX);
+        unsafe {
+            assert_eq!(
+                nntmux_container_splice(
+                    1,
+                    std::ptr::null(),
+                    1,
+                    b"x".as_ptr(),
+                    1,
+                    &mut head_end,
+                    &mut tail_start
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_container_splice(
+                    1,
+                    b"x".as_ptr(),
+                    1,
+                    b"x".as_ptr(),
+                    1,
+                    std::ptr::null_mut(),
+                    &mut tail_start
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_container_splice(
+                    3,
+                    std::ptr::null(),
+                    0,
+                    b"\x00\x00\x01\xBA".as_ptr(),
+                    4,
+                    &mut head_end,
+                    &mut tail_start
+                ),
+                1
+            );
+            assert_eq!((head_end, tail_start), (0, 0));
+            assert_eq!(
+                nntmux_container_splice(
+                    5,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    &mut head_end,
+                    &mut tail_start
+                ),
+                0
+            );
+        }
+    }
+}
