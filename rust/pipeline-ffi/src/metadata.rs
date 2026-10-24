@@ -25507,3 +25507,673 @@ pub mod user_stats_invitation {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 24 Slice 24.5: DatabaseFingerprintCollector, HorizonCollector,
+// ApplicationCollector, ServiceProbeRegistry, and GlobalDataComposer helpers
+// ---------------------------------------------------------------------------
+
+pub mod monitoring_probe_composer {
+    use std::mem::size_of;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = (isize::MAX as usize) / 8;
+    const THREE_HOURS_SECS: i64 = 3 * 3600;
+    const FINGERPRINT_JOB_STATUSES_NUL: &[u8] = b"pending\0processing\0complete\0failed";
+    const FINGERPRINT_PROVIDERS_NUL: &[u8] = b"primary\0alternate";
+
+    #[inline]
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || !ptr.is_aligned()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_buf.is_aligned()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    #[inline]
+    fn valid_mut_ptr<T>(ptr: *mut T) -> bool {
+        !ptr.is_null()
+            && ptr.is_aligned()
+            && (ptr as usize).checked_add(size_of::<T>()).is_some()
+    }
+
+    #[inline]
+    fn valid_mut_slice<T>(ptr: *mut T, len: usize) -> bool {
+        if ptr.is_null() || !ptr.is_aligned() {
+            return false;
+        }
+        let Some(byte_len) = len.checked_mul(size_of::<T>()) else {
+            return false;
+        };
+        byte_len <= isize::MAX as usize && (ptr as usize).checked_add(byte_len).is_some()
+    }
+
+    #[inline]
+    unsafe fn write_bytes(out_buf: *mut u8, out_cap: usize, bytes: &[u8]) -> isize {
+        if !valid_out_buf(out_buf, out_cap) {
+            return DECLINE;
+        }
+        let needed = bytes.len();
+        if needed > isize::MAX as usize {
+            return DECLINE;
+        }
+        if needed > out_cap {
+            let neg = -(needed as isize);
+            return if neg == -1 { -2 } else { neg };
+        }
+        if needed > 0 {
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, needed) };
+            dst.copy_from_slice(bytes);
+        }
+        needed as isize
+    }
+
+    #[inline]
+    fn format_i64_dec(v: i64, buf: &mut [u8; 24]) -> &[u8] {
+        let mut n = v.unsigned_abs();
+        let mut i = buf.len();
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        if v < 0 {
+            i -= 1;
+            buf[i] = b'-';
+        }
+        &buf[i..]
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. DatabaseFingerprintCollector helpers
+    // -------------------------------------------------------------------------
+
+    /// Writes NUL-separated fingerprint job statuses (`pending\0processing\0complete\0failed`)
+    /// into `out_buf` and `4` into `*out_count`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_db_fingerprint_job_statuses(
+        out_count: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_ptr(out_count) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let written = unsafe { write_bytes(out_buf, out_cap, FINGERPRINT_JOB_STATUSES_NUL) };
+            if written >= 0 {
+                unsafe {
+                    *out_count = 4;
+                }
+            }
+            written
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Writes NUL-separated fingerprint connection providers (`primary\0alternate`)
+    /// into `out_buf` and `2` into `*out_count`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_db_fingerprint_connection_providers(
+        out_count: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_ptr(out_count) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let written = unsafe { write_bytes(out_buf, out_cap, FINGERPRINT_PROVIDERS_NUL) };
+            if written >= 0 {
+                unsafe {
+                    *out_count = 2;
+                }
+            }
+            written
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. HorizonCollector helpers
+    // -------------------------------------------------------------------------
+
+    /// Returns `1` when `queue == b"release-fingerprint"` and `worker == b"rust"`,
+    /// `0` otherwise, or `-1` on invalid arguments.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_horizon_should_skip_queue(
+        queue_ptr: *const u8,
+        queue_len: usize,
+        worker_ptr: *const u8,
+        worker_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(queue) = (unsafe { valid_slice(queue_ptr, queue_len) }) else {
+                return -1;
+            };
+            let Some(worker) = (unsafe { valid_slice(worker_ptr, worker_len) }) else {
+                return -1;
+            };
+            i32::from(queue == b"release-fingerprint" && worker == b"rust")
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Evaluates whether any of `count` NUL-delimited master supervisor status strings
+    /// equals `"running"`. Returns `1` if any is `"running"`, `0` if none, or `-1` on invalid arguments.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_horizon_any_master_running(
+        statuses_ptr: *const u8,
+        statuses_len: usize,
+        count: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(raw) = (unsafe { valid_slice(statuses_ptr, statuses_len) }) else {
+                return -1;
+            };
+            if count == 0 {
+                return if raw.is_empty() { 0 } else { -1 };
+            }
+            let mut seen_parts = 0usize;
+            let mut any_running = false;
+            for part in raw.split(|&b| b == 0) {
+                seen_parts += 1;
+                if part == b"running" {
+                    any_running = true;
+                }
+            }
+            if seen_parts != count {
+                return -1;
+            }
+            i32::from(any_running)
+        }))
+        .unwrap_or(-1)
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. ApplicationCollector helpers
+    // -------------------------------------------------------------------------
+
+    /// Writes `php_version`, `php_ver`, `laravel_version`, `laravel_ver` slices into `out_buf`
+    /// and their 4 byte lengths into `out_lens[0..4]`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_application_collector_build_version_labels(
+        php_ptr: *const u8,
+        php_len: usize,
+        laravel_ptr: *const u8,
+        laravel_len: usize,
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_lens, 4) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(php_ver) = (unsafe { valid_slice(php_ptr, php_len) }) else {
+                return DECLINE;
+            };
+            let Some(laravel_ver) = (unsafe { valid_slice(laravel_ptr, laravel_len) }) else {
+                return DECLINE;
+            };
+
+            const K_PHP: &[u8] = b"php_version";
+            const K_LARAVEL: &[u8] = b"laravel_version";
+
+            let Some(needed) = K_PHP
+                .len()
+                .checked_add(php_ver.len())
+                .and_then(|n| n.checked_add(K_LARAVEL.len()))
+                .and_then(|n| n.checked_add(laravel_ver.len()))
+            else {
+                return DECLINE;
+            };
+            if needed > isize::MAX as usize {
+                return DECLINE;
+            }
+            if needed > out_cap {
+                let neg = -(needed as isize);
+                return if neg == -1 { -2 } else { neg };
+            }
+
+            let parts = [K_PHP, php_ver, K_LARAVEL, laravel_ver];
+            let lens_out = unsafe { slice::from_raw_parts_mut(out_lens, 4) };
+            let mut offset = 0usize;
+            for (i, part) in parts.iter().enumerate() {
+                lens_out[i] = part.len();
+                if !part.is_empty() {
+                    let dst =
+                        unsafe { slice::from_raw_parts_mut(out_buf.add(offset), part.len()) };
+                    dst.copy_from_slice(part);
+                    offset += part.len();
+                }
+            }
+            needed as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. ServiceProbeRegistry helpers
+    // -------------------------------------------------------------------------
+
+    /// Formats `sprintf('Unknown probe identifier "%s"', $identifier)` into `out_buf`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_service_probe_format_unknown_reason(
+        id_ptr: *const u8,
+        id_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(ident) = (unsafe { valid_slice(id_ptr, id_len) }) else {
+                return DECLINE;
+            };
+            const PREFIX: &[u8] = b"Unknown probe identifier \"";
+            const SUFFIX: &[u8] = b"\"";
+
+            let Some(needed) = PREFIX
+                .len()
+                .checked_add(ident.len())
+                .and_then(|n| n.checked_add(SUFFIX.len()))
+            else {
+                return DECLINE;
+            };
+            if needed > isize::MAX as usize {
+                return DECLINE;
+            }
+            if needed > out_cap {
+                let neg = -(needed as isize);
+                return if neg == -1 { -2 } else { neg };
+            }
+
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, needed) };
+            dst[..PREFIX.len()].copy_from_slice(PREFIX);
+            dst[PREFIX.len()..PREFIX.len() + ident.len()].copy_from_slice(ident);
+            dst[PREFIX.len() + ident.len()..].copy_from_slice(SUFFIX);
+            needed as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. GlobalDataComposer helpers
+    // -------------------------------------------------------------------------
+
+    /// Formats the 3 cache keys (`content_useful_links`, `composer_user_<id>`, `menu_user_<id>`)
+    /// into `out_buf` and their byte lengths into `out_lens[0..3]`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_global_composer_format_cache_keys(
+        user_id: i64,
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_lens, 3) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            const USEFUL: &[u8] = b"content_useful_links";
+            const USER_PREFIX: &[u8] = b"composer_user_";
+            const MENU_PREFIX: &[u8] = b"menu_user_";
+
+            let mut dec_buf = [0u8; 24];
+            let id_dec = format_i64_dec(user_id, &mut dec_buf);
+
+            let len0 = USEFUL.len();
+            let len1 = USER_PREFIX.len() + id_dec.len();
+            let len2 = MENU_PREFIX.len() + id_dec.len();
+            let needed = len0 + len1 + len2;
+
+            if needed > out_cap {
+                let neg = -(needed as isize);
+                return if neg == -1 { -2 } else { neg };
+            }
+
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, needed) };
+            let mut pos = 0usize;
+            dst[pos..pos + len0].copy_from_slice(USEFUL);
+            pos += len0;
+            dst[pos..pos + USER_PREFIX.len()].copy_from_slice(USER_PREFIX);
+            pos += USER_PREFIX.len();
+            dst[pos..pos + id_dec.len()].copy_from_slice(id_dec);
+            pos += id_dec.len();
+            dst[pos..pos + MENU_PREFIX.len()].copy_from_slice(MENU_PREFIX);
+            pos += MENU_PREFIX.len();
+            dst[pos..pos + id_dec.len()].copy_from_slice(id_dec);
+
+            let lens_out = unsafe { slice::from_raw_parts_mut(out_lens, 3) };
+            lens_out[0] = len0;
+            lens_out[1] = len1;
+            lens_out[2] = len2;
+            needed as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Evaluates `(now_ts - 10800) > last_login_ts` for `GlobalDataComposer::shouldRefreshLastLogin`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_global_composer_should_refresh_last_login(
+        last_login_ts: i64,
+        now_ts: i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(threshold) = now_ts.checked_sub(THREE_HOURS_SECS) else {
+                return -1;
+            };
+            i32::from(threshold > last_login_ts)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Resolves guest/authenticated display preferences (`loggedin`, `isadmin`, `ismod`, `userTheme`, `userColorScheme`).
+    /// Writes `[loggedin, isadmin, ismod]` into `out_flags[0..3]`, `[theme_len, color_len]` into `out_lens[0..2]`,
+    /// and `theme || color` bytes into `out_buf`.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_global_composer_resolve_display_prefs(
+        has_theme: u32,
+        theme_ptr: *const u8,
+        theme_len: usize,
+        has_color: u32,
+        color_ptr: *const u8,
+        color_len: usize,
+        logged_in: u32,
+        is_admin: u32,
+        is_mod: u32,
+        out_flags: *mut u32,
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if has_theme > 1
+                || has_color > 1
+                || logged_in > 1
+                || is_admin > 1
+                || is_mod > 1
+                || !valid_mut_slice(out_flags, 3)
+                || !valid_mut_slice(out_lens, 2)
+                || !valid_out_buf(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some(theme_in) = (unsafe { valid_slice(theme_ptr, theme_len) }) else {
+                return DECLINE;
+            };
+            let Some(color_in) = (unsafe { valid_slice(color_ptr, color_len) }) else {
+                return DECLINE;
+            };
+
+            let (flags, theme_out, color_out): ([u32; 3], &[u8], &[u8]) = if logged_in == 1 {
+                (
+                    [1, is_admin, is_mod],
+                    if has_theme == 1 {
+                        theme_in
+                    } else {
+                        b"light"
+                    },
+                    if has_color == 1 { color_in } else { b"blue" },
+                )
+            } else {
+                ([0, 0, 0], b"light", b"blue")
+            };
+
+            let Some(needed) = theme_out.len().checked_add(color_out.len()) else {
+                return DECLINE;
+            };
+            if needed > isize::MAX as usize {
+                return DECLINE;
+            }
+            if needed > out_cap {
+                let neg = -(needed as isize);
+                return if neg == -1 { -2 } else { neg };
+            }
+
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, needed) };
+            dst[..theme_out.len()].copy_from_slice(theme_out);
+            dst[theme_out.len()..].copy_from_slice(color_out);
+
+            let flags_out = unsafe { slice::from_raw_parts_mut(out_flags, 3) };
+            flags_out.copy_from_slice(&flags);
+
+            let lens_out = unsafe { slice::from_raw_parts_mut(out_lens, 2) };
+            lens_out[0] = theme_out.len();
+            lens_out[1] = color_out.len();
+            needed as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn db_fingerprint_horizon_app_and_probe_helpers() {
+            let mut count = 0usize;
+            let mut buf = [0u8; 256];
+
+            let n1 = unsafe {
+                nntmux_db_fingerprint_job_statuses(&mut count, buf.as_mut_ptr(), buf.len())
+            };
+            assert_eq!((n1, count), (34, 4));
+            assert_eq!(
+                &buf[..n1 as usize],
+                b"pending\0processing\0complete\0failed"
+            );
+
+            let n2 = unsafe {
+                nntmux_db_fingerprint_connection_providers(&mut count, buf.as_mut_ptr(), buf.len())
+            };
+            assert_eq!((n2, count), (17, 2));
+            assert_eq!(&buf[..n2 as usize], b"primary\0alternate");
+
+            assert_eq!(
+                unsafe {
+                    nntmux_horizon_should_skip_queue(
+                        b"release-fingerprint".as_ptr(),
+                        19,
+                        b"rust".as_ptr(),
+                        4,
+                    )
+                },
+                1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_horizon_should_skip_queue(
+                        b"default".as_ptr(),
+                        7,
+                        b"rust".as_ptr(),
+                        4,
+                    )
+                },
+                0
+            );
+
+            assert_eq!(
+                unsafe {
+                    nntmux_horizon_any_master_running(b"paused\0running".as_ptr(), 14, 2)
+                },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_horizon_any_master_running(b"paused\0idle".as_ptr(), 11, 2) },
+                0
+            );
+
+            let mut lens4 = [0usize; 4];
+            let n3 = unsafe {
+                nntmux_application_collector_build_version_labels(
+                    b"8.5.12".as_ptr(),
+                    6,
+                    b"13.0.0".as_ptr(),
+                    6,
+                    lens4.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(n3 > 0);
+            assert_eq!(lens4, [11, 6, 15, 6]);
+
+            let n4 = unsafe {
+                nntmux_service_probe_format_unknown_reason(
+                    b"manticore".as_ptr(),
+                    9,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(
+                &buf[..n4 as usize],
+                b"Unknown probe identifier \"manticore\""
+            );
+        }
+
+        #[test]
+        fn global_composer_helpers_and_abi_safety() {
+            let mut lens3 = [0usize; 3];
+            let mut buf = [0u8; 256];
+            let nk = unsafe {
+                nntmux_global_composer_format_cache_keys(
+                    42,
+                    lens3.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(nk > 0);
+            assert_eq!(lens3, [20, 16, 12]);
+            assert_eq!(
+                &buf[..nk as usize],
+                b"content_useful_linkscomposer_user_42menu_user_42"
+            );
+
+            assert_eq!(
+                unsafe { nntmux_global_composer_should_refresh_last_login(100, 100 + 10_801) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_global_composer_should_refresh_last_login(100, 100 + 10_800) },
+                0
+            );
+
+            let mut flags = [0u32; 3];
+            let mut lens2 = [0usize; 2];
+            let np = unsafe {
+                nntmux_global_composer_resolve_display_prefs(
+                    1,
+                    b"dark".as_ptr(),
+                    4,
+                    1,
+                    b"emerald".as_ptr(),
+                    7,
+                    1,
+                    1,
+                    0,
+                    flags.as_mut_ptr(),
+                    lens2.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(np, 11);
+            assert_eq!(flags, [1, 1, 0]);
+            assert_eq!(lens2, [4, 7]);
+            assert_eq!(&buf[..11], b"darkemerald");
+
+            let mut raw = [0u8; 64];
+            let unaligned_usize = unsafe { raw.as_mut_ptr().add(1).cast::<usize>() };
+            let unaligned_u32 = unsafe { raw.as_mut_ptr().add(1).cast::<u32>() };
+            let mut small = [b'Z'; 4];
+            let mut cnt = 99usize;
+
+            assert_eq!(
+                unsafe {
+                    nntmux_db_fingerprint_job_statuses(
+                        unaligned_usize,
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_db_fingerprint_job_statuses(&mut cnt, small.as_mut_ptr(), small.len())
+                },
+                -34
+            );
+            assert_eq!((cnt, small), (99, [b'Z'; 4]));
+
+            assert_eq!(
+                unsafe {
+                    nntmux_global_composer_resolve_display_prefs(
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        unaligned_u32,
+                        lens2.as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_global_composer_resolve_display_prefs(
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        flags.as_mut_ptr(),
+                        lens2.as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -9
+            );
+            assert_eq!(small, [b'Z'; 4]);
+        }
+    }
+}
+
