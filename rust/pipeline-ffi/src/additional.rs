@@ -11655,3 +11655,560 @@ mod wave15_binaries_collection_workplan_tests {
         assert!(w15_encode_retry(b"abc").is_none());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 16: orchestrator timing, media byte budget, processing metrics,
+// media article fetcher and downloaded archive helpers
+// ---------------------------------------------------------------------------
+
+/// `(end - start) / 1_000_000_000` with PHP int division semantics; `None` on overflow.
+pub(crate) fn w16_elapsed_seconds(start_ns: i64, end_ns: i64) -> Option<f64> {
+    w15_php_int_div(end_ns.checked_sub(start_ns)?, 1_000_000_000)
+}
+
+/// `AdditionalProcessingOrchestrator::elapsedSecondsBetween`. `*status` receives 1 for a
+/// value and -1 when PHP must evaluate it (overflowing subtraction).
+///
+/// # Safety
+/// `status` must be null or writable for one `int32_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_aporch_elapsed_seconds(
+    start_ns: i64,
+    end_ns: i64,
+    status: *mut i32,
+) -> f64 {
+    if status.is_null() {
+        return f64::NAN;
+    }
+    let result = std::panic::catch_unwind(|| w16_elapsed_seconds(start_ns, end_ns)).unwrap_or(None);
+    // SAFETY: `status` is non-null and the caller promises it is writable.
+    unsafe { status.write_unaligned(if result.is_some() { 1 } else { -1 }) };
+    result.unwrap_or(0.0)
+}
+
+/// `AdditionalProcessingOrchestrator::effectiveQueryLimit`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_aporch_query_limit(limit: i64) -> i64 {
+    if limit > 0 { limit } else { 25 }
+}
+
+/// `AdditionalProcessingOrchestrator::batchDisposition`: 0 setup failed, 1 empty, 2 process.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_aporch_batch_disposition(setup_ok: u8, total_releases: i64) -> i32 {
+    if setup_ok == 0 {
+        0
+    } else if total_releases > 0 {
+        2
+    } else {
+        1
+    }
+}
+
+/// `AdditionalProcessingOrchestrator::shouldClearClaim`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_aporch_should_clear_claim(token_len: usize, release_id: i64) -> i32 {
+    i32::from(token_len > 0 && release_id > 0)
+}
+
+pub(crate) const W16_BUDGET_ALLOWS: u32 = 0;
+pub(crate) const W16_BUDGET_SPEND: u32 = 1;
+pub(crate) const W16_BUDGET_REMAINING: u32 = 2;
+pub(crate) const W16_BUDGET_EXHAUSTED: u32 = 3;
+pub(crate) const W16_BUDGET_CLAMP: u32 = 4;
+
+/// `max(0, limit - spent)`; `None` when PHP would produce a float.
+#[inline]
+fn w16_budget_remaining(limit: i64, spent: i64) -> Option<i64> {
+    let remaining = (i128::from(limit) - i128::from(spent)).max(0);
+    i64::try_from(remaining).ok()
+}
+
+/// `MediaByteBudget` operations. `Ok(None)` defers to PHP (integer overflow), `Err` is an
+/// unknown operation.
+pub(crate) fn w16_budget_eval(
+    op: u32,
+    limit: i64,
+    spent: i64,
+    bytes: i64,
+) -> Result<Option<i64>, ()> {
+    Ok(match op {
+        W16_BUDGET_ALLOWS => spent
+            .checked_add(bytes.max(0))
+            .map(|total| i64::from(total <= limit)),
+        W16_BUDGET_SPEND => spent.checked_add(bytes.max(0)),
+        W16_BUDGET_REMAINING => w16_budget_remaining(limit, spent),
+        W16_BUDGET_EXHAUSTED => Some(i64::from(spent >= limit)),
+        W16_BUDGET_CLAMP => {
+            w16_budget_remaining(limit, spent).map(|remaining| bytes.min(remaining))
+        }
+        _ => return Err(()),
+    })
+}
+
+/// `MediaByteBudget` operations (0 allows, 1 spend, 2 remaining, 3 exhausted, 4 clamp a
+/// request). Returns 1 with `*out` set, 0 when PHP must evaluate it and -1 for invalid input.
+///
+/// # Safety
+/// `out` must be null or writable for one `int64_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_budget_eval(
+    op: u32,
+    limit: i64,
+    spent: i64,
+    bytes: i64,
+    out: *mut i64,
+) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    match std::panic::catch_unwind(|| w16_budget_eval(op, limit, spent, bytes)) {
+        Ok(Ok(Some(value))) => {
+            // SAFETY: `out` is non-null and the caller promises it is writable.
+            unsafe { out.write_unaligned(value) };
+            1
+        }
+        Ok(Ok(None)) => 0,
+        _ => -1,
+    }
+}
+
+/// `MediaByteBudget::utilization`: 1.0 for a non-positive limit, else `spent / limit` capped at 1.0.
+pub(crate) fn w16_budget_utilization(limit: i64, spent: i64) -> Option<f64> {
+    if limit <= 0 {
+        return Some(1.0);
+    }
+    let ratio = w15_php_int_div(spent, limit)?;
+    Some(if ratio >= 1.0 { 1.0 } else { ratio })
+}
+
+/// `MediaByteBudget::utilization`; `*status` receives 1 for a value and -1 otherwise.
+///
+/// # Safety
+/// `status` must be null or writable for one `int32_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_budget_utilization(
+    limit: i64,
+    spent: i64,
+    status: *mut i32,
+) -> f64 {
+    if status.is_null() {
+        return f64::NAN;
+    }
+    let result = std::panic::catch_unwind(|| w16_budget_utilization(limit, spent)).unwrap_or(None);
+    // SAFETY: `status` is non-null and the caller promises it is writable.
+    unsafe { status.write_unaligned(if result.is_some() { 1 } else { -1 }) };
+    result.unwrap_or(0.0)
+}
+
+/// Packed little-endian `int64` nanoseconds to packed little-endian `double` seconds.
+pub(crate) fn w16_ns_to_seconds(packed: &[u8]) -> Option<Vec<u8>> {
+    if !packed.len().is_multiple_of(8) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(packed.len());
+    for chunk in packed.as_chunks::<8>().0 {
+        let seconds = w15_php_int_div(i64::from_le_bytes(*chunk), 1_000_000_000)?;
+        out.extend_from_slice(&seconds.to_le_bytes());
+    }
+    Some(out)
+}
+
+/// `ProcessingMetrics::secondsFromNanoseconds`. Returns bytes written, `-needed` for a short
+/// buffer or -1 for invalid input.
+///
+/// # Safety
+/// Non-null input/output pointers must be valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_pmetrics_ns_to_seconds(
+    packed: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(input) = w15_input(packed, len) else {
+            return -1;
+        };
+        match w16_ns_to_seconds(input) {
+            Some(result) => w15_write(out, cap, &result),
+            None => -1,
+        }
+    })
+    .unwrap_or(-1)
+}
+
+/// `ProcessingMetrics::rate`: `count / seconds` for positive seconds, else 0.0.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_pmetrics_rate(count: i64, seconds: f64) -> f64 {
+    if seconds > 0.0 {
+        count as f64 / seconds
+    } else {
+        0.0
+    }
+}
+
+/// Entries packed as `[u32 LE key length][key][f64 LE seconds]` rendered as
+/// `key=%.6Fs` joined by spaces. Non-finite values defer to PHP.
+pub(crate) fn w16_format_summary(packed: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write;
+
+    let mut out = Vec::with_capacity(packed.len() + 16);
+    let mut rest = packed;
+    while !rest.is_empty() {
+        let (len_bytes, tail) = rest.split_at_checked(4)?;
+        let key_len = u32::from_le_bytes(len_bytes.try_into().ok()?) as usize;
+        let (key, tail) = tail.split_at_checked(key_len)?;
+        let (value_bytes, tail) = tail.split_at_checked(8)?;
+        let seconds = f64::from_le_bytes(value_bytes.try_into().ok()?);
+        if !seconds.is_finite() {
+            return None;
+        }
+        // PHP's `%F` prints a sign only for values below zero, never for -0.0.
+        let seconds = if seconds == 0.0 { 0.0 } else { seconds };
+        if !out.is_empty() {
+            out.push(b' ');
+        }
+        out.extend_from_slice(key);
+        out.push(b'=');
+        write!(out, "{seconds:.6}").ok()?;
+        out.push(b's');
+        rest = tail;
+    }
+    Some(out)
+}
+
+/// `ProcessingMetrics::formatStageSummary`. Returns bytes written, `-needed` for a short
+/// buffer or -1 for invalid input.
+///
+/// # Safety
+/// Non-null input/output pointers must be valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_pmetrics_format_summary(
+    packed: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(input) = w15_input(packed, len) else {
+            return -1;
+        };
+        match w16_format_summary(input) {
+            Some(result) => w15_write(out, cap, &result),
+            None => -1,
+        }
+    })
+    .unwrap_or(-1)
+}
+
+/// `MediaArticleFetcher::isSafeWitnessName`: a bare, printable UTF-8 file name.
+pub(crate) fn w16_safe_witness_name(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name.len() <= 4096
+        && std::str::from_utf8(name).is_ok()
+        && !name
+            .iter()
+            .any(|&b| b < 0x20 || b == 0x7f || b == b'/' || b == b'\\')
+        && name[0] != b'.'
+        && name[0] != b'-'
+}
+
+/// `MediaArticleFetcher::isSafeWitnessName`; -1 for an invalid pointer.
+///
+/// # Safety
+/// A non-null `ptr` must point to at least `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_fetcher_safe_witness_name(ptr: *const u8, len: usize) -> i32 {
+    std::panic::catch_unwind(|| match w15_input(ptr, len) {
+        Some(name) => i32::from(w16_safe_witness_name(name)),
+        None => -1,
+    })
+    .unwrap_or(-1)
+}
+
+/// Length of `substr($data, 0, $length)` for a `data_len`-byte string; `None` for a
+/// negative data length.
+pub(crate) fn w16_chunk_length(data_len: i64, length: i64) -> Option<i64> {
+    if data_len < 0 {
+        return None;
+    }
+    Some(if length >= 0 {
+        length.min(data_len)
+    } else {
+        (i128::from(data_len) + i128::from(length)).max(0) as i64
+    })
+}
+
+/// `MediaArticleFetcher::chunkLength`; -1 for invalid input.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_fetcher_chunk_length(data_len: i64, length: i64) -> i64 {
+    w16_chunk_length(data_len, length).unwrap_or(-1)
+}
+
+pub(crate) const W16_ARCHIVE_IS_DIR: u8 = 1;
+pub(crate) const W16_ARCHIVE_PASSWORDED: u8 = 2;
+
+/// `[files, directories, bytes, passworded]`; `Ok(None)` defers an overflowing byte total
+/// to PHP and `Err` rejects malformed input.
+pub(crate) fn w16_archive_summary(flags: &[u8], sizes: &[u8]) -> Result<Option<[i64; 4]>, ()> {
+    if flags.len().checked_mul(8) != Some(sizes.len()) {
+        return Err(());
+    }
+    let (mut files, mut directories, mut bytes, mut passworded) = (0i64, 0i64, 0i64, 0i64);
+    for (&flag, chunk) in flags.iter().zip(sizes.as_chunks::<8>().0) {
+        if flag & !(W16_ARCHIVE_IS_DIR | W16_ARCHIVE_PASSWORDED) != 0 {
+            return Err(());
+        }
+        if flag & W16_ARCHIVE_IS_DIR != 0 {
+            directories += 1;
+            continue;
+        }
+        files += 1;
+        let Some(total) = bytes.checked_add(i64::from_le_bytes(*chunk)) else {
+            return Ok(None);
+        };
+        bytes = total;
+        if flag & W16_ARCHIVE_PASSWORDED != 0 {
+            passworded = 1;
+        }
+    }
+    Ok(Some([files, directories, bytes, passworded]))
+}
+
+/// `DownloadedArchive::fileSummary`. `flags` holds one byte per file (bit 0 directory,
+/// bit 1 passworded) and `sizes` one little-endian `int64` per file. Returns 1 with
+/// `out[0..4]` set, 0 when PHP must evaluate it and -1 for invalid input.
+///
+/// # Safety
+/// Non-null pointers must be valid for their declared lengths; `out` must be writable for
+/// `out_len` `int64_t` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_dlarchive_summary(
+    flags: *const u8,
+    count: usize,
+    sizes: *const u8,
+    sizes_len: usize,
+    out: *mut i64,
+    out_len: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        if out.is_null() || out_len < 4 {
+            return -1;
+        }
+        let (Some(flag_bytes), Some(size_bytes)) =
+            (w15_input(flags, count), w15_input(sizes, sizes_len))
+        else {
+            return -1;
+        };
+        match w16_archive_summary(flag_bytes, size_bytes) {
+            Ok(Some(summary)) => {
+                for (slot, value) in summary.into_iter().enumerate() {
+                    // SAFETY: `out` is non-null and writable for `out_len >= 4` values.
+                    unsafe { out.add(slot).write_unaligned(value) };
+                }
+                1
+            }
+            Ok(None) => 0,
+            Err(()) => -1,
+        }
+    })
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave16_additional_budget_metrics_tests {
+    use super::*;
+
+    fn pack(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn entry(key: &str, seconds: f64) -> Vec<u8> {
+        let mut out = (key.len() as u32).to_le_bytes().to_vec();
+        out.extend_from_slice(key.as_bytes());
+        out.extend_from_slice(&seconds.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn orchestrator_helpers() {
+        assert_eq!(w16_elapsed_seconds(1_000_000_000, 3_000_000_000), Some(2.0));
+        assert_eq!(w16_elapsed_seconds(0, 1_500_000_000), Some(1.5));
+        assert_eq!(w16_elapsed_seconds(i64::MIN, i64::MAX), None);
+        assert_eq!(nntmux_aporch_query_limit(0), 25);
+        assert_eq!(nntmux_aporch_query_limit(-4), 25);
+        assert_eq!(nntmux_aporch_query_limit(7), 7);
+        assert_eq!(nntmux_aporch_batch_disposition(0, 9), 0);
+        assert_eq!(nntmux_aporch_batch_disposition(1, 0), 1);
+        assert_eq!(nntmux_aporch_batch_disposition(1, 3), 2);
+        assert_eq!(nntmux_aporch_should_clear_claim(32, 1), 1);
+        assert_eq!(nntmux_aporch_should_clear_claim(0, 1), 0);
+        assert_eq!(nntmux_aporch_should_clear_claim(32, 0), 0);
+        let mut status = 0;
+        assert!(unsafe { nntmux_aporch_elapsed_seconds(0, 1, std::ptr::null_mut()) }.is_nan());
+        assert_eq!(
+            unsafe { nntmux_aporch_elapsed_seconds(0, 1_000, &mut status) },
+            1e-6
+        );
+        assert_eq!(status, 1);
+    }
+
+    #[test]
+    fn budget_operations_saturate_or_defer() {
+        assert_eq!(w16_budget_eval(W16_BUDGET_ALLOWS, 10, 4, 6), Ok(Some(1)));
+        assert_eq!(w16_budget_eval(W16_BUDGET_ALLOWS, 10, 4, 7), Ok(Some(0)));
+        assert_eq!(w16_budget_eval(W16_BUDGET_ALLOWS, 10, 4, -50), Ok(Some(1)));
+        assert_eq!(
+            w16_budget_eval(W16_BUDGET_ALLOWS, i64::MAX, i64::MAX, 1),
+            Ok(None)
+        );
+        assert_eq!(w16_budget_eval(W16_BUDGET_SPEND, 0, 4, -3), Ok(Some(4)));
+        assert_eq!(w16_budget_eval(W16_BUDGET_SPEND, 0, i64::MAX, 1), Ok(None));
+        assert_eq!(
+            w16_budget_eval(W16_BUDGET_REMAINING, 10, 14, 0),
+            Ok(Some(0))
+        );
+        assert_eq!(
+            w16_budget_eval(W16_BUDGET_REMAINING, i64::MIN, i64::MAX, 0),
+            Ok(Some(0))
+        );
+        assert_eq!(
+            w16_budget_eval(W16_BUDGET_REMAINING, i64::MAX, -1, 0),
+            Ok(None)
+        );
+        assert_eq!(
+            w16_budget_eval(W16_BUDGET_EXHAUSTED, 10, 10, 0),
+            Ok(Some(1))
+        );
+        assert_eq!(w16_budget_eval(W16_BUDGET_CLAMP, 10, 4, 100), Ok(Some(6)));
+        assert_eq!(w16_budget_eval(W16_BUDGET_CLAMP, 10, 4, -3), Ok(Some(-3)));
+        assert_eq!(w16_budget_eval(99, 0, 0, 0), Err(()));
+        assert_eq!(w16_budget_utilization(0, 5), Some(1.0));
+        assert_eq!(w16_budget_utilization(4, 1), Some(0.25));
+        assert_eq!(w16_budget_utilization(4, 9), Some(1.0));
+        let mut out = 0;
+        assert_eq!(
+            unsafe { nntmux_budget_eval(0, 1, 0, 0, std::ptr::null_mut()) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_budget_eval(1, 0, i64::MAX, 1, &mut out) },
+            0
+        );
+        assert_eq!(unsafe { nntmux_budget_eval(2, 9, 2, 0, &mut out) }, 1);
+        assert_eq!(out, 7);
+    }
+
+    #[test]
+    fn metrics_convert_and_format() {
+        let seconds = w16_ns_to_seconds(&pack(&[0, 1_500_000_000, 3_000_000_000, -7])).unwrap();
+        let values: Vec<f64> = seconds
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_le_bytes(*c))
+            .collect();
+        assert_eq!(values, vec![0.0, 1.5, 3.0, -7e-9]);
+        assert!(w16_ns_to_seconds(b"abc").is_none());
+        assert_eq!(nntmux_pmetrics_rate(10, 4.0), 2.5);
+        assert_eq!(nntmux_pmetrics_rate(10, 0.0), 0.0);
+        assert_eq!(nntmux_pmetrics_rate(10, f64::NAN), 0.0);
+        let mut packed = entry("download", 1.25);
+        packed.extend(entry("probe", 0.0000025));
+        assert_eq!(
+            w16_format_summary(&packed).unwrap(),
+            b"download=1.250000s probe=0.000003s"
+        );
+        assert_eq!(w16_format_summary(b"").unwrap(), b"");
+        assert_eq!(
+            w16_format_summary(&entry("z", -0.0)).unwrap(),
+            b"z=0.000000s"
+        );
+        assert_eq!(
+            w16_format_summary(&entry("n", -1.5e-7)).unwrap(),
+            b"n=-0.000000s"
+        );
+        assert!(w16_format_summary(&entry("x", f64::INFINITY)).is_none());
+        assert!(w16_format_summary(&packed[..packed.len() - 1]).is_none());
+        let mut tiny = [0u8; 2];
+        let needed = unsafe {
+            nntmux_pmetrics_format_summary(packed.as_ptr(), packed.len(), tiny.as_mut_ptr(), 2)
+        };
+        assert_eq!(needed, -34);
+        assert_eq!(
+            unsafe { nntmux_pmetrics_ns_to_seconds(std::ptr::null(), 8, tiny.as_mut_ptr(), 2) },
+            -1
+        );
+    }
+
+    #[test]
+    fn fetcher_helpers() {
+        assert!(w16_safe_witness_name(b"Movie.2024.mkv"));
+        assert!(w16_safe_witness_name("Fïlm.mp4".as_bytes()));
+        for bad in [
+            &b""[..],
+            b".hidden.mkv",
+            b"-x.mkv",
+            b"a/b.mkv",
+            b"a\\b.mkv",
+            b"a\x01.mkv",
+            b"a\x7f",
+            b"\xff.mkv",
+        ] {
+            assert!(!w16_safe_witness_name(bad), "{bad:?}");
+        }
+        assert!(!w16_safe_witness_name(&vec![b'a'; 4097]));
+        assert!(w16_safe_witness_name(&vec![b'a'; 4096]));
+        assert_eq!(w16_chunk_length(10, 4), Some(4));
+        assert_eq!(w16_chunk_length(10, 40), Some(10));
+        assert_eq!(w16_chunk_length(10, -3), Some(7));
+        assert_eq!(w16_chunk_length(10, i64::MIN), Some(0));
+        assert_eq!(nntmux_fetcher_chunk_length(-1, 3), -1);
+        assert_eq!(
+            unsafe { nntmux_fetcher_safe_witness_name(std::ptr::null(), 3) },
+            -1
+        );
+    }
+
+    #[test]
+    fn archive_summary_counts_and_defers() {
+        let flags = [0u8, W16_ARCHIVE_IS_DIR, W16_ARCHIVE_PASSWORDED, 0];
+        let summary = w16_archive_summary(&flags, &pack(&[10, 999, 5, -2])).unwrap();
+        assert_eq!(summary, Some([3, 1, 13, 1]));
+        assert_eq!(w16_archive_summary(&[], &[]), Ok(Some([0, 0, 0, 0])));
+        assert_eq!(
+            w16_archive_summary(&[0, 0], &pack(&[i64::MAX, 1])),
+            Ok(None)
+        );
+        assert_eq!(w16_archive_summary(&[0], &pack(&[1, 2])), Err(()));
+        assert_eq!(w16_archive_summary(&[4], &pack(&[1])), Err(()));
+        let mut out = [0i64; 4];
+        assert_eq!(
+            unsafe {
+                nntmux_dlarchive_summary(
+                    flags.as_ptr(),
+                    4,
+                    std::ptr::null(),
+                    32,
+                    out.as_mut_ptr(),
+                    4,
+                )
+            },
+            -1
+        );
+        let sizes = pack(&[1, 2, 3, 4]);
+        assert_eq!(
+            unsafe {
+                nntmux_dlarchive_summary(flags.as_ptr(), 4, sizes.as_ptr(), 32, out.as_mut_ptr(), 3)
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_dlarchive_summary(flags.as_ptr(), 4, sizes.as_ptr(), 32, out.as_mut_ptr(), 4)
+            },
+            1
+        );
+        assert_eq!(out, [3, 1, 8, 1]);
+    }
+}

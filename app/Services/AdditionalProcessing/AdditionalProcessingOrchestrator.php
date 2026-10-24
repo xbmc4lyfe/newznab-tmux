@@ -11,9 +11,12 @@ use App\Services\AdditionalProcessing\DTO\ReleaseProcessingResult;
 use App\Services\AdditionalProcessing\Enums\ProcessingOutcome;
 use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
 use App\Services\TempWorkspaceService;
+use App\Support\RustPipelineLibrary;
 use Exception;
+use FFI;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
+use Throwable;
 
 /**
  * Main orchestrator for additional release post-processing.
@@ -22,6 +25,26 @@ use Illuminate\Support\Facades\Log;
 class AdditionalProcessingOrchestrator
 {
     public const int MAX_COMPRESSED_FILES_TO_CHECK = 10;
+
+    public const string FFI_CDEF = <<<'C'
+        double nntmux_aporch_elapsed_seconds(int64_t start_ns, int64_t end_ns, int32_t *status);
+        int64_t nntmux_aporch_query_limit(int64_t limit);
+        int32_t nntmux_aporch_batch_disposition(uint8_t setup_ok, int64_t total_releases);
+        int32_t nntmux_aporch_should_clear_claim(size_t token_len, int64_t release_id);
+        C;
+
+    public const int BATCH_SETUP_FAILED = 0;
+
+    public const int BATCH_EMPTY = 1;
+
+    public const int BATCH_PROCESS = 2;
+
+    public const int DEFAULT_QUERY_LIMIT = 25;
+
+    // PHP remains the production default: FFI marshaling stays below the 1.5x gate.
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
 
     /**
      * @var Collection<int, mixed>
@@ -43,6 +66,16 @@ class AdditionalProcessingOrchestrator
         private readonly ConsoleOutputService $output
     ) {}
 
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
     /**
      * Start the additional processing.
      *
@@ -63,7 +96,7 @@ class AdditionalProcessingOrchestrator
 
         $this->fetchReleases($groupID, $guidChar, $excludedReleaseIds);
 
-        if ($this->totalReleases > 0) {
+        if (self::batchDisposition(true, $this->totalReleases) === self::BATCH_PROCESS) {
             $this->output->echoDescription($this->totalReleases);
 
             return $this->processReleases($guidChar);
@@ -117,7 +150,7 @@ class AdditionalProcessingOrchestrator
                 ProcessingOutcome::Failed,
                 reason: 'No processing result was produced.',
             );
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             if ($this->config->debugMode) {
                 Log::error('processSingleGuid failed: '.$e->getMessage());
             }
@@ -146,7 +179,7 @@ class AdditionalProcessingOrchestrator
                 $workerToken !== '' ? $workerToken : bin2hex(random_bytes(16)),
             );
             $this->tempWorkspace->clearDirectory($this->mainTmpPath, true);
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             $this->lastSetupError = $e->getMessage();
             $this->output->warning('Additional post-processing skipped: '.$e->getMessage());
             Log::error('Additional post-processing temp path is unavailable', [
@@ -180,7 +213,7 @@ class AdditionalProcessingOrchestrator
         $this->claimToken = bin2hex(random_bytes(16));
         $this->releases = AdditionalCandidateQuery::claimBatch(
             $guidChar,
-            $this->config->queryLimit > 0 ? $this->config->queryLimit : 25,
+            self::effectiveQueryLimit($this->config->queryLimit),
             $this->claimToken,
             $groupID,
             $this->config->minSizeBytes,
@@ -234,7 +267,7 @@ class AdditionalProcessingOrchestrator
 
             try {
                 $results[] = $this->processor->process(new ReleaseProcessingContext($release), $this->mainTmpPath);
-            } catch (\Throwable $e) {
+            } catch (Throwable $e) {
                 $results[] = new ReleaseProcessingResult(
                     releaseId: $releaseId,
                     guid: $releaseGuid,
@@ -252,7 +285,7 @@ class AdditionalProcessingOrchestrator
                 // re-selected on the next cycle, and the pp_timeout_count /
                 // maxpptimeoutcount machinery will eventually drop it.
             } finally {
-                if ($this->claimToken !== '' && $releaseId > 0) {
+                if (self::shouldClearClaim($this->claimToken, $releaseId)) {
                     AdditionalCandidateQuery::clearClaim($releaseId, $this->claimToken);
                 }
             }
@@ -303,7 +336,134 @@ class AdditionalProcessingOrchestrator
 
     private function elapsedSecondsSince(int $startedAtNanoseconds): float
     {
-        return (hrtime(true) - $startedAtNanoseconds) / 1_000_000_000;
+        return self::elapsedSecondsBetween($startedAtNanoseconds, hrtime(true));
+    }
+
+    public static function elapsedSecondsBetween(int $startedAtNanoseconds, int $endedAtNanoseconds): float
+    {
+        return (self::$useRustFfi ? self::elapsedSecondsBetweenNative($startedAtNanoseconds, $endedAtNanoseconds) : null)
+            ?? self::elapsedSecondsBetweenPhp($startedAtNanoseconds, $endedAtNanoseconds);
+    }
+
+    public static function elapsedSecondsBetweenPhp(int $startedAtNanoseconds, int $endedAtNanoseconds): float
+    {
+        return ($endedAtNanoseconds - $startedAtNanoseconds) / 1_000_000_000;
+    }
+
+    public static function elapsedSecondsBetweenNative(int $startedAtNanoseconds, int $endedAtNanoseconds): ?float
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            $status = $ffi->new('int32_t');
+            // @phpstan-ignore method.notFound
+            $value = $ffi->nntmux_aporch_elapsed_seconds($startedAtNanoseconds, $endedAtNanoseconds, FFI::addr($status));
+            // @phpstan-ignore property.notFound
+            $code = (int) $status->cdata;
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $code === 1 ? (float) $value : null;
+    }
+
+    /**
+     * Batch size to claim; a non-positive configured limit falls back to the default.
+     */
+    public static function effectiveQueryLimit(int $configured): int
+    {
+        return (self::$useRustFfi ? self::effectiveQueryLimitNative($configured) : null) ?? self::effectiveQueryLimitPhp($configured);
+    }
+
+    public static function effectiveQueryLimitPhp(int $configured): int
+    {
+        return $configured > 0 ? $configured : self::DEFAULT_QUERY_LIMIT;
+    }
+
+    public static function effectiveQueryLimitNative(int $configured): ?int
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            return (int) $ffi->nntmux_aporch_query_limit($configured);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * One of the BATCH_* outcomes for a batch whose workspace setup succeeded or failed.
+     */
+    public static function batchDisposition(bool $setupSucceeded, int $totalReleases): int
+    {
+        return (self::$useRustFfi ? self::batchDispositionNative($setupSucceeded, $totalReleases) : null)
+            ?? self::batchDispositionPhp($setupSucceeded, $totalReleases);
+    }
+
+    public static function batchDispositionPhp(bool $setupSucceeded, int $totalReleases): int
+    {
+        if (! $setupSucceeded) {
+            return self::BATCH_SETUP_FAILED;
+        }
+
+        return $totalReleases > 0 ? self::BATCH_PROCESS : self::BATCH_EMPTY;
+    }
+
+    public static function batchDispositionNative(bool $setupSucceeded, int $totalReleases): ?int
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $code = (int) $ffi->nntmux_aporch_batch_disposition($setupSucceeded ? 1 : 0, $totalReleases);
+        } catch (Throwable) {
+            return null;
+        }
+
+        return \in_array($code, [self::BATCH_SETUP_FAILED, self::BATCH_EMPTY, self::BATCH_PROCESS], true) ? $code : null;
+    }
+
+    /**
+     * Whether a processed candidate still holds a claim this batch must release.
+     */
+    public static function shouldClearClaim(string $claimToken, int $releaseId): bool
+    {
+        return (self::$useRustFfi ? self::shouldClearClaimNative($claimToken, $releaseId) : null) ?? self::shouldClearClaimPhp($claimToken, $releaseId);
+    }
+
+    public static function shouldClearClaimPhp(string $claimToken, int $releaseId): bool
+    {
+        return $claimToken !== '' && $releaseId > 0;
+    }
+
+    public static function shouldClearClaimNative(string $claimToken, int $releaseId): ?bool
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            return (int) $ffi->nntmux_aporch_should_clear_claim(\strlen($claimToken), $releaseId) === 1;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
     }
 
     /**
