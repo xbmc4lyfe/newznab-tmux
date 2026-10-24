@@ -4720,3 +4720,1150 @@ mod container_splice_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// 11. EpisodeHydrationService (`nntmux_episode_parse_searchname` & `nntmux_episode_hydrate_batch_nul`)
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn is_episode_sep(b: u8) -> bool {
+    matches!(
+        b,
+        b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r' | b'.' | b'_' | b'-'
+    )
+}
+
+#[inline]
+fn parse_ascii_digits_i32(digits: &[u8]) -> i32 {
+    let mut acc = 0i32;
+    for &b in digits {
+        acc = acc * 10 + (b - b'0') as i32;
+    }
+    acc
+}
+
+/// Parses `YYYY[-/]MM[-/]DD` (with matching `-` or `/` separators) and optional `[ T]HH:MM:SS`
+/// when the calendar date is valid (`1000..=9999`, `01..=12`, `01..=days_in_month`).
+/// Non-canonical strings return `None` so PHP falls back to `Carbon::parse`.
+pub(crate) fn parse_canonical_firstaired(s: &[u8]) -> Option<(i32, i32)> {
+    if s.len() != 10 && s.len() != 19 {
+        return None;
+    }
+    let sep = s[4];
+    if !matches!(sep, b'-' | b'/') || s[7] != sep {
+        return None;
+    }
+    if !s[0..4].iter().all(u8::is_ascii_digit)
+        || !s[5..7].iter().all(u8::is_ascii_digit)
+        || !s[8..10].iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let year = parse_ascii_digits_i32(&s[0..4]);
+    let month = parse_ascii_digits_i32(&s[5..7]);
+    let day = parse_ascii_digits_i32(&s[8..10]);
+    if !(1000..=9999).contains(&year) || !(1..=12).contains(&month) {
+        return None;
+    }
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => return None,
+    };
+    if !(1..=max_day).contains(&day) {
+        return None;
+    }
+    if s.len() == 19 {
+        if !matches!(s[10], b' ' | b'T' | b't') || s[13] != b':' || s[16] != b':' {
+            return None;
+        }
+        if !s[11..13].iter().all(u8::is_ascii_digit)
+            || !s[14..16].iter().all(u8::is_ascii_digit)
+            || !s[17..19].iter().all(u8::is_ascii_digit)
+        {
+            return None;
+        }
+        let hh = parse_ascii_digits_i32(&s[11..13]);
+        let mm = parse_ascii_digits_i32(&s[14..16]);
+        let ss = parse_ascii_digits_i32(&s[17..19]);
+        if hh > 23 || mm > 59 || ss > 59 {
+            return None;
+        }
+    }
+    Some((year, month * 100 + day))
+}
+
+/// Evaluates the 7 regexes of `EpisodeHydrationService::hydrateFromSearchname` in exact order.
+/// Returns `(series_out, episode_out)` where `-1` means the field is left untouched.
+pub(crate) fn episode_parse_searchname(
+    searchname: &[u8],
+    missing_series: bool,
+    missing_episode: bool,
+) -> (i32, i32) {
+    if (!missing_series && !missing_episode) || searchname.is_empty() {
+        return (-1, -1);
+    }
+    let n = searchname.len();
+
+    // 1. `/\bS(\d{1,2})E(\d{1,3})\b/i`
+    let mut i = 0;
+    while i < n {
+        if (i == 0 || !is_word_char(searchname[i - 1])) && matches!(searchname[i], b'S' | b's') {
+            let d1_start = i + 1;
+            let mut d1_end = d1_start;
+            while d1_end < n && d1_end - d1_start < 2 && searchname[d1_end].is_ascii_digit() {
+                d1_end += 1;
+            }
+            if d1_end > d1_start && matches!(searchname.get(d1_end), Some(b'E' | b'e')) {
+                let d2_start = d1_end + 1;
+                let mut d2_end = d2_start;
+                while d2_end < n && d2_end - d2_start < 3 && searchname[d2_end].is_ascii_digit() {
+                    d2_end += 1;
+                }
+                if d2_end > d2_start && (d2_end == n || !is_word_char(searchname[d2_end])) {
+                    let s = if missing_series {
+                        parse_ascii_digits_i32(&searchname[d1_start..d1_end])
+                    } else {
+                        -1
+                    };
+                    let e = if missing_episode {
+                        parse_ascii_digits_i32(&searchname[d2_start..d2_end])
+                    } else {
+                        -1
+                    };
+                    return (s, e);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // 2. `/\b(\d{1,2})x(\d{1,3})\b/i`
+    i = 0;
+    while i < n {
+        if (i == 0 || !is_word_char(searchname[i - 1])) && searchname[i].is_ascii_digit() {
+            let d1_start = i;
+            let mut d1_end = d1_start;
+            while d1_end < n && d1_end - d1_start < 2 && searchname[d1_end].is_ascii_digit() {
+                d1_end += 1;
+            }
+            if matches!(searchname.get(d1_end), Some(b'x' | b'X')) {
+                let d2_start = d1_end + 1;
+                let mut d2_end = d2_start;
+                while d2_end < n && d2_end - d2_start < 3 && searchname[d2_end].is_ascii_digit() {
+                    d2_end += 1;
+                }
+                if d2_end > d2_start && (d2_end == n || !is_word_char(searchname[d2_end])) {
+                    let s = if missing_series {
+                        parse_ascii_digits_i32(&searchname[d1_start..d1_end])
+                    } else {
+                        -1
+                    };
+                    let e = if missing_episode {
+                        parse_ascii_digits_i32(&searchname[d2_start..d2_end])
+                    } else {
+                        -1
+                    };
+                    return (s, e);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // 3. `/\bSeason[\s._-]*(\d{1,2})[\s._-]*Episode[\s._-]*(\d{1,3})\b/i`
+    i = 0;
+    while i + 15 <= n {
+        if (i == 0 || !is_word_char(searchname[i - 1]))
+            && searchname[i..i + 6].eq_ignore_ascii_case(b"season")
+        {
+            let mut p = i + 6;
+            while p < n && is_episode_sep(searchname[p]) {
+                p += 1;
+            }
+            let d1_start = p;
+            while p < n && p - d1_start < 2 && searchname[p].is_ascii_digit() {
+                p += 1;
+            }
+            let d1_end = p;
+            if d1_end > d1_start {
+                while p < n && is_episode_sep(searchname[p]) {
+                    p += 1;
+                }
+                if p + 7 <= n && searchname[p..p + 7].eq_ignore_ascii_case(b"episode") {
+                    p += 7;
+                    while p < n && is_episode_sep(searchname[p]) {
+                        p += 1;
+                    }
+                    let d2_start = p;
+                    while p < n && p - d2_start < 3 && searchname[p].is_ascii_digit() {
+                        p += 1;
+                    }
+                    let d2_end = p;
+                    if d2_end > d2_start && (d2_end == n || !is_word_char(searchname[d2_end])) {
+                        let s = if missing_series {
+                            parse_ascii_digits_i32(&searchname[d1_start..d1_end])
+                        } else {
+                            -1
+                        };
+                        let e = if missing_episode {
+                            parse_ascii_digits_i32(&searchname[d2_start..d2_end])
+                        } else {
+                            -1
+                        };
+                        return (s, e);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // 4. Compact format: `/\b(\d)(0[1-9]|[1-9]\d)\b/` (only applies if both series and episode are missing)
+    if missing_series && missing_episode {
+        i = 0;
+        while i + 3 <= n {
+            if (i == 0 || !is_word_char(searchname[i - 1]))
+                && (i + 3 == n || !is_word_char(searchname[i + 3]))
+                && searchname[i].is_ascii_digit()
+                && searchname[i + 1].is_ascii_digit()
+                && searchname[i + 2].is_ascii_digit()
+                && !(searchname[i + 1] == b'0' && searchname[i + 2] == b'0')
+            {
+                let s = (searchname[i] - b'0') as i32;
+                let e = ((searchname[i + 1] - b'0') as i32) * 10 + (searchname[i + 2] - b'0') as i32;
+                return (s, e);
+            }
+            i += 1;
+        }
+    }
+
+    // 5. Date-based: `/\b(\d{4})[._-](\d{2})[._-](\d{2})\b/`
+    i = 0;
+    while i + 10 <= n {
+        if (i == 0 || !is_word_char(searchname[i - 1]))
+            && (i + 10 == n || !is_word_char(searchname[i + 10]))
+            && matches!(searchname[i + 4], b'.' | b'_' | b'-')
+            && matches!(searchname[i + 7], b'.' | b'_' | b'-')
+            && searchname[i..i + 4].iter().all(u8::is_ascii_digit)
+            && searchname[i + 5..i + 7].iter().all(u8::is_ascii_digit)
+            && searchname[i + 8..i + 10].iter().all(u8::is_ascii_digit)
+        {
+            let s = if missing_series {
+                parse_ascii_digits_i32(&searchname[i..i + 4])
+            } else {
+                -1
+            };
+            let e = if missing_episode {
+                parse_ascii_digits_i32(&searchname[i + 5..i + 7]) * 100
+                    + parse_ascii_digits_i32(&searchname[i + 8..i + 10])
+            } else {
+                -1
+            };
+            return (s, e);
+        }
+        i += 1;
+    }
+
+    if !missing_episode {
+        return (-1, -1);
+    }
+
+    // 6. Part/Pt N: `/\b(?:Part|Pt)[\s._-]*(\d{1,3})\b/i`
+    i = 0;
+    while i + 3 <= n {
+        if i == 0 || !is_word_char(searchname[i - 1]) {
+            let kw_len = if i + 4 <= n && searchname[i..i + 4].eq_ignore_ascii_case(b"part") {
+                4
+            } else if i + 2 <= n && searchname[i..i + 2].eq_ignore_ascii_case(b"pt") {
+                2
+            } else {
+                0
+            };
+            if kw_len > 0 {
+                let mut p = i + kw_len;
+                while p < n && is_episode_sep(searchname[p]) {
+                    p += 1;
+                }
+                let d_start = p;
+                while p < n && p - d_start < 3 && searchname[p].is_ascii_digit() {
+                    p += 1;
+                }
+                let d_end = p;
+                if d_end > d_start && (d_end == n || !is_word_char(searchname[d_end])) {
+                    let e = parse_ascii_digits_i32(&searchname[d_start..d_end]);
+                    let s = if missing_series { 1 } else { -1 };
+                    return (s, e);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // 7. Ep/E N: `/\bEp?[\s._-]*(\d{1,3})\b/i`
+    i = 0;
+    while i + 2 <= n {
+        if (i == 0 || !is_word_char(searchname[i - 1])) && matches!(searchname[i], b'E' | b'e') {
+            let mut p = i + 1;
+            if p < n && matches!(searchname[p], b'P' | b'p') {
+                p += 1;
+            }
+            while p < n && is_episode_sep(searchname[p]) {
+                p += 1;
+            }
+            let d_start = p;
+            while p < n && p - d_start < 3 && searchname[p].is_ascii_digit() {
+                p += 1;
+            }
+            let d_end = p;
+            if d_end > d_start && (d_end == n || !is_word_char(searchname[d_end])) {
+                let e = parse_ascii_digits_i32(&searchname[d_start..d_end]);
+                let s = if missing_series { 1 } else { -1 };
+                return (s, e);
+            }
+        }
+        i += 1;
+    }
+
+    (-1, -1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_episode_parse_searchname(
+    ptr: *const u8,
+    len: usize,
+    flags: u8,
+    out_series: *mut i32,
+    out_episode: *mut i32,
+) -> i32 {
+    if (ptr.is_null() && len > 0) || out_series.is_null() || out_episode.is_null() {
+        return -1;
+    }
+    let searchname = if len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(ptr, len) }
+    };
+    let (s, e) = episode_parse_searchname(searchname, (flags & 1) != 0, (flags & 2) != 0);
+    unsafe {
+        *out_series = s;
+        *out_episode = e;
+    }
+    if s >= 0 || e >= 0 { 1 } else { 0 }
+}
+
+/// Batch-parses `firstaired` and `searchname` across `count` releases in a single FFI call.
+/// Writes `count` pairs of native-endian `i32` (`series_out, episode_out`, 8 bytes per release)
+/// where `>= 0` updates the property, `-1` leaves it unchanged, and `-2` declines the item to PHP.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_episode_hydrate_batch_nul(
+    searchnames_ptr: *const u8,
+    searchnames_len: usize,
+    firstaired_ptr: *const u8,
+    firstaired_len: usize,
+    flags_ptr: *const u8,
+    flags_len: usize,
+    count: usize,
+    out_ptr: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if count == 0 {
+        return 0;
+    }
+    if (searchnames_ptr.is_null() && searchnames_len > 0)
+        || (firstaired_ptr.is_null() && firstaired_len > 0)
+        || (flags_ptr.is_null() && flags_len > 0)
+        || (out_ptr.is_null() && out_cap > 0)
+    {
+        return -1;
+    }
+    if flags_len != 0 && flags_len != count {
+        return -1;
+    }
+    let needed = match count.checked_mul(8) {
+        Some(v) => v,
+        None => return -1,
+    };
+    if out_cap < needed {
+        return -((needed + 16) as isize);
+    }
+
+    let searchnames = if searchnames_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(searchnames_ptr, searchnames_len) }
+    };
+    let firstaired = if firstaired_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(firstaired_ptr, firstaired_len) }
+    };
+    let flags = if flags_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(flags_ptr, flags_len) }
+    };
+
+    let mut out = unsafe { OutCursor::new(out_ptr, out_cap) };
+    let mut sn_iter = searchnames.split(|&b| b == 0);
+    let mut fa_iter = if firstaired_len == 0 {
+        None
+    } else {
+        Some(firstaired.split(|&b| b == 0))
+    };
+
+    for idx in 0..count {
+        let sn = match sn_iter.next() {
+            Some(v) => v,
+            None => return -1,
+        };
+        let fa = match fa_iter.as_mut() {
+            Some(iter) => match iter.next() {
+                Some(v) => v,
+                None => return -1,
+            },
+            None => &[][..],
+        };
+        let flag = if flags.is_empty() { 3u8 } else { flags[idx] & 3 };
+        let mut missing_series = (flag & 1) != 0;
+        let mut missing_episode = (flag & 2) != 0;
+        let mut series_out = -1i32;
+        let mut episode_out = -1i32;
+
+        if (missing_series || missing_episode) && !fa.is_empty() {
+            match parse_canonical_firstaired(fa) {
+                Some((year, md)) => {
+                    if missing_series {
+                        series_out = year;
+                        missing_series = false;
+                    }
+                    if missing_episode {
+                        episode_out = md;
+                        missing_episode = false;
+                    }
+                }
+                None => {
+                    out.extend(&(-2i32).to_ne_bytes());
+                    out.extend(&(-2i32).to_ne_bytes());
+                    continue;
+                }
+            }
+        }
+
+        if (missing_series || missing_episode) && !sn.is_empty() {
+            let (s, e) = episode_parse_searchname(sn, missing_series, missing_episode);
+            if s >= 0 {
+                series_out = s;
+            }
+            if e >= 0 {
+                episode_out = e;
+            }
+        }
+
+        out.extend(&series_out.to_ne_bytes());
+        out.extend(&episode_out.to_ne_bytes());
+    }
+
+    if sn_iter.next().is_some() || fa_iter.as_mut().and_then(|it| it.next()).is_some() {
+        return -1;
+    }
+
+    out.pos as isize
+}
+
+// ---------------------------------------------------------------------------
+// 12. ArchiveExtractionService (`withSevenZipEndHeader`, `isNfoFile`, `sortFilesWithNfoPriority`, `detectStandaloneVideo`)
+// ---------------------------------------------------------------------------
+
+const SEVENZIP_SIGNATURE: [u8; 6] = [b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C];
+const SEVENZIP_MAX_ARCHIVE_BYTES: u64 = 1u64 << 40;
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+unsafe fn crc32_ieee_aarch64(data: &[u8]) -> u32 {
+    use std::arch::aarch64::{__crc32b, __crc32d, __crc32h, __crc32w};
+    let mut crc = 0xFFFF_FFFFu32;
+    let (chunks, rem) = data.as_chunks::<8>();
+    for chunk in chunks {
+        crc = __crc32d(crc, u64::from_le_bytes(*chunk));
+    }
+    let mut rem = rem;
+    if rem.len() >= 4 {
+        let w = u32::from_le_bytes([rem[0], rem[1], rem[2], rem[3]]);
+        crc = __crc32w(crc, w);
+        rem = &rem[4..];
+    }
+    if rem.len() >= 2 {
+        let h = u16::from_le_bytes([rem[0], rem[1]]);
+        crc = __crc32h(crc, h);
+        rem = &rem[2..];
+    }
+    if let Some(&b) = rem.first() {
+        crc = __crc32b(crc, b);
+    }
+    !crc
+}
+
+#[inline]
+fn crc32_fast(data: &[u8]) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("crc") {
+            return unsafe { crc32_ieee_aarch64(data) };
+        }
+    }
+    crate::nfo::crc32_ieee(data)
+}
+
+pub(crate) fn validate_and_rebuild_7z_end_header<'a>(
+    head: &'a [u8],
+    tail: &'a [u8],
+) -> Option<([u8; 32], &'a [u8])> {
+    if head.len() < 32 || !head.starts_with(&SEVENZIP_SIGNATURE) {
+        return None;
+    }
+    let next_offset = u64::from_le_bytes([
+        head[12], head[13], head[14], head[15], head[16], head[17], head[18], head[19],
+    ]);
+    let next_size = u64::from_le_bytes([
+        head[20], head[21], head[22], head[23], head[24], head[25], head[26], head[27],
+    ]);
+    let next_crc = u32::from_le_bytes([head[28], head[29], head[30], head[31]]);
+
+    let max = SEVENZIP_MAX_ARCHIVE_BYTES - 32;
+    if next_offset > max
+        || next_size > max - next_offset
+        || next_size == 0
+        || (next_size as usize) > tail.len()
+    {
+        return None;
+    }
+
+    let end_header = &tail[tail.len() - (next_size as usize)..];
+    if crc32_fast(end_header) != next_crc {
+        return None;
+    }
+
+    let mut start_header = [0u8; 20];
+    start_header[8..16].copy_from_slice(&next_size.to_le_bytes());
+    start_header[16..20].copy_from_slice(&next_crc.to_le_bytes());
+    let start_crc = crc32_fast(&start_header);
+
+    let mut full_start = [0u8; 32];
+    full_start[0..8].copy_from_slice(&head[0..8]);
+    full_start[8..12].copy_from_slice(&start_crc.to_le_bytes());
+    full_start[12..32].copy_from_slice(&start_header);
+    Some((full_start, end_header))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_archive_7z_validate_end_header(
+    head_ptr: *const u8,
+    head_len: usize,
+    tail_ptr: *const u8,
+    tail_len: usize,
+    out_ptr: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if (head_ptr.is_null() && head_len > 0)
+        || (tail_ptr.is_null() && tail_len > 0)
+        || (out_ptr.is_null() && out_cap > 0)
+    {
+        return -1;
+    }
+    let head = if head_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(head_ptr, head_len) }
+    };
+    let tail = if tail_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(tail_ptr, tail_len) }
+    };
+    let Some((full_start, end_header)) = validate_and_rebuild_7z_end_header(head, tail) else {
+        return 0;
+    };
+    let needed = 32 + end_header.len();
+    if out_cap < needed {
+        return -((needed + 16) as isize);
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(full_start.as_ptr(), out_ptr, 32);
+        std::ptr::copy_nonoverlapping(end_header.as_ptr(), out_ptr.add(32), end_header.len());
+    }
+    needed as isize
+}
+
+#[inline]
+fn posix_basename(mut path: &[u8]) -> &[u8] {
+    while path.last() == Some(&b'/') {
+        path = &path[..path.len() - 1];
+    }
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(idx) => &path[idx + 1..],
+        None => path,
+    }
+}
+
+pub(crate) fn archive_is_nfo_file(filename: &[u8]) -> bool {
+    let base = posix_basename(filename);
+    if base.is_empty() {
+        return false;
+    }
+    let b_no_nl = if base.last() == Some(&b'\n') {
+        &base[..base.len() - 1]
+    } else {
+        base
+    };
+
+    // 1. `/\.(nfo|diz|inf)$/i`
+    if b_no_nl.len() >= 4 && b_no_nl[b_no_nl.len() - 4] == b'.' {
+        let ext = &b_no_nl[b_no_nl.len() - 3..];
+        if ext.eq_ignore_ascii_case(b"nfo")
+            || ext.eq_ignore_ascii_case(b"diz")
+            || ext.eq_ignore_ascii_case(b"inf")
+        {
+            return true;
+        }
+    }
+
+    // 2. Exact lowercased basename match against $nfoNames
+    if base.len() <= 16 {
+        let mut lower_buf = [0u8; 16];
+        for (i, &b) in base.iter().enumerate() {
+            lower_buf[i] = b.to_ascii_lowercase();
+        }
+        let lower = &lower_buf[..base.len()];
+        if matches!(
+            lower,
+            b"file_id.diz"
+                | b"fileid.diz"
+                | b"file-id.diz"
+                | b"readme.txt"
+                | b"readme.1st"
+                | b"read.me"
+                | b"readmenow.txt"
+                | b"info.txt"
+                | b"information.txt"
+                | b"about.txt"
+                | b"notes.txt"
+                | b"release.txt"
+                | b"release.nfo"
+        ) {
+            return true;
+        }
+    }
+
+    // 3. `/^(?:00?-[a-z0-9_-]+|[a-z0-9]+-[a-z0-9._-]+)\.(?:nfo|txt)$/i`
+    if b_no_nl.len() >= 7 && b_no_nl[b_no_nl.len() - 4] == b'.' {
+        let ext = &b_no_nl[b_no_nl.len() - 3..];
+        if ext.eq_ignore_ascii_case(b"nfo") || ext.eq_ignore_ascii_case(b"txt") {
+            let stem = &b_no_nl[..b_no_nl.len() - 4];
+            if let Some(dash) = stem.iter().position(|&b| b == b'-') {
+                if dash >= 1 && dash + 1 < stem.len() {
+                    let prefix = &stem[..dash];
+                    let suffix = &stem[dash + 1..];
+                    if prefix.iter().all(u8::is_ascii_alphanumeric)
+                        && suffix
+                            .iter()
+                            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_archive_is_nfo_file(ptr: *const u8, len: usize) -> i32 {
+    if ptr.is_null() && len > 0 {
+        return -1;
+    }
+    let filename = if len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(ptr, len) }
+    };
+    if archive_is_nfo_file(filename) { 1 } else { 0 }
+}
+
+/// Ranks `count` NUL-separated archive filenames with NFO priority (stable partition).
+/// Returns `0` when the input is already in NFO-priority order, or `count * 4` with the
+/// `u32` little-endian permutation indices written to `out_ptr`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_archive_rank_nfo_files_nul(
+    names_ptr: *const u8,
+    names_len: usize,
+    count: usize,
+    out_ptr: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if count == 0 {
+        return 0;
+    }
+    if (names_ptr.is_null() && names_len > 0) || (out_ptr.is_null() && out_cap > 0) {
+        return -1;
+    }
+    let needed = match count.checked_mul(4) {
+        Some(v) => v,
+        None => return -1,
+    };
+    if out_cap < needed {
+        return -((needed + 16) as isize);
+    }
+    let names = if names_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(names_ptr, names_len) }
+    };
+
+    let mut nfo_indices: Vec<u32> = Vec::new();
+    let mut other_indices: Vec<u32> = Vec::with_capacity(count);
+    let mut seen_non_nfo = false;
+    let mut needs_reorder = false;
+
+    let mut iter = names.split(|&b| b == 0);
+    for idx in 0..count {
+        let Some(name) = iter.next() else {
+            return -1;
+        };
+        if archive_is_nfo_file(name) {
+            if seen_non_nfo {
+                needs_reorder = true;
+            }
+            nfo_indices.push(idx as u32);
+        } else {
+            seen_non_nfo = true;
+            other_indices.push(idx as u32);
+        }
+    }
+    if iter.next().is_some() {
+        return -1;
+    }
+    if !needs_reorder {
+        return 0;
+    }
+
+    let mut out = unsafe { OutCursor::new(out_ptr, out_cap) };
+    for idx in nfo_indices {
+        out.extend(&idx.to_le_bytes());
+    }
+    for idx in other_indices {
+        out.extend(&idx.to_le_bytes());
+    }
+    out.pos as isize
+}
+
+/// Standalone video signature code:
+/// 0 = null, 1 = avi, 2 = mkv, 3 = mpg, 4 = ts, 5 = mp4, 6 = wmv, 7 = flv, 8 = ogv
+pub(crate) fn detect_standalone_video(data: &[u8]) -> i32 {
+    if data.len() < 16 {
+        return 0;
+    }
+    let sig4 = &data[0..4];
+    if sig4 == b"RIFF" && &data[8..12] == b"AVI " {
+        return 1;
+    }
+    if sig4 == b"\x1A\x45\xDF\xA3" {
+        return 2;
+    }
+    if sig4 == b"\x00\x00\x01\xBA" || sig4 == b"\x00\x00\x01\xB3" {
+        return 3;
+    }
+    if data[0] == 0x47 && data.get(188) == Some(&0x47) && data.get(376) == Some(&0x47) {
+        return 4;
+    }
+    if &data[4..8] == b"ftyp" && data[8..12].iter().all(|&b| (0x20..=0x7E).contains(&b)) {
+        return 5;
+    }
+    if data.starts_with(b"\x30\x26\xB2\x75\x8E\x66\xCF\x11") {
+        return 6;
+    }
+    if sig4 == b"FLV\x01" {
+        return 7;
+    }
+    if sig4 == b"OggS" {
+        return 8;
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_archive_detect_standalone_video(
+    ptr: *const u8,
+    len: usize,
+) -> i32 {
+    if ptr.is_null() && len > 0 {
+        return -1;
+    }
+    let data = if len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(ptr, len) }
+    };
+    detect_standalone_video(data)
+}
+
+// ---------------------------------------------------------------------------
+// 13. MediaSourceResolver::wantedFiles (`nntmux_media_source_rank_wanted_files_nul`)
+// ---------------------------------------------------------------------------
+
+const DEFAULT_VIDEO_REGEX_BYTES: &[u8] =
+    b"\\.(AVI|F4V|IFO|M1V|M2V|M4V|MKV|MOV|MP4|MPEG|MPG|MPGV|MPV|OGV|QT|RM|RMVB|TS|VOB|WMV)";
+
+enum VideoExtConfig<'a> {
+    Default,
+    Custom(Vec<&'a [u8]>),
+}
+
+impl<'a> VideoExtConfig<'a> {
+    fn parse(regex: &'a [u8]) -> Option<Self> {
+        if regex == DEFAULT_VIDEO_REGEX_BYTES {
+            return Some(Self::Default);
+        }
+        if !regex.starts_with(b"\\.(") || !regex.ends_with(b")") {
+            return None;
+        }
+        let mut inner = &regex[3..regex.len() - 1];
+        if inner.starts_with(b"?:") {
+            inner = &inner[2..];
+        }
+        if inner.is_empty() {
+            return None;
+        }
+        let mut exts = Vec::new();
+        for part in inner.split(|&b| b == b'|') {
+            if part.is_empty() || !part.iter().all(u8::is_ascii_alphanumeric) {
+                return None;
+            }
+            exts.push(part);
+        }
+        Some(Self::Custom(exts))
+    }
+
+    #[inline]
+    fn matches_end(&self, s: &[u8]) -> bool {
+        let Some(dot_pos) = s.iter().rposition(|&b| b == b'.') else {
+            return false;
+        };
+        let ext = &s[dot_pos + 1..];
+        match self {
+            Self::Default => {
+                if !(2..=4).contains(&ext.len()) {
+                    return false;
+                }
+                let mut lower = [0u8; 4];
+                for (i, &b) in ext.iter().enumerate() {
+                    lower[i] = b.to_ascii_lowercase();
+                }
+                matches!(
+                    &lower[..ext.len()],
+                    b"avi"
+                        | b"f4v"
+                        | b"ifo"
+                        | b"m1v"
+                        | b"m2v"
+                        | b"m4v"
+                        | b"mkv"
+                        | b"mov"
+                        | b"mp4"
+                        | b"mpeg"
+                        | b"mpg"
+                        | b"mpgv"
+                        | b"mpv"
+                        | b"ogv"
+                        | b"qt"
+                        | b"rm"
+                        | b"rmvb"
+                        | b"ts"
+                        | b"vob"
+                        | b"wmv"
+                )
+            }
+            Self::Custom(exts) => exts.iter().any(|cand| ext.eq_ignore_ascii_case(cand)),
+        }
+    }
+}
+
+#[inline]
+fn is_zero_star_one(digits: &[u8]) -> bool {
+    !digits.is_empty()
+        && digits[digits.len() - 1] == b'1'
+        && digits[..digits.len() - 1].iter().all(|&b| b == b'0')
+}
+
+#[inline]
+fn matches_first_archive_volume(s: &[u8]) -> bool {
+    // 1. `/\.(?:part0*1\.rar|rar|7z(?:\.0*1)?|zip|0*1)$/i`
+    // 2. `&& preg_match('/\.part(?!0*1\.)\d+\.rar$/i', $file->name) !== 1`
+    let Some(dot_pos) = s.iter().rposition(|&b| b == b'.') else {
+        return false;
+    };
+    let ext = &s[dot_pos + 1..];
+    if ext.eq_ignore_ascii_case(b"rar") {
+        let stem = &s[..dot_pos];
+        if let Some(prev_dot) = stem.iter().rposition(|&b| b == b'.') {
+            let part_seg = &stem[prev_dot + 1..];
+            if part_seg.len() > 4
+                && part_seg[..4].eq_ignore_ascii_case(b"part")
+                && part_seg[4..].iter().all(u8::is_ascii_digit)
+            {
+                return is_zero_star_one(&part_seg[4..]);
+            }
+        }
+        return true;
+    }
+    if ext.eq_ignore_ascii_case(b"7z") || ext.eq_ignore_ascii_case(b"zip") {
+        return true;
+    }
+    is_zero_star_one(ext)
+}
+
+#[inline]
+fn is_sample_boundary_byte(b: u8) -> bool {
+    matches!(b, b'\\' | b'/' | b'.' | b'_' | b' ' | b'-')
+}
+
+#[inline]
+fn has_sample_token(name: &[u8]) -> bool {
+    // `/(?:^|[\\\\\/._ -])sample(?:[\\\\\/._ -]|$)/i`
+    if name.len() < 6 {
+        return false;
+    }
+    let end = name.len() - 6;
+    let mut i = 0;
+    while i <= end {
+        if (i == 0 || is_sample_boundary_byte(name[i - 1]))
+            && name[i..i + 6].eq_ignore_ascii_case(b"sample")
+        {
+            let after = i + 6;
+            if after == name.len()
+                || (after + 1 == name.len() && name[after] == b'\n')
+                || is_sample_boundary_byte(name[after])
+            {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+#[inline]
+fn matches_image_ext(s: &[u8]) -> bool {
+    // `/\.(?:jpe?g|png|webp)$/i`
+    let Some(dot_pos) = s.iter().rposition(|&b| b == b'.') else {
+        return false;
+    };
+    let ext = &s[dot_pos + 1..];
+    ext.eq_ignore_ascii_case(b"jpg")
+        || ext.eq_ignore_ascii_case(b"jpeg")
+        || ext.eq_ignore_ascii_case(b"png")
+        || ext.eq_ignore_ascii_case(b"webp")
+}
+
+fn classify_wanted_file(name: &[u8], video_cfg: &VideoExtConfig<'_>) -> Option<u8> {
+    let s = if name.last() == Some(&b'\n') {
+        &name[..name.len() - 1]
+    } else {
+        name
+    };
+    if matches_first_archive_volume(s) {
+        return Some(0);
+    }
+    if video_cfg.matches_end(s) {
+        return if has_sample_token(name) {
+            Some(1)
+        } else {
+            Some(2)
+        };
+    }
+    if matches_image_ext(s) {
+        return Some(3);
+    }
+    None
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_media_source_rank_wanted_files_nul(
+    names_ptr: *const u8,
+    names_len: usize,
+    sizes_ptr: *const u8,
+    sizes_len: usize,
+    video_regex_ptr: *const u8,
+    video_regex_len: usize,
+    count: usize,
+    out_ptr: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if count == 0 {
+        return 0;
+    }
+    if (names_ptr.is_null() && names_len > 0)
+        || sizes_ptr.is_null()
+        || video_regex_ptr.is_null()
+        || (out_ptr.is_null() && out_cap > 0)
+    {
+        return -1;
+    }
+    let Some(expected_sizes_len) = count.checked_mul(8) else {
+        return -1;
+    };
+    if sizes_len != expected_sizes_len {
+        return -1;
+    }
+    let names = if names_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(names_ptr, names_len) }
+    };
+    let sizes = unsafe { slice::from_raw_parts(sizes_ptr, sizes_len) };
+    let video_regex = if video_regex_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(video_regex_ptr, video_regex_len) }
+    };
+
+    let Some(video_cfg) = VideoExtConfig::parse(video_regex) else {
+        return -1;
+    };
+
+    let mut ranked: Vec<(u8, i64, u32)> = Vec::new();
+    let mut iter = names.split(|&b| b == 0);
+    for idx in 0..count {
+        let Some(name) = iter.next() else {
+            return -1;
+        };
+        if let Some(rank) = classify_wanted_file(name, &video_cfg) {
+            let off = idx * 8;
+            let size = i64::from_ne_bytes([
+                sizes[off],
+                sizes[off + 1],
+                sizes[off + 2],
+                sizes[off + 3],
+                sizes[off + 4],
+                sizes[off + 5],
+                sizes[off + 6],
+                sizes[off + 7],
+            ]);
+            ranked.push((rank, size, idx as u32));
+        }
+    }
+    if iter.next().is_some() {
+        return -1;
+    }
+
+    if ranked.is_empty() {
+        return 0;
+    }
+    let needed = ranked.len() * 4;
+    if out_cap < needed {
+        return -((needed + 16) as isize);
+    }
+
+    ranked.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+
+    let mut out = unsafe { OutCursor::new(out_ptr, out_cap) };
+    for &(_, _, idx) in &ranked {
+        out.extend(&idx.to_le_bytes());
+    }
+    out.pos as isize
+}
+
+#[cfg(test)]
+mod wave7_episode_archive_rank_tests {
+    use super::*;
+
+    #[test]
+    fn episode_searchname_patterns_and_precedence() {
+        assert_eq!(
+            episode_parse_searchname(b"Show.Name.S02E14.1080p.WEB-DL", true, true),
+            (2, 14)
+        );
+        assert_eq!(
+            episode_parse_searchname(b"Show.Name.2x07.720p.HDTV", true, true),
+            (2, 7)
+        );
+        assert_eq!(
+            episode_parse_searchname(b"Show.Season_03_Episode-019.mkv", true, true),
+            (3, 19)
+        );
+        assert_eq!(
+            episode_parse_searchname(b"Show.Name.305.HDTV", true, true),
+            (3, 5)
+        );
+        // Compact 3-digit format does not fire when only one of series/episode is missing
+        assert_eq!(
+            episode_parse_searchname(b"Show.Name.305.Part.9.HDTV", false, true),
+            (-1, 9)
+        );
+        assert_eq!(
+            episode_parse_searchname(b"Daily.Show.2024.01.15.1080p", true, true),
+            (2024, 115)
+        );
+        assert_eq!(
+            episode_parse_searchname(b"Mini.Series.Part.4.1080p", true, true),
+            (1, 4)
+        );
+        assert_eq!(
+            episode_parse_searchname(b"Anime.Title.Ep12.1080p", false, true),
+            (-1, 12)
+        );
+    }
+
+    #[test]
+    fn canonical_firstaired_validation() {
+        assert_eq!(parse_canonical_firstaired(b"2024-01-15"), Some((2024, 115)));
+        assert_eq!(
+            parse_canonical_firstaired(b"2024-02-29 23:59:59"),
+            Some((2024, 229))
+        );
+        assert_eq!(parse_canonical_firstaired(b"2023-02-29"), None);
+        assert_eq!(parse_canonical_firstaired(b"2024.01.15"), None);
+    }
+
+    #[test]
+    fn archive_nfo_and_standalone_video_detection() {
+        assert!(archive_is_nfo_file(b"dir/00-group.txt"));
+        assert!(archive_is_nfo_file(b"dir/group-release.1080p.txt"));
+        assert!(archive_is_nfo_file(b"dir/file_id.diz"));
+        assert!(!archive_is_nfo_file(b"dir/notes_extra.txt"));
+
+        assert_eq!(
+            detect_standalone_video(b"RIFF\0\0\0\0AVI \0\0\0\0"),
+            1
+        );
+        assert_eq!(
+            detect_standalone_video(b"\0\0\0\x18ftypmp42\0\0\0\0"),
+            5
+        );
+    }
+
+    #[test]
+    fn wanted_files_classification_and_ordering() {
+        let cfg = VideoExtConfig::parse(DEFAULT_VIDEO_REGEX_BYTES).unwrap();
+        assert_eq!(classify_wanted_file(b"Movie.part01.rar", &cfg), Some(0));
+        assert_eq!(classify_wanted_file(b"Movie.part02.rar", &cfg), None);
+        assert_eq!(classify_wanted_file(b"Movie.rar", &cfg), Some(0));
+        assert_eq!(classify_wanted_file(b"Movie.7z.001", &cfg), Some(0));
+        assert_eq!(classify_wanted_file(b"Movie.sample.mkv", &cfg), Some(1));
+        assert_eq!(classify_wanted_file(b"Movie.1080p.mkv", &cfg), Some(2));
+        assert_eq!(classify_wanted_file(b"poster.jpg", &cfg), Some(3));
+    }
+}

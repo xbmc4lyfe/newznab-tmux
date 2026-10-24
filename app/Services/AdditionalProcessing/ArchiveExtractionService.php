@@ -7,14 +7,17 @@ namespace App\Services\AdditionalProcessing;
 use App\Services\AdditionalProcessing\Config\ProcessingConfiguration;
 use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
 use App\Services\Releases\ReleaseBrowseService;
+use App\Support\RustPipelineLibrary;
 use dariusiii\rarinfo\ArchiveInfo;
 use dariusiii\rarinfo\Par2Info;
 use dariusiii\rarinfo\RarInfo;
 use dariusiii\rarinfo\SzipInfo;
+use FFI;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Process;
 use Symfony\Component\Process\Process as SymfonyProcess;
+use Throwable;
 
 /**
  * Service for extracting and processing archive files (RAR, ZIP, 7z).
@@ -31,6 +34,24 @@ class ArchiveExtractionService
 
     public const SEVENZIP_LISTING_MAX_ENTRIES = 1000;
 
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_archive_7z_validate_end_header(const char *head, size_t head_len, const char *tail, size_t tail_len, char *out_buf, size_t out_cap);
+        int32_t nntmux_archive_is_nfo_file(const char *filename, size_t filename_len);
+        ssize_t nntmux_archive_rank_nfo_files_nul(const char *names, size_t names_len, size_t count, char *out_buf, size_t out_cap);
+        int32_t nntmux_archive_detect_standalone_video(const char *data, size_t data_len);
+        C;
+
+    private const array STANDALONE_VIDEO_CODES = [
+        1 => 'avi',
+        2 => 'mkv',
+        3 => 'mpg',
+        4 => 'ts',
+        5 => 'mp4',
+        6 => 'wmv',
+        7 => 'flv',
+        8 => 'ogv',
+    ];
+
     private ArchiveInfo $archiveInfo;
 
     private Par2Info $par2Info;
@@ -38,7 +59,8 @@ class ArchiveExtractionService
     public function __construct(
         private readonly ProcessingConfiguration $config,
         ?ArchiveInfo $archiveInfo = null,
-        ?Par2Info $par2Info = null
+        ?Par2Info $par2Info = null,
+        private readonly ?string $libraryPath = null,
     ) {
         $this->archiveInfo = $archiveInfo ?? new ArchiveInfo;
         $this->par2Info = $par2Info ?? new Par2Info;
@@ -232,12 +254,147 @@ class ArchiveExtractionService
     }
 
     /**
+     * `isNfoFile()` backed by the Rust pipeline library; falls back to `isNfoFile()`
+     * (and leaves `$supported` false) when the library is unavailable.
+     */
+    public function isNfoFileNative(string $filename, bool &$supported = false): bool
+    {
+        $supported = false;
+        $ffi = RustPipelineLibrary::resolveDomain('archive_extraction', self::FFI_CDEF, $this->libraryPath);
+        if ($ffi === null) {
+            return $this->isNfoFile($filename);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_archive_is_nfo_file($filename, strlen($filename));
+        } catch (Throwable) {
+            return $this->isNfoFile($filename);
+        }
+
+        if (! is_int($status) || $status < 0) {
+            return $this->isNfoFile($filename);
+        }
+
+        $supported = true;
+
+        return $status === 1;
+    }
+
+    /**
      * Sort files to prioritize NFO files for processing.
      *
      * @param  list<array<string, mixed>>  $files  Array of file info arrays.
      * @return list<array<string, mixed>> Sorted array with NFO files first.
      */
     public function sortFilesWithNfoPriority(array $files): array
+    {
+        if (static::class !== self::class) {
+            return $this->sortFilesWithNfoPriorityPhp($files);
+        }
+
+        return $this->sortFilesWithNfoPriorityNative($files);
+    }
+
+    /**
+     * Sort archive file records with NFO priority in a single Rust FFI crossing, falling back to PHP.
+     *
+     * @param  list<array<string, mixed>>  $files
+     * @return list<array<string, mixed>>
+     */
+    public function sortFilesWithNfoPriorityNative(array $files, bool &$supported = false): array
+    {
+        $supported = false;
+        $count = count($files);
+        $ffi = RustPipelineLibrary::resolveDomain('archive_extraction', self::FFI_CDEF, $this->libraryPath);
+        if ($ffi === null) {
+            return $this->sortFilesWithNfoPriorityPhp($files);
+        }
+        if ($count <= 1) {
+            $supported = true;
+
+            return array_values($files);
+        }
+
+        $values = array_values($files);
+        $names = [];
+        foreach ($values as $file) {
+            $names[] = is_string($file['name'] ?? null) ? $file['name'] : '';
+        }
+
+        $joined = implode("\0", $names);
+        if (substr_count($joined, "\0") !== $count - 1) {
+            return $this->sortFilesWithNfoPriorityPhp($files);
+        }
+
+        $needed = $count * 4 + 16;
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, $needed, $cap);
+        if ($scratch === null) {
+            return $this->sortFilesWithNfoPriorityPhp($files);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_archive_rank_nfo_files_nul(
+                $joined,
+                strlen($joined),
+                $count,
+                $scratch,
+                $cap,
+            );
+            if (is_int($written) && $written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return $this->sortFilesWithNfoPriorityPhp($files);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_archive_rank_nfo_files_nul(
+                    $joined,
+                    strlen($joined),
+                    $count,
+                    $scratch,
+                    $cap,
+                );
+            }
+        } catch (Throwable) {
+            return $this->sortFilesWithNfoPriorityPhp($files);
+        }
+
+        if (! is_int($written) || $written < 0) {
+            return $this->sortFilesWithNfoPriorityPhp($files);
+        }
+        if ($written === 0) {
+            $supported = true;
+
+            return $values;
+        }
+        if ($written !== $count * 4) {
+            return $this->sortFilesWithNfoPriorityPhp($files);
+        }
+
+        /** @var array<int, int>|false $order */
+        $order = unpack('V*', FFI::string($scratch, $written));
+        if ($order === false) {
+            return $this->sortFilesWithNfoPriorityPhp($files);
+        }
+
+        $supported = true;
+        $sorted = [];
+        foreach ($order as $idx) {
+            $sorted[] = $values[$idx];
+        }
+
+        return $sorted;
+    }
+
+    /**
+     * Pure PHP reference implementation of NFO-priority sorting.
+     *
+     * @param  list<array<string, mixed>>  $files
+     * @return list<array<string, mixed>>
+     */
+    public function sortFilesWithNfoPriorityPhp(array $files): array
     {
         usort($files, function ($a, $b) {
             $aIsNfo = $this->isNfoFile($a['name'] ?? '');
@@ -278,7 +435,7 @@ class ArchiveExtractionService
             if (! File::isDirectory($unzipDir)) {
                 File::makeDirectory($unzipDir, 0777, true, true);
             }
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             if ($this->config->debugMode) {
                 Log::warning('Failed ensuring extraction subdirectories: '.$e->getMessage());
             }
@@ -367,6 +524,69 @@ class ArchiveExtractionService
      * last, so it can be cut from the tail and checked. Packed data is left out.
      */
     public function withSevenZipEndHeader(string $head, string $tail): ?string
+    {
+        return $this->withSevenZipEndHeaderNative($head, $tail);
+    }
+
+    /**
+     * Rebuild a listable 7z via the Rust CRC32/header accelerator, falling back to PHP.
+     */
+    public function withSevenZipEndHeaderNative(string $head, string $tail, bool &$supported = false): ?string
+    {
+        $supported = false;
+        $ffi = RustPipelineLibrary::resolveDomain('archive_extraction', self::FFI_CDEF, $this->libraryPath);
+        if ($ffi === null) {
+            return $this->withSevenZipEndHeaderPhp($head, $tail);
+        }
+
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, 256, $cap);
+        if ($scratch === null) {
+            return $this->withSevenZipEndHeaderPhp($head, $tail);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_archive_7z_validate_end_header(
+                $head,
+                strlen($head),
+                $tail,
+                strlen($tail),
+                $scratch,
+                $cap,
+            );
+            if (is_int($written) && $written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return $this->withSevenZipEndHeaderPhp($head, $tail);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_archive_7z_validate_end_header(
+                    $head,
+                    strlen($head),
+                    $tail,
+                    strlen($tail),
+                    $scratch,
+                    $cap,
+                );
+            }
+        } catch (Throwable) {
+            return $this->withSevenZipEndHeaderPhp($head, $tail);
+        }
+
+        if (! is_int($written) || $written < 0) {
+            return $this->withSevenZipEndHeaderPhp($head, $tail);
+        }
+
+        $supported = true;
+
+        return $written === 0 ? null : FFI::string($scratch, $written);
+    }
+
+    /**
+     * Pure PHP reference implementation of 7z end-header validation and reconstruction.
+     */
+    public function withSevenZipEndHeaderPhp(string $head, string $tail): ?string
     {
         $start = $this->sevenZipStartHeader($head);
         if ($start === null || $start['next_size'] === 0 || $start['next_size'] > strlen($tail)) {
@@ -467,7 +687,7 @@ class ArchiveExtractionService
             $process = new SymfonyProcess([$client, 'l', '-slt', '-ba', '-sccUTF-8', '-pnntmux', '-t7z', '--', $file]);
             $process->setTimeout(60)->start();
             [$files, $complete] = $this->readSevenZipListing($process);
-        } catch (\Throwable) {
+        } catch (Throwable) {
             return null;
         } finally {
             if ($process?->isRunning()) {
@@ -590,6 +810,9 @@ class ArchiveExtractionService
 
     /**
      * Detect a plain media container (not an archive) from its leading bytes.
+     *
+     * Stays on native PHP in production because the 4-byte signature checks cost ~100 ns,
+     * so a single-buffer FFI crossing (~80 ns) measures below the 1.5x adoption threshold.
      */
     public function detectStandaloneVideo(string $data): ?string
     {
@@ -610,6 +833,34 @@ class ArchiveExtractionService
             $sig4 === 'OggS' => 'ogv',
             default => null,
         };
+    }
+
+    /**
+     * `detectStandaloneVideo()` backed by the Rust pipeline library; falls back to
+     * `detectStandaloneVideo()` (and leaves `$supported` false) when unavailable.
+     */
+    public function detectStandaloneVideoNative(string $data, bool &$supported = false): ?string
+    {
+        $supported = false;
+        $ffi = RustPipelineLibrary::resolveDomain('archive_extraction', self::FFI_CDEF, $this->libraryPath);
+        if ($ffi === null) {
+            return $this->detectStandaloneVideo($data);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $code = $ffi->nntmux_archive_detect_standalone_video($data, strlen($data));
+        } catch (Throwable) {
+            return $this->detectStandaloneVideo($data);
+        }
+
+        if (! is_int($code) || $code < 0) {
+            return $this->detectStandaloneVideo($data);
+        }
+
+        $supported = true;
+
+        return self::STANDALONE_VIDEO_CODES[$code] ?? null;
     }
 
     /**
@@ -678,7 +929,7 @@ class ArchiveExtractionService
                         $extractedFiles[$filename] = $extracted;
                         $remaining = array_values(array_diff($remaining, [$filename]));
                     }
-                } catch (\Throwable $e) {
+                } catch (Throwable $e) {
                     if ($this->config->debugMode) {
                         Log::debug('ArchiveInfo getFileData failed: '.$e->getMessage());
                     }
@@ -704,6 +955,42 @@ class ArchiveExtractionService
      * @return array<string, int> name => size
      */
     public static function completeStoredEntries(array $files): array
+    {
+        $entries = [];
+        foreach ($files as $file) {
+            if (! is_array($file) || ! isset($file['name'], $file['size'], $file['range'])
+                || ($file['source'] ?? 'main') !== 'main'
+                || ! empty($file['pass'])
+                || ! empty($file['is_dir'])
+                || ($file['compressed'] ?? null) !== 0
+            ) {
+                continue;
+            }
+
+            $size = (int) $file['size'];
+            if ($size <= 0) {
+                continue;
+            }
+
+            $range = (string) $file['range'];
+            $dash = strpos($range, '-');
+            $start = $dash === 0 ? 0 : (int) $range;
+            $end = $dash === false ? -1 : (int) substr($range, $dash + 1);
+            if ($end - $start + 1 === $size) {
+                $entries[(string) $file['name']] = $size;
+            }
+        }
+
+        return $entries;
+    }
+
+    /**
+     * Original array_map/explode implementation of `completeStoredEntries()` retained for parity checks.
+     *
+     * @param  array<int|string, mixed>  $files
+     * @return array<string, int> name => size
+     */
+    public static function completeStoredEntriesLegacy(array $files): array
     {
         $entries = [];
         foreach ($files as $file) {
@@ -815,7 +1102,7 @@ class ArchiveExtractionService
                     return File::get($file->getPathname());
                 }
             }
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             if ($this->config->debugMode) {
                 Log::debug('External extraction failed: '.$e->getMessage());
             }

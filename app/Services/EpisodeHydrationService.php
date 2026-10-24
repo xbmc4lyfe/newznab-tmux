@@ -5,11 +5,34 @@ declare(strict_types=1);
 namespace App\Services;
 
 use App\Models\TvEpisode;
+use App\Support\RustPipelineLibrary;
 use Carbon\Carbon;
+use FFI;
+use FFI\CData;
 use Illuminate\Support\Collection;
+use Throwable;
 
 class EpisodeHydrationService
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_episode_parse_searchname(const char *searchname, size_t searchname_len, uint8_t flags, int32_t *out_series, int32_t *out_episode);
+        ssize_t nntmux_episode_hydrate_batch_nul(const char *searchnames, size_t searchnames_len, const char *firstaired, size_t firstaired_len, const char *flags, size_t flags_len, size_t count, char *out_buf, size_t out_cap);
+        C;
+
+    private ?FFI $ffi = null;
+
+    private bool $ffiResolved = false;
+
+    private ?CData $singleOut = null;
+
+    private ?CData $seriesOutPtr = null;
+
+    private ?CData $episodeOutPtr = null;
+
+    public function __construct(
+        private readonly ?string $libraryPath = null,
+    ) {}
+
     /**
      * Hydrate missing season/episode numbers on release objects.
      * Uses episode metadata from the database, then falls back to regex parsing of searchname.
@@ -17,6 +40,211 @@ class EpisodeHydrationService
      * @param  iterable<int, object>  $releases
      */
     public function hydrateEpisodeMetadata(iterable $releases): void
+    {
+        $this->hydrateEpisodeMetadataNative($releases);
+    }
+
+    /**
+     * Hydrate release episode metadata via the batch Rust FFI accelerator, falling back to PHP.
+     *
+     * @param  iterable<int, object>  $releases
+     */
+    public function hydrateEpisodeMetadataNative(iterable $releases, bool &$supported = false): void
+    {
+        $supported = false;
+        $items = is_array($releases) ? array_values($releases) : iterator_to_array($releases, false);
+        $ffi = $this->ffi();
+        if ($ffi === null) {
+            $this->hydrateEpisodeMetadataPhp($items);
+
+            return;
+        }
+        if ($items === []) {
+            $supported = true;
+
+            return;
+        }
+
+        $episodeIds = [];
+        foreach ($items as $r) {
+            $epId = (int) ($r->tv_episodes_id ?? 0);
+            if ($epId > 0) {
+                $episodeIds[$epId] = $epId;
+            }
+        }
+
+        /** @var Collection<int, TvEpisode>|null $episodeMeta */
+        $episodeMeta = $episodeIds !== []
+            ? TvEpisode::whereIn('id', array_values($episodeIds))->get()->keyBy('id')
+            : null;
+
+        $pending = [];
+        $searchnames = [];
+        $firstAireds = [];
+        $flags = [];
+        $hasFirstAired = false;
+        $hasNonDefaultFlags = false;
+
+        foreach ($items as $r) {
+            $epId = $episodeMeta !== null ? (int) ($r->tv_episodes_id ?? 0) : 0;
+            $firstAired = '';
+
+            if ($epId > 0 && $episodeMeta !== null && $episodeMeta->has($epId)) {
+                $meta = $episodeMeta[$epId];
+                if ($this->isMissing($r->series ?? null)) {
+                    $r->series = (int) $meta->series;
+                }
+                if ($this->isMissing($r->episode ?? null)) {
+                    $r->episode = (int) $meta->episode;
+                }
+                if ((! $meta->series || (int) $meta->series === 0) && ! empty($meta->firstaired)) {
+                    $firstAired = (string) $meta->firstaired;
+                }
+            } elseif (! empty($r->firstaired) && (int) ($r->tv_episodes_id ?? 0) <= 0) {
+                $firstAired = (string) $r->firstaired;
+            }
+
+            $missingSeries = $this->isMissing($r->series ?? null);
+            $missingEpisode = $this->isMissing($r->episode ?? null);
+            if (! $missingSeries && ! $missingEpisode) {
+                continue;
+            }
+
+            $searchname = ! empty($r->searchname) ? (string) $r->searchname : '';
+            if ($firstAired === '' && $searchname === '') {
+                continue;
+            }
+
+            $flag = ($missingSeries ? 1 : 0) | ($missingEpisode ? 2 : 0);
+            if ($flag !== 3) {
+                $hasNonDefaultFlags = true;
+            }
+            if ($firstAired !== '') {
+                $hasFirstAired = true;
+            }
+
+            $pending[] = $r;
+            $searchnames[] = $searchname;
+            $firstAireds[] = $firstAired;
+            $flags[] = chr($flag);
+        }
+
+        $pendingCount = count($pending);
+        if ($pendingCount === 0) {
+            $supported = true;
+
+            return;
+        }
+
+        $joinedSearchnames = implode("\0", $searchnames);
+        if (substr_count($joinedSearchnames, "\0") !== $pendingCount - 1) {
+            $this->hydratePendingPhp($pending, $episodeMeta ?? collect());
+
+            return;
+        }
+
+        $joinedFirstAired = '';
+        if ($hasFirstAired) {
+            $joinedFirstAired = implode("\0", $firstAireds);
+            if (substr_count($joinedFirstAired, "\0") !== $pendingCount - 1) {
+                $this->hydratePendingPhp($pending, $episodeMeta ?? collect());
+
+                return;
+            }
+        }
+
+        $flagsStr = $hasNonDefaultFlags ? implode('', $flags) : '';
+        $needed = $pendingCount * 8 + 16;
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, $needed, $cap);
+        if ($scratch === null) {
+            $this->hydratePendingPhp($pending, $episodeMeta ?? collect());
+
+            return;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_episode_hydrate_batch_nul(
+                $joinedSearchnames,
+                strlen($joinedSearchnames),
+                $joinedFirstAired,
+                strlen($joinedFirstAired),
+                $flagsStr,
+                strlen($flagsStr),
+                $pendingCount,
+                $scratch,
+                $cap,
+            );
+            if (is_int($written) && $written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    $this->hydratePendingPhp($pending, $episodeMeta ?? collect());
+
+                    return;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_episode_hydrate_batch_nul(
+                    $joinedSearchnames,
+                    strlen($joinedSearchnames),
+                    $joinedFirstAired,
+                    strlen($joinedFirstAired),
+                    $flagsStr,
+                    strlen($flagsStr),
+                    $pendingCount,
+                    $scratch,
+                    $cap,
+                );
+            }
+        } catch (Throwable) {
+            $this->hydratePendingPhp($pending, $episodeMeta ?? collect());
+
+            return;
+        }
+
+        if (! is_int($written) || $written !== $pendingCount * 8) {
+            $this->hydratePendingPhp($pending, $episodeMeta ?? collect());
+
+            return;
+        }
+
+        /** @var array<int, int>|false $unpacked */
+        $unpacked = unpack('l*', FFI::string($scratch, $written));
+        if ($unpacked === false) {
+            $this->hydratePendingPhp($pending, $episodeMeta ?? collect());
+
+            return;
+        }
+
+        $supported = true;
+        $pos = 1;
+        foreach ($pending as $r) {
+            $s = $unpacked[$pos++];
+            $e = $unpacked[$pos++];
+            if ($s === -2) {
+                if ($episodeMeta !== null && (int) ($r->tv_episodes_id ?? 0) > 0) {
+                    $this->hydrateFromMetadata($r, $episodeMeta);
+                }
+                $this->hydrateFromFirstAired($r);
+                $this->hydrateFromSearchname($r);
+
+                continue;
+            }
+            if ($s >= 0) {
+                $r->series = $s;
+            }
+            if ($e >= 0) {
+                $r->episode = $e;
+            }
+        }
+    }
+
+    /**
+     * Pure PHP reference implementation of episode metadata hydration.
+     *
+     * @param  iterable<int, object>  $releases
+     */
+    public function hydrateEpisodeMetadataPhp(iterable $releases): void
     {
         $episodeIds = collect($releases)->pluck('tv_episodes_id')->filter(fn ($v) => $v > 0)->unique()->values();
         $episodeMeta = $episodeIds->isNotEmpty()
@@ -28,6 +256,110 @@ class EpisodeHydrationService
             $this->hydrateFromFirstAired($r);
             $this->hydrateFromSearchname($r);
         }
+    }
+
+    /**
+     * Parse a single searchname via `nntmux_episode_parse_searchname`, falling back to PHP.
+     *
+     * @return array{series: int|null, episode: int|null}
+     */
+    public function parseSearchnameNative(
+        string $searchname,
+        bool $missingSeries = true,
+        bool $missingEpisode = true,
+        bool &$supported = false,
+    ): array {
+        $supported = false;
+        $ffi = $this->ffi();
+        if ($ffi === null || $this->seriesOutPtr === null || $this->episodeOutPtr === null || $this->singleOut === null) {
+            return $this->parseSearchnamePhp($searchname, $missingSeries, $missingEpisode);
+        }
+
+        $flags = ($missingSeries ? 1 : 0) | ($missingEpisode ? 2 : 0);
+        try {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_episode_parse_searchname(
+                $searchname,
+                strlen($searchname),
+                $flags,
+                $this->seriesOutPtr,
+                $this->episodeOutPtr,
+            );
+        } catch (Throwable) {
+            return $this->parseSearchnamePhp($searchname, $missingSeries, $missingEpisode);
+        }
+
+        if (! is_int($status) || $status < 0) {
+            return $this->parseSearchnamePhp($searchname, $missingSeries, $missingEpisode);
+        }
+
+        $supported = true;
+        $s = (int) $this->singleOut[0];
+        $e = (int) $this->singleOut[1];
+
+        return [
+            'series' => $s >= 0 ? $s : null,
+            'episode' => $e >= 0 ? $e : null,
+        ];
+    }
+
+    /**
+     * Parse a single searchname using the PHP regex cascade.
+     *
+     * @return array{series: int|null, episode: int|null}
+     */
+    public function parseSearchnamePhp(
+        string $searchname,
+        bool $missingSeries = true,
+        bool $missingEpisode = true,
+    ): array {
+        $probe = (object) [
+            'searchname' => $searchname,
+            'series' => $missingSeries ? null : 1,
+            'episode' => $missingEpisode ? null : 1,
+        ];
+        $this->hydrateFromSearchname($probe);
+
+        return [
+            'series' => $missingSeries && is_int($probe->series) ? $probe->series : null,
+            'episode' => $missingEpisode && is_int($probe->episode) ? $probe->episode : null,
+        ];
+    }
+
+    /**
+     * @param  list<object>  $pending
+     * @param  Collection<int, TvEpisode>  $episodeMeta
+     */
+    private function hydratePendingPhp(array $pending, Collection $episodeMeta): void
+    {
+        foreach ($pending as $r) {
+            if ((int) ($r->tv_episodes_id ?? 0) > 0) {
+                $this->hydrateFromMetadata($r, $episodeMeta);
+            }
+            $this->hydrateFromFirstAired($r);
+            $this->hydrateFromSearchname($r);
+        }
+    }
+
+    private function ffi(): ?FFI
+    {
+        if (! $this->ffiResolved) {
+            $this->ffiResolved = true;
+            $ffi = RustPipelineLibrary::resolveDomain('episode_hydration', self::FFI_CDEF, $this->libraryPath);
+            if ($ffi !== null) {
+                try {
+                    $out = $ffi->new('int32_t[2]');
+                    $this->seriesOutPtr = FFI::addr($out[0]);
+                    $this->episodeOutPtr = FFI::addr($out[1]);
+                    $this->singleOut = $out;
+                    $this->ffi = $ffi;
+                } catch (Throwable) {
+                    $this->ffi = null;
+                }
+            }
+        }
+
+        return $this->ffi;
     }
 
     /**
