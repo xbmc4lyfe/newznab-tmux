@@ -7,11 +7,15 @@ namespace App\Services;
 use App\Services\IGDB\Models\Company;
 use App\Services\IGDB\Models\Game;
 use App\Support\MetadataSources;
+use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\RateLimiter;
+use Throwable;
 
 /**
  * IGDBService - IGDB (Internet Game Database) API integration.
@@ -73,6 +77,28 @@ class IGDBService
         'nintendo super nes' => 'snes',
         'snes' => 'snes',
     ];
+
+    private const string FFI_CDEF = <<<'C'
+        const char *nntmux_igdb_normalize_for_match(const char *input, size_t input_len);
+        const char *nntmux_igdb_extract_base_title(const char *input, size_t input_len);
+        double nntmux_igdb_compute_similarity(const char *a, size_t a_len, const char *b, size_t b_len);
+        ssize_t nntmux_igdb_score_candidates_batch_nul(const char *query, size_t query_len, const char *candidates, size_t candidates_len, size_t count, double *out_scores);
+        C;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
+    private static bool $useRustFfi = true;
+
+    private static ?CData $scoreBuf = null;
+
+    private static int $scoreCap = 0;
+
+    public static function setUseRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
 
     /**
      * Check if IGDB is configured.
@@ -390,6 +416,47 @@ class IGDBService
         }
 
         return $bestMatch;
+    }
+
+    /**
+     * Rust `nntmux_igdb_score_candidates_batch_nul` for parity testing: `computeSimilarity(normalizeForMatch($title),
+     * normalizeForMatch($name))` per name; `null` when the library is unavailable or declines.
+     *
+     * @param  array<int, string>  $names
+     * @return array<int, float>|null
+     */
+    public static function scoreCandidatesNative(string $title, array $names): ?array
+    {
+        $ffi = self::$ffi ?? (self::$ffiResolved ? null : self::ffi());
+        $count = count($names);
+        if ($ffi === null || $count === 0) {
+            return null;
+        }
+        $joined = implode("\0", $names);
+        if (substr_count($joined, "\0") !== $count - 1) {
+            return null;
+        }
+        try {
+            if (self::$scoreBuf === null || self::$scoreCap < $count) {
+                $cap = max(64, $count * 2);
+                self::$scoreBuf = $ffi->new("double[{$cap}]");
+                self::$scoreCap = $cap;
+            }
+            $buf = self::$scoreBuf;
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_igdb_score_candidates_batch_nul($title, strlen($title), $joined, strlen($joined), $count, $buf);
+            if ($written !== $count) {
+                return null;
+            }
+            $scores = [];
+            for ($i = 0; $i < $count; $i++) {
+                $scores[] = (float) $buf[$i];
+            }
+
+            return $scores;
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     /**
@@ -818,6 +885,41 @@ class IGDBService
      */
     protected function extractBaseTitle(string $title): string
     {
+        if (self::$useRustFfi && ($ffi = self::$ffi ?? (self::$ffiResolved ? null : self::ffi())) !== null) {
+            try {
+                // @phpstan-ignore method.notFound
+                $base = $ffi->nntmux_igdb_extract_base_title($title, strlen($title));
+                if (is_string($base)) {
+                    return $base;
+                }
+            } catch (Throwable) {
+            }
+        }
+
+        return $this->extractBaseTitlePhp($title);
+    }
+
+    /**
+     * Rust `nntmux_igdb_extract_base_title`; `null` when the library is unavailable or declines the input.
+     */
+    public static function extractBaseTitleNative(string $title): ?string
+    {
+        $ffi = self::$ffi ?? (self::$ffiResolved ? null : self::ffi());
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $base = $ffi->nntmux_igdb_extract_base_title($title, strlen($title));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return is_string($base) ? $base : null;
+    }
+
+    protected function extractBaseTitlePhp(string $title): string
+    {
         $patterns = [
             '/\s*[-:]\s+.*$/',
             '/\s+(?:Episode|Chapter|Part)\s+\d+.*/i',
@@ -838,6 +940,37 @@ class IGDBService
      */
     protected function normalizeForMatch(string $title): string
     {
+        if (self::$useRustFfi) {
+            $native = self::normalizeForMatchNative($title);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->normalizeForMatchPhp($title);
+    }
+
+    /**
+     * Rust `nntmux_igdb_normalize_for_match`; `null` when the library is unavailable or declines the input.
+     */
+    public static function normalizeForMatchNative(string $title): ?string
+    {
+        $ffi = self::$ffi ?? (self::$ffiResolved ? null : self::ffi());
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $normalized = $ffi->nntmux_igdb_normalize_for_match($title, strlen($title));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return is_string($normalized) ? $normalized : null;
+    }
+
+    protected function normalizeForMatchPhp(string $title): string
+    {
         $t = mb_strtolower($title);
         $t = (string) preg_replace('/\b(game of the year|goty|definitive edition|deluxe edition|ultimate edition|complete edition|remastered|hd remaster|directors? cut|anniversary edition|update|patch|hotfix|incl(?:uding)? dlcs?|dlcs?|repack|rip|iso|crack(?:fix)?|beta|alpha)\b/i', ' ', $t);
         $t = (string) preg_replace('/\b(pc|gog|steam|x64|x86|win64|win32|mult[iy]?\d*|eng|english|fr|french|de|german|es|spanish|it|italian|pt|ptbr|portuguese|ru|russian|pl|polish|tr|turkish|nl|dutch|se|swedish|no|norwegian|da|danish|fi|finnish|jp|japanese|cn|chs|cht|ko|korean)\b/i', ' ', $t);
@@ -851,6 +984,37 @@ class IGDBService
      * Compute similarity between two strings.
      */
     protected function computeSimilarity(string $a, string $b): float
+    {
+        if (self::$useRustFfi) {
+            $native = self::computeSimilarityNative($a, $b);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->computeSimilarityPhp($a, $b);
+    }
+
+    /**
+     * Rust `nntmux_igdb_compute_similarity`; `null` when the library is unavailable.
+     */
+    public static function computeSimilarityNative(string $a, string $b): ?float
+    {
+        $ffi = self::$ffi ?? (self::$ffiResolved ? null : self::ffi());
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $score = $ffi->nntmux_igdb_compute_similarity($a, strlen($a), $b, strlen($b));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return is_float($score) && $score >= 0.0 ? $score : null;
+    }
+
+    protected function computeSimilarityPhp(string $a, string $b): float
     {
         if ($a === $b) {
             return 100.0;
@@ -868,6 +1032,16 @@ class IGDBService
         }
 
         return max($percent, $levScore);
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (! self::$ffiResolved) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('igdb_matching', self::FFI_CDEF);
+            self::$ffiResolved = true;
+        }
+
+        return self::$ffi;
     }
 
     /**
