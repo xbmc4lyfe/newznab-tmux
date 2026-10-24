@@ -69,10 +69,10 @@ on:
 permissions:
   contents: read
 
-# Keep manual measurements independent of automatic push coverage.
+# Keep manual measurements independent of automatic push coverage and never cancel runs.
 concurrency:
-  group: yenc-performance-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: true
+  group: yenc-performance-${{ github.ref }}-${{ github.event_name }}-${{ github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   paired-decoding:

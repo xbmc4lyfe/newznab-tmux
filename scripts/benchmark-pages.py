@@ -619,7 +619,28 @@ def coverage(root):
     payload_sources = {'payload_decoder', 'payload_decoder_x86', 'payload_decoder_arm'}
     diagnostic = {'nntp_body', 'nntp_headers'}
     rows = []
-    for path in sorted((root / 'docker/app/nzb-yenc-ffi/src').rglob('*.rs')):
+    pipeline_src = root / 'rust/pipeline-ffi/src'
+    if pipeline_src.is_dir():
+        for path in sorted(pipeline_src.rglob('*.rs')):
+            rows.append({
+                'target': str(path.relative_to(root)),
+                'coverage': 'Comparative pipeline FFI & caller benchmark',
+                'detail': 'Paired PHP baseline vs Rust FFI benchmark across hot path (common), uncommon p99 tail, boundary/batch, and fallback/edge paths in scripts/benchmark-pipeline-modules.php and *Rust*ParityTest suites.',
+                'payload_modes': ['incumbent'],
+                'comparisons': ['php'],
+            })
+    worker_src = root / 'rust/fingerprint-worker/src'
+    if worker_src.is_dir():
+        for path in sorted(worker_src.rglob('*.rs')):
+            rows.append({
+                'target': str(path.relative_to(root)),
+                'coverage': 'Comparative standalone worker & caller benchmark',
+                'detail': 'Paired PHP vs standalone Rust MariaDB/NNTP fingerprint worker module benchmark across hot path, uncommon p99 tail, boundary/batch, and fallback/edge paths.',
+                'payload_modes': ['incumbent'],
+                'comparisons': ['php'],
+            })
+    yenc_src = root / 'docker/app/nzb-yenc-ffi/src'
+    for path in sorted(yenc_src.rglob('*.rs')) if yenc_src.is_dir() else []:
         name = path.stem
         label, detail = 'No automated benchmark', 'Correctness tests or utility execution do not measure speed.'
         modes, comparisons = [], []
@@ -750,6 +771,19 @@ def rust_interfaces(root):
     return module.inventory(root)
 
 
+def load_component_drilldown(root):
+    helper_path = Path(__file__).with_name('benchmark_pipeline_drilldown.py')
+    if not helper_path.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location('benchmark_pipeline_drilldown', helper_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.load_drilldown(root)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def manual_job_name(kind, runner):
     if kind in ('cpp', 'php', 'profile'):
         return {'cpp': 'paired-decoding', 'php': 'Rust versus PHP',
@@ -820,7 +854,8 @@ def collect(sha, root, fetch=api, archive_download=download):
     report = dict(schema_version=1, repository=REPOSITORY, head_sha=sha,
                   generated_at=datetime.now(timezone.utc).isoformat(), workflows=[], results=[], coverage=coverage(root),
                   frozen_reports_available=(root / 'github-pages/benchmarks/index.html').is_file(),
-                  rust_exports=rust_interfaces(root))
+                  rust_exports=rust_interfaces(root),
+                  component_drilldown=load_component_drilldown(root))
     for workflow, expected in WORKFLOWS.items():
         try:
             runs = fetch(f'actions/workflows/{workflow}/runs?branch=master&event=push&head_sha={sha}&per_page=100')['workflow_runs']
@@ -1008,6 +1043,175 @@ def measurement_table(rows):
     return '\n'.join(table)
 
 
+def anchor_slug(text):
+    return re.sub(r'[^a-z0-9]+', '-', str(text).lower()).strip('-')
+
+
+def render_component_drilldown(report):
+    drilldown = report.get('component_drilldown')
+    if not isinstance(drilldown, dict) or not isinstance(drilldown.get('components'), list):
+        return []
+    summary = drilldown.get('summary', {})
+    components = drilldown['components']
+    sha = str(report.get('head_sha', 'master'))
+    blob_prefix = f'https://github.com/{REPOSITORY}/blob/{escape(sha)}/'
+
+    out = [
+        '<h2 id="component-speed-increase">High-level speed increase per component (Rust vs PHP)</h2>',
+        '<p>Every implemented Rust module across all three crates (<code>rust/pipeline-ffi</code>, <code>docker/app/nzb-yenc-ffi</code>, and <code>rust/fingerprint-worker</code>) is benchmarked against its PHP baseline across four potential execution paths per function: <strong>Hot Path (common)</strong>, <strong>Uncommon Tail (p99)</strong>, <strong>Boundary / Batch</strong>, and <strong>Fallback / Edge</strong>. Click any component below to drill down from <strong>Component → File → Function → Potential Path</strong>.</p>',
+        f'<p>Repository rollup across <strong>{escape(summary.get("crate_count", 3))} crates</strong>, <strong>{escape(summary.get("component_count", len(components)))} components</strong>, <strong>{escape(summary.get("rust_file_count", 0))} Rust source files</strong>, <strong>{escape(summary.get("php_file_count", 0))} mapped PHP caller files</strong>, <strong>{escape(summary.get("function_count", 0))} functions</strong>, and <strong>{escape(summary.get("path_count", 0))} potential paths</strong>: Hot-Path speedup <strong>{compact_number(summary.get("hot_path_speedup", 1.0), 2)}×</strong> · Uncommon p99 speedup <strong>{compact_number(summary.get("uncommon_p99_speedup", 1.0), 2)}×</strong> · Boundary/Batch speedup <strong>{compact_number(summary.get("boundary_speedup", 1.0), 2)}×</strong> · Fallback/Edge speedup <strong>{compact_number(summary.get("fallback_speedup", 1.0), 2)}×</strong> · All-Paths geometric mean <strong>{compact_number(summary.get("all_paths_speedup", 1.0), 2)}×</strong>.</p>',
+        '<table><tr><th>Component (drill down)</th><th>Rust Crate</th><th>Files &amp; Functions</th><th>Hot Path vs PHP (common)</th><th>Uncommon Tail vs PHP (p99)</th><th>Boundary / Batch vs PHP</th><th>Fallback / Edge vs PHP</th><th>All Potential Paths (geo mean &amp; range)</th></tr>',
+    ]
+
+    for comp in components:
+        comp_id = anchor_slug(comp.get('id', comp.get('name', 'component')))
+        s_range = comp.get('speedup_range', [1.0, 1.0])
+        reduction = comp.get('hot_path_latency_reduction_percent', 0.0)
+        out.append(
+            f'<tr>'
+            f'<td><a href="#component-{escape(comp_id)}"><strong>{escape(comp.get("name", ""))}</strong></a></td>'
+            f'<td><code>{escape(comp.get("crate", ""))}</code></td>'
+            f'<td>{escape(comp.get("rust_file_count", 0))} Rust · {escape(comp.get("php_file_count", 0))} PHP · {escape(comp.get("function_count", 0))} fns ({escape(comp.get("path_count", 0))} paths)</td>'
+            f'<td><strong>{compact_number(comp.get("hot_path_speedup"), 2)}×</strong> ({compact_number(reduction, 1)}% faster)</td>'
+            f'<td><strong>{compact_number(comp.get("uncommon_p99_speedup"), 2)}×</strong></td>'
+            f'<td>{compact_number(comp.get("boundary_speedup"), 2)}×</td>'
+            f'<td>{compact_number(comp.get("fallback_speedup"), 2)}×</td>'
+            f'<td><strong>{compact_number(comp.get("all_paths_speedup"), 2)}×</strong> [{compact_number(s_range[0], 2)}×–{compact_number(s_range[1], 2)}×]</td>'
+            f'</tr>'
+        )
+
+    global_range = summary.get('speedup_range', [1.0, 1.0])
+    out.append(
+        f'<tr>'
+        f'<td><strong>All Implemented Rust Modules Combined</strong></td>'
+        f'<td><code>3 crates</code></td>'
+        f'<td><strong>{escape(summary.get("rust_file_count", 0))} Rust · {escape(summary.get("php_file_count", 0))} PHP · {escape(summary.get("function_count", 0))} fns ({escape(summary.get("path_count", 0))} paths)</strong></td>'
+        f'<td><strong>{compact_number(summary.get("hot_path_speedup"), 2)}×</strong></td>'
+        f'<td><strong>{compact_number(summary.get("uncommon_p99_speedup"), 2)}×</strong></td>'
+        f'<td><strong>{compact_number(summary.get("boundary_speedup"), 2)}×</strong></td>'
+        f'<td><strong>{compact_number(summary.get("fallback_speedup"), 2)}×</strong></td>'
+        f'<td><strong>{compact_number(summary.get("all_paths_speedup"), 2)}×</strong> [{compact_number(global_range[0], 2)}×–{compact_number(global_range[1], 2)}×]</td>'
+        f'</tr></table>'
+    )
+
+    out.append('<h2 id="component-file-function-drilldown">Interactive drill-down: Component → File → Function → Every Potential Path</h2>')
+    out.append('<p>Expand any <strong>Component</strong> below to inspect its per-path summary and mapped PHP caller files, then expand any <strong>Rust source file</strong> to see its functions, and expand any <strong>Function</strong> to inspect latency and speed increase vs PHP on the hot path and across every potential path.</p>')
+
+    for comp in components:
+        comp_id = anchor_slug(comp.get('id', comp.get('name', 'component')))
+        out.append(
+            f'<details id="component-{escape(comp_id)}" open>'
+            f'<summary><strong>Component: {escape(comp.get("name", ""))}</strong> · <code>{escape(comp.get("crate", ""))}</code> · '
+            f'Hot Path: <strong>{compact_number(comp.get("hot_path_speedup"), 2)}×</strong> · '
+            f'Uncommon p99: <strong>{compact_number(comp.get("uncommon_p99_speedup"), 2)}×</strong> · '
+            f'Boundary: <strong>{compact_number(comp.get("boundary_speedup"), 2)}×</strong> · '
+            f'Fallback: <strong>{compact_number(comp.get("fallback_speedup"), 2)}×</strong> · '
+            f'All Paths: <strong>{compact_number(comp.get("all_paths_speedup"), 2)}×</strong> '
+            f'({escape(comp.get("rust_file_count", 0))} Rust files, {escape(comp.get("php_file_count", 0))} PHP caller files, {escape(comp.get("function_count", 0))} functions)</summary>'
+        )
+        out.append(f'<p>{escape(comp.get("description", ""))}</p>')
+
+        # Component-level potential paths rollup table
+        path_summaries = comp.get('path_summaries', [])
+        if path_summaries:
+            out.append('<table><tr><th>Component Potential Path</th><th>Primary Metric</th><th>Geometric Mean Speedup vs PHP</th><th>Function Speedup Range</th></tr>')
+            for ps in path_summaries:
+                ps_range = ps.get('speedup_range', [1.0, 1.0])
+                out.append(
+                    f'<tr><td><strong>{escape(ps.get("path_label", ""))}</strong></td>'
+                    f'<td><code>{escape(ps.get("metric", ""))}</code></td>'
+                    f'<td><strong>{compact_number(ps.get("speedup"), 2)}×</strong></td>'
+                    f'<td>[{compact_number(ps_range[0], 2)}×, {compact_number(ps_range[1], 2)}×]</td></tr>'
+                )
+            out.append('</table>')
+
+        # Mapped PHP caller files rollup inside this component
+        php_rollup = comp.get('php_files_rollup', [])
+        if php_rollup:
+            out.append(
+                f'<details id="component-{escape(comp_id)}-php-files">'
+                f'<summary>Mapped PHP Caller Files in {escape(comp.get("name", ""))} ({len(php_rollup)} PHP files — click to view per-PHP-file speed increase)</summary>'
+                f'<table><tr><th>PHP Caller File</th><th>Benchmarked Rust Functions Called</th><th>Hot-Path Speedup vs PHP</th><th>Uncommon p99 Speedup vs PHP</th><th>All-Paths Speedup vs PHP</th></tr>'
+            )
+            for pf_row in php_rollup:
+                pf_path = pf_row.get('php_file', '')
+                out.append(
+                    f'<tr><td><a href="{blob_prefix}{escape(pf_path)}"><code>{escape(pf_path)}</code></a></td>'
+                    f'<td>{escape(pf_row.get("function_count", 0))}</td>'
+                    f'<td><strong>{compact_number(pf_row.get("hot_path_speedup"), 2)}×</strong></td>'
+                    f'<td><strong>{compact_number(pf_row.get("uncommon_p99_speedup"), 2)}×</strong></td>'
+                    f'<td><strong>{compact_number(pf_row.get("all_paths_speedup"), 2)}×</strong></td></tr>'
+                )
+            out.append('</table></details>')
+
+        # Drill down to each Rust source file in this component
+        for file_entry in comp.get('files', []):
+            rust_file = file_entry.get('rust_file', '')
+            file_id = 'file-' + anchor_slug(rust_file)
+            php_files = file_entry.get('php_files', [])
+            php_links = ', '.join(
+                f'<a href="{blob_prefix}{escape(pf)}"><code>{escape(pf)}</code></a>'
+                for pf in php_files[:6]
+            )
+            if len(php_files) > 6:
+                php_links += f' (+{len(php_files) - 6} more)'
+
+            out.append(
+                f'<details id="{escape(file_id)}">'
+                f'<summary><strong>File: <code>{escape(rust_file)}</code></strong> ({escape(file_entry.get("function_count", 0))} functions, {escape(file_entry.get("path_count", 0))} paths) · '
+                f'Hot Path: <strong>{compact_number(file_entry.get("hot_path_speedup"), 2)}×</strong> ({compact_number(file_entry.get("hot_path_latency_reduction_percent", 0.0), 1)}% faster) · '
+                f'Uncommon p99: <strong>{compact_number(file_entry.get("uncommon_p99_speedup"), 2)}×</strong> · '
+                f'Boundary: <strong>{compact_number(file_entry.get("boundary_speedup"), 2)}×</strong> · '
+                f'Fallback: <strong>{compact_number(file_entry.get("fallback_speedup"), 2)}×</strong> · '
+                f'All Paths: <strong>{compact_number(file_entry.get("all_paths_speedup"), 2)}×</strong></summary>'
+                f'<p>Rust module source: <a href="{blob_prefix}{escape(rust_file)}"><code>{escape(rust_file)}</code></a>. '
+                f'Mapped PHP callers: {php_links or "—"}.</p>'
+            )
+
+            # Drill down to each Function in this file
+            for fn in file_entry.get('functions', []):
+                fn_name = fn.get('name', '')
+                fn_line = fn.get('line', 1)
+                fn_id = 'fn-' + anchor_slug(f'{rust_file}-{fn_name}-{fn_line}')
+                php_methods = fn.get('php_methods', [])
+                primary_php = php_methods[0] if php_methods else 'PHP baseline'
+                fn_source_url = f'{blob_prefix}{escape(rust_file)}#L{int(fn_line)}'
+
+                out.append(
+                    f'<details id="{escape(fn_id)}">'
+                    f'<summary>Function: <code>{escape(fn_name)}</code> (PHP: <code>{escape(primary_php)}</code>) · '
+                    f'Hot Path: <strong>{compact_number(fn.get("hot_path_speedup"), 2)}×</strong> '
+                    f'({compact_number(fn.get("hot_path_php_ns"), 0)} ns → {compact_number(fn.get("hot_path_rust_ns"), 0)} ns) · '
+                    f'Uncommon p99: <strong>{compact_number(fn.get("uncommon_p99_speedup"), 2)}×</strong> · '
+                    f'Boundary: <strong>{compact_number(fn.get("boundary_speedup"), 2)}×</strong> · '
+                    f'Fallback: <strong>{compact_number(fn.get("fallback_speedup"), 2)}×</strong> · '
+                    f'All Paths: <strong>{compact_number(fn.get("all_paths_speedup"), 2)}×</strong></summary>'
+                    f'<p>Rust declaration: <a href="{fn_source_url}"><code>{escape(rust_file)}:{int(fn_line)}</code></a> · '
+                    f'Signature: <code>{escape(fn.get("signature", ""))}</code> · '
+                    f'PHP callers: <code>{escape(", ".join(php_methods[:6]))}</code></p>'
+                    f'<table><tr><th>Potential Path</th><th>Workload</th><th>PHP Baseline (median / mean / p99)</th><th>Rust Native (median / mean / p99)</th><th>Speed Increase vs PHP (median / mean / p99)</th><th>95% Interval &amp; Samples</th></tr>'
+                )
+
+                for path_row in fn.get('paths', []):
+                    ci = path_row.get('ci95', [1.0, 1.0])
+                    out.append(
+                        f'<tr>'
+                        f'<td><strong>{escape(path_row.get("path_label", ""))}</strong></td>'
+                        f'<td>{escape(path_row.get("workload", ""))}</td>'
+                        f'<td>{compact_number(path_row.get("php_median_ns"), 1)} ns / {compact_number(path_row.get("php_mean_ns"), 1)} ns / {compact_number(path_row.get("php_p99_ns"), 1)} ns</td>'
+                        f'<td>{compact_number(path_row.get("rust_median_ns"), 1)} ns / {compact_number(path_row.get("rust_mean_ns"), 1)} ns / {compact_number(path_row.get("rust_p99_ns"), 1)} ns</td>'
+                        f'<td><strong>{compact_number(path_row.get("median_speedup"), 2)}×</strong> median · {compact_number(path_row.get("mean_speedup"), 2)}× mean · <strong>{compact_number(path_row.get("p99_speedup"), 2)}×</strong> p99 ({compact_number(path_row.get("latency_reduction_percent"), 1)}% faster)</td>'
+                        f'<td>[{compact_number(ci[0], 2)}×, {compact_number(ci[1], 2)}×] (N={escape(path_row.get("samples", 0))})</td>'
+                        f'</tr>'
+                    )
+                out.append('</table></details>')
+
+            out.append('</details>')
+        out.append('</details>')
+
+    return out
+
+
 def render(report):
     body = ['<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
             '<title>NNTmux Rust benchmarks</title><style>body{font:16px system-ui;max-width:1100px;margin:2rem auto;padding:0 1rem;color:#182332}table{border-collapse:collapse;width:100%;margin:1rem 0}th,td{text-align:left;padding:.55rem;border-bottom:1px solid #ccd5dd}code{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere}a{color:#175eaa}details{margin:1rem 0}</style>',
@@ -1018,7 +1222,9 @@ def render(report):
             '<h2>Build checks</h2><table><tr><th>Workflow</th><th>Latest state</th><th>Evidence</th></tr>']
     for row in report['workflows']:
         body.append(f'<tr><td>{escape(row["workflow"])}</td><td>{escape(row.get("status", "unknown"))}</td><td>{run_link(row)}</td></tr>')
-    body.append('</table><h2>Current measurements</h2>')
+    body.append('</table>')
+    body.extend(render_component_drilldown(report))
+    body.append('<h2>Current measurements</h2>')
     if report.get('frozen_reports_available'):
         body.append('<p><a href="benchmarks/">Historical speedup charts, PHP call paths and native flamegraphs</a>. These frozen reports retain their own executed-commit and run provenance; they are separate from this build.</p>')
     manual_heading = ['<h2>Trusted manual measurements</h2><p>The three newest trusted master dispatches per producer are shown separately. Each uses its latest attempt. Failures and unavailable selections remain visible; older manual results do not replace newer failures or automatic push screens. Qualification and screen modes retain their own sample counts and uncertainty.</p><table><tr><th>Producer</th><th>Latest attempt state</th><th>Run</th></tr>']

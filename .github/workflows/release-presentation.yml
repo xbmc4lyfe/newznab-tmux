@@ -28,6 +28,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-presentation-${{ github.ref }}-${{ github.event_name }}-${{ github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   native-presentation:
     # Avoid self-hosted workers that also advertise ubuntu-latest but have no Docker daemon.
